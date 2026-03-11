@@ -1,0 +1,78 @@
+use crate::config::*;
+
+pub fn global_cas_dir() -> Option<std::path::PathBuf> {
+    dirs::config_dir().map(|d| d.join("cas"))
+}
+
+/// Load the global CAS config from ~/.config/cas/
+///
+/// Returns default config if the directory or config file doesn't exist.
+pub fn load_global_config() -> Config {
+    if let Some(global_dir) = global_cas_dir() {
+        if global_dir.exists() {
+            Config::load(&global_dir).unwrap_or_default()
+        } else {
+            Config::default()
+        }
+    } else {
+        Config::default()
+    }
+}
+
+/// Save config to the global CAS directory (~/.config/cas/)
+///
+/// Creates the directory if it doesn't exist.
+pub fn save_global_config(config: &Config) -> Result<(), MemError> {
+    if let Some(global_dir) = global_cas_dir() {
+        std::fs::create_dir_all(&global_dir)?;
+        config.save(&global_dir)
+    } else {
+        Err(MemError::Other(
+            "Could not determine global config directory".to_string(),
+        ))
+    }
+}
+
+/// Check if telemetry consent has been given (either way)
+///
+/// Returns None if consent hasn't been asked yet, Some(true) if opted in,
+/// Some(false) if opted out.
+pub fn get_telemetry_consent() -> Option<bool> {
+    load_global_config().telemetry().consent_given
+}
+
+/// Set telemetry consent in the global config
+pub fn set_telemetry_consent(consent: bool) -> Result<(), MemError> {
+    let mut config = load_global_config();
+    let telemetry = config
+        .telemetry
+        .get_or_insert_with(TelemetryConfig::default);
+    telemetry.consent_given = Some(consent);
+    telemetry.enabled = consent;
+    save_global_config(&config)
+}
+
+/// Prompt the user for telemetry consent
+///
+/// Returns true if user consents, false otherwise.
+/// This function reads from stdin and should only be called in interactive contexts.
+pub fn prompt_telemetry_consent() -> bool {
+    use std::io::{self, Write};
+
+    println!();
+    println!("CAS collects anonymous usage data to improve the product.");
+    println!("- No personal data or file contents collected");
+    println!("- You can disable anytime: cas config telemetry.enabled false");
+    println!();
+    print!("Enable anonymous telemetry? [Y/n] ");
+    let _ = io::stdout().flush();
+
+    let mut input = String::new();
+    if io::stdin().read_line(&mut input).is_err() {
+        return false;
+    }
+
+    let input = input.trim().to_lowercase();
+    // Default to yes if empty, otherwise check for explicit no
+    input.is_empty() || !input.starts_with('n')
+}

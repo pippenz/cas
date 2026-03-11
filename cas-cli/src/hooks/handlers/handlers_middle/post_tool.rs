@@ -1,0 +1,693 @@
+use crate::hooks::handlers::*;
+
+pub fn handle_post_tool_use(
+    input: &HookInput,
+    cas_root: Option<&Path>,
+) -> Result<HookOutput, MemError> {
+    let tool_name = match &input.tool_name {
+        Some(name) => name.as_str(),
+        None => return Ok(HookOutput::empty()),
+    };
+
+    // Check if CAS is initialized
+    let cas_root = match cas_root {
+        Some(root) => root,
+        None => return Ok(HookOutput::empty()),
+    };
+
+    // === WORKER ACTIVITY TRACKING (for supervisor visibility) ===
+    // Send activity events for significant tools to the daemon
+    #[cfg(feature = "mcp-server")]
+    if let Some((event_type, description)) = detect_significant_activity(tool_name, input) {
+        let event = crate::mcp::socket::DaemonEvent::WorkerActivity {
+            session_id: input.session_id.clone(),
+            event_type,
+            description,
+            entity_id: extract_activity_entity_id(tool_name, input),
+        };
+        // Best-effort send - don't block hook on daemon availability
+        let _ = crate::mcp::socket::send_event(cas_root, &event);
+    }
+
+    // === RIPPLE CHECK (file-to-task/spec consistency reminder) ===
+    // When a file linked to a task or spec is modified, remind agent to check consistency
+    if tool_name == "Write" || tool_name == "Edit" {
+        if let Some(reminder) = check_ripple_consistency(cas_root, input) {
+            return Ok(HookOutput::with_context("PostToolUse", reminder));
+        }
+    }
+
+    // Check if this tool is worth capturing for observations
+    if !CAPTURE_TOOLS.contains(&tool_name) {
+        return Ok(HookOutput::empty());
+    }
+
+    // Initialize dev tracer for rich tool tracing
+    let _ = DevTracer::init_global(cas_root);
+
+    // Check config for capture settings
+    let config = Config::load(cas_root).unwrap_or_default();
+    if let Some(ref hooks_config) = config.hooks {
+        if !hooks_config.capture_enabled {
+            return Ok(HookOutput::empty());
+        }
+
+        // Check if this specific tool should be captured
+        if !hooks_config.capture_tools.is_empty()
+            && !hooks_config.capture_tools.iter().any(|t| t == tool_name)
+        {
+            return Ok(HookOutput::empty());
+        }
+    }
+
+    // Record rich tool trace for learning loop detection (dev mode only)
+    if config.dev.as_ref().map(|d| d.dev_mode).unwrap_or(false) {
+        record_rich_tool_trace(input, tool_name);
+    }
+
+    // === ATTRIBUTION CAPTURE (must happen before smart filtering) ===
+    // Attribution must be captured for ALL file changes, not just "significant" ones.
+    // This enables git blame-style attribution for every line of AI-generated code.
+    if tool_name == "Write" || tool_name == "Edit" {
+        crate::hooks::handlers::handlers_events::capture_file_change_for_attribution(
+            cas_root, input, tool_name,
+        );
+    }
+
+    // Detect git commit and link file changes (Bash tool only)
+    if tool_name == "Bash" {
+        crate::hooks::handlers::handlers_events::detect_and_link_git_commit(cas_root, input);
+    }
+
+    // === SMART FILTERING ===
+    // Only capture significant observations to reduce noise
+    let should_buffer = should_buffer_observation(input, tool_name);
+
+    if !should_buffer {
+        return Ok(HookOutput::empty());
+    }
+
+    // Format observation content (use configurable skip lists)
+    let skip_config = config.hooks.as_ref().map(|h| &h.post_tool_use.skip);
+    let content = format_observation(input, skip_config);
+
+    if content.is_empty() {
+        return Ok(HookOutput::empty());
+    }
+
+    // Extract common fields for both storage paths
+    let file_path = input
+        .tool_input
+        .as_ref()
+        .and_then(|ti| ti.get("file_path").and_then(|v| v.as_str()));
+
+    // Track file for session-aware context boosting
+    // This enables "streaming observations" - context adapts to files being worked on
+    if let Some(fp) = file_path {
+        track_session_file(cas_root, fp);
+    }
+
+    let exit_code = input
+        .tool_response
+        .as_ref()
+        .and_then(|tr| tr.get("exitCode").and_then(|v| v.as_i64()))
+        .map(|v| v as i32);
+
+    let is_error = exit_code.map(|c| c != 0).unwrap_or(false)
+        || input
+            .tool_response
+            .as_ref()
+            .and_then(|tr| tr.get("stderr").and_then(|v| v.as_str()))
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+
+    // Buffer for session-end synthesis (only when DevTracer is available)
+    // Raw observations without synthesis are noise — skip if no tracer
+    if let Some(tracer) = DevTracer::get() {
+        let _ = tracer.buffer_observation(tool_name, file_path, &content, exit_code, is_error);
+    }
+
+    // Silent success - don't clutter Claude's output
+    Ok(HookOutput::empty())
+}
+
+/// Determine if an observation is significant enough to buffer
+///
+/// We only buffer observations that are likely to yield useful learnings:
+/// - Errors (always capture - failures are learning opportunities)
+/// - New file creation (architectural decisions)
+/// - Large edits (significant changes)
+/// - Commands with interesting output
+pub fn should_buffer_observation(input: &HookInput, tool_name: &str) -> bool {
+    match tool_name {
+        "Bash" => {
+            // Always capture errors
+            let exit_code = input
+                .tool_response
+                .as_ref()
+                .and_then(|tr| tr.get("exitCode").and_then(|v| v.as_i64()))
+                .unwrap_or(0);
+
+            if exit_code != 0 {
+                return true;
+            }
+
+            // Capture build/test commands (even successful ones - patterns matter)
+            if let Some(ti) = &input.tool_input {
+                if let Some(cmd) = ti.get("command").and_then(|v| v.as_str()) {
+                    let cmd_lower = cmd.to_lowercase();
+                    let significant_commands = [
+                        "cargo build",
+                        "cargo test",
+                        "cargo check",
+                        "mix compile",
+                        "mix test",
+                        "mix credo",
+                        "npm build",
+                        "npm test",
+                        "bun test",
+                        "git commit",
+                        "git push",
+                    ];
+                    if significant_commands.iter().any(|sc| cmd_lower.contains(sc)) {
+                        return true;
+                    }
+                }
+            }
+
+            false
+        }
+        "Write" => {
+            // New file creation is always significant
+            true
+        }
+        "Edit" => {
+            // Only capture large edits (significant changes)
+            if let Some(ti) = &input.tool_input {
+                let old_string = ti.get("old_string").and_then(|v| v.as_str()).unwrap_or("");
+                let new_string = ti.get("new_string").and_then(|v| v.as_str()).unwrap_or("");
+
+                let old_lines = old_string.lines().count();
+                let new_lines = new_string.lines().count();
+                let line_diff = (new_lines as i32 - old_lines as i32).abs();
+
+                // Capture edits that add/remove 10+ lines or involve 50+ line changes
+                line_diff >= 10 || old_lines + new_lines >= 50
+            } else {
+                false
+            }
+        }
+        "Read" => {
+            // Don't buffer reads - they're just information gathering
+            false
+        }
+        _ => false,
+    }
+}
+
+pub fn record_rich_tool_trace(input: &HookInput, tool_name: &str) {
+    let tracer = match DevTracer::get() {
+        Some(t) => t,
+        None => return,
+    };
+
+    // Get last trace to compute sequence info
+    let last_trace = tracer.get_last_tool_trace(&input.session_id).ok().flatten();
+
+    let sequence_pos = last_trace.as_ref().map(|t| t.sequence_pos + 1).unwrap_or(0);
+    let prev_tool = last_trace.as_ref().map(|t| t.tool_name.clone());
+    let prev_failed = last_trace.as_ref().map(|t| !t.success).unwrap_or(false);
+    let time_since_prev_ms = last_trace.as_ref().map(|t| {
+        let now = chrono::Utc::now();
+        (now - t.timestamp).num_milliseconds().max(0) as u64
+    });
+
+    let mut trace = ToolTrace::new(
+        input.session_id.clone(),
+        tool_name.to_string(),
+        sequence_pos,
+    );
+
+    trace.prev_tool = prev_tool;
+    trace.prev_failed = prev_failed;
+    trace.time_since_prev_ms = time_since_prev_ms;
+
+    // Extract tool-specific information
+    match tool_name {
+        "Edit" => {
+            if let Some(ref tool_input) = input.tool_input {
+                if let Some(path) = tool_input.get("file_path").and_then(|v| v.as_str()) {
+                    trace.file_path = Some(path.to_string());
+                    trace.is_dependency = ToolTrace::is_dep_path(path);
+                }
+                // Capture edit content for semantic analysis
+                if let Some(old) = tool_input.get("old_string").and_then(|v| v.as_str()) {
+                    trace.old_content = Some(old.chars().take(1000).collect());
+                    trace.old_content_hash = Some(ToolTrace::hash_content(old));
+                }
+                if let Some(new) = tool_input.get("new_string").and_then(|v| v.as_str()) {
+                    trace.new_content = Some(new.chars().take(1000).collect());
+                    trace.new_content_hash = Some(ToolTrace::hash_content(new));
+                }
+                // Compute line changes
+                if let (Some(old), Some(new)) = (
+                    tool_input.get("old_string").and_then(|v| v.as_str()),
+                    tool_input.get("new_string").and_then(|v| v.as_str()),
+                ) {
+                    let old_lines = old.lines().count() as u32;
+                    let new_lines = new.lines().count() as u32;
+                    if new_lines > old_lines {
+                        trace.lines_added = Some(new_lines - old_lines);
+                    } else if old_lines > new_lines {
+                        trace.lines_removed = Some(old_lines - new_lines);
+                    }
+                }
+            }
+            // Check tool response for success
+            if let Some(ref response) = input.tool_response {
+                trace.success = response.get("error").is_none();
+                if let Some(err) = response.get("error").and_then(|v| v.as_str()) {
+                    trace.error_snippet = Some(err.chars().take(500).collect());
+                    trace.error_type = Some(ToolTrace::classify_error(err).to_string());
+                }
+            }
+        }
+        "Write" => {
+            if let Some(ref tool_input) = input.tool_input {
+                if let Some(path) = tool_input.get("file_path").and_then(|v| v.as_str()) {
+                    trace.file_path = Some(path.to_string());
+                    trace.is_dependency = ToolTrace::is_dep_path(path);
+                }
+                // Capture written content
+                if let Some(content) = tool_input.get("content").and_then(|v| v.as_str()) {
+                    trace.new_content = Some(content.chars().take(1000).collect());
+                    trace.new_content_hash = Some(ToolTrace::hash_content(content));
+                    trace.lines_added = Some(content.lines().count() as u32);
+                }
+            }
+            if let Some(ref response) = input.tool_response {
+                trace.success = response.get("error").is_none();
+                if let Some(err) = response.get("error").and_then(|v| v.as_str()) {
+                    trace.error_snippet = Some(err.chars().take(500).collect());
+                    trace.error_type = Some(ToolTrace::classify_error(err).to_string());
+                }
+            }
+        }
+        "Bash" => {
+            if let Some(ref tool_input) = input.tool_input {
+                if let Some(cmd) = tool_input.get("command").and_then(|v| v.as_str()) {
+                    trace.command = Some(cmd.chars().take(500).collect());
+                    trace.command_type = Some(ToolTrace::classify_command(cmd).to_string());
+                }
+            }
+            if let Some(ref response) = input.tool_response {
+                // Try to get exit code from response
+                if let Some(exit_code) = response.get("exit_code").and_then(|v| v.as_i64()) {
+                    trace.exit_code = Some(exit_code as i32);
+                    trace.success = exit_code == 0;
+                }
+                // Extract output/error snippets
+                if let Some(output) = response.get("stdout").and_then(|v| v.as_str()) {
+                    trace.output_snippet = Some(output.chars().take(500).collect());
+                }
+                if let Some(stderr) = response.get("stderr").and_then(|v| v.as_str()) {
+                    if !stderr.is_empty() {
+                        trace.error_snippet = Some(stderr.chars().take(500).collect());
+                        trace.error_type = Some(ToolTrace::classify_error(stderr).to_string());
+                    }
+                }
+                // Also check for error in result field
+                if let Some(result) = response.get("result").and_then(|v| v.as_str()) {
+                    if trace.output_snippet.is_none() && !result.is_empty() {
+                        trace.output_snippet = Some(result.chars().take(500).collect());
+                    }
+                    // If still no error type, try to classify from result
+                    if trace.error_type.is_none() && !trace.success {
+                        trace.error_type = Some(ToolTrace::classify_error(result).to_string());
+                    }
+                }
+            }
+        }
+        "Read" => {
+            if let Some(ref tool_input) = input.tool_input {
+                if let Some(path) = tool_input.get("file_path").and_then(|v| v.as_str()) {
+                    trace.file_path = Some(path.to_string());
+                    trace.is_dependency = ToolTrace::is_dep_path(path);
+                }
+            }
+        }
+        "Grep" => {
+            if let Some(ref tool_input) = input.tool_input {
+                if let Some(pattern) = tool_input.get("pattern").and_then(|v| v.as_str()) {
+                    trace.search_pattern = Some(pattern.chars().take(200).collect());
+                }
+                if let Some(path) = tool_input.get("path").and_then(|v| v.as_str()) {
+                    trace.file_path = Some(path.to_string());
+                }
+            }
+            if let Some(ref response) = input.tool_response {
+                // Try to count matches from response
+                if let Some(matches) = response.get("matches").and_then(|v| v.as_array()) {
+                    trace.search_results_count = Some(matches.len() as u32);
+                }
+                // Or count from files_with_matches
+                if let Some(files) = response.get("files").and_then(|v| v.as_array()) {
+                    trace.search_results_count = Some(files.len() as u32);
+                }
+            }
+        }
+        "Glob" => {
+            if let Some(ref tool_input) = input.tool_input {
+                if let Some(pattern) = tool_input.get("pattern").and_then(|v| v.as_str()) {
+                    trace.search_pattern = Some(pattern.chars().take(200).collect());
+                }
+                if let Some(path) = tool_input.get("path").and_then(|v| v.as_str()) {
+                    trace.file_path = Some(path.to_string());
+                }
+            }
+            if let Some(ref response) = input.tool_response {
+                if let Some(files) = response.get("files").and_then(|v| v.as_array()) {
+                    trace.search_results_count = Some(files.len() as u32);
+                }
+            }
+        }
+        "WebFetch" => {
+            if let Some(ref tool_input) = input.tool_input {
+                if let Some(url) = tool_input.get("url").and_then(|v| v.as_str()) {
+                    trace.url = Some(url.chars().take(500).collect());
+                }
+            }
+            if let Some(ref response) = input.tool_response {
+                trace.success = response.get("error").is_none();
+                if let Some(err) = response.get("error").and_then(|v| v.as_str()) {
+                    trace.error_snippet = Some(err.chars().take(500).collect());
+                    trace.error_type = Some(ToolTrace::classify_error(err).to_string());
+                }
+            }
+        }
+        "Task" => {
+            // Task tool is used for sub-agents, capture the prompt/description
+            if let Some(ref tool_input) = input.tool_input {
+                if let Some(prompt) = tool_input.get("prompt").and_then(|v| v.as_str()) {
+                    // Store prompt snippet as search_pattern (repurposed for context)
+                    trace.search_pattern = Some(prompt.chars().take(200).collect());
+                }
+            }
+        }
+        _ => {}
+    }
+
+    // Record the trace
+    let _ = tracer.record_tool_trace(&trace);
+}
+
+/// Format an observation from tool usage
+pub fn format_observation(
+    input: &HookInput,
+    skip_config: Option<&crate::config::PostToolUseSkipConfig>,
+) -> String {
+    let tool_name = input.tool_name.as_deref().unwrap_or("unknown");
+
+    match tool_name {
+        "Write" | "Edit" => format_file_change(input),
+        "Bash" => format_bash_command(input, skip_config),
+        "Read" => format_file_read(input, skip_config),
+        _ => String::new(),
+    }
+}
+
+/// Format a file write/edit observation
+pub fn format_file_change(input: &HookInput) -> String {
+    let tool_input = match &input.tool_input {
+        Some(v) => v,
+        None => return String::new(),
+    };
+
+    let file_path = tool_input
+        .get("file_path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+
+    let tool_name = input.tool_name.as_deref().unwrap_or("Write");
+
+    // Don't capture the full content, just the fact that it was modified
+    format!("{tool_name}: {file_path}")
+}
+
+/// Format a bash command observation
+pub fn format_bash_command(
+    input: &HookInput,
+    skip_config: Option<&crate::config::PostToolUseSkipConfig>,
+) -> String {
+    let tool_input = match &input.tool_input {
+        Some(v) => v,
+        None => return String::new(),
+    };
+
+    let command = tool_input
+        .get("command")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    // Use config skip lists or defaults
+    let default_skip = crate::config::PostToolUseSkipConfig::default();
+    let skip = skip_config.unwrap_or(&default_skip);
+
+    // Default commands to always skip (hardcoded for safety)
+    let always_skip = [
+        "which", "type", "command", "whereis", "file", "wc", "sort", "uniq", "tr", "cut", "awk",
+        "sed", "grep", "rg", "find", "fd", "ag", "true", "false", "test", "[",
+    ];
+
+    // CAS dev build prefixes (always skip, not configurable)
+    let dev_prefixes = ["./target/release/cas ", "./target/debug/cas "];
+
+    // Git readonly commands with extended set (always skip)
+    let always_skip_git = [
+        "git remote",
+        "git tag",
+        "git stash list",
+        "git config --get",
+        "git rev-parse",
+        "git ls-files",
+        "git describe",
+    ];
+
+    let first_word = command.split_whitespace().next().unwrap_or("");
+
+    // Check configurable skip commands
+    if skip.commands.iter().any(|c| c == first_word) {
+        return String::new();
+    }
+
+    // Check always-skip commands
+    if always_skip.contains(&first_word) {
+        return String::new();
+    }
+
+    // Check configurable skip prefixes (cas commands)
+    if skip.prefixes.iter().any(|p| command.starts_with(p)) {
+        return String::new();
+    }
+
+    // Check dev build prefixes (always skip)
+    if dev_prefixes.iter().any(|p| command.starts_with(p)) {
+        return String::new();
+    }
+
+    // Check configurable read-only git commands
+    if skip.git_readonly.iter().any(|gc| command.starts_with(gc)) {
+        return String::new();
+    }
+
+    // Check always-skip git commands
+    if always_skip_git.iter().any(|gc| command.starts_with(gc)) {
+        return String::new();
+    }
+
+    // Truncate long commands
+    let cmd = truncate_display(command, 200);
+
+    format!("Bash: {cmd}")
+}
+
+/// Format a file read observation
+pub fn format_file_read(
+    input: &HookInput,
+    skip_config: Option<&crate::config::PostToolUseSkipConfig>,
+) -> String {
+    let tool_input = match &input.tool_input {
+        Some(v) => v,
+        None => return String::new(),
+    };
+
+    let file_path = tool_input
+        .get("file_path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+
+    // Use config skip extensions or defaults
+    let default_skip = crate::config::PostToolUseSkipConfig::default();
+    let skip = skip_config.unwrap_or(&default_skip);
+
+    // Only note important file reads, skip common ones (configurable)
+    if skip
+        .read_extensions
+        .iter()
+        .any(|ext| file_path.ends_with(ext))
+    {
+        return String::new();
+    }
+
+    format!("Read: {file_path}")
+}
+
+/// Check if a modified file is referenced by any active task or spec.
+/// Returns a reminder string if matches are found, None otherwise.
+/// Designed to be lightweight (< 50ms) — fails silently on any error.
+fn check_ripple_consistency(cas_root: &Path, input: &HookInput) -> Option<String> {
+    let file_path = input.tool_input.as_ref()?.get("file_path")?.as_str()?;
+
+    let path = std::path::Path::new(file_path);
+
+    // Compute relative path from cwd for matching against task descriptions
+    let cwd = std::env::current_dir().ok()?;
+    let relative = path
+        .strip_prefix(&cwd)
+        .ok()
+        .and_then(|p| p.to_str())
+        .unwrap_or(file_path);
+
+    // Build a short path (parent_dir/filename) for partial matching
+    let short_path = path.file_name().and_then(|f| {
+        path.parent()
+            .and_then(|p| p.file_name())
+            .map(|parent| format!("{}/{}", parent.to_string_lossy(), f.to_string_lossy()))
+    });
+
+    // Open task store (best-effort, fail silently)
+    let task_store = open_task_store(cas_root).ok()?;
+
+    let mut matching_task_ids = Vec::new();
+
+    // Check open and in_progress tasks for file path references
+    for status in [TaskStatus::Open, TaskStatus::InProgress] {
+        if let Ok(tasks) = task_store.list(Some(status)) {
+            for task in &tasks {
+                if task_references_file(task, relative, short_path.as_deref()) {
+                    matching_task_ids.push(task.id.clone());
+                    if matching_task_ids.len() >= 5 {
+                        break;
+                    }
+                }
+            }
+        }
+        if matching_task_ids.len() >= 5 {
+            break;
+        }
+    }
+
+    // Also check active specs (best-effort, separate store)
+    let mut matching_spec_ids = Vec::new();
+    if let Ok(spec_store) = crate::store::open_spec_store(cas_root) {
+        if let Ok(specs) = spec_store.list(None) {
+            for spec in &specs {
+                // Skip superseded/rejected specs
+                if spec.status == crate::types::SpecStatus::Superseded
+                    || spec.status == crate::types::SpecStatus::Rejected
+                {
+                    continue;
+                }
+                if spec_references_file(spec, relative, short_path.as_deref()) {
+                    matching_spec_ids.push(spec.id.clone());
+                    if matching_spec_ids.len() >= 3 {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    if matching_task_ids.is_empty() && matching_spec_ids.is_empty() {
+        return None;
+    }
+
+    // Build reminder with matched IDs
+    let mut parts = Vec::new();
+    if !matching_task_ids.is_empty() {
+        let refs = matching_task_ids
+            .iter()
+            .take(3)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        parts.push(format!("task(s) {refs}"));
+    }
+    if !matching_spec_ids.is_empty() {
+        let refs = matching_spec_ids
+            .iter()
+            .take(3)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        parts.push(format!("spec(s) {refs}"));
+    }
+
+    Some(format!(
+        "<system-reminder>Ripple check: `{}` is referenced in {}. \
+         Verify the parent epic/spec descriptions are still consistent with your changes.</system-reminder>",
+        relative,
+        parts.join(" and "),
+    ))
+}
+
+/// Check if a task's text fields reference a given file path.
+fn task_references_file(task: &Task, relative: &str, short_path: Option<&str>) -> bool {
+    let haystack = format!(
+        "{}\n{}\n{}",
+        task.description, task.acceptance_criteria, task.design
+    );
+
+    if haystack.contains(relative) {
+        return true;
+    }
+
+    // Fall back to short path (parent/filename) for less specific references,
+    // but only if the short path is distinctive enough (> 5 chars)
+    if let Some(short) = short_path {
+        if short.len() > 5 && haystack.contains(short) {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Check if a spec's text fields reference a given file path.
+fn spec_references_file(
+    spec: &crate::types::Spec,
+    relative: &str,
+    short_path: Option<&str>,
+) -> bool {
+    let haystack = format!(
+        "{}\n{}\n{}\n{}\n{}\n{}",
+        spec.summary,
+        spec.design_notes,
+        spec.additional_notes,
+        spec.goals.join(" "),
+        spec.technical_requirements.join(" "),
+        spec.in_scope.join(" "),
+    );
+
+    if haystack.contains(relative) {
+        return true;
+    }
+
+    if let Some(short) = short_path {
+        if short.len() > 5 && haystack.contains(short) {
+            return true;
+        }
+    }
+
+    false
+}

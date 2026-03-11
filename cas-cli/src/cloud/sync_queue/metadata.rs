@@ -1,0 +1,39 @@
+use rusqlite::{OptionalExtension, params};
+
+use crate::cloud::sync_queue::SyncQueue;
+use crate::error::CasError;
+
+impl SyncQueue {
+    /// Get sync metadata value.
+    pub fn get_metadata(&self, key: &str) -> Result<Option<String>, CasError> {
+        let conn = self.conn.lock().unwrap();
+        let value: Option<String> = conn
+            .query_row(
+                "SELECT value FROM sync_metadata WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(value)
+    }
+
+    /// Set sync metadata value.
+    pub fn set_metadata(&self, key: &str, value: &str) -> Result<(), CasError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            r#"
+            INSERT INTO sync_metadata (key, value) VALUES (?1, ?2)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            "#,
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// Delete sync metadata value.
+    pub fn delete_metadata(&self, key: &str) -> Result<(), CasError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM sync_metadata WHERE key = ?1", params![key])?;
+        Ok(())
+    }
+}

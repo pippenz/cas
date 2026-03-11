@@ -1,0 +1,727 @@
+//! Hybrid search combining BM25, semantic, temporal, graph, and code search (Hindsight-inspired)
+//!
+//! This module provides a 6-channel hybrid search:
+//! 1. BM25 (lexical) - traditional text matching
+//! 2. Semantic - embedding-based similarity
+//! 3. Temporal - time-aware retrieval using valid_from/valid_until
+//! 4. Graph - spreading activation over entity relationships
+//! 5. Code - semantic code search over indexed symbols
+//! 6. Reranking (optional) - ML-based score refinement
+
+use std::hash::{Hash, Hasher};
+use std::path::Path;
+use std::sync::Arc;
+
+use std::path::Path as StdPath;
+
+use crate::hybrid_search::cache::SearchCache;
+use crate::hybrid_search::code::{CasCodeSearch, open_code_search};
+use crate::hybrid_search::graph::{GraphRetriever, SpreadingActivationConfig};
+use crate::hybrid_search::scorer::{
+    SearchWeights, calibrate_scores, combine_multi_channel, rrf_with_magnitude,
+};
+use crate::hybrid_search::temporal::{TemporalRetriever, TimePeriod};
+use crate::hybrid_search::{DocType, SearchIndex, SearchOptions, SearchResult};
+// Note: Local embeddings have been removed. Semantic search is now cloud-only.
+// The hybrid search continues to support BM25, temporal, graph, and code search locally.
+use crate::error::Result;
+use crate::store::EntityStore;
+use crate::types::Entry;
+use cas_search::CodeSearchOptions;
+
+/// Options specific to hybrid search
+#[derive(Debug, Clone)]
+pub struct HybridSearchOptions {
+    /// Base search options (query, limit, filters)
+    pub base: SearchOptions,
+
+    /// Enable semantic search component
+    pub enable_semantic: bool,
+
+    /// Enable temporal search component (Hindsight-inspired)
+    pub enable_temporal: bool,
+
+    /// Enable graph-based search component (Hindsight-inspired)
+    pub enable_graph: bool,
+
+    /// Enable code search component (searches indexed code symbols)
+    pub enable_code: bool,
+
+    /// Weight for BM25 score (0.0-1.0) - only used if use_adaptive_weights is false
+    pub bm25_weight: f32,
+
+    /// Weight for semantic score (0.0-1.0) - only used if use_adaptive_weights is false
+    pub semantic_weight: f32,
+
+    /// Weight for temporal score (0.0-1.0) - only used if use_adaptive_weights is false
+    pub temporal_weight: f32,
+
+    /// Weight for graph score (0.0-1.0) - only used if use_adaptive_weights is false
+    pub graph_weight: f32,
+
+    /// Weight for code score (0.0-1.0) - only used if use_adaptive_weights is false
+    pub code_weight: f32,
+
+    /// Enable reranking of top results
+    pub enable_rerank: bool,
+
+    /// Number of candidates to fetch before reranking
+    pub rerank_candidates: usize,
+
+    /// Use Reciprocal Rank Fusion instead of weighted sum
+    pub use_rrf: bool,
+
+    /// RRF constant (typically 60)
+    pub rrf_k: f64,
+
+    /// Explicit temporal period to search (overrides auto-extraction)
+    pub temporal_period: Option<TimePeriod>,
+
+    /// Use adaptive weights based on query analysis (recommended)
+    pub use_adaptive_weights: bool,
+
+    /// Calibrate final scores to meaningful 0-1 range
+    pub calibrate_scores: bool,
+}
+
+impl Default for HybridSearchOptions {
+    fn default() -> Self {
+        Self {
+            base: SearchOptions::default(),
+            enable_semantic: true,
+            enable_temporal: true, // Enable by default for Hindsight-style search
+            enable_graph: true,    // Enable by default for Hindsight-style search
+            enable_code: false,    // Disabled by default (requires indexed codebase)
+            bm25_weight: 0.30,     // Fallback weights (not used when adaptive is enabled)
+            semantic_weight: 0.30,
+            temporal_weight: 0.15,
+            graph_weight: 0.15,
+            code_weight: 0.10, // Code search weight
+            enable_rerank: false,
+            rerank_candidates: 10, // Reduced from 20 for better performance
+            use_rrf: false,
+            rrf_k: 60.0,
+            temporal_period: None,
+            use_adaptive_weights: true, // Use intelligent weight selection by default
+            calibrate_scores: true,     // Produce meaningful 0-1 scores by default
+        }
+    }
+}
+
+impl HybridSearchOptions {
+    /// Compute a hash of the search options for cache keying
+    pub fn cache_key(&self) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.base.query.hash(&mut hasher);
+        self.base.limit.hash(&mut hasher);
+        self.enable_semantic.hash(&mut hasher);
+        self.enable_temporal.hash(&mut hasher);
+        self.enable_graph.hash(&mut hasher);
+        self.enable_code.hash(&mut hasher);
+        self.enable_rerank.hash(&mut hasher);
+        self.use_rrf.hash(&mut hasher);
+        self.use_adaptive_weights.hash(&mut hasher);
+        // Hash weights as bits for determinism
+        self.bm25_weight.to_bits().hash(&mut hasher);
+        self.semantic_weight.to_bits().hash(&mut hasher);
+        self.temporal_weight.to_bits().hash(&mut hasher);
+        self.graph_weight.to_bits().hash(&mut hasher);
+        self.code_weight.to_bits().hash(&mut hasher);
+        // Hash filter options
+        for tag in &self.base.tags {
+            tag.hash(&mut hasher);
+        }
+        for t in &self.base.types {
+            t.hash(&mut hasher);
+        }
+        self.base.include_archived.hash(&mut hasher);
+        hasher.finish()
+    }
+}
+
+/// Extended search result with hybrid scores
+#[derive(Debug, Clone)]
+pub struct HybridSearchResult {
+    /// Entry ID
+    pub id: String,
+    /// Final combined score
+    pub score: f64,
+    /// BM25 component score (normalized)
+    pub bm25_score: f64,
+    /// Semantic component score (cosine similarity)
+    pub semantic_score: f64,
+    /// Temporal component score (time-relevance)
+    pub temporal_score: f64,
+    /// Graph component score (spreading activation)
+    pub graph_score: f64,
+    /// Code search component score
+    pub code_score: f64,
+    /// Rerank score (if reranking enabled)
+    pub rerank_score: Option<f64>,
+}
+
+/// Consolidated channel scores for a single result
+///
+/// Instead of 5 separate HashMaps, we use a single map with this struct
+/// to reduce memory allocation and simplify score merging logic.
+#[derive(Debug, Clone, Default)]
+struct ChannelScores {
+    bm25: f64,
+    semantic: f64,
+    temporal: f64,
+    graph: f64,
+    code: f64,
+}
+
+impl From<HybridSearchResult> for SearchResult {
+    fn from(h: HybridSearchResult) -> Self {
+        SearchResult {
+            id: h.id,
+            doc_type: DocType::Entry, // Hybrid search currently only supports entries
+            score: h.score,
+            bm25_score: h.bm25_score,
+            boosted_score: h.score,
+        }
+    }
+}
+
+/// Hybrid search orchestrator combining BM25, temporal, graph, and code search
+///
+/// Note: Local semantic/embedding search has been removed and is now cloud-only.
+/// This orchestrator still supports BM25 full-text search, temporal filtering,
+/// knowledge graph traversal, and code symbol search.
+pub struct HybridSearch {
+    bm25_index: SearchIndex,
+    graph_retriever: Option<GraphRetriever>,
+    /// Code search for semantic code symbol search
+    code_search: Option<CasCodeSearch>,
+    /// Query and results cache for performance
+    cache: Arc<SearchCache>,
+}
+
+impl HybridSearch {
+    /// Create a new hybrid search instance
+    pub fn new(bm25_index: SearchIndex) -> Self {
+        Self {
+            bm25_index,
+            graph_retriever: None,
+            code_search: None,
+            cache: Arc::new(SearchCache::new()),
+        }
+    }
+
+    /// Create a new hybrid search instance with a shared cache
+    pub fn with_cache(bm25_index: SearchIndex, cache: Arc<SearchCache>) -> Self {
+        Self {
+            bm25_index,
+            graph_retriever: None,
+            code_search: None,
+            cache,
+        }
+    }
+
+    /// Create a new hybrid search instance with graph retriever
+    pub fn with_graph(bm25_index: SearchIndex, entity_store: Arc<dyn EntityStore>) -> Self {
+        Self {
+            bm25_index,
+            graph_retriever: Some(GraphRetriever::with_defaults(entity_store)),
+            code_search: None,
+            cache: Arc::new(SearchCache::new()),
+        }
+    }
+
+    /// Create a new hybrid search instance with custom graph config
+    pub fn with_graph_config(
+        bm25_index: SearchIndex,
+        entity_store: Arc<dyn EntityStore>,
+        graph_config: SpreadingActivationConfig,
+    ) -> Self {
+        Self {
+            bm25_index,
+            graph_retriever: Some(GraphRetriever::new(entity_store, graph_config)),
+            code_search: None,
+            cache: Arc::new(SearchCache::new()),
+        }
+    }
+
+    /// Open hybrid search from a CAS directory
+    ///
+    /// Note: Local semantic search has been removed and is now cloud-only.
+    /// This opens BM25 search only.
+    pub fn open(cas_dir: &Path) -> Result<Self> {
+        let index_dir = cas_dir.join("index").join("tantivy");
+
+        // Open BM25 index
+        let bm25_index = SearchIndex::open(&index_dir)?;
+
+        Ok(Self {
+            bm25_index,
+            graph_retriever: None, // Needs entity store to be set separately
+            code_search: None,     // Needs code store to be set separately
+            cache: Arc::new(SearchCache::new()),
+        })
+    }
+
+    /// Open hybrid search with graph retriever (knowledge graph enabled)
+    pub fn open_with_graph(cas_dir: &Path) -> Result<Self> {
+        let mut search = Self::open(cas_dir)?;
+        // Try to open entity store - if it fails, continue without graph
+        if let Ok(entity_store) = crate::store::open_entity_store(cas_dir) {
+            search.graph_retriever = Some(GraphRetriever::with_defaults(entity_store));
+        }
+        Ok(search)
+    }
+
+    /// Open hybrid search with graph retriever enabled
+    ///
+    /// Note: Local reranker has been removed and is now cloud-only.
+    /// This is now equivalent to `open_with_graph`.
+    pub fn open_full(cas_dir: &Path) -> Result<Self> {
+        Self::open_with_graph(cas_dir)
+    }
+
+    /// Set the graph retriever (requires entity store)
+    pub fn set_graph_retriever(&mut self, entity_store: Arc<dyn EntityStore>) {
+        self.graph_retriever = Some(GraphRetriever::with_defaults(entity_store));
+    }
+
+    /// Set the graph retriever with custom config
+    pub fn set_graph_retriever_with_config(
+        &mut self,
+        entity_store: Arc<dyn EntityStore>,
+        config: SpreadingActivationConfig,
+    ) {
+        self.graph_retriever = Some(GraphRetriever::new(entity_store, config));
+    }
+
+    /// Set the code search from a CAS directory path
+    ///
+    /// Opens all required components (code store, vector store, BM25 index, embedder)
+    /// and wires them together into a CasCodeSearch instance.
+    pub fn set_code_search_from_path(&mut self, cas_dir: &StdPath) -> Result<()> {
+        self.code_search = Some(open_code_search(cas_dir)?);
+        Ok(())
+    }
+
+    /// Set the code search directly from an existing instance
+    pub fn set_code_search(&mut self, code_search: CasCodeSearch) {
+        self.code_search = Some(code_search);
+    }
+
+    /// Perform hybrid search (6-channel: BM25 + semantic + temporal + graph + code + rerank)
+    pub fn search(
+        &self,
+        opts: &HybridSearchOptions,
+        entries: &[Entry],
+    ) -> Result<Vec<HybridSearchResult>> {
+        // Try to get cached hybrid results
+        let cache_key = opts.cache_key();
+        if let Some(cached) = self.cache.get_hybrid_results(cache_key) {
+            return Ok(cached);
+        }
+
+        // Extract temporal period from query if enabled and not explicitly set
+        let (search_query, temporal_period) =
+            if opts.enable_temporal && opts.temporal_period.is_none() {
+                if let Some((cleaned, period)) =
+                    TemporalRetriever::extract_temporal_query(&opts.base.query)
+                {
+                    (cleaned, Some(period))
+                } else {
+                    (opts.base.query.clone(), None)
+                }
+            } else {
+                (opts.base.query.clone(), opts.temporal_period.clone())
+            };
+
+        // 1. BM25 search (using cleaned query without temporal expressions)
+        let mut bm25_opts = opts.base.clone();
+        bm25_opts.query = search_query.clone();
+        let bm25_results = self.bm25_index.search(&bm25_opts, entries)?;
+        let bm25_scores: Vec<(String, f64)> = bm25_results
+            .iter()
+            .map(|r| (r.id.clone(), r.bm25_score))
+            .collect();
+
+        // 2. Semantic search (if enabled)
+        // Filter to only include IDs that exist in the active entries list
+        let valid_ids: std::collections::HashSet<&str> =
+            entries.iter().map(|e| e.id.as_str()).collect();
+
+        let semantic_scores: Vec<(String, f32)> =
+            if opts.enable_semantic && !search_query.is_empty() {
+                self.semantic_search(&search_query, opts.base.limit * 3)?
+                    .into_iter()
+                    .filter(|(id, _)| valid_ids.contains(id.as_str()))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+        // 3. Temporal search (if enabled and we have a period)
+        let temporal_scores: Vec<(String, f64)> = if opts.enable_temporal {
+            if let Some(ref period) = temporal_period {
+                let retriever = TemporalRetriever::default();
+                retriever
+                    .retrieve(entries, period, opts.base.limit * 3)
+                    .into_iter()
+                    .map(|r| (r.id, r.temporal_score as f64))
+                    .collect()
+            } else {
+                // No explicit temporal period - use recency as a fallback
+                // Score entries by how recently they were created/accessed
+                self.recency_scores(entries, opts.base.limit * 3)
+            }
+        } else {
+            Vec::new()
+        };
+
+        // 4. Graph search (if enabled and graph retriever is available)
+        let graph_scores: Vec<(String, f64)> =
+            if opts.enable_graph && self.graph_retriever.is_some() {
+                if let Some(ref retriever) = self.graph_retriever {
+                    retriever
+                        .retrieve_entries(&search_query, opts.base.limit * 3)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|r| valid_ids.contains(r.entry_id.as_str()))
+                        .map(|r| (r.entry_id, r.activation_score as f64))
+                        .collect()
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
+
+        // 5. Code search (if enabled and code search is available)
+        let code_scores: Vec<(String, f64)> = if opts.enable_code && self.code_search.is_some() {
+            if let Some(ref code_search) = self.code_search {
+                let code_opts = CodeSearchOptions {
+                    query: search_query.clone(),
+                    limit: opts.base.limit * 3,
+                    ..Default::default()
+                };
+                code_search
+                    .search(&code_opts)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|r| (r.id, r.score))
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
+        // 6. Combine scores using the new scoring system
+        let semantic_f64: Vec<(String, f64)> = semantic_scores
+            .iter()
+            .map(|(id, s)| (id.clone(), *s as f64))
+            .collect();
+
+        let combined = if opts.use_rrf {
+            // Enhanced RRF with magnitude awareness
+            let mut rankings = vec![bm25_scores.clone(), semantic_f64.clone()];
+            if !temporal_scores.is_empty() {
+                rankings.push(temporal_scores.clone());
+            }
+            if !graph_scores.is_empty() {
+                rankings.push(graph_scores.clone());
+            }
+            if !code_scores.is_empty() {
+                rankings.push(code_scores.clone());
+            }
+            rrf_with_magnitude(&rankings, opts.rrf_k)
+        } else {
+            // Determine weights - adaptive or manual
+            let weights = if opts.use_adaptive_weights {
+                SearchWeights::from_query(&search_query)
+            } else {
+                SearchWeights::custom(opts.bm25_weight, opts.semantic_weight, opts.temporal_weight)
+            };
+
+            // Single-step multi-channel combination
+            let mut combined =
+                combine_multi_channel(&bm25_scores, &semantic_f64, &temporal_scores, weights);
+
+            // Add graph scores if available (as an additional boost)
+            if !graph_scores.is_empty() && opts.graph_weight > 0.0 {
+                let graph_map: std::collections::HashMap<&str, f64> = graph_scores
+                    .iter()
+                    .map(|(id, s)| (id.as_str(), *s))
+                    .collect();
+
+                for (id, score) in combined.iter_mut() {
+                    if let Some(graph_score) = graph_map.get(id.as_str()) {
+                        // Apply graph boost (multiplicative to preserve ranking)
+                        let boost = 1.0 + (opts.graph_weight as f64) * graph_score;
+                        *score *= boost;
+                    }
+                }
+
+                // Re-sort after graph boost
+                combined.sort_by(|a, b| b.1.total_cmp(&a.1));
+            }
+
+            // Add code scores if available (as an additional boost)
+            if !code_scores.is_empty() && opts.code_weight > 0.0 {
+                let code_map: std::collections::HashMap<&str, f64> = code_scores
+                    .iter()
+                    .map(|(id, s)| (id.as_str(), *s))
+                    .collect();
+
+                for (id, score) in combined.iter_mut() {
+                    if let Some(code_score) = code_map.get(id.as_str()) {
+                        // Apply code boost (multiplicative to preserve ranking)
+                        let boost = 1.0 + (opts.code_weight as f64) * code_score;
+                        *score *= boost;
+                    }
+                }
+
+                // Re-sort after code boost
+                combined.sort_by(|a, b| b.1.total_cmp(&a.1));
+            }
+
+            combined
+        };
+
+        // Note: Calibration moved to after reranking (step 8b) so reranker scores also get calibrated
+
+        // 7. Create initial results using consolidated score map
+        // Single HashMap instead of 5 separate ones - reduces memory and simplifies lookups
+        let mut score_map: std::collections::HashMap<String, ChannelScores> =
+            std::collections::HashMap::new();
+
+        // Populate from all score vectors in a single pass per channel
+        for (id, score) in &bm25_scores {
+            score_map.entry(id.clone()).or_default().bm25 = *score;
+        }
+        for (id, score) in &semantic_scores {
+            score_map.entry(id.clone()).or_default().semantic = *score as f64;
+        }
+        for (id, score) in &temporal_scores {
+            score_map.entry(id.clone()).or_default().temporal = *score;
+        }
+        for (id, score) in &graph_scores {
+            score_map.entry(id.clone()).or_default().graph = *score;
+        }
+        for (id, score) in &code_scores {
+            score_map.entry(id.clone()).or_default().code = *score;
+        }
+
+        let mut results: Vec<HybridSearchResult> = combined
+            .into_iter()
+            .take(if opts.enable_rerank {
+                opts.rerank_candidates
+            } else {
+                opts.base.limit
+            })
+            .map(|(id, score)| {
+                let channel_scores = score_map.get(&id).cloned().unwrap_or_default();
+                HybridSearchResult {
+                    bm25_score: channel_scores.bm25,
+                    semantic_score: channel_scores.semantic,
+                    temporal_score: channel_scores.temporal,
+                    graph_score: channel_scores.graph,
+                    code_score: channel_scores.code,
+                    id,
+                    score,
+                    rerank_score: None,
+                }
+            })
+            .collect();
+
+        // 8. Rerank if enabled
+        // Note: Local reranking has been removed and is now cloud-only.
+        // The enable_rerank option is preserved for API compatibility but has no effect locally.
+
+        // 8b. Calibrate scores AFTER reranking so all scores are in meaningful 0-1 range
+        if opts.calibrate_scores && !results.is_empty() {
+            // Extract scores, calibrate, and apply back
+            let mut scores: Vec<(String, f64)> =
+                results.iter().map(|r| (r.id.clone(), r.score)).collect();
+            calibrate_scores(&mut scores);
+
+            // Apply calibrated scores back to results
+            let score_map: std::collections::HashMap<&str, f64> =
+                scores.iter().map(|(id, s)| (id.as_str(), *s)).collect();
+            for result in results.iter_mut() {
+                if let Some(&cal_score) = score_map.get(result.id.as_str()) {
+                    result.score = cal_score;
+                }
+            }
+        }
+
+        // 9. Apply final limit
+        results.truncate(opts.base.limit);
+
+        // Cache the results
+        self.cache.put_hybrid_results(cache_key, results.clone());
+
+        Ok(results)
+    }
+
+    /// Generate recency scores for entries (fallback when no explicit temporal query)
+    fn recency_scores(&self, entries: &[Entry], limit: usize) -> Vec<(String, f64)> {
+        use chrono::Utc;
+
+        let now = Utc::now();
+        let mut scores: Vec<(String, f64)> = entries
+            .iter()
+            .filter(|e| !e.archived)
+            .map(|e| {
+                // Use last_accessed if available, otherwise created
+                let last_time = e.last_accessed.unwrap_or(e.created);
+                let days_ago = (now - last_time).num_days().max(0) as f64;
+
+                // Exponential decay: score = 0.5^(days/30)
+                // Recent entries score ~1.0, entries from 30 days ago score ~0.5
+                let score = 0.5f64.powf(days_ago / 30.0);
+
+                (e.id.clone(), score)
+            })
+            .collect();
+
+        // Sort by score descending
+        scores.sort_by(|a, b| b.1.total_cmp(&a.1));
+        scores.truncate(limit);
+
+        scores
+    }
+
+    /// Perform semantic-only search (with caching)
+    /// Semantic search is now cloud-only. Returns empty results.
+    ///
+    /// Note: Local embeddings have been removed. For semantic search,
+    /// use the cloud API via CAS Cloud.
+    fn semantic_search(&self, _query: &str, _k: usize) -> Result<Vec<(String, f32)>> {
+        // Semantic search requires cloud - return empty results locally
+        Ok(Vec::new())
+    }
+
+    /// Index a single entry (BM25 only - embeddings are now cloud-only)
+    pub fn index_entry(&self, entry: &Entry) -> Result<()> {
+        // Invalidate cache entries that depend on this entry
+        self.cache.invalidate_entry(&entry.id);
+
+        // Index in BM25
+        self.bm25_index.index_entry(entry)?;
+
+        Ok(())
+    }
+
+    /// Delete from BM25 index
+    pub fn delete(&self, id: &str) -> Result<()> {
+        // Invalidate cache entries that depend on this entry
+        self.cache.invalidate_entry(id);
+
+        self.bm25_index.delete(id)?;
+        Ok(())
+    }
+
+    /// Reindex all entries (BM25 only - embeddings are now cloud-only)
+    pub fn reindex(&self, entries: &[Entry]) -> Result<()> {
+        // Clear all caches since we're reindexing everything
+        self.cache.clear();
+
+        // Reindex BM25
+        self.bm25_index.reindex(entries)?;
+
+        Ok(())
+    }
+
+    /// Check if reranker is available
+    ///
+    /// Note: Local reranking has been removed and is now cloud-only.
+    /// Always returns false.
+    pub fn has_reranker(&self) -> bool {
+        false
+    }
+
+    /// Check if graph retriever is available
+    pub fn has_graph_retriever(&self) -> bool {
+        self.graph_retriever.is_some()
+    }
+
+    /// Check if code search is available
+    pub fn has_code_search(&self) -> bool {
+        self.code_search.is_some()
+    }
+
+    /// Get a reference to the search cache
+    pub fn cache(&self) -> &Arc<SearchCache> {
+        &self.cache
+    }
+
+    /// Get cache statistics
+    pub fn cache_stats(&self) -> super::cache::SearchCacheStats {
+        self.cache.stats()
+    }
+
+    /// Invalidate cache entries for a specific entry ID
+    ///
+    /// Should be called when an entry is archived or otherwise modified
+    /// outside of the index_entry/delete methods.
+    pub fn invalidate_cache(&self, entry_id: &str) {
+        self.cache.invalidate_entry(entry_id);
+    }
+
+    /// Clear all caches
+    pub fn clear_cache(&self) {
+        self.cache.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::hybrid_search::hybrid::*;
+
+    #[test]
+    fn test_hybrid_search_options_default() {
+        let opts = HybridSearchOptions::default();
+        assert!(opts.enable_semantic);
+        assert!(opts.enable_temporal);
+        assert!(opts.enable_graph);
+        assert!(!opts.enable_code); // Code search disabled by default
+        assert_eq!(opts.bm25_weight, 0.30);
+        assert_eq!(opts.semantic_weight, 0.30);
+        assert_eq!(opts.temporal_weight, 0.15);
+        assert_eq!(opts.graph_weight, 0.15);
+        assert_eq!(opts.code_weight, 0.10);
+        assert!(!opts.enable_rerank);
+        assert!(!opts.use_rrf);
+        assert!(opts.use_adaptive_weights);
+        assert!(opts.calibrate_scores);
+    }
+
+    #[test]
+    fn test_hybrid_result_to_search_result() {
+        let hybrid = HybridSearchResult {
+            id: "test".to_string(),
+            score: 0.8,
+            bm25_score: 0.7,
+            semantic_score: 0.9,
+            temporal_score: 0.6,
+            graph_score: 0.5,
+            code_score: 0.4,
+            rerank_score: Some(0.85),
+        };
+
+        let search_result: SearchResult = hybrid.into();
+        assert_eq!(search_result.id, "test");
+        assert_eq!(search_result.score, 0.8);
+    }
+
+    #[test]
+    fn test_temporal_query_extraction() {
+        // Test that temporal expressions are extracted from queries
+        let query = "what did I learn last week about rust";
+        if let Some((cleaned, period)) = TemporalRetriever::extract_temporal_query(query) {
+            assert!(!cleaned.contains("last week"));
+            // Period should cover ~7 days ago to now
+            assert!(period.start < chrono::Utc::now());
+        }
+    }
+}

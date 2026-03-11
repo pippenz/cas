@@ -1,0 +1,122 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: "0 8 * * 1"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTC_WRAPPER: sccache
+
+jobs:
+  fast-validation:
+    name: Fast Validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Zig
+        run: ./scripts/bootstrap-zig.sh
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.5
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Check
+        env:
+          ZIG: ${{ github.workspace }}/.context/zig/zig
+        run: cargo check -p cas
+
+      - name: Build (no default features)
+        env:
+          ZIG: ${{ github.workspace }}/.context/zig/zig
+        run: cargo build -p cas --no-default-features
+
+      - name: Test (all features)
+        env:
+          ZIG: ${{ github.workspace }}/.context/zig/zig
+        run: cargo test -p cas --all-features
+
+      - name: Clippy (report warnings)
+        env:
+          ZIG: ${{ github.workspace }}/.context/zig/zig
+        run: cargo clippy -p cas --all-targets --all-features
+
+      - name: Build timings
+        env:
+          ZIG: ${{ github.workspace }}/.context/zig/zig
+        run: cargo build -p cas --timings
+
+      - name: Upload timings
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-timings
+          path: target/cargo-timings
+
+  full-matrix:
+    name: Full Matrix
+    if: github.event_name == 'schedule' || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Zig
+        run: ./scripts/bootstrap-zig.sh
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.5
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Test compile full features
+        env:
+          ZIG: ${{ github.workspace }}/.context/zig/zig
+        run: cargo test -p cas --all-features --no-run
+
+      - name: Benchmark build
+        env:
+          ZIG: ${{ github.workspace }}/.context/zig/zig
+          CAS_BENCH_MODE: quick
+        run: ./scripts/benchmark-build.sh
+
+      - name: Check build regression
+        run: ./scripts/check-build-regression.sh
+
+      - name: Upload benchmark
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-benchmark
+          path: |
+            history/build-benchmark-latest.md
+            history/build-benchmark-latest.env

@@ -1,0 +1,499 @@
+//! Factory TUI client - attaches to factory daemon via Unix socket
+//!
+//! Connects to the daemon's Unix socket and forwards terminal I/O.
+//! The daemon renders the full TUI and broadcasts raw terminal output.
+//! This client just forwards bytes between the terminal and socket.
+
+use crate::ui::factory::session::{SessionInfo, SessionManager};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use cas_factory::SessionSummary;
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::execute;
+use crossterm::terminal::{self, disable_raw_mode, enable_raw_mode};
+use ghostty_vt::KeyModifiers as GhosttyKeyModifiers;
+use std::io::{self, Read, Write};
+use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
+use std::time::Duration;
+
+/// Attach to an existing factory session via Unix socket
+///
+/// Connects to the daemon's Unix socket for the given session.
+pub fn attach(session_name: Option<String>) -> anyhow::Result<()> {
+    let session_manager = SessionManager::new();
+
+    // Find session to attach to
+    let session = session_manager
+        .find_session(session_name.as_deref())?
+        .ok_or_else(|| {
+            if let Some(name) = &session_name {
+                anyhow::anyhow!("Session '{name}' not found or not running")
+            } else {
+                anyhow::anyhow!("No running factory sessions found. Start one with 'cas'")
+            }
+        })?;
+
+    if !session.can_attach() {
+        anyhow::bail!(
+            "Cannot attach to session '{}': daemon not running",
+            session.name
+        );
+    }
+
+    attach_unix(&session)
+}
+
+/// Attach via Unix socket (local daemon mode)
+///
+/// The daemon renders the full TUI and broadcasts raw terminal output.
+/// This client just forwards bytes between the terminal and socket.
+fn attach_unix(session: &SessionInfo) -> anyhow::Result<()> {
+    // Control sequence constants (must match daemon.rs)
+    const CONTROL_PREFIX: &[u8] = b"\x1b]777;";
+    const CONTROL_SUFFIX: u8 = 0x07; // BEL
+
+    let sock_path = PathBuf::from(&session.metadata.socket_path);
+
+    // Connect to daemon socket
+    let mut stream = UnixStream::connect(&sock_path)
+        .map_err(|e| anyhow::anyhow!("Failed to connect to daemon socket: {e}"))?;
+
+    // Set socket to non-blocking for the read loop
+    stream.set_nonblocking(true)?;
+
+    // Check if stdin is a TTY
+    let stdin_fd = std::os::unix::io::AsRawFd::as_raw_fd(&io::stdin());
+    let is_tty = unsafe { libc::isatty(stdin_fd) } == 1;
+    if !is_tty {
+        anyhow::bail!(
+            "Cannot attach: stdin is not a terminal.\n\
+            Factory mode requires an interactive terminal."
+        );
+    }
+
+    // Enable raw mode + mouse capture
+    enable_raw_mode()?;
+    execute!(
+        io::stdout(),
+        crossterm::event::EnableMouseCapture,
+        crossterm::event::EnableBracketedPaste
+    )?;
+
+    // Send initial terminal size as control sequence
+    if let Ok((cols, rows)) = terminal::size() {
+        let resize_cmd = format!("resize;{cols};{rows}");
+        let mut msg = Vec::new();
+        msg.extend_from_slice(CONTROL_PREFIX);
+        msg.extend_from_slice(resize_cmd.as_bytes());
+        msg.push(CONTROL_SUFFIX);
+        let _ = stream.write_all(&msg);
+
+        // Auto-request compact mode for narrow terminals (phone SSH)
+        if cols < 80 {
+            let mut mode_msg = Vec::new();
+            mode_msg.extend_from_slice(CONTROL_PREFIX);
+            mode_msg.extend_from_slice(b"mode;compact");
+            mode_msg.push(CONTROL_SUFFIX);
+            let _ = stream.write_all(&mode_msg);
+        }
+    }
+
+    let mut stdout = io::stdout();
+    let mut read_buf = [0u8; 4096];
+    let quit = std::sync::atomic::AtomicBool::new(false);
+
+    // Client-side resize debounce: coalesce rapid resize events before sending
+    let mut pending_resize: Option<(u16, u16)> = None;
+    let mut pending_resize_at = std::time::Instant::now();
+    const CLIENT_RESIZE_DEBOUNCE_MS: u64 = 50;
+    let mut last_mouse_pos: Option<(u16, u16)> = None;
+
+    // Main loop
+    while !quit.load(std::sync::atomic::Ordering::Relaxed) {
+        // Read from socket (non-blocking)
+        match stream.read(&mut read_buf) {
+            Ok(0) => {
+                // Connection closed
+                break;
+            }
+            Ok(n) => {
+                // Write output to terminal
+                let _ = stdout.write_all(&read_buf[..n]);
+                let _ = stdout.flush();
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // No data available, continue
+            }
+            Err(_) => {
+                // Error, exit
+                break;
+            }
+        }
+
+        // Poll for terminal events
+        if event::poll(Duration::from_millis(10))? {
+            match event::read()? {
+                Event::Key(key) => {
+                    // Ctrl+Q = detach this client (do not shut down daemon)
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && matches!(key.code, KeyCode::Char('q'))
+                    {
+                        // Send detach control sequence
+                        let mut msg = Vec::new();
+                        msg.extend_from_slice(CONTROL_PREFIX);
+                        msg.extend_from_slice(b"detach");
+                        msg.push(CONTROL_SUFFIX);
+                        let _ = stream.write_all(&msg);
+                        break;
+                    }
+
+                    // Convert key to bytes and send
+                    let data = key_to_bytes(&key);
+                    if !data.is_empty() {
+                        let _ = stream.write_all(&data);
+                    }
+                }
+                Event::Resize(cols, rows) => {
+                    // Debounce resize: store latest dims, send after quiet period
+                    pending_resize = Some((cols, rows));
+                    pending_resize_at = std::time::Instant::now();
+                }
+                Event::Mouse(mouse) => {
+                    last_mouse_pos = Some((mouse.column, mouse.row));
+                    // Convert mouse event to control sequence
+                    let mouse_cmd = match mouse.kind {
+                        crossterm::event::MouseEventKind::Down(
+                            crossterm::event::MouseButton::Left,
+                        ) => Some(format!("mouse;down_left;{};{}", mouse.column, mouse.row)),
+                        crossterm::event::MouseEventKind::Drag(
+                            crossterm::event::MouseButton::Left,
+                        ) => Some(format!("mouse;drag_left;{};{}", mouse.column, mouse.row)),
+                        crossterm::event::MouseEventKind::Up(
+                            crossterm::event::MouseButton::Left,
+                        ) => Some(format!("mouse;up_left;{};{}", mouse.column, mouse.row)),
+                        crossterm::event::MouseEventKind::ScrollUp => {
+                            Some(format!("mouse;scroll_up;{};{}", mouse.column, mouse.row))
+                        }
+                        crossterm::event::MouseEventKind::ScrollDown => {
+                            Some(format!("mouse;scroll_down;{};{}", mouse.column, mouse.row))
+                        }
+                        _ => None,
+                    };
+                    if let Some(cmd) = mouse_cmd {
+                        let mut msg = Vec::new();
+                        msg.extend_from_slice(CONTROL_PREFIX);
+                        msg.extend_from_slice(cmd.as_bytes());
+                        msg.push(CONTROL_SUFFIX);
+                        let _ = stream.write_all(&msg);
+                    }
+                }
+                Event::Paste(text) => {
+                    if !contains_dropped_image_path(&text) {
+                        let _ = stream.write_all(text.as_bytes());
+                    } else {
+                        // Preserve the original drop payload and route it as a drop event.
+                        // Normalizing paths here changes Claude's interpretation compared
+                        // to native terminal drop/paste behavior.
+                        let encoded_payload = URL_SAFE_NO_PAD.encode(text.as_bytes());
+                        let (col, row) = last_mouse_pos.unwrap_or((u16::MAX, u16::MAX));
+                        let cmd = format!("drop_image;{col};{row};{encoded_payload}");
+                        let mut msg = Vec::new();
+                        msg.extend_from_slice(CONTROL_PREFIX);
+                        msg.extend_from_slice(cmd.as_bytes());
+                        msg.push(CONTROL_SUFFIX);
+                        let _ = stream.write_all(&msg);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Send debounced resize if quiet period elapsed
+        if let Some((cols, rows)) = pending_resize {
+            if pending_resize_at.elapsed() >= Duration::from_millis(CLIENT_RESIZE_DEBOUNCE_MS) {
+                let resize_cmd = format!("resize;{cols};{rows}");
+                let mut msg = Vec::new();
+                msg.extend_from_slice(CONTROL_PREFIX);
+                msg.extend_from_slice(resize_cmd.as_bytes());
+                msg.push(CONTROL_SUFFIX);
+                let _ = stream.write_all(&msg);
+                pending_resize = None;
+            }
+        }
+    }
+
+    // Restore terminal
+    let _ = execute!(
+        io::stdout(),
+        crossterm::event::DisableMouseCapture,
+        crossterm::event::DisableBracketedPaste
+    );
+    disable_raw_mode()?;
+
+    // Leave alternate screen and show cursor
+    print!("\x1b[?1049l\x1b[?25h");
+    let _ = io::stdout().flush();
+
+    Ok(())
+}
+
+fn contains_dropped_image_path(text: &str) -> bool {
+    text.lines().any(|candidate| {
+        normalize_image_path_candidate(candidate)
+            .map(|path| is_image_path(&path))
+            .unwrap_or(false)
+    })
+}
+
+fn normalize_image_path_candidate(candidate: &str) -> Option<String> {
+    let trimmed = candidate.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let unquoted = trimmed.trim_matches(|c| c == '"' || c == '\'');
+    let path = if let Some(rest) = unquoted.strip_prefix("file://") {
+        decode_file_uri_path(rest)
+    } else {
+        unquoted.to_string()
+    };
+
+    if is_image_path(&path) {
+        Some(path)
+    } else {
+        None
+    }
+}
+
+fn decode_file_uri_path(uri_path: &str) -> String {
+    let bytes = uri_path.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = bytes[i + 1] as char;
+            let lo = bytes[i + 2] as char;
+            if let (Some(hi), Some(lo)) = (hi.to_digit(16), lo.to_digit(16)) {
+                decoded.push(((hi << 4) | lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        decoded.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&decoded).to_string()
+}
+
+fn is_image_path(path: &str) -> bool {
+    let stripped = path.split('?').next().unwrap_or(path);
+    let stripped = stripped.split('#').next().unwrap_or(stripped);
+    std::path::Path::new(stripped)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "png"
+                    | "jpg"
+                    | "jpeg"
+                    | "gif"
+                    | "webp"
+                    | "bmp"
+                    | "tif"
+                    | "tiff"
+                    | "heic"
+                    | "heif"
+                    | "avif"
+                    | "svg"
+            )
+        })
+}
+
+/// List all factory sessions
+pub fn list_sessions() -> anyhow::Result<Vec<SessionInfo>> {
+    let manager = SessionManager::new();
+    manager.list_sessions().map_err(|e| e.into())
+}
+
+/// List factory sessions for a specific project directory
+pub fn list_sessions_for_project(project_dir: &str) -> anyhow::Result<Vec<SessionInfo>> {
+    let manager = SessionManager::new();
+    let sessions = manager.list_sessions()?;
+    Ok(sessions
+        .into_iter()
+        .filter(|s| {
+            s.metadata
+                .project_dir
+                .as_ref()
+                .is_some_and(|p| p == project_dir)
+        })
+        .collect())
+}
+
+/// Find a running session for a specific project directory
+pub fn find_session_for_project(
+    project_dir: &str,
+    name: Option<&str>,
+) -> anyhow::Result<Option<SessionInfo>> {
+    let manager = SessionManager::new();
+    manager
+        .find_session_for_project(name, project_dir)
+        .map_err(|e| e.into())
+}
+
+/// List all factory sessions as unified SessionSummary.
+///
+/// This provides rich session metadata using the unified session model
+/// from `cas_factory::UnifiedSessionManager`.
+pub fn list_session_summaries() -> anyhow::Result<Vec<SessionSummary>> {
+    let sessions = list_sessions()?;
+    Ok(sessions.iter().map(|s| s.to_session_summary()).collect())
+}
+
+/// List factory sessions for a project as unified SessionSummary.
+pub fn list_session_summaries_for_project(
+    project_dir: &str,
+) -> anyhow::Result<Vec<SessionSummary>> {
+    let sessions = list_sessions_for_project(project_dir)?;
+    Ok(sessions.iter().map(|s| s.to_session_summary()).collect())
+}
+
+/// Convert a key event to terminal bytes using ghostty_vt's key encoding
+fn key_to_bytes(key: &KeyEvent) -> Vec<u8> {
+    // Convert crossterm modifiers to ghostty_vt modifiers
+    let mods = GhosttyKeyModifiers {
+        shift: key.modifiers.contains(KeyModifiers::SHIFT),
+        ctrl: key.modifiers.contains(KeyModifiers::CONTROL),
+        alt: key.modifiers.contains(KeyModifiers::ALT),
+        super_key: key.modifiers.contains(KeyModifiers::SUPER),
+    };
+
+    // Handle Ctrl+char specially.
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        if let KeyCode::Char(c) = key.code {
+            if let Some(ctrl) = ctrl_char_to_byte(c) {
+                return vec![ctrl];
+            }
+        }
+    }
+
+    // Try ghostty_vt's encode_key for named keys (handles modifiers properly)
+    let key_name = match key.code {
+        KeyCode::Up => Some("up"),
+        KeyCode::Down => Some("down"),
+        KeyCode::Left => Some("left"),
+        KeyCode::Right => Some("right"),
+        KeyCode::Home => Some("home"),
+        KeyCode::End => Some("end"),
+        KeyCode::PageUp => Some("page_up"),
+        KeyCode::PageDown => Some("page_down"),
+        KeyCode::Delete => Some("delete"),
+        KeyCode::Insert => Some("insert"),
+        KeyCode::F(1) => Some("f1"),
+        KeyCode::F(2) => Some("f2"),
+        KeyCode::F(3) => Some("f3"),
+        KeyCode::F(4) => Some("f4"),
+        KeyCode::F(5) => Some("f5"),
+        KeyCode::F(6) => Some("f6"),
+        KeyCode::F(7) => Some("f7"),
+        KeyCode::F(8) => Some("f8"),
+        KeyCode::F(9) => Some("f9"),
+        KeyCode::F(10) => Some("f10"),
+        KeyCode::F(11) => Some("f11"),
+        KeyCode::F(12) => Some("f12"),
+        _ => None,
+    };
+
+    if let Some(name) = key_name {
+        if let Some(encoded) = ghostty_vt::encode_key(name, mods) {
+            return encoded;
+        }
+    }
+
+    // Handle remaining keys manually
+    match key.code {
+        KeyCode::Char(c) => {
+            let mut buf = [0u8; 4];
+            c.encode_utf8(&mut buf).as_bytes().to_vec()
+        }
+        KeyCode::Enter => vec![b'\r'],
+        KeyCode::Tab => vec![b'\t'],
+        KeyCode::Backspace => vec![0x7f],
+        KeyCode::Esc => vec![0x1b],
+        _ => Vec::new(),
+    }
+}
+
+fn ctrl_char_to_byte(c: char) -> Option<u8> {
+    if c.is_ascii_alphabetic() {
+        return Some((c.to_ascii_lowercase() as u8) - b'a' + 1);
+    }
+
+    // ASCII control punctuation mappings.
+    // Include both punctuation and crossterm's canonical digit forms:
+    // Ctrl+3/[/ESC, Ctrl+4/\\, Ctrl+5/], Ctrl+6/^, Ctrl+7/_.
+    match c {
+        '@' | '`' | ' ' | '2' => Some(0x00),
+        '[' | '3' => Some(0x1b),
+        '\\' | '4' => Some(0x1c),
+        ']' | '5' => Some(0x1d),
+        '^' | '6' => Some(0x1e),
+        '_' | '7' => Some(0x1f),
+        '?' | '8' => Some(0x7f),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::KeyEventKind;
+    use crossterm::event::KeyEventState;
+
+    #[test]
+    fn detects_dropped_images_from_plain_path_and_file_uri() {
+        assert!(contains_dropped_image_path(
+            "/tmp/screenshot.png\nfile:///Users/test/Pictures/image%201.jpeg\n/tmp/not-image.txt"
+        ));
+    }
+
+    #[test]
+    fn ignores_non_image_paste_content() {
+        assert!(!contains_dropped_image_path("hello world\n/tmp/readme.md"));
+    }
+
+    #[test]
+    fn key_to_bytes_encodes_ctrl_bracket_as_group_separator() {
+        let key = KeyEvent {
+            code: KeyCode::Char(']'),
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        };
+        assert_eq!(key_to_bytes(&key), vec![0x1d]);
+    }
+
+    #[test]
+    fn key_to_bytes_encodes_ctrl_digit_five_as_group_separator() {
+        let key = KeyEvent {
+            code: KeyCode::Char('5'),
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        };
+        assert_eq!(key_to_bytes(&key), vec![0x1d]);
+    }
+
+    #[test]
+    fn key_to_bytes_encodes_ctrl_alpha() {
+        let key = KeyEvent {
+            code: KeyCode::Char('d'),
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        };
+        assert_eq!(key_to_bytes(&key), vec![0x04]);
+    }
+}

@@ -1,0 +1,76 @@
+use rusqlite::Connection;
+
+use crate::cloud::sync_queue::SyncQueue;
+use crate::error::CasError;
+
+pub(super) const SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS sync_queue (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    entity_type TEXT NOT NULL,
+    entity_id TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    payload TEXT,
+    team_id TEXT,
+    created_at TEXT NOT NULL,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    UNIQUE(entity_type, entity_id, team_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sync_queue_created ON sync_queue(created_at);
+CREATE INDEX IF NOT EXISTS idx_sync_queue_retry ON sync_queue(retry_count);
+CREATE INDEX IF NOT EXISTS idx_sync_queue_team ON sync_queue(team_id);
+
+CREATE TABLE IF NOT EXISTS sync_metadata (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+"#;
+
+impl SyncQueue {
+    /// Add team_id column to existing sync_queue tables.
+    pub(super) fn migrate_team_id(&self, conn: &Connection) -> Result<(), CasError> {
+        let has_team_id: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('sync_queue') WHERE name = 'team_id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+
+        if !has_team_id {
+            conn.execute_batch(
+                r#"
+                ALTER TABLE sync_queue ADD COLUMN team_id TEXT;
+                CREATE INDEX IF NOT EXISTS idx_sync_queue_team ON sync_queue(team_id);
+                "#,
+            )?;
+
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS sync_queue_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    entity_type TEXT NOT NULL,
+                    entity_id TEXT NOT NULL,
+                    operation TEXT NOT NULL,
+                    payload TEXT,
+                    team_id TEXT,
+                    created_at TEXT NOT NULL,
+                    retry_count INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    UNIQUE(entity_type, entity_id, team_id)
+                );
+                INSERT INTO sync_queue_new (id, entity_type, entity_id, operation, payload, team_id, created_at, retry_count, last_error)
+                    SELECT id, entity_type, entity_id, operation, payload, team_id, created_at, retry_count, last_error FROM sync_queue;
+                DROP TABLE sync_queue;
+                ALTER TABLE sync_queue_new RENAME TO sync_queue;
+                CREATE INDEX IF NOT EXISTS idx_sync_queue_created ON sync_queue(created_at);
+                CREATE INDEX IF NOT EXISTS idx_sync_queue_retry ON sync_queue(retry_count);
+                CREATE INDEX IF NOT EXISTS idx_sync_queue_team ON sync_queue(team_id);
+                "#,
+            )?;
+        }
+
+        Ok(())
+    }
+}

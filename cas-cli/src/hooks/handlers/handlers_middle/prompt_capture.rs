@@ -1,0 +1,442 @@
+use crate::hooks::handlers::*;
+
+pub fn handle_user_prompt_submit(
+    input: &HookInput,
+    cas_root: Option<&Path>,
+) -> Result<HookOutput, MemError> {
+    // Get the user prompt
+    let prompt_text = match &input.user_prompt {
+        Some(p) if !p.trim().is_empty() => p.trim(),
+        _ => return Ok(HookOutput::empty()),
+    };
+
+    // Check if CAS is initialized (needed for all operations)
+    let cas_root = match cas_root {
+        Some(root) => root,
+        None => return Ok(HookOutput::empty()),
+    };
+
+    // === ATTRIBUTION: Capture ALL prompts (even short ones) ===
+    // This enables git blame-style attribution: tracing code back to prompts.
+    // We capture all prompts because any prompt could trigger code changes.
+    capture_prompt_for_attribution(cas_root, input, prompt_text);
+
+    // Skip very short prompts for context/preference extraction
+    // (acknowledgments like "yes", "ok" don't need context entries)
+    if prompt_text.len() < 20 {
+        return Ok(HookOutput::empty());
+    }
+
+    // Check if this prompt seems important enough to capture as context
+    // Important prompts typically: are questions, contain task descriptions, or are substantial
+    let is_important = is_important_prompt(prompt_text);
+
+    if !is_important {
+        return Ok(HookOutput::empty());
+    }
+
+    let store = match open_store(cas_root) {
+        Ok(s) => s,
+        Err(_) => return Ok(HookOutput::empty()),
+    };
+
+    // Create context entry for the user prompt
+    let id = match store.generate_id() {
+        Ok(id) => id,
+        Err(_) => return Ok(HookOutput::empty()),
+    };
+
+    let entry = Entry {
+        id,
+        entry_type: EntryType::Context,
+        content: format!("User request: {prompt_text}"),
+        tags: vec!["user-prompt".to_string()],
+        session_id: Some(input.session_id.clone()),
+        importance: 0.6, // User prompts are moderately important
+        ..Default::default()
+    };
+
+    // Store silently - don't fail the hook if storage fails
+    let _ = store.add(&entry);
+
+    // Check if this prompt expresses a preference/rule that should be remembered
+    if is_preference_prompt(prompt_text) {
+        // Try to extract and create a rule from the preference
+        if let Some(preference) = extract_preference_from_prompt(prompt_text) {
+            // Create a rule from the extracted preference
+            if let Ok(rule_store) = crate::store::open_rule_store(cas_root) {
+                let rule_id = rule_store
+                    .generate_id()
+                    .unwrap_or_else(|_| "rule-auto".to_string());
+                let scope = if preference.scope == "global" {
+                    crate::types::Scope::Global
+                } else {
+                    crate::types::Scope::Project
+                };
+
+                let rule = crate::types::Rule {
+                    id: rule_id.clone(),
+                    content: preference.content.clone(),
+                    scope,
+                    status: crate::types::RuleStatus::Draft,
+                    paths: preference.path_pattern.unwrap_or_default(),
+                    tags: vec!["auto-extracted".to_string()],
+                    helpful_count: 0,
+                    harmful_count: 0,
+                    created: chrono::Utc::now(),
+                    source_ids: vec![],
+                    last_accessed: None,
+                    review_after: None,
+                    hook_command: None,
+                    category: crate::types::RuleCategory::General,
+                    priority: 2, // Normal priority
+                    surface_count: 0,
+                    auto_approve_tools: None,
+                    auto_approve_paths: None,
+                    team_id: None,
+                };
+
+                if rule_store.add(&rule).is_ok() {
+                    // Return context to inform the user about the created rule
+                    let msg = format!(
+                        "\n<system-reminder>\n📝 Auto-detected preference from your message: \"{}\"\n   Created rule {} (scope: {}). Use `mcp__cas__rule action=helpful id={}` to confirm and promote to active.\n</system-reminder>",
+                        preference.content, rule_id, preference.scope, rule_id
+                    );
+                    return Ok(HookOutput::with_context("UserPromptSubmit", msg));
+                }
+            }
+        }
+    }
+
+    // Silent success
+    Ok(HookOutput::empty())
+}
+
+/// Capture a prompt for code attribution (git blame for AI sessions)
+///
+/// This function stores every user prompt in the prompts table, enabling
+/// later attribution: "which prompt created this code?"
+///
+/// Unlike the context entry logic, this captures ALL prompts (even short ones)
+/// because any prompt could trigger code changes.
+pub fn capture_prompt_for_attribution(
+    cas_root: &std::path::Path,
+    input: &HookInput,
+    prompt_text: &str,
+) {
+    // Try to open the prompt store
+    let store = match open_prompt_store(cas_root) {
+        Ok(s) => s,
+        Err(_) => return, // Silent failure - don't break the hook
+    };
+
+    // Use session_id-based agent ID for attribution
+    let agent_id = current_agent_id(input);
+
+    // Get current task ID from the task store (if any task is in_progress)
+    let task_id = get_current_task_id(cas_root);
+
+    // Create the prompt entry
+    let prompt = Prompt::with_task(
+        generate_prompt_id(),
+        input.session_id.clone(),
+        agent_id,
+        prompt_text.to_string(),
+        task_id,
+    );
+
+    // Store silently - attribution is best-effort
+    let _ = store.add(&prompt);
+}
+
+/// Generate a unique prompt ID using ULID
+pub fn generate_prompt_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    // Simple ULID-like format: prompt-{timestamp_hex}-{random_hex}
+    let random: u32 = rand::random();
+    format!("prompt-{:x}-{:04x}", timestamp, random & 0xFFFF)
+}
+
+/// Get the ID of the currently in-progress task (if any)
+pub fn get_current_task_id(cas_root: &std::path::Path) -> Option<String> {
+    let store = open_task_store(cas_root).ok()?;
+
+    // Get tasks that are in_progress
+    let tasks = store.list(Some(TaskStatus::InProgress)).ok()?;
+
+    // Return the first in-progress task (most likely the one being worked on)
+    tasks.into_iter().next().map(|t| t.id)
+}
+
+/// Capture the conversation transcript and update prompts with messages (blame v2)
+///
+/// Called at session end to store the full conversation for each prompt,
+/// enabling rich context display in `cas blame --verbose`.
+pub fn capture_transcript_for_prompts(cas_root: &std::path::Path, input: &HookInput) {
+    // Skip if no transcript path available
+    let transcript_path = match &input.transcript_path {
+        Some(path) => std::path::Path::new(path),
+        None => return,
+    };
+
+    // Parse transcript into messages
+    let messages = match crate::hooks::transcript::parse_transcript_to_messages(transcript_path) {
+        Ok(msgs) if !msgs.is_empty() => msgs,
+        _ => return, // No messages or parse error - silent failure
+    };
+
+    // Extract model and tool version from transcript
+    let metadata =
+        crate::hooks::transcript::extract_transcript_metadata(transcript_path).unwrap_or_default();
+
+    // Open prompt store
+    let prompt_store = match open_prompt_store(cas_root) {
+        Ok(store) => store,
+        Err(_) => return,
+    };
+
+    // Get all prompts for this session
+    let prompts = match prompt_store.list_by_session(&input.session_id, 100) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+
+    if prompts.is_empty() {
+        return;
+    }
+
+    // Group messages by their corresponding prompts based on user message content matching
+    // We'll associate all messages with the last prompt (simplest approach)
+    if let Some(last_prompt) = prompts.first() {
+        // Update the prompt with messages and metadata
+        if prompt_store
+            .update_blame_fields(
+                &last_prompt.id,
+                &messages,
+                metadata.model.as_deref(),
+                metadata.tool_version.as_deref(),
+            )
+            .is_ok()
+        {
+            let model_info = metadata
+                .model
+                .as_ref()
+                .map(|m| format!(", model: {m}"))
+                .unwrap_or_default();
+            eprintln!(
+                "cas: Captured {} conversation messages for prompt {}{}",
+                messages.len(),
+                &last_prompt.id[..16.min(last_prompt.id.len())],
+                model_info
+            );
+        }
+    }
+}
+
+/// Determine if a user prompt is important enough to capture
+pub fn is_important_prompt(prompt: &str) -> bool {
+    let prompt_lower = prompt.to_lowercase();
+
+    // Task indicators - starting a new task
+    let task_indicators = [
+        "implement",
+        "create",
+        "add",
+        "fix",
+        "update",
+        "refactor",
+        "build",
+        "write",
+        "design",
+        "help me",
+        "i need",
+        "please",
+        "could you",
+        "can you",
+    ];
+
+    // Question indicators
+    let question_indicators = [
+        "how",
+        "what",
+        "why",
+        "where",
+        "when",
+        "which",
+        "should",
+        "would",
+        "is there",
+        "are there",
+        "?",
+    ];
+
+    // Check for task indicators
+    for indicator in task_indicators.iter() {
+        if prompt_lower.contains(indicator) {
+            return true;
+        }
+    }
+
+    // Check for question indicators
+    for indicator in question_indicators.iter() {
+        if prompt_lower.contains(indicator) {
+            return true;
+        }
+    }
+
+    // Capture longer prompts (likely detailed instructions)
+    if prompt.len() > 100 {
+        return true;
+    }
+
+    false
+}
+
+/// Detect if a user prompt expresses a preference or rule
+///
+/// Looks for patterns like:
+/// - "never add TODOs" / "don't add TODOs"
+/// - "always implement full functionality"
+/// - "prefer X over Y" / "use X instead of Y"
+pub fn is_preference_prompt(prompt: &str) -> bool {
+    let prompt_lower = prompt.to_lowercase();
+
+    // Too short to be a meaningful preference
+    if prompt.len() < 15 {
+        return false;
+    }
+
+    // Preference indicators - patterns that suggest a rule/preference
+    let preference_patterns = [
+        // Negative patterns
+        "never ",
+        "don't ",
+        "dont ",
+        "do not ",
+        "don't ever",
+        "avoid ",
+        "stop ",
+        // Positive patterns
+        "always ",
+        "prefer ",
+        "i prefer ",
+        "use ",
+        // Comparative patterns
+        " instead of ",
+        " over ",
+        " rather than ",
+    ];
+
+    // Check for preference indicators
+    for pattern in preference_patterns.iter() {
+        if prompt_lower.contains(pattern) {
+            // Ensure there's meaningful content after the keyword
+            // (not just "never" or "always" alone)
+            if let Some(pos) = prompt_lower.find(pattern) {
+                let after = &prompt_lower[pos + pattern.len()..];
+                if after.trim().len() >= 5 {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
+/// Extract a preference/rule from a user prompt using AI
+///
+/// Returns None if no clear preference is detected or extraction fails
+pub fn extract_preference_from_prompt(prompt: &str) -> Option<ExtractedPreference> {
+    use std::time::Duration;
+    use tokio::runtime::Runtime;
+
+    let rt = Runtime::new().ok()?;
+
+    // 3 second timeout - we don't want to delay the user too much
+    rt.block_on(async {
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            extract_preference_from_prompt_async(prompt),
+        )
+        .await
+        .ok()? // Timeout -> Option
+        .ok() // Result -> Option
+    })
+    .flatten() // Option<Option<T>> -> Option<T>
+}
+
+/// Async implementation of preference extraction using Haiku
+async fn extract_preference_from_prompt_async(
+    prompt: &str,
+) -> Result<Option<ExtractedPreference>, MemError> {
+    use crate::tracing::claude_wrapper::traced_prompt;
+    use claude_rs::QueryOptions;
+
+    let prompt_text = format!(
+        r#"Analyze this user prompt and determine if it expresses a coding preference or rule that should be remembered.
+
+## User Prompt
+{prompt}
+
+## What Counts as a Preference
+- Explicit rules: "never add TODOs", "always implement fully"
+- Style preferences: "use async/await instead of .then()"
+- Workflow rules: "run tests before committing"
+- Code patterns: "prefer functional components"
+
+## What to IGNORE
+- Task requests: "fix the bug", "add a button"
+- Questions: "how does this work?"
+- Acknowledgments: "yes", "ok", "thanks"
+- One-time instructions for current task only
+
+## Task
+If this is a preference that should be remembered for future sessions, extract it as JSON:
+- content: The rule in imperative form ("Never X", "Always Y", "Use X instead of Y")
+- scope: "global" if it's a personal preference, "project" if it seems project-specific
+- confidence: 0.7-1.0 based on how clear and intentional the preference is
+
+Respond with JSON only, no markdown:
+{{"content": "...", "scope": "global", "confidence": 0.9}}
+
+If this is NOT a preference to remember, respond with: null"#
+    );
+
+    let result = traced_prompt(
+        &prompt_text,
+        QueryOptions::new().model("claude-haiku-4-5").max_turns(1),
+        "preference_extraction",
+    )
+    .await
+    .map_err(|e| MemError::Other(format!("Preference extraction failed: {e}")))?;
+
+    let response_text = result.text().trim();
+
+    // Check for null response
+    if response_text == "null" || response_text.is_empty() {
+        return Ok(None);
+    }
+
+    // Parse JSON response
+    let json_str = response_text
+        .find('{')
+        .and_then(|start| {
+            response_text
+                .rfind('}')
+                .map(|end| &response_text[start..=end])
+        })
+        .unwrap_or(response_text);
+
+    match serde_json::from_str::<ExtractedPreference>(json_str) {
+        Ok(pref) if pref.confidence >= 0.7 => Ok(Some(pref)),
+        Ok(_) => Ok(None),  // Low confidence, ignore
+        Err(_) => Ok(None), // Parse failed, ignore
+    }
+}

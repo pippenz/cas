@@ -1,0 +1,232 @@
+use crate::config::meta::registry::ConfigRegistry;
+use crate::config::meta::types::{ConfigMeta, ConfigType, Constraint};
+
+pub(super) fn register_coordination_lease_telemetry_and_missing(registry: &mut ConfigRegistry) {
+    // COORDINATION SECTION
+    // ============================================================
+    registry.register(ConfigMeta {
+            key: "coordination.mode",
+            section: "coordination",
+            name: "Coordination Mode",
+            description: "Agent coordination mode. 'local' for standalone operation, 'cloud' for multi-device sync via CAS Cloud.",
+            value_type: ConfigType::String,
+            default: "local",
+            constraint: Constraint::OneOf(vec!["local".to_string(), "cloud".to_string()]),
+            advanced: false,
+            requires_feature: None,
+            keywords: &["coordination", "mode", "local", "cloud", "sync", "multi-device"],
+            use_cases: &[
+                "Use 'local' for single-machine development",
+                "Use 'cloud' for team collaboration or multi-device sync",
+            ],
+        });
+
+    registry.register(ConfigMeta {
+            key: "coordination.cloud_url",
+            section: "coordination",
+            name: "Cloud URL",
+            description: "URL of the CAS Cloud server for cloud coordination mode. Only used when coordination.mode is 'cloud'.",
+            value_type: ConfigType::String,
+            default: "",
+            constraint: Constraint::None,
+            advanced: true,
+            requires_feature: None,
+            keywords: &["cloud", "url", "server", "endpoint", "api"],
+            use_cases: &[
+                "Set to your CAS Cloud instance URL",
+                "Leave empty to use default CAS Cloud",
+            ],
+        });
+
+    // ============================================================
+    // LEASE SECTION
+    // ============================================================
+    registry.register(ConfigMeta {
+            key: "lease.default_duration_mins",
+            section: "lease",
+            name: "Default Duration",
+            description: "Default task lease duration in minutes. Tasks are automatically released if the lease expires without renewal.",
+            value_type: ConfigType::Int,
+            default: "30",
+            constraint: Constraint::Range(1, 480),
+            advanced: false,
+            requires_feature: None,
+            keywords: &["lease", "duration", "timeout", "task", "minutes"],
+            use_cases: &[
+                "Increase for long-running tasks",
+                "Decrease for faster task turnover in multi-agent scenarios",
+            ],
+        });
+
+    registry.register(ConfigMeta {
+            key: "lease.max_duration_mins",
+            section: "lease",
+            name: "Max Duration",
+            description: "Maximum allowed task lease duration in minutes. Prevents tasks from being locked indefinitely.",
+            value_type: ConfigType::Int,
+            default: "240",
+            constraint: Constraint::Range(30, 1440),
+            advanced: true,
+            requires_feature: None,
+            keywords: &["lease", "maximum", "limit", "cap", "duration"],
+            use_cases: &[
+                "Increase for very long tasks that need extended ownership",
+                "Decrease to ensure faster task recycling",
+            ],
+        });
+
+    registry.register(ConfigMeta {
+        key: "lease.heartbeat_interval_secs",
+        section: "lease",
+        name: "Heartbeat Interval",
+        description: "How often agents send heartbeats to renew their task leases, in seconds.",
+        value_type: ConfigType::Int,
+        default: "300",
+        constraint: Constraint::Range(30, 900),
+        advanced: true,
+        requires_feature: None,
+        keywords: &["heartbeat", "interval", "renewal", "keepalive", "ping"],
+        use_cases: &[
+            "Decrease for more responsive lease management",
+            "Increase to reduce overhead in stable environments",
+        ],
+    });
+
+    registry.register(ConfigMeta {
+            key: "lease.expiry_grace_secs",
+            section: "lease",
+            name: "Expiry Grace Period",
+            description: "Grace period in seconds after a lease expires before the task is released. Allows for network delays.",
+            value_type: ConfigType::Int,
+            default: "120",
+            constraint: Constraint::Range(30, 600),
+            advanced: true,
+            requires_feature: None,
+            keywords: &["grace", "expiry", "buffer", "delay", "tolerance"],
+            use_cases: &[
+                "Increase for unreliable network conditions",
+                "Decrease for faster task recycling on failures",
+            ],
+        });
+
+    // ============================================================
+    // TELEMETRY SECTION
+    // ============================================================
+    registry.register(ConfigMeta {
+            key: "telemetry.enabled",
+            section: "telemetry",
+            name: "Enable Telemetry",
+            description: "Enable anonymous usage telemetry to help improve CAS. Opt-in via CAS_TELEMETRY=1 or this setting. No personal or code data is collected.",
+            value_type: ConfigType::Bool,
+            default: "false",
+            constraint: Constraint::None,
+            advanced: false,
+            requires_feature: None,
+            keywords: &["telemetry", "analytics", "usage", "metrics", "anonymous"],
+            use_cases: &[
+                "Disable for complete privacy",
+                "Enable to help improve CAS with anonymous usage data",
+            ],
+        });
+
+    // ============================================================
+    // MISSING FROM EXISTING SECTIONS
+    // ============================================================
+
+    // tasks.block_exit_on_open
+    registry.register(ConfigMeta {
+            key: "tasks.block_exit_on_open",
+            section: "tasks",
+            name: "Block Exit on Open Tasks",
+            description: "Prevent session exit when there are open tasks assigned to the agent. Ensures tasks are completed or reassigned before stopping.",
+            value_type: ConfigType::Bool,
+            default: "true",
+            constraint: Constraint::None,
+            advanced: false,
+            requires_feature: None,
+            keywords: &["block", "exit", "open", "tasks", "prevent", "stop"],
+            use_cases: &[
+                "Disable to allow stopping with unfinished tasks",
+                "Enable to ensure all tasks are handled before exit",
+            ],
+        });
+
+    // notifications.on_permission_prompt
+    registry.register(ConfigMeta {
+        key: "notifications.on_permission_prompt",
+        section: "notifications",
+        name: "On Permission Prompt",
+        description: "Show notification when Claude Code requests a permission prompt.",
+        value_type: ConfigType::Bool,
+        default: "false",
+        constraint: Constraint::None,
+        advanced: true,
+        requires_feature: None,
+        keywords: &[
+            "permission",
+            "prompt",
+            "notification",
+            "approval",
+            "request",
+        ],
+        use_cases: &[
+            "Enable to be alerted when Claude needs approval",
+            "Disable if permission prompts are too frequent",
+        ],
+    });
+
+    // notifications.on_idle_prompt
+    registry.register(ConfigMeta {
+        key: "notifications.on_idle_prompt",
+        section: "notifications",
+        name: "On Idle Prompt",
+        description: "Show notification when Claude Code becomes idle awaiting input.",
+        value_type: ConfigType::Bool,
+        default: "false",
+        constraint: Constraint::None,
+        advanced: true,
+        requires_feature: None,
+        keywords: &["idle", "prompt", "notification", "waiting", "input"],
+        use_cases: &[
+            "Enable to be alerted when Claude is waiting for you",
+            "Disable to reduce notification noise",
+        ],
+    });
+
+    // notifications.on_auth_success
+    registry.register(ConfigMeta {
+        key: "notifications.on_auth_success",
+        section: "notifications",
+        name: "On Auth Success",
+        description: "Show notification when CAS Cloud authentication succeeds.",
+        value_type: ConfigType::Bool,
+        default: "false",
+        constraint: Constraint::None,
+        advanced: true,
+        requires_feature: None,
+        keywords: &["auth", "authentication", "login", "success", "cloud"],
+        use_cases: &[
+            "Enable to confirm cloud login",
+            "Disable if auth notifications are unnecessary",
+        ],
+    });
+
+    // notifications.webhook_url
+    registry.register(ConfigMeta {
+            key: "notifications.webhook_url",
+            section: "notifications",
+            name: "Webhook URL",
+            description: "Optional webhook URL for sending notifications to external services (Slack, Discord, etc.).",
+            value_type: ConfigType::String,
+            default: "",
+            constraint: Constraint::None,
+            advanced: true,
+            requires_feature: None,
+            keywords: &["webhook", "url", "slack", "discord", "external", "integration"],
+            use_cases: &[
+                "Set to Slack webhook URL for team notifications",
+                "Set to Discord webhook for personal alerts",
+                "Leave empty to disable external notifications",
+            ],
+        });
+}

@@ -1,0 +1,218 @@
+use crate::mcp::tools::core::imports::*;
+
+impl CasCore {
+    pub async fn cas_agent_register(
+        &self,
+        Parameters(req): Parameters<AgentRegisterRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        // Session ID is required - it becomes the agent's unique identifier
+        let session_id = req.session_id.ok_or_else(|| McpError {
+            code: ErrorCode::INVALID_PARAMS,
+            message: Cow::from(
+                "session_id is required. Use the session ID from your SessionStart context.",
+            ),
+            data: None,
+        })?;
+
+        let requested_agent_type = req.agent_type.parse::<crate::types::AgentType>().ok();
+        let requested_role = req.agent_type.parse::<crate::types::AgentRole>().ok();
+
+        // Use explicit type/role hints when provided.
+        let id = self.register_agent_with_hints(
+            session_id,
+            req.name,
+            req.parent_id,
+            requested_agent_type,
+            requested_role,
+        )?;
+
+        Ok(Self::success(format!("Registered agent: {id}")))
+    }
+
+    /// Start a session without Claude hooks (Codex-friendly)
+    pub async fn cas_agent_session_start(
+        &self,
+        Parameters(req): Parameters<SessionStartRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let agent_name = req
+            .name
+            .clone()
+            .or_else(|| std::env::var("CAS_AGENT_NAME").ok())
+            .unwrap_or_else(|| "Codex".to_string());
+        let session_id = req.session_id.unwrap_or_else(|| {
+            let name = agent_name.to_lowercase();
+            let safe_name: String = name
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() {
+                        c.to_ascii_lowercase()
+                    } else {
+                        '-'
+                    }
+                })
+                .collect();
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            format!("codex-{}-{}", safe_name.trim_matches('-'), ts)
+        });
+
+        let requested_agent_type = req
+            .agent_type
+            .as_deref()
+            .and_then(|v| v.parse::<crate::types::AgentType>().ok());
+        let requested_role = req
+            .agent_type
+            .as_deref()
+            .and_then(|v| v.parse::<crate::types::AgentRole>().ok())
+            .or_else(|| {
+                if requested_agent_type == Some(crate::types::AgentType::Worker) {
+                    Some(crate::types::AgentRole::Worker)
+                } else {
+                    None
+                }
+            });
+
+        // Best-effort name hint for session registration
+        if let Some(ref name) = req.name {
+            unsafe { std::env::set_var("CAS_AGENT_NAME", name) };
+        } else if std::env::var("CAS_AGENT_NAME").is_err() {
+            unsafe { std::env::set_var("CAS_AGENT_NAME", &agent_name) };
+        }
+        if let Some(role) = requested_role {
+            unsafe { std::env::set_var("CAS_AGENT_ROLE", role.to_string()) };
+        } else if requested_agent_type == Some(crate::types::AgentType::Worker) {
+            unsafe { std::env::set_var("CAS_AGENT_ROLE", "worker") };
+        }
+
+        let cwd = req.cwd.unwrap_or_else(|| {
+            self.cas_root
+                .parent()
+                .unwrap_or(&self.cas_root)
+                .to_string_lossy()
+                .to_string()
+        });
+
+        let input = HookInput {
+            session_id: session_id.clone(),
+            cwd,
+            hook_event_name: "SessionStart".to_string(),
+            transcript_path: None,
+            permission_mode: req.permission_mode,
+            tool_name: None,
+            tool_input: None,
+            tool_response: None,
+            tool_use_id: None,
+            user_prompt: None,
+            source: Some("codex".to_string()),
+            reason: None,
+            subagent_type: None,
+            subagent_prompt: None,
+        };
+
+        // Use hook handler for session start side effects
+        let output = handle_session_start(&input, Some(&self.cas_root)).map_err(|e| McpError {
+            code: ErrorCode::INTERNAL_ERROR,
+            message: Cow::from(format!("Failed to start session: {e}")),
+            data: None,
+        })?;
+
+        let context = output
+            .hook_specific_output
+            .and_then(|o| o.additional_context)
+            .filter(|c| !c.is_empty())
+            .unwrap_or_else(|| {
+                build_context(&input, req.limit.unwrap_or(5), &self.cas_root)
+                    .unwrap_or_else(|_| String::new())
+            });
+
+        // Write current_session for CLI parity (best effort)
+        let _ = std::fs::write(self.cas_root.join("current_session"), &session_id);
+
+        // Ensure the agent is registered immediately for subsequent MCP calls (whoami/task/...).
+        // In Codex no-hooks mode, relying on PID/session mapping can race.
+        if let Ok(store) = self.open_agent_store() {
+            if let Ok(mut existing) = store.get(&session_id) {
+                // Refresh role/type if session_start provides explicit hints.
+                if let Some(agent_type) = requested_agent_type {
+                    existing.agent_type = agent_type;
+                }
+                if let Some(role) = requested_role {
+                    existing.role = role;
+                } else if requested_agent_type == Some(crate::types::AgentType::Worker) {
+                    existing.role = crate::types::AgentRole::Worker;
+                }
+                let _ = store.update(&existing);
+
+                let _ = self.agent_id.set(Some(session_id.clone()));
+                let _ = self.ensure_agent_active(&session_id);
+            } else {
+                // Ignore already-registered races; primary goal is to establish local session identity.
+                let _ = self.register_agent_with_hints(
+                    session_id.clone(),
+                    agent_name.clone(),
+                    None,
+                    requested_agent_type,
+                    requested_role,
+                );
+            }
+        }
+
+        let mut response = format!("Session: {session_id}");
+        if !context.is_empty() {
+            response.push_str("\n\n");
+            response.push_str(&context);
+        }
+
+        Ok(Self::success(response))
+    }
+
+    /// End a session without Claude hooks (Codex-friendly)
+    pub async fn cas_agent_session_end(
+        &self,
+        Parameters(req): Parameters<SessionEndRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let session_id = match req.session_id {
+            Some(id) => id,
+            None => self.get_agent_id()?,
+        };
+
+        let cwd = self
+            .cas_root
+            .parent()
+            .unwrap_or(&self.cas_root)
+            .to_string_lossy()
+            .to_string();
+
+        let input = HookInput {
+            session_id: session_id.clone(),
+            cwd,
+            hook_event_name: "SessionEnd".to_string(),
+            transcript_path: None,
+            permission_mode: None,
+            tool_name: None,
+            tool_input: None,
+            tool_response: None,
+            tool_use_id: None,
+            user_prompt: None,
+            source: Some("codex".to_string()),
+            reason: req.reason,
+            subagent_type: None,
+            subagent_prompt: None,
+        };
+
+        handle_session_end(&input, Some(&self.cas_root)).map_err(|e| McpError {
+            code: ErrorCode::INTERNAL_ERROR,
+            message: Cow::from(format!("Failed to end session: {e}")),
+            data: None,
+        })?;
+
+        let _ = std::fs::remove_file(self.cas_root.join("current_session"));
+
+        let store = self.open_agent_store()?;
+        let _ = store.unregister(&session_id);
+
+        Ok(Self::success(format!("Session ended: {session_id}")))
+    }
+}

@@ -1,0 +1,707 @@
+//! MCP Protocol Integration Tests
+//!
+//! Tests the actual MCP server protocol by spawning the server and
+//! communicating via JSON-RPC over stdio.
+//!
+//! These tests verify that:
+//! 1. The server responds correctly to MCP protocol messages
+//! 2. Tool calls work end-to-end through the protocol
+//! 3. Error handling follows MCP spec
+
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use std::io::{BufRead, BufReader, Write};
+use std::process::{Command, Stdio};
+use tempfile::TempDir;
+
+// ============================================================================
+// MCP Protocol Types
+// ============================================================================
+
+#[derive(Debug, Serialize)]
+struct JsonRpcRequest {
+    jsonrpc: &'static str,
+    id: u64,
+    method: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    params: Option<Value>,
+}
+
+impl JsonRpcRequest {
+    fn new(id: u64, method: &str, params: Option<Value>) -> Self {
+        Self {
+            jsonrpc: "2.0",
+            id,
+            method: method.to_string(),
+            params,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct JsonRpcResponse {
+    jsonrpc: String,
+    id: Option<u64>,
+    #[serde(default)]
+    result: Option<Value>,
+    #[serde(default)]
+    error: Option<JsonRpcError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct JsonRpcError {
+    code: i64,
+    message: String,
+    #[serde(default)]
+    data: Option<Value>,
+}
+
+// ============================================================================
+// Test Helpers
+// ============================================================================
+
+/// Helper to communicate with MCP server
+struct McpTestClient {
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    stdout: BufReader<std::process::ChildStdout>,
+    next_id: u64,
+}
+
+impl McpTestClient {
+    /// Spawn MCP server (7 meta-tools)
+    fn spawn(cas_dir: &std::path::Path) -> Self {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_cas"))
+            .arg("serve")
+            .env("CAS_DIR", cas_dir)
+            .current_dir(cas_dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("Failed to spawn cas serve");
+
+        let stdin = child.stdin.take().expect("Failed to get stdin");
+        let stdout = BufReader::new(child.stdout.take().expect("Failed to get stdout"));
+
+        Self {
+            child,
+            stdin,
+            stdout,
+            next_id: 1,
+        }
+    }
+
+    fn send_request(&mut self, method: &str, params: Option<Value>) -> JsonRpcResponse {
+        let id = self.next_id;
+        self.next_id += 1;
+
+        let request = JsonRpcRequest::new(id, method, params);
+        let request_json = serde_json::to_string(&request).expect("Failed to serialize request");
+
+        // Send request
+        writeln!(self.stdin, "{request_json}").expect("Failed to write request");
+        self.stdin.flush().expect("Failed to flush");
+
+        // Read response (skip notifications with no id)
+        loop {
+            let mut response_line = String::new();
+            self.stdout
+                .read_line(&mut response_line)
+                .expect("Failed to read response");
+
+            let response: JsonRpcResponse =
+                serde_json::from_str(&response_line).expect("Failed to parse response");
+            assert_eq!(response.jsonrpc, "2.0", "Invalid JSON-RPC version");
+
+            match response.id {
+                Some(resp_id) => {
+                    assert_eq!(resp_id, id, "Response ID should match request");
+                    return response;
+                }
+                None => {
+                    // Notification or event; continue reading.
+                    continue;
+                }
+            }
+        }
+    }
+
+    fn call_tool(&mut self, name: &str, arguments: Value) -> JsonRpcResponse {
+        self.send_request(
+            "tools/call",
+            Some(json!({
+                "name": name,
+                "arguments": arguments
+            })),
+        )
+    }
+
+    fn initialize(&mut self) -> JsonRpcResponse {
+        let response = self.send_request(
+            "initialize",
+            Some(json!({
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "cas-test-client",
+                    "version": "1.0.0"
+                }
+            })),
+        );
+
+        // Send the required 'initialized' notification after successful initialize
+        if response.error.is_none() {
+            self.send_notification("notifications/initialized", None);
+        }
+
+        response
+    }
+
+    /// Send a notification (no response expected)
+    fn send_notification(&mut self, method: &str, params: Option<Value>) {
+        let notification = json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params.unwrap_or(json!({}))
+        });
+        let notification_json = serde_json::to_string(&notification).expect("Failed to serialize");
+        writeln!(self.stdin, "{notification_json}").expect("Failed to write notification");
+        self.stdin.flush().expect("Failed to flush");
+    }
+
+    fn list_tools(&mut self) -> JsonRpcResponse {
+        self.send_request("tools/list", None)
+    }
+}
+
+impl Drop for McpTestClient {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+    }
+}
+
+/// Initialize CAS in temp directory
+fn init_cas_dir(dir: &TempDir) {
+    let output = Command::new(env!("CARGO_BIN_EXE_cas"))
+        .args(["init", "--yes"])
+        .current_dir(dir.path())
+        .output()
+        .expect("Failed to init cas");
+
+    assert!(
+        output.status.success(),
+        "cas init failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+// ============================================================================
+// Protocol Tests
+// ============================================================================
+
+#[test]
+fn test_mcp_initialize() {
+    let dir = TempDir::new().unwrap();
+    init_cas_dir(&dir);
+
+    let mut client = McpTestClient::spawn(dir.path());
+    let response = client.initialize();
+
+    assert!(response.error.is_none(), "Initialize should succeed");
+    assert!(response.result.is_some(), "Should have result");
+
+    let result = response.result.unwrap();
+    assert!(result.get("protocolVersion").is_some());
+    assert!(result.get("serverInfo").is_some());
+    assert!(result.get("capabilities").is_some());
+
+    let server_info = result.get("serverInfo").unwrap();
+    assert_eq!(server_info.get("name").unwrap().as_str().unwrap(), "cas");
+}
+
+#[test]
+fn test_mcp_list_tools() {
+    let dir = TempDir::new().unwrap();
+    init_cas_dir(&dir);
+
+    let mut client = McpTestClient::spawn(dir.path());
+    client.initialize();
+
+    let response = client.list_tools();
+
+    assert!(response.error.is_none(), "List tools should succeed");
+    assert!(response.result.is_some());
+
+    let result = response.result.unwrap();
+    let tools = result.get("tools").and_then(|t| t.as_array());
+    assert!(tools.is_some(), "Should have tools array");
+
+    let tools = tools.unwrap();
+    assert!(!tools.is_empty(), "Should have at least one tool");
+
+    // Check that expected tools exist
+    let tool_names: Vec<&str> = tools
+        .iter()
+        .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+        .collect();
+
+    // We should have the 8 meta-tools
+    assert!(
+        tool_names.contains(&"memory") && tool_names.contains(&"task"),
+        "Should have meta-tools (memory, task): {tool_names:?}"
+    );
+}
+
+#[test]
+fn test_mcp_tool_call_remember() {
+    let dir = TempDir::new().unwrap();
+    init_cas_dir(&dir);
+
+    let mut client = McpTestClient::spawn(dir.path());
+    client.initialize();
+
+    // Call the memory tool with remember action (meta-tool API)
+    let response = client.call_tool(
+        "memory",
+        json!({
+            "action": "remember",
+            "content": "Test memory from MCP protocol test",
+            "entry_type": "learning",
+            "tags": "test,mcp"
+        }),
+    );
+
+    assert!(
+        response.error.is_none(),
+        "Tool call should succeed: {:?}",
+        response.error
+    );
+    assert!(response.result.is_some());
+
+    let result = response.result.unwrap();
+    // MCP tool results have a "content" array
+    let content = result.get("content").and_then(|c| c.as_array());
+    assert!(content.is_some(), "Should have content array");
+
+    let content = content.unwrap();
+    assert!(!content.is_empty(), "Content should not be empty");
+
+    // First content item should have text
+    let text = content[0].get("text").and_then(|t| t.as_str());
+    assert!(text.is_some(), "Should have text in content");
+}
+
+#[test]
+fn test_mcp_tool_call_task_create() {
+    let dir = TempDir::new().unwrap();
+    init_cas_dir(&dir);
+
+    let mut client = McpTestClient::spawn(dir.path());
+    client.initialize();
+
+    // Create a task (meta-tool API)
+    let response = client.call_tool(
+        "task",
+        json!({
+            "action": "create",
+            "title": "MCP Protocol Test Task",
+            "priority": 2,
+            "task_type": "task"
+        }),
+    );
+
+    assert!(
+        response.error.is_none(),
+        "Task create should succeed: {:?}",
+        response.error
+    );
+
+    // Verify task was created by listing tasks
+    let list_response = client.call_tool(
+        "task",
+        json!({
+            "action": "list"
+        }),
+    );
+
+    assert!(list_response.error.is_none());
+    let result = list_response.result.unwrap();
+
+    // Content should mention the task we created
+    let empty_vec = vec![];
+    let content = result
+        .get("content")
+        .and_then(|c| c.as_array())
+        .unwrap_or(&empty_vec);
+
+    let content_text: String = content
+        .iter()
+        .filter_map(|c| c.get("text").and_then(|t| t.as_str()))
+        .collect();
+
+    assert!(
+        content_text.contains("MCP Protocol Test Task") || content_text.contains("cas-"),
+        "Task list should include our task"
+    );
+}
+
+#[test]
+fn test_mcp_tool_call_search() {
+    let dir = TempDir::new().unwrap();
+    init_cas_dir(&dir);
+
+    let mut client = McpTestClient::spawn(dir.path());
+    client.initialize();
+
+    // Add some content first (meta-tool API)
+    client.call_tool(
+        "memory",
+        json!({
+            "action": "remember",
+            "content": "Rust programming language with ownership and borrowing",
+            "tags": "rust,programming"
+        }),
+    );
+
+    // Search for it (meta-tool API)
+    let response = client.call_tool(
+        "search",
+        json!({
+            "action": "search",
+            "query": "rust ownership"
+        }),
+    );
+
+    assert!(response.error.is_none(), "Search should succeed");
+    assert!(response.result.is_some());
+}
+
+#[test]
+fn test_mcp_tool_call_invalid_arguments() {
+    let dir = TempDir::new().unwrap();
+    init_cas_dir(&dir);
+
+    let mut client = McpTestClient::spawn(dir.path());
+    client.initialize();
+
+    // Call with missing required argument (meta-tool API)
+    let response = client.call_tool(
+        "task",
+        json!({
+            "action": "create"
+            // Missing required "title"
+        }),
+    );
+
+    // Should get an error response
+    assert!(
+        response.error.is_some() || {
+            // Some implementations return success with error in content
+            response
+                .result
+                .as_ref()
+                .and_then(|r| r.get("isError"))
+                .and_then(|e| e.as_bool())
+                .unwrap_or(false)
+        },
+        "Should indicate error for missing required field"
+    );
+}
+
+#[test]
+fn test_mcp_unknown_tool() {
+    let dir = TempDir::new().unwrap();
+    init_cas_dir(&dir);
+
+    let mut client = McpTestClient::spawn(dir.path());
+    client.initialize();
+
+    let response = client.call_tool("nonexistent_tool", json!({}));
+
+    // Should return an error
+    assert!(
+        response.error.is_some(),
+        "Unknown tool should return error: {response:?}"
+    );
+}
+
+#[test]
+fn test_mcp_rule_lifecycle() {
+    let dir = TempDir::new().unwrap();
+    init_cas_dir(&dir);
+
+    let mut client = McpTestClient::spawn(dir.path());
+    client.initialize();
+
+    // Create a rule (meta-tool API)
+    let create_response = client.call_tool(
+        "rule",
+        json!({
+            "action": "create",
+            "content": "Always use descriptive variable names in tests",
+            "tags": "testing,style"
+        }),
+    );
+
+    assert!(
+        create_response.error.is_none(),
+        "Rule create should succeed: {:?}",
+        create_response.error
+    );
+
+    // List all rules (meta-tool API)
+    let list_all_response = client.call_tool(
+        "rule",
+        json!({
+            "action": "list_all"
+        }),
+    );
+    assert!(list_all_response.error.is_none());
+}
+
+#[test]
+fn test_mcp_context() {
+    let dir = TempDir::new().unwrap();
+    init_cas_dir(&dir);
+
+    let mut client = McpTestClient::spawn(dir.path());
+    client.initialize();
+
+    // Add some data (meta-tool API)
+    client.call_tool(
+        "memory",
+        json!({
+            "action": "remember",
+            "content": "Context test memory entry"
+        }),
+    );
+
+    client.call_tool(
+        "task",
+        json!({
+            "action": "create",
+            "title": "Context test task"
+        }),
+    );
+
+    // Get context (meta-tool API)
+    let response = client.call_tool(
+        "search",
+        json!({
+            "action": "context"
+        }),
+    );
+
+    assert!(response.error.is_none(), "Context should succeed");
+    assert!(response.result.is_some());
+
+    let result = response.result.unwrap();
+    let empty_vec = vec![];
+    let content = result
+        .get("content")
+        .and_then(|c| c.as_array())
+        .unwrap_or(&empty_vec);
+
+    // Context should have content
+    assert!(!content.is_empty(), "Context should have content");
+}
+
+#[test]
+fn test_mcp_doctor() {
+    let dir = TempDir::new().unwrap();
+    init_cas_dir(&dir);
+
+    let mut client = McpTestClient::spawn(dir.path());
+    client.initialize();
+
+    // Doctor is accessed via system with action: doctor
+    let response = client.call_tool(
+        "system",
+        json!({
+            "action": "doctor"
+        }),
+    );
+
+    assert!(response.error.is_none(), "Doctor should succeed");
+    assert!(response.result.is_some());
+}
+
+// ============================================================================
+// Consolidated Tools Tests
+// ============================================================================
+
+#[test]
+fn test_mcp_consolidated_memory_tool() {
+    let dir = TempDir::new().unwrap();
+    init_cas_dir(&dir);
+
+    let mut client = McpTestClient::spawn(dir.path());
+    client.initialize();
+
+    // Test memory with "remember" action
+    let response = client.call_tool(
+        "memory",
+        json!({
+            "action": "remember",
+            "content": "Consolidated memory test entry",
+            "entry_type": "learning"
+        }),
+    );
+
+    assert!(
+        response.error.is_none(),
+        "Memory remember should succeed: {:?}",
+        response.error
+    );
+}
+
+#[test]
+fn test_mcp_consolidated_task_tool() {
+    let dir = TempDir::new().unwrap();
+    init_cas_dir(&dir);
+
+    let mut client = McpTestClient::spawn(dir.path());
+    client.initialize();
+
+    // Test task with "create" action
+    let response = client.call_tool(
+        "task",
+        json!({
+            "action": "create",
+            "title": "Consolidated task test"
+        }),
+    );
+
+    assert!(
+        response.error.is_none(),
+        "Task create should succeed: {:?}",
+        response.error
+    );
+}
+
+// ============================================================================
+// Error Handling Tests
+// ============================================================================
+
+#[test]
+fn test_mcp_invalid_json_rpc() {
+    let dir = TempDir::new().unwrap();
+    init_cas_dir(&dir);
+
+    let mut client = McpTestClient::spawn(dir.path());
+    // Must initialize first per MCP protocol
+    client.initialize();
+
+    // Send request with invalid method
+    let response = client.send_request("invalid/method", None);
+
+    // Should get method not found error
+    assert!(response.error.is_some(), "Invalid method should error");
+    if let Some(error) = response.error {
+        assert_eq!(error.code, -32601, "Should be method not found error");
+        assert!(
+            !error.message.is_empty(),
+            "Error message should be populated"
+        );
+        let _ = error.data.as_ref();
+    }
+}
+
+#[test]
+fn test_mcp_resources_list_changed_capability() {
+    let dir = TempDir::new().unwrap();
+    init_cas_dir(&dir);
+
+    let mut client = McpTestClient::spawn(dir.path());
+    let response = client.initialize();
+
+    assert!(response.error.is_none(), "Initialize should succeed");
+    let result = response.result.unwrap();
+
+    // Check that resources.listChanged capability is advertised
+    let capabilities = result
+        .get("capabilities")
+        .expect("should have capabilities");
+    let resources = capabilities.get("resources");
+
+    assert!(
+        resources.is_some(),
+        "Should have resources capability: {capabilities:?}"
+    );
+
+    let resources = resources.unwrap();
+    let list_changed = resources.get("listChanged").and_then(|v| v.as_bool());
+
+    assert_eq!(
+        list_changed,
+        Some(true),
+        "resources.listChanged should be true: {resources:?}"
+    );
+}
+
+#[test]
+fn test_mcp_mutation_with_notifications() {
+    // This test verifies that mutations work correctly even with notification code path
+    // (notifications are fire-and-forget, so we can't directly verify they were sent,
+    // but we verify the mutation succeeds and doesn't crash)
+    let dir = TempDir::new().unwrap();
+    init_cas_dir(&dir);
+
+    let mut client = McpTestClient::spawn(dir.path());
+    client.initialize();
+
+    // List resources first (this captures the peer for notifications)
+    let list_response = client.send_request("resources/list", None);
+    assert!(
+        list_response.error.is_none(),
+        "List resources should succeed"
+    );
+
+    // Create a memory (triggers notification)
+    let response = client.call_tool(
+        "memory",
+        json!({
+            "action": "remember",
+            "content": "Test entry for notification test"
+        }),
+    );
+
+    assert!(
+        response.error.is_none(),
+        "Memory create should succeed: {:?}",
+        response.error
+    );
+
+    // Create a task (triggers notification)
+    let response = client.call_tool(
+        "task",
+        json!({
+            "action": "create",
+            "title": "Test task for notification test"
+        }),
+    );
+
+    assert!(
+        response.error.is_none(),
+        "Task create should succeed: {:?}",
+        response.error
+    );
+
+    // Verify the resources were created by listing them
+    let list_response = client.send_request("resources/list", None);
+    assert!(list_response.error.is_none());
+
+    let result = list_response.result.unwrap();
+    let resources = result
+        .get("resources")
+        .and_then(|r| r.as_array())
+        .expect("Should have resources array");
+
+    // Should have at least one resource after mutations
+    // (exact count may vary due to test parallelism)
+    assert!(
+        !resources.is_empty(),
+        "Should have resources after mutations: {resources:?}"
+    );
+}

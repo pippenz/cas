@@ -1,0 +1,899 @@
+//! Initialize cas command with streamlined animated wizard
+//!
+//! Init flow:
+//! 1. Welcome screen
+//! 2. Confirmation with file summary
+//! 3. Animated execution
+
+use std::io::{Write, stdout};
+use std::path::Path;
+use std::process::Command;
+use std::thread;
+use std::time::Duration;
+
+use clap::Parser;
+use crossterm::{
+    execute,
+    style::{Color, Print, SetForegroundColor},
+};
+
+use crate::builtins::sync_all_builtins_for_harness;
+use crate::config::{Config, HookConfig, SyncConfig, TasksConfig};
+use crate::store::detect::init_cas_dir;
+
+use crate::cli::Cli;
+use crate::cli::factory_tooling;
+use crate::cli::hook::{configure_claude_hooks, configure_codex_mcp_server, configure_mcp_server};
+use crate::cli::interactive;
+
+#[derive(Parser)]
+pub struct InitArgs {
+    /// Accept all defaults without prompts
+    #[arg(long, short = 'y')]
+    pub yes: bool,
+
+    /// Force reinitialize even if already initialized
+    #[arg(long, short = 'f')]
+    pub force: bool,
+}
+
+// ============================================================================
+// Colors (CRT aesthetic matching boot.rs)
+// ============================================================================
+
+mod colors {
+    use crossterm::style::Color;
+
+    pub const CYAN: Color = Color::Rgb {
+        r: 0,
+        g: 200,
+        b: 255,
+    };
+    pub const CYAN_BRIGHT: Color = Color::Rgb {
+        r: 150,
+        g: 230,
+        b: 255,
+    };
+    pub const GREEN: Color = Color::Rgb {
+        r: 80,
+        g: 250,
+        b: 120,
+    };
+    pub const ORANGE: Color = Color::Rgb {
+        r: 255,
+        g: 200,
+        b: 80,
+    };
+    pub const RED: Color = Color::Rgb {
+        r: 255,
+        g: 90,
+        b: 90,
+    };
+    pub const WHITE: Color = Color::White;
+    pub const GRAY: Color = Color::Rgb {
+        r: 120,
+        g: 120,
+        b: 130,
+    };
+    pub const DARK_GRAY: Color = Color::Rgb {
+        r: 70,
+        g: 70,
+        b: 75,
+    };
+}
+
+// Spinner frames (braille pattern)
+const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+// ============================================================================
+// Configuration (simplified - uses smart defaults)
+// ============================================================================
+
+/// Agent selection for init configuration
+#[derive(Clone, Copy, Debug)]
+struct AgentSelection {
+    claude: bool,
+    codex: bool,
+}
+
+/// Simplified wizard configuration
+struct WizardConfig {
+    agents: AgentSelection,
+}
+
+impl Default for WizardConfig {
+    fn default() -> Self {
+        Self {
+            agents: AgentSelection {
+                claude: true,
+                codex: false,
+            },
+        }
+    }
+}
+
+impl WizardConfig {
+    fn with_detected_agents(cwd: &Path) -> Self {
+        Self {
+            agents: detect_agent_defaults(cwd),
+        }
+    }
+
+    /// Convert to full config with smart defaults
+    fn to_config(&self) -> Config {
+        let mut sync = SyncConfig {
+            enabled: true,
+            target: ".claude/rules/cas".to_string(),
+            min_helpful: 1,
+        };
+
+        if self.agents.codex && !self.agents.claude {
+            sync.target = ".codex/rules/cas".to_string();
+        }
+
+        Config {
+            sync,
+            hooks: Some(HookConfig {
+                capture_enabled: true,
+                capture_tools: vec!["Write".to_string(), "Edit".to_string(), "Bash".to_string()],
+                inject_context: true,
+                context_limit: 5,
+                generate_summaries: false,
+                token_budget: 4000,
+                ai_context: false,
+                ai_model: "claude-haiku-4-5".to_string(),
+                plan_mode: Default::default(),
+                minimal_start: false,
+                ..Default::default()
+            }),
+            tasks: Some(TasksConfig {
+                commit_nudge_on_close: false,
+                block_exit_on_open: true,
+            }),
+            dev: None,
+            code: None,
+            cloud: None,
+            notifications: None,
+            agent: None,
+            coordination: None,
+            lease: None,
+            verification: None,
+            worktrees: None,
+            theme: None,
+            orchestration: None,
+            factory: None,
+            telemetry: None,
+            logging: None,
+            llm: None,
+        }
+    }
+}
+
+// ============================================================================
+// Entry point
+// ============================================================================
+
+pub fn execute(args: &InitArgs, cli: &Cli) -> anyhow::Result<()> {
+    let cwd = std::env::current_dir()?;
+
+    // JSON mode: non-interactive, use defaults
+    if cli.json {
+        return execute_json(&cwd, args);
+    }
+
+    // Yes mode: non-interactive, use defaults with text output
+    if args.yes {
+        return execute_defaults(&cwd, args);
+    }
+
+    // Interactive wizard
+    run_wizard(&cwd, args)
+}
+
+// ============================================================================
+// JSON mode (non-interactive)
+// ============================================================================
+
+fn execute_json(cwd: &Path, args: &InitArgs) -> anyhow::Result<()> {
+    let cas_dir_path = cwd.join(".cas");
+
+    if cas_dir_path.exists() && !args.force {
+        println!(
+            r#"{{"status":"already_initialized","path":"{}"}}"#,
+            cas_dir_path.display()
+        );
+        return Ok(());
+    }
+
+    let cas_dir = init_cas_dir(cwd)?;
+    let config = WizardConfig::with_detected_agents(cwd);
+    let config_data = config.to_config();
+    let mut hooks_configured = false;
+    let mut claude_md_updated = false;
+    let mut skill_generated = false;
+    let mut builtins_count = 0;
+    let mut codex_configured = false;
+    let gitignore_updated = ensure_gitignore(cwd).is_ok();
+    let _ = gitignore_updated;
+
+    if config.agents.claude {
+        hooks_configured = configure_claude_hooks(cwd, false).unwrap_or(false);
+        claude_md_updated = update_claude_md(cwd).unwrap_or(false);
+        skill_generated = generate_cas_skill(cwd).unwrap_or(false);
+
+        let claude_dir = cwd.join(".claude");
+        let builtins_result =
+            sync_all_builtins_for_harness(cas_mux::SupervisorCli::Claude, &claude_dir).ok();
+        builtins_count = builtins_result
+            .as_ref()
+            .map(|r| r.agents_updated + r.skills_updated)
+            .unwrap_or(0);
+    }
+
+    if config.agents.codex {
+        codex_configured = configure_codex_mcp_server(cwd).unwrap_or(false);
+
+        let codex_dir = cwd.join(".codex");
+        let builtins_result =
+            sync_all_builtins_for_harness(cas_mux::SupervisorCli::Codex, &codex_dir).ok();
+        builtins_count += builtins_result
+            .as_ref()
+            .map(|r| r.agents_updated + r.skills_updated)
+            .unwrap_or(0);
+    }
+
+    // Setup factory tooling
+    let factory_tooling_result = factory_tooling::setup_factory_tooling(cwd).unwrap_or_default();
+
+    config_data.save(&cas_dir)?;
+
+    let steps = next_steps_needed(cwd);
+
+    println!(
+        r#"{{"status":"initialized","path":"{}","agents":{},"hooks_configured":{},"claude_md_updated":{},"skill_generated":{},"builtins_synced":{},"codex_configured":{},"factory_tooling":"{}","next_steps":{}}}"#,
+        cas_dir.display(),
+        serde_json::json!({
+            "claude": config.agents.claude,
+            "codex": config.agents.codex,
+        }),
+        hooks_configured,
+        claude_md_updated,
+        skill_generated,
+        builtins_count,
+        codex_configured,
+        factory_tooling_result,
+        serde_json::json!(steps),
+    );
+
+    Ok(())
+}
+
+// ============================================================================
+// Defaults mode (--yes flag)
+// ============================================================================
+
+fn execute_defaults(cwd: &Path, args: &InitArgs) -> anyhow::Result<()> {
+    let cas_dir_path = cwd.join(".cas");
+
+    if cas_dir_path.exists() && !args.force {
+        print_colored("", colors::WHITE)?;
+        print_colored("  ● ", colors::CYAN)?;
+        print_colored("CAS already initialized at ", colors::WHITE)?;
+        print_colored(&cas_dir_path.display().to_string(), colors::CYAN)?;
+        println!();
+        print_colored("  → ", colors::GRAY)?;
+        print_colored("Use ", colors::GRAY)?;
+        print_colored("--force", colors::WHITE)?;
+        print_colored(" to reinitialize\n\n", colors::GRAY)?;
+        return Ok(());
+    }
+
+    // Mini header
+    println!();
+    print_colored("  █▀▀ ▄▀█ █▀ ", colors::CYAN_BRIGHT)?;
+    print_colored("Init ", colors::WHITE)?;
+    print_colored("(using defaults)\n", colors::GRAY)?;
+    print_colored("  █▄▄ █▀█ ▄█\n\n", colors::CYAN_BRIGHT)?;
+
+    let cas_dir = init_cas_dir(cwd)?;
+
+    // Apply with animation
+    let config = WizardConfig::with_detected_agents(cwd);
+    apply_configuration(&cas_dir, cwd, &config, false)?;
+
+    print_quick_start();
+    print_next_steps(cwd);
+    Ok(())
+}
+
+// ============================================================================
+// Interactive wizard (streamlined)
+// ============================================================================
+
+fn run_wizard(cwd: &Path, args: &InitArgs) -> anyhow::Result<()> {
+    let cas_dir_path = cwd.join(".cas");
+
+    // Welcome
+    print_welcome()?;
+
+    // Check if already initialized
+    if cas_dir_path.exists() && !args.force {
+        println!();
+        print_colored("  CAS is already initialized at ", colors::WHITE)?;
+        print_colored(&cas_dir_path.display().to_string(), colors::CYAN)?;
+        println!("\n");
+
+        let options = ["Reconfigure settings", "Keep existing and exit"];
+        let choice = interactive::select("What would you like to do", &options)?;
+
+        if choice == 1 {
+            println!("\n  Keeping existing configuration.");
+            return Ok(());
+        }
+        println!("\n  Reconfiguring CAS...");
+    }
+
+    // Initialize .cas directory
+    let cas_dir = init_cas_dir(cwd)?;
+    let wizard_config = WizardConfig::with_detected_agents(cwd);
+
+    // Confirmation with file summary
+    if !confirm_and_apply(&cas_dir, cwd, &wizard_config)? {
+        println!("\n  Initialization cancelled.");
+        return Ok(());
+    }
+
+    print_quick_start();
+    print_next_steps(cwd);
+    Ok(())
+}
+
+// ============================================================================
+// Wizard sections
+// ============================================================================
+
+fn print_welcome() -> anyhow::Result<()> {
+    println!();
+    print_colored(
+        "  ╭──────────────────────────────────────────────────────╮\n",
+        colors::CYAN,
+    )?;
+    print_colored("  │", colors::CYAN)?;
+    print_colored(
+        "                                                      ",
+        colors::CYAN,
+    )?;
+    print_colored("│\n", colors::CYAN)?;
+    print_colored("  │  ", colors::CYAN)?;
+    print_colored("█▀▀ ▄▀█ █▀", colors::CYAN_BRIGHT)?;
+    print_colored("  Init", colors::WHITE)?;
+    print_colored("                                     ", colors::CYAN)?;
+    print_colored("│\n", colors::CYAN)?;
+    print_colored("  │  ", colors::CYAN)?;
+    print_colored("█▄▄ █▀█ ▄█", colors::CYAN_BRIGHT)?;
+    print_colored("                                          ", colors::CYAN)?;
+    print_colored("│\n", colors::CYAN)?;
+    print_colored("  │", colors::CYAN)?;
+    print_colored(
+        "                                                      ",
+        colors::CYAN,
+    )?;
+    print_colored("│\n", colors::CYAN)?;
+    print_colored(
+        "  ╰──────────────────────────────────────────────────────╯\n",
+        colors::CYAN,
+    )?;
+    println!();
+    print_colored("  │ ", colors::GRAY)?;
+    print_colored(
+        "Multi-agent coding factory with persistent memory and task coordination.\n",
+        colors::WHITE,
+    )?;
+    println!();
+    Ok(())
+}
+
+fn print_section_header(title: &str) -> anyhow::Result<()> {
+    println!();
+    print_colored("  ● ", colors::CYAN)?;
+    print_colored(title, colors::WHITE)?;
+    println!();
+    print_colored("  ", colors::GRAY)?;
+    print_colored(&"─".repeat(50), colors::DARK_GRAY)?;
+    println!();
+    Ok(())
+}
+
+fn is_claude_cli_installed() -> bool {
+    std::process::Command::new("claude")
+        .arg("--version")
+        .output()
+        .is_ok()
+}
+
+fn is_codex_cli_installed() -> bool {
+    std::process::Command::new("codex")
+        .arg("--version")
+        .output()
+        .is_ok()
+}
+
+fn detect_agent_defaults(cwd: &Path) -> AgentSelection {
+    let claude = cwd.join(".claude").exists();
+    let codex = cwd.join(".codex").exists();
+
+    if !claude && !codex {
+        // Fresh project: pick defaults from installed CLIs first.
+        let claude_cli = is_claude_cli_installed();
+        let codex_cli = is_codex_cli_installed();
+
+        match (claude_cli, codex_cli) {
+            (false, true) => AgentSelection {
+                claude: false,
+                codex: true,
+            },
+            (true, false) => AgentSelection {
+                claude: true,
+                codex: false,
+            },
+            // Keep existing preference when both are installed (or both absent).
+            _ => AgentSelection {
+                claude: true,
+                codex: false,
+            },
+        }
+    } else {
+        AgentSelection { claude, codex }
+    }
+}
+
+// ============================================================================
+// Confirmation and execution
+// ============================================================================
+
+fn confirm_and_apply(cas_dir: &Path, cwd: &Path, config: &WizardConfig) -> anyhow::Result<bool> {
+    print_section_header("Confirmation")?;
+    println!();
+
+    // Calculate what files will be affected
+    let cas_exists = cwd.join(".cas").exists();
+    let settings_exists = cwd.join(".claude/settings.json").exists();
+    let mcp_exists = cwd.join(".mcp.json").exists();
+    let claude_md_exists = cwd.join("CLAUDE.md").exists();
+    let skill_exists = cwd.join(".claude/skills/cas/SKILL.md").exists();
+    let codex_config_exists = cwd.join(".codex/config.toml").exists();
+    let gitignore_exists = cwd.join(".gitignore").exists();
+
+    // Files to create
+    print_colored("  Create:\n", colors::WHITE)?;
+
+    if !cas_exists {
+        print_file_item(".cas/", "CAS data directory", colors::GREEN)?;
+    }
+    print_file_item(".cas/config.toml", "Configuration", colors::GREEN)?;
+    if !gitignore_exists {
+        print_file_item(".gitignore", "Add .cas/ exclusion", colors::GREEN)?;
+    }
+
+    if config.agents.claude {
+        if !mcp_exists {
+            print_file_item(".mcp.json", "MCP server config", colors::GREEN)?;
+        }
+        if !settings_exists {
+            print_file_item(".claude/settings.json", "Claude Code hooks", colors::GREEN)?;
+        }
+        if !skill_exists {
+            print_file_item(".claude/skills/cas/SKILL.md", "CAS skill", colors::GREEN)?;
+        }
+        print_file_item(".claude/agents/", "Built-in agents", colors::GREEN)?;
+        print_file_item(".claude/commands/", "Built-in commands", colors::GREEN)?;
+    }
+
+    if config.agents.codex {
+        if !codex_config_exists {
+            print_file_item(".codex/config.toml", "Codex MCP config", colors::GREEN)?;
+        }
+        print_file_item(".codex/agents/", "Built-in agents", colors::GREEN)?;
+        print_file_item(".codex/commands/", "Built-in commands", colors::GREEN)?;
+    }
+
+    // Factory tooling files
+    let env_template_exists = cwd.join(".env.worktree.template").exists();
+    let boot_script_exists = cwd.join("scripts/worktree-boot.sh").exists();
+    let has_factory_changes = !env_template_exists || !boot_script_exists;
+
+    if has_factory_changes {
+        println!();
+        print_colored("  Factory tooling:\n", colors::WHITE)?;
+        if !env_template_exists {
+            print_file_item(
+                ".env.worktree.template",
+                "Worktree env template",
+                colors::GREEN,
+            )?;
+        }
+        if !boot_script_exists {
+            print_file_item("scripts/worktree-boot.sh", "Boot script", colors::GREEN)?;
+        }
+    }
+
+    // Files to modify
+    let has_modifications = (config.agents.claude
+        && (settings_exists || mcp_exists || claude_md_exists))
+        || (config.agents.codex && codex_config_exists)
+        || gitignore_exists;
+    if has_modifications {
+        println!();
+        print_colored("  Modify:\n", colors::WHITE)?;
+
+        if gitignore_exists {
+            print_file_item(".gitignore", "Add .cas/ exclusion", colors::ORANGE)?;
+        }
+
+        if config.agents.claude {
+            if settings_exists {
+                print_file_item(".claude/settings.json", "Add CAS hooks", colors::ORANGE)?;
+            }
+            if mcp_exists {
+                print_file_item(".mcp.json", "Add CAS server", colors::ORANGE)?;
+            }
+            if claude_md_exists {
+                print_file_item("CLAUDE.md", "Add CAS instructions", colors::ORANGE)?;
+            } else {
+                print_file_item("CLAUDE.md", "Create with CAS instructions", colors::GREEN)?;
+            }
+        }
+
+        if config.agents.codex && codex_config_exists {
+            print_file_item(".codex/config.toml", "Add CAS server", colors::ORANGE)?;
+        }
+    }
+
+    println!();
+    if !interactive::confirm("  Proceed", true)? {
+        return Ok(false);
+    }
+
+    // Telemetry is opt-in; don't enable by default
+
+    // Apply with animation
+    apply_configuration(cas_dir, cwd, config, true)?;
+
+    Ok(true)
+}
+
+fn print_file_item(path: &str, description: &str, color: Color) -> anyhow::Result<()> {
+    print_colored("    ", colors::WHITE)?;
+    print_colored(path, color)?;
+    // Pad to align descriptions
+    let padding = 32_usize.saturating_sub(path.len());
+    print_colored(&" ".repeat(padding), colors::WHITE)?;
+    print_colored(description, colors::GRAY)?;
+    println!();
+    Ok(())
+}
+
+// ============================================================================
+// Animated execution
+// ============================================================================
+
+fn apply_configuration(
+    cas_dir: &Path,
+    cwd: &Path,
+    config: &WizardConfig,
+    animate: bool,
+) -> anyhow::Result<()> {
+    println!();
+
+    // Step 1: Save configuration
+    execute_step("Saving configuration", animate, || {
+        let cas_config = config.to_config();
+        cas_config.save(cas_dir)?;
+        Ok(".cas/config.toml".to_string())
+    })?;
+
+    // Step 2: Ensure .cas is in .gitignore
+    execute_step("Updating .gitignore", animate, || ensure_gitignore(cwd))?;
+
+    if config.agents.claude {
+        // Step 2: Configure local editor hooks
+        execute_step("Configuring editor hooks", animate, || {
+            configure_claude_hooks(cwd, false)?;
+            Ok(".claude/settings.json".to_string())
+        })?;
+
+        // Step 3: Configure MCP server
+        execute_step("Configuring MCP server", animate, || {
+            configure_mcp_server(cwd)?;
+            Ok(".mcp.json".to_string())
+        })?;
+
+        // Step 4: Update agent instructions
+        execute_step("Updating agent instructions", animate, || {
+            update_claude_md(cwd)?;
+            Ok("CLAUDE.md".to_string())
+        })?;
+
+        // Step 5: Generate CAS skill
+        execute_step("Generating CAS guidance skill", animate, || {
+            generate_cas_skill(cwd)?;
+            Ok(".claude/skills/cas/SKILL.md".to_string())
+        })?;
+
+        // Step 6: Sync built-ins
+        execute_step("Syncing built-in files", animate, || {
+            let claude_dir = cwd.join(".claude");
+            let result =
+                sync_all_builtins_for_harness(cas_mux::SupervisorCli::Claude, &claude_dir)?;
+            let total = result.agents_updated + result.skills_updated;
+            Ok(format!("{total} files"))
+        })?;
+    }
+
+    if config.agents.codex {
+        execute_step("Configuring Codex MCP server", animate, || {
+            configure_codex_mcp_server(cwd)?;
+            Ok(".codex/config.toml".to_string())
+        })?;
+
+        execute_step("Syncing Codex built-in files", animate, || {
+            let codex_dir = cwd.join(".codex");
+            let result = sync_all_builtins_for_harness(cas_mux::SupervisorCli::Codex, &codex_dir)?;
+            let total = result.agents_updated + result.skills_updated;
+            Ok(format!("{total} files"))
+        })?;
+    }
+
+    // Step 7: Setup factory tooling helper templates
+    execute_step("Setting up factory tooling", animate, || {
+        factory_tooling::setup_factory_tooling(cwd)
+    })?;
+
+    // Final success message
+    println!();
+    print_colored("  ✓ ", colors::GREEN)?;
+    print_colored("CAS initialized at ", colors::WHITE)?;
+    print_colored(&cas_dir.display().to_string(), colors::CYAN)?;
+    println!("\n");
+
+    Ok(())
+}
+
+fn execute_step<F>(label: &str, animate: bool, action: F) -> anyhow::Result<()>
+where
+    F: FnOnce() -> anyhow::Result<String>,
+{
+    let mut stdout = stdout();
+
+    // Show spinner
+    print_colored("  ", colors::WHITE)?;
+    print_colored(&format!("{}", SPINNER_FRAMES[0]), colors::ORANGE)?;
+    print_colored(&format!(" {label}..."), colors::WHITE)?;
+    stdout.flush()?;
+
+    if animate {
+        // Animate spinner briefly
+        for i in 0..8 {
+            thread::sleep(Duration::from_millis(50));
+            print!("\r");
+            print_colored("  ", colors::WHITE)?;
+            print_colored(
+                &format!("{}", SPINNER_FRAMES[i % SPINNER_FRAMES.len()]),
+                colors::ORANGE,
+            )?;
+            print_colored(&format!(" {label}..."), colors::WHITE)?;
+            stdout.flush()?;
+        }
+    }
+
+    // Execute action
+    match action() {
+        Ok(result) => {
+            // Show success
+            print!("\r");
+            print_colored("  ✓ ", colors::GREEN)?;
+            print_colored(label, colors::WHITE)?;
+            // Pad to clear any remnants
+            let padding = 40_usize.saturating_sub(label.len());
+            print_colored(&" ".repeat(padding), colors::WHITE)?;
+            print_colored(&result, colors::GRAY)?;
+            println!();
+            Ok(())
+        }
+        Err(e) => {
+            // Show failure
+            print!("\r");
+            print_colored("  ✗ ", colors::RED)?;
+            print_colored(label, colors::WHITE)?;
+            print_colored(" — ", colors::GRAY)?;
+            print_colored(&format!("{e}"), colors::RED)?;
+            println!();
+            Err(e)
+        }
+    }
+}
+
+// ============================================================================
+// Quick start guide
+// ============================================================================
+
+fn print_quick_start() {
+    use crate::ui::components::{Formatter, Renderable, Table};
+    use crate::ui::theme::ActiveTheme;
+
+    let table = Table::new()
+        .columns(&["Command", "Description"])
+        .rows(vec![
+            vec!["cas", "Launch multi-agent factory"],
+            vec!["cas attach", "Attach to running session"],
+            vec!["cas serve", "Start MCP server"],
+            vec!["cas doctor", "Run diagnostics"],
+        ])
+        .indent(2);
+
+    let theme = ActiveTheme::default();
+    let mut out = std::io::stdout();
+    let mut fmt = Formatter::stdout(&mut out, theme);
+    let _ = fmt.newline();
+    let _ = table.render(&mut fmt);
+    let _ = fmt.newline();
+}
+
+// ============================================================================
+// Post-init next steps
+// ============================================================================
+
+/// Check if .claude/settings.json is tracked by git (committed at least once).
+fn is_claude_dir_tracked(cwd: &Path) -> bool {
+    Command::new("git")
+        .args(["ls-files", "--error-unmatch", ".claude/settings.json"])
+        .current_dir(cwd)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Check if we're inside a git repository.
+fn is_git_repo(cwd: &Path) -> bool {
+    Command::new("git")
+        .args(["rev-parse", "--git-dir"])
+        .current_dir(cwd)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Print "Next steps" box telling users to commit .claude/ for factory workers.
+/// Skips if not in a git repo or if .claude/ is already tracked.
+fn print_next_steps(cwd: &Path) {
+    if !is_git_repo(cwd) || is_claude_dir_tracked(cwd) {
+        return;
+    }
+
+    let _ = (|| -> anyhow::Result<()> {
+        print_colored(
+            "  ┌─ Next steps ──────────────────────────────────────────┐\n",
+            colors::CYAN,
+        )?;
+        print_colored("  │", colors::CYAN)?;
+        print_colored(
+            "                                                        ",
+            colors::WHITE,
+        )?;
+        print_colored("│\n", colors::CYAN)?;
+
+        print_colored("  │", colors::CYAN)?;
+        print_colored(
+            "  Commit CAS config so factory workers can access it:   ",
+            colors::WHITE,
+        )?;
+        print_colored("│\n", colors::CYAN)?;
+
+        print_colored("  │", colors::CYAN)?;
+        print_colored(
+            "                                                        ",
+            colors::WHITE,
+        )?;
+        print_colored("│\n", colors::CYAN)?;
+
+        print_colored("  │", colors::CYAN)?;
+        print_colored(
+            "    git add .claude/ CLAUDE.md .mcp.json .gitignore     ",
+            colors::GREEN,
+        )?;
+        print_colored("│\n", colors::CYAN)?;
+
+        print_colored("  │", colors::CYAN)?;
+        print_colored(
+            "    git commit -m \"Configure CAS\"                       ",
+            colors::GREEN,
+        )?;
+        print_colored("│\n", colors::CYAN)?;
+
+        print_colored("  │", colors::CYAN)?;
+        print_colored(
+            "                                                        ",
+            colors::WHITE,
+        )?;
+        print_colored("│\n", colors::CYAN)?;
+
+        print_colored(
+            "  └────────────────────────────────────────────────────────┘\n",
+            colors::CYAN,
+        )?;
+        println!();
+        Ok(())
+    })();
+}
+
+/// Returns next steps as JSON-friendly data (for --json mode).
+fn next_steps_needed(cwd: &Path) -> Option<Vec<String>> {
+    if !is_git_repo(cwd) || is_claude_dir_tracked(cwd) {
+        return None;
+    }
+    Some(vec![
+        "git add .claude/ CLAUDE.md .mcp.json .gitignore".to_string(),
+        "git commit -m \"Configure CAS\"".to_string(),
+    ])
+}
+
+// ============================================================================
+// Helper functions
+// ============================================================================
+
+fn print_colored(text: &str, color: Color) -> anyhow::Result<()> {
+    let mut stdout = stdout();
+    execute!(stdout, SetForegroundColor(color), Print(text))?;
+    execute!(stdout, SetForegroundColor(Color::Reset))?;
+    Ok(())
+}
+
+// ============================================================================
+// .gitignore management
+// ============================================================================
+
+/// Ensure `.cas` is listed in `.gitignore`. If no `.gitignore` exists, create one.
+fn ensure_gitignore(cwd: &Path) -> anyhow::Result<String> {
+    let gitignore_path = cwd.join(".gitignore");
+    if gitignore_path.exists() {
+        let content = std::fs::read_to_string(&gitignore_path)?;
+        // Check if .cas is already ignored (exact line match)
+        let already_ignored = content.lines().any(|line| {
+            let trimmed = line.trim();
+            trimmed == ".cas" || trimmed == ".cas/" || trimmed == "/.cas" || trimmed == "/.cas/"
+        });
+        if already_ignored {
+            return Ok("already in .gitignore".to_string());
+        }
+        // Append .cas to existing .gitignore
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&gitignore_path)?;
+        // Ensure we start on a new line
+        if !content.ends_with('\n') {
+            std::io::Write::write_all(&mut file, b"\n")?;
+        }
+        std::io::Write::write_all(&mut file, b".cas/\n")?;
+        Ok(".gitignore (appended)".to_string())
+    } else {
+        std::fs::write(&gitignore_path, ".cas/\n")?;
+        Ok(".gitignore (created)".to_string())
+    }
+}
+
+// ============================================================================
+// CLAUDE.md management
+// ============================================================================
+
+/// Marker for CAS-managed section in CLAUDE.md
+mod docs_and_skill;
+
+pub(crate) use crate::cli::init::docs_and_skill::{
+    CAS_SECTION_BEGIN, CAS_SECTION_END, CAS_SKILL, build_cas_section, is_old_cas_skill,
+    is_skill_managed_by_cas,
+};
+pub use crate::cli::init::docs_and_skill::{generate_cas_skill, update_claude_md};

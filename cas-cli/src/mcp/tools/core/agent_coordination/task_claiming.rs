@@ -1,0 +1,560 @@
+use crate::harness_policy::is_worker_without_subagents_from_env;
+use crate::mcp::tools::core::imports::*;
+
+impl CasCore {
+    pub async fn cas_task_claim(
+        &self,
+        Parameters(req): Parameters<TaskClaimRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let agent_store = self.open_agent_store()?;
+        let task_store = self.open_task_store()?;
+
+        // Verify task exists and is claimable
+        let task = task_store.get(&req.task_id).map_err(|e| McpError {
+            code: ErrorCode::INVALID_PARAMS,
+            message: Cow::from(format!("Task not found: {e}")),
+            data: None,
+        })?;
+
+        if task.status == TaskStatus::Closed {
+            return Err(McpError {
+                code: ErrorCode::INVALID_PARAMS,
+                message: Cow::from("Cannot claim a closed task"),
+                data: None,
+            });
+        }
+
+        // Get or register the agent - this ensures the agent exists in the database
+        // before we try to claim a task (required due to foreign key constraint)
+        let agent_id = self.get_agent_id()?;
+
+        // Check assignee restriction - task MUST be assigned to this agent
+        // Exception: supervisors can claim unassigned tasks (auto-assigns to them)
+        let agent = agent_store.get(&agent_id).ok();
+        let agent_name = agent
+            .as_ref()
+            .map(|a| a.name.clone())
+            .unwrap_or_else(|| agent_id.clone());
+        let is_supervisor = agent
+            .as_ref()
+            .map(|a| a.role == cas_types::AgentRole::Supervisor)
+            .unwrap_or(false);
+        let is_worker = agent
+            .as_ref()
+            .map(|a| a.role == cas_types::AgentRole::Worker)
+            .unwrap_or(false);
+        let prefer_start_hint = if is_worker && task.status == TaskStatus::Open {
+            Some(format!(
+                "\n\n⚠️ Workflow hint: prefer `cas_task action=start id={}` for normal execution.\n\
+                 Use `claim` when you need manual lease control (custom duration/reason/recovery).",
+                req.task_id
+            ))
+        } else {
+            None
+        };
+
+        // Supervisors can only claim epics, not regular tasks
+        if is_supervisor && task.task_type != crate::types::TaskType::Epic {
+            return Err(McpError {
+                code: ErrorCode::INVALID_PARAMS,
+                message: Cow::from(
+                    "Supervisors cannot claim non-epic tasks. To delegate work:\n\n\
+                    1. Assign to existing worker:\n\
+                       mcp__cas__task action=update id=<task_id> assignee=<worker_name>\n\
+                       mcp__cas__coordination action=message target=<worker_name> message=\"Task <task_id> assigned\"\n\n\
+                    2. Or spawn a new worker:\n\
+                       mcp__cas__coordination action=spawn_workers count=1\n\n\
+                    Supervisors coordinate and review; workers execute tasks.",
+                ),
+                data: None,
+            });
+        }
+
+        // Auto-assign to supervisor if task is unassigned (only for epics)
+        let mut task = task;
+        if task.assignee.is_none() && is_supervisor {
+            task.assignee = Some(agent_name.clone());
+            let _ = task_store.update(&task);
+        }
+
+        match &task.assignee {
+            None => {
+                return Err(McpError {
+                    code: ErrorCode::INVALID_PARAMS,
+                    message: Cow::from(
+                        "Cannot claim task: no assignee set. Ask supervisor to assign this task to you first.",
+                    ),
+                    data: None,
+                });
+            }
+            Some(assignee) if assignee != &agent_id && assignee != &agent_name => {
+                return Err(McpError {
+                    code: ErrorCode::INVALID_PARAMS,
+                    message: Cow::from(format!(
+                        "Cannot claim task: assigned to '{assignee}', not you ({agent_name})"
+                    )),
+                    data: None,
+                });
+            }
+            _ => {} // Assigned to this agent - allow claim
+        }
+
+        // Check if agent has pending verification (blocks claiming new tasks)
+        if let Some((blocked_task_id, blocked_task_title)) =
+            self.check_pending_verification(&agent_id)?
+        {
+            // Allow if claiming the same task that's blocking (resuming work)
+            if blocked_task_id != req.task_id {
+                let is_worker_without_subagents = is_worker_without_subagents_from_env();
+
+                return Ok(Self::tool_error(format!(
+                    "🚫 VERIFICATION PENDING\n\n\
+                    You have an unverified task: [{}] {}\n\n\
+                    Before claiming new tasks, complete verification:\n\
+                    {}\n\n\
+                    Use `cas_task_show` with id={} to see task details.",
+                    blocked_task_id,
+                    blocked_task_title,
+                    if is_worker_without_subagents {
+                        format!(
+                            "1. Ask supervisor to verify task {blocked_task_id} (task-verifier or direct mcp__cs__verification)\n\
+                            2. Fix any issues found\n\
+                            3. Ask supervisor to close the task once verification is approved"
+                        )
+                    } else {
+                        format!(
+                            "1. Spawn the 'task-verifier' agent with task_id={blocked_task_id}\n\
+                            2. Fix any issues found\n\
+                            3. Once verified, close the task and claim new work"
+                        )
+                    },
+                    blocked_task_id
+                )));
+            }
+        }
+
+        let result = agent_store
+            .try_claim(
+                &req.task_id,
+                &agent_id,
+                req.duration_secs,
+                req.reason.as_deref(),
+            )
+            .map_err(|e| McpError {
+                code: ErrorCode::INTERNAL_ERROR,
+                message: Cow::from(format!("Failed to claim task: {e}")),
+                data: None,
+            })?;
+
+        match result {
+            ClaimResult::Success(lease) => {
+                // Update task to in_progress if it's open
+                if task.status == TaskStatus::Open {
+                    let mut updated = task.clone();
+                    updated.status = TaskStatus::InProgress;
+                    let _ = task_store.update(&updated);
+                }
+
+                // Record working epic if this task belongs to one
+                // Also look up the parent epic's worktree and sibling notes
+                let mut worktree_info: Option<String> = None;
+                let mut sibling_notes_info: Option<String> = None;
+                if let Ok(deps) = task_store.get_dependencies(&req.task_id) {
+                    for dep in deps {
+                        if dep.dep_type == crate::types::DependencyType::ParentChild {
+                            if let Ok(parent) = task_store.get(&dep.to_id) {
+                                if parent.task_type == crate::types::TaskType::Epic {
+                                    let _ = agent_store.add_working_epic(&agent_id, &parent.id);
+
+                                    // Fetch sibling task notes for epic context
+                                    if let Ok(sibling_notes) =
+                                        task_store.get_sibling_notes(&parent.id, &req.task_id)
+                                    {
+                                        if !sibling_notes.is_empty() {
+                                            let mut notes_output = String::from(
+                                                "\n\n📋 SIBLING TASK NOTES (from other workers on this epic):",
+                                            );
+                                            for (task_id, title, notes) in sibling_notes {
+                                                notes_output.push_str(&format!(
+                                                    "\n\n**[{task_id}] {title}**\n{notes}"
+                                                ));
+                                            }
+                                            sibling_notes_info = Some(notes_output);
+                                        }
+                                    }
+
+                                    // Look up the parent epic's worktree and claim exclusive lock
+                                    if let Some(ref worktree_id) = parent.worktree_id {
+                                        if let Ok(wt_store) = self.open_worktree_store() {
+                                            if let Ok(worktree) = wt_store.get(worktree_id) {
+                                                if worktree.path.exists() {
+                                                    // Try to claim the worktree lease for exclusive access
+                                                    let wt_claim_result = agent_store
+                                                        .try_claim_worktree(
+                                                            worktree_id,
+                                                            &agent_id,
+                                                            req.duration_secs,
+                                                        );
+
+                                                    let wt_lock_info = match wt_claim_result {
+                                                        Ok(crate::types::WorktreeClaimResult::Success(_)) => {
+                                                            "🔒 Worktree locked".to_string()
+                                                        }
+                                                        Ok(crate::types::WorktreeClaimResult::AlreadyClaimed { held_by, expires_at, .. }) => {
+                                                            if held_by == agent_id {
+                                                                "🔒 Worktree locked (renewed)".to_string()
+                                                            } else {
+                                                                format!("⚠️ Worktree locked by {} (expires {})", held_by, expires_at.format("%H:%M:%S"))
+                                                            }
+                                                        }
+                                                        _ => "".to_string()
+                                                    };
+
+                                                    worktree_info = Some(format!(
+                                                        "\n\n🌳 This task belongs to epic [{}] {}\n   Work in directory: {}\n   Branch: {}\n   {}",
+                                                        parent.id,
+                                                        parent.title,
+                                                        worktree.path.display(),
+                                                        worktree.branch,
+                                                        wt_lock_info
+                                                    ));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Ok(Self::success(format!(
+                    "Task claimed: {}\n\
+                     Agent: {}\n\
+                     Expires in: {}s\n\
+                     Reason: {}{}{}{}{}",
+                    lease.task_id,
+                    lease.agent_id,
+                    lease.remaining_secs(),
+                    lease.claim_reason.as_deref().unwrap_or("none"),
+                    worktree_info.unwrap_or_default(),
+                    sibling_notes_info.unwrap_or_default(),
+                    prefer_start_hint.clone().unwrap_or_default(),
+                    Self::workflow_guidance()
+                )))
+            }
+            ClaimResult::AlreadyClaimed {
+                task_id,
+                held_by,
+                expires_at,
+            } => Ok(Self::success(format!(
+                "Task {} is already claimed by {}\nExpires at: {}{}",
+                task_id,
+                held_by,
+                expires_at.format("%Y-%m-%d %H:%M:%S"),
+                prefer_start_hint.unwrap_or_default()
+            ))),
+            ClaimResult::TaskNotFound(id) => Err(McpError {
+                code: ErrorCode::INVALID_PARAMS,
+                message: Cow::from(format!("Task not found: {id}")),
+                data: None,
+            }),
+            ClaimResult::NotClaimable { task_id, reason } => Err(McpError {
+                code: ErrorCode::INVALID_PARAMS,
+                message: Cow::from(format!("Task {task_id} not claimable: {reason}")),
+                data: None,
+            }),
+            ClaimResult::Unauthorized(msg) => Err(McpError {
+                code: ErrorCode::INVALID_PARAMS,
+                message: Cow::from(format!("Unauthorized: {msg}")),
+                data: None,
+            }),
+        }
+    }
+
+    /// Release a claimed task
+    pub async fn cas_task_release(
+        &self,
+        Parameters(req): Parameters<TaskReleaseRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let agent_store = self.open_agent_store()?;
+
+        // Get the registered agent ID (matches how claim works)
+        let agent_id = self.get_agent_id()?;
+
+        agent_store
+            .release_lease(&req.task_id, &agent_id)
+            .map_err(|e| McpError {
+                code: ErrorCode::INVALID_PARAMS,
+                message: Cow::from(format!("Failed to release task: {e}")),
+                data: None,
+            })?;
+
+        Ok(Self::success(format!("Released task: {}", req.task_id)))
+    }
+
+    /// List tasks available for claiming
+    pub async fn cas_tasks_available(
+        &self,
+        Parameters(req): Parameters<LimitRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let task_store = self.open_task_store()?;
+        let agent_store = self.open_agent_store()?;
+
+        // Get ready tasks (open, not blocked)
+        let ready_tasks = task_store.list_ready().map_err(|e| McpError {
+            code: ErrorCode::INTERNAL_ERROR,
+            message: Cow::from(format!("Failed to list tasks: {e}")),
+            data: None,
+        })?;
+
+        // Get active leases to filter out claimed tasks
+        let active_leases = agent_store.list_active_leases().unwrap_or_default();
+        let claimed_ids: std::collections::HashSet<_> =
+            active_leases.iter().map(|l| l.task_id.as_str()).collect();
+
+        // Filter to unclaimed tasks
+        let available: Vec<_> = ready_tasks
+            .iter()
+            .filter(|t| !claimed_ids.contains(t.id.as_str()))
+            .collect();
+
+        if available.is_empty() {
+            return Ok(Self::success(
+                "No available tasks (all claimed or none ready)",
+            ));
+        }
+
+        let limit = req.limit.unwrap_or(20);
+        let mut output = format!("Available Tasks ({} total):\n\n", available.len());
+
+        for task in available.iter().take(limit) {
+            output.push_str(&format!(
+                "[P{}] {} - {}\n",
+                task.priority.0, task.id, task.title
+            ));
+        }
+
+        Ok(Self::success(output))
+    }
+
+    /// Transfer a task to another agent
+    pub async fn cas_task_transfer(
+        &self,
+        Parameters(req): Parameters<TaskTransferRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let agent_store = self.open_agent_store()?;
+        let task_store = self.open_task_store()?;
+
+        // Use registered agent ID (fail if not registered)
+        let agent_id = self
+            .agent_id
+            .get()
+            .and_then(|o| o.clone())
+            .ok_or_else(|| McpError {
+                code: ErrorCode::INTERNAL_ERROR,
+                message: Cow::from("No agent registered - SessionStart hook may not have run"),
+                data: None,
+            })?;
+
+        // Verify current agent owns the lease
+        let lease = agent_store.get_lease(&req.task_id).map_err(|e| McpError {
+            code: ErrorCode::INTERNAL_ERROR,
+            message: Cow::from(format!("Failed to get lease: {e}")),
+            data: None,
+        })?;
+
+        let _lease = match lease {
+            Some(l) if l.agent_id == agent_id && l.status == LeaseStatus::Active => l,
+            Some(l) if l.agent_id != agent_id => {
+                return Err(McpError {
+                    code: ErrorCode::INVALID_PARAMS,
+                    message: Cow::from(format!(
+                        "Task {} is owned by {}, not {}",
+                        req.task_id, l.agent_id, agent_id
+                    )),
+                    data: None,
+                });
+            }
+            _ => {
+                return Err(McpError {
+                    code: ErrorCode::INVALID_PARAMS,
+                    message: Cow::from(format!("No active lease found for task {}", req.task_id)),
+                    data: None,
+                });
+            }
+        };
+
+        // Verify target agent exists and is active
+        let target_agent = agent_store.get(&req.to_agent).map_err(|_| McpError {
+            code: ErrorCode::INVALID_PARAMS,
+            message: Cow::from(format!("Target agent not found: {}", req.to_agent)),
+            data: None,
+        })?;
+
+        if !target_agent.is_alive() {
+            return Err(McpError {
+                code: ErrorCode::INVALID_PARAMS,
+                message: Cow::from(format!(
+                    "Target agent {} is not active (status: {})",
+                    req.to_agent, target_agent.status
+                )),
+                data: None,
+            });
+        }
+
+        // Add handoff note to task
+        let mut task = task_store.get(&req.task_id).map_err(|e| McpError {
+            code: ErrorCode::INVALID_PARAMS,
+            message: Cow::from(format!("Task not found: {e}")),
+            data: None,
+        })?;
+
+        let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M");
+        let handoff_note = if let Some(note) = &req.note {
+            format!(
+                "[{}] Handoff from {} to {}: {}",
+                timestamp, agent_id, req.to_agent, note
+            )
+        } else {
+            format!(
+                "[{}] Handoff from {} to {}",
+                timestamp, agent_id, req.to_agent
+            )
+        };
+
+        if task.notes.is_empty() {
+            task.notes = handoff_note;
+        } else {
+            task.notes = format!("{}\n\n{}", task.notes, handoff_note);
+        }
+        task.updated_at = chrono::Utc::now();
+
+        task_store.update(&task).map_err(|e| McpError {
+            code: ErrorCode::INTERNAL_ERROR,
+            message: Cow::from(format!("Failed to update task: {e}")),
+            data: None,
+        })?;
+
+        // Release our lease
+        agent_store
+            .release_lease(&req.task_id, &agent_id)
+            .map_err(|e| McpError {
+                code: ErrorCode::INTERNAL_ERROR,
+                message: Cow::from(format!("Failed to release lease: {e}")),
+                data: None,
+            })?;
+
+        // Try to claim for target agent (best effort - they may need to claim themselves)
+        let claim_result = agent_store.try_claim(
+            &req.task_id,
+            &req.to_agent,
+            DEFAULT_LEASE_DURATION_SECS,
+            Some(&format!("Transferred from {agent_id}")),
+        );
+
+        let claim_msg = match claim_result {
+            Ok(ClaimResult::Success(_)) => {
+                format!(
+                    "Task claimed for {} - they can start immediately",
+                    req.to_agent
+                )
+            }
+            _ => format!(
+                "Task released - {} will need to claim it manually",
+                req.to_agent
+            ),
+        };
+
+        Ok(Self::success(format!(
+            "Transferred task {} from {} to {}\n{}\nNote: {}",
+            req.task_id,
+            agent_id,
+            req.to_agent,
+            claim_msg,
+            req.note.as_deref().unwrap_or("(none)")
+        )))
+    }
+
+    /// List tasks claimed by this agent
+    pub async fn cas_tasks_mine(
+        &self,
+        Parameters(req): Parameters<LimitRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let agent_store = self.open_agent_store()?;
+        let task_store = self.open_task_store()?;
+
+        // Use the current CAS agent identity (session-based in factory/Codex mode).
+        let agent_id = self.get_agent_id()?;
+        let agent_name = agent_store
+            .get(&agent_id)
+            .map(|a| a.name)
+            .unwrap_or_else(|_| agent_id.clone());
+
+        let leases = agent_store.list_agent_leases(&agent_id).unwrap_or_default();
+        let mut assigned: Vec<Task> = task_store
+            .list(None)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|t| {
+                t.status != TaskStatus::Closed
+                    && matches!(
+                        t.assignee.as_deref(),
+                        Some(a) if a == agent_id || a == agent_name
+                    )
+            })
+            .collect();
+
+        // Show highest-priority tasks first.
+        assigned.sort_by(|a, b| a.priority.0.cmp(&b.priority.0));
+        let limit = req.limit.unwrap_or(20);
+
+        if assigned.is_empty() {
+            return Ok(Self::success(format!(
+                "No open tasks assigned to this agent ({agent_name})"
+            )));
+        }
+
+        let mut output = format!(
+            "My Tasks ({} assigned, {} claimed):\n\n",
+            assigned.len(),
+            leases.len()
+        );
+        for task in assigned.iter().take(limit) {
+            let lease_info = leases
+                .iter()
+                .find(|l| l.task_id == task.id)
+                .map(|l| {
+                    format!(
+                        "\n  Lease: active (expires in {}s, renewals: {})",
+                        l.remaining_secs(),
+                        l.renewal_count
+                    )
+                })
+                .unwrap_or_else(|| "\n  Lease: not claimed yet".to_string());
+            output.push_str(&format!(
+                "- [{}] {:?} P{} {} - {}{}{}\n",
+                task.id,
+                task.status,
+                task.priority.0,
+                task.task_type,
+                task.title,
+                lease_info,
+                if task.assignee.as_deref() == Some(agent_id.as_str()) {
+                    " (assignee=agent_id)"
+                } else {
+                    ""
+                }
+            ));
+        }
+
+        if assigned.len() > limit {
+            output.push_str(&format!(
+                "\n... and {} more assigned task(s)",
+                assigned.len() - limit
+            ));
+        }
+
+        Ok(Self::success(output))
+    }
+}

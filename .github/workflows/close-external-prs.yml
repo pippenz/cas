@@ -1,0 +1,37 @@
+name: Close External PRs
+
+on:
+  pull_request_target:
+    types: [opened, reopened]
+
+jobs:
+  close:
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.head.repo.fork == true
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: [
+                'Thank you for your interest in CAS! We appreciate you taking the time to contribute.',
+                '',
+                'CAS is source-available but does not accept pull requests at this time. Instead, please:',
+                '',
+                '- **Report bugs** via [Issues](https://github.com/' + context.repo.owner + '/' + context.repo.repo + '/issues)',
+                '- **Suggest features** via [Discussions](https://github.com/' + context.repo.owner + '/' + context.repo.repo + '/discussions)',
+                '',
+                'See [CONTRIBUTING.md](https://github.com/' + context.repo.owner + '/' + context.repo.repo + '/blob/master/CONTRIBUTING.md) for more details on how to participate.',
+              ].join('\n'),
+            });
+            await github.rest.pulls.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+              state: 'closed',
+            });

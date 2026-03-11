@@ -1,0 +1,473 @@
+use chrono::Utc;
+use flate2::Compression;
+use flate2::write::GzEncoder;
+use std::io::Write;
+use std::time::Instant;
+
+use crate::cloud::syncer::{CloudSyncer, SyncResult};
+use crate::cloud::{QueuedSync, SyncOperation, get_project_canonical_id};
+use crate::error::CasError;
+use crate::types::Session;
+
+impl CloudSyncer {
+    pub fn push(&self) -> Result<SyncResult, CasError> {
+        self.push_with_sessions(&[])
+    }
+
+    /// Push queued changes and sessions to cloud
+    pub fn push_with_sessions(&self, sessions: &[Session]) -> Result<SyncResult, CasError> {
+        let mut result = SyncResult::default();
+        let start = Instant::now();
+
+        if !self.is_available() {
+            return Ok(result);
+        }
+
+        let pending = self
+            .queue
+            .pending_by_type(self.config.batch_size, self.config.max_retries)?;
+
+        // Check if there's anything to push
+        if pending.is_empty() && sessions.is_empty() {
+            result.duration_ms = start.elapsed().as_millis() as u64;
+            return Ok(result);
+        }
+
+        let token = self
+            .cloud_config
+            .token
+            .as_ref()
+            .ok_or_else(|| CasError::Other("Not logged in".to_string()))?;
+
+        // Push each entity type
+        if !pending.entries.is_empty() {
+            match self.push_batch(&pending.entries, "entries", token) {
+                Ok(count) => result.pushed_entries = count,
+                Err(e) => {
+                    result.errors.push(format!("Entry push failed: {e}"));
+                    self.mark_batch_failed(&pending.entries, &e.to_string());
+                }
+            }
+        }
+
+        if !pending.tasks.is_empty() {
+            match self.push_batch(&pending.tasks, "tasks", token) {
+                Ok(count) => result.pushed_tasks = count,
+                Err(e) => {
+                    result.errors.push(format!("Task push failed: {e}"));
+                    self.mark_batch_failed(&pending.tasks, &e.to_string());
+                }
+            }
+        }
+
+        if !pending.rules.is_empty() {
+            match self.push_batch(&pending.rules, "rules", token) {
+                Ok(count) => result.pushed_rules = count,
+                Err(e) => {
+                    result.errors.push(format!("Rule push failed: {e}"));
+                    self.mark_batch_failed(&pending.rules, &e.to_string());
+                }
+            }
+        }
+
+        if !pending.skills.is_empty() {
+            match self.push_batch(&pending.skills, "skills", token) {
+                Ok(count) => result.pushed_skills = count,
+                Err(e) => {
+                    result.errors.push(format!("Skill push failed: {e}"));
+                    self.mark_batch_failed(&pending.skills, &e.to_string());
+                }
+            }
+        }
+
+        // Push sessions (queued or directly passed)
+        if !pending.sessions.is_empty() {
+            match self.push_batch(&pending.sessions, "sessions", token) {
+                Ok(count) => result.pushed_sessions = count,
+                Err(e) => {
+                    result.errors.push(format!("Session push failed: {e}"));
+                    self.mark_batch_failed(&pending.sessions, &e.to_string());
+                }
+            }
+        } else if !sessions.is_empty() {
+            // Fallback to directly-passed sessions
+            match self.push_sessions(sessions, token) {
+                Ok(count) => result.pushed_sessions = count,
+                Err(e) => {
+                    result.errors.push(format!("Session push failed: {e}"));
+                }
+            }
+        }
+
+        // Push verifications
+        if !pending.verifications.is_empty() {
+            match self.push_batch(&pending.verifications, "verifications", token) {
+                Ok(count) => result.pushed_verifications = count,
+                Err(e) => {
+                    result.errors.push(format!("Verification push failed: {e}"));
+                    self.mark_batch_failed(&pending.verifications, &e.to_string());
+                }
+            }
+        }
+
+        // Push events
+        if !pending.events.is_empty() {
+            match self.push_batch(&pending.events, "events", token) {
+                Ok(count) => result.pushed_events = count,
+                Err(e) => {
+                    result.errors.push(format!("Event push failed: {e}"));
+                    self.mark_batch_failed(&pending.events, &e.to_string());
+                }
+            }
+        }
+
+        // Push prompts
+        if !pending.prompts.is_empty() {
+            match self.push_batch(&pending.prompts, "prompts", token) {
+                Ok(count) => result.pushed_prompts = count,
+                Err(e) => {
+                    result.errors.push(format!("Prompt push failed: {e}"));
+                    self.mark_batch_failed(&pending.prompts, &e.to_string());
+                }
+            }
+        }
+
+        // Push file changes
+        if !pending.file_changes.is_empty() {
+            match self.push_batch(&pending.file_changes, "file_changes", token) {
+                Ok(count) => result.pushed_file_changes = count,
+                Err(e) => {
+                    result.errors.push(format!("FileChange push failed: {e}"));
+                    self.mark_batch_failed(&pending.file_changes, &e.to_string());
+                }
+            }
+        }
+
+        // Push commit links
+        if !pending.commit_links.is_empty() {
+            match self.push_batch(&pending.commit_links, "commit_links", token) {
+                Ok(count) => result.pushed_commit_links = count,
+                Err(e) => {
+                    result.errors.push(format!("CommitLink push failed: {e}"));
+                    self.mark_batch_failed(&pending.commit_links, &e.to_string());
+                }
+            }
+        }
+
+        // Push agents
+        if !pending.agents.is_empty() {
+            match self.push_batch(&pending.agents, "agents", token) {
+                Ok(count) => result.pushed_agents = count,
+                Err(e) => {
+                    result.errors.push(format!("Agent push failed: {e}"));
+                    self.mark_batch_failed(&pending.agents, &e.to_string());
+                }
+            }
+        }
+
+        // Push worktrees
+        if !pending.worktrees.is_empty() {
+            match self.push_batch(&pending.worktrees, "worktrees", token) {
+                Ok(count) => result.pushed_worktrees = count,
+                Err(e) => {
+                    result.errors.push(format!("Worktree push failed: {e}"));
+                    self.mark_batch_failed(&pending.worktrees, &e.to_string());
+                }
+            }
+        }
+
+        // Update last push timestamp
+        let _ = self
+            .queue
+            .set_metadata("last_push_at", &Utc::now().to_rfc3339());
+
+        result.duration_ms = start.elapsed().as_millis() as u64;
+        Ok(result)
+    }
+
+    /// Push sessions to cloud
+    fn push_sessions(&self, sessions: &[Session], token: &str) -> Result<usize, CasError> {
+        if sessions.is_empty() {
+            return Ok(0);
+        }
+
+        let push_url = format!("{}/api/sync/push", self.cloud_config.endpoint);
+
+        let mut payload = serde_json::Map::new();
+        payload.insert("sessions".to_string(), serde_json::json!(sessions));
+
+        // Include team_id if configured
+        if let Some(team_id) = &self.cloud_config.team_id {
+            payload.insert("team_id".to_string(), serde_json::json!(team_id));
+        }
+
+        // Include project_canonical_id for project association
+        if let Some(project_id) = get_project_canonical_id() {
+            payload.insert(
+                "project_canonical_id".to_string(),
+                serde_json::json!(project_id),
+            );
+        }
+
+        let json_bytes = serde_json::to_vec(&payload)
+            .map_err(|e| CasError::Other(format!("JSON serialization failed: {e}")))?;
+        let compressed = Self::gzip_json(&json_bytes)?;
+
+        let response = ureq::post(&push_url)
+            .timeout(self.config.timeout)
+            .set("Authorization", &format!("Bearer {token}"))
+            .set("Content-Type", "application/json")
+            .set("Content-Encoding", "gzip")
+            .send_bytes(&compressed);
+
+        match response {
+            Ok(resp) if resp.status() == 200 || resp.status() == 201 => {
+                // Update last session push timestamp
+                let _ = self
+                    .queue
+                    .set_metadata("last_session_push_at", &Utc::now().to_rfc3339());
+                Ok(sessions.len())
+            }
+            Ok(resp) => {
+                let status = resp.status();
+                let body = resp.into_string().unwrap_or_default();
+                Err(CasError::Other(format!(
+                    "Session push failed with status {status}: {body}"
+                )))
+            }
+            Err(ureq::Error::Status(code, resp)) => {
+                let body = resp.into_string().unwrap_or_default();
+                Err(CasError::Other(format!(
+                    "Session push failed with status {code}: {body}"
+                )))
+            }
+            Err(ureq::Error::Transport(e)) => Err(CasError::Other(format!("Network error: {e}"))),
+        }
+    }
+
+    fn push_batch(
+        &self,
+        items: &[QueuedSync],
+        entity_type: &str,
+        token: &str,
+    ) -> Result<usize, CasError> {
+        // Separate upserts and deletes
+        let upsert_items: Vec<&QueuedSync> = items
+            .iter()
+            .filter(|i| i.operation == SyncOperation::Upsert)
+            .collect();
+
+        let deletes: Vec<&str> = items
+            .iter()
+            .filter(|i| i.operation == SyncOperation::Delete)
+            .map(|i| i.entity_id.as_str())
+            .collect();
+
+        // Parse payloads to (item, json_value, estimated_size) tuples
+        let upsert_entries: Vec<(&QueuedSync, serde_json::Value)> = upsert_items
+            .iter()
+            .filter_map(|item| {
+                item.payload
+                    .as_deref()
+                    .and_then(|p| serde_json::from_str(p).ok())
+                    .map(|v| (*item, v))
+            })
+            .collect();
+
+        let mut synced_count = 0;
+
+        // Split upserts into size-limited sub-batches
+        if !upsert_entries.is_empty() {
+            let sub_batches = self.split_into_sub_batches(&upsert_entries);
+
+            for sub_batch in &sub_batches {
+                let values: Vec<&serde_json::Value> = sub_batch.iter().map(|(_, v)| *v).collect();
+                let batch_items: Vec<&QueuedSync> =
+                    sub_batch.iter().map(|(item, _)| *item).collect();
+
+                match self.push_sub_batch(&values, entity_type, token) {
+                    Ok(()) => {
+                        for item in &batch_items {
+                            let _ = self.queue.mark_synced(item.id);
+                            synced_count += 1;
+                        }
+                    }
+                    Err(e) => {
+                        // Mark this sub-batch as failed but continue with others
+                        for item in &batch_items {
+                            let _ = self.queue.mark_failed(item.id, &e.to_string());
+                        }
+                        // If any sub-batch fails, report the error
+                        return Err(e);
+                    }
+                }
+            }
+        }
+
+        // Send individual delete requests
+        for cas_id in deletes {
+            let delete_url = format!(
+                "{}/api/sync/{}/{}",
+                self.cloud_config.endpoint, entity_type, cas_id
+            );
+
+            let response = ureq::delete(&delete_url)
+                .timeout(self.config.timeout)
+                .set("Authorization", &format!("Bearer {token}"))
+                .call();
+
+            match response {
+                Ok(resp) if resp.status() == 200 || resp.status() == 404 => {
+                    // Mark delete as synced (404 means already deleted, that's fine)
+                    if let Some(item) = items
+                        .iter()
+                        .find(|i| i.entity_id == cas_id && i.operation == SyncOperation::Delete)
+                    {
+                        let _ = self.queue.mark_synced(item.id);
+                        synced_count += 1;
+                    }
+                }
+                Ok(resp) => {
+                    let status = resp.status();
+                    let body = resp.into_string().unwrap_or_default();
+                    eprintln!("Delete {cas_id} failed with status {status}: {body}");
+                }
+                Err(e) => {
+                    eprintln!("Delete {cas_id} failed: {e}");
+                }
+            }
+        }
+
+        Ok(synced_count)
+    }
+
+    /// Split upsert entries into sub-batches that each stay under max_payload_bytes.
+    fn split_into_sub_batches<'a, 'b>(
+        &self,
+        entries: &'b [(&'a QueuedSync, serde_json::Value)],
+    ) -> Vec<Vec<(&'a QueuedSync, &'b serde_json::Value)>> {
+        let max_bytes = self.config.max_payload_bytes;
+        // Estimate overhead for the wrapper JSON (entity type key, team_id, project_id, etc.)
+        let overhead = 256;
+        let mut batches = Vec::new();
+        let mut current_batch: Vec<(&QueuedSync, &serde_json::Value)> = Vec::new();
+        let mut current_size = overhead;
+
+        for (item, value) in entries {
+            // Estimate this item's JSON size from the original payload
+            let item_size = item.payload.as_ref().map(|p| p.len()).unwrap_or(256);
+            // Account for array separator
+            let item_total = item_size + 1;
+
+            if !current_batch.is_empty() && current_size + item_total > max_bytes {
+                // Current batch would exceed limit, start a new one
+                batches.push(current_batch);
+                current_batch = Vec::new();
+                current_size = overhead;
+            }
+
+            current_batch.push((*item, value));
+            current_size += item_total;
+        }
+
+        if !current_batch.is_empty() {
+            batches.push(current_batch);
+        }
+
+        batches
+    }
+
+    /// Gzip-compress a JSON payload.
+    pub(crate) fn gzip_json(json_bytes: &[u8]) -> Result<Vec<u8>, CasError> {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder
+            .write_all(json_bytes)
+            .map_err(|e| CasError::Other(format!("Gzip compression failed: {e}")))?;
+        encoder
+            .finish()
+            .map_err(|e| CasError::Other(format!("Gzip finalize failed: {e}")))
+    }
+
+    /// Push a single sub-batch of upsert values with retry.
+    fn push_sub_batch(
+        &self,
+        values: &[&serde_json::Value],
+        entity_type: &str,
+        token: &str,
+    ) -> Result<(), CasError> {
+        let push_url = format!("{}/api/sync/push", self.cloud_config.endpoint);
+
+        let mut payload = serde_json::Map::new();
+        payload.insert(
+            entity_type.to_string(),
+            serde_json::Value::Array(values.iter().map(|v| (*v).clone()).collect()),
+        );
+
+        if let Some(team_id) = &self.cloud_config.team_id {
+            payload.insert("team_id".to_string(), serde_json::json!(team_id));
+        }
+
+        if let Some(project_id) = get_project_canonical_id() {
+            payload.insert(
+                "project_canonical_id".to_string(),
+                serde_json::json!(project_id),
+            );
+        }
+
+        // Serialize and compress the payload
+        let json_bytes = serde_json::to_vec(&payload)
+            .map_err(|e| CasError::Other(format!("JSON serialization failed: {e}")))?;
+        let compressed = Self::gzip_json(&json_bytes)?;
+
+        let mut last_error = None;
+        for attempt in 0..3 {
+            if attempt > 0 {
+                std::thread::sleep(self.config.backoff_duration(attempt as u32));
+            }
+
+            let response = ureq::post(&push_url)
+                .timeout(self.config.timeout)
+                .set("Authorization", &format!("Bearer {token}"))
+                .set("Content-Type", "application/json")
+                .set("Content-Encoding", "gzip")
+                .send_bytes(&compressed);
+
+            match response {
+                Ok(resp) => {
+                    if resp.status() == 200 || resp.status() == 201 {
+                        return Ok(());
+                    } else {
+                        let status = resp.status();
+                        let body = resp.into_string().unwrap_or_default();
+                        last_error = Some(CasError::Other(format!(
+                            "Push failed with status {status}: {body}"
+                        )));
+                        if (400..500).contains(&status) {
+                            break;
+                        }
+                    }
+                }
+                Err(ureq::Error::Status(code, resp)) => {
+                    let body = resp.into_string().unwrap_or_default();
+                    last_error = Some(CasError::Other(format!(
+                        "Push failed with status {code}: {body}"
+                    )));
+                    if (400..500).contains(&code) {
+                        break;
+                    }
+                }
+                Err(ureq::Error::Transport(e)) => {
+                    last_error = Some(CasError::Other(format!("Network error: {e}")));
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| CasError::Other("Push failed".to_string())))
+    }
+
+    fn mark_batch_failed(&self, items: &[QueuedSync], error: &str) {
+        for item in items {
+            let _ = self.queue.mark_failed(item.id, error);
+        }
+    }
+}

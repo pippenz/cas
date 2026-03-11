@@ -1,0 +1,566 @@
+use crate::hooks::handlers::*;
+
+pub(crate) fn detect_significant_activity(
+    tool_name: &str,
+    input: &HookInput,
+) -> Option<(String, String)> {
+    let tool_input = input.tool_input.as_ref()?;
+
+    match tool_name {
+        "Edit" | "Write" => {
+            let path = tool_input.get("file_path")?.as_str()?;
+            let filename = std::path::Path::new(path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("file");
+            Some((
+                "worker_file_edited".to_string(),
+                format!("Edited {filename}"),
+            ))
+        }
+        "Bash" => {
+            let cmd = tool_input.get("command")?.as_str()?;
+            if cmd.contains("git commit") {
+                Some((
+                    "worker_git_commit".to_string(),
+                    "Committed changes".to_string(),
+                ))
+            } else {
+                None // Skip other bash commands
+            }
+        }
+        "Task" => {
+            let subagent = tool_input.get("subagent_type")?.as_str()?;
+            Some((
+                "worker_subagent_spawned".to_string(),
+                format!("Running {subagent}"),
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Extract entity ID for activity tracking
+#[allow(dead_code)]
+pub(crate) fn extract_activity_entity_id(tool_name: &str, input: &HookInput) -> Option<String> {
+    let tool_input = input.tool_input.as_ref()?;
+
+    match tool_name {
+        "Edit" | "Write" => tool_input.get("file_path")?.as_str().map(String::from),
+        "Task" => tool_input.get("subagent_type")?.as_str().map(String::from),
+        _ => None,
+    }
+}
+
+/// Track a file access for session-aware context boosting
+///
+/// Records files being worked on so they can influence context selection.
+/// Uses a simple JSON file in the CAS directory.
+pub(crate) fn track_session_file(cas_root: &std::path::Path, file_path: &str) {
+    let session_files_path = cas_root.join("session_files.json");
+
+    // Read existing files
+    let mut files: Vec<String> = std::fs::read_to_string(&session_files_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+
+    // Add new file if not already present
+    if !files.contains(&file_path.to_string()) {
+        files.insert(0, file_path.to_string());
+        // Keep only recent files
+        files.truncate(MAX_RECENT_FILES);
+
+        // Write back
+        let _ = std::fs::write(
+            &session_files_path,
+            serde_json::to_string(&files).unwrap_or_default(),
+        );
+    }
+}
+
+/// Read recent files being worked on in this session
+pub fn get_session_files(cas_root: &std::path::Path) -> Vec<String> {
+    let session_files_path = cas_root.join("session_files.json");
+    std::fs::read_to_string(&session_files_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Determine the current agent ID in hook context.
+///
+/// Prefer the session_id (canonical agent ID) and fall back to PPID-based
+/// computation when the session_id is missing.
+pub(crate) fn current_agent_id(input: &HookInput) -> String {
+    if !input.session_id.is_empty() {
+        input.session_id.clone()
+    } else {
+        crate::agent_id::compute_agent_id_for_hook()
+    }
+}
+
+/// Clear session files (called on session end)
+pub(crate) fn clear_session_files(cas_root: &std::path::Path) {
+    let session_files_path = cas_root.join("session_files.json");
+    let _ = std::fs::remove_file(&session_files_path);
+}
+
+/// Add an interruption note to a task (instead of resetting status)
+///
+/// Preserves the InProgress status but adds a system note indicating the work was interrupted.
+/// This allows the next agent to see that work was attempted and decide whether to resume or reset.
+pub(crate) fn add_interruption_note(task: &mut crate::types::Task, agent_id: &str) {
+    let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M");
+    let note = format!(
+        "[{}] ⚠️ INTERRUPTED Agent {} stopped/timed out while task was in progress",
+        timestamp,
+        &agent_id[..12.min(agent_id.len())]
+    );
+
+    if task.notes.is_empty() {
+        task.notes = note;
+    } else {
+        task.notes = format!("{}\n\n{}", task.notes, note);
+    }
+    task.updated_at = chrono::Utc::now();
+}
+
+/// Clean up agent leases for a session
+///
+/// Called during Stop/SubagentStop/SessionEnd to:
+/// 1. Release all leases held by the agent
+/// 2. Clear working epics tracking
+/// 3. Add interruption note to tasks that were in progress (preserves status)
+///
+/// Note: Agents are registered with their session_id, so we use session_id
+/// as the agent_id for lookup and cleanup.
+/// PID → session mapping is handled by the daemon via socket events.
+pub(crate) fn cleanup_agent_leases(
+    cas_root: &std::path::Path,
+    session_id: &str,
+) -> Option<Vec<String>> {
+    let agent_store = open_agent_store(cas_root).ok()?;
+
+    // Use session_id as agent_id (agents are registered with their session_id)
+    let agent_id = session_id;
+
+    let agent = match agent_store.get(agent_id) {
+        Ok(a) => a,
+        Err(_) => {
+            return Some(Vec::new());
+        }
+    };
+
+    // Gracefully shutdown the agent and get list of released task IDs
+    let released_task_ids = agent_store.graceful_shutdown(&agent.id).unwrap_or_default();
+
+    // Clear working epics for this agent (session is ending)
+    let _ = agent_store.clear_working_epics(&agent.id);
+
+    // Unregister the agent (delete from database)
+    let _ = agent_store.unregister(&agent.id);
+
+    if released_task_ids.is_empty() {
+        return Some(released_task_ids);
+    }
+
+    // Add interruption note to tasks that were in progress (don't reset status)
+    if let Ok(task_store) = open_task_store(cas_root) {
+        for task_id in &released_task_ids {
+            if let Ok(mut task) = task_store.get(task_id) {
+                // Only add note if task was in progress
+                if task.status == TaskStatus::InProgress {
+                    add_interruption_note(&mut task, &agent.id);
+                    let _ = task_store.update(&task);
+                }
+            }
+        }
+    }
+
+    eprintln!("cas: Released {} task lease(s)", released_task_ids.len());
+
+    Some(released_task_ids)
+}
+
+/// Cleanup orphaned tasks on session start
+///
+/// Finds in_progress tasks that have no active lease (from crashed/interrupted sessions)
+/// and resets them to Open status so they can be worked on again.
+pub(crate) fn cleanup_orphaned_tasks(cas_root: &std::path::Path) -> usize {
+    let task_store = match open_task_store(cas_root) {
+        Ok(store) => store,
+        Err(_) => return 0,
+    };
+
+    let agent_store = match open_agent_store(cas_root) {
+        Ok(store) => store,
+        Err(_) => return 0,
+    };
+
+    // Get all in_progress tasks
+    let in_progress = match task_store.list(Some(TaskStatus::InProgress)) {
+        Ok(tasks) => tasks,
+        Err(_) => return 0,
+    };
+
+    if in_progress.is_empty() {
+        return 0;
+    }
+
+    // Get all active leases
+    let active_leases = agent_store.list_active_leases().unwrap_or_default();
+    let claimed_task_ids: std::collections::HashSet<_> =
+        active_leases.iter().map(|l| l.task_id.as_str()).collect();
+
+    // Find orphaned tasks (in_progress but no active lease)
+    let mut reopened = 0;
+    for task in in_progress {
+        if !claimed_task_ids.contains(task.id.as_str()) {
+            // Reopen the task by setting status back to Open
+            if let Ok(mut t) = task_store.get(&task.id) {
+                t.status = TaskStatus::Open;
+                t.updated_at = chrono::Utc::now();
+                if task_store.update(&t).is_ok() {
+                    reopened += 1;
+                }
+            }
+        }
+    }
+
+    reopened
+}
+
+/// Exit blockers preventing agent from stopping
+#[derive(Debug, Default)]
+pub struct ExitBlockers {
+    /// Active child agents that must complete first
+    pub active_children: Vec<Agent>,
+    /// Tasks with active lease that must be closed
+    pub claimed_tasks: Vec<Task>,
+    /// Subtasks of claimed epics that must be closed
+    pub epic_subtasks: Vec<Task>,
+}
+
+impl ExitBlockers {
+    /// Check if there are any blockers preventing exit
+    pub fn has_blockers(&self) -> bool {
+        !self.active_children.is_empty()
+            || !self.claimed_tasks.is_empty()
+            || !self.epic_subtasks.is_empty()
+    }
+
+    /// Format a message describing the blockers
+    pub fn format_message(&self) -> String {
+        let mut lines = vec!["⚠️ Cannot exit - you have remaining work:".to_string()];
+
+        if !self.active_children.is_empty() {
+            lines.push(String::new());
+            lines.push("Active Child Agents:".to_string());
+            for agent in &self.active_children {
+                let claimed_info = if agent.active_tasks > 0 {
+                    format!(" ({} tasks)", agent.active_tasks)
+                } else {
+                    String::new()
+                };
+                lines.push(format!(
+                    "  🤖 [{}] {}{}",
+                    &agent.id[..8.min(agent.id.len())],
+                    agent.name,
+                    claimed_info
+                ));
+            }
+        }
+
+        if !self.claimed_tasks.is_empty() {
+            lines.push(String::new());
+            lines.push("Claimed Tasks:".to_string());
+            for task in &self.claimed_tasks {
+                let type_str = if task.task_type == TaskType::Epic {
+                    " (epic)"
+                } else {
+                    ""
+                };
+                lines.push(format!("  ○ [{}] {}{}", task.id, task.title, type_str));
+            }
+        }
+
+        if !self.epic_subtasks.is_empty() {
+            lines.push(String::new());
+            lines.push("Epic Subtasks:".to_string());
+            for task in &self.epic_subtasks {
+                lines.push(format!(
+                    "  ○ [{}] {} [{}]",
+                    task.id, task.title, task.status
+                ));
+            }
+        }
+
+        lines.push(String::new());
+        if !self.active_children.is_empty() {
+            lines.push(
+                "Wait for child agents to complete, then finish remaining tasks.".to_string(),
+            );
+        } else {
+            // Count tasks by status
+            let open_count = self
+                .claimed_tasks
+                .iter()
+                .filter(|t| t.status == TaskStatus::Open)
+                .count()
+                + self
+                    .epic_subtasks
+                    .iter()
+                    .filter(|t| t.status == TaskStatus::Open)
+                    .count();
+            let in_progress_count = self
+                .claimed_tasks
+                .iter()
+                .filter(|t| t.status == TaskStatus::InProgress)
+                .count()
+                + self
+                    .epic_subtasks
+                    .iter()
+                    .filter(|t| t.status == TaskStatus::InProgress)
+                    .count();
+
+            lines.push("To exit, complete all remaining tasks:".to_string());
+
+            if open_count > 0 {
+                lines.push(format!("  {open_count} open task(s): Start with mcp__cas__task action: start, implement, then close"));
+            }
+            if in_progress_count > 0 {
+                lines.push(format!("  {in_progress_count} in_progress task(s): Verify before close (spawn 'task-verifier' directly, or ask supervisor if workers are Codex)"));
+            }
+        }
+
+        lines.join("\n")
+    }
+}
+
+/// Check for blockers that would prevent agent from exiting
+///
+/// Returns exit blockers if there are open tasks/children that must be handled first.
+///
+/// Exit blocker logic:
+/// 1. Check for active child agents (subagents still running)
+/// 2. Check for claimed tasks that aren't closed (active leases)
+/// 3. Check working_epics for open subtasks (epics the agent is working on)
+///
+/// Note: `session_id` is the canonical agent ID; PPID-based ID is a fallback
+/// when the session ID is missing.
+pub(crate) fn get_exit_blockers(
+    cas_root: &std::path::Path,
+    session_id: &str,
+) -> Result<ExitBlockers, MemError> {
+    let agent_store = open_agent_store(cas_root)?;
+    let task_store = open_task_store(cas_root)?;
+
+    // Prefer session_id as canonical agent ID; fall back to PPID-based ID if missing.
+    let agent_id = if !session_id.is_empty() {
+        session_id.to_string()
+    } else {
+        crate::agent_id::compute_agent_id_for_hook()
+    };
+    let agent = agent_store.get(&agent_id).ok();
+
+    let mut blockers = ExitBlockers::default();
+    let mut epic_ids = std::collections::HashSet::new();
+
+    if let Some(ref agent) = agent {
+        // 1. Check for active child agents
+        blockers
+            .active_children
+            .extend(agent_store.get_active_children(&agent.id)?);
+
+        // 2. Get claimed tasks (active leases)
+        if let Ok(leases) = agent_store.list_agent_leases(&agent.id) {
+            for lease in &leases {
+                if let Ok(task) = task_store.get(&lease.task_id) {
+                    // Only include open tasks as blockers
+                    if task.status != TaskStatus::Closed {
+                        // Track epics for subtask check (directly claimed epics)
+                        if task.task_type == TaskType::Epic {
+                            epic_ids.insert(task.id.clone());
+                        }
+
+                        blockers.claimed_tasks.push(task);
+                    }
+                }
+            }
+        }
+
+        // 3. Get working_epics - epics the agent is actively working on
+        if let Ok(working_epics) = agent_store.get_working_epics(&agent.id) {
+            for epic_id in working_epics {
+                epic_ids.insert(epic_id);
+            }
+        }
+    }
+
+    // 4. NOTE: We only check working_epics for THIS agent (session_id).
+    // The MCP server now fails early if no session ID exists, so the agent ID
+    // used for working_epics will always match the session_id in Stop hook.
+    // No need to check other agents' working_epics.
+
+    // 5. Get subtasks of all relevant epics
+    let claimed_ids: std::collections::HashSet<_> = blockers
+        .claimed_tasks
+        .iter()
+        .map(|t| t.id.as_str())
+        .collect();
+
+    for epic_id in &epic_ids {
+        // Skip epics that are already closed
+        if let Ok(epic) = task_store.get(epic_id) {
+            if epic.status == TaskStatus::Closed {
+                // Clean up stale working_epics entry
+                if let Some(ref agent) = agent {
+                    let _ = agent_store.remove_working_epic(&agent.id, epic_id);
+                }
+                continue;
+            }
+        }
+
+        if let Ok(subtasks) = task_store.get_subtasks(epic_id) {
+            for subtask in subtasks {
+                // Include all non-closed subtasks - agent must complete the entire epic
+                if subtask.status != TaskStatus::Closed
+                    && !claimed_ids.contains(subtask.id.as_str())
+                {
+                    blockers.epic_subtasks.push(subtask);
+                }
+            }
+        }
+    }
+
+    Ok(blockers)
+}
+
+/// Handle SubagentStop hook - minimal cleanup for subagent completion
+///
+/// Called when a Claude Code subagent (Task tool call) finishes.
+///
+/// IMPORTANT: The session_id in SubagentStop is the PARENT's session_id, not the
+/// subagent's. We do NOT have the subagent's agent ID, and subagents spawned via
+/// Task tool may not even be registered as CAS agents. Therefore, we do NOT
+/// perform any agent cleanup here - that would incorrectly shut down the parent!
+///
+/// Only the parent's Stop hook should clean up agents and PID mappings.
+pub fn handle_subagent_stop(
+    _input: &HookInput,
+    cas_root: Option<&Path>,
+) -> Result<HookOutput, MemError> {
+    let cas_root = match cas_root {
+        Some(root) => root,
+        None => return Ok(HookOutput::empty()),
+    };
+
+    // NOTE: Do NOT call cleanup_subagent_leases or any agent cleanup here!
+    // The session_id is the parent's, not the subagent's.
+
+    // Clean up verifier marker file if present
+    // This file is created when task-verifier is spawned and allows its tool calls
+    let marker_path = cas_root.join(".verifier_unjail_marker");
+    if marker_path.exists() {
+        let _ = std::fs::remove_file(&marker_path);
+        debug!("[VERIFICATION JAIL] cleaned up verifier marker file (subagent completed)");
+
+        // Send subagent completed activity event (for supervisor visibility)
+        // Note: subagent_type may not be populated, but we know it's task-verifier from the marker
+        #[cfg(feature = "mcp-server")]
+        {
+            let subagent_type = _input.subagent_type.as_deref().unwrap_or("task-verifier");
+            let event = crate::mcp::socket::DaemonEvent::WorkerActivity {
+                session_id: _input.session_id.clone(),
+                event_type: "worker_subagent_completed".to_string(),
+                description: format!("{subagent_type} completed"),
+                entity_id: Some(subagent_type.to_string()),
+            };
+            let _ = crate::mcp::socket::send_event(cas_root, &event);
+        }
+    }
+
+    Ok(HookOutput::empty())
+}
+
+/// Handle SubagentStart hook - unjail for task-verifier
+///
+/// Called when a Claude Code subagent (Task tool call) is about to start.
+/// If the subagent is task-verifier, clear pending_verification to release the jail.
+pub fn handle_subagent_start(
+    input: &HookInput,
+    cas_root: Option<&Path>,
+) -> Result<HookOutput, MemError> {
+    // NOTE: Claude Code fires SubagentStart but doesn't populate subagent_type (always None).
+    // The actual unjailing happens in PreToolUse when Task(task-verifier) is detected.
+    // This handler is kept for potential future use when Claude Code populates the field.
+
+    let cas_root = match cas_root {
+        Some(root) => root,
+        None => return Ok(HookOutput::empty()),
+    };
+
+    // Check if this is a verifier subagent (task-verifier)
+    let is_verifier_agent = input
+        .subagent_type
+        .as_ref()
+        .map(|st| st == "task-verifier")
+        .unwrap_or(false);
+
+    if is_verifier_agent {
+        // Clear pending_verification on all tasks to release the jail
+        if let Ok(task_store) = open_task_store(cas_root) {
+            if let Ok(tasks) = task_store.list(None) {
+                let current_agent_id = current_agent_id(input);
+                let agent_task_ids: std::collections::HashSet<String> =
+                    if let Ok(agent_store) = open_agent_store(cas_root) {
+                        agent_store
+                            .list_agent_leases(&current_agent_id)
+                            .ok()
+                            .map(|leases| leases.into_iter().map(|l| l.task_id).collect())
+                            .unwrap_or_default()
+                    } else {
+                        std::collections::HashSet::new()
+                    };
+
+                let pending_tasks: Vec<_> = tasks
+                    .iter()
+                    .filter(|t| {
+                        if !t.pending_verification {
+                            return false;
+                        }
+                        if agent_task_ids.contains(&t.id) {
+                            return true;
+                        }
+                        if t.task_type == TaskType::Epic {
+                            if let Some(ref owner) = t.epic_verification_owner {
+                                return owner == &current_agent_id;
+                            }
+                        }
+                        if let Some(ref assignee) = t.assignee {
+                            return assignee == &current_agent_id;
+                        }
+                        false
+                    })
+                    .collect();
+
+                if !pending_tasks.is_empty() {
+                    let task_ids: Vec<_> = pending_tasks.iter().map(|t| t.id.as_str()).collect();
+                    for task in &pending_tasks {
+                        let mut task_to_update = (*task).clone();
+                        task_to_update.pending_verification = false;
+                        task_to_update.updated_at = chrono::Utc::now();
+                        let _ = task_store.update(&task_to_update);
+                    }
+                    eprintln!(
+                        "cas: SubagentStart unjailing (tasks: {})",
+                        task_ids.join(", ")
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(HookOutput::empty())
+}

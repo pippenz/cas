@@ -1,0 +1,705 @@
+use std::path::Path;
+use tantivy::schema::*;
+use tantivy::{Index, IndexWriter};
+
+use cas_code::CodeSymbol;
+
+use crate::error::MemError;
+use crate::hybrid_search::{DEFAULT_WRITER_MEMORY, DocType, EXPECTED_FIELD_COUNT, SearchIndex};
+use crate::types::{Entry, Rule, Skill, Spec, Task};
+impl SearchIndex {
+    /// Build the current schema
+    fn build_schema() -> Schema {
+        let mut schema_builder = Schema::builder();
+        schema_builder.add_text_field("id", STRING | STORED);
+        schema_builder.add_text_field("content", TEXT);
+        schema_builder.add_text_field("tags", TEXT);
+        schema_builder.add_text_field("type", STRING);
+        schema_builder.add_text_field("title", TEXT);
+        schema_builder.add_text_field("doc_type", STRING | STORED);
+        // Code-specific fields (added in schema v2)
+        schema_builder.add_text_field("language", STRING);
+        schema_builder.add_text_field("kind", STRING);
+        schema_builder.add_text_field("file_path", STRING | STORED);
+        schema_builder.build()
+    }
+
+    /// Open or create a search index
+    pub fn open(index_dir: &Path) -> Result<Self, MemError> {
+        let schema = Self::build_schema();
+
+        let index = if index_dir.exists() && index_dir.join("meta.json").exists() {
+            // Open existing index and check for schema mismatch
+            let existing_index = Index::open_in_dir(index_dir)?;
+            let existing_field_count = existing_index.schema().fields().count();
+
+            if existing_field_count != EXPECTED_FIELD_COUNT {
+                // Schema mismatch - delete old index and recreate
+                tracing::info!(
+                    "Schema mismatch detected: existing index has {} fields, expected {}. Rebuilding index.",
+                    existing_field_count,
+                    EXPECTED_FIELD_COUNT
+                );
+                drop(existing_index); // Release file handles
+                std::fs::remove_dir_all(index_dir)?;
+                std::fs::create_dir_all(index_dir)?;
+                Index::create_in_dir(index_dir, schema.clone())?
+            } else {
+                existing_index
+            }
+        } else {
+            std::fs::create_dir_all(index_dir)?;
+            Index::create_in_dir(index_dir, schema.clone())?
+        };
+
+        // Get field handles from the index's schema (whether existing or new)
+        let schema = index.schema();
+        let id_field = schema.get_field("id").expect("id field missing");
+        let content_field = schema.get_field("content").expect("content field missing");
+        let tags_field = schema.get_field("tags").expect("tags field missing");
+        let type_field = schema.get_field("type").expect("type field missing");
+        let title_field = schema.get_field("title").expect("title field missing");
+        let doc_type_field = schema
+            .get_field("doc_type")
+            .expect("doc_type field missing");
+        let language_field = schema
+            .get_field("language")
+            .expect("language field missing");
+        let kind_field = schema.get_field("kind").expect("kind field missing");
+        let file_path_field = schema
+            .get_field("file_path")
+            .expect("file_path field missing");
+
+        Ok(Self {
+            index,
+            schema: schema.clone(),
+            id_field,
+            content_field,
+            tags_field,
+            type_field,
+            title_field,
+            doc_type_field,
+            language_field,
+            kind_field,
+            file_path_field,
+            writer_memory: DEFAULT_WRITER_MEMORY,
+        })
+    }
+
+    /// Open or create a search index with custom writer memory budget
+    pub fn open_with_memory(index_dir: &Path, writer_memory: usize) -> Result<Self, MemError> {
+        let mut index = Self::open(index_dir)?;
+        index.writer_memory = writer_memory;
+        Ok(index)
+    }
+
+    /// Create an in-memory search index (for testing)
+    pub fn in_memory() -> Result<Self, MemError> {
+        let schema = Self::build_schema();
+        let index = Index::create_in_ram(schema.clone());
+
+        // Get field handles from schema
+        let id_field = schema.get_field("id").expect("id field missing");
+        let content_field = schema.get_field("content").expect("content field missing");
+        let tags_field = schema.get_field("tags").expect("tags field missing");
+        let type_field = schema.get_field("type").expect("type field missing");
+        let title_field = schema.get_field("title").expect("title field missing");
+        let doc_type_field = schema
+            .get_field("doc_type")
+            .expect("doc_type field missing");
+        let language_field = schema
+            .get_field("language")
+            .expect("language field missing");
+        let kind_field = schema.get_field("kind").expect("kind field missing");
+        let file_path_field = schema
+            .get_field("file_path")
+            .expect("file_path field missing");
+
+        Ok(Self {
+            index,
+            schema,
+            id_field,
+            content_field,
+            tags_field,
+            type_field,
+            title_field,
+            doc_type_field,
+            language_field,
+            kind_field,
+            file_path_field,
+            writer_memory: DEFAULT_WRITER_MEMORY,
+        })
+    }
+
+    /// Get an index writer with configurable memory budget
+    fn writer(&self) -> Result<IndexWriter, MemError> {
+        Ok(self.index.writer(self.writer_memory)?)
+    }
+
+    /// Get the names of all indexed fields from the schema
+    pub fn field_names(&self) -> Vec<&str> {
+        self.schema
+            .fields()
+            .map(|(_, entry)| entry.name())
+            .collect()
+    }
+
+    /// Get the number of fields in the schema
+    pub fn field_count(&self) -> usize {
+        self.schema.fields().count()
+    }
+
+    /// Index a single entry
+    pub fn index_entry(&self, entry: &Entry) -> Result<(), MemError> {
+        let mut writer = self.writer()?;
+
+        // Delete existing document with same ID
+        let id_term = tantivy::Term::from_field_text(self.id_field, &entry.id);
+        writer.delete_term(id_term);
+
+        // Add new document
+        let mut doc = tantivy::TantivyDocument::new();
+        doc.add_text(self.id_field, &entry.id);
+        doc.add_text(self.content_field, &entry.content);
+        doc.add_text(self.tags_field, entry.tags.join(" "));
+        doc.add_text(self.type_field, entry.entry_type.to_string());
+        doc.add_text(self.doc_type_field, DocType::Entry.as_str());
+        if let Some(ref title) = entry.title {
+            doc.add_text(self.title_field, title);
+        }
+
+        writer.add_document(doc)?;
+        writer.commit()?;
+
+        Ok(())
+    }
+
+    /// Index multiple entries efficiently with a single commit
+    ///
+    /// This is 10-100x faster than calling index_entry() for each entry
+    /// because it uses a single commit for all documents.
+    pub fn index_entries_batch(&self, entries: &[Entry]) -> Result<usize, MemError> {
+        if entries.is_empty() {
+            return Ok(0);
+        }
+
+        let mut writer = self.writer()?;
+        let mut count = 0;
+
+        for entry in entries {
+            if entry.archived {
+                continue;
+            }
+
+            // Delete existing document with same ID
+            let id_term = tantivy::Term::from_field_text(self.id_field, &entry.id);
+            writer.delete_term(id_term);
+
+            // Add new document
+            let mut doc = tantivy::TantivyDocument::new();
+            doc.add_text(self.id_field, &entry.id);
+            doc.add_text(self.content_field, &entry.content);
+            doc.add_text(self.tags_field, entry.tags.join(" "));
+            doc.add_text(self.type_field, entry.entry_type.to_string());
+            doc.add_text(self.doc_type_field, DocType::Entry.as_str());
+            if let Some(ref title) = entry.title {
+                doc.add_text(self.title_field, title);
+            }
+
+            writer.add_document(doc)?;
+            count += 1;
+        }
+
+        writer.commit()?;
+        Ok(count)
+    }
+
+    /// Index a single task
+    pub fn index_task(&self, task: &Task) -> Result<(), MemError> {
+        let mut writer = self.writer()?;
+
+        // Delete existing document with same ID
+        let id_term = tantivy::Term::from_field_text(self.id_field, &task.id);
+        writer.delete_term(id_term);
+
+        // Build content from title + description + acceptance criteria
+        let mut content = task.title.clone();
+        if !task.description.is_empty() {
+            content.push(' ');
+            content.push_str(&task.description);
+        }
+        if !task.acceptance_criteria.is_empty() {
+            content.push(' ');
+            content.push_str(&task.acceptance_criteria);
+        }
+
+        // Add new document
+        let mut doc = tantivy::TantivyDocument::new();
+        doc.add_text(self.id_field, &task.id);
+        doc.add_text(self.content_field, &content);
+        doc.add_text(self.tags_field, ""); // Tasks don't have tags
+        doc.add_text(self.type_field, task.status.to_string());
+        doc.add_text(self.doc_type_field, DocType::Task.as_str());
+        doc.add_text(self.title_field, &task.title);
+
+        writer.add_document(doc)?;
+        writer.commit()?;
+
+        Ok(())
+    }
+
+    /// Index a single rule
+    pub fn index_rule(&self, rule: &Rule) -> Result<(), MemError> {
+        let mut writer = self.writer()?;
+
+        // Delete existing document with same ID
+        let id_term = tantivy::Term::from_field_text(self.id_field, &rule.id);
+        writer.delete_term(id_term);
+
+        // Add new document
+        let mut doc = tantivy::TantivyDocument::new();
+        doc.add_text(self.id_field, &rule.id);
+        doc.add_text(self.content_field, &rule.content);
+        doc.add_text(self.tags_field, ""); // Rules don't have tags
+        doc.add_text(self.type_field, rule.status.to_string());
+        doc.add_text(self.doc_type_field, DocType::Rule.as_str());
+        doc.add_text(self.title_field, ""); // Rules don't have separate titles
+
+        writer.add_document(doc)?;
+        writer.commit()?;
+
+        Ok(())
+    }
+
+    /// Index a single skill
+    pub fn index_skill(&self, skill: &Skill) -> Result<(), MemError> {
+        let mut writer = self.writer()?;
+
+        // Delete existing document with same ID
+        let id_term = tantivy::Term::from_field_text(self.id_field, &skill.id);
+        writer.delete_term(id_term);
+
+        // Build content from name + description + invocation + example
+        let mut content = skill.name.clone();
+        if !skill.description.is_empty() {
+            content.push(' ');
+            content.push_str(&skill.description);
+        }
+        if !skill.invocation.is_empty() {
+            content.push(' ');
+            content.push_str(&skill.invocation);
+        }
+        if !skill.example.is_empty() {
+            content.push(' ');
+            content.push_str(&skill.example);
+        }
+
+        // Add new document
+        let mut doc = tantivy::TantivyDocument::new();
+        doc.add_text(self.id_field, &skill.id);
+        doc.add_text(self.content_field, &content);
+        doc.add_text(self.tags_field, skill.tags.join(" "));
+        doc.add_text(self.type_field, skill.status.to_string());
+        doc.add_text(self.doc_type_field, DocType::Skill.as_str());
+        doc.add_text(self.title_field, &skill.name);
+
+        writer.add_document(doc)?;
+        writer.commit()?;
+
+        Ok(())
+    }
+
+    /// Index a single code symbol
+    pub fn index_code_symbol(&self, symbol: &CodeSymbol) -> Result<(), MemError> {
+        let mut writer = self.writer()?;
+
+        // Delete existing document with same ID
+        let id_term = tantivy::Term::from_field_text(self.id_field, &symbol.id);
+        writer.delete_term(id_term);
+
+        // Build content from source + documentation + qualified name
+        let mut content = symbol.qualified_name.clone();
+        content.push(' ');
+        content.push_str(&symbol.source);
+        if let Some(ref doc) = symbol.documentation {
+            content.push(' ');
+            content.push_str(doc);
+        }
+
+        // Add new document
+        let mut doc = tantivy::TantivyDocument::new();
+        doc.add_text(self.id_field, &symbol.id);
+        doc.add_text(self.content_field, &content);
+        doc.add_text(self.tags_field, ""); // Code symbols don't have tags
+        doc.add_text(self.type_field, symbol.kind.to_string());
+        doc.add_text(self.doc_type_field, DocType::CodeSymbol.as_str());
+        doc.add_text(self.title_field, &symbol.qualified_name);
+        // Code-specific fields
+        doc.add_text(self.language_field, symbol.language.to_string());
+        doc.add_text(self.kind_field, symbol.kind.to_string());
+        doc.add_text(self.file_path_field, &symbol.file_path);
+
+        writer.add_document(doc)?;
+        writer.commit()?;
+
+        Ok(())
+    }
+
+    /// Index multiple code symbols in batch (more efficient)
+    pub fn index_code_symbols(&self, symbols: &[CodeSymbol]) -> Result<usize, MemError> {
+        if symbols.is_empty() {
+            return Ok(0);
+        }
+
+        let mut writer = self.writer()?;
+        let mut count = 0;
+
+        for symbol in symbols {
+            // Delete existing document with same ID
+            let id_term = tantivy::Term::from_field_text(self.id_field, &symbol.id);
+            writer.delete_term(id_term);
+
+            // Build content from source + documentation + qualified name
+            let mut content = symbol.qualified_name.clone();
+            content.push(' ');
+            content.push_str(&symbol.source);
+            if let Some(ref doc) = symbol.documentation {
+                content.push(' ');
+                content.push_str(doc);
+            }
+
+            // Add new document
+            let mut doc = tantivy::TantivyDocument::new();
+            doc.add_text(self.id_field, &symbol.id);
+            doc.add_text(self.content_field, &content);
+            doc.add_text(self.tags_field, "");
+            doc.add_text(self.type_field, symbol.kind.to_string());
+            doc.add_text(self.doc_type_field, DocType::CodeSymbol.as_str());
+            doc.add_text(self.title_field, &symbol.qualified_name);
+            doc.add_text(self.language_field, symbol.language.to_string());
+            doc.add_text(self.kind_field, symbol.kind.to_string());
+            doc.add_text(self.file_path_field, &symbol.file_path);
+
+            writer.add_document(doc)?;
+            count += 1;
+        }
+
+        writer.commit()?;
+        Ok(count)
+    }
+
+    /// Delete an entry from the index
+    pub fn delete(&self, id: &str) -> Result<(), MemError> {
+        let mut writer = self.writer()?;
+        let id_term = tantivy::Term::from_field_text(self.id_field, id);
+        writer.delete_term(id_term);
+        writer.commit()?;
+        Ok(())
+    }
+
+    /// Reindex all entries (legacy method - use reindex_all for unified search)
+    pub fn reindex(&self, entries: &[Entry]) -> Result<(), MemError> {
+        let mut writer = self.writer()?;
+
+        // Clear the index
+        writer.delete_all_documents()?;
+
+        // Add all entries
+        for entry in entries {
+            if entry.archived {
+                continue;
+            }
+
+            let mut doc = tantivy::TantivyDocument::new();
+            doc.add_text(self.id_field, &entry.id);
+            doc.add_text(self.content_field, &entry.content);
+            doc.add_text(self.tags_field, entry.tags.join(" "));
+            doc.add_text(self.type_field, entry.entry_type.to_string());
+            doc.add_text(self.doc_type_field, DocType::Entry.as_str());
+            if let Some(ref title) = entry.title {
+                doc.add_text(self.title_field, title);
+            }
+
+            writer.add_document(doc)?;
+        }
+
+        writer.commit()?;
+        Ok(())
+    }
+
+    /// Reindex all entity types (entries, tasks, rules, skills, specs)
+    pub fn reindex_all(
+        &self,
+        entries: &[Entry],
+        tasks: &[Task],
+        rules: &[Rule],
+        skills: &[Skill],
+        specs: &[Spec],
+    ) -> Result<usize, MemError> {
+        let mut writer = self.writer()?;
+        let mut count = 0;
+
+        // Clear the index
+        writer.delete_all_documents()?;
+
+        // Add entries
+        for entry in entries {
+            if entry.archived {
+                continue;
+            }
+
+            let mut doc = tantivy::TantivyDocument::new();
+            doc.add_text(self.id_field, &entry.id);
+            doc.add_text(self.content_field, &entry.content);
+            doc.add_text(self.tags_field, entry.tags.join(" "));
+            doc.add_text(self.type_field, entry.entry_type.to_string());
+            doc.add_text(self.doc_type_field, DocType::Entry.as_str());
+            if let Some(ref title) = entry.title {
+                doc.add_text(self.title_field, title);
+            }
+
+            writer.add_document(doc)?;
+            count += 1;
+        }
+
+        // Add tasks
+        for task in tasks {
+            let mut content = task.title.clone();
+            if !task.description.is_empty() {
+                content.push(' ');
+                content.push_str(&task.description);
+            }
+            if !task.acceptance_criteria.is_empty() {
+                content.push(' ');
+                content.push_str(&task.acceptance_criteria);
+            }
+
+            let mut doc = tantivy::TantivyDocument::new();
+            doc.add_text(self.id_field, &task.id);
+            doc.add_text(self.content_field, &content);
+            doc.add_text(self.tags_field, ""); // Tasks don't have tags
+            doc.add_text(self.type_field, task.status.to_string());
+            doc.add_text(self.doc_type_field, DocType::Task.as_str());
+            doc.add_text(self.title_field, &task.title);
+
+            writer.add_document(doc)?;
+            count += 1;
+        }
+
+        // Add rules
+        for rule in rules {
+            let mut doc = tantivy::TantivyDocument::new();
+            doc.add_text(self.id_field, &rule.id);
+            doc.add_text(self.content_field, &rule.content);
+            doc.add_text(self.tags_field, "");
+            doc.add_text(self.type_field, rule.status.to_string());
+            doc.add_text(self.doc_type_field, DocType::Rule.as_str());
+            doc.add_text(self.title_field, "");
+
+            writer.add_document(doc)?;
+            count += 1;
+        }
+
+        // Add skills
+        for skill in skills {
+            let mut content = skill.name.clone();
+            if !skill.description.is_empty() {
+                content.push(' ');
+                content.push_str(&skill.description);
+            }
+            if !skill.invocation.is_empty() {
+                content.push(' ');
+                content.push_str(&skill.invocation);
+            }
+
+            let mut doc = tantivy::TantivyDocument::new();
+            doc.add_text(self.id_field, &skill.id);
+            doc.add_text(self.content_field, &content);
+            doc.add_text(self.tags_field, skill.tags.join(" "));
+            doc.add_text(self.type_field, skill.status.to_string());
+            doc.add_text(self.doc_type_field, DocType::Skill.as_str());
+            doc.add_text(self.title_field, &skill.name);
+
+            writer.add_document(doc)?;
+            count += 1;
+        }
+
+        // Add specs
+        for spec in specs {
+            // Build content with weighted fields
+            let mut content = String::new();
+
+            // High weight: title (repeat for emphasis)
+            content.push_str(&spec.title);
+            content.push(' ');
+            content.push_str(&spec.title);
+            content.push(' ');
+
+            // High weight: summary (repeat for emphasis)
+            if !spec.summary.is_empty() {
+                content.push_str(&spec.summary);
+                content.push(' ');
+                content.push_str(&spec.summary);
+                content.push(' ');
+            }
+
+            // Medium weight: goals
+            if !spec.goals.is_empty() {
+                content.push_str(&spec.goals.join(" "));
+                content.push(' ');
+            }
+
+            // Medium weight: acceptance_criteria
+            if !spec.acceptance_criteria.is_empty() {
+                content.push_str(&spec.acceptance_criteria.join(" "));
+                content.push(' ');
+            }
+
+            // Medium weight: design_notes
+            if !spec.design_notes.is_empty() {
+                content.push_str(&spec.design_notes);
+                content.push(' ');
+            }
+
+            let mut doc = tantivy::TantivyDocument::new();
+            doc.add_text(self.id_field, &spec.id);
+            doc.add_text(self.content_field, &content);
+            doc.add_text(self.tags_field, spec.tags.join(" ")); // Low weight: tags
+            doc.add_text(self.type_field, spec.status.to_string());
+            doc.add_text(self.doc_type_field, DocType::Spec.as_str());
+            doc.add_text(self.title_field, &spec.title);
+
+            writer.add_document(doc)?;
+            count += 1;
+        }
+
+        writer.commit()?;
+        Ok(count)
+    }
+
+    /// Reindex all entity types including code symbols
+    pub fn reindex_all_with_code(
+        &self,
+        entries: &[Entry],
+        tasks: &[Task],
+        rules: &[Rule],
+        skills: &[Skill],
+        symbols: &[CodeSymbol],
+    ) -> Result<usize, MemError> {
+        let mut writer = self.writer()?;
+        let mut count = 0;
+
+        // Clear the index
+        writer.delete_all_documents()?;
+
+        // Add entries
+        for entry in entries {
+            if entry.archived {
+                continue;
+            }
+
+            let mut doc = tantivy::TantivyDocument::new();
+            doc.add_text(self.id_field, &entry.id);
+            doc.add_text(self.content_field, &entry.content);
+            doc.add_text(self.tags_field, entry.tags.join(" "));
+            doc.add_text(self.type_field, entry.entry_type.to_string());
+            doc.add_text(self.doc_type_field, DocType::Entry.as_str());
+            if let Some(ref title) = entry.title {
+                doc.add_text(self.title_field, title);
+            }
+
+            writer.add_document(doc)?;
+            count += 1;
+        }
+
+        // Add tasks
+        for task in tasks {
+            let mut content = task.title.clone();
+            if !task.description.is_empty() {
+                content.push(' ');
+                content.push_str(&task.description);
+            }
+            if !task.acceptance_criteria.is_empty() {
+                content.push(' ');
+                content.push_str(&task.acceptance_criteria);
+            }
+
+            let mut doc = tantivy::TantivyDocument::new();
+            doc.add_text(self.id_field, &task.id);
+            doc.add_text(self.content_field, &content);
+            doc.add_text(self.tags_field, "");
+            doc.add_text(self.type_field, task.status.to_string());
+            doc.add_text(self.doc_type_field, DocType::Task.as_str());
+            doc.add_text(self.title_field, &task.title);
+
+            writer.add_document(doc)?;
+            count += 1;
+        }
+
+        // Add rules
+        for rule in rules {
+            let mut doc = tantivy::TantivyDocument::new();
+            doc.add_text(self.id_field, &rule.id);
+            doc.add_text(self.content_field, &rule.content);
+            doc.add_text(self.tags_field, "");
+            doc.add_text(self.type_field, rule.status.to_string());
+            doc.add_text(self.doc_type_field, DocType::Rule.as_str());
+            doc.add_text(self.title_field, "");
+
+            writer.add_document(doc)?;
+            count += 1;
+        }
+
+        // Add skills
+        for skill in skills {
+            let mut content = skill.name.clone();
+            if !skill.description.is_empty() {
+                content.push(' ');
+                content.push_str(&skill.description);
+            }
+            if !skill.invocation.is_empty() {
+                content.push(' ');
+                content.push_str(&skill.invocation);
+            }
+
+            let mut doc = tantivy::TantivyDocument::new();
+            doc.add_text(self.id_field, &skill.id);
+            doc.add_text(self.content_field, &content);
+            doc.add_text(self.tags_field, skill.tags.join(" "));
+            doc.add_text(self.type_field, skill.status.to_string());
+            doc.add_text(self.doc_type_field, DocType::Skill.as_str());
+            doc.add_text(self.title_field, &skill.name);
+
+            writer.add_document(doc)?;
+            count += 1;
+        }
+
+        // Add code symbols
+        for symbol in symbols {
+            let mut content = symbol.qualified_name.clone();
+            content.push(' ');
+            content.push_str(&symbol.source);
+            if let Some(ref documentation) = symbol.documentation {
+                content.push(' ');
+                content.push_str(documentation);
+            }
+
+            let mut doc = tantivy::TantivyDocument::new();
+            doc.add_text(self.id_field, &symbol.id);
+            doc.add_text(self.content_field, &content);
+            doc.add_text(self.tags_field, "");
+            doc.add_text(self.type_field, symbol.kind.to_string());
+            doc.add_text(self.doc_type_field, DocType::CodeSymbol.as_str());
+            doc.add_text(self.title_field, &symbol.qualified_name);
+            doc.add_text(self.language_field, symbol.language.to_string());
+            doc.add_text(self.kind_field, symbol.kind.to_string());
+            doc.add_text(self.file_path_field, &symbol.file_path);
+
+            writer.add_document(doc)?;
+            count += 1;
+        }
+
+        writer.commit()?;
+        Ok(count)
+    }
+}

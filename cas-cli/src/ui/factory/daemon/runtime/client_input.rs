@@ -1,0 +1,852 @@
+use crate::ui::factory::daemon::imports::*;
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+impl FactoryDaemon {
+    pub(super) fn accept_clients(&mut self) -> anyhow::Result<bool> {
+        let mut any_new = false;
+        loop {
+            match self.listener.accept() {
+                Ok((mut stream, _addr)) => {
+                    // Setup stream - skip client if any setup fails (don't crash daemon)
+                    // Use non-blocking reads to prevent any single client from blocking the main loop.
+                    // Write timeout prevents slow clients from stalling output.
+                    if stream.set_nonblocking(true).is_err()
+                        || stream
+                            .set_write_timeout(Some(Duration::from_millis(50)))
+                            .is_err()
+                    {
+                        continue;
+                    }
+
+                    let client_id = self.next_client_id;
+                    self.next_client_id += 1;
+
+                    // Send initial screen setup to new client (before inserting)
+                    // Temporarily switch to blocking for the init sequence write
+                    let init = b"\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H";
+                    let _ = stream.set_nonblocking(false);
+                    let write_result = stream.write_all(init);
+                    let _ = stream.set_nonblocking(true);
+                    if write_result.is_err() {
+                        // Failed to send init, skip this client
+                        continue;
+                    }
+
+                    self.clients.insert(
+                        client_id,
+                        ClientConnection {
+                            stream,
+                            input_buf: Vec::with_capacity(1024),
+                            output_buf: VecDeque::with_capacity(8192),
+                            needs_full_redraw: true,
+                            view_mode: ClientViewMode::Full,
+                            client_cols: self.cols,
+                            client_rows: self.rows,
+                        },
+                    );
+                    any_new = true;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    break;
+                }
+                Err(_) => {
+                    break;
+                }
+            }
+        }
+        Ok(any_new)
+    }
+
+    /// Process input from all connected clients
+    pub(super) async fn process_client_input(&mut self) -> anyhow::Result<bool> {
+        let client_ids: Vec<usize> = self.clients.keys().copied().collect();
+        let mut disconnected = Vec::new();
+        let mut all_input: Vec<(usize, Vec<u8>)> = Vec::new();
+        let mut resize_event: Option<(u16, u16)> = None;
+        let mut had_activity = false;
+        let now = Instant::now();
+
+        // Read from all clients
+        for client_id in client_ids {
+            if let Some(client) = self.clients.get_mut(&client_id) {
+                let mut buf = [0u8; 4096];
+                loop {
+                    match client.stream.read(&mut buf) {
+                        Ok(0) => {
+                            disconnected.push(client_id);
+                            break;
+                        }
+                        Ok(n) => {
+                            client.input_buf.extend_from_slice(&buf[..n]);
+                        }
+                        Err(e)
+                            if e.kind() == std::io::ErrorKind::WouldBlock
+                                || e.kind() == std::io::ErrorKind::TimedOut
+                                || e.kind() == std::io::ErrorKind::Interrupted =>
+                        {
+                            // No more data available right now
+                            break;
+                        }
+                        Err(_) => {
+                            disconnected.push(client_id);
+                            break;
+                        }
+                    }
+                }
+
+                // Parse input buffer for control sequences
+                let (input_data, events) = Self::parse_client_input(&mut client.input_buf);
+                let has_activity = !input_data.is_empty() || !events.is_empty();
+                if has_activity {
+                    let can_take = self.owner_client_id.is_none()
+                        || self.owner_client_id == Some(client_id)
+                        || self.owner_last_activity.elapsed()
+                            > Duration::from_secs(INPUT_OWNER_IDLE_SECS);
+                    if can_take {
+                        self.owner_client_id = Some(client_id);
+                        self.owner_last_activity = now;
+                        had_activity = true;
+                        if !input_data.is_empty() {
+                            all_input.push((client_id, input_data));
+                        }
+                        for event in events {
+                            match event {
+                                ControlEvent::Resize(cols, rows) => {
+                                    // Store per-client dimensions
+                                    if let Some(c) = self.clients.get_mut(&client_id) {
+                                        c.client_cols = cols;
+                                        c.client_rows = rows;
+                                        // Auto-detect compact mode on first resize
+                                        if cols < COMPACT_WIDTH_THRESHOLD
+                                            && c.view_mode == ClientViewMode::Full
+                                        {
+                                            c.view_mode = ClientViewMode::Compact;
+                                            tracing::info!(
+                                                "Client {} auto-switched to compact mode ({}x{})",
+                                                client_id,
+                                                cols,
+                                                rows
+                                            );
+                                        } else if cols >= COMPACT_WIDTH_THRESHOLD
+                                            && c.view_mode == ClientViewMode::Compact
+                                        {
+                                            c.view_mode = ClientViewMode::Full;
+                                            tracing::info!(
+                                                "Client {} auto-switched to full mode ({}x{})",
+                                                client_id,
+                                                cols,
+                                                rows
+                                            );
+                                        }
+                                        c.needs_full_redraw = true;
+                                    }
+                                    resize_event = Some((cols, rows));
+                                }
+                                ControlEvent::SetMode(mode) => {
+                                    if let Some(c) = self.clients.get_mut(&client_id) {
+                                        c.view_mode = mode;
+                                        c.needs_full_redraw = true;
+                                        tracing::info!(
+                                            "Client {} set mode to {:?}",
+                                            client_id,
+                                            mode
+                                        );
+                                    }
+                                }
+                                ControlEvent::MouseDown(col, row) => {
+                                    // Block clicks when a modal dialog is open
+                                    if self.app.show_task_dialog
+                                        || self.app.show_changes_dialog
+                                        || self.app.show_help
+                                    {
+                                        // Consume - don't interact with panes behind dialog
+                                    } else {
+                                        if self.app.input_mode.is_resize() {
+                                            self.app.exit_resize_mode();
+                                        }
+                                        self.app.start_selection(col, row);
+                                        self.app.handle_click(col, row);
+                                    }
+                                }
+                                ControlEvent::MouseDrag(col, row) => {
+                                    if !(self.app.show_task_dialog
+                                        || self.app.show_changes_dialog
+                                        || self.app.show_help)
+                                    {
+                                        self.app.update_selection(col, row);
+                                    }
+                                }
+                                ControlEvent::MouseUp => {
+                                    if !(self.app.show_task_dialog
+                                        || self.app.show_changes_dialog
+                                        || self.app.show_help)
+                                    {
+                                        self.app.handle_mouse_up();
+                                    }
+                                }
+                                ControlEvent::MouseScrollUp => {
+                                    if self.app.show_changes_dialog {
+                                        self.app.diff_scroll_up();
+                                    } else {
+                                        self.app.handle_scroll_up();
+                                    }
+                                }
+                                ControlEvent::MouseScrollDown => {
+                                    if self.app.show_changes_dialog {
+                                        self.app.diff_scroll_down();
+                                    } else {
+                                        self.app.handle_scroll_down();
+                                    }
+                                }
+                                ControlEvent::DropImage { col, row, path } => {
+                                    let target = self.resolve_drop_target(col, row);
+                                    if let Some(target_pane) = target {
+                                        let _ = self.app.mux.focus(&target_pane);
+                                        let payload = bracketed_paste_bytes(&path);
+                                        if let Err(e) =
+                                            self.app.mux.send_input_to(&target_pane, &payload).await
+                                        {
+                                            tracing::warn!(
+                                                "Failed to deliver dropped image payload to {}: {}",
+                                                target_pane,
+                                                e
+                                            );
+                                        }
+                                    } else {
+                                        tracing::debug!(
+                                            "Ignoring image drop outside worker/supervisor panes at ({}, {})",
+                                            col,
+                                            row
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Remove disconnected clients and recalibrate if any left
+        let had_disconnects = !disconnected.is_empty();
+        for id in disconnected {
+            self.clients.remove(&id);
+            if self.owner_client_id == Some(id) {
+                self.owner_client_id = None;
+            }
+        }
+        if had_disconnects {
+            self.recalibrate_after_disconnect();
+        }
+
+        // Debounce resize: store pending event, apply in main loop after 100ms
+        if let Some((cols, rows)) = resize_event {
+            self.pending_resize = Some((cols, rows));
+            self.pending_resize_at = Instant::now();
+        }
+
+        // Process keyboard input (use first client's input)
+        for (_client_id, input) in all_input {
+            self.process_input(&input).await?;
+        }
+
+        Ok(had_activity)
+    }
+
+    /// Parse client input, extracting control sequences
+    fn parse_client_input(buf: &mut Vec<u8>) -> (Vec<u8>, Vec<ControlEvent>) {
+        let mut input_data = Vec::new();
+        let mut events = Vec::new();
+        let mut i = 0;
+
+        while i < buf.len() {
+            // Check for control sequence prefix
+            if buf[i..].starts_with(CONTROL_PREFIX) {
+                // Find the end of the control sequence (BEL)
+                if let Some(end_offset) = buf[i + CONTROL_PREFIX.len()..]
+                    .iter()
+                    .position(|&b| b == CONTROL_SUFFIX)
+                {
+                    let cmd_start = i + CONTROL_PREFIX.len();
+                    let cmd_end = cmd_start + end_offset;
+                    let cmd = &buf[cmd_start..cmd_end];
+
+                    // Parse command
+                    if let Ok(cmd_str) = std::str::from_utf8(cmd) {
+                        if cmd_str.starts_with("resize;") {
+                            let parts: Vec<&str> = cmd_str.split(';').collect();
+                            if parts.len() == 3 {
+                                if let (Ok(cols), Ok(rows)) =
+                                    (parts[1].parse::<u16>(), parts[2].parse::<u16>())
+                                {
+                                    events.push(ControlEvent::Resize(cols, rows));
+                                }
+                            }
+                        } else if cmd_str.starts_with("mouse;") {
+                            // Format: mouse;kind;col;row
+                            let parts: Vec<&str> = cmd_str.split(';').collect();
+                            if parts.len() == 4 {
+                                let kind = parts[1];
+                                if let (Ok(col), Ok(row)) =
+                                    (parts[2].parse::<u16>(), parts[3].parse::<u16>())
+                                {
+                                    match kind {
+                                        "down_left" => {
+                                            events.push(ControlEvent::MouseDown(col, row))
+                                        }
+                                        "drag_left" => {
+                                            events.push(ControlEvent::MouseDrag(col, row))
+                                        }
+                                        "up_left" => events.push(ControlEvent::MouseUp),
+                                        "scroll_up" => events.push(ControlEvent::MouseScrollUp),
+                                        "scroll_down" => events.push(ControlEvent::MouseScrollDown),
+                                        _ => {} // Ignore other mouse events (right/middle clicks)
+                                    }
+                                }
+                            }
+                        } else if let Some(rest) = cmd_str.strip_prefix("drop_image;") {
+                            // Format: drop_image;col;row;base64_payload
+                            let parts: Vec<&str> = rest.splitn(3, ';').collect();
+                            if parts.len() == 3 {
+                                if let (Ok(col), Ok(row)) =
+                                    (parts[0].parse::<u16>(), parts[1].parse::<u16>())
+                                {
+                                    if let Ok(decoded) = URL_SAFE_NO_PAD.decode(parts[2]) {
+                                        if let Ok(payload) = String::from_utf8(decoded) {
+                                            events.push(ControlEvent::DropImage {
+                                                col,
+                                                row,
+                                                path: payload,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        } else if let Some(mode_str) = cmd_str.strip_prefix("mode;") {
+                            match mode_str {
+                                "compact" => {
+                                    events.push(ControlEvent::SetMode(ClientViewMode::Compact))
+                                }
+                                "full" => events.push(ControlEvent::SetMode(ClientViewMode::Full)),
+                                _ => {}
+                            }
+                        } else if cmd_str == "detach" {
+                            // Client wants to detach - just disconnect them
+                        }
+                    }
+
+                    i = cmd_end + 1; // Skip past BEL
+                    continue;
+                }
+            }
+
+            // Regular input byte
+            input_data.push(buf[i]);
+            i += 1;
+        }
+
+        buf.clear();
+        (input_data, events)
+    }
+
+    /// Process input bytes (handles escape sequences for arrow keys)
+    async fn process_input(&mut self, input: &[u8]) -> anyhow::Result<()> {
+        use crate::ui::factory::input::LayoutSizes;
+
+        let mut i = 0;
+        while i < input.len() {
+            let byte = input[i];
+
+            // Modal dialog interception - when a dialog is open, capture all input
+            if self.app.show_task_dialog || self.app.show_changes_dialog || self.app.show_help {
+                // Check for escape sequence (arrow keys: ESC [ A/B)
+                if byte == 0x1b && i + 2 < input.len() && input[i + 1] == b'[' {
+                    if self.app.show_changes_dialog {
+                        match input[i + 2] {
+                            b'A' => self.app.diff_scroll_up(),   // Up arrow
+                            b'B' => self.app.diff_scroll_down(), // Down arrow
+                            b'5' if i + 3 < input.len() && input[i + 3] == b'~' => {
+                                self.app.diff_page_up(); // PageUp
+                                i += 4;
+                                continue;
+                            }
+                            b'6' if i + 3 < input.len() && input[i + 3] == b'~' => {
+                                self.app.diff_page_down(); // PageDown
+                                i += 4;
+                                continue;
+                            }
+                            _ => {}
+                        }
+                    } else {
+                        match input[i + 2] {
+                            b'A' => self.app.handle_scroll_up(),   // Up arrow
+                            b'B' => self.app.handle_scroll_down(), // Down arrow
+                            _ => {}
+                        }
+                    }
+                    i += 3;
+                    continue;
+                }
+
+                // Standalone ESC = cancel search mode or close dialog
+                if byte == 0x1b {
+                    if self.app.is_diff_search_mode() {
+                        self.app.cancel_diff_search();
+                    } else if self.app.show_help {
+                        self.app.show_help = false;
+                    } else {
+                        self.app.handle_escape();
+                    }
+                    i += 1;
+                    continue;
+                }
+
+                // Changes dialog has rich key handling
+                if self.app.show_changes_dialog {
+                    if self.app.is_diff_search_mode() {
+                        match byte {
+                            0x0d => self.app.confirm_diff_search(),          // Enter
+                            0x7f => self.app.handle_diff_search_backspace(), // Backspace
+                            0x1b => self.app.cancel_diff_search(), // Esc (standalone, already checked above)
+                            c if (0x20..0x7f).contains(&c) => {
+                                self.app.handle_diff_search_char(c as char)
+                            }
+                            _ => {}
+                        }
+                    } else {
+                        match byte {
+                            b'j' => self.app.diff_scroll_down(),
+                            b'k' => self.app.diff_scroll_up(),
+                            b']' => self.app.diff_next_hunk(),
+                            b'[' => self.app.diff_prev_hunk(),
+                            b's' => self.app.diff_toggle_style(),
+                            b'/' => self.app.start_diff_search(),
+                            b'n' => self.app.next_diff_match(),
+                            b'N' => self.app.prev_diff_match(),
+                            b'd' => self.app.diff_cycle_inline_mode(),
+                            b'l' => self.app.diff_toggle_line_numbers(),
+                            b'e' => self.app.diff_toggle_expand_all(),
+                            _ => {}
+                        }
+                    }
+                } else {
+                    match byte {
+                        b'j' => self.app.handle_scroll_down(),
+                        b'k' => self.app.handle_scroll_up(),
+                        b'?' => {
+                            if self.app.show_help {
+                                self.app.show_help = false;
+                            }
+                        }
+                        _ => {} // Consume all other keys
+                    }
+                }
+                i += 1;
+                continue;
+            }
+
+            // Terminal dialog interception - forward all input to shell PTY
+            if self.app.show_terminal_dialog {
+                // Ctrl+T (0x14) = hide terminal (shell keeps running)
+                if byte == 0x14 {
+                    self.app.hide_terminal_dialog();
+                    i += 1;
+                    continue;
+                }
+                // Ctrl+D (0x04) = kill terminal shell and close dialog
+                if byte == 0x04 {
+                    self.app.kill_terminal();
+                    i += 1;
+                    continue;
+                }
+                // Forward everything else to the shell PTY (preserving escape sequences)
+                if let Some(ref name) = self.app.terminal_pane_name {
+                    let name = name.clone();
+                    let chunk_len = if byte == 0x1b && i + 2 < input.len() && input[i + 1] == b'[' {
+                        // CSI sequence: ESC [ ... final_byte
+                        let mut end = i + 2;
+                        while end < input.len() && input[end] < 0x40 {
+                            end += 1;
+                        }
+                        if end < input.len() {
+                            end + 1 - i
+                        } else {
+                            input.len() - i
+                        }
+                    } else {
+                        1
+                    };
+                    if let Some(pane) = self.app.mux.get(&name) {
+                        let _ = pane.write(&input[i..i + chunk_len]).await;
+                    }
+                    i += chunk_len;
+                } else {
+                    i += 1;
+                }
+                continue;
+            }
+
+            // Handle resize mode first - intercepts all input
+            if self.app.input_mode.is_resize() {
+                // Arrow keys (ESC [ A/B/C/D)
+                if byte == 0x1b && i + 2 < input.len() && input[i + 1] == b'[' {
+                    let arrow = input[i + 2];
+                    match arrow {
+                        b'A' => self
+                            .app
+                            .resize_layout(|s| s.grow_supervisor(LayoutSizes::STEP)),
+                        b'B' => self
+                            .app
+                            .resize_layout(|s| s.shrink_supervisor(LayoutSizes::STEP)),
+                        b'C' => self
+                            .app
+                            .resize_layout(|s| s.grow_workers(LayoutSizes::STEP)),
+                        b'D' => self
+                            .app
+                            .resize_layout(|s| s.shrink_workers(LayoutSizes::STEP)),
+                        _ => {}
+                    }
+                    i += 3;
+                    continue;
+                }
+                match byte {
+                    b'h' => self
+                        .app
+                        .resize_layout(|s| s.shrink_workers(LayoutSizes::STEP)),
+                    b'H' => self
+                        .app
+                        .resize_layout(|s| s.shrink_workers(LayoutSizes::LARGE_STEP)),
+                    b'l' => self
+                        .app
+                        .resize_layout(|s| s.grow_workers(LayoutSizes::STEP)),
+                    b'L' => self
+                        .app
+                        .resize_layout(|s| s.grow_workers(LayoutSizes::LARGE_STEP)),
+                    b'j' => self
+                        .app
+                        .resize_layout(|s| s.shrink_supervisor(LayoutSizes::STEP)),
+                    b'J' => self
+                        .app
+                        .resize_layout(|s| s.shrink_supervisor(LayoutSizes::LARGE_STEP)),
+                    b'k' => self
+                        .app
+                        .resize_layout(|s| s.grow_supervisor(LayoutSizes::STEP)),
+                    b'K' => self
+                        .app
+                        .resize_layout(|s| s.grow_supervisor(LayoutSizes::LARGE_STEP)),
+                    b'r' => self.app.reset_layout(),
+                    0x1b | b'\r' => self.app.exit_resize_mode(),
+                    b'q' | b'Q' => self.shutdown.store(true, Ordering::Relaxed),
+                    _ => {}
+                }
+                i += 1;
+                continue;
+            }
+
+            // Mission Control mode input handling
+            if self.app.is_mission_control() {
+                // Ctrl+W toggles back to Panes view
+                if byte == 0x17 {
+                    self.app.toggle_factory_view_mode();
+                    i += 1;
+                    continue;
+                }
+                // Arrow keys in MC mode
+                if byte == 0x1b && i + 2 < input.len() && input[i + 1] == b'[' {
+                    match input[i + 2] {
+                        b'A' => self.app.mc_scroll_up(),   // Up
+                        b'B' => self.app.mc_scroll_down(), // Down
+                        _ => {}
+                    }
+                    i += 3;
+                    continue;
+                }
+                // Standalone ESC in MC mode
+                if byte == 0x1b {
+                    let is_standalone_esc = i + 1 >= input.len() || input[i + 1] != b'[';
+                    if is_standalone_esc {
+                        self.app.mc_handle_escape();
+                        i += 1;
+                        continue;
+                    }
+                }
+                // Regular keys in MC mode
+                match byte {
+                    b'\t' => self.app.mc_focus_next(),
+                    b'j' | b'J' => self.app.mc_scroll_down(),
+                    b'k' | b'K' => self.app.mc_scroll_up(),
+                    b'\r' => self.app.mc_handle_enter(),
+                    b' ' => self.app.mc_toggle_collapse(),
+                    b'i' | b'I' => self.app.mc_start_inject(),
+                    // Direct panel jump keys
+                    b'w' | b'W' => self
+                        .app
+                        .mc_focus_panel(crate::ui::factory::renderer::MissionControlFocus::Workers),
+                    b't' | b'T' => self
+                        .app
+                        .mc_focus_panel(crate::ui::factory::renderer::MissionControlFocus::Tasks),
+                    b'c' | b'C' => self
+                        .app
+                        .mc_focus_panel(crate::ui::factory::renderer::MissionControlFocus::Changes),
+                    b'a' | b'A' => self.app.mc_focus_panel(
+                        crate::ui::factory::renderer::MissionControlFocus::Activity,
+                    ),
+                    b'?' => self.app.show_help = !self.app.show_help,
+                    b'q' | b'Q' => self.shutdown.store(true, Ordering::Relaxed),
+                    _ => {}
+                }
+                i += 1;
+                continue;
+            }
+
+            // Check for escape sequence (arrow keys: ESC [ A/B/C/D)
+            if byte == 0x1b && i + 2 < input.len() && input[i + 1] == b'[' {
+                let arrow = input[i + 2];
+                let is_arrow = matches!(arrow, b'A' | b'B' | b'C' | b'D');
+
+                if is_arrow {
+                    if self.app.sidecar_is_focused() {
+                        // Handle arrows in sidecar
+                        match arrow {
+                            b'A' => self.app.sidecar_scroll_up(),   // Up
+                            b'B' => self.app.sidecar_scroll_down(), // Down
+                            _ => {}                                 // Left/Right ignored in sidecar
+                        }
+                        i += 3;
+                        continue;
+                    } else if self.app.focused_accepts_input() {
+                        // Forward arrow keys to focused pane
+                        let _ = self.app.mux.send_input(&input[i..i + 3]).await;
+                        i += 3;
+                        continue;
+                    }
+                }
+            }
+
+            // Check for standalone ESC (not followed by '[' or at end of input)
+            // Give it a chance to be part of a sequence by checking next byte
+            if byte == 0x1b {
+                let is_standalone_esc = i + 1 >= input.len() || input[i + 1] != b'[';
+                if is_standalone_esc && self.app.sidecar_is_focused() {
+                    // Use handle_escape which properly handles view mode transitions
+                    self.app.handle_escape();
+                    i += 1;
+                    continue;
+                } else if is_standalone_esc && self.app.focused_accepts_input() {
+                    // Forward ESC to focused pane
+                    let _ = self.app.mux.send_input(&[byte]).await;
+                    i += 1;
+                    continue;
+                } else if !is_standalone_esc {
+                    // Part of unknown escape sequence - forward to focused pane if applicable
+                    if self.app.focused_accepts_input() {
+                        let _ = self.app.mux.send_input(&[byte]).await;
+                    }
+                    i += 1;
+                    continue;
+                }
+            }
+
+            // Ctrl+D (0x04) = detach - client handles this, just ignore
+            if byte == 0x04 {
+                i += 1;
+                continue;
+            }
+
+            // Ctrl+E (0x05) = dismiss active error banner
+            if byte == 0x05 {
+                self.app.clear_error();
+                i += 1;
+                continue;
+            }
+
+            // Ctrl+Q (0x11) = quit daemon
+            if byte == 0x11 {
+                self.shutdown.store(true, Ordering::Relaxed);
+                i += 1;
+                continue;
+            }
+
+            // Ctrl+R (0x12) = refresh CAS data (global)
+            if byte == 0x12 {
+                let _ = self.app.refresh_data();
+                i += 1;
+                continue;
+            }
+
+            // Ctrl+C (0x03) = interrupt focused pane (debounced)
+            if byte == 0x03 {
+                let now = Instant::now();
+                if self
+                    .app
+                    .last_interrupt_time
+                    .is_none_or(|t| now.duration_since(t) >= Duration::from_secs(2))
+                {
+                    self.app.last_interrupt_time = Some(now);
+                    let _ = self.app.mux.interrupt_focused().await;
+                }
+                i += 1;
+                continue;
+            }
+
+            // Ctrl+T (0x14) = open/hide terminal dialog
+            if byte == 0x14 {
+                if self.app.show_terminal_dialog {
+                    self.app.hide_terminal_dialog();
+                } else {
+                    self.app.open_terminal_dialog();
+                }
+                i += 1;
+                continue;
+            }
+
+            // Ctrl+N (0x0E) = enter resize mode (global)
+            if byte == 0x0E {
+                self.app.enter_resize_mode();
+                i += 1;
+                continue;
+            }
+
+            // Ctrl+] (0x1D) = collapse/expand entire sidebar (global)
+            if byte == 0x1d {
+                self.app.toggle_sidecar_collapsed();
+                i += 1;
+                continue;
+            }
+
+            // Ctrl+W (0x17) = toggle factory view mode (Panes ↔ Mission Control)
+            if byte == 0x17 {
+                self.app.toggle_factory_view_mode();
+                i += 1;
+                continue;
+            }
+
+            // Check if sidecar is focused first - handle sidecar navigation
+            if self.app.sidecar_is_focused() {
+                match byte {
+                    // Tab = cycle sidecar panels, exit to supervisor on last panel
+                    b'\t' => {
+                        if self.app.sidecar_focus
+                            == crate::ui::factory::director::SidecarFocus::Activity
+                        {
+                            // Last panel, exit to supervisor
+                            self.app.toggle_sidecar_focus();
+                            let sup_name = self.app.supervisor_name().to_string();
+                            let _ = self.app.mux.focus(&sup_name);
+                        } else {
+                            self.app.next_sidecar_panel();
+                        }
+                    }
+                    // j = scroll down
+                    b'j' | b'J' => {
+                        self.app.sidecar_scroll_down();
+                    }
+                    // k = scroll up
+                    b'k' | b'K' => {
+                        self.app.sidecar_scroll_up();
+                    }
+                    // Enter = open detail view
+                    b'\r' => {
+                        self.app.handle_enter();
+                    }
+                    // Space = toggle epic/directory collapse
+                    b' ' => {
+                        self.app.toggle_collapse();
+                    }
+                    // 'q' = quit
+                    b'q' | b'Q' => {
+                        self.shutdown.store(true, Ordering::Relaxed);
+                    }
+                    _ => {}
+                }
+                i += 1;
+                continue;
+            }
+
+            // If focused pane accepts input, forward most input
+            if self.app.focused_accepts_input() {
+                // Tab = enter sidecar focus (from supervisor)
+                if byte == 0x09 {
+                    self.app.toggle_sidecar_focus();
+                    i += 1;
+                    continue;
+                }
+
+                // Ctrl+P (0x10) = toggle sidecar focus (works even from supervisor)
+                if byte == 0x10 {
+                    self.app.toggle_sidecar_focus();
+                    i += 1;
+                    continue;
+                }
+
+                // Forward all other input to the focused pane
+                let _ = self.app.mux.send_input(&[byte]).await;
+                i += 1;
+                continue;
+            }
+
+            // When focused on a non-input pane, handle navigation keys
+            match byte {
+                // Tab = go to sidecar (workers are view-only, not in tab cycle)
+                b'\t' => {
+                    self.app.toggle_sidecar_focus();
+                }
+                // 'p' or 'd' = toggle sidecar panel focus
+                b'p' | b'P' | b'd' | b'D' => {
+                    self.app.toggle_sidecar_focus();
+                }
+                // 's' = focus supervisor
+                b's' | b'S' => {
+                    let sup_name = self.app.supervisor_name().to_string();
+                    let _ = self.app.mux.focus(&sup_name);
+                }
+                // '1'-'9' = focus worker by number
+                b'1'..=b'9' => {
+                    let idx = (byte - b'0') as usize;
+                    self.app.select_worker_by_number(idx);
+                }
+                // 'q' = quit
+                b'q' | b'Q' => {
+                    self.shutdown.store(true, Ordering::Relaxed);
+                }
+                _ => {}
+            }
+
+            i += 1;
+        }
+
+        Ok(())
+    }
+
+    fn resolve_drop_target(&self, col: u16, row: u16) -> Option<String> {
+        if col != u16::MAX && row != u16::MAX {
+            if let Some(pane_name) = self.app.pane_at_screen(col, row) {
+                if pane_name == self.app.supervisor_name()
+                    || self.app.worker_names().iter().any(|w| w == &pane_name)
+                {
+                    return Some(pane_name);
+                }
+            }
+        }
+
+        if self.app.focused_is_supervisor() {
+            return Some(self.app.supervisor_name().to_string());
+        }
+
+        self.app.mux.focused().and_then(|pane| match pane.kind() {
+            cas_mux::PaneKind::Worker | cas_mux::PaneKind::Supervisor => {
+                Some(pane.id().to_string())
+            }
+            _ => None,
+        })
+    }
+}
+
+fn bracketed_paste_bytes(payload: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(payload.len() + 12);
+    out.extend_from_slice(b"\x1b[200~");
+    out.extend_from_slice(payload.as_bytes());
+    out.extend_from_slice(b"\x1b[201~");
+    out
+}

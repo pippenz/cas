@@ -1,0 +1,123 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTC_WRAPPER: sccache
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux linker
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.5
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Install Zig
+        run: ./scripts/bootstrap-zig.sh
+
+      - name: Build
+        env:
+          ZIG: ${{ github.workspace }}/.context/zig/zig
+        run: cargo build -p cas --release --target ${{ matrix.target }}
+
+      - name: Package (Unix)
+        run: |
+          mkdir -p package
+          cp target/${{ matrix.target }}/release/cas package/
+          cp LICENSE package/
+          cd package
+          tar -czvf cas-${{ matrix.target }}.tar.gz cas LICENSE
+          mv cas-${{ matrix.target }}.tar.gz ../
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cas-${{ matrix.target }}
+          path: cas-${{ matrix.target }}.tar.gz
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release
+          find artifacts -name "*.tar.gz" -exec mv {} release/ \;
+          ls -la release/
+
+      - name: Generate release notes
+        id: notes
+        run: |
+          # Get the previous tag
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          if [ -n "$PREV_TAG" ]; then
+            NOTES=$(git log --pretty=format:"- %s" $PREV_TAG..HEAD)
+          else
+            NOTES=$(git log --pretty=format:"- %s" -10)
+          fi
+          echo "notes<<EOF" >> $GITHUB_OUTPUT
+          echo "$NOTES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Create Release on Public Repo
+        env:
+          GH_TOKEN: ${{ secrets.PUBLIC_REPO_TOKEN }}
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/}"
+
+          # Delete existing release if it exists (handles retags)
+          gh release delete "$VERSION" --repo ${{ github.repository }} --yes 2>/dev/null || true
+
+          # Create the release on the public repo
+          gh release create "$VERSION" \
+            --repo ${{ github.repository }} \
+            --title "CAS $VERSION" \
+            --notes "${{ steps.notes.outputs.notes }}" \
+            release/*

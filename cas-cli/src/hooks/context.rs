@@ -1,0 +1,868 @@
+//! Context building wrappers for CLI
+//!
+//! This module provides CLI-specific wrappers around the core context building
+//! functions from `cas-core::hooks::context`. These wrappers handle:
+//!
+//! - Opening stores from the filesystem
+//! - Loading configuration
+//! - DevTracer integration for tracing
+//! - Feedback nudging
+//! - AI-powered context selection (via claude CLI)
+//! - Hybrid search scoring for semantic context selection
+//!
+//! The core logic lives in `cas-core::hooks::context`.
+
+use std::process::Command;
+use std::sync::Arc;
+
+use cas_code::{CodeSymbol, SymbolKind};
+use cas_core::hooks::{
+    ContextScorer, ContextStores, HookInput, HooksConfig, RuleMatchCache, SurfacedItemCallback,
+    build_context_with_stores, build_plan_context_with_stores, estimate_tokens, rule_matches_path,
+    token_display, truncate,
+};
+use cas_store::{AgentStore, RuleStore, SkillStore, Store, TaskStore};
+use cas_types::{Entry, Rule, RuleStatus, Skill, Task, TaskStatus};
+
+use crate::hooks::get_session_files;
+use crate::hooks::scorer::HybridContextScorer;
+
+use std::path::Path;
+
+use crate::config::Config;
+use crate::error::MemError;
+use crate::store::{
+    open_agent_store, open_code_store, open_rule_store, open_skill_store, open_store,
+    open_task_store,
+};
+
+/// Build context string for session start injection
+///
+/// This is the main entry point for CLI usage. It:
+/// 1. Opens stores from project directory
+/// 2. Loads configuration
+/// 3. Calls the core context builder from cas-core
+/// 4. Records tracing information
+/// 5. Handles feedback nudging
+pub fn build_context(input: &HookInput, limit: usize, cas_root: &Path) -> Result<String, MemError> {
+    // Open stores
+    let project_store: Option<Arc<dyn Store>> = open_store(cas_root).ok();
+    let project_rule_store: Option<Arc<dyn RuleStore>> = open_rule_store(cas_root).ok();
+    let task_store: Option<Arc<dyn TaskStore>> = open_task_store(cas_root).ok();
+    let agent_store: Option<Arc<dyn AgentStore>> = open_agent_store(cas_root).ok();
+    let project_skill_store: Option<Arc<dyn SkillStore>> = open_skill_store(cas_root).ok();
+
+    let config = Config::load(cas_root).unwrap_or_default();
+
+    // Try to initialize hybrid context scorer for semantic relevance
+    // Falls back to basic scoring if search infrastructure isn't available
+    let hybrid_scorer = HybridContextScorer::open_with_graph(cas_root).ok();
+    let scorer_ref: Option<&dyn ContextScorer> =
+        hybrid_scorer.as_ref().map(|s| s as &dyn ContextScorer);
+
+    // Build rule match cache for performance (avoids repeated glob parsing)
+    let all_rules: Vec<Rule> = {
+        let mut rules = Vec::new();
+        if let Some(ref store) = project_rule_store {
+            if let Ok(r) = store.list() {
+                rules.extend(r);
+            }
+        }
+        rules
+    };
+    let rule_cache = RuleMatchCache::build(&all_rules, &input.cwd);
+
+    // Get recent session files for context query boosting
+    let recent_files = get_session_files(cas_root);
+
+    // Create ContextStores with references to Arc contents
+    let stores = ContextStores {
+        global_store: None, // Global store removed
+        project_store: project_store.as_ref().map(|s| s.as_ref()),
+        global_rule_store: None, // Global store removed
+        project_rule_store: project_rule_store.as_ref().map(|s| s.as_ref()),
+        task_store: task_store.as_ref().map(|s| s.as_ref()),
+        agent_store: agent_store.as_ref().map(|s| s.as_ref()),
+        global_skill_store: None, // Global store removed
+        project_skill_store: project_skill_store.as_ref().map(|s| s.as_ref()),
+        entry_scorer: scorer_ref,
+        rule_match_cache: Some(&rule_cache),
+        recent_files,
+    };
+
+    let start_time = std::time::Instant::now();
+
+    // Create surfaced item callback for feedback tracking
+    let surfaced_callback: Option<SurfacedItemCallback> =
+        if crate::tracing::DevTracer::get().is_some() {
+            Some(Box::new(
+                |id: &str, item_type: &str, preview: Option<&str>| {
+                    if let Some(tracer) = crate::tracing::DevTracer::get() {
+                        let _ = tracer.record_surfaced_item(id, item_type, preview);
+                    }
+                },
+            ))
+        } else {
+            None
+        };
+
+    // Build context using cas-core
+    let (context, stats) =
+        build_context_with_stores(input, &stores, &config, limit, surfaced_callback.as_ref())
+            .map_err(|e| MemError::Other(e.to_string()))?;
+
+    // Inject connected MCP proxy tools (from cached catalog)
+    let context = {
+        let mut ctx = context;
+        let tools_section = build_mcp_tools_section(cas_root);
+        if !tools_section.is_empty() {
+            ctx.push_str("\n\n");
+            ctx.push_str(&tools_section);
+        }
+        ctx
+    };
+
+    // Inject personal patterns and team suggestions from cloud (if logged in)
+    let context = {
+        let mut ctx = context;
+        if let Ok(patterns_section) = fetch_personal_patterns_for_context() {
+            if !patterns_section.is_empty() {
+                ctx.push_str("\n\n");
+                ctx.push_str(&patterns_section);
+            }
+        }
+        if let Ok(suggestions_section) = fetch_team_suggestions_for_context() {
+            if !suggestions_section.is_empty() {
+                ctx.push_str("\n\n");
+                ctx.push_str(&suggestions_section);
+            }
+        }
+        ctx
+    };
+
+    // Record trace if dev tracing is enabled
+    if let Some(tracer) = crate::tracing::DevTracer::get() {
+        let trace = crate::tracing::ContextInjectionTrace {
+            cwd: input.cwd.clone(),
+            tasks_included: stats.tasks_included,
+            rules_included: stats.rules_included,
+            skills_included: stats.skills_included,
+            memories_included: stats.memories_included,
+            pinned_included: stats.pinned_included,
+            total_tokens: stats.total_tokens,
+            token_budget: config.token_budget(),
+            items_omitted: stats.items_omitted,
+        };
+        let _ = tracer.record_context_injection(&trace, start_time.elapsed().as_millis() as u64);
+    }
+
+    Ok(context)
+}
+
+/// Build context with AI-powered prioritization
+///
+/// Uses Claude CLI to select the most relevant context items.
+pub fn build_context_ai(
+    input: &HookInput,
+    limit: usize,
+    cas_root: &Path,
+) -> Result<String, MemError> {
+    let store = open_store(cas_root)?;
+    let rule_store = open_rule_store(cas_root)?;
+    let task_store = open_task_store(cas_root).ok();
+    let skill_store = open_skill_store(cas_root).ok();
+    let config = Config::load(cas_root).unwrap_or_default();
+    let hooks_config = config.hooks.clone().unwrap_or_default();
+    let token_budget = hooks_config.token_budget;
+    let model = &hooks_config.ai_model;
+
+    // Collect all candidate items
+    let mut candidates: Vec<ContextCandidate> = Vec::new();
+
+    // Add tasks
+    if let Some(ref ts) = task_store {
+        if let Ok(tasks) = ts.list_ready() {
+            for task in tasks.iter().take(limit * 2) {
+                candidates.push(ContextCandidate::from_task(task));
+            }
+        }
+        if let Ok(in_progress) = ts.list(Some(TaskStatus::InProgress)) {
+            for task in in_progress.iter().take(5) {
+                candidates.push(ContextCandidate::from_task(task));
+            }
+        }
+    }
+
+    // Add proven rules
+    let rules = rule_store.list()?;
+    for rule in rules
+        .iter()
+        .filter(|r| r.status == RuleStatus::Proven)
+        .filter(|r| rule_matches_path(r, &input.cwd))
+        .take(limit * 2)
+    {
+        candidates.push(ContextCandidate::from_rule(rule));
+    }
+
+    // Add enabled skills
+    if let Some(ref ss) = skill_store {
+        if let Ok(skills) = ss.list_enabled() {
+            for skill in skills.iter().take(limit) {
+                candidates.push(ContextCandidate::from_skill(skill));
+            }
+        }
+    }
+
+    // Add relevant code symbols (if code is indexed)
+    if let Ok(code_store) = open_code_store(cas_root) {
+        // Find symbols from files in the working directory
+        let cwd_path = std::path::Path::new(&input.cwd);
+        if let Ok(files) = code_store.list_files("", None) {
+            for file in files.iter().take(limit * 2) {
+                // Check if file is in or under the working directory
+                let file_path = std::path::Path::new(&file.path);
+                if file_path.starts_with(cwd_path)
+                    || cwd_path.starts_with(file_path.parent().unwrap_or(file_path))
+                {
+                    if let Ok(symbols) = code_store.get_symbols_in_file(&file.id) {
+                        for symbol in symbols.iter().take(5) {
+                            candidates.push(ContextCandidate::from_code_symbol(symbol));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Add high-value memories
+    let helpful_entries = store.list_helpful(limit)?;
+    for entry in helpful_entries.iter() {
+        candidates.push(ContextCandidate::from_entry(entry));
+    }
+
+    // Add pinned memories (always included)
+    let pinned_entries = store.list_pinned().unwrap_or_default();
+    let pinned_ids: std::collections::HashSet<_> =
+        pinned_entries.iter().map(|e| e.id.clone()).collect();
+
+    if candidates.is_empty() && pinned_entries.is_empty() {
+        return Ok(String::new());
+    }
+
+    // Sort candidates by priority (highest first) before AI selection
+    candidates.sort_by(|a, b| b.priority.cmp(&a.priority));
+
+    // Build AI prompt
+    let prompt = build_ai_prioritization_prompt(&candidates, &input.cwd, token_budget);
+
+    // Call Claude for selection
+    let response = call_claude_for_selection(&prompt, model)?;
+    let selected_ids = parse_ai_selection(&response);
+
+    // Build context from selected items
+    let mut context_parts = Vec::new();
+    let mut total_tokens: usize = 0;
+
+    // Always include pinned first
+    if !pinned_entries.is_empty() {
+        context_parts.push("## 📌 Pinned (Critical Context)".to_string());
+        context_parts.push(String::new());
+        for entry in &pinned_entries {
+            context_parts.push(format!("### {} [{}]", entry.id, entry.entry_type));
+            context_parts.push(entry.content.clone());
+            context_parts.push(String::new());
+            total_tokens += estimate_tokens(&entry.content);
+        }
+    }
+
+    // Add AI-selected items
+    if !selected_ids.is_empty() {
+        context_parts.push("## 🤖 AI-Selected Context".to_string());
+        context_parts.push(String::new());
+
+        for candidate in candidates.iter().filter(|c| selected_ids.contains(&c.id)) {
+            if pinned_ids.contains(&candidate.id) {
+                continue; // Skip if already shown as pinned
+            }
+            context_parts.push(format!(
+                "- {} [{}] {}",
+                candidate.id, candidate.item_type, candidate.summary
+            ));
+            total_tokens += estimate_tokens(&candidate.summary) + 20;
+        }
+    }
+
+    // Add hints
+    if !context_parts.is_empty() {
+        context_parts.push(String::new());
+        let hints = if input.source.as_deref() == Some("codex") {
+            "Fetch details: `mcp__cs__memory` | Search: `mcp__cs__search`"
+        } else {
+            "Fetch details: `mcp__cas__memory` | Search: `mcp__cas__search`"
+        };
+        context_parts.push(format!(
+            "**Context: {} (AI-selected)** | {}",
+            token_display(total_tokens),
+            hints
+        ));
+    }
+
+    Ok(context_parts.join("\n"))
+}
+
+/// Build context optimized for plan mode
+pub fn build_plan_context(
+    input: &HookInput,
+    limit: usize,
+    cas_root: &Path,
+) -> Result<String, MemError> {
+    // Open stores
+    let project_store: Option<Arc<dyn Store>> = open_store(cas_root).ok();
+    let project_rule_store: Option<Arc<dyn RuleStore>> = open_rule_store(cas_root).ok();
+    let task_store: Option<Arc<dyn TaskStore>> = open_task_store(cas_root).ok();
+    let project_skill_store: Option<Arc<dyn SkillStore>> = open_skill_store(cas_root).ok();
+
+    let config = Config::load(cas_root).unwrap_or_default();
+
+    // Try to initialize hybrid context scorer for semantic relevance
+    let hybrid_scorer = HybridContextScorer::open_with_graph(cas_root).ok();
+    let scorer_ref: Option<&dyn ContextScorer> =
+        hybrid_scorer.as_ref().map(|s| s as &dyn ContextScorer);
+
+    // Build rule match cache for performance (avoids repeated glob parsing)
+    let all_rules: Vec<Rule> = {
+        let mut rules = Vec::new();
+        if let Some(ref store) = project_rule_store {
+            if let Ok(r) = store.list() {
+                rules.extend(r);
+            }
+        }
+        rules
+    };
+    let rule_cache = RuleMatchCache::build(&all_rules, &input.cwd);
+
+    // Get recent session files for context query boosting
+    let recent_files = get_session_files(cas_root);
+
+    let stores = ContextStores {
+        global_store: None, // Global store removed
+        project_store: project_store.as_ref().map(|s| s.as_ref()),
+        global_rule_store: None, // Global store removed
+        project_rule_store: project_rule_store.as_ref().map(|s| s.as_ref()),
+        task_store: task_store.as_ref().map(|s| s.as_ref()),
+        agent_store: None,
+        global_skill_store: None, // Global store removed
+        project_skill_store: project_skill_store.as_ref().map(|s| s.as_ref()),
+        entry_scorer: scorer_ref,
+        rule_match_cache: Some(&rule_cache),
+        recent_files,
+    };
+
+    let (context, _stats) = build_plan_context_with_stores(input, &stores, &config, limit)
+        .map_err(|e| MemError::Other(e.to_string()))?;
+
+    Ok(context)
+}
+
+/// Candidate item for AI prioritization
+#[derive(Debug, Clone)]
+pub struct ContextCandidate {
+    pub id: String,
+    pub item_type: String,
+    pub summary: String,
+    pub tokens: usize,
+    pub priority: i32,
+}
+
+impl ContextCandidate {
+    fn from_task(task: &Task) -> Self {
+        let content = format!("{}: {}", task.id, task.title);
+        let priority = match task.status {
+            TaskStatus::InProgress => 100,
+            TaskStatus::Open => 50,
+            _ => 10,
+        } + (5 - task.priority.0.clamp(0, 4)) * 10;
+
+        Self {
+            id: task.id.clone(),
+            item_type: "task".to_string(),
+            summary: task.preview(80),
+            tokens: estimate_tokens(&content),
+            priority,
+        }
+    }
+
+    fn from_rule(rule: &Rule) -> Self {
+        let priority = 50 + rule.helpful_count * 10;
+        Self {
+            id: rule.id.clone(),
+            item_type: "rule".to_string(),
+            summary: truncate(&rule.content, 80),
+            tokens: estimate_tokens(&rule.content),
+            priority,
+        }
+    }
+
+    fn from_skill(skill: &Skill) -> Self {
+        let priority = 30 + skill.usage_count * 5;
+        Self {
+            id: skill.id.clone(),
+            item_type: "skill".to_string(),
+            summary: truncate(&skill.description, 80),
+            tokens: estimate_tokens(&format!("{}\n{}", skill.description, skill.invocation)),
+            priority,
+        }
+    }
+
+    fn from_entry(entry: &Entry) -> Self {
+        let priority = 20 + entry.feedback_score() * 10;
+        Self {
+            id: entry.id.clone(),
+            item_type: "memory".to_string(),
+            summary: entry.preview(80),
+            tokens: estimate_tokens(&entry.content),
+            priority,
+        }
+    }
+
+    fn from_code_symbol(symbol: &CodeSymbol) -> Self {
+        // Higher priority for public API items (traits, structs, functions)
+        let kind_priority = match symbol.kind {
+            SymbolKind::Trait | SymbolKind::Interface => 40,
+            SymbolKind::Struct | SymbolKind::Class | SymbolKind::Enum => 35,
+            SymbolKind::Function => 30,
+            SymbolKind::Method => 25,
+            SymbolKind::Impl => 20,
+            _ => 15,
+        };
+
+        // Boost items with documentation
+        let doc_boost = if symbol.documentation.is_some() {
+            10
+        } else {
+            0
+        };
+
+        let summary = if let Some(ref sig) = symbol.signature {
+            truncate(sig, 80)
+        } else {
+            format!("{:?} {}", symbol.kind, symbol.name)
+        };
+
+        let content = format!(
+            "{} {} in {}:{}",
+            format!("{:?}", symbol.kind).to_lowercase(),
+            symbol.qualified_name,
+            symbol.file_path,
+            symbol.line_start
+        );
+
+        Self {
+            id: symbol.id.clone(),
+            item_type: "code".to_string(),
+            summary,
+            tokens: estimate_tokens(&content),
+            priority: kind_priority + doc_boost,
+        }
+    }
+}
+
+/// Build AI prompt for context prioritization
+fn build_ai_prioritization_prompt(
+    candidates: &[ContextCandidate],
+    cwd: &str,
+    token_budget: usize,
+) -> String {
+    let items_list: Vec<String> = candidates
+        .iter()
+        .map(|c| {
+            format!(
+                "- {} [{}] {} (~{}tk)",
+                c.id, c.item_type, c.summary, c.tokens
+            )
+        })
+        .collect();
+
+    format!(
+        r#"You are helping prioritize context items for an AI coding assistant session.
+
+Working directory: {cwd}
+Token budget: {token_budget}
+
+Available context items (ID, type, summary, token estimate):
+{items}
+
+Select the most relevant items to include in the session context, staying within the token budget.
+Consider:
+- In-progress tasks are highest priority (current work)
+- Rules that apply to the current directory
+- Memories/skills relevant to likely tasks
+- Higher feedback scores indicate more useful items
+
+Return a JSON object with selected item IDs:
+```json
+{{
+  "selected": ["id1", "id2", "id3"],
+  "reasoning": "Brief explanation of selection"
+}}
+```
+
+IMPORTANT: Only return the JSON object, no other text."#,
+        cwd = cwd,
+        token_budget = token_budget,
+        items = items_list.join("\n")
+    )
+}
+
+/// Parse AI response to extract selected item IDs
+fn parse_ai_selection(response: &str) -> Vec<String> {
+    // Try to extract JSON from the response
+    let json_start = response.find('{');
+    let json_end = response.rfind('}');
+
+    if let (Some(start), Some(end)) = (json_start, json_end) {
+        if start < end {
+            let json_str = &response[start..=end];
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) {
+                if let Some(selected) = parsed.get("selected").and_then(|s| s.as_array()) {
+                    return selected
+                        .iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect();
+                }
+            }
+        }
+    }
+
+    // Fallback: extract IDs that look like cas-XXXX or rule-XXX patterns
+    let mut ids = Vec::new();
+    for word in response.split_whitespace() {
+        let word = word.trim_matches(|c: char| !c.is_alphanumeric() && c != '-');
+        if word.starts_with("cas-") || word.starts_with("rule-") {
+            ids.push(word.to_string());
+        }
+    }
+    ids
+}
+
+/// Call Claude to select context items
+fn call_claude_for_selection(prompt: &str, model: &str) -> Result<String, MemError> {
+    let output = Command::new("claude")
+        .args([
+            "-p",
+            prompt,
+            "--model",
+            model,
+            "--no-input",
+            "--output-format",
+            "text",
+        ])
+        .output()
+        .map_err(|e| MemError::Other(format!("Failed to run claude CLI: {e}")))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(MemError::Other(format!("Claude CLI error: {stderr}")));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// Fetch personal patterns from CAS Cloud and format as context section.
+///
+/// Returns empty string if not logged in, no patterns, or on any error.
+/// Failures are silent — personal patterns are optional enhancement.
+fn fetch_personal_patterns_for_context() -> Result<String, MemError> {
+    use crate::cloud::CloudConfig;
+
+    let cloud_config = CloudConfig::load().map_err(|e| MemError::Other(e.to_string()))?;
+
+    if !cloud_config.is_logged_in() {
+        return Ok(String::new());
+    }
+
+    let token = match &cloud_config.token {
+        Some(t) => t.clone(),
+        None => return Ok(String::new()),
+    };
+
+    let url = format!("{}/api/patterns", cloud_config.endpoint);
+    let response = ureq::get(&url)
+        .timeout(std::time::Duration::from_secs(5))
+        .set("Authorization", &format!("Bearer {token}"))
+        .call();
+
+    let body: serde_json::Value = match response {
+        Ok(resp) => match resp.into_json() {
+            Ok(v) => v,
+            Err(_) => return Ok(String::new()),
+        },
+        Err(_) => return Ok(String::new()),
+    };
+
+    let patterns = match body.get("patterns").and_then(|v| v.as_array()) {
+        Some(arr) if !arr.is_empty() => arr,
+        _ => return Ok(String::new()),
+    };
+
+    let mut section = String::from("## Personal Patterns (Cross-Project)\n\n");
+    section.push_str(
+        "These are your personal conventions that apply across all projects.\n\
+         They should be treated as high-priority proven rules.\n\n",
+    );
+
+    for pattern in patterns.iter().take(20) {
+        let content = pattern
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let category = pattern
+            .get("category")
+            .and_then(|v| v.as_str())
+            .unwrap_or("general");
+        let priority = pattern
+            .get("priority")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(2);
+
+        let priority_label = match priority {
+            0 => "Critical",
+            1 => "High",
+            2 => "Medium",
+            _ => "Low",
+        };
+
+        // Truncate long content for context injection
+        let display_content = if content.len() > 200 {
+            format!("{}...", &content[..197])
+        } else {
+            content.to_string()
+        };
+
+        section.push_str(&format!(
+            "- [{category}] [P{priority} {priority_label}] {display_content}\n"
+        ));
+    }
+
+    if patterns.len() > 20 {
+        section.push_str(&format!(
+            "\n... and {} more patterns (use `mcp__cas__pattern action=list` to see all)\n",
+            patterns.len() - 20
+        ));
+    }
+
+    Ok(section)
+}
+
+/// Fetch new team suggestions from CAS Cloud and format as context section.
+///
+/// Only shows pending (not yet adopted/dismissed) suggestions.
+/// Returns empty string if not in a team, no suggestions, or on any error.
+/// Failures are silent — team suggestions are optional enhancement.
+fn fetch_team_suggestions_for_context() -> Result<String, MemError> {
+    use crate::cloud::CloudConfig;
+
+    let cloud_config = CloudConfig::load().map_err(|e| MemError::Other(e.to_string()))?;
+
+    if !cloud_config.is_logged_in() {
+        return Ok(String::new());
+    }
+
+    let team_id = match &cloud_config.team_id {
+        Some(id) => id.clone(),
+        None => return Ok(String::new()),
+    };
+
+    let token = match &cloud_config.token {
+        Some(t) => t.clone(),
+        None => return Ok(String::new()),
+    };
+
+    let url = format!(
+        "{}/api/teams/{}/suggestions/new",
+        cloud_config.endpoint, team_id
+    );
+    let response = ureq::get(&url)
+        .timeout(std::time::Duration::from_secs(5))
+        .set("Authorization", &format!("Bearer {token}"))
+        .call();
+
+    let body: serde_json::Value = match response {
+        Ok(resp) => match resp.into_json() {
+            Ok(v) => v,
+            Err(_) => return Ok(String::new()),
+        },
+        Err(_) => return Ok(String::new()),
+    };
+
+    let suggestions = match body.get("suggestions").and_then(|v| v.as_array()) {
+        Some(arr) if !arr.is_empty() => arr,
+        _ => return Ok(String::new()),
+    };
+
+    let team_name = cloud_config.team_slug.as_deref().unwrap_or("your team");
+
+    let mut section = format!(
+        "## Team Suggestions ({team_name})\n\n\
+         Your team has shared pattern suggestions for you to review.\n\
+         Use `mcp__cas__pattern action=team_adopt team_id={team_id} suggestion_id=<id>` to adopt, \
+         or `action=team_dismiss` to hide.\n\n"
+    );
+
+    for s in suggestions.iter().take(10) {
+        let content = s.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        let category = s
+            .get("category")
+            .and_then(|v| v.as_str())
+            .unwrap_or("general");
+        let priority = s.get("priority").and_then(|v| v.as_u64()).unwrap_or(2);
+        let recommended = s
+            .get("recommended")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let id = s.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+
+        let priority_label = match priority {
+            0 => "Critical",
+            1 => "High",
+            2 => "Medium",
+            _ => "Low",
+        };
+
+        let rec = if recommended { " *RECOMMENDED*" } else { "" };
+
+        let display_content = if content.len() > 200 {
+            format!("{}...", &content[..197])
+        } else {
+            content.to_string()
+        };
+
+        section.push_str(&format!(
+            "- [{category}] [P{priority} {priority_label}]{rec} {id} — {display_content}\n"
+        ));
+    }
+
+    if suggestions.len() > 10 {
+        section.push_str(&format!(
+            "\n... and {} more suggestions (use `mcp__cas__pattern action=team_suggestions team_id={}` to see all)\n",
+            suggestions.len() - 10,
+            team_id
+        ));
+    }
+
+    Ok(section)
+}
+
+/// Build the MCP proxy tools section from the cached catalog file.
+///
+/// Reads `.cas/proxy_catalog.json` (written by the MCP server on startup/reload)
+/// and formats a concise section listing connected servers and their tools.
+/// Returns empty string if no cache file exists or it's empty.
+fn build_mcp_tools_section(cas_root: &Path) -> String {
+    let cache_path = cas_root.join("proxy_catalog.json");
+    let data = match std::fs::read_to_string(&cache_path) {
+        Ok(d) => d,
+        Err(_) => return String::new(),
+    };
+
+    let servers: std::collections::BTreeMap<String, Vec<String>> = match serde_json::from_str(&data)
+    {
+        Ok(s) => s,
+        Err(_) => return String::new(),
+    };
+
+    if servers.is_empty() {
+        return String::new();
+    }
+
+    let total_tools: usize = servers.values().map(|v| v.len()).sum();
+    let mut parts = Vec::new();
+    parts.push(format!(
+        "## Connected MCP Tools ({} servers, {} tools)",
+        servers.len(),
+        total_tools
+    ));
+    parts.push(String::new());
+    parts.push(
+        "Use `mcp__cas__mcp_search` to discover tools, `mcp__cas__mcp_execute` to call them."
+            .to_string(),
+    );
+    parts.push(String::new());
+
+    for (server, tools) in &servers {
+        parts.push(format!("- **{}**: {}", server, tools.join(", ")));
+    }
+
+    parts.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::hooks::context::*;
+
+    #[test]
+    fn test_parse_ai_selection_json() {
+        let response = r#"{"selected": ["cas-1234", "rule-001", "cas-5678"], "reasoning": "Selected based on relevance"}"#;
+        let ids = parse_ai_selection(response);
+        assert_eq!(ids, vec!["cas-1234", "rule-001", "cas-5678"]);
+    }
+
+    #[test]
+    fn test_parse_ai_selection_with_text() {
+        let response =
+            "Here are the selected items:\n{\"selected\": [\"cas-abcd\"]}\nHope this helps!";
+        let ids = parse_ai_selection(response);
+        assert_eq!(ids, vec!["cas-abcd"]);
+    }
+
+    #[test]
+    fn test_parse_ai_selection_fallback() {
+        let response = "I recommend cas-1234 and rule-005 for this session.";
+        let ids = parse_ai_selection(response);
+        assert!(ids.contains(&"cas-1234".to_string()));
+        assert!(ids.contains(&"rule-005".to_string()));
+    }
+
+    #[test]
+    fn test_context_candidate_priority() {
+        let mut task = Task {
+            status: TaskStatus::InProgress,
+            id: "test".to_string(),
+            ..Default::default()
+        };
+        let candidate = ContextCandidate::from_task(&task);
+        assert!(candidate.priority > 100); // In progress gets 100 + priority bonus
+
+        task.status = TaskStatus::Open;
+        let candidate2 = ContextCandidate::from_task(&task);
+        assert!(candidate.priority > candidate2.priority);
+    }
+
+    #[test]
+    fn test_build_mcp_tools_section_with_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_path = dir.path().join("proxy_catalog.json");
+
+        // No cache file → empty string
+        assert!(build_mcp_tools_section(dir.path()).is_empty());
+
+        // Empty servers → empty string
+        std::fs::write(&cache_path, "{}").unwrap();
+        assert!(build_mcp_tools_section(dir.path()).is_empty());
+
+        // Valid catalog
+        let catalog = serde_json::json!({
+            "chrome-devtools": ["navigate_page", "take_screenshot", "click", "type_text"],
+            "github": ["list_issues", "create_pr"]
+        });
+        std::fs::write(&cache_path, catalog.to_string()).unwrap();
+        let section = build_mcp_tools_section(dir.path());
+        assert!(section.contains("Connected MCP Tools"));
+        assert!(section.contains("2 servers"));
+        assert!(section.contains("6 tools"));
+        assert!(section.contains("chrome-devtools"));
+        assert!(section.contains("navigate_page"));
+        assert!(section.contains("github"));
+        assert!(section.contains("mcp__cas__mcp_search"));
+    }
+}

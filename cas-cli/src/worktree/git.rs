@@ -1,0 +1,753 @@
+//! Low-level git operations for worktree management
+//!
+//! This module provides a safe wrapper around git commands for worktree operations.
+//! It's independent of CAS storage - purely git operations.
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use thiserror::Error;
+
+use crate::types::GitContext;
+
+mod branch_ops;
+
+/// Errors that can occur during git operations
+#[derive(Debug, Error)]
+pub enum GitError {
+    #[error("Git is not available: {0}")]
+    GitNotAvailable(String),
+
+    #[error("Not in a git repository")]
+    NotAGitRepo,
+
+    #[error("Failed to execute git command: {0}")]
+    CommandFailed(String),
+
+    #[error("Worktree already exists at {0}")]
+    WorktreeExists(PathBuf),
+
+    #[error("Worktree not found at {0}")]
+    WorktreeNotFound(PathBuf),
+
+    #[error("Branch already exists: {0}")]
+    BranchExists(String),
+
+    #[error("Branch not found: {0}")]
+    BranchNotFound(String),
+
+    #[error("Merge conflict detected")]
+    MergeConflict,
+
+    #[error("Uncommitted changes in worktree")]
+    UncommittedChanges,
+
+    #[error("Already inside a worktree at {0}")]
+    AlreadyInWorktree(PathBuf),
+
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+/// Result type for git operations
+pub type Result<T> = std::result::Result<T, GitError>;
+
+/// Status of a worktree's uncommitted/unmerged state
+#[derive(Debug, Clone)]
+pub struct WorktreeDirtyStatus {
+    /// Number of modified/staged files
+    pub modified_count: usize,
+    /// Number of untracked files
+    pub untracked_count: usize,
+    /// Number of commits not merged to target branch
+    pub unmerged_count: usize,
+    /// Target branch for unmerged check (e.g., epic branch)
+    pub target_branch: Option<String>,
+}
+
+impl WorktreeDirtyStatus {
+    /// Check if the worktree is clean
+    pub fn is_clean(&self) -> bool {
+        self.modified_count == 0 && self.untracked_count == 0 && self.unmerged_count == 0
+    }
+
+    /// Format as human-readable message
+    pub fn to_message(&self) -> String {
+        let mut parts = Vec::new();
+
+        if self.modified_count > 0 {
+            parts.push(format!("{} modified file(s)", self.modified_count));
+        }
+        if self.untracked_count > 0 {
+            parts.push(format!("{} untracked file(s)", self.untracked_count));
+        }
+        if self.unmerged_count > 0 {
+            if let Some(ref branch) = self.target_branch {
+                parts.push(format!(
+                    "{} commit(s) not merged to {}",
+                    self.unmerged_count, branch
+                ));
+            } else {
+                parts.push(format!("{} unmerged commit(s)", self.unmerged_count));
+            }
+        }
+
+        if parts.is_empty() {
+            "clean".to_string()
+        } else {
+            parts.join(", ")
+        }
+    }
+}
+
+/// Git operations wrapper
+pub struct GitOperations {
+    /// Path to the main repository root
+    repo_root: PathBuf,
+}
+
+impl GitOperations {
+    /// Create a new GitOperations instance for a repository
+    pub fn new(repo_root: PathBuf) -> Self {
+        Self { repo_root }
+    }
+
+    /// Detect the repository root from a path
+    pub fn detect_repo_root(from: &Path) -> Result<PathBuf> {
+        let output = Command::new("git")
+            .args(["rev-parse", "--show-toplevel"])
+            .current_dir(from)
+            .output()?;
+
+        if !output.status.success() {
+            return Err(GitError::NotAGitRepo);
+        }
+
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        Ok(PathBuf::from(path))
+    }
+
+    /// Check if git is available
+    pub fn is_git_available() -> bool {
+        Command::new("git")
+            .args(["--version"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// Get the current git context (branch, worktree info)
+    pub fn get_context(from: &Path) -> Result<GitContext> {
+        let mut context = GitContext::default();
+
+        // Get current branch
+        let branch_output = Command::new("git")
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .current_dir(from)
+            .output()?;
+
+        if branch_output.status.success() {
+            context.branch = Some(
+                String::from_utf8_lossy(&branch_output.stdout)
+                    .trim()
+                    .to_string(),
+            );
+        }
+
+        // Check if we're in a worktree
+        let wt_output = Command::new("git")
+            .args(["rev-parse", "--git-common-dir"])
+            .current_dir(from)
+            .output()?;
+
+        if wt_output.status.success() {
+            let common_dir = String::from_utf8_lossy(&wt_output.stdout)
+                .trim()
+                .to_string();
+
+            let git_dir_output = Command::new("git")
+                .args(["rev-parse", "--git-dir"])
+                .current_dir(from)
+                .output()?;
+
+            if git_dir_output.status.success() {
+                let git_dir = String::from_utf8_lossy(&git_dir_output.stdout)
+                    .trim()
+                    .to_string();
+
+                // If git-dir and git-common-dir differ, we're in a worktree
+                if git_dir != common_dir && git_dir != ".git" {
+                    context.is_worktree = true;
+
+                    // Get worktree path
+                    let toplevel = Command::new("git")
+                        .args(["rev-parse", "--show-toplevel"])
+                        .current_dir(from)
+                        .output()?;
+
+                    if toplevel.status.success() {
+                        context.worktree_path = Some(PathBuf::from(
+                            String::from_utf8_lossy(&toplevel.stdout).trim(),
+                        ));
+                    }
+                }
+
+                context.git_dir = Some(PathBuf::from(common_dir));
+            }
+        }
+
+        Ok(context)
+    }
+
+    /// Get the current branch name
+    pub fn current_branch(&self) -> Result<String> {
+        let output = Command::new("git")
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .current_dir(&self.repo_root)
+            .output()?;
+
+        if !output.status.success() {
+            return Err(GitError::CommandFailed(
+                String::from_utf8_lossy(&output.stderr).to_string(),
+            ));
+        }
+
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    /// Check if the repository has any commits
+    pub fn has_commits(&self) -> Result<bool> {
+        let output = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&self.repo_root)
+            .output()?;
+
+        Ok(output.status.success())
+    }
+
+    /// Detect the default branch of the repository.
+    ///
+    /// Uses git's own mechanisms in priority order:
+    /// 1. Remote origin HEAD (authoritative if remote exists)
+    /// 2. HEAD symref target (what git init / clone set up)
+    /// 3. `init.defaultBranch` config
+    /// 4. Check common branch names that actually exist as refs
+    /// 5. "main" as absolute last resort
+    pub fn detect_default_branch(&self) -> String {
+        // 1. Remote origin HEAD - most authoritative when a remote exists
+        if let Ok(output) = Command::new("git")
+            .args(["symbolic-ref", "refs/remotes/origin/HEAD"])
+            .current_dir(&self.repo_root)
+            .output()
+        {
+            if output.status.success() {
+                let refname = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if let Some(branch) = refname.strip_prefix("refs/remotes/origin/") {
+                    if !branch.is_empty() {
+                        return branch.to_string();
+                    }
+                }
+            }
+        }
+
+        // 2. HEAD symref - what the repo was initialized with (works even with no commits)
+        if let Ok(output) = Command::new("git")
+            .args(["symbolic-ref", "HEAD"])
+            .current_dir(&self.repo_root)
+            .output()
+        {
+            if output.status.success() {
+                let refname = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if let Some(branch) = refname.strip_prefix("refs/heads/") {
+                    if !branch.is_empty() {
+                        return branch.to_string();
+                    }
+                }
+            }
+        }
+
+        // 3. git config init.defaultBranch
+        if let Ok(output) = Command::new("git")
+            .args(["config", "init.defaultBranch"])
+            .current_dir(&self.repo_root)
+            .output()
+        {
+            if output.status.success() {
+                let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !branch.is_empty() {
+                    return branch;
+                }
+            }
+        }
+
+        // 4. Check common branch names that actually exist as refs
+        for candidate in &["main", "master", "develop", "trunk"] {
+            if self.branch_exists(candidate).unwrap_or(false) {
+                return candidate.to_string();
+            }
+        }
+
+        // 5. Last resort
+        "main".to_string()
+    }
+
+    /// Check if a branch exists
+    pub fn branch_exists(&self, branch: &str) -> Result<bool> {
+        let output = Command::new("git")
+            .args(["rev-parse", "--verify", branch])
+            .current_dir(&self.repo_root)
+            .output()?;
+
+        Ok(output.status.success())
+    }
+
+    /// Create a worktree with a new branch
+    pub fn create_worktree(
+        &self,
+        path: &Path,
+        branch: &str,
+        base_branch: Option<&str>,
+    ) -> Result<()> {
+        // Check if path already exists
+        if path.exists() {
+            return Err(GitError::WorktreeExists(path.to_path_buf()));
+        }
+
+        // Check if branch already exists
+        if self.branch_exists(branch)? {
+            return Err(GitError::BranchExists(branch.to_string()));
+        }
+
+        // Validate base branch is a valid ref (catches empty repos with no commits)
+        if let Some(base) = base_branch {
+            if !self.branch_exists(base)? {
+                return Err(GitError::CommandFailed(format!(
+                    "Base branch '{base}' is not a valid reference. Does the repository have any commits? \
+                     Try making an initial commit first."
+                )));
+            }
+        }
+
+        // Build command
+        let mut args = vec!["worktree", "add"];
+
+        if let Some(base) = base_branch {
+            args.extend(["-b", branch, path.to_str().unwrap(), base]);
+        } else {
+            args.extend(["-b", branch, path.to_str().unwrap()]);
+        }
+
+        let output = Command::new("git")
+            .args(&args)
+            .current_dir(&self.repo_root)
+            .output()?;
+
+        if !output.status.success() {
+            return Err(GitError::CommandFailed(
+                String::from_utf8_lossy(&output.stderr).to_string(),
+            ));
+        }
+
+        // Initialize submodules in the new worktree
+        // This is necessary because git worktree add doesn't copy submodule contents
+        self.init_submodules(path)?;
+
+        Ok(())
+    }
+
+    /// Initialize git submodules in a directory
+    ///
+    /// This is necessary for worktrees because `git worktree add` doesn't
+    /// automatically populate submodule contents. Without this, builds that
+    /// depend on vendored submodules (like ghostty_vt_sys) will fail.
+    ///
+    /// Note: This function does not fail if submodule init fails, because the
+    /// worktree is still usable for many tasks that don't require submodules.
+    /// A clear error message will be shown if a build later requires the submodule.
+    pub fn init_submodules(&self, path: &Path) -> Result<()> {
+        // Check if there are any submodules configured
+        let gitmodules = self.repo_root.join(".gitmodules");
+        if !gitmodules.exists() {
+            return Ok(()); // No submodules to initialize
+        }
+
+        tracing::info!("Initializing submodules in worktree: {}", path.display());
+
+        let output = Command::new("git")
+            .args(["submodule", "update", "--init", "--recursive"])
+            .current_dir(path)
+            .output()?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // Log warning but don't fail - submodule init may fail for various reasons
+            // (network issues, etc.) but the worktree is still usable for many tasks.
+            // If a build later requires the submodule, ghostty_vt_sys/build.rs will
+            // provide a clear error message with instructions.
+            tracing::warn!(
+                "Failed to initialize submodules in {}: {}",
+                path.display(),
+                stderr
+            );
+            eprintln!(
+                "[CAS] Warning: Failed to initialize git submodules in worktree.\n\
+                 [CAS] If you need to build components that depend on vendor/ghostty,\n\
+                 [CAS] run: git submodule update --init --recursive\n\
+                 [CAS] Error: {}",
+                stderr.trim()
+            );
+        } else {
+            tracing::info!("Submodules initialized successfully");
+        }
+
+        Ok(())
+    }
+
+    /// Get submodule paths from .gitmodules
+    ///
+    /// Parses the .gitmodules file to extract the paths of all configured submodules.
+    pub fn get_submodule_paths(&self) -> Result<Vec<PathBuf>> {
+        let gitmodules = self.repo_root.join(".gitmodules");
+        if !gitmodules.exists() {
+            return Ok(Vec::new());
+        }
+
+        let content = std::fs::read_to_string(&gitmodules)?;
+        let mut paths = Vec::new();
+
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("path = ") || trimmed.starts_with("path=") {
+                let path = trimmed
+                    .trim_start_matches("path = ")
+                    .trim_start_matches("path=")
+                    .trim();
+                paths.push(PathBuf::from(path));
+            }
+        }
+
+        Ok(paths)
+    }
+
+    /// Fix symlinked submodules before merge operations
+    ///
+    /// Git merge fails when submodule paths are symbolic links with:
+    /// "error: expected submodule path 'vendor/...' not to be a symbolic link"
+    ///
+    /// This function detects symlinked submodules in the given directory and replaces
+    /// them with properly initialized submodules.
+    pub fn fix_symlinked_submodules(&self, path: &Path) -> Result<()> {
+        let submodule_paths = self.get_submodule_paths()?;
+        if submodule_paths.is_empty() {
+            return Ok(());
+        }
+
+        let mut fixed_any = false;
+        for submodule in &submodule_paths {
+            let full_path = path.join(submodule);
+            if full_path.is_symlink() {
+                tracing::info!(
+                    "Removing symlinked submodule at {} for merge compatibility",
+                    full_path.display()
+                );
+
+                // Remove the symlink
+                if let Err(e) = std::fs::remove_file(&full_path) {
+                    tracing::warn!("Failed to remove symlink {}: {}", full_path.display(), e);
+                    continue;
+                }
+
+                fixed_any = true;
+            }
+        }
+
+        // Re-initialize submodules if we removed any symlinks
+        if fixed_any {
+            tracing::info!("Re-initializing submodules after removing symlinks");
+            self.init_submodules(path)?;
+        }
+
+        Ok(())
+    }
+
+    /// List all worktrees
+    pub fn list_worktrees(&self) -> Result<Vec<WorktreeInfo>> {
+        let output = Command::new("git")
+            .args(["worktree", "list", "--porcelain"])
+            .current_dir(&self.repo_root)
+            .output()?;
+
+        if !output.status.success() {
+            return Err(GitError::CommandFailed(
+                String::from_utf8_lossy(&output.stderr).to_string(),
+            ));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut worktrees = Vec::new();
+        let mut current: Option<WorktreeInfo> = None;
+
+        for line in stdout.lines() {
+            if line.starts_with("worktree ") {
+                if let Some(wt) = current.take() {
+                    worktrees.push(wt);
+                }
+                current = Some(WorktreeInfo {
+                    path: PathBuf::from(line.strip_prefix("worktree ").unwrap()),
+                    branch: None,
+                    commit: None,
+                    is_bare: false,
+                    is_detached: false,
+                });
+            } else if let Some(ref mut wt) = current {
+                if line.starts_with("HEAD ") {
+                    wt.commit = Some(line.strip_prefix("HEAD ").unwrap().to_string());
+                } else if line.starts_with("branch ") {
+                    let branch = line.strip_prefix("branch ").unwrap();
+                    // Remove refs/heads/ prefix if present
+                    wt.branch = Some(
+                        branch
+                            .strip_prefix("refs/heads/")
+                            .unwrap_or(branch)
+                            .to_string(),
+                    );
+                } else if line == "bare" {
+                    wt.is_bare = true;
+                } else if line == "detached" {
+                    wt.is_detached = true;
+                }
+            }
+        }
+
+        if let Some(wt) = current {
+            worktrees.push(wt);
+        }
+
+        Ok(worktrees)
+    }
+
+    /// Remove a worktree
+    pub fn remove_worktree(&self, path: &Path, force: bool) -> Result<()> {
+        if !path.exists() {
+            return Err(GitError::WorktreeNotFound(path.to_path_buf()));
+        }
+
+        let mut args = vec!["worktree", "remove"];
+        if force {
+            args.push("--force");
+        }
+        args.push(path.to_str().unwrap());
+
+        let output = Command::new("git")
+            .args(&args)
+            .current_dir(&self.repo_root)
+            .output()?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.contains("uncommitted changes") || stderr.contains("untracked files") {
+                return Err(GitError::UncommittedChanges);
+            }
+            return Err(GitError::CommandFailed(stderr.to_string()));
+        }
+
+        Ok(())
+    }
+
+    /// Delete a branch
+    pub fn delete_branch(&self, branch: &str, force: bool) -> Result<()> {
+        let flag = if force { "-D" } else { "-d" };
+
+        let output = Command::new("git")
+            .args(["branch", flag, branch])
+            .current_dir(&self.repo_root)
+            .output()?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.contains("not found") {
+                return Err(GitError::BranchNotFound(branch.to_string()));
+            }
+            return Err(GitError::CommandFailed(stderr.to_string()));
+        }
+
+        Ok(())
+    }
+
+    /// Merge a branch into the current branch
+    pub fn merge_branch(&self, branch: &str, no_ff: bool) -> Result<Option<String>> {
+        // Fix symlinked submodules before merge to avoid:
+        // "error: expected submodule path 'vendor/...' not to be a symbolic link"
+        self.fix_symlinked_submodules(&self.repo_root)?;
+
+        let mut args = vec!["merge"];
+        if no_ff {
+            args.push("--no-ff");
+        }
+        args.push(branch);
+
+        let output = Command::new("git")
+            .args(&args)
+            .current_dir(&self.repo_root)
+            .output()?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.contains("CONFLICT") || stderr.contains("Automatic merge failed") {
+                return Err(GitError::MergeConflict);
+            }
+            return Err(GitError::CommandFailed(stderr.to_string()));
+        }
+
+        // Get the merge commit hash
+        let commit_output = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&self.repo_root)
+            .output()?;
+
+        if commit_output.status.success() {
+            Ok(Some(
+                String::from_utf8_lossy(&commit_output.stdout)
+                    .trim()
+                    .to_string(),
+            ))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Check if the worktree has uncommitted changes
+    pub fn has_uncommitted_changes(&self, path: &Path) -> Result<bool> {
+        let output = Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(path)
+            .output()?;
+
+        if !output.status.success() {
+            return Err(GitError::CommandFailed(
+                String::from_utf8_lossy(&output.stderr).to_string(),
+            ));
+        }
+
+        Ok(!output.stdout.is_empty())
+    }
+
+    /// Count commits in worktree HEAD that are not in target branch
+    ///
+    /// Returns the number of commits that exist on the worktree's current branch
+    /// but not on the target branch (e.g., epic branch).
+    pub fn unmerged_commit_count(
+        &self,
+        worktree_path: &Path,
+        target_branch: &str,
+    ) -> Result<usize> {
+        let output = Command::new("git")
+            .args(["rev-list", "--count", &format!("{target_branch}..HEAD")])
+            .current_dir(worktree_path)
+            .output()?;
+
+        if !output.status.success() {
+            // If branch doesn't exist or other error, return 0
+            return Ok(0);
+        }
+
+        let count_str = String::from_utf8_lossy(&output.stdout);
+        Ok(count_str.trim().parse().unwrap_or(0))
+    }
+
+    /// Get detailed dirty status of a worktree
+    ///
+    /// Returns a summary of uncommitted changes, untracked files, and unmerged commits.
+    pub fn get_worktree_dirty_status(
+        &self,
+        worktree_path: &Path,
+        target_branch: Option<&str>,
+    ) -> Result<WorktreeDirtyStatus> {
+        let output = Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(worktree_path)
+            .output()?;
+
+        if !output.status.success() {
+            return Err(GitError::CommandFailed(
+                String::from_utf8_lossy(&output.stderr).to_string(),
+            ));
+        }
+
+        let status_output = String::from_utf8_lossy(&output.stdout);
+        let mut modified_count = 0;
+        let mut untracked_count = 0;
+
+        for line in status_output.lines() {
+            if line.starts_with("??") {
+                untracked_count += 1;
+            } else if !line.is_empty() {
+                modified_count += 1;
+            }
+        }
+
+        let unmerged_count = if let Some(branch) = target_branch {
+            self.unmerged_commit_count(worktree_path, branch)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
+        Ok(WorktreeDirtyStatus {
+            modified_count,
+            untracked_count,
+            unmerged_count,
+            target_branch: target_branch.map(|s| s.to_string()),
+        })
+    }
+
+    /// Checkout a branch in the main repo
+    pub fn checkout(&self, branch: &str) -> Result<()> {
+        let output = Command::new("git")
+            .args(["checkout", branch])
+            .current_dir(&self.repo_root)
+            .output()?;
+
+        if !output.status.success() {
+            return Err(GitError::CommandFailed(
+                String::from_utf8_lossy(&output.stderr).to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Prune stale worktree references
+    pub fn prune_worktrees(&self) -> Result<()> {
+        let output = Command::new("git")
+            .args(["worktree", "prune"])
+            .current_dir(&self.repo_root)
+            .output()?;
+
+        if !output.status.success() {
+            return Err(GitError::CommandFailed(
+                String::from_utf8_lossy(&output.stderr).to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+/// Information about a git worktree
+#[derive(Debug, Clone)]
+pub struct WorktreeInfo {
+    /// Path to the worktree
+    pub path: PathBuf,
+    /// Branch checked out in the worktree (None if detached)
+    pub branch: Option<String>,
+    /// Current commit hash
+    pub commit: Option<String>,
+    /// Whether this is a bare worktree
+    pub is_bare: bool,
+    /// Whether HEAD is detached
+    pub is_detached: bool,
+}
+
+#[cfg(test)]
+#[path = "git_tests/tests.rs"]
+mod tests;
