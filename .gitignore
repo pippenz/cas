@@ -32,3 +32,4 @@ node_modules/
 
 # Process sockets
 .overmind.sock
+# Worktree-specific files (generated per worktree)

@@ -57,7 +57,7 @@
             "type": "command"
           }
         ],
-        "matcher": "Read|Glob|Grep|Write|Edit|Bash|WebFetch|WebSearch|Task"
+        "matcher": "Read|Glob|Grep|Write|Edit|Bash|WebFetch|WebSearch|Task|SendMessage"
       }
     ],
     "SessionEnd": [
