@@ -106,18 +106,51 @@ jobs:
           echo "$NOTES" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
-      - name: Create Release on Public Repo
+      - name: Create Release
         env:
-          GH_TOKEN: ${{ secrets.PUBLIC_REPO_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           VERSION="${GITHUB_REF#refs/tags/}"
 
           # Delete existing release if it exists (handles retags)
           gh release delete "$VERSION" --repo ${{ github.repository }} --yes 2>/dev/null || true
 
-          # Create the release on the public repo
+          # Create the release
           gh release create "$VERSION" \
             --repo ${{ github.repository }} \
             --title "CAS $VERSION" \
             --notes "${{ steps.notes.outputs.notes }}" \
             release/*
+
+  update-homebrew:
+    name: Update Homebrew Formula
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Update Homebrew formula
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+
+          # Download and compute SHA256 for each platform
+          MACOS_SHA=$(curl -fsSL "https://github.com/${{ github.repository }}/releases/download/v${VERSION}/cas-aarch64-apple-darwin.tar.gz" | shasum -a 256 | cut -d' ' -f1)
+          LINUX_SHA=$(curl -fsSL "https://github.com/${{ github.repository }}/releases/download/v${VERSION}/cas-x86_64-unknown-linux-gnu.tar.gz" | shasum -a 256 | cut -d' ' -f1)
+
+          # Clone homebrew-cas tap
+          git clone https://x-access-token:${GH_TOKEN}@github.com/codingagentsystem/homebrew-cas.git /tmp/homebrew-cas
+          cd /tmp/homebrew-cas
+
+          # Update version and SHA256 hashes in formula
+          sed -i "s/version \"[^\"]*\"/version \"${VERSION}\"/" Formula/cas.rb
+          sed -i "0,/sha256 \"[a-f0-9]\{64\}\"/s/sha256 \"[a-f0-9]\{64\}\"/sha256 \"${MACOS_SHA}\"/" Formula/cas.rb
+          sed -i "/sha256 \"${MACOS_SHA}\"/!s/sha256 \"[a-f0-9]\{64\}\"/sha256 \"${LINUX_SHA}\"/" Formula/cas.rb
+
+          # Commit and push
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/cas.rb
+          git commit -m "Update CAS to ${VERSION}"
+          git push
