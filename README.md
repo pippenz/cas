@@ -127,10 +127,7 @@ curl -fsSL https://cas.dev/install.sh | sh
 # Initialize in your project
 cas init
 
-# Start the MCP server
-cas serve
-
-# Or launch the factory TUI directly
+# Launch the factory TUI
 cas
 ```
 
