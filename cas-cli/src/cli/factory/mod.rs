@@ -826,6 +826,7 @@ fn preflight_factory_launch(
     let mut missing_git_repo = false;
     let mut missing_initial_commit = false;
     let mut missing_claude_commit = false;
+    let mut missing_mcp_commit = false;
 
     let resolved_cas_root = match validate_cas_root(cwd, cas_root) {
         Ok(path) => Some(path),
@@ -961,6 +962,33 @@ fn preflight_factory_launch(
         }
     }
 
+    // Check if .mcp.json is committed (required for worktree-based workers)
+    if enable_worktrees && !missing_git_repo && !missing_initial_commit {
+        let mcp_tracked = std::process::Command::new("git")
+            .args(["ls-files", "--error-unmatch", ".mcp.json"])
+            .current_dir(cwd)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+
+        if !mcp_tracked {
+            if args.workers > 0 {
+                failures.push(
+                    ".mcp.json is not committed. Workers need it for MCP tool access in their worktrees."
+                        .to_string(),
+                );
+                missing_mcp_commit = true;
+            } else {
+                notices.push(
+                    ".mcp.json is not committed. Commit it before spawning workers: git add .mcp.json && git commit -m \"Configure CAS MCP\""
+                        .to_string(),
+                );
+            }
+        }
+    }
+
     if !failures.is_empty() {
         let details = failures
             .iter()
@@ -985,6 +1013,10 @@ fn preflight_factory_launch(
         if missing_claude_commit {
             steps.push("git add .claude/ CLAUDE.md .mcp.json .gitignore".to_string());
             steps.push("git commit -m \"Configure CAS\"".to_string());
+        }
+        if missing_mcp_commit && !missing_claude_commit {
+            steps.push("git add .mcp.json".to_string());
+            steps.push("git commit -m \"Configure CAS MCP\"".to_string());
         }
         let launch = if args.no_worktrees {
             "cas factory --no-worktrees"

@@ -786,11 +786,28 @@ pub(crate) fn queue_codex_worker_intro_prompt(
     worker_name: &str,
     worker_cli: cas_mux::SupervisorCli,
 ) {
-    let _ = cas_dir;
-    let _ = worker_name;
-    if worker_cli == cas_mux::SupervisorCli::Codex {
-        // Codex workers now receive startup workflow as the initial codex prompt arg at spawn time.
-        // Avoid queue injection here to prevent duplicate or draft-only startup prompts.
+    match worker_cli {
+        cas_mux::SupervisorCli::Codex => {
+            // Codex workers now receive startup workflow as the initial codex prompt arg at spawn time.
+            // Avoid queue injection here to prevent duplicate or draft-only startup prompts.
+        }
+        cas_mux::SupervisorCli::Claude => {
+            // Inject MCP fallback instructions so workers can self-diagnose and notify the
+            // supervisor if MCP tools fail to load (e.g. .mcp.json missing from worktree).
+            let prompt = format!(
+                "You are a CAS factory worker ({worker_name}).\n\
+                 Check your assigned tasks: `mcp__cas__task action=mine`\n\n\
+                 IMPORTANT — if mcp__cas__* tools are unavailable:\n\
+                 1. Run: `cat .mcp.json` to verify MCP config exists in your worktree\n\
+                 2. If missing, run: `cas init -y` to regenerate it (takes effect next session)\n\
+                 3. Notify supervisor immediately via CLI fallback:\n\
+                    `cas factory message --target supervisor --message \"Worker {worker_name}: MCP tools unavailable. .mcp.json may be missing from worktree.\"`\n\
+                 Do not remain silently idle — always notify the supervisor if you cannot access MCP tools."
+            );
+            if let Ok(queue) = open_prompt_queue_store(cas_dir) {
+                let _ = queue.enqueue("cas", worker_name, &prompt);
+            }
+        }
     }
 }
 
