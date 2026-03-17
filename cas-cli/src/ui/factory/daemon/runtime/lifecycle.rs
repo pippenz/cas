@@ -221,7 +221,7 @@ impl FactoryDaemon {
             // Poll prompt queue (on notification or timer)
             if prompt_notified || last_prompt_poll.elapsed() >= poll_interval {
                 if prompt_notified {
-                    if let Some(ref notify) = self.notify_rx {
+                    if let Some(ref mut notify) = self.notify_rx {
                         notify.drain();
                     }
                 }
@@ -478,7 +478,7 @@ impl FactoryDaemon {
                 16
             };
             let sleep_dur = Duration::from_millis(sleep_ms);
-            if let Some(ref notify) = self.notify_rx {
+            if let Some(ref mut notify) = self.notify_rx {
                 tokio::select! {
                     result = notify.recv() => {
                         if result.is_ok() {

@@ -124,7 +124,7 @@ pub struct TaskRequest {
 
     /// Priority 0-4 (for create, update)
     #[schemars(description = "Priority: 0=Critical, 1=High, 2=Medium, 3=Low, 4=Backlog")]
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deser::option_u8")]
     pub priority: Option<u8>,
 
     /// Task type (for create): task, bug, feature, epic, chore
@@ -690,7 +690,7 @@ pub struct PatternRequest {
 
     /// Priority 0-3 (for create, update, team_create_suggestion)
     #[schemars(description = "Priority: 0=Critical, 1=High, 2=Medium (default), 3=Low")]
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deser::option_u8")]
     pub priority: Option<u8>,
 
     /// Propagation mode (for create, update)
@@ -746,6 +746,7 @@ pub struct PatternRequest {
     pub include_dismissed: Option<bool>,
 }
 
+pub(crate) mod deser;
 mod ops_secondary;
 
 pub use crate::types::ops_secondary::{

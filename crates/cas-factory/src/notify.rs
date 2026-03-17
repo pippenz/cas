@@ -19,7 +19,10 @@ pub fn notify_socket_path(cas_dir: &Path) -> PathBuf {
 /// Used in a `tokio::select!` branch to wake the event loop instantly when
 /// new prompts are enqueued.
 pub struct DaemonNotifier {
-    socket: UnixDatagram,
+    /// Bound std socket — converted to tokio lazily on first async use so that
+    /// `bind()` can be called before a Tokio runtime exists.
+    std_socket: Option<StdUnixDatagram>,
+    socket: Option<UnixDatagram>,
     path: PathBuf,
 }
 
@@ -27,6 +30,7 @@ impl DaemonNotifier {
     /// Bind the notification socket at `{cas_dir}/notify.sock`.
     ///
     /// Removes a stale socket file from a previous run if one exists.
+    /// Safe to call before a Tokio runtime is active.
     pub fn bind(cas_dir: &Path) -> std::io::Result<Self> {
         let path = notify_socket_path(cas_dir);
 
@@ -40,23 +44,43 @@ impl DaemonNotifier {
             std::fs::create_dir_all(parent)?;
         }
 
-        let socket = UnixDatagram::bind(&path)?;
-        Ok(Self { socket, path })
+        let std_socket = StdUnixDatagram::bind(&path)?;
+        std_socket.set_nonblocking(true)?;
+        Ok(Self {
+            std_socket: Some(std_socket),
+            socket: None,
+            path,
+        })
+    }
+
+    /// Convert the std socket to a tokio socket. Must be called from within a
+    /// Tokio runtime. Idempotent — safe to call multiple times.
+    fn tokio_socket(&mut self) -> std::io::Result<&UnixDatagram> {
+        if self.socket.is_none() {
+            let std_sock = self
+                .std_socket
+                .take()
+                .expect("std_socket already consumed");
+            self.socket = Some(UnixDatagram::from_std(std_sock)?);
+        }
+        Ok(self.socket.as_ref().unwrap())
     }
 
     /// Async wait for a notification byte. Cancellation-safe (tokio
     /// `UnixDatagram::recv` is cancellation-safe).
-    pub async fn recv(&self) -> std::io::Result<()> {
+    pub async fn recv(&mut self) -> std::io::Result<()> {
         let mut buf = [0u8; 64];
-        self.socket.recv(&mut buf).await?;
+        self.tokio_socket()?.recv(&mut buf).await?;
         Ok(())
     }
 
     /// Non-blocking drain of all pending datagrams to coalesce multiple
     /// notifications into a single wakeup.
-    pub fn drain(&self) {
+    pub fn drain(&mut self) {
         let mut buf = [0u8; 64];
-        while self.socket.try_recv(&mut buf).is_ok() {}
+        if let Ok(sock) = self.tokio_socket() {
+            while sock.try_recv(&mut buf).is_ok() {}
+        }
     }
 
     /// Remove the socket file (called on shutdown).

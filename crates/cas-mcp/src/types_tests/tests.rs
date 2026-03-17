@@ -139,3 +139,81 @@ fn test_spec_request_supersede() {
     assert_eq!(req.supersedes_id, Some("spec-old456".to_string()));
     assert_eq!(req.new_version, Some(true));
 }
+
+// ===== String-coercion tests (Claude Code serializes numbers as strings) =====
+
+#[test]
+fn test_task_request_priority_as_string() {
+    let req: TaskRequest = serde_json::from_str(
+        r#"{
+            "action": "create",
+            "title": "Test",
+            "priority": "1"
+        }"#,
+    )
+    .unwrap();
+    assert_eq!(req.priority, Some(1));
+}
+
+#[test]
+fn test_task_request_priority_null() {
+    let req: TaskRequest = serde_json::from_str(
+        r#"{
+            "action": "list",
+            "priority": null
+        }"#,
+    )
+    .unwrap();
+    assert_eq!(req.priority, None);
+}
+
+#[test]
+fn test_task_request_priority_absent() {
+    let req: TaskRequest = serde_json::from_str(r#"{"action": "list"}"#).unwrap();
+    assert_eq!(req.priority, None);
+}
+
+#[test]
+fn test_factory_request_count_as_string() {
+    let req: FactoryRequest = serde_json::from_str(
+        r#"{
+            "action": "spawn_workers",
+            "count": "3"
+        }"#,
+    )
+    .unwrap();
+    assert_eq!(req.count, Some(3));
+}
+
+#[test]
+fn test_coordination_request_count_as_string() {
+    let req: CoordinationRequest = serde_json::from_str(
+        r#"{
+            "action": "spawn_workers",
+            "count": "3",
+            "isolate": true
+        }"#,
+    )
+    .unwrap();
+    assert_eq!(req.count, Some(3));
+}
+
+#[test]
+fn test_coordination_request_count_as_int() {
+    // Existing integer encoding must still work
+    let req: CoordinationRequest = serde_json::from_str(
+        r#"{
+            "action": "shutdown_workers",
+            "count": 0
+        }"#,
+    )
+    .unwrap();
+    assert_eq!(req.count, Some(0));
+}
+
+#[test]
+fn test_coordination_request_count_null() {
+    let req: CoordinationRequest =
+        serde_json::from_str(r#"{"action": "worker_status", "count": null}"#).unwrap();
+    assert_eq!(req.count, None);
+}

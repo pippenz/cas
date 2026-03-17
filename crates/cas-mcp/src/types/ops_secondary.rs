@@ -361,7 +361,7 @@ pub struct FactoryRequest {
     #[schemars(
         description = "Number of workers (for spawn: how many to create, for shutdown: how many to stop, 0 = all)"
     )]
-    #[serde(default)]
+    #[serde(default, deserialize_with = "super::deser::option_i32")]
     pub count: Option<i32>,
 
     /// Specific worker names (comma-separated)
@@ -584,7 +584,7 @@ pub struct CoordinationRequest {
     #[schemars(
         description = "Number of workers (for spawn: how many to create, for shutdown: how many to stop, 0 = all)"
     )]
-    #[serde(default)]
+    #[serde(default, deserialize_with = "super::deser::option_i32")]
     pub count: Option<i32>,
 
     /// Comma-separated worker names
