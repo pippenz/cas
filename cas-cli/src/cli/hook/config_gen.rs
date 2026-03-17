@@ -232,9 +232,12 @@ pub(crate) fn get_cas_hooks_config(config: &crate::config::HookConfig) -> serde_
         );
     }
 
+    let mut allow_permissions = get_cas_bash_permissions();
+    allow_permissions.extend(get_cas_mcp_permissions());
+
     serde_json::json!({
         "permissions": {
-            "allow": get_cas_bash_permissions()
+            "allow": allow_permissions
         },
         "hooks": hooks,
         "statusLine": {
@@ -254,6 +257,24 @@ pub fn get_cas_bash_permissions() -> Vec<String> {
         "Bash(cas task:*)".to_string(),   // Task operations
         "Bash(cas search:*)".to_string(), // Search operations
         "Bash(cas add:*)".to_string(),    // Memory operations
+    ]
+}
+
+/// Get MCP tool permission patterns for CAS tools
+///
+/// Workers need these permissions to call mcp__cas__* tools without prompts.
+pub fn get_cas_mcp_permissions() -> Vec<String> {
+    vec![
+        "mcp__cas__task".to_string(),
+        "mcp__cas__coordination".to_string(),
+        "mcp__cas__memory".to_string(),
+        "mcp__cas__search".to_string(),
+        "mcp__cas__rule".to_string(),
+        "mcp__cas__skill".to_string(),
+        "mcp__cas__spec".to_string(),
+        "mcp__cas__verification".to_string(),
+        "mcp__cas__system".to_string(),
+        "mcp__cas__pattern".to_string(),
     ]
 }
 

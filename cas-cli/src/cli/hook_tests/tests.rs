@@ -31,6 +31,31 @@ fn test_configure_creates_settings() {
         allow_arr.iter().any(|v| v.as_str() == Some("Bash(cas :*)")),
         "Bash(cas :*) permission missing"
     );
+    // Verify CAS MCP tool permissions
+    assert!(
+        allow_arr
+            .iter()
+            .any(|v| v.as_str() == Some("mcp__cas__task")),
+        "mcp__cas__task permission missing"
+    );
+    assert!(
+        allow_arr
+            .iter()
+            .any(|v| v.as_str() == Some("mcp__cas__coordination")),
+        "mcp__cas__coordination permission missing"
+    );
+    assert!(
+        allow_arr
+            .iter()
+            .any(|v| v.as_str() == Some("mcp__cas__memory")),
+        "mcp__cas__memory permission missing"
+    );
+    assert!(
+        allow_arr
+            .iter()
+            .any(|v| v.as_str() == Some("mcp__cas__search")),
+        "mcp__cas__search permission missing"
+    );
 }
 
 #[test]
@@ -90,6 +115,18 @@ fn test_configure_merges_existing() {
     assert!(
         allow_arr.iter().any(|v| v.as_str() == Some("Bash(cas :*)")),
         "Bash(cas :*) permission should be added"
+    );
+    assert!(
+        allow_arr
+            .iter()
+            .any(|v| v.as_str() == Some("mcp__cas__task")),
+        "mcp__cas__task permission should be added"
+    );
+    assert!(
+        allow_arr
+            .iter()
+            .any(|v| v.as_str() == Some("mcp__cas__coordination")),
+        "mcp__cas__coordination permission should be added"
     );
 }
 
