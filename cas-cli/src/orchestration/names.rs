@@ -12,7 +12,7 @@ use std::collections::HashSet;
 const MINION_WORKERS: &[&str] = &[
     "kevin", "stuart", "bob", "dave", "jerry", "tim", "mark", "phil", "carl",
     "norbert", "jorge", "otto", "steve", "herb", "pete", "donnie", "mel",
-    "abel", "lance", "walter",
+    "abel", "tony", "walter",
 ];
 
 const MINION_SUPERVISORS: &[&str] = &["gru", "dru", "nefario"];
