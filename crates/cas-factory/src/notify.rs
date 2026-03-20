@@ -154,12 +154,15 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut notifier = DaemonNotifier::bind(dir.path()).unwrap();
 
-        // Send multiple notifications
+        // First recv registers the tokio socket with the reactor — without
+        // this, try_recv inside drain() will never see pending datagrams.
+        notify_daemon(dir.path()).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(100), notifier.recv()).await;
+
+        // Now send several more notifications
         for _ in 0..5 {
             notify_daemon(dir.path()).unwrap();
         }
-
-        // Small delay so datagrams land
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
         // Drain should clear all pending
