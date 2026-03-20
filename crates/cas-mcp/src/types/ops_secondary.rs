@@ -1,5 +1,6 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use super::deser;
 
 /// Unified search, context, and entity operations request
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
@@ -29,7 +30,7 @@ pub struct SearchContextRequest {
 
     /// Max tokens for context
     #[schemars(description = "Maximum tokens for context")]
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deser::option_usize")]
     pub max_tokens: Option<usize>,
 
     /// Include related memories
@@ -78,7 +79,7 @@ pub struct SearchContextRequest {
 
     /// Limit for list/search
     #[schemars(description = "Maximum items to return")]
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deser::option_usize")]
     pub limit: Option<usize>,
 
     /// Sort field (for search)
@@ -121,12 +122,12 @@ pub struct SearchContextRequest {
 
     /// Lines of context before match (for grep)
     #[schemars(description = "Lines of context before each match (grep -B)")]
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deser::option_usize")]
     pub before_context: Option<usize>,
 
     /// Lines of context after match (for grep)
     #[schemars(description = "Lines of context after each match (grep -A)")]
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deser::option_usize")]
     pub after_context: Option<usize>,
 
     /// Case insensitive search (for grep)
@@ -142,12 +143,12 @@ pub struct SearchContextRequest {
 
     /// Start line for blame range
     #[schemars(description = "Start line number for blame range")]
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deser::option_usize")]
     pub line_start: Option<usize>,
 
     /// End line for blame range
     #[schemars(description = "End line number for blame range")]
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deser::option_usize")]
     pub line_end: Option<usize>,
 
     /// Filter to only AI-generated lines (for blame)
@@ -316,12 +317,12 @@ pub struct VerificationRequest {
 
     /// Duration of verification in milliseconds (for add)
     #[schemars(description = "Duration in milliseconds")]
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deser::option_u64")]
     pub duration_ms: Option<u64>,
 
     /// Limit for list
     #[schemars(description = "Maximum items to return")]
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deser::option_usize")]
     pub limit: Option<usize>,
 
     /// Verification type: 'task' (default) or 'epic'
@@ -344,7 +345,7 @@ pub struct TeamRequest {
 
     /// Limit for list operations
     #[schemars(description = "Maximum items to return")]
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deser::option_usize")]
     pub limit: Option<usize>,
 }
 
@@ -361,7 +362,7 @@ pub struct FactoryRequest {
     #[schemars(
         description = "Number of workers (for spawn: how many to create, for shutdown: how many to stop, 0 = all)"
     )]
-    #[serde(default, deserialize_with = "super::deser::option_i32")]
+    #[serde(default, deserialize_with = "deser::option_i32")]
     pub count: Option<i32>,
 
     /// Specific worker names (comma-separated)
@@ -397,7 +398,7 @@ pub struct FactoryRequest {
 
     /// Threshold used by cleanup/report actions (seconds)
     #[schemars(description = "Optional threshold in seconds for cleanup/report actions")]
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deser::option_i64")]
     pub older_than_secs: Option<i64>,
 
     /// Whether spawned workers need isolated worktrees (git worktree per worker)
@@ -414,7 +415,7 @@ pub struct FactoryRequest {
 
     /// Delay in seconds before reminder fires (time-based trigger)
     #[schemars(description = "Delay in seconds before reminder fires (time-based trigger)")]
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deser::option_i64")]
     pub remind_delay_secs: Option<i64>,
 
     /// Event type that triggers the reminder (event-based trigger)
@@ -433,14 +434,14 @@ pub struct FactoryRequest {
 
     /// Reminder ID for cancel operations
     #[schemars(description = "Reminder ID for cancel operations")]
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deser::option_i64")]
     pub remind_id: Option<i64>,
 
     /// TTL in seconds for the reminder (default: 3600)
     #[schemars(
         description = "Time-to-live in seconds for the reminder before auto-expiry (default: 3600)"
     )]
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deser::option_i64")]
     pub remind_ttl_secs: Option<i64>,
 }
 
@@ -501,7 +502,7 @@ pub struct CoordinationRequest {
 
     /// Maximum items to return
     #[schemars(description = "Maximum items to return")]
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deser::option_usize")]
     pub limit: Option<usize>,
 
     // ========== Agent Fields ==========
@@ -532,7 +533,7 @@ pub struct CoordinationRequest {
 
     /// Max iterations (for loop_start, 0 = unlimited)
     #[schemars(description = "Maximum iterations (0 = unlimited)")]
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deser::option_u32")]
     pub max_iterations: Option<u32>,
 
     /// Completion promise (for loop_start)
@@ -547,7 +548,7 @@ pub struct CoordinationRequest {
 
     /// Stale threshold seconds (for agent_cleanup)
     #[schemars(description = "Seconds since last heartbeat to consider stale")]
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deser::option_i64")]
     pub stale_threshold_secs: Option<i64>,
 
     /// Supervisor ID (for queue operations)
@@ -576,7 +577,7 @@ pub struct CoordinationRequest {
 
     /// Notification ID (for queue_ack)
     #[schemars(description = "Notification ID to acknowledge")]
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deser::option_i64")]
     pub notification_id: Option<i64>,
 
     // ========== Factory Fields ==========
@@ -584,7 +585,7 @@ pub struct CoordinationRequest {
     #[schemars(
         description = "Number of workers (for spawn: how many to create, for shutdown: how many to stop, 0 = all)"
     )]
-    #[serde(default, deserialize_with = "super::deser::option_i32")]
+    #[serde(default, deserialize_with = "deser::option_i32")]
     pub count: Option<i32>,
 
     /// Comma-separated worker names
@@ -601,7 +602,7 @@ pub struct CoordinationRequest {
 
     /// Threshold in seconds for cleanup/report actions
     #[schemars(description = "Optional threshold in seconds for cleanup/report actions")]
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deser::option_i64")]
     pub older_than_secs: Option<i64>,
 
     /// Whether workers need isolated git worktrees
@@ -618,7 +619,7 @@ pub struct CoordinationRequest {
 
     /// Delay in seconds before reminder fires (time-based trigger)
     #[schemars(description = "Delay in seconds before reminder fires (time-based trigger)")]
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deser::option_i64")]
     pub remind_delay_secs: Option<i64>,
 
     /// Event type that triggers reminder
@@ -637,14 +638,14 @@ pub struct CoordinationRequest {
 
     /// Reminder ID for cancel operations
     #[schemars(description = "Reminder ID for cancel operations")]
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deser::option_i64")]
     pub remind_id: Option<i64>,
 
     /// Time-to-live in seconds for the reminder (default: 3600)
     #[schemars(
         description = "Time-to-live in seconds for the reminder before auto-expiry (default: 3600)"
     )]
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deser::option_i64")]
     pub remind_ttl_secs: Option<i64>,
 
     // ========== Worktree Fields ==========
@@ -690,7 +691,7 @@ pub struct ExecuteRequest {
     #[schemars(
         description = "Max response length in characters. Default: 40000. Use your code to extract only what you need rather than increasing this."
     )]
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deser::option_usize")]
     pub max_length: Option<usize>,
 }
 

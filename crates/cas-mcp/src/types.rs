@@ -60,7 +60,7 @@ pub struct MemoryRequest {
 
     /// Limit for list/recent
     #[schemars(description = "Maximum items to return")]
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deser::option_usize")]
     pub limit: Option<usize>,
 
     /// Scope filter
@@ -178,7 +178,7 @@ pub struct TaskRequest {
 
     /// Lease duration in seconds (for claim)
     #[schemars(description = "Lease duration in seconds (default: 600)")]
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deser::option_i64")]
     pub duration_secs: Option<i64>,
 
     /// Target agent ID (for transfer)
@@ -188,7 +188,7 @@ pub struct TaskRequest {
 
     /// Limit for list operations
     #[schemars(description = "Maximum items to return")]
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deser::option_usize")]
     pub limit: Option<usize>,
 
     /// Scope filter
@@ -288,7 +288,7 @@ pub struct RuleRequest {
 
     /// Limit for list operations
     #[schemars(description = "Maximum items to return")]
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deser::option_usize")]
     pub limit: Option<usize>,
 
     /// Scope filter
@@ -357,7 +357,7 @@ pub struct SkillRequest {
 
     /// Limit for list operations
     #[schemars(description = "Maximum items to return")]
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deser::option_usize")]
     pub limit: Option<usize>,
 
     /// Scope filter
@@ -536,7 +536,7 @@ pub struct SpecRequest {
 
     /// Limit for list operations
     #[schemars(description = "Maximum items to return")]
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deser::option_usize")]
     pub limit: Option<usize>,
 }
 
@@ -586,7 +586,7 @@ pub struct AgentRequest {
 
     /// Max iterations (for loop_start, 0 = unlimited)
     #[schemars(description = "Maximum iterations (0 = unlimited)")]
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deser::option_u32")]
     pub max_iterations: Option<u32>,
 
     /// Completion promise (for loop_start)
@@ -601,12 +601,12 @@ pub struct AgentRequest {
 
     /// Stale threshold seconds (for cleanup)
     #[schemars(description = "Seconds since last heartbeat to consider stale")]
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deser::option_i64")]
     pub stale_threshold_secs: Option<i64>,
 
     /// Limit for list operations
     #[schemars(description = "Maximum items to return")]
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deser::option_usize")]
     pub limit: Option<usize>,
 
     // ========== Queue Operations Fields (Factory Mode) ==========
@@ -636,7 +636,7 @@ pub struct AgentRequest {
 
     /// Notification ID (for queue_ack)
     #[schemars(description = "Notification ID to acknowledge")]
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deser::option_i64")]
     pub notification_id: Option<i64>,
 
     // ========== Message Queue Fields (Agent → Agent) ==========
@@ -717,7 +717,7 @@ pub struct PatternRequest {
 
     /// Limit for list operations
     #[schemars(description = "Maximum items to return")]
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deser::option_usize")]
     pub limit: Option<usize>,
 
     /// Team ID (for team_* actions)

@@ -8,100 +8,73 @@
 use serde::{de, Deserializer};
 use std::fmt;
 
-/// Deserialize `Option<u8>` accepting both numeric and string-encoded values.
+/// Generate an `Option<$target>` deserializer that accepts numbers, strings, and null.
 ///
-/// Handles: `null` → `None`, absent field (via `#[serde(default)]`) → `None`,
-/// `3` → `Some(3)`, `"3"` → `Some(3)`.
-pub fn option_u8<'de, D>(deserializer: D) -> Result<Option<u8>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    struct V;
-    impl<'de> de::Visitor<'de> for V {
-        type Value = Option<u8>;
+/// Produces a public function `$fn_name` usable with `#[serde(deserialize_with = "...")]`.
+macro_rules! option_numeric_deser {
+    ($fn_name:ident, $target:ty, $desc:expr) => {
+        pub fn $fn_name<'de, D>(deserializer: D) -> Result<Option<$target>, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            struct V;
+            impl<'de> de::Visitor<'de> for V {
+                type Value = Option<$target>;
 
-        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-            f.write_str("an integer 0-255, a string containing an integer, or null")
-        }
+                fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                    write!(f, "{}, a string containing one, or null", $desc)
+                }
 
-        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
-            Ok(None)
-        }
-        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
-            Ok(None)
-        }
-        fn visit_some<D2: Deserializer<'de>>(self, d: D2) -> Result<Self::Value, D2::Error> {
-            d.deserialize_any(self)
-        }
-        fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
-            u8::try_from(v).map(Some).map_err(|_| {
-                de::Error::invalid_value(de::Unexpected::Unsigned(v), &"a u8 value (0-255)")
-            })
-        }
-        fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
-            u8::try_from(v).map(Some).map_err(|_| {
-                de::Error::invalid_value(de::Unexpected::Signed(v), &"a u8 value (0-255)")
-            })
-        }
-        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
-            let t = v.trim();
-            if t.is_empty() {
-                return Ok(None);
+                fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+                    Ok(None)
+                }
+                fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+                    Ok(None)
+                }
+                fn visit_some<D2: Deserializer<'de>>(
+                    self,
+                    d: D2,
+                ) -> Result<Self::Value, D2::Error> {
+                    d.deserialize_any(self)
+                }
+                fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                    <$target>::try_from(v).map(Some).map_err(|_| {
+                        de::Error::invalid_value(
+                            de::Unexpected::Unsigned(v),
+                            &concat!("a ", stringify!($target), " value"),
+                        )
+                    })
+                }
+                fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
+                    <$target>::try_from(v).map(Some).map_err(|_| {
+                        de::Error::invalid_value(
+                            de::Unexpected::Signed(v),
+                            &concat!("a ", stringify!($target), " value"),
+                        )
+                    })
+                }
+                fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                    let t = v.trim();
+                    if t.is_empty() {
+                        return Ok(None);
+                    }
+                    t.parse::<$target>().map(Some).map_err(|_| {
+                        de::Error::invalid_value(
+                            de::Unexpected::Str(v),
+                            &concat!("a string encoding a ", stringify!($target)),
+                        )
+                    })
+                }
             }
-            t.parse::<u8>().map(Some).map_err(|_| {
-                de::Error::invalid_value(de::Unexpected::Str(v), &"a string encoding a u8 (0-255)")
-            })
-        }
-    }
 
-    deserializer.deserialize_option(V)
+            deserializer.deserialize_option(V)
+        }
+    };
 }
 
-/// Deserialize `Option<i32>` accepting both numeric and string-encoded values.
-///
-/// Handles: `null` → `None`, absent field (via `#[serde(default)]`) → `None`,
-/// `3` → `Some(3)`, `"3"` → `Some(3)`.
-pub fn option_i32<'de, D>(deserializer: D) -> Result<Option<i32>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    struct V;
-    impl<'de> de::Visitor<'de> for V {
-        type Value = Option<i32>;
-
-        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-            f.write_str("an integer, a string containing an integer, or null")
-        }
-
-        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
-            Ok(None)
-        }
-        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
-            Ok(None)
-        }
-        fn visit_some<D2: Deserializer<'de>>(self, d: D2) -> Result<Self::Value, D2::Error> {
-            d.deserialize_any(self)
-        }
-        fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
-            i32::try_from(v).map(Some).map_err(|_| {
-                de::Error::invalid_value(de::Unexpected::Unsigned(v), &"an i32 value")
-            })
-        }
-        fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
-            i32::try_from(v).map(Some).map_err(|_| {
-                de::Error::invalid_value(de::Unexpected::Signed(v), &"an i32 value")
-            })
-        }
-        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
-            let t = v.trim();
-            if t.is_empty() {
-                return Ok(None);
-            }
-            t.parse::<i32>().map(Some).map_err(|_| {
-                de::Error::invalid_value(de::Unexpected::Str(v), &"a string encoding an i32")
-            })
-        }
-    }
-
-    deserializer.deserialize_option(V)
-}
+option_numeric_deser!(option_u8, u8, "an integer 0-255");
+option_numeric_deser!(option_i32, i32, "an i32 integer");
+option_numeric_deser!(option_i64, i64, "an i64 integer");
+option_numeric_deser!(option_u32, u32, "a u32 integer");
+option_numeric_deser!(option_usize, usize, "a usize integer");
+option_numeric_deser!(option_u64, u64, "a u64 integer");
