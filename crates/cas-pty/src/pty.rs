@@ -17,10 +17,10 @@ use tokio::sync::mpsc;
 const CODEX_SUPERVISOR_INSTRUCTIONS: &str = "You are the CAS Factory Supervisor. Coordinate only: plan epics, assign tasks, monitor progress, review/merge. Never implement tasks. Use skills cas-supervisor and cas-codex-supervisor-checklist. Use MCP tools explicitly; no /cas-start, /cas-context, or /cas-end.";
 
 /// Instructions injected into Codex worker agents via `--config developer_instructions`.
-const CODEX_WORKER_INSTRUCTIONS: &str = "You are a CAS Factory Worker. Always use CAS MCP tools for task lifecycle and coordination. On startup run `mcp__cas__coordination action=session_start name=<worker-name> agent_type=worker` then `mcp__cas__coordination action=whoami`, then run `mcp__cas__task action=mine`. For assigned tasks run `mcp__cas__task action=show id=<task-id>` then `mcp__cas__task action=start id=<task-id>` before coding. Add progress notes frequently using `mcp__cas__task action=notes id=<task-id> note_type=progress notes=\"...\"`. For blockers, add blocker note, set `status=blocked`, and message supervisor via `mcp__cas__coordination action=message target=supervisor message=\"...\"`. When implementation is complete, close with `mcp__cas__task action=close id=<task-id> reason=\"...\"`. If close returns verification-required guidance, immediately ask supervisor to verify/close on your behalf. Do not use /cas-start, /cas-context, or /cas-end. Stay within assigned task scope.";
+const CODEX_WORKER_INSTRUCTIONS: &str = "You are a CAS Factory Worker. Always use CAS MCP tools for task lifecycle and coordination. On startup run `mcp__cs__coordination action=session_start name=<worker-name> agent_type=worker` then `mcp__cs__coordination action=whoami`, then run `mcp__cs__task action=mine`. For assigned tasks run `mcp__cs__task action=show id=<task-id>` then `mcp__cs__task action=start id=<task-id>` before coding. Add progress notes frequently using `mcp__cs__task action=notes id=<task-id> note_type=progress notes=\"...\"`. For blockers, add blocker note, set `status=blocked`, and message supervisor via `mcp__cs__coordination action=message target=supervisor message=\"...\"`. When implementation is complete, close with `mcp__cs__task action=close id=<task-id> reason=\"...\"`. If close returns verification-required guidance, immediately ask supervisor to verify/close on your behalf. Do not use /cas-start, /cas-context, or /cas-end. Stay within assigned task scope.";
 
 /// Prefix for the Codex worker startup prompt. The worker name is appended at runtime.
-const CODEX_WORKER_STARTUP_PREFIX: &str = "I'm initiating CAS worker startup now: register this worker session, confirm identity, check assigned tasks, then start any assigned task with a progress note.\n1) Run mcp__cas__coordination action=session_start name=";
+const CODEX_WORKER_STARTUP_PREFIX: &str = "I'm initiating CAS worker startup now: register this worker session, confirm identity, check assigned tasks, then start any assigned task with a progress note.\n1) Run mcp__cs__coordination action=session_start name=";
 
 /// Configuration for spawning a PTY
 #[derive(Debug, Clone)]
@@ -274,10 +274,10 @@ impl PtyConfig {
             // in the composer without submitting in some startup timing windows.
             let startup_prompt = format!(
                 "{CODEX_WORKER_STARTUP_PREFIX}{name} agent_type=worker\n\
-                 2) Run mcp__cas__coordination action=whoami\n\
-                 3) Run mcp__cas__task action=mine\n\
+                 2) Run mcp__cs__coordination action=whoami\n\
+                 3) Run mcp__cs__task action=mine\n\
                  4) If tasks are assigned: show/start each task and add a progress note\n\
-                 5) If no tasks are assigned: send mcp__cas__coordination action=message target=supervisor confirming ready state\n\
+                 5) If no tasks are assigned: send mcp__cs__coordination action=message target=supervisor confirming ready state\n\
                  6) Do NOT message target=cas. Use target=supervisor."
             );
             args.push(startup_prompt);
@@ -749,7 +749,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_pty_config_codex_worker_uses_cas_prefix() {
+    async fn test_pty_config_codex_worker_uses_cs_prefix() {
         let config = PtyConfig::codex(
             "test-worker",
             "worker",
@@ -762,12 +762,8 @@ mod tests {
         );
         let all_args = config.args.join(" ");
         assert!(
-            all_args.contains("mcp__cas__"),
-            "Codex worker instructions should use mcp__cas__ prefix"
-        );
-        assert!(
-            !all_args.contains("mcp__cs__"),
-            "Codex worker instructions should NOT use mcp__cs__ prefix"
+            all_args.contains("mcp__cs__"),
+            "Codex worker instructions should use mcp__cs__ prefix"
         );
     }
 
