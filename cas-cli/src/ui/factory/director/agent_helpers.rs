@@ -9,7 +9,7 @@ use chrono::Utc;
 use ratatui::prelude::Color;
 
 use super::data::DirectorData;
-use crate::ui::theme::{Icons, Palette};
+use crate::ui::theme::{Icons, MinionsIcons, Palette};
 
 /// Agents with no heartbeat for this many seconds are considered disconnected.
 pub const HEARTBEAT_TIMEOUT_SECS: i64 = 300;
@@ -35,14 +35,25 @@ pub fn is_disconnected(agent: &cas_factory::AgentSummary) -> bool {
 pub fn agent_status_icon(
     agent: &cas_factory::AgentSummary,
     palette: &Palette,
+    minions: bool,
 ) -> (&'static str, Color) {
     if is_disconnected(agent) {
-        ("\u{2298}", palette.agent_dead) // ⊘
+        let icon = if minions { MinionsIcons::AGENT_DEAD } else { "\u{2298}" };
+        (icon, palette.agent_dead)
     } else {
         match agent.status {
-            AgentStatus::Active => (Icons::CIRCLE_FILLED, palette.agent_active),
-            AgentStatus::Idle => (Icons::CIRCLE_HALF, palette.agent_idle),
-            _ => (Icons::CIRCLE_EMPTY, palette.agent_dead),
+            AgentStatus::Active => {
+                let icon = if minions { MinionsIcons::AGENT_ACTIVE } else { Icons::CIRCLE_FILLED };
+                (icon, palette.agent_active)
+            }
+            AgentStatus::Idle => {
+                let icon = if minions { MinionsIcons::AGENT_IDLE } else { Icons::CIRCLE_HALF };
+                (icon, palette.agent_idle)
+            }
+            _ => {
+                let icon = if minions { MinionsIcons::AGENT_DEAD } else { Icons::CIRCLE_EMPTY };
+                (icon, palette.agent_dead)
+            }
         }
     }
 }
@@ -51,11 +62,20 @@ pub fn agent_status_icon(
 pub fn agent_status_icon_simple(
     agent: &cas_factory::AgentSummary,
     palette: &Palette,
+    minions: bool,
 ) -> (&'static str, Color) {
-    match agent.status {
-        AgentStatus::Active => ("\u{25cf}", palette.agent_active), // ●
-        AgentStatus::Idle => ("\u{25cb}", palette.agent_idle),     // ○
-        _ => ("\u{2298}", palette.agent_dead),                     // ⊘
+    if minions {
+        match agent.status {
+            AgentStatus::Active => (MinionsIcons::AGENT_ACTIVE, palette.agent_active),
+            AgentStatus::Idle => (MinionsIcons::AGENT_IDLE, palette.agent_idle),
+            _ => (MinionsIcons::AGENT_DEAD, palette.agent_dead),
+        }
+    } else {
+        match agent.status {
+            AgentStatus::Active => ("\u{25cf}", palette.agent_active), // ●
+            AgentStatus::Idle => ("\u{25cb}", palette.agent_idle),     // ○
+            _ => ("\u{2298}", palette.agent_dead),                     // ⊘
+        }
     }
 }
 

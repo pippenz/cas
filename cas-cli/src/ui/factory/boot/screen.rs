@@ -93,6 +93,91 @@ mod colors {
     };
 }
 
+/// Minions-themed colors for the boot screen
+mod minions_colors {
+    use crossterm::style::Color;
+
+    // Logo colors - Minion yellow with glow
+    pub const LOGO: Color = Color::Rgb {
+        r: 255,
+        g: 213,
+        b: 0,
+    };
+    pub const LOGO_GLOW: Color = Color::Rgb {
+        r: 255,
+        g: 235,
+        b: 100,
+    };
+
+    // Text colors
+    pub const HEADER: Color = Color::White;
+    pub const LABEL: Color = Color::Rgb {
+        r: 120,
+        g: 120,
+        b: 130,
+    };
+    pub const VALUE: Color = Color::Rgb {
+        r: 255,
+        g: 213,
+        b: 0,
+    };
+
+    // Status colors (keep functional)
+    pub const OK: Color = Color::Rgb {
+        r: 80,
+        g: 250,
+        b: 120,
+    };
+    pub const PENDING: Color = Color::Rgb {
+        r: 255,
+        g: 213,
+        b: 0,
+    };
+    pub const ERROR: Color = Color::Rgb {
+        r: 255,
+        g: 90,
+        b: 90,
+    };
+
+    // Progress bar - yellow fill
+    pub const PROGRESS_DONE: Color = Color::Rgb {
+        r: 255,
+        g: 213,
+        b: 0,
+    };
+    pub const PROGRESS_EMPTY: Color = Color::Rgb {
+        r: 50,
+        g: 50,
+        b: 55,
+    };
+
+    // Agent role colors - denim blue for workers, dark for supervisor (Gru)
+    pub const WORKER: Color = Color::Rgb {
+        r: 65,
+        g: 105,
+        b: 225,
+    };
+    pub const SUPERVISOR: Color = Color::Rgb {
+        r: 80,
+        g: 80,
+        b: 85,
+    };
+
+    // Box/frame colors - denim blue tint
+    pub const BOX: Color = Color::Rgb {
+        r: 50,
+        g: 60,
+        b: 90,
+    };
+
+    // Final ready state - banana yellow
+    pub const READY: Color = Color::Rgb {
+        r: 255,
+        g: 235,
+        b: 59,
+    };
+}
+
 /// ASCII art logo for CAS Factory
 const LOGO: &str = r#"
    ██████╗ █████╗ ███████╗    ███████╗ █████╗  ██████╗████████╗ ██████╗ ██████╗ ██╗   ██╗
@@ -114,6 +199,37 @@ const LOGO_SMALL: &str = r#"
   ╚═══════════════════════════════════════════════════════╝
 "#;
 
+/// Minion ASCII art logo — pill-shaped body, goggles, overalls
+const MINION_LOGO: &str = r#"
+            ▄██████████▄
+          ██            ██
+        ██   ▄██████▄    ██
+        ██ ██ ◉    ◉ ██  ██
+        ██ ██          ██ ██
+        ██   ▀██████▀    ██
+        ██    ╭╌╌╌╌╮     ██
+        ██    ┊    ┊     ██
+        █▌    ╰╌╌╌╌╯     ▐█
+       ▐█ ▄▄▄▄▄▄▄▄▄▄▄▄▄▄ █▌
+       ▐█ █ B A N A N A █ █▌
+       ▐█ █▄▄▄▄▄▄▄▄▄▄▄▄█ █▌
+        █▌                ▐█
+         █▌  ██      ██  ▐█
+          ██  ██    ██  ██
+            ████ ██ ████
+                 ██
+"#;
+
+/// Smaller minion for narrow/short terminals
+const MINION_LOGO_SMALL: &str = r#"
+     ▄██████▄
+    ██ (◉◉) ██
+    ██ ╰──╯ ██
+    █▌▐████▌▐█
+    █▌ │  │ ▐█
+     ▀▀    ▀▀
+"#;
+
 /// Braille spinner frames for smooth animation
 const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
@@ -131,11 +247,23 @@ pub(crate) struct BootScreen {
     pub(crate) steps_row: u16,
     pub(crate) agent_row: u16,
     pub(crate) skip_animation: bool,
+    pub(crate) minions_theme: bool,
     spinner_tick: usize,
 }
 
+/// Helper to select default or minions color
+macro_rules! themed {
+    ($self:expr, $name:ident) => {
+        if $self.minions_theme {
+            minions_colors::$name
+        } else {
+            colors::$name
+        }
+    };
+}
+
 impl BootScreen {
-    pub(crate) fn new(skip_animation: bool) -> std::io::Result<Self> {
+    pub(crate) fn new_themed(skip_animation: bool, minions_theme: bool) -> std::io::Result<Self> {
         let mut stdout = stdout();
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
 
@@ -153,29 +281,59 @@ impl BootScreen {
             steps_row: 0, // Set after logo
             agent_row: 0, // Set after steps
             skip_animation,
+            minions_theme,
             spinner_tick: 0,
         })
     }
     pub(crate) fn draw_logo(&mut self) -> std::io::Result<u16> {
+        let logo_color = themed!(self, LOGO);
+        let logo_glow = themed!(self, LOGO_GLOW);
+        let header_color = themed!(self, HEADER);
+        let label_color = themed!(self, LABEL);
+
+        let (title, subtitle) = if self.minions_theme {
+            (
+                "═══  BANANA!  ═══",
+                format!("Bee-do Bee-do  •  v{}", APP_VERSION),
+            )
+        } else {
+            (
+                "═══  Coding Agent System  ═══",
+                format!("Multi-Agent Orchestration  •  v{}", APP_VERSION),
+            )
+        };
+
+        let compact_title = if self.minions_theme {
+            "Minion Factory Boot"
+        } else {
+            "CAS Factory Boot"
+        };
+
+        let compact_subtitle = if self.minions_theme {
+            format!("Bee-do Bee-do  •  v{}", APP_VERSION)
+        } else {
+            format!("Coding Agent System  •  v{}", APP_VERSION)
+        };
+
         // Tmux and many terminal defaults are 24 rows tall. The full logo + subtitle
         // pushes the boot box out of view, so fall back to a compact header.
         if self.rows < 36 {
             execute!(
                 self.stdout,
                 MoveTo(0, 1),
-                SetForegroundColor(colors::HEADER),
+                SetForegroundColor(header_color),
                 SetAttribute(Attribute::Bold),
                 Print(format!(
                     "{:^width$}",
-                    "CAS Factory Boot",
+                    compact_title,
                     width = self.cols as usize
                 )),
                 SetAttribute(Attribute::Reset),
                 MoveTo(0, 2),
-                SetForegroundColor(colors::LABEL),
+                SetForegroundColor(label_color),
                 Print(format!(
                     "{:^width$}",
-                    format!("Coding Agent System  •  v{}", APP_VERSION),
+                    compact_subtitle,
                     width = self.cols as usize
                 )),
             )?;
@@ -187,7 +345,11 @@ impl BootScreen {
         }
 
         let delay = if self.skip_animation { 0 } else { 35 };
-        let logo = if self.cols >= 100 { LOGO } else { LOGO_SMALL };
+        let logo = if self.minions_theme {
+            if self.cols >= 100 { MINION_LOGO } else { MINION_LOGO_SMALL }
+        } else {
+            if self.cols >= 100 { LOGO } else { LOGO_SMALL }
+        };
         let logo_lines: Vec<&str> = logo.lines().filter(|l| !l.is_empty()).collect();
 
         // Starting row with top padding
@@ -202,7 +364,7 @@ impl BootScreen {
                 execute!(
                     self.stdout,
                     MoveTo(padding as u16, row),
-                    SetForegroundColor(colors::LOGO_GLOW),
+                    SetForegroundColor(logo_glow),
                     SetAttribute(Attribute::Bold),
                     Print(line),
                     SetAttribute(Attribute::Reset)
@@ -214,7 +376,7 @@ impl BootScreen {
                 execute!(
                     self.stdout,
                     MoveTo(padding as u16, row),
-                    SetForegroundColor(colors::LOGO),
+                    SetForegroundColor(logo_color),
                     Print(line)
                 )?;
                 self.stdout.flush()?;
@@ -224,7 +386,7 @@ impl BootScreen {
                 execute!(
                     self.stdout,
                     MoveTo(padding as u16, row),
-                    SetForegroundColor(colors::LOGO),
+                    SetForegroundColor(logo_color),
                     Print(line)
                 )?;
             }
@@ -237,19 +399,19 @@ impl BootScreen {
         execute!(
             self.stdout,
             MoveTo(0, subtitle_row),
-            SetForegroundColor(colors::HEADER),
+            SetForegroundColor(header_color),
             SetAttribute(Attribute::Bold),
             Print(format!(
                 "{:^width$}",
-                "═══  Coding Agent System  ═══",
+                title,
                 width = self.cols as usize
             )),
             SetAttribute(Attribute::Reset),
             MoveTo(0, subtitle_row + 1),
-            SetForegroundColor(colors::LABEL),
+            SetForegroundColor(label_color),
             Print(format!(
                 "{:^width$}",
-                format!("Multi-Agent Orchestration  •  v{}", APP_VERSION),
+                subtitle,
                 width = self.cols as usize
             )),
         )?;
@@ -293,7 +455,7 @@ impl BootScreen {
         self.steps_row = steps_row;
 
         // Draw box outline
-        execute!(self.stdout, SetForegroundColor(colors::BOX))?;
+        execute!(self.stdout, SetForegroundColor(themed!(self, BOX)))?;
 
         // Top border with double line for emphasis
         execute!(
@@ -352,11 +514,11 @@ impl BootScreen {
         execute!(
             self.stdout,
             MoveTo(self.box_left + 1, row),
-            SetForegroundColor(colors::BOX),
+            SetForegroundColor(themed!(self, BOX)),
             Print("─".repeat(side_len)),
-            SetForegroundColor(colors::LABEL),
+            SetForegroundColor(themed!(self, LABEL)),
             Print(&label_with_padding),
-            SetForegroundColor(colors::BOX),
+            SetForegroundColor(themed!(self, BOX)),
             Print("─".repeat(right_side))
         )?;
         Ok(())
@@ -370,9 +532,9 @@ impl BootScreen {
         execute!(
             self.stdout,
             MoveTo(self.box_left + 2, row),
-            SetForegroundColor(colors::LABEL),
+            SetForegroundColor(themed!(self, LABEL)),
             Print(format!("{label:>12}: ")),
-            SetForegroundColor(colors::VALUE),
+            SetForegroundColor(themed!(self, VALUE)),
             Print(value)
         )?;
         Ok(())
@@ -381,12 +543,12 @@ impl BootScreen {
         execute!(
             self.stdout,
             MoveTo(self.box_left + 4, row),
-            SetForegroundColor(colors::PENDING),
+            SetForegroundColor(themed!(self, PENDING)),
             Print(SPINNER_FRAMES[0]),
             Print("  "),
-            SetForegroundColor(colors::HEADER),
+            SetForegroundColor(themed!(self, HEADER)),
             Print(text),
-            SetForegroundColor(colors::LABEL),
+            SetForegroundColor(themed!(self, LABEL)),
             Print(" ...")
         )?;
         self.stdout.flush()?;
@@ -402,7 +564,7 @@ impl BootScreen {
             execute!(
                 self.stdout,
                 MoveTo(self.box_left + 4, row),
-                SetForegroundColor(colors::PENDING),
+                SetForegroundColor(themed!(self, PENDING)),
                 Print(SPINNER_FRAMES[frame_idx])
             )?;
             self.stdout.flush()?;
@@ -415,10 +577,10 @@ impl BootScreen {
         execute!(
             self.stdout,
             MoveTo(self.box_left + 4, row),
-            SetForegroundColor(colors::OK),
+            SetForegroundColor(themed!(self, OK)),
             Print("✓"),
             Print("  "),
-            SetForegroundColor(colors::HEADER),
+            SetForegroundColor(themed!(self, HEADER)),
             Print(text),
             Print("        ") // Clear any remnants
         )?;
@@ -429,14 +591,14 @@ impl BootScreen {
         execute!(
             self.stdout,
             MoveTo(self.box_left + 4, row),
-            SetForegroundColor(colors::ERROR),
+            SetForegroundColor(themed!(self, ERROR)),
             Print("✗"),
             Print("  "),
-            SetForegroundColor(colors::HEADER),
+            SetForegroundColor(themed!(self, HEADER)),
             Print(text),
-            SetForegroundColor(colors::LABEL),
+            SetForegroundColor(themed!(self, LABEL)),
             Print(" — "),
-            SetForegroundColor(colors::ERROR),
+            SetForegroundColor(themed!(self, ERROR)),
             Print(truncate_path(error, 30))
         )?;
         self.stdout.flush()?;
@@ -454,9 +616,9 @@ impl BootScreen {
             "worker"
         };
         let role_color = if is_supervisor {
-            colors::SUPERVISOR
+            themed!(self, SUPERVISOR)
         } else {
-            colors::WORKER
+            themed!(self, WORKER)
         };
         let bar_width = 24;
         let name_width = 14;
@@ -467,17 +629,17 @@ impl BootScreen {
             SetForegroundColor(role_color),
             Print(format!("{role:>10}")),
             Print("  "),
-            SetForegroundColor(colors::VALUE),
+            SetForegroundColor(themed!(self, VALUE)),
             Print(format!("{name:<name_width$}")),
             Print("  "),
-            SetForegroundColor(colors::BOX),
+            SetForegroundColor(themed!(self, BOX)),
             Print("▐"),
-            SetForegroundColor(colors::PROGRESS_EMPTY),
+            SetForegroundColor(themed!(self, PROGRESS_EMPTY)),
             Print("░".repeat(bar_width)),
-            SetForegroundColor(colors::BOX),
+            SetForegroundColor(themed!(self, BOX)),
             Print("▌"),
             Print(" "),
-            SetForegroundColor(colors::PENDING),
+            SetForegroundColor(themed!(self, PENDING)),
             Print("INIT")
         )?;
         self.stdout.flush()?;
@@ -494,11 +656,14 @@ impl BootScreen {
         let partial_char_idx = filled_units % 8;
         let empty_chars = bar_width - full_chars - if partial_char_idx > 0 { 1 } else { 0 };
 
+        let done_color = themed!(self, PROGRESS_DONE);
+        let empty_color = themed!(self, PROGRESS_EMPTY);
+
         // Move to progress bar position
         execute!(
             self.stdout,
             MoveTo(self.box_left + 4 + 12 + name_width as u16 + 3, row),
-            SetForegroundColor(colors::PROGRESS_DONE),
+            SetForegroundColor(done_color),
             Print("█".repeat(full_chars))
         )?;
 
@@ -506,7 +671,7 @@ impl BootScreen {
         if partial_char_idx > 0 {
             execute!(
                 self.stdout,
-                SetForegroundColor(colors::PROGRESS_DONE),
+                SetForegroundColor(done_color),
                 Print(PROGRESS_CHARS[partial_char_idx - 1])
             )?;
         }
@@ -514,7 +679,7 @@ impl BootScreen {
         // Draw empty portion
         execute!(
             self.stdout,
-            SetForegroundColor(colors::PROGRESS_EMPTY),
+            SetForegroundColor(empty_color),
             Print("░".repeat(empty_chars))
         )?;
 
@@ -528,12 +693,12 @@ impl BootScreen {
         execute!(
             self.stdout,
             MoveTo(self.box_left + 4 + 12 + name_width as u16 + 3, row),
-            SetForegroundColor(colors::PROGRESS_DONE),
+            SetForegroundColor(themed!(self, PROGRESS_DONE)),
             Print("█".repeat(bar_width)),
-            SetForegroundColor(colors::BOX),
+            SetForegroundColor(themed!(self, BOX)),
             Print("▌"),
             Print(" "),
-            SetForegroundColor(colors::OK),
+            SetForegroundColor(themed!(self, OK)),
             SetAttribute(Attribute::Bold),
             Print("READY"),
             SetAttribute(Attribute::Reset)
@@ -542,13 +707,23 @@ impl BootScreen {
         Ok(())
     }
     pub(crate) fn show_ready(&mut self, final_row: u16) -> std::io::Result<()> {
+        let ready_color = themed!(self, READY);
+        let glow_color = themed!(self, LOGO_GLOW);
+        let label_color = themed!(self, LABEL);
+
+        let (ready_text, launch_text) = if self.minions_theme {
+            ("  BANANA!", "  —  Bee-do Bee-do Bee-do")
+        } else {
+            ("  SYSTEM READY", "  —  Launching interface")
+        };
+
         if !self.skip_animation {
             // Pulsing animation before showing ready
             for _ in 0..3 {
                 execute!(
                     self.stdout,
                     MoveTo(self.box_left + 4, final_row),
-                    SetForegroundColor(colors::LOGO_GLOW),
+                    SetForegroundColor(glow_color),
                     SetAttribute(Attribute::Bold),
                     Print("●"),
                     SetAttribute(Attribute::Reset),
@@ -559,7 +734,7 @@ impl BootScreen {
                 execute!(
                     self.stdout,
                     MoveTo(self.box_left + 4, final_row),
-                    SetForegroundColor(colors::READY),
+                    SetForegroundColor(ready_color),
                     Print("○"),
                 )?;
                 self.stdout.flush()?;
@@ -571,10 +746,10 @@ impl BootScreen {
         execute!(
             self.stdout,
             MoveTo(self.box_left + 4, final_row),
-            SetForegroundColor(colors::READY),
+            SetForegroundColor(ready_color),
             SetAttribute(Attribute::Bold),
             Print("▶"),
-            Print("  SYSTEM READY"),
+            Print(ready_text),
             SetAttribute(Attribute::Reset),
         )?;
         self.stdout.flush()?;
@@ -582,13 +757,13 @@ impl BootScreen {
         if !self.skip_animation {
             thread::sleep(Duration::from_millis(200));
 
+            let ready_len = ready_text.len() as u16 + 1; // +1 for ▶
             // Type out the launching message
-            let message = "  —  Launching interface";
-            for (i, ch) in message.chars().enumerate() {
+            for (i, ch) in launch_text.chars().enumerate() {
                 execute!(
                     self.stdout,
-                    MoveTo(self.box_left + 4 + 16 + i as u16, final_row),
-                    SetForegroundColor(colors::LABEL),
+                    MoveTo(self.box_left + 4 + ready_len + i as u16, final_row),
+                    SetForegroundColor(label_color),
                     Print(ch)
                 )?;
                 self.stdout.flush()?;

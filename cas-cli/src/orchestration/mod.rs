@@ -7,4 +7,4 @@
 
 pub mod names;
 
-pub use names::generate_unique;
+pub use names::{generate_minion_supervisor, generate_minion_unique, generate_unique};

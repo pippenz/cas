@@ -69,6 +69,11 @@ pub(super) fn execute_daemon(
         },
         teams_configs,
         lead_session_id: Some(lead_session_id),
+        minions_theme: cas_config
+            .theme
+            .as_ref()
+            .map(|t| t.variant == crate::ui::theme::ThemeVariant::Minions)
+            .unwrap_or(false),
     };
 
     let daemon_config = DaemonConfig {
@@ -127,6 +132,7 @@ pub(super) fn run_factory_with_daemon(
             .unwrap_or_else(|| "supervisor".to_string());
         let worker_names = config.worker_names.clone();
         let worktrees_enabled = config.enable_worktrees;
+        let minions_theme = config.minions_theme;
         let cwd = config.cwd.to_string_lossy().to_string();
         let profile = build_boot_profile(&config, worker_names.len());
 
@@ -148,6 +154,7 @@ pub(super) fn run_factory_with_daemon(
             session_name: session_name.clone(),
             profile,
             skip_animation: false,
+            minions_theme,
         };
 
         if let Err(e) = run_boot_screen_client(&boot_config, &sock_path, 0) {
@@ -177,6 +184,7 @@ pub(super) fn run_factory_with_daemon(
         .unwrap_or_else(|| "supervisor".to_string());
     let worker_names = config.worker_names.clone();
     let worktrees_enabled = config.enable_worktrees;
+    let minions_theme = config.minions_theme;
     let cwd = config.cwd.to_string_lossy().to_string();
     let profile = build_boot_profile(&config, worker_names.len());
 
@@ -199,6 +207,7 @@ pub(super) fn run_factory_with_daemon(
                 session_name: session_name.clone(),
                 profile,
                 skip_animation: false,
+                minions_theme,
             };
 
             if let Err(e) = run_boot_screen_client(&boot_config, &sock_path, daemon_pid) {

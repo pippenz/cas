@@ -111,3 +111,17 @@ impl Icons {
     pub const AGENT_WORKER: &'static str = "W";
     pub const AGENT_CI: &'static str = "C";
 }
+
+/// Minion-themed icon overrides (used when minions variant is active)
+pub struct MinionsIcons;
+
+impl MinionsIcons {
+    // Agent status indicators
+    pub const AGENT_ACTIVE: &'static str = "\u{1F34C}";  // 🍌
+    pub const AGENT_IDLE: &'static str = "\u{1F441}";    // 👁
+    pub const AGENT_DEAD: &'static str = "\u{1F4A4}";    // 💤
+
+    // Agent types
+    pub const AGENT_WORKER: &'static str = "\u{1F34C}";  // 🍌
+    pub const AGENT_SUPERVISOR: &'static str = "\u{1F576}"; // 🕶 (Gru's glasses)
+}

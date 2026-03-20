@@ -129,7 +129,7 @@ mod tests {
     #[tokio::test]
     async fn notify_and_recv_round_trip() {
         let dir = TempDir::new().unwrap();
-        let notifier = DaemonNotifier::bind(dir.path()).unwrap();
+        let mut notifier = DaemonNotifier::bind(dir.path()).unwrap();
 
         // Send a notification from the "worker" side
         notify_daemon(dir.path()).unwrap();
@@ -152,7 +152,7 @@ mod tests {
     #[tokio::test]
     async fn drain_clears_pending_notifications() {
         let dir = TempDir::new().unwrap();
-        let notifier = DaemonNotifier::bind(dir.path()).unwrap();
+        let mut notifier = DaemonNotifier::bind(dir.path()).unwrap();
 
         // Send multiple notifications
         for _ in 0..5 {

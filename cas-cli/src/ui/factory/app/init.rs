@@ -29,14 +29,25 @@ impl FactoryApp {
 
         let cas_dir = find_cas_root()?;
 
-        let all_names = generate_unique(config.workers + 1);
-        let supervisor_name = config
-            .supervisor_name
-            .unwrap_or_else(|| all_names[0].clone());
-        let worker_names: Vec<String> = if config.worker_names.is_empty() {
-            all_names[1..].to_vec()
+        let (supervisor_name, worker_names) = if config.minions_theme
+            && config.supervisor_name.is_none()
+            && config.worker_names.is_empty()
+        {
+            use crate::orchestration::names::{generate_minion_supervisor, generate_minion_unique};
+            let sup = generate_minion_supervisor();
+            let workers = generate_minion_unique(config.workers);
+            (sup, workers)
         } else {
-            config.worker_names
+            let all_names = generate_unique(config.workers + 1);
+            let sup = config
+                .supervisor_name
+                .unwrap_or_else(|| all_names[0].clone());
+            let workers = if config.worker_names.is_empty() {
+                all_names[1..].to_vec()
+            } else {
+                config.worker_names
+            };
+            (sup, workers)
         };
 
         let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
