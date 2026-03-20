@@ -145,7 +145,17 @@
       "Bash(cas :*)",
       "Bash(cas task:*)",
       "Bash(cas search:*)",
-      "Bash(cas add:*)"
+      "Bash(cas add:*)",
+      "mcp__cas__task",
+      "mcp__cas__coordination",
+      "mcp__cas__memory",
+      "mcp__cas__search",
+      "mcp__cas__rule",
+      "mcp__cas__skill",
+      "mcp__cas__spec",
+      "mcp__cas__verification",
+      "mcp__cas__system",
+      "mcp__cas__pattern"
     ]
   },
   "statusLine": {

@@ -1,3 +1,6 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 <!-- CAS:BEGIN - This section is managed by CAS. Do not edit manually. -->
 # IMPORTANT: USE CAS FOR TASK AND MEMORY MANAGEMENT
 
@@ -13,258 +16,127 @@ Use CAS MCP tools instead:
 CAS provides persistent context across sessions. Built-in tools are ephemeral.
 <!-- CAS:END -->
 
-# CAS - Coding Agent System
+## What is CAS
 
-Unified context system for AI agents: persistent memory, tasks, rules, and skills across sessions.
+CAS (Coding Agent System) is a multi-agent coding factory and persistent context system for AI agents. Written in Rust.
 
-**Design Philosophy**: CAS is built for AI agents as the primary users. Humans are observers who review agent activity, provide feedback, and guide direction - but the tools and workflows are optimized for agent consumption and production.
-
-## Use CAS for Task & Memory Management
-
-**Agents use CAS MCP tools instead of built-in TodoWrite:**
-
-```
-mcp__cas__task action=create     - Create/track tasks
-mcp__cas__task action=start      - Start working on a task (sets status to in_progress)
-mcp__cas__task action=notes      - Add progress notes (progress, blocker, decision, discovery)
-mcp__cas__task action=close      - Complete tasks
-mcp__cas__memory action=remember - Store learnings and context
-mcp__cas__search action=search   - Find relevant context (filter with doc_type: entry/task/rule/skill)
-```
-
-**Human CLI:**
-```bash
-cas init           # Initialize CAS in a project
-cas serve          # Start MCP server
-cas config list    # View configuration
-cas doctor         # Run diagnostics
-cas update         # Self-update
-```
-
-## Project Structure
-
-```
-cas-cli/           # Rust CLI & MCP server (primary)
-crates/            # Workspace crates (cas-core, cas-store, cas-search, etc.)
-```
-
-### cas-cli Architecture
-
-| Directory | Purpose |
-|-----------|---------|
-| `src/types/` | Core data: Entry, Task, Rule, Skill |
-| `src/store/` | Storage abstraction (SqliteStore primary) |
-| `src/search/` | Full-text search (BM25 via Tantivy) |
-| `src/cli/` | Command handlers |
-| `src/hooks/` | Claude Code integration |
-
-## Key Patterns
-
-**Store Trait** (`cas-cli/src/store/mod.rs`): All storage ops go through trait abstractions. SqliteStore is primary.
-
-**Rule Auto-Promotion**: Use `mcp__cas__rule action=helpful id=<id>` to promote Draft/Stale rules to Proven, auto-syncs to `.claude/rules/`.
-
-**MCP Server**: `cas serve` exposes all functionality as MCP tools for Claude Code integration.
-
-## Skill Frontmatter Fields (Claude Code 2.1.3+)
-
-CAS skills sync to `.claude/skills/` as SKILL.md files with YAML frontmatter.
-
-**Note:** In Claude Code 2.1.3, skills and commands were unified into a single system.
-
-The following fields are supported:
-
-### Required Fields
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `name` | string | Skill name (prefixed with `cas-`) |
-| `description` | string | 1-2 line description |
-
-### Optional Fields
-
-| Field | Type | Description | Example |
-|-------|------|-------------|---------|
-| `user-invocable` | bool | Hide from slash menu (model can still invoke) | `false` |
-| `argument-hint` | string | Hint shown when invoked (must be quoted) | `"[query]"` |
-| `context` | string | Execution context mode | `fork` |
-| `agent` | string | Specialized agent to use | `Explore`, `code-reviewer` |
-| `allowed-tools` | list | Restrict tools the skill can use | `- Read`<br>`- Grep` |
-| `disable-model-invocation` | bool | Block model from invoking (command-only) | `true` |
-| `hooks` | object | Skill-scoped hooks (Claude Code 2.1.0+) | See below |
-
-**Note:** `user-invocable: false` only hides the skill from the user's slash menu. The model can still invoke the skill unless `disable-model-invocation: true` is also set.
-
-### Hooks Structure (Claude Code 2.1.0+)
-
-```yaml
-hooks:
-  PreToolUse:
-    - matcher: "Write|Edit"
-      hooks:
-        - type: command
-          command: cas hook PreToolUse
-          timeout: 3000
-  PostToolUse:
-    - matcher: "Write|Edit"
-      hooks:
-        - type: command
-          command: cas hook PostToolUse
-          timeout: 3000
-  Stop:
-    - hooks:
-        - type: command
-          command: cas hook Stop
-```
-
-### Example SKILL.md
-
-```yaml
----
-name: cas-deep-search
-description: Comprehensive codebase search using forked context
-argument-hint: "[query]"
-context: fork
-agent: Explore
-allowed-tools:
-  - Read
-  - Grep
-  - Glob
----
-
-# Deep Search
-
-Instructions for the skill...
-```
-
-### Creating Skills
-
-**Via MCP (for agents):**
-```
-mcp__cas__skill action=create name="My Skill" invokable=true argument_hint="[args]"
-```
-
-**Via CLI (for humans):**
-```bash
-cas skill create "My Skill" --invokable --argument-hint "[args]"
-```
-
-Skills are automatically synced to `.claude/skills/` when enabled.
-
-## Hook Configuration (Claude Code 2.1.0+)
-
-### once: true Support
-
-Claude Code 2.1.0 adds `once: true` for hooks that should only execute once per session (even on resume). CAS hooks intentionally do NOT use this because:
-
-- **SessionStart**: Should inject context on every start/resume
-- **PostToolUse/Stop**: Should run on every matching event
-
-To add `once: true` to a specific hook, manually edit `.claude/settings.json`:
-
-```json
-{
-  "hooks": {
-    "SessionStart": [{
-      "hooks": [{
-        "type": "command",
-        "command": "cas hook SessionStart",
-        "timeout": 5000,
-        "once": true
-      }]
-    }]
-  }
-}
-```
-
-### Bash Wildcard Permissions
-
-Claude Code 2.1.0 supports wildcard patterns for Bash permissions. Add to `.claude/settings.json`:
-
-```json
-{
-  "permissions": {
-    "allow": [
-      "Bash(cas :*)",
-      "Bash(cas task:*)",
-      "Bash(cas search:*)"
-    ]
-  }
-}
-```
-
-Patterns:
-- `Bash(cas :*)` - Allow all CAS commands
-- `Bash(cas task:*)` - Allow task operations only
-- `Bash(:* --help)` - Allow help for any command
-
-## Code Search with ast-grep
-
-Use `ast-grep` for syntax-aware structural matching instead of text-only tools like `rg` or `grep`. This is especially useful for finding code patterns, refactoring, and understanding structure.
-
-```bash
-# Rust: Find all function definitions
-ast-grep --lang rust -p 'fn $NAME($$$) { $$$ }'
-
-# Rust: Find impl blocks for a trait
-ast-grep --lang rust -p 'impl $TRAIT for $TYPE { $$$ }'
-
-# Rust: Find unwrap() calls (potential error handling issues)
-ast-grep --lang rust -p '$EXPR.unwrap()'
-
-# Elixir: Find function definitions
-ast-grep --lang elixir -p 'def $NAME($$$) do $$$ end'
-
-# Elixir: Find pipe chains
-ast-grep --lang elixir -p '$EXPR |> $FUNC($$$)'
-
-# TypeScript: Find React component definitions
-ast-grep --lang typescript -p 'function $NAME($$$): JSX.Element { $$$ }'
-
-# TypeScript: Find useState hooks
-ast-grep --lang typescript -p 'const [$STATE, $SETTER] = useState($$$)'
-```
-
-Only fall back to `rg` or `grep` for plain-text searches (comments, strings, config files) or when explicitly requested.
+Two core capabilities:
+1. **Factory** — Terminal UI orchestrating multiple Claude Code instances in parallel via isolated git worktrees, with supervisor/worker coordination.
+2. **Context System** — MCP server providing persistent memory, tasks, rules, skills, and search (55+ tools) backed by SQLite + Tantivy BM25 search.
 
 ## Build & Test
 
 ```bash
-# cas-cli (Rust)
-cd cas-cli && cargo build --release
+# Build (from repo root or cas-cli/)
+cargo build                          # Dev build
+cargo build --release                # Release build (LTO, strip)
+cargo build --profile release-fast   # Fast release (thin LTO, 16 codegen units)
+
+# Run all tests
 cargo test
 
+# Run a single test by name
+cargo test test_name
+
+# Run tests in a specific file
+cargo test --test cli_test
+
+# Run tests matching a pattern
+cargo test migration
+
+# Run benchmarks
+cargo bench --bench code_indexing
+
+# Run with specific feature
+cargo test --features claude_rs_e2e
 ```
+
+The `mcp-server` feature is enabled by default. The binary is `cas` (both lib and bin targets in `cas-cli/`).
+
+The build script (`cas-cli/build.rs`) embeds git hash and build date into the binary, and loads telemetry keys from `.env` if present.
+
+## Architecture
+
+### Workspace Layout
+
+The root `Cargo.toml` defines a workspace. `cas-cli/` is the main binary crate; `crates/` contains library crates.
+
+**Core data flow**: CLI commands and MCP tool calls both go through the store trait abstractions in `cas-cli/src/store/`, which wraps `cas-store` (SQLite) with notification and sync layers.
+
+### cas-cli (main crate) — `cas-cli/src/`
+
+| Module | Purpose |
+|--------|---------|
+| `main.rs` / `lib.rs` | Entry point, module declarations |
+| `cli/` | Clap command definitions and handlers. `mod.rs` has the `Commands` enum — add new subcommands here. |
+| `mcp/` | MCP server: `server/` (CasCore with cached OnceLock stores), `tools/` (55 tool handlers split into `core/` and `service/`), `daemon.rs` (embedded background maintenance), `socket.rs` (notification socket) |
+| `store/` | Re-exports from `cas-store` + wrappers: `notifying_*.rs` (emit change notifications), `syncing_*.rs` (sync to `.claude/` filesystem), `layered.rs` (project + global store composition), `detect.rs` (find `.cas/` root) |
+| `hooks/` | Claude Code hook event handlers (SessionStart, Stop, PostToolUse, etc.). `handlers/` has session, state, event, and middleware handlers. `scorer.rs` ranks context items for injection. |
+| `migration/` | Forward-only schema migrations. `migrations/` has individual migration files (m001-m182+). `detector.rs` introspects existing schema. |
+| `ui/` | Ratatui TUI components for factory view: `factory/`, `components/`, `widgets/`, `theme/`, `markdown/` |
+| `config/` | Configuration loading from `.cas/config.yaml` |
+| `orchestration/` | Agent name generation and orchestration logic |
+| `worktree/` | Git worktree management for factory workers |
+| `consolidation/` | Memory consolidation and decay |
+| `extraction/` | AI-powered extraction of observations into structured memory |
+| `bridge/` | Local helper server for external tool integration |
+| `cloud/` | CAS Cloud sync (optional) |
+| `sync/` | Filesystem sync to `.claude/rules/` and `.claude/skills/` |
+
+### Workspace Crates — `crates/`
+
+| Crate | Purpose |
+|-------|---------|
+| `cas-types` | Shared data types (Entry, Task, Rule, Skill, Agent, etc.) |
+| `cas-store` | SQLite storage layer — trait definitions (`Store`, `TaskStore`, `RuleStore`, etc.) and `SqliteStore` implementation |
+| `cas-search` | Full-text search via Tantivy (BM25 scoring) |
+| `cas-core` | Core business logic, hooks framework, search index abstraction, skill/rule syncing |
+| `cas-mcp` | MCP protocol types and request/response models |
+| `cas-factory` | Factory session lifecycle: `FactoryCore`, config, director, recording, notifications |
+| `cas-factory-protocol` | WebSocket message protocol between supervisor and worker agents |
+| `cas-mux` | Terminal multiplexer layout and rendering (side-by-side/tabbed agent views) |
+| `cas-pty` | PTY management for agent terminal sessions |
+| `cas-recording` | Terminal session recording and playback |
+| `cas-code` | Code analysis via tree-sitter |
+| `cas-diffs` | Diff parsing, rendering, syntax highlighting |
+| `cas-tui-test` | TUI testing framework |
+| `ghostty_vt` / `ghostty_vt_sys` | Virtual terminal parser (based on Ghostty) |
+
+### Key Patterns
+
+**Store trait hierarchy**: `cas-store` defines traits (`Store`, `TaskStore`, `RuleStore`, `SkillStore`, `EntityStore`, `AgentStore`, `VerificationStore`, `WorktreeStore`). `SqliteStore` implements all of them. `cas-cli/src/store/` wraps these with notification and sync decorators.
+
+**CasCore (MCP server)**: Lives in `cas-cli/src/mcp/server/mod.rs`. Caches all store instances in `OnceLock` fields — each store type opened exactly once per server lifetime. Has an embedded daemon for background maintenance (embedding generation every 2min, full maintenance every 30min).
+
+**CasContext**: In `cas-cli/src/store/mod.rs`. Resolves the `.cas/` directory once at CLI entry points and passes it through — enables deterministic test behavior.
+
+**Hook scoring**: `cas-cli/src/hooks/scorer.rs` ranks context items (memories, tasks, rules, skills) by relevance for injection into SessionStart context, staying within a token budget.
 
 ## Adding Features
 
-**New CLI command**: Add to `cas-cli/src/cli/mod.rs` Commands enum, create handler file, add integration test in `tests/cli_test.rs`.
+**New CLI command**: Add variant to `Commands` enum in `cas-cli/src/cli/mod.rs`, create handler file in `cli/`, add integration test in `tests/cli_test.rs`.
 
-**New MCP tool**: Add handler in `cas-cli/src/mcp/`, register in tool list.
+**New MCP tool**: Add handler in `cas-cli/src/mcp/tools/core/` (data tools) or `cas-cli/src/mcp/tools/service/` (orchestration tools). Request types go in `cas-cli/src/mcp/tools/types/`. Register in the tool list via the `CasService` impl.
 
-## Schema Migrations
+**New migration**: Create file in `cas-cli/src/migration/migrations/` following naming convention `m{NNN}_{table}_{description}.rs`. Add to the `MIGRATIONS` array in `migrations/mod.rs`. Each migration needs: unique sequential ID, up SQL, and a detect query. See `cas-cli/docs/MIGRATIONS.md` for full details. Migration ID ranges: Entries 1-50, Rules 51-70, Skills 71-90, Agents 91-110, Entities/Worktrees 111+, Verification 131+, Loops/Events 151+.
 
-CAS uses a versioned migration system for database schema changes. See `cas-cli/docs/MIGRATIONS.md` for full documentation.
+## Testing
 
-### Quick Reference
+Integration tests are in `cas-cli/tests/`. Key test files:
+- `cli_test.rs` — CLI command integration tests
+- `mcp_tools_test.rs` — MCP tool handler tests
+- `mcp_protocol_test.rs` — MCP protocol compliance
+- `factory_server_test.rs` — Factory WebSocket server tests
+- `distributed_factory_test.rs` — Multi-agent factory tests
+- `proptest_test.rs` — Property-based tests
+- `e2e_test.rs` / `e2e/` — End-to-end tests
 
-**Adding a new column:**
-1. Add column to base schema in `src/store/sqlite.rs` or `src/store/skill_store.rs`
-2. Add migration in `src/migration/migrations.rs` with detection query
-3. Run `cargo test migration`
+Dev dependencies include: `insta` (snapshot testing), `wiremock` (HTTP mocking), `rstest` (parametrized tests), `proptest` (property-based), `criterion` (benchmarks), `cas-tui-test` (TUI testing).
 
-**Migration ID ranges:**
-| Subsystem | Range | Tables |
-|-----------|-------|--------|
-| Entries | 1-50 | entries, sessions |
-| Rules | 51-70 | rules |
-| Skills | 71-90 | skills |
-| Agents | 91-110 | agents, task_leases |
+## Rust Version
 
-**Human CLI commands:**
-```bash
-cas update --check        # Check for pending migrations
-cas update --dry-run      # Preview migrations
-cas update --schema-only  # Apply migrations
-cas doctor                # Shows schema version
-```
+Minimum supported Rust version: **1.85** (edition 2024).
+
+## Skill & Rule Sync
+
+CAS auto-syncs rules to `.claude/rules/` and skills to `.claude/skills/` as SKILL.md files with YAML frontmatter. The sync logic lives in `cas-cli/src/sync/`. Rule promotion: Draft → Proven via `mcp__cas__rule action=helpful`.
