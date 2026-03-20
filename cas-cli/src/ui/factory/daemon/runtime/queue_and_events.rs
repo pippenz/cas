@@ -337,7 +337,7 @@ impl FactoryDaemon {
                                  </system-notice>",
                                 queued.source,
                                 pane_target,
-                                queued.prompt.chars().take(500).collect::<String>()
+                                &queued.prompt
                             );
                             let _ = queue.enqueue_with_session(
                                 super::teams::DIRECTOR_AGENT_NAME,
