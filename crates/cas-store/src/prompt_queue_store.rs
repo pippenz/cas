@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::Result;
 use crate::recording_store::capture_message_event;
+use crate::supervisor_queue_store::NotificationPriority;
 
 /// A prompt in the queue
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,6 +30,8 @@ pub struct QueuedPrompt {
     pub processed_at: Option<DateTime<Utc>>,
     /// Short summary for UI display
     pub summary: Option<String>,
+    /// Message priority (lower = higher priority)
+    pub priority: NotificationPriority,
 }
 
 /// Schema for prompt queue table
@@ -56,6 +59,11 @@ const PROMPT_QUEUE_SUMMARY_MIGRATION: &str = r#"
 ALTER TABLE prompt_queue ADD COLUMN summary TEXT;
 "#;
 
+/// Add priority column for message ordering (0=Critical, 1=High, 2=Normal).
+const PROMPT_QUEUE_PRIORITY_MIGRATION: &str = r#"
+ALTER TABLE prompt_queue ADD COLUMN priority INTEGER NOT NULL DEFAULT 2;
+"#;
+
 /// Trait for prompt queue operations
 pub trait PromptQueueStore: Send + Sync {
     /// Initialize the store (create tables)
@@ -73,7 +81,7 @@ pub trait PromptQueueStore: Send + Sync {
         factory_session: &str,
     ) -> Result<i64>;
 
-    /// Queue a prompt with session and summary for UI display
+    /// Queue a prompt with session, summary, and priority for UI display
     fn enqueue_with_summary(
         &self,
         source: &str,
@@ -81,6 +89,19 @@ pub trait PromptQueueStore: Send + Sync {
         prompt: &str,
         factory_session: Option<&str>,
         summary: Option<&str>,
+    ) -> Result<i64> {
+        self.enqueue_full(source, target, prompt, factory_session, summary, None)
+    }
+
+    /// Queue a prompt with all options including priority
+    fn enqueue_full(
+        &self,
+        source: &str,
+        target: &str,
+        prompt: &str,
+        factory_session: Option<&str>,
+        summary: Option<&str>,
+        priority: Option<NotificationPriority>,
     ) -> Result<i64>;
 
     /// Poll for pending prompts for a specific target (marks as processed)
@@ -147,6 +168,7 @@ impl SqlitePromptQueueStore {
         let processed_at_str: Option<String> = row.get(5)?;
         let processed_at = processed_at_str.and_then(|s| Self::parse_datetime(&s));
         let summary: Option<String> = row.get(6).unwrap_or(None);
+        let priority: u8 = row.get(7).unwrap_or(2);
 
         Ok(QueuedPrompt {
             id: row.get(0)?,
@@ -156,6 +178,7 @@ impl SqlitePromptQueueStore {
             created_at: Self::parse_datetime(&row.get::<_, String>(4)?).unwrap_or_else(Utc::now),
             processed_at,
             summary,
+            priority: NotificationPriority::from(priority),
         })
     }
 }
@@ -181,24 +204,19 @@ impl PromptQueueStore for SqlitePromptQueueStore {
             conn.execute_batch(PROMPT_QUEUE_SUMMARY_MIGRATION)?;
         }
 
+        // Add priority column if missing
+        let has_priority_col = conn
+            .prepare("SELECT priority FROM prompt_queue LIMIT 0")
+            .is_ok();
+        if !has_priority_col {
+            conn.execute_batch(PROMPT_QUEUE_PRIORITY_MIGRATION)?;
+        }
+
         Ok(())
     }
 
     fn enqueue(&self, source: &str, target: &str, prompt: &str) -> Result<i64> {
-        let conn = self.conn.lock().unwrap();
-        let now = Utc::now().to_rfc3339();
-
-        conn.execute(
-            "INSERT INTO prompt_queue (source, target, prompt, created_at) VALUES (?, ?, ?, ?)",
-            params![source, target, prompt, now],
-        )?;
-
-        let id = conn.last_insert_rowid();
-
-        // Capture event for recording playback
-        let _ = capture_message_event(&conn, source, target);
-
-        Ok(id)
+        self.enqueue_full(source, target, prompt, None, None, None)
     }
 
     fn enqueue_with_session(
@@ -208,33 +226,25 @@ impl PromptQueueStore for SqlitePromptQueueStore {
         prompt: &str,
         factory_session: &str,
     ) -> Result<i64> {
-        let conn = self.conn.lock().unwrap();
-        let now = Utc::now().to_rfc3339();
-
-        conn.execute(
-            "INSERT INTO prompt_queue (source, target, prompt, created_at, factory_session) VALUES (?, ?, ?, ?, ?)",
-            params![source, target, prompt, now, factory_session],
-        )?;
-
-        let id = conn.last_insert_rowid();
-        let _ = capture_message_event(&conn, source, target);
-        Ok(id)
+        self.enqueue_full(source, target, prompt, Some(factory_session), None, None)
     }
 
-    fn enqueue_with_summary(
+    fn enqueue_full(
         &self,
         source: &str,
         target: &str,
         prompt: &str,
         factory_session: Option<&str>,
         summary: Option<&str>,
+        priority: Option<NotificationPriority>,
     ) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
         let now = Utc::now().to_rfc3339();
+        let prio: i32 = priority.unwrap_or(NotificationPriority::Normal).into();
 
         conn.execute(
-            "INSERT INTO prompt_queue (source, target, prompt, created_at, factory_session, summary) VALUES (?, ?, ?, ?, ?, ?)",
-            params![source, target, prompt, now, factory_session, summary],
+            "INSERT INTO prompt_queue (source, target, prompt, created_at, factory_session, summary, priority) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            params![source, target, prompt, now, factory_session, summary, prio],
         )?;
 
         let id = conn.last_insert_rowid();
@@ -248,10 +258,10 @@ impl PromptQueueStore for SqlitePromptQueueStore {
 
         // Get pending prompts for this target or "all_workers"
         let mut stmt = conn.prepare(
-            "SELECT id, source, target, prompt, created_at, processed_at, summary
+            "SELECT id, source, target, prompt, created_at, processed_at, summary, priority
              FROM prompt_queue
              WHERE (target = ? OR target = 'all_workers') AND processed_at IS NULL
-             ORDER BY created_at ASC
+             ORDER BY priority ASC, id ASC
              LIMIT ?",
         )?;
 
@@ -287,10 +297,10 @@ impl PromptQueueStore for SqlitePromptQueueStore {
         let now = Utc::now().to_rfc3339();
 
         let mut stmt = conn.prepare(
-            "SELECT id, source, target, prompt, created_at, processed_at, summary
+            "SELECT id, source, target, prompt, created_at, processed_at, summary, priority
              FROM prompt_queue
              WHERE processed_at IS NULL
-             ORDER BY created_at ASC
+             ORDER BY priority ASC, id ASC
              LIMIT ?",
         )?;
 
@@ -325,10 +335,10 @@ impl PromptQueueStore for SqlitePromptQueueStore {
         let conn = self.conn.lock().unwrap();
 
         let mut stmt = conn.prepare(
-            "SELECT id, source, target, prompt, created_at, processed_at, summary
+            "SELECT id, source, target, prompt, created_at, processed_at, summary, priority
              FROM prompt_queue
              WHERE processed_at IS NULL
-             ORDER BY created_at ASC
+             ORDER BY priority ASC, id ASC
              LIMIT ?",
         )?;
 
@@ -372,11 +382,11 @@ impl PromptQueueStore for SqlitePromptQueueStore {
 
         let where_clause = conditions.join(" OR ");
         let sql = format!(
-            "SELECT id, source, target, prompt, created_at, processed_at, summary
+            "SELECT id, source, target, prompt, created_at, processed_at, summary, priority
              FROM prompt_queue
              WHERE processed_at IS NULL
                AND ({where_clause})
-             ORDER BY created_at ASC
+             ORDER BY priority ASC, id ASC
              LIMIT ?"
         );
 
@@ -592,5 +602,99 @@ mod tests {
             .peek_for_targets(&["nonexistent"], Some("my-session"), 10)
             .unwrap();
         assert_eq!(by_session.len(), 1); // session match
+    }
+
+    #[test]
+    fn test_priority_ordering() {
+        let (_temp, store) = create_test_store();
+
+        // Enqueue in reverse priority order: normal first, then critical
+        store
+            .enqueue_full(
+                "supervisor",
+                "worker",
+                "Normal update",
+                None,
+                None,
+                Some(NotificationPriority::Normal),
+            )
+            .unwrap();
+        store
+            .enqueue_full(
+                "supervisor",
+                "worker",
+                "Critical blocker",
+                None,
+                None,
+                Some(NotificationPriority::Critical),
+            )
+            .unwrap();
+        store
+            .enqueue_full(
+                "supervisor",
+                "worker",
+                "High priority",
+                None,
+                None,
+                Some(NotificationPriority::High),
+            )
+            .unwrap();
+
+        let prompts = store.peek_all(10).unwrap();
+        assert_eq!(prompts.len(), 3);
+        // Critical (0) should come first, then High (1), then Normal (2)
+        assert_eq!(prompts[0].prompt, "Critical blocker");
+        assert_eq!(prompts[0].priority, NotificationPriority::Critical);
+        assert_eq!(prompts[1].prompt, "High priority");
+        assert_eq!(prompts[1].priority, NotificationPriority::High);
+        assert_eq!(prompts[2].prompt, "Normal update");
+        assert_eq!(prompts[2].priority, NotificationPriority::Normal);
+    }
+
+    #[test]
+    fn test_default_priority_is_normal() {
+        let (_temp, store) = create_test_store();
+
+        store
+            .enqueue("supervisor", "worker", "Default priority")
+            .unwrap();
+
+        let prompts = store.peek_all(10).unwrap();
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].priority, NotificationPriority::Normal);
+    }
+
+    #[test]
+    fn test_priority_with_peek_for_targets() {
+        let (_temp, store) = create_test_store();
+
+        store
+            .enqueue_full(
+                "worker",
+                "supervisor",
+                "Status update",
+                Some("session-1"),
+                None,
+                Some(NotificationPriority::Normal),
+            )
+            .unwrap();
+        store
+            .enqueue_full(
+                "worker",
+                "supervisor",
+                "BLOCKED: need help",
+                Some("session-1"),
+                None,
+                Some(NotificationPriority::High),
+            )
+            .unwrap();
+
+        let prompts = store
+            .peek_for_targets(&["supervisor"], Some("session-1"), 10)
+            .unwrap();
+        assert_eq!(prompts.len(), 2);
+        // High priority should come first
+        assert_eq!(prompts[0].prompt, "BLOCKED: need help");
+        assert_eq!(prompts[1].prompt, "Status update");
     }
 }

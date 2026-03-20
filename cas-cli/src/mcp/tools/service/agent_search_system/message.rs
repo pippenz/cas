@@ -246,13 +246,19 @@ impl CasService {
         };
 
         let factory_session = std::env::var("CAS_FACTORY_SESSION").ok();
+        let priority = req.priority.as_deref().map(|p| match p {
+            "critical" | "0" => cas_store::NotificationPriority::Critical,
+            "high" | "1" => cas_store::NotificationPriority::High,
+            _ => cas_store::NotificationPriority::Normal,
+        });
         let message_id = queue
-            .enqueue_with_summary(
+            .enqueue_full(
                 &display_name,
                 &resolved_target,
                 &message,
                 factory_session.as_deref(),
                 Some(summary.as_str()),
+                priority,
             )
             .map_err(|error| {
                 Self::error(
