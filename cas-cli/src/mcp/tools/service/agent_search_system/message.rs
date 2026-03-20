@@ -1,13 +1,6 @@
 use crate::mcp::tools::service::imports::*;
 
 impl CasService {
-    fn format_agent_message(message: &str, _from: &str, respond_to: &str) -> String {
-        let response_hint = format!(
-            "To respond, use: coordination action=message target={respond_to} message=\"...\" summary=\"...\"\n\nDO NOT USE SENDMESSAGE."
-        );
-        format!("{}\n\n{}", message.trim_end(), response_hint)
-    }
-
     pub(in crate::mcp::tools::service) async fn message_send(
         &self,
         req: AgentRequest,
@@ -252,13 +245,12 @@ impl CasService {
                 .unwrap_or_else(|| source.clone())
         };
 
-        let wrapped_message = Self::format_agent_message(&message, &display_name, &display_name);
         let factory_session = std::env::var("CAS_FACTORY_SESSION").ok();
         let message_id = queue
             .enqueue_with_summary(
                 &display_name,
                 &resolved_target,
-                &wrapped_message,
+                &message,
                 factory_session.as_deref(),
                 Some(summary.as_str()),
             )
