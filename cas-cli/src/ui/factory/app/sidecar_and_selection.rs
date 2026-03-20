@@ -352,26 +352,25 @@ impl FactoryApp {
         }
     }
 
-    /// Handle mouse up - finalize selection and copy to clipboard
-    pub fn handle_mouse_up(&mut self) {
+    /// Handle mouse up - finalize selection and return selected text for clipboard.
+    ///
+    /// Returns the selected text (if any) so the caller can relay it to the
+    /// client terminal via OSC 52. The daemon process is headless and cannot
+    /// write to the system clipboard directly.
+    pub fn handle_mouse_up(&mut self) -> Option<String> {
         // Finalize the selection
         if self.selection.is_active {
             self.selection.finalize();
         }
 
-        // Copy to clipboard if selection exists
+        // Return selected text for the caller to handle clipboard
         if let Some(text) = self.get_selected_text() {
             if !text.is_empty() {
-                match crate::ui::factory::clipboard::copy_to_clipboard(&text) {
-                    Ok(()) => {
-                        tracing::debug!("Copied {} chars to clipboard", text.len());
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to copy to clipboard: {}", e);
-                    }
-                }
+                tracing::debug!("Selection complete: {} chars", text.len());
+                return Some(text);
             }
         }
+        None
     }
 
     /// Start a text selection at the given screen position

@@ -182,7 +182,18 @@ impl FactoryDaemon {
                                         || self.app.show_changes_dialog
                                         || self.app.show_help)
                                     {
-                                        self.app.handle_mouse_up();
+                                        if let Some(text) = self.app.handle_mouse_up() {
+                                            // Send OSC 52 to the owner client so its
+                                            // terminal writes the text to the system
+                                            // clipboard. The daemon is headless and
+                                            // cannot access the clipboard directly.
+                                            let osc52 = osc52_copy_sequence(&text);
+                                            if let Some(client) =
+                                                self.clients.get_mut(&client_id)
+                                            {
+                                                client.output_buf.extend(osc52.as_bytes());
+                                            }
+                                        }
                                     }
                                 }
                                 ControlEvent::MouseScrollUp => {
@@ -213,6 +224,11 @@ impl FactoryDaemon {
                                                 e
                                             );
                                         }
+                                        // Auto-enter inject mode so the user can
+                                        // immediately type context for the image.
+                                        self.app.inject_target = Some(target_pane);
+                                        self.app.inject_buffer.clear();
+                                        self.app.input_mode = crate::ui::factory::input::InputMode::Inject;
                                     } else {
                                         tracing::debug!(
                                             "Ignoring image drop outside worker/supervisor panes at ({}, {})",
@@ -841,6 +857,19 @@ impl FactoryDaemon {
             _ => None,
         })
     }
+}
+
+/// Build an OSC 52 escape sequence that tells the terminal to copy `text`
+/// to the system clipboard.
+///
+/// Format: `ESC ] 52 ; c ; <base64> ST`
+/// where ST (String Terminator) = `ESC \`
+///
+/// Supported by kitty, alacritty, wezterm, ghostty, iTerm2, and most modern
+/// terminal emulators.
+fn osc52_copy_sequence(text: &str) -> String {
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    format!("\x1b]52;c;{}\x1b\\", encoded)
 }
 
 fn bracketed_paste_bytes(payload: &str) -> Vec<u8> {
