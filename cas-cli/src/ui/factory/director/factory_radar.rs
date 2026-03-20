@@ -240,7 +240,8 @@ fn render_worker_list(
         }
 
         // Status indicator
-        let (status_char, status_color) = agent_helpers::agent_status_icon_simple(agent, palette);
+        let (status_char, status_color) =
+            agent_helpers::agent_status_icon_simple(agent, palette, theme.is_minions());
 
         let is_selected = selected == Some(idx);
         let name_style = if is_selected {

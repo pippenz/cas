@@ -470,6 +470,7 @@ mod tests {
             session_id: None,
             teams_configs: std::collections::HashMap::new(),
             lead_session_id: None,
+            minions_theme: false,
         }
     }
 

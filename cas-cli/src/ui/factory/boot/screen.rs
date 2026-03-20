@@ -199,24 +199,35 @@ const LOGO_SMALL: &str = r#"
   ╚═══════════════════════════════════════════════════════╝
 "#;
 
-/// Minion ASCII art logo
+/// Minion ASCII art logo — pill-shaped body, goggles, overalls
 const MINION_LOGO: &str = r#"
-       ╭──────────╮
-      ╭┤  ╭────╮  ├╮
-      │╰──┤ ●● ├──╯│
-      │   ╰────╯   │
-      │   ╭────╮   │
-      │   │    │   │
-      ╰───┤    ├───╯
-          ╰────╯
+            ▄██████████▄
+          ██            ██
+        ██   ▄██████▄    ██
+        ██ ██ ◉    ◉ ██  ██
+        ██ ██          ██ ██
+        ██   ▀██████▀    ██
+        ██    ╭╌╌╌╌╮     ██
+        ██    ┊    ┊     ██
+        █▌    ╰╌╌╌╌╯     ▐█
+       ▐█ ▄▄▄▄▄▄▄▄▄▄▄▄▄▄ █▌
+       ▐█ █ B A N A N A █ █▌
+       ▐█ █▄▄▄▄▄▄▄▄▄▄▄▄█ █▌
+        █▌                ▐█
+         █▌  ██      ██  ▐█
+          ██  ██    ██  ██
+            ████ ██ ████
+                 ██
 "#;
 
 /// Smaller minion for narrow/short terminals
 const MINION_LOGO_SMALL: &str = r#"
-   ╭──────╮
-   │ (●●) │
-   │ ╭──╮ │
-   ╰─┤  ├─╯
+     ▄██████▄
+    ██ (◉◉) ██
+    ██ ╰──╯ ██
+    █▌▐████▌▐█
+    █▌ │  │ ▐█
+     ▀▀    ▀▀
 "#;
 
 /// Braille spinner frames for smooth animation

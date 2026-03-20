@@ -67,7 +67,8 @@ pub fn render_workers_panel_with_focus(
 
         // Status icon and color
         let is_disconnected = agent_helpers::is_disconnected(agent);
-        let (status_icon, icon_color) = agent_helpers::agent_status_icon(agent, palette);
+        let (status_icon, icon_color) =
+            agent_helpers::agent_status_icon(agent, palette, theme.is_minions());
 
         let selection_marker = if is_selected { "\u{25b8} " } else { "  " };
         let name_width = agent.name.len();
