@@ -32,6 +32,8 @@ pub struct QueuedPrompt {
     pub summary: Option<String>,
     /// Message priority (lower = higher priority)
     pub priority: NotificationPriority,
+    /// When the target agent acknowledged receipt (None if not yet acked)
+    pub acked_at: Option<DateTime<Utc>>,
 }
 
 /// Schema for prompt queue table
@@ -63,6 +65,32 @@ ALTER TABLE prompt_queue ADD COLUMN summary TEXT;
 const PROMPT_QUEUE_PRIORITY_MIGRATION: &str = r#"
 ALTER TABLE prompt_queue ADD COLUMN priority INTEGER NOT NULL DEFAULT 2;
 "#;
+
+/// Add acked_at column for delivery confirmation.
+const PROMPT_QUEUE_ACKED_AT_MIGRATION: &str = r#"
+ALTER TABLE prompt_queue ADD COLUMN acked_at TEXT;
+"#;
+
+/// Delivery status of a prompt queue message
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum MessageStatus {
+    /// Message is queued but not yet delivered
+    Pending,
+    /// Message was injected/delivered but not yet acknowledged by the target
+    Delivered,
+    /// Target agent has confirmed receipt
+    Confirmed,
+}
+
+impl std::fmt::Display for MessageStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pending => write!(f, "pending"),
+            Self::Delivered => write!(f, "delivered"),
+            Self::Confirmed => write!(f, "confirmed"),
+        }
+    }
+}
 
 /// Trait for prompt queue operations
 pub trait PromptQueueStore: Send + Sync {
@@ -130,6 +158,15 @@ pub trait PromptQueueStore: Send + Sync {
     /// Mark a prompt as processed
     fn mark_processed(&self, prompt_id: i64) -> Result<()>;
 
+    /// Acknowledge receipt of a prompt (target agent confirms delivery)
+    fn ack(&self, prompt_id: i64) -> Result<()>;
+
+    /// Get messages that were processed but not acked within the timeout
+    fn unacked(&self, timeout_secs: i64, limit: usize) -> Result<Vec<QueuedPrompt>>;
+
+    /// Get delivery status of a specific message
+    fn message_status(&self, prompt_id: i64) -> Result<Option<MessageStatus>>;
+
     /// Get count of pending prompts
     fn pending_count(&self) -> Result<usize>;
 
@@ -169,6 +206,8 @@ impl SqlitePromptQueueStore {
         let processed_at = processed_at_str.and_then(|s| Self::parse_datetime(&s));
         let summary: Option<String> = row.get(6).unwrap_or(None);
         let priority: u8 = row.get(7).unwrap_or(2);
+        let acked_at_str: Option<String> = row.get(8).unwrap_or(None);
+        let acked_at = acked_at_str.and_then(|s| Self::parse_datetime(&s));
 
         Ok(QueuedPrompt {
             id: row.get(0)?,
@@ -179,6 +218,7 @@ impl SqlitePromptQueueStore {
             processed_at,
             summary,
             priority: NotificationPriority::from(priority),
+            acked_at,
         })
     }
 }
@@ -210,6 +250,14 @@ impl PromptQueueStore for SqlitePromptQueueStore {
             .is_ok();
         if !has_priority_col {
             conn.execute_batch(PROMPT_QUEUE_PRIORITY_MIGRATION)?;
+        }
+
+        // Add acked_at column if missing (delivery confirmation)
+        let has_acked_at_col = conn
+            .prepare("SELECT acked_at FROM prompt_queue LIMIT 0")
+            .is_ok();
+        if !has_acked_at_col {
+            conn.execute_batch(PROMPT_QUEUE_ACKED_AT_MIGRATION)?;
         }
 
         Ok(())
@@ -258,7 +306,7 @@ impl PromptQueueStore for SqlitePromptQueueStore {
 
         // Get pending prompts for this target or "all_workers"
         let mut stmt = conn.prepare(
-            "SELECT id, source, target, prompt, created_at, processed_at, summary, priority
+            "SELECT id, source, target, prompt, created_at, processed_at, summary, priority, acked_at
              FROM prompt_queue
              WHERE (target = ? OR target = 'all_workers') AND processed_at IS NULL
              ORDER BY priority ASC, id ASC
@@ -297,7 +345,7 @@ impl PromptQueueStore for SqlitePromptQueueStore {
         let now = Utc::now().to_rfc3339();
 
         let mut stmt = conn.prepare(
-            "SELECT id, source, target, prompt, created_at, processed_at, summary, priority
+            "SELECT id, source, target, prompt, created_at, processed_at, summary, priority, acked_at
              FROM prompt_queue
              WHERE processed_at IS NULL
              ORDER BY priority ASC, id ASC
@@ -335,7 +383,7 @@ impl PromptQueueStore for SqlitePromptQueueStore {
         let conn = self.conn.lock().unwrap();
 
         let mut stmt = conn.prepare(
-            "SELECT id, source, target, prompt, created_at, processed_at, summary, priority
+            "SELECT id, source, target, prompt, created_at, processed_at, summary, priority, acked_at
              FROM prompt_queue
              WHERE processed_at IS NULL
              ORDER BY priority ASC, id ASC
@@ -382,7 +430,7 @@ impl PromptQueueStore for SqlitePromptQueueStore {
 
         let where_clause = conditions.join(" OR ");
         let sql = format!(
-            "SELECT id, source, target, prompt, created_at, processed_at, summary, priority
+            "SELECT id, source, target, prompt, created_at, processed_at, summary, priority, acked_at
              FROM prompt_queue
              WHERE processed_at IS NULL
                AND ({where_clause})
@@ -413,6 +461,76 @@ impl PromptQueueStore for SqlitePromptQueueStore {
         )?;
 
         Ok(())
+    }
+
+    fn ack(&self, prompt_id: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now().to_rfc3339();
+
+        let rows = conn.execute(
+            "UPDATE prompt_queue SET acked_at = ? WHERE id = ? AND acked_at IS NULL",
+            params![now, prompt_id],
+        )?;
+
+        if rows == 0 {
+            // Check if the prompt exists at all
+            let exists: bool = conn.query_row(
+                "SELECT COUNT(*) > 0 FROM prompt_queue WHERE id = ?",
+                params![prompt_id],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                return Err(crate::StoreError::NotFound(format!(
+                    "Prompt {prompt_id} not found"
+                )));
+            }
+            // Already acked — idempotent, not an error
+        }
+
+        Ok(())
+    }
+
+    fn unacked(&self, timeout_secs: i64, limit: usize) -> Result<Vec<QueuedPrompt>> {
+        let conn = self.conn.lock().unwrap();
+        let cutoff = (Utc::now() - chrono::Duration::seconds(timeout_secs)).to_rfc3339();
+
+        let mut stmt = conn.prepare(
+            "SELECT id, source, target, prompt, created_at, processed_at, summary, priority, acked_at
+             FROM prompt_queue
+             WHERE processed_at IS NOT NULL
+               AND processed_at < ?
+               AND acked_at IS NULL
+             ORDER BY priority ASC, id ASC
+             LIMIT ?",
+        )?;
+
+        let prompts = stmt
+            .query_map(params![cutoff, limit as i64], Self::prompt_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        Ok(prompts)
+    }
+
+    fn message_status(&self, prompt_id: i64) -> Result<Option<MessageStatus>> {
+        let conn = self.conn.lock().unwrap();
+
+        let result = conn.query_row(
+            "SELECT processed_at, acked_at FROM prompt_queue WHERE id = ?",
+            params![prompt_id],
+            |row| {
+                let processed_at: Option<String> = row.get(0)?;
+                let acked_at: Option<String> = row.get(1)?;
+                Ok((processed_at, acked_at))
+            },
+        );
+
+        match result {
+            Ok((_, Some(_))) => Ok(Some(MessageStatus::Confirmed)),
+            Ok((Some(_), None)) => Ok(Some(MessageStatus::Delivered)),
+            Ok((None, _)) => Ok(Some(MessageStatus::Pending)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     fn pending_count(&self) -> Result<usize> {
@@ -696,5 +814,80 @@ mod tests {
         // High priority should come first
         assert_eq!(prompts[0].prompt, "BLOCKED: need help");
         assert_eq!(prompts[1].prompt, "Status update");
+    }
+
+    #[test]
+    fn test_ack_delivery_confirmation() {
+        let (_temp, store) = create_test_store();
+
+        let id = store.enqueue("supervisor", "worker-1", "Do task").unwrap();
+
+        // Initially pending
+        let status = store.message_status(id).unwrap();
+        assert_eq!(status, Some(MessageStatus::Pending));
+
+        // Mark as processed (delivered)
+        store.mark_processed(id).unwrap();
+        let status = store.message_status(id).unwrap();
+        assert_eq!(status, Some(MessageStatus::Delivered));
+
+        // Ack (confirmed)
+        store.ack(id).unwrap();
+        let status = store.message_status(id).unwrap();
+        assert_eq!(status, Some(MessageStatus::Confirmed));
+
+        // Ack is idempotent
+        store.ack(id).unwrap();
+
+        // Peek shows acked_at is set
+        let prompts = store.poll_for_target("worker-1", 10).unwrap();
+        assert!(prompts.is_empty()); // already processed
+    }
+
+    #[test]
+    fn test_ack_nonexistent_returns_error() {
+        let (_temp, store) = create_test_store();
+        let result = store.ack(99999);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_message_status_nonexistent() {
+        let (_temp, store) = create_test_store();
+        let status = store.message_status(99999).unwrap();
+        assert_eq!(status, None);
+    }
+
+    #[test]
+    fn test_unacked_timeout() {
+        let (_temp, store) = create_test_store();
+
+        let id1 = store.enqueue("supervisor", "worker-1", "Msg 1").unwrap();
+        let id2 = store.enqueue("supervisor", "worker-2", "Msg 2").unwrap();
+
+        // Process both
+        store.mark_processed(id1).unwrap();
+        store.mark_processed(id2).unwrap();
+
+        // Ack only one
+        store.ack(id2).unwrap();
+
+        // With timeout=0, all delivered-but-unacked messages should appear
+        let unacked = store.unacked(0, 10).unwrap();
+        assert_eq!(unacked.len(), 1);
+        assert_eq!(unacked[0].id, id1);
+        assert_eq!(unacked[0].prompt, "Msg 1");
+    }
+
+    #[test]
+    fn test_unacked_respects_timeout() {
+        let (_temp, store) = create_test_store();
+
+        let id = store.enqueue("supervisor", "worker-1", "Recent").unwrap();
+        store.mark_processed(id).unwrap();
+
+        // With a large timeout, the recently processed message should NOT appear
+        let unacked = store.unacked(3600, 10).unwrap();
+        assert!(unacked.is_empty());
     }
 }

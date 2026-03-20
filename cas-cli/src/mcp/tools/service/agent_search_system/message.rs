@@ -284,4 +284,73 @@ impl CasService {
             truncate_str(&message, 100)
         )))
     }
+
+    pub(in crate::mcp::tools::service) async fn message_ack(
+        &self,
+        req: AgentRequest,
+    ) -> Result<CallToolResult, McpError> {
+        use crate::store::open_prompt_queue_store;
+
+        let notification_id = req.notification_id.ok_or_else(|| {
+            Self::error(
+                ErrorCode::INVALID_PARAMS,
+                "notification_id required for message_ack (the prompt queue message ID)",
+            )
+        })?;
+
+        let queue = open_prompt_queue_store(&self.inner.cas_root).map_err(|error| {
+            Self::error(
+                ErrorCode::INTERNAL_ERROR,
+                format!("Failed to open prompt queue: {error}"),
+            )
+        })?;
+
+        queue.ack(notification_id).map_err(|error| {
+            Self::error(
+                ErrorCode::INTERNAL_ERROR,
+                format!("Failed to acknowledge message: {error}"),
+            )
+        })?;
+
+        Ok(Self::success(format!(
+            "Message {notification_id} acknowledged (delivery confirmed)"
+        )))
+    }
+
+    pub(in crate::mcp::tools::service) async fn message_status_query(
+        &self,
+        req: AgentRequest,
+    ) -> Result<CallToolResult, McpError> {
+        use crate::store::open_prompt_queue_store;
+
+        let notification_id = req.notification_id.ok_or_else(|| {
+            Self::error(
+                ErrorCode::INVALID_PARAMS,
+                "notification_id required for message_status (the prompt queue message ID)",
+            )
+        })?;
+
+        let queue = open_prompt_queue_store(&self.inner.cas_root).map_err(|error| {
+            Self::error(
+                ErrorCode::INTERNAL_ERROR,
+                format!("Failed to open prompt queue: {error}"),
+            )
+        })?;
+
+        let status = queue.message_status(notification_id).map_err(|error| {
+            Self::error(
+                ErrorCode::INTERNAL_ERROR,
+                format!("Failed to query message status: {error}"),
+            )
+        })?;
+
+        match status {
+            Some(s) => Ok(Self::success(format!(
+                "Message {notification_id} status: {s}"
+            ))),
+            None => Ok(Self::success(format!(
+                "Message {notification_id} not found"
+            ))),
+        }
+    }
 }
