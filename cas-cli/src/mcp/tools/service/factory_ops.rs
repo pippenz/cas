@@ -818,22 +818,33 @@ impl CasService {
 /// Returns the set of worker names this supervisor owns, derived from the `CAS_FACTORY_WORKER_NAMES`
 /// environment variable. Returns `None` when not running as a supervisor or when the variable is
 /// absent, meaning no scoping should be applied.
+///
+/// The result is cached per-thread since env vars don't change during a session.
 fn supervisor_owned_workers() -> Option<std::collections::HashSet<String>> {
-    let role = std::env::var("CAS_AGENT_ROLE").unwrap_or_default();
-    if !role.eq_ignore_ascii_case("supervisor") {
-        return None;
+    thread_local! {
+        static CACHE: std::cell::OnceCell<Option<std::collections::HashSet<String>>> =
+            const { std::cell::OnceCell::new() };
     }
-    let csv = std::env::var("CAS_FACTORY_WORKER_NAMES").ok()?;
-    if csv.trim().is_empty() {
-        return None;
-    }
-    Some(
-        csv.split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(ToOwned::to_owned)
-            .collect(),
-    )
+    CACHE.with(|cell| {
+        cell.get_or_init(|| {
+            let role = std::env::var("CAS_AGENT_ROLE").unwrap_or_default();
+            if !role.eq_ignore_ascii_case("supervisor") {
+                return None;
+            }
+            let csv = std::env::var("CAS_FACTORY_WORKER_NAMES").ok()?;
+            if csv.trim().is_empty() {
+                return None;
+            }
+            Some(
+                csv.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect(),
+            )
+        })
+        .clone()
+    })
 }
 
 fn run_git(path: &std::path::Path, args: &[&str]) -> std::result::Result<String, String> {
