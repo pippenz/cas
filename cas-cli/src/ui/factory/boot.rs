@@ -17,6 +17,8 @@ pub struct BootConfig {
     pub profile: String,
     /// Skip animations (for testing)
     pub skip_animation: bool,
+    /// Use minions theme
+    pub minions_theme: bool,
 }
 
 mod screen;
@@ -36,7 +38,7 @@ pub fn run_boot_screen_client(
     use std::collections::HashMap as AgentMap;
     use std::io::Read;
 
-    let mut screen = BootScreen::new(boot_config.skip_animation)?;
+    let mut screen = BootScreen::new_themed(boot_config.skip_animation, boot_config.minions_theme)?;
 
     // Draw logo and get starting row
     let box_start = screen.draw_logo()?;

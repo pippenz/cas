@@ -127,6 +127,30 @@ impl ColorPalette {
         }
     }
 
+    /// Minions theme variant - yellow primary, denim blue secondary
+    pub fn minions(is_dark: bool) -> Self {
+        let base = if is_dark { Self::dark() } else { Self::light() };
+        Self {
+            // Override primary accent from teal to Minion yellow
+            primary_100: Color::Rgb(255, 245, 157), // Light banana
+            primary_200: Color::Rgb(255, 235, 59),  // Bright yellow
+            primary_300: Color::Rgb(255, 213, 0),   // Minion yellow
+            primary_400: Color::Rgb(255, 193, 7),   // Amber accent
+            primary_500: Color::Rgb(255, 160, 0),   // Deep amber
+
+            // Override info to denim blue (overalls)
+            info: Color::Rgb(65, 105, 225),     // Royal blue / denim
+            info_dim: Color::Rgb(33, 53, 113),  // Dark denim
+
+            // Override cyan to goggle silver
+            cyan: Color::Rgb(192, 200, 210),    // Goggle silver
+            cyan_dim: Color::Rgb(96, 100, 105), // Dark goggle
+
+            // Keep everything else from the base
+            ..base
+        }
+    }
+
     /// High contrast accessibility variant
     pub fn high_contrast() -> Self {
         Self {

@@ -16,6 +16,36 @@ pub enum ThemeMode {
     HighContrast,
 }
 
+/// Theme variant selection (cosmetic flavor)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThemeVariant {
+    #[default]
+    Default,
+    Minions,
+}
+
+impl std::fmt::Display for ThemeVariant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ThemeVariant::Default => write!(f, "default"),
+            ThemeVariant::Minions => write!(f, "minions"),
+        }
+    }
+}
+
+impl std::str::FromStr for ThemeVariant {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "default" => Ok(ThemeVariant::Default),
+            "minions" => Ok(ThemeVariant::Minions),
+            _ => Err(format!("Unknown theme variant: {s}")),
+        }
+    }
+}
+
 impl std::fmt::Display for ThemeMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -45,12 +75,17 @@ pub struct ThemeConfig {
     /// Theme mode: dark, light, or high_contrast
     #[serde(default)]
     pub mode: ThemeMode,
+
+    /// Theme variant: default or minions
+    #[serde(default)]
+    pub variant: ThemeVariant,
 }
 
 /// Active theme instance with computed styles
 #[derive(Debug, Clone)]
 pub struct ActiveTheme {
     pub mode: ThemeMode,
+    pub variant: ThemeVariant,
     pub is_dark: bool,
     pub palette: Palette,
     pub styles: Styles,
@@ -59,15 +94,25 @@ pub struct ActiveTheme {
 impl ActiveTheme {
     /// Create theme from configuration
     pub fn from_config(config: &ThemeConfig) -> Self {
-        Self::from_mode(config.mode)
+        Self::from_mode_and_variant(config.mode, config.variant)
     }
 
-    /// Create theme from mode
+    /// Create theme from mode (default variant)
     pub fn from_mode(mode: ThemeMode) -> Self {
-        let (colors, is_dark) = match mode {
+        Self::from_mode_and_variant(mode, ThemeVariant::Default)
+    }
+
+    /// Create theme from mode and variant
+    pub fn from_mode_and_variant(mode: ThemeMode, variant: ThemeVariant) -> Self {
+        let (base_colors, is_dark) = match mode {
             ThemeMode::Dark => (ColorPalette::dark(), true),
             ThemeMode::Light => (ColorPalette::light(), false),
             ThemeMode::HighContrast => (ColorPalette::high_contrast(), true),
+        };
+
+        let colors = match variant {
+            ThemeVariant::Default => base_colors,
+            ThemeVariant::Minions => ColorPalette::minions(is_dark),
         };
 
         let palette = Palette::from_colors(colors, is_dark);
@@ -75,6 +120,7 @@ impl ActiveTheme {
 
         Self {
             mode,
+            variant,
             is_dark,
             palette,
             styles,
@@ -113,6 +159,11 @@ impl ActiveTheme {
             Some(cfg) => Self::from_config(cfg),
             None => Self::detect(),
         }
+    }
+
+    /// Check if the minions variant is active
+    pub fn is_minions(&self) -> bool {
+        self.variant == ThemeVariant::Minions
     }
 }
 

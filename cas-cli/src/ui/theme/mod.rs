@@ -13,8 +13,8 @@ mod styles;
 
 pub use agent_colors::{get_agent_color, register_agent_color, team_color_rgb};
 pub use colors::ColorPalette;
-pub use config::{ActiveTheme, ThemeConfig, ThemeMode};
+pub use config::{ActiveTheme, ThemeConfig, ThemeMode, ThemeVariant};
 pub use detect::detect_background_theme;
-pub use icons::Icons;
+pub use icons::{Icons, MinionsIcons};
 pub use palette::Palette;
 pub use styles::Styles;

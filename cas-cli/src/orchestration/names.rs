@@ -7,6 +7,69 @@ use rand::Rng;
 use rand::seq::IndexedRandom;
 use std::collections::HashSet;
 
+// ── Minions theme names ──────────────────────────────────────────────────────
+
+const MINION_WORKERS: &[&str] = &[
+    "kevin", "stuart", "bob", "dave", "jerry", "tim", "mark", "phil", "carl",
+    "norbert", "larry", "tom", "chris", "john", "paul", "mike", "ken", "mel",
+    "lance", "donny",
+];
+
+const MINION_SUPERVISORS: &[&str] = &["gru", "dru", "nefario"];
+
+/// Generate a single minion worker name (e.g., "kevin", "stuart")
+pub fn generate_minion() -> String {
+    let mut rng = rand::rng();
+    let name = MINION_WORKERS.choose(&mut rng).unwrap_or(&"bob");
+    (*name).to_string()
+}
+
+/// Generate a minion supervisor name
+pub fn generate_minion_supervisor() -> String {
+    let mut rng = rand::rng();
+    let name = MINION_SUPERVISORS.choose(&mut rng).unwrap_or(&"gru");
+    (*name).to_string()
+}
+
+/// Generate N unique minion worker names.
+///
+/// If more names are requested than available, appends a numeric suffix.
+pub fn generate_minion_unique(count: usize) -> Vec<String> {
+    let mut names = Vec::with_capacity(count);
+    let mut rng = rand::rng();
+
+    // Shuffle the pool and take as many as we can
+    let mut pool: Vec<&str> = MINION_WORKERS.to_vec();
+    // Fisher-Yates shuffle
+    for i in (1..pool.len()).rev() {
+        let j = rng.random_range(0..=i);
+        pool.swap(i, j);
+    }
+
+    for (i, name) in pool.iter().enumerate() {
+        if i >= count {
+            break;
+        }
+        names.push((*name).to_string());
+    }
+
+    // If we need more than the pool, add suffixed duplicates
+    let mut suffix = 2;
+    while names.len() < count {
+        for name in &pool {
+            if names.len() >= count {
+                break;
+            }
+            names.push(format!("{name}-{suffix}"));
+        }
+        suffix += 1;
+    }
+
+    names
+}
+
+// ── Default theme names ──────────────────────────────────────────────────────
+
 const ADJECTIVES: &[&str] = &[
     "agile", "bold", "brave", "bright", "calm", "clever", "cosmic", "crisp", "daring", "eager",
     "fair", "fast", "fierce", "gentle", "golden", "happy", "jolly", "keen", "kind", "lively",
@@ -122,5 +185,45 @@ mod tests {
         // Should not panic even with large count
         let names = generate_unique(100);
         assert_eq!(names.len(), 100);
+    }
+
+    #[test]
+    fn test_generate_minion_returns_valid_name() {
+        let name = generate_minion();
+        assert!(
+            MINION_WORKERS.contains(&name.as_str()),
+            "Minion name should be valid: {name}"
+        );
+    }
+
+    #[test]
+    fn test_generate_minion_supervisor_returns_valid_name() {
+        let name = generate_minion_supervisor();
+        assert!(
+            MINION_SUPERVISORS.contains(&name.as_str()),
+            "Supervisor name should be valid: {name}"
+        );
+    }
+
+    #[test]
+    fn test_generate_minion_unique_returns_correct_count() {
+        let names = generate_minion_unique(5);
+        assert_eq!(names.len(), 5);
+    }
+
+    #[test]
+    fn test_generate_minion_unique_all_different() {
+        let names = generate_minion_unique(10);
+        let unique: HashSet<_> = names.iter().collect();
+        assert_eq!(unique.len(), names.len(), "All minion names should be unique");
+    }
+
+    #[test]
+    fn test_generate_minion_unique_exceeds_pool() {
+        // More than 20 minion names, should use suffixes
+        let names = generate_minion_unique(25);
+        assert_eq!(names.len(), 25);
+        let unique: HashSet<_> = names.iter().collect();
+        assert_eq!(unique.len(), 25, "All names should still be unique");
     }
 }

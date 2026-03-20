@@ -189,6 +189,8 @@ pub struct FactoryConfig {
     /// UUID for the team lead's Claude Code session.
     /// Used as `leadSessionId` in config.json and passed as `--session-id` to the supervisor.
     pub lead_session_id: Option<String>,
+    /// Use Minions theme for boot screen, names, and colors
+    pub minions_theme: bool,
 }
 
 impl Default for FactoryConfig {
@@ -211,6 +213,7 @@ impl Default for FactoryConfig {
             session_id: None,
             teams_configs: std::collections::HashMap::new(),
             lead_session_id: None,
+            minions_theme: false,
         }
     }
 }

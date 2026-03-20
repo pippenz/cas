@@ -549,9 +549,27 @@ pub fn execute(args: &FactoryArgs, cli: &Cli, cas_root: Option<&std::path::Path>
         }
     }
 
-    let all_names = generate_unique(args.workers as usize + 1);
-    let supervisor_name = all_names[0].clone();
-    let worker_names: Vec<String> = all_names[1..].to_vec();
+    // Determine theme variant early so we can use themed names
+    let theme_variant = {
+        let cd = cwd.join(".cas");
+        let cr = cas_root.or_else(|| if cd.exists() { Some(cd.as_path()) } else { None });
+        cr.and_then(|r| Config::load(r).ok())
+            .and_then(|c| c.theme.as_ref().map(|t| t.variant))
+            .unwrap_or_default()
+    };
+    let is_minions = theme_variant == crate::ui::theme::ThemeVariant::Minions;
+
+    let (supervisor_name, worker_names) = if is_minions {
+        use crate::orchestration::names::{generate_minion_supervisor, generate_minion_unique};
+        let sup = generate_minion_supervisor();
+        let workers = generate_minion_unique(args.workers as usize);
+        (sup, workers)
+    } else {
+        let all_names = generate_unique(args.workers as usize + 1);
+        let sup = all_names[0].clone();
+        let workers: Vec<String> = all_names[1..].to_vec();
+        (sup, workers)
+    };
 
     let session_name = args
         .name
@@ -613,6 +631,7 @@ pub fn execute(args: &FactoryArgs, cli: &Cli, cas_root: Option<&std::path::Path>
         },
         teams_configs,
         lead_session_id: Some(lead_session_id),
+        minions_theme: is_minions,
     };
 
     let phone_home = !args.no_phone_home;
