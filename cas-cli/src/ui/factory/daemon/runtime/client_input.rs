@@ -872,6 +872,42 @@ fn osc52_copy_sequence(text: &str) -> String {
     format!("\x1b]52;c;{}\x1b\\", encoded)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn osc52_encodes_text_as_base64() {
+        let seq = osc52_copy_sequence("hello");
+        // "hello" in base64 is "aGVsbG8="
+        assert_eq!(seq, "\x1b]52;c;aGVsbG8=\x1b\\");
+    }
+
+    #[test]
+    fn osc52_handles_empty_string() {
+        let seq = osc52_copy_sequence("");
+        assert_eq!(seq, "\x1b]52;c;\x1b\\");
+    }
+
+    #[test]
+    fn osc52_handles_unicode() {
+        let seq = osc52_copy_sequence("🍌");
+        let expected_b64 = base64::engine::general_purpose::STANDARD.encode("🍌".as_bytes());
+        assert_eq!(seq, format!("\x1b]52;c;{}\x1b\\", expected_b64));
+    }
+
+    #[test]
+    fn osc52_handles_multiline() {
+        let seq = osc52_copy_sequence("line1\nline2\nline3");
+        assert!(seq.starts_with("\x1b]52;c;"));
+        assert!(seq.ends_with("\x1b\\"));
+        // Decode and verify round-trip
+        let b64 = &seq[7..seq.len() - 2];
+        let decoded = base64::engine::general_purpose::STANDARD.decode(b64).unwrap();
+        assert_eq!(std::str::from_utf8(&decoded).unwrap(), "line1\nline2\nline3");
+    }
+}
+
 fn bracketed_paste_bytes(payload: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(payload.len() + 12);
     out.extend_from_slice(b"\x1b[200~");

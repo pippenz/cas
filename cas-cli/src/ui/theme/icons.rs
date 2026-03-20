@@ -125,3 +125,25 @@ impl MinionsIcons {
     pub const AGENT_WORKER: &'static str = "\u{1F34C}";  // 🍌
     pub const AGENT_SUPERVISOR: &'static str = "\u{1F576}"; // 🕶 (Gru's glasses)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn minions_icons_are_non_empty() {
+        assert!(!MinionsIcons::AGENT_ACTIVE.is_empty());
+        assert!(!MinionsIcons::AGENT_IDLE.is_empty());
+        assert!(!MinionsIcons::AGENT_DEAD.is_empty());
+        assert!(!MinionsIcons::AGENT_WORKER.is_empty());
+        assert!(!MinionsIcons::AGENT_SUPERVISOR.is_empty());
+    }
+
+    #[test]
+    fn minions_icons_differ_from_default_circles() {
+        // Default TUI uses circle icons (●/○/⊘) for agent status
+        assert_ne!(MinionsIcons::AGENT_ACTIVE, Icons::CIRCLE_FILLED);
+        assert_ne!(MinionsIcons::AGENT_IDLE, Icons::CIRCLE_EMPTY);
+        assert_ne!(MinionsIcons::AGENT_DEAD, Icons::CIRCLE_X);
+    }
+}

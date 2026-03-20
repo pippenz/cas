@@ -172,3 +172,52 @@ impl Default for ActiveTheme {
         Self::detect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn theme_variant_default_is_default() {
+        assert_eq!(ThemeVariant::default(), ThemeVariant::Default);
+    }
+
+    #[test]
+    fn theme_variant_display() {
+        assert_eq!(ThemeVariant::Default.to_string(), "default");
+        assert_eq!(ThemeVariant::Minions.to_string(), "minions");
+    }
+
+    #[test]
+    fn theme_variant_from_str() {
+        assert_eq!("default".parse::<ThemeVariant>().unwrap(), ThemeVariant::Default);
+        assert_eq!("minions".parse::<ThemeVariant>().unwrap(), ThemeVariant::Minions);
+        assert_eq!("MINIONS".parse::<ThemeVariant>().unwrap(), ThemeVariant::Minions);
+        assert!("banana".parse::<ThemeVariant>().is_err());
+    }
+
+    #[test]
+    fn theme_variant_serde_round_trip() {
+        let json = serde_json::to_string(&ThemeVariant::Minions).unwrap();
+        assert_eq!(json, "\"minions\"");
+        let parsed: ThemeVariant = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, ThemeVariant::Minions);
+    }
+
+    #[test]
+    fn active_theme_minions_variant() {
+        let config = ThemeConfig {
+            mode: ThemeMode::Dark,
+            variant: ThemeVariant::Minions,
+        };
+        let theme = ActiveTheme::from_config(&config);
+        assert!(theme.is_minions());
+        assert_eq!(theme.variant, ThemeVariant::Minions);
+    }
+
+    #[test]
+    fn active_theme_default_is_not_minions() {
+        let theme = ActiveTheme::from_mode(ThemeMode::Dark);
+        assert!(!theme.is_minions());
+    }
+}

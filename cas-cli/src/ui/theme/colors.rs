@@ -189,3 +189,48 @@ impl ColorPalette {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::style::Color;
+
+    #[test]
+    fn minions_palette_has_yellow_primary() {
+        let minions = ColorPalette::minions(true);
+        match minions.primary_300 {
+            Color::Rgb(r, g, _) => {
+                assert!(r > 200, "primary_300 red should be bright yellow, got {r}");
+                assert!(g > 150, "primary_300 green should be bright yellow, got {g}");
+            }
+            other => panic!("Expected RGB color, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn minions_palette_has_denim_blue_info() {
+        let minions = ColorPalette::minions(true);
+        match minions.info {
+            Color::Rgb(r, _, b) => {
+                assert!(b > r, "info blue should exceed red for denim blue");
+                assert!(b > 150, "info blue component should be strong, got {b}");
+            }
+            other => panic!("Expected RGB color, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn minions_palette_differs_from_dark() {
+        let dark = ColorPalette::dark();
+        let minions = ColorPalette::minions(true);
+        assert_ne!(minions.primary_300, dark.primary_300, "primary should differ");
+        assert_ne!(minions.info, dark.info, "info should differ");
+    }
+
+    #[test]
+    fn minions_palette_preserves_base_bg() {
+        let dark = ColorPalette::dark();
+        let minions = ColorPalette::minions(true);
+        assert_eq!(minions.gray_900, dark.gray_900, "bg should inherit from dark base");
+    }
+}
