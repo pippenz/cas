@@ -95,6 +95,40 @@ pub struct Config {
     pub llm: Option<LlmConfig>,
 }
 
+impl Config {
+    /// Merge fields from `other` into `self` where `self` has `None`.
+    /// Returns `true` if any field was updated.
+    pub fn merge_missing(&mut self, other: &Self) -> bool {
+        let mut changed = false;
+        macro_rules! merge_option {
+            ($field:ident) => {
+                if self.$field.is_none() && other.$field.is_some() {
+                    self.$field = other.$field.clone();
+                    changed = true;
+                }
+            };
+        }
+        merge_option!(cloud);
+        merge_option!(hooks);
+        merge_option!(tasks);
+        merge_option!(dev);
+        merge_option!(code);
+        merge_option!(notifications);
+        merge_option!(agent);
+        merge_option!(coordination);
+        merge_option!(lease);
+        merge_option!(verification);
+        merge_option!(worktrees);
+        merge_option!(theme);
+        merge_option!(orchestration);
+        merge_option!(factory);
+        merge_option!(telemetry);
+        merge_option!(logging);
+        merge_option!(llm);
+        changed
+    }
+}
+
 mod access;
 pub use access::{
     get_telemetry_consent, global_cas_dir, load_global_config, prompt_telemetry_consent,

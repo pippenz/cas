@@ -5,6 +5,10 @@ impl Config {
     ///
     /// Tries TOML first (config.toml), falls back to YAML (config.yaml),
     /// and auto-migrates YAML to TOML on first load.
+    ///
+    /// When both files exist, merges any YAML-only settings into the TOML
+    /// config (covers the case where something wrote to config.yaml while
+    /// config.toml already existed).
     pub fn load(cas_dir: &std::path::Path) -> Result<Self, MemError> {
         let toml_path = cas_dir.join("config.toml");
         let yaml_path = cas_dir.join("config.yaml");
@@ -12,8 +16,28 @@ impl Config {
         // Try TOML first (preferred format)
         if toml_path.exists() {
             let content = std::fs::read_to_string(&toml_path)?;
-            return toml::from_str(&content)
-                .map_err(|e| MemError::Parse(format!("Failed to parse config.toml: {e}")));
+            let mut config: Self = toml::from_str(&content)
+                .map_err(|e| MemError::Parse(format!("Failed to parse config.toml: {e}")))?;
+
+            // If YAML also exists, merge any settings that are missing from TOML.
+            // This handles the case where something wrote to config.yaml after
+            // config.toml was already created (e.g. theme variant).
+            if yaml_path.exists() {
+                if let Ok(yaml_content) = std::fs::read_to_string(&yaml_path) {
+                    if let Ok(yaml_config) = serde_yaml::from_str::<Self>(&yaml_content) {
+                        let changed = config.merge_missing(&yaml_config);
+                        if changed {
+                            // Persist the merged config and clean up stale YAML
+                            let _ = config.save_toml(cas_dir);
+                        }
+                        // Always remove the stale YAML to prevent future confusion
+                        let backup_path = cas_dir.join("config.yaml.bak");
+                        let _ = std::fs::rename(&yaml_path, &backup_path);
+                    }
+                }
+            }
+
+            return Ok(config);
         }
 
         // Fall back to YAML and auto-migrate

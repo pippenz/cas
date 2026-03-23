@@ -1,4 +1,5 @@
 use crate::config::*;
+use crate::ui::theme::{ThemeConfig, ThemeMode, ThemeVariant};
 use tempfile::TempDir;
 
 #[test]
@@ -19,6 +20,73 @@ fn test_config_save_load() {
     let loaded = Config::load(temp.path()).unwrap();
 
     assert_eq!(loaded.sync.min_helpful, 5);
+}
+
+#[test]
+fn test_merge_missing_fills_none_fields() {
+    let mut base = Config::default();
+    assert!(base.theme.is_none());
+
+    let mut other = Config::default();
+    other.theme = Some(ThemeConfig {
+        mode: ThemeMode::Dark,
+        variant: ThemeVariant::Minions,
+    });
+
+    let changed = base.merge_missing(&other);
+    assert!(changed);
+    assert_eq!(base.theme.as_ref().unwrap().variant, ThemeVariant::Minions);
+}
+
+#[test]
+fn test_merge_missing_does_not_overwrite_existing() {
+    let mut base = Config::default();
+    base.theme = Some(ThemeConfig {
+        mode: ThemeMode::Light,
+        variant: ThemeVariant::Default,
+    });
+
+    let mut other = Config::default();
+    other.theme = Some(ThemeConfig {
+        mode: ThemeMode::Dark,
+        variant: ThemeVariant::Minions,
+    });
+
+    let changed = base.merge_missing(&other);
+    assert!(!changed);
+    assert_eq!(base.theme.as_ref().unwrap().variant, ThemeVariant::Default);
+}
+
+#[test]
+fn test_load_merges_stale_yaml_into_toml() {
+    let temp = TempDir::new().unwrap();
+
+    // Write TOML without theme
+    let config = Config::default();
+    config.save_toml(temp.path()).unwrap();
+
+    // Write YAML with theme (simulates stale write)
+    let yaml = "theme:\n  variant: minions\n";
+    std::fs::write(temp.path().join("config.yaml"), yaml).unwrap();
+
+    let loaded = Config::load(temp.path()).unwrap();
+    assert_eq!(
+        loaded.theme.as_ref().unwrap().variant,
+        ThemeVariant::Minions,
+        "theme from YAML should be merged into TOML config"
+    );
+
+    // YAML should be renamed to .bak
+    assert!(!temp.path().join("config.yaml").exists());
+    assert!(temp.path().join("config.yaml.bak").exists());
+
+    // TOML should now contain the theme
+    let reloaded = Config::load(temp.path()).unwrap();
+    assert_eq!(
+        reloaded.theme.as_ref().unwrap().variant,
+        ThemeVariant::Minions,
+        "theme should persist in TOML after merge"
+    );
 }
 
 #[test]
