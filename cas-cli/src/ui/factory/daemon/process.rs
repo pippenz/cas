@@ -305,6 +305,7 @@ pub async fn run_daemon_after_fork(
         pending_spawns: VecDeque::new(),
         spawn_task: None,
         cloud_handle,
+        phone_home: false,
         relay_clients: HashMap::new(),
         pane_watchers: HashMap::new(),
         pane_buffers: HashMap::new(),

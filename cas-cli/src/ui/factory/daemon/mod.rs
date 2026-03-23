@@ -142,6 +142,8 @@ pub struct FactoryDaemon {
     spawn_task: Option<(String, JoinHandle<anyhow::Result<WorkerSpawnResult>>)>,
     /// Cloud phone-home WebSocket client handle
     cloud_handle: Option<cloud_client::CloudClientHandle>,
+    /// Whether cloud phone-home should be started (deferred from init for fork-first path)
+    phone_home: bool,
     /// Remote relay clients connected via cloud WebSocket
     relay_clients: HashMap<String, runtime::relay::RelayClient>,
     /// Per-pane web watchers: pane_name -> set of watcher IDs

@@ -25,16 +25,29 @@ Read each staged file fully. Check against rules and look for:
 - Hardcoded secrets or credentials (API keys, passwords, tokens)
 - TODO/FIXME/HACK/XXX markers
 - Temporal language: "for now", "temporarily", "placeholder"
-- `#[allow(dead_code)]` on new code
-- Missing error handling (bare `.unwrap()`, empty catch blocks, swallowed errors)
+- Missing error handling (empty catch blocks, swallowed errors, bare `.unwrap()`)
 - Missing input validation at boundaries
 - Inconsistent naming vs surrounding code
+
+Language-specific red flags:
+- **TypeScript**: `as any`, `// @ts-ignore` without justification, `console.log` in production
+- **Rust**: `#[allow(dead_code)]` on new code, bare `.unwrap()` on user input, `todo!()` / `unimplemented!()`
+- **Python**: bare `except:` clauses, `# type: ignore` without justification
 
 ### Step 3: Structural Verification with ast-grep
 
 Run targeted structural checks on staged files to confirm findings — don't just read and opine:
 
 ```bash
+# TypeScript: Find type assertions to any
+ast-grep --lang typescript -p '$EXPR as any' <file>
+
+# TypeScript: Find empty catch blocks
+ast-grep --lang typescript -p 'catch ($ERR) {}' <file>
+
+# TypeScript: Find console.log in production code
+ast-grep --lang typescript -p 'console.log($$$)' <file>
+
 # Rust: Find unwrap() calls (potential panics on user input)
 ast-grep --lang rust -p '$EXPR.unwrap()' <file>
 
@@ -44,44 +57,43 @@ ast-grep --lang rust -p 'todo!($$$)' <file>
 # Rust: Find ignored Results
 ast-grep --lang rust -p 'let _ = $EXPR' <file>
 
-# TypeScript: Find type assertions to any
-ast-grep --lang typescript -p '$EXPR as any' <file>
-
 # Python: Find bare except clauses
 ast-grep --lang python -p 'except:' <file>
 ```
 
+Choose checks based on the file types in the diff.
+
 ### Step 4: Cross-File Impact Check
 
-If the diff changes a function signature, struct fields, or public API:
+If the diff changes a function signature, type/struct fields, or public API:
 
 ```bash
 # Find all callers of a changed function
-ast-grep --lang rust -p 'changed_function($$$)' src/
+rg 'changed_function' src/ --type-add 'code:*.{ts,rs,py,vue}' --type code
 
-# Find all usages of a changed struct field
-rg 'field_name' src/ --type rust
+# Find all usages of a changed type/struct field
+rg 'field_name' src/ --type-add 'code:*.{ts,rs,py,vue}' --type code
 ```
 
 Flag if callers exist but weren't updated in the same diff.
 
 ### Step 5: Verify New Code Is Wired Up
 
-For each **new** function, struct, module, route, or handler introduced in the diff:
+For each **new** function, class, module, route, or handler introduced in the diff:
 
 ```bash
 # Check if the new symbol is actually used/imported anywhere
-rg 'new_function_name' src/ --type rust
-rg 'mod new_module' src/ --type rust
+rg 'new_function_name' src/
 ```
 
 New code with zero external references = dead code. Flag as **error**.
 
-Registration points to check:
-- New CLI command → added to `Commands` enum and match arm
-- New MCP tool → registered in tool list
-- New route → added to router
-- New migration → listed in migration runner
+Registration points to check (varies by framework):
+- New CLI command -> added to command registry
+- New MCP tool -> registered in tool list
+- New API route/endpoint -> added to router or controller module
+- New migration -> listed in migration runner
+- New module/service -> registered in dependency injection container
 
 ### Step 6: Search for Broader Context
 
@@ -97,14 +109,14 @@ Check if similar code already exists (potential duplication) or if there are rel
 ## Code Review: [Branch/Commit]
 
 ### Rule Compliance
-- rule-XXX: Compliant / Violation at file.rs:42 — description, suggested fix
+- rule-XXX: Compliant / Violation at file:42 — description, suggested fix
 
 ### Issues Found
 | Severity | File | Line | Issue | Evidence | Suggestion |
 |----------|------|------|-------|----------|------------|
-| error    | src/handler.rs | 42 | Unwrap on user input | `ast-grep` found `.unwrap()` | Use `.map_err()?` |
+| error    | src/handler.ts | 42 | `as any` on user input | `ast-grep` found `as any` | Add proper type annotation |
 | warning  | src/store.rs | 88 | Unbounded query | No LIMIT clause | Add pagination |
-| info     | src/types.rs | 15 | Naming inconsistency | Neighbors use `snake_case` | Rename to match |
+| info     | src/types.py | 15 | Naming inconsistency | Neighbors use `snake_case` | Rename to match |
 
 ### Security Concerns
 (list with evidence, or "None found")

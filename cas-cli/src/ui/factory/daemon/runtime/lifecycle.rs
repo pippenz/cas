@@ -145,6 +145,7 @@ impl FactoryDaemon {
             pending_spawns: VecDeque::new(),
             spawn_task: None,
             cloud_handle,
+            phone_home: false,
             relay_clients: HashMap::new(),
             pane_watchers: HashMap::new(),
             pane_buffers: HashMap::new(),
@@ -165,6 +166,12 @@ impl FactoryDaemon {
 
     /// Run the daemon main loop with TUI rendering
     pub async fn run(&mut self) -> anyhow::Result<()> {
+        // Start deferred cloud phone-home client (fork-first path defers this
+        // because run_with_progress() runs before the Tokio runtime exists).
+        if self.phone_home && self.cloud_handle.is_none() {
+            self.cloud_handle = Self::try_start_cloud_client(&self.session_name);
+        }
+
         let session_started_at = Instant::now();
 
         // Create buffer backend for rendering

@@ -45,42 +45,47 @@ Before running `mcp__cas__task action=close`, verify your own work. The task-ver
 ### 1. No shortcut markers
 ```bash
 # Must return zero results in your changed files
-rg 'TODO|FIXME|XXX|HACK|unimplemented!|todo!' <changed_files>
+rg 'TODO|FIXME|XXX|HACK' <changed_files>
 rg 'for now|temporarily|placeholder|stub|workaround' <changed_files>
 ```
 
+Also check for language-specific incomplete markers:
+- **TypeScript**: `throw new Error('Not implemented')`
+- **Rust**: `unimplemented!()`, `todo!()`
+- **Python**: `raise NotImplementedError`
+
 ### 2. All new code is wired up
-For every new function, struct, module, route, or handler you created:
+For every new function, class, module, route, or handler you created:
 ```bash
 # Verify it's actually called/imported somewhere outside its definition
-rg 'your_new_function' src/
-ast-grep --lang rust -p 'your_new_function($$$)' src/
+rg 'your_new_symbol' src/
 ```
-If zero external references → you built it but didn't wire it in. Fix before closing.
+If zero external references -> you built it but didn't wire it in. Fix before closing.
 
-Registration checklist:
-- New CLI command → added to `Commands` enum + match arm?
-- New MCP tool → registered in tool list?
-- New route → added to router?
-- New migration → listed in migration runner?
-- New config field → has a default, is read somewhere?
+Registration checklist (varies by framework):
+- New CLI command -> added to command registry?
+- New API route/endpoint -> added to router or module?
+- New migration -> listed in migration runner?
+- New service/provider -> registered in DI container?
+- New config field -> has a default, is read somewhere?
 
 ### 3. Changed signatures don't break callers
 ```bash
-# If you changed a function signature, verify all call sites compile
-ast-grep --lang rust -p 'changed_function($$$)' src/
+# If you changed a function signature, verify all call sites
+rg 'changed_function' src/
 ```
 
 ### 4. Tests pass
 ```bash
-cargo test  # or equivalent for the project
+# Run the project's test suite
+# Examples: cargo test, pnpm test, pytest, npm test
 ```
 
 ### 5. No dead code left behind
-```bash
-# Check for allow(dead_code) on your new code
-rg '#\[allow\(dead_code\)\]' <changed_files>
-```
+Check for language-specific dead code markers on your new code:
+- **TypeScript**: `// @ts-ignore` without justification
+- **Rust**: `#[allow(dead_code)]`
+- **Python**: `# type: ignore` without justification
 
 Only close after all checks pass. The verifier will catch what you miss — but rejections cost time.
 

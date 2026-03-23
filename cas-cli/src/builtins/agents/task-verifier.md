@@ -78,16 +78,29 @@ mcp__cas__search action=search query="TODO FIXME placeholder stub workaround"
 ### Step 8: Read and Verify Each File
 
 Read each changed file fully. Reject if you find:
-- TODO/FIXME/XXX/HACK markers, `unimplemented!()`, `todo!()`, `raise NotImplementedError`
+- TODO/FIXME/XXX/HACK markers
+- `throw new Error('Not implemented')`, `unimplemented!()`, `todo!()`, `raise NotImplementedError`
 - Temporal language: "for now", "temporarily", "later", "eventually", "placeholder"
-- `#[allow(dead_code)]` on new code
+- `// @ts-ignore`, `#[allow(dead_code)]`, `# type: ignore` on new code without justification
 - Code duplicating existing functionality (search the codebase before approving)
 
 ### Step 8.5: Structural Verification (Evidence-Based)
 
-Don't just read and opine — **run commands to confirm findings**. Use ast-grep and grep to structurally verify patterns in changed files:
+Don't just read and opine — **run commands to confirm findings**. Use ast-grep and grep to structurally verify patterns in changed files. Choose checks based on the file types in the diff:
 
 ```bash
+# TypeScript: Find `as any` type assertions
+ast-grep --lang typescript -p '$EXPR as any' <changed_file>
+
+# TypeScript: Find empty catch blocks
+ast-grep --lang typescript -p 'catch ($ERR) {}' <changed_file>
+
+# TypeScript: Find console.log in production code
+ast-grep --lang typescript -p 'console.log($$$)' <changed_file>
+
+# TypeScript: Find ts-ignore/ts-expect-error
+rg '@ts-ignore|@ts-expect-error' <changed_file>
+
 # Rust: Find unwrap() calls in changed files (potential panics)
 ast-grep --lang rust -p '$EXPR.unwrap()' <changed_file>
 
@@ -97,9 +110,6 @@ ast-grep --lang rust -p 'unimplemented!($$$)' <changed_file>
 
 # Rust: Find functions that ignore Result/Option
 ast-grep --lang rust -p 'let _ = $EXPR' <changed_file>
-
-# TypeScript: Find any/unknown type assertions
-ast-grep --lang typescript -p '$EXPR as any' <changed_file>
 
 # Python: Find bare except clauses
 ast-grep --lang python -p 'except:' <changed_file>
@@ -113,16 +123,15 @@ Check beyond the diff — verify that changes don't break consumers:
 
 1. **Changed function signatures**: Search for all callers
    ```bash
-   # If function `process_task` was modified, find all call sites
-   ast-grep --lang rust -p 'process_task($$$)' src/
+   rg 'changed_function' src/
    ```
 
-2. **Changed struct fields**: Search for all usages
+2. **Changed type/struct/interface fields**: Search for all usages
    ```bash
-   ast-grep --lang rust -p '$EXPR.$FIELD_NAME' src/
+   rg 'changed_field' src/
    ```
 
-3. **Changed trait implementations**: Verify trait bounds still satisfied
+3. **Changed module exports or trait implementations**: Verify consumers still work
 
 4. **Changed public API**: Check if docs, tests, and consumers are updated
 
@@ -130,44 +139,36 @@ If a public interface changed but callers weren't updated, that's a **blocking**
 
 ### Step 8.9: Verify New Code Is Wired Up (No Dead Code)
 
-Every new function, struct, route, handler, or module the task introduced **must be reachable**. Workers often build components but forget to wire them in. This is a **blocking** issue.
+Every new function, class, route, handler, or module the task introduced **must be reachable**. Workers often build components but forget to wire them in. This is a **blocking** issue.
 
-For each new symbol (function, struct, enum, trait impl, route, handler) added by the task:
+For each new symbol added by the task:
 
 1. **Search for call sites / usages outside the definition file**:
    ```bash
-   # Verify new function is actually called somewhere
-   ast-grep --lang rust -p 'new_function_name($$$)' src/
-
-   # Verify new struct is instantiated or referenced
-   ast-grep --lang rust -p 'NewStructName { $$$  }' src/
-   ast-grep --lang rust -p 'NewStructName::$METHOD($$$)' src/
-
-   # Verify new module is imported
-   rg 'mod new_module' src/
-   rg 'use.*new_module' src/
+   # Verify new symbol is actually used somewhere
+   rg 'new_symbol_name' src/
    ```
 
-2. **Check registration points** — new code often needs to be registered:
-   - New CLI command → added to the `Commands` enum and match arm
-   - New MCP tool → registered in the tool list
-   - New route → added to the router
-   - New migration → listed in the migration runner
-   - New trait impl → used by at least one consumer
-   - New config field → read somewhere, has a default
+2. **Check registration points** — new code often needs to be registered (varies by framework):
+   - New CLI command -> added to command registry/enum
+   - New MCP tool -> registered in tool list
+   - New route/endpoint -> added to router or module
+   - New migration -> listed in migration runner
+   - New service/provider -> registered in dependency injection
+   - New config field -> read somewhere, has a default
 
 3. **Flag as blocking** if a new symbol has zero external references. The code exists but does nothing — that's incomplete work, not a style issue.
 
-Exception: Test helpers, trait implementations required by derive macros, and `pub` items in library crates intended for external consumers are acceptable without internal call sites.
+Exception: Test helpers, trait implementations required by derive macros, type definitions, and `pub`/`export`ed items in library modules intended for external consumers are acceptable without internal call sites.
 
 ### Step 8.10: Check for Missing Co-Changes
 
 Certain files must change together. Flag as **blocking** if missing:
 
-- **Changed implementation but not its tests** — If `src/foo.rs` changed and `tests/foo_test.rs` or `src/foo_test.rs` exists, were tests updated?
-- **Added database column but no migration** — Schema changes need migrations
+- **Changed implementation but not its tests** — If the source file changed and a test file exists for it, were tests updated?
+- **Added database column/table but no migration** — Schema changes need migrations
 - **Changed API handler but not route registration** — New endpoints need wiring
-- **Changed types but not serialization** — Struct changes may need serde updates
+- **Changed types but not serialization** — Type changes may need serialization updates
 - **Changed config structure but not docs/defaults** — Config changes need default updates
 
 ```bash
@@ -188,7 +189,7 @@ Phase 2 evaluates implementation quality and identifies concrete improvements. T
 Before judging the implementation, understand the codebase conventions:
 ```bash
 # Find similar code in the project for pattern comparison
-ast-grep --lang rust -p 'fn $NAME($$$) -> Result<$$$> { $$$ }' src/
+rg 'similar_pattern' src/ -l
 ```
 Look for:
 - How similar features are implemented elsewhere in the codebase
@@ -213,14 +214,14 @@ For each changed file, assess these dimensions:
 - Would a different data structure or algorithm be meaningfully better?
 
 **Performance**
-- Are there unnecessary allocations, clones, or copies?
-- Are there O(n²) operations where O(n) or O(n log n) is feasible?
+- Are there unnecessary allocations, copies, or redundant operations?
+- Are there O(n^2) operations where O(n) or O(n log n) is feasible?
 - Are database queries efficient? (missing indexes, N+1 queries, unbounded SELECTs)
 - Is there unnecessary work inside hot loops?
 
 **Security**
 - Is user input validated at the boundary?
-- Are SQL queries parameterized?
+- Are database queries parameterized?
 - Could this introduce injection (command, SQL, XSS)?
 - Are secrets or sensitive data properly handled?
 
@@ -255,28 +256,28 @@ Skip trivial style nits. Focus on improvements that make the code meaningfully b
 
 ## Approved (no improvements needed):
 ```
-mcp__cas__verification action=add task_id=<id> status=approved summary="Work complete and production-ready. Implementation follows codebase patterns with clean error handling and appropriate abstractions." confidence=0.95 files="file1.rs,file2.rs"
+mcp__cas__verification action=add task_id=<id> status=approved summary="Work complete and production-ready. Implementation follows codebase patterns with clean error handling and appropriate abstractions." confidence=0.95 files="file1,file2"
 ```
 
 ## Approved with Improvements:
 
 When work is complete but could be better, approve AND include warning-level issues with suggestions:
 ```
-mcp__cas__verification action=add task_id=<id> status=approved summary="Work complete and production-ready.\n\nImprovements suggested (non-blocking):\n1. [file:line] [brief description of improvement]\n2. [file:line] [brief description of improvement]" confidence=0.85 files="file1.rs,file2.rs" issues='[{"file":"src/handler.rs","line":55,"severity":"warning","category":"error_handling","code":"unwrap()","problem":"Using unwrap() on user-provided input could panic in production","suggestion":"Replace with .map_err(|e| AppError::InvalidInput(e.to_string()))? to return a 400 response instead of crashing"},{"file":"src/store.rs","line":120,"severity":"warning","category":"performance","code":"SELECT * FROM entries","problem":"Unbounded SELECT could return thousands of rows for large datasets","suggestion":"Add LIMIT/OFFSET pagination or require a WHERE clause. The entries_list handler already accepts limit/offset params — pass them through to the query"}]'
+mcp__cas__verification action=add task_id=<id> status=approved summary="Work complete and production-ready.\n\nImprovements suggested (non-blocking):\n1. [file:line] [brief description of improvement]\n2. [file:line] [brief description of improvement]" confidence=0.85 files="file1,file2" issues='[{"file":"src/handler","line":55,"severity":"warning","category":"error_handling","code":"<pattern>","problem":"Description of concern","suggestion":"Specific fix recommendation"}]'
 ```
 
 **Key**: Use `severity: "warning"` for improvements. These are non-blocking — the task still closes, but the worker receives actionable feedback for a follow-up.
 
 ## Rejected:
 ```
-mcp__cas__verification action=add task_id=<id> status=rejected confidence=0.95 files="file1.rs" summary="REJECTED: [missing functionality]\n\nIncomplete:\n- src/file.rs:42: [what must be done]\n\nRequired:\n- [exact logic needed]\n\nRemoving or rewording the comment without implementing the functionality will fail re-verification." issues='[{"file":"src/file.rs","line":42,"severity":"blocking","category":"todo_comment","code":"// TODO: validate","problem":"Function accepts any input without validation","suggestion":"Add validation: non-empty, matches [a-z0-9]+, under 1000 chars."}]'
+mcp__cas__verification action=add task_id=<id> status=rejected confidence=0.95 files="file1" summary="REJECTED: [missing functionality]\n\nIncomplete:\n- src/file:42: [what must be done]\n\nRequired:\n- [exact logic needed]\n\nRemoving or rewording the comment without implementing the functionality will fail re-verification." issues='[{"file":"src/file","line":42,"severity":"blocking","category":"todo_comment","code":"// TODO: validate","problem":"Function accepts any input without validation","suggestion":"Add input validation with proper schema/type checks."}]'
 ```
 
 ## Rejected with Improvement Guidance:
 
 When rejecting, include both blocking issues AND improvement suggestions so the worker can fix everything in one pass:
 ```
-mcp__cas__verification action=add task_id=<id> status=rejected confidence=0.90 files="file1.rs,file2.rs" summary="REJECTED: [blocking reason]\n\nBlocking:\n- [what must be fixed]\n\nImprovements (fix while you're at it):\n- [suggestion 1]\n- [suggestion 2]\n\nRemoving or rewording the comment without implementing the functionality will fail re-verification." issues='[{"file":"src/file.rs","line":42,"severity":"blocking","category":"todo_comment","code":"// TODO: validate","problem":"Function lacks input validation","suggestion":"Add validation: non-empty, matches [a-z0-9]+, under 1000 chars."},{"file":"src/file.rs","line":80,"severity":"warning","category":"error_handling","code":".unwrap()","problem":"Panic on invalid input instead of returning error","suggestion":"Use .map_err(|e| Error::Parse(e))? for graceful error propagation"}]'
+mcp__cas__verification action=add task_id=<id> status=rejected confidence=0.90 files="file1,file2" summary="REJECTED: [blocking reason]\n\nBlocking:\n- [what must be fixed]\n\nImprovements (fix while you're at it):\n- [suggestion 1]\n- [suggestion 2]\n\nRemoving or rewording the comment without implementing the functionality will fail re-verification." issues='[{"file":"src/file","line":42,"severity":"blocking","category":"todo_comment","code":"// TODO: validate","problem":"Function lacks input validation","suggestion":"Add validation for required fields."},{"file":"src/file","line":80,"severity":"warning","category":"error_handling","code":"<pattern>","problem":"Error swallowed silently","suggestion":"Log and propagate the error properly"}]'
 ```
 
 ## Confidence Scoring
@@ -306,7 +307,7 @@ Adjust confidence based on both completeness AND quality:
 
 For each unique issue category in a rejection:
 1. Check: `mcp__cas__rule action=check_similar content="[proposed rule]"`
-2. If no match: `mcp__cas__rule action=create content="[rule]" paths="**/*.rs,**/*.ts" tags="from_verification,category:[cat]"`
+2. If no match: `mcp__cas__rule action=create content="[rule]" tags="from_verification,category:[cat]"`
 
 One rule per category per rejection. Rules start as Draft.
 

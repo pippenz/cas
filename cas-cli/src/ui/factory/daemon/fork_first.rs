@@ -389,12 +389,11 @@ impl DaemonInitPhase {
             drop(stream);
         }
 
-        // Optionally start cloud phone-home client
-        let cloud_handle = if self.phone_home {
-            FactoryDaemon::try_start_cloud_client(&self.session_name)
-        } else {
-            None
-        };
+        // Defer cloud phone-home client start to daemon.run() where a Tokio
+        // runtime is available.  In the fork-first path, run_with_progress()
+        // executes *before* the Tokio runtime is created, so calling
+        // tokio::spawn() here would panic.
+        let cloud_handle = None;
 
         // Create GUI socket for desktop clients
         let gui_sock_path = gui_socket_path(&self.session_name);
@@ -486,6 +485,7 @@ impl DaemonInitPhase {
             pending_spawns: VecDeque::new(),
             spawn_task: None,
             cloud_handle,
+            phone_home: self.phone_home,
             relay_clients: HashMap::new(),
             pane_watchers: HashMap::new(),
             pane_buffers: HashMap::new(),
