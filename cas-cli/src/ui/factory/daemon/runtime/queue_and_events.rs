@@ -19,9 +19,9 @@ impl FactoryDaemon {
                 let is_worker = self.app.worker_names().contains(&pane_id);
 
                 if is_supervisor {
-                    self.app.set_error(format!(
-                        "CRITICAL: Supervisor crashed with exit code {exit_code:?}"
-                    ));
+                    // Supervisor exited (either /exit or crash) — shut down the whole factory
+                    tracing::info!("Supervisor exited with code {exit_code:?}, shutting down");
+                    self.shutdown.store(true, Ordering::Relaxed);
                 } else if is_worker {
                     let _ = self.handle_worker_crash(&pane_id, exit_code);
                 }
