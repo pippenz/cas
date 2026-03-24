@@ -339,7 +339,7 @@ impl StatusBar {
             } else if input_focused {
                 // Input focused: keys go to pane, show Ctrl combos
                 right_spans.push(Span::styled(
-                    "Tab",
+                    "^P",
                     styles.text_info.add_modifier(Modifier::BOLD),
                 ));
                 right_spans.push(Span::styled(" focus", styles.text_muted));
@@ -462,7 +462,7 @@ impl StatusBar {
                 right_spans.push(Span::raw(" "));
                 right_spans.push(Span::styled("q", styles.text_error));
             } else if input_focused {
-                right_spans.push(Span::styled("Tab", styles.text_info));
+                right_spans.push(Span::styled("^P", styles.text_info));
                 right_spans.push(Span::raw(" "));
                 right_spans.push(Span::styled("^N", styles.text_success));
                 right_spans.push(Span::raw(" "));

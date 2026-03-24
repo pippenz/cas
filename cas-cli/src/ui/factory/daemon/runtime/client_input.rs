@@ -751,8 +751,8 @@ impl FactoryDaemon {
             // Check if sidecar is focused first - handle sidecar navigation
             if self.app.sidecar_is_focused() {
                 match byte {
-                    // Tab = cycle sidecar panels, exit to supervisor on last panel
-                    b'\t' => {
+                    // Tab or Ctrl+P = cycle sidecar panels, exit to supervisor on last panel
+                    b'\t' | 0x10 => {
                         if self.app.sidecar_focus
                             == crate::ui::factory::director::SidecarFocus::Activity
                         {
@@ -792,21 +792,15 @@ impl FactoryDaemon {
 
             // If focused pane accepts input, forward most input
             if self.app.focused_accepts_input() {
-                // Tab = enter sidecar focus (from supervisor)
-                if byte == 0x09 {
-                    self.app.toggle_sidecar_focus();
-                    i += 1;
-                    continue;
-                }
-
-                // Ctrl+P (0x10) = toggle sidecar focus (works even from supervisor)
+                // Ctrl+P (0x10) = toggle sidecar focus (use Ctrl+P instead of Tab
+                // so Tab flows through to the PTY for autocomplete acceptance)
                 if byte == 0x10 {
                     self.app.toggle_sidecar_focus();
                     i += 1;
                     continue;
                 }
 
-                // Forward all other input to the focused pane
+                // Forward all other input (including Tab) to the focused pane
                 let _ = self.app.mux.send_input(&[byte]).await;
                 i += 1;
                 continue;
@@ -814,8 +808,8 @@ impl FactoryDaemon {
 
             // When focused on a non-input pane, handle navigation keys
             match byte {
-                // Tab = go to sidecar (workers are view-only, not in tab cycle)
-                b'\t' => {
+                // Tab or Ctrl+P = go to sidecar (workers are view-only, not in tab cycle)
+                b'\t' | 0x10 => {
                     self.app.toggle_sidecar_focus();
                 }
                 // 'p' or 'd' = toggle sidecar panel focus
