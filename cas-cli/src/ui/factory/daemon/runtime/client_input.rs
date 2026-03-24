@@ -183,16 +183,28 @@ impl FactoryDaemon {
                                         || self.app.show_help)
                                     {
                                         if let Some(text) = self.app.handle_mouse_up() {
-                                            // Send OSC 52 to the owner client so its
-                                            // terminal writes the text to the system
-                                            // clipboard. The daemon is headless and
-                                            // cannot access the clipboard directly.
-                                            let osc52 = osc52_copy_sequence(&text);
+                                            let char_count = text.len();
                                             if let Some(client) =
                                                 self.clients.get_mut(&client_id)
                                             {
+                                                // Send OSC 52 for terminals that support it
+                                                let osc52 = osc52_copy_sequence(&text);
                                                 client.output_buf.extend(osc52.as_bytes());
+
+                                                // Send clipboard control sequence so the
+                                                // client can write to clipboard directly
+                                                // (more reliable since the client has
+                                                // display server access).
+                                                let clipboard_seq =
+                                                    clipboard_control_sequence(&text);
+                                                client
+                                                    .output_buf
+                                                    .extend(clipboard_seq.as_bytes());
                                             }
+                                            // Visual feedback in status bar
+                                            self.app.set_error(format!(
+                                                "Copied {char_count} chars"
+                                            ));
                                         }
                                     }
                                 }
@@ -870,6 +882,20 @@ fn osc52_copy_sequence(text: &str) -> String {
     format!("\x1b]52;c;{}\x1b\\", encoded)
 }
 
+/// Build a custom control sequence that tells the client to write `text`
+/// to the system clipboard via platform-native methods.
+///
+/// Format: `ESC ] 777 ; clipboard ; <base64> BEL`
+///
+/// The client process runs in the user's terminal session and has access
+/// to DISPLAY/WAYLAND_DISPLAY, so it can reliably write to the clipboard
+/// using arboard (Linux) or pbcopy (macOS). This is a fallback for
+/// terminals that don't support OSC 52.
+fn clipboard_control_sequence(text: &str) -> String {
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    format!("\x1b]777;clipboard;{}\x07", encoded)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -903,6 +929,24 @@ mod tests {
         let b64 = &seq[7..seq.len() - 2];
         let decoded = base64::engine::general_purpose::STANDARD.decode(b64).unwrap();
         assert_eq!(std::str::from_utf8(&decoded).unwrap(), "line1\nline2\nline3");
+    }
+
+    #[test]
+    fn clipboard_control_sequence_encodes_base64() {
+        let seq = clipboard_control_sequence("hello");
+        let expected_b64 = base64::engine::general_purpose::STANDARD.encode("hello".as_bytes());
+        assert_eq!(seq, format!("\x1b]777;clipboard;{}\x07", expected_b64));
+    }
+
+    #[test]
+    fn clipboard_control_sequence_round_trips() {
+        let text = "line1\nline2\n🍌";
+        let seq = clipboard_control_sequence(text);
+        assert!(seq.starts_with("\x1b]777;clipboard;"));
+        assert!(seq.ends_with("\x07"));
+        let b64 = &seq["\x1b]777;clipboard;".len()..seq.len() - 1];
+        let decoded = base64::engine::general_purpose::STANDARD.decode(b64).unwrap();
+        assert_eq!(std::str::from_utf8(&decoded).unwrap(), text);
     }
 }
 
