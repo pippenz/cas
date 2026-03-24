@@ -516,23 +516,25 @@ fn execute_whoami(cli: &Cli) -> anyhow::Result<()> {
                 fmt.write_raw(&config.endpoint)?;
                 fmt.newline()?;
             }
-        } else if cli.json {
-            let output = serde_json::json!({
-                "logged_in": false,
-                "message": "Not logged in. Run 'cas login' to authenticate."
-            });
-            println!("{}", serde_json::to_string_pretty(&output)?);
+            Ok(())
         } else {
-            let mut out = io::stdout();
-            let theme = ActiveTheme::default();
-            let mut fmt = Formatter::stdout(&mut out, theme);
-            fmt.write_raw("Not logged in. Run ")?;
-            fmt.write_accent("cas login")?;
-            fmt.write_raw(" to authenticate.")?;
-            fmt.newline()?;
+            if cli.json {
+                let output = serde_json::json!({
+                    "logged_in": false,
+                    "message": "Not logged in. Run 'cas login' to authenticate."
+                });
+                println!("{}", serde_json::to_string_pretty(&output)?);
+            } else {
+                let mut out = io::stdout();
+                let theme = ActiveTheme::default();
+                let mut fmt = Formatter::stdout(&mut out, theme);
+                fmt.write_raw("Not logged in. Run ")?;
+                fmt.write_accent("cas login")?;
+                fmt.write_raw(" to authenticate.")?;
+                fmt.newline()?;
+            }
+            anyhow::bail!("not logged in")
         }
-
-        Ok(())
     }
 }
 
