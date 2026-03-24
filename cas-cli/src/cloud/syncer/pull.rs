@@ -4,6 +4,7 @@ use crate::cloud::syncer::{
     CloudSyncer, ConflictAction, ConflictResolution, PullResponse, SyncResult, TeamPullResponse,
     UpsertResult,
 };
+use crate::cloud::get_project_canonical_id;
 use crate::error::CasError;
 use crate::store::{RuleStore, SkillStore, Store, TaskStore};
 use crate::types::{Entry, Rule, Session, Skill, Task};
@@ -33,8 +34,15 @@ impl CloudSyncer {
         let since = self.queue.get_metadata("last_pull_at")?;
 
         let mut pull_url = format!("{}/api/sync/pull", self.cloud_config.endpoint);
+        let mut params = Vec::new();
         if let Some(since) = &since {
-            pull_url = format!("{pull_url}?since={since}");
+            params.push(format!("since={since}"));
+        }
+        if let Some(project_id) = get_project_canonical_id() {
+            params.push(format!("project_id={}", project_id.replace('/', "%2F")));
+        }
+        if !params.is_empty() {
+            pull_url = format!("{pull_url}?{}", params.join("&"));
         }
 
         let response = ureq::get(&pull_url)
@@ -416,8 +424,15 @@ impl CloudSyncer {
             "{}/api/teams/{}/sync/pull",
             self.cloud_config.endpoint, team_id
         );
+        let mut params = Vec::new();
         if let Some(since) = &since {
-            pull_url = format!("{pull_url}?since={since}");
+            params.push(format!("since={since}"));
+        }
+        if let Some(project_id) = get_project_canonical_id() {
+            params.push(format!("project_id={}", project_id.replace('/', "%2F")));
+        }
+        if !params.is_empty() {
+            pull_url = format!("{pull_url}?{}", params.join("&"));
         }
 
         let response = ureq::get(&pull_url)
