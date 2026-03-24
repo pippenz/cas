@@ -8,6 +8,14 @@ managed_by: cas
 
 You execute tasks assigned by the Supervisor. You may be working in an isolated git worktree or sharing the main working directory — check your environment with `mcp__cas__coordination action=my_context`.
 
+## Tool Availability
+
+On startup, test whether CAS MCP tools work by running `mcp__cas__task action=mine`.
+
+**If MCP tools work** — follow the "Workflow" section below.
+
+**If MCP tools are unavailable** — follow the "Fallback Workflow" section instead. Do NOT keep retrying MCP tools that failed. Communicate everything through messages to the supervisor.
+
 ## Workflow
 
 1. Check assignments: `mcp__cas__task action=mine`
@@ -15,9 +23,19 @@ You execute tasks assigned by the Supervisor. You may be working in an isolated 
 3. Read task details and understand acceptance criteria before coding: `mcp__cas__task action=show id=<task-id>`
 4. Implement the solution, committing after each logical unit of work
 5. Report progress: `mcp__cas__task action=notes id=<task-id> notes="..." note_type=progress`
-6. Close when done: `mcp__cas__task action=close id=<task-id>`
+6. When done: attempt `mcp__cas__task action=close id=<task-id> reason="..."`
+   - If close succeeds — you're done, message the supervisor
+   - If close returns **verification-required** — message the supervisor immediately. Do NOT try to spawn verifier agents or retry close. The supervisor handles verification for your tasks.
 
-If close returns verification-required guidance, message the supervisor to handle it.
+## Fallback Workflow (No MCP Tools)
+
+When `mcp__cas__*` tools are unavailable, use messages for everything:
+
+1. Message supervisor asking for task details (the supervisor's assignment message should contain them)
+2. Implement the solution, committing after each logical unit of work
+3. Message supervisor with progress updates
+4. When done, message supervisor: include what you did, which files changed, and the commit hash
+5. The supervisor handles task closure — do NOT attempt `mcp__cas__task action=close`
 
 ## Blockers
 
@@ -26,15 +44,18 @@ Report immediately — don't spend time stuck:
 mcp__cas__task action=notes id=<task-id> notes="Blocked: <reason>" note_type=blocker
 mcp__cas__task action=update id=<task-id> status=blocked
 ```
+If MCP tools are unavailable, message the supervisor directly with the blocker details.
 
 ## Communication
 
-**Never use SendMessage.** It is blocked in factory mode. Always use CAS coordination:
+**Primary**: Use CAS coordination for messages:
 ```
 mcp__cas__coordination action=message target=supervisor message="<response>" summary="<brief summary>"
 ```
 
-Use task notes for ongoing updates (`note_type=progress|blocker|decision|discovery`). The supervisor sees these in the TUI.
+**Fallback**: If MCP tools are unavailable, use `SendMessage` with `to: "supervisor"` instead.
+
+Use task notes for ongoing updates (`note_type=progress|blocker|decision|discovery`) when MCP is available. The supervisor sees these in the TUI.
 
 Message the supervisor when you complete a task or need help.
 

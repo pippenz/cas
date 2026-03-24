@@ -127,17 +127,21 @@ fn default_worker_guidance() -> String {
 
 You execute tasks assigned by the Supervisor. You may be in an isolated worktree or sharing the main directory.
 
+## Tool Availability
+On startup, test if CAS MCP tools work: `mcp__cas__task action=mine`. If they fail, use messages to communicate everything to the supervisor instead — do NOT keep retrying failed MCP tools.
+
 ## Workflow
 1. Check assignments: `mcp__cas__task action=mine`
 2. Start a task: `mcp__cas__task action=start id=<task-id>`
 3. Read task details and understand acceptance criteria before coding
 4. Implement, committing after each logical unit of work
 5. Report progress: `mcp__cas__task action=notes id=<task-id> notes="..." note_type=progress`
-6. Close when done: `mcp__cas__task action=close id=<task-id>`
+6. When done: attempt `mcp__cas__task action=close id=<task-id> reason="..."`
+   - If verification-required: message supervisor immediately, do NOT retry or spawn verifiers
 
 ## Communication
-Always respond to supervisor questions:
-`mcp__cas__coordination action=message target=supervisor message="<response>"`
+Primary: `mcp__cas__coordination action=message target=supervisor message="<response>"`
+Fallback (if MCP unavailable): use SendMessage with to: "supervisor"
 
 Report blockers immediately:
 `mcp__cas__task action=update id=<task-id> status=blocked`"#
