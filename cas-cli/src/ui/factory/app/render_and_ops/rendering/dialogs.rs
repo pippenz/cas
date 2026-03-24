@@ -1110,6 +1110,8 @@ impl FactoryApp {
                 Line::from(" Diff + Mouse"),
                 Line::from("   /, n, N    search"),
                 Line::from("   click/wheel focus+scroll"),
+                Line::from("   drag       select + copy"),
+                Line::from("   Shift+drag native select"),
                 Line::from(""),
             ]
         } else {
@@ -1143,6 +1145,8 @@ impl FactoryApp {
                 Line::from("   Click tab  Switch worker tab"),
                 Line::from("   Click pane Focus pane"),
                 Line::from("   Scroll     Scroll focused pane"),
+                Line::from("   Drag       Select text + copy"),
+                Line::from("   Shift+drag Native terminal select"),
                 Line::from(""),
                 Line::from(" In DIFF view:"),
                 Line::from("   /          Start search"),
