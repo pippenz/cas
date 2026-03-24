@@ -224,11 +224,9 @@ impl FactoryDaemon {
                                                 e
                                             );
                                         }
-                                        // Auto-enter inject mode so the user can
-                                        // immediately type context for the image.
-                                        self.app.inject_target = Some(target_pane);
-                                        self.app.inject_buffer.clear();
-                                        self.app.input_mode = crate::ui::factory::input::InputMode::Inject;
+                                        // Clear sidecar focus so keystrokes route
+                                        // directly to the PTY pane.
+                                        self.app.sidecar_focus = crate::ui::factory::director::SidecarFocus::None;
                                     } else {
                                         tracing::debug!(
                                             "Ignoring image drop outside worker/supervisor panes at ({}, {})",
