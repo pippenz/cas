@@ -23,6 +23,7 @@ pub enum ThemeVariant {
     #[default]
     Default,
     Minions,
+    TokyoNight,
 }
 
 impl std::fmt::Display for ThemeVariant {
@@ -30,6 +31,7 @@ impl std::fmt::Display for ThemeVariant {
         match self {
             ThemeVariant::Default => write!(f, "default"),
             ThemeVariant::Minions => write!(f, "minions"),
+            ThemeVariant::TokyoNight => write!(f, "tokyo_night"),
         }
     }
 }
@@ -41,6 +43,7 @@ impl std::str::FromStr for ThemeVariant {
         match s.to_lowercase().as_str() {
             "default" => Ok(ThemeVariant::Default),
             "minions" => Ok(ThemeVariant::Minions),
+            "tokyo_night" | "tokyonight" | "tokyo-night" => Ok(ThemeVariant::TokyoNight),
             _ => Err(format!("Unknown theme variant: {s}")),
         }
     }
@@ -113,6 +116,7 @@ impl ActiveTheme {
         let colors = match variant {
             ThemeVariant::Default => base_colors,
             ThemeVariant::Minions => ColorPalette::minions(is_dark),
+            ThemeVariant::TokyoNight => ColorPalette::tokyo_night(is_dark),
         };
 
         let palette = Palette::from_colors(colors, is_dark);
@@ -165,6 +169,11 @@ impl ActiveTheme {
     pub fn is_minions(&self) -> bool {
         self.variant == ThemeVariant::Minions
     }
+
+    /// Check if the tokyo night variant is active
+    pub fn is_tokyo_night(&self) -> bool {
+        self.variant == ThemeVariant::TokyoNight
+    }
 }
 
 impl Default for ActiveTheme {
@@ -186,6 +195,7 @@ mod tests {
     fn theme_variant_display() {
         assert_eq!(ThemeVariant::Default.to_string(), "default");
         assert_eq!(ThemeVariant::Minions.to_string(), "minions");
+        assert_eq!(ThemeVariant::TokyoNight.to_string(), "tokyo_night");
     }
 
     #[test]
@@ -193,6 +203,10 @@ mod tests {
         assert_eq!("default".parse::<ThemeVariant>().unwrap(), ThemeVariant::Default);
         assert_eq!("minions".parse::<ThemeVariant>().unwrap(), ThemeVariant::Minions);
         assert_eq!("MINIONS".parse::<ThemeVariant>().unwrap(), ThemeVariant::Minions);
+        assert_eq!("tokyo_night".parse::<ThemeVariant>().unwrap(), ThemeVariant::TokyoNight);
+        assert_eq!("tokyonight".parse::<ThemeVariant>().unwrap(), ThemeVariant::TokyoNight);
+        assert_eq!("tokyo-night".parse::<ThemeVariant>().unwrap(), ThemeVariant::TokyoNight);
+        assert_eq!("TOKYO_NIGHT".parse::<ThemeVariant>().unwrap(), ThemeVariant::TokyoNight);
         assert!("banana".parse::<ThemeVariant>().is_err());
     }
 
@@ -202,6 +216,31 @@ mod tests {
         assert_eq!(json, "\"minions\"");
         let parsed: ThemeVariant = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, ThemeVariant::Minions);
+    }
+
+    #[test]
+    fn theme_variant_tokyo_night_serde_round_trip() {
+        let json = serde_json::to_string(&ThemeVariant::TokyoNight).unwrap();
+        assert_eq!(json, "\"tokyo_night\"");
+        let parsed: ThemeVariant = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, ThemeVariant::TokyoNight);
+    }
+
+    #[test]
+    fn active_theme_tokyo_night_variant() {
+        let config = ThemeConfig {
+            mode: ThemeMode::Dark,
+            variant: ThemeVariant::TokyoNight,
+        };
+        let theme = ActiveTheme::from_config(&config);
+        assert!(theme.is_tokyo_night());
+        assert_eq!(theme.variant, ThemeVariant::TokyoNight);
+    }
+
+    #[test]
+    fn active_theme_default_is_not_tokyo_night() {
+        let theme = ActiveTheme::from_mode(ThemeMode::Dark);
+        assert!(!theme.is_tokyo_night());
     }
 
     #[test]
