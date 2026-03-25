@@ -380,6 +380,7 @@ impl FactoryApp {
                 .title_style(
                     Style::default()
                         .fg(agent_color)
+                        .bg(palette.bg_elevated)
                         .add_modifier(Modifier::BOLD),
                 )
                 .borders(Borders::ALL)
@@ -763,8 +764,8 @@ impl FactoryApp {
                     (palette.accent_dim, BorderType::Rounded)
                 }
             } else if is_focused {
-                // Normal mode, focused: use agent color
-                (agent_color, BorderType::Rounded)
+                // Normal mode, focused: use theme border color
+                (palette.border_focused, BorderType::Rounded)
             } else {
                 // Normal mode, not focused: dimmed
                 (palette.border_muted, BorderType::Rounded)
@@ -776,6 +777,7 @@ impl FactoryApp {
                 .title_style(
                     Style::default()
                         .fg(agent_color)
+                        .bg(palette.bg_elevated)
                         .add_modifier(Modifier::BOLD),
                 )
                 .borders(Borders::ALL)
