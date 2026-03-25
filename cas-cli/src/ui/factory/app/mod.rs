@@ -368,6 +368,20 @@ impl FactoryApp {
         self.director_data
             .agent_id_to_name
             .retain(|_, name| allowed.contains(name));
+
+        // Filter tasks to active epic's subtasks only (prevents cross-project task leakage)
+        if let Some(epic_id) = self.epic_state.epic_id() {
+            let epic_id = epic_id.to_string();
+            self.director_data
+                .ready_tasks
+                .retain(|t| t.epic.as_deref() == Some(&epic_id));
+            self.director_data
+                .in_progress_tasks
+                .retain(|t| t.epic.as_deref() == Some(&epic_id));
+            self.director_data
+                .epic_tasks
+                .retain(|t| t.id == epic_id);
+        }
     }
 
     /// Check if we should refresh CAS data
