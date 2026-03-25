@@ -287,6 +287,7 @@ async fn test_shutdown_workers_validates_existence() {
 
 #[tokio::test]
 async fn test_shutdown_workers_enqueues() {
+    let _guard = EnvGuard::set(&[]);
     let env = FactoryTestEnv::new();
     env.register_worker("alice");
     env.register_worker("bob");
@@ -309,6 +310,7 @@ async fn test_shutdown_workers_enqueues() {
 
 #[tokio::test]
 async fn test_shutdown_workers_all() {
+    let _guard = EnvGuard::set(&[]);
     let env = FactoryTestEnv::new();
     env.register_worker("alice");
 
@@ -364,6 +366,10 @@ async fn test_worker_status_empty() {
 
 #[tokio::test]
 async fn test_worker_status_shows_agents() {
+    // Acquire env mutex to prevent concurrent tests from setting CAS_AGENT_ROLE=supervisor
+    // which would activate supervisor scoping and filter out our test workers.
+    let _guard = EnvGuard::set(&[]);
+
     let env = FactoryTestEnv::new();
     env.register_supervisor("sup-1");
 
