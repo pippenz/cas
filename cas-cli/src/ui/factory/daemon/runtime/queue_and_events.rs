@@ -52,6 +52,7 @@ impl FactoryDaemon {
         }
 
         self.app.mark_worker_crashed(worker_name);
+        self.dead_workers.insert(worker_name.to_string());
 
         let exit_info = match exit_code {
             Some(0) => "exited normally".to_string(),
@@ -64,6 +65,14 @@ impl FactoryDaemon {
         self.app.notifier().notify_crash(worker_name, &exit_info);
 
         Ok(())
+    }
+
+    /// Check if a message source is a dead (shutdown/crashed) worker.
+    ///
+    /// Returns true only for sources that were known factory workers but have
+    /// since been removed. External sources (openclaw, bridge, etc.) pass through.
+    fn is_dead_worker_source(&self, source: &str) -> bool {
+        self.dead_workers.contains(source)
     }
 
     /// Process prompt queue
@@ -118,6 +127,20 @@ impl FactoryDaemon {
 
         for queued in prompts {
             let target = &queued.target;
+
+            // Suppress messages from workers that have been shut down or crashed.
+            // These workers are no longer in the session and their messages (especially
+            // idle notifications) would just add noise to the supervisor context.
+            if self.is_dead_worker_source(&queued.source) {
+                tracing::debug!(
+                    prompt_id = queued.id,
+                    source = %queued.source,
+                    target = %queued.target,
+                    "Dropping message from dead worker"
+                );
+                let _ = queue.mark_processed(queued.id);
+                continue;
+            }
 
             // Skip PTY injection for native extension agents that use plain PTY mode —
             // they poll the queue and deliver messages via their own extension API.
@@ -591,6 +614,10 @@ impl FactoryDaemon {
                     for name in &workers_to_stop {
                         let _ = self.app.stop_recording_for_pane(name).await;
                     }
+                }
+                // Track shut-down workers so their queued messages are dropped
+                for name in &workers_to_stop {
+                    self.dead_workers.insert(name.clone());
                 }
                 if let Err(e) = self.app.shutdown_workers(count, &names, force) {
                     let target = if !names.is_empty() {

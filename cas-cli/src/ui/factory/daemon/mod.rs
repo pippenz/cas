@@ -166,6 +166,8 @@ pub struct FactoryDaemon {
     /// Notification socket for instant prompt queue wakeup.
     /// Falls back to pure polling if socket creation fails.
     notify_rx: Option<cas_factory::DaemonNotifier>,
+    /// Workers that have been shut down or crashed — their queued messages are dropped.
+    dead_workers: std::collections::HashSet<String>,
 }
 
 /// Parsed control events from client

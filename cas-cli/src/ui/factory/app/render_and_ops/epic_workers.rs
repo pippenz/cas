@@ -347,6 +347,9 @@ impl FactoryApp {
         // Remove from worker tracking
         self.worker_names.retain(|n| n != name);
 
+        // Update event detector (suppresses future events from this worker)
+        self.event_detector.remove_worker(name);
+
         // Update pane grid for navigation
         self.pane_grid = PaneGrid::new(&self.worker_names, &self.supervisor_name, self.is_tabbed);
 
