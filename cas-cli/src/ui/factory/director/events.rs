@@ -12,6 +12,11 @@ use cas_types::TaskStatus;
 /// Debounce duration for events (don't emit same event within this window)
 const DEBOUNCE_DURATION: Duration = Duration::from_secs(30);
 
+/// Rate limit for WorkerIdle events — at most one per worker per 5 minutes.
+/// Idle notifications are low-priority and flood the supervisor when multiple
+/// workers idle simultaneously.
+const IDLE_RATE_LIMIT: Duration = Duration::from_secs(300);
+
 /// Events detected from CAS state changes
 #[derive(Debug, Clone)]
 pub enum DirectorEvent {
@@ -271,6 +276,8 @@ pub struct DirectorEventDetector {
     supervisor_name: String,
     /// Last prompt times for debouncing (event key -> instant)
     last_prompt_times: HashMap<String, Instant>,
+    /// Workers that have been removed (shutdown/crashed) — suppress their events
+    removed_workers: HashSet<String>,
 }
 
 impl DirectorEventDetector {
@@ -281,6 +288,7 @@ impl DirectorEventDetector {
             worker_names,
             supervisor_name,
             last_prompt_times: HashMap::new(),
+            removed_workers: HashSet::new(),
         }
     }
 
@@ -299,6 +307,7 @@ impl DirectorEventDetector {
     /// Remove a worker from the tracked list (call when shutting down workers)
     pub fn remove_worker(&mut self, name: &str) {
         self.worker_names.retain(|n| n != name);
+        self.removed_workers.insert(name.to_string());
     }
 
     /// Detect changes between the last state and new data
@@ -466,21 +475,37 @@ impl DirectorEventDetector {
         self.debounce_events(events, now)
     }
 
-    /// Filter out events that were emitted recently (within DEBOUNCE_DURATION)
+    /// Filter out events that were emitted recently (within debounce window)
+    ///
+    /// WorkerIdle events use a longer rate limit (5 minutes) to prevent flooding
+    /// the supervisor when multiple workers idle simultaneously.
+    /// Events from removed (shutdown/crashed) workers are suppressed entirely.
     fn debounce_events(&mut self, events: Vec<DirectorEvent>, now: Instant) -> Vec<DirectorEvent> {
-        // Clean up old entries first
+        // Clean up old entries (use the longer idle rate limit as max TTL)
         self.last_prompt_times
-            .retain(|_, time| now.duration_since(*time) < DEBOUNCE_DURATION);
+            .retain(|_, time| now.duration_since(*time) < IDLE_RATE_LIMIT);
 
         // Filter events and update timestamps
         events
             .into_iter()
             .filter(|event| {
+                // Suppress all events from removed (shutdown/crashed) workers
+                if let Some(target) = event.target() {
+                    if self.removed_workers.contains(target) {
+                        return false;
+                    }
+                }
+
                 let key = event.debounce_key();
+                let window = if matches!(event, DirectorEvent::WorkerIdle { .. }) {
+                    IDLE_RATE_LIMIT
+                } else {
+                    DEBOUNCE_DURATION
+                };
                 let should_emit = self
                     .last_prompt_times
                     .get(&key)
-                    .map(|last_time| now.duration_since(*last_time) >= DEBOUNCE_DURATION)
+                    .map(|last_time| now.duration_since(*last_time) >= window)
                     .unwrap_or(true);
 
                 if should_emit {

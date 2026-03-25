@@ -316,6 +316,7 @@ pub async fn run_daemon_after_fork(
         web_pane_sizes: HashMap::new(),
         teams,
         notify_rx,
+        dead_workers: std::collections::HashSet::new(),
     };
 
     daemon.run().await

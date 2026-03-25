@@ -464,3 +464,156 @@ fn test_no_epic_event_when_unchanged() {
         DirectorEvent::EpicStarted { .. } | DirectorEvent::EpicCompleted { .. }
     )));
 }
+
+#[test]
+fn test_idle_events_suppressed_for_removed_workers() {
+    let mut detector = DirectorEventDetector::new(
+        vec!["swift-fox".to_string(), "calm-owl".to_string()],
+        "supervisor".to_string(),
+    );
+
+    // Initial state: both workers have tasks
+    let data1 = DirectorData {
+        ready_tasks: vec![],
+        in_progress_tasks: vec![
+            make_task("task-1", "Task 1", TaskStatus::InProgress, Some("agent-1")),
+            make_task("task-2", "Task 2", TaskStatus::InProgress, Some("agent-2")),
+        ],
+        epic_tasks: vec![],
+        agents: vec![
+            make_agent("agent-1", "swift-fox", Some("task-1")),
+            make_agent("agent-2", "calm-owl", Some("task-2")),
+        ],
+        activity: vec![],
+        agent_id_to_name: [
+            ("agent-1".to_string(), "swift-fox".to_string()),
+            ("agent-2".to_string(), "calm-owl".to_string()),
+        ]
+        .into_iter()
+        .collect(),
+        changes: vec![],
+        git_loaded: true,
+        reminders: vec![],
+        epic_closed_counts: HashMap::new(),
+    };
+    detector.initialize(&data1);
+
+    // Shut down swift-fox
+    detector.remove_worker("swift-fox");
+
+    // New state: both workers idle (swift-fox's agent might still linger in data)
+    let data2 = DirectorData {
+        ready_tasks: vec![],
+        in_progress_tasks: vec![],
+        epic_tasks: vec![],
+        agents: vec![
+            make_agent("agent-1", "swift-fox", None),
+            make_agent("agent-2", "calm-owl", None),
+        ],
+        activity: vec![],
+        agent_id_to_name: [
+            ("agent-1".to_string(), "swift-fox".to_string()),
+            ("agent-2".to_string(), "calm-owl".to_string()),
+        ]
+        .into_iter()
+        .collect(),
+        changes: vec![],
+        git_loaded: true,
+        reminders: vec![],
+        epic_closed_counts: HashMap::new(),
+    };
+
+    let events = detector.detect_changes(&data2);
+
+    // calm-owl idle event should be emitted
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            DirectorEvent::WorkerIdle { worker } if worker == "calm-owl"
+        )),
+        "Expected idle event for calm-owl"
+    );
+
+    // swift-fox idle event should be suppressed (removed worker)
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            DirectorEvent::WorkerIdle { worker } if worker == "swift-fox"
+        )),
+        "Expected no idle event for removed worker swift-fox"
+    );
+}
+
+#[test]
+fn test_idle_rate_limit_longer_than_general_debounce() {
+    use std::time::Duration;
+
+    let mut detector =
+        DirectorEventDetector::new(vec!["swift-fox".to_string()], "supervisor".to_string());
+
+    // Initial state: worker has task
+    let data1 = DirectorData {
+        ready_tasks: vec![],
+        in_progress_tasks: vec![make_task(
+            "task-1",
+            "Test Task",
+            TaskStatus::InProgress,
+            Some("agent-1"),
+        )],
+        epic_tasks: vec![],
+        agents: vec![make_agent("agent-1", "swift-fox", Some("task-1"))],
+        activity: vec![],
+        agent_id_to_name: [("agent-1".to_string(), "swift-fox".to_string())]
+            .into_iter()
+            .collect(),
+        changes: vec![],
+        git_loaded: true,
+        reminders: vec![],
+        epic_closed_counts: HashMap::new(),
+    };
+    detector.initialize(&data1);
+
+    // Worker goes idle - first event should emit
+    let data2 = DirectorData {
+        ready_tasks: vec![],
+        in_progress_tasks: vec![],
+        epic_tasks: vec![],
+        agents: vec![make_agent("agent-1", "swift-fox", None)],
+        activity: vec![],
+        agent_id_to_name: [("agent-1".to_string(), "swift-fox".to_string())]
+            .into_iter()
+            .collect(),
+        changes: vec![],
+        git_loaded: true,
+        reminders: vec![],
+        epic_closed_counts: HashMap::new(),
+    };
+
+    let events = detector.detect_changes(&data2);
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            DirectorEvent::WorkerIdle { worker } if worker == "swift-fox"
+        )),
+        "First idle event should emit"
+    );
+
+    // Simulate: worker gets task and goes idle again after 60 seconds
+    // (past the 30s general debounce but within the 5-minute idle rate limit)
+    detector.last_state = DirectorState::from_data(&data1);
+
+    // Manually advance the idle debounce time to 60s ago (past 30s general debounce)
+    let key = "idle:swift-fox".to_string();
+    if let Some(time) = detector.last_prompt_times.get_mut(&key) {
+        *time = std::time::Instant::now() - Duration::from_secs(60);
+    }
+
+    let events2 = detector.detect_changes(&data2);
+    assert!(
+        !events2.iter().any(|e| matches!(
+            e,
+            DirectorEvent::WorkerIdle { worker } if worker == "swift-fox"
+        )),
+        "Idle event should be rate-limited (within 5-minute window)"
+    );
+}

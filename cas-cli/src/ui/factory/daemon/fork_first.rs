@@ -496,6 +496,7 @@ impl DaemonInitPhase {
             web_pane_sizes: HashMap::new(),
             teams,
             notify_rx,
+            dead_workers: std::collections::HashSet::new(),
         })
     }
 
