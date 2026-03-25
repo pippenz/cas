@@ -379,8 +379,7 @@ impl FactoryApp {
                 .title(title)
                 .title_style(
                     Style::default()
-                        .fg(agent_color)
-                        .bg(palette.bg_elevated)
+                        .fg(border_color)
                         .add_modifier(Modifier::BOLD),
                 )
                 .borders(Borders::ALL)
@@ -776,8 +775,7 @@ impl FactoryApp {
                 .title(title)
                 .title_style(
                     Style::default()
-                        .fg(agent_color)
-                        .bg(palette.bg_elevated)
+                        .fg(border_color)
                         .add_modifier(Modifier::BOLD),
                 )
                 .borders(Borders::ALL)
