@@ -61,7 +61,37 @@ impl CasCore {
                 policy.task_required()
             };
 
-        if verification_enabled {
+        // Skip verification for orphaned tasks: if caller is supervisor and the
+        // task's assignee is inactive (heartbeat expired), allow close without verification.
+        let assignee_inactive = if verification_enabled && is_supervisor_from_env() {
+            if let Some(assignee_id) = task.assignee.as_deref() {
+                if let Ok(agent_store) = self.open_agent_store() {
+                    agent_store
+                        .get(assignee_id)
+                        .map(|agent| !agent.is_alive() || agent.is_heartbeat_expired(300))
+                        .unwrap_or(true) // assignee not found → treat as inactive
+                } else {
+                    false
+                }
+            } else {
+                // No assignee at all → orphaned
+                true
+            }
+        } else {
+            false
+        };
+
+        // Also allow supervisor to skip verification jail when they are the
+        // task assignee for a non-epic task (fixes supervisor self-close deadlock).
+        let supervisor_is_assignee = is_supervisor_from_env()
+            && task.task_type != TaskType::Epic
+            && self
+                .get_agent_id()
+                .ok()
+                .map(|aid| task.assignee.as_deref() == Some(aid.as_str()))
+                .unwrap_or(false);
+
+        if verification_enabled && !assignee_inactive {
             let is_worker_without_subagents = is_worker_without_subagents_from_env();
 
             // Check for approved verification
@@ -208,7 +238,7 @@ impl CasCore {
                             let _ = crate::mcp::socket::send_event(&self.cas_root, &event);
                         }
 
-                        let verification_gate = if is_factory_worker {
+                        let verification_gate = if is_factory_worker || supervisor_is_assignee {
                             "Factory worker flow: verification is pending. Continue with other assigned tasks while waiting."
                                 .to_string()
                         } else {
@@ -408,7 +438,9 @@ impl CasCore {
             ""
         };
 
-        let verification_note = if verification_enabled {
+        let verification_note = if assignee_inactive {
+            " (verification skipped — assignee inactive)"
+        } else if verification_enabled {
             " (verified)"
         } else {
             ""

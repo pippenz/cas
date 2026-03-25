@@ -18,8 +18,11 @@ impl CasCore {
         })?;
 
         // Supervisors can usually only verify epics.
-        // Exception: in factory sessions with Codex workers, supervisors may verify
-        // individual worker tasks because Codex cannot spawn task-verifier subagents.
+        // Exceptions:
+        // 1. Factory sessions with Codex workers (no subagent support)
+        // 2. Task-verifier subagent running within supervisor context
+        // 3. Supervisor is the task assignee (self-implemented task)
+        // 4. Task assignee is inactive (orphaned task)
         if let Ok(agent_id) = self.get_agent_id() {
             if let Ok(agent) = agent_store.get(&agent_id) {
                 let worker_supports_subagents =
@@ -28,17 +31,44 @@ impl CasCore {
                     && task.task_type != crate::types::TaskType::Epic
                     && worker_supports_subagents
                 {
-                    return Err(McpError {
-                        code: ErrorCode::INVALID_PARAMS,
-                        message: Cow::from(
-                            "Supervisors can only verify epics, not individual tasks.\n\n\
-                            Workers are responsible for verifying their own tasks before closing.\n\
-                            Supervisors verify epics after all subtasks are complete and merged.\n\n\
-                            If a worker's task needs review, message them to verify and close it:\n\
-                            mcp__cas__coordination action=message target=<worker> message=\"Please verify and close task <task_id>\"",
-                        ),
-                        data: None,
-                    });
+                    // Check if this is a task-verifier subagent context
+                    let is_verifier_subagent = self
+                        .cas_root
+                        .join(".verifier_unjail_marker")
+                        .exists();
+
+                    // Check if supervisor is the task assignee
+                    let supervisor_is_assignee =
+                        task.assignee.as_deref() == Some(agent_id.as_str());
+
+                    // Check if task assignee is inactive (orphaned)
+                    let assignee_inactive = task
+                        .assignee
+                        .as_deref()
+                        .map(|aid| {
+                            agent_store
+                                .get(aid)
+                                .map(|a| !a.is_alive() || a.is_heartbeat_expired(300))
+                                .unwrap_or(true)
+                        })
+                        .unwrap_or(true); // no assignee → treat as orphaned
+
+                    if !is_verifier_subagent
+                        && !supervisor_is_assignee
+                        && !assignee_inactive
+                    {
+                        return Err(McpError {
+                            code: ErrorCode::INVALID_PARAMS,
+                            message: Cow::from(
+                                "Supervisors can only verify epics, not individual tasks.\n\n\
+                                Workers are responsible for verifying their own tasks before closing.\n\
+                                Supervisors verify epics after all subtasks are complete and merged.\n\n\
+                                If a worker's task needs review, message them to verify and close it:\n\
+                                mcp__cas__coordination action=message target=<worker> message=\"Please verify and close task <task_id>\"",
+                            ),
+                            data: None,
+                        });
+                    }
                 }
             }
         }
