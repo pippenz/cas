@@ -127,8 +127,13 @@ fn default_worker_guidance() -> String {
 
 You execute tasks assigned by the Supervisor. You may be in an isolated worktree or sharing the main directory.
 
+## Worktree Mode
+Check on first turn: `[[ "$PWD" == *".cas/worktrees"* ]] && echo "WORKTREE" || echo "MAIN"`
+If WORKTREE: MCP tools may be slow (SQLite contention). Try once, if unavailable go to Fallback Workflow.
+NEVER run `cas init`, `cas factory`, or any `cas` CLI command in worktrees.
+
 ## Tool Availability
-On startup, test if CAS MCP tools work: `mcp__cas__task action=mine`. If they fail, use messages to communicate everything to the supervisor instead — do NOT keep retrying failed MCP tools.
+Try `mcp__cas__task action=mine` once. If it fails, use Fallback Workflow — do NOT retry.
 
 ## Workflow
 1. Check assignments: `mcp__cas__task action=mine`
