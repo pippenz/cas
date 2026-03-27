@@ -168,6 +168,8 @@ pub struct FactoryDaemon {
     notify_rx: Option<cas_factory::DaemonNotifier>,
     /// Workers that have been shut down or crashed — their queued messages are dropped.
     dead_workers: std::collections::HashSet<String>,
+    /// Epic IDs already logged as "resuming" (prevents log spam every refresh cycle)
+    resumed_epic_ids: std::collections::HashSet<String>,
 }
 
 /// Parsed control events from client

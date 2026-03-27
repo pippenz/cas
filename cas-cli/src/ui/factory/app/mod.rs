@@ -937,12 +937,13 @@ pub(crate) fn detect_epic_state(data: &DirectorData) -> EpicState {
 
     // Fall back to open epics that have a branch set (auto-created branch)
     // This allows workers to branch from the epic branch before the epic is started
-    // When multiple qualify, the last one in the list wins (typically the newest)
+    // When multiple qualify, pick the one with the lexicographically greatest ID
+    // for deterministic selection (avoids flip-flopping when list order is unstable)
     if let Some(epic) = data
         .epic_tasks
         .iter()
-        .rev()
-        .find(|e| e.status == TaskStatus::Open && e.branch.is_some())
+        .filter(|e| e.status == TaskStatus::Open && e.branch.is_some())
+        .max_by(|a, b| a.id.cmp(&b.id))
     {
         return EpicState::Active {
             epic_id: epic.id.clone(),

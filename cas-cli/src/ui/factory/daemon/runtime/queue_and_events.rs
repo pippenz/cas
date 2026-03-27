@@ -828,7 +828,7 @@ impl FactoryDaemon {
                                 .set_error(format!("Failed to create epic branch: {e}"));
                         }
                     }
-                } else {
+                } else if self.resumed_epic_ids.insert(epic_id.clone()) {
                     tracing::info!(
                         "EPIC {} started (resuming) - using existing branch",
                         epic_id
