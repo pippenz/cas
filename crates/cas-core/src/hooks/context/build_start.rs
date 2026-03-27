@@ -659,12 +659,10 @@ pub fn build_context_with_stores(
             && context_query.has_content()
             && scorer.name() == "hybrid"
         {
-            // Get semantically similar entries that weren't already shown
-            let related_entries = scorer.score_entries(&filtered_entries, &context_query);
-
+            // Reuse scored entries from above — no need to re-score
             // Filter to entries not already shown in Helpful Memories
             let shown_ids: HashSet<_> = entries_to_show.iter().map(|e| e.id.as_str()).collect();
-            let related_new: Vec<_> = related_entries
+            let related_new: Vec<_> = scored_entries
                 .iter()
                 .filter(|(e, score)| !shown_ids.contains(e.id.as_str()) && *score > 0.3)
                 .take(5)
