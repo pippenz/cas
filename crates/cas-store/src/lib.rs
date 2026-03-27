@@ -351,6 +351,12 @@ pub trait TaskStore: Send + Sync {
     /// List blocked tasks with their blockers
     fn list_blocked(&self) -> Result<Vec<(Task, Vec<Task>)>>;
 
+    /// List tasks with pending_verification=true (for PreToolUse jail check)
+    fn list_pending_verification(&self) -> Result<Vec<Task>>;
+
+    /// List tasks with pending_worktree_merge=true (for PreToolUse merge jail check)
+    fn list_pending_worktree_merge(&self) -> Result<Vec<Task>>;
+
     /// Close the store
     fn close(&self) -> Result<()>;
 

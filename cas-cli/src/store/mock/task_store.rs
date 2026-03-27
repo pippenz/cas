@@ -202,6 +202,18 @@ impl TaskStore for MockTaskStore {
         Ok(result)
     }
 
+    fn list_pending_verification(&self) -> Result<Vec<Task>> {
+        self.check_error()?;
+        let tasks = self.tasks.read().unwrap();
+        Ok(tasks.values().filter(|t| t.pending_verification).cloned().collect())
+    }
+
+    fn list_pending_worktree_merge(&self) -> Result<Vec<Task>> {
+        self.check_error()?;
+        let tasks = self.tasks.read().unwrap();
+        Ok(tasks.values().filter(|t| t.pending_worktree_merge).cloned().collect())
+    }
+
     fn close(&self) -> Result<()> {
         self.check_error()
     }
