@@ -360,22 +360,17 @@ impl EmbeddedDaemon {
         let cc_pid = std::process::id();
 
         if let Ok(store) = open_agent_store(&self.config.cas_root) {
-            if let Ok(agents) = store.list(None) {
-                for agent in agents {
-                    if agent.pid == Some(cc_pid) {
-                        eprintln!(
-                            "[CAS] Adopting pre-registered agent: {} (registered via fallback)",
-                            agent.id
-                        );
-                        // Populate pid_sessions so GetSession queries work
-                        {
-                            let mut pid_sessions = self.pid_sessions.write().await;
-                            pid_sessions.insert(cc_pid, agent.id.clone());
-                        }
-                        self.set_agent_id(agent.id).await;
-                        break;
-                    }
+            if let Ok(Some(agent)) = store.get_by_pid(cc_pid) {
+                eprintln!(
+                    "[CAS] Adopting pre-registered agent: {} (registered via fallback)",
+                    agent.id
+                );
+                // Populate pid_sessions so GetSession queries work
+                {
+                    let mut pid_sessions = self.pid_sessions.write().await;
+                    pid_sessions.insert(cc_pid, agent.id.clone());
                 }
+                self.set_agent_id(agent.id).await;
             }
         }
 
@@ -791,23 +786,18 @@ impl EmbeddedDaemon {
                 #[cfg(not(unix))]
                 let our_cc_pid = std::process::id();
 
-                if let Ok(agents) = store.list(None) {
-                    for agent in agents {
-                        if agent.pid == Some(our_cc_pid) {
-                            eprintln!(
-                                "[CAS] Adopted agent by PID match: {} (pid: {})",
-                                &agent.id[..8.min(agent.id.len())],
-                                our_cc_pid
-                            );
-                            // Populate pid_sessions so GetSession queries work
-                            {
-                                let mut pid_sessions = self.pid_sessions.write().await;
-                                pid_sessions.insert(our_cc_pid, agent.id.clone());
-                            }
-                            self.set_agent_id(agent.id).await;
-                            break;
-                        }
+                if let Ok(Some(agent)) = store.get_by_pid(our_cc_pid) {
+                    eprintln!(
+                        "[CAS] Adopted agent by PID match: {} (pid: {})",
+                        &agent.id[..8.min(agent.id.len())],
+                        our_cc_pid
+                    );
+                    // Populate pid_sessions so GetSession queries work
+                    {
+                        let mut pid_sessions = self.pid_sessions.write().await;
+                        pid_sessions.insert(our_cc_pid, agent.id.clone());
                     }
+                    self.set_agent_id(agent.id).await;
                 }
             }
 

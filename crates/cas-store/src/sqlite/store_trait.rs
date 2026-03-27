@@ -52,6 +52,10 @@ impl Store for SqliteStore {
         self.store_list_archived()
     }
 
+    fn list_by_branch(&self, branch: &str) -> Result<Vec<Entry>> {
+        self.store_list_by_branch(branch)
+    }
+
     fn list_pending(&self, limit: usize) -> Result<Vec<Entry>> {
         self.store_list_pending(limit)
     }

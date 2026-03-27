@@ -196,6 +196,9 @@ pub trait Store: Send + Sync {
     /// List all archived entries
     fn list_archived(&self) -> Result<Vec<Entry>>;
 
+    /// List entries matching a specific branch (for worktree scoping)
+    fn list_by_branch(&self, branch: &str) -> Result<Vec<Entry>>;
+
     /// List entries pending AI extraction
     fn list_pending(&self, limit: usize) -> Result<Vec<Entry>>;
 
