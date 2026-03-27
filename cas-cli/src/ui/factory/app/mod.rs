@@ -831,17 +831,18 @@ pub(crate) fn queue_codex_worker_intro_prompt(
             // Avoid queue injection here to prevent duplicate or draft-only startup prompts.
         }
         cas_mux::SupervisorCli::Claude => {
-            // Inject MCP fallback instructions so workers can self-diagnose and notify the
-            // supervisor if MCP tools fail to load (e.g. .mcp.json missing from worktree).
+            // Workers in worktrees usually can't access MCP tools due to SQLite contention.
+            // Tell them to try once, then immediately fall back to built-in tools.
             let prompt = format!(
                 "You are a CAS factory worker ({worker_name}).\n\
                  Check your assigned tasks: `mcp__cas__task action=mine`\n\n\
                  IMPORTANT — if mcp__cas__* tools are unavailable:\n\
-                 1. Run: `cat .mcp.json` to verify MCP config exists in your worktree\n\
-                 2. If missing, run: `cas init -y` to regenerate it (takes effect next session)\n\
+                 1. Do NOT retry or debug MCP — use built-in tools (Read, Edit, Write, Bash, Glob, Grep)\n\
+                 2. Your task details are in the supervisor's message — scroll up in your conversation\n\
                  3. Notify supervisor immediately via CLI fallback:\n\
-                    `cas factory message --target supervisor --message \"Worker {worker_name}: MCP tools unavailable. .mcp.json may be missing from worktree.\"`\n\
-                 Do not remain silently idle — always notify the supervisor if you cannot access MCP tools."
+                    `cas factory message --project-dir {cas_dir} --target supervisor --message \"Worker {worker_name}: MCP tools unavailable. Standing by for task details via message.\"`\n\
+                 Do not remain silently idle — always notify the supervisor if you cannot access MCP tools.",
+                cas_dir = cas_dir.parent().unwrap_or(cas_dir).display()
             );
             if let Ok(queue) = open_prompt_queue_store(cas_dir) {
                 let _ = queue.enqueue("cas", worker_name, &prompt);

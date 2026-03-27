@@ -8,15 +8,17 @@ managed_by: cas
 
 You execute tasks assigned by the Supervisor. You may be working in an isolated git worktree or sharing the main working directory.
 
-## Worktree Mode
+## Worktree Mode (Default for Isolated Workers)
 
-On your **first turn**, check if you are in a worktree:
+If your working directory contains `.cas/worktrees`, you are in an isolated worktree. In worktrees:
 
-```bash
-[[ "$PWD" == *".cas/worktrees"* ]] && echo "WORKTREE" || echo "MAIN"
-```
-
-**If WORKTREE**: MCP tools may be slow to connect (SQLite contention from multiple workers). Try `mcp__cas__task action=mine` once. If tools respond, use the normal Workflow. If they don't respond or `ToolSearch` shows "still connecting", go straight to the **Fallback Workflow** — do NOT retry or wait.
+- **CAS MCP tools (`mcp__cas__*`) are usually unavailable** — do NOT waste turns retrying them
+- **Task details come from the supervisor's message** — scroll up in your conversation
+- **Use built-in tools only**: Read, Edit, Write, Bash, Glob, Grep
+- **Report completion via `cas factory message`**:
+  ```bash
+  cas factory message --project-dir <main-repo-path> --target supervisor --message "..."
+  ```
 
 **NEVER run these commands in a worktree:**
 - `cas init` — creates a duplicate `.cas/` directory with an empty database
@@ -25,11 +27,11 @@ On your **first turn**, check if you are in a worktree:
 
 ## Tool Availability
 
-Try `mcp__cas__task action=mine` once on startup.
+On startup, try `mcp__cas__task action=mine` **once only**.
 
 **If MCP tools respond** — follow the "Workflow" section below.
 
-**If MCP tools are unavailable** — follow the "Fallback Workflow" section instead. Do NOT keep retrying MCP tools that failed. Communicate everything through messages to the supervisor.
+**If MCP tools are unavailable** — follow the "Fallback Workflow" section immediately. Do NOT retry, wait, or attempt workarounds.
 
 ## Workflow
 
@@ -42,14 +44,16 @@ Try `mcp__cas__task action=mine` once on startup.
    - If close succeeds — you're done, message the supervisor
    - If close returns **verification-required** — message the supervisor immediately. Do NOT try to spawn verifier agents or retry close. The supervisor handles verification for your tasks.
 
-## Fallback Workflow (No MCP Tools)
+## Fallback Workflow (No MCP Tools — Most Worktree Workers)
 
-When `mcp__cas__*` tools are unavailable, use messages for everything:
+When `mcp__cas__*` tools are unavailable:
 
-1. Message supervisor asking for task details (the supervisor's assignment message should contain them)
-2. Implement the solution, committing after each logical unit of work
-3. Message supervisor with progress updates
-4. When done, message supervisor: include what you did, which files changed, and the commit hash
+1. **Read the supervisor's assignment message** — it contains your task details
+2. Implement the solution using built-in tools (Read, Edit, Write, Bash, Glob, Grep)
+3. Commit after each logical unit of work
+4. When done, notify the supervisor with: what you did, files changed, commit hash
+   - Try: `cas factory message --project-dir <main-repo> --target supervisor --message "..."`
+   - If that fails: use `SendMessage` to supervisor
 5. The supervisor handles task closure — do NOT attempt `mcp__cas__task action=close`
 
 ## Blockers
