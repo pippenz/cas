@@ -226,6 +226,9 @@ fn release_agent_tasks(cas_root: &std::path::Path, agent_id: &str) -> anyhow::Re
 }
 
 /// Write the proxy tool catalog to `.cas/proxy_catalog.json` for SessionStart context injection.
+///
+/// Writes a JSON map of `{ server_name: [tool_name, ...] }` which is consumed by
+/// `build_mcp_tools_section` in hooks/context.rs.
 #[cfg(feature = "mcp-proxy")]
 pub async fn write_proxy_catalog_cache(
     cas_root: &std::path::Path,
@@ -235,8 +238,16 @@ pub async fn write_proxy_catalog_cache(
     if servers.is_empty() {
         return;
     }
+    // Convert to the format expected by build_mcp_tools_section: { server: [tool_names] }
+    let simplified: std::collections::HashMap<String, Vec<String>> = servers
+        .into_iter()
+        .map(|(server, entries)| {
+            let names = entries.into_iter().map(|e| e.name).collect();
+            (server, names)
+        })
+        .collect();
     let cache_path = cas_root.join("proxy_catalog.json");
-    match serde_json::to_string(&servers) {
+    match serde_json::to_string(&simplified) {
         Ok(json) => {
             if let Err(e) = std::fs::write(&cache_path, json) {
                 eprintln!("[CAS] Failed to write proxy catalog cache: {e}");
