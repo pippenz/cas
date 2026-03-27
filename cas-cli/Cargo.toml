@@ -143,9 +143,8 @@ rmcp = { version = "0.16", features = ["server", "macros", "transport-io", "clie
 schemars = { version = "1.0", optional = true }
 cas-mcp = { path = "../crates/cas-mcp", optional = true }
 
-# MCP Proxy (code-mode-mcp) — optional, not included in public builds
-# To enable: place code-mode-mcp at ../../code-mode-mcp and build with --features mcp-proxy
-# cmcp_core = { package = "code-mode-mcp", path = "../../code-mode-mcp", optional = true }
+# MCP Proxy (code-mode-mcp) — optional
+cmcp_core = { package = "code-mode-mcp", path = "../crates/cas-mcp-proxy", optional = true }
 
 # HTTP Client (for auth and cloud sync)
 ureq = { version = "2.12", features = ["json"] }
@@ -172,8 +171,7 @@ sentry = { version = "0.35", default-features = false, features = ["backtrace", 
 [features]
 default = ["mcp-server"]
 mcp-server = ["dep:rmcp", "dep:schemars", "dep:cas-mcp"]
-# mcp-proxy requires code-mode-mcp — uncomment cmcp_core dep above and add dep:cmcp_core here to enable
-mcp-proxy = ["mcp-server"]
+mcp-proxy = ["mcp-server", "dep:cmcp_core"]
 claude_rs_e2e = []
 # factory-recording feature removed - recording is now always available
 
