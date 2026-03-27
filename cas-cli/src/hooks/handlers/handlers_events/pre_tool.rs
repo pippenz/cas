@@ -74,18 +74,13 @@ pub fn handle_pre_tool_use(
     // Verification jail is only relevant when worker harness supports subagents.
     if worker_supports_subagents && !is_supervisor {
         if let Ok(task_store) = open_task_store(cas_root) {
-            if let Ok(tasks) = task_store.list(None) {
-                // Only consider tasks that:
-                // 1. Have pending_verification=true AND
-                // 2. Either:
+            if let Ok(tasks) = task_store.list_pending_verification() {
+                // Filter to tasks owned by the current agent:
                 //    a. The current agent has an active lease on them (regular tasks), OR
                 //    b. The current agent is the epic_verification_owner (epic tasks)
                 let pending_tasks: Vec<_> = tasks
                     .iter()
                     .filter(|t| {
-                        if !t.pending_verification {
-                            return false;
-                        }
                         // For epics with epic_verification_owner set, jail that owner
                         if t.task_type == TaskType::Epic {
                             if let Some(ref owner) = t.epic_verification_owner {
@@ -278,14 +273,11 @@ pub fn handle_pre_tool_use(
 
     if worktrees_enabled && !is_factory_worker_for_wt {
         if let Ok(task_store) = open_task_store(cas_root) {
-            if let Ok(tasks) = task_store.list(None) {
+            if let Ok(tasks) = task_store.list_pending_worktree_merge() {
                 // Only consider tasks the current agent owns (reuses agent_task_ids from above)
                 let pending_merge_tasks: Vec<_> = tasks
                     .iter()
                     .filter(|t| {
-                        if !t.pending_worktree_merge {
-                            return false;
-                        }
                         agent_task_ids.contains(&t.id)
                             || t.assignee
                                 .as_ref()

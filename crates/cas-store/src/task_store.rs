@@ -739,6 +739,36 @@ impl TaskStore for SqliteTaskStore {
         Ok(result)
     }
 
+    fn list_pending_verification(&self) -> Result<Vec<Task>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, title, description, design, acceptance_criteria, notes,
+             status, priority, task_type, assignee, labels, created_at, updated_at,
+             closed_at, close_reason, external_ref, content_hash, branch, worktree_id,
+             pending_verification, pending_worktree_merge, epic_verification_owner, team_id, deliverables, demo_statement
+             FROM tasks WHERE pending_verification = 1",
+        )?;
+        let tasks = stmt
+            .query_map([], Self::task_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(tasks)
+    }
+
+    fn list_pending_worktree_merge(&self) -> Result<Vec<Task>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, title, description, design, acceptance_criteria, notes,
+             status, priority, task_type, assignee, labels, created_at, updated_at,
+             closed_at, close_reason, external_ref, content_hash, branch, worktree_id,
+             pending_verification, pending_worktree_merge, epic_verification_owner, team_id, deliverables, demo_statement
+             FROM tasks WHERE pending_worktree_merge = 1",
+        )?;
+        let tasks = stmt
+            .query_map([], Self::task_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(tasks)
+    }
+
     fn close(&self) -> Result<()> {
         Ok(())
     }

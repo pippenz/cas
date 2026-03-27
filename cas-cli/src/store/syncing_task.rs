@@ -95,6 +95,14 @@ impl TaskStore for SyncingTaskStore {
         self.inner.list_blocked()
     }
 
+    fn list_pending_verification(&self) -> Result<Vec<Task>> {
+        self.inner.list_pending_verification()
+    }
+
+    fn list_pending_worktree_merge(&self) -> Result<Vec<Task>> {
+        self.inner.list_pending_worktree_merge()
+    }
+
     fn close(&self) -> Result<()> {
         self.inner.close()
     }
