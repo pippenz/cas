@@ -28,35 +28,52 @@ pub(crate) fn process_observations(
     let runtime = tokio::runtime::Runtime::new()
         .map_err(|error| CasError::Other(format!("Failed to create runtime: {error}")))?;
 
-    let mut extracted_count = 0;
-
+    // Skip entries that are too short and mark them as extracted
+    let mut batch: Vec<Entry> = Vec::with_capacity(pending.len());
     for entry in &pending {
         if entry.content.len() < 20 {
             store.mark_extracted(&entry.id)?;
-            continue;
+        } else {
+            batch.push(entry.clone());
         }
+    }
 
-        match runtime.block_on(extractor.extract_async(entry)) {
-            Ok(result) => {
-                for learning in result.learnings {
-                    if learning.confidence >= 0.6 {
-                        let id = store.generate_id()?;
-                        let new_entry = Entry {
-                            id,
-                            entry_type: EntryType::Learning,
-                            content: learning.content,
-                            tags: learning.tags,
-                            importance: learning.confidence,
-                            ..Default::default()
-                        };
-                        let _ = store.add(&new_entry);
-                        extracted_count += 1;
-                    }
+    if batch.is_empty() {
+        return Ok(0);
+    }
+
+    let mut extracted_count = 0;
+
+    match runtime.block_on(extractor.extract_batch_async(&batch)) {
+        Ok(result) => {
+            for learning in result.learnings {
+                if learning.confidence >= 0.6 {
+                    let id = store.generate_id()?;
+                    let new_entry = Entry {
+                        id,
+                        entry_type: EntryType::Learning,
+                        content: learning.content,
+                        tags: learning.tags,
+                        importance: learning.confidence,
+                        ..Default::default()
+                    };
+                    let _ = store.add(&new_entry);
+                    extracted_count += 1;
                 }
+            }
+            // Mark all batched entries as extracted
+            for entry in &batch {
                 store.mark_extracted(&entry.id)?;
             }
-            Err(error) => {
-                eprintln!("cas: Extraction failed for {}: {}", entry.id, error);
+        }
+        Err(error) => {
+            eprintln!(
+                "cas: Batch extraction failed for {} observations: {}",
+                batch.len(),
+                error
+            );
+            // Mark all as extracted to avoid retrying forever
+            for entry in &batch {
                 store.mark_extracted(&entry.id)?;
             }
         }
