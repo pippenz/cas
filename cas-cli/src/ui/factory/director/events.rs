@@ -220,8 +220,8 @@ struct DirectorState {
     active_agents: HashSet<String>,
     /// Map of agent_id -> current_task_id
     agent_tasks: HashMap<String, Option<String>>,
-    /// Map of epic_id -> status
-    epic_statuses: HashMap<String, TaskStatus>,
+    /// Map of epic_id -> (status, has_branch)
+    epic_statuses: HashMap<String, (TaskStatus, bool)>,
 }
 
 impl DirectorState {
@@ -249,11 +249,11 @@ impl DirectorState {
             .map(|a| (a.id.clone(), a.current_task.clone()))
             .collect();
 
-        // Track epic statuses
-        let epic_statuses: HashMap<String, TaskStatus> = data
+        // Track epic statuses and branch presence
+        let epic_statuses: HashMap<String, (TaskStatus, bool)> = data
             .epic_tasks
             .iter()
-            .map(|e| (e.id.clone(), e.status))
+            .map(|e| (e.id.clone(), (e.status, e.branch.is_some())))
             .collect();
 
         Self {
@@ -431,22 +431,49 @@ impl DirectorEventDetector {
         }
 
         // Detect epic state changes
-        // EpicStarted: Epic status changed to InProgress (from Open or didn't exist)
-        for epic in &data.epic_tasks {
-            if epic.status == TaskStatus::InProgress {
-                let was_in_progress = self
-                    .last_state
-                    .epic_statuses
-                    .get(&epic.id)
-                    .map(|s| *s == TaskStatus::InProgress)
-                    .unwrap_or(false);
+        // EpicStarted fires when:
+        // 1. An epic transitions to InProgress (highest priority)
+        // 2. A new Open-with-branch epic appears (mirrors detect_epic_state init logic)
+        //
+        // When multiple epics qualify, later entries in the list win (typically newer).
+        {
+            let mut epic_started: Option<(&str, &str)> = None;
 
-                if !was_in_progress {
-                    events.push(DirectorEvent::EpicStarted {
-                        epic_id: epic.id.clone(),
-                        epic_title: epic.title.clone(),
-                    });
+            for epic in &data.epic_tasks {
+                if epic.status == TaskStatus::InProgress {
+                    let was_in_progress = self
+                        .last_state
+                        .epic_statuses
+                        .get(&epic.id)
+                        .map(|(s, _)| *s == TaskStatus::InProgress)
+                        .unwrap_or(false);
+
+                    if !was_in_progress {
+                        epic_started = Some((&epic.id, &epic.title));
+                    }
+                } else if epic.status == TaskStatus::Open && epic.branch.is_some() {
+                    // New Open-with-branch epic that wasn't previously tracked with a branch
+                    let was_open_with_branch = self
+                        .last_state
+                        .epic_statuses
+                        .get(&epic.id)
+                        .map(|(s, had_branch)| *s == TaskStatus::Open && *had_branch)
+                        .unwrap_or(false);
+
+                    if !was_open_with_branch {
+                        // Only pick Open-with-branch if no InProgress epic already selected
+                        if epic_started.is_none() {
+                            epic_started = Some((&epic.id, &epic.title));
+                        }
+                    }
                 }
+            }
+
+            if let Some((id, title)) = epic_started {
+                events.push(DirectorEvent::EpicStarted {
+                    epic_id: id.to_string(),
+                    epic_title: title.to_string(),
+                });
             }
         }
 
@@ -457,7 +484,7 @@ impl DirectorEventDetector {
                     .last_state
                     .epic_statuses
                     .get(&epic.id)
-                    .map(|s| *s == TaskStatus::Closed)
+                    .map(|(s, _)| *s == TaskStatus::Closed)
                     .unwrap_or(false);
 
                 if !was_closed {
