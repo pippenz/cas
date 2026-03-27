@@ -13,9 +13,13 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
 use crate::error::CasError;
 use crate::store::find_cas_root;
+
+/// Cached project canonical ID. The git remote doesn't change during a process lifetime.
+static CACHED_PROJECT_ID: OnceLock<Option<String>> = OnceLock::new();
 
 /// Get the canonical project ID from the current git repository.
 ///
@@ -25,23 +29,27 @@ use crate::store::find_cas_root;
 /// - `ssh://git@gitlab.com/team/project.git` → `gitlab.com/team/project`
 ///
 /// Returns None if not in a git repository or no remote is configured.
+/// The result is cached for the lifetime of the process.
 pub fn get_project_canonical_id() -> Option<String> {
-    // Try to get the origin remote URL
-    let output = Command::new("git")
-        .args(["remote", "get-url", "origin"])
-        .output()
-        .ok()?;
+    CACHED_PROJECT_ID
+        .get_or_init(|| {
+            let output = Command::new("git")
+                .args(["remote", "get-url", "origin"])
+                .output()
+                .ok()?;
 
-    if !output.status.success() {
-        return None;
-    }
+            if !output.status.success() {
+                return None;
+            }
 
-    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if url.is_empty() {
-        return None;
-    }
+            let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if url.is_empty() {
+                return None;
+            }
 
-    Some(normalize_git_remote(&url))
+            Some(normalize_git_remote(&url))
+        })
+        .clone()
 }
 
 /// Normalize a git remote URL to a canonical format.
