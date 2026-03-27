@@ -640,36 +640,101 @@ impl TaskStore for SqliteTaskStore {
     }
 
     fn list_blocked(&self) -> Result<Vec<(Task, Vec<Task>)>> {
-        // Get blocked tasks first, then drop the connection lock
-        let blocked_tasks: Vec<Task> = {
-            let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap();
 
-            let mut stmt = conn.prepare(
-                "SELECT DISTINCT t.id, t.title, t.description, t.design, t.acceptance_criteria, t.notes,
-                 t.status, t.priority, t.task_type, t.assignee, t.labels, t.created_at, t.updated_at,
-                 t.closed_at, t.close_reason, t.external_ref, t.content_hash, t.branch, t.worktree_id,
-                 t.pending_verification, t.pending_worktree_merge, t.epic_verification_owner, t.team_id, t.deliverables, t.demo_statement
-                 FROM tasks t
-                 JOIN dependencies d ON d.from_id = t.id
-                 JOIN tasks blocker ON d.to_id = blocker.id
-                 WHERE t.status != 'closed'
-                 AND d.dep_type = 'blocks'
-                 AND blocker.status != 'closed'
-                 ORDER BY t.priority, t.created_at DESC",
-            )?;
+        // Fetch blocked tasks
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT t.id, t.title, t.description, t.design, t.acceptance_criteria, t.notes,
+             t.status, t.priority, t.task_type, t.assignee, t.labels, t.created_at, t.updated_at,
+             t.closed_at, t.close_reason, t.external_ref, t.content_hash, t.branch, t.worktree_id,
+             t.pending_verification, t.pending_worktree_merge, t.epic_verification_owner, t.team_id, t.deliverables, t.demo_statement
+             FROM tasks t
+             JOIN dependencies d ON d.from_id = t.id
+             JOIN tasks blocker ON d.to_id = blocker.id
+             WHERE t.status != 'closed'
+             AND d.dep_type = 'blocks'
+             AND blocker.status != 'closed'
+             ORDER BY t.priority, t.created_at DESC",
+        )?;
 
-            let tasks: Vec<Task> = stmt
-                .query_map([], Self::task_from_row)?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            tasks
-        }; // conn lock is dropped here
+        let blocked_tasks: Vec<Task> = stmt
+            .query_map([], Self::task_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
 
-        // Now get blockers for each blocked task (can acquire new locks safely)
-        let mut result = Vec::new();
-        for task in blocked_tasks {
-            let blockers = self.get_blockers(&task.id)?;
-            result.push((task, blockers));
+        if blocked_tasks.is_empty() {
+            return Ok(Vec::new());
         }
+
+        // Batch-fetch all blockers for all blocked tasks in a single query
+        let task_ids: Vec<&str> = blocked_tasks.iter().map(|t| t.id.as_str()).collect();
+        let placeholders: String = task_ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        let sql = format!(
+            "SELECT d.from_id,
+             t.id, t.title, t.description, t.design, t.acceptance_criteria, t.notes,
+             t.status, t.priority, t.task_type, t.assignee, t.labels, t.created_at, t.updated_at,
+             t.closed_at, t.close_reason, t.external_ref, t.content_hash, t.branch, t.worktree_id,
+             t.pending_verification, t.pending_worktree_merge, t.epic_verification_owner, t.team_id, t.deliverables, t.demo_statement
+             FROM dependencies d
+             JOIN tasks t ON d.to_id = t.id
+             WHERE d.from_id IN ({placeholders})
+             AND d.dep_type = 'blocks'
+             AND t.status != 'closed'"
+        );
+
+        let mut blocker_stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::types::ToSql> =
+            task_ids.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
+        let rows = blocker_stmt.query_map(params.as_slice(), |row| {
+            let from_id: String = row.get(0)?;
+            // task_from_row expects columns starting at index 0, but here they start at 1
+            let task = Task {
+                id: row.get(1)?,
+                scope: Scope::Project,
+                title: row.get(2)?,
+                description: row.get::<_, String>(3)?,
+                design: row.get::<_, String>(4)?,
+                acceptance_criteria: row.get::<_, String>(5)?,
+                notes: row.get::<_, String>(6)?,
+                status: row.get::<_, String>(7)?.parse().unwrap_or(TaskStatus::Open),
+                priority: Priority(row.get::<_, i32>(8)?),
+                task_type: row.get::<_, String>(9)?.parse().unwrap_or(TaskType::Task),
+                assignee: row.get(10)?,
+                labels: Self::parse_labels(&row.get::<_, String>(11)?),
+                created_at: Self::parse_datetime(&row.get::<_, String>(12)?).unwrap_or_else(Utc::now),
+                updated_at: Self::parse_datetime(&row.get::<_, String>(13)?).unwrap_or_else(Utc::now),
+                closed_at: row
+                    .get::<_, Option<String>>(14)?
+                    .and_then(|s| Self::parse_datetime(&s)),
+                close_reason: row.get(15)?,
+                external_ref: row.get(16)?,
+                content_hash: row.get(17)?,
+                branch: row.get(18)?,
+                worktree_id: row.get(19)?,
+                pending_verification: row.get::<_, i32>(20).unwrap_or(0) == 1,
+                pending_worktree_merge: row.get::<_, i32>(21).unwrap_or(0) == 1,
+                epic_verification_owner: row.get(22)?,
+                team_id: row.get(23)?,
+                deliverables: Self::parse_deliverables(&row.get::<_, String>(24)?),
+                demo_statement: row.get::<_, String>(25)?,
+            };
+            Ok((from_id, task))
+        })?;
+
+        // Group blockers by blocked task id
+        let mut blockers_map: std::collections::HashMap<String, Vec<Task>> =
+            std::collections::HashMap::new();
+        for row in rows {
+            let (from_id, blocker) = row?;
+            blockers_map.entry(from_id).or_default().push(blocker);
+        }
+
+        let result = blocked_tasks
+            .into_iter()
+            .map(|task| {
+                let blockers = blockers_map.remove(&task.id).unwrap_or_default();
+                (task, blockers)
+            })
+            .collect();
 
         Ok(result)
     }
@@ -742,36 +807,21 @@ impl TaskStore for SqliteTaskStore {
     }
 
     fn would_create_cycle(&self, from_id: &str, to_id: &str) -> Result<bool> {
-        // DFS to check if to_id can reach from_id through blocking deps
+        // Use recursive CTE to check if to_id can reach from_id through blocking deps
         let conn = self.conn.lock().unwrap();
-        let mut visited = HashSet::new();
-        let mut stack = vec![to_id.to_string()];
-
-        while let Some(current) = stack.pop() {
-            if current == from_id {
-                return Ok(true);
-            }
-            if visited.contains(&current) {
-                continue;
-            }
-            visited.insert(current.clone());
-
-            // Get blocking dependencies from current
-            let mut stmt = conn.prepare(
-                "SELECT to_id FROM dependencies WHERE from_id = ? AND dep_type = 'blocks'",
-            )?;
-            let deps: Vec<String> = stmt
-                .query_map(params![&current], |row| row.get(0))?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-
-            for dep in deps {
-                if !visited.contains(&dep) {
-                    stack.push(dep);
-                }
-            }
-        }
-
-        Ok(false)
+        let count: i64 = conn.query_row(
+            "WITH RECURSIVE reachable(node) AS (
+                 SELECT ?1
+                 UNION
+                 SELECT d.to_id FROM dependencies d
+                 JOIN reachable r ON d.from_id = r.node
+                 WHERE d.dep_type = 'blocks'
+             )
+             SELECT COUNT(*) FROM reachable WHERE node = ?2",
+            params![to_id, from_id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
     }
 
     fn list_dependencies(&self, dep_type: Option<DependencyType>) -> Result<Vec<Dependency>> {
@@ -803,41 +853,31 @@ impl TaskStore for SqliteTaskStore {
     }
 
     fn get_subtasks(&self, parent_id: &str) -> Result<Vec<Task>> {
+        // Use recursive CTE to fetch all descendants in a single query
+        // ParentChild dependency: from_id (child) -> to_id (parent)
         let conn = self.conn.lock().unwrap();
-        let mut all_subtasks = Vec::new();
-        let mut to_process = vec![parent_id.to_string()];
-        let mut processed = HashSet::new();
+        let mut stmt = conn.prepare(
+            "WITH RECURSIVE subtree(task_id) AS (
+                 SELECT from_id FROM dependencies
+                 WHERE to_id = ?1 AND dep_type = 'parent-child'
+                 UNION
+                 SELECT d.from_id FROM dependencies d
+                 JOIN subtree s ON d.to_id = s.task_id
+                 WHERE d.dep_type = 'parent-child'
+             )
+             SELECT t.id, t.title, t.description, t.design, t.acceptance_criteria, t.notes,
+             t.status, t.priority, t.task_type, t.assignee, t.labels, t.created_at, t.updated_at,
+             t.closed_at, t.close_reason, t.external_ref, t.content_hash, t.branch, t.worktree_id,
+             t.pending_verification, t.pending_worktree_merge, t.epic_verification_owner, t.team_id, t.deliverables, t.demo_statement
+             FROM tasks t
+             JOIN subtree s ON t.id = s.task_id",
+        )?;
 
-        while let Some(current_id) = to_process.pop() {
-            if processed.contains(&current_id) {
-                continue;
-            }
-            processed.insert(current_id.clone());
+        let tasks = stmt
+            .query_map(params![parent_id], Self::task_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
 
-            // Find tasks that have this task as their parent (dep_type = 'parent-child', to_id = current)
-            // ParentChild dependency: from_id (child) -> to_id (parent)
-            let mut stmt = conn.prepare(
-                "SELECT t.id, t.title, t.description, t.design, t.acceptance_criteria, t.notes,
-                 t.status, t.priority, t.task_type, t.assignee, t.labels, t.created_at, t.updated_at,
-                 t.closed_at, t.close_reason, t.external_ref, t.content_hash, t.branch, t.worktree_id,
-                 t.pending_verification, t.pending_worktree_merge, t.epic_verification_owner, t.team_id, t.deliverables, t.demo_statement
-                 FROM tasks t
-                 JOIN dependencies d ON d.from_id = t.id
-                 WHERE d.to_id = ? AND d.dep_type = 'parent-child'",
-            )?;
-
-            let children: Vec<Task> = stmt
-                .query_map(params![&current_id], Self::task_from_row)?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-
-            for child in children {
-                // Queue child for recursive processing (to find grandchildren)
-                to_process.push(child.id.clone());
-                all_subtasks.push(child);
-            }
-        }
-
-        Ok(all_subtasks)
+        Ok(tasks)
     }
 
     fn get_sibling_notes(
