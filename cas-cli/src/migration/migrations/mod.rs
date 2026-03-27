@@ -157,6 +157,11 @@ mod m179_recording_events_idx_recording;
 mod m180_recording_events_idx_timestamp;
 mod m181_tasks_add_deliverables;
 mod m182_tasks_add_demo_statement;
+mod m183_entries_idx_team_id;
+mod m184_rules_idx_team_id;
+mod m185_skills_idx_team_id;
+mod m186_tasks_idx_team_id;
+mod m187_tasks_idx_assignee;
 
 /// All migrations in order. IDs must be sequential and never reused.
 pub const MIGRATIONS: &[Migration] = &[
@@ -302,6 +307,12 @@ pub const MIGRATIONS: &[Migration] = &[
     m180_recording_events_idx_timestamp::MIGRATION,
     m181_tasks_add_deliverables::MIGRATION,
     m182_tasks_add_demo_statement::MIGRATION,
+    // Missing team_id and assignee indexes
+    m183_entries_idx_team_id::MIGRATION,
+    m184_rules_idx_team_id::MIGRATION,
+    m185_skills_idx_team_id::MIGRATION,
+    m186_tasks_idx_team_id::MIGRATION,
+    m187_tasks_idx_assignee::MIGRATION,
 ];
 
 #[cfg(test)]
