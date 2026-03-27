@@ -330,10 +330,13 @@ impl GitOperations {
         // Build command
         let mut args = vec!["worktree", "add"];
 
+        let path_str = path.to_str().ok_or_else(|| {
+            GitError::CommandFailed(format!("Path contains invalid UTF-8: {}", path.display()))
+        })?;
         if let Some(base) = base_branch {
-            args.extend(["-b", branch, path.to_str().unwrap(), base]);
+            args.extend(["-b", branch, path_str, base]);
         } else {
-            args.extend(["-b", branch, path.to_str().unwrap()]);
+            args.extend(["-b", branch, path_str]);
         }
 
         let output = Command::new("git")
@@ -487,22 +490,21 @@ impl GitOperations {
         let mut current: Option<WorktreeInfo> = None;
 
         for line in stdout.lines() {
-            if line.starts_with("worktree ") {
+            if let Some(path) = line.strip_prefix("worktree ") {
                 if let Some(wt) = current.take() {
                     worktrees.push(wt);
                 }
                 current = Some(WorktreeInfo {
-                    path: PathBuf::from(line.strip_prefix("worktree ").unwrap()),
+                    path: PathBuf::from(path),
                     branch: None,
                     commit: None,
                     is_bare: false,
                     is_detached: false,
                 });
             } else if let Some(ref mut wt) = current {
-                if line.starts_with("HEAD ") {
-                    wt.commit = Some(line.strip_prefix("HEAD ").unwrap().to_string());
-                } else if line.starts_with("branch ") {
-                    let branch = line.strip_prefix("branch ").unwrap();
+                if let Some(commit) = line.strip_prefix("HEAD ") {
+                    wt.commit = Some(commit.to_string());
+                } else if let Some(branch) = line.strip_prefix("branch ") {
                     // Remove refs/heads/ prefix if present
                     wt.branch = Some(
                         branch
@@ -535,7 +537,10 @@ impl GitOperations {
         if force {
             args.push("--force");
         }
-        args.push(path.to_str().unwrap());
+        let path_str = path.to_str().ok_or_else(|| {
+            GitError::CommandFailed(format!("Path contains invalid UTF-8: {}", path.display()))
+        })?;
+        args.push(path_str);
 
         let output = Command::new("git")
             .args(&args)
