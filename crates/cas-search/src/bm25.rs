@@ -31,7 +31,7 @@ use std::sync::RwLock;
 use tantivy::collector::TopDocs;
 use tantivy::query::{BooleanQuery, Occur, QueryParser, TermQuery};
 use tantivy::schema::*;
-use tantivy::{Index, IndexWriter, ReloadPolicy, TantivyDocument, Term};
+use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term};
 
 use crate::error::{Result, SearchError};
 use crate::traits::{SearchDocument, TextIndex};
@@ -73,6 +73,8 @@ pub struct Bm25Index {
     index_dir: Option<PathBuf>,
     // Write lock for thread safety
     write_lock: RwLock<()>,
+    // Cached IndexReader (auto-reloads on commit via ReloadPolicy)
+    cached_reader: RwLock<Option<IndexReader>>,
 }
 
 impl Bm25Index {
@@ -104,6 +106,7 @@ impl Bm25Index {
             config,
             index_dir: Some(index_dir.to_path_buf()),
             write_lock: RwLock::new(()),
+            cached_reader: RwLock::new(None),
         })
     }
 
@@ -128,7 +131,49 @@ impl Bm25Index {
             config,
             index_dir: None,
             write_lock: RwLock::new(()),
+            cached_reader: RwLock::new(None),
         })
+    }
+
+    /// Get or create the cached IndexReader.
+    ///
+    /// The reader uses `ReloadPolicy::OnCommitWithDelay` so it automatically
+    /// picks up new segments after normal writes without manual reload.
+    fn reader(&self) -> Result<IndexReader> {
+        // Fast path: reader already cached
+        {
+            let guard = self
+                .cached_reader
+                .read()
+                .map_err(|_| SearchError::Index("Reader lock poisoned".to_string()))?;
+            if let Some(reader) = guard.as_ref() {
+                return Ok(reader.clone());
+            }
+        }
+        // Slow path: create and cache
+        let reader: IndexReader = self
+            .index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::OnCommitWithDelay)
+            .try_into()
+            .map_err(|e: tantivy::TantivyError| SearchError::Index(e.to_string()))?;
+        let mut guard = self
+            .cached_reader
+            .write()
+            .map_err(|_| SearchError::Index("Reader lock poisoned".to_string()))?;
+        // Double-check: another thread may have initialized while we waited
+        if guard.is_none() {
+            *guard = Some(reader.clone());
+        }
+        Ok(guard.as_ref().unwrap().clone())
+    }
+
+    /// Invalidate the cached reader, forcing a fresh one on next access.
+    /// Called after operations that fundamentally change the index (e.g., rebuild).
+    fn invalidate_reader(&self) {
+        if let Ok(mut guard) = self.cached_reader.write() {
+            *guard = None;
+        }
     }
 
     /// Build the index schema
@@ -202,6 +247,7 @@ impl Bm25Index {
             .commit()
             .map_err(|e| SearchError::Index(e.to_string()))?;
 
+        self.invalidate_reader();
         Ok(count)
     }
 
@@ -225,6 +271,7 @@ impl Bm25Index {
             .commit()
             .map_err(|e| SearchError::Index(e.to_string()))?;
 
+        self.invalidate_reader();
         Ok(count)
     }
 
@@ -280,6 +327,7 @@ impl Bm25Index {
                 .commit()
                 .map_err(|e| SearchError::Index(e.to_string()))?;
 
+            self.invalidate_reader();
             return Ok(count);
         }
 
@@ -336,30 +384,19 @@ impl Bm25Index {
         // Clean up backup
         let _ = std::fs::remove_dir_all(&backup_dir);
 
+        self.invalidate_reader();
         Ok(count)
     }
 
     /// Get the number of documents in the index
     pub fn num_docs(&self) -> Result<u64> {
-        let reader = self
-            .index
-            .reader_builder()
-            .reload_policy(ReloadPolicy::OnCommitWithDelay)
-            .try_into()
-            .map_err(|e: tantivy::TantivyError| SearchError::Index(e.to_string()))?;
-
+        let reader = self.reader()?;
         Ok(reader.searcher().num_docs())
     }
 
     /// Check if a document exists in the index
     pub fn exists(&self, doc_id: &str) -> Result<bool> {
-        let reader = self
-            .index
-            .reader_builder()
-            .reload_policy(ReloadPolicy::OnCommitWithDelay)
-            .try_into()
-            .map_err(|e: tantivy::TantivyError| SearchError::Index(e.to_string()))?;
-
+        let reader = self.reader()?;
         let searcher = reader.searcher();
         let term = Term::from_field_text(self.id_field, doc_id);
         let query = TermQuery::new(term, IndexRecordOption::Basic);
@@ -382,13 +419,7 @@ impl Bm25Index {
             return Ok(Vec::new());
         }
 
-        let reader = self
-            .index
-            .reader_builder()
-            .reload_policy(ReloadPolicy::OnCommitWithDelay)
-            .try_into()
-            .map_err(|e: tantivy::TantivyError| SearchError::Index(e.to_string()))?;
-
+        let reader = self.reader()?;
         let searcher = reader.searcher();
 
         // Build full-text query
@@ -494,6 +525,7 @@ impl TextIndex for Bm25Index {
             .commit()
             .map_err(|e| SearchError::Index(e.to_string()))?;
 
+        self.invalidate_reader();
         Ok(())
     }
 
@@ -510,6 +542,7 @@ impl TextIndex for Bm25Index {
             .commit()
             .map_err(|e| SearchError::Index(e.to_string()))?;
 
+        self.invalidate_reader();
         Ok(())
     }
 
