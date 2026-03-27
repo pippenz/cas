@@ -12,6 +12,7 @@ serde_json = "1.0"
 toml = "0.9"
 anyhow = "1.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+rmcp = { version = "0.16", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
 
 [dev-dependencies]
 tempfile = "3.14"
