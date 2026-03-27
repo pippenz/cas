@@ -420,7 +420,6 @@ impl FactoryApp {
             if git_due {
                 self.last_git_refresh = Instant::now();
             }
-            self.filter_director_agents_to_current_session();
         } else if git_due {
             self.director_data
                 .refresh_git_changes(&self.cas_dir, worktree_root.as_deref())?;
@@ -436,8 +435,15 @@ impl FactoryApp {
         // Sync session_id → pane_name mappings from agent store
         self.sync_session_mappings();
 
-        // Detect state changes
+        // Detect state changes BEFORE filtering so new epics are visible to the
+        // event detector. This allows EpicStarted to fire and update epic_state,
+        // which the filter depends on for subsequent refresh cycles.
         let events = self.event_detector.detect_changes(&self.director_data);
+
+        // Now filter to current session (agents + tasks scoped to active epic)
+        if db_changed {
+            self.filter_director_agents_to_current_session();
+        }
 
         // Generate prompts from events (respecting auto-prompt config)
         let prompts: Vec<Prompt> = events
