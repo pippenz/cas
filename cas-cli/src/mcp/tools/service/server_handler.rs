@@ -8,6 +8,7 @@ use rmcp::model::{
     ServerCapabilities, ServerInfo,
 };
 use rmcp::service::{RequestContext, RoleServer};
+use tracing::info;
 
 use crate::mcp::server::CasCore;
 use crate::mcp::tools::service::CasService;
@@ -45,14 +46,17 @@ impl ServerHandler for CasService {
     ) -> impl std::future::Future<Output = Result<ListResourcesResult, rmcp::ErrorData>> + Send + '_
     {
         async move {
+            let start = std::time::Instant::now();
             if let Ok(mut peer_guard) = self.inner.peer.write() {
                 if peer_guard.is_none() {
                     *peer_guard = Some(context.peer.clone());
                 }
             }
 
+            let resources = self.inner.build_resources();
+            info!(method = "resources/list", count = resources.len(), elapsed_ms = start.elapsed().as_millis() as u64, "MCP request");
             Ok(ListResourcesResult {
-                resources: self.inner.build_resources(),
+                resources,
                 next_cursor: None,
                 meta: None,
             })
@@ -130,8 +134,15 @@ impl ServerHandler for CasService {
     + Send
     + '_ {
         async move {
+            let start = std::time::Instant::now();
+            let tool_name = request.name.clone();
             let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-            self.tool_router.call(tcc).await
+            let result = self.tool_router.call(tcc).await;
+            let elapsed = start.elapsed();
+            if elapsed.as_secs() >= 5 {
+                info!(method = "tools/call", tool = %tool_name, elapsed_ms = elapsed.as_millis() as u64, "MCP slow request");
+            }
+            result
         }
     }
 }
