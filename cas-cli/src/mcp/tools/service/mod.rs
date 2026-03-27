@@ -847,8 +847,17 @@ impl CasService {
     // mcp_search - Search across all connected MCP servers
     // ========================================================================
 
-    #[tool(
-        description = "Search across all tools from all connected MCP servers. Write TypeScript code to filter the tool catalog. A typed `tools` array is available with { server, name, description, input_schema } fields."
+    #[cfg_attr(
+        feature = "mcp-proxy",
+        tool(
+            description = "Search across all tools from all connected MCP servers. Pass a keyword query to filter by tool name and description (case-insensitive). Use 'server:name' prefix to filter by server. Examples: 'screenshot', 'server:github issue', 'file read'."
+        )
+    )]
+    #[cfg_attr(
+        not(feature = "mcp-proxy"),
+        tool(
+            description = "Search across all tools from all connected MCP servers. Write TypeScript code to filter the tool catalog. A typed `tools` array is available with { server, name, description, input_schema } fields."
+        )
     )]
     pub async fn mcp_search(
         &self,

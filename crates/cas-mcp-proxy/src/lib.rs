@@ -80,11 +80,53 @@ impl ProxyEngine {
         })
     }
 
-    /// Search across all upstream tool catalogs using a code filter.
-    pub async fn search(&self, _code: &str, _max_length: Option<usize>) -> Result<Value> {
-        // Search/execute will be implemented in a later task (cas-4bfb).
-        let catalog = self.catalog_entries_by_server().await;
-        Ok(serde_json::to_value(catalog)?)
+    /// Search across all upstream tool catalogs.
+    ///
+    /// The `query` parameter supports:
+    /// - Plain keywords: case-insensitive substring match on tool name + description
+    /// - `server:name` prefix: filter to a specific server before matching keywords
+    /// - Empty query: returns all tools
+    ///
+    /// Results are returned as a JSON array of matching tools with server, name,
+    /// description, and input_schema fields. If `max_length` is set, the JSON
+    /// output is truncated to that many bytes.
+    pub async fn search(&self, query: &str, max_length: Option<usize>) -> Result<Value> {
+        let servers = self.servers.read().await;
+
+        // Parse optional server: prefix
+        let (server_filter, keywords) = parse_search_query(query);
+
+        let mut results: Vec<SearchResult> = Vec::new();
+
+        for (server_name, connected) in servers.iter() {
+            // Apply server filter if present
+            if let Some(ref filter) = server_filter {
+                if !server_name.to_lowercase().contains(&filter.to_lowercase()) {
+                    continue;
+                }
+            }
+
+            for tool in &connected.tools {
+                if matches_keywords(tool, &keywords) {
+                    results.push(SearchResult {
+                        server: server_name.clone(),
+                        name: tool.name.to_string(),
+                        description: tool.description.as_ref().map(|d| d.to_string()),
+                        input_schema: serde_json::to_value(&*tool.input_schema)
+                            .unwrap_or_default(),
+                    });
+                }
+            }
+        }
+
+        let mut json = serde_json::to_string_pretty(&results)?;
+        if let Some(max) = max_length {
+            if json.len() > max {
+                json.truncate(max);
+            }
+        }
+
+        Ok(Value::String(json))
     }
 
     /// Execute tool calls across upstream MCP servers.
@@ -267,4 +309,136 @@ async fn connect_server(name: &str, config: &ServerConfig) -> Result<ConnectedSe
         service,
         tools: tools_result.tools,
     })
+}
+
+/// A search result entry including the server name.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SearchResult {
+    server: String,
+    name: String,
+    description: Option<String>,
+    input_schema: Value,
+}
+
+/// Parse a search query into an optional server filter and keyword tokens.
+///
+/// Supports `server:name keyword1 keyword2` syntax.
+fn parse_search_query(query: &str) -> (Option<String>, Vec<String>) {
+    let mut server_filter = None;
+    let mut keywords = Vec::new();
+
+    for token in query.split_whitespace() {
+        if let Some(server) = token.strip_prefix("server:") {
+            server_filter = Some(server.to_string());
+        } else {
+            keywords.push(token.to_lowercase());
+        }
+    }
+
+    (server_filter, keywords)
+}
+
+/// Check if a tool matches all keyword tokens (case-insensitive substring on name + description).
+fn matches_keywords(tool: &Tool, keywords: &[String]) -> bool {
+    if keywords.is_empty() {
+        return true;
+    }
+
+    let name_lower = tool.name.to_lowercase();
+    let desc_lower = tool
+        .description
+        .as_ref()
+        .map(|d| d.to_lowercase())
+        .unwrap_or_default();
+
+    keywords.iter().all(|kw| {
+        name_lower.contains(kw.as_str()) || desc_lower.contains(kw.as_str())
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rmcp::model::Tool;
+    use std::borrow::Cow;
+    use std::sync::Arc;
+
+    fn make_tool(name: &str, description: &str) -> Tool {
+        Tool {
+            name: Cow::Owned(name.to_string()),
+            title: None,
+            description: Some(Cow::Owned(description.to_string())),
+            input_schema: Arc::new(serde_json::Map::new()),
+            output_schema: None,
+            annotations: None,
+            icons: None,
+            meta: None,
+            execution: None,
+        }
+    }
+
+    #[test]
+    fn parse_query_plain_keywords() {
+        let (server, kw) = parse_search_query("screenshot capture");
+        assert!(server.is_none());
+        assert_eq!(kw, vec!["screenshot", "capture"]);
+    }
+
+    #[test]
+    fn parse_query_with_server_filter() {
+        let (server, kw) = parse_search_query("server:github issue create");
+        assert_eq!(server, Some("github".to_string()));
+        assert_eq!(kw, vec!["issue", "create"]);
+    }
+
+    #[test]
+    fn parse_query_empty() {
+        let (server, kw) = parse_search_query("");
+        assert!(server.is_none());
+        assert!(kw.is_empty());
+    }
+
+    #[test]
+    fn matches_keywords_empty_matches_all() {
+        let tool = make_tool("anything", "some description");
+        assert!(matches_keywords(&tool, &[]));
+    }
+
+    #[test]
+    fn matches_keywords_name_match() {
+        let tool = make_tool("take_screenshot", "Captures a screenshot");
+        let keywords = vec!["screenshot".to_string()];
+        assert!(matches_keywords(&tool, &keywords));
+    }
+
+    #[test]
+    fn matches_keywords_description_match() {
+        let tool = make_tool("capture", "Takes a screenshot of the page");
+        let keywords = vec!["screenshot".to_string()];
+        assert!(matches_keywords(&tool, &keywords));
+    }
+
+    #[test]
+    fn matches_keywords_case_insensitive() {
+        let tool = make_tool("TakeScreenshot", "CAPTURES A SCREENSHOT");
+        let keywords = vec!["screenshot".to_string()];
+        assert!(matches_keywords(&tool, &keywords));
+    }
+
+    #[test]
+    fn matches_keywords_all_must_match() {
+        let tool = make_tool("create_issue", "Create a GitHub issue");
+        let keywords = vec!["create".to_string(), "issue".to_string()];
+        assert!(matches_keywords(&tool, &keywords));
+
+        let keywords_no_match = vec!["create".to_string(), "screenshot".to_string()];
+        assert!(!matches_keywords(&tool, &keywords_no_match));
+    }
+
+    #[test]
+    fn matches_keywords_no_match() {
+        let tool = make_tool("list_files", "List files in a directory");
+        let keywords = vec!["screenshot".to_string()];
+        assert!(!matches_keywords(&tool, &keywords));
+    }
 }
