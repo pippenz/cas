@@ -177,6 +177,17 @@ impl Store for MockStore {
         Ok(list)
     }
 
+    fn list_by_branch(&self, branch: &str) -> Result<Vec<Entry>> {
+        self.check_error()?;
+        let entries = self.entries.read().unwrap();
+        let list: Vec<Entry> = entries
+            .values()
+            .filter(|e| e.branch.as_deref() == Some(branch))
+            .cloned()
+            .collect();
+        Ok(list)
+    }
+
     fn list_pending(&self, limit: usize) -> Result<Vec<Entry>> {
         self.check_error()?;
         let entries = self.entries.read().unwrap();

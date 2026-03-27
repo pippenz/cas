@@ -828,20 +828,18 @@ impl CasCore {
     /// become visible in the parent context.
     pub(crate) fn promote_branch_entries(&self, branch: &str) -> Result<usize, McpError> {
         let store = self.open_store()?;
-        let entries = store.list().map_err(|e| {
+        let entries = store.list_by_branch(branch).map_err(|e| {
             Self::error(
                 ErrorCode::INTERNAL_ERROR,
-                format!("Failed to list entries: {e}"),
+                format!("Failed to list entries for branch: {e}"),
             )
         })?;
 
         let mut promoted = 0;
         for mut entry in entries {
-            if entry.branch.as_deref() == Some(branch) {
-                entry.branch = None; // Promote to parent scope
-                if store.update(&entry).is_ok() {
-                    promoted += 1;
-                }
+            entry.branch = None; // Promote to parent scope
+            if store.update(&entry).is_ok() {
+                promoted += 1;
             }
         }
 

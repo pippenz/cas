@@ -177,6 +177,9 @@ pub trait AgentStore: Send + Sync {
     /// Get agent by Claude Code parent PID (fallback when session file missing)
     fn get_by_cc_pid(&self, cc_pid: u32) -> Result<Option<Agent>>;
 
+    /// Get agent by its own PID (for daemon PID-based adoption)
+    fn get_by_pid(&self, pid: u32) -> Result<Option<Agent>>;
+
     /// Try to claim a task for an agent (atomic operation)
     fn try_claim(
         &self,
