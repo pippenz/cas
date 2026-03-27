@@ -60,9 +60,6 @@ pub enum CloudMessage {
         cols: u16,
         rows: u16,
     },
-    /// Reject a relay attach request
-    #[allow(dead_code)]
-    RelayAttachReject { client_id: String, reason: String },
     /// Send PTY output to a relay client
     RelayPtyOutput { client_id: String, data: Vec<u8> },
     /// Send per-pane PTY output to cloud (for web terminal viewers)
@@ -176,15 +173,6 @@ impl CloudClientHandle {
         });
     }
 
-    /// Reject a relay attach request
-    #[allow(dead_code)]
-    pub fn relay_reject(&self, client_id: &str, reason: &str) {
-        let _ = self.tx.send(CloudMessage::RelayAttachReject {
-            client_id: client_id.to_string(),
-            reason: reason.to_string(),
-        });
-    }
-
     /// Send PTY output to a relay client
     pub fn relay_output(&self, client_id: &str, data: Vec<u8>) {
         let _ = self.tx.send(CloudMessage::RelayPtyOutput {
@@ -243,6 +231,13 @@ use crate::ui::factory::phoenix::{encode_msg, ws_url};
 /// Within this window, only changed state is sent; beyond it, a full snapshot is pushed.
 const RECONNECT_FULL_STATE_THRESHOLD: Duration = Duration::from_secs(300);
 
+/// Maximum consecutive connection failures before giving up.
+/// Prevents infinite retry spam (e.g., TLS not compiled in, invalid certs).
+const MAX_CONSECUTIVE_FAILURES: u32 = 10;
+
+/// Maximum buffered events when disconnected. Oldest are dropped when exceeded.
+const MAX_EVENT_BUFFER: usize = 1000;
+
 /// The main cloud client loop with reconnection
 async fn cloud_client_task(
     config: CloudClientConfig,
@@ -253,6 +248,7 @@ async fn cloud_client_task(
     let max_backoff = 60u64;
     let mut event_buffer: Vec<CloudMessage> = Vec::new();
     let mut disconnected_at: Option<Instant> = None;
+    let mut consecutive_failures: u32 = 0;
 
     loop {
         // Determine if this reconnect should push full state
@@ -284,6 +280,9 @@ async fn cloud_client_task(
                 if disconnected_at.is_none() {
                     disconnected_at = Some(Instant::now());
                 }
+                // Reconnect means we were at least partially connected — reset circuit breaker
+                consecutive_failures = 0;
+                backoff_secs = 1;
                 cloud_log(
                     &config.factory_id,
                     &format!("Connection lost, reconnecting in {backoff_secs}s"),
@@ -294,16 +293,41 @@ async fn cloud_client_task(
                 if disconnected_at.is_none() {
                     disconnected_at = Some(Instant::now());
                 }
+                consecutive_failures += 1;
                 cloud_log(
                     &config.factory_id,
-                    &format!("ERROR: {e}, reconnecting in {backoff_secs}s"),
+                    &format!("ERROR: {e}, reconnecting in {backoff_secs}s (attempt {consecutive_failures}/{MAX_CONSECUTIVE_FAILURES})"),
                 );
-                tracing::warn!(
-                    "Cloud client error: {}, reconnecting in {}s",
-                    e,
-                    backoff_secs
-                );
+                // Only log at warn level on the first failure; demote to debug after that
+                if consecutive_failures == 1 {
+                    tracing::warn!("Cloud client error: {}, reconnecting in {}s", e, backoff_secs);
+                } else {
+                    tracing::debug!("Cloud client error: {}, reconnecting in {}s (attempt {}/{})", e, backoff_secs, consecutive_failures, MAX_CONSECUTIVE_FAILURES);
+                }
             }
+        }
+
+        // Circuit breaker: give up after too many consecutive failures
+        if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+            cloud_log(
+                &config.factory_id,
+                &format!("Giving up after {consecutive_failures} consecutive failures"),
+            );
+            tracing::warn!(
+                "Cloud client giving up after {} consecutive failures — phone-home disabled for this session",
+                consecutive_failures
+            );
+            return;
+        }
+
+        // Cap event buffer to prevent unbounded memory growth
+        if event_buffer.len() > MAX_EVENT_BUFFER {
+            let excess = event_buffer.len() - MAX_EVENT_BUFFER;
+            event_buffer.drain(..excess);
+            cloud_log(
+                &config.factory_id,
+                &format!("Dropped {excess} oldest buffered events (cap={MAX_EVENT_BUFFER})"),
+            );
         }
 
         // Exponential backoff with jitter
@@ -450,7 +474,6 @@ async fn connect_and_run(
                     Some(CloudMessage::Disconnect) => "Disconnect".to_string(),
                     Some(CloudMessage::RecordingChunk { .. }) => "RecordingChunk".to_string(),
                     Some(CloudMessage::RelayAttachAccept { .. }) => "RelayAttachAccept".to_string(),
-                    Some(CloudMessage::RelayAttachReject { .. }) => "RelayAttachReject".to_string(),
                     Some(CloudMessage::RelayPtyOutput { .. }) => "RelayPtyOutput".to_string(),
                     None => "Channel closed".to_string(),
                 };
@@ -486,7 +509,6 @@ async fn connect_and_run(
                     }
                     // Relay/pane messages are sent immediately (low-latency terminal I/O)
                     Some(msg @ CloudMessage::RelayAttachAccept { .. })
-                    | Some(msg @ CloudMessage::RelayAttachReject { .. })
                     | Some(msg @ CloudMessage::RelayPtyOutput { .. })
                     | Some(msg @ CloudMessage::PaneOutput { .. })
                     | Some(msg @ CloudMessage::PaneList { .. }) => {
@@ -619,15 +641,6 @@ where
                 "client_id": client_id,
                 "cols": cols,
                 "rows": rows,
-            }),
-        ),
-        CloudMessage::RelayAttachReject { client_id, reason } => encode_msg(
-            jr,
-            topic,
-            "relay.attach_reject",
-            &serde_json::json!({
-                "client_id": client_id,
-                "reason": reason,
             }),
         ),
         CloudMessage::RelayPtyOutput { client_id, data } => {
