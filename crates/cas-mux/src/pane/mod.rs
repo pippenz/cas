@@ -91,6 +91,10 @@ pub struct Pane {
     pub(crate) last_total_scrollback: u32,
     /// Sequence counter for incremental updates (pane-scoped)
     pub(crate) seq_counter: u64,
+    /// Whether the user has scrolled up from the bottom
+    user_scrolled: bool,
+    /// Number of new output lines received while user was scrolled up
+    new_lines_below: u32,
 }
 
 impl Pane {
@@ -123,6 +127,8 @@ impl Pane {
             force_all_dirty: true,
             last_total_scrollback: info.total_scrollback,
             seq_counter: 0,
+            user_scrolled: false,
+            new_lines_below: 0,
         })
     }
 
@@ -384,9 +390,35 @@ impl Pane {
     }
 
     pub fn feed(&mut self, data: &[u8]) -> Result<()> {
-        self.terminal
-            .feed(data)
-            .map_err(|e| Error::terminal(e.to_string()))
+        if self.user_scrolled {
+            // Save scroll position: the terminal auto-scrolls to bottom on new output,
+            // but the user has scrolled up and we want to preserve their position
+            let before = self.terminal.scrollback_info();
+            let old_total = before.total_scrollback;
+            let old_offset = before.viewport_offset;
+
+            self.terminal
+                .feed(data)
+                .map_err(|e| Error::terminal(e.to_string()))?;
+
+            let after = self.terminal.scrollback_info();
+            let new_lines = after.total_scrollback.saturating_sub(old_total);
+            if new_lines > 0 {
+                self.new_lines_below = self.new_lines_below.saturating_add(new_lines);
+            }
+            // Restore viewport: feed() scrolls to bottom (offset=0), so scroll back up
+            // by old_offset + new_lines to keep the same content visible
+            let restore = old_offset.saturating_add(new_lines);
+            if restore > 0 {
+                let _ = self.terminal.scroll(-(restore as i32));
+            }
+
+            Ok(())
+        } else {
+            self.terminal
+                .feed(data)
+                .map_err(|e| Error::terminal(e.to_string()))
+        }
     }
 
     /// Strip literal cursor-position report echoes such as `^[[1;1R`.
@@ -629,6 +661,15 @@ impl Pane {
             .scroll(delta)
             .map_err(|e| Error::terminal(e.to_string()));
         let info_after = self.terminal.scrollback_info();
+
+        // Track whether user has scrolled away from bottom
+        if info_after.viewport_offset > 0 {
+            self.user_scrolled = true;
+        } else {
+            self.user_scrolled = false;
+            self.new_lines_below = 0;
+        }
+
         if debug_log_enabled() {
             tracing::debug!(
                 "Pane {}: scroll complete, after: offset={}, total={}",
@@ -647,9 +688,21 @@ impl Pane {
     }
 
     pub fn scroll_to_bottom(&mut self) -> Result<()> {
+        self.user_scrolled = false;
+        self.new_lines_below = 0;
         self.terminal
             .scroll_to_bottom()
             .map_err(|e| Error::terminal(e.to_string()))
+    }
+
+    /// Whether the user has scrolled up from the bottom
+    pub fn is_user_scrolled(&self) -> bool {
+        self.user_scrolled
+    }
+
+    /// Number of new output lines received while user was scrolled up
+    pub fn new_lines_below(&self) -> u32 {
+        self.new_lines_below
     }
 
     pub fn kill(&mut self) {
