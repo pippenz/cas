@@ -44,6 +44,7 @@ type McpClientService = RunningService<rmcp::RoleClient, ()>;
 struct ConnectedServer {
     service: McpClientService,
     tools: Vec<Tool>,
+    config: ServerConfig,
 }
 
 /// Engine that proxies tool calls to upstream MCP servers.
@@ -221,7 +222,11 @@ impl ProxyEngine {
 
     /// Reload with new server configurations.
     ///
-    /// Disconnects servers no longer in config, connects new ones.
+    /// Compares against current connections:
+    /// - Removes servers no longer in config
+    /// - Connects newly added servers
+    /// - Reconnects servers whose config changed
+    /// - Leaves unchanged servers connected
     pub async fn reload(&self, configs: HashMap<String, ServerConfig>) -> Result<()> {
         let mut servers = self.servers.write().await;
 
@@ -236,10 +241,18 @@ impl ProxyEngine {
             }
         }
 
-        // Connect new servers
+        // Connect new servers and reconnect changed ones
         for (name, config) in configs {
-            if servers.contains_key(&name) {
-                continue;
+            // Check if config changed for existing server
+            if let Some(existing) = servers.get(&name) {
+                if existing.config == config {
+                    continue; // No change, keep existing connection
+                }
+                // Config changed — disconnect old, will reconnect below
+                if let Some(removed) = servers.remove(&name) {
+                    let _ = removed.service.cancel().await;
+                    eprintln!("[proxy] Config changed for '{name}', reconnecting...");
+                }
             }
 
             match connect_server(&name, &config).await {
@@ -400,6 +413,7 @@ async fn connect_server(name: &str, config: &ServerConfig) -> Result<ConnectedSe
     Ok(ConnectedServer {
         service,
         tools: tools_result.tools,
+        config: config.clone(),
     })
 }
 
