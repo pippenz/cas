@@ -59,7 +59,7 @@ impl Default for Bm25Config {
 /// This index is generic over any document type implementing [`SearchDocument`].
 /// It stores documents with their content, type, tags, and metadata for filtering.
 pub struct Bm25Index {
-    index: Index,
+    index: RwLock<Index>,
     schema: Schema,
     // Fields
     id_field: Field,
@@ -102,7 +102,7 @@ impl Bm25Index {
             title_field: schema.get_field("title").unwrap(),
             doc_type_field: schema.get_field("doc_type").unwrap(),
             tags_field: schema.get_field("tags").unwrap(),
-            index,
+            index: RwLock::new(index),
             config,
             index_dir: Some(index_dir.to_path_buf()),
             write_lock: RwLock::new(()),
@@ -127,7 +127,7 @@ impl Bm25Index {
             title_field: schema.get_field("title").unwrap(),
             doc_type_field: schema.get_field("doc_type").unwrap(),
             tags_field: schema.get_field("tags").unwrap(),
-            index,
+            index: RwLock::new(index),
             config,
             index_dir: None,
             write_lock: RwLock::new(()),
@@ -151,12 +151,16 @@ impl Bm25Index {
             }
         }
         // Slow path: create and cache
-        let reader: IndexReader = self
+        let index_guard = self
             .index
+            .read()
+            .map_err(|_| SearchError::Index("Index lock poisoned".to_string()))?;
+        let reader: IndexReader = index_guard
             .reader_builder()
             .reload_policy(ReloadPolicy::OnCommitWithDelay)
             .try_into()
             .map_err(|e: tantivy::TantivyError| SearchError::Index(e.to_string()))?;
+        drop(index_guard);
         let mut guard = self
             .cached_reader
             .write()
@@ -200,7 +204,11 @@ impl Bm25Index {
 
     /// Get an index writer
     fn writer(&self) -> Result<IndexWriter> {
-        self.index
+        let index = self
+            .index
+            .read()
+            .map_err(|_| SearchError::Index("Index lock poisoned".to_string()))?;
+        index
             .writer(self.config.writer_memory)
             .map_err(|e| SearchError::Index(e.to_string()))
     }
@@ -384,6 +392,13 @@ impl Bm25Index {
         // Clean up backup
         let _ = std::fs::remove_dir_all(&backup_dir);
 
+        // Reopen the Index from the new directory so subsequent reads use fresh data
+        let new_index = Index::open_in_dir(index_dir)
+            .map_err(|e| SearchError::Index(e.to_string()))?;
+        if let Ok(mut guard) = self.index.write() {
+            *guard = new_index;
+        }
+
         self.invalidate_reader();
         Ok(count)
     }
@@ -423,8 +438,12 @@ impl Bm25Index {
         let searcher = reader.searcher();
 
         // Build full-text query
+        let index = self
+            .index
+            .read()
+            .map_err(|_| SearchError::Index("Index lock poisoned".to_string()))?;
         let query_parser = QueryParser::for_index(
-            &self.index,
+            &index,
             vec![self.content_field, self.title_field, self.tags_field],
         );
 
