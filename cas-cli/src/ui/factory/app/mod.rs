@@ -223,6 +223,9 @@ pub struct FactoryApp {
     notifier: Notifier,
     /// Current epic state
     epic_state: EpicState,
+    /// Explicit current epic ID — set when supervisor creates/starts an epic.
+    /// Takes priority over passive scanning in detect_epic_state().
+    current_epic_id: Option<String>,
     /// Sidecar panel focus
     pub sidecar_focus: SidecarFocus,
     /// Sidecar panel scroll/collapse state
@@ -448,6 +451,7 @@ impl FactoryApp {
                 epic_title,
             } = event
             {
+                self.current_epic_id = Some(epic_id.clone());
                 self.epic_state = EpicState::Active {
                     epic_id: epic_id.clone(),
                     epic_title: epic_title.clone(),
@@ -921,9 +925,28 @@ fn extract_selected_text_from_pane(
     if text.is_empty() { None } else { Some(text) }
 }
 
-/// Detect the initial epic state from loaded data
-pub(crate) fn detect_epic_state(data: &DirectorData) -> EpicState {
+/// Detect the initial epic state from loaded data.
+///
+/// If `preferred_epic_id` is set (from session metadata or explicit tracking),
+/// look it up directly instead of scanning all epics. Falls back to scanning
+/// if the preferred epic is not found or is closed.
+pub(crate) fn detect_epic_state(
+    data: &DirectorData,
+    preferred_epic_id: Option<&str>,
+) -> EpicState {
     use cas_types::TaskStatus;
+
+    // If we have an explicit epic ID, try to use it directly (skip scanning)
+    if let Some(epic_id) = preferred_epic_id {
+        if let Some(epic) = data.epic_tasks.iter().find(|e| e.id == epic_id) {
+            if epic.status != TaskStatus::Closed {
+                return EpicState::Active {
+                    epic_id: epic.id.clone(),
+                    epic_title: epic.title.clone(),
+                };
+            }
+        }
+    }
 
     // Find an in-progress epic first (highest priority)
     for epic in &data.epic_tasks {

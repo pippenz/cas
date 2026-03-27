@@ -53,7 +53,7 @@ impl FactoryApp {
         let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
 
         let director_data = DirectorData::load_fast(&cas_dir)?;
-        let epic_state = detect_epic_state(&director_data);
+        let epic_state = detect_epic_state(&director_data, None);
 
         let epic_branch = if let EpicState::Active { epic_title, .. } = &epic_state {
             let branch_name = epic_branch_name(epic_title);
@@ -190,6 +190,7 @@ impl FactoryApp {
             selected_pane: None,
             event_detector,
             notifier,
+            current_epic_id: epic_state.epic_id().map(|s| s.to_string()),
             epic_state,
             sidecar_focus: SidecarFocus::None,
             panels: Default::default(),
@@ -279,7 +280,7 @@ impl FactoryApp {
             DirectorEventDetector::new(worker_names.clone(), supervisor_name.clone());
         event_detector.initialize(&director_data);
 
-        let epic_state = detect_epic_state(&director_data);
+        let epic_state = detect_epic_state(&director_data, None);
         let epic_branch = match &epic_state {
             EpicState::Active { epic_title, .. } => Some(epic_branch_name(epic_title)),
             _ => None,
@@ -340,6 +341,7 @@ impl FactoryApp {
             selected_pane: None,
             event_detector,
             notifier,
+            current_epic_id: epic_state.epic_id().map(|s| s.to_string()),
             epic_state,
             sidecar_focus: SidecarFocus::None,
             panels: Default::default(),
