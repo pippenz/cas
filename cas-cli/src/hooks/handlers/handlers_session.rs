@@ -8,10 +8,9 @@ pub fn handle_session_start(
 
     // Record session start for analytics and register agent
     if let Some(cas_root) = cas_root {
-        if let Ok(sqlite_store) = SqliteStore::open(cas_root) {
-            // Ensure schema is up to date
-            let _ = sqlite_store.init();
+        let mut stores = HookStores::new(cas_root);
 
+        if let Some(sqlite_store) = stores.sqlite() {
             let session = Session::new(
                 input.session_id.clone(),
                 input.cwd.clone(),
@@ -23,110 +22,109 @@ pub fn handle_session_start(
                     &input.session_id[..8.min(input.session_id.len())]
                 );
             }
+        }
 
-            // Notify daemon via socket for instant agent registration
-            // Daemon tracks PID → session mapping in memory (no files needed)
-            // Pass agent_name and agent_role from this process's env (set by factory mode)
-            use crate::agent_id::get_cc_pid_for_hook;
-            let cc_pid = get_cc_pid_for_hook();
-            let agent_name = std::env::var("CAS_AGENT_NAME").ok();
-            let agent_role = std::env::var("CAS_AGENT_ROLE").ok();
-            let clone_path = std::env::var("CAS_CLONE_PATH").ok();
+        // Notify daemon via socket for instant agent registration
+        // Daemon tracks PID → session mapping in memory (no files needed)
+        // Pass agent_name and agent_role from this process's env (set by factory mode)
+        use crate::agent_id::get_cc_pid_for_hook;
+        let cc_pid = get_cc_pid_for_hook();
+        let agent_name = std::env::var("CAS_AGENT_NAME").ok();
+        let agent_role = std::env::var("CAS_AGENT_ROLE").ok();
+        let clone_path = std::env::var("CAS_CLONE_PATH").ok();
 
-            // Helper to register agent directly in database
-            let register_directly = || {
-                if let Ok(agent_store) = open_agent_store(cas_root) {
-                    use crate::orchestration::names as friendly_names;
-                    use crate::types::{Agent, AgentRole};
+        // Helper to register agent directly in database
+        let register_directly = |stores: &mut HookStores| {
+            if let Some(agent_store) = stores.agents() {
+                use crate::orchestration::names as friendly_names;
+                use crate::types::{Agent, AgentRole};
 
-                    let name = agent_name.clone().unwrap_or_else(friendly_names::generate);
-                    let mut agent = Agent::new(input.session_id.clone(), name);
-                    agent.pid = Some(cc_pid);
-                    agent.machine_id = Some(Agent::get_or_generate_machine_id());
+                let name = agent_name.clone().unwrap_or_else(friendly_names::generate);
+                let mut agent = Agent::new(input.session_id.clone(), name);
+                agent.pid = Some(cc_pid);
+                agent.machine_id = Some(Agent::get_or_generate_machine_id());
 
-                    // Set role from environment
-                    if let Some(ref role_str) = agent_role {
-                        if let Ok(role) = role_str.parse::<AgentRole>() {
-                            agent.role = role;
-                        }
-                    }
-
-                    // Store clone path in metadata for factory workers
-                    if let Some(ref path) = clone_path {
-                        agent
-                            .metadata
-                            .insert("clone_path".to_string(), path.clone());
-                    }
-
-                    if let Err(reg_err) = agent_store.register(&agent) {
-                        eprintln!("cas: Failed to register agent: {reg_err}");
-                    } else {
-                        eprintln!(
-                            "cas: Registered agent directly (pid: {cc_pid}, role: {agent_role:?})"
-                        );
+                // Set role from environment
+                if let Some(ref role_str) = agent_role {
+                    if let Ok(role) = role_str.parse::<AgentRole>() {
+                        agent.role = role;
                     }
                 }
+
+                // Store clone path in metadata for factory workers
+                if let Some(ref path) = clone_path {
+                    agent
+                        .metadata
+                        .insert("clone_path".to_string(), path.clone());
+                }
+
+                if let Err(reg_err) = agent_store.register(&agent) {
+                    eprintln!("cas: Failed to register agent: {reg_err}");
+                } else {
+                    eprintln!(
+                        "cas: Registered agent directly (pid: {cc_pid}, role: {agent_role:?})"
+                    );
+                }
+            }
+        };
+
+        #[cfg(feature = "mcp-server")]
+        {
+            use crate::mcp::socket::{DaemonEvent, send_event};
+            let event = DaemonEvent::SessionStart {
+                session_id: input.session_id.clone(),
+                agent_name: agent_name.clone(),
+                agent_role: agent_role.clone(),
+                cc_pid,
+                clone_path: clone_path.clone(),
             };
-
-            #[cfg(feature = "mcp-server")]
-            {
-                use crate::mcp::socket::{DaemonEvent, send_event};
-                let event = DaemonEvent::SessionStart {
-                    session_id: input.session_id.clone(),
-                    agent_name: agent_name.clone(),
-                    agent_role: agent_role.clone(),
+            match send_event(cas_root, &event) {
+                Ok(_) => eprintln!(
+                    "cas: Notified daemon of session start (pid: {}, role: {:?})",
                     cc_pid,
-                    clone_path: clone_path.clone(),
-                };
-                match send_event(cas_root, &event) {
-                    Ok(_) => eprintln!(
-                        "cas: Notified daemon of session start (pid: {}, role: {:?})",
-                        cc_pid,
-                        std::env::var("CAS_AGENT_ROLE").ok()
-                    ),
-                    Err(e) => {
-                        // Daemon socket not available - register directly in database as fallback
-                        eprintln!("cas: Daemon not available ({e}), registering directly");
-                        register_directly();
-                    }
+                    std::env::var("CAS_AGENT_ROLE").ok()
+                ),
+                Err(e) => {
+                    // Daemon socket not available - register directly in database as fallback
+                    eprintln!("cas: Daemon not available ({e}), registering directly");
+                    register_directly(&mut stores);
                 }
             }
+        }
 
-            #[cfg(not(feature = "mcp-server"))]
-            {
-                // Without MCP server, register directly
-                register_directly();
-            }
+        #[cfg(not(feature = "mcp-server"))]
+        {
+            // Without MCP server, register directly
+            register_directly(&mut stores);
+        }
 
-            // Write OTEL context for telemetry correlation
-            let project_id = crate::cloud::get_project_canonical_id();
-            let project_path = cas_root.parent().map(|p| p.to_string_lossy().to_string());
+        // Write OTEL context for telemetry correlation
+        let project_id = crate::cloud::get_project_canonical_id();
+        let project_path = cas_root.parent().map(|p| p.to_string_lossy().to_string());
 
-            // Check for active task
-            let active_task_id = if let Ok(task_store) = open_task_store(cas_root) {
-                task_store
-                    .list(Some(TaskStatus::InProgress))
+        // Check for active task (reuses cached task store)
+        let active_task_id = stores
+            .tasks()
+            .and_then(|ts| {
+                ts.list(Some(TaskStatus::InProgress))
                     .ok()
                     .and_then(|tasks| tasks.first().map(|t| t.id.clone()))
-            } else {
-                None
-            };
+            });
 
-            let otel_ctx = OtelContext::new(input.session_id.clone())
-                .with_project_id(project_id)
-                .with_project_path(project_path)
-                .with_permission_mode(input.permission_mode.clone())
-                .with_task_id(active_task_id);
+        let otel_ctx = OtelContext::new(input.session_id.clone())
+            .with_project_id(project_id)
+            .with_project_path(project_path)
+            .with_permission_mode(input.permission_mode.clone())
+            .with_task_id(active_task_id);
 
-            if let Err(e) = otel_ctx.write(cas_root) {
-                eprintln!("cas: Warning: Failed to write OTEL context: {e}");
-            }
+        if let Err(e) = otel_ctx.write(cas_root) {
+            eprintln!("cas: Warning: Failed to write OTEL context: {e}");
+        }
 
-            // Cleanup orphaned tasks from crashed/interrupted previous sessions
-            let reopened = cleanup_orphaned_tasks(cas_root);
-            if reopened > 0 {
-                eprintln!("cas: Reopened {reopened} orphaned task(s) from previous session");
-            }
+        // Cleanup orphaned tasks from crashed/interrupted previous sessions
+        let reopened = cleanup_orphaned_tasks(cas_root);
+        if reopened > 0 {
+            eprintln!("cas: Reopened {reopened} orphaned task(s) from previous session");
         }
     }
 
@@ -226,10 +224,11 @@ pub fn handle_session_end(
         None => return Ok(HookOutput::empty()),
     };
 
-    let store = open_store(cas_root)?;
+    let mut stores = HookStores::new(cas_root);
 
     // Get observations from this session
-    let entries = store.list()?;
+    let entry_store = stores.entries()?;
+    let entries = entry_store.list()?;
     let session_observations: Vec<_> = entries
         .iter()
         .filter(|e| e.session_id.as_deref() == Some(&input.session_id))
@@ -290,8 +289,8 @@ pub fn handle_session_end(
         .map(|h| h.generate_summaries)
         .unwrap_or(false);
 
-    // Generate session title (always try - uses Claude CLI via subscription)
-    if let Ok(sqlite_store) = SqliteStore::open(cas_root) {
+    // Generate session title and compute outcome (reuses single SqliteStore)
+    if let Some(sqlite_store) = stores.sqlite() {
         match generate_session_title_sync(&session_observations) {
             Ok(title) => {
                 if sqlite_store
@@ -305,14 +304,10 @@ pub fn handle_session_end(
                 eprintln!("cas: Title generation failed: {e}");
             }
         }
-    }
 
-    // === COMPUTE SESSION OUTCOME ===
-    if let Ok(sqlite_store) = SqliteStore::open(cas_root) {
-        // Get session record (may not exist if not tracked)
+        // Compute session outcome
         let session_opt = sqlite_store.get_session(&input.session_id).ok().flatten();
 
-        // Compute outcome based on session metrics
         let outcome = if let Some(session) = session_opt {
             if session.tasks_closed > 0 {
                 cas_types::SessionOutcome::TasksCompleted
@@ -329,7 +324,6 @@ pub fn handle_session_end(
             cas_types::SessionOutcome::Abandoned
         };
 
-        // Update session with outcome
         if sqlite_store
             .update_session_signals(&input.session_id, Some(outcome), None, None)
             .is_ok()
@@ -340,11 +334,12 @@ pub fn handle_session_end(
 
     if should_summarize {
         // Generate summary
+        let entry_store = stores.entries()?;
         {
             if let Ok(summary) = generate_session_summary_sync(&session_observations) {
                 // Store the summary as a context entry
                 if !summary.summary.is_empty() {
-                    let id = store.generate_id()?;
+                    let id = entry_store.generate_id()?;
                     let mut content = format!("## Session Summary\n\n{}\n", summary.summary);
 
                     if !summary.decisions.is_empty() {
@@ -377,7 +372,7 @@ pub fn handle_session_end(
                         ..Default::default()
                     };
 
-                    if store.add(&entry).is_ok() {
+                    if entry_store.add(&entry).is_ok() {
                         eprintln!("cas: Generated session summary: {id}");
                     }
                 }

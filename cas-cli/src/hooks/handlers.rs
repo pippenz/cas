@@ -25,6 +25,71 @@ use crate::hooks::transcript::check_promise_in_transcript;
 
 use crate::hooks::context::{build_context, build_context_ai, build_plan_context};
 use crate::hooks::types::{HookInput, HookOutput};
+use crate::store::{AgentStore, TaskStore};
+use std::sync::Arc;
+
+/// Shared store context for hook handlers.
+///
+/// Opens each store lazily on first use and caches it, avoiding redundant
+/// `open_*()` calls (each of which runs `.init()` migrations and `Config::load()`).
+pub(crate) struct HookStores<'a> {
+    cas_root: &'a Path,
+    sqlite: Option<SqliteStore>,
+    entry_store: Option<Arc<dyn Store>>,
+    task_store: Option<Arc<dyn TaskStore>>,
+    agent_store: Option<Arc<dyn AgentStore>>,
+}
+
+impl<'a> HookStores<'a> {
+    pub fn new(cas_root: &'a Path) -> Self {
+        Self {
+            cas_root,
+            sqlite: None,
+            entry_store: None,
+            task_store: None,
+            agent_store: None,
+        }
+    }
+
+    /// Get the raw SqliteStore (for session tracking, titles, outcomes)
+    pub fn sqlite(&mut self) -> Option<&SqliteStore> {
+        if self.sqlite.is_none() {
+            if let Ok(store) = SqliteStore::open(self.cas_root) {
+                let _ = store.init();
+                self.sqlite = Some(store);
+            }
+        }
+        self.sqlite.as_ref()
+    }
+
+    /// Get the entry store (for listing entries)
+    pub fn entries(&mut self) -> Result<&Arc<dyn Store>, MemError> {
+        if self.entry_store.is_none() {
+            self.entry_store = Some(open_store(self.cas_root)?);
+        }
+        Ok(self.entry_store.as_ref().unwrap())
+    }
+
+    /// Get the task store
+    pub fn tasks(&mut self) -> Option<&Arc<dyn TaskStore>> {
+        if self.task_store.is_none() {
+            if let Ok(store) = open_task_store(self.cas_root) {
+                self.task_store = Some(store);
+            }
+        }
+        self.task_store.as_ref()
+    }
+
+    /// Get the agent store
+    pub fn agents(&mut self) -> Option<&Arc<dyn AgentStore>> {
+        if self.agent_store.is_none() {
+            if let Ok(store) = open_agent_store(self.cas_root) {
+                self.agent_store = Some(store);
+            }
+        }
+        self.agent_store.as_ref()
+    }
+}
 
 /// Session summary result from AI analysis
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
