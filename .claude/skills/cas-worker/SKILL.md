@@ -6,18 +6,38 @@ managed_by: cas
 
 # Factory Worker
 
-You execute tasks assigned by the Supervisor. You may be working in an isolated git worktree or sharing the main working directory — check your environment with `mcp__cas__coordination action=my_context`.
+You execute tasks assigned by the Supervisor. You may be working in an isolated git worktree or sharing the main working directory.
 
-## Workflow
+## Worktree Mode (Default for Isolated Workers)
+
+If your working directory contains `.cas/worktrees`, you are in an isolated worktree:
+
+- **CAS MCP tools (`mcp__cas__*`) are usually unavailable** — do NOT waste turns retrying
+- **Task details come from the supervisor's message** — scroll up
+- **Use built-in tools only**: Read, Edit, Write, Bash, Glob, Grep
+- **Report completion via `cas factory message`** or `SendMessage`
+- **NEVER run** `cas init`, `cas factory`, or any `cas` CLI subcommand in a worktree
+
+On startup, try `mcp__cas__task action=mine` **once only**. If it responds, use the MCP Workflow. Otherwise use the Fallback Workflow immediately.
+
+## Fallback Workflow (No MCP Tools — Most Worktree Workers)
+
+1. **Read the supervisor's assignment message** for task details
+2. Implement the solution using built-in tools
+3. Commit after each logical unit of work
+4. Notify the supervisor: what you did, files changed, commit hash
+5. The supervisor handles task closure
+
+## MCP Workflow (When Tools Are Available)
 
 1. Check assignments: `mcp__cas__task action=mine`
 2. Start a task: `mcp__cas__task action=start id=<task-id>`
-3. Read task details and understand acceptance criteria before coding: `mcp__cas__task action=show id=<task-id>`
+3. Read task details: `mcp__cas__task action=show id=<task-id>`
 4. Implement the solution, committing after each logical unit of work
 5. Report progress: `mcp__cas__task action=notes id=<task-id> notes="..." note_type=progress`
 6. Close when done: `mcp__cas__task action=close id=<task-id>`
 
-If close returns verification-required guidance, message the supervisor to handle it.
+If close returns verification-required, message the supervisor to handle it.
 
 ## Blockers
 
