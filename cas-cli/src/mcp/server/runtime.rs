@@ -112,6 +112,22 @@ async fn run_server_impl() -> anyhow::Result<()> {
 
     let core = CasCore::with_daemon(cas_root.clone(), activity, daemon.clone());
 
+    // Eagerly initialize all stores before serving MCP requests.
+    // This moves cold-start overhead (connection open, schema init) out of the
+    // first tool call path, preventing timeouts on the initial request.
+    {
+        let start = std::time::Instant::now();
+        let _ = core.open_store();
+        let _ = core.open_task_store();
+        let _ = core.open_rule_store();
+        let _ = core.open_skill_store();
+        let _ = core.open_agent_store();
+        let _ = core.open_entity_store();
+        let _ = core.open_verification_store();
+        let _ = core.open_worktree_store();
+        eprintln!("[CAS] Stores initialized in {}ms", start.elapsed().as_millis());
+    }
+
     // Eager auto-registration for factory workers where SessionStart hook may not fire.
     // When CAS_SESSION_ID is set (by PtyConfig::claude()), register immediately so the
     // agent appears in worker_status before any MCP tool call is made.
