@@ -899,8 +899,17 @@ impl CasService {
     // mcp_execute - Execute tool calls across connected MCP servers
     // ========================================================================
 
-    #[tool(
-        description = "Execute TypeScript code that calls tools across all connected MCP servers. Each server is a typed global object (e.g. `canva`, `figma`) where every tool is an async function with typed parameters: `await server.tool_name({ param: value })`. Chain calls sequentially or run them in parallel with Promise.all across different servers."
+    #[cfg_attr(
+        feature = "mcp-proxy",
+        tool(
+            description = "Execute tool calls across all connected MCP servers. Use JSON dispatch: {\"server\": \"name\", \"tool\": \"tool_name\", \"args\": {...}} or an array for parallel calls. Also supports dot-call syntax: server.tool_name({\"param\": \"value\"})."
+        )
+    )]
+    #[cfg_attr(
+        not(feature = "mcp-proxy"),
+        tool(
+            description = "Execute TypeScript code that calls tools across all connected MCP servers. Each server is a typed global object (e.g. `canva`, `figma`) where every tool is an async function with typed parameters: `await server.tool_name({ param: value })`. Chain calls sequentially or run them in parallel with Promise.all across different servers."
+        )
     )]
     pub async fn mcp_execute(
         &self,
