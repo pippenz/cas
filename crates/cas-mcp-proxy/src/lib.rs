@@ -130,9 +130,66 @@ impl ProxyEngine {
     }
 
     /// Execute tool calls across upstream MCP servers.
-    pub async fn execute(&self, _code: &str, _max_length: Option<usize>) -> Result<ExecuteResult> {
-        // Execute will be implemented in a later task (cas-4bfb).
-        anyhow::bail!("execute not yet implemented — see task cas-4bfb")
+    ///
+    /// The `code` parameter supports two formats:
+    ///
+    /// **JSON dispatch** (preferred):
+    /// ```json
+    /// { "server": "github", "tool": "list_issues", "args": { "repo": "myorg/app" } }
+    /// ```
+    ///
+    /// **Batch (parallel)** — array of calls:
+    /// ```json
+    /// [
+    ///   { "server": "github", "tool": "list_issues", "args": { "repo": "myorg/app" } },
+    ///   { "server": "sentry", "tool": "list_errors", "args": { "project": "backend" } }
+    /// ]
+    /// ```
+    ///
+    /// **Dot-call syntax** (fallback):
+    /// ```text
+    /// server.tool_name({ "param": "value" })
+    /// ```
+    pub async fn execute(&self, code: &str, max_length: Option<usize>) -> Result<ExecuteResult> {
+        let calls = parse_dispatch(code)?;
+
+        let mut text_parts: Vec<String> = Vec::new();
+        let mut images: Vec<ImageResult> = Vec::new();
+
+        if calls.len() == 1 {
+            let call = &calls[0];
+            let result = self.call_tool_raw(&call.server, &call.tool, call.args.clone()).await?;
+            collect_result(&result, &mut text_parts, &mut images);
+        } else {
+            // Execute in parallel
+            let futures: Vec<_> = calls
+                .iter()
+                .map(|call| self.call_tool_raw(&call.server, &call.tool, call.args.clone()))
+                .collect();
+
+            let results = futures::future::join_all(futures).await;
+
+            for (i, result) in results.into_iter().enumerate() {
+                match result {
+                    Ok(result) => collect_result(&result, &mut text_parts, &mut images),
+                    Err(e) => {
+                        text_parts.push(format!(
+                            "[{}.{} error]: {e}",
+                            calls[i].server, calls[i].tool
+                        ));
+                    }
+                }
+            }
+        }
+
+        let mut text = text_parts.join("\n\n");
+        if let Some(max) = max_length {
+            if text.len() > max {
+                text.truncate(max);
+            }
+        }
+
+        Ok(ExecuteResult { text, images })
     }
 
     /// Return the total number of tools across all connected servers.
@@ -229,6 +286,41 @@ impl ProxyEngine {
             .with_context(|| format!("tool call '{tool_name}' on '{server_name}' failed"))?;
 
         serde_json::to_value(result).context("failed to serialize tool result")
+    }
+
+    /// Call a tool and return the raw rmcp result (for internal use by execute).
+    async fn call_tool_raw(
+        &self,
+        server_name: &str,
+        tool_name: &str,
+        arguments: Option<serde_json::Map<String, Value>>,
+    ) -> Result<rmcp::model::CallToolResult> {
+        use rmcp::model::CallToolRequestParams;
+
+        let servers = self.servers.read().await;
+        let server = servers.get(server_name).with_context(|| {
+            let available: Vec<&str> = servers.keys().map(|s| s.as_str()).collect();
+            format!(
+                "server '{}' not connected. Available: {}",
+                server_name,
+                if available.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    available.join(", ")
+                }
+            )
+        })?;
+
+        server
+            .service
+            .call_tool(CallToolRequestParams {
+                name: tool_name.to_string().into(),
+                arguments,
+                meta: None,
+                task: None,
+            })
+            .await
+            .with_context(|| format!("tool call '{tool_name}' on '{server_name}' failed"))
     }
 
     /// Gracefully shut down all connected servers.
@@ -338,6 +430,114 @@ fn parse_search_query(query: &str) -> (Option<String>, Vec<String>) {
     (server_filter, keywords)
 }
 
+/// A parsed tool call dispatch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ToolCall {
+    server: String,
+    tool: String,
+    #[serde(default)]
+    args: Option<serde_json::Map<String, Value>>,
+}
+
+/// Parse the `code` parameter into one or more tool calls.
+///
+/// Tries JSON dispatch first, then falls back to dot-call syntax.
+fn parse_dispatch(code: &str) -> Result<Vec<ToolCall>> {
+    let trimmed = code.trim();
+
+    // Try JSON array
+    if trimmed.starts_with('[') {
+        let calls: Vec<ToolCall> = serde_json::from_str(trimmed)
+            .context("failed to parse batch dispatch as JSON array")?;
+        if calls.is_empty() {
+            anyhow::bail!("empty dispatch array");
+        }
+        return Ok(calls);
+    }
+
+    // Try JSON object
+    if trimmed.starts_with('{') {
+        let call: ToolCall = serde_json::from_str(trimmed)
+            .context("failed to parse dispatch as JSON object")?;
+        return Ok(vec![call]);
+    }
+
+    // Fall back to dot-call syntax: server.tool_name({ ... })
+    parse_dot_syntax(trimmed)
+}
+
+/// Parse `server.tool_name({ "param": "value" })` syntax.
+fn parse_dot_syntax(code: &str) -> Result<Vec<ToolCall>> {
+    let dot_pos = code
+        .find('.')
+        .context("invalid syntax: expected 'server.tool(args)' or JSON dispatch.\n\nExamples:\n  github.list_issues({\"repo\": \"myorg/app\"})\n  {\"server\": \"github\", \"tool\": \"list_issues\", \"args\": {\"repo\": \"myorg/app\"}}")?;
+
+    let server = &code[..dot_pos];
+    let rest = &code[dot_pos + 1..];
+
+    // Find the tool name (everything before the first '(')
+    let paren_pos = rest.find('(');
+
+    let (tool, args) = if let Some(pos) = paren_pos {
+        let tool_name = &rest[..pos];
+        let args_str = rest[pos..].trim();
+
+        // Strip surrounding parens
+        let args_inner = args_str
+            .strip_prefix('(')
+            .and_then(|s| s.strip_suffix(')'))
+            .unwrap_or(args_str)
+            .trim();
+
+        let args = if args_inner.is_empty() {
+            None
+        } else {
+            let parsed: serde_json::Map<String, Value> = serde_json::from_str(args_inner)
+                .with_context(|| format!("failed to parse arguments as JSON: {args_inner}"))?;
+            Some(parsed)
+        };
+
+        (tool_name.to_string(), args)
+    } else {
+        (rest.trim().to_string(), None)
+    };
+
+    Ok(vec![ToolCall {
+        server: server.to_string(),
+        tool,
+        args,
+    }])
+}
+
+/// Extract text and images from an rmcp CallToolResult.
+fn collect_result(
+    result: &rmcp::model::CallToolResult,
+    text_parts: &mut Vec<String>,
+    images: &mut Vec<ImageResult>,
+) {
+    use rmcp::model::RawContent;
+
+    for content in &result.content {
+        match &content.raw {
+            RawContent::Text(t) => {
+                text_parts.push(t.text.clone());
+            }
+            RawContent::Image(img) => {
+                images.push(ImageResult {
+                    data: img.data.clone(),
+                    mime_type: img.mime_type.clone(),
+                });
+            }
+            _ => {
+                // Resource, Audio, ResourceLink — serialize as JSON text
+                if let Ok(json) = serde_json::to_string_pretty(&content) {
+                    text_parts.push(json);
+                }
+            }
+        }
+    }
+}
+
 /// Check if a tool matches all keyword tokens (case-insensitive substring on name + description).
 fn matches_keywords(tool: &Tool, keywords: &[String]) -> bool {
     if keywords.is_empty() {
@@ -440,5 +640,75 @@ mod tests {
         let tool = make_tool("list_files", "List files in a directory");
         let keywords = vec!["screenshot".to_string()];
         assert!(!matches_keywords(&tool, &keywords));
+    }
+
+    // ── Dispatch parsing tests ──────────────────────────────────────
+
+    #[test]
+    fn parse_dispatch_json_single() {
+        let calls =
+            parse_dispatch(r#"{"server": "github", "tool": "list_issues", "args": {"repo": "myorg/app"}}"#)
+                .unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].server, "github");
+        assert_eq!(calls[0].tool, "list_issues");
+        assert!(calls[0].args.is_some());
+        assert_eq!(calls[0].args.as_ref().unwrap()["repo"], "myorg/app");
+    }
+
+    #[test]
+    fn parse_dispatch_json_batch() {
+        let calls = parse_dispatch(
+            r#"[
+                {"server": "github", "tool": "list_issues", "args": {"repo": "app"}},
+                {"server": "sentry", "tool": "list_errors", "args": {"project": "be"}}
+            ]"#,
+        )
+        .unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].server, "github");
+        assert_eq!(calls[1].server, "sentry");
+    }
+
+    #[test]
+    fn parse_dispatch_dot_syntax_with_args() {
+        let calls =
+            parse_dispatch(r#"github.list_issues({"repo": "myorg/app"})"#).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].server, "github");
+        assert_eq!(calls[0].tool, "list_issues");
+        assert!(calls[0].args.is_some());
+    }
+
+    #[test]
+    fn parse_dispatch_dot_syntax_no_args() {
+        let calls = parse_dispatch("github.list_repos()").unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].server, "github");
+        assert_eq!(calls[0].tool, "list_repos");
+        assert!(calls[0].args.is_none());
+    }
+
+    #[test]
+    fn parse_dispatch_dot_syntax_no_parens() {
+        let calls = parse_dispatch("github.list_repos").unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].server, "github");
+        assert_eq!(calls[0].tool, "list_repos");
+        assert!(calls[0].args.is_none());
+    }
+
+    #[test]
+    fn parse_dispatch_invalid_no_dot() {
+        let result = parse_dispatch("just_a_word");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_dispatch_json_no_args() {
+        let calls =
+            parse_dispatch(r#"{"server": "github", "tool": "list_repos"}"#).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].args.is_none());
     }
 }
