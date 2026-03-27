@@ -330,6 +330,19 @@ fn remote_for_ref(path: &std::path::Path, reference: &str) -> Option<String> {
 // CasCore methods are called directly, not through tool routing.
 // This reduces compile time by avoiding proc-macro expansion of ~77 tools.
 
+/// Helper to truncate strings for display (shared by core and service modules)
+pub(crate) fn truncate_str(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else {
+        let mut end = max_len.min(s.len());
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}...", &s[..end])
+    }
+}
+
 mod core;
 
 #[cfg(test)]

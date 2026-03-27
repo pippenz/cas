@@ -132,6 +132,7 @@ impl DocType {
 }
 
 /// Search index backed by Tantivy
+#[derive(Clone)]
 pub struct SearchIndex {
     pub(crate) index: Index,
     pub(crate) schema: Schema,
