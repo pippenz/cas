@@ -435,9 +435,11 @@ impl DirectorEventDetector {
         // 1. An epic transitions to InProgress (highest priority)
         // 2. A new Open-with-branch epic appears (mirrors detect_epic_state init logic)
         //
-        // When multiple epics qualify, later entries in the list win (typically newer).
+        // When multiple qualify, prefer InProgress over Open-with-branch, and among
+        // Open-with-branch pick the lexicographically greatest ID for determinism.
         {
-            let mut epic_started: Option<(&str, &str)> = None;
+            let mut in_progress_started: Option<(&str, &str)> = None;
+            let mut open_branch_started: Option<(&str, &str)> = None;
 
             for epic in &data.epic_tasks {
                 if epic.status == TaskStatus::InProgress {
@@ -449,7 +451,7 @@ impl DirectorEventDetector {
                         .unwrap_or(false);
 
                     if !was_in_progress {
-                        epic_started = Some((&epic.id, &epic.title));
+                        in_progress_started = Some((&epic.id, &epic.title));
                     }
                 } else if epic.status == TaskStatus::Open && epic.branch.is_some() {
                     // New Open-with-branch epic that wasn't previously tracked with a branch
@@ -461,14 +463,19 @@ impl DirectorEventDetector {
                         .unwrap_or(false);
 
                     if !was_open_with_branch {
-                        // Only pick Open-with-branch if no InProgress epic already selected
-                        if epic_started.is_none() {
-                            epic_started = Some((&epic.id, &epic.title));
+                        // Among new Open-with-branch epics, pick greatest ID for stability
+                        if open_branch_started
+                            .map(|(id, _)| epic.id.as_str() > id)
+                            .unwrap_or(true)
+                        {
+                            open_branch_started = Some((&epic.id, &epic.title));
                         }
                     }
                 }
             }
 
+            // InProgress takes priority over Open-with-branch
+            let epic_started = in_progress_started.or(open_branch_started);
             if let Some((id, title)) = epic_started {
                 events.push(DirectorEvent::EpicStarted {
                     epic_id: id.to_string(),

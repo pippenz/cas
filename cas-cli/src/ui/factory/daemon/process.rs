@@ -317,6 +317,7 @@ pub async fn run_daemon_after_fork(
         teams,
         notify_rx,
         dead_workers: std::collections::HashSet::new(),
+        resumed_epic_ids: std::collections::HashSet::new(),
     };
 
     daemon.run().await

@@ -157,6 +157,7 @@ impl FactoryDaemon {
             teams,
             notify_rx,
             dead_workers: std::collections::HashSet::new(),
+            resumed_epic_ids: std::collections::HashSet::new(),
         })
     }
 
