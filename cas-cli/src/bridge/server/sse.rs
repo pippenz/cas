@@ -16,7 +16,6 @@ use crate::bridge::server::session::{
 use crate::bridge::server::types::{ActivityJson, InboxPollJson, session_json};
 use crate::store::open_supervisor_queue_store;
 
-#[derive(Debug)]
 struct SseSessionStream {
     cas_root: std::path::PathBuf,
     session: crate::ui::factory::SessionInfo,
@@ -32,6 +31,10 @@ struct SseSessionStream {
     last_emit_at: std::time::Instant,
     buf: std::io::Cursor<Vec<u8>>,
     done: bool,
+    /// Cached event store — opened once, reused for all poll cycles
+    event_store: Option<Arc<dyn EventStore>>,
+    /// Cached supervisor queue store — opened once, reused for all poll cycles
+    queue_store: Option<Arc<dyn cas_store::SupervisorQueueStore>>,
 }
 
 impl SseSessionStream {
@@ -51,6 +54,14 @@ impl SseSessionStream {
         // Ensure the response can start immediately (some clients/proxies won't
         // treat the connection as established until at least one byte is sent).
         let initial = b": connected\n\n".to_vec();
+
+        // Open stores once at stream creation, reuse for all poll cycles
+        let event_store = SqliteEventStore::open(&cas_root)
+            .ok()
+            .map(|s| Arc::new(s) as Arc<dyn EventStore>);
+        let queue_store = open_supervisor_queue_store(&cas_root)
+            .ok();
+
         Self {
             cas_root,
             session,
@@ -66,6 +77,8 @@ impl SseSessionStream {
             last_emit_at: std::time::Instant::now(),
             buf: std::io::Cursor::new(initial),
             done: false,
+            event_store,
+            queue_store,
         }
     }
 
@@ -134,7 +147,7 @@ impl SseSessionStream {
             }
 
             // Activity: list recent and filter by allowed agents.
-            match SqliteEventStore::open(&self.cas_root).and_then(|store| store.list_recent(200)) {
+            match self.event_store.as_ref().ok_or_else(|| cas_store::StoreError::Other("Event store not available".to_string())).and_then(|store| store.list_recent(200)) {
                 Ok(mut activity) => {
                     filter_events_for_session_agents(&mut activity, &allowed);
                     if self.last_activity_id > 0 {
@@ -176,8 +189,8 @@ impl SseSessionStream {
             }
 
             // Inbox: poll external inbox (marks processed).
-            match open_supervisor_queue_store(&self.cas_root) {
-                Ok(q) => match q.poll(&self.inbox_id, self.inbox_limit) {
+            match &self.queue_store {
+                Some(q) => match q.poll(&self.inbox_id, self.inbox_limit) {
                     Ok(notifications) => {
                         if !notifications.is_empty() {
                             let s = serde_json::to_string(&InboxPollJson {
@@ -204,10 +217,10 @@ impl SseSessionStream {
                         return Ok(());
                     }
                 },
-                Err(e) => {
+                None => {
                     let s = serde_json::to_string(&serde_json::json!({
                         "schema_version": 1,
-                        "error": { "code": "inbox_error", "message": e.to_string() }
+                        "error": { "code": "inbox_error", "message": "Supervisor queue store not available" }
                     }))
                     .unwrap_or_else(|_| "{}".to_string());
                     Self::push_sse_event(&mut out, "error", &s);
