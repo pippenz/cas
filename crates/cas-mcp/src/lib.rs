@@ -26,7 +26,6 @@ pub mod types;
 
 // Re-exports
 pub use daemon::{ActivityTracker, EmbeddedDaemonConfig, EmbeddedDaemonStatus, MaintenanceResult};
-pub use error::McpError;
 pub use types::{
     AgentRequest, CoordinationRequest, ExecuteRequest, FactoryRequest, MemoryRequest,
     PatternRequest, RuleRequest, SearchContextRequest, SkillRequest, SpecRequest, SystemRequest,

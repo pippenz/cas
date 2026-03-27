@@ -21,6 +21,8 @@ impl CasCore {
             cached_agent_store: std::sync::OnceLock::new(),
             cached_verification_store: std::sync::OnceLock::new(),
             cached_worktree_store: std::sync::OnceLock::new(),
+            cached_search_index: std::sync::OnceLock::new(),
+            cached_config: std::sync::OnceLock::new(),
         }
     }
 

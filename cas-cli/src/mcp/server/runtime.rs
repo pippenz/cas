@@ -125,6 +125,8 @@ async fn run_server_impl() -> anyhow::Result<()> {
         let _ = core.open_entity_store();
         let _ = core.open_verification_store();
         let _ = core.open_worktree_store();
+        let _ = core.open_search_index();
+        let _ = core.load_config();
         eprintln!("[CAS] Stores initialized in {}ms", start.elapsed().as_millis());
     }
 

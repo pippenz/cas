@@ -55,6 +55,10 @@ pub struct CasCore {
     pub(crate) cached_agent_store: OnceLock<Arc<dyn AgentStore>>,
     pub(crate) cached_verification_store: OnceLock<Arc<dyn VerificationStore>>,
     pub(crate) cached_worktree_store: OnceLock<Arc<dyn WorktreeStore>>,
+    /// Cached search index (lazily initialized, opened once per server lifetime)
+    pub(crate) cached_search_index: OnceLock<SearchIndex>,
+    /// Cached config (lazily initialized, loaded once per server lifetime)
+    pub(crate) cached_config: OnceLock<Config>,
 }
 
 impl CasCore {
@@ -219,14 +223,19 @@ impl CasCore {
         git_context.branch
     }
 
-    /// Get search index
+    /// Get search index (cached — opened once per server lifetime)
     pub(crate) fn open_search_index(&self) -> Result<SearchIndex, McpError> {
+        if let Some(idx) = self.cached_search_index.get() {
+            return Ok(idx.clone());
+        }
         let index_dir = self.cas_root.join("index/tantivy");
-        SearchIndex::open(&index_dir).map_err(|e| McpError {
+        let idx = SearchIndex::open(&index_dir).map_err(|e| McpError {
             code: ErrorCode::INTERNAL_ERROR,
             message: Cow::from(format!("Failed to open search index: {e}")),
             data: None,
-        })
+        })?;
+        let _ = self.cached_search_index.set(idx);
+        Ok(self.cached_search_index.get().unwrap().clone())
     }
 
     /// Create success result with text content
@@ -306,9 +315,14 @@ impl CasCore {
         }
     }
 
-    /// Load and return config
+    /// Load and return config (cached — loaded once per server lifetime)
     pub(crate) fn load_config(&self) -> Config {
-        Config::load(&self.cas_root).unwrap_or_default()
+        if let Some(cfg) = self.cached_config.get() {
+            return cfg.clone();
+        }
+        let cfg = Config::load(&self.cas_root).unwrap_or_default();
+        let _ = self.cached_config.set(cfg);
+        self.cached_config.get().unwrap().clone()
     }
 
     /// Get the registered agent ID, auto-registering if a session file exists
@@ -760,7 +774,7 @@ impl CasCore {
 
     /// Sync rules to Claude Code
     pub(crate) fn sync_rules(&self) -> Result<usize, McpError> {
-        let config = Config::load(&self.cas_root).unwrap_or_default();
+        let config = self.load_config();
         let project_root = self.cas_root.parent().unwrap_or(&self.cas_root);
         let syncer = Syncer::new(
             project_root.join(&config.sync.target),
