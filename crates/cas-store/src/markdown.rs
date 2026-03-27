@@ -285,6 +285,14 @@ impl Store for MarkdownStore {
         Ok(entries)
     }
 
+    fn list_by_branch(&self, branch: &str) -> Result<Vec<Entry>> {
+        let entries = self.list()?;
+        Ok(entries
+            .into_iter()
+            .filter(|e| e.branch.as_deref() == Some(branch))
+            .collect())
+    }
+
     fn list_pending(&self, _limit: usize) -> Result<Vec<Entry>> {
         // Markdown store doesn't support pending extraction tracking
         Ok(vec![])

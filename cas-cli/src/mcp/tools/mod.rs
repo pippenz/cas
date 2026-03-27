@@ -33,36 +33,28 @@ pub use service::CasService;
 // Sort Helper Functions
 // ============================================================================
 
-/// Sort a vector of tasks based on sort options
-pub(super) fn sort_tasks(tasks: &mut [Task], opts: &cas_types::TaskSortOptions) {
+/// Sort any slice by task sort options, using a key function to extract the Task
+fn sort_by_task_opts<T>(items: &mut [T], opts: &cas_types::TaskSortOptions, key: impl Fn(&T) -> &Task) {
     use cas_types::{SortOrder, TaskSortField};
 
-    match opts.field {
-        TaskSortField::Created => {
-            tasks.sort_by(|a, b| match opts.effective_order() {
-                SortOrder::Asc => a.created_at.cmp(&b.created_at),
-                SortOrder::Desc => b.created_at.cmp(&a.created_at),
-            });
+    items.sort_by(|a, b| {
+        let (a, b) = (key(a), key(b));
+        let cmp = match opts.field {
+            TaskSortField::Created => a.created_at.cmp(&b.created_at),
+            TaskSortField::Updated => a.updated_at.cmp(&b.updated_at),
+            TaskSortField::Priority => a.priority.0.cmp(&b.priority.0),
+            TaskSortField::Title => a.title.cmp(&b.title),
+        };
+        match opts.effective_order() {
+            SortOrder::Asc => cmp,
+            SortOrder::Desc => cmp.reverse(),
         }
-        TaskSortField::Updated => {
-            tasks.sort_by(|a, b| match opts.effective_order() {
-                SortOrder::Asc => a.updated_at.cmp(&b.updated_at),
-                SortOrder::Desc => b.updated_at.cmp(&a.updated_at),
-            });
-        }
-        TaskSortField::Priority => {
-            tasks.sort_by(|a, b| match opts.effective_order() {
-                SortOrder::Asc => a.priority.0.cmp(&b.priority.0),
-                SortOrder::Desc => b.priority.0.cmp(&a.priority.0),
-            });
-        }
-        TaskSortField::Title => {
-            tasks.sort_by(|a, b| match opts.effective_order() {
-                SortOrder::Asc => a.title.cmp(&b.title),
-                SortOrder::Desc => b.title.cmp(&a.title),
-            });
-        }
-    }
+    });
+}
+
+/// Sort a vector of tasks based on sort options
+pub(super) fn sort_tasks(tasks: &mut [Task], opts: &cas_types::TaskSortOptions) {
+    sort_by_task_opts(tasks, opts, |t| t);
 }
 
 /// Sort a vector of blocked tasks (task, blockers) tuples based on sort options
@@ -70,34 +62,7 @@ pub(super) fn sort_blocked_tasks(
     blocked: &mut [(Task, Vec<Task>)],
     opts: &cas_types::TaskSortOptions,
 ) {
-    use cas_types::{SortOrder, TaskSortField};
-
-    match opts.field {
-        TaskSortField::Created => {
-            blocked.sort_by(|(a, _), (b, _)| match opts.effective_order() {
-                SortOrder::Asc => a.created_at.cmp(&b.created_at),
-                SortOrder::Desc => b.created_at.cmp(&a.created_at),
-            });
-        }
-        TaskSortField::Updated => {
-            blocked.sort_by(|(a, _), (b, _)| match opts.effective_order() {
-                SortOrder::Asc => a.updated_at.cmp(&b.updated_at),
-                SortOrder::Desc => b.updated_at.cmp(&a.updated_at),
-            });
-        }
-        TaskSortField::Priority => {
-            blocked.sort_by(|(a, _), (b, _)| match opts.effective_order() {
-                SortOrder::Asc => a.priority.0.cmp(&b.priority.0),
-                SortOrder::Desc => b.priority.0.cmp(&a.priority.0),
-            });
-        }
-        TaskSortField::Title => {
-            blocked.sort_by(|(a, _), (b, _)| match opts.effective_order() {
-                SortOrder::Asc => a.title.cmp(&b.title),
-                SortOrder::Desc => b.title.cmp(&a.title),
-            });
-        }
-    }
+    sort_by_task_opts(blocked, opts, |(t, _)| t);
 }
 
 // ============================================================================

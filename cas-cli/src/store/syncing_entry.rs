@@ -105,6 +105,10 @@ impl Store for SyncingEntryStore {
         self.inner.list_archived()
     }
 
+    fn list_by_branch(&self, branch: &str) -> Result<Vec<Entry>> {
+        self.inner.list_by_branch(branch)
+    }
+
     fn list_pending(&self, limit: usize) -> Result<Vec<Entry>> {
         self.inner.list_pending(limit)
     }
