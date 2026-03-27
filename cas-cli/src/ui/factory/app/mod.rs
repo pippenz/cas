@@ -440,6 +440,21 @@ impl FactoryApp {
         // which the filter depends on for subsequent refresh cycles.
         let events = self.event_detector.detect_changes(&self.director_data);
 
+        // Update epic_state immediately from detected events so the filter below
+        // uses the correct epic_id (otherwise a new epic's tasks get filtered out)
+        for event in &events {
+            if let DirectorEvent::EpicStarted {
+                epic_id,
+                epic_title,
+            } = event
+            {
+                self.epic_state = EpicState::Active {
+                    epic_id: epic_id.clone(),
+                    epic_title: epic_title.clone(),
+                };
+            }
+        }
+
         // Now filter to current session (agents + tasks scoped to active epic)
         if db_changed {
             self.filter_director_agents_to_current_session();
@@ -961,6 +976,121 @@ mod tests {
             reminders: Vec::new(),
             epic_closed_counts: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn epic_state_update_before_filter_retains_new_epic_tasks() {
+        use cas_factory::{EpicState, TaskSummary};
+        use cas_types::{Priority, TaskStatus, TaskType};
+
+        use super::{DirectorEvent, DirectorEventDetector};
+
+        let old_epic_id = "epic-old";
+        let new_epic_id = "epic-new";
+        let new_epic_title = "New Feature Epic";
+
+        // Simulate director_data with a new Open-with-branch epic and its subtasks
+        let mut data = DirectorData {
+            ready_tasks: vec![TaskSummary {
+                id: "task-1".to_string(),
+                title: "Subtask of new epic".to_string(),
+                status: TaskStatus::Open,
+                priority: Priority::MEDIUM,
+                assignee: None,
+                task_type: TaskType::Task,
+                epic: Some(new_epic_id.to_string()),
+                branch: None,
+            }],
+            in_progress_tasks: vec![TaskSummary {
+                id: "task-2".to_string(),
+                title: "In-progress subtask".to_string(),
+                status: TaskStatus::InProgress,
+                priority: Priority::MEDIUM,
+                assignee: Some("worker-1".to_string()),
+                task_type: TaskType::Task,
+                epic: Some(new_epic_id.to_string()),
+                branch: None,
+            }],
+            epic_tasks: vec![TaskSummary {
+                id: new_epic_id.to_string(),
+                title: new_epic_title.to_string(),
+                status: TaskStatus::Open,
+                priority: Priority::MEDIUM,
+                assignee: None,
+                task_type: TaskType::Epic,
+                epic: None,
+                branch: Some("epic/new-feature".to_string()),
+            }],
+            agents: Vec::new(),
+            activity: Vec::new(),
+            agent_id_to_name: HashMap::new(),
+            changes: Vec::new(),
+            git_loaded: false,
+            reminders: Vec::new(),
+            epic_closed_counts: HashMap::new(),
+        };
+
+        // Start with stale epic_state pointing to old epic
+        let mut epic_state = EpicState::Active {
+            epic_id: old_epic_id.to_string(),
+            epic_title: "Old Epic".to_string(),
+        };
+
+        // Event detector sees the new epic and fires EpicStarted
+        let mut detector = DirectorEventDetector::new(
+            vec!["worker-1".to_string()],
+            "supervisor".to_string(),
+        );
+        // Initialize with empty state so detector sees the new epic as new
+        detector.initialize(&DirectorData {
+            ready_tasks: Vec::new(),
+            in_progress_tasks: Vec::new(),
+            epic_tasks: Vec::new(),
+            agents: Vec::new(),
+            activity: Vec::new(),
+            agent_id_to_name: HashMap::new(),
+            changes: Vec::new(),
+            git_loaded: false,
+            reminders: Vec::new(),
+            epic_closed_counts: HashMap::new(),
+        });
+
+        let events = detector.detect_changes(&data);
+
+        // Verify EpicStarted was fired
+        let epic_started = events.iter().any(|e| {
+            matches!(e, DirectorEvent::EpicStarted { epic_id, .. } if epic_id == new_epic_id)
+        });
+        assert!(epic_started, "EpicStarted event should fire for new epic");
+
+        // THE FIX: Update epic_state from events BEFORE filtering
+        for event in &events {
+            if let DirectorEvent::EpicStarted {
+                epic_id,
+                epic_title,
+            } = event
+            {
+                epic_state = EpicState::Active {
+                    epic_id: epic_id.clone(),
+                    epic_title: epic_title.clone(),
+                };
+            }
+        }
+
+        // Filter tasks to active epic (simulating filter_director_agents_to_current_session)
+        if let Some(eid) = epic_state.epic_id() {
+            let eid = eid.to_string();
+            data.ready_tasks
+                .retain(|t| t.epic.as_deref() == Some(&eid));
+            data.in_progress_tasks
+                .retain(|t| t.epic.as_deref() == Some(&eid));
+            data.epic_tasks.retain(|t| t.id == eid);
+        }
+
+        // Tasks should be retained because epic_state now points to new epic
+        assert_eq!(data.ready_tasks.len(), 1, "ready_tasks should not be empty after filter");
+        assert_eq!(data.in_progress_tasks.len(), 1, "in_progress_tasks should not be empty after filter");
+        assert_eq!(data.epic_tasks.len(), 1, "epic_tasks should have the new epic");
     }
 
     #[test]
