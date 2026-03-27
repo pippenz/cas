@@ -589,10 +589,21 @@ pub(super) fn execute_message(
 }
 
 fn resolve_project_dir(project_dir: Option<&std::path::Path>) -> Result<std::path::PathBuf> {
-    Ok(match project_dir {
-        Some(path) => path.to_path_buf(),
-        None => std::env::current_dir()?,
-    })
+    if let Some(path) = project_dir {
+        return Ok(path.to_path_buf());
+    }
+
+    // When running from a git worktree (e.g., .cas/worktrees/<name>/), the CWD
+    // won't match the factory session's registered project_dir. Use find_cas_root()
+    // which already handles worktree detection via CAS_ROOT env and .git file parsing,
+    // then derive the project root from the .cas directory.
+    if let Ok(cas_root) = crate::store::find_cas_root() {
+        if let Some(project_root) = cas_root.parent() {
+            return Ok(project_root.to_path_buf());
+        }
+    }
+
+    Ok(std::env::current_dir()?)
 }
 
 fn resolve_session(
