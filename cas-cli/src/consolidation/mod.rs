@@ -280,10 +280,10 @@ pub mod ai {
         let groups = find_related_groups(entries, config.similarity_threshold);
 
         for group in groups {
-            // Process each group with AI
-            if group.len() <= config.batch_size {
-                let group_entries: Vec<Entry> = group.into_iter().cloned().collect();
-                let batch_result = consolidate_batch(&group_entries, config).await?;
+            // Process each group with AI, chunking large groups into batch_size pieces
+            let group_entries: Vec<Entry> = group.into_iter().cloned().collect();
+            for chunk in group_entries.chunks(config.batch_size) {
+                let batch_result = consolidate_batch(chunk, config).await?;
 
                 all_suggestions.extend(batch_result.suggestions);
                 total_duplicates += batch_result.duplicates_found;
