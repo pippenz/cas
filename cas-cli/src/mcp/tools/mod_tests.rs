@@ -50,4 +50,19 @@ mod tests {
         );
         assert_eq!(slugify_for_branch("CAS v1"), "cas-v1");
     }
+
+    // ========================================================================
+    // truncate_str Tests
+    // ========================================================================
+
+    #[test]
+    fn truncate_str_handles_unicode_boundary() {
+        let value = format!("{}✅ trailing", "a".repeat(99));
+        assert_eq!(truncate_str(&value, 100), format!("{}...", "a".repeat(99)));
+    }
+
+    #[test]
+    fn truncate_str_keeps_short_values() {
+        assert_eq!(truncate_str("short", 10), "short");
+    }
 }

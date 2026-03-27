@@ -90,17 +90,7 @@ pub(super) fn parse_git_blame_porcelain(content: &str) -> Vec<GitBlameLine> {
     results
 }
 
-pub(super) fn truncate_str(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
-        s.to_string()
-    } else {
-        let mut end = max_len.min(s.len());
-        while end > 0 && !s.is_char_boundary(end) {
-            end -= 1;
-        }
-        format!("{}...", &s[..end])
-    }
-}
+pub(super) use super::truncate_str;
 
 /// Internal worktree request type used by handler methods.
 /// The MCP-facing type is CoordinationRequest; this is used for internal dispatch.
