@@ -353,7 +353,7 @@ impl FactoryApp {
 
         if let Some(pane) = self.mux.get(name) {
             let palette = &self.theme().palette;
-            let agent_color = get_agent_color(name);
+            let _agent_color = get_agent_color(name);
             let is_pane_select = self.input_mode.is_pane_select();
             let is_focused = pane.is_focused();
 
@@ -750,7 +750,7 @@ impl FactoryApp {
             let palette = &self.theme().palette;
             // Supervisor is only truly focused if mux says so AND sidecar is not focused
             let is_focused = pane.is_focused() && !self.sidecar_is_focused();
-            let agent_color = get_agent_color(&self.supervisor_name);
+            let _agent_color = get_agent_color(&self.supervisor_name);
             let is_pane_select = self.input_mode.is_pane_select();
 
             // Determine border style based on mode
