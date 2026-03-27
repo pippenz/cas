@@ -253,42 +253,82 @@ impl SummaryGenerator {
         score.min(1.0)
     }
 
-    /// Deduplicate similar facts
+    /// Deduplicate similar facts using pre-computed word sets.
+    ///
+    /// Tokenizes each fact once upfront instead of re-tokenizing on every
+    /// pairwise comparison, reducing per-comparison cost from O(W) to O(min(W1,W2)).
     fn deduplicate_facts(&self, facts: Vec<ExtractedFact>) -> Vec<ExtractedFact> {
-        let mut unique: Vec<ExtractedFact> = Vec::new();
+        use std::collections::HashSet;
 
-        for fact in facts {
-            let is_duplicate = unique
-                .iter()
-                .any(|existing| self.facts_similar(&existing.content, &fact.content));
+        // Pre-compute word sets for all facts (tokenize once)
+        let word_sets: Vec<HashSet<String>> = facts
+            .iter()
+            .map(|f| {
+                f.content
+                    .to_lowercase()
+                    .split_whitespace()
+                    .filter(|w| w.len() > 3)
+                    .map(|w| w.to_string())
+                    .collect()
+            })
+            .collect();
+
+        let mut unique_indices: Vec<usize> = Vec::new();
+
+        for (i, words) in word_sets.iter().enumerate() {
+            if words.is_empty() {
+                unique_indices.push(i);
+                continue;
+            }
+
+            let is_duplicate = unique_indices.iter().any(|&j| {
+                let existing = &word_sets[j];
+                if existing.is_empty() {
+                    return false;
+                }
+                let intersection = words.intersection(existing).count();
+                let union = words.union(existing).count();
+                // Jaccard similarity > 0.6 means likely duplicate
+                (intersection as f32 / union as f32) > 0.6
+            });
 
             if !is_duplicate {
-                unique.push(fact);
+                unique_indices.push(i);
             }
         }
 
-        unique
+        // Collect unique facts by index
+        let mut unique_set: HashSet<usize> = unique_indices.iter().copied().collect();
+        let mut result = Vec::with_capacity(unique_indices.len());
+        for (i, fact) in facts.into_iter().enumerate() {
+            if unique_set.remove(&i) {
+                result.push(fact);
+            }
+        }
+        result
     }
 
-    /// Check if two facts are similar (simple word overlap)
+    /// Check if two facts are similar (Jaccard similarity > 0.6 on words > 3 chars)
+    #[cfg(test)]
     fn facts_similar(&self, a: &str, b: &str) -> bool {
-        let a_lower = a.to_lowercase();
-        let b_lower = b.to_lowercase();
-
-        let words_a: std::collections::HashSet<_> =
-            a_lower.split_whitespace().filter(|w| w.len() > 3).collect();
-
-        let words_b: std::collections::HashSet<_> =
-            b_lower.split_whitespace().filter(|w| w.len() > 3).collect();
-
+        use std::collections::HashSet;
+        let words_a: HashSet<String> = a
+            .to_lowercase()
+            .split_whitespace()
+            .filter(|w| w.len() > 3)
+            .map(|w| w.to_string())
+            .collect();
+        let words_b: HashSet<String> = b
+            .to_lowercase()
+            .split_whitespace()
+            .filter(|w| w.len() > 3)
+            .map(|w| w.to_string())
+            .collect();
         if words_a.is_empty() || words_b.is_empty() {
             return false;
         }
-
         let intersection = words_a.intersection(&words_b).count();
         let union = words_a.union(&words_b).count();
-
-        // Jaccard similarity > 0.6 means likely duplicate
         (intersection as f32 / union as f32) > 0.6
     }
 
