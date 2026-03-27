@@ -28,6 +28,19 @@ fn make_epic(id: &str, title: &str, status: TaskStatus) -> TaskSummary {
     }
 }
 
+fn make_epic_with_branch(id: &str, title: &str, status: TaskStatus, branch: &str) -> TaskSummary {
+    TaskSummary {
+        id: id.to_string(),
+        title: title.to_string(),
+        status,
+        priority: cas_types::Priority::HIGH,
+        assignee: None,
+        task_type: TaskType::Epic,
+        epic: None,
+        branch: Some(branch.to_string()),
+    }
+}
+
 fn make_agent(id: &str, name: &str, current_task: Option<&str>) -> AgentSummary {
     AgentSummary {
         id: id.to_string(),
@@ -615,5 +628,160 @@ fn test_idle_rate_limit_longer_than_general_debounce() {
             DirectorEvent::WorkerIdle { worker } if worker == "swift-fox"
         )),
         "Idle event should be rate-limited (within 5-minute window)"
+    );
+}
+
+#[test]
+fn test_detect_epic_started_open_with_branch() {
+    let mut detector =
+        DirectorEventDetector::new(vec!["swift-fox".to_string()], "supervisor".to_string());
+
+    // Initial state: no epics
+    let data1 = DirectorData {
+        ready_tasks: vec![],
+        in_progress_tasks: vec![],
+        epic_tasks: vec![],
+        agents: vec![],
+        activity: vec![],
+        agent_id_to_name: HashMap::new(),
+        changes: vec![],
+        git_loaded: true,
+        reminders: vec![],
+        epic_closed_counts: HashMap::new(),
+    };
+    detector.initialize(&data1);
+
+    // New state: an Open epic with a branch appears (auto-created by supervisor)
+    let data2 = DirectorData {
+        ready_tasks: vec![],
+        in_progress_tasks: vec![],
+        epic_tasks: vec![make_epic_with_branch(
+            "epic-1",
+            "New Epic",
+            TaskStatus::Open,
+            "epic/new-epic",
+        )],
+        agents: vec![],
+        activity: vec![],
+        agent_id_to_name: HashMap::new(),
+        changes: vec![],
+        git_loaded: true,
+        reminders: vec![],
+        epic_closed_counts: HashMap::new(),
+    };
+
+    let events = detector.detect_changes(&data2);
+
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            DirectorEvent::EpicStarted { epic_id, epic_title }
+                if epic_id == "epic-1" && epic_title == "New Epic"
+        )),
+        "Open-with-branch epic should fire EpicStarted"
+    );
+}
+
+#[test]
+fn test_no_duplicate_epic_started_for_existing_open_with_branch() {
+    let mut detector =
+        DirectorEventDetector::new(vec!["swift-fox".to_string()], "supervisor".to_string());
+
+    // Initial state: already has an Open epic with branch
+    let data1 = DirectorData {
+        ready_tasks: vec![],
+        in_progress_tasks: vec![],
+        epic_tasks: vec![make_epic_with_branch(
+            "epic-1",
+            "Existing Epic",
+            TaskStatus::Open,
+            "epic/existing",
+        )],
+        agents: vec![],
+        activity: vec![],
+        agent_id_to_name: HashMap::new(),
+        changes: vec![],
+        git_loaded: true,
+        reminders: vec![],
+        epic_closed_counts: HashMap::new(),
+    };
+    detector.initialize(&data1);
+
+    // Same state: epic still Open with branch
+    let data2 = DirectorData {
+        ready_tasks: vec![],
+        in_progress_tasks: vec![],
+        epic_tasks: vec![make_epic_with_branch(
+            "epic-1",
+            "Existing Epic",
+            TaskStatus::Open,
+            "epic/existing",
+        )],
+        agents: vec![],
+        activity: vec![],
+        agent_id_to_name: HashMap::new(),
+        changes: vec![],
+        git_loaded: true,
+        reminders: vec![],
+        epic_closed_counts: HashMap::new(),
+    };
+
+    let events = detector.detect_changes(&data2);
+
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            DirectorEvent::EpicStarted { .. }
+        )),
+        "Should not fire EpicStarted for already-tracked Open-with-branch epic"
+    );
+}
+
+#[test]
+fn test_in_progress_epic_takes_priority_over_open_with_branch() {
+    let mut detector =
+        DirectorEventDetector::new(vec!["swift-fox".to_string()], "supervisor".to_string());
+
+    // Initial state: no epics
+    let data1 = DirectorData {
+        ready_tasks: vec![],
+        in_progress_tasks: vec![],
+        epic_tasks: vec![],
+        agents: vec![],
+        activity: vec![],
+        agent_id_to_name: HashMap::new(),
+        changes: vec![],
+        git_loaded: true,
+        reminders: vec![],
+        epic_closed_counts: HashMap::new(),
+    };
+    detector.initialize(&data1);
+
+    // Both an Open-with-branch and an InProgress epic appear
+    let data2 = DirectorData {
+        ready_tasks: vec![],
+        in_progress_tasks: vec![],
+        epic_tasks: vec![
+            make_epic_with_branch("epic-open", "Open Epic", TaskStatus::Open, "epic/open"),
+            make_epic("epic-active", "Active Epic", TaskStatus::InProgress),
+        ],
+        agents: vec![],
+        activity: vec![],
+        agent_id_to_name: HashMap::new(),
+        changes: vec![],
+        git_loaded: true,
+        reminders: vec![],
+        epic_closed_counts: HashMap::new(),
+    };
+
+    let events = detector.detect_changes(&data2);
+
+    // InProgress should win
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            DirectorEvent::EpicStarted { epic_id, .. } if epic_id == "epic-active"
+        )),
+        "InProgress epic should take priority over Open-with-branch"
     );
 }
