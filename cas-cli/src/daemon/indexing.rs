@@ -143,17 +143,28 @@ pub fn index_code_files(files: &[PathBuf], cas_root: &Path) -> Result<CodeIndexR
                 }
 
                 let symbol_count = parse_result.symbols.len();
-                for mut symbol in parse_result.symbols {
-                    symbol.file_id = file_id.clone();
-                    symbol.id = code_store.generate_symbol_id_for(
-                        &symbol.qualified_name,
-                        &symbol.file_path,
-                        &symbol.repository,
-                    );
-                    if let Err(error) = code_store.add_symbol(&symbol) {
-                        result
-                            .errors
-                            .push(format!("Symbol {}: {}", symbol.name, error));
+                let symbols: Vec<cas_code::CodeSymbol> = parse_result
+                    .symbols
+                    .into_iter()
+                    .map(|mut symbol| {
+                        symbol.file_id = file_id.clone();
+                        symbol.id = code_store.generate_symbol_id_for(
+                            &symbol.qualified_name,
+                            &symbol.file_path,
+                            &symbol.repository,
+                        );
+                        symbol
+                    })
+                    .collect();
+
+                if let Err(_batch_err) = code_store.add_symbols_batch(&symbols) {
+                    // Fall back to individual inserts on batch failure
+                    for symbol in &symbols {
+                        if let Err(error) = code_store.add_symbol(symbol) {
+                            result
+                                .errors
+                                .push(format!("Symbol {}: {}", symbol.name, error));
+                        }
                     }
                 }
 
