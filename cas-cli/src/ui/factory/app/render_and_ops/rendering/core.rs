@@ -348,7 +348,7 @@ impl FactoryApp {
     /// Render a single worker pane
     fn render_single_worker(&self, frame: &mut Frame, area: Rect, name: &str) {
         use ratatui::style::{Modifier, Style};
-        use ratatui::text::Line;
+        use ratatui::text::{Line, Span};
         use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 
         if let Some(pane) = self.mux.get(name) {
@@ -412,6 +412,27 @@ impl FactoryApp {
 
             let content = Paragraph::new(lines).block(block);
             frame.render_widget(content, area);
+
+            // Show new-lines indicator when user has scrolled up
+            let new_below = pane.new_lines_below();
+            if pane.is_user_scrolled() && new_below > 0 {
+                let label = format!(" ↓ {} new lines ", new_below);
+                let label_width = label.len() as u16;
+                let indicator_area = Rect {
+                    x: inner.x + inner.width.saturating_sub(label_width),
+                    y: inner.y + inner.height.saturating_sub(1),
+                    width: label_width.min(inner.width),
+                    height: 1,
+                };
+                let indicator = Paragraph::new(Line::from(Span::styled(
+                    label,
+                    Style::default()
+                        .fg(ratatui::style::Color::Black)
+                        .bg(ratatui::style::Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )));
+                frame.render_widget(indicator, indicator_area);
+            }
         }
     }
 
@@ -743,7 +764,7 @@ impl FactoryApp {
 
     fn render_supervisor(&self, frame: &mut Frame, layout: &FactoryLayout) {
         use ratatui::style::{Modifier, Style};
-        use ratatui::text::Line;
+        use ratatui::text::{Line, Span};
         use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 
         if let Some(pane) = self.mux.get(&self.supervisor_name) {
@@ -809,6 +830,27 @@ impl FactoryApp {
 
             let content = Paragraph::new(lines).block(block);
             frame.render_widget(content, layout.supervisor_area);
+
+            // Show new-lines indicator when user has scrolled up
+            let new_below = pane.new_lines_below();
+            if pane.is_user_scrolled() && new_below > 0 {
+                let label = format!(" ↓ {} new lines ", new_below);
+                let label_width = label.len() as u16;
+                let indicator_area = Rect {
+                    x: inner.x + inner.width.saturating_sub(label_width),
+                    y: inner.y + inner.height.saturating_sub(1),
+                    width: label_width.min(inner.width),
+                    height: 1,
+                };
+                let indicator = Paragraph::new(Line::from(Span::styled(
+                    label,
+                    Style::default()
+                        .fg(ratatui::style::Color::Black)
+                        .bg(ratatui::style::Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )));
+                frame.render_widget(indicator, indicator_area);
+            }
         }
     }
 
