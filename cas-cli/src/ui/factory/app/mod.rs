@@ -840,18 +840,26 @@ pub(crate) fn queue_codex_worker_intro_prompt(
             // Avoid queue injection here to prevent duplicate or draft-only startup prompts.
         }
         cas_mux::SupervisorCli::Claude => {
-            // Workers in worktrees usually can't access MCP tools due to SQLite contention.
-            // Tell them to try once, then immediately fall back to built-in tools.
+            // Workers in worktrees can't access MCP tools. Detect worktree mode
+            // BEFORE attempting any MCP call to avoid wasting 2-4 turns.
+            let project_dir = cas_dir.parent().unwrap_or(cas_dir).display();
             let prompt = format!(
                 "You are a CAS factory worker ({worker_name}).\n\
-                 Check your assigned tasks: `mcp__cas__task action=mine`\n\n\
-                 IMPORTANT — if mcp__cas__* tools are unavailable:\n\
-                 1. Do NOT retry or debug MCP — use built-in tools (Read, Edit, Write, Bash, Glob, Grep)\n\
-                 2. Your task details are in the supervisor's message — scroll up in your conversation\n\
-                 3. Notify supervisor immediately via CLI fallback:\n\
-                    `cas factory message --project-dir {cas_dir} --target supervisor --message \"Worker {worker_name}: MCP tools unavailable. Standing by for task details via message.\"`\n\
-                 Do not remain silently idle — always notify the supervisor if you cannot access MCP tools.",
-                cas_dir = cas_dir.parent().unwrap_or(cas_dir).display()
+                 \n\
+                 FIRST: detect your mode — if your working directory contains `.cas/worktrees`, \
+                 CAS MCP tools will NOT work. Skip them entirely.\n\
+                 \n\
+                 **Worktree mode** (MCP unavailable):\n\
+                 1. Your task details are in the supervisor's message — scroll up in your conversation\n\
+                 2. Use built-in tools only: Read, Edit, Write, Bash, Glob, Grep\n\
+                 3. Notify supervisor you're ready:\n\
+                    `cas factory message --project-dir {project_dir} --target supervisor --message \"Worker {worker_name}: ready for task.\"`\n\
+                 \n\
+                 **Normal mode** (MCP available):\n\
+                 Check your assigned tasks: `mcp__cas__task action=mine`\n\
+                 If MCP tools fail, switch to worktree mode instructions above. Do NOT retry.\n\
+                 \n\
+                 See the cas-worker skill for detailed workflow guidance."
             );
             if let Ok(queue) = open_prompt_queue_store(cas_dir) {
                 let _ = queue.enqueue("cas", worker_name, &prompt);
