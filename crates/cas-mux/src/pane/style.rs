@@ -173,15 +173,3 @@ fn is_default_color(rgb: &Rgb) -> bool {
     rgb.r == 0 && rgb.g == 0 && rgb.b == 0
 }
 
-/// Check if two CellStyles are equal (for span grouping)
-pub(crate) fn styles_equal(a: &CellStyle, b: &CellStyle) -> bool {
-    a.fg == b.fg
-        && a.bg == b.bg
-        && a.bold == b.bold
-        && a.italic == b.italic
-        && a.underline == b.underline
-        && a.faint == b.faint
-        && a.strikethrough == b.strikethrough
-        && a.inverse == b.inverse
-        && a.invisible == b.invisible
-}

@@ -476,15 +476,19 @@ impl FactoryDaemon {
                 self.flush_gui_client_output();
             }
 
-            // Adaptive sleep: ~120fps when active, ~60fps when idle, ~10fps for spinner
-            let sleep_ms = if had_output {
+            // Adaptive sleep: ~120fps when active, ~60fps idle with clients,
+            // ~2fps headless (no clients, no GUI) to minimize CPU usage.
+            let has_any_client = !self.clients.is_empty()
+                || !self.gui_clients.is_empty()
+                || self.has_relay_clients();
+            let sleep_ms = if had_output && has_any_client {
                 4
-            } else if spawning {
+            } else if spawning && has_any_client {
                 100 // Spinner updates every 100ms
-            } else if !self.clients.is_empty() {
+            } else if has_any_client {
                 8
             } else {
-                16
+                500 // Headless: no rendering needed, sleep longer
             };
             let sleep_dur = Duration::from_millis(sleep_ms);
             if let Some(ref mut notify) = self.notify_rx {

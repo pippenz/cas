@@ -11,11 +11,10 @@ mod tests;
 
 use crate::error::{Error, Result};
 use crate::harness::SupervisorCli;
-use crate::pane::style::{cell_style_to_ratatui, debug_log_enabled, styles_equal};
+use crate::pane::style::{cell_style_to_ratatui, debug_log_enabled};
 use crate::pty::{Pty, PtyConfig, PtyEvent, TeamsSpawnConfig};
 pub use cas_factory_protocol::TerminalSnapshot;
 use ghostty_vt::{CellStyle, Rgb, Terminal};
-use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use std::borrow::Cow;
 use std::path::PathBuf;
@@ -499,28 +498,26 @@ impl Pane {
 
     pub fn row_as_line(&self, row: u16) -> Result<Line<'static>> {
         let text = self.dump_row(row)?;
-        let styles = self.row_styles(row)?;
+        // Use style runs (pre-grouped by the VT) instead of per-cell styles
+        // to avoid a separate O(cols) traversal + per-cell comparison.
+        let runs = self.terminal.row_style_runs(row).map_err(|e| Error::terminal(e.to_string()))?;
+
+        if runs.is_empty() {
+            return Ok(Line::from(vec![Span::raw(text)]));
+        }
 
         let chars: Vec<char> = text.chars().collect();
-        let mut spans = Vec::new();
-        let mut current_start = 0;
+        let mut spans = Vec::with_capacity(runs.len());
 
-        for i in 1..=chars.len() {
-            let style_changed = i < chars.len()
-                && i < styles.len()
-                && current_start < styles.len()
-                && !styles_equal(&styles[current_start], &styles[i]);
-
-            if i == chars.len() || style_changed {
-                let span_text: String = chars[current_start..i].iter().collect();
-                let style = if current_start < styles.len() {
-                    cell_style_to_ratatui(&styles[current_start])
-                } else {
-                    Style::default()
-                };
-                spans.push(Span::styled(span_text, style));
-                current_start = i;
+        for run in &runs {
+            let start = run.start_col as usize;
+            let end = (run.end_col as usize).min(chars.len());
+            if start >= chars.len() {
+                break;
             }
+            let span_text: String = chars[start..end].iter().collect();
+            let style = cell_style_to_ratatui(&run.style);
+            spans.push(Span::styled(span_text, style));
         }
 
         if spans.is_empty() && !text.is_empty() {
@@ -635,9 +632,16 @@ impl Pane {
             PaneBackend::Pty(pty) => {
                 let text = prompt.trim();
                 pty.write(text.as_bytes()).await?;
+                // Send carriage return after a settle delay in a background task
+                // so we don't block the daemon event loop for 150-500ms.
+                let writer = pty.writer_handle();
                 let settle_ms = if pty.is_codex() { 500 } else { 150 };
-                tokio::time::sleep(std::time::Duration::from_millis(settle_ms)).await;
-                pty.write(b"\r").await?;
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(settle_ms)).await;
+                    let mut guard = writer.lock().await;
+                    let _ = guard.write_all(b"\r");
+                    let _ = guard.flush();
+                });
                 Ok(())
             }
             PaneBackend::None => Err(Error::pty("Pane has no backend")),
