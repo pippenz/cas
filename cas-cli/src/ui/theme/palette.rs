@@ -239,6 +239,9 @@ impl Palette {
         }
     }
 
+    // MAINTENANCE: light_from_colors mirrors dark_from_colors field-for-field.
+    // The light palette works via ColorPalette inversion (gray_50↔gray_900 etc.).
+    // When adding a new semantic color to dark_from_colors, you MUST also add it here.
     fn light_from_colors(colors: ColorPalette) -> Self {
         Self {
             // Core UI - inverted for light

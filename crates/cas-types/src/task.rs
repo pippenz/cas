@@ -42,12 +42,19 @@ impl FromStr for TaskStatus {
     type Err = TypeError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "open" => Ok(TaskStatus::Open),
-            "in_progress" | "in-progress" | "inprogress" => Ok(TaskStatus::InProgress),
-            "blocked" => Ok(TaskStatus::Blocked),
-            "closed" => Ok(TaskStatus::Closed),
-            _ => Err(TypeError::InvalidTaskStatus(s.to_string())),
+        if s.eq_ignore_ascii_case("open") {
+            Ok(TaskStatus::Open)
+        } else if s.eq_ignore_ascii_case("in_progress")
+            || s.eq_ignore_ascii_case("in-progress")
+            || s.eq_ignore_ascii_case("inprogress")
+        {
+            Ok(TaskStatus::InProgress)
+        } else if s.eq_ignore_ascii_case("blocked") {
+            Ok(TaskStatus::Blocked)
+        } else if s.eq_ignore_ascii_case("closed") {
+            Ok(TaskStatus::Closed)
+        } else {
+            Err(TypeError::InvalidTaskStatus(s.to_string()))
         }
     }
 }
@@ -88,14 +95,20 @@ impl FromStr for TaskType {
     type Err = TypeError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "task" => Ok(TaskType::Task),
-            "bug" => Ok(TaskType::Bug),
-            "feature" => Ok(TaskType::Feature),
-            "epic" => Ok(TaskType::Epic),
-            "chore" => Ok(TaskType::Chore),
-            "spike" => Ok(TaskType::Spike),
-            _ => Err(TypeError::Parse(format!("invalid task type: {s}"))),
+        if s.eq_ignore_ascii_case("task") {
+            Ok(TaskType::Task)
+        } else if s.eq_ignore_ascii_case("bug") {
+            Ok(TaskType::Bug)
+        } else if s.eq_ignore_ascii_case("feature") {
+            Ok(TaskType::Feature)
+        } else if s.eq_ignore_ascii_case("epic") {
+            Ok(TaskType::Epic)
+        } else if s.eq_ignore_ascii_case("chore") {
+            Ok(TaskType::Chore)
+        } else if s.eq_ignore_ascii_case("spike") {
+            Ok(TaskType::Spike)
+        } else {
+            Err(TypeError::Parse(format!("invalid task type: {s}")))
         }
     }
 }
@@ -328,7 +341,34 @@ impl Task {
 
 impl Default for Task {
     fn default() -> Self {
-        Self::new(String::new(), String::new())
+        Self {
+            id: String::new(),
+            scope: Scope::default(),
+            title: String::new(),
+            description: String::new(),
+            design: String::new(),
+            acceptance_criteria: String::new(),
+            notes: String::new(),
+            status: TaskStatus::Open,
+            priority: Priority::MEDIUM,
+            task_type: TaskType::Task,
+            assignee: None,
+            labels: Vec::new(),
+            created_at: DateTime::<Utc>::default(),
+            updated_at: DateTime::<Utc>::default(),
+            closed_at: None,
+            close_reason: None,
+            external_ref: None,
+            content_hash: None,
+            branch: None,
+            worktree_id: None,
+            pending_verification: false,
+            pending_worktree_merge: false,
+            epic_verification_owner: None,
+            deliverables: TaskDeliverables::default(),
+            team_id: None,
+            demo_statement: String::new(),
+        }
     }
 }
 

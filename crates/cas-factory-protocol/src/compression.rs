@@ -24,7 +24,9 @@ pub const PREFIX_COMPRESSED: u8 = 0x01;
 
 /// Threshold in bytes above which messages are compressed.
 /// Messages <= this size are sent uncompressed.
-pub const COMPRESSION_THRESHOLD: usize = 256;
+/// Set to 1024 because PTY output (the dominant message type) is high-entropy
+/// and compresses poorly below this size, wasting CPU on LZ4 attempts.
+pub const COMPRESSION_THRESHOLD: usize = 1024;
 
 /// Errors that can occur during compression/decompression.
 #[derive(Debug, Error)]
@@ -141,8 +143,8 @@ mod tests {
 
     #[test]
     fn test_large_data_compressed() {
-        // Create compressible data (repeated pattern)
-        let data: Vec<u8> = (0..1000).map(|i| (i % 10) as u8).collect();
+        // Create compressible data (repeated pattern) above threshold
+        let data: Vec<u8> = (0..2000).map(|i| (i % 10) as u8).collect();
         let result = compress(&data);
         assert_eq!(result[0], PREFIX_COMPRESSED);
         // Compressed data should be smaller
@@ -226,7 +228,7 @@ mod tests {
     fn test_incompressible_data_stays_uncompressed() {
         // High-entropy data that doesn't compress well
         // Even if above threshold, if compression makes it bigger, keep uncompressed
-        let data: Vec<u8> = (0..300).map(|i| ((i * 127 + 53) % 256) as u8).collect();
+        let data: Vec<u8> = (0..2048).map(|i| ((i * 127 + 53) % 256) as u8).collect();
         let result = compress(&data);
         let decompressed = decompress(&result).unwrap();
         assert_eq!(data.as_slice(), decompressed.as_ref());
