@@ -159,7 +159,7 @@ pub fn build_task_item(
     let status_icon = match task.status {
         TaskStatus::InProgress => Icons::SPINNER_STATIC,
         TaskStatus::Open => Icons::CIRCLE_EMPTY,
-        TaskStatus::Blocked => Icons::BLOCKED,
+        TaskStatus::Blocked => Icons::CIRCLE_X,
         TaskStatus::Closed => Icons::CHECK,
     };
 
