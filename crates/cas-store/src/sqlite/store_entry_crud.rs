@@ -56,8 +56,9 @@ impl SqliteStore {
         let timer = TraceTimer::new();
         crate::shared_db::with_write_retry(|| {
             let conn = self.conn.lock().unwrap();
+            let tx = crate::shared_db::ImmediateTx::new(&conn)?;
             let now = Utc::now().to_rfc3339();
-            let result = conn.execute(
+            let result = tx.execute(
             "INSERT INTO entries (id, type, tags, created, content, title,
              helpful_count, harmful_count, last_accessed, archived,
              session_id, source_tool, pending_extraction, observation_type,
@@ -121,7 +122,7 @@ impl SqliteStore {
 
             result?;
 
-            // Record event for sidecar activity feed
+            // Record event for sidecar activity feed (within same transaction)
             let summary = entry.title.as_deref().unwrap_or_else(|| {
                 // Truncate content for summary
                 if entry.content.len() > 50 {
@@ -137,11 +138,12 @@ impl SqliteStore {
                 format!("Memory stored: {summary}"),
             )
             .with_session(entry.session_id.as_deref().unwrap_or(""));
-            let _ = record_event_with_conn(&conn, &event);
+            let _ = record_event_with_conn(&tx, &event);
 
-            // Capture event for recording playback
-            let _ = capture_memory_event(&conn, &entry.id, None);
+            // Capture event for recording playback (within same transaction)
+            let _ = capture_memory_event(&tx, &entry.id, None);
 
+            tx.commit()?;
             Ok(())
         }) // with_write_retry
     }
