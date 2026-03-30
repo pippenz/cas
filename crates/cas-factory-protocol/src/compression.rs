@@ -13,6 +13,7 @@
 //! - `0x00`: Payload is uncompressed
 //! - `0x01`: Payload is LZ4 compressed
 
+use std::borrow::Cow;
 use thiserror::Error;
 
 /// Compression prefix byte indicating uncompressed data.
@@ -89,6 +90,9 @@ pub fn compress(data: &[u8]) -> Vec<u8> {
 
 /// Decompress data that was compressed with [`compress`].
 ///
+/// Returns `Cow::Borrowed` for uncompressed messages (avoids allocation),
+/// and `Cow::Owned` for LZ4-compressed messages.
+///
 /// # Errors
 ///
 /// Returns an error if:
@@ -104,9 +108,9 @@ pub fn compress(data: &[u8]) -> Vec<u8> {
 /// let original = vec![0u8; 1000]; // Large enough to compress
 /// let compressed = compress(&original);
 /// let decompressed = decompress(&compressed).unwrap();
-/// assert_eq!(original, decompressed);
+/// assert_eq!(original, decompressed.as_ref());
 /// ```
-pub fn decompress(data: &[u8]) -> Result<Vec<u8>, CompressionError> {
+pub fn decompress(data: &[u8]) -> Result<Cow<'_, [u8]>, CompressionError> {
     if data.is_empty() {
         return Err(CompressionError::DataTooShort);
     }
@@ -115,10 +119,10 @@ pub fn decompress(data: &[u8]) -> Result<Vec<u8>, CompressionError> {
     let payload = &data[1..];
 
     match prefix {
-        PREFIX_UNCOMPRESSED => Ok(payload.to_vec()),
-        PREFIX_COMPRESSED => {
-            lz4_flex::decompress_size_prepended(payload).map_err(CompressionError::from)
-        }
+        PREFIX_UNCOMPRESSED => Ok(Cow::Borrowed(payload)),
+        PREFIX_COMPRESSED => lz4_flex::decompress_size_prepended(payload)
+            .map(Cow::Owned)
+            .map_err(CompressionError::from),
         _ => Err(CompressionError::InvalidPrefix(prefix)),
     }
 }
@@ -150,7 +154,7 @@ mod tests {
         let data = b"Hello, world!";
         let compressed = compress(data);
         let decompressed = decompress(&compressed).unwrap();
-        assert_eq!(data.as_slice(), decompressed.as_slice());
+        assert_eq!(data.as_slice(), decompressed.as_ref());
     }
 
     #[test]
@@ -159,7 +163,7 @@ mod tests {
         let data: Vec<u8> = (0..10000).map(|i| (i % 256) as u8).collect();
         let compressed = compress(&data);
         let decompressed = decompress(&compressed).unwrap();
-        assert_eq!(data, decompressed);
+        assert_eq!(data.as_slice(), decompressed.as_ref());
     }
 
     #[test]
@@ -168,7 +172,17 @@ mod tests {
         let data: Vec<u8> = (0..500).map(|i| ((i * 17 + 31) % 256) as u8).collect();
         let compressed = compress(&data);
         let decompressed = decompress(&compressed).unwrap();
-        assert_eq!(data, decompressed);
+        assert_eq!(data.as_slice(), decompressed.as_ref());
+    }
+
+    #[test]
+    fn test_small_data_returns_borrowed() {
+        // Sub-threshold messages should return Cow::Borrowed (zero-copy)
+        let data = b"small";
+        let compressed = compress(data);
+        let decompressed = decompress(&compressed).unwrap();
+        assert!(matches!(decompressed, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(data.as_slice(), decompressed.as_ref());
     }
 
     #[test]
@@ -215,6 +229,6 @@ mod tests {
         let data: Vec<u8> = (0..300).map(|i| ((i * 127 + 53) % 256) as u8).collect();
         let result = compress(&data);
         let decompressed = decompress(&result).unwrap();
-        assert_eq!(data, decompressed);
+        assert_eq!(data.as_slice(), decompressed.as_ref());
     }
 }

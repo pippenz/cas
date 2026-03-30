@@ -33,9 +33,7 @@ impl FactoryDaemon {
                     disconnected.push(*id);
                 }
                 Ok(n) => {
-                    for _ in 0..n {
-                        client.output_buf.pop_front();
-                    }
+                    client.output_buf.drain(..n);
                 }
                 Err(e) => match e.kind() {
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted => {}
@@ -76,9 +74,7 @@ impl FactoryDaemon {
                     disconnected.push(*id);
                 }
                 Ok(n) => {
-                    for _ in 0..n {
-                        client.output_buf.pop_front();
-                    }
+                    client.output_buf.drain(..n);
                 }
                 Err(e) => match e.kind() {
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted => {}

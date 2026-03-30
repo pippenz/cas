@@ -64,7 +64,7 @@ pub fn encode<T: Serialize>(msg: &T) -> Result<Vec<u8>, ProtocolError> {
 /// ```
 pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, ProtocolError> {
     let msgpack = compression::decompress(bytes)?;
-    rmp_serde::from_slice(&msgpack).map_err(ProtocolError::from)
+    rmp_serde::from_slice(msgpack.as_ref()).map_err(ProtocolError::from)
 }
 
 /// Encode a message to raw MessagePack bytes without compression.

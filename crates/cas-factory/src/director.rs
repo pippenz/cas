@@ -18,6 +18,32 @@ use cas_types::{
 
 use crate::changes::{FileChangeInfo, GitFileStatus, SourceChangesInfo};
 
+/// Cached store handles to avoid re-opening on every refresh cycle.
+///
+/// Each `open()` call does path canonicalization + global hashmap lookup.
+/// Caching the handles in the caller (e.g., FactoryApp) eliminates that overhead.
+pub struct DirectorStores {
+    pub task_store: SqliteTaskStore,
+    pub event_store: SqliteEventStore,
+    pub agent_store: SqliteAgentStore,
+    pub worktree_store: Option<SqliteWorktreeStore>,
+    pub reminder_store: Option<SqliteReminderStore>,
+}
+
+impl DirectorStores {
+    /// Open all stores for a CAS directory. Worktree and reminder stores
+    /// are best-effort (None on failure) since they are not critical.
+    pub fn open(cas_dir: &Path) -> anyhow::Result<Self> {
+        Ok(Self {
+            task_store: SqliteTaskStore::open(cas_dir)?,
+            event_store: SqliteEventStore::open(cas_dir)?,
+            agent_store: SqliteAgentStore::open(cas_dir)?,
+            worktree_store: SqliteWorktreeStore::open(cas_dir).ok(),
+            reminder_store: SqliteReminderStore::open(cas_dir).ok(),
+        })
+    }
+}
+
 /// A summary of a task for display
 #[derive(Debug, Clone)]
 pub struct TaskSummary {
@@ -107,7 +133,7 @@ impl DirectorData {
         worktree_root: Option<&Path>,
         load_git: bool,
     ) -> anyhow::Result<Self> {
-        Self::load_with_options(cas_dir, worktree_root, load_git)
+        Self::load_with_stores(cas_dir, worktree_root, load_git, None)
     }
 
     /// Refresh only git changes while preserving already-loaded task/agent/activity data.
@@ -116,20 +142,44 @@ impl DirectorData {
         cas_dir: &Path,
         worktree_root: Option<&Path>,
     ) -> anyhow::Result<()> {
-        self.changes = load_all_git_changes(cas_dir, worktree_root, &self.agent_id_to_name)?;
+        self.changes =
+            load_all_git_changes(cas_dir, worktree_root, &self.agent_id_to_name, None)?;
         self.git_loaded = true;
         Ok(())
     }
 
-    /// Load data with configurable options
-    fn load_with_options(
+    /// Refresh only git changes using cached stores.
+    pub fn refresh_git_changes_with_stores(
+        &mut self,
+        cas_dir: &Path,
+        worktree_root: Option<&Path>,
+        stores: Option<&DirectorStores>,
+    ) -> anyhow::Result<()> {
+        let wt_store = stores.and_then(|s| s.worktree_store.as_ref());
+        self.changes =
+            load_all_git_changes(cas_dir, worktree_root, &self.agent_id_to_name, wt_store)?;
+        self.git_loaded = true;
+        Ok(())
+    }
+
+    /// Load data with configurable options and optional cached stores.
+    ///
+    /// When `stores` is provided, uses the cached handles instead of re-opening.
+    pub fn load_with_stores(
         cas_dir: &Path,
         worktree_root: Option<&Path>,
         load_git: bool,
+        stores: Option<&DirectorStores>,
     ) -> anyhow::Result<Self> {
-        // Load tasks
-        let task_store = SqliteTaskStore::open(cas_dir)?;
-        let tasks: Vec<Task> = TaskStore::list(&task_store, None)?;
+        // Use cached stores or open fresh ones
+        let owned_task;
+        let task_store: &SqliteTaskStore = if let Some(s) = stores {
+            &s.task_store
+        } else {
+            owned_task = SqliteTaskStore::open(cas_dir)?;
+            &owned_task
+        };
+        let tasks: Vec<Task> = TaskStore::list(task_store, None)?;
 
         // Build assignee to task map for looking up current tasks
         let mut assignee_tasks: HashMap<String, String> = HashMap::new();
@@ -199,7 +249,13 @@ impl DirectorData {
         }
 
         // Load recent activity first (needed for agent latest_activity)
-        let event_store = SqliteEventStore::open(cas_dir)?;
+        let owned_event;
+        let event_store: &SqliteEventStore = if let Some(s) = stores {
+            &s.event_store
+        } else {
+            owned_event = SqliteEventStore::open(cas_dir)?;
+            &owned_event
+        };
         let activity = event_store.list_recent(50)?; // Load more to find worker activities
 
         // Build map of agent_id -> latest worker activity
@@ -226,8 +282,14 @@ impl DirectorData {
         }
 
         // Load agents
-        let agent_store = SqliteAgentStore::open(cas_dir)?;
-        let agents_list = AgentStore::list(&agent_store, None)?;
+        let owned_agent;
+        let agent_store: &SqliteAgentStore = if let Some(s) = stores {
+            &s.agent_store
+        } else {
+            owned_agent = SqliteAgentStore::open(cas_dir)?;
+            &owned_agent
+        };
+        let agents_list = AgentStore::list(agent_store, None)?;
 
         let mut agent_id_to_name = HashMap::new();
         let agents: Vec<AgentSummary> = agents_list
@@ -258,24 +320,30 @@ impl DirectorData {
         let activity: Vec<Event> = activity.into_iter().take(20).collect();
 
         // Load git changes (optionally skip for fast startup)
+        let worktree_store_ref = stores.and_then(|s| s.worktree_store.as_ref());
         let (changes, git_loaded) = if load_git {
-            let changes = load_all_git_changes(cas_dir, worktree_root, &agent_id_to_name)?;
+            let changes = load_all_git_changes(
+                cas_dir,
+                worktree_root,
+                &agent_id_to_name,
+                worktree_store_ref,
+            )?;
             (changes, true)
         } else {
             (Vec::new(), false)
         };
 
         // Load pending + recently fired reminders (best-effort, non-fatal)
-        let reminders = SqliteReminderStore::open(cas_dir)
-            .and_then(|store| {
-                store.init()?;
-                let mut all = store.list_all_pending()?;
-                // Include reminders fired within the last 60 seconds so they
-                // don't silently vanish from the panel
-                all.extend(store.list_recently_fired(60)?);
-                Ok(all)
-            })
-            .unwrap_or_default();
+        let reminders = if let Some(store) = stores.and_then(|s| s.reminder_store.as_ref()) {
+            load_reminders(store)
+        } else {
+            SqliteReminderStore::open(cas_dir)
+                .map(|store| {
+                    store.init().ok();
+                    load_reminders(&store)
+                })
+                .unwrap_or_default()
+        };
 
         Ok(Self {
             ready_tasks,
@@ -339,6 +407,17 @@ impl DirectorData {
     }
 }
 
+/// Load pending + recently fired reminders from a reminder store.
+fn load_reminders(store: &SqliteReminderStore) -> Vec<Reminder> {
+    let init_result = store.init();
+    if init_result.is_err() {
+        return Vec::new();
+    }
+    let mut all = store.list_all_pending().unwrap_or_default();
+    all.extend(store.list_recently_fired(60).unwrap_or_default());
+    all
+}
+
 /// A repo to check for git changes
 struct RepoToCheck {
     path: PathBuf,
@@ -353,15 +432,20 @@ fn load_all_git_changes(
     cas_dir: &Path,
     worktree_root: Option<&Path>,
     agent_id_to_name: &HashMap<String, String>,
+    worktree_store: Option<&SqliteWorktreeStore>,
 ) -> anyhow::Result<Vec<SourceChangesInfo>> {
     use rayon::prelude::*;
+    use std::collections::HashSet;
 
     let repo_root = cas_dir.parent().unwrap_or(cas_dir);
 
     // Collect all repos to check (fast, no I/O)
     let mut repos_to_check: Vec<RepoToCheck> = Vec::new();
+    // Track paths to deduplicate between DB worktrees and filesystem scan
+    let mut seen_paths: HashSet<PathBuf> = HashSet::new();
 
     // 1. Main repo
+    seen_paths.insert(repo_root.to_path_buf());
     repos_to_check.push(RepoToCheck {
         path: repo_root.to_path_buf(),
         name: "main".to_string(),
@@ -369,10 +453,21 @@ fn load_all_git_changes(
     });
 
     // 2. Worktrees (from CAS database)
-    if let Ok(worktree_store) = SqliteWorktreeStore::open(cas_dir)
-        && let Ok(worktrees) = worktree_store.list_by_status(WorktreeStatus::Active)
+    let owned_wt_store;
+    let wt_store = if let Some(s) = worktree_store {
+        Some(s)
+    } else {
+        owned_wt_store = SqliteWorktreeStore::open(cas_dir).ok();
+        owned_wt_store.as_ref()
+    };
+    if let Some(store) = wt_store
+        && let Ok(worktrees) = store.list_by_status(WorktreeStatus::Active)
     {
         for wt in worktrees {
+            let path = PathBuf::from(&wt.path);
+            if !seen_paths.insert(path.clone()) {
+                continue; // Already tracked
+            }
             let name = wt
                 .branch
                 .split('/')
@@ -384,7 +479,7 @@ fn load_all_git_changes(
                 .as_ref()
                 .and_then(|id| agent_id_to_name.get(id).cloned());
             repos_to_check.push(RepoToCheck {
-                path: PathBuf::from(&wt.path),
+                path,
                 name,
                 agent_name,
             });
@@ -398,7 +493,7 @@ fn load_all_git_changes(
     {
         for agent_name in agent_id_to_name.values() {
             let path = wt_dir.join(agent_name);
-            if path.is_dir() && path.join(".git").exists() {
+            if path.is_dir() && path.join(".git").exists() && seen_paths.insert(path.clone()) {
                 repos_to_check.push(RepoToCheck {
                     path,
                     name: agent_name.clone(),
@@ -470,22 +565,11 @@ fn get_git_changes(repo_path: &Path) -> Vec<FileChangeInfo> {
 
     let status_str = String::from_utf8_lossy(&status_output.stdout);
 
-    // Get line counts from both staged and unstaged diffs
+    // Get line counts from combined staged + unstaged diff against HEAD
     let mut line_counts: HashMap<String, (usize, usize)> = HashMap::new();
 
-    // Staged changes
     if let Ok(output) = Command::new("git")
-        .args(["diff", "--cached", "--numstat"])
-        .current_dir(repo_path)
-        .output()
-        && output.status.success()
-    {
-        parse_diff_numstat(&String::from_utf8_lossy(&output.stdout), &mut line_counts);
-    }
-
-    // Unstaged changes
-    if let Ok(output) = Command::new("git")
-        .args(["diff", "--numstat"])
+        .args(["diff", "HEAD", "--numstat"])
         .current_dir(repo_path)
         .output()
         && output.status.success()
@@ -527,14 +611,9 @@ fn get_git_changes(repo_path: &Path) -> Vec<FileChangeInfo> {
         let first_char = status_code.chars().next().unwrap_or(' ');
         let staged = first_char != ' ' && first_char != '?';
 
-        // Get line counts, or count file lines for new/untracked files
-        let (lines_added, lines_removed) = if let Some(&counts) = line_counts.get(&file_path) {
-            counts
-        } else if status == GitFileStatus::Untracked || status == GitFileStatus::Added {
-            count_file_lines(&repo_path.join(&file_path))
-        } else {
-            (0, 0)
-        };
+        // Get line counts from diff (untracked files won't appear in diff, use 0)
+        let (lines_added, lines_removed) =
+            line_counts.get(&file_path).copied().unwrap_or((0, 0));
 
         changes.push(FileChangeInfo {
             file_path,
@@ -577,22 +656,3 @@ fn parse_diff_numstat(output: &str, line_counts: &mut HashMap<String, (usize, us
     }
 }
 
-/// Count lines in a file (for new/untracked files)
-fn count_file_lines(path: &Path) -> (usize, usize) {
-    use std::fs::File;
-    use std::io::{BufRead, BufReader};
-
-    // Skip directories - git status can report untracked directories with trailing slash
-    if path.is_dir() {
-        return (0, 0);
-    }
-
-    match File::open(path) {
-        Ok(file) => {
-            let reader = BufReader::new(file);
-            let line_count = reader.lines().count();
-            (line_count, 0)
-        }
-        Err(_) => (0, 0),
-    }
-}
