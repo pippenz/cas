@@ -75,6 +75,22 @@ impl FactoryDaemon {
         self.dead_workers.contains(source)
     }
 
+    /// Detect idle-like messages that don't carry new information.
+    ///
+    /// Matches common patterns workers produce when idle: "standing by",
+    /// "ready for task", "MCP tools unavailable", "awaiting instructions", etc.
+    fn is_idle_message(text: &str) -> bool {
+        let lower = text.to_lowercase();
+        lower.contains("standing by")
+            || lower.contains("ready for task")
+            || lower.contains("awaiting instructions")
+            || lower.contains("awaiting task")
+            || lower.contains("waiting for work")
+            || lower.contains("mcp tools unavailable")
+            || lower.contains("idle")
+            || lower.contains("no task assigned")
+    }
+
     /// Process prompt queue
     pub(super) async fn process_prompt_queue(&mut self) -> anyhow::Result<()> {
         use cas_store::{EventStore, SqliteEventStore};
@@ -140,6 +156,27 @@ impl FactoryDaemon {
                 );
                 let _ = queue.mark_processed(queued.id);
                 continue;
+            }
+
+            // Dedup idle-like messages from the same worker (max 1 per 5 minutes).
+            // Workers often send repeated "standing by", "ready", "idle" messages
+            // that flood the supervisor context without adding information.
+            if Self::is_idle_message(&queued.prompt) {
+                let now = std::time::Instant::now();
+                let dominated = self
+                    .last_idle_message_times
+                    .get(&queued.source)
+                    .is_some_and(|last| now.duration_since(*last) < std::time::Duration::from_secs(300));
+                if dominated {
+                    tracing::debug!(
+                        prompt_id = queued.id,
+                        source = %queued.source,
+                        "Suppressing duplicate idle message (rate-limited to 5min)"
+                    );
+                    let _ = queue.mark_processed(queued.id);
+                    continue;
+                }
+                self.last_idle_message_times.insert(queued.source.clone(), now);
             }
 
             // Skip PTY injection for native extension agents that use plain PTY mode —
@@ -1032,6 +1069,7 @@ fn is_exact_agent_name_match(agent: &AgentSummary, worker_name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::is_exact_agent_name_match;
+    use crate::ui::factory::daemon::FactoryDaemon;
     use crate::ui::factory::director::AgentSummary;
     use cas_types::AgentStatus;
 
@@ -1051,5 +1089,21 @@ mod tests {
             "worker-1 must not match worker-10"
         );
         assert!(is_exact_agent_name_match(&worker_10, "worker-10"));
+    }
+
+    #[test]
+    fn test_is_idle_message_matches_common_patterns() {
+        assert!(FactoryDaemon::is_idle_message("Worker fox-1: Standing by for task details."));
+        assert!(FactoryDaemon::is_idle_message("Worker fox-1: ready for task."));
+        assert!(FactoryDaemon::is_idle_message("MCP tools unavailable. Awaiting instructions."));
+        assert!(FactoryDaemon::is_idle_message("I am idle, waiting for work."));
+        assert!(FactoryDaemon::is_idle_message("No task assigned yet."));
+    }
+
+    #[test]
+    fn test_is_idle_message_does_not_match_real_content() {
+        assert!(!FactoryDaemon::is_idle_message("COMPLETED task cas-1234. Commit: abc123."));
+        assert!(!FactoryDaemon::is_idle_message("Blocked: cannot compile due to missing dep."));
+        assert!(!FactoryDaemon::is_idle_message("Fixed the bug in parser.rs, tests pass."));
     }
 }
