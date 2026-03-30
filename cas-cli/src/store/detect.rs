@@ -69,6 +69,12 @@ pub fn find_cas_root() -> Result<PathBuf> {
 /// This function handles git worktrees: if we're in a worktree, it looks
 /// for .cas in the main repository first, before falling back to walking
 /// up the directory tree.
+///
+/// Detection priority:
+/// 1. CAS_ROOT env var (explicit override)
+/// 2. CAS worktree detection (path contains .cas/worktrees/)
+/// 3. Git worktree detection (parse .git file)
+/// 4. Directory walk (walk up looking for .cas/)
 pub fn find_cas_root_from(start: &Path) -> Result<PathBuf> {
     // Respect CAS_ROOT for explicit overrides (useful for workers in clones and external tooling).
     // This mirrors `find_cas_root()` behavior but applies when callers start from an explicit path.
@@ -79,7 +85,16 @@ pub fn find_cas_root_from(start: &Path) -> Result<PathBuf> {
         }
     }
 
-    // First, check if we're in a git worktree and look for .cas in the main repo.
+    // Check if we're inside a CAS worktree (.cas/worktrees/<name>/).
+    // This is the most reliable detection for factory workers because it
+    // doesn't depend on git state or .git file parsing.
+    if let Some(cas_dir) = find_cas_root_from_cas_worktree(start) {
+        if cas_dir.exists() && cas_dir.is_dir() {
+            return Ok(cas_dir);
+        }
+    }
+
+    // Check if we're in a git worktree and look for .cas in the main repo.
     // This takes priority because worktrees should share the main repo's .cas.
     if let Some(main_repo) = find_main_repo_from_worktree(start) {
         let cas_dir = main_repo.join(".cas");
@@ -105,6 +120,27 @@ pub fn find_cas_root_from(start: &Path) -> Result<PathBuf> {
     Err(CasError::NotInitialized)
 }
 
+/// Detect if `start` is inside a CAS factory worktree (.cas/worktrees/<name>/)
+/// and return the parent repo's .cas/ directory.
+///
+/// CAS factory worktrees are always created under `<project>/.cas/worktrees/<worker>/`.
+/// By detecting the `.cas/worktrees/` path component, we can resolve directly to the
+/// parent `.cas/` directory without relying on git state.
+fn find_cas_root_from_cas_worktree(start: &Path) -> Option<PathBuf> {
+    // Convert to string for pattern matching
+    let path_str = start.to_string_lossy();
+
+    // Look for .cas/worktrees/ in the path
+    if let Some(idx) = path_str.find(".cas/worktrees/") {
+        let cas_dir = PathBuf::from(&path_str[..idx + ".cas".len()]);
+        if cas_dir.join("cas.db").exists() || cas_dir.is_dir() {
+            return Some(cas_dir);
+        }
+    }
+
+    None
+}
+
 /// Check if we're in a git worktree and return the main repository path.
 ///
 /// Git worktrees have a `.git` file (not directory) containing:
@@ -113,6 +149,7 @@ pub fn find_cas_root_from(start: &Path) -> Result<PathBuf> {
 /// ```
 ///
 /// We parse this to find the main repository's path.
+/// Handles both absolute and relative gitdir paths.
 fn find_main_repo_from_worktree(start: &Path) -> Option<PathBuf> {
     let mut current = start.to_path_buf();
 
@@ -127,6 +164,13 @@ fn find_main_repo_from_worktree(start: &Path) -> Option<PathBuf> {
                     let gitdir = gitdir.trim();
                     let gitdir_path = PathBuf::from(gitdir);
 
+                    // Resolve relative paths against the worktree root (where .git file lives)
+                    let gitdir_path = if gitdir_path.is_relative() {
+                        current.join(&gitdir_path)
+                    } else {
+                        gitdir_path
+                    };
+
                     // The gitdir points to .git/worktrees/<name>
                     // We need to go up to .git, then up again to the repo root
                     // e.g., /path/to/main/.git/worktrees/wt1 -> /path/to/main
@@ -135,8 +179,11 @@ fn find_main_repo_from_worktree(start: &Path) -> Option<PathBuf> {
                         if let Some(git_dir) = git_dir.parent() {
                             // .git
                             if let Some(main_repo) = git_dir.parent() {
-                                // main repo
-                                return Some(main_repo.to_path_buf());
+                                // main repo — canonicalize to resolve any ../ components
+                                let main_repo = main_repo
+                                    .canonicalize()
+                                    .unwrap_or_else(|_| main_repo.to_path_buf());
+                                return Some(main_repo);
                             }
                         }
                     }
@@ -676,6 +723,73 @@ mod tests {
         std::fs::create_dir_all(&non_git).unwrap();
         let found = find_main_repo_from_worktree(&non_git);
         assert!(found.is_none());
+    }
+
+    #[test]
+    fn test_find_cas_root_from_cas_worktree() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let original_cas_root = std::env::var("CAS_ROOT").ok();
+        unsafe { std::env::remove_var("CAS_ROOT") };
+
+        // Simulate a CAS factory worktree structure:
+        // /project/.cas/          <- CAS directory with cas.db
+        // /project/.cas/worktrees/fox/  <- Worker worktree
+        let temp = TempDir::new().unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        init_cas_dir(&project).unwrap();
+
+        let worktree = project.join(".cas/worktrees/fox");
+        std::fs::create_dir_all(&worktree).unwrap();
+
+        // Should find .cas from CAS worktree via path pattern detection
+        let found = find_cas_root_from_cas_worktree(&worktree);
+        assert_eq!(found, Some(project.join(".cas")));
+
+        // Should also work from a subdirectory of the worktree
+        let subdir = worktree.join("src/deep/nested");
+        std::fs::create_dir_all(&subdir).unwrap();
+        let found = find_cas_root_from_cas_worktree(&subdir);
+        assert_eq!(found, Some(project.join(".cas")));
+
+        // find_cas_root_from should use CAS worktree detection
+        let found = find_cas_root_from(&worktree).unwrap();
+        assert_eq!(found, project.join(".cas"));
+
+        // Should return None for non-worktree paths
+        let found = find_cas_root_from_cas_worktree(&project);
+        assert!(found.is_none());
+
+        match original_cas_root {
+            Some(val) => unsafe { std::env::set_var("CAS_ROOT", val) },
+            None => unsafe { std::env::remove_var("CAS_ROOT") },
+        }
+    }
+
+    #[test]
+    fn test_find_main_repo_from_worktree_relative_gitdir() {
+        let temp = TempDir::new().unwrap();
+        let main_repo = temp.path().join("main_repo");
+        let worktree = temp.path().join("worktrees/wt1");
+
+        // Create main repo's .git directory and worktrees subdir
+        let git_dir = main_repo.join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        let worktree_git_data = git_dir.join("worktrees/wt1");
+        std::fs::create_dir_all(&worktree_git_data).unwrap();
+
+        // Create worktree with RELATIVE .git path (Git 2.40+)
+        std::fs::create_dir_all(&worktree).unwrap();
+        let relative_gitdir = "../../main_repo/.git/worktrees/wt1";
+        std::fs::write(worktree.join(".git"), format!("gitdir: {relative_gitdir}")).unwrap();
+
+        // Should find main repo even with relative path
+        let found = find_main_repo_from_worktree(&worktree);
+        assert!(found.is_some());
+        // Canonicalize both sides for comparison (resolves symlinks and ../)
+        let found_canon = found.unwrap().canonicalize().unwrap();
+        let expected_canon = main_repo.canonicalize().unwrap();
+        assert_eq!(found_canon, expected_canon);
     }
 
     #[test]
