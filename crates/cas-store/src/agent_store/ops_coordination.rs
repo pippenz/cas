@@ -7,7 +7,7 @@ use rusqlite::params;
 impl SqliteAgentStore {
     pub(crate) fn coord_get_active_children(&self, agent_id: &str) -> Result<Vec<Agent>> {
         let conn = self.lock_conn()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, name, agent_type, role, status, pid, ppid, cc_session_id, parent_id,
              machine_id, registered_at, last_heartbeat, active_tasks, metadata
              FROM agents WHERE parent_id = ? AND status = 'active'
@@ -24,7 +24,7 @@ impl SqliteAgentStore {
         let conn = self.lock_conn()?;
 
         // Get all active task leases for this agent
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT task_id, epoch FROM task_leases WHERE agent_id = ? AND status = 'active'",
         )?;
         let leases: Vec<(String, i64)> = stmt
@@ -83,7 +83,7 @@ impl SqliteAgentStore {
     }
     pub(crate) fn coord_get_working_epics(&self, agent_id: &str) -> Result<Vec<String>> {
         let conn = self.lock_conn()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT epic_id FROM working_epics WHERE agent_id = ? ORDER BY started_at DESC",
         )?;
 
@@ -96,7 +96,7 @@ impl SqliteAgentStore {
     pub(crate) fn coord_list_all_working_epics(&self) -> Result<Vec<String>> {
         let conn = self.lock_conn()?;
         let mut stmt =
-            conn.prepare("SELECT DISTINCT epic_id FROM working_epics ORDER BY started_at DESC")?;
+            conn.prepare_cached("SELECT DISTINCT epic_id FROM working_epics ORDER BY started_at DESC")?;
 
         let epic_ids = stmt
             .query_map([], |row| row.get::<_, String>(0))?
@@ -108,7 +108,7 @@ impl SqliteAgentStore {
         let conn = self.lock_conn()?;
         // Only return epics from agents that are NOT active
         // This prevents blocking Agent B when Agent A has an active epic
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT DISTINCT w.epic_id
              FROM working_epics w
              LEFT JOIN agents a ON w.agent_id = a.id

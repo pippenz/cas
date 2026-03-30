@@ -279,7 +279,7 @@ impl SqliteStore {
     /// List recent sessions (for sync)
     pub fn list_sessions_since(&self, since: DateTime<Utc>) -> Result<Vec<cas_types::Session>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT session_id, cwd, started_at, ended_at, duration_secs,
                     permission_mode, entries_created, tasks_closed, tool_uses, team_id, title,
                     outcome, friction_score, delight_count
@@ -405,7 +405,7 @@ impl SqliteStore {
         let conn = self.conn.lock().unwrap();
         let cutoff = Utc::now() - chrono::Duration::days(days);
 
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT
                 json_extract(metadata, '$.friction_type') as friction_type,
                 COUNT(*) as count,
@@ -445,7 +445,7 @@ impl SqliteStore {
         let conn = self.conn.lock().unwrap();
         let cutoff = Utc::now() - chrono::Duration::days(days);
 
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT
                 e.session_id,
                 COUNT(*) as friction_count,
@@ -498,7 +498,7 @@ impl SqliteStore {
             return Ok(Vec::new());
         }
 
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT
                 outcome,
                 COUNT(*) as count
@@ -529,7 +529,7 @@ impl SqliteStore {
         let conn = self.conn.lock().unwrap();
         let cutoff = Utc::now() - chrono::Duration::days(days);
 
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT
                 s.outcome,
                 AVG(COALESCE(s.friction_score, 0.0)) as avg_friction_score,
@@ -570,7 +570,7 @@ impl SqliteStore {
         let conn = self.conn.lock().unwrap();
         let cutoff = Utc::now() - chrono::Duration::days(days);
 
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT
                 json_extract(metadata, '$.friction_type') as friction_type,
                 COUNT(*) as count,
@@ -670,7 +670,7 @@ impl SqliteRuleStore {
     /// List only proven rules (status = 'proven')
     pub fn list_proven(&self) -> Result<Vec<Rule>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, created, source_ids, helpful_count, harmful_count,
              tags, paths, content, status, last_accessed, review_after, hook_command,
              category, priority, surface_count, scope, auto_approve_tools, auto_approve_paths, team_id
@@ -720,7 +720,7 @@ impl SqliteRuleStore {
     /// List critical rules (priority = 0, proven or draft)
     pub fn list_critical(&self) -> Result<Vec<Rule>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, created, source_ids, helpful_count, harmful_count,
              tags, paths, content, status, last_accessed, review_after, hook_command,
              category, priority, surface_count, scope, auto_approve_tools, auto_approve_paths, team_id

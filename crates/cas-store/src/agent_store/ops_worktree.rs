@@ -188,7 +188,7 @@ impl SqliteAgentStore {
         agent_id: &str,
     ) -> Result<Vec<WorktreeLease>> {
         let conn = self.lock_conn()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT worktree_id, agent_id, status, acquired_at, expires_at, renewed_at, renewal_count
              FROM worktree_leases WHERE agent_id = ? AND status = 'active'
              ORDER BY acquired_at DESC",
@@ -202,7 +202,7 @@ impl SqliteAgentStore {
     }
     pub(crate) fn worktree_list_active_worktree_leases(&self) -> Result<Vec<WorktreeLease>> {
         let conn = self.lock_conn()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT worktree_id, agent_id, status, acquired_at, expires_at, renewed_at, renewal_count
              FROM worktree_leases WHERE status = 'active'
              ORDER BY expires_at ASC",

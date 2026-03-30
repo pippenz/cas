@@ -47,25 +47,18 @@ impl SqliteStore {
     pub(crate) fn store_generate_id(&self) -> Result<String> {
         let today = Utc::now().format("%Y-%m-%d").to_string();
         let conn = self.conn.lock().unwrap();
-
-        // Use MAX instead of COUNT to handle gaps from deleted entries
-        let max_num: Option<i32> = conn
-            .query_row(
-                "SELECT MAX(CAST(SUBSTR(id, 12) AS INTEGER)) FROM entries WHERE id LIKE ?",
-                params![format!("{}-%", today)],
-                |row| row.get(0),
-            )
-            .ok();
-
-        let next_num = max_num.unwrap_or(0) + 1;
+        // Use a per-day sequence key so IDs reset daily (e.g., "entry:2026-03-30")
+        let seq_name = format!("entry:{today}");
+        let next_num = crate::shared_db::next_sequence_val(&conn, &seq_name)?;
         Ok(format!("{today}-{next_num}"))
     }
     pub(crate) fn store_add(&self, entry: &Entry) -> Result<()> {
         let timer = TraceTimer::new();
         crate::shared_db::with_write_retry(|| {
             let conn = self.conn.lock().unwrap();
+            let tx = crate::shared_db::ImmediateTx::new(&conn)?;
             let now = Utc::now().to_rfc3339();
-            let result = conn.execute(
+            let result = tx.execute(
             "INSERT INTO entries (id, type, tags, created, content, title,
              helpful_count, harmful_count, last_accessed, archived,
              session_id, source_tool, pending_extraction, observation_type,
@@ -129,7 +122,7 @@ impl SqliteStore {
 
             result?;
 
-            // Record event for sidecar activity feed
+            // Record event for sidecar activity feed (within same transaction)
             let summary = entry.title.as_deref().unwrap_or_else(|| {
                 // Truncate content for summary
                 if entry.content.len() > 50 {
@@ -145,11 +138,12 @@ impl SqliteStore {
                 format!("Memory stored: {summary}"),
             )
             .with_session(entry.session_id.as_deref().unwrap_or(""));
-            let _ = record_event_with_conn(&conn, &event);
+            let _ = record_event_with_conn(&tx, &event);
 
-            // Capture event for recording playback
-            let _ = capture_memory_event(&conn, &entry.id, None);
+            // Capture event for recording playback (within same transaction)
+            let _ = capture_memory_event(&tx, &entry.id, None);
 
+            tx.commit()?;
             Ok(())
         }) // with_write_retry
     }
@@ -394,7 +388,7 @@ impl SqliteStore {
     }
     pub(crate) fn store_list(&self) -> Result<Vec<Entry>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, type, tags, created, content, title, helpful_count,
              harmful_count, last_accessed, archived, session_id, source_tool,
              pending_extraction, observation_type, stability, access_count,
@@ -462,7 +456,7 @@ impl SqliteStore {
     }
     pub(crate) fn store_recent(&self, n: usize) -> Result<Vec<Entry>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, type, tags, created, content, title, helpful_count,
              harmful_count, last_accessed, archived, session_id, source_tool,
              pending_extraction, observation_type, stability, access_count,
@@ -552,7 +546,7 @@ impl SqliteStore {
     }
     pub(crate) fn store_list_archived(&self) -> Result<Vec<Entry>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, type, tags, created, content, title, helpful_count,
              harmful_count, last_accessed, archived, session_id, source_tool,
              pending_extraction, observation_type, stability, access_count,
@@ -621,7 +615,7 @@ impl SqliteStore {
 
     pub(crate) fn store_list_by_branch(&self, branch: &str) -> Result<Vec<Entry>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, type, tags, created, content, title, helpful_count,
              harmful_count, last_accessed, archived, session_id, source_tool,
              pending_extraction, observation_type, stability, access_count,

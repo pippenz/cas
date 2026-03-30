@@ -328,7 +328,7 @@ impl SpecStore for SqliteSpecStore {
             ),
         };
 
-        let mut stmt = conn.prepare(sql)?;
+        let mut stmt = conn.prepare_cached(sql)?;
         let specs = if params.is_empty() {
             stmt.query_map([], Self::spec_from_row)?
                 .collect::<std::result::Result<Vec<_>, _>>()?
@@ -346,7 +346,7 @@ impl SpecStore for SqliteSpecStore {
 
     fn get_for_task(&self, task_id: &str) -> Result<Vec<Spec>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, scope, title, summary, goals, in_scope, out_of_scope, users,
              technical_requirements, acceptance_criteria, design_notes, additional_notes,
              spec_type, status, version, previous_version_id, task_id, source_ids,
@@ -428,7 +428,7 @@ impl SpecStore for SqliteSpecStore {
         let conn = self.conn.lock().unwrap();
         let pattern = format!("%{query}%");
 
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, scope, title, summary, goals, in_scope, out_of_scope, users,
              technical_requirements, acceptance_criteria, design_notes, additional_notes,
              spec_type, status, version, previous_version_id, task_id, source_ids,

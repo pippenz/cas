@@ -154,7 +154,7 @@ impl EventStore for SqliteEventStore {
         let conn = self.conn.lock().map_err(lock_error)?;
 
         let mut stmt = conn
-            .prepare(
+            .prepare_cached(
                 "SELECT id, event_type, entity_type, entity_id, summary, metadata, created_at, session_id
                  FROM events
                  ORDER BY created_at DESC
@@ -179,7 +179,7 @@ impl EventStore for SqliteEventStore {
         let conn = self.conn.lock().map_err(lock_error)?;
 
         let mut stmt = conn
-            .prepare(
+            .prepare_cached(
                 "SELECT id, event_type, entity_type, entity_id, summary, metadata, created_at, session_id
                  FROM events
                  WHERE entity_type = ?1 AND entity_id = ?2
@@ -203,7 +203,7 @@ impl EventStore for SqliteEventStore {
         let conn = self.conn.lock().map_err(lock_error)?;
 
         let mut stmt = conn
-            .prepare(
+            .prepare_cached(
                 "SELECT id, event_type, entity_type, entity_id, summary, metadata, created_at, session_id
                  FROM events
                  WHERE event_type = ?1
@@ -227,7 +227,7 @@ impl EventStore for SqliteEventStore {
         let conn = self.conn.lock().map_err(lock_error)?;
 
         let mut stmt = conn
-            .prepare(
+            .prepare_cached(
                 "SELECT id, event_type, entity_type, entity_id, summary, metadata, created_at, session_id
                  FROM events
                  WHERE created_at >= ?1
@@ -251,7 +251,7 @@ impl EventStore for SqliteEventStore {
         let conn = self.conn.lock().map_err(lock_error)?;
 
         let mut stmt = conn
-            .prepare(
+            .prepare_cached(
                 "SELECT id, event_type, entity_type, entity_id, summary, metadata, created_at, session_id
                  FROM events
                  WHERE session_id = ?1
@@ -271,7 +271,7 @@ impl EventStore for SqliteEventStore {
     fn count_by_type(&self) -> Result<Vec<(EventType, i64)>> {
         let conn = self.conn.lock().map_err(lock_error)?;
 
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT event_type, COUNT(*) as count
                  FROM events
                  GROUP BY event_type

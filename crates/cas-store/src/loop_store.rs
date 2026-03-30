@@ -240,7 +240,7 @@ impl LoopStore for SqliteLoopStore {
     fn list_recent(&self, limit: usize) -> Result<Vec<Loop>> {
         let conn = self.conn.lock().map_err(lock_err)?;
 
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, session_id, prompt, completion_promise, iteration, max_iterations,
              status, task_id, started_at, ended_at, end_reason, cwd
              FROM loops ORDER BY started_at DESC LIMIT ?1",

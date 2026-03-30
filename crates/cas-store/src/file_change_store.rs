@@ -194,7 +194,7 @@ impl FileChangeStore for SqliteFileChangeStore {
     fn get(&self, id: &str) -> Result<Option<FileChange>> {
         let conn = self.conn.lock().map_err(lock_error)?;
 
-        let mut stmt = conn.prepare(&format!(
+        let mut stmt = conn.prepare_cached(&format!(
             "SELECT {SELECT_COLS} FROM file_changes WHERE id = ?1"
         ))?;
 
@@ -208,7 +208,7 @@ impl FileChangeStore for SqliteFileChangeStore {
     fn list_by_session(&self, session_id: &str, limit: usize) -> Result<Vec<FileChange>> {
         let conn = self.conn.lock().map_err(lock_error)?;
 
-        let mut stmt = conn.prepare(&format!(
+        let mut stmt = conn.prepare_cached(&format!(
             "SELECT {SELECT_COLS} FROM file_changes
              WHERE session_id = ?1
              ORDER BY created_at DESC
@@ -226,7 +226,7 @@ impl FileChangeStore for SqliteFileChangeStore {
     fn list_by_prompt(&self, prompt_id: &str, limit: usize) -> Result<Vec<FileChange>> {
         let conn = self.conn.lock().map_err(lock_error)?;
 
-        let mut stmt = conn.prepare(&format!(
+        let mut stmt = conn.prepare_cached(&format!(
             "SELECT {SELECT_COLS} FROM file_changes
              WHERE prompt_id = ?1
              ORDER BY created_at DESC
@@ -249,7 +249,7 @@ impl FileChangeStore for SqliteFileChangeStore {
     ) -> Result<Vec<FileChange>> {
         let conn = self.conn.lock().map_err(lock_error)?;
 
-        let mut stmt = conn.prepare(&format!(
+        let mut stmt = conn.prepare_cached(&format!(
             "SELECT {SELECT_COLS} FROM file_changes
              WHERE repository = ?1 AND file_path = ?2
              ORDER BY created_at DESC
@@ -270,7 +270,7 @@ impl FileChangeStore for SqliteFileChangeStore {
     fn list_uncommitted(&self, session_id: &str) -> Result<Vec<FileChange>> {
         let conn = self.conn.lock().map_err(lock_error)?;
 
-        let mut stmt = conn.prepare(&format!(
+        let mut stmt = conn.prepare_cached(&format!(
             "SELECT {SELECT_COLS} FROM file_changes
              WHERE session_id = ?1 AND commit_hash IS NULL
              ORDER BY created_at ASC"
@@ -304,7 +304,7 @@ impl FileChangeStore for SqliteFileChangeStore {
     fn list_by_commit(&self, commit_hash: &str) -> Result<Vec<FileChange>> {
         let conn = self.conn.lock().map_err(lock_error)?;
 
-        let mut stmt = conn.prepare(&format!(
+        let mut stmt = conn.prepare_cached(&format!(
             "SELECT {SELECT_COLS} FROM file_changes
              WHERE commit_hash = ?1
              ORDER BY created_at ASC"
@@ -321,7 +321,7 @@ impl FileChangeStore for SqliteFileChangeStore {
     fn list_recent(&self, limit: usize) -> Result<Vec<FileChange>> {
         let conn = self.conn.lock().map_err(lock_error)?;
 
-        let mut stmt = conn.prepare(&format!(
+        let mut stmt = conn.prepare_cached(&format!(
             "SELECT {SELECT_COLS} FROM file_changes
              ORDER BY created_at DESC
              LIMIT ?1"

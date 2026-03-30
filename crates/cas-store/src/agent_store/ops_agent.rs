@@ -173,7 +173,7 @@ impl SqliteAgentStore {
             ),
         };
 
-        let mut stmt = conn.prepare(sql)?;
+        let mut stmt = conn.prepare_cached(sql)?;
         let agents = if params.is_empty() {
             stmt.query_map([], Self::agent_from_row)?
                 .collect::<std::result::Result<Vec<_>, _>>()?
@@ -188,7 +188,7 @@ impl SqliteAgentStore {
         let conn = self.lock_conn()?;
         let cutoff = (Utc::now() - chrono::Duration::seconds(timeout_secs)).to_rfc3339();
 
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, name, agent_type, role, status, pid, ppid, cc_session_id, parent_id,
              machine_id, registered_at, last_heartbeat, active_tasks, metadata
              FROM agents
@@ -249,7 +249,7 @@ impl SqliteAgentStore {
         let conn = self.lock_conn()?;
 
         // Get all active leases for this agent before revoking
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT task_id, epoch FROM task_leases WHERE agent_id = ? AND status = 'active'",
         )?;
         let leases_to_revoke: Vec<(String, i64)> = stmt
@@ -314,7 +314,7 @@ impl SqliteAgentStore {
     }
     pub(crate) fn agent_get_by_cc_pid(&self, cc_pid: u32) -> Result<Option<Agent>> {
         let conn = self.lock_conn()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, name, agent_type, role, status, pid, ppid, cc_session_id, parent_id,
              machine_id, registered_at, last_heartbeat, active_tasks, metadata
              FROM agents WHERE ppid = ? AND status IN ('active', 'idle', 'stale', 'dead', 'shutdown')
@@ -328,7 +328,7 @@ impl SqliteAgentStore {
 
     pub(crate) fn agent_get_by_pid(&self, pid: u32) -> Result<Option<Agent>> {
         let conn = self.lock_conn()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, name, agent_type, role, status, pid, ppid, cc_session_id, parent_id,
              machine_id, registered_at, last_heartbeat, active_tasks, metadata
              FROM agents WHERE pid = ? AND status IN ('active', 'idle', 'stale', 'dead', 'shutdown')

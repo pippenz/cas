@@ -10,7 +10,7 @@ use std::str::FromStr;
 impl SqliteStore {
     pub(crate) fn store_list_pending_index(&self, limit: usize) -> Result<Vec<Entry>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, type, tags, created, content, title, helpful_count,
              harmful_count, last_accessed, archived, session_id, source_tool,
              pending_extraction, observation_type, stability, access_count,

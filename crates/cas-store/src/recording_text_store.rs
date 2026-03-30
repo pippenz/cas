@@ -153,7 +153,7 @@ impl RecordingTextStore for SqliteRecordingTextStore {
     fn search(&self, query: &str, limit: usize) -> Result<Vec<RecordingSearchResult>> {
         let conn = self.conn.lock().map_err(lock_error)?;
 
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT
                 rt.id, rt.recording_id, rt.agent_name, rt.timestamp_ms, rt.text_content, rt.created_at,
                 bm25(recording_text_fts) as score,
@@ -194,7 +194,7 @@ impl RecordingTextStore for SqliteRecordingTextStore {
     ) -> Result<Vec<RecordingSearchResult>> {
         let conn = self.conn.lock().map_err(lock_error)?;
 
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT
                 rt.id, rt.recording_id, rt.agent_name, rt.timestamp_ms, rt.text_content, rt.created_at,
                 bm25(recording_text_fts) as score,
@@ -230,7 +230,7 @@ impl RecordingTextStore for SqliteRecordingTextStore {
     fn list_for_recording(&self, recording_id: &str) -> Result<Vec<RecordingTextEntry>> {
         let conn = self.conn.lock().map_err(lock_error)?;
 
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, recording_id, agent_name, timestamp_ms, text_content, created_at
              FROM recording_text
              WHERE recording_id = ?1

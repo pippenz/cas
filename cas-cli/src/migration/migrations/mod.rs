@@ -162,6 +162,7 @@ mod m184_rules_idx_team_id;
 mod m185_skills_idx_team_id;
 mod m186_tasks_idx_team_id;
 mod m187_tasks_idx_assignee;
+mod m188_id_sequences_create_table;
 
 /// All migrations in order. IDs must be sequential and never reused.
 pub const MIGRATIONS: &[Migration] = &[
@@ -313,6 +314,8 @@ pub const MIGRATIONS: &[Migration] = &[
     m185_skills_idx_team_id::MIGRATION,
     m186_tasks_idx_team_id::MIGRATION,
     m187_tasks_idx_assignee::MIGRATION,
+    // ID sequences
+    m188_id_sequences_create_table::MIGRATION,
 ];
 
 #[cfg(test)]

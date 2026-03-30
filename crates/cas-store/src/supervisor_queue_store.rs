@@ -188,7 +188,7 @@ impl SupervisorQueueStore for SqliteSupervisorQueueStore {
         let now = Utc::now().to_rfc3339();
 
         // Get pending notifications ordered by priority (ascending = critical first), then created_at
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, supervisor_id, event_type, payload, priority, created_at, processed_at
              FROM supervisor_queue
              WHERE supervisor_id = ? AND processed_at IS NULL
@@ -229,7 +229,7 @@ impl SupervisorQueueStore for SqliteSupervisorQueueStore {
     fn peek(&self, supervisor_id: &str, limit: usize) -> Result<Vec<SupervisorNotification>> {
         let conn = self.conn.lock().unwrap();
 
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, supervisor_id, event_type, payload, priority, created_at, processed_at
              FROM supervisor_queue
              WHERE supervisor_id = ? AND processed_at IS NULL
@@ -280,7 +280,7 @@ impl SupervisorQueueStore for SqliteSupervisorQueueStore {
     fn list_pending(&self, supervisor_id: &str) -> Result<Vec<SupervisorNotification>> {
         let conn = self.conn.lock().unwrap();
 
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, supervisor_id, event_type, payload, priority, created_at, processed_at
              FROM supervisor_queue
              WHERE supervisor_id = ? AND processed_at IS NULL

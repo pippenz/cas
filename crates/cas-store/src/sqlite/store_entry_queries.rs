@@ -9,7 +9,7 @@ use std::str::FromStr;
 impl SqliteStore {
     pub(crate) fn store_list_pending(&self, limit: usize) -> Result<Vec<Entry>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, type, tags, created, content, title, helpful_count,
              harmful_count, last_accessed, archived, session_id, source_tool,
              pending_extraction, observation_type, stability, access_count,
@@ -89,7 +89,7 @@ impl SqliteStore {
     }
     pub(crate) fn store_list_pinned(&self) -> Result<Vec<Entry>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, type, tags, created, content, title, helpful_count,
              harmful_count, last_accessed, archived, session_id, source_tool,
              pending_extraction, observation_type, stability, access_count,
@@ -158,7 +158,7 @@ impl SqliteStore {
     }
     pub(crate) fn store_list_helpful(&self, limit: usize) -> Result<Vec<Entry>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, type, tags, created, content, title, helpful_count,
              harmful_count, last_accessed, archived, session_id, source_tool,
              pending_extraction, observation_type, stability, access_count,
@@ -229,7 +229,7 @@ impl SqliteStore {
     }
     pub(crate) fn store_list_by_session(&self, session_id: &str) -> Result<Vec<Entry>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, type, tags, created, content, title, helpful_count,
              harmful_count, last_accessed, archived, session_id, source_tool,
              pending_extraction, observation_type, stability, access_count,
@@ -299,7 +299,7 @@ impl SqliteStore {
     }
     pub(crate) fn store_list_unreviewed_learnings(&self, limit: usize) -> Result<Vec<Entry>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, type, tags, created, content, title, helpful_count,
              harmful_count, last_accessed, archived, session_id, source_tool,
              pending_extraction, observation_type, stability, access_count,

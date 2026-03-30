@@ -88,7 +88,7 @@ impl RecordingStore for SqliteRecordingStore {
 
     fn list(&self) -> Result<Vec<Recording>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, session_id, started_at, ended_at, duration_ms,
              file_path, file_size, title, description, created_at
              FROM recordings ORDER BY started_at DESC",
@@ -149,7 +149,7 @@ impl RecordingStore for SqliteRecordingStore {
 
         let params_refs: Vec<&dyn rusqlite::ToSql> =
             params_vec.iter().map(|p| p.as_ref()).collect();
-        let mut stmt = conn.prepare(&sql)?;
+        let mut stmt = conn.prepare_cached(&sql)?;
         let recordings = stmt
             .query_map(params_refs.as_slice(), Self::recording_from_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -159,7 +159,7 @@ impl RecordingStore for SqliteRecordingStore {
 
     fn list_by_session(&self, session_id: &str) -> Result<Vec<Recording>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, session_id, started_at, ended_at, duration_ms,
              file_path, file_size, title, description, created_at
              FROM recordings WHERE session_id = ? ORDER BY started_at DESC",
@@ -174,7 +174,7 @@ impl RecordingStore for SqliteRecordingStore {
 
     fn list_by_date_range(&self, from: DateTime<Utc>, to: DateTime<Utc>) -> Result<Vec<Recording>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, session_id, started_at, ended_at, duration_ms,
              file_path, file_size, title, description, created_at
              FROM recordings WHERE started_at >= ? AND started_at <= ?
@@ -193,7 +193,7 @@ impl RecordingStore for SqliteRecordingStore {
 
     fn list_by_agent(&self, agent_name: &str) -> Result<Vec<Recording>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT DISTINCT r.id, r.session_id, r.started_at, r.ended_at, r.duration_ms,
              r.file_path, r.file_size, r.title, r.description, r.created_at
              FROM recordings r
@@ -227,7 +227,7 @@ impl RecordingStore for SqliteRecordingStore {
 
     fn get_agents(&self, recording_id: &str) -> Result<Vec<RecordingAgent>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, recording_id, agent_name, agent_type, file_path, created_at
              FROM recording_agents WHERE recording_id = ?",
         )?;
@@ -268,7 +268,7 @@ impl RecordingStore for SqliteRecordingStore {
 
     fn get_events(&self, recording_id: &str) -> Result<Vec<RecordingEvent>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, recording_id, timestamp_ms, event_type, entity_type, entity_id, metadata
              FROM recording_events WHERE recording_id = ? ORDER BY timestamp_ms",
         )?;
@@ -287,7 +287,7 @@ impl RecordingStore for SqliteRecordingStore {
         to_ms: i64,
     ) -> Result<Vec<RecordingEvent>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, recording_id, timestamp_ms, event_type, entity_type, entity_id, metadata
              FROM recording_events
              WHERE recording_id = ? AND timestamp_ms >= ? AND timestamp_ms <= ?
@@ -311,7 +311,7 @@ impl RecordingStore for SqliteRecordingStore {
         entity_id: &str,
     ) -> Result<Vec<RecordingEvent>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, recording_id, timestamp_ms, event_type, entity_type, entity_id, metadata
              FROM recording_events
              WHERE recording_id = ? AND entity_type = ? AND entity_id = ?
@@ -360,7 +360,7 @@ impl RecordingStore for SqliteRecordingStore {
 
     fn search_fts(&self, query: &str, limit: usize) -> Result<Vec<(String, i64)>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT recording_id, CAST(timestamp_ms AS INTEGER)
              FROM recordings_fts
              WHERE recordings_fts MATCH ?

@@ -211,16 +211,8 @@ impl EntityStore for SqliteEntityStore {
 
     fn generate_entity_id(&self) -> Result<String> {
         let conn = self.conn.lock().unwrap();
-        let max_num: Option<i32> = conn
-            .query_row(
-                "SELECT MAX(CAST(SUBSTR(id, 5) AS INTEGER)) FROM entities WHERE id LIKE 'ent-%'",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?
-            .flatten();
-
-        Ok(format!("ent-{:04}", max_num.unwrap_or(0) + 1))
+        let next = crate::shared_db::next_sequence_val(&conn, "entity")?;
+        Ok(format!("ent-{next:04}"))
     }
 
     fn add_entity(&self, entity: &Entity) -> Result<()> {
@@ -272,7 +264,7 @@ impl EntityStore for SqliteEntityStore {
         // First try exact name match
         let query = match entity_type {
             Some(et) => {
-                let mut stmt = conn.prepare(
+                let mut stmt = conn.prepare_cached(
                     "SELECT id, name, type, aliases, description, created, updated,
                      mention_count, confidence, archived, metadata
                      FROM entities WHERE LOWER(name) = ? AND type = ? AND archived = 0",
@@ -281,7 +273,7 @@ impl EntityStore for SqliteEntityStore {
                     .optional()?
             }
             None => {
-                let mut stmt = conn.prepare(
+                let mut stmt = conn.prepare_cached(
                     "SELECT id, name, type, aliases, description, created, updated,
                      mention_count, confidence, archived, metadata
                      FROM entities WHERE LOWER(name) = ? AND archived = 0",
@@ -300,7 +292,7 @@ impl EntityStore for SqliteEntityStore {
             .map(|t| format!(" AND type = '{t}'"))
             .unwrap_or_default();
 
-        let mut stmt = conn.prepare(&format!(
+        let mut stmt = conn.prepare_cached(&format!(
             "SELECT id, name, type, aliases, description, created, updated,
              mention_count, confidence, archived, metadata
              FROM entities WHERE archived = 0{type_filter} AND aliases LIKE ?"
@@ -374,7 +366,7 @@ impl EntityStore for SqliteEntityStore {
             ),
         };
 
-        let mut stmt = conn.prepare(sql)?;
+        let mut stmt = conn.prepare_cached(sql)?;
         let entities: Vec<Entity> = if let Some(type_str) = type_param {
             stmt.query_map(params![type_str], Self::row_to_entity)?
                 .filter_map(|r| r.ok())
@@ -413,7 +405,7 @@ impl EntityStore for SqliteEntityStore {
             ),
         };
 
-        let mut stmt = conn.prepare(sql)?;
+        let mut stmt = conn.prepare_cached(sql)?;
         let entities: Vec<Entity> = if let Some(type_str) = type_param {
             stmt.query_map(
                 params![&search_pattern, &search_pattern, &search_pattern, type_str],
@@ -435,16 +427,8 @@ impl EntityStore for SqliteEntityStore {
 
     fn generate_relationship_id(&self) -> Result<String> {
         let conn = self.conn.lock().unwrap();
-        let max_num: Option<i32> = conn
-            .query_row(
-                "SELECT MAX(CAST(SUBSTR(id, 5) AS INTEGER)) FROM relationships WHERE id LIKE 'rel-%'",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?
-            .flatten();
-
-        Ok(format!("rel-{:04}", max_num.unwrap_or(0) + 1))
+        let next = crate::shared_db::next_sequence_val(&conn, "relationship")?;
+        Ok(format!("rel-{next:04}"))
     }
 
     fn add_relationship(&self, relationship: &Relationship) -> Result<()> {
@@ -570,7 +554,7 @@ impl EntityStore for SqliteEntityStore {
             ),
         };
 
-        let mut stmt = conn.prepare(sql)?;
+        let mut stmt = conn.prepare_cached(sql)?;
         let rels: Vec<Relationship> = if let Some(type_str) = type_param {
             stmt.query_map(params![type_str], Self::row_to_relationship)?
                 .filter_map(|r| r.ok())
@@ -586,7 +570,7 @@ impl EntityStore for SqliteEntityStore {
 
     fn get_entity_relationships(&self, entity_id: &str) -> Result<Vec<Relationship>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, source_id, target_id, type, created, valid_from, valid_until,
              weight, observation_count, description, source_entries
              FROM relationships WHERE source_id = ? OR target_id = ? ORDER BY weight DESC",
@@ -602,7 +586,7 @@ impl EntityStore for SqliteEntityStore {
 
     fn get_outgoing_relationships(&self, entity_id: &str) -> Result<Vec<Relationship>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, source_id, target_id, type, created, valid_from, valid_until,
              weight, observation_count, description, source_entries
              FROM relationships WHERE source_id = ? ORDER BY weight DESC",
@@ -618,7 +602,7 @@ impl EntityStore for SqliteEntityStore {
 
     fn get_incoming_relationships(&self, entity_id: &str) -> Result<Vec<Relationship>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, source_id, target_id, type, created, valid_from, valid_until,
              weight, observation_count, description, source_entries
              FROM relationships WHERE target_id = ? ORDER BY weight DESC",
@@ -652,7 +636,7 @@ impl EntityStore for SqliteEntityStore {
 
     fn get_entity_mentions(&self, entity_id: &str) -> Result<Vec<EntityMention>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT entity_id, entry_id, position, matched_text, confidence, created
              FROM entity_mentions WHERE entity_id = ? ORDER BY created DESC",
         )?;
@@ -667,7 +651,7 @@ impl EntityStore for SqliteEntityStore {
 
     fn get_entry_mentions(&self, entry_id: &str) -> Result<Vec<EntityMention>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT entity_id, entry_id, position, matched_text, confidence, created
              FROM entity_mentions WHERE entry_id = ? ORDER BY position",
         )?;
@@ -693,7 +677,7 @@ impl EntityStore for SqliteEntityStore {
         let conn = self.conn.lock().unwrap();
 
         // Get all relationships involving this entity
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT r.id, r.source_id, r.target_id, r.type, r.created, r.valid_from, r.valid_until,
                     r.weight, r.observation_count, r.description, r.source_entries,
                     e.id, e.name, e.type, e.aliases, e.description, e.created, e.updated,
@@ -740,7 +724,7 @@ impl EntityStore for SqliteEntityStore {
 
     fn get_entity_entries(&self, entity_id: &str, limit: usize) -> Result<Vec<String>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT DISTINCT entry_id FROM entity_mentions
              WHERE entity_id = ? ORDER BY created DESC LIMIT ?",
         )?;

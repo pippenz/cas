@@ -150,7 +150,7 @@ impl SqliteVerificationStore {
         conn: &Connection,
         verification_id: &str,
     ) -> Result<Vec<VerificationIssue>> {
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT file, line, severity, category, code, problem, suggestion
              FROM verification_issues WHERE verification_id = ?1
              ORDER BY id",
@@ -185,7 +185,7 @@ impl SqliteVerificationStore {
         )?;
 
         // Insert new issues
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "INSERT INTO verification_issues
              (verification_id, file, line, severity, category, code, problem, suggestion)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -250,7 +250,7 @@ pub fn save_verification_issues_with_conn(
         params![verification.id],
     )?;
 
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "INSERT INTO verification_issues
          (verification_id, file, line, severity, category, code, problem, suggestion)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -396,7 +396,7 @@ impl VerificationStore for SqliteVerificationStore {
     fn get_for_task(&self, task_id: &str) -> Result<Vec<Verification>> {
         let conn = self.conn.lock().map_err(lock_err)?;
 
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, task_id, agent_id, verification_type, status, confidence, summary,
                     files_reviewed, duration_ms, created_at
              FROM verifications WHERE task_id = ?1
@@ -473,7 +473,7 @@ impl VerificationStore for SqliteVerificationStore {
     fn list_recent(&self, limit: usize) -> Result<Vec<Verification>> {
         let conn = self.conn.lock().map_err(lock_err)?;
 
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, task_id, agent_id, verification_type, status, confidence, summary,
                     files_reviewed, duration_ms, created_at
              FROM verifications ORDER BY created_at DESC LIMIT ?1",
@@ -497,7 +497,7 @@ impl VerificationStore for SqliteVerificationStore {
     fn list_by_status(&self, status: VerificationStatus) -> Result<Vec<Verification>> {
         let conn = self.conn.lock().map_err(lock_err)?;
 
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, task_id, agent_id, verification_type, status, confidence, summary,
                     files_reviewed, duration_ms, created_at
              FROM verifications WHERE status = ?1

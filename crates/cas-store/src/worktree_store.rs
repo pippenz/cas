@@ -246,7 +246,7 @@ impl WorktreeStore for SqliteWorktreeStore {
 
     fn list(&self) -> Result<Vec<Worktree>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, epic_id, branch, parent_branch, path, status,
              created_at, merged_at, removed_at, created_by_agent, merge_commit
              FROM worktrees ORDER BY created_at DESC",
@@ -261,7 +261,7 @@ impl WorktreeStore for SqliteWorktreeStore {
 
     fn list_active(&self) -> Result<Vec<Worktree>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, epic_id, branch, parent_branch, path, status,
              created_at, merged_at, removed_at, created_by_agent, merge_commit
              FROM worktrees WHERE status = 'active' ORDER BY created_at DESC",
@@ -276,7 +276,7 @@ impl WorktreeStore for SqliteWorktreeStore {
 
     fn list_by_status(&self, status: WorktreeStatus) -> Result<Vec<Worktree>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, epic_id, branch, parent_branch, path, status,
              created_at, merged_at, removed_at, created_by_agent, merge_commit
              FROM worktrees WHERE status = ? ORDER BY created_at DESC",
