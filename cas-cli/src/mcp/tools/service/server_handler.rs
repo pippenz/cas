@@ -8,7 +8,7 @@ use rmcp::model::{
     ServerCapabilities, ServerInfo,
 };
 use rmcp::service::{RequestContext, RoleServer};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::mcp::server::CasCore;
 use crate::mcp::tools::service::CasService;
@@ -47,6 +47,7 @@ impl ServerHandler for CasService {
     {
         async move {
             let start = std::time::Instant::now();
+            info!(method = "resources/list", "MCP resources/list START");
             if let Ok(mut peer_guard) = self.inner.peer.write() {
                 if peer_guard.is_none() {
                     *peer_guard = Some(context.peer.clone());
@@ -54,7 +55,7 @@ impl ServerHandler for CasService {
             }
 
             let resources = self.inner.build_resources();
-            info!(method = "resources/list", count = resources.len(), elapsed_ms = start.elapsed().as_millis() as u64, "MCP request");
+            info!(method = "resources/list", count = resources.len(), elapsed_ms = start.elapsed().as_millis() as u64, "MCP resources/list DONE");
             Ok(ListResourcesResult {
                 resources,
                 next_cursor: None,
@@ -116,7 +117,10 @@ impl ServerHandler for CasService {
     ) -> impl std::future::Future<Output = Result<ListToolsResult, rmcp::ErrorData>> + Send + '_
     {
         async move {
+            let start = std::time::Instant::now();
+            info!(method = "tools/list", "MCP tools/list START");
             let tools = self.tool_router.list_all();
+            info!(method = "tools/list", count = tools.len(), elapsed_ms = start.elapsed().as_millis() as u64, "MCP tools/list DONE");
 
             Ok(ListToolsResult {
                 tools,
@@ -136,12 +140,37 @@ impl ServerHandler for CasService {
         async move {
             let start = std::time::Instant::now();
             let tool_name = request.name.clone();
+            let request_id = format!("{}", context.id);
+            info!(method = "tools/call", tool = %tool_name, id = %request_id, "MCP call_tool START");
             let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-            let result = self.tool_router.call(tcc).await;
-            let elapsed = start.elapsed();
-            if elapsed.as_secs() >= 5 {
-                info!(method = "tools/call", tool = %tool_name, elapsed_ms = elapsed.as_millis() as u64, "MCP slow request");
-            }
+
+            // Timeout after 55s to prevent silent hangs (Claude Code cancels at 60s)
+            let result = match tokio::time::timeout(
+                std::time::Duration::from_secs(55),
+                self.tool_router.call(tcc),
+            )
+            .await
+            {
+                Ok(result) => {
+                    let elapsed = start.elapsed();
+                    if elapsed.as_secs() >= 5 {
+                        info!(method = "tools/call", tool = %tool_name, id = %request_id, elapsed_ms = elapsed.as_millis() as u64, "MCP slow request");
+                    }
+                    result
+                }
+                Err(_) => {
+                    warn!(method = "tools/call", tool = %tool_name, id = %request_id, "MCP tool call TIMED OUT after 55s — handler hung");
+                    Err(rmcp::ErrorData {
+                        code: rmcp::model::ErrorCode::INTERNAL_ERROR,
+                        message: format!(
+                            "Tool '{}' timed out after 55s. This is a CAS server bug — please report it.",
+                            tool_name
+                        ).into(),
+                        data: None,
+                    })
+                }
+            };
+
             result
         }
     }
