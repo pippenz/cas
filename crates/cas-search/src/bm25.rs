@@ -76,6 +76,8 @@ pub struct Bm25Index {
     // Cached IndexWriter — avoids allocating 50MB per write operation.
     // Also serializes write operations (only one writer can exist at a time).
     cached_writer: Mutex<Option<IndexWriter>>,
+    // Cached QueryParser — avoids rebuilding per search call
+    cached_query_parser: Mutex<Option<QueryParser>>,
 }
 
 impl Bm25Index {
@@ -108,6 +110,7 @@ impl Bm25Index {
             index_dir: Some(index_dir.to_path_buf()),
             cached_reader: RwLock::new(None),
             cached_writer: Mutex::new(None),
+            cached_query_parser: Mutex::new(None),
         })
     }
 
@@ -133,6 +136,7 @@ impl Bm25Index {
             index_dir: None,
             cached_reader: RwLock::new(None),
             cached_writer: Mutex::new(None),
+            cached_query_parser: Mutex::new(None),
         })
     }
 
@@ -238,6 +242,44 @@ impl Bm25Index {
     /// Invalidate the cached writer (e.g., after rebuild_atomic swaps the index).
     fn invalidate_writer(&self) {
         if let Ok(mut guard) = self.cached_writer.lock() {
+            *guard = None;
+        }
+    }
+
+    /// Get a cached QueryParser, creating one if needed.
+    fn query_parser(&self) -> Result<QueryParser> {
+        {
+            let guard = self
+                .cached_query_parser
+                .lock()
+                .map_err(|_| SearchError::Index("QueryParser lock poisoned".to_string()))?;
+            if let Some(parser) = guard.as_ref() {
+                return Ok(parser.clone());
+            }
+        }
+        // Create and cache
+        let index = self
+            .index
+            .lock()
+            .map_err(|_| SearchError::Index("Index lock poisoned".to_string()))?
+            .clone();
+        let parser = QueryParser::for_index(
+            &index,
+            vec![self.content_field, self.title_field, self.tags_field],
+        );
+        let mut guard = self
+            .cached_query_parser
+            .lock()
+            .map_err(|_| SearchError::Index("QueryParser lock poisoned".to_string()))?;
+        if guard.is_none() {
+            *guard = Some(parser.clone());
+        }
+        Ok(guard.as_ref().unwrap().clone())
+    }
+
+    /// Invalidate the cached QueryParser (e.g., after rebuild_atomic swaps the index).
+    fn invalidate_query_parser(&self) {
+        if let Ok(mut guard) = self.cached_query_parser.lock() {
             *guard = None;
         }
     }
@@ -415,6 +457,7 @@ impl Bm25Index {
         }
 
         self.invalidate_writer();
+        self.invalidate_query_parser();
         self.invalidate_reader();
         Ok(count)
     }
@@ -453,18 +496,8 @@ impl Bm25Index {
         let reader = self.reader()?;
         let searcher = reader.searcher();
 
-        // Build full-text query. Clone Index (cheap, Arc-backed) so we don't
-        // hold the Mutex during query parsing.
-        let index = self
-            .index
-            .lock()
-            .map_err(|_| SearchError::Index("Index lock poisoned".to_string()))?
-            .clone();
-        let query_parser = QueryParser::for_index(
-            &index,
-            vec![self.content_field, self.title_field, self.tags_field],
-        );
-
+        // Build full-text query using cached QueryParser
+        let query_parser = self.query_parser()?;
         let text_query = query_parser
             .parse_query(query)
             .map_err(|e| SearchError::Query(e.to_string()))?;
