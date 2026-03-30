@@ -2,7 +2,6 @@
 
 use chrono::{DateTime, TimeZone, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
-use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -278,32 +277,27 @@ impl SqliteTaskStore {
         Self::validate_task_exists_with_conn(conn, &dep.to_id)?;
 
         // Cycle checks only apply to "blocks" edges.
+        // Uses a single recursive CTE instead of iterative BFS with N queries.
         if check_cycle && dep.dep_type == DependencyType::Blocks {
-            let mut visited = HashSet::new();
-            let mut stack = vec![dep.to_id.clone()];
-
-            while let Some(current) = stack.pop() {
-                if current == dep.from_id {
-                    return Err(StoreError::Parse(format!(
-                        "adding dependency {} -> {} would create a cycle",
-                        dep.from_id, dep.to_id
-                    )));
-                }
-                if visited.contains(&current) {
-                    continue;
-                }
-                visited.insert(current.clone());
-
-                let mut stmt = conn.prepare_cached(
-                    "SELECT to_id FROM dependencies
-                     WHERE from_id = ? AND dep_type = 'blocks'",
+            let would_cycle: bool = conn
+                .query_row(
+                    "WITH RECURSIVE reachable(node) AS (
+                         SELECT ?1
+                         UNION
+                         SELECT d.to_id FROM dependencies d
+                         JOIN reachable r ON d.from_id = r.node
+                         WHERE d.dep_type = 'blocks'
+                     )
+                     SELECT COUNT(*) FROM reachable WHERE node = ?2",
+                    params![&dep.to_id, &dep.from_id],
+                    |row| Ok(row.get::<_, i64>(0)? > 0),
                 )?;
-                let next_ids = stmt
-                    .query_map(params![current], |row| row.get::<_, String>(0))?
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-                for next in next_ids {
-                    stack.push(next);
-                }
+
+            if would_cycle {
+                return Err(StoreError::Parse(format!(
+                    "adding dependency {} -> {} would create a cycle",
+                    dep.from_id, dep.to_id
+                )));
             }
         }
 
