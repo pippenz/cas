@@ -645,15 +645,19 @@ fn get_git_changes(repo_path: &Path) -> Vec<FileChangeInfo> {
 /// Parse git diff --numstat output
 fn parse_diff_numstat(output: &str, line_counts: &mut HashMap<String, (usize, usize)>) {
     for line in output.lines() {
-        let parts: Vec<&str> = line.split('\t').collect();
-        if parts.len() >= 3 {
-            let added = parts[0].parse().unwrap_or(0);
-            let removed = parts[1].parse().unwrap_or(0);
-            let file = parts[2].to_string();
-            let entry = line_counts.entry(file).or_insert((0, 0));
-            entry.0 += added;
-            entry.1 += removed;
-        }
+        let mut parts = line.splitn(3, '\t');
+        let (Some(added_s), Some(removed_s), Some(file_s)) =
+            (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        let added = added_s.parse().unwrap_or(0);
+        let removed = removed_s.parse().unwrap_or(0);
+        let entry = line_counts
+            .entry(file_s.to_string())
+            .or_insert((0, 0));
+        entry.0 += added;
+        entry.1 += removed;
     }
 }
 

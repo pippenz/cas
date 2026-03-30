@@ -378,13 +378,13 @@ impl Pty {
 
         if is_codex {
             let writer = Arc::clone(&writer);
-            std::thread::spawn(move || {
+            tokio::spawn(async move {
                 for _ in 0..10 {
-                    let mut locked = writer.blocking_lock();
+                    let mut locked = writer.lock().await;
                     let _ = locked.write_all(b"\x1b[1;1R");
                     let _ = locked.flush();
                     drop(locked);
-                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 }
             });
         }
