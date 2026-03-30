@@ -250,6 +250,57 @@ pub fn handle_pre_tool_use(
     }
 
     // ========================================================================
+    // SUPERVISOR TASK-VERIFIER UNJAIL
+    //
+    // Supervisors are exempt from verification jail (above), but when they
+    // spawn task-verifier for their own tasks (or a worker's task), we still
+    // need to write the unjail marker so the task-verifier subagent (running
+    // in supervisor context) can record verification via cas_verification_add.
+    // We also clear pending_verification so the task isn't stuck.
+    // ========================================================================
+    if is_supervisor && tool_name == "Task" {
+        let is_task_verifier = input
+            .tool_input
+            .as_ref()
+            .and_then(|ti| ti.get("subagent_type").and_then(|v| v.as_str()))
+            == Some("task-verifier");
+
+        if is_task_verifier {
+            let marker_path = cas_root.join(".verifier_unjail_marker");
+            let marker_content = format!(
+                "session={}\ntimestamp={}",
+                current_agent_id,
+                chrono::Utc::now()
+            );
+            let _ = std::fs::write(&marker_path, &marker_content);
+
+            // Clear pending_verification for tasks assigned to this supervisor
+            if let Ok(task_store) = open_task_store(cas_root) {
+                if let Ok(tasks) = task_store.list_pending_verification() {
+                    for task in &tasks {
+                        let is_owned = task
+                            .assignee
+                            .as_deref()
+                            .map(|a| a == current_agent_id)
+                            .unwrap_or(false)
+                            || agent_task_ids.contains(&task.id);
+                        if is_owned {
+                            let mut task_to_update = task.clone();
+                            task_to_update.pending_verification = false;
+                            task_to_update.updated_at = chrono::Utc::now();
+                            let _ = task_store.update(&task_to_update);
+                        }
+                    }
+                }
+            }
+
+            info!(
+                "[VERIFICATION] Supervisor spawning task-verifier — wrote unjail marker and cleared pending_verification"
+            );
+        }
+    }
+
+    // ========================================================================
     // WORKTREE MERGE JAIL: Block all tools except worktree-merger when pending
     //
     // When a task has pending_worktree_merge=true, block all tools except:

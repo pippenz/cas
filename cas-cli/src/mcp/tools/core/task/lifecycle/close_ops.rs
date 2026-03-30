@@ -238,9 +238,17 @@ impl CasCore {
                             let _ = crate::mcp::socket::send_event(&self.cas_root, &event);
                         }
 
-                        let verification_gate = if is_factory_worker || supervisor_is_assignee {
+                        let verification_gate = if is_factory_worker {
                             "Factory worker flow: verification is pending. Continue with other assigned tasks while waiting."
                                 .to_string()
+                        } else if supervisor_is_assignee {
+                            format!(
+                                "You implemented this task yourself. Spawn a task-verifier to review your work:\n\n\
+                                 Task(subagent_type=\"{}\", prompt=\"Verify task {}\")\n\n\
+                                 Or record verification directly:\n\
+                                 mcp__cas__verification action=add task_id={} status=approved summary=\"Self-verified: <reason>\"",
+                                verifier_agent, req.id, req.id
+                            )
                         } else {
                             format!(
                                 "🔒 VERIFICATION JAIL ACTIVE: You cannot use other tools until you verify this task.\n\n\
