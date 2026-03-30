@@ -75,6 +75,8 @@ pub struct Bm25Index {
     write_lock: RwLock<()>,
     // Cached IndexReader (auto-reloads on commit via ReloadPolicy)
     cached_reader: RwLock<Option<IndexReader>>,
+    // Cached IndexWriter — avoids allocating 50MB per write operation
+    cached_writer: std::sync::Mutex<Option<IndexWriter>>,
 }
 
 impl Bm25Index {
@@ -107,6 +109,7 @@ impl Bm25Index {
             index_dir: Some(index_dir.to_path_buf()),
             write_lock: RwLock::new(()),
             cached_reader: RwLock::new(None),
+            cached_writer: std::sync::Mutex::new(None),
         })
     }
 
@@ -132,6 +135,7 @@ impl Bm25Index {
             index_dir: None,
             write_lock: RwLock::new(()),
             cached_reader: RwLock::new(None),
+            cached_writer: std::sync::Mutex::new(None),
         })
     }
 
@@ -202,8 +206,19 @@ impl Bm25Index {
         builder.build()
     }
 
-    /// Get an index writer
-    fn writer(&self) -> Result<IndexWriter> {
+    /// Get a cached index writer, creating one if needed.
+    ///
+    /// Must be called while holding `write_lock`. The writer is taken from the
+    /// cache; callers must call `return_writer()` after committing to put it back.
+    fn take_writer(&self) -> Result<IndexWriter> {
+        let mut guard = self
+            .cached_writer
+            .lock()
+            .map_err(|_| SearchError::Index("Writer lock poisoned".to_string()))?;
+        if let Some(writer) = guard.take() {
+            return Ok(writer);
+        }
+        drop(guard);
         let index = self
             .index
             .read()
@@ -211,6 +226,20 @@ impl Bm25Index {
         index
             .writer(self.config.writer_memory)
             .map_err(|e| SearchError::Index(e.to_string()))
+    }
+
+    /// Return a writer to the cache for reuse.
+    fn return_writer(&self, writer: IndexWriter) {
+        if let Ok(mut guard) = self.cached_writer.lock() {
+            *guard = Some(writer);
+        }
+    }
+
+    /// Invalidate the cached writer (e.g., after rebuild_atomic swaps the index).
+    fn invalidate_writer(&self) {
+        if let Ok(mut guard) = self.cached_writer.lock() {
+            *guard = None;
+        }
     }
 
     /// Index a batch of documents efficiently
@@ -226,7 +255,7 @@ impl Bm25Index {
             .write()
             .map_err(|_| SearchError::Index("Failed to acquire write lock".to_string()))?;
 
-        let mut writer = self.writer()?;
+        let mut writer = self.take_writer()?;
         let mut count = 0;
 
         for doc in docs {
@@ -254,6 +283,7 @@ impl Bm25Index {
         writer
             .commit()
             .map_err(|e| SearchError::Index(e.to_string()))?;
+        self.return_writer(writer);
 
         self.invalidate_reader();
         Ok(count)
@@ -266,7 +296,7 @@ impl Bm25Index {
             .write()
             .map_err(|_| SearchError::Index("Failed to acquire write lock".to_string()))?;
 
-        let mut writer = self.writer()?;
+        let mut writer = self.take_writer()?;
         let mut count = 0;
 
         for doc_id in doc_ids {
@@ -278,6 +308,7 @@ impl Bm25Index {
         writer
             .commit()
             .map_err(|e| SearchError::Index(e.to_string()))?;
+        self.return_writer(writer);
 
         self.invalidate_reader();
         Ok(count)
@@ -301,17 +332,15 @@ impl Bm25Index {
 
         // For in-memory indexes, just clear and rebuild
         if self.index_dir.is_none() {
-            let mut writer = self.writer()?;
+            let mut writer = self.take_writer()?;
             writer
                 .delete_all_documents()
                 .map_err(|e| SearchError::Index(e.to_string()))?;
             writer
                 .commit()
                 .map_err(|e| SearchError::Index(e.to_string()))?;
-            drop(writer);
 
-            // Re-index documents
-            let mut writer = self.writer()?;
+            // Re-index documents using the same writer
             let mut count = 0;
 
             for doc in docs {
@@ -334,6 +363,7 @@ impl Bm25Index {
             writer
                 .commit()
                 .map_err(|e| SearchError::Index(e.to_string()))?;
+            self.return_writer(writer);
 
             self.invalidate_reader();
             return Ok(count);
@@ -399,6 +429,7 @@ impl Bm25Index {
             *guard = new_index;
         }
 
+        self.invalidate_writer();
         self.invalidate_reader();
         Ok(count)
     }
@@ -520,7 +551,7 @@ impl TextIndex for Bm25Index {
             .write()
             .map_err(|_| SearchError::Index("Failed to acquire write lock".to_string()))?;
 
-        let mut writer = self.writer()?;
+        let mut writer = self.take_writer()?;
 
         // Delete existing document with same ID
         let id_term = Term::from_field_text(self.id_field, doc.doc_id());
@@ -543,6 +574,7 @@ impl TextIndex for Bm25Index {
         writer
             .commit()
             .map_err(|e| SearchError::Index(e.to_string()))?;
+        self.return_writer(writer);
 
         self.invalidate_reader();
         Ok(())
@@ -554,12 +586,13 @@ impl TextIndex for Bm25Index {
             .write()
             .map_err(|_| SearchError::Index("Failed to acquire write lock".to_string()))?;
 
-        let mut writer = self.writer()?;
+        let mut writer = self.take_writer()?;
         let id_term = Term::from_field_text(self.id_field, doc_id);
         writer.delete_term(id_term);
         writer
             .commit()
             .map_err(|e| SearchError::Index(e.to_string()))?;
+        self.return_writer(writer);
 
         self.invalidate_reader();
         Ok(())
