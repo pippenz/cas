@@ -26,7 +26,7 @@
 //! ```
 
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 
 use tantivy::collector::TopDocs;
 use tantivy::query::{BooleanQuery, Occur, QueryParser, TermQuery};
@@ -59,7 +59,7 @@ impl Default for Bm25Config {
 /// This index is generic over any document type implementing [`SearchDocument`].
 /// It stores documents with their content, type, tags, and metadata for filtering.
 pub struct Bm25Index {
-    index: RwLock<Index>,
+    index: Mutex<Index>,
     schema: Schema,
     // Fields
     id_field: Field,
@@ -71,12 +71,11 @@ pub struct Bm25Index {
     config: Bm25Config,
     // Index directory (None for in-memory)
     index_dir: Option<PathBuf>,
-    // Write lock for thread safety
-    write_lock: RwLock<()>,
     // Cached IndexReader (auto-reloads on commit via ReloadPolicy)
     cached_reader: RwLock<Option<IndexReader>>,
-    // Cached IndexWriter — avoids allocating 50MB per write operation
-    cached_writer: std::sync::Mutex<Option<IndexWriter>>,
+    // Cached IndexWriter — avoids allocating 50MB per write operation.
+    // Also serializes write operations (only one writer can exist at a time).
+    cached_writer: Mutex<Option<IndexWriter>>,
 }
 
 impl Bm25Index {
@@ -104,12 +103,11 @@ impl Bm25Index {
             title_field: schema.get_field("title").unwrap(),
             doc_type_field: schema.get_field("doc_type").unwrap(),
             tags_field: schema.get_field("tags").unwrap(),
-            index: RwLock::new(index),
+            index: Mutex::new(index),
             config,
             index_dir: Some(index_dir.to_path_buf()),
-            write_lock: RwLock::new(()),
             cached_reader: RwLock::new(None),
-            cached_writer: std::sync::Mutex::new(None),
+            cached_writer: Mutex::new(None),
         })
     }
 
@@ -130,12 +128,11 @@ impl Bm25Index {
             title_field: schema.get_field("title").unwrap(),
             doc_type_field: schema.get_field("doc_type").unwrap(),
             tags_field: schema.get_field("tags").unwrap(),
-            index: RwLock::new(index),
+            index: Mutex::new(index),
             config,
             index_dir: None,
-            write_lock: RwLock::new(()),
             cached_reader: RwLock::new(None),
-            cached_writer: std::sync::Mutex::new(None),
+            cached_writer: Mutex::new(None),
         })
     }
 
@@ -154,17 +151,18 @@ impl Bm25Index {
                 return Ok(reader.clone());
             }
         }
-        // Slow path: create and cache
-        let index_guard = self
+        // Slow path: create and cache. Clone the Index (cheap, Arc-backed) to
+        // release the Mutex before the potentially slow reader construction.
+        let index_clone = self
             .index
-            .read()
-            .map_err(|_| SearchError::Index("Index lock poisoned".to_string()))?;
-        let reader: IndexReader = index_guard
+            .lock()
+            .map_err(|_| SearchError::Index("Index lock poisoned".to_string()))?
+            .clone();
+        let reader: IndexReader = index_clone
             .reader_builder()
             .reload_policy(ReloadPolicy::OnCommitWithDelay)
             .try_into()
             .map_err(|e: tantivy::TantivyError| SearchError::Index(e.to_string()))?;
-        drop(index_guard);
         let mut guard = self
             .cached_reader
             .write()
@@ -208,8 +206,9 @@ impl Bm25Index {
 
     /// Get a cached index writer, creating one if needed.
     ///
-    /// Must be called while holding `write_lock`. The writer is taken from the
-    /// cache; callers must call `return_writer()` after committing to put it back.
+    /// The writer is taken from the cache; callers must call `return_writer()`
+    /// after committing to put it back. The `cached_writer` Mutex serializes
+    /// concurrent write attempts.
     fn take_writer(&self) -> Result<IndexWriter> {
         let mut guard = self
             .cached_writer
@@ -221,8 +220,9 @@ impl Bm25Index {
         drop(guard);
         let index = self
             .index
-            .read()
-            .map_err(|_| SearchError::Index("Index lock poisoned".to_string()))?;
+            .lock()
+            .map_err(|_| SearchError::Index("Index lock poisoned".to_string()))?
+            .clone();
         index
             .writer(self.config.writer_memory)
             .map_err(|e| SearchError::Index(e.to_string()))
@@ -250,11 +250,6 @@ impl Bm25Index {
         &self,
         docs: impl IntoIterator<Item = &'a dyn SearchDocument>,
     ) -> Result<usize> {
-        let _lock = self
-            .write_lock
-            .write()
-            .map_err(|_| SearchError::Index("Failed to acquire write lock".to_string()))?;
-
         let mut writer = self.take_writer()?;
         let mut count = 0;
 
@@ -291,11 +286,6 @@ impl Bm25Index {
 
     /// Delete multiple documents by ID efficiently
     pub fn delete_batch<'a>(&self, doc_ids: impl IntoIterator<Item = &'a str>) -> Result<usize> {
-        let _lock = self
-            .write_lock
-            .write()
-            .map_err(|_| SearchError::Index("Failed to acquire write lock".to_string()))?;
-
         let mut writer = self.take_writer()?;
         let mut count = 0;
 
@@ -325,11 +315,6 @@ impl Bm25Index {
         &self,
         docs: impl IntoIterator<Item = &'a dyn SearchDocument>,
     ) -> Result<usize> {
-        let _lock = self
-            .write_lock
-            .write()
-            .map_err(|_| SearchError::Index("Failed to acquire write lock".to_string()))?;
-
         // For in-memory indexes, just clear and rebuild
         if self.index_dir.is_none() {
             let mut writer = self.take_writer()?;
@@ -425,7 +410,7 @@ impl Bm25Index {
         // Reopen the Index from the new directory so subsequent reads use fresh data
         let new_index = Index::open_in_dir(index_dir)
             .map_err(|e| SearchError::Index(e.to_string()))?;
-        if let Ok(mut guard) = self.index.write() {
+        if let Ok(mut guard) = self.index.lock() {
             *guard = new_index;
         }
 
@@ -468,11 +453,13 @@ impl Bm25Index {
         let reader = self.reader()?;
         let searcher = reader.searcher();
 
-        // Build full-text query
+        // Build full-text query. Clone Index (cheap, Arc-backed) so we don't
+        // hold the Mutex during query parsing.
         let index = self
             .index
-            .read()
-            .map_err(|_| SearchError::Index("Index lock poisoned".to_string()))?;
+            .lock()
+            .map_err(|_| SearchError::Index("Index lock poisoned".to_string()))?
+            .clone();
         let query_parser = QueryParser::for_index(
             &index,
             vec![self.content_field, self.title_field, self.tags_field],
@@ -546,11 +533,6 @@ impl Bm25Index {
 
 impl TextIndex for Bm25Index {
     fn index(&self, doc: &dyn SearchDocument) -> Result<()> {
-        let _lock = self
-            .write_lock
-            .write()
-            .map_err(|_| SearchError::Index("Failed to acquire write lock".to_string()))?;
-
         let mut writer = self.take_writer()?;
 
         // Delete existing document with same ID
@@ -581,11 +563,6 @@ impl TextIndex for Bm25Index {
     }
 
     fn remove(&self, doc_id: &str) -> Result<()> {
-        let _lock = self
-            .write_lock
-            .write()
-            .map_err(|_| SearchError::Index("Failed to acquire write lock".to_string()))?;
-
         let mut writer = self.take_writer()?;
         let id_term = Term::from_field_text(self.id_field, doc_id);
         writer.delete_term(id_term);
