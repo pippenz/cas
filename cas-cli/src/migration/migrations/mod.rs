@@ -163,6 +163,7 @@ mod m185_skills_idx_team_id;
 mod m186_tasks_idx_team_id;
 mod m187_tasks_idx_assignee;
 mod m188_id_sequences_create_table;
+mod m189_events_friction_type_index;
 
 /// All migrations in order. IDs must be sequential and never reused.
 pub const MIGRATIONS: &[Migration] = &[
@@ -316,6 +317,8 @@ pub const MIGRATIONS: &[Migration] = &[
     m187_tasks_idx_assignee::MIGRATION,
     // ID sequences
     m188_id_sequences_create_table::MIGRATION,
+    // Events friction_type index
+    m189_events_friction_type_index::MIGRATION,
 ];
 
 #[cfg(test)]

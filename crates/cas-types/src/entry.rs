@@ -55,11 +55,14 @@ impl FromStr for BeliefType {
     type Err = TypeError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "fact" | "factual" | "objective" => Ok(BeliefType::Fact),
-            "opinion" | "subjective" | "belief" => Ok(BeliefType::Opinion),
-            "hypothesis" | "tentative" | "speculation" => Ok(BeliefType::Hypothesis),
-            _ => Err(TypeError::Parse(format!("Invalid belief type: {s}"))),
+        if s.eq_ignore_ascii_case("fact") || s.eq_ignore_ascii_case("factual") || s.eq_ignore_ascii_case("objective") {
+            Ok(BeliefType::Fact)
+        } else if s.eq_ignore_ascii_case("opinion") || s.eq_ignore_ascii_case("subjective") || s.eq_ignore_ascii_case("belief") {
+            Ok(BeliefType::Opinion)
+        } else if s.eq_ignore_ascii_case("hypothesis") || s.eq_ignore_ascii_case("tentative") || s.eq_ignore_ascii_case("speculation") {
+            Ok(BeliefType::Hypothesis)
+        } else {
+            Err(TypeError::Parse(format!("Invalid belief type: {s}")))
         }
     }
 }
@@ -115,20 +118,18 @@ impl FromStr for ObservationType {
     type Err = TypeError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "general" => Ok(ObservationType::General),
-            "decision" => Ok(ObservationType::Decision),
-            "bugfix" | "bug" => Ok(ObservationType::Bugfix),
-            "feature" => Ok(ObservationType::Feature),
-            "refactor" => Ok(ObservationType::Refactor),
-            "discovery" => Ok(ObservationType::Discovery),
-            "change" => Ok(ObservationType::Change),
-            "preference" => Ok(ObservationType::Preference),
-            "pattern" => Ok(ObservationType::Pattern),
-            "test" => Ok(ObservationType::Test),
-            "config" => Ok(ObservationType::Config),
-            _ => Err(TypeError::Parse(format!("Invalid observation type: {s}"))),
-        }
+        if s.eq_ignore_ascii_case("general") { Ok(ObservationType::General) }
+        else if s.eq_ignore_ascii_case("decision") { Ok(ObservationType::Decision) }
+        else if s.eq_ignore_ascii_case("bugfix") || s.eq_ignore_ascii_case("bug") { Ok(ObservationType::Bugfix) }
+        else if s.eq_ignore_ascii_case("feature") { Ok(ObservationType::Feature) }
+        else if s.eq_ignore_ascii_case("refactor") { Ok(ObservationType::Refactor) }
+        else if s.eq_ignore_ascii_case("discovery") { Ok(ObservationType::Discovery) }
+        else if s.eq_ignore_ascii_case("change") { Ok(ObservationType::Change) }
+        else if s.eq_ignore_ascii_case("preference") { Ok(ObservationType::Preference) }
+        else if s.eq_ignore_ascii_case("pattern") { Ok(ObservationType::Pattern) }
+        else if s.eq_ignore_ascii_case("test") { Ok(ObservationType::Test) }
+        else if s.eq_ignore_ascii_case("config") { Ok(ObservationType::Config) }
+        else { Err(TypeError::Parse(format!("Invalid observation type: {s}"))) }
     }
 }
 
@@ -147,13 +148,11 @@ impl FromStr for EntryType {
     type Err = TypeError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "learning" => Ok(EntryType::Learning),
-            "preference" => Ok(EntryType::Preference),
-            "context" => Ok(EntryType::Context),
-            "observation" => Ok(EntryType::Observation),
-            _ => Err(TypeError::InvalidEntryType(s.to_string())),
-        }
+        if s.eq_ignore_ascii_case("learning") { Ok(EntryType::Learning) }
+        else if s.eq_ignore_ascii_case("preference") { Ok(EntryType::Preference) }
+        else if s.eq_ignore_ascii_case("context") { Ok(EntryType::Context) }
+        else if s.eq_ignore_ascii_case("observation") { Ok(EntryType::Observation) }
+        else { Err(TypeError::InvalidEntryType(s.to_string())) }
     }
 }
 
@@ -201,14 +200,21 @@ impl FromStr for MemoryTier {
     type Err = TypeError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "in-context" | "in_context" | "incontext" | "pinned" | "core" => {
-                Ok(MemoryTier::InContext)
-            }
-            "working" | "hot" | "active" => Ok(MemoryTier::Working),
-            "cold" | "warm" => Ok(MemoryTier::Cold),
-            "archive" | "archived" => Ok(MemoryTier::Archive),
-            _ => Err(TypeError::Parse(format!("Invalid memory tier: {s}"))),
+        if s.eq_ignore_ascii_case("in-context") || s.eq_ignore_ascii_case("in_context")
+            || s.eq_ignore_ascii_case("incontext") || s.eq_ignore_ascii_case("pinned")
+            || s.eq_ignore_ascii_case("core")
+        {
+            Ok(MemoryTier::InContext)
+        } else if s.eq_ignore_ascii_case("working") || s.eq_ignore_ascii_case("hot")
+            || s.eq_ignore_ascii_case("active")
+        {
+            Ok(MemoryTier::Working)
+        } else if s.eq_ignore_ascii_case("cold") || s.eq_ignore_ascii_case("warm") {
+            Ok(MemoryTier::Cold)
+        } else if s.eq_ignore_ascii_case("archive") || s.eq_ignore_ascii_case("archived") {
+            Ok(MemoryTier::Archive)
+        } else {
+            Err(TypeError::Parse(format!("Invalid memory tier: {s}")))
         }
     }
 }

@@ -307,40 +307,46 @@ impl Mux {
 
     /// Focus the next pane
     pub fn focus_next(&mut self) {
-        let ids: Vec<_> = self.panes.keys().cloned().collect();
-        if ids.is_empty() {
+        let len = self.panes.len();
+        if len == 0 {
             return;
         }
 
         let current_idx = self
             .focused
             .as_ref()
-            .and_then(|f| ids.iter().position(|id| id == f))
+            .and_then(|f| self.panes.get_index_of(f))
             .unwrap_or(0);
 
-        let next_idx = (current_idx + 1) % ids.len();
-        self.focus(&ids[next_idx]);
+        let next_idx = (current_idx + 1) % len;
+        if let Some((id, _)) = self.panes.get_index(next_idx) {
+            let id = id.clone();
+            self.focus(&id);
+        }
     }
 
     /// Focus the previous pane
     pub fn focus_prev(&mut self) {
-        let ids: Vec<_> = self.panes.keys().cloned().collect();
-        if ids.is_empty() {
+        let len = self.panes.len();
+        if len == 0 {
             return;
         }
 
         let current_idx = self
             .focused
             .as_ref()
-            .and_then(|f| ids.iter().position(|id| id == f))
+            .and_then(|f| self.panes.get_index_of(f))
             .unwrap_or(0);
 
         let prev_idx = if current_idx == 0 {
-            ids.len() - 1
+            len - 1
         } else {
             current_idx - 1
         };
-        self.focus(&ids[prev_idx]);
+        if let Some((id, _)) = self.panes.get_index(prev_idx) {
+            let id = id.clone();
+            self.focus(&id);
+        }
     }
 
     /// Get all pane IDs

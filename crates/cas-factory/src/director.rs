@@ -214,37 +214,29 @@ impl DirectorData {
             }
         };
 
-        // Filter and convert tasks
-        let ready_tasks: Vec<TaskSummary> = tasks
-            .iter()
-            .filter(|t| {
-                (t.status == TaskStatus::Open || t.status == TaskStatus::Blocked)
-                    && t.task_type != TaskType::Epic
-            })
-            .map(to_summary)
-            .collect();
-
-        let in_progress_tasks: Vec<TaskSummary> = tasks
-            .iter()
-            .filter(|t| t.status == TaskStatus::InProgress && t.task_type != TaskType::Epic)
-            .map(to_summary)
-            .collect();
-
-        // Epic tasks (for tracking epic lifecycle)
-        let epic_tasks: Vec<TaskSummary> = tasks
-            .iter()
-            .filter(|t| t.task_type == TaskType::Epic)
-            .map(to_summary)
-            .collect();
-
-        // Count closed subtasks per epic
+        // Single pass: partition tasks into ready, in_progress, epic, and count closed per epic
+        let mut ready_tasks: Vec<TaskSummary> = Vec::new();
+        let mut in_progress_tasks: Vec<TaskSummary> = Vec::new();
+        let mut epic_tasks: Vec<TaskSummary> = Vec::new();
         let mut epic_closed_counts: HashMap<String, usize> = HashMap::new();
+
         for task in &tasks {
-            if task.status == TaskStatus::Closed
-                && task.task_type != TaskType::Epic
-                && let Some(epic_id) = child_to_epic.get(&task.id)
-            {
-                *epic_closed_counts.entry(epic_id.clone()).or_insert(0) += 1;
+            if task.task_type == TaskType::Epic {
+                epic_tasks.push(to_summary(task));
+            } else {
+                match task.status {
+                    TaskStatus::Open | TaskStatus::Blocked => {
+                        ready_tasks.push(to_summary(task));
+                    }
+                    TaskStatus::InProgress => {
+                        in_progress_tasks.push(to_summary(task));
+                    }
+                    TaskStatus::Closed => {
+                        if let Some(epic_id) = child_to_epic.get(&task.id) {
+                            *epic_closed_counts.entry(epic_id.clone()).or_insert(0) += 1;
+                        }
+                    }
+                }
             }
         }
 

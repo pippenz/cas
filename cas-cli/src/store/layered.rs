@@ -121,10 +121,12 @@ impl LayeredEntryStore {
             ScopeFilter::All => {
                 let mut entries = self.global.list()?;
                 if let Some(ref project) = self.project {
-                    entries.extend(project.list()?);
+                    let project_entries = project.list()?;
+                    entries.reserve(project_entries.len());
+                    entries.extend(project_entries);
                 }
                 // Sort by creation date descending
-                entries.sort_by(|a, b| b.created.cmp(&a.created));
+                entries.sort_unstable_by(|a, b| b.created.cmp(&a.created));
                 Ok(entries)
             }
         }
