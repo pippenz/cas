@@ -216,29 +216,30 @@ impl SqliteAgentStore {
         )?;
 
             if rows == 0 {
-                // Check if the agent exists but is in a terminal state
+                // Use a single query to check existence and get status,
+                // providing a specific error message without a second round-trip.
+                // We already know the UPDATE didn't match, so the agent either
+                // doesn't exist or is in a non-live state.
                 let status: Option<String> = conn
                     .query_row(
                         "SELECT status FROM agents WHERE id = ?",
                         params![id],
                         |row| row.get(0),
                     )
-                    .ok();
+                    .optional()?;
                 match status {
                     Some(s) if s == "shutdown" || s == "stale" => {
                         return Err(StoreError::Other(format!(
                             "Agent {id} is {s} — heartbeat ignored"
                         )));
                     }
+                    Some(s) => {
+                        return Err(StoreError::Other(format!(
+                            "Agent {id} has unexpected status '{s}'"
+                        )));
+                    }
                     None => {
                         return Err(StoreError::NotFound(format!("Agent not found: {id}")));
-                    }
-                    _ => {
-                        // Unknown status — still skip silently
-                        return Err(StoreError::Other(format!(
-                            "Agent {id} has unexpected status '{}'",
-                            status.unwrap_or_default()
-                        )));
                     }
                 }
             }

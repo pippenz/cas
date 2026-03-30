@@ -451,11 +451,14 @@ impl TaskStore for SqliteTaskStore {
         crate::shared_db::with_write_retry(|| {
             let conn = self.conn.lock().unwrap();
 
-            // Get previous status for event emission
+            // Combine the status read with the UPDATE: only SELECT the old status
+            // when the new status differs from what's in the DB, avoiding the
+            // pre-read on the common case where status hasn't changed.
+            let new_status_str = task.status.to_string();
             let prev_status: Option<String> = conn
                 .query_row(
-                    "SELECT status FROM tasks WHERE id = ?",
-                    params![task.id],
+                    "SELECT status FROM tasks WHERE id = ? AND status != ?",
+                    params![task.id, new_status_str],
                     |row| row.get(0),
                 )
                 .optional()?;
@@ -475,7 +478,7 @@ impl TaskStore for SqliteTaskStore {
                 task.design,
                 task.acceptance_criteria,
                 task.notes,
-                task.status.to_string(),
+                new_status_str,
                 task.priority.0,
                 task.task_type.to_string(),
                 task.assignee,
@@ -500,7 +503,8 @@ impl TaskStore for SqliteTaskStore {
                 return Err(StoreError::TaskNotFound(task.id.clone()));
             }
 
-            // Emit status change events for sidecar activity feed
+            // Emit status change events only when status actually changed
+            // (prev_status is Some only when old status differs from new)
             if let Some(prev) = prev_status {
                 let prev_status: TaskStatus = prev.parse().unwrap_or(TaskStatus::Open);
                 if prev_status != task.status {
