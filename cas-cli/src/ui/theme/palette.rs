@@ -136,12 +136,12 @@ impl Palette {
 
             text_primary: colors.gray_100,
             text_secondary: colors.gray_300,
-            text_muted: colors.gray_500,
-            text_disabled: colors.gray_600,
+            text_muted: colors.gray_400,
+            text_disabled: colors.gray_500,
 
             border_default: colors.gray_700,
             border_focused: colors.primary_400,
-            border_muted: colors.gray_800,
+            border_muted: colors.gray_600,
 
             // Interactive
             accent: colors.primary_400,
@@ -167,7 +167,7 @@ impl Palette {
             priority_high: Color::Rgb(255, 120, 100),
             priority_medium: colors.warning,
             priority_low: colors.gray_400,
-            priority_backlog: colors.gray_600,
+            priority_backlog: colors.gray_500,
 
             // Entities
             entity_id: colors.cyan,
@@ -254,7 +254,7 @@ impl Palette {
 
             border_default: colors.gray_600,
             border_focused: colors.primary_400,
-            border_muted: colors.gray_700,
+            border_muted: colors.gray_600,
 
             // Interactive
             accent: colors.primary_400,
@@ -280,7 +280,7 @@ impl Palette {
             priority_high: Color::Rgb(200, 80, 60),
             priority_medium: colors.warning,
             priority_low: colors.gray_500,
-            priority_backlog: colors.gray_600,
+            priority_backlog: colors.gray_500,
 
             // Entities
             entity_id: colors.cyan,

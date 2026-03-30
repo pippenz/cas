@@ -138,15 +138,15 @@ fn build_agent_item(
     let status_icon = match agent.status {
         AgentStatus::Active => Span::styled(
             Icons::CIRCLE_FILLED.to_string(),
-            Style::default().fg(agent_color),
+            Style::default().fg(palette.agent_active),
         ),
         AgentStatus::Idle => Span::styled(
             Icons::CIRCLE_HALF.to_string(),
-            Style::default().fg(agent_color),
+            Style::default().fg(palette.agent_idle),
         ),
         _ => Span::styled(
             Icons::CIRCLE_EMPTY.to_string(),
-            Style::default().fg(palette.status_neutral),
+            Style::default().fg(palette.agent_dead),
         ),
     };
 
