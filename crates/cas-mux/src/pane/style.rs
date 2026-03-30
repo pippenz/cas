@@ -51,7 +51,7 @@ pub(crate) fn convert_style_runs_to_proto(
     if text.is_ascii() {
         let bytes = text.as_bytes();
         for run in runs {
-            let start = (run.start_col as usize).saturating_sub(1);
+            let start = run.start_col as usize;
             let end = run.end_col as usize;
 
             if start >= bytes.len() {
@@ -85,7 +85,7 @@ pub(crate) fn convert_style_runs_to_proto(
     } else {
         let chars: Vec<char> = text.chars().collect();
         for run in runs {
-            let start = (run.start_col as usize).saturating_sub(1);
+            let start = run.start_col as usize;
             let end = run.end_col as usize;
 
             let run_text: String = chars

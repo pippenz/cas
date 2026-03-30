@@ -423,7 +423,7 @@ export fn ghostty_vt_terminal_dump_viewport_row_style_runs(
     }
 
     var current_resolved = .{ .fg = current_fg, .bg = current_bg, .flags = current_flags };
-    var run_start: u16 = 1;
+    var run_start: u16 = 0;
 
     var col_idx: usize = 1;
     while (col_idx < cells.len) : (col_idx += 1) {
@@ -452,7 +452,7 @@ export fn ghostty_vt_terminal_dump_viewport_row_style_runs(
             current_inverse = current_style.flags.inverse;
             current_invisible = current_style.flags.invisible;
 
-            run_start = @intCast(col_idx + 1);
+            run_start = @intCast(col_idx);
 
             const bg_cell = current_style.bg(cell, palette) orelse default_bg;
             var fg_cell = current_base_fg;
@@ -502,7 +502,7 @@ export fn ghostty_vt_terminal_dump_viewport_row_style_runs(
         };
         out.appendSlice(alloc, std.mem.asBytes(&rec)) catch return .{ .ptr = null, .len = 0 };
 
-        run_start = @intCast(col_idx + 1);
+        run_start = @intCast(col_idx);
         current_resolved = .{ .fg = fg_cell, .bg = bg, .flags = current_flags };
     }
 
@@ -745,7 +745,7 @@ export fn ghostty_vt_terminal_screen_row_style_runs(
     }
 
     var current_resolved = .{ .fg = current_fg, .bg = current_bg, .flags = current_flags };
-    var run_start: u16 = 1;
+    var run_start: u16 = 0;
 
     var col_idx: usize = 1;
     while (col_idx < cells.len) : (col_idx += 1) {
@@ -774,7 +774,7 @@ export fn ghostty_vt_terminal_screen_row_style_runs(
             current_inverse = current_style.flags.inverse;
             current_invisible = current_style.flags.invisible;
 
-            run_start = @intCast(col_idx + 1);
+            run_start = @intCast(col_idx);
 
             const bg_cell = current_style.bg(cell, palette) orelse default_bg;
             var fg_cell = current_base_fg;
@@ -824,7 +824,7 @@ export fn ghostty_vt_terminal_screen_row_style_runs(
         };
         out.appendSlice(alloc, std.mem.asBytes(&rec)) catch return .{ .ptr = null, .len = 0 };
 
-        run_start = @intCast(col_idx + 1);
+        run_start = @intCast(col_idx);
         current_resolved = .{ .fg = fg_cell, .bg = bg, .flags = current_flags };
     }
 
