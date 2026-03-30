@@ -353,14 +353,23 @@ impl SqliteAgentStore {
             params![now],
         )?;
 
-        // Decrement active task counts and log expired events
-        for (task_id, agent_id, epoch) in &expired {
-            conn.execute(
-                "UPDATE agents SET active_tasks = MAX(0, active_tasks - 1) WHERE id = ?",
-                params![agent_id],
-            )?;
+        // Batch decrement active task counts: count expirations per agent
+        // and apply in a single UPDATE instead of N separate UPDATEs.
+        {
+            let mut agent_counts: std::collections::HashMap<&str, i64> = std::collections::HashMap::new();
+            for (_, agent_id, _) in &expired {
+                *agent_counts.entry(agent_id.as_str()).or_insert(0) += 1;
+            }
+            for (agent_id, decrement) in &agent_counts {
+                conn.execute(
+                    "UPDATE agents SET active_tasks = MAX(0, active_tasks - ?1) WHERE id = ?2",
+                    params![decrement, agent_id],
+                )?;
+            }
+        }
 
-            // Log the expired event
+        // Log expired events (still per-lease for accurate history)
+        for (task_id, agent_id, epoch) in &expired {
             Self::log_lease_event(
                 &conn,
                 task_id,

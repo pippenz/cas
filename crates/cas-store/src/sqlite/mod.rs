@@ -369,27 +369,21 @@ impl SqliteStore {
     ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
 
-        if let Some(outcome) = outcome {
-            conn.execute(
-                "UPDATE sessions SET outcome = ?1 WHERE session_id = ?2",
-                params![outcome.to_string(), session_id],
-            )?;
-        }
-
-        if let Some(score) = friction_score {
-            let clamped = score.clamp(0.0, 1.0);
-            conn.execute(
-                "UPDATE sessions SET friction_score = ?1 WHERE session_id = ?2",
-                params![clamped, session_id],
-            )?;
-        }
-
-        if let Some(count) = delight_count {
-            conn.execute(
-                "UPDATE sessions SET delight_count = ?1 WHERE session_id = ?2",
-                params![count as i32, session_id],
-            )?;
-        }
+        // Single UPDATE using COALESCE to only set provided values,
+        // replacing up to 3 separate UPDATEs.
+        conn.execute(
+            "UPDATE sessions SET
+                outcome = COALESCE(?1, outcome),
+                friction_score = COALESCE(?2, friction_score),
+                delight_count = COALESCE(?3, delight_count)
+             WHERE session_id = ?4",
+            params![
+                outcome.map(|o| o.to_string()),
+                friction_score.map(|s| s.clamp(0.0, 1.0) as f64),
+                delight_count.map(|c| c as i32),
+                session_id,
+            ],
+        )?;
 
         Ok(())
     }
@@ -487,21 +481,13 @@ impl SqliteStore {
         let conn = self.conn.lock().unwrap();
         let cutoff = Utc::now() - chrono::Duration::days(days);
 
-        // First get total count
-        let total: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM sessions WHERE ended_at >= ?1 AND outcome IS NOT NULL",
-            params![cutoff.to_rfc3339()],
-            |row| row.get(0),
-        )?;
-
-        if total == 0 {
-            return Ok(Vec::new());
-        }
-
+        // Single query using window function to compute percentage inline,
+        // avoiding a separate COUNT(*) query that re-reads the same rows.
         let mut stmt = conn.prepare_cached(
             "SELECT
                 outcome,
-                COUNT(*) as count
+                COUNT(*) as count,
+                COUNT(*) * 100.0 / SUM(COUNT(*)) OVER () as pct
              FROM sessions
              WHERE ended_at >= ?1
                AND outcome IS NOT NULL
@@ -513,7 +499,7 @@ impl SqliteStore {
             .query_map(params![cutoff.to_rfc3339()], |row| {
                 let outcome: String = row.get(0)?;
                 let count: i64 = row.get(1)?;
-                let percentage = (count as f64 / total as f64) * 100.0;
+                let percentage: f64 = row.get(2)?;
                 Ok((outcome, count, percentage))
             })?
             .filter_map(|r| r.ok())

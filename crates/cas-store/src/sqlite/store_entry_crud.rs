@@ -295,8 +295,8 @@ impl SqliteStore {
              stability = ?13, access_count = ?14, raw_content = ?15, compressed = ?16,
              memory_tier = ?17, importance = ?18, valid_from = ?19, valid_until = ?20, review_after = ?21,
              last_reviewed = ?22, pending_embedding = ?23, belief_type = ?24, confidence = ?25, domain = ?26, branch = ?27,
-             updated_at = ?28
-             WHERE id = ?29",
+             updated_at = ?28, scope = ?29
+             WHERE id = ?30",
             params![
                 entry.entry_type.to_string(),
                 Self::tags_to_string(&entry.tags),
@@ -326,6 +326,7 @@ impl SqliteStore {
                 entry.domain,
                 entry.branch,
                 now, // updated_at = current time on update
+                entry.scope.to_string(),
                 entry.id,
             ],
         );
