@@ -116,30 +116,31 @@ pub fn is_busy_error(e: &rusqlite::Error) -> bool {
 
 /// Execute a fallible closure with retry on SQLITE_BUSY errors.
 ///
-/// Uses exponential backoff: 50ms, 100ms, 200ms, 400ms, 800ms (5 retries).
-/// Combined with the 5s busy_timeout, this gives a total max wait of ~26.5s
-/// before giving up, but with jitter that reduces convoy effects.
+/// Uses exponential backoff with jitter: base delays of 50ms, 100ms, 200ms,
+/// 400ms, 800ms plus ±50% random jitter (5 retries). The jitter breaks convoy
+/// patterns where multiple agents wake up and retry at the same instant.
+/// Combined with the 5s busy_timeout, this gives a total max wait of ~28s
+/// before giving up.
 pub fn with_write_retry<T, F>(f: F) -> crate::Result<T>
 where
     F: Fn() -> crate::Result<T>,
 {
-    let delays = [
-        Duration::from_millis(50),
-        Duration::from_millis(100),
-        Duration::from_millis(200),
-        Duration::from_millis(400),
-        Duration::from_millis(800),
-    ];
+    let base_delays_ms: [u64; 5] = [50, 100, 200, 400, 800];
 
-    for delay in &delays {
+    for base_ms in &base_delays_ms {
         match f() {
             Ok(val) => return Ok(val),
             Err(crate::error::StoreError::Database(ref e)) if is_busy_error(e) => {
+                // Add ±50% jitter: actual delay is in [base/2, base*3/2]
+                let jitter_range = base_ms / 2;
+                let jitter = cheap_random_u64() % (jitter_range * 2 + 1);
+                let delay_ms = base_ms - jitter_range + jitter;
                 tracing::warn!(
-                    delay_ms = delay.as_millis(),
-                    "SQLite busy, retrying after backoff"
+                    base_ms,
+                    delay_ms,
+                    "SQLite busy, retrying after backoff with jitter"
                 );
-                std::thread::sleep(*delay);
+                std::thread::sleep(Duration::from_millis(delay_ms));
             }
             Err(e) => return Err(e),
         }
@@ -147,6 +148,40 @@ where
 
     // Final attempt (no retry)
     f()
+}
+
+/// Fast, non-cryptographic random u64 using thread-local xorshift state.
+/// Seeded from thread ID + timestamp to avoid convoy patterns across agents.
+fn cheap_random_u64() -> u64 {
+    use std::cell::Cell;
+
+    thread_local! {
+        static STATE: Cell<u64> = Cell::new({
+            let thread_id = std::thread::current().id();
+            let tid_hash = format!("{thread_id:?}");
+            let mut seed: u64 = 0;
+            for b in tid_hash.bytes() {
+                seed = seed.wrapping_mul(31).wrapping_add(b as u64);
+            }
+            // Mix in timestamp for cross-process uniqueness
+            seed ^= std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
+            // Ensure non-zero
+            if seed == 0 { 1 } else { seed }
+        });
+    }
+
+    STATE.with(|cell| {
+        let mut s = cell.get();
+        // xorshift64
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        cell.set(s);
+        s
+    })
 }
 
 #[cfg(test)]
