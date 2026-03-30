@@ -147,7 +147,7 @@ cas-mcp = { path = "../crates/cas-mcp", optional = true }
 cmcp_core = { package = "code-mode-mcp", path = "../crates/cas-mcp-proxy", optional = true }
 
 # HTTP Client (for auth and cloud sync)
-ureq = { version = "2.12", features = ["json"] }
+ureq = { version = "2.12", features = ["json", "tls"] }
 flate2 = "1.0"
 
 # Self-update from GitHub releases
