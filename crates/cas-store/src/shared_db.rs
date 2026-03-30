@@ -100,6 +100,41 @@ impl<'a> std::ops::Deref for ImmediateTx<'a> {
     }
 }
 
+/// Atomically fetch-and-increment a named sequence, returning the next value.
+///
+/// Uses `INSERT ... ON CONFLICT DO UPDATE` for a single atomic statement.
+/// If the table does not yet exist (fresh database before migration), it is
+/// created lazily on first call.
+pub fn next_sequence_val(conn: &Connection, name: &str) -> crate::Result<i64> {
+    match next_sequence_val_inner(conn, name) {
+        Ok(val) => Ok(val),
+        Err(crate::error::StoreError::Database(ref e))
+            if e.to_string().contains("no such table: id_sequences") =>
+        {
+            // Table hasn't been created via migration yet — bootstrap it
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS id_sequences (
+                    name TEXT PRIMARY KEY,
+                    next_val INTEGER NOT NULL DEFAULT 1
+                )",
+            )?;
+            next_sequence_val_inner(conn, name)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn next_sequence_val_inner(conn: &Connection, name: &str) -> crate::Result<i64> {
+    let val: i64 = conn.query_row(
+        "INSERT INTO id_sequences (name, next_val) VALUES (?1, 1)
+         ON CONFLICT(name) DO UPDATE SET next_val = next_val + 1
+         RETURNING next_val",
+        rusqlite::params![name],
+        |row| row.get(0),
+    )?;
+    Ok(val)
+}
+
 /// Check if a `rusqlite::Error` is a SQLITE_BUSY error.
 pub fn is_busy_error(e: &rusqlite::Error) -> bool {
     matches!(

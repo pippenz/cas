@@ -211,16 +211,8 @@ impl EntityStore for SqliteEntityStore {
 
     fn generate_entity_id(&self) -> Result<String> {
         let conn = self.conn.lock().unwrap();
-        let max_num: Option<i32> = conn
-            .query_row(
-                "SELECT MAX(CAST(SUBSTR(id, 5) AS INTEGER)) FROM entities WHERE id LIKE 'ent-%'",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?
-            .flatten();
-
-        Ok(format!("ent-{:04}", max_num.unwrap_or(0) + 1))
+        let next = crate::shared_db::next_sequence_val(&conn, "entity")?;
+        Ok(format!("ent-{next:04}"))
     }
 
     fn add_entity(&self, entity: &Entity) -> Result<()> {
@@ -435,16 +427,8 @@ impl EntityStore for SqliteEntityStore {
 
     fn generate_relationship_id(&self) -> Result<String> {
         let conn = self.conn.lock().unwrap();
-        let max_num: Option<i32> = conn
-            .query_row(
-                "SELECT MAX(CAST(SUBSTR(id, 5) AS INTEGER)) FROM relationships WHERE id LIKE 'rel-%'",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?
-            .flatten();
-
-        Ok(format!("rel-{:04}", max_num.unwrap_or(0) + 1))
+        let next = crate::shared_db::next_sequence_val(&conn, "relationship")?;
+        Ok(format!("rel-{next:04}"))
     }
 
     fn add_relationship(&self, relationship: &Relationship) -> Result<()> {

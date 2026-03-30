@@ -47,17 +47,9 @@ impl SqliteStore {
     pub(crate) fn store_generate_id(&self) -> Result<String> {
         let today = Utc::now().format("%Y-%m-%d").to_string();
         let conn = self.conn.lock().unwrap();
-
-        // Use MAX instead of COUNT to handle gaps from deleted entries
-        let max_num: Option<i32> = conn
-            .query_row(
-                "SELECT MAX(CAST(SUBSTR(id, 12) AS INTEGER)) FROM entries WHERE id LIKE ?",
-                params![format!("{}-%", today)],
-                |row| row.get(0),
-            )
-            .ok();
-
-        let next_num = max_num.unwrap_or(0) + 1;
+        // Use a per-day sequence key so IDs reset daily (e.g., "entry:2026-03-30")
+        let seq_name = format!("entry:{today}");
+        let next_num = crate::shared_db::next_sequence_val(&conn, &seq_name)?;
         Ok(format!("{today}-{next_num}"))
     }
     pub(crate) fn store_add(&self, entry: &Entry) -> Result<()> {

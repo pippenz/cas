@@ -17,17 +17,8 @@ impl RuleStore for SqliteRuleStore {
 
     fn generate_id(&self) -> Result<String> {
         let conn = self.conn.lock().unwrap();
-
-        let max_num: Option<i32> = conn
-            .query_row(
-                "SELECT MAX(CAST(SUBSTR(id, 6) AS INTEGER)) FROM rules WHERE id LIKE 'rule-%'",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?
-            .flatten();
-
-        Ok(format!("rule-{:03}", max_num.unwrap_or(0) + 1))
+        let next = crate::shared_db::next_sequence_val(&conn, "rule")?;
+        Ok(format!("rule-{next:03}"))
     }
 
     fn add(&self, rule: &Rule) -> Result<()> {
