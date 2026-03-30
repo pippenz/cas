@@ -108,7 +108,7 @@ impl CodeStore for SqliteCodeStore {
              FROM code_files WHERE repository = ?1 ORDER BY path"
         };
 
-        let mut stmt = conn.prepare(sql)?;
+        let mut stmt = conn.prepare_cached(sql)?;
         let rows = if let Some(lang) = language {
             stmt.query_map(
                 params![repository, lang.to_string()],
@@ -206,7 +206,7 @@ impl CodeStore for SqliteCodeStore {
             .conn
             .lock()
             .map_err(|_| StoreError::Other("lock poisoned".to_string()))?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, qualified_name, name, kind, language, file_path, file_id, line_start, line_end,
                     source, documentation, signature, parent_id, repository, created, updated, commit_hash, content_hash, scope
              FROM code_symbols WHERE qualified_name = ?1",
@@ -221,7 +221,7 @@ impl CodeStore for SqliteCodeStore {
             .conn
             .lock()
             .map_err(|_| StoreError::Other("lock poisoned".to_string()))?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, qualified_name, name, kind, language, file_path, file_id, line_start, line_end,
                     source, documentation, signature, parent_id, repository, created, updated, commit_hash, content_hash, scope
              FROM code_symbols WHERE file_id = ?1 ORDER BY line_start",
@@ -265,7 +265,7 @@ impl CodeStore for SqliteCodeStore {
         sql.push_str(" ORDER BY name LIMIT ?");
         params_vec.push(Box::new(limit as i64));
 
-        let mut stmt = conn.prepare(&sql)?;
+        let mut stmt = conn.prepare_cached(&sql)?;
         let params_refs: Vec<&dyn rusqlite::ToSql> =
             params_vec.iter().map(|p| p.as_ref()).collect();
         let rows = stmt.query_map(params_refs.as_slice(), Self::row_to_code_symbol)?;
@@ -310,7 +310,7 @@ impl CodeStore for SqliteCodeStore {
         params_vec.push(Box::new(limit as i64));
         params_vec.push(Box::new(offset as i64));
 
-        let mut stmt = conn.prepare(&sql)?;
+        let mut stmt = conn.prepare_cached(&sql)?;
         let params_refs: Vec<&dyn rusqlite::ToSql> =
             params_vec.iter().map(|p| p.as_ref()).collect();
         let rows = stmt.query_map(params_refs.as_slice(), Self::row_to_code_symbol)?;
@@ -372,7 +372,7 @@ impl CodeStore for SqliteCodeStore {
             .conn
             .lock()
             .map_err(|_| StoreError::Other("lock poisoned".to_string()))?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT s.id, s.qualified_name, s.name, s.kind, s.language, s.file_path, s.file_id,
                     s.line_start, s.line_end, s.source, s.documentation, s.signature, s.parent_id,
                     s.repository, s.created, s.updated, s.commit_hash, s.content_hash, s.scope
@@ -390,7 +390,7 @@ impl CodeStore for SqliteCodeStore {
             .conn
             .lock()
             .map_err(|_| StoreError::Other("lock poisoned".to_string()))?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT s.id, s.qualified_name, s.name, s.kind, s.language, s.file_path, s.file_id,
                     s.line_start, s.line_end, s.source, s.documentation, s.signature, s.parent_id,
                     s.repository, s.created, s.updated, s.commit_hash, s.content_hash, s.scope
@@ -408,7 +408,7 @@ impl CodeStore for SqliteCodeStore {
             .conn
             .lock()
             .map_err(|_| StoreError::Other("lock poisoned".to_string()))?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, source_id, target_id, relation_type, weight, created
              FROM code_relationships WHERE source_id = ?1",
         )?;
@@ -422,7 +422,7 @@ impl CodeStore for SqliteCodeStore {
             .conn
             .lock()
             .map_err(|_| StoreError::Other("lock poisoned".to_string()))?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, source_id, target_id, relation_type, weight, created
              FROM code_relationships WHERE target_id = ?1",
         )?;
@@ -470,7 +470,7 @@ impl CodeStore for SqliteCodeStore {
             .conn
             .lock()
             .map_err(|_| StoreError::Other("lock poisoned".to_string()))?;
-        let mut stmt = conn.prepare("SELECT entry_id FROM code_memory_links WHERE code_id = ?1")?;
+        let mut stmt = conn.prepare_cached("SELECT entry_id FROM code_memory_links WHERE code_id = ?1")?;
         let rows = stmt.query_map(params![code_id], |row| row.get(0))?;
         rows.collect::<std::result::Result<Vec<String>, _>>()
             .map_err(StoreError::from)
@@ -481,7 +481,7 @@ impl CodeStore for SqliteCodeStore {
             .conn
             .lock()
             .map_err(|_| StoreError::Other("lock poisoned".to_string()))?;
-        let mut stmt = conn.prepare("SELECT code_id FROM code_memory_links WHERE entry_id = ?1")?;
+        let mut stmt = conn.prepare_cached("SELECT code_id FROM code_memory_links WHERE entry_id = ?1")?;
         let rows = stmt.query_map(params![entry_id], |row| row.get(0))?;
         rows.collect::<std::result::Result<Vec<String>, _>>()
             .map_err(StoreError::from)
@@ -492,7 +492,7 @@ impl CodeStore for SqliteCodeStore {
             .conn
             .lock()
             .map_err(|_| StoreError::Other("lock poisoned".to_string()))?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT code_id, entry_id, link_type, confidence, created
              FROM code_memory_links WHERE code_id = ?1",
         )?;
@@ -620,7 +620,7 @@ impl CodeStore for SqliteCodeStore {
             placeholders.join(", ")
         );
 
-        let mut stmt = conn.prepare(&sql)?;
+        let mut stmt = conn.prepare_cached(&sql)?;
         let params: Vec<&dyn rusqlite::ToSql> =
             ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
         let rows = stmt.query_map(params.as_slice(), Self::row_to_code_symbol)?;
@@ -661,7 +661,7 @@ impl CodeStore for SqliteCodeStore {
             .lock()
             .map_err(|_| StoreError::Other("lock poisoned".to_string()))?;
         let mut stmt =
-            conn.prepare("SELECT language, COUNT(*) FROM code_files GROUP BY language")?;
+            conn.prepare_cached("SELECT language, COUNT(*) FROM code_files GROUP BY language")?;
         let rows = stmt.query_map([], |row| {
             let lang_str: String = row.get(0)?;
             let count: i64 = row.get(1)?;

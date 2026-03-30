@@ -300,7 +300,7 @@ impl SqliteAgentStore {
     }
     pub(crate) fn lease_list_agent_leases(&self, agent_id: &str) -> Result<Vec<TaskLease>> {
         let conn = self.lock_conn()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT task_id, agent_id, status, acquired_at, expires_at, renewed_at,
              renewal_count, epoch, claim_reason
              FROM task_leases WHERE agent_id = ? AND status = 'active'
@@ -315,7 +315,7 @@ impl SqliteAgentStore {
     }
     pub(crate) fn lease_list_active_leases(&self) -> Result<Vec<TaskLease>> {
         let conn = self.lock_conn()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT task_id, agent_id, status, acquired_at, expires_at, renewed_at,
              renewal_count, epoch, claim_reason
              FROM task_leases WHERE status = 'active'
@@ -333,7 +333,7 @@ impl SqliteAgentStore {
         let now = Utc::now().to_rfc3339();
 
         // Find expired leases with their agents and epochs
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT task_id, agent_id, epoch FROM task_leases
              WHERE status = 'active' AND expires_at < ?",
         )?;
@@ -382,7 +382,7 @@ impl SqliteAgentStore {
         let conn = self.lock_conn()?;
         let limit_val = limit.unwrap_or(100) as i64;
 
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, task_id, agent_id, event_type, epoch, timestamp, details, previous_agent_id
              FROM task_lease_history
              WHERE task_id = ?
@@ -420,7 +420,7 @@ impl SqliteAgentStore {
         // Only include tasks where the agent 'claimed' them (not just received via transfer)
         let task_ids: Vec<String> = if let Some(since_time) = since {
             let since_str = since_time.to_rfc3339();
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT DISTINCT task_id FROM task_lease_history
                  WHERE agent_id = ? AND event_type = 'claimed' AND timestamp >= ?
                  ORDER BY timestamp DESC",
@@ -429,7 +429,7 @@ impl SqliteAgentStore {
                 stmt.query_map(params![agent_id, since_str], |row| row.get::<_, String>(0))?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
         } else {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT DISTINCT task_id FROM task_lease_history
                  WHERE agent_id = ? AND event_type = 'claimed'
                  ORDER BY timestamp DESC",

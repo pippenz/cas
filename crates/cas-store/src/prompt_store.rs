@@ -196,7 +196,7 @@ impl PromptStore for SqlitePromptStore {
     fn get(&self, id: &str) -> Result<Option<Prompt>> {
         let conn = self.conn.lock().map_err(lock_error)?;
 
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, session_id, agent_id, content, content_hash, timestamp, response_started, task_id, scope, messages_json, model, tool_version
              FROM prompts
              WHERE id = ?1",
@@ -212,7 +212,7 @@ impl PromptStore for SqlitePromptStore {
     fn get_by_hash(&self, content_hash: &str, session_id: &str) -> Result<Option<Prompt>> {
         let conn = self.conn.lock().map_err(lock_error)?;
 
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, session_id, agent_id, content, content_hash, timestamp, response_started, task_id, scope, messages_json, model, tool_version
              FROM prompts
              WHERE content_hash = ?1 AND session_id = ?2",
@@ -228,7 +228,7 @@ impl PromptStore for SqlitePromptStore {
     fn list_by_session(&self, session_id: &str, limit: usize) -> Result<Vec<Prompt>> {
         let conn = self.conn.lock().map_err(lock_error)?;
 
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, session_id, agent_id, content, content_hash, timestamp, response_started, task_id, scope, messages_json, model, tool_version
              FROM prompts
              WHERE session_id = ?1
@@ -247,7 +247,7 @@ impl PromptStore for SqlitePromptStore {
     fn list_by_task(&self, task_id: &str, limit: usize) -> Result<Vec<Prompt>> {
         let conn = self.conn.lock().map_err(lock_error)?;
 
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, session_id, agent_id, content, content_hash, timestamp, response_started, task_id, scope, messages_json, model, tool_version
              FROM prompts
              WHERE task_id = ?1
@@ -266,7 +266,7 @@ impl PromptStore for SqlitePromptStore {
     fn list_recent(&self, limit: usize) -> Result<Vec<Prompt>> {
         let conn = self.conn.lock().map_err(lock_error)?;
 
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, session_id, agent_id, content, content_hash, timestamp, response_started, task_id, scope, messages_json, model, tool_version
              FROM prompts
              ORDER BY timestamp DESC
@@ -284,7 +284,7 @@ impl PromptStore for SqlitePromptStore {
     fn list_since(&self, since: DateTime<Utc>, limit: usize) -> Result<Vec<Prompt>> {
         let conn = self.conn.lock().map_err(lock_error)?;
 
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, session_id, agent_id, content, content_hash, timestamp, response_started, task_id, scope, messages_json, model, tool_version
              FROM prompts
              WHERE timestamp >= ?1
@@ -411,7 +411,7 @@ pub fn get_current_prompt_for_session(
     conn: &Connection,
     session_id: &str,
 ) -> std::result::Result<Option<Prompt>, rusqlite::Error> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT id, session_id, agent_id, content, content_hash, timestamp, response_started, task_id, scope, messages_json, model, tool_version
          FROM prompts
          WHERE session_id = ?1

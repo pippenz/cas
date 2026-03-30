@@ -386,7 +386,7 @@ impl SqliteStore {
     }
     pub(crate) fn store_list(&self) -> Result<Vec<Entry>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, type, tags, created, content, title, helpful_count,
              harmful_count, last_accessed, archived, session_id, source_tool,
              pending_extraction, observation_type, stability, access_count,
@@ -454,7 +454,7 @@ impl SqliteStore {
     }
     pub(crate) fn store_recent(&self, n: usize) -> Result<Vec<Entry>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, type, tags, created, content, title, helpful_count,
              harmful_count, last_accessed, archived, session_id, source_tool,
              pending_extraction, observation_type, stability, access_count,
@@ -544,7 +544,7 @@ impl SqliteStore {
     }
     pub(crate) fn store_list_archived(&self) -> Result<Vec<Entry>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, type, tags, created, content, title, helpful_count,
              harmful_count, last_accessed, archived, session_id, source_tool,
              pending_extraction, observation_type, stability, access_count,
@@ -613,7 +613,7 @@ impl SqliteStore {
 
     pub(crate) fn store_list_by_branch(&self, branch: &str) -> Result<Vec<Entry>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, type, tags, created, content, title, helpful_count,
              harmful_count, last_accessed, archived, session_id, source_tool,
              pending_extraction, observation_type, stability, access_count,

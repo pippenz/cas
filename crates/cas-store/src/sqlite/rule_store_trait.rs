@@ -208,7 +208,7 @@ impl RuleStore for SqliteRuleStore {
 
     fn list(&self) -> Result<Vec<Rule>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, created, source_ids, helpful_count, harmful_count,
              tags, paths, content, status, last_accessed, review_after, hook_command,
              category, priority, surface_count, scope, auto_approve_tools, auto_approve_paths, team_id

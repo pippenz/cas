@@ -272,7 +272,7 @@ impl SpawnQueueStore for SqliteSpawnQueueStore {
         let conn = self.conn.lock().unwrap();
         let now = Utc::now().to_rfc3339();
 
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, action, count, worker_names, force, isolate, created_at, processed_at
              FROM spawn_queue
              WHERE processed_at IS NULL
@@ -310,7 +310,7 @@ impl SpawnQueueStore for SqliteSpawnQueueStore {
     fn peek(&self, limit: usize) -> Result<Vec<SpawnRequest>> {
         let conn = self.conn.lock().unwrap();
 
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, action, count, worker_names, force, isolate, created_at, processed_at
              FROM spawn_queue
              WHERE processed_at IS NULL

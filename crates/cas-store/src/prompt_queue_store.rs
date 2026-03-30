@@ -230,7 +230,7 @@ impl PromptQueueStore for SqlitePromptQueueStore {
 
         // Add factory_session column if missing (safe migration for multi-session isolation)
         let has_session_col = conn
-            .prepare("SELECT factory_session FROM prompt_queue LIMIT 0")
+            .prepare_cached("SELECT factory_session FROM prompt_queue LIMIT 0")
             .is_ok();
         if !has_session_col {
             conn.execute_batch(PROMPT_QUEUE_SESSION_MIGRATION)?;
@@ -238,7 +238,7 @@ impl PromptQueueStore for SqlitePromptQueueStore {
 
         // Add summary column if missing
         let has_summary_col = conn
-            .prepare("SELECT summary FROM prompt_queue LIMIT 0")
+            .prepare_cached("SELECT summary FROM prompt_queue LIMIT 0")
             .is_ok();
         if !has_summary_col {
             conn.execute_batch(PROMPT_QUEUE_SUMMARY_MIGRATION)?;
@@ -246,7 +246,7 @@ impl PromptQueueStore for SqlitePromptQueueStore {
 
         // Add priority column if missing
         let has_priority_col = conn
-            .prepare("SELECT priority FROM prompt_queue LIMIT 0")
+            .prepare_cached("SELECT priority FROM prompt_queue LIMIT 0")
             .is_ok();
         if !has_priority_col {
             conn.execute_batch(PROMPT_QUEUE_PRIORITY_MIGRATION)?;
@@ -254,7 +254,7 @@ impl PromptQueueStore for SqlitePromptQueueStore {
 
         // Add acked_at column if missing (delivery confirmation)
         let has_acked_at_col = conn
-            .prepare("SELECT acked_at FROM prompt_queue LIMIT 0")
+            .prepare_cached("SELECT acked_at FROM prompt_queue LIMIT 0")
             .is_ok();
         if !has_acked_at_col {
             conn.execute_batch(PROMPT_QUEUE_ACKED_AT_MIGRATION)?;
@@ -305,7 +305,7 @@ impl PromptQueueStore for SqlitePromptQueueStore {
         let now = Utc::now().to_rfc3339();
 
         // Get pending prompts for this target or "all_workers"
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, source, target, prompt, created_at, processed_at, summary, priority, acked_at
              FROM prompt_queue
              WHERE (target = ? OR target = 'all_workers') AND processed_at IS NULL
@@ -344,7 +344,7 @@ impl PromptQueueStore for SqlitePromptQueueStore {
         let conn = self.conn.lock().unwrap();
         let now = Utc::now().to_rfc3339();
 
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, source, target, prompt, created_at, processed_at, summary, priority, acked_at
              FROM prompt_queue
              WHERE processed_at IS NULL
@@ -382,7 +382,7 @@ impl PromptQueueStore for SqlitePromptQueueStore {
     fn peek_all(&self, limit: usize) -> Result<Vec<QueuedPrompt>> {
         let conn = self.conn.lock().unwrap();
 
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, source, target, prompt, created_at, processed_at, summary, priority, acked_at
              FROM prompt_queue
              WHERE processed_at IS NULL
@@ -440,7 +440,7 @@ impl PromptQueueStore for SqlitePromptQueueStore {
 
         param_values.push(Box::new(limit as i64));
 
-        let mut stmt = conn.prepare(&sql)?;
+        let mut stmt = conn.prepare_cached(&sql)?;
         let prompts = stmt
             .query_map(
                 rusqlite::params_from_iter(param_values.iter().map(|p| p.as_ref())),
@@ -494,7 +494,7 @@ impl PromptQueueStore for SqlitePromptQueueStore {
         let conn = self.conn.lock().unwrap();
         let cutoff = (Utc::now() - chrono::Duration::seconds(timeout_secs)).to_rfc3339();
 
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, source, target, prompt, created_at, processed_at, summary, priority, acked_at
              FROM prompt_queue
              WHERE processed_at IS NOT NULL

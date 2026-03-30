@@ -276,14 +276,14 @@ impl SqliteReminderStore {
     /// Run migrations to add new columns if missing
     fn migrate(&self, conn: &Connection) -> Result<()> {
         if conn
-            .prepare("SELECT target_id FROM reminders LIMIT 0")
+            .prepare_cached("SELECT target_id FROM reminders LIMIT 0")
             .is_err()
         {
             conn.execute_batch(MIGRATION_TARGET_ID)?;
         }
 
         if conn
-            .prepare("SELECT fired_event FROM reminders LIMIT 0")
+            .prepare_cached("SELECT fired_event FROM reminders LIMIT 0")
             .is_err()
         {
             conn.execute_batch(MIGRATION_FIRED_EVENT)?;
@@ -346,7 +346,7 @@ impl ReminderStore for SqliteReminderStore {
             Self::SELECT_COLUMNS
         );
 
-        let mut stmt = conn.prepare(&sql)?;
+        let mut stmt = conn.prepare_cached(&sql)?;
         let reminders = stmt
             .query_map(params![owner_id], Self::reminder_from_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -361,7 +361,7 @@ impl ReminderStore for SqliteReminderStore {
             Self::SELECT_COLUMNS
         );
 
-        let mut stmt = conn.prepare(&sql)?;
+        let mut stmt = conn.prepare_cached(&sql)?;
         let reminders = stmt
             .query_map(params![target_id], Self::reminder_from_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -376,7 +376,7 @@ impl ReminderStore for SqliteReminderStore {
             Self::SELECT_COLUMNS
         );
 
-        let mut stmt = conn.prepare(&sql)?;
+        let mut stmt = conn.prepare_cached(&sql)?;
         let reminders = stmt
             .query_map([], Self::reminder_from_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -392,7 +392,7 @@ impl ReminderStore for SqliteReminderStore {
             Self::SELECT_COLUMNS
         );
 
-        let mut stmt = conn.prepare(&sql)?;
+        let mut stmt = conn.prepare_cached(&sql)?;
         let reminders = stmt
             .query_map(params![cutoff], Self::reminder_from_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -408,7 +408,7 @@ impl ReminderStore for SqliteReminderStore {
             Self::SELECT_COLUMNS
         );
 
-        let mut stmt = conn.prepare(&sql)?;
+        let mut stmt = conn.prepare_cached(&sql)?;
         let reminders = stmt
             .query_map(params![now], Self::reminder_from_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -423,7 +423,7 @@ impl ReminderStore for SqliteReminderStore {
             Self::SELECT_COLUMNS
         );
 
-        let mut stmt = conn.prepare(&sql)?;
+        let mut stmt = conn.prepare_cached(&sql)?;
         let reminders = stmt
             .query_map(params![event_type], Self::reminder_from_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;

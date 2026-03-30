@@ -158,7 +158,7 @@ impl CommitLinkStore for SqliteCommitLinkStore {
     fn get(&self, commit_hash: &str) -> Result<Option<CommitLink>> {
         let conn = self.conn.lock().map_err(lock_error)?;
 
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT commit_hash, session_id, agent_id, branch, message, files_changed, prompt_ids, committed_at, author, scope
              FROM commit_links
              WHERE commit_hash = ?1",
@@ -174,7 +174,7 @@ impl CommitLinkStore for SqliteCommitLinkStore {
     fn list_by_session(&self, session_id: &str, limit: usize) -> Result<Vec<CommitLink>> {
         let conn = self.conn.lock().map_err(lock_error)?;
 
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT commit_hash, session_id, agent_id, branch, message, files_changed, prompt_ids, committed_at, author, scope
              FROM commit_links
              WHERE session_id = ?1
@@ -193,7 +193,7 @@ impl CommitLinkStore for SqliteCommitLinkStore {
     fn list_by_branch(&self, branch: &str, limit: usize) -> Result<Vec<CommitLink>> {
         let conn = self.conn.lock().map_err(lock_error)?;
 
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT commit_hash, session_id, agent_id, branch, message, files_changed, prompt_ids, committed_at, author, scope
              FROM commit_links
              WHERE branch = ?1
@@ -212,7 +212,7 @@ impl CommitLinkStore for SqliteCommitLinkStore {
     fn list_recent(&self, limit: usize) -> Result<Vec<CommitLink>> {
         let conn = self.conn.lock().map_err(lock_error)?;
 
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT commit_hash, session_id, agent_id, branch, message, files_changed, prompt_ids, committed_at, author, scope
              FROM commit_links
              ORDER BY committed_at DESC
@@ -233,7 +233,7 @@ impl CommitLinkStore for SqliteCommitLinkStore {
         let conn = self.conn.lock().map_err(lock_error)?;
 
         let pattern = format!("%\"{file_path}%");
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT commit_hash, session_id, agent_id, branch, message, files_changed, prompt_ids, committed_at, author, scope
              FROM commit_links
              WHERE files_changed LIKE ?1

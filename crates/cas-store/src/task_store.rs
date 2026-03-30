@@ -294,7 +294,7 @@ impl SqliteTaskStore {
                 }
                 visited.insert(current.clone());
 
-                let mut stmt = conn.prepare(
+                let mut stmt = conn.prepare_cached(
                     "SELECT to_id FROM dependencies
                      WHERE from_id = ? AND dep_type = 'blocks'",
                 )?;
@@ -599,7 +599,7 @@ impl TaskStore for SqliteTaskStore {
             ),
         };
 
-        let mut stmt = conn.prepare(sql)?;
+        let mut stmt = conn.prepare_cached(sql)?;
         let tasks = if params.is_empty() {
             stmt.query_map([], Self::task_from_row)?
                 .collect::<std::result::Result<Vec<_>, _>>()?
@@ -615,7 +615,7 @@ impl TaskStore for SqliteTaskStore {
         let conn = self.conn.lock().unwrap();
 
         // Ready = open tasks with no open blocking dependencies
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT t.id, t.title, t.description, t.design, t.acceptance_criteria, t.notes,
              t.status, t.priority, t.task_type, t.assignee, t.labels, t.created_at, t.updated_at,
              t.closed_at, t.close_reason, t.external_ref, t.content_hash, t.branch, t.worktree_id,
@@ -643,7 +643,7 @@ impl TaskStore for SqliteTaskStore {
         let conn = self.conn.lock().unwrap();
 
         // Fetch blocked tasks
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT DISTINCT t.id, t.title, t.description, t.design, t.acceptance_criteria, t.notes,
              t.status, t.priority, t.task_type, t.assignee, t.labels, t.created_at, t.updated_at,
              t.closed_at, t.close_reason, t.external_ref, t.content_hash, t.branch, t.worktree_id,
@@ -681,7 +681,7 @@ impl TaskStore for SqliteTaskStore {
              AND t.status != 'closed'"
         );
 
-        let mut blocker_stmt = conn.prepare(&sql)?;
+        let mut blocker_stmt = conn.prepare_cached(&sql)?;
         let params: Vec<&dyn rusqlite::types::ToSql> =
             task_ids.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
         let rows = blocker_stmt.query_map(params.as_slice(), |row| {
@@ -741,7 +741,7 @@ impl TaskStore for SqliteTaskStore {
 
     fn list_pending_verification(&self) -> Result<Vec<Task>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, title, description, design, acceptance_criteria, notes,
              status, priority, task_type, assignee, labels, created_at, updated_at,
              closed_at, close_reason, external_ref, content_hash, branch, worktree_id,
@@ -756,7 +756,7 @@ impl TaskStore for SqliteTaskStore {
 
     fn list_pending_worktree_merge(&self) -> Result<Vec<Task>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, title, description, design, acceptance_criteria, notes,
              status, priority, task_type, assignee, labels, created_at, updated_at,
              closed_at, close_reason, external_ref, content_hash, branch, worktree_id,
@@ -791,7 +791,7 @@ impl TaskStore for SqliteTaskStore {
 
     fn get_dependencies(&self, task_id: &str) -> Result<Vec<Dependency>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT from_id, to_id, dep_type, created_at, created_by
              FROM dependencies WHERE from_id = ?",
         )?;
@@ -805,7 +805,7 @@ impl TaskStore for SqliteTaskStore {
 
     fn get_dependents(&self, task_id: &str) -> Result<Vec<Dependency>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT from_id, to_id, dep_type, created_at, created_by
              FROM dependencies WHERE to_id = ?",
         )?;
@@ -819,7 +819,7 @@ impl TaskStore for SqliteTaskStore {
 
     fn get_blockers(&self, task_id: &str) -> Result<Vec<Task>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT t.id, t.title, t.description, t.design, t.acceptance_criteria, t.notes,
              t.status, t.priority, t.task_type, t.assignee, t.labels, t.created_at, t.updated_at,
              t.closed_at, t.close_reason, t.external_ref, t.content_hash, t.branch, t.worktree_id,
@@ -870,7 +870,7 @@ impl TaskStore for SqliteTaskStore {
             ),
         };
 
-        let mut stmt = conn.prepare(sql)?;
+        let mut stmt = conn.prepare_cached(sql)?;
         let deps = if params.is_empty() {
             stmt.query_map([], Self::dep_from_row)?
                 .collect::<std::result::Result<Vec<_>, _>>()?
@@ -886,7 +886,7 @@ impl TaskStore for SqliteTaskStore {
         // Use recursive CTE to fetch all descendants in a single query
         // ParentChild dependency: from_id (child) -> to_id (parent)
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "WITH RECURSIVE subtree(task_id) AS (
                  SELECT from_id FROM dependencies
                  WHERE to_id = ?1 AND dep_type = 'parent-child'
@@ -919,7 +919,7 @@ impl TaskStore for SqliteTaskStore {
 
         // Get direct subtasks of the epic that have non-empty notes
         // excluding the specified task
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT t.id, t.title, t.notes
              FROM tasks t
              JOIN dependencies d ON d.from_id = t.id
@@ -947,7 +947,7 @@ impl TaskStore for SqliteTaskStore {
         let conn = self.conn.lock().unwrap();
 
         // Find parent via ParentChild dependency where the parent is an epic
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT t.id, t.title, t.description, t.design, t.acceptance_criteria, t.notes,
              t.status, t.priority, t.task_type, t.assignee, t.labels, t.created_at, t.updated_at,
              t.closed_at, t.close_reason, t.external_ref, t.content_hash, t.branch, t.worktree_id,

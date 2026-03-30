@@ -331,7 +331,7 @@ impl SkillStore for SqliteSkillStore {
             ),
         };
 
-        let mut stmt = conn.prepare(sql)?;
+        let mut stmt = conn.prepare_cached(sql)?;
         let skills = if params.is_empty() {
             stmt.query_map([], Self::skill_from_row)?
                 .collect::<std::result::Result<Vec<_>, _>>()?
@@ -351,7 +351,7 @@ impl SkillStore for SqliteSkillStore {
         let conn = self.conn.lock().unwrap();
         let pattern = format!("%{query}%");
 
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, name, description, skill_type, invocation, parameters_schema,
              example, preconditions, postconditions, validation_script, status, tags, summary,
              usage_count, created_at, updated_at, last_used, invokable, argument_hint,
