@@ -139,8 +139,8 @@ impl ColorPalette {
             primary_500: Color::Rgb(255, 160, 0),   // Deep amber
 
             // Override info to denim blue (overalls)
-            info: Color::Rgb(65, 105, 225),     // Royal blue / denim
-            info_dim: Color::Rgb(33, 53, 113),  // Dark denim
+            info: Color::Rgb(96, 140, 245),     // Bright denim blue (WCAG AA)
+            info_dim: Color::Rgb(48, 70, 123),  // Dark denim
 
             // Override cyan to goggle silver
             cyan: Color::Rgb(192, 200, 210),    // Goggle silver

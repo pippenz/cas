@@ -21,7 +21,7 @@ const TEAM_PALETTE: &[(&str, u8, u8, u8)] = &[
     ("cyan", 34, 211, 238),     // #22D3EE
     ("magenta", 232, 121, 249), // #E879F9
     ("red", 248, 113, 113),     // #F87171
-    ("white", 226, 232, 240),   // #E2E8F0
+    ("white", 100, 116, 139),   // #64748B — slate-500, visible on both light and dark
 ];
 
 /// Order for auto-assigning colors when no explicit registration exists.
