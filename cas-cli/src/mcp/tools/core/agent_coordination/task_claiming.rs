@@ -53,24 +53,37 @@ impl CasCore {
             None
         };
 
-        // Supervisors can only claim epics, not regular tasks
+        // Supervisors can only claim epics, not regular tasks —
+        // UNLESS the task is orphaned (assignee is inactive/dead worker).
         if is_supervisor && task.task_type != crate::types::TaskType::Epic {
-            return Err(McpError {
-                code: ErrorCode::INVALID_PARAMS,
-                message: Cow::from(
-                    "Supervisors cannot claim non-epic tasks. To delegate work:\n\n\
-                    1. Assign to existing worker:\n\
-                       mcp__cas__task action=update id=<task_id> assignee=<worker_name>\n\
-                       mcp__cas__coordination action=message target=<worker_name> message=\"Task <task_id> assigned\"\n\n\
-                    2. Or spawn a new worker:\n\
-                       mcp__cas__coordination action=spawn_workers count=1\n\n\
-                    Supervisors coordinate and review; workers execute tasks.",
-                ),
-                data: None,
-            });
+            let assignee_inactive = if let Some(assignee_id) = task.assignee.as_deref() {
+                agent_store
+                    .get(assignee_id)
+                    .map(|a| !a.is_alive() || a.is_heartbeat_expired(300))
+                    .unwrap_or(true) // assignee not found → treat as inactive
+            } else {
+                // No assignee at all → treat as orphaned
+                true
+            };
+
+            if !assignee_inactive {
+                return Err(McpError {
+                    code: ErrorCode::INVALID_PARAMS,
+                    message: Cow::from(
+                        "Supervisors cannot claim non-epic tasks. To delegate work:\n\n\
+                        1. Assign to existing worker:\n\
+                           mcp__cas__task action=update id=<task_id> assignee=<worker_name>\n\
+                           mcp__cas__coordination action=message target=<worker_name> message=\"Task <task_id> assigned\"\n\n\
+                        2. Or spawn a new worker:\n\
+                           mcp__cas__coordination action=spawn_workers count=1\n\n\
+                        Supervisors coordinate and review; workers execute tasks.",
+                    ),
+                    data: None,
+                });
+            }
         }
 
-        // Auto-assign to supervisor if task is unassigned (only for epics)
+        // Auto-assign to supervisor if task is unassigned (epics or orphaned tasks)
         let mut task = task;
         if task.assignee.is_none() && is_supervisor {
             task.assignee = Some(agent_name.clone());
@@ -88,13 +101,40 @@ impl CasCore {
                 });
             }
             Some(assignee) if assignee != &agent_id && assignee != &agent_name => {
-                return Err(McpError {
-                    code: ErrorCode::INVALID_PARAMS,
-                    message: Cow::from(format!(
-                        "Cannot claim task: assigned to '{assignee}', not you ({agent_name})"
-                    )),
-                    data: None,
-                });
+                // Allow supervisors to reclaim orphaned tasks from dead workers
+                let prev_assignee = assignee.clone();
+                let can_reclaim = is_supervisor
+                    && agent_store
+                        .get(&prev_assignee)
+                        .map(|a| !a.is_alive() || a.is_heartbeat_expired(300))
+                        .unwrap_or(true);
+
+                if can_reclaim {
+                    // Re-assign orphaned task to supervisor
+                    task.assignee = Some(agent_name.clone());
+                    task.updated_at = chrono::Utc::now();
+                    let timestamp = task.updated_at.format("%Y-%m-%d %H:%M");
+                    let reclaim_note = format!(
+                        "[{timestamp}] Reclaimed from inactive worker '{prev_assignee}' by supervisor '{agent_name}'"
+                    );
+                    if task.notes.is_empty() {
+                        task.notes = reclaim_note;
+                    } else {
+                        task.notes = format!("{}\n\n{}", task.notes, reclaim_note);
+                    }
+                    let _ = task_store.update(&task);
+
+                    // Release stale lease held by dead worker
+                    let _ = agent_store.release_lease(&req.task_id, &prev_assignee);
+                } else {
+                    return Err(McpError {
+                        code: ErrorCode::INVALID_PARAMS,
+                        message: Cow::from(format!(
+                            "Cannot claim task: assigned to '{prev_assignee}', not you ({agent_name})"
+                        )),
+                        data: None,
+                    });
+                }
             }
             _ => {} // Assigned to this agent - allow claim
         }
