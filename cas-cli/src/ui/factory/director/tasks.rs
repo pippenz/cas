@@ -194,16 +194,12 @@ pub fn render_with_focus(
 fn render_task_item(
     task: &TaskSummary,
     width: u16,
-    agent_id_to_name: &std::collections::HashMap<String, String>,
+    _agent_id_to_name: &std::collections::HashMap<String, String>,
     indented: bool,
     palette: &Palette,
 ) -> ListItem<'static> {
-    // Get agent name from ID for display
-    let agent_name = task
-        .assignee
-        .as_ref()
-        .and_then(|id| agent_id_to_name.get(id))
-        .cloned();
+    // Task assignees store agent names directly (not IDs)
+    let agent_name = task.assignee.clone();
 
     // Color by assignee agent's name
     let task_color = agent_name

@@ -149,12 +149,10 @@ pub fn build_task_item(
     indented: bool,
 ) -> ListItem<'static> {
     let palette = &theme.palette;
-    // Determine color based on assignee
+    // Determine color based on assignee (assignees store agent names directly)
     let task_color = task
         .assignee
         .as_ref()
-        .filter(|a| config.active_agent_ids.contains(*a))
-        .and_then(|a| config.agent_id_to_name.get(a))
         .map(|name| get_agent_color(name))
         .unwrap_or(palette.text_primary);
 
@@ -238,10 +236,10 @@ pub fn render_compact_task_list(
 
     // In-progress tasks first
     for task in in_progress {
+        // Task assignees store agent names directly (not IDs)
         let agent_color = task
             .assignee
             .as_ref()
-            .and_then(|id| config.agent_id_to_name.get(id))
             .map(|name| get_agent_color(name))
             .unwrap_or(palette.task_in_progress);
 

@@ -241,7 +241,8 @@ impl DirectorData {
             })
             .map(|a| {
                 agent_id_to_name.insert(a.id.clone(), a.name.clone());
-                let current_task = assignee_tasks.get(&a.id).cloned();
+                // Task assignees store agent names (not IDs), so look up by name
+                let current_task = assignee_tasks.get(&a.name).cloned();
                 let latest_activity = agent_latest_activity.get(&a.id).cloned();
                 AgentSummary {
                     id: a.id,

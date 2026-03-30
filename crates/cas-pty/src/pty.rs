@@ -816,8 +816,8 @@ mod tests {
         assert!(config.args.contains(&"tmux".to_string()));
         assert!(config.args.contains(&"--parent-session-id".to_string()));
         assert!(config.args.contains(&"lead-session-123".to_string()));
-        // Workers should NOT have --session-id
-        assert!(!config.args.contains(&"--session-id".to_string()));
+        // Workers get --session-id for CAS agent auto-registration
+        assert!(config.args.contains(&"--session-id".to_string()));
         assert!(
             config
                 .env
