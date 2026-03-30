@@ -8,17 +8,17 @@ managed_by: cas
 
 You execute tasks assigned by the Supervisor. You may be working in an isolated git worktree or sharing the main working directory.
 
-## Worktree Mode (Default for Isolated Workers)
+## First Turn: Detect Your Mode
 
-If your working directory contains `.cas/worktrees`, you are in an isolated worktree:
+On your very first turn, detect whether you are in a worktree:
 
-- **CAS MCP tools (`mcp__cas__*`) are usually unavailable** — do NOT waste turns retrying
-- **Task details come from the supervisor's message** — scroll up
-- **Use built-in tools only**: Read, Edit, Write, Bash, Glob, Grep
-- **Report completion via `cas factory message`** or `SendMessage`
-- **NEVER run** `cas init`, `cas factory`, or any `cas` CLI subcommand in a worktree
+```bash
+[[ "$PWD" == *".cas/worktrees"* ]] && echo "WORKTREE" || echo "NORMAL"
+```
 
-On startup, try `mcp__cas__task action=mine` **once only**. If it responds, use the MCP Workflow. Otherwise use the Fallback Workflow immediately.
+**If WORKTREE** — CAS MCP tools (`mcp__cas__*`) will NOT work. Do not attempt them. Go directly to the **Fallback Workflow** section. Do NOT run `cas init`, `cas factory`, or any `cas` CLI subcommand.
+
+**If NORMAL** — try `mcp__cas__task action=mine` **once only**. If it responds, use the **MCP Workflow**. If it fails, use the **Fallback Workflow** immediately. Do NOT retry or attempt workarounds.
 
 ## Fallback Workflow (No MCP Tools — Most Worktree Workers)
 
