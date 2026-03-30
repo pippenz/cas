@@ -95,6 +95,8 @@ pub struct Pane {
     user_scrolled: bool,
     /// Number of new output lines received while user was scrolled up
     new_lines_below: u32,
+    /// Reusable scratch buffer for drain_output (avoids 65KB alloc per poll)
+    drain_buf: Vec<u8>,
 }
 
 impl Pane {
@@ -129,6 +131,7 @@ impl Pane {
             seq_counter: 0,
             user_scrolled: false,
             new_lines_below: 0,
+            drain_buf: Vec::with_capacity(65536),
         })
     }
 
@@ -561,7 +564,7 @@ impl Pane {
 
     pub fn drain_output(&mut self) -> (Vec<u8>, Vec<PtyEvent>) {
         let mut other_events = Vec::new();
-        let mut coalesced = Vec::with_capacity(65536);
+        self.drain_buf.clear();
 
         let try_recv = |backend: &mut PaneBackend| -> Option<PtyEvent> {
             match backend {
@@ -573,7 +576,7 @@ impl Pane {
         while let Some(event) = try_recv(&mut self.backend) {
             match event {
                 PtyEvent::Output(data) => {
-                    coalesced.extend_from_slice(&data);
+                    self.drain_buf.extend_from_slice(&data);
                 }
                 PtyEvent::Exited(code) => {
                     self.exited = true;
@@ -587,6 +590,9 @@ impl Pane {
             }
         }
 
+        // Take the buffer out to avoid borrow conflict with self.feed()
+        let coalesced = std::mem::take(&mut self.drain_buf);
+
         if !coalesced.is_empty() {
             let feed_data = Self::strip_literal_cursor_reports(&coalesced);
             if let Err(e) = self.feed(feed_data.as_ref()) {
@@ -598,7 +604,10 @@ impl Pane {
             }
         }
 
-        (coalesced, other_events)
+        // Put the buffer back for reuse (capacity preserved across calls)
+        self.drain_buf = coalesced;
+        let result = self.drain_buf.clone();
+        (result, other_events)
     }
 
     pub async fn write(&self, data: &[u8]) -> Result<()> {

@@ -9,8 +9,8 @@ use cas_mux::{Mux, PaneKind};
 use ratatui::layout::Rect;
 
 use super::director::{
-    DiffLine, DirectorData, DirectorEvent, DirectorEventDetector, PanelAreas, Prompt, SidecarFocus,
-    ViewMode, generate_prompt,
+    DiffLine, DirectorData, DirectorEvent, DirectorEventDetector, DirectorStores, PanelAreas,
+    Prompt, SidecarFocus, ViewMode, generate_prompt,
 };
 use crate::store::open_prompt_queue_store;
 use crate::types::Worktree;
@@ -128,6 +128,8 @@ pub struct FactoryApp {
     pub mux: Mux,
     /// CAS directory for data loading
     cas_dir: PathBuf,
+    /// Cached store handles (avoid re-opening on every 2s refresh)
+    director_stores: Option<DirectorStores>,
     /// Director panel data
     director_data: DirectorData,
     /// Current input mode
@@ -416,16 +418,23 @@ impl FactoryApp {
 
         let worktree_root = self.worktree_manager.as_ref().map(|m| m.worktree_root());
         if db_changed {
-            let loaded =
-                DirectorData::load_with_git(&self.cas_dir, worktree_root.as_deref(), git_due)?;
+            let loaded = DirectorData::load_with_stores(
+                &self.cas_dir,
+                worktree_root.as_deref(),
+                git_due,
+                self.director_stores.as_ref(),
+            )?;
             self.director_data =
                 merge_director_data_preserving_git(&self.director_data, loaded, git_due);
             if git_due {
                 self.last_git_refresh = Instant::now();
             }
         } else if git_due {
-            self.director_data
-                .refresh_git_changes(&self.cas_dir, worktree_root.as_deref())?;
+            self.director_data.refresh_git_changes_with_stores(
+                &self.cas_dir,
+                worktree_root.as_deref(),
+                self.director_stores.as_ref(),
+            )?;
             self.last_git_refresh = Instant::now();
         } else {
             self.last_refresh = Instant::now();

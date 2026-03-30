@@ -12,6 +12,7 @@ use crate::ui::factory::app::{
     AutoPromptConfig, EpicState, FactoryApp, FactoryConfig, detect_epic_state, epic_branch_name,
     queue_codex_worker_intro_prompt, queue_supervisor_intro_prompt,
 };
+use crate::ui::factory::director::DirectorStores;
 use crate::ui::factory::director::{
     DirectorData, DirectorEventDetector, PanelAreas, SidecarFocus, ViewMode,
 };
@@ -130,6 +131,9 @@ impl FactoryApp {
             teams_configs: config.teams_configs,
         };
 
+        // Cache store handles for efficient periodic refresh
+        let director_stores = DirectorStores::open(&cas_dir).ok();
+
         let mut mux = Mux::factory(mux_config)?;
         mux.focus(&supervisor_name);
 
@@ -144,6 +148,7 @@ impl FactoryApp {
         let app = Self {
             mux,
             cas_dir,
+            director_stores,
             director_data,
             input_mode: InputMode::Normal,
             inject_buffer: String::new(),
@@ -288,6 +293,9 @@ impl FactoryApp {
 
         let notifier = Notifier::new(notify_config);
 
+        // Cache store handles for efficient periodic refresh
+        let director_stores = DirectorStores::open(&cas_dir).ok();
+
         // Resolve theme: explicit config overrides auto-detection
         let cas_config = Config::load(&cas_dir).unwrap_or_default();
         let theme = ActiveTheme::resolve(cas_config.theme.as_ref());
@@ -295,6 +303,7 @@ impl FactoryApp {
         let app = Self {
             mux,
             cas_dir,
+            director_stores,
             director_data,
             input_mode: InputMode::Normal,
             inject_buffer: String::new(),

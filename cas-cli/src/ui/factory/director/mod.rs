@@ -17,7 +17,7 @@ mod prompts;
 mod reminders;
 pub(crate) mod tasks;
 
-pub use data::{AgentSummary, DirectorData, TaskSummary};
+pub use data::{AgentSummary, DirectorData, DirectorStores, TaskSummary};
 pub use events::{DirectorEvent, DirectorEventDetector};
 pub use panel::PanelRegistry;
 pub use prompts::{Prompt, generate_prompt, with_response_instructions};

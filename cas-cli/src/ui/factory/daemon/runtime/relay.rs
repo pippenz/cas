@@ -44,7 +44,11 @@ impl PaneBuffer {
     }
 
     pub(in crate::ui::factory::daemon) fn as_bytes(&self) -> Vec<u8> {
-        self.data.iter().copied().collect()
+        let (front, back) = self.data.as_slices();
+        let mut v = Vec::with_capacity(front.len() + back.len());
+        v.extend_from_slice(front);
+        v.extend_from_slice(back);
+        v
     }
 
     pub(in crate::ui::factory::daemon) fn replace_with(&mut self, bytes: Vec<u8>) {
