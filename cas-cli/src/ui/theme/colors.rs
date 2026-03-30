@@ -200,9 +200,9 @@ impl ColorPalette {
             info:        Color::Rgb(187, 154, 247), // #bb9af7 — magenta / purple
             info_dim:    Color::Rgb(86, 67, 130),   // muted purple shadow
 
-            // Specialty colors
-            purple:     Color::Rgb(187, 154, 247), // #bb9af7 — magenta
-            purple_dim: Color::Rgb(93, 73, 155),   // deep purple shadow
+            // Specialty colors — purple shifted lighter to differentiate from info
+            purple:     Color::Rgb(207, 174, 247), // #cfaef7 — lighter magenta (distinct from info)
+            purple_dim: Color::Rgb(103, 87, 155),  // deep purple shadow
             cyan:       Color::Rgb(125, 207, 255), // #7dcfff — cyan
             cyan_dim:   Color::Rgb(42, 195, 222),  // #2ac3de — blue1 (brighter cyan)
             orange:     Color::Rgb(255, 158, 100), // #ff9e64 — orange
@@ -213,8 +213,8 @@ impl ColorPalette {
     /// High contrast accessibility variant
     pub fn high_contrast() -> Self {
         Self {
-            gray_50: Color::White,
-            gray_100: Color::White,
+            gray_50: Color::Rgb(255, 255, 255),
+            gray_100: Color::Rgb(255, 255, 255),
             gray_200: Color::Rgb(220, 220, 220),
             gray_300: Color::Rgb(180, 180, 180),
             gray_400: Color::Rgb(140, 140, 140),
@@ -222,12 +222,12 @@ impl ColorPalette {
             gray_600: Color::Rgb(60, 60, 60),
             gray_700: Color::Rgb(40, 40, 40),
             gray_800: Color::Rgb(20, 20, 20),
-            gray_900: Color::Black,
+            gray_900: Color::Rgb(0, 0, 0),
 
             primary_100: Color::Rgb(255, 255, 100),
             primary_200: Color::Rgb(255, 255, 80),
             primary_300: Color::Rgb(255, 255, 60),
-            primary_400: Color::Yellow,
+            primary_400: Color::Rgb(255, 255, 0),
             primary_500: Color::Rgb(200, 200, 0),
 
             success: Color::Rgb(0, 255, 0),
@@ -239,9 +239,9 @@ impl ColorPalette {
             info: Color::Rgb(0, 200, 255),
             info_dim: Color::Rgb(0, 80, 100),
 
-            purple: Color::Magenta,
+            purple: Color::Rgb(255, 0, 255),
             purple_dim: Color::Rgb(100, 0, 100),
-            cyan: Color::Cyan,
+            cyan: Color::Rgb(0, 255, 255),
             cyan_dim: Color::Rgb(0, 100, 100),
             orange: Color::Rgb(255, 165, 0),
             orange_dim: Color::Rgb(100, 65, 0),

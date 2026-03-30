@@ -203,7 +203,7 @@ impl Palette {
             worktree_merged: colors.cyan,
             worktree_abandoned: colors.error,
             worktree_conflict: colors.purple,
-            worktree_removed: colors.gray_600,
+            worktree_removed: colors.gray_500,
             worktree_orphaned: colors.warning,
 
             // Feedback
@@ -225,7 +225,7 @@ impl Palette {
 
             // Heatmap
             heatmap_empty: colors.gray_800,
-            heatmap_low: Color::Rgb(50, 100, 50),
+            heatmap_low: Color::Rgb(70, 140, 70),
             heatmap_medium: Color::Rgb(80, 160, 80),
             heatmap_high: Color::Rgb(100, 200, 100),
             heatmap_max: colors.success,
@@ -316,7 +316,7 @@ impl Palette {
             worktree_merged: colors.cyan,
             worktree_abandoned: colors.error,
             worktree_conflict: colors.purple,
-            worktree_removed: colors.gray_600,
+            worktree_removed: colors.gray_500,
             worktree_orphaned: colors.warning,
 
             // Feedback

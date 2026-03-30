@@ -214,7 +214,7 @@ fn render_task_item(
     let status_icon = match task.status {
         TaskStatus::InProgress => Icons::SPINNER_STATIC,
         TaskStatus::Open => Icons::CIRCLE_EMPTY,
-        TaskStatus::Blocked => Icons::BLOCKED,
+        TaskStatus::Blocked => Icons::CIRCLE_X,
         TaskStatus::Closed => Icons::CHECK,
     };
 
@@ -258,7 +258,7 @@ fn render_task_item(
     if let Some(badge) = worker_badge {
         spans.push(Span::styled(
             badge,
-            Style::default().fg(task_color).add_modifier(Modifier::DIM),
+            Style::default().fg(palette.text_muted),
         ));
     }
 
