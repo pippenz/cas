@@ -58,7 +58,6 @@ mod app;
 mod boot;
 mod buffer_backend;
 mod client;
-mod clipboard;
 pub(crate) mod daemon;
 mod director;
 mod input;
@@ -67,7 +66,6 @@ mod notification;
 pub(crate) mod phoenix;
 mod protocol;
 pub mod renderer;
-mod selection;
 mod session;
 mod status_bar;
 pub use app::{FactoryApp, FactoryConfig};
@@ -76,7 +74,6 @@ pub use client::{
     attach, find_session_for_project, list_session_summaries, list_session_summaries_for_project,
     list_sessions, list_sessions_for_project,
 };
-pub use clipboard::copy_to_clipboard;
 pub use daemon::{
     DaemonConfig, DaemonInitPhase, FactoryDaemon, ForkFirstResult, ForkResult, daemonize,
     fork_first_daemon, fork_into_daemon, run_daemon, run_daemon_after_fork,
@@ -86,7 +83,6 @@ pub use layout::{Direction, MissionControlLayout, PANE_SIDECAR, PaneGrid};
 pub use notification::{Notifier, NotifyBackend, NotifyConfig};
 pub use protocol::{ClientMessage, DaemonMessage, PaneInfo, PaneKind, SessionState};
 pub use renderer::{FactoryViewMode, MissionControlFocus};
-pub use selection::{Selection, apply_selection_to_line};
 pub use session::{
     SessionInfo, SessionManager, create_metadata, daemon_log_path, daemon_trace_log_path,
     generate_session_name, metadata_path, panic_log_path, session_log_dir, socket_path,

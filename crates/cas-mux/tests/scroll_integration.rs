@@ -477,3 +477,67 @@ fn test_mux_scroll_with_cache_zero_window() {
     assert!(cache_rows.is_empty());
     assert!(cache_start.is_none());
 }
+
+#[test]
+fn test_feed_while_scrolled_preserves_viewport() {
+    // Regression test: feeding new data while scrolled up must preserve
+    // the user's viewport position (not jump to top or bottom).
+    let mut pane = Pane::director("test", 10, 80).unwrap();
+
+    // Generate scrollback
+    for i in 0..50 {
+        pane.feed(format!("Line {i}\r\n").as_bytes()).unwrap();
+    }
+    assert_eq!(pane.scrollback_info().viewport_offset, 0);
+
+    // Scroll up 20 lines
+    pane.scroll(-20).unwrap();
+    let before = pane.scrollback_info();
+    assert_eq!(before.viewport_offset, 20);
+
+    // Feed 5 new lines while scrolled up
+    pane.feed(b"New1\r\nNew2\r\nNew3\r\nNew4\r\nNew5\r\n")
+        .unwrap();
+    let after = pane.scrollback_info();
+
+    let new_lines = after.total_scrollback.saturating_sub(before.total_scrollback);
+    let expected_offset = before.viewport_offset + new_lines;
+
+    assert_eq!(
+        after.viewport_offset, expected_offset,
+        "Viewport should stay at old_offset + new_lines (same content visible)"
+    );
+    assert_eq!(pane.new_lines_below(), new_lines);
+}
+
+#[test]
+fn test_repeated_feed_while_scrolled_no_drift() {
+    // Verify that multiple feed() calls while scrolled don't cause
+    // cumulative drift (the bug that sent viewport to the top).
+    let mut pane = Pane::director("test", 10, 80).unwrap();
+
+    for i in 0..100 {
+        pane.feed(format!("Line {i}\r\n").as_bytes()).unwrap();
+    }
+
+    pane.scroll(-30).unwrap();
+    let initial_offset = pane.scrollback_info().viewport_offset;
+    let mut total_new_lines = 0u32;
+
+    // Simulate 10 rounds of agent output arriving while user reads earlier content
+    for round in 0..10 {
+        let before_total = pane.scrollback_info().total_scrollback;
+        pane.feed(format!("Agent output round {round}\r\n").as_bytes())
+            .unwrap();
+        let after = pane.scrollback_info();
+        total_new_lines += after.total_scrollback.saturating_sub(before_total);
+    }
+
+    let final_offset = pane.scrollback_info().viewport_offset;
+    assert_eq!(
+        final_offset,
+        initial_offset + total_new_lines,
+        "After 10 feed rounds, offset should be initial + total_new_lines (no drift)"
+    );
+    assert_eq!(pane.new_lines_below(), total_new_lines);
+}

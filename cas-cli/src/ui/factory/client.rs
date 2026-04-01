@@ -6,7 +6,7 @@
 
 use crate::ui::factory::session::{SessionInfo, SessionManager};
 use base64::Engine;
-use base64::engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use cas_factory::SessionSummary;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::execute;
@@ -72,13 +72,10 @@ fn attach_unix(session: &SessionInfo) -> anyhow::Result<()> {
         );
     }
 
-    // Enable raw mode + mouse capture
+    // Enable raw mode (no mouse capture — let the terminal handle native
+    // text selection so users can select + right-click → Copy).
     enable_raw_mode()?;
-    execute!(
-        io::stdout(),
-        crossterm::event::EnableMouseCapture,
-        crossterm::event::EnableBracketedPaste
-    )?;
+    execute!(io::stdout(), crossterm::event::EnableBracketedPaste)?;
 
     // Send initial terminal size as control sequence
     if let Ok((cols, rows)) = terminal::size() {
@@ -107,10 +104,6 @@ fn attach_unix(session: &SessionInfo) -> anyhow::Result<()> {
     let mut pending_resize: Option<(u16, u16)> = None;
     let mut pending_resize_at = std::time::Instant::now();
     const CLIENT_RESIZE_DEBOUNCE_MS: u64 = 50;
-    let mut last_mouse_pos: Option<(u16, u16)> = None;
-    // Buffer for partially received clipboard control sequences that span reads
-    let mut clipboard_remainder: Vec<u8> = Vec::new();
-
     // Main loop
     while !quit.load(std::sync::atomic::Ordering::Relaxed) {
         // Read from socket (non-blocking)
@@ -120,10 +113,8 @@ fn attach_unix(session: &SessionInfo) -> anyhow::Result<()> {
                 break;
             }
             Ok(n) => {
-                // Filter out clipboard control sequences and handle them
-                // locally, forwarding everything else to the terminal.
                 let data = &read_buf[..n];
-                write_filtering_clipboard(data, &mut stdout, &mut clipboard_remainder);
+                let _ = stdout.write_all(data);
                 let _ = stdout.flush();
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -163,45 +154,13 @@ fn attach_unix(session: &SessionInfo) -> anyhow::Result<()> {
                     pending_resize = Some((cols, rows));
                     pending_resize_at = std::time::Instant::now();
                 }
-                Event::Mouse(mouse) => {
-                    last_mouse_pos = Some((mouse.column, mouse.row));
-                    // Convert mouse event to control sequence
-                    let mouse_cmd = match mouse.kind {
-                        crossterm::event::MouseEventKind::Down(
-                            crossterm::event::MouseButton::Left,
-                        ) => Some(format!("mouse;down_left;{};{}", mouse.column, mouse.row)),
-                        crossterm::event::MouseEventKind::Drag(
-                            crossterm::event::MouseButton::Left,
-                        ) => Some(format!("mouse;drag_left;{};{}", mouse.column, mouse.row)),
-                        crossterm::event::MouseEventKind::Up(
-                            crossterm::event::MouseButton::Left,
-                        ) => Some(format!("mouse;up_left;{};{}", mouse.column, mouse.row)),
-                        crossterm::event::MouseEventKind::ScrollUp => {
-                            Some(format!("mouse;scroll_up;{};{}", mouse.column, mouse.row))
-                        }
-                        crossterm::event::MouseEventKind::ScrollDown => {
-                            Some(format!("mouse;scroll_down;{};{}", mouse.column, mouse.row))
-                        }
-                        _ => None,
-                    };
-                    if let Some(cmd) = mouse_cmd {
-                        let mut msg = Vec::new();
-                        msg.extend_from_slice(CONTROL_PREFIX);
-                        msg.extend_from_slice(cmd.as_bytes());
-                        msg.push(CONTROL_SUFFIX);
-                        let _ = stream.write_all(&msg);
-                    }
-                }
                 Event::Paste(text) => {
                     if !contains_dropped_image_path(&text) {
                         let _ = stream.write_all(text.as_bytes());
                     } else {
                         // Preserve the original drop payload and route it as a drop event.
-                        // Normalizing paths here changes Claude's interpretation compared
-                        // to native terminal drop/paste behavior.
                         let encoded_payload = URL_SAFE_NO_PAD.encode(text.as_bytes());
-                        let (col, row) = last_mouse_pos.unwrap_or((u16::MAX, u16::MAX));
-                        let cmd = format!("drop_image;{col};{row};{encoded_payload}");
+                        let cmd = format!("drop_image;{};{};{encoded_payload}", u16::MAX, u16::MAX);
                         let mut msg = Vec::new();
                         msg.extend_from_slice(CONTROL_PREFIX);
                         msg.extend_from_slice(cmd.as_bytes());
@@ -228,11 +187,7 @@ fn attach_unix(session: &SessionInfo) -> anyhow::Result<()> {
     }
 
     // Restore terminal
-    let _ = execute!(
-        io::stdout(),
-        crossterm::event::DisableMouseCapture,
-        crossterm::event::DisableBracketedPaste
-    );
+    let _ = execute!(io::stdout(), crossterm::event::DisableBracketedPaste);
     disable_raw_mode()?;
 
     // Leave alternate screen and show cursor
@@ -450,67 +405,6 @@ fn ctrl_char_to_byte(c: char) -> Option<u8> {
     }
 }
 
-/// Clipboard control sequence prefix: `ESC ] 777 ; clipboard ;`
-const CLIPBOARD_PREFIX: &[u8] = b"\x1b]777;clipboard;";
-
-/// Filter daemon output, intercepting `ESC]777;clipboard;<base64>BEL` sequences.
-///
-/// Clipboard sequences are consumed and the base64 payload is decoded and written
-/// to the system clipboard via [`crate::ui::factory::clipboard::copy_to_clipboard`].
-/// All other bytes are forwarded to `out` (the terminal).
-///
-/// `remainder` accumulates partial clipboard sequences across read boundaries.
-fn write_filtering_clipboard(
-    data: &[u8],
-    out: &mut impl Write,
-    remainder: &mut Vec<u8>,
-) {
-    // If we have a partial sequence from a previous read, prepend it.
-    let buf: std::borrow::Cow<'_, [u8]> = if remainder.is_empty() {
-        std::borrow::Cow::Borrowed(data)
-    } else {
-        let mut combined = std::mem::take(remainder);
-        combined.extend_from_slice(data);
-        std::borrow::Cow::Owned(combined)
-    };
-
-    let mut i = 0;
-    while i < buf.len() {
-        // Look for the start of our clipboard control sequence.
-        if buf[i] == 0x1b {
-            if buf[i..].starts_with(CLIPBOARD_PREFIX) {
-                // Find the BEL terminator.
-                let payload_start = i + CLIPBOARD_PREFIX.len();
-                if let Some(bel_offset) = buf[payload_start..].iter().position(|&b| b == 0x07) {
-                    let payload = &buf[payload_start..payload_start + bel_offset];
-                    // Decode base64 and copy to clipboard.
-                    if let Ok(decoded) = BASE64_STANDARD.decode(payload) {
-                        if let Ok(text) = String::from_utf8(decoded) {
-                            let _ =
-                                crate::ui::factory::clipboard::copy_to_clipboard(&text);
-                        }
-                    }
-                    i = payload_start + bel_offset + 1; // skip past BEL
-                    continue;
-                } else {
-                    // Incomplete sequence — save remainder for next read.
-                    *remainder = buf[i..].to_vec();
-                    return;
-                }
-            }
-        }
-
-        // Find next potential ESC or end of buffer.
-        let next_esc = buf[i + 1..]
-            .iter()
-            .position(|&b| b == 0x1b)
-            .map(|p| i + 1 + p)
-            .unwrap_or(buf.len());
-        let _ = out.write_all(&buf[i..next_esc]);
-        i = next_esc;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -560,53 +454,5 @@ mod tests {
             state: KeyEventState::empty(),
         };
         assert_eq!(key_to_bytes(&key), vec![0x04]);
-    }
-
-    #[test]
-    fn filter_clipboard_passes_through_normal_data() {
-        let mut out = Vec::new();
-        let mut remainder = Vec::new();
-        let data = b"hello world";
-        write_filtering_clipboard(data, &mut out, &mut remainder);
-        assert_eq!(out, b"hello world");
-        assert!(remainder.is_empty());
-    }
-
-    #[test]
-    fn filter_clipboard_strips_clipboard_sequence() {
-        let mut out = Vec::new();
-        let mut remainder = Vec::new();
-        let b64 = BASE64_STANDARD.encode("copied text");
-        let data = format!("before\x1b]777;clipboard;{}\x07after", b64);
-        write_filtering_clipboard(data.as_bytes(), &mut out, &mut remainder);
-        assert_eq!(out, b"beforeafter");
-        assert!(remainder.is_empty());
-    }
-
-    #[test]
-    fn filter_clipboard_handles_partial_sequence() {
-        let mut out = Vec::new();
-        let mut remainder = Vec::new();
-        // Send partial clipboard sequence (no BEL terminator)
-        let data = b"before\x1b]777;clipboard;aGVsbG8";
-        write_filtering_clipboard(data, &mut out, &mut remainder);
-        assert_eq!(out, b"before");
-        assert!(!remainder.is_empty());
-
-        // Now send the rest
-        let mut out2 = Vec::new();
-        write_filtering_clipboard(b"=\x07after", &mut out2, &mut remainder);
-        assert_eq!(out2, b"after");
-        assert!(remainder.is_empty());
-    }
-
-    #[test]
-    fn filter_clipboard_preserves_other_esc_sequences() {
-        let mut out = Vec::new();
-        let mut remainder = Vec::new();
-        // OSC 52 should pass through (it's not our clipboard sequence)
-        let data = b"\x1b]52;c;aGVsbG8=\x1b\\rest";
-        write_filtering_clipboard(data, &mut out, &mut remainder);
-        assert_eq!(out, b"\x1b]52;c;aGVsbG8=\x1b\\rest");
     }
 }

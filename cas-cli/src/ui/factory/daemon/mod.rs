@@ -180,9 +180,6 @@ pub struct FactoryDaemon {
 enum ControlEvent {
     Resize(u16, u16),
     SetMode(ClientViewMode),
-    MouseDown(u16, u16),
-    MouseDrag(u16, u16),
-    MouseUp,
     MouseScrollUp,
     MouseScrollDown,
     DropImage { col: u16, row: u16, path: String },

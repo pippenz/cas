@@ -25,7 +25,6 @@ pub(super) use crate::ui::theme::{ActiveTheme, get_agent_color};
 pub(super) use crate::ui::widgets::TreeItemType;
 pub(super) use crate::worktree::{WorktreeConfig, WorktreeManager};
 
-pub(super) use crate::ui::factory::app::extract_selected_text_from_pane;
 pub(super) use crate::ui::factory::app::{
     EpicStateChange, FactoryApp, WorkerSpawnPrep, WorkerSpawnResult, WorktreePrep, epic_branch_name,
 };

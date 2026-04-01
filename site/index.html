@@ -1,0 +1,1226 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>The System — Claude Code + CAS</title>
+<style>
+  /* ═══════════════ RESET ═══════════════ */
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg:        #f8f9fb;
+    --bg-card:   #ffffff;
+    --bg-code:   #f0f1f5;
+    --bg-surface:#eef0f4;
+    --border:    #dde0e6;
+    --border-hi: #c5c9d2;
+    --text:      #2d3142;
+    --text-dim:  #5c6170;
+    --text-hi:   #1a1d2b;
+    --white:     #ffffff;
+    --accent:    #6c5ce7;
+    --accent-hi: #5a4bd1;
+    --accent-bg: rgba(108,92,231,0.08);
+    --green:     #0d9668;
+    --green-bg:  rgba(13,150,104,0.08);
+    --amber:     #d97706;
+    --amber-bg:  rgba(217,119,6,0.07);
+    --red:       #dc2626;
+    --cyan:      #0284c7;
+    --cyan-bg:   rgba(2,132,199,0.07);
+    --rose:      #db2777;
+    --rose-bg:   rgba(219,39,119,0.07);
+    --font:      'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+    --mono:      'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'SF Mono', Consolas, monospace;
+    --r:         14px;
+    --r-sm:      10px;
+  }
+
+  html { scroll-behavior: smooth; font-size: 16px; }
+
+  body {
+    font-family: var(--font);
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.75;
+    -webkit-font-smoothing: antialiased;
+    overflow-x: hidden;
+  }
+
+  /* ═══════════════ AMBIENT ═══════════════ */
+  .ambient {
+    position: fixed; inset: 0; z-index: -2; pointer-events: none;
+    background:
+      radial-gradient(ellipse 800px 600px at 15% 10%, rgba(108,92,231,0.06) 0%, transparent 70%),
+      radial-gradient(ellipse 600px 500px at 85% 50%, rgba(2,132,199,0.04) 0%, transparent 70%),
+      radial-gradient(ellipse 500px 400px at 40% 90%, rgba(13,150,104,0.03) 0%, transparent 70%);
+    animation: drift 25s ease-in-out infinite alternate;
+  }
+  @keyframes drift { to { transform: translate(-1.5%,-1.5%) scale(1.02); } }
+
+  .grid-dots {
+    position: fixed; inset: 0; z-index: -3; pointer-events: none;
+    background-image: radial-gradient(circle 1px, rgba(108,92,231,0.08) 1px, transparent 1px);
+    background-size: 40px 40px;
+  }
+
+  /* ═══════════════ TYPOGRAPHY ═══════════════ */
+  h1, h2, h3, h4, h5 { color: var(--text-hi); font-weight: 700; letter-spacing: -0.025em; line-height: 1.3; }
+  h2 { font-size: 2.2rem; margin-bottom: 0.3em; }
+  h3 { font-size: 1.25rem; }
+
+  .section-lead {
+    color: var(--text);
+    font-size: 1.08rem;
+    max-width: 640px;
+    margin-bottom: 2.8rem;
+    line-height: 1.8;
+  }
+
+  a { color: var(--accent-hi); text-decoration: none; }
+  a:hover { color: #c4b8ff; }
+
+  code {
+    font-family: var(--mono);
+    background: var(--bg-code);
+    border: 1px solid var(--border);
+    padding: 0.12em 0.45em;
+    border-radius: 5px;
+    font-size: 0.86em;
+    color: var(--accent-hi);
+    white-space: nowrap;
+  }
+
+  /* ═══════════════ LAYOUT ═══════════════ */
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 0 2rem; }
+  section { padding: 6rem 0; position: relative; }
+  section + section { border-top: 1px solid var(--border); }
+
+  /* ═══════════════ NAV ═══════════════ */
+  nav {
+    position: sticky; top: 0; z-index: 100;
+    background: rgba(248,249,251,0.92);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    border-bottom: 1px solid var(--border);
+  }
+  nav .inner {
+    max-width: 1180px; margin: 0 auto; padding: 0 2rem;
+    display: flex; align-items: center; justify-content: space-between; height: 56px;
+  }
+  .nav-mark {
+    font-family: var(--mono); font-weight: 800; font-size: 0.95rem;
+    color: var(--text-dim); letter-spacing: 0.12em;
+  }
+  .nav-mark b { color: var(--accent); }
+  nav ul { list-style: none; display: flex; gap: 1.8rem; }
+  nav a { color: var(--text-dim); font-size: 0.82rem; font-weight: 500; letter-spacing: 0.03em; }
+  nav a:hover { color: var(--text-hi); }
+
+  /* ═══════════════ HERO ═══════════════ */
+  .hero { padding: 7rem 0 5.5rem; text-align: center; border-bottom: 1px solid var(--border); }
+
+  .hero-tag {
+    display: inline-flex; align-items: center; gap: 0.6rem;
+    font-family: var(--mono); font-size: 0.78rem; color: var(--accent);
+    text-transform: uppercase; letter-spacing: 0.14em;
+    margin-bottom: 1.4rem;
+    background: var(--accent-bg); border: 1px solid rgba(124,106,239,0.15);
+    padding: 0.4em 1.2em; border-radius: 20px;
+  }
+
+  .hero h1 {
+    font-size: clamp(2.6rem, 5.5vw, 4.2rem);
+    line-height: 1.1; margin-bottom: 1.5rem;
+    background: linear-gradient(135deg, var(--text-hi) 0%, var(--accent) 55%, var(--cyan) 100%);
+    -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
+  }
+
+  .hero-desc {
+    font-size: 1.15rem; color: var(--text); max-width: 720px;
+    margin: 0 auto 3rem; line-height: 1.85;
+  }
+
+  .hero-desc strong { color: var(--text-hi); font-weight: 600; }
+
+  /* ═══════════════ LAYER STACK ═══════════════ */
+  .layer-stack {
+    display: flex; flex-direction: column; gap: 0; max-width: 700px; margin: 0 auto;
+  }
+
+  .layer {
+    display: flex; align-items: center; gap: 1.2rem;
+    padding: 1.2rem 1.8rem;
+    border: 1px solid var(--border);
+    background: var(--bg-card);
+    position: relative;
+  }
+  .layer:first-child { border-radius: var(--r) var(--r) 0 0; }
+  .layer:last-child  { border-radius: 0 0 var(--r) var(--r); }
+  .layer + .layer { border-top: none; }
+
+  .layer-icon {
+    width: 40px; height: 40px; border-radius: 10px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 1.1rem; flex-shrink: 0; font-weight: 700;
+  }
+
+  .layer-icon.human  { background: var(--rose-bg); color: var(--rose); border: 1px solid rgba(244,114,182,0.2); }
+  .layer-icon.claude  { background: var(--amber-bg); color: var(--amber); border: 1px solid rgba(245,158,11,0.2); }
+  .layer-icon.hooks  { background: var(--green-bg); color: var(--green); border: 1px solid rgba(52,211,153,0.2); }
+  .layer-icon.mcp    { background: var(--accent-bg); color: var(--accent); border: 1px solid rgba(124,106,239,0.2); }
+  .layer-icon.store  { background: var(--cyan-bg); color: var(--cyan); border: 1px solid rgba(56,189,248,0.2); }
+
+  .layer-text h4 { font-size: 0.95rem; margin-bottom: 0.15rem; }
+  .layer-text p  { font-size: 0.82rem; color: var(--text-dim); line-height: 1.5; }
+
+  .layer-connector {
+    position: absolute; left: 50%; bottom: -1px;
+    width: 2px; height: 16px; background: var(--border-hi);
+    transform: translateX(-50%); z-index: 1;
+    display: none; /* hidden since layers touch */
+  }
+
+  /* ═══════════════ CARDS ═══════════════ */
+  .card-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 1.4rem; }
+
+  .card {
+    background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--r);
+    padding: 2rem; transition: border-color 0.3s, box-shadow 0.3s, transform 0.25s;
+    position: relative; overflow: hidden;
+  }
+  .card::after {
+    content: ''; position: absolute; top: 0; left: 0; right: 0; height: 2px;
+    background: linear-gradient(90deg, transparent, var(--accent), transparent);
+    opacity: 0; transition: opacity 0.3s;
+  }
+  .card { box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
+  .card:hover { border-color: var(--border-hi); box-shadow: 0 4px 16px rgba(108,92,231,0.12); transform: translateY(-2px); }
+  .card:hover::after { opacity: 1; }
+
+  .card-icon {
+    width: 42px; height: 42px; border-radius: 10px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 1.15rem; margin-bottom: 1.1rem; font-weight: 700;
+  }
+
+  .card h3 { font-size: 1.1rem; margin-bottom: 0.5rem; }
+  .card p  { color: var(--text-dim); font-size: 0.9rem; line-height: 1.7; }
+
+  /* ═══════════════ DIAGRAM (ASCII art) ═══════════════ */
+  .diagram {
+    background: var(--bg-code); border: 1px solid var(--border); border-radius: var(--r);
+    padding: 2rem 2.5rem; overflow-x: auto;
+    font-family: var(--mono); font-size: 0.78rem; line-height: 1.55;
+    color: var(--text-dim); white-space: pre;
+    box-shadow: 0 0 50px rgba(124,106,239,0.06);
+  }
+  .diagram .hl  { color: var(--accent-hi); }
+  .diagram .hlg { color: var(--green); }
+  .diagram .hla { color: var(--amber); }
+  .diagram .hlc { color: var(--cyan); }
+  .diagram .hlr { color: var(--rose); }
+  .diagram .dim { color: #b0b4be; }
+  .diagram .hi  { color: var(--text-hi); }
+
+  /* ═══════════════ FACTORY MOCKUP ═══════════════ */
+  .tui {
+    background: #1a1d2b; border: 1px solid #2d3142; border-radius: var(--r);
+    overflow: hidden; box-shadow: 0 4px 24px rgba(0,0,0,0.12), 0 1px 4px rgba(0,0,0,0.08);
+  }
+  .tui-bar {
+    background: #252836; padding: 0.45rem 1rem;
+    display: flex; align-items: center; gap: 0.5rem;
+    border-bottom: 1px solid var(--border);
+    font-family: var(--mono); font-size: 0.72rem; color: var(--text-dim);
+  }
+  .dot-r, .dot-y, .dot-g { width: 10px; height: 10px; border-radius: 50%; }
+  .dot-r { background: #ff5f56; }
+  .dot-y { background: #ffbd2e; }
+  .dot-g { background: #27c93f; }
+
+  .tui-body {
+    display: grid; grid-template-columns: 1fr 1fr 260px;
+    min-height: 340px; font-family: var(--mono); font-size: 0.7rem; line-height: 1.55;
+  }
+  .tui-pane { padding: 0.7rem 0.8rem; border-right: 1px solid var(--border); }
+  .tui-pane:last-child { border-right: none; background: #1e2130; }
+
+  .pane-head {
+    font-weight: 700; margin-bottom: 0.5rem; padding-bottom: 0.35rem;
+    border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 0.45rem;
+  }
+  .pane-head .d { width: 5px; height: 5px; border-radius: 50%; display: inline-block; }
+
+  .tl       { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .tl.acc   { color: var(--accent-hi); }
+  .tl.grn   { color: var(--green); }
+  .tl.amb   { color: var(--amber); }
+  .tl.cy    { color: var(--cyan); }
+  .tl.hi    { color: var(--text-hi); }
+  .tl.dim   { color: #4a4d5e; }
+  .tl.red   { color: var(--red); }
+  .tl.rose  { color: var(--rose); }
+
+  .cur { display: inline-block; width: 7px; height: 13px; background: var(--accent); animation: blink 1s step-end infinite; vertical-align: middle; }
+  @keyframes blink { 50% { opacity: 0; } }
+
+  .tui-foot {
+    background: #111119; padding: 0.35rem 0.8rem; border-top: 1px solid var(--border);
+    font-family: var(--mono); font-size: 0.68rem; color: var(--text-dim);
+    display: flex; justify-content: space-between;
+  }
+
+  /* ═══════════════ HOOK FLOW ═══════════════ */
+  .hook-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1.2rem; }
+
+  .hook-card {
+    background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--r-sm);
+    padding: 1.3rem 1.5rem; display: flex; align-items: flex-start; gap: 1rem;
+    transition: border-color 0.2s;
+  }
+  .hook-card:hover { border-color: var(--border-hi); }
+
+  .hook-num {
+    width: 28px; height: 28px; border-radius: 50%; flex-shrink: 0;
+    display: flex; align-items: center; justify-content: center;
+    font-family: var(--mono); font-size: 0.7rem; font-weight: 800;
+  }
+  .hook-num.p { background: var(--accent-bg); color: var(--accent); border: 1px solid rgba(124,106,239,0.25); }
+  .hook-num.g { background: var(--green-bg); color: var(--green); border: 1px solid rgba(52,211,153,0.25); }
+  .hook-num.a { background: var(--amber-bg); color: var(--amber); border: 1px solid rgba(245,158,11,0.25); }
+  .hook-num.c { background: var(--cyan-bg); color: var(--cyan); border: 1px solid rgba(56,189,248,0.25); }
+  .hook-num.r { background: var(--rose-bg); color: var(--rose); border: 1px solid rgba(244,114,182,0.25); }
+
+  .hook-body h4 { font-size: 0.95rem; margin-bottom: 0.2rem; }
+  .hook-body p  { font-size: 0.83rem; color: var(--text-dim); line-height: 1.6; }
+
+  /* ═══════════════ SKILL CHIPS ═══════════════ */
+  .skill-row { display: flex; flex-wrap: wrap; gap: 0.6rem; margin-top: 1.2rem; }
+
+  .skill-chip {
+    font-family: var(--mono); font-size: 0.78rem; padding: 0.4em 1em;
+    border-radius: 20px; border: 1px solid var(--border); background: var(--bg-card);
+    color: var(--text-dim); cursor: default; transition: all 0.2s;
+  }
+  .skill-chip:hover { border-color: var(--accent); color: var(--accent-hi); background: var(--accent-bg); }
+  .skill-chip.active { border-color: rgba(52,211,153,0.4); color: var(--green); }
+
+  /* ═══════════════ TOOL SURFACE ═══════════════ */
+  .tool-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 0.8rem; }
+
+  .tool-item {
+    font-family: var(--mono); font-size: 0.8rem; padding: 0.7rem 1rem;
+    background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--r-sm);
+    display: flex; align-items: center; gap: 0.7rem; transition: border-color 0.2s;
+  }
+  .tool-item:hover { border-color: var(--border-hi); }
+  .tool-item .ti-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+  .tool-item .ti-name { color: var(--text-hi); font-weight: 600; }
+  .tool-item .ti-desc { color: var(--text-dim); font-size: 0.72rem; margin-left: auto; }
+
+  /* ═══════════════ AGENT SPECIALISTS ═══════════════ */
+  .agent-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+    gap: 1rem;
+  }
+
+  .agent-card {
+    background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--r-sm);
+    padding: 1.4rem 1.6rem; transition: border-color 0.25s, box-shadow 0.25s;
+    display: flex; flex-direction: column; gap: 0.5rem;
+  }
+  .agent-card:hover { border-color: var(--border-hi); box-shadow: 0 0 24px rgba(124,106,239,0.07); }
+
+  .agent-label {
+    font-family: var(--mono); font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.1em;
+    padding: 0.2em 0.75em; border-radius: 12px; align-self: flex-start;
+    font-weight: 700;
+  }
+
+  .agent-card h4 { font-size: 1rem; margin: 0; }
+  .agent-card p  { color: var(--text-dim); font-size: 0.86rem; line-height: 1.65; margin: 0; }
+
+  /* ═══════════════ CLOUD SECTION ═══════════════ */
+  .cloud-diagram {
+    display: flex; align-items: center; justify-content: center;
+    gap: 1.2rem; margin: 2.8rem 0; flex-wrap: wrap;
+  }
+
+  .cloud-node {
+    background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--r-sm);
+    padding: 1.1rem 1.6rem; text-align: center; min-width: 160px;
+    font-family: var(--mono); font-size: 0.78rem;
+  }
+  .cloud-node .cn-label { color: var(--text-dim); font-size: 0.67rem; text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 0.3rem; }
+  .cloud-node .cn-name  { color: var(--text-hi); font-weight: 700; font-size: 0.9rem; }
+  .cloud-node .cn-sub   { color: var(--text-dim); font-size: 0.68rem; margin-top: 0.2rem; }
+  .cloud-node.center {
+    border-color: rgba(124,106,239,0.3);
+    background: rgba(124,106,239,0.05);
+    min-width: 200px; padding: 1.3rem 1.8rem;
+  }
+  .cloud-node.center .cn-name { color: var(--accent-hi); }
+
+  .cloud-arrow {
+    display: flex; flex-direction: column; align-items: center; gap: 0.2rem;
+    color: var(--text-dim); font-family: var(--mono); font-size: 0.65rem;
+  }
+  .cloud-arrow .ca-line {
+    width: 60px; height: 1px; background: var(--border-hi); position: relative;
+  }
+  .cloud-arrow .ca-line::before,
+  .cloud-arrow .ca-line::after {
+    content: ''; position: absolute; top: -3px;
+    width: 0; height: 0;
+    border-top: 4px solid transparent;
+    border-bottom: 4px solid transparent;
+  }
+  .cloud-arrow.bidirectional .ca-line::before {
+    left: 0; border-right: 6px solid var(--border-hi);
+  }
+  .cloud-arrow.bidirectional .ca-line::after {
+    right: 0; border-left: 6px solid var(--border-hi);
+  }
+  .ca-label { color: var(--text-dim); font-size: 0.62rem; letter-spacing: 0.06em; white-space: nowrap; }
+
+  .cloud-stack-note {
+    background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--r-sm);
+    padding: 0.6rem 1.2rem; font-family: var(--mono); font-size: 0.72rem;
+    color: var(--text-dim); text-align: center; margin-top: -0.2rem;
+  }
+
+  /* ═══════════════ FOOTER ═══════════════ */
+  footer {
+    padding: 3rem 0; border-top: 1px solid var(--border);
+    text-align: center; font-size: 0.85rem; color: var(--text-dim);
+  }
+  footer strong { color: var(--accent); font-family: var(--mono); letter-spacing: 0.08em; }
+
+  /* ═══════════════ RESPONSIVE ═══════════════ */
+  @media (max-width: 900px) {
+    .tui-body { grid-template-columns: 1fr; }
+    .tui-pane { border-right: none; border-bottom: 1px solid var(--border); }
+    .tui-pane:last-child { border-bottom: none; }
+    .hook-grid { grid-template-columns: 1fr; }
+    .hero h1 { font-size: 2.2rem; }
+    nav ul { gap: 1rem; }
+    .card-grid { grid-template-columns: 1fr; }
+    .tool-grid { grid-template-columns: 1fr; }
+    .cloud-diagram { flex-direction: column; align-items: flex-start; gap: 0.6rem; }
+    .cloud-arrow { transform: rotate(90deg); align-self: center; }
+  }
+  @media (max-width: 600px) {
+    nav ul { display: none; }
+    section { padding: 3.5rem 0; }
+    .wrap { padding: 0 1.2rem; }
+    h2 { font-size: 1.7rem; }
+    .layer { padding: 1rem 1.2rem; }
+    .hero-desc { font-size: 1rem; }
+    .diagram { padding: 1.2rem 1rem; font-size: 0.7rem; }
+    .tui-body { min-height: auto; font-size: 0.65rem; }
+    .card { padding: 1.5rem; }
+    .agent-grid { grid-template-columns: 1fr; }
+  }
+
+  /* ═══════════════ SCROLL REVEAL ═══════════════ */
+  .rv { opacity: 0; transform: translateY(24px); transition: opacity 0.6s ease, transform 0.6s ease; }
+  .rv.vis { opacity: 1; transform: translateY(0); }
+  .rv:nth-child(2) { transition-delay: 0.07s; }
+  .rv:nth-child(3) { transition-delay: 0.14s; }
+  .rv:nth-child(4) { transition-delay: 0.21s; }
+
+  /* ═══════════════ NUMBER ACCENT ═══════════════ */
+  .big-num {
+    font-family: var(--mono); font-size: 3rem; font-weight: 800;
+    color: var(--accent); opacity: 0.15; position: absolute;
+    top: -0.3rem; right: 1rem; line-height: 1;
+  }
+</style>
+</head>
+<body>
+<div class="grid-dots"></div>
+<div class="ambient"></div>
+
+<!-- ═══════════════════════════════════════════════
+     NAV
+     ═══════════════════════════════════════════════ -->
+<nav>
+  <div class="inner">
+    <div class="nav-mark"><b>CLAUDE CODE</b> + CAS</div>
+    <ul>
+      <li><a href="#stack">The Stack</a></li>
+      <li><a href="#factory">Factory</a></li>
+      <li><a href="#hooks">Hooks</a></li>
+      <li><a href="#context">Context</a></li>
+      <li><a href="#tools">Tools</a></li>
+      <li><a href="#agents">Agents</a></li>
+      <li><a href="#loop">The Loop</a></li>
+      <li><a href="#cloud">Cloud</a></li>
+    </ul>
+  </div>
+</nav>
+
+<!-- ═══════════════════════════════════════════════
+     HERO
+     ═══════════════════════════════════════════════ -->
+<section class="hero">
+  <div class="wrap">
+    <div class="hero-tag">AI-Powered Development System</div>
+    <h1>An AI That Remembers,<br>Coordinates, and Learns</h1>
+    <p class="hero-desc">
+      <strong>Claude Code</strong> is the AI agent. <strong>CAS</strong> is the infrastructure that gives it
+      persistent memory, task tracking, reusable skills, behavioral rules, and the ability to
+      orchestrate <strong>multiple agents in parallel</strong>&mdash;each in its own git worktree,
+      coordinated through a real-time terminal UI.
+    </p>
+
+    <!-- THE STACK AT A GLANCE -->
+    <div class="layer-stack">
+      <div class="layer">
+        <div class="layer-icon human">&#x1F9D1;</div>
+        <div class="layer-text">
+          <h4>You</h4>
+          <p>Type a prompt. Describe the work. Watch it happen.</p>
+        </div>
+      </div>
+      <div class="layer">
+        <div class="layer-icon claude">&#x2728;</div>
+        <div class="layer-text">
+          <h4>Claude Code</h4>
+          <p>Anthropic's AI coding agent. Reads, writes, runs, and reasons about code.</p>
+        </div>
+      </div>
+      <div class="layer">
+        <div class="layer-icon hooks">&#x21C5;</div>
+        <div class="layer-text">
+          <h4>CAS Hooks</h4>
+          <p>12 event hooks intercept Claude Code lifecycle&mdash;injecting context in, capturing learnings out.</p>
+        </div>
+      </div>
+      <div class="layer">
+        <div class="layer-icon mcp">&#x2699;</div>
+        <div class="layer-text">
+          <h4>CAS MCP Server</h4>
+          <p>55+ tools over Model Context Protocol. Memory, tasks, rules, skills, search, coordination.</p>
+        </div>
+      </div>
+      <div class="layer">
+        <div class="layer-icon store">&#x1F4BE;</div>
+        <div class="layer-text">
+          <h4>SQLite + Tantivy</h4>
+          <p>Persistent storage with BM25 full-text search. Everything survives across sessions.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════════
+     THE STACK
+     ═══════════════════════════════════════════════ -->
+<section id="stack">
+  <div class="wrap">
+    <h2 class="rv">How It Works</h2>
+    <p class="section-lead rv">
+      Claude Code is an AI agent that edits files, runs commands, and reasons about your codebase.
+      CAS wraps around it, giving it a brain that persists and the ability to work in teams.
+    </p>
+
+    <div class="diagram rv">
+<span class="hi">The Single-Agent Flow</span>  (you + one Claude Code instance)
+<span class="dim">══════════════════════════════════════════════════════════════════════════</span>
+
+  <span class="hlr">You type a prompt</span>
+    <span class="dim">│</span>
+    <span class="dim">▼</span>
+  <span class="hlg">UserPromptSubmit hook</span> ── CAS can intercept, analyze, or annotate prompts
+    <span class="dim">│</span>
+    <span class="dim">▼</span>
+  <span class="hla">Claude Code thinks + acts</span> ── reads files, writes code, runs tests
+    <span class="dim">│</span>
+    <span class="dim">├──</span> <span class="hlg">PreToolUse hook</span> ──── protection rules block dangerous operations
+    <span class="dim">│</span>                        (configurable file/command patterns)
+    <span class="dim">│</span>
+    <span class="dim">├──</span> <span class="hl">MCP tool calls</span> ──── agent calls CAS tools: remember things, check tasks,
+    <span class="dim">│</span>                        search memories, update progress, find code symbols
+    <span class="dim">│</span>
+    <span class="dim">├──</span> <span class="hlg">PostToolUse hook</span> ── CAS captures observations from Write, Edit, Bash
+    <span class="dim">│</span>                        (filters out trivial: ls, cd, git status, etc.)
+    <span class="dim">│</span>
+    <span class="dim">▼</span>
+  <span class="hlc">Agent finishes</span>
+    <span class="dim">├──</span> <span class="hla">Stop hook</span> ────────── generates a session summary
+    <span class="dim">└──</span> <span class="hlc">SessionEnd hook</span> ─── marks observations for async AI extraction
+                            into structured memories and entities
+
+<span class="hi">Next time you start a session:</span>
+  <span class="hlg">SessionStart hook</span> ── hybrid scorer (BM25 + temporal) ranks all memories,
+                        tasks, rules, and skills by relevance. Injects the
+                        top items within a <span class="hla">4,000-token budget</span>.
+                        The agent starts already knowing what matters.</div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════════
+     FACTORY
+     ═══════════════════════════════════════════════ -->
+<section id="factory">
+  <div class="wrap">
+    <h2 class="rv">The Factory</h2>
+    <p class="section-lead rv">
+      Multi-agent mode. A supervisor plans the work, workers execute in parallel, each in its own
+      git worktree. You watch it all happen in a real-time terminal UI.
+    </p>
+
+    <!-- TUI Mockup -->
+    <div class="tui rv">
+      <div class="tui-bar">
+        <span class="dot-r"></span><span class="dot-y"></span><span class="dot-g"></span>
+        <span style="margin-left:0.6rem;">cas factory &mdash; zen-tiger-34</span>
+        <span style="margin-left:auto;">3 agents &bull; 2 workers &bull; isolated worktrees</span>
+      </div>
+      <div class="tui-body">
+        <!-- Workers -->
+        <div class="tui-pane">
+          <div class="pane-head"><span class="d" style="background:var(--green);"></span><span class="grn">WORKERS</span></div>
+          <div class="tl dim">&mdash;&mdash; swift-fox-12 &mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;</div>
+          <div class="tl grn">&#10003; Task cas-a1b2: Add retry logic</div>
+          <div class="tl">  Reading src/client/http.rs...</div>
+          <div class="tl acc">  Edit: src/client/http.rs:142-168</div>
+          <div class="tl">  Running cargo test...</div>
+          <div class="tl grn">  All 47 tests passed</div>
+          <div class="tl">&nbsp;</div>
+          <div class="tl dim">&mdash;&mdash; calm-owl-09 &mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;</div>
+          <div class="tl amb">&#9673; Task cas-f3e4: Fix auth timeout</div>
+          <div class="tl">  Grep: "timeout" in src/auth/</div>
+          <div class="tl acc">  Found 3 matches in 2 files</div>
+          <div class="tl">  <span class="cur"></span></div>
+        </div>
+
+        <!-- Supervisor -->
+        <div class="tui-pane">
+          <div class="pane-head"><span class="d" style="background:var(--accent);"></span><span class="acc">SUPERVISOR</span></div>
+          <div class="tl dim">&mdash;&mdash; lively-kestrel-77 &mdash;&mdash;&mdash;&mdash;&mdash;&mdash;</div>
+          <div class="tl hi">Epic: Improve error handling</div>
+          <div class="tl">&nbsp;</div>
+          <div class="tl">swift-fox completed cas-a1b2</div>
+          <div class="tl grn">&#10003; Merging factory/swift-fox-12</div>
+          <div class="tl">  into main...</div>
+          <div class="tl grn">  Merge successful</div>
+          <div class="tl">&nbsp;</div>
+          <div class="tl acc">Messaging calm-owl to rebase...</div>
+          <div class="tl">&nbsp;</div>
+          <div class="tl">Assigning next task to swift-fox</div>
+          <div class="tl">  <span class="cur"></span></div>
+        </div>
+
+        <!-- Director -->
+        <div class="tui-pane">
+          <div class="pane-head"><span class="d" style="background:var(--amber);"></span><span class="amb">DIRECTOR</span></div>
+          <div class="tl dim">TASKS</div>
+          <div class="tl grn"> &#10003; cas-a1b2 Add retry logic</div>
+          <div class="tl amb"> &#9673; cas-f3e4 Fix auth timeout</div>
+          <div class="tl cy">  &#9675; cas-d5c6 Add rate limiter</div>
+          <div class="tl cy">  &#9675; cas-b7a8 Update error types</div>
+          <div class="tl">&nbsp;</div>
+          <div class="tl dim">AGENTS</div>
+          <div class="tl acc"> &#9632; lively-kestrel-77 sup</div>
+          <div class="tl grn"> &#9632; swift-fox-12 idle</div>
+          <div class="tl amb"> &#9632; calm-owl-09 working</div>
+          <div class="tl">&nbsp;</div>
+          <div class="tl dim">ACTIVITY</div>
+          <div class="tl">12:04 task_completed a1b2</div>
+          <div class="tl">12:04 branch merged fox-12</div>
+          <div class="tl">12:05 task_assigned d5c6</div>
+        </div>
+      </div>
+      <div class="tui-foot">
+        <span>Focus: supervisor | Tab: cycle panes | i: inject prompt | Ctrl+D: detach</span>
+        <span>uptime 00:23:17</span>
+      </div>
+    </div>
+
+    <!-- Factory Mechanics -->
+    <div class="card-grid" style="margin-top:2.5rem;">
+      <div class="card rv">
+        <div class="card-icon" style="background:var(--green-bg);color:var(--green);border:1px solid rgba(52,211,153,0.2);">&#x2387;</div>
+        <h3>Worktree Isolation</h3>
+        <p>
+          Each worker gets its own git worktree and branch. They code simultaneously without merge
+          conflicts. When a worker finishes, the supervisor merges their branch, then tells
+          remaining workers to rebase. Launch with <code>cas -w3</code> for 3 workers.
+        </p>
+      </div>
+      <div class="card rv">
+        <div class="card-icon" style="background:var(--accent-bg);color:var(--accent);border:1px solid rgba(124,106,239,0.2);">&#x1F3AD;</div>
+        <h3>Supervisor + Workers</h3>
+        <p>
+          The supervisor is a Claude Code instance loaded with the <code>/cas-supervisor</code>
+          skill. It plans EPICs, creates subtasks, assigns them to workers, handles blockers,
+          reviews completions, and merges branches. Workers get the <code>/cas-worker</code>
+          skill and focus purely on execution.
+        </p>
+      </div>
+      <div class="card rv">
+        <div class="card-icon" style="background:var(--amber-bg);color:var(--amber);border:1px solid rgba(245,158,11,0.2);">&#x25A3;</div>
+        <h3>Director Panel</h3>
+        <p>
+          A native Ratatui widget (not a terminal) showing live task statuses, agent states,
+          and an activity event log. It updates in real-time as tasks complete, agents go idle,
+          and branches get merged. You see the whole operation at a glance.
+        </p>
+      </div>
+      <div class="card rv">
+        <div class="card-icon" style="background:var(--cyan-bg);color:var(--cyan);border:1px solid rgba(56,189,248,0.2);">&#x21C4;</div>
+        <h3>Persistent Sessions</h3>
+        <p>
+          The factory runs as a background daemon. Detach with <code>Ctrl+D</code>,
+          reattach later with <code>cas attach</code>. Workers keep coding while
+          you're away. Communication uses a MessagePack WebSocket protocol with
+          reconnection and delta replay.
+        </p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════════
+     HOOKS
+     ═══════════════════════════════════════════════ -->
+<section id="hooks">
+  <div class="wrap">
+    <h2 class="rv">12 Hooks Into Claude Code</h2>
+    <p class="section-lead rv">
+      CAS registers event hooks in Claude Code's <code>settings.json</code>. Every significant
+      lifecycle event is intercepted&mdash;context flows in at session start, learnings flow
+      out at session end.
+    </p>
+
+    <div class="hook-grid rv">
+      <div class="hook-card">
+        <div class="hook-num p">&#x2193;</div>
+        <div class="hook-body">
+          <h4>SessionStart</h4>
+          <p>Ranks all memories, tasks, rules, and skills by BM25 + temporal relevance.
+          Injects the top items within a 4K token budget so the agent starts with full context.</p>
+        </div>
+      </div>
+      <div class="hook-card">
+        <div class="hook-num g">&#x2191;</div>
+        <div class="hook-body">
+          <h4>PostToolUse</h4>
+          <p>After Write, Edit, or Bash calls, captures observations. Filters out trivial
+          commands (ls, cd, git status). Stores significant interactions for later extraction.</p>
+        </div>
+      </div>
+      <div class="hook-card">
+        <div class="hook-num a">&#x25CF;</div>
+        <div class="hook-body">
+          <h4>Stop</h4>
+          <p>When the agent finishes, generates a session summary. Captures what was accomplished,
+          decisions made, and open questions for next-session continuity.</p>
+        </div>
+      </div>
+      <div class="hook-card">
+        <div class="hook-num c">&#x21BB;</div>
+        <div class="hook-body">
+          <h4>SessionEnd</h4>
+          <p>Marks observations for async extraction. The embedded daemon processes them
+          into structured memories and knowledge entities in the background.</p>
+        </div>
+      </div>
+      <div class="hook-card">
+        <div class="hook-num r">&#x26A0;</div>
+        <div class="hook-body">
+          <h4>PreToolUse</h4>
+          <p>Protection layer. Intercepts Read, Write, Edit, Bash, and other tools.
+          Can block dangerous operations via configurable file/command patterns.</p>
+        </div>
+      </div>
+      <div class="hook-card">
+        <div class="hook-num p">&#x270E;</div>
+        <div class="hook-body">
+          <h4>UserPromptSubmit</h4>
+          <p>Intercepts the user's prompt before Claude sees it. Can annotate with context,
+          redirect based on patterns, or pass through unchanged.</p>
+        </div>
+      </div>
+      <div class="hook-card">
+        <div class="hook-num g">&#x2193;</div>
+        <div class="hook-body">
+          <h4>SubagentStart / SubagentStop</h4>
+          <p>Manages subagent lifecycle. Cleans up leases when subagents finish. The
+          SubagentStart hook has special handling for task-verifier agents.</p>
+        </div>
+      </div>
+      <div class="hook-card">
+        <div class="hook-num a">&#x2709;</div>
+        <div class="hook-body">
+          <h4>PreCompact / Notification / Permission</h4>
+          <p>PreCompact preserves info before context compression. Notification drives desktop/bell
+          alerts. PermissionRequest enables automated approval in factory mode.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="diagram rv" style="margin-top:2.5rem; font-size: 0.75rem;">
+<span class="hi">Actual hook configuration</span>  (from settings.json)
+<span class="dim">══════════════════════════════════════════════════════════════════════════</span>
+  "SessionStart":      [{ command: "<span class="hlg">cas hook SessionStart</span>",      timeout: 5000 }]
+  "PostToolUse":       [{ command: "<span class="hlg">cas hook PostToolUse</span>",       timeout: 3000,  matcher: "Write|Edit|Bash" }]
+  "Stop":              [{ command: "<span class="hlg">cas hook Stop</span>",              timeout: 10000 }]
+  "SessionEnd":        [{ command: "<span class="hlg">cas hook SessionEnd</span>",        timeout: 5000,  async: true }]
+  "PreToolUse":        [{ command: "<span class="hlg">cas hook PreToolUse</span>",        timeout: 2000,  matcher: "Read|Write|..." }]
+  "UserPromptSubmit":  [{ command: "<span class="hlg">cas hook UserPromptSubmit</span>",  timeout: 3000 }]
+  "SubagentStop":      [{ command: "<span class="hlg">cas hook SubagentStop</span>",      timeout: 5000,  async: true }]
+  "SubagentStart":     [{ command: "<span class="hlg">cas hook SubagentStart</span>",     timeout: 2000,  matcher: "task-verifier" }]
+  "PreCompact":        [{ command: "<span class="hlg">cas hook PreCompact</span>",        timeout: 3000 }]
+  "Notification":      [{ command: "<span class="hlg">cas hook Notification</span>",      timeout: 1000,  async: true }]
+  "PermissionRequest": [{ command: "<span class="hlg">cas hook PermissionRequest</span>", timeout: 2000 }]
+
+<span class="hla">+ factory staleness check on SessionStart:</span>
+  "SessionStart":      [{ command: "<span class="hlc">cas factory check-staleness</span>", timeout: 5000 }]</div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════════
+     CONTEXT SYSTEM
+     ═══════════════════════════════════════════════ -->
+<section id="context">
+  <div class="wrap">
+    <h2 class="rv">Persistent Context</h2>
+    <p class="section-lead rv">
+      Everything the agent discovers, decides, and tracks persists in SQLite.
+      Next session, the most relevant items are automatically surfaced.
+    </p>
+
+    <div class="card-grid">
+      <div class="card rv" style="position:relative;">
+        <span class="big-num">M</span>
+        <div class="card-icon" style="background:var(--accent-bg);color:var(--accent);border:1px solid rgba(124,106,239,0.2);">&#x1F4AD;</div>
+        <h3>Memory</h3>
+        <p>
+          Persistent entries typed as learning, preference, context, or observation. Each has
+          importance scores, tags, and a memory tier (working / cold / archive). AI-powered
+          consolidation merges duplicates. Time-based decay keeps the context fresh. Temporal
+          validity windows let facts expire.
+        </p>
+      </div>
+      <div class="card rv" style="position:relative;">
+        <span class="big-num">T</span>
+        <div class="card-icon" style="background:var(--green-bg);color:var(--green);border:1px solid rgba(52,211,153,0.2);">&#x2713;</div>
+        <h3>Tasks</h3>
+        <p>
+          Full work tracking: EPICs with subtasks, dependencies (blocks, related, parent),
+          P0-P4 priorities, structured notes (progress, blocker, decision, discovery),
+          assignees, leases for multi-agent claim, and verification gates. Demo statements
+          enforce vertical slice delivery.
+        </p>
+      </div>
+      <div class="card rv" style="position:relative;">
+        <span class="big-num">R</span>
+        <div class="card-icon" style="background:var(--amber-bg);color:var(--amber);border:1px solid rgba(245,158,11,0.2);">&#x2696;</div>
+        <h3>Rules</h3>
+        <p>
+          Behavioral rules start as drafts. Mark a rule "helpful" and it promotes to
+          proven status. Proven rules auto-sync to <code>.claude/rules/cas/</code>
+          so Claude Code loads them as native rules. Supports glob-based file path
+          matching and global vs. project scoping.
+        </p>
+      </div>
+      <div class="card rv" style="position:relative;">
+        <span class="big-num">S</span>
+        <div class="card-icon" style="background:var(--cyan-bg);color:var(--cyan);border:1px solid rgba(56,189,248,0.2);">&#x2699;</div>
+        <h3>Skills</h3>
+        <p>
+          Reusable agent behaviors stored as SKILL.md files with YAML frontmatter.
+          Synced to <code>.claude/skills/</code> for native integration. Users invoke
+          them via <code>/skill-name</code>. Skills define trigger conditions so
+          agents know when to use them.
+        </p>
+      </div>
+      <div class="card rv" style="position:relative;">
+        <span class="big-num">Q</span>
+        <div class="card-icon" style="background:var(--rose-bg);color:var(--rose);border:1px solid rgba(244,114,182,0.2);">&#x1F50D;</div>
+        <h3>Search</h3>
+        <p>
+          Hybrid BM25 full-text search via Tantivy with temporal scoring and
+          graph-aware retrieval. Code symbol search indexes functions, structs,
+          traits, and enums via tree-sitter. Plus regex grep with context lines
+          and git blame with AI-line filtering.
+        </p>
+      </div>
+      <div class="card rv" style="position:relative;">
+        <span class="big-num">E</span>
+        <div class="card-icon" style="background:var(--accent-bg);color:var(--accent);border:1px solid rgba(124,106,239,0.2);">&#x1F465;</div>
+        <h3>Entities</h3>
+        <p>
+          Knowledge entities extracted from observations: people, projects,
+          technologies, files, concepts, organizations, domains. Forms a structured
+          knowledge graph that the search system can traverse for context-aware
+          retrieval across memories and tasks.
+        </p>
+      </div>
+    </div>
+
+    <!-- Active Skills -->
+    <h3 style="margin-top:3rem;" class="rv">Active Skills</h3>
+    <p style="color:var(--text-dim);font-size:0.92rem;margin-bottom:0.3rem;" class="rv">
+      Skills synced to <code>.claude/skills/</code> for this project:
+    </p>
+    <div class="skill-row rv">
+      <span class="skill-chip active">/cas</span>
+      <span class="skill-chip active">/cas-supervisor</span>
+      <span class="skill-chip active">/cas-worker</span>
+      <span class="skill-chip active">/cas-search</span>
+      <span class="skill-chip active">/cas-task-tracking</span>
+      <span class="skill-chip active">/cas-memory-management</span>
+      <span class="skill-chip active">/cas-supervisor-checklist</span>
+      <span class="skill-chip">/create-skill</span>
+      <span class="skill-chip">/servers</span>
+      <span class="skill-chip">/unraid</span>
+      <span class="skill-chip">/quickbooks-online</span>
+      <span class="skill-chip">/saasant</span>
+      <span class="skill-chip">/real-estate-accountant</span>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════════
+     MCP TOOLS
+     ═══════════════════════════════════════════════ -->
+<section id="tools">
+  <div class="wrap">
+    <h2 class="rv">55+ MCP Tools</h2>
+    <p class="section-lead rv">
+      The CAS MCP server exposes tools over Model Context Protocol (JSON-RPC over stdio).
+      Claude Code calls these directly during conversation. Each tool is a unified action
+      endpoint with multiple operations.
+    </p>
+
+    <div class="tool-grid rv">
+      <div class="tool-item"><span class="ti-dot" style="background:var(--accent);"></span><span class="ti-name">memory</span><span class="ti-desc">remember, list, update, archive, helpful, harmful, tiers</span></div>
+      <div class="tool-item"><span class="ti-dot" style="background:var(--green);"></span><span class="ti-name">task</span><span class="ti-desc">create, start, close, notes, deps, claim, transfer, EPICs</span></div>
+      <div class="tool-item"><span class="ti-dot" style="background:var(--amber);"></span><span class="ti-name">rule</span><span class="ti-desc">create, update, helpful/harmful, sync to .claude/rules/</span></div>
+      <div class="tool-item"><span class="ti-dot" style="background:var(--cyan);"></span><span class="ti-name">skill</span><span class="ti-desc">create, enable, disable, sync to .claude/skills/</span></div>
+      <div class="tool-item"><span class="ti-dot" style="background:var(--rose);"></span><span class="ti-name">search</span><span class="ti-desc">BM25 full-text, code_search, grep, blame, context</span></div>
+      <div class="tool-item"><span class="ti-dot" style="background:var(--green);"></span><span class="ti-name">coordination</span><span class="ti-desc">spawn workers, message, worktrees, heartbeat, queues</span></div>
+      <div class="tool-item"><span class="ti-dot" style="background:var(--accent);"></span><span class="ti-name">verification</span><span class="ti-desc">task verification gates, acceptance criteria checks</span></div>
+      <div class="tool-item"><span class="ti-dot" style="background:var(--amber);"></span><span class="ti-name">pattern</span><span class="ti-desc">discover and manage code patterns, anti-patterns</span></div>
+      <div class="tool-item"><span class="ti-dot" style="background:var(--cyan);"></span><span class="ti-name">spec</span><span class="ti-desc">epic specifications, design notes, breakdown planning</span></div>
+      <div class="tool-item"><span class="ti-dot" style="background:var(--rose);"></span><span class="ti-name">system</span><span class="ti-desc">configuration, diagnostics, maintenance, status</span></div>
+      <div class="tool-item"><span class="ti-dot" style="background:var(--green);"></span><span class="ti-name">team</span><span class="ti-desc">team coordination, shared context, cross-agent communication</span></div>
+      <div class="tool-item"><span class="ti-dot" style="background:var(--accent);"></span><span class="ti-name">mcp_execute</span><span class="ti-desc">call other MCP servers through CAS as proxy</span></div>
+    </div>
+
+    <div class="diagram rv" style="margin-top:2rem; font-size:0.75rem;">
+<span class="hi">Example: Agent remembers a learning</span>
+<span class="dim">══════════════════════════════════════════════════════════════════════════</span>
+  Claude Code calls:  <span class="hl">mcp__cas__memory</span>
+    action:     <span class="hlg">"remember"</span>
+    title:      <span class="hlg">"Config loads TOML first, ignores stale YAML"</span>
+    content:    <span class="hlg">"Root cause: Config::load() reads TOML first..."</span>
+    entry_type: <span class="hlg">"learning"</span>
+    tags:       <span class="hlg">"config, debugging"</span>
+
+  CAS stores it in SQLite, indexes in Tantivy.
+  Next session, if relevant work is detected, <span class="hla">SessionStart injects it automatically</span>.</div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════════
+     AGENT SPECIALISTS
+     ═══════════════════════════════════════════════ -->
+<section id="agents">
+  <div class="wrap">
+    <h2 class="rv">Agent Specialists</h2>
+    <p class="section-lead rv">
+      Define specialist agents with targeted expertise. Claude Code spawns them automatically
+      based on the task &mdash; a security review triggers the auditor, a database migration
+      triggers the optimizer.
+    </p>
+
+    <div class="agent-grid rv">
+      <div class="agent-card">
+        <span class="agent-label" style="background:var(--accent-bg);color:var(--accent-hi);border:1px solid rgba(124,106,239,0.2);">Architecture</span>
+        <h4>Software Architect</h4>
+        <p>System design, architecture decisions, domain-driven design, trade-off analysis, ADRs</p>
+      </div>
+      <div class="agent-card">
+        <span class="agent-label" style="background:var(--red-bg, rgba(239,68,68,0.08));color:#f87171;border:1px solid rgba(239,68,68,0.2);">Security</span>
+        <h4>Security Auditor</h4>
+        <p>Threat modeling, vulnerability assessment, OWASP Top 10, STRIDE analysis</p>
+      </div>
+      <div class="agent-card">
+        <span class="agent-label" style="background:var(--cyan-bg);color:var(--cyan);border:1px solid rgba(56,189,248,0.2);">Database</span>
+        <h4>Database Optimizer</h4>
+        <p>Schema design, query optimization, indexing strategies, PostgreSQL/MySQL tuning</p>
+      </div>
+      <div class="agent-card">
+        <span class="agent-label" style="background:var(--amber-bg);color:var(--amber);border:1px solid rgba(245,158,11,0.2);">Performance</span>
+        <h4>Performance Engineer</h4>
+        <p>Diagnosing slow responses, connection pool issues, cold starts, bundle size</p>
+      </div>
+      <div class="agent-card">
+        <span class="agent-label" style="background:var(--green-bg);color:var(--green);border:1px solid rgba(52,211,153,0.2);">Quality</span>
+        <h4>QA Expert</h4>
+        <p>Test strategy, E2E tests, component tests, quality gates</p>
+      </div>
+      <div class="agent-card">
+        <span class="agent-label" style="background:var(--rose-bg);color:var(--rose);border:1px solid rgba(244,114,182,0.2);">Frontend</span>
+        <h4>Frontend Design</h4>
+        <p>Production-grade interfaces, creative UI/UX, component architecture</p>
+      </div>
+      <div class="agent-card">
+        <span class="agent-label" style="background:var(--accent-bg);color:var(--accent-hi);border:1px solid rgba(124,106,239,0.2);">DevOps</span>
+        <h4>Deployment Engineer</h4>
+        <p>CI/CD pipelines, Vercel/GitHub Actions, environment management</p>
+      </div>
+      <div class="agent-card">
+        <span class="agent-label" style="background:rgba(239,68,68,0.08);color:#f87171;border:1px solid rgba(239,68,68,0.2);">Ops</span>
+        <h4>Incident Response</h4>
+        <p>Production incident management, structured resolution, post-mortems</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════════
+     THE LOOP
+     ═══════════════════════════════════════════════ -->
+<section id="loop">
+  <div class="wrap">
+    <h2 class="rv">The Learning Loop</h2>
+    <p class="section-lead rv">
+      This is the core insight: agents get smarter over time because every session feeds
+      into the next. It's a flywheel.
+    </p>
+
+    <div class="diagram rv" style="font-size:0.82rem; text-align:center;">
+
+                          <span class="hlr">You give a task</span>
+                               <span class="dim">│</span>
+                               <span class="dim">▼</span>
+                    <span class="hl">SessionStart hook injects</span>
+                    <span class="hl">ranked memories + tasks + rules</span>
+                               <span class="dim">│</span>
+                               <span class="dim">▼</span>
+                    <span class="hla">Agent works with full context</span>
+                    <span class="hla">Calls MCP tools as needed</span>
+                          <span class="dim">╱</span>                <span class="dim">╲</span>
+                        <span class="dim">╱</span>                    <span class="dim">╲</span>
+          <span class="hlg">Observations captured</span>       <span class="hlc">Tasks tracked</span>
+          <span class="hlg">from tool use (hooks)</span>       <span class="hlc">with progress notes</span>
+                        <span class="dim">╲</span>                    <span class="dim">╱</span>
+                          <span class="dim">╲</span>                <span class="dim">╱</span>
+                    <span class="hla">Session ends</span>
+                    <span class="hla">Summary generated</span>
+                               <span class="dim">│</span>
+                               <span class="dim">▼</span>
+                    <span class="hlg">Daemon extracts learnings</span>
+                    <span class="hlg">from observations (async AI)</span>
+                               <span class="dim">│</span>
+                               <span class="dim">▼</span>
+                    <span class="hlc">Memories stored in SQLite</span>
+                    <span class="hlc">Indexed in Tantivy BM25</span>
+                               <span class="dim">│</span>
+                               <span class="dim">▼</span>
+                    <span class="hl">Ready for next session</span>  <span class="dim">───&gt;</span>  <span class="hla">(loops back to top)</span></div>
+
+    <!-- The multiplier effect -->
+    <div class="card-grid" style="margin-top:2.5rem;">
+      <div class="card rv">
+        <h3>Single Agent</h3>
+        <p>
+          You talk to Claude Code. CAS gives it memory, so it remembers your project's patterns,
+          past bugs, architectural decisions, and preferences. Each session starts smarter than
+          the last. Rules evolve from drafts to proven and become permanent behavior.
+        </p>
+      </div>
+      <div class="card rv">
+        <h3>Factory (Multi-Agent)</h3>
+        <p>
+          You describe a large feature. The supervisor breaks it into an EPIC with subtasks,
+          spawns workers in isolated worktrees, assigns tasks, merges completed work, and
+          coordinates rebases. Workers share the same memory store, so discoveries in one
+          agent are available to all. You detach and come back when it's done.
+        </p>
+      </div>
+      <div class="card rv">
+        <h3>The Stack in Practice</h3>
+        <p>
+          This system&mdash;CAS + Claude Code&mdash;was used to build CAS itself. The codebase
+          is 945K lines of Rust across 14 crates with 182+ database migrations. Factory mode
+          runs multiple Claude Code instances coordinating through the same tools described
+          on this page. It's recursive: the tool builds itself.
+        </p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════════
+     PETRA STELLA CLOUD
+     ═══════════════════════════════════════════════ -->
+<section id="cloud">
+  <div class="wrap">
+    <h2 class="rv">Petra Stella Cloud</h2>
+    <p class="section-lead rv">
+      Your AI agent's memory shouldn't be trapped on one machine. Petra Stella Cloud syncs
+      context across your entire team &mdash; automatically, in the background, with zero
+      impact on local performance.
+    </p>
+
+    <!-- Sync Diagram -->
+    <div class="cloud-diagram rv">
+      <div style="display:flex;flex-direction:column;align-items:center;gap:0.5rem;">
+        <div class="cloud-node">
+          <div class="cn-label">Developer A</div>
+          <div class="cn-name">Local SQLite</div>
+          <div class="cn-sub">memories &middot; tasks &middot; rules</div>
+        </div>
+        <div class="cloud-stack-note">↕ write-through queue</div>
+      </div>
+
+      <div class="cloud-arrow bidirectional">
+        <div class="ca-label">push</div>
+        <div class="ca-line"></div>
+        <div class="ca-label">pull</div>
+      </div>
+
+      <div style="display:flex;flex-direction:column;align-items:center;gap:0.5rem;">
+        <div class="cloud-node center">
+          <div class="cn-label">Petra Stella Cloud</div>
+          <div class="cn-name">Vercel + Neon</div>
+          <div class="cn-sub">PostgreSQL &middot; device auth</div>
+        </div>
+        <div class="cloud-stack-note">self-hosted &middot; your infra</div>
+      </div>
+
+      <div class="cloud-arrow bidirectional">
+        <div class="ca-label">push</div>
+        <div class="ca-line"></div>
+        <div class="ca-label">pull</div>
+      </div>
+
+      <div style="display:flex;flex-direction:column;align-items:center;gap:0.5rem;">
+        <div class="cloud-node">
+          <div class="cn-label">Developer B</div>
+          <div class="cn-name">Local SQLite</div>
+          <div class="cn-sub">memories &middot; tasks &middot; rules</div>
+        </div>
+        <div class="cloud-stack-note">↕ background sync</div>
+      </div>
+    </div>
+
+    <div class="card-grid rv">
+      <div class="card">
+        <div class="card-icon" style="background:var(--accent-bg);color:var(--accent);border:1px solid rgba(124,106,239,0.2);">&#x2601;</div>
+        <h3>Cloud Sync</h3>
+        <p>
+          Memories, tasks, rules, and skills sync automatically across devices.
+          Write-through queue with background push/pull. Zero latency impact on local operations.
+        </p>
+      </div>
+      <div class="card">
+        <div class="card-icon" style="background:var(--green-bg);color:var(--green);border:1px solid rgba(52,211,153,0.2);">&#x1F465;</div>
+        <h3>Team Knowledge</h3>
+        <p>
+          Share proven rules, coding conventions, and learnings across your team.
+          New members onboard with the team's accumulated AI context instantly.
+        </p>
+      </div>
+      <div class="card">
+        <div class="card-icon" style="background:var(--amber-bg);color:var(--amber);border:1px solid rgba(245,158,11,0.2);">&#x1F3E0;</div>
+        <h3>Self-Hosted</h3>
+        <p>
+          Your data stays on your infrastructure. Vercel + Neon PostgreSQL.
+          No vendor lock-in, no usage limits, no monthly fees.
+        </p>
+      </div>
+      <div class="card">
+        <div class="card-icon" style="background:var(--cyan-bg);color:var(--cyan);border:1px solid rgba(56,189,248,0.2);">&#x1F511;</div>
+        <h3>Device Flow Auth</h3>
+        <p>
+          Clean login experience with email verification via AWS SES.
+          Run <code>cas login</code> and you're connected. Works across all your machines.
+        </p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════════
+     UNDER THE HOOD
+     ═══════════════════════════════════════════════ -->
+<section>
+  <div class="wrap">
+    <h2 class="rv">Under the Hood</h2>
+    <p class="section-lead rv">
+      CAS is a Rust binary (<code>cas</code>) with 14 workspace crates. Written in Rust 2024 edition
+      with SQLite for storage and Tantivy for search.
+    </p>
+
+    <div class="diagram rv" style="font-size:0.75rem;">
+<span class="hi">CAS Binary Modes</span>
+<span class="dim">══════════════════════════════════════════════════════════════════════════</span>
+  <span class="hla">cas</span>                       Launch factory (auto-detects flags)
+  <span class="hla">cas -w3</span>                   Factory with 3 workers in isolated worktrees
+  <span class="hla">cas attach</span>                Reattach to a running factory session
+  <span class="hla">cas serve</span>                 Start MCP server (Claude Code calls this)
+  <span class="hla">cas hook SessionStart</span>     Handle a hook event (reads JSON from stdin)
+  <span class="hla">cas init</span>                  Initialize .cas/ in current project
+  <span class="hla">cas doctor</span>                Run diagnostics
+
+<span class="hi">Storage</span>
+<span class="dim">══════════════════════════════════════════════════════════════════════════</span>
+  <span class="hlg">Project store</span>:   .cas/store.db         Memories, tasks, rules, skills, agents
+  <span class="hlg">Global store</span>:    ~/.config/cas/store.db User-wide preferences and learnings
+  <span class="hlc">Search index</span>:    .cas/search/           Tantivy BM25 full-text index
+  <span class="hla">Config</span>:          .cas/config.toml       Hook settings, sync, daemon behavior
+  <span class="hl">Skill sync</span>:      .claude/skills/cas-*/  SKILL.md files with YAML frontmatter
+  <span class="hl">Rule sync</span>:       .claude/rules/cas/     Proven rules become Claude Code rules
+
+<span class="hi">Background Daemon</span>  (runs inside the MCP server process)
+<span class="dim">══════════════════════════════════════════════════════════════════════════</span>
+  BM25 index updates ─── every 2 minutes (batch incremental)
+  Full maintenance ───── every 30 minutes (decay, cleanup, agent purge)
+  Observation extraction  AI-powered, processes captured tool interactions
+  Code indexing ───────── tree-sitter symbol extraction (configurable)
+  Cloud sync ──────────── optional push to CAS Cloud</div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════════
+     FOOTER
+     ═══════════════════════════════════════════════ -->
+<footer>
+  <div class="wrap">
+    <p><strong>CLAUDE CODE + CAS</strong></p>
+    <p style="margin-top:0.3rem;">An AI development system with persistent memory, multi-agent coordination, and a learning loop that compounds.</p>
+    <p style="margin-top:0.8rem; color:#2a2a3e; font-size:0.75rem;">Built by agents. For agents. Using agents.</p>
+  </div>
+</footer>
+
+<!-- ═══════════════════════════════════════════════
+     SCROLL REVEAL
+     ═══════════════════════════════════════════════ -->
+<script>
+(function(){
+  var els = document.querySelectorAll('.rv');
+  if (!els.length) return;
+  if ('IntersectionObserver' in window) {
+    var io = new IntersectionObserver(function(entries){
+      entries.forEach(function(e){ if(e.isIntersecting){ e.target.classList.add('vis'); io.unobserve(e.target); } });
+    }, { threshold: 0.08, rootMargin: '0px 0px -30px 0px' });
+    els.forEach(function(el){ io.observe(el); });
+  } else {
+    els.forEach(function(el){ el.classList.add('vis'); });
+  }
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,56 @@
+# CAS Architecture
+
+## Workspace Layout
+
+The root `Cargo.toml` defines a workspace. `cas-cli/` is the main binary crate; `crates/` contains library crates.
+
+**Core data flow**: CLI commands and MCP tool calls both go through the store trait abstractions in `cas-cli/src/store/`, which wraps `cas-store` (SQLite) with notification and sync layers.
+
+### cas-cli (main crate) — `cas-cli/src/`
+
+| Module | Purpose |
+|--------|---------|
+| `main.rs` / `lib.rs` | Entry point, module declarations |
+| `cli/` | Clap command definitions and handlers. `mod.rs` has the `Commands` enum — add new subcommands here. |
+| `mcp/` | MCP server: `server/` (CasCore with cached OnceLock stores), `tools/` (55 tool handlers split into `core/` and `service/`), `daemon.rs` (embedded background maintenance), `socket.rs` (notification socket) |
+| `store/` | Re-exports from `cas-store` + wrappers: `notifying_*.rs` (emit change notifications), `syncing_*.rs` (sync to `.claude/` filesystem), `layered.rs` (project + global store composition), `detect.rs` (find `.cas/` root) |
+| `hooks/` | Claude Code hook event handlers (SessionStart, Stop, PostToolUse, etc.). `handlers/` has session, state, event, and middleware handlers. `scorer.rs` ranks context items for injection. |
+| `migration/` | Forward-only schema migrations. `migrations/` has individual migration files (m001-m182+). `detector.rs` introspects existing schema. |
+| `ui/` | Ratatui TUI components for factory view: `factory/`, `components/`, `widgets/`, `theme/`, `markdown/` |
+| `config/` | Configuration loading from `.cas/config.yaml` |
+| `orchestration/` | Agent name generation and orchestration logic |
+| `worktree/` | Git worktree management for factory workers |
+| `consolidation/` | Memory consolidation and decay |
+| `extraction/` | AI-powered extraction of observations into structured memory |
+| `bridge/` | Local helper server for external tool integration |
+| `cloud/` | CAS Cloud sync (optional) |
+| `sync/` | Filesystem sync to `.claude/rules/` and `.claude/skills/` |
+
+### Workspace Crates — `crates/`
+
+| Crate | Purpose |
+|-------|---------|
+| `cas-types` | Shared data types (Entry, Task, Rule, Skill, Agent, etc.) |
+| `cas-store` | SQLite storage layer — trait definitions (`Store`, `TaskStore`, `RuleStore`, etc.) and `SqliteStore` implementation |
+| `cas-search` | Full-text search via Tantivy (BM25 scoring) |
+| `cas-core` | Core business logic, hooks framework, search index abstraction, skill/rule syncing |
+| `cas-mcp` | MCP protocol types and request/response models |
+| `cas-factory` | Factory session lifecycle: `FactoryCore`, config, director, recording, notifications |
+| `cas-factory-protocol` | WebSocket message protocol between supervisor and worker agents |
+| `cas-mux` | Terminal multiplexer layout and rendering (side-by-side/tabbed agent views) |
+| `cas-pty` | PTY management for agent terminal sessions |
+| `cas-recording` | Terminal session recording and playback |
+| `cas-code` | Code analysis via tree-sitter |
+| `cas-diffs` | Diff parsing, rendering, syntax highlighting |
+| `cas-tui-test` | TUI testing framework |
+| `ghostty_vt` / `ghostty_vt_sys` | Virtual terminal parser (based on Ghostty) |
+
+### Key Patterns
+
+**Store trait hierarchy**: `cas-store` defines traits (`Store`, `TaskStore`, `RuleStore`, `SkillStore`, `EntityStore`, `AgentStore`, `VerificationStore`, `WorktreeStore`). `SqliteStore` implements all of them. `cas-cli/src/store/` wraps these with notification and sync decorators.
+
+**CasCore (MCP server)**: Lives in `cas-cli/src/mcp/server/mod.rs`. Caches all store instances in `OnceLock` fields — each store type opened exactly once per server lifetime. Has an embedded daemon for background maintenance (embedding generation every 2min, full maintenance every 30min).
+
+**CasContext**: In `cas-cli/src/store/mod.rs`. Resolves the `.cas/` directory once at CLI entry points and passes it through — enables deterministic test behavior.
+
+**Hook scoring**: `cas-cli/src/hooks/scorer.rs` ranks context items (memories, tasks, rules, skills) by relevance for injection into SessionStart context, staying within a token budget.

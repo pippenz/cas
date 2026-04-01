@@ -283,8 +283,6 @@ pub struct FactoryApp {
     /// Stored terminal dimensions (for daemon mode where crossterm::terminal::size() doesn't work)
     terminal_cols: u16,
     terminal_rows: u16,
-    /// Current text selection (for copy support)
-    selection: super::selection::Selection,
     /// Auto-prompting configuration
     auto_prompt: AutoPromptConfig,
     /// Epic branch name (e.g., "epic/add-user-auth") - workers branch from this
@@ -879,68 +877,6 @@ pub enum EpicStateChange {
     },
     /// An epic was completed
     Completed { epic_id: String, epic_title: String },
-}
-
-/// Extract selected text from a terminal pane.
-///
-/// This function extracts text from the pane's terminal buffer based on
-/// the selection coordinates. It handles single-line and multi-line
-/// selections, respecting line boundaries.
-fn extract_selected_text_from_pane(
-    pane: &cas_mux::Pane,
-    selection: &super::selection::Selection,
-) -> Option<String> {
-    if selection.is_empty() {
-        return None;
-    }
-
-    let (sr, sc, er, ec) = selection.normalized();
-
-    // Adjust selection rows for any scrolling that happened after the selection was made.
-    let scroll_delta = pane.scroll_offset() as i32 - selection.scroll_offset as i32;
-
-    let mut text = String::new();
-
-    for row in sr..=er {
-        let adjusted_row = row as i32 + scroll_delta;
-        if adjusted_row < 0 {
-            continue;
-        }
-        let row_text = match pane.dump_row(adjusted_row as u16) {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
-        let chars: Vec<char> = row_text.chars().collect();
-
-        let (start_col, end_col) = if sr == er {
-            // Single line selection
-            (sc as usize, ec as usize)
-        } else if row == sr {
-            // First line: from start_col to end
-            (sc as usize, chars.len().saturating_sub(1))
-        } else if row == er {
-            // Last line: from start to end_col
-            (0, ec as usize)
-        } else {
-            // Middle lines: entire line
-            (0, chars.len().saturating_sub(1))
-        };
-
-        // Extract the relevant portion
-        let start = start_col.min(chars.len());
-        let end = (end_col + 1).min(chars.len());
-        if start < end {
-            let selected: String = chars[start..end].iter().collect();
-            text.push_str(selected.trim_end());
-        }
-
-        // Add newline between lines (but not after last line)
-        if row < er {
-            text.push('\n');
-        }
-    }
-
-    if text.is_empty() { None } else { Some(text) }
 }
 
 /// Detect the initial epic state from loaded data.

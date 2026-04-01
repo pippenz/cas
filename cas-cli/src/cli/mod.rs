@@ -5,6 +5,7 @@
 mod auth;
 pub(crate) mod bridge;
 mod changelog;
+mod claude_md;
 mod cloud;
 mod config;
 mod config_tui;
@@ -32,6 +33,7 @@ use crate::store::find_cas_root;
 pub use auth::AuthCommands;
 pub use bridge::BridgeArgs;
 pub use changelog::ChangelogArgs;
+pub use claude_md::ClaudeMdArgs;
 pub use config::ConfigCommands;
 pub use doctor::DoctorArgs;
 pub use factory::{AttachArgs, FactoryArgs, KillAllArgs, KillArgs};
@@ -161,6 +163,10 @@ pub enum Commands {
     /// Manage registered devices
     #[command(subcommand)]
     Device(device::DeviceCommands),
+
+    /// Evaluate and optimize CLAUDE.md files for token efficiency
+    #[command(name = "claude-md")]
+    ClaudeMd(ClaudeMdArgs),
 }
 
 /// Authentication requirement for a command.
@@ -199,7 +205,8 @@ fn auth_requirement(command: &Option<Commands>) -> AuthRequirement {
         | Commands::Status(_)
         | Commands::StatusLine(_)
         | Commands::Mcp(_)
-        | Commands::Queue(_) => AuthRequirement::NotRequired,
+        | Commands::Queue(_)
+        | Commands::ClaudeMd(_) => AuthRequirement::NotRequired,
 
         #[cfg(feature = "mcp-server")]
         Commands::Serve => AuthRequirement::NotRequired,
@@ -343,6 +350,7 @@ fn get_command_name(cmd: &Option<Commands>) -> String {
         Commands::Queue(_) => "queue".to_string(),
         Commands::Cloud(_) => "cloud".to_string(),
         Commands::Device(_) => "device".to_string(),
+        Commands::ClaudeMd(_) => "claude-md".to_string(),
     }
 }
 
@@ -388,6 +396,7 @@ fn run_command(cli: &Cli, cas_root: Option<&Path>) -> anyhow::Result<()> {
         Commands::Queue(cmd) => queue::execute(cmd, cli),
         Commands::Cloud(cmd) => cloud::execute(cmd, cli, require_cas_root(cas_root)?),
         Commands::Device(cmd) => device::execute(cmd, cli),
+        Commands::ClaudeMd(args) => claude_md::execute(args, cli),
     }
 }
 

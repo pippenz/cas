@@ -19,7 +19,6 @@ use crate::ui::factory::director::{
 use crate::ui::factory::input::{FeedbackCategory, InputMode};
 use crate::ui::factory::layout::PaneGrid;
 use crate::ui::factory::notification::Notifier;
-use crate::ui::factory::selection::Selection;
 use crate::ui::theme::ActiveTheme;
 use crate::worktree::{WorktreeConfig, WorktreeManager};
 
@@ -227,7 +226,6 @@ impl FactoryApp {
             sidecar_area: None,
             terminal_cols: cols,
             terminal_rows: rows,
-            selection: Selection::default(),
             auto_prompt: config.auto_prompt.clone(),
             epic_branch,
             record_enabled: config.record,
@@ -382,7 +380,6 @@ impl FactoryApp {
             sidecar_area: None,
             terminal_cols: cols,
             terminal_rows: rows,
-            selection: Selection::default(),
             auto_prompt,
             epic_branch,
             record_enabled,

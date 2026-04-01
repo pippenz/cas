@@ -393,8 +393,7 @@ impl Pane {
 
     pub fn feed(&mut self, data: &[u8]) -> Result<()> {
         if self.user_scrolled {
-            // Save scroll position: the terminal auto-scrolls to bottom on new output,
-            // but the user has scrolled up and we want to preserve their position
+            // Save scroll position before feeding new data
             let before = self.terminal.scrollback_info();
             let old_total = before.total_scrollback;
             let old_offset = before.viewport_offset;
@@ -408,11 +407,18 @@ impl Pane {
             if new_lines > 0 {
                 self.new_lines_below = self.new_lines_below.saturating_add(new_lines);
             }
-            // Restore viewport: feed() scrolls to bottom (offset=0), so scroll back up
-            // by old_offset + new_lines to keep the same content visible
-            let restore = old_offset.saturating_add(new_lines);
-            if restore > 0 {
-                let _ = self.terminal.scroll(-(restore as i32));
+
+            // Preserve viewport: the user should see the same content as before feed.
+            // Target offset = old_offset + new_lines (same absolute position, measured
+            // from the new bottom which is now further away by new_lines).
+            // The terminal may or may not auto-scroll after feed — check the actual
+            // offset and only adjust the delta needed.
+            let target_offset = old_offset.saturating_add(new_lines);
+            let current_offset = after.viewport_offset;
+            if current_offset != target_offset {
+                // Positive delta = scroll down (toward bottom), negative = scroll up
+                let delta = current_offset as i32 - target_offset as i32;
+                let _ = self.terminal.scroll(delta);
             }
 
             Ok(())

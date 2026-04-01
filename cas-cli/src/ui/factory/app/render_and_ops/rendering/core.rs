@@ -386,28 +386,9 @@ impl FactoryApp {
                 .border_type(border_type)
                 .border_style(Style::default().fg(border_color));
 
-            // Get terminal content with selection highlighting
             let inner = block.inner(area);
-            let has_selection = self.selection.pane_name == name && !self.selection.is_empty();
-            let scroll_delta = if has_selection {
-                pane.scroll_offset() as i32 - self.selection.scroll_offset as i32
-            } else {
-                0
-            };
             let lines: Vec<Line> = (0..inner.height)
-                .map(|row| {
-                    let line = pane.row_as_line(row).unwrap_or_default();
-                    if has_selection {
-                        crate::ui::factory::selection::apply_selection_to_line(
-                            line,
-                            row,
-                            &self.selection,
-                            scroll_delta,
-                        )
-                    } else {
-                        line
-                    }
-                })
+                .map(|row| pane.row_as_line(row).unwrap_or_default())
                 .collect();
 
             let content = Paragraph::new(lines).block(block);
@@ -803,29 +784,9 @@ impl FactoryApp {
                 .border_type(border_type)
                 .border_style(Style::default().fg(border_color));
 
-            // Get terminal content with selection highlighting
             let inner = block.inner(layout.supervisor_area);
-            let has_selection =
-                self.selection.pane_name == self.supervisor_name && !self.selection.is_empty();
-            let scroll_delta = if has_selection {
-                pane.scroll_offset() as i32 - self.selection.scroll_offset as i32
-            } else {
-                0
-            };
             let lines: Vec<Line> = (0..inner.height)
-                .map(|row| {
-                    let line = pane.row_as_line(row).unwrap_or_default();
-                    if has_selection {
-                        crate::ui::factory::selection::apply_selection_to_line(
-                            line,
-                            row,
-                            &self.selection,
-                            scroll_delta,
-                        )
-                    } else {
-                        line
-                    }
-                })
+                .map(|row| pane.row_as_line(row).unwrap_or_default())
                 .collect();
 
             let content = Paragraph::new(lines).block(block);

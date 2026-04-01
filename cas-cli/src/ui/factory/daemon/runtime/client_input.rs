@@ -154,60 +154,6 @@ impl FactoryDaemon {
                                         );
                                     }
                                 }
-                                ControlEvent::MouseDown(col, row) => {
-                                    // Block clicks when a modal dialog is open
-                                    if self.app.show_task_dialog
-                                        || self.app.show_changes_dialog
-                                        || self.app.show_help
-                                    {
-                                        // Consume - don't interact with panes behind dialog
-                                    } else {
-                                        if self.app.input_mode.is_resize() {
-                                            self.app.exit_resize_mode();
-                                        }
-                                        self.app.start_selection(col, row);
-                                        self.app.handle_click(col, row);
-                                    }
-                                }
-                                ControlEvent::MouseDrag(col, row) => {
-                                    if !(self.app.show_task_dialog
-                                        || self.app.show_changes_dialog
-                                        || self.app.show_help)
-                                    {
-                                        self.app.update_selection(col, row);
-                                    }
-                                }
-                                ControlEvent::MouseUp => {
-                                    if !(self.app.show_task_dialog
-                                        || self.app.show_changes_dialog
-                                        || self.app.show_help)
-                                    {
-                                        if let Some(text) = self.app.handle_mouse_up() {
-                                            let char_count = text.len();
-                                            if let Some(client) =
-                                                self.clients.get_mut(&client_id)
-                                            {
-                                                // Send OSC 52 for terminals that support it
-                                                let osc52 = osc52_copy_sequence(&text);
-                                                client.output_buf.extend(osc52.as_bytes());
-
-                                                // Send clipboard control sequence so the
-                                                // client can write to clipboard directly
-                                                // (more reliable since the client has
-                                                // display server access).
-                                                let clipboard_seq =
-                                                    clipboard_control_sequence(&text);
-                                                client
-                                                    .output_buf
-                                                    .extend(clipboard_seq.as_bytes());
-                                            }
-                                            // Visual feedback in status bar
-                                            self.app.set_error(format!(
-                                                "Copied {char_count} chars"
-                                            ));
-                                        }
-                                    }
-                                }
                                 ControlEvent::MouseScrollUp => {
                                     if self.app.show_changes_dialog {
                                         self.app.diff_scroll_up();
@@ -313,22 +259,10 @@ impl FactoryDaemon {
                             // Format: mouse;kind;col;row
                             let parts: Vec<&str> = cmd_str.split(';').collect();
                             if parts.len() == 4 {
-                                let kind = parts[1];
-                                if let (Ok(col), Ok(row)) =
-                                    (parts[2].parse::<u16>(), parts[3].parse::<u16>())
-                                {
-                                    match kind {
-                                        "down_left" => {
-                                            events.push(ControlEvent::MouseDown(col, row))
-                                        }
-                                        "drag_left" => {
-                                            events.push(ControlEvent::MouseDrag(col, row))
-                                        }
-                                        "up_left" => events.push(ControlEvent::MouseUp),
-                                        "scroll_up" => events.push(ControlEvent::MouseScrollUp),
-                                        "scroll_down" => events.push(ControlEvent::MouseScrollDown),
-                                        _ => {} // Ignore other mouse events (right/middle clicks)
-                                    }
+                                match parts[1] {
+                                    "scroll_up" => events.push(ControlEvent::MouseScrollUp),
+                                    "scroll_down" => events.push(ControlEvent::MouseScrollDown),
+                                    _ => {} // Click/drag handled by native terminal selection
                                 }
                             }
                         } else if let Some(rest) = cmd_str.strip_prefix("drop_image;") {
@@ -860,87 +794,6 @@ impl FactoryDaemon {
             }
             _ => None,
         })
-    }
-}
-
-/// Build an OSC 52 escape sequence that tells the terminal to copy `text`
-/// to the system clipboard.
-///
-/// Format: `ESC ] 52 ; c ; <base64> ST`
-/// where ST (String Terminator) = `ESC \`
-///
-/// Supported by kitty, alacritty, wezterm, ghostty, iTerm2, and most modern
-/// terminal emulators.
-fn osc52_copy_sequence(text: &str) -> String {
-    let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
-    format!("\x1b]52;c;{}\x1b\\", encoded)
-}
-
-/// Build a custom control sequence that tells the client to write `text`
-/// to the system clipboard via platform-native methods.
-///
-/// Format: `ESC ] 777 ; clipboard ; <base64> BEL`
-///
-/// The client process runs in the user's terminal session and has access
-/// to DISPLAY/WAYLAND_DISPLAY, so it can reliably write to the clipboard
-/// using arboard (Linux) or pbcopy (macOS). This is a fallback for
-/// terminals that don't support OSC 52.
-fn clipboard_control_sequence(text: &str) -> String {
-    let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
-    format!("\x1b]777;clipboard;{}\x07", encoded)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn osc52_encodes_text_as_base64() {
-        let seq = osc52_copy_sequence("hello");
-        // "hello" in base64 is "aGVsbG8="
-        assert_eq!(seq, "\x1b]52;c;aGVsbG8=\x1b\\");
-    }
-
-    #[test]
-    fn osc52_handles_empty_string() {
-        let seq = osc52_copy_sequence("");
-        assert_eq!(seq, "\x1b]52;c;\x1b\\");
-    }
-
-    #[test]
-    fn osc52_handles_unicode() {
-        let seq = osc52_copy_sequence("🍌");
-        let expected_b64 = base64::engine::general_purpose::STANDARD.encode("🍌".as_bytes());
-        assert_eq!(seq, format!("\x1b]52;c;{}\x1b\\", expected_b64));
-    }
-
-    #[test]
-    fn osc52_handles_multiline() {
-        let seq = osc52_copy_sequence("line1\nline2\nline3");
-        assert!(seq.starts_with("\x1b]52;c;"));
-        assert!(seq.ends_with("\x1b\\"));
-        // Decode and verify round-trip
-        let b64 = &seq[7..seq.len() - 2];
-        let decoded = base64::engine::general_purpose::STANDARD.decode(b64).unwrap();
-        assert_eq!(std::str::from_utf8(&decoded).unwrap(), "line1\nline2\nline3");
-    }
-
-    #[test]
-    fn clipboard_control_sequence_encodes_base64() {
-        let seq = clipboard_control_sequence("hello");
-        let expected_b64 = base64::engine::general_purpose::STANDARD.encode("hello".as_bytes());
-        assert_eq!(seq, format!("\x1b]777;clipboard;{}\x07", expected_b64));
-    }
-
-    #[test]
-    fn clipboard_control_sequence_round_trips() {
-        let text = "line1\nline2\n🍌";
-        let seq = clipboard_control_sequence(text);
-        assert!(seq.starts_with("\x1b]777;clipboard;"));
-        assert!(seq.ends_with("\x07"));
-        let b64 = &seq["\x1b]777;clipboard;".len()..seq.len() - 1];
-        let decoded = base64::engine::general_purpose::STANDARD.decode(b64).unwrap();
-        assert_eq!(std::str::from_utf8(&decoded).unwrap(), text);
     }
 }
 

@@ -82,184 +82,6 @@ impl FactoryApp {
         self.sidecar_focus != SidecarFocus::None
     }
 
-    /// Handle mouse click - focus the clicked panel, tab, or pane
-    pub fn handle_click(&mut self, x: u16, y: u16) {
-        let point: (u16, u16) = (x, y);
-
-        tracing::debug!(
-            "handle_click at ({}, {}), is_tabbed={}, worker_tab_bar={:?}, worker_content={:?}, supervisor_area={:?}, sidecar_area={:?}",
-            x,
-            y,
-            self.is_tabbed,
-            self.worker_tab_bar_area,
-            self.worker_content_area,
-            self.supervisor_area,
-            self.sidecar_area
-        );
-
-        // Mission Control mode: check MC panel areas
-        if self.is_mission_control() {
-            use crate::ui::factory::renderer::MissionControlFocus;
-            if self.mc_workers_area.contains(point.into()) {
-                tracing::debug!("MC click in Workers panel");
-                self.mc_focus_panel(MissionControlFocus::Workers);
-            } else if self.mc_tasks_area.contains(point.into()) {
-                tracing::debug!("MC click in Tasks panel");
-                self.mc_focus_panel(MissionControlFocus::Tasks);
-            } else if self.mc_changes_area.contains(point.into()) {
-                tracing::debug!("MC click in Changes panel");
-                self.mc_focus_panel(MissionControlFocus::Changes);
-            } else if self.mc_activity_area.contains(point.into()) {
-                tracing::debug!("MC click in Activity panel");
-                self.mc_focus_panel(MissionControlFocus::Activity);
-            }
-            return;
-        }
-
-        if self.is_tabbed {
-            // Tabbed mode: check tab bar and content area
-            if let Some(tab_bar) = self.worker_tab_bar_area {
-                tracing::debug!(
-                    "Checking tab_bar area: {:?}, contains: {}",
-                    tab_bar,
-                    tab_bar.contains(point.into())
-                );
-                if tab_bar.contains(point.into()) {
-                    if let Some(tab_idx) = self.calculate_clicked_tab(x, &tab_bar) {
-                        tracing::debug!(
-                            "Tab bar click, tab_idx: {}, worker_names.len: {}",
-                            tab_idx,
-                            self.worker_names.len()
-                        );
-                        if tab_idx < self.worker_names.len() {
-                            self.selected_worker_tab = tab_idx;
-                            if let Some(name) = self.worker_names.get(tab_idx).cloned() {
-                                tracing::debug!("Focusing worker from tab bar: {}", name);
-                                self.mux.focus(&name);
-                            }
-                            self.sidecar_focus = SidecarFocus::None;
-                        }
-                    }
-                    return;
-                }
-            }
-
-            if let Some(content_area) = self.worker_content_area {
-                tracing::debug!(
-                    "Checking content_area: {:?}, contains: {}",
-                    content_area,
-                    content_area.contains(point.into())
-                );
-                if content_area.contains(point.into()) {
-                    if let Some(name) = self.worker_names.get(self.selected_worker_tab).cloned() {
-                        tracing::debug!("Focusing worker from content area: {}", name);
-                        self.mux.focus(&name);
-                    }
-                    self.sidecar_focus = SidecarFocus::None;
-                    return;
-                }
-            }
-        } else {
-            // Side-by-side mode: check each worker area
-            tracing::debug!(
-                "Side-by-side mode, worker_areas count: {}",
-                self.worker_areas.len()
-            );
-            for (i, worker_area) in self.worker_areas.iter().enumerate() {
-                tracing::debug!(
-                    "Checking worker_area[{}]: {:?}, contains: {}",
-                    i,
-                    worker_area,
-                    worker_area.contains(point.into())
-                );
-                if worker_area.contains(point.into()) {
-                    self.selected_worker_tab = i;
-                    if let Some(name) = self.worker_names.get(i).cloned() {
-                        tracing::debug!("Focusing worker[{}]: {}", i, name);
-                        self.mux.focus(&name);
-                    }
-                    self.sidecar_focus = SidecarFocus::None;
-                    return;
-                }
-            }
-        }
-
-        // Check supervisor area clicks
-        if let Some(sup_area) = self.supervisor_area {
-            tracing::debug!(
-                "Checking supervisor area: {:?}, contains point: {}",
-                sup_area,
-                sup_area.contains(point.into())
-            );
-            if sup_area.contains(point.into()) {
-                let name = self.supervisor_name.clone();
-                tracing::debug!("Clicking on supervisor, focusing: {}", name);
-                let focused = self.mux.focus(&name);
-                tracing::debug!("mux.focus result: {}", focused);
-                self.sidecar_focus = SidecarFocus::None;
-                return;
-            }
-        }
-
-        // Check sidecar panel clicks - check panel areas directly like Sidecar does
-        // This avoids issues with nested area checking
-        if self.panel_areas.factory.contains(point.into()) {
-            tracing::debug!("Click in Factory panel");
-            self.sidecar_focus = SidecarFocus::Factory;
-            self.init_panel_selection();
-        } else if self.panel_areas.tasks.contains(point.into()) {
-            tracing::debug!("Click in Tasks panel");
-            self.sidecar_focus = SidecarFocus::Tasks;
-            self.init_panel_selection();
-        } else if self.panel_areas.reminders.area() > 0
-            && self.panel_areas.reminders.contains(point.into())
-        {
-            tracing::debug!("Click in Reminders panel");
-            self.sidecar_focus = SidecarFocus::Reminders;
-            self.init_panel_selection();
-        } else if self.panel_areas.changes.contains(point.into()) {
-            tracing::debug!("Click in Changes panel");
-            self.sidecar_focus = SidecarFocus::Changes;
-            self.init_panel_selection();
-        } else if self.panel_areas.activity.contains(point.into()) {
-            tracing::debug!("Click in Activity panel");
-            self.sidecar_focus = SidecarFocus::Activity;
-            self.init_panel_selection();
-        }
-    }
-
-    /// Calculate which tab was clicked based on x position
-    fn calculate_clicked_tab(&self, x: u16, tab_bar: &Rect) -> Option<usize> {
-        if self.worker_names.is_empty() {
-            return None;
-        }
-
-        // Tab format: " N name● " — variable width per tab
-        let mut current_x = tab_bar.x + 1; // account for left padding " "
-
-        for (idx, name) in self.worker_names.iter().enumerate() {
-            let has_in_progress = self
-                .director_data
-                .in_progress_tasks
-                .iter()
-                .any(|t| t.assignee.as_deref() == Some(name.as_str()));
-            let status_icon = if has_in_progress { " ●" } else { "" };
-            // " N name● " = 1 + number_width + 1 + name.len + status_icon.len + 1
-            let label = format!(" {} {}{} ", idx + 1, name, status_icon);
-            let tab_width = label.chars().count() as u16;
-
-            if x >= current_x && x < current_x + tab_width {
-                return Some(idx);
-            }
-            current_x += tab_width;
-            if idx < self.worker_names.len() - 1 {
-                current_x += 1; // separator " "
-            }
-        }
-
-        None
-    }
-
     /// Register a session ID to pane name mapping
     ///
     /// This is called when a Claude session is detected to enable
@@ -352,104 +174,16 @@ impl FactoryApp {
         }
     }
 
-    /// Handle mouse up - finalize selection and return selected text for clipboard.
+    /// Convert screen coordinates to the pane at that position.
     ///
-    /// Returns the selected text (if any) so the caller can relay it to the
-    /// client terminal via OSC 52. The daemon process is headless and cannot
-    /// write to the system clipboard directly.
-    pub fn handle_mouse_up(&mut self) -> Option<String> {
-        // Finalize the selection
-        if self.selection.is_active {
-            self.selection.finalize();
-        }
-
-        // Return selected text for the caller to handle clipboard
-        if let Some(text) = self.get_selected_text() {
-            if !text.is_empty() {
-                tracing::debug!("Selection complete: {} chars", text.len());
-                return Some(text);
-            }
-        }
-        None
-    }
-
-    /// Start a text selection at the given screen position
-    pub fn start_selection(&mut self, screen_x: u16, screen_y: u16) {
-        // Determine which pane was clicked and convert to pane-relative coordinates
-        if let Some((pane_name, row, col)) = self.screen_to_pane_coords(screen_x, screen_y) {
-            let scroll_offset = self
-                .mux
-                .get(&pane_name)
-                .map(|p| p.scroll_offset())
-                .unwrap_or(0);
-            let mut sel = crate::ui::factory::selection::Selection::new(pane_name, row, col);
-            sel.scroll_offset = scroll_offset;
-            self.selection = sel;
-            tracing::debug!(
-                "Started selection at ({}, {}) in pane, scroll_offset={}",
-                row,
-                col,
-                scroll_offset
-            );
-        }
-    }
-
-    /// Update the selection end position during drag
-    pub fn update_selection(&mut self, screen_x: u16, screen_y: u16) {
-        if !self.selection.is_active {
-            return;
-        }
-
-        // Convert screen coords to pane coords, but only update if same pane
-        if let Some((pane_name, row, col)) = self.screen_to_pane_coords(screen_x, screen_y) {
-            if pane_name == self.selection.pane_name {
-                self.selection.update_end(row, col);
-            }
-        }
-    }
-
-    /// Extend the selection endpoint when scrolling while holding the mouse button.
-    /// Moves the selection end row by `delta` lines (negative = up, positive = down).
-    pub fn extend_selection_by_scroll(&mut self, delta: i32) {
-        if !self.selection.is_active {
-            return;
-        }
-        let (_, end_col) = self.selection.end;
-        let new_row = (self.selection.end.0 as i32 + delta).max(0) as u16;
-        self.selection.update_end(new_row, end_col);
-    }
-
-    /// Clear the current selection
-    pub fn clear_selection(&mut self) {
-        self.selection.clear();
-    }
-
-    /// Get the current selection reference
-    pub fn selection(&self) -> &crate::ui::factory::selection::Selection {
-        &self.selection
-    }
-
-    /// Convert screen coordinates to pane-relative coordinates
-    ///
-    /// Returns (pane_name, row, col) if the coordinates are inside a pane.
+    /// Returns the pane name if the coordinates are inside a pane.
     pub fn pane_at_screen(&self, x: u16, y: u16) -> Option<String> {
-        self.screen_to_pane_coords(x, y)
-            .map(|(pane_name, _, _)| pane_name)
-    }
-
-    /// Convert screen coordinates to pane-relative coordinates
-    ///
-    /// Returns (pane_name, row, col) if the coordinates are inside a pane.
-    fn screen_to_pane_coords(&self, x: u16, y: u16) -> Option<(String, u16, u16)> {
         let point = (x, y);
 
         // Check supervisor area
         if let Some(sup_area) = self.supervisor_area {
             if sup_area.contains(point.into()) {
-                // Account for border (1 pixel each side)
-                let inner_x = x.saturating_sub(sup_area.x + 1);
-                let inner_y = y.saturating_sub(sup_area.y + 1);
-                return Some((self.supervisor_name.clone(), inner_y, inner_x));
+                return Some(self.supervisor_name.clone());
             }
         }
 
@@ -457,41 +191,18 @@ impl FactoryApp {
         if self.is_tabbed {
             if let Some(content_area) = self.worker_content_area {
                 if content_area.contains(point.into()) {
-                    if let Some(name) = self.worker_names.get(self.selected_worker_tab) {
-                        let inner_x = x.saturating_sub(content_area.x + 1);
-                        let inner_y = y.saturating_sub(content_area.y + 1);
-                        return Some((name.clone(), inner_y, inner_x));
-                    }
+                    return self.worker_names.get(self.selected_worker_tab).cloned();
                 }
             }
         } else {
             for (i, worker_area) in self.worker_areas.iter().enumerate() {
                 if worker_area.contains(point.into()) {
-                    if let Some(name) = self.worker_names.get(i) {
-                        let inner_x = x.saturating_sub(worker_area.x + 1);
-                        let inner_y = y.saturating_sub(worker_area.y + 1);
-                        return Some((name.clone(), inner_y, inner_x));
-                    }
+                    return self.worker_names.get(i).cloned();
                 }
             }
         }
 
         None
-    }
-
-    /// Get the currently selected text, if any.
-    ///
-    /// Returns None if no text is selected.
-    pub fn get_selected_text(&self) -> Option<String> {
-        if self.selection.is_empty() || self.selection.pane_name.is_empty() {
-            return None;
-        }
-
-        // Get the pane for this selection
-        let pane = self.mux.get(&self.selection.pane_name)?;
-
-        // Extract text using the extraction function (to be implemented in cas-7f47)
-        extract_selected_text_from_pane(pane, &self.selection)
     }
 
     /// Scroll the supervisor pane by delta lines
