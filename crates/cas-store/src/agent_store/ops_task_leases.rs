@@ -1,6 +1,7 @@
 use crate::Result;
 use crate::agent_store::{LeaseHistoryEntry, SqliteAgentStore};
 use crate::error::StoreError;
+use crate::shared_db::ImmediateTx;
 use cas_types::{ClaimResult, LeaseStatus, TaskLease};
 use chrono::Utc;
 use rusqlite::{OptionalExtension, params};
@@ -14,11 +15,12 @@ impl SqliteAgentStore {
         reason: Option<&str>,
     ) -> Result<ClaimResult> {
         let conn = self.lock_conn()?;
+        let tx = ImmediateTx::new(&conn)?;
         let now = Utc::now();
         let expires_at = now + chrono::Duration::seconds(duration_secs);
 
         // Check if task is already claimed with an active, non-expired lease
-        let existing: Option<(String, String, String, i64)> = conn
+        let existing: Option<(String, String, String, i64)> = tx
             .query_row(
                 "SELECT agent_id, status, expires_at, epoch FROM task_leases WHERE task_id = ?",
                 params![task_id],
@@ -41,7 +43,7 @@ impl SqliteAgentStore {
                         // Lease is still valid - check if worker can take over from supervisor
                         let can_takeover = if held_by != agent_id {
                             // Check if requesting agent's parent is the current holder
-                            let parent: Option<Option<String>> = conn
+                            let parent: Option<Option<String>> = tx
                                 .query_row(
                                     "SELECT parent_id FROM agents WHERE id = ?",
                                     params![agent_id],
@@ -55,13 +57,13 @@ impl SqliteAgentStore {
 
                         if can_takeover {
                             // Worker taking over from supervisor - release supervisor's lease
-                            conn.execute(
+                            tx.execute(
                                 "UPDATE agents SET active_tasks = MAX(0, active_tasks - 1) WHERE id = ?",
                                 params![&held_by],
                             )?;
                             // Log transfer event
                             Self::log_lease_event(
-                                &conn,
+                                &tx,
                                 task_id,
                                 &held_by,
                                 "transferred",
@@ -85,7 +87,7 @@ impl SqliteAgentStore {
             }
             // Lease exists but is expired/released/revoked - update it with incremented epoch
             new_epoch = (current_epoch as u64) + 1;
-            conn.execute(
+            tx.execute(
                 "UPDATE task_leases SET agent_id = ?, status = 'active', acquired_at = ?,
                  expires_at = ?, renewed_at = ?, renewal_count = 0, epoch = ?, claim_reason = ?
                  WHERE task_id = ?",
@@ -102,7 +104,7 @@ impl SqliteAgentStore {
         } else {
             // No existing lease - create new one with epoch 1
             new_epoch = 1;
-            conn.execute(
+            tx.execute(
                 "INSERT INTO task_leases (task_id, agent_id, status, acquired_at, expires_at,
                  renewed_at, renewal_count, epoch, claim_reason)
                  VALUES (?, ?, 'active', ?, ?, ?, 0, 1, ?)",
@@ -118,7 +120,7 @@ impl SqliteAgentStore {
         }
 
         // Update agent's active task count
-        conn.execute(
+        tx.execute(
             "UPDATE agents SET active_tasks = active_tasks + 1 WHERE id = ?",
             params![agent_id],
         )?;
@@ -138,7 +140,7 @@ impl SqliteAgentStore {
         // Log the claim event
         let details = reason.map(|r| format!(r#"{{"reason":"{r}"}}"#));
         Self::log_lease_event(
-            &conn,
+            &tx,
             task_id,
             agent_id,
             "claimed",
@@ -147,6 +149,7 @@ impl SqliteAgentStore {
             None,
         )?;
 
+        tx.commit()?;
         Ok(ClaimResult::Success(lease))
     }
     pub(crate) fn lease_release_lease(&self, task_id: &str, agent_id: &str) -> Result<()> {
@@ -448,5 +451,17 @@ impl SqliteAgentStore {
         };
 
         Ok(task_ids)
+    }
+
+    pub(crate) fn lease_cleanup_lease_history(&self, older_than_days: i64) -> Result<usize> {
+        let conn = self.lock_conn()?;
+        let cutoff = (Utc::now() - chrono::Duration::days(older_than_days)).to_rfc3339();
+
+        let rows = conn.execute(
+            "DELETE FROM task_lease_history WHERE timestamp < ?",
+            params![cutoff],
+        )?;
+
+        Ok(rows)
     }
 }

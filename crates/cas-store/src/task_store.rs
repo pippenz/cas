@@ -538,6 +538,7 @@ impl TaskStore for SqliteTaskStore {
 
     fn delete(&self, id: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
+        let tx = crate::shared_db::ImmediateTx::new(&conn)?;
 
         // Get task title before deleting for event summary
         let title: Option<String> = conn
@@ -572,6 +573,7 @@ impl TaskStore for SqliteTaskStore {
         // Capture event for recording playback
         let _ = capture_task_event(&conn, RecordingEventType::TaskDeleted, id, None);
 
+        tx.commit()?;
         Ok(())
     }
 

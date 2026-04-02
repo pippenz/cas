@@ -39,7 +39,6 @@ CREATE TABLE IF NOT EXISTS prompts (
 CREATE INDEX IF NOT EXISTS idx_prompts_session ON prompts(session_id);
 CREATE INDEX IF NOT EXISTS idx_prompts_timestamp ON prompts(timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_prompts_task ON prompts(task_id);
-CREATE INDEX IF NOT EXISTS idx_prompts_content_hash ON prompts(content_hash);
 "#;
 
 /// Trait for prompt storage operations

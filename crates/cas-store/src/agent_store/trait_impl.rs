@@ -70,6 +70,9 @@ impl AgentStore for SqliteAgentStore {
     fn reclaim_expired_leases(&self) -> Result<usize> {
         self.lease_reclaim_expired_leases()
     }
+    fn cleanup_lease_history(&self, older_than_days: i64) -> Result<usize> {
+        self.lease_cleanup_lease_history(older_than_days)
+    }
     fn get_lease_history(
         &self,
         task_id: &str,

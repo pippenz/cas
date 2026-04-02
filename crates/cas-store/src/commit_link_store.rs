@@ -228,21 +228,18 @@ impl CommitLinkStore for SqliteCommitLinkStore {
     }
 
     fn find_by_file(&self, file_path: &str, limit: usize) -> Result<Vec<CommitLink>> {
-        // Search for file path in the JSON array
-        // Using LIKE with the JSON string is a simple approach
         let conn = self.conn.lock().map_err(lock_error)?;
 
-        let pattern = format!("%\"{file_path}%");
         let mut stmt = conn.prepare_cached(
-            "SELECT commit_hash, session_id, agent_id, branch, message, files_changed, prompt_ids, committed_at, author, scope
-             FROM commit_links
-             WHERE files_changed LIKE ?1
-             ORDER BY committed_at DESC
+            "SELECT cl.commit_hash, cl.session_id, cl.agent_id, cl.branch, cl.message, cl.files_changed, cl.prompt_ids, cl.committed_at, cl.author, cl.scope
+             FROM commit_links cl, json_each(cl.files_changed) je
+             WHERE je.value = ?1
+             ORDER BY cl.committed_at DESC
              LIMIT ?2",
         )?;
 
         let links = stmt
-            .query_map(params![pattern, limit as i64], Self::row_to_commit_link)?
+            .query_map(params![file_path, limit as i64], Self::row_to_commit_link)?
             .filter_map(|r| r.ok())
             .collect();
 

@@ -173,6 +173,9 @@ pub trait PromptQueueStore: Send + Sync {
     /// Clear all prompts (for cleanup)
     fn clear(&self) -> Result<usize>;
 
+    /// Clear old processed prompts (cleanup)
+    fn cleanup_old(&self, older_than_secs: i64) -> Result<usize>;
+
     /// Close the store
     fn close(&self) -> Result<()>;
 }
@@ -467,26 +470,12 @@ impl PromptQueueStore for SqlitePromptQueueStore {
         let conn = self.conn.lock().unwrap();
         let now = Utc::now().to_rfc3339();
 
-        let rows = conn.execute(
+        conn.execute(
             "UPDATE prompt_queue SET acked_at = ? WHERE id = ? AND acked_at IS NULL",
             params![now, prompt_id],
         )?;
 
-        if rows == 0 {
-            // Check if the prompt exists at all
-            let exists: bool = conn.query_row(
-                "SELECT COUNT(*) > 0 FROM prompt_queue WHERE id = ?",
-                params![prompt_id],
-                |row| row.get(0),
-            )?;
-            if !exists {
-                return Err(crate::StoreError::NotFound(format!(
-                    "Prompt {prompt_id} not found"
-                )));
-            }
-            // Already acked — idempotent, not an error
-        }
-
+        // rows_affected == 0 means either not found or already acked — both idempotent
         Ok(())
     }
 
@@ -548,6 +537,18 @@ impl PromptQueueStore for SqlitePromptQueueStore {
     fn clear(&self) -> Result<usize> {
         let conn = self.conn.lock().unwrap();
         let rows = conn.execute("DELETE FROM prompt_queue", [])?;
+        Ok(rows)
+    }
+
+    fn cleanup_old(&self, older_than_secs: i64) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let cutoff = (Utc::now() - chrono::Duration::seconds(older_than_secs)).to_rfc3339();
+
+        let rows = conn.execute(
+            "DELETE FROM prompt_queue WHERE processed_at IS NOT NULL AND processed_at < ?",
+            params![cutoff],
+        )?;
+
         Ok(rows)
     }
 
@@ -845,10 +846,11 @@ mod tests {
     }
 
     #[test]
-    fn test_ack_nonexistent_returns_error() {
+    fn test_ack_nonexistent_is_idempotent() {
         let (_temp, store) = create_test_store();
+        // Acking a nonexistent prompt is idempotent — no error
         let result = store.ack(99999);
-        assert!(result.is_err());
+        assert!(result.is_ok());
     }
 
     #[test]

@@ -5,8 +5,10 @@ use rusqlite::{Connection, OptionalExtension, params};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use std::str::FromStr;
+
 use crate::Result;
-use cas_types::{BeliefType, MemoryTier, ObservationType, Rule, RuleStatus, Scope};
+use cas_types::{BeliefType, Entry, EntryType, MemoryTier, ObservationType, Rule, RuleStatus, Scope};
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS entries (
@@ -60,19 +62,17 @@ CREATE TABLE IF NOT EXISTS entries (
 );
 
 CREATE INDEX IF NOT EXISTS idx_entries_created ON entries(created DESC);
-CREATE INDEX IF NOT EXISTS idx_entries_archived ON entries(archived);
 CREATE INDEX IF NOT EXISTS idx_entries_session ON entries(session_id);
 CREATE INDEX IF NOT EXISTS idx_entries_pending ON entries(pending_extraction);
 CREATE INDEX IF NOT EXISTS idx_entries_obs_type ON entries(observation_type);
 CREATE INDEX IF NOT EXISTS idx_entries_stability ON entries(stability);
-CREATE INDEX IF NOT EXISTS idx_entries_memory_tier ON entries(memory_tier);
 CREATE INDEX IF NOT EXISTS idx_entries_importance ON entries(importance);
 CREATE INDEX IF NOT EXISTS idx_entries_pending_embedding ON entries(pending_embedding) WHERE pending_embedding = 1;
-CREATE INDEX IF NOT EXISTS idx_entries_belief_type ON entries(belief_type);
 CREATE INDEX IF NOT EXISTS idx_entries_confidence ON entries(confidence);
 CREATE INDEX IF NOT EXISTS idx_entries_domain ON entries(domain);
 CREATE INDEX IF NOT EXISTS idx_entries_branch ON entries(branch);
 CREATE INDEX IF NOT EXISTS idx_entries_pending_index ON entries(updated_at) WHERE indexed_at IS NULL OR updated_at > indexed_at;
+CREATE INDEX IF NOT EXISTS idx_entries_unreviewed_learnings ON entries(created DESC) WHERE type = 'learning' AND archived = 0 AND last_reviewed IS NULL;
 
 CREATE TABLE IF NOT EXISTS rules (
     id TEXT PRIMARY KEY,
@@ -162,6 +162,67 @@ impl SqliteStore {
         } else {
             serde_json::to_string(tags).unwrap_or_default()
         }
+    }
+
+    /// Construct an `Entry` from a row selected with the standard 31-column projection.
+    ///
+    /// Expected column order (indices 0–30):
+    ///   id, type, tags, created, content, title, helpful_count,
+    ///   harmful_count, last_accessed, archived, session_id, source_tool,
+    ///   pending_extraction, observation_type, stability, access_count,
+    ///   raw_content, compressed, memory_tier, importance, valid_from, valid_until,
+    ///   review_after, last_reviewed, pending_embedding, belief_type, confidence,
+    ///   domain, branch, scope, team_id
+    fn row_to_entry(row: &rusqlite::Row) -> rusqlite::Result<Entry> {
+        Ok(Entry {
+            id: row.get(0)?,
+            entry_type: row
+                .get::<_, String>(1)?
+                .parse()
+                .unwrap_or(EntryType::Learning),
+            observation_type: Self::parse_observation_type(row.get(13)?),
+            tags: Self::parse_tags(row.get(2)?),
+            created: Self::parse_datetime(&row.get::<_, String>(3)?).unwrap_or_else(Utc::now),
+            content: row.get(4)?,
+            raw_content: row.get(16)?,
+            compressed: row.get::<_, i32>(17).unwrap_or(0) != 0,
+            memory_tier: Self::parse_memory_tier(row.get(18)?),
+            title: row.get(5)?,
+            helpful_count: row.get(6)?,
+            harmful_count: row.get(7)?,
+            last_accessed: row
+                .get::<_, Option<String>>(8)?
+                .and_then(|s| Self::parse_datetime(&s)),
+            archived: row.get::<_, i32>(9)? != 0,
+            session_id: row.get(10)?,
+            source_tool: row.get(11)?,
+            pending_extraction: row.get::<_, i32>(12).unwrap_or(0) != 0,
+            stability: row.get::<_, f32>(14).unwrap_or(0.5),
+            access_count: row.get::<_, i32>(15).unwrap_or(0),
+            importance: row.get::<_, f32>(19).unwrap_or(0.5),
+            valid_from: row
+                .get::<_, Option<String>>(20)?
+                .and_then(|s| Self::parse_datetime(&s)),
+            valid_until: row
+                .get::<_, Option<String>>(21)?
+                .and_then(|s| Self::parse_datetime(&s)),
+            review_after: row
+                .get::<_, Option<String>>(22)?
+                .and_then(|s| Self::parse_datetime(&s)),
+            last_reviewed: row
+                .get::<_, Option<String>>(23)?
+                .and_then(|s| Self::parse_datetime(&s)),
+            pending_embedding: row.get::<_, i32>(24).unwrap_or(1) != 0,
+            belief_type: Self::parse_belief_type(row.get(25)?),
+            confidence: row.get::<_, f32>(26).unwrap_or(1.0),
+            domain: row.get(27)?,
+            branch: row.get(28)?,
+            scope: row
+                .get::<_, Option<String>>(29)?
+                .map(|s| Scope::from_str(&s).unwrap_or_default())
+                .unwrap_or_default(),
+            team_id: row.get(30)?,
+        })
     }
 
     fn parse_observation_type(s: Option<String>) -> Option<ObservationType> {

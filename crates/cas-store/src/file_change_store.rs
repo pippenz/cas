@@ -47,9 +47,7 @@ CREATE TABLE IF NOT EXISTS file_changes (
 
 CREATE INDEX IF NOT EXISTS idx_file_changes_session ON file_changes(session_id);
 CREATE INDEX IF NOT EXISTS idx_file_changes_file ON file_changes(repository, file_path);
-CREATE INDEX IF NOT EXISTS idx_file_changes_commit ON file_changes(commit_hash);
-CREATE INDEX IF NOT EXISTS idx_file_changes_prompt ON file_changes(prompt_id);
-CREATE INDEX IF NOT EXISTS idx_file_changes_created ON file_changes(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_file_changes_commit ON file_changes(commit_hash) WHERE commit_hash IS NOT NULL;
 "#;
 
 /// Trait for file change storage operations
@@ -290,10 +288,23 @@ impl FileChangeStore for SqliteFileChangeStore {
         let now = Utc::now().to_rfc3339();
         let mut updated = 0;
 
-        for id in ids {
+        for chunk in ids.chunks(500) {
+            let placeholders: Vec<String> = chunk.iter().enumerate().map(|(i, _)| format!("?{}", i + 3)).collect();
+            let sql = format!(
+                "UPDATE file_changes SET commit_hash = ?1, committed_at = ?2 WHERE id IN ({})",
+                placeholders.join(", ")
+            );
+
+            let mut param_values: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(chunk.len() + 2);
+            param_values.push(Box::new(commit_hash.to_string()));
+            param_values.push(Box::new(now.clone()));
+            for id in chunk {
+                param_values.push(Box::new(id.clone()));
+            }
+
             let rows = conn.execute(
-                "UPDATE file_changes SET commit_hash = ?1, committed_at = ?2 WHERE id = ?3",
-                params![commit_hash, now, id],
+                &sql,
+                rusqlite::params_from_iter(param_values.iter().map(|p| p.as_ref())),
             )?;
             updated += rows;
         }

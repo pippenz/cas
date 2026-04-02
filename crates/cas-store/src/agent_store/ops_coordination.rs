@@ -1,5 +1,6 @@
 use crate::Result;
 use crate::agent_store::SqliteAgentStore;
+use crate::shared_db::ImmediateTx;
 use cas_types::Agent;
 use chrono::Utc;
 use rusqlite::params;
@@ -22,9 +23,10 @@ impl SqliteAgentStore {
     }
     pub(crate) fn coord_graceful_shutdown(&self, agent_id: &str) -> Result<Vec<String>> {
         let conn = self.lock_conn()?;
+        let tx = ImmediateTx::new(&conn)?;
 
         // Get all active task leases for this agent
-        let mut stmt = conn.prepare_cached(
+        let mut stmt = tx.prepare_cached(
             "SELECT task_id, epoch FROM task_leases WHERE agent_id = ? AND status = 'active'",
         )?;
         let leases: Vec<(String, i64)> = stmt
@@ -37,13 +39,13 @@ impl SqliteAgentStore {
         let task_ids: Vec<String> = leases.iter().map(|(id, _)| id.clone()).collect();
 
         // Release all active task leases
-        conn.execute(
+        tx.execute(
             "UPDATE task_leases SET status = 'released' WHERE agent_id = ? AND status = 'active'",
             params![agent_id],
         )?;
 
         // Release all active worktree leases
-        conn.execute(
+        tx.execute(
             "UPDATE worktree_leases SET status = 'released' WHERE agent_id = ? AND status = 'active'",
             params![agent_id],
         )?;
@@ -51,7 +53,7 @@ impl SqliteAgentStore {
         // Log released events for each task lease
         for (task_id, epoch) in &leases {
             Self::log_lease_event(
-                &conn,
+                &tx,
                 task_id,
                 agent_id,
                 "released",
@@ -62,11 +64,12 @@ impl SqliteAgentStore {
         }
 
         // Mark agent as shutdown
-        conn.execute(
+        tx.execute(
             "UPDATE agents SET status = 'shutdown', active_tasks = 0 WHERE id = ?",
             params![agent_id],
         )?;
 
+        tx.commit()?;
         Ok(task_ids)
     }
     pub(crate) fn coord_add_working_epic(&self, agent_id: &str, epic_id: &str) -> Result<()> {
