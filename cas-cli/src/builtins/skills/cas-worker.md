@@ -8,31 +8,6 @@ managed_by: cas
 
 You execute tasks assigned by the Supervisor. You may be working in an isolated git worktree or sharing the main working directory.
 
-## Worktree Mode (Default for Isolated Workers)
-
-If your working directory contains `.cas/worktrees`, you are in an isolated worktree. In worktrees:
-
-- **CAS MCP tools (`mcp__cas__*`) are usually unavailable** — do NOT waste turns retrying them
-- **Task details come from the supervisor's message** — scroll up in your conversation
-- **Use built-in tools only**: Read, Edit, Write, Bash, Glob, Grep
-- **Report completion via `cas factory message`**:
-  ```bash
-  cas factory message --project-dir <main-repo-path> --target supervisor --message "..."
-  ```
-
-**NEVER run these commands in a worktree:**
-- `cas init` — creates a duplicate `.cas/` directory with an empty database
-- `cas factory` — only the supervisor runs the factory
-- Any `cas` CLI subcommand — the CLI doesn't support worktree contexts
-
-## Tool Availability
-
-On startup, try `mcp__cas__task action=mine` **once only**.
-
-**If MCP tools respond** — follow the "Workflow" section below.
-
-**If MCP tools are unavailable** — follow the "Fallback Workflow" section immediately. Do NOT retry, wait, or attempt workarounds.
-
 ## Workflow
 
 1. Check assignments: `mcp__cas__task action=mine`
@@ -44,18 +19,6 @@ On startup, try `mcp__cas__task action=mine` **once only**.
    - If close succeeds — you're done, message the supervisor
    - If close returns **verification-required** — message the supervisor immediately. Do NOT try to spawn verifier agents or retry close. The supervisor handles verification for your tasks.
 
-## Fallback Workflow (No MCP Tools — Most Worktree Workers)
-
-When `mcp__cas__*` tools are unavailable:
-
-1. **Read the supervisor's assignment message** — it contains your task details
-2. Implement the solution using built-in tools (Read, Edit, Write, Bash, Glob, Grep)
-3. Commit after each logical unit of work
-4. When done, notify the supervisor with: what you did, files changed, commit hash
-   - Try: `cas factory message --project-dir <main-repo> --target supervisor --message "..."`
-   - If that fails: use `SendMessage` to supervisor
-5. The supervisor handles task closure — do NOT attempt `mcp__cas__task action=close`
-
 ## Blockers
 
 Report immediately — don't spend time stuck:
@@ -63,18 +26,15 @@ Report immediately — don't spend time stuck:
 mcp__cas__task action=notes id=<task-id> notes="Blocked: <reason>" note_type=blocker
 mcp__cas__task action=update id=<task-id> status=blocked
 ```
-If MCP tools are unavailable, message the supervisor directly with the blocker details.
 
 ## Communication
 
-**Primary**: Use CAS coordination for messages:
+Use CAS coordination for messages:
 ```
 mcp__cas__coordination action=message target=supervisor message="<response>" summary="<brief summary>"
 ```
 
-**Fallback**: If MCP tools are unavailable, use `SendMessage` with `to: "supervisor"` instead.
-
-Use task notes for ongoing updates (`note_type=progress|blocker|decision|discovery`) when MCP is available. The supervisor sees these in the TUI.
+Use task notes for ongoing updates (`note_type=progress|blocker|decision|discovery`). The supervisor sees these in the TUI.
 
 Message the supervisor when you complete a task or need help.
 

@@ -30,4 +30,4 @@ pub mod git;
 mod manager;
 
 pub use git::{GitError, GitOperations};
-pub use manager::{WorktreeConfig, WorktreeManager, WorktreeResult};
+pub use manager::{WorktreeConfig, WorktreeManager, WorktreeResult, symlink_project_config};

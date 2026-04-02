@@ -217,11 +217,13 @@ impl WorktreeManager {
         self.git
             .create_worktree(&worktree_path, &branch_name, Some(&parent_branch))?;
 
-        // .claude, .mcp.json, and CLAUDE.md are tracked in git, so
-        // git worktree add already checks them out. No symlinks needed.
-        // Mark them as skip-worktree so workers can't accidentally commit
-        // CAS-synced changes (rules, skills, settings).
+        // Mark tracked config files as skip-worktree so workers can't
+        // accidentally commit CAS-synced changes (rules, skills, settings).
         let _ = self.git.mark_config_skip_worktree(&worktree_path);
+
+        // Symlink gitignored config (.mcp.json, .claude/) into the worktree
+        // so workers get MCP server access even when these files aren't tracked.
+        symlink_project_config(&self.repo_root, &worktree_path);
 
         // Build the Worktree record
         let worktree = Worktree::for_epic(
@@ -361,6 +363,35 @@ impl WorktreeManager {
     }
 
     // Worker and epic operations are split into dedicated modules.
+}
+
+/// Symlink `.mcp.json` and `.claude/` from the main project into a worktree.
+///
+/// These files are typically gitignored (`.mcp.json` contains API keys, `.claude/`
+/// contains local settings), so `git worktree add` doesn't check them out.
+/// Without them, workers have no MCP server config and lose access to CAS tools.
+///
+/// Safe to call on worktrees where the files are already present (tracked in git):
+/// existing paths are silently skipped.
+pub fn symlink_project_config(repo_root: &Path, worktree_path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+
+        // .mcp.json — MCP server definitions (CAS, Context7, etc.)
+        let mcp_src = repo_root.join(".mcp.json");
+        let mcp_dst = worktree_path.join(".mcp.json");
+        if mcp_src.exists() && !mcp_dst.exists() {
+            let _ = symlink(&mcp_src, &mcp_dst);
+        }
+
+        // .claude/ — settings, permissions, skills, agents, hooks
+        let claude_src = repo_root.join(".claude");
+        let claude_dst = worktree_path.join(".claude");
+        if claude_src.is_dir() && !claude_dst.exists() {
+            let _ = symlink(&claude_src, &claude_dst);
+        }
+    }
 }
 
 /// Convert a title to a branch-safe slug

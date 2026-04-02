@@ -75,6 +75,11 @@ impl WorkerSpawnPrep {
             // Check if worktree already exists on disk (reuse from previous session)
             if wt.worktree_path.exists() {
                 let _ = git.init_submodules(&wt.worktree_path);
+                // Ensure gitignored config is available (may be missing from prior run)
+                crate::worktree::symlink_project_config(
+                    &wt.repo_root,
+                    &wt.worktree_path,
+                );
                 let worktree = Worktree::new(
                     Worktree::generate_id(),
                     wt.branch_name,
@@ -96,6 +101,9 @@ impl WorkerSpawnPrep {
 
             // Create git worktree (THE SLOW PART)
             git.create_worktree(&wt.worktree_path, &wt.branch_name, Some(&wt.parent_branch))?;
+
+            // Symlink .mcp.json and .claude/ so workers get MCP access
+            crate::worktree::symlink_project_config(&wt.repo_root, &wt.worktree_path);
 
             let worktree = Worktree::new(
                 Worktree::generate_id(),
@@ -838,24 +846,10 @@ pub(crate) fn queue_codex_worker_intro_prompt(
             // Avoid queue injection here to prevent duplicate or draft-only startup prompts.
         }
         cas_mux::SupervisorCli::Claude => {
-            // Workers in worktrees can't access MCP tools. Detect worktree mode
-            // BEFORE attempting any MCP call to avoid wasting 2-4 turns.
-            let project_dir = cas_dir.parent().unwrap_or(cas_dir).display();
             let prompt = format!(
                 "You are a CAS factory worker ({worker_name}).\n\
                  \n\
-                 FIRST: detect your mode — if your working directory contains `.cas/worktrees`, \
-                 CAS MCP tools will NOT work. Skip them entirely.\n\
-                 \n\
-                 **Worktree mode** (MCP unavailable):\n\
-                 1. Your task details are in the supervisor's message — scroll up in your conversation\n\
-                 2. Use built-in tools only: Read, Edit, Write, Bash, Glob, Grep\n\
-                 3. Notify supervisor you're ready:\n\
-                    `cas factory message --project-dir {project_dir} --target supervisor --message \"Worker {worker_name}: ready for task.\"`\n\
-                 \n\
-                 **Normal mode** (MCP available):\n\
                  Check your assigned tasks: `mcp__cas__task action=mine`\n\
-                 If MCP tools fail, switch to worktree mode instructions above. Do NOT retry.\n\
                  \n\
                  See the cas-worker skill for detailed workflow guidance."
             );
