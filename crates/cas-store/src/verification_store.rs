@@ -5,6 +5,7 @@
 
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
+use std::collections::HashMap;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
@@ -175,6 +176,66 @@ impl SqliteVerificationStore {
             .collect();
 
         Ok(issues)
+    }
+
+    fn load_issues_batch(
+        &self,
+        conn: &Connection,
+        verification_ids: &[&str],
+    ) -> Result<HashMap<String, Vec<VerificationIssue>>> {
+        if verification_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let placeholders: Vec<String> = (0..verification_ids.len())
+            .map(|i| format!("?{}", i + 1))
+            .collect();
+        let query = format!(
+            "SELECT verification_id, file, line, severity, category, code, problem, suggestion
+             FROM verification_issues WHERE verification_id IN ({})
+             ORDER BY id",
+            placeholders.join(", ")
+        );
+
+        let mut stmt = conn.prepare(&query)?;
+        let mut params_vec: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(verification_ids.len());
+        for id in verification_ids {
+            params_vec.push(id);
+        }
+
+        let rows = stmt.query_map(params_vec.as_slice(), |row| {
+            let vid: String = row.get(0)?;
+            let severity_str: String = row.get(3)?;
+            let severity = IssueSeverity::from_str(&severity_str).unwrap_or_default();
+
+            Ok((
+                vid,
+                VerificationIssue {
+                    file: row.get(1)?,
+                    line: row.get::<_, Option<i32>>(2)?.map(|v| v as u32),
+                    severity,
+                    category: row.get(4)?,
+                    code: row.get(5)?,
+                    problem: row.get(6)?,
+                    suggestion: row.get(7)?,
+                },
+            ))
+        })?;
+
+        let mut map: HashMap<String, Vec<VerificationIssue>> = HashMap::new();
+        for row in rows.filter_map(|r| r.ok()) {
+            map.entry(row.0).or_default().push(row.1);
+        }
+        Ok(map)
+    }
+
+    fn attach_issues_batch(&self, conn: &Connection, verifications: &mut [Verification]) -> Result<()> {
+        let ids: Vec<&str> = verifications.iter().map(|v| v.id.as_str()).collect();
+        let mut map = self.load_issues_batch(conn, &ids)?;
+        for v in verifications.iter_mut() {
+            v.issues = map.remove(&v.id).unwrap_or_default();
+        }
+        Ok(())
     }
 
     fn save_issues(&self, conn: &Connection, verification: &Verification) -> Result<()> {
@@ -403,19 +464,14 @@ impl VerificationStore for SqliteVerificationStore {
              ORDER BY created_at DESC",
         )?;
 
-        let verifications: Vec<Verification> = stmt
+        let mut verifications: Vec<Verification> = stmt
             .query_map(params![task_id], Self::parse_verification)?
             .filter_map(|r| r.ok())
             .collect();
 
-        // Load issues for each verification
-        let mut result = Vec::with_capacity(verifications.len());
-        for mut v in verifications {
-            v.issues = self.load_issues(&conn, &v.id)?;
-            result.push(v);
-        }
+        self.attach_issues_batch(&conn, &mut verifications)?;
 
-        Ok(result)
+        Ok(verifications)
     }
 
     fn get_latest_for_task(&self, task_id: &str) -> Result<Option<Verification>> {
@@ -479,19 +535,14 @@ impl VerificationStore for SqliteVerificationStore {
              FROM verifications ORDER BY created_at DESC LIMIT ?1",
         )?;
 
-        let verifications: Vec<Verification> = stmt
+        let mut verifications: Vec<Verification> = stmt
             .query_map(params![limit as i32], Self::parse_verification)?
             .filter_map(|r| r.ok())
             .collect();
 
-        // Load issues for each verification
-        let mut result = Vec::with_capacity(verifications.len());
-        for mut v in verifications {
-            v.issues = self.load_issues(&conn, &v.id)?;
-            result.push(v);
-        }
+        self.attach_issues_batch(&conn, &mut verifications)?;
 
-        Ok(result)
+        Ok(verifications)
     }
 
     fn list_by_status(&self, status: VerificationStatus) -> Result<Vec<Verification>> {
@@ -504,19 +555,14 @@ impl VerificationStore for SqliteVerificationStore {
              ORDER BY created_at DESC",
         )?;
 
-        let verifications: Vec<Verification> = stmt
+        let mut verifications: Vec<Verification> = stmt
             .query_map(params![status.to_string()], Self::parse_verification)?
             .filter_map(|r| r.ok())
             .collect();
 
-        // Load issues for each verification
-        let mut result = Vec::with_capacity(verifications.len());
-        for mut v in verifications {
-            v.issues = self.load_issues(&conn, &v.id)?;
-            result.push(v);
-        }
+        self.attach_issues_batch(&conn, &mut verifications)?;
 
-        Ok(result)
+        Ok(verifications)
     }
 
     fn close(&self) -> Result<()> {
