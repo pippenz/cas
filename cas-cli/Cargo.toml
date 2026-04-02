@@ -120,7 +120,7 @@ notify-rust = "4.11"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "net", "sync"] }
 
 # WebSocket support (for factory server)
-tokio-tungstenite = "0.24"
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 futures-util = "0.3"
 
 # LRU cache (for playback engine)
