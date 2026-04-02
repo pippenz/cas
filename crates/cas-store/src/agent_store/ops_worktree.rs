@@ -1,6 +1,7 @@
 use crate::Result;
 use crate::agent_store::SqliteAgentStore;
 use crate::error::StoreError;
+use crate::shared_db::ImmediateTx;
 use cas_types::{LeaseStatus, WorktreeClaimResult, WorktreeLease};
 use chrono::Utc;
 use rusqlite::{OptionalExtension, params};
@@ -13,11 +14,12 @@ impl SqliteAgentStore {
         duration_secs: i64,
     ) -> Result<WorktreeClaimResult> {
         let conn = self.lock_conn()?;
+        let tx = ImmediateTx::new(&conn)?;
         let now = Utc::now();
         let expires_at = now + chrono::Duration::seconds(duration_secs);
 
         // Check if worktree is already claimed with an active, non-expired lease
-        let existing: Option<(String, String, String)> = conn
+        let existing: Option<(String, String, String)> = tx
             .query_row(
                 "SELECT agent_id, status, expires_at FROM worktree_leases WHERE worktree_id = ?",
                 params![worktree_id],
@@ -31,7 +33,7 @@ impl SqliteAgentStore {
                     if expires > now {
                         if held_by == agent_id {
                             // Same agent - renew the lease
-                            conn.execute(
+                            tx.execute(
                                 "UPDATE worktree_leases SET expires_at = ?, renewed_at = ?, renewal_count = renewal_count + 1
                                  WHERE worktree_id = ?",
                                 params![expires_at.to_rfc3339(), now.to_rfc3339(), worktree_id],
@@ -46,9 +48,11 @@ impl SqliteAgentStore {
                                 renewed_at: now,
                                 renewal_count: 1, // Incremented
                             };
+                            tx.commit()?;
                             return Ok(WorktreeClaimResult::Success(lease));
                         }
                         // Different agent holds active lease
+                        // No commit needed - tx rolls back (read-only path)
                         return Ok(WorktreeClaimResult::AlreadyClaimed {
                             worktree_id: worktree_id.to_string(),
                             held_by,
@@ -58,7 +62,7 @@ impl SqliteAgentStore {
                 }
             }
             // Lease exists but is expired/released/revoked - update it
-            conn.execute(
+            tx.execute(
                 "UPDATE worktree_leases SET agent_id = ?, status = 'active', acquired_at = ?,
                  expires_at = ?, renewed_at = ?, renewal_count = 0
                  WHERE worktree_id = ?",
@@ -72,7 +76,7 @@ impl SqliteAgentStore {
             )?;
         } else {
             // No existing lease - create new one
-            conn.execute(
+            tx.execute(
                 "INSERT INTO worktree_leases (worktree_id, agent_id, status, acquired_at, expires_at, renewed_at, renewal_count)
                  VALUES (?, ?, 'active', ?, ?, ?, 0)",
                 params![
@@ -95,6 +99,7 @@ impl SqliteAgentStore {
             renewal_count: 0,
         };
 
+        tx.commit()?;
         Ok(WorktreeClaimResult::Success(lease))
     }
     pub(crate) fn worktree_release_worktree_lease(
