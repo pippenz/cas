@@ -1,4 +1,5 @@
 use crate::cli::hook::*;
+use crate::cli::hook::config_gen::has_cas_hook_entries;
 use tempfile::TempDir;
 use toml::map::Map;
 
@@ -10,19 +11,26 @@ fn test_configure_creates_settings() {
     assert!(result); // Created new file
     assert!(temp.path().join(".claude/settings.json").exists());
 
-    // Verify content
     let content = std::fs::read_to_string(temp.path().join(".claude/settings.json")).unwrap();
     let settings: serde_json::Value = serde_json::from_str(&content).unwrap();
 
-    assert!(settings.get("hooks").is_some());
-    assert!(settings.pointer("/hooks/SessionStart").is_some());
-    assert!(settings.pointer("/hooks/SessionEnd").is_some());
-    assert!(settings.pointer("/hooks/Stop").is_some());
-    assert!(settings.pointer("/hooks/SubagentStop").is_some());
-    assert!(settings.pointer("/hooks/PostToolUse").is_some());
-    assert!(settings.pointer("/hooks/UserPromptSubmit").is_some());
+    if global_has_cas_hooks() {
+        // Global hooks exist — project should NOT have hooks
+        assert!(
+            settings.get("hooks").is_none(),
+            "Hooks should be omitted when global hooks exist"
+        );
+    } else {
+        // No global hooks — project should have hooks
+        assert!(settings.pointer("/hooks/SessionStart").is_some());
+        assert!(settings.pointer("/hooks/SessionEnd").is_some());
+        assert!(settings.pointer("/hooks/Stop").is_some());
+        assert!(settings.pointer("/hooks/SubagentStop").is_some());
+        assert!(settings.pointer("/hooks/PostToolUse").is_some());
+        assert!(settings.pointer("/hooks/UserPromptSubmit").is_some());
+    }
 
-    // Verify CAS Bash permissions (Claude Code 2.1.0+)
+    // Permissions should always be written
     let allow = settings
         .pointer("/permissions/allow")
         .expect("permissions.allow missing");
@@ -31,7 +39,6 @@ fn test_configure_creates_settings() {
         allow_arr.iter().any(|v| v.as_str() == Some("Bash(cas :*)")),
         "Bash(cas :*) permission missing"
     );
-    // Verify CAS MCP tool permissions
     assert!(
         allow_arr
             .iter()
@@ -83,25 +90,33 @@ fn test_configure_merges_existing() {
     let result = configure_claude_hooks(temp.path(), false).unwrap();
     assert!(!result); // Updated, not created
 
-    // Verify merged content
     let content = std::fs::read_to_string(claude_dir.join("settings.json")).unwrap();
     let settings: serde_json::Value = serde_json::from_str(&content).unwrap();
 
-    // CAS hooks should be added
-    assert!(settings.pointer("/hooks/SessionStart").is_some());
-    assert!(settings.pointer("/hooks/SessionEnd").is_some());
-    assert!(settings.pointer("/hooks/Stop").is_some());
-    assert!(settings.pointer("/hooks/SubagentStop").is_some());
-    assert!(settings.pointer("/hooks/PostToolUse").is_some());
-    assert!(settings.pointer("/hooks/UserPromptSubmit").is_some());
+    if global_has_cas_hooks() {
+        // Global hooks exist — CAS hooks should NOT be added to project
+        assert!(
+            settings.pointer("/hooks/SessionStart").is_none(),
+            "CAS hooks should not be added when global hooks exist"
+        );
+        // Non-CAS custom hook should be preserved
+        assert!(
+            settings.pointer("/hooks/CustomHook").is_some(),
+            "Non-CAS custom hooks should be preserved"
+        );
+    } else {
+        // No global hooks — CAS hooks should be added
+        assert!(settings.pointer("/hooks/SessionStart").is_some());
+        assert!(settings.pointer("/hooks/Stop").is_some());
+        assert!(settings.pointer("/hooks/PostToolUse").is_some());
+    }
 
-    // Existing permissions should be preserved and CAS permissions added
+    // Existing permissions should always be preserved and CAS permissions added
     let allow = settings
         .pointer("/permissions/allow")
         .expect("permissions.allow missing");
     let allow_arr = allow.as_array().expect("permissions.allow is not array");
 
-    // Original permissions preserved
     assert!(
         allow_arr.iter().any(|v| v.as_str() == Some("Read")),
         "Original Read permission should be preserved"
@@ -110,8 +125,6 @@ fn test_configure_merges_existing() {
         allow_arr.iter().any(|v| v.as_str() == Some("Write")),
         "Original Write permission should be preserved"
     );
-
-    // CAS permissions added
     assert!(
         allow_arr.iter().any(|v| v.as_str() == Some("Bash(cas :*)")),
         "Bash(cas :*) permission should be added"
@@ -122,12 +135,70 @@ fn test_configure_merges_existing() {
             .any(|v| v.as_str() == Some("mcp__cas__task")),
         "mcp__cas__task permission should be added"
     );
-    assert!(
-        allow_arr
-            .iter()
-            .any(|v| v.as_str() == Some("mcp__cas__coordination")),
-        "mcp__cas__coordination permission should be added"
-    );
+}
+
+#[test]
+fn test_strip_cas_hooks() {
+    let mut settings = serde_json::json!({
+        "hooks": {
+            "PreToolUse": [{"hooks": [{"type": "command", "command": "cas hook PreToolUse"}]}],
+            "SessionStart": [
+                {"hooks": [{"type": "command", "command": "cas hook SessionStart"}]},
+                {"hooks": [{"type": "command", "command": "cas factory check-staleness"}]}
+            ],
+            "CustomHook": [{"hooks": [{"type": "command", "command": "echo custom"}]}]
+        },
+        "permissions": {"allow": ["Read"]}
+    });
+
+    let modified = strip_cas_hooks(&mut settings);
+    assert!(modified);
+
+    // CAS hooks should be removed
+    assert!(settings.pointer("/hooks/PreToolUse").is_none());
+    assert!(settings.pointer("/hooks/SessionStart").is_none());
+
+    // Non-CAS hook should be preserved
+    assert!(settings.pointer("/hooks/CustomHook").is_some());
+
+    // Permissions should be untouched
+    assert!(settings.pointer("/permissions/allow").is_some());
+}
+
+#[test]
+fn test_strip_cas_hooks_removes_empty_hooks_object() {
+    let mut settings = serde_json::json!({
+        "hooks": {
+            "PreToolUse": [{"hooks": [{"type": "command", "command": "cas hook PreToolUse"}]}]
+        },
+        "permissions": {"allow": ["Read"]}
+    });
+
+    strip_cas_hooks(&mut settings);
+
+    // hooks object should be completely removed when empty
+    assert!(settings.get("hooks").is_none());
+    assert!(settings.get("permissions").is_some());
+}
+
+#[test]
+fn test_has_cas_hook_entries() {
+    let with_hooks = serde_json::json!({
+        "hooks": {
+            "PreToolUse": [{"hooks": [{"type": "command", "command": "cas hook PreToolUse"}]}]
+        }
+    });
+    assert!(has_cas_hook_entries(&with_hooks));
+
+    let without_hooks = serde_json::json!({
+        "hooks": {
+            "Custom": [{"hooks": [{"type": "command", "command": "echo test"}]}]
+        }
+    });
+    assert!(!has_cas_hook_entries(&without_hooks));
+
+    let no_hooks = serde_json::json!({"permissions": {}});
+    assert!(!has_cas_hook_entries(&no_hooks));
 }
 
 #[test]

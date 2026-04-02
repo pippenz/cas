@@ -13,10 +13,12 @@ use crate::ui::components::{Formatter, Header, KeyValue, Renderable, StatusLine}
 use crate::ui::theme::ActiveTheme;
 
 use crate::cli::Cli;
-use crate::cli::hook::config_gen::get_cas_hooks_config;
+use crate::cli::hook::config_gen::{get_cas_hooks_config, has_cas_hook_entries};
 
 mod config_gen;
-pub use crate::cli::hook::config_gen::{configure_codex_mcp_server, configure_mcp_server};
+pub use crate::cli::hook::config_gen::{
+    configure_codex_mcp_server, configure_mcp_server, global_has_cas_hooks, strip_cas_hooks,
+};
 
 /// Arguments for the hook command
 #[derive(Parser)]
@@ -61,12 +63,25 @@ pub enum HookCommand {
     Notification,
     /// Handle PreCompact hook event (context preservation)
     PreCompact,
+    /// Remove duplicate CAS hooks from project-level .claude/settings.json files
+    ///
+    /// When CAS hooks are configured globally in ~/.claude/settings.json,
+    /// project-level hooks cause duplicates (each hook runs twice per tool call).
+    /// This command strips CAS hook entries from project settings while preserving
+    /// non-hook settings like permissions and statusLine.
+    #[command(name = "cleanup")]
+    Cleanup {
+        /// Dry run - show what would be changed without modifying files
+        #[arg(short = 'n', long)]
+        dry_run: bool,
+    },
 }
 
 /// Execute the hook command
 pub fn execute(args: &HookArgs, cli: &Cli) -> anyhow::Result<()> {
     match &args.command {
         HookCommand::Configure { force } => execute_configure(*force, cli),
+        HookCommand::Cleanup { dry_run } => execute_cleanup(*dry_run, cli),
         HookCommand::Status => execute_status(cli),
         HookCommand::SessionStart => execute_event("SessionStart", cli),
         HookCommand::SessionEnd => execute_event("SessionEnd", cli),
@@ -118,20 +133,238 @@ fn init_hook_logging(verbose: bool) {
     let _ = crate::logging::init(cas_root.as_deref(), verbose, &logging_config);
 }
 
+/// Strip duplicate CAS hooks from project-level .claude/settings.json files
+fn execute_cleanup(dry_run: bool, cli: &Cli) -> anyhow::Result<()> {
+    if !global_has_cas_hooks() {
+        if cli.json {
+            println!(r#"{{"status":"skipped","reason":"no_global_hooks"}}"#);
+        } else {
+            let theme = ActiveTheme::default();
+            let mut stdout = io::stdout();
+            let mut fmt = Formatter::stdout(&mut stdout, theme);
+            StatusLine::info("No CAS hooks found in global ~/.claude/settings.json").render(&mut fmt)?;
+            fmt.newline()?;
+            fmt.info("Nothing to clean up. Run 'cas hook configure' in a project first, or add hooks to ~/.claude/settings.json.")?;
+        }
+        return Ok(());
+    }
+
+    // Find all project-level .claude/settings.json files with CAS hooks
+    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
+    let global_path = home.join(".claude").join("settings.json");
+
+    let mut candidates = Vec::new();
+    find_settings_files_with_cas_hooks(&home, &global_path, &mut candidates);
+
+    if candidates.is_empty() {
+        if cli.json {
+            println!(r#"{{"status":"clean","files_checked":0}}"#);
+        } else {
+            let theme = ActiveTheme::default();
+            let mut stdout = io::stdout();
+            let mut fmt = Formatter::stdout(&mut stdout, theme);
+            StatusLine::success("No duplicate CAS hooks found in project settings").render(&mut fmt)?;
+        }
+        return Ok(());
+    }
+
+    let mut cleaned = 0u32;
+    let mut deleted = 0u32;
+    let mut errors = 0u32;
+
+    let theme = ActiveTheme::default();
+    let mut stdout = io::stdout();
+    let mut fmt = Formatter::stdout(&mut stdout, theme);
+
+    if !cli.json {
+        Header::h1(&format!(
+            "CAS Hook Cleanup{}",
+            if dry_run { " (dry run)" } else { "" }
+        ))
+        .render(&mut fmt)?;
+        fmt.newline()?;
+    }
+
+    for path in &candidates {
+        match cleanup_single_file(path, dry_run) {
+            Ok(CleanupAction::Stripped) => {
+                cleaned += 1;
+                if !cli.json {
+                    fmt.bullet(&format!("Stripped hooks: {}", path.display()))?;
+                }
+            }
+            Ok(CleanupAction::Deleted) => {
+                deleted += 1;
+                if !cli.json {
+                    fmt.bullet(&format!("Deleted (hooks-only file): {}", path.display()))?;
+                }
+            }
+            Ok(CleanupAction::Unchanged) => {}
+            Err(e) => {
+                errors += 1;
+                if !cli.json {
+                    eprintln!("  Error processing {}: {e}", path.display());
+                }
+            }
+        }
+    }
+
+    if cli.json {
+        println!(
+            r#"{{"status":"done","dry_run":{dry_run},"stripped":{cleaned},"deleted":{deleted},"errors":{errors}}}"#
+        );
+    } else {
+        fmt.newline()?;
+        StatusLine::success(&format!(
+            "{}: {} stripped, {} deleted, {} errors",
+            if dry_run { "Would process" } else { "Processed" },
+            cleaned,
+            deleted,
+            errors
+        ))
+        .render(&mut fmt)?;
+    }
+
+    Ok(())
+}
+
+enum CleanupAction {
+    Stripped,
+    Deleted,
+    Unchanged,
+}
+
+/// Clean up a single project-level settings file by stripping CAS hooks.
+fn cleanup_single_file(path: &Path, dry_run: bool) -> anyhow::Result<CleanupAction> {
+    let content = std::fs::read_to_string(path)?;
+    let mut settings: serde_json::Value = serde_json::from_str(&content)?;
+
+    if !strip_cas_hooks(&mut settings) {
+        return Ok(CleanupAction::Unchanged);
+    }
+
+    // Also strip CAS statusLine if present (global provides it)
+    if let Some(obj) = settings.as_object_mut() {
+        obj.remove("statusLine");
+    }
+
+    // Check if the file is now empty or only has empty objects
+    let is_empty = settings
+        .as_object()
+        .map(|obj| {
+            obj.is_empty()
+                || obj.iter().all(|(_, v)| {
+                    v.as_object().map(|o| o.is_empty()).unwrap_or(false)
+                        || v.as_array().map(|a| a.is_empty()).unwrap_or(false)
+                })
+        })
+        .unwrap_or(false);
+
+    if dry_run {
+        return Ok(if is_empty {
+            CleanupAction::Deleted
+        } else {
+            CleanupAction::Stripped
+        });
+    }
+
+    if is_empty {
+        std::fs::remove_file(path)?;
+        // Also remove empty .claude directory if it's now empty
+        if let Some(parent) = path.parent() {
+            if parent.file_name().is_some_and(|n| n == ".claude") {
+                if let Ok(mut entries) = std::fs::read_dir(parent) {
+                    if entries.next().is_none() {
+                        let _ = std::fs::remove_dir(parent);
+                    }
+                }
+            }
+        }
+        Ok(CleanupAction::Deleted)
+    } else {
+        let output = serde_json::to_string_pretty(&settings)?;
+        std::fs::write(path, output)?;
+        Ok(CleanupAction::Stripped)
+    }
+}
+
+/// Recursively find .claude/settings.json files containing CAS hooks.
+fn find_settings_files_with_cas_hooks(
+    dir: &Path,
+    global_path: &Path,
+    results: &mut Vec<std::path::PathBuf>,
+) {
+    // Check this directory for .claude/settings.json
+    let settings_path = dir.join(".claude").join("settings.json");
+    if settings_path.exists() && settings_path != *global_path {
+        if let Ok(content) = std::fs::read_to_string(&settings_path) {
+            if let Ok(settings) = serde_json::from_str::<serde_json::Value>(&content) {
+                if has_cas_hook_entries(&settings) {
+                    results.push(settings_path);
+                }
+            }
+        }
+    }
+
+    // Recurse into subdirectories, but skip heavy/irrelevant paths
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+
+        // Skip directories that won't have project settings
+        if name.starts_with('.')
+            && name != ".cas" // .cas/worktrees/ may have settings
+        {
+            continue;
+        }
+        if matches!(
+            name.as_ref(),
+            "node_modules" | "target" | "dist" | ".git" | "__pycache__" | "venv"
+        ) {
+            continue;
+        }
+
+        find_settings_files_with_cas_hooks(&path, global_path, results);
+    }
+}
+
 /// Configure Claude Code hooks
 fn execute_configure(force: bool, cli: &Cli) -> anyhow::Result<()> {
     let cwd = std::env::current_dir()?;
+    let hooks_in_global = global_has_cas_hooks();
 
     match configure_claude_hooks(&cwd, force) {
         Ok(created) => {
             if cli.json {
-                println!(r#"{{"status":"configured","created":{created}}}"#);
+                println!(
+                    r#"{{"status":"configured","created":{created},"hooks_skipped":{hooks_in_global}}}"#
+                );
             } else {
                 let theme = ActiveTheme::default();
                 let mut stdout = io::stdout();
                 let mut fmt = Formatter::stdout(&mut stdout, theme);
 
-                if created {
+                if hooks_in_global {
+                    StatusLine::success(if created {
+                        "Created .claude/settings.json (permissions only — hooks are global)"
+                    } else {
+                        "Updated .claude/settings.json (permissions only — hooks are global)"
+                    })
+                    .render(&mut fmt)?;
+                    fmt.newline()?;
+                    StatusLine::info(
+                        "CAS hooks already in ~/.claude/settings.json — skipped to avoid duplicates.",
+                    )
+                    .render(&mut fmt)?;
+                } else if created {
                     StatusLine::success("Created .claude/settings.json with CAS hooks")
                         .render(&mut fmt)?;
                     fmt.newline()?;
@@ -267,6 +500,10 @@ fn execute_status(cli: &Cli) -> anyhow::Result<()> {
 /// This function creates or updates the settings.json file to include
 /// CAS hooks for SessionStart, Stop, and PostToolUse events.
 ///
+/// When global ~/.claude/settings.json already has CAS hooks configured,
+/// this function only writes permissions and statusLine to the project
+/// settings — no hooks — to avoid duplicate hook execution.
+///
 /// Returns Ok(true) if file was created, Ok(false) if updated.
 pub fn configure_claude_hooks(project_root: &Path, force: bool) -> anyhow::Result<bool> {
     let claude_dir = project_root.join(".claude");
@@ -289,37 +526,48 @@ pub fn configure_claude_hooks(project_root: &Path, force: bool) -> anyhow::Resul
 
     let cas_hooks = get_cas_hooks_config(&hook_config);
 
+    // Check if global settings already have CAS hooks — if so, skip project-level
+    // hooks to avoid duplicate execution. Only write permissions and statusLine.
+    let skip_hooks = global_has_cas_hooks();
+
     let created = if settings_path.exists() && !force {
         // Merge with existing settings
         let content = std::fs::read_to_string(&settings_path)?;
         let mut settings: serde_json::Value = serde_json::from_str(&content)?;
 
-        let settings_obj = settings
-            .as_object_mut()
-            .ok_or_else(|| anyhow::anyhow!("settings.json is not an object"))?;
+        if !settings.is_object() {
+            anyhow::bail!("settings.json is not an object");
+        }
 
-        // Get or create hooks object
-        let hooks = settings_obj
-            .entry("hooks")
-            .or_insert_with(|| serde_json::json!({}));
+        if skip_hooks {
+            // Global hooks exist — strip any existing CAS hooks from project settings
+            strip_cas_hooks(&mut settings);
+        } else {
+            // No global hooks — add hooks to project settings
+            let hooks = settings
+                .as_object_mut()
+                .unwrap()
+                .entry("hooks")
+                .or_insert_with(|| serde_json::json!({}));
 
-        let hooks_obj = hooks
-            .as_object_mut()
-            .ok_or_else(|| anyhow::anyhow!("hooks is not an object"))?;
+            let hooks_obj = hooks
+                .as_object_mut()
+                .ok_or_else(|| anyhow::anyhow!("hooks is not an object"))?;
 
-        // Merge CAS hooks (don't overwrite existing non-CAS hooks)
-        let cas_hooks_obj = cas_hooks.as_object().unwrap();
-        for (key, value) in cas_hooks_obj.get("hooks").unwrap().as_object().unwrap() {
-            hooks_obj.insert(key.clone(), value.clone());
+            let cas_hooks_obj = cas_hooks.as_object().unwrap();
+            for (key, value) in cas_hooks_obj.get("hooks").unwrap().as_object().unwrap() {
+                hooks_obj.insert(key.clone(), value.clone());
+            }
         }
 
         // Add statusLine configuration (overwrite if exists - CAS owns this)
-        if let Some(status_line) = cas_hooks_obj.get("statusLine") {
+        let settings_obj = settings.as_object_mut().unwrap();
+        if let Some(status_line) = cas_hooks.get("statusLine") {
             settings_obj.insert("statusLine".to_string(), status_line.clone());
         }
 
         // Merge CAS Bash permissions (Claude Code 2.1.0+ wildcard patterns)
-        if let Some(cas_permissions) = cas_hooks_obj.get("permissions") {
+        if let Some(cas_permissions) = cas_hooks.get("permissions") {
             let permissions = settings_obj
                 .entry("permissions")
                 .or_insert_with(|| serde_json::json!({}));
@@ -342,47 +590,7 @@ pub fn configure_claude_hooks(project_root: &Path, force: bool) -> anyhow::Resul
         }
 
         // Add worktree directory to additionalDirectories if worktrees are enabled
-        let cas_root = project_root.join(".cas");
-        if let Ok(config) = Config::load(&cas_root) {
-            let worktrees_config = config.worktrees();
-            if worktrees_config.enabled {
-                // Compute worktree base path
-                let base = worktrees_config.base_path.replace(
-                    "{project}",
-                    project_root
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("project"),
-                );
-
-                let worktree_path = if base.starts_with('/') {
-                    base
-                } else {
-                    // Relative path - resolve from project root's parent
-                    project_root
-                        .parent()
-                        .unwrap_or(project_root)
-                        .join(&base)
-                        .to_string_lossy()
-                        .to_string()
-                };
-
-                let permissions = settings_obj
-                    .entry("permissions")
-                    .or_insert_with(|| serde_json::json!({}));
-                if let Some(permissions_obj) = permissions.as_object_mut() {
-                    let additional_dirs = permissions_obj
-                        .entry("additionalDirectories")
-                        .or_insert_with(|| serde_json::json!([]));
-                    if let Some(dirs_arr) = additional_dirs.as_array_mut() {
-                        let path_value = serde_json::Value::String(worktree_path.clone());
-                        if !dirs_arr.contains(&path_value) {
-                            dirs_arr.push(path_value);
-                        }
-                    }
-                }
-            }
-        }
+        merge_worktree_permissions(project_root, settings_obj);
 
         // Write back
         let output = serde_json::to_string_pretty(&settings)?;
@@ -390,45 +598,23 @@ pub fn configure_claude_hooks(project_root: &Path, force: bool) -> anyhow::Resul
         false
     } else {
         // Create new settings file
-        let mut settings = cas_hooks.clone();
+        let mut settings = if skip_hooks {
+            // Global hooks exist — only write permissions and statusLine
+            let mut obj = serde_json::Map::new();
+            if let Some(perms) = cas_hooks.get("permissions") {
+                obj.insert("permissions".to_string(), perms.clone());
+            }
+            if let Some(sl) = cas_hooks.get("statusLine") {
+                obj.insert("statusLine".to_string(), sl.clone());
+            }
+            serde_json::Value::Object(obj)
+        } else {
+            cas_hooks.clone()
+        };
 
         // Add worktree directory if worktrees are enabled
-        let cas_root = project_root.join(".cas");
-        if let Ok(config) = Config::load(&cas_root) {
-            let worktrees_config = config.worktrees();
-            if worktrees_config.enabled {
-                // Compute worktree base path
-                let base = worktrees_config.base_path.replace(
-                    "{project}",
-                    project_root
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("project"),
-                );
-
-                let worktree_path = if base.starts_with('/') {
-                    base
-                } else {
-                    project_root
-                        .parent()
-                        .unwrap_or(project_root)
-                        .join(&base)
-                        .to_string_lossy()
-                        .to_string()
-                };
-
-                if let Some(settings_obj) = settings.as_object_mut() {
-                    let permissions = settings_obj
-                        .entry("permissions")
-                        .or_insert_with(|| serde_json::json!({}));
-                    if let Some(permissions_obj) = permissions.as_object_mut() {
-                        permissions_obj.insert(
-                            "additionalDirectories".to_string(),
-                            serde_json::json!([worktree_path]),
-                        );
-                    }
-                }
-            }
+        if let Some(settings_obj) = settings.as_object_mut() {
+            merge_worktree_permissions(project_root, settings_obj);
         }
 
         let output = serde_json::to_string_pretty(&settings)?;
@@ -437,6 +623,52 @@ pub fn configure_claude_hooks(project_root: &Path, force: bool) -> anyhow::Resul
     };
 
     Ok(created)
+}
+
+/// Merge worktree additionalDirectories into settings permissions if enabled.
+fn merge_worktree_permissions(
+    project_root: &Path,
+    settings_obj: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    let cas_root = project_root.join(".cas");
+    if let Ok(config) = Config::load(&cas_root) {
+        let worktrees_config = config.worktrees();
+        if worktrees_config.enabled {
+            let base = worktrees_config.base_path.replace(
+                "{project}",
+                project_root
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("project"),
+            );
+
+            let worktree_path = if base.starts_with('/') {
+                base
+            } else {
+                project_root
+                    .parent()
+                    .unwrap_or(project_root)
+                    .join(&base)
+                    .to_string_lossy()
+                    .to_string()
+            };
+
+            let permissions = settings_obj
+                .entry("permissions")
+                .or_insert_with(|| serde_json::json!({}));
+            if let Some(permissions_obj) = permissions.as_object_mut() {
+                let additional_dirs = permissions_obj
+                    .entry("additionalDirectories")
+                    .or_insert_with(|| serde_json::json!([]));
+                if let Some(dirs_arr) = additional_dirs.as_array_mut() {
+                    let path_value = serde_json::Value::String(worktree_path.clone());
+                    if !dirs_arr.contains(&path_value) {
+                        dirs_arr.push(path_value);
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

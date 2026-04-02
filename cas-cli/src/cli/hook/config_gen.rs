@@ -2,6 +2,106 @@ use std::path::Path;
 
 use toml::map::Map;
 
+/// Check if the global ~/.claude/settings.json already has CAS hooks configured.
+///
+/// Returns true if the global settings contain at least one hook entry whose
+/// command starts with "cas hook". When this is true, project-level settings
+/// should NOT add hooks (only permissions/statusLine) to avoid duplication.
+pub fn global_has_cas_hooks() -> bool {
+    let Some(home) = dirs::home_dir() else {
+        return false;
+    };
+    let global_settings_path = home.join(".claude").join("settings.json");
+    let Ok(content) = std::fs::read_to_string(&global_settings_path) else {
+        return false;
+    };
+    let Ok(settings) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return false;
+    };
+    has_cas_hook_entries(&settings)
+}
+
+/// Check if a settings JSON value contains any CAS hook entries.
+pub fn has_cas_hook_entries(settings: &serde_json::Value) -> bool {
+    let Some(hooks) = settings.get("hooks").and_then(|h| h.as_object()) else {
+        return false;
+    };
+    // Check if any hook event has a "cas hook" command
+    for (_event, entries) in hooks {
+        let Some(entries_arr) = entries.as_array() else {
+            continue;
+        };
+        for entry in entries_arr {
+            let Some(hook_list) = entry.get("hooks").and_then(|h| h.as_array()) else {
+                continue;
+            };
+            for hook in hook_list {
+                if let Some(cmd) = hook.get("command").and_then(|c| c.as_str()) {
+                    if cmd.starts_with("cas hook ") {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Strip CAS hook entries from a settings JSON value.
+///
+/// Removes hook event keys where ALL entries are CAS hooks. If an event has
+/// a mix of CAS and non-CAS hooks, only the CAS entries are removed.
+/// Returns true if any hooks were removed.
+pub fn strip_cas_hooks(settings: &mut serde_json::Value) -> bool {
+    let Some(hooks) = settings.get_mut("hooks").and_then(|h| h.as_object_mut()) else {
+        return false;
+    };
+
+    let mut events_to_remove = Vec::new();
+    let mut modified = false;
+
+    for (event, entries) in hooks.iter_mut() {
+        let Some(entries_arr) = entries.as_array_mut() else {
+            continue;
+        };
+
+        let original_len = entries_arr.len();
+        entries_arr.retain(|entry| {
+            let Some(hook_list) = entry.get("hooks").and_then(|h| h.as_array()) else {
+                return true; // keep non-standard entries
+            };
+            // Remove entry if ALL its hooks are CAS hooks
+            let all_cas = hook_list.iter().all(|hook| {
+                hook.get("command")
+                    .and_then(|c| c.as_str())
+                    .map(|cmd| cmd.starts_with("cas hook ") || cmd.starts_with("cas factory "))
+                    .unwrap_or(false)
+            });
+            !all_cas
+        });
+
+        if entries_arr.len() != original_len {
+            modified = true;
+        }
+        if entries_arr.is_empty() {
+            events_to_remove.push(event.clone());
+        }
+    }
+
+    for event in events_to_remove {
+        hooks.remove(&event);
+    }
+
+    // Remove empty hooks object
+    if hooks.is_empty() {
+        if let Some(obj) = settings.as_object_mut() {
+            obj.remove("hooks");
+        }
+    }
+
+    modified
+}
+
 /// Get the CAS hooks configuration JSON
 ///
 /// Note: Claude Code 2.1.0+ supports `once: true` for hooks that should only run once
