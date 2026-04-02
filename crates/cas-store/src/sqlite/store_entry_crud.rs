@@ -4,10 +4,9 @@ use crate::event_store::record_event_with_conn;
 use crate::recording_store::capture_memory_event;
 use crate::sqlite::{SCHEMA, SqliteStore};
 use crate::tracing::{DevTracer, TraceTimer};
-use cas_types::{Entry, EntryType, Event, EventEntityType, EventType, Scope};
+use cas_types::{Entry, Event, EventEntityType, EventType};
 use chrono::Utc;
 use rusqlite::{OptionalExtension, params};
-use std::str::FromStr;
 
 impl SqliteStore {
     pub(crate) fn store_init(&self) -> Result<()> {
@@ -39,6 +38,12 @@ impl SqliteStore {
         );
         let _ = conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_sessions_team ON sessions(team_id)",
+            [],
+        );
+
+        // Expression index for helpful score sort (requires SQLite 3.31+)
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_entries_helpful_score ON entries((helpful_count - harmful_count) DESC, last_accessed DESC) WHERE archived = 0 AND (helpful_count - harmful_count) > 0",
             [],
         );
 
@@ -158,58 +163,7 @@ impl SqliteStore {
                  belief_type, confidence, domain, branch, scope, team_id
                  FROM entries WHERE id = ? AND archived = 0",
                 params![id],
-                |row| {
-                    Ok(Entry {
-                        id: row.get(0)?,
-                        entry_type: row
-                            .get::<_, String>(1)?
-                            .parse()
-                            .unwrap_or(EntryType::Learning),
-                        observation_type: Self::parse_observation_type(row.get(13)?),
-                        tags: Self::parse_tags(row.get(2)?),
-                        created: Self::parse_datetime(&row.get::<_, String>(3)?)
-                            .unwrap_or_else(Utc::now),
-                        content: row.get(4)?,
-                        raw_content: row.get(16)?,
-                        compressed: row.get::<_, i32>(17).unwrap_or(0) != 0,
-                        memory_tier: Self::parse_memory_tier(row.get(18)?),
-                        title: row.get(5)?,
-                        helpful_count: row.get(6)?,
-                        harmful_count: row.get(7)?,
-                        last_accessed: row
-                            .get::<_, Option<String>>(8)?
-                            .and_then(|s| Self::parse_datetime(&s)),
-                        archived: row.get::<_, i32>(9)? != 0,
-                        session_id: row.get(10)?,
-                        source_tool: row.get(11)?,
-                        pending_extraction: row.get::<_, i32>(12).unwrap_or(0) != 0,
-                        stability: row.get::<_, f32>(14).unwrap_or(0.5),
-                        access_count: row.get::<_, i32>(15).unwrap_or(0),
-                        importance: row.get::<_, f32>(19).unwrap_or(0.5),
-                        valid_from: row
-                            .get::<_, Option<String>>(20)?
-                            .and_then(|s| Self::parse_datetime(&s)),
-                        valid_until: row
-                            .get::<_, Option<String>>(21)?
-                            .and_then(|s| Self::parse_datetime(&s)),
-                        review_after: row
-                            .get::<_, Option<String>>(22)?
-                            .and_then(|s| Self::parse_datetime(&s)),
-                        last_reviewed: row
-                            .get::<_, Option<String>>(23)?
-                            .and_then(|s| Self::parse_datetime(&s)),
-                        pending_embedding: row.get::<_, i32>(24).unwrap_or(1) != 0,
-                        belief_type: Self::parse_belief_type(row.get(25)?),
-                        confidence: row.get::<_, f32>(26).unwrap_or(1.0),
-                        domain: row.get(27)?,
-                        branch: row.get(28)?,
-                        scope: row
-                            .get::<_, Option<String>>(29)?
-                            .map(|s| Scope::from_str(&s).unwrap_or_default())
-                            .unwrap_or_default(),
-                        team_id: row.get(30)?,
-                    })
-                },
+                Self::row_to_entry,
             )
             .optional()?
             .ok_or_else(|| StoreError::EntryNotFound(id.to_string()))?;
@@ -226,58 +180,7 @@ impl SqliteStore {
                  belief_type, confidence, domain, branch, scope, team_id
                  FROM entries WHERE id = ? AND archived = 1",
                 params![id],
-                |row| {
-                    Ok(Entry {
-                        id: row.get(0)?,
-                        entry_type: row
-                            .get::<_, String>(1)?
-                            .parse()
-                            .unwrap_or(EntryType::Learning),
-                        observation_type: Self::parse_observation_type(row.get(13)?),
-                        tags: Self::parse_tags(row.get(2)?),
-                        created: Self::parse_datetime(&row.get::<_, String>(3)?)
-                            .unwrap_or_else(Utc::now),
-                        content: row.get(4)?,
-                        raw_content: row.get(16)?,
-                        compressed: row.get::<_, i32>(17).unwrap_or(0) != 0,
-                        memory_tier: Self::parse_memory_tier(row.get(18)?),
-                        title: row.get(5)?,
-                        helpful_count: row.get(6)?,
-                        harmful_count: row.get(7)?,
-                        last_accessed: row
-                            .get::<_, Option<String>>(8)?
-                            .and_then(|s| Self::parse_datetime(&s)),
-                        archived: row.get::<_, i32>(9)? != 0,
-                        session_id: row.get(10)?,
-                        source_tool: row.get(11)?,
-                        pending_extraction: row.get::<_, i32>(12).unwrap_or(0) != 0,
-                        stability: row.get::<_, f32>(14).unwrap_or(0.5),
-                        access_count: row.get::<_, i32>(15).unwrap_or(0),
-                        importance: row.get::<_, f32>(19).unwrap_or(0.5),
-                        valid_from: row
-                            .get::<_, Option<String>>(20)?
-                            .and_then(|s| Self::parse_datetime(&s)),
-                        valid_until: row
-                            .get::<_, Option<String>>(21)?
-                            .and_then(|s| Self::parse_datetime(&s)),
-                        review_after: row
-                            .get::<_, Option<String>>(22)?
-                            .and_then(|s| Self::parse_datetime(&s)),
-                        last_reviewed: row
-                            .get::<_, Option<String>>(23)?
-                            .and_then(|s| Self::parse_datetime(&s)),
-                        pending_embedding: row.get::<_, i32>(24).unwrap_or(1) != 0,
-                        belief_type: Self::parse_belief_type(row.get(25)?),
-                        confidence: row.get::<_, f32>(26).unwrap_or(1.0),
-                        domain: row.get(27)?,
-                        branch: row.get(28)?,
-                        scope: row
-                            .get::<_, Option<String>>(29)?
-                            .map(|s| Scope::from_str(&s).unwrap_or_default())
-                            .unwrap_or_default(),
-                        team_id: row.get(30)?,
-                    })
-                },
+                Self::row_to_entry,
             )
             .optional()?
             .ok_or_else(|| StoreError::EntryNotFound(id.to_string()))?;
@@ -287,8 +190,9 @@ impl SqliteStore {
         let timer = TraceTimer::new();
         crate::shared_db::with_write_retry(|| {
             let conn = self.conn.lock().unwrap();
+            let tx = crate::shared_db::ImmediateTx::new(&conn)?;
             let now = Utc::now().to_rfc3339();
-            let result = conn.execute(
+            let result = tx.execute(
             "UPDATE entries SET type = ?1, tags = ?2, content = ?3, title = ?4,
              helpful_count = ?5, harmful_count = ?6, last_accessed = ?7, archived = ?8,
              session_id = ?9, source_tool = ?10, pending_extraction = ?11, observation_type = ?12,
@@ -354,6 +258,7 @@ impl SqliteStore {
             if rows == 0 {
                 return Err(StoreError::EntryNotFound(entry.id.clone()));
             }
+            tx.commit()?;
             Ok(())
         }) // with_write_retry
     }
@@ -395,62 +300,11 @@ impl SqliteStore {
              pending_extraction, observation_type, stability, access_count,
              raw_content, compressed, memory_tier, importance, valid_from, valid_until, review_after, last_reviewed, pending_embedding,
              belief_type, confidence, domain, branch, scope, team_id
-             FROM entries WHERE archived = 0 ORDER BY created DESC",
+             FROM entries WHERE archived = 0 ORDER BY created DESC LIMIT 10000",
         )?;
 
         let entries = stmt
-            .query_map([], |row| {
-                Ok(Entry {
-                    id: row.get(0)?,
-                    entry_type: row
-                        .get::<_, String>(1)?
-                        .parse()
-                        .unwrap_or(EntryType::Learning),
-                    observation_type: Self::parse_observation_type(row.get(13)?),
-                    tags: Self::parse_tags(row.get(2)?),
-                    created: Self::parse_datetime(&row.get::<_, String>(3)?)
-                        .unwrap_or_else(Utc::now),
-                    content: row.get(4)?,
-                    raw_content: row.get(16)?,
-                    compressed: row.get::<_, i32>(17).unwrap_or(0) != 0,
-                    memory_tier: Self::parse_memory_tier(row.get(18)?),
-                    title: row.get(5)?,
-                    helpful_count: row.get(6)?,
-                    harmful_count: row.get(7)?,
-                    last_accessed: row
-                        .get::<_, Option<String>>(8)?
-                        .and_then(|s| Self::parse_datetime(&s)),
-                    archived: row.get::<_, i32>(9)? != 0,
-                    session_id: row.get(10)?,
-                    source_tool: row.get(11)?,
-                    pending_extraction: row.get::<_, i32>(12).unwrap_or(0) != 0,
-                    stability: row.get::<_, f32>(14).unwrap_or(0.5),
-                    access_count: row.get::<_, i32>(15).unwrap_or(0),
-                    importance: row.get::<_, f32>(19).unwrap_or(0.5),
-                    valid_from: row
-                        .get::<_, Option<String>>(20)?
-                        .and_then(|s| Self::parse_datetime(&s)),
-                    valid_until: row
-                        .get::<_, Option<String>>(21)?
-                        .and_then(|s| Self::parse_datetime(&s)),
-                    review_after: row
-                        .get::<_, Option<String>>(22)?
-                        .and_then(|s| Self::parse_datetime(&s)),
-                    last_reviewed: row
-                        .get::<_, Option<String>>(23)?
-                        .and_then(|s| Self::parse_datetime(&s)),
-                    pending_embedding: row.get::<_, i32>(24).unwrap_or(1) != 0,
-                    belief_type: Self::parse_belief_type(row.get(25)?),
-                    confidence: row.get::<_, f32>(26).unwrap_or(1.0),
-                    domain: row.get(27)?,
-                    branch: row.get(28)?,
-                    scope: row
-                        .get::<_, Option<String>>(29)?
-                        .map(|s| Scope::from_str(&s).unwrap_or_default())
-                        .unwrap_or_default(),
-                    team_id: row.get(30)?,
-                })
-            })?
+            .query_map([], Self::row_to_entry)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
         Ok(entries)
@@ -467,58 +321,7 @@ impl SqliteStore {
         )?;
 
         let entries = stmt
-            .query_map(params![n as i64], |row| {
-                Ok(Entry {
-                    id: row.get(0)?,
-                    entry_type: row
-                        .get::<_, String>(1)?
-                        .parse()
-                        .unwrap_or(EntryType::Learning),
-                    observation_type: Self::parse_observation_type(row.get(13)?),
-                    tags: Self::parse_tags(row.get(2)?),
-                    created: Self::parse_datetime(&row.get::<_, String>(3)?)
-                        .unwrap_or_else(Utc::now),
-                    content: row.get(4)?,
-                    raw_content: row.get(16)?,
-                    compressed: row.get::<_, i32>(17).unwrap_or(0) != 0,
-                    memory_tier: Self::parse_memory_tier(row.get(18)?),
-                    title: row.get(5)?,
-                    helpful_count: row.get(6)?,
-                    harmful_count: row.get(7)?,
-                    last_accessed: row
-                        .get::<_, Option<String>>(8)?
-                        .and_then(|s| Self::parse_datetime(&s)),
-                    archived: row.get::<_, i32>(9)? != 0,
-                    session_id: row.get(10)?,
-                    source_tool: row.get(11)?,
-                    pending_extraction: row.get::<_, i32>(12).unwrap_or(0) != 0,
-                    stability: row.get::<_, f32>(14).unwrap_or(0.5),
-                    access_count: row.get::<_, i32>(15).unwrap_or(0),
-                    importance: row.get::<_, f32>(19).unwrap_or(0.5),
-                    valid_from: row
-                        .get::<_, Option<String>>(20)?
-                        .and_then(|s| Self::parse_datetime(&s)),
-                    valid_until: row
-                        .get::<_, Option<String>>(21)?
-                        .and_then(|s| Self::parse_datetime(&s)),
-                    review_after: row
-                        .get::<_, Option<String>>(22)?
-                        .and_then(|s| Self::parse_datetime(&s)),
-                    last_reviewed: row
-                        .get::<_, Option<String>>(23)?
-                        .and_then(|s| Self::parse_datetime(&s)),
-                    pending_embedding: row.get::<_, i32>(24).unwrap_or(1) != 0,
-                    belief_type: Self::parse_belief_type(row.get(25)?),
-                    confidence: row.get::<_, f32>(26).unwrap_or(1.0),
-                    domain: row.get(27)?,
-                    branch: row.get(28)?,
-                    scope: row
-                        .get::<_, Option<String>>(29)?
-                        .map(|s| Scope::from_str(&s).unwrap_or_default())
-                        .unwrap_or_default(),
-                    team_id: row.get(30)?,
-                })
-            })?
+            .query_map(params![n as i64], Self::row_to_entry)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
         Ok(entries)
@@ -553,62 +356,11 @@ impl SqliteStore {
              pending_extraction, observation_type, stability, access_count,
              raw_content, compressed, memory_tier, importance, valid_from, valid_until, review_after, last_reviewed, pending_embedding,
              belief_type, confidence, domain, branch, scope, team_id
-             FROM entries WHERE archived = 1 ORDER BY created DESC",
+             FROM entries WHERE archived = 1 ORDER BY created DESC LIMIT 10000",
         )?;
 
         let entries = stmt
-            .query_map([], |row| {
-                Ok(Entry {
-                    id: row.get(0)?,
-                    entry_type: row
-                        .get::<_, String>(1)?
-                        .parse()
-                        .unwrap_or(EntryType::Learning),
-                    observation_type: Self::parse_observation_type(row.get(13)?),
-                    tags: Self::parse_tags(row.get(2)?),
-                    created: Self::parse_datetime(&row.get::<_, String>(3)?)
-                        .unwrap_or_else(Utc::now),
-                    content: row.get(4)?,
-                    raw_content: row.get(16)?,
-                    compressed: row.get::<_, i32>(17).unwrap_or(0) != 0,
-                    memory_tier: Self::parse_memory_tier(row.get(18)?),
-                    title: row.get(5)?,
-                    helpful_count: row.get(6)?,
-                    harmful_count: row.get(7)?,
-                    last_accessed: row
-                        .get::<_, Option<String>>(8)?
-                        .and_then(|s| Self::parse_datetime(&s)),
-                    archived: row.get::<_, i32>(9)? != 0,
-                    session_id: row.get(10)?,
-                    source_tool: row.get(11)?,
-                    pending_extraction: row.get::<_, i32>(12).unwrap_or(0) != 0,
-                    stability: row.get::<_, f32>(14).unwrap_or(0.5),
-                    access_count: row.get::<_, i32>(15).unwrap_or(0),
-                    importance: row.get::<_, f32>(19).unwrap_or(0.5),
-                    valid_from: row
-                        .get::<_, Option<String>>(20)?
-                        .and_then(|s| Self::parse_datetime(&s)),
-                    valid_until: row
-                        .get::<_, Option<String>>(21)?
-                        .and_then(|s| Self::parse_datetime(&s)),
-                    review_after: row
-                        .get::<_, Option<String>>(22)?
-                        .and_then(|s| Self::parse_datetime(&s)),
-                    last_reviewed: row
-                        .get::<_, Option<String>>(23)?
-                        .and_then(|s| Self::parse_datetime(&s)),
-                    pending_embedding: row.get::<_, i32>(24).unwrap_or(1) != 0,
-                    belief_type: Self::parse_belief_type(row.get(25)?),
-                    confidence: row.get::<_, f32>(26).unwrap_or(1.0),
-                    domain: row.get(27)?,
-                    branch: row.get(28)?,
-                    scope: row
-                        .get::<_, Option<String>>(29)?
-                        .map(|s| Scope::from_str(&s).unwrap_or_default())
-                        .unwrap_or_default(),
-                    team_id: row.get(30)?,
-                })
-            })?
+            .query_map([], Self::row_to_entry)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
         Ok(entries)
@@ -626,58 +378,7 @@ impl SqliteStore {
         )?;
 
         let entries = stmt
-            .query_map(params![branch], |row| {
-                Ok(Entry {
-                    id: row.get(0)?,
-                    entry_type: row
-                        .get::<_, String>(1)?
-                        .parse()
-                        .unwrap_or(EntryType::Learning),
-                    observation_type: Self::parse_observation_type(row.get(13)?),
-                    tags: Self::parse_tags(row.get(2)?),
-                    created: Self::parse_datetime(&row.get::<_, String>(3)?)
-                        .unwrap_or_else(Utc::now),
-                    content: row.get(4)?,
-                    raw_content: row.get(16)?,
-                    compressed: row.get::<_, i32>(17).unwrap_or(0) != 0,
-                    memory_tier: Self::parse_memory_tier(row.get(18)?),
-                    title: row.get(5)?,
-                    helpful_count: row.get(6)?,
-                    harmful_count: row.get(7)?,
-                    last_accessed: row
-                        .get::<_, Option<String>>(8)?
-                        .and_then(|s| Self::parse_datetime(&s)),
-                    archived: row.get::<_, i32>(9)? != 0,
-                    session_id: row.get(10)?,
-                    source_tool: row.get(11)?,
-                    pending_extraction: row.get::<_, i32>(12).unwrap_or(0) != 0,
-                    stability: row.get::<_, f32>(14).unwrap_or(0.5),
-                    access_count: row.get::<_, i32>(15).unwrap_or(0),
-                    importance: row.get::<_, f32>(19).unwrap_or(0.5),
-                    valid_from: row
-                        .get::<_, Option<String>>(20)?
-                        .and_then(|s| Self::parse_datetime(&s)),
-                    valid_until: row
-                        .get::<_, Option<String>>(21)?
-                        .and_then(|s| Self::parse_datetime(&s)),
-                    review_after: row
-                        .get::<_, Option<String>>(22)?
-                        .and_then(|s| Self::parse_datetime(&s)),
-                    last_reviewed: row
-                        .get::<_, Option<String>>(23)?
-                        .and_then(|s| Self::parse_datetime(&s)),
-                    pending_embedding: row.get::<_, i32>(24).unwrap_or(1) != 0,
-                    belief_type: Self::parse_belief_type(row.get(25)?),
-                    confidence: row.get::<_, f32>(26).unwrap_or(1.0),
-                    domain: row.get(27)?,
-                    branch: row.get(28)?,
-                    scope: row
-                        .get::<_, Option<String>>(29)?
-                        .map(|s| Scope::from_str(&s).unwrap_or_default())
-                        .unwrap_or_default(),
-                    team_id: row.get(30)?,
-                })
-            })?
+            .query_map(params![branch], Self::row_to_entry)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
         Ok(entries)
