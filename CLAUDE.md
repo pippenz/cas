@@ -1,29 +1,5 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
-<!-- CAS:BEGIN - This section is managed by CAS. Do not edit manually. -->
-# IMPORTANT: USE CAS FOR TASK AND MEMORY MANAGEMENT
-
-**DO NOT USE BUILT-IN TOOLS (TodoWrite, EnterPlanMode) FOR TASK TRACKING.**
-
-Use CAS MCP tools instead:
-- `mcp__cas__task` with action: create - Create tasks (NOT TodoWrite)
-- `mcp__cas__task` with action: start/close - Manage task status
-- `mcp__cas__task` with action: ready - See ready tasks
-- `mcp__cas__memory` with action: remember - Store memories and learnings
-- `mcp__cas__search` with action: search - Search all context
-
-CAS provides persistent context across sessions. Built-in tools are ephemeral.
-<!-- CAS:END -->
-
-## What is CAS
-
-CAS (Coding Agent System) is a multi-agent coding factory and persistent context system for AI agents. Written in Rust.
-
-Two core capabilities:
-1. **Factory** — Terminal UI orchestrating multiple Claude Code instances in parallel via isolated git worktrees, with supervisor/worker coordination.
-2. **Context System** — MCP server providing persistent memory, tasks, rules, skills, and search (55+ tools) backed by SQLite + Tantivy BM25 search.
-
 ## Build & Test
 
 ```bash

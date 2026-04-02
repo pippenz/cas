@@ -18,12 +18,12 @@ fn main() {
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|| "unknown".to_string());
 
-    // Check if working directory is dirty
+    // Check if tracked files have uncommitted changes (ignore untracked files)
     let is_dirty = Command::new("git")
-        .args(["status", "--porcelain"])
-        .output()
+        .args(["diff", "--quiet", "HEAD"])
+        .status()
         .ok()
-        .map(|o| !o.stdout.is_empty())
+        .map(|s| !s.success())
         .unwrap_or(false);
 
     let git_info = if is_dirty {
