@@ -325,6 +325,51 @@ struct SyncedCounts {
     worktrees: usize,
 }
 
+/// Response from team projects listing endpoint
+#[derive(Debug, Deserialize)]
+pub struct TeamProjectsResponse {
+    pub projects: Vec<TeamProject>,
+}
+
+/// A project registered with a team
+#[derive(Debug, Deserialize, Serialize)]
+pub struct TeamProject {
+    pub id: String,
+    pub canonical_id: String,
+    pub name: String,
+    pub contributor_count: u32,
+    pub memory_count: u32,
+}
+
+/// Response from team memories endpoint
+#[derive(Debug, Deserialize)]
+pub struct TeamMemoriesResponse {
+    pub project: Option<TeamMemoriesProject>,
+    pub memories: TeamMemoriesData,
+    #[serde(default)]
+    pub contributors: Vec<String>,
+    pub pulled_at: Option<String>,
+}
+
+/// Project info in team memories response
+#[derive(Debug, Deserialize)]
+pub struct TeamMemoriesProject {
+    pub id: String,
+    pub canonical_id: String,
+    pub name: String,
+}
+
+/// Team memories data grouped by type
+#[derive(Debug, Default, Deserialize)]
+pub struct TeamMemoriesData {
+    #[serde(default)]
+    pub entries: Vec<Entry>,
+    #[serde(default)]
+    pub rules: Vec<Rule>,
+    #[serde(default)]
+    pub skills: Vec<Skill>,
+}
+
 /// Grouped queued items by entity type and operation
 #[derive(Default)]
 struct GroupedQueuedItems {
