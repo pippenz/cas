@@ -51,6 +51,9 @@ pub trait WorktreeStore: Send + Sync {
     /// Delete a worktree record
     fn delete(&self, id: &str) -> Result<()>;
 
+    /// Delete worktrees older than the given number of days
+    fn prune(&self, older_than_days: i64) -> Result<usize>;
+
     /// Close connection
     fn close(&self) -> Result<()>;
 }
@@ -296,6 +299,18 @@ impl WorktreeStore for SqliteWorktreeStore {
             return Err(StoreError::Other(format!("Worktree not found: {id}")));
         }
         Ok(())
+    }
+
+    fn prune(&self, older_than_days: i64) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let cutoff = (Utc::now() - chrono::Duration::days(older_than_days)).to_rfc3339();
+
+        let rows = conn.execute(
+            "DELETE FROM worktrees WHERE created_at < ?",
+            params![cutoff],
+        )?;
+
+        Ok(rows)
     }
 
     fn close(&self) -> Result<()> {

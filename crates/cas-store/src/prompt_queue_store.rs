@@ -173,6 +173,9 @@ pub trait PromptQueueStore: Send + Sync {
     /// Clear all prompts (for cleanup)
     fn clear(&self) -> Result<usize>;
 
+    /// Clear old processed prompts (cleanup)
+    fn cleanup_old(&self, older_than_secs: i64) -> Result<usize>;
+
     /// Close the store
     fn close(&self) -> Result<()>;
 }
@@ -534,6 +537,18 @@ impl PromptQueueStore for SqlitePromptQueueStore {
     fn clear(&self) -> Result<usize> {
         let conn = self.conn.lock().unwrap();
         let rows = conn.execute("DELETE FROM prompt_queue", [])?;
+        Ok(rows)
+    }
+
+    fn cleanup_old(&self, older_than_secs: i64) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let cutoff = (Utc::now() - chrono::Duration::seconds(older_than_secs)).to_rfc3339();
+
+        let rows = conn.execute(
+            "DELETE FROM prompt_queue WHERE processed_at IS NOT NULL AND processed_at < ?",
+            params![cutoff],
+        )?;
+
         Ok(rows)
     }
 
