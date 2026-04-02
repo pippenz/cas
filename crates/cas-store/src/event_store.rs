@@ -32,9 +32,7 @@ CREATE TABLE IF NOT EXISTS events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type);
 CREATE INDEX IF NOT EXISTS idx_events_entity ON events(entity_type, entity_id);
-CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id);
 "#;
 
 /// Trait for event storage operations

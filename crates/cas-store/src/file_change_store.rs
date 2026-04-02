@@ -47,9 +47,7 @@ CREATE TABLE IF NOT EXISTS file_changes (
 
 CREATE INDEX IF NOT EXISTS idx_file_changes_session ON file_changes(session_id);
 CREATE INDEX IF NOT EXISTS idx_file_changes_file ON file_changes(repository, file_path);
-CREATE INDEX IF NOT EXISTS idx_file_changes_commit ON file_changes(commit_hash);
-CREATE INDEX IF NOT EXISTS idx_file_changes_prompt ON file_changes(prompt_id);
-CREATE INDEX IF NOT EXISTS idx_file_changes_created ON file_changes(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_file_changes_commit ON file_changes(commit_hash) WHERE commit_hash IS NOT NULL;
 "#;
 
 /// Trait for file change storage operations

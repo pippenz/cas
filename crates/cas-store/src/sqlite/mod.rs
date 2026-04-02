@@ -60,15 +60,12 @@ CREATE TABLE IF NOT EXISTS entries (
 );
 
 CREATE INDEX IF NOT EXISTS idx_entries_created ON entries(created DESC);
-CREATE INDEX IF NOT EXISTS idx_entries_archived ON entries(archived);
 CREATE INDEX IF NOT EXISTS idx_entries_session ON entries(session_id);
 CREATE INDEX IF NOT EXISTS idx_entries_pending ON entries(pending_extraction);
 CREATE INDEX IF NOT EXISTS idx_entries_obs_type ON entries(observation_type);
 CREATE INDEX IF NOT EXISTS idx_entries_stability ON entries(stability);
-CREATE INDEX IF NOT EXISTS idx_entries_memory_tier ON entries(memory_tier);
 CREATE INDEX IF NOT EXISTS idx_entries_importance ON entries(importance);
 CREATE INDEX IF NOT EXISTS idx_entries_pending_embedding ON entries(pending_embedding) WHERE pending_embedding = 1;
-CREATE INDEX IF NOT EXISTS idx_entries_belief_type ON entries(belief_type);
 CREATE INDEX IF NOT EXISTS idx_entries_confidence ON entries(confidence);
 CREATE INDEX IF NOT EXISTS idx_entries_domain ON entries(domain);
 CREATE INDEX IF NOT EXISTS idx_entries_branch ON entries(branch);
