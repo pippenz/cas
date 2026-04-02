@@ -449,4 +449,16 @@ impl SqliteAgentStore {
 
         Ok(task_ids)
     }
+
+    pub(crate) fn lease_cleanup_lease_history(&self, older_than_days: i64) -> Result<usize> {
+        let conn = self.lock_conn()?;
+        let cutoff = (Utc::now() - chrono::Duration::days(older_than_days)).to_rfc3339();
+
+        let rows = conn.execute(
+            "DELETE FROM task_lease_history WHERE timestamp < ?",
+            params![cutoff],
+        )?;
+
+        Ok(rows)
+    }
 }

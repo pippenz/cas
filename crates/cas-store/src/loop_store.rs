@@ -63,6 +63,9 @@ pub trait LoopStore: Send + Sync {
     /// List recent loops
     fn list_recent(&self, limit: usize) -> Result<Vec<Loop>>;
 
+    /// Delete loops older than the given number of days
+    fn prune(&self, older_than_days: i64) -> Result<usize>;
+
     /// Close the store
     fn close(&self) -> Result<()>;
 }
@@ -252,6 +255,18 @@ impl LoopStore for SqliteLoopStore {
             .collect();
 
         Ok(loops)
+    }
+
+    fn prune(&self, older_than_days: i64) -> Result<usize> {
+        let conn = self.conn.lock().map_err(lock_err)?;
+        let cutoff = (Utc::now() - chrono::Duration::days(older_than_days)).to_rfc3339();
+
+        let rows = conn.execute(
+            "DELETE FROM loops WHERE started_at < ?",
+            params![cutoff],
+        )?;
+
+        Ok(rows)
     }
 
     fn close(&self) -> Result<()> {

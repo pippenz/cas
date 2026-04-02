@@ -196,6 +196,9 @@ pub trait ReminderStore: Send + Sync {
     /// Expire reminders past their TTL, returns count expired
     fn expire_stale(&self) -> Result<usize>;
 
+    /// Delete non-pending reminders older than the given number of days
+    fn prune(&self, older_than_days: i64) -> Result<usize>;
+
     /// Close the store
     fn close(&self) -> Result<()>;
 }
@@ -482,6 +485,18 @@ impl ReminderStore for SqliteReminderStore {
              WHERE status = 'pending'
              AND datetime(created_at, '+' || ttl_secs || ' seconds') < datetime('now')",
             [],
+        )?;
+
+        Ok(rows)
+    }
+
+    fn prune(&self, older_than_days: i64) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let cutoff = (Utc::now() - chrono::Duration::days(older_than_days)).to_rfc3339();
+
+        let rows = conn.execute(
+            "DELETE FROM reminders WHERE status != 'pending' AND created_at < ?",
+            params![cutoff],
         )?;
 
         Ok(rows)

@@ -210,6 +210,9 @@ pub trait AgentStore: Send + Sync {
     /// Reclaim expired leases (returns number reclaimed)
     fn reclaim_expired_leases(&self) -> Result<usize>;
 
+    /// Delete lease history entries older than the given number of days
+    fn cleanup_lease_history(&self, older_than_days: i64) -> Result<usize>;
+
     /// Get lease history for a task (audit log)
     fn get_lease_history(
         &self,

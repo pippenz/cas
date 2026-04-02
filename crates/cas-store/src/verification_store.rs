@@ -92,6 +92,9 @@ pub trait VerificationStore: Send + Sync {
     /// List verifications by status
     fn list_by_status(&self, status: VerificationStatus) -> Result<Vec<Verification>>;
 
+    /// Delete verifications older than the given number of days
+    fn prune(&self, older_than_days: i64) -> Result<usize>;
+
     /// Close the store
     fn close(&self) -> Result<()>;
 }
@@ -517,6 +520,19 @@ impl VerificationStore for SqliteVerificationStore {
         }
 
         Ok(result)
+    }
+
+    fn prune(&self, older_than_days: i64) -> Result<usize> {
+        let conn = self.conn.lock().map_err(lock_err)?;
+        let cutoff = (Utc::now() - chrono::Duration::days(older_than_days)).to_rfc3339();
+
+        // Issues are deleted via CASCADE
+        let rows = conn.execute(
+            "DELETE FROM verifications WHERE created_at < ?",
+            params![cutoff],
+        )?;
+
+        Ok(rows)
     }
 
     fn close(&self) -> Result<()> {
