@@ -96,23 +96,25 @@ impl SqliteStore {
             return Ok(());
         }
 
+        const CHUNK_SIZE: usize = 500;
         let conn = self.conn.lock().unwrap();
         let now = Utc::now().to_rfc3339();
 
-        // Build a parameterized query for batch update
-        let placeholders: Vec<String> = (0..ids.len()).map(|i| format!("?{}", i + 2)).collect();
-        let query = format!(
-            "UPDATE entries SET indexed_at = ?1 WHERE id IN ({})",
-            placeholders.join(", ")
-        );
+        for chunk in ids.chunks(CHUNK_SIZE) {
+            let placeholders: Vec<String> =
+                (0..chunk.len()).map(|i| format!("?{}", i + 2)).collect();
+            let query = format!(
+                "UPDATE entries SET indexed_at = ?1 WHERE id IN ({})",
+                placeholders.join(", ")
+            );
 
-        // Build params dynamically
-        let mut params_vec: Vec<&dyn rusqlite::ToSql> = vec![&now];
-        for id in ids {
-            params_vec.push(id);
+            let mut params_vec: Vec<&dyn rusqlite::ToSql> = vec![&now];
+            for id in chunk {
+                params_vec.push(id);
+            }
+
+            conn.execute(&query, params_vec.as_slice())?;
         }
-
-        conn.execute(&query, params_vec.as_slice())?;
         Ok(())
     }
     pub(crate) fn store_cas_dir(&self) -> &Path {
