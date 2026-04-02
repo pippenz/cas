@@ -72,10 +72,14 @@ fn attach_unix(session: &SessionInfo) -> anyhow::Result<()> {
         );
     }
 
-    // Enable raw mode (no mouse capture — let the terminal handle native
-    // text selection so users can select + right-click → Copy).
+    // Enable raw mode + mouse capture for scroll events.
+    // Native text selection still works via Shift+click/drag in most terminals.
     enable_raw_mode()?;
-    execute!(io::stdout(), crossterm::event::EnableBracketedPaste)?;
+    execute!(
+        io::stdout(),
+        crossterm::event::EnableBracketedPaste,
+        crossterm::event::EnableMouseCapture
+    )?;
 
     // Send initial terminal size as control sequence
     if let Ok((cols, rows)) = terminal::size() {
@@ -154,6 +158,23 @@ fn attach_unix(session: &SessionInfo) -> anyhow::Result<()> {
                     pending_resize = Some((cols, rows));
                     pending_resize_at = std::time::Instant::now();
                 }
+                Event::Mouse(mouse) => {
+                    // Only handle scroll events — clicks/drag are ignored
+                    // so native terminal selection (Shift+click) still works.
+                    let scroll_cmd = match mouse.kind {
+                        crossterm::event::MouseEventKind::ScrollUp => Some("scroll_up"),
+                        crossterm::event::MouseEventKind::ScrollDown => Some("scroll_down"),
+                        _ => None,
+                    };
+                    if let Some(dir) = scroll_cmd {
+                        let cmd = format!("mouse;{dir};{};{}", mouse.column, mouse.row);
+                        let mut msg = Vec::new();
+                        msg.extend_from_slice(CONTROL_PREFIX);
+                        msg.extend_from_slice(cmd.as_bytes());
+                        msg.push(CONTROL_SUFFIX);
+                        let _ = stream.write_all(&msg);
+                    }
+                }
                 Event::Paste(text) => {
                     if !contains_dropped_image_path(&text) {
                         let _ = stream.write_all(text.as_bytes());
@@ -187,7 +208,11 @@ fn attach_unix(session: &SessionInfo) -> anyhow::Result<()> {
     }
 
     // Restore terminal
-    let _ = execute!(io::stdout(), crossterm::event::DisableBracketedPaste);
+    let _ = execute!(
+        io::stdout(),
+        crossterm::event::DisableMouseCapture,
+        crossterm::event::DisableBracketedPaste
+    );
     disable_raw_mode()?;
 
     // Leave alternate screen and show cursor
