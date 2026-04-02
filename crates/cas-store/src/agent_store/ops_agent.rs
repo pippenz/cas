@@ -3,6 +3,7 @@ use crate::agent_store::{AGENT_SCHEMA, SqliteAgentStore};
 use crate::error::StoreError;
 use crate::event_store::record_event_with_conn;
 use crate::recording_store::capture_agent_event;
+use crate::shared_db::ImmediateTx;
 use cas_types::{Agent, AgentStatus, Event, EventEntityType, EventType, RecordingEventType};
 use chrono::Utc;
 use rusqlite::{OptionalExtension, params};
@@ -248,9 +249,10 @@ impl SqliteAgentStore {
     }
     pub(crate) fn agent_mark_stale(&self, id: &str) -> Result<()> {
         let conn = self.lock_conn()?;
+        let tx = ImmediateTx::new(&conn)?;
 
         // Get all active leases for this agent before revoking
-        let mut stmt = conn.prepare_cached(
+        let mut stmt = tx.prepare_cached(
             "SELECT task_id, epoch FROM task_leases WHERE agent_id = ? AND status = 'active'",
         )?;
         let leases_to_revoke: Vec<(String, i64)> = stmt
@@ -261,19 +263,19 @@ impl SqliteAgentStore {
         drop(stmt);
 
         // Mark agent as stale (was: dead)
-        conn.execute(
+        tx.execute(
             "UPDATE agents SET status = 'stale' WHERE id = ?",
             params![id],
         )?;
 
         // Revoke all active task leases
-        conn.execute(
+        tx.execute(
             "UPDATE task_leases SET status = 'revoked' WHERE agent_id = ? AND status = 'active'",
             params![id],
         )?;
 
         // Revoke all active worktree leases
-        conn.execute(
+        tx.execute(
             "UPDATE worktree_leases SET status = 'revoked' WHERE agent_id = ? AND status = 'active'",
             params![id],
         )?;
@@ -281,7 +283,7 @@ impl SqliteAgentStore {
         // Log revoked events for each lease
         for (task_id, epoch) in &leases_to_revoke {
             Self::log_lease_event(
-                &conn,
+                &tx,
                 task_id,
                 id,
                 "revoked",
@@ -291,6 +293,7 @@ impl SqliteAgentStore {
             )?;
         }
 
+        tx.commit()?;
         Ok(())
     }
     pub(crate) fn agent_revive(&self, id: &str) -> Result<()> {
