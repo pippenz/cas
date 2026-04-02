@@ -1166,12 +1166,24 @@ fn execute_projects(args: &CloudProjectsArgs, cli: &Cli) -> anyhow::Result<()> {
                         .max(4);
 
                     for project in &body.projects {
+                        let contrib_label = if project.contributor_count == 1 {
+                            "contributor"
+                        } else {
+                            "contributors"
+                        };
+                        let mem_label = if project.memory_count == 1 {
+                            "memory"
+                        } else {
+                            "memories"
+                        };
                         fmt.write_raw(&format!(
-                            "    {:<name_w$}   {:<canonical_w$}   {} contributors   {} memories",
+                            "    {:<name_w$}   {:<canonical_w$}   {} {:<14}  {} {}",
                             project.name,
                             project.canonical_id,
                             project.contributor_count,
+                            contrib_label,
                             project.memory_count,
+                            mem_label,
                             name_w = max_name,
                             canonical_w = max_canonical,
                         ))?;
@@ -1197,6 +1209,9 @@ fn execute_projects(args: &CloudProjectsArgs, cli: &Cli) -> anyhow::Result<()> {
                 fmt.write_raw(" to re-authenticate")?;
                 fmt.newline()?;
             }
+        }
+        Err(ureq::Error::Status(403, _)) => {
+            anyhow::bail!("You're not a member of this team.");
         }
         Err(e) => {
             anyhow::bail!("Failed to fetch projects: {e}");
@@ -1261,6 +1276,12 @@ fn execute_team_memories(
             }
             anyhow::bail!("Session expired. Run `cas login` to re-authenticate.");
         }
+        Err(ureq::Error::Status(403, _)) => {
+            if prev_lines > 0 {
+                clear_inline(prev_lines)?;
+            }
+            anyhow::bail!("You're not a member of this team.");
+        }
         Err(e) => {
             if prev_lines > 0 {
                 clear_inline(prev_lines)?;
@@ -1310,6 +1331,18 @@ fn execute_team_memories(
                 clear_inline(prev_lines)?;
             }
             anyhow::bail!("Session expired. Run `cas login` to re-authenticate.");
+        }
+        Err(ureq::Error::Status(403, _)) => {
+            if prev_lines > 0 {
+                clear_inline(prev_lines)?;
+            }
+            anyhow::bail!("You're not a member of this team.");
+        }
+        Err(ureq::Error::Status(404, _)) => {
+            if prev_lines > 0 {
+                clear_inline(prev_lines)?;
+            }
+            anyhow::bail!("Project not found in this team.");
         }
         Err(e) => {
             if prev_lines > 0 {
