@@ -144,6 +144,10 @@ pub struct CloudConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub team_sync_timestamps: HashMap<String, DateTime<Utc>>,
 
+    /// Per-project team memory sync timestamps (canonical_id -> last pull time)
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub team_memory_sync_timestamps: HashMap<String, String>,
+
     /// Last sync timestamp for entries
     pub last_entry_sync: Option<String>,
 
@@ -173,6 +177,7 @@ impl Default for CloudConfig {
             team_id: None,
             team_slug: None,
             team_sync_timestamps: HashMap::new(),
+            team_memory_sync_timestamps: HashMap::new(),
             last_entry_sync: None,
             last_task_sync: None,
             last_rule_sync: None,
@@ -284,6 +289,19 @@ impl CloudConfig {
     pub fn clear_team_sync_timestamp(&mut self, team_id: &str) {
         self.team_sync_timestamps.remove(team_id);
     }
+
+    /// Get the last team memory sync timestamp for a project
+    pub fn get_team_memory_sync(&self, canonical_id: &str) -> Option<&str> {
+        self.team_memory_sync_timestamps
+            .get(canonical_id)
+            .map(|s| s.as_str())
+    }
+
+    /// Set the last team memory sync timestamp for a project
+    pub fn set_team_memory_sync(&mut self, canonical_id: &str, timestamp: &str) {
+        self.team_memory_sync_timestamps
+            .insert(canonical_id.to_string(), timestamp.to_string());
+    }
 }
 
 #[cfg(test)]
@@ -377,6 +395,35 @@ mod tests {
         config.clear_team_sync_timestamp("team-a");
         assert!(config.get_team_sync_timestamp("team-a").is_none());
         assert_eq!(config.get_team_sync_timestamp("team-b"), Some(ts2));
+    }
+
+    #[test]
+    fn test_team_memory_sync_timestamps() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("cloud.json");
+
+        let mut config = CloudConfig {
+            token: Some("t".to_string()),
+            ..Default::default()
+        };
+
+        // Initially no timestamp
+        assert!(config.get_team_memory_sync("github.com/foo/bar").is_none());
+
+        // Set and get
+        config.set_team_memory_sync("github.com/foo/bar", "2026-04-02T10:00:00Z");
+        assert_eq!(
+            config.get_team_memory_sync("github.com/foo/bar"),
+            Some("2026-04-02T10:00:00Z")
+        );
+
+        // Persists through save/load
+        config.save_to(&path).unwrap();
+        let loaded = CloudConfig::load_from(&path).unwrap();
+        assert_eq!(
+            loaded.get_team_memory_sync("github.com/foo/bar"),
+            Some("2026-04-02T10:00:00Z")
+        );
     }
 
     #[test]

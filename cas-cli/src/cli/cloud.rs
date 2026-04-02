@@ -32,6 +32,8 @@ pub enum CloudCommands {
     Sync(CloudSyncArgs),
     /// List team projects in cloud
     Projects(CloudProjectsArgs),
+    /// Pull team memories for the current project
+    TeamMemories(CloudTeamMemoriesArgs),
 }
 
 #[derive(Parser)]
@@ -79,6 +81,17 @@ pub struct CloudProjectsArgs {
 }
 
 #[derive(Parser)]
+pub struct CloudTeamMemoriesArgs {
+    /// Show what would be pulled without merging
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Ignore last sync timestamp, pull everything
+    #[arg(long)]
+    pub full: bool,
+}
+
+#[derive(Parser)]
 pub struct CloudQueueArgs {
     /// Show detailed list of queued items
     #[arg(long, short)]
@@ -105,6 +118,7 @@ pub fn execute(cmd: &CloudCommands, cli: &Cli, cas_root: &Path) -> anyhow::Resul
         CloudCommands::Pull(args) => execute_pull(args, cli, cas_root),
         CloudCommands::Sync(args) => execute_sync(args, cli, cas_root),
         CloudCommands::Projects(args) => execute_projects(args, cli),
+        CloudCommands::TeamMemories(args) => execute_team_memories(args, cli, cas_root),
     }
 }
 
@@ -1186,6 +1200,291 @@ fn execute_projects(args: &CloudProjectsArgs, cli: &Cli) -> anyhow::Result<()> {
         }
         Err(e) => {
             anyhow::bail!("Failed to fetch projects: {e}");
+        }
+    }
+
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TEAM MEMORIES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn execute_team_memories(
+    args: &CloudTeamMemoriesArgs,
+    cli: &Cli,
+    cas_root: &Path,
+) -> anyhow::Result<()> {
+    use crate::cloud::{TeamMemoriesResponse, TeamProjectsResponse};
+    use crate::ui::components::{Spinner, clear_inline, render_inline_view};
+
+    let mut config = CloudConfig::load()?;
+
+    let team_id = config
+        .team_id
+        .as_ref()
+        .ok_or_else(|| {
+            anyhow::anyhow!("No team configured. Run `cas cloud team set <slug>` first.")
+        })?
+        .clone();
+
+    let canonical_id = crate::cloud::get_project_canonical_id().ok_or_else(|| {
+        anyhow::anyhow!("Not in a git repository with a remote.")
+    })?;
+
+    let token = config
+        .token
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Not logged in. Run 'cas login' first."))?
+        .clone();
+
+    let theme = ActiveTheme::default();
+    let prev_lines = if !cli.json {
+        let spinner = Spinner::new("Pulling team memories...");
+        render_inline_view(&spinner, &theme)?
+    } else {
+        0u16
+    };
+
+    // Step 1: Find the project UUID by listing team projects
+    let projects_url = format!("{}/api/teams/{}/projects", config.endpoint, team_id);
+    let projects_resp = ureq::get(&projects_url)
+        .set("Authorization", &format!("Bearer {token}"))
+        .timeout(Duration::from_secs(30))
+        .call();
+
+    let projects_body: TeamProjectsResponse = match projects_resp {
+        Ok(resp) => resp.into_json()?,
+        Err(ureq::Error::Status(401, _)) => {
+            if prev_lines > 0 {
+                clear_inline(prev_lines)?;
+            }
+            anyhow::bail!("Session expired. Run `cas login` to re-authenticate.");
+        }
+        Err(e) => {
+            if prev_lines > 0 {
+                clear_inline(prev_lines)?;
+            }
+            anyhow::bail!("Failed to list team projects: {e}");
+        }
+    };
+
+    let project = projects_body
+        .projects
+        .iter()
+        .find(|p| p.canonical_id == canonical_id);
+
+    let project_uuid = match project {
+        Some(p) => p.id.clone(),
+        None => {
+            if prev_lines > 0 {
+                clear_inline(prev_lines)?;
+            }
+            anyhow::bail!(
+                "This project hasn't been synced to the team yet. Run `cas cloud sync --team` to register it."
+            );
+        }
+    };
+
+    // Step 2: Fetch team memories for this project
+    let mut memories_url = format!(
+        "{}/api/teams/{}/projects/{}/memories",
+        config.endpoint, team_id, project_uuid
+    );
+
+    if !args.full {
+        if let Some(since) = config.get_team_memory_sync(&canonical_id) {
+            memories_url = format!("{memories_url}?since={since}");
+        }
+    }
+
+    let memories_resp = ureq::get(&memories_url)
+        .set("Authorization", &format!("Bearer {token}"))
+        .timeout(Duration::from_secs(60))
+        .call();
+
+    let body: TeamMemoriesResponse = match memories_resp {
+        Ok(resp) => resp.into_json()?,
+        Err(ureq::Error::Status(401, _)) => {
+            if prev_lines > 0 {
+                clear_inline(prev_lines)?;
+            }
+            anyhow::bail!("Session expired. Run `cas login` to re-authenticate.");
+        }
+        Err(e) => {
+            if prev_lines > 0 {
+                clear_inline(prev_lines)?;
+            }
+            anyhow::bail!("Failed to fetch team memories: {e}");
+        }
+    };
+
+    let entry_count = body.memories.entries.len();
+    let rule_count = body.memories.rules.len();
+    let skill_count = body.memories.skills.len();
+    let contributor_count = body.contributors.len();
+
+    // Dry run: just show counts
+    if args.dry_run {
+        if prev_lines > 0 {
+            clear_inline(prev_lines)?;
+        }
+
+        if cli.json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "dry_run": true,
+                    "entries": entry_count,
+                    "rules": rule_count,
+                    "skills": skill_count,
+                    "contributors": contributor_count,
+                })
+            );
+        } else {
+            let mut out = io::stdout();
+            let mut fmt = Formatter::stdout(&mut out, theme);
+            fmt.write_accent("  \u{2192} ")?;
+            fmt.write_raw(&format!(
+                "Would pull: {} entries, {} rules, {} skills from {} contributors",
+                entry_count, rule_count, skill_count, contributor_count
+            ))?;
+            fmt.newline()?;
+        }
+        return Ok(());
+    }
+
+    // Check if there's anything to merge
+    if entry_count == 0 && rule_count == 0 && skill_count == 0 {
+        if prev_lines > 0 {
+            clear_inline(prev_lines)?;
+        }
+        if cli.json {
+            println!(r#"{{"status":"ok","message":"up_to_date"}}"#);
+        } else {
+            let mut out = io::stdout();
+            let mut fmt = Formatter::stdout(&mut out, theme);
+            let success_color = fmt.theme().palette.status_success;
+            fmt.write_colored("  \u{2713} ", success_color)?;
+            fmt.write_raw("Team memories are up to date.")?;
+            fmt.newline()?;
+        }
+        return Ok(());
+    }
+
+    // Merge into local stores using LWW
+    let store = open_store(cas_root)?;
+    let rule_store = open_rule_store(cas_root)?;
+    let skill_store = open_skill_store(cas_root)?;
+
+    let mut entries_merged = 0usize;
+    let mut entries_skipped = 0usize;
+    let mut rules_merged = 0usize;
+    let mut rules_skipped = 0usize;
+    let mut skills_merged = 0usize;
+    let mut skills_skipped = 0usize;
+
+    // Merge entries (LWW by last_accessed or created)
+    for entry in body.memories.entries {
+        match store.get(&entry.id) {
+            Ok(local) => {
+                let local_time = local.last_accessed.unwrap_or(local.created);
+                let remote_time = entry.last_accessed.unwrap_or(entry.created);
+                if remote_time > local_time {
+                    store.update(&entry)?;
+                    entries_merged += 1;
+                } else {
+                    entries_skipped += 1;
+                }
+            }
+            Err(_) => {
+                store.add(&entry)?;
+                entries_merged += 1;
+            }
+        }
+    }
+
+    // Merge rules (LWW by last_accessed or created)
+    for rule in body.memories.rules {
+        match rule_store.get(&rule.id) {
+            Ok(local) => {
+                let local_time = local.last_accessed.unwrap_or(local.created);
+                let remote_time = rule.last_accessed.unwrap_or(rule.created);
+                if remote_time > local_time {
+                    rule_store.update(&rule)?;
+                    rules_merged += 1;
+                } else {
+                    rules_skipped += 1;
+                }
+            }
+            Err(_) => {
+                rule_store.add(&rule)?;
+                rules_merged += 1;
+            }
+        }
+    }
+
+    // Merge skills (LWW by updated_at)
+    for skill in body.memories.skills {
+        match skill_store.get(&skill.id) {
+            Ok(local) => {
+                if skill.updated_at > local.updated_at {
+                    skill_store.update(&skill)?;
+                    skills_merged += 1;
+                } else {
+                    skills_skipped += 1;
+                }
+            }
+            Err(_) => {
+                skill_store.add(&skill)?;
+                skills_merged += 1;
+            }
+        }
+    }
+
+    // Save sync timestamp
+    if let Some(pulled_at) = &body.pulled_at {
+        config.set_team_memory_sync(&canonical_id, pulled_at);
+        config.save()?;
+    }
+
+    if prev_lines > 0 {
+        clear_inline(prev_lines)?;
+    }
+
+    if cli.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "status": "ok",
+                "entries": { "merged": entries_merged, "skipped": entries_skipped },
+                "rules": { "merged": rules_merged, "skipped": rules_skipped },
+                "skills": { "merged": skills_merged, "skipped": skills_skipped },
+                "contributors": contributor_count,
+            })
+        );
+    } else {
+        let mut out = io::stdout();
+        let mut fmt = Formatter::stdout(&mut out, theme);
+        fmt.success("Team memories synced")?;
+        if entries_merged > 0 {
+            fmt.write_raw(&format!("    {} entries merged", entries_merged))?;
+            fmt.newline()?;
+        }
+        if rules_merged > 0 {
+            fmt.write_raw(&format!("    {} rules merged", rules_merged))?;
+            fmt.newline()?;
+        }
+        if skills_merged > 0 {
+            fmt.write_raw(&format!("    {} skills merged", skills_merged))?;
+            fmt.newline()?;
+        }
+        if entries_skipped + rules_skipped + skills_skipped > 0 {
+            fmt.write_muted(&format!(
+                "    {} skipped (local newer)",
+                entries_skipped + rules_skipped + skills_skipped
+            ))?;
+            fmt.newline()?;
         }
     }
 
