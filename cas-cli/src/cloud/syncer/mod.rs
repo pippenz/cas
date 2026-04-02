@@ -290,6 +290,22 @@ struct TeamPullResponse {
     status: Option<String>,
 }
 
+/// Response from team projects endpoint
+#[derive(Debug, Deserialize)]
+pub struct TeamProjectsResponse {
+    pub projects: Vec<TeamProject>,
+}
+
+/// A project within a team
+#[derive(Debug, Deserialize, Serialize)]
+pub struct TeamProject {
+    pub id: String,
+    pub canonical_id: String,
+    pub name: String,
+    pub contributor_count: u32,
+    pub memory_count: u32,
+}
+
 /// Response from team push endpoint
 #[derive(Debug, Deserialize)]
 struct TeamPushResponse {

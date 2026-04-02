@@ -30,6 +30,8 @@ pub enum CloudCommands {
     Pull(CloudPullArgs),
     /// Full sync (push then pull)
     Sync(CloudSyncArgs),
+    /// List team projects in cloud
+    Projects(CloudProjectsArgs),
 }
 
 #[derive(Parser)]
@@ -70,6 +72,13 @@ pub struct CloudSyncArgs {
 }
 
 #[derive(Parser)]
+pub struct CloudProjectsArgs {
+    /// Specify team slug (defaults to active team)
+    #[arg(long)]
+    pub team: Option<String>,
+}
+
+#[derive(Parser)]
 pub struct CloudQueueArgs {
     /// Show detailed list of queued items
     #[arg(long, short)]
@@ -95,6 +104,7 @@ pub fn execute(cmd: &CloudCommands, cli: &Cli, cas_root: &Path) -> anyhow::Resul
         CloudCommands::Push(args) => execute_push(args, cli, cas_root),
         CloudCommands::Pull(args) => execute_pull(args, cli, cas_root),
         CloudCommands::Sync(args) => execute_sync(args, cli, cas_root),
+        CloudCommands::Projects(args) => execute_projects(args, cli),
     }
 }
 
@@ -1051,6 +1061,132 @@ fn execute_sync(args: &CloudSyncArgs, cli: &Cli, cas_root: &Path) -> anyhow::Res
             cli,
             cas_root,
         )?;
+    }
+
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PROJECTS - List team projects
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn execute_projects(args: &CloudProjectsArgs, cli: &Cli) -> anyhow::Result<()> {
+    let config = CloudConfig::load()?;
+    let token = config
+        .token
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Not logged in. Run 'cas login' first"))?;
+
+    // Resolve team_id: --team flag overrides config
+    let team_id = args
+        .team
+        .as_deref()
+        .or(config.team_id.as_deref())
+        .or(config.team_slug.as_deref());
+
+    let team_id = match team_id {
+        Some(id) => id,
+        None => {
+            if cli.json {
+                println!(r#"{{"status":"error","message":"No team configured"}}"#);
+            } else {
+                let theme = ActiveTheme::default();
+                let mut out = io::stdout();
+                let mut fmt = Formatter::stdout(&mut out, theme);
+                let warning_color = fmt.theme().palette.status_warning;
+                fmt.write_colored("  \u{25CF} ", warning_color)?;
+                fmt.write_raw("No team configured. Run ")?;
+                fmt.write_accent("cas cloud team set <slug>")?;
+                fmt.write_raw(" first.")?;
+                fmt.newline()?;
+            }
+            return Ok(());
+        }
+    };
+
+    let url = format!("{}/api/teams/{}/projects", config.endpoint, team_id);
+
+    match ureq::get(&url)
+        .set("Authorization", &format!("Bearer {token}"))
+        .call()
+    {
+        Ok(resp) => {
+            let body: crate::cloud::TeamProjectsResponse = resp.into_json()?;
+
+            if cli.json {
+                println!("{}", serde_json::to_string(&body.projects)?);
+            } else {
+                let theme = ActiveTheme::default();
+                let mut out = io::stdout();
+                let mut fmt = Formatter::stdout(&mut out, theme);
+
+                fmt.newline()?;
+                let team_display = args
+                    .team
+                    .as_deref()
+                    .or(config.team_slug.as_deref())
+                    .unwrap_or(team_id);
+                fmt.write_muted("  Team: ")?;
+                fmt.write_accent(team_display)?;
+                fmt.newline()?;
+                fmt.newline()?;
+
+                if body.projects.is_empty() {
+                    fmt.write_muted("  No projects found.")?;
+                    fmt.newline()?;
+                } else {
+                    // Calculate column widths for aligned output
+                    let max_name = body
+                        .projects
+                        .iter()
+                        .map(|p| p.name.len())
+                        .max()
+                        .unwrap_or(0)
+                        .max(4);
+                    let max_canonical = body
+                        .projects
+                        .iter()
+                        .map(|p| p.canonical_id.len())
+                        .max()
+                        .unwrap_or(0)
+                        .max(4);
+
+                    for project in &body.projects {
+                        fmt.write_raw(&format!(
+                            "    {:<name_w$}   {:<canonical_w$}   {} contributors   {} memories",
+                            project.name,
+                            project.canonical_id,
+                            project.contributor_count,
+                            project.memory_count,
+                            name_w = max_name,
+                            canonical_w = max_canonical,
+                        ))?;
+                        fmt.newline()?;
+                    }
+                }
+                fmt.newline()?;
+            }
+        }
+        Err(ureq::Error::Status(401, _)) => {
+            if cli.json {
+                println!(r#"{{"status":"error","message":"Invalid or expired token"}}"#);
+            } else {
+                let theme = ActiveTheme::default();
+                let mut err = io::stderr();
+                let mut fmt = Formatter::stdout(&mut err, theme);
+                let error_color = fmt.theme().palette.status_error;
+                fmt.write_colored("  \u{2717} ", error_color)?;
+                fmt.write_raw("Session expired")?;
+                fmt.newline()?;
+                fmt.write_raw("  Run ")?;
+                fmt.write_accent("cas login")?;
+                fmt.write_raw(" to re-authenticate")?;
+                fmt.newline()?;
+            }
+        }
+        Err(e) => {
+            anyhow::bail!("Failed to fetch projects: {e}");
+        }
     }
 
     Ok(())

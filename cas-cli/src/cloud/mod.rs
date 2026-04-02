@@ -28,4 +28,5 @@ pub use device::DeviceConfig;
 pub use sync_queue::{EntityType, QueuedSync, SyncOperation, SyncQueue};
 pub use syncer::{
     CloudSyncer, CloudSyncerConfig, ConflictAction, ConflictResolution, SyncConflict, SyncResult,
+    TeamProject, TeamProjectsResponse,
 };
