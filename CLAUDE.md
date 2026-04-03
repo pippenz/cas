@@ -40,3 +40,6 @@ Module layout, crate purposes, store traits, CasCore, hook scoring:
 
 Adding CLI commands, MCP tools, migrations, testing setup, skill/rule sync:
 -> See [cas-cli/docs/CONTRIBUTING.md](cas-cli/docs/CONTRIBUTING.md)
+
+Codebase navigation map (breadcrumb index of all modules):
+-> See [.claude/CODEMAP.md](.claude/CODEMAP.md)
