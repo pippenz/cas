@@ -107,7 +107,7 @@ impl CloudSyncer {
 
         // Get the current project ID once — used for client-side entity validation
         let current_project_id = get_project_canonical_id()
-            .unwrap_or_else(|| "local:unknown".to_string());
+            .unwrap_or_else(|| "unknown".to_string());
 
         // Process entries
         for raw_entry in body.entries.unwrap_or_default() {
@@ -546,7 +546,7 @@ impl CloudSyncer {
 
         // Get the current project ID for client-side validation
         let current_project_id = get_project_canonical_id()
-            .unwrap_or_else(|| "local:unknown".to_string());
+            .unwrap_or_else(|| "unknown".to_string());
 
         // Process entries
         for raw_entry in body.entries.unwrap_or_default() {

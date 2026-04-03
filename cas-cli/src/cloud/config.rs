@@ -12,142 +12,47 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::OnceLock;
 
 use crate::error::CasError;
 use crate::store::find_cas_root;
 
-/// Cached project canonical ID. The git remote and filesystem path don't change during a
-/// process lifetime.
-static CACHED_PROJECT_ID: OnceLock<String> = OnceLock::new();
+/// Cached project canonical ID. The folder name doesn't change during a process lifetime.
+static CACHED_PROJECT_ID: OnceLock<Option<String>> = OnceLock::new();
 
 /// Get the canonical project ID for the current CAS project.
 ///
-/// For projects with a git remote, this normalizes the remote URL:
-/// - `git@github.com:owner/repo.git` → `github.com/owner/repo`
-/// - `https://github.com/owner/repo.git` → `github.com/owner/repo`
-/// - `ssh://git@gitlab.com/team/project.git` → `gitlab.com/team/project`
-///
-/// For projects without a git remote (e.g. local-only directories), falls back to a
-/// deterministic identifier derived from the canonical path of the project directory:
-/// - `local:<first-16-hex-chars-of-sha256(canonical_path)>`
-///
-/// Always returns `Some` for a valid CAS project — every project gets an ID.
-/// The result is cached for the lifetime of the process.
-pub fn get_project_canonical_id() -> Option<String> {
-    Some(
-        CACHED_PROJECT_ID
-            .get_or_init(|| {
-                // Try git remote first
-                if let Some(id) = get_project_id_from_git_remote() {
-                    return id;
-                }
-
-                // Fallback: derive a stable ID from the canonical project directory path
-                get_project_id_from_path()
-                    .unwrap_or_else(|| "local:unknown".to_string())
-            })
-            .clone(),
-    )
-}
-
-/// Attempt to get a project ID from the git remote URL.
-fn get_project_id_from_git_remote() -> Option<String> {
-    let output = Command::new("git")
-        .args(["remote", "get-url", "origin"])
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if url.is_empty() {
-        return None;
-    }
-
-    Some(normalize_git_remote(&url))
-}
-
-/// Derive a stable project ID from the canonical filesystem path of the project root.
-///
-/// Uses the first 16 hex characters of the SHA-256 hash of the canonical path,
-/// prefixed with `local:` to distinguish it from git-remote-based IDs.
-fn get_project_id_from_path() -> Option<String> {
-    use sha2::{Digest, Sha256};
-
-    let cas_root = find_cas_root().ok()?;
-    // Use the project directory (parent of .cas), not the .cas dir itself
-    let project_dir = cas_root.parent().unwrap_or(&cas_root);
-    // Canonicalize to resolve symlinks and get a stable absolute path
-    let canonical = project_dir.canonicalize().unwrap_or_else(|_| project_dir.to_path_buf());
-    let path_str = canonical.to_string_lossy();
-
-    let mut hasher = Sha256::new();
-    hasher.update(path_str.as_bytes());
-    let hash = hasher.finalize();
-
-    // Use the first 16 hex characters (64 bits of entropy — sufficient for scoping)
-    let hex: String = hash.iter().take(8).map(|b| format!("{b:02x}")).collect();
-    Some(format!("local:{hex}"))
-}
-
-/// Normalize a git remote URL to a canonical format.
+/// The canonical ID is the folder name of the project root directory (the directory
+/// containing `.cas/`). This is:
+/// - Stable across git remote changes (fork, transfer, rename)
+/// - Works for non-git projects
+/// - Human-readable in logs, UI, and team project lists
 ///
 /// Examples:
-/// - `git@github.com:company/repo.git` → `github.com/company/repo`
-/// - `https://github.com/company/repo.git` → `github.com/company/repo`
-/// - `ssh://git@gitlab.com/team/project.git` → `gitlab.com/team/project`
-pub fn normalize_git_remote(url: &str) -> String {
-    let mut result = url.trim().to_string();
+/// - `/home/user/projects/petra-stella-cloud/.cas/` → `petra-stella-cloud`
+/// - `/home/user/cas-src/.cas/` → `cas-src`
+/// - `/home/user/gabber-studio/.cas/` → `gabber-studio`
+///
+/// Returns `None` only if not inside a CAS project directory.
+/// The result is cached for the lifetime of the process.
+pub fn get_project_canonical_id() -> Option<String> {
+    CACHED_PROJECT_ID
+        .get_or_init(|| {
+            let cas_root = find_cas_root().ok()?;
+            canonical_id_from_cas_root(&cas_root)
+        })
+        .clone()
+}
 
-    // Remove protocol (https://, ssh://, git://)
-    if let Some(pos) = result.find("://") {
-        result = result[pos + 3..].to_string();
-    }
-
-    // Remove git@ prefix
-    if result.starts_with("git@") {
-        result = result[4..].to_string();
-    }
-
-    // Convert : to / for SSH URLs (git@github.com:owner/repo)
-    // But don't convert port numbers (github.com:443/owner/repo)
-    if let Some(pos) = result.find(':') {
-        let after_colon = &result[pos + 1..];
-        // If what follows the colon starts with a digit, it's a port
-        if !after_colon
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_digit())
-        {
-            result = format!("{}/{}", &result[..pos], after_colon);
-        }
-    }
-
-    // Remove .git suffix
-    if result.ends_with(".git") {
-        result = result[..result.len() - 4].to_string();
-    }
-
-    // Remove trailing slashes
-    while result.ends_with('/') {
-        result.pop();
-    }
-
-    // Remove any userinfo (user:pass@)
-    if let Some(at_pos) = result.find('@') {
-        if let Some(slash_pos) = result.find('/') {
-            if at_pos < slash_pos {
-                result = result[at_pos + 1..].to_string();
-            }
-        }
-    }
-
-    // Lowercase for consistency
-    result.to_lowercase()
+/// Derive the canonical project ID from a `.cas` directory path.
+///
+/// The canonical ID is the folder name of the parent directory (the project root).
+/// Returns `None` if the path has no parent or no file name (e.g. filesystem root).
+pub fn canonical_id_from_cas_root(cas_root: &Path) -> Option<String> {
+    let project_dir = cas_root.parent().unwrap_or(cas_root);
+    project_dir
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
 }
 
 /// Cloud configuration stored in .cas/cloud.json
@@ -469,79 +374,53 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_git_remote_ssh() {
-        assert_eq!(
-            normalize_git_remote("git@github.com:owner/repo.git"),
-            "github.com/owner/repo"
-        );
-    }
-
-    #[test]
-    fn test_normalize_git_remote_https() {
-        assert_eq!(
-            normalize_git_remote("https://github.com/owner/repo.git"),
-            "github.com/owner/repo"
-        );
-    }
-
-    #[test]
-    fn test_normalize_git_remote_ssh_protocol() {
-        assert_eq!(
-            normalize_git_remote("ssh://git@gitlab.com/team/project.git"),
-            "gitlab.com/team/project"
-        );
-    }
-
-    #[test]
-    fn test_get_project_id_from_path_stable() {
-        // get_project_id_from_path uses find_cas_root() which depends on process state;
-        // we test the hash logic directly by checking that calling it twice gives the same result.
-        // The real stability guarantee is: same canonical path → same hash.
+    fn test_canonical_id_from_cas_root() {
+        // Create real temp directories simulating different project layouts
         let temp = TempDir::new().unwrap();
-        let project_path = temp.path().canonicalize().unwrap();
 
-        use sha2::{Digest, Sha256};
-        let path_str = project_path.to_string_lossy();
-        let mut hasher = Sha256::new();
-        hasher.update(path_str.as_bytes());
-        let hash = hasher.finalize();
-        let hex1: String = hash.iter().take(8).map(|b| format!("{b:02x}")).collect();
+        // Simulate /tmp/.../petra-stella-cloud/.cas
+        let project_a = temp.path().join("petra-stella-cloud");
+        let cas_a = project_a.join(".cas");
+        std::fs::create_dir_all(&cas_a).unwrap();
+        assert_eq!(
+            canonical_id_from_cas_root(&cas_a),
+            Some("petra-stella-cloud".to_string())
+        );
 
-        // Same path should produce the same hash
-        let mut hasher2 = Sha256::new();
-        hasher2.update(path_str.as_bytes());
-        let hash2 = hasher2.finalize();
-        let hex2: String = hash2.iter().take(8).map(|b| format!("{b:02x}")).collect();
+        // Simulate /tmp/.../gabber-studio/.cas
+        let project_b = temp.path().join("gabber-studio");
+        let cas_b = project_b.join(".cas");
+        std::fs::create_dir_all(&cas_b).unwrap();
+        assert_eq!(
+            canonical_id_from_cas_root(&cas_b),
+            Some("gabber-studio".to_string())
+        );
 
-        assert_eq!(hex1, hex2);
-        assert_eq!(hex1.len(), 16);
-        let id = format!("local:{hex1}");
-        assert!(id.starts_with("local:"));
+        // Non-git project works the same way
+        let project_c = temp.path().join("local-only-project");
+        let cas_c = project_c.join(".cas");
+        std::fs::create_dir_all(&cas_c).unwrap();
+        assert_eq!(
+            canonical_id_from_cas_root(&cas_c),
+            Some("local-only-project".to_string())
+        );
+
+        // Folder with spaces
+        let project_d = temp.path().join("Richards LLC");
+        let cas_d = project_d.join(".cas");
+        std::fs::create_dir_all(&cas_d).unwrap();
+        assert_eq!(
+            canonical_id_from_cas_root(&cas_d),
+            Some("Richards LLC".to_string())
+        );
     }
 
     #[test]
-    fn test_get_project_id_from_path_different_paths() {
-        use sha2::{Digest, Sha256};
-
-        // Different paths should produce different IDs
-        let compute_id = |path: &str| -> String {
-            let mut hasher = Sha256::new();
-            hasher.update(path.as_bytes());
-            let hash = hasher.finalize();
-            let hex: String = hash.iter().take(8).map(|b| format!("{b:02x}")).collect();
-            format!("local:{hex}")
-        };
-
-        let id_a = compute_id("/home/user/project-a");
-        let id_b = compute_id("/home/user/project-b");
-        let id_c = compute_id("/home/user/Accounting");
-
-        assert_ne!(id_a, id_b);
-        assert_ne!(id_a, id_c);
-        assert_ne!(id_b, id_c);
-        assert!(id_a.starts_with("local:"));
-        assert!(id_b.starts_with("local:"));
-        assert!(id_c.starts_with("local:"));
+    fn test_canonical_id_from_filesystem_root() {
+        // Edge case: .cas at filesystem root — parent is "/" which has no file_name
+        use std::path::Path;
+        let root_cas = Path::new("/.cas");
+        assert_eq!(canonical_id_from_cas_root(root_cas), None);
     }
 
     #[test]

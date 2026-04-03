@@ -1244,7 +1244,7 @@ fn execute_team_memories(
         .clone();
 
     let canonical_id = crate::cloud::get_project_canonical_id().ok_or_else(|| {
-        anyhow::anyhow!("Not in a git repository with a remote.")
+        anyhow::anyhow!("Not inside a CAS project directory.")
     })?;
 
     let token = config

@@ -22,7 +22,7 @@ pub mod device;
 mod sync_queue;
 mod syncer;
 
-pub use config::{CloudConfig, get_project_canonical_id, normalize_git_remote};
+pub use config::{CloudConfig, get_project_canonical_id};
 pub use coordinator::CloudCoordinator;
 pub use device::DeviceConfig;
 pub use sync_queue::{EntityType, QueuedSync, SyncOperation, SyncQueue};

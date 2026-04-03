@@ -201,13 +201,13 @@ impl CloudSyncer {
             payload.insert("team_id".to_string(), serde_json::json!(team_id));
         }
 
-        // Include project_canonical_id for project association
-        if let Some(project_id) = get_project_canonical_id() {
-            payload.insert(
-                "project_canonical_id".to_string(),
-                serde_json::json!(project_id),
-            );
-        }
+        // Include project_canonical_id (required for project scoping)
+        let project_id = get_project_canonical_id()
+            .ok_or_else(|| CasError::Other("Cannot sync: not inside a CAS project directory".to_string()))?;
+        payload.insert(
+            "project_canonical_id".to_string(),
+            serde_json::json!(project_id),
+        );
 
         let json_bytes = serde_json::to_vec(&payload)
             .map_err(|e| CasError::Other(format!("JSON serialization failed: {e}")))?;
@@ -407,12 +407,12 @@ impl CloudSyncer {
             payload.insert("team_id".to_string(), serde_json::json!(team_id));
         }
 
-        if let Some(project_id) = get_project_canonical_id() {
-            payload.insert(
-                "project_canonical_id".to_string(),
-                serde_json::json!(project_id),
-            );
-        }
+        let project_id = get_project_canonical_id()
+            .ok_or_else(|| CasError::Other("Cannot sync: not inside a CAS project directory".to_string()))?;
+        payload.insert(
+            "project_canonical_id".to_string(),
+            serde_json::json!(project_id),
+        );
 
         // Serialize and compress the payload
         let json_bytes = serde_json::to_vec(&payload)
