@@ -517,6 +517,13 @@ pub fn handle_stop(input: &HookInput, cas_root: Option<&Path>) -> Result<HookOut
         }
     }
 
+    // Best-effort codemap reminder
+    let codemap_reminder =
+        crate::hooks::handlers::handlers_events::codemap_stop_reminder(cas_root);
+    if let Some(ref reminder) = codemap_reminder {
+        eprintln!("cas: {reminder}");
+    }
+
     // Clean up session files
     // NOTE: Agent cleanup (graceful_shutdown) happens in SessionEnd, NOT here.
     // Stop hook can be blocked and the agent continues working, so we can't
@@ -525,5 +532,10 @@ pub fn handle_stop(input: &HookInput, cas_root: Option<&Path>) -> Result<HookOut
     clear_session_files(cas_root);
     let _ = std::fs::remove_file(cas_root.join(".verifier_unjail_marker"));
 
-    Ok(HookOutput::empty())
+    // Return codemap reminder as context if present, otherwise empty
+    if let Some(reminder) = codemap_reminder {
+        Ok(HookOutput::with_context("Stop", format!("<system-reminder>{reminder}</system-reminder>")))
+    } else {
+        Ok(HookOutput::empty())
+    }
 }

@@ -77,6 +77,7 @@ pub fn handle_post_tool_use(
     // Detect git commit and link file changes (Bash tool only)
     if tool_name == "Bash" {
         crate::hooks::handlers::handlers_events::detect_and_link_git_commit(cas_root, input);
+        crate::hooks::handlers::handlers_events::detect_codemap_structural_changes(cas_root, input);
     }
 
     // === SMART FILTERING ===
