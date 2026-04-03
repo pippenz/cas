@@ -23,6 +23,15 @@ managed_by: cas
 
 Do not use `/cas-start`, `/cas-context`, or `/cas-end` — they are not available in Codex.
 
+## Intake Gate (Before Planning)
+
+- [ ] "What does done look like?" has a measurable answer
+- [ ] No vague terms — "better/faster/cleaner" replaced with testable criteria
+- [ ] All assumptions stated and confirmed
+- [ ] Scope broken into discrete chunks if sprawling
+- [ ] No conflicts with existing architecture or prior decisions
+- [ ] User override logged if any challenge was overridden
+
 ## During Coordination
 
 Record decisions as you go:
@@ -35,6 +44,15 @@ mcp__cs__memory action=remember title="..." content="..." tags="decision"
 - Every subtask has a `demo_statement` (if not, it may be a horizontal slice — restructure)
 - Investigation tasks use `task_type=spike` with question-based acceptance criteria
 - When multiple approaches exist, a spike with a fit check comparison in `design_notes` precedes implementation tasks
+
+## Review Gate (Per Task Completion)
+
+- [ ] Tests exist and pass (including failure paths)
+- [ ] No DRY violations or SRP violations
+- [ ] No work outside declared layer boundary
+- [ ] Output matches declared interface
+- [ ] No magic numbers that should be configurable
+- [ ] Obvious SOLID violations flagged with specifics
 
 ## Before Closing an EPIC
 

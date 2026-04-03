@@ -95,6 +95,16 @@ Only close after all checks pass. The verifier will catch what you miss — but 
 
 **Demo statements** — If a task has a `demo_statement`, it describes what should be demonstrable when the task is complete. Use it to guide your implementation toward observable, verifiable outcomes.
 
+## Rules of Engagement
+
+Your scope is locked at assignment. The supervisor will reject work that violates these:
+
+- **Scope is frozen** — Build exactly what the spec says. If you see "related" improvements, note them but don't build them.
+- **Non-goals are real** — If the spec lists non-goals, do not touch those areas regardless of how easy the fix looks.
+- **Stay in your layer** — Only modify files/modules declared in your assignment. Crossing the boundary is an automatic rejection.
+- **Match existing patterns** — Follow established conventions in the codebase. Don't introduce new patterns without asking.
+- **No config surprises** — Don't hardcode values that should be configurable. Don't add config that wasn't requested.
+
 ## Rules
 
 - One task at a time — complete current before taking another
