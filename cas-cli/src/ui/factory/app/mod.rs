@@ -380,15 +380,26 @@ impl FactoryApp {
             .agent_id_to_name
             .retain(|_, name| allowed.contains(name));
 
-        // Filter tasks to active epic's subtasks only (prevents cross-project task leakage)
+        // Filter tasks to active epic's subtasks only (prevents cross-project task leakage).
+        // Also keep tasks assigned to current-session workers that have no epic link yet —
+        // there's a read race between task list and dependency list queries where a newly
+        // created task may not yet have its parent-child dependency visible, causing its
+        // `epic` field to be `None`. Dropping those tasks causes the panel to flash empty.
         if let Some(epic_id) = self.epic_state.epic_id() {
             let epic_id = epic_id.to_string();
+            let belongs_to_session = |t: &cas_factory::TaskSummary| -> bool {
+                t.epic.as_deref() == Some(&epic_id)
+                    || (t.epic.is_none()
+                        && t.assignee
+                            .as_ref()
+                            .is_some_and(|a| allowed.contains(a)))
+            };
             self.director_data
                 .ready_tasks
-                .retain(|t| t.epic.as_deref() == Some(&epic_id));
+                .retain(|t| belongs_to_session(t));
             self.director_data
                 .in_progress_tasks
-                .retain(|t| t.epic.as_deref() == Some(&epic_id));
+                .retain(|t| belongs_to_session(t));
             self.director_data
                 .epic_tasks
                 .retain(|t| t.id == epic_id);
