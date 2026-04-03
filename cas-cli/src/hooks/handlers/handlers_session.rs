@@ -167,6 +167,19 @@ pub fn handle_session_start(
         build_context(input, 5, cas_root)?
     };
 
+    // Check codemap freshness and append to context if needed
+    let context = if let Some(codemap_ctx) =
+        crate::hooks::handlers::handlers_events::check_codemap_freshness(cas_root)
+    {
+        if context.is_empty() {
+            codemap_ctx
+        } else {
+            format!("{context}\n{codemap_ctx}")
+        }
+    } else {
+        context
+    };
+
     let output = if context.is_empty() {
         HookOutput::empty()
     } else {
