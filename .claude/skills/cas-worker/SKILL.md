@@ -37,7 +37,10 @@ On startup, try `mcp__cas__task action=mine` **once only**. If it responds, use 
 5. Report progress: `mcp__cas__task action=notes id=<task-id> notes="..." note_type=progress`
 6. Close when done: `mcp__cas__task action=close id=<task-id>`
 
-If close returns verification-required, message the supervisor to handle it.
+If close returns verification-required, follow the instructions in the response:
+- If you can spawn subagents: spawn a task-verifier — `Agent(subagent_type="task-verifier", prompt="Verify task <id>")`
+- If you cannot spawn subagents: verification is automatically bypassed, so `close` should succeed directly
+- If genuinely stuck (close keeps failing), message the supervisor
 
 ## Blockers
 

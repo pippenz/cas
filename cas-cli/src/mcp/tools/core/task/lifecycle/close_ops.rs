@@ -503,9 +503,23 @@ impl CasCore {
                                 .unwrap_or(false);
 
                             if is_factory_worker {
+                                // Send real notification to supervisor via daemon event
+                                if let Ok(agent_id) = self.get_agent_id() {
+                                    let event = crate::mcp::socket::DaemonEvent::WorkerActivity {
+                                        session_id: agent_id,
+                                        event_type: "epic_subtasks_complete".to_string(),
+                                        description: format!(
+                                            "All subtasks of epic '{}' ({}) are complete — ready to close",
+                                            parent.title, parent.id
+                                        ),
+                                        entity_id: Some(parent.id.clone()),
+                                    };
+                                    let _ = crate::mcp::socket::send_event(&self.cas_root, &event);
+                                }
+
                                 format!(
                                     "\n\n🎉 All subtasks of epic '{}' ({}) are now complete!\n\
-                                     → The supervisor will be notified to close the epic.",
+                                     → The supervisor has been notified to close the epic.",
                                     parent.title, parent.id
                                 )
                             } else {
