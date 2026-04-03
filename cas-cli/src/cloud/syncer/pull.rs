@@ -9,6 +9,46 @@ use crate::error::CasError;
 use crate::store::{RuleStore, SkillStore, Store, TaskStore};
 use crate::types::{Entry, Rule, Session, Skill, Task};
 
+/// Check whether a raw JSON entity belongs to the current project.
+///
+/// Returns `true` if the entity should be accepted, `false` if it should be skipped.
+///
+/// An entity is accepted when:
+/// - It has no `project_canonical_id` or `project_id` field (legacy / server not yet scoping)
+/// - Its project field is `null`
+/// - Its project field matches `current_project_id`
+fn entity_matches_project(
+    raw: &serde_json::Value,
+    current_project_id: &str,
+    entity_kind: &str,
+) -> bool {
+    // Check both field names the server might use
+    let project_field = raw
+        .get("project_canonical_id")
+        .or_else(|| raw.get("project_id"));
+
+    match project_field {
+        None => true, // No field present — legacy entity, accept it
+        Some(serde_json::Value::Null) => true, // Explicitly null — not scoped, accept it
+        Some(serde_json::Value::String(s)) => {
+            if s == current_project_id {
+                true
+            } else {
+                let entity_id = raw
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("<unknown>");
+                eprintln!(
+                    "[CAS sync] WARNING: skipping {entity_kind} '{entity_id}' from foreign \
+                     project '{s}' (expected '{current_project_id}')"
+                );
+                false
+            }
+        }
+        Some(_) => true, // Unexpected type — don't block on it, accept
+    }
+}
+
 impl CloudSyncer {
     pub fn pull(
         &self,
@@ -65,8 +105,22 @@ impl CloudSyncer {
             }
         };
 
+        // Get the current project ID once — used for client-side entity validation
+        let current_project_id = get_project_canonical_id()
+            .unwrap_or_else(|| "local:unknown".to_string());
+
         // Process entries
-        for remote_entry in body.entries.unwrap_or_default() {
+        for raw_entry in body.entries.unwrap_or_default() {
+            if !entity_matches_project(&raw_entry, &current_project_id, "entry") {
+                continue;
+            }
+            let remote_entry: Entry = match serde_json::from_value(raw_entry) {
+                Ok(e) => e,
+                Err(e) => {
+                    result.errors.push(format!("Entry deserialize error: {e}"));
+                    continue;
+                }
+            };
             match self.upsert_entry(store, remote_entry) {
                 Ok(UpsertResult::Created) | Ok(UpsertResult::Updated) => {
                     result.pulled_entries += 1;
@@ -81,7 +135,17 @@ impl CloudSyncer {
         }
 
         // Process tasks
-        for remote_task in body.tasks.unwrap_or_default() {
+        for raw_task in body.tasks.unwrap_or_default() {
+            if !entity_matches_project(&raw_task, &current_project_id, "task") {
+                continue;
+            }
+            let remote_task: Task = match serde_json::from_value(raw_task) {
+                Ok(t) => t,
+                Err(e) => {
+                    result.errors.push(format!("Task deserialize error: {e}"));
+                    continue;
+                }
+            };
             match self.upsert_task(task_store, remote_task) {
                 Ok(UpsertResult::Created) | Ok(UpsertResult::Updated) => {
                     result.pulled_tasks += 1;
@@ -96,7 +160,17 @@ impl CloudSyncer {
         }
 
         // Process rules
-        for remote_rule in body.rules.unwrap_or_default() {
+        for raw_rule in body.rules.unwrap_or_default() {
+            if !entity_matches_project(&raw_rule, &current_project_id, "rule") {
+                continue;
+            }
+            let remote_rule: Rule = match serde_json::from_value(raw_rule) {
+                Ok(r) => r,
+                Err(e) => {
+                    result.errors.push(format!("Rule deserialize error: {e}"));
+                    continue;
+                }
+            };
             match self.upsert_rule(rule_store, remote_rule) {
                 Ok(UpsertResult::Created) | Ok(UpsertResult::Updated) => {
                     result.pulled_rules += 1;
@@ -111,7 +185,17 @@ impl CloudSyncer {
         }
 
         // Process skills
-        for remote_skill in body.skills.unwrap_or_default() {
+        for raw_skill in body.skills.unwrap_or_default() {
+            if !entity_matches_project(&raw_skill, &current_project_id, "skill") {
+                continue;
+            }
+            let remote_skill: Skill = match serde_json::from_value(raw_skill) {
+                Ok(s) => s,
+                Err(e) => {
+                    result.errors.push(format!("Skill deserialize error: {e}"));
+                    continue;
+                }
+            };
             match self.upsert_skill(skill_store, remote_skill) {
                 Ok(UpsertResult::Created) | Ok(UpsertResult::Updated) => {
                     result.pulled_skills += 1;
@@ -460,8 +544,22 @@ impl CloudSyncer {
         #[cfg(debug_assertions)]
         eprintln!("[CAS sync] Starting team pull: team={team_id} strategy={strategy:?}");
 
+        // Get the current project ID for client-side validation
+        let current_project_id = get_project_canonical_id()
+            .unwrap_or_else(|| "local:unknown".to_string());
+
         // Process entries
-        for remote_entry in body.entries.unwrap_or_default() {
+        for raw_entry in body.entries.unwrap_or_default() {
+            if !entity_matches_project(&raw_entry, &current_project_id, "entry") {
+                continue;
+            }
+            let remote_entry: Entry = match serde_json::from_value(raw_entry) {
+                Ok(e) => e,
+                Err(e) => {
+                    result.errors.push(format!("Entry deserialize error: {e}"));
+                    continue;
+                }
+            };
             match self.upsert_entry_with_strategy(store, remote_entry, strategy) {
                 Ok(UpsertResult::Created) | Ok(UpsertResult::Updated) => {
                     result.pulled_entries += 1;
@@ -476,7 +574,17 @@ impl CloudSyncer {
         }
 
         // Process tasks
-        for remote_task in body.tasks.unwrap_or_default() {
+        for raw_task in body.tasks.unwrap_or_default() {
+            if !entity_matches_project(&raw_task, &current_project_id, "task") {
+                continue;
+            }
+            let remote_task: Task = match serde_json::from_value(raw_task) {
+                Ok(t) => t,
+                Err(e) => {
+                    result.errors.push(format!("Task deserialize error: {e}"));
+                    continue;
+                }
+            };
             match self.upsert_task_with_strategy(task_store, remote_task, strategy) {
                 Ok(UpsertResult::Created) | Ok(UpsertResult::Updated) => {
                     result.pulled_tasks += 1;
@@ -491,7 +599,17 @@ impl CloudSyncer {
         }
 
         // Process rules
-        for remote_rule in body.rules.unwrap_or_default() {
+        for raw_rule in body.rules.unwrap_or_default() {
+            if !entity_matches_project(&raw_rule, &current_project_id, "rule") {
+                continue;
+            }
+            let remote_rule: Rule = match serde_json::from_value(raw_rule) {
+                Ok(r) => r,
+                Err(e) => {
+                    result.errors.push(format!("Rule deserialize error: {e}"));
+                    continue;
+                }
+            };
             match self.upsert_rule_with_strategy(rule_store, remote_rule, strategy) {
                 Ok(UpsertResult::Created) | Ok(UpsertResult::Updated) => {
                     result.pulled_rules += 1;
@@ -506,7 +624,17 @@ impl CloudSyncer {
         }
 
         // Process skills
-        for remote_skill in body.skills.unwrap_or_default() {
+        for raw_skill in body.skills.unwrap_or_default() {
+            if !entity_matches_project(&raw_skill, &current_project_id, "skill") {
+                continue;
+            }
+            let remote_skill: Skill = match serde_json::from_value(raw_skill) {
+                Ok(s) => s,
+                Err(e) => {
+                    result.errors.push(format!("Skill deserialize error: {e}"));
+                    continue;
+                }
+            };
             match self.upsert_skill_with_strategy(skill_store, remote_skill, strategy) {
                 Ok(UpsertResult::Created) | Ok(UpsertResult::Updated) => {
                     result.pulled_skills += 1;
@@ -527,5 +655,67 @@ impl CloudSyncer {
 
         result.duration_ms = start.elapsed().as_millis() as u64;
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::entity_matches_project;
+    use serde_json::json;
+
+    #[test]
+    fn test_entity_matches_project_no_field() {
+        // No project field — legacy entity, always accepted
+        let entity = json!({ "id": "e-001", "content": "hello" });
+        assert!(entity_matches_project(&entity, "github.com/owner/repo", "entry"));
+    }
+
+    #[test]
+    fn test_entity_matches_project_null_field() {
+        // Null project_canonical_id — not scoped to any project, accepted
+        let entity = json!({ "id": "e-001", "project_canonical_id": null });
+        assert!(entity_matches_project(&entity, "github.com/owner/repo", "entry"));
+    }
+
+    #[test]
+    fn test_entity_matches_project_matching() {
+        // Matching project — accepted
+        let entity = json!({ "id": "e-001", "project_canonical_id": "github.com/owner/repo" });
+        assert!(entity_matches_project(&entity, "github.com/owner/repo", "entry"));
+    }
+
+    #[test]
+    fn test_entity_matches_project_foreign() {
+        // Different project — rejected (returns false)
+        let entity = json!({ "id": "e-001", "project_canonical_id": "github.com/other/repo" });
+        assert!(!entity_matches_project(&entity, "github.com/owner/repo", "entry"));
+    }
+
+    #[test]
+    fn test_entity_matches_project_id_field_alias() {
+        // Also checks `project_id` field as an alias
+        let entity = json!({ "id": "t-abc", "project_id": "github.com/owner/repo" });
+        assert!(entity_matches_project(&entity, "github.com/owner/repo", "task"));
+    }
+
+    #[test]
+    fn test_entity_matches_project_id_field_foreign() {
+        let entity = json!({ "id": "t-abc", "project_id": "github.com/other/repo" });
+        assert!(!entity_matches_project(&entity, "github.com/owner/repo", "task"));
+    }
+
+    #[test]
+    fn test_entity_matches_project_null_project_id() {
+        // Null project_id — accepted (not scoped)
+        let entity = json!({ "id": "t-abc", "project_id": null });
+        assert!(entity_matches_project(&entity, "github.com/owner/repo", "task"));
+    }
+
+    #[test]
+    fn test_entity_matches_local_project() {
+        // local: prefix IDs work the same way
+        let entity = json!({ "id": "p-001", "project_canonical_id": "local:abcd1234ef567890" });
+        assert!(entity_matches_project(&entity, "local:abcd1234ef567890", "entry"));
+        assert!(!entity_matches_project(&entity, "local:0000000000000000", "entry"));
     }
 }

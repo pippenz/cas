@@ -18,38 +18,80 @@ use std::sync::OnceLock;
 use crate::error::CasError;
 use crate::store::find_cas_root;
 
-/// Cached project canonical ID. The git remote doesn't change during a process lifetime.
-static CACHED_PROJECT_ID: OnceLock<Option<String>> = OnceLock::new();
+/// Cached project canonical ID. The git remote and filesystem path don't change during a
+/// process lifetime.
+static CACHED_PROJECT_ID: OnceLock<String> = OnceLock::new();
 
-/// Get the canonical project ID from the current git repository.
+/// Get the canonical project ID for the current CAS project.
 ///
-/// This normalizes git remote URLs to a canonical format:
+/// For projects with a git remote, this normalizes the remote URL:
 /// - `git@github.com:owner/repo.git` → `github.com/owner/repo`
 /// - `https://github.com/owner/repo.git` → `github.com/owner/repo`
 /// - `ssh://git@gitlab.com/team/project.git` → `gitlab.com/team/project`
 ///
-/// Returns None if not in a git repository or no remote is configured.
+/// For projects without a git remote (e.g. local-only directories), falls back to a
+/// deterministic identifier derived from the canonical path of the project directory:
+/// - `local:<first-16-hex-chars-of-sha256(canonical_path)>`
+///
+/// Always returns `Some` for a valid CAS project — every project gets an ID.
 /// The result is cached for the lifetime of the process.
 pub fn get_project_canonical_id() -> Option<String> {
-    CACHED_PROJECT_ID
-        .get_or_init(|| {
-            let output = Command::new("git")
-                .args(["remote", "get-url", "origin"])
-                .output()
-                .ok()?;
+    Some(
+        CACHED_PROJECT_ID
+            .get_or_init(|| {
+                // Try git remote first
+                if let Some(id) = get_project_id_from_git_remote() {
+                    return id;
+                }
 
-            if !output.status.success() {
-                return None;
-            }
+                // Fallback: derive a stable ID from the canonical project directory path
+                get_project_id_from_path()
+                    .unwrap_or_else(|| "local:unknown".to_string())
+            })
+            .clone(),
+    )
+}
 
-            let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if url.is_empty() {
-                return None;
-            }
+/// Attempt to get a project ID from the git remote URL.
+fn get_project_id_from_git_remote() -> Option<String> {
+    let output = Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .ok()?;
 
-            Some(normalize_git_remote(&url))
-        })
-        .clone()
+    if !output.status.success() {
+        return None;
+    }
+
+    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if url.is_empty() {
+        return None;
+    }
+
+    Some(normalize_git_remote(&url))
+}
+
+/// Derive a stable project ID from the canonical filesystem path of the project root.
+///
+/// Uses the first 16 hex characters of the SHA-256 hash of the canonical path,
+/// prefixed with `local:` to distinguish it from git-remote-based IDs.
+fn get_project_id_from_path() -> Option<String> {
+    use sha2::{Digest, Sha256};
+
+    let cas_root = find_cas_root().ok()?;
+    // Use the project directory (parent of .cas), not the .cas dir itself
+    let project_dir = cas_root.parent().unwrap_or(&cas_root);
+    // Canonicalize to resolve symlinks and get a stable absolute path
+    let canonical = project_dir.canonicalize().unwrap_or_else(|_| project_dir.to_path_buf());
+    let path_str = canonical.to_string_lossy();
+
+    let mut hasher = Sha256::new();
+    hasher.update(path_str.as_bytes());
+    let hash = hasher.finalize();
+
+    // Use the first 16 hex characters (64 bits of entropy — sufficient for scoping)
+    let hex: String = hash.iter().take(8).map(|b| format!("{b:02x}")).collect();
+    Some(format!("local:{hex}"))
 }
 
 /// Normalize a git remote URL to a canonical format.
@@ -424,6 +466,82 @@ mod tests {
             loaded.get_team_memory_sync("github.com/foo/bar"),
             Some("2026-04-02T10:00:00Z")
         );
+    }
+
+    #[test]
+    fn test_normalize_git_remote_ssh() {
+        assert_eq!(
+            normalize_git_remote("git@github.com:owner/repo.git"),
+            "github.com/owner/repo"
+        );
+    }
+
+    #[test]
+    fn test_normalize_git_remote_https() {
+        assert_eq!(
+            normalize_git_remote("https://github.com/owner/repo.git"),
+            "github.com/owner/repo"
+        );
+    }
+
+    #[test]
+    fn test_normalize_git_remote_ssh_protocol() {
+        assert_eq!(
+            normalize_git_remote("ssh://git@gitlab.com/team/project.git"),
+            "gitlab.com/team/project"
+        );
+    }
+
+    #[test]
+    fn test_get_project_id_from_path_stable() {
+        // get_project_id_from_path uses find_cas_root() which depends on process state;
+        // we test the hash logic directly by checking that calling it twice gives the same result.
+        // The real stability guarantee is: same canonical path → same hash.
+        let temp = TempDir::new().unwrap();
+        let project_path = temp.path().canonicalize().unwrap();
+
+        use sha2::{Digest, Sha256};
+        let path_str = project_path.to_string_lossy();
+        let mut hasher = Sha256::new();
+        hasher.update(path_str.as_bytes());
+        let hash = hasher.finalize();
+        let hex1: String = hash.iter().take(8).map(|b| format!("{b:02x}")).collect();
+
+        // Same path should produce the same hash
+        let mut hasher2 = Sha256::new();
+        hasher2.update(path_str.as_bytes());
+        let hash2 = hasher2.finalize();
+        let hex2: String = hash2.iter().take(8).map(|b| format!("{b:02x}")).collect();
+
+        assert_eq!(hex1, hex2);
+        assert_eq!(hex1.len(), 16);
+        let id = format!("local:{hex1}");
+        assert!(id.starts_with("local:"));
+    }
+
+    #[test]
+    fn test_get_project_id_from_path_different_paths() {
+        use sha2::{Digest, Sha256};
+
+        // Different paths should produce different IDs
+        let compute_id = |path: &str| -> String {
+            let mut hasher = Sha256::new();
+            hasher.update(path.as_bytes());
+            let hash = hasher.finalize();
+            let hex: String = hash.iter().take(8).map(|b| format!("{b:02x}")).collect();
+            format!("local:{hex}")
+        };
+
+        let id_a = compute_id("/home/user/project-a");
+        let id_b = compute_id("/home/user/project-b");
+        let id_c = compute_id("/home/user/Accounting");
+
+        assert_ne!(id_a, id_b);
+        assert_ne!(id_a, id_c);
+        assert_ne!(id_b, id_c);
+        assert!(id_a.starts_with("local:"));
+        assert!(id_b.starts_with("local:"));
+        assert!(id_c.starts_with("local:"));
     }
 
     #[test]

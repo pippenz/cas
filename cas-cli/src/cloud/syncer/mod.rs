@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::cloud::{CloudConfig, SyncQueue};
-use crate::types::{Entry, Rule, Skill, Task};
+use crate::types::{Entry, Rule, Skill};
 
 mod pull;
 mod push;
@@ -263,26 +263,36 @@ enum UpsertResult {
 }
 
 /// Response from pull endpoint
+///
+/// Entities are kept as raw JSON values so that per-entity project filtering can be applied
+/// before deserialization. This lets us reject entities from foreign projects even if the
+/// strongly-typed structs don't carry a `project_canonical_id` field.
 #[derive(Debug, Deserialize)]
 struct PullResponse {
-    entries: Option<Vec<Entry>>,
-    tasks: Option<Vec<Task>>,
-    rules: Option<Vec<Rule>>,
-    skills: Option<Vec<Skill>>,
+    #[serde(default)]
+    entries: Option<Vec<serde_json::Value>>,
+    #[serde(default)]
+    tasks: Option<Vec<serde_json::Value>>,
+    #[serde(default)]
+    rules: Option<Vec<serde_json::Value>>,
+    #[serde(default)]
+    skills: Option<Vec<serde_json::Value>>,
     pulled_at: Option<String>,
 }
 
 /// Response from team pull endpoint
+///
+/// Entities are kept as raw JSON values for the same reason as `PullResponse`.
 #[derive(Debug, Deserialize)]
 struct TeamPullResponse {
     #[serde(default)]
-    entries: Option<Vec<Entry>>,
+    entries: Option<Vec<serde_json::Value>>,
     #[serde(default)]
-    tasks: Option<Vec<Task>>,
+    tasks: Option<Vec<serde_json::Value>>,
     #[serde(default)]
-    rules: Option<Vec<Rule>>,
+    rules: Option<Vec<serde_json::Value>>,
     #[serde(default)]
-    skills: Option<Vec<Skill>>,
+    skills: Option<Vec<serde_json::Value>>,
     pulled_at: Option<String>,
     #[allow(dead_code)]
     team_id: Option<String>,
