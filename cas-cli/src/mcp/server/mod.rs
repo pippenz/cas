@@ -643,6 +643,17 @@ impl CasCore {
             return Ok(());
         }
 
+        // Factory workers are exempt — they may have multiple tasks and must continue
+        // working while one awaits verification. close_ops.rs still blocks re-closing
+        // unverified tasks, so data integrity is maintained.
+        let is_factory_worker = std::env::var("CAS_AGENT_ROLE")
+            .map(|r| r.eq_ignore_ascii_case("worker"))
+            .unwrap_or(false)
+            && std::env::var("CAS_FACTORY_MODE").is_ok();
+        if is_factory_worker {
+            return Ok(());
+        }
+
         // Check if agent is jailed
         let agent_id = match self.get_agent_id() {
             Ok(id) => id,

@@ -71,8 +71,18 @@ pub fn handle_pre_tool_use(
     // Supervisors are exempt from verification jail — their job is coordination
     let is_supervisor = crate::harness_policy::is_supervisor_from_env();
     let worker_supports_subagents = worker_harness_from_env().capabilities().supports_subagents;
+
+    // Factory workers are exempt from verification jail — they may have multiple
+    // tasks assigned and must be able to continue working on other tasks while
+    // one awaits verification. The pending_verification flag on the task itself
+    // still prevents re-closing without verification (enforced in close_ops.rs).
+    let is_factory_worker = std::env::var("CAS_AGENT_ROLE")
+        .map(|role| role.eq_ignore_ascii_case("worker"))
+        .unwrap_or(false)
+        && std::env::var("CAS_FACTORY_MODE").is_ok();
+
     // Verification jail is only relevant when worker harness supports subagents.
-    if worker_supports_subagents && !is_supervisor {
+    if worker_supports_subagents && !is_supervisor && !is_factory_worker {
         if let Ok(task_store) = open_task_store(cas_root) {
             if let Ok(tasks) = task_store.list_pending_verification() {
                 // Filter to tasks owned by the current agent:

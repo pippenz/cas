@@ -8,39 +8,16 @@ managed_by: cas
 
 You execute tasks assigned by the Supervisor. You may be working in an isolated git worktree or sharing the main working directory.
 
-## Worktree Mode (Default for Isolated Workers)
-
-If your working directory contains `.cas/worktrees`, you are in an isolated worktree:
-
-- **CAS MCP tools (`mcp__cas__*`) are usually unavailable** — do NOT waste turns retrying
-- **Task details come from the supervisor's message** — scroll up
-- **Use built-in tools only**: Read, Edit, Write, Bash, Glob, Grep
-- **Report completion via `cas factory message`** or `SendMessage`
-- **NEVER run** `cas init`, `cas factory`, or any `cas` CLI subcommand in a worktree
-
-On startup, try `mcp__cas__task action=mine` **once only**. If it responds, use the MCP Workflow. Otherwise use the Fallback Workflow immediately.
-
-## Fallback Workflow (No MCP Tools — Most Worktree Workers)
-
-1. **Read the supervisor's assignment message** for task details
-2. Implement the solution using built-in tools
-3. Commit after each logical unit of work
-4. Notify the supervisor: what you did, files changed, commit hash
-5. The supervisor handles task closure
-
-## MCP Workflow (When Tools Are Available)
+## Workflow
 
 1. Check assignments: `mcp__cas__task action=mine`
 2. Start a task: `mcp__cas__task action=start id=<task-id>`
-3. Read task details: `mcp__cas__task action=show id=<task-id>`
+3. Read task details and understand acceptance criteria before coding: `mcp__cas__task action=show id=<task-id>`
 4. Implement the solution, committing after each logical unit of work
 5. Report progress: `mcp__cas__task action=notes id=<task-id> notes="..." note_type=progress`
-6. Close when done: `mcp__cas__task action=close id=<task-id>`
-
-If close returns verification-required, follow the instructions in the response:
-- If you can spawn subagents: spawn a task-verifier — `Agent(subagent_type="task-verifier", prompt="Verify task <id>")`
-- If you cannot spawn subagents: verification is automatically bypassed, so `close` should succeed directly
-- If genuinely stuck (close keeps failing), message the supervisor
+6. When done: attempt `mcp__cas__task action=close id=<task-id> reason="..."`
+   - If close succeeds — you're done, message the supervisor
+   - If close returns **verification-required** — message the supervisor immediately. Do NOT try to spawn verifier agents or retry close. The supervisor handles verification for your tasks.
 
 ## Blockers
 
@@ -52,7 +29,7 @@ mcp__cas__task action=update id=<task-id> status=blocked
 
 ## Communication
 
-**Never use SendMessage.** It is blocked in factory mode. Always use CAS coordination:
+Use CAS coordination for messages:
 ```
 mcp__cas__coordination action=message target=supervisor message="<response>" summary="<brief summary>"
 ```
@@ -68,42 +45,47 @@ Before running `mcp__cas__task action=close`, verify your own work. The task-ver
 ### 1. No shortcut markers
 ```bash
 # Must return zero results in your changed files
-rg 'TODO|FIXME|XXX|HACK|unimplemented!|todo!' <changed_files>
+rg 'TODO|FIXME|XXX|HACK' <changed_files>
 rg 'for now|temporarily|placeholder|stub|workaround' <changed_files>
 ```
 
+Also check for language-specific incomplete markers:
+- **TypeScript**: `throw new Error('Not implemented')`
+- **Rust**: `unimplemented!()`, `todo!()`
+- **Python**: `raise NotImplementedError`
+
 ### 2. All new code is wired up
-For every new function, struct, module, route, or handler you created:
+For every new function, class, module, route, or handler you created:
 ```bash
 # Verify it's actually called/imported somewhere outside its definition
-rg 'your_new_function' src/
-ast-grep --lang rust -p 'your_new_function($$$)' src/
+rg 'your_new_symbol' src/
 ```
-If zero external references → you built it but didn't wire it in. Fix before closing.
+If zero external references -> you built it but didn't wire it in. Fix before closing.
 
-Registration checklist:
-- New CLI command → added to `Commands` enum + match arm?
-- New MCP tool → registered in tool list?
-- New route → added to router?
-- New migration → listed in migration runner?
-- New config field → has a default, is read somewhere?
+Registration checklist (varies by framework):
+- New CLI command -> added to command registry?
+- New API route/endpoint -> added to router or module?
+- New migration -> listed in migration runner?
+- New service/provider -> registered in DI container?
+- New config field -> has a default, is read somewhere?
 
 ### 3. Changed signatures don't break callers
 ```bash
-# If you changed a function signature, verify all call sites compile
-ast-grep --lang rust -p 'changed_function($$$)' src/
+# If you changed a function signature, verify all call sites
+rg 'changed_function' src/
 ```
 
 ### 4. Tests pass
 ```bash
-cargo test  # or equivalent for the project
+# Run the project's test suite
+# Examples: cargo test, pnpm test, pytest, npm test
 ```
 
 ### 5. No dead code left behind
-```bash
-# Check for allow(dead_code) on your new code
-rg '#\[allow\(dead_code\)\]' <changed_files>
-```
+Check for language-specific dead code markers on your new code:
+- **TypeScript**: `// @ts-ignore` without justification
+- **Rust**: `#[allow(dead_code)]`
+- **Python**: `# type: ignore` without justification
 
 Only close after all checks pass. The verifier will catch what you miss — but rejections cost time.
 

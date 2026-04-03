@@ -8,6 +8,18 @@ use cas::types::Agent;
 
 /// Helper to create an initialized CAS environment.
 pub(crate) fn setup_cas() -> (TempDir, CasCore) {
+    // Clear factory env vars that leak from parent process (e.g., running
+    // inside a factory supervisor session). Without this, is_supervisor_from_env()
+    // returns true and the assignee_inactive bypass skips verification checks.
+    // SAFETY: Tests are run with --test-threads=1 or accept the race; no other
+    // thread reads these vars concurrently during setup_cas().
+    unsafe {
+        std::env::remove_var("CAS_AGENT_ROLE");
+        std::env::remove_var("CAS_FACTORY_MODE");
+        std::env::remove_var("CAS_FACTORY_SUPERVISOR_CLI");
+        std::env::remove_var("CAS_FACTORY_WORKER_CLI");
+    }
+
     let temp = TempDir::new().expect("temp dir should be created");
     let cas_dir = temp.path().join(".cas");
     std::fs::create_dir_all(&cas_dir).expect(".cas dir should be created");
