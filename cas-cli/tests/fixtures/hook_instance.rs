@@ -261,6 +261,17 @@ enabled = false
         tool_name: &str,
         tool_input: serde_json::Value,
     ) -> (bool, String) {
+        self.run_pre_tool_use_with_env(tool_name, tool_input, &[])
+    }
+
+    /// Run PreToolUse hook with extra environment variables (e.g., simulating
+    /// a factory-worker session via CAS_AGENT_ROLE=worker + CAS_FACTORY_MODE=1).
+    pub fn run_pre_tool_use_with_env(
+        &self,
+        tool_name: &str,
+        tool_input: serde_json::Value,
+        extra_env: &[(&str, &str)],
+    ) -> (bool, String) {
         use std::io::Write;
         use std::process::{Command, Stdio};
 
@@ -272,12 +283,16 @@ enabled = false
             "tool_input": tool_input
         });
 
-        let mut child = Command::new(cas_bin())
-            .args(["hook", "PreToolUse"])
+        let mut cmd = Command::new(cas_bin());
+        cmd.args(["hook", "PreToolUse"])
             .current_dir(self.dir())
             .env("CAS_DIR", &self.cas.cas_dir)
             .env_remove("CAS_ROOT")
-            .env("CAS_SKIP_FACTORY_TOOLING", "1")
+            .env("CAS_SKIP_FACTORY_TOOLING", "1");
+        for (k, v) in extra_env {
+            cmd.env(k, v);
+        }
+        let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -310,6 +325,18 @@ enabled = false
     pub fn run_pre_tool_use_task_verifier(&self) -> (bool, String) {
         self.run_pre_tool_use(
             "Task",
+            serde_json::json!({
+                "subagent_type": "task-verifier",
+                "prompt": "Verify task completion"
+            }),
+        )
+    }
+
+    /// Run PreToolUse for Agent(task-verifier) - newer Claude Code renamed
+    /// the "Task" tool to "Agent". Used to verify the jail accepts both names.
+    pub fn run_pre_tool_use_agent_verifier(&self) -> (bool, String) {
+        self.run_pre_tool_use(
+            "Agent",
             serde_json::json!({
                 "subagent_type": "task-verifier",
                 "prompt": "Verify task completion"

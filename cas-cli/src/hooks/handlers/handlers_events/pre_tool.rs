@@ -161,15 +161,17 @@ pub fn handle_pre_tool_use(
 
                 // Skip jail check if marker cleared it (verifier is running)
                 if !jail_cleared_via_marker && !pending_tasks.is_empty() {
-                    // Check if this is Task tool spawning task-verifier
-                    let is_verifier_agent = if tool_name == "Task" {
+                    // Check if this is Task/Agent tool spawning task-verifier
+                    // (Newer Claude Code renamed "Task" to "Agent" — accept both.)
+                    let is_verifier_agent = if tool_name == "Task" || tool_name == "Agent" {
                         let subagent_type = input
                             .tool_input
                             .as_ref()
                             .and_then(|ti| ti.get("subagent_type").and_then(|v| v.as_str()));
                         debug!(
                             subagent_type = ?subagent_type,
-                            "[VERIFICATION JAIL] Task tool detected"
+                            tool = tool_name,
+                            "[VERIFICATION JAIL] Task/Agent tool detected"
                         );
                         subagent_type == Some("task-verifier")
                     } else {
@@ -268,7 +270,7 @@ pub fn handle_pre_tool_use(
     // in supervisor context) can record verification via cas_verification_add.
     // We also clear pending_verification so the task isn't stuck.
     // ========================================================================
-    if is_supervisor && tool_name == "Task" {
+    if is_supervisor && (tool_name == "Task" || tool_name == "Agent") {
         let is_task_verifier = input
             .tool_input
             .as_ref()

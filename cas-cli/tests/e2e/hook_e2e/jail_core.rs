@@ -117,6 +117,45 @@ fn test_verification_jail_release() {
     );
 }
 
+/// Regression for cas-c496: the `Task` tool was renamed to `Agent` in newer
+/// Claude Code. The jail check in pre_tool.rs must accept both names, or
+/// workers cannot spawn task-verifier (deadlock: the only way out of the
+/// jail is a tool that the jail is blocking).
+#[test]
+#[ignore]
+fn test_agent_tool_spawns_task_verifier_and_unjails() {
+    let env = HookTestEnv::new();
+
+    let task_id = env.create_task("Task for Agent-tool unjail test");
+    env.set_task_assignee(&task_id, HOOK_TEST_SESSION_ID);
+    env.set_pending_verification(&task_id, true);
+    assert!(
+        env.get_pending_verification(&task_id),
+        "precondition: task should be jailed"
+    );
+
+    // A plain Read is blocked (jail is live).
+    let (_, stdout_read) = env.run_pre_tool_use_read("test.txt");
+    assert!(
+        stdout_read.contains("deny"),
+        "jail should block unrelated tools while active: {}",
+        stdout_read
+    );
+
+    // Agent(task-verifier) must be ALLOWED (same allowance as Task(task-verifier))
+    // and must clear pending_verification as a side effect.
+    let (_, stdout_agent) = env.run_pre_tool_use_agent_verifier();
+    assert!(
+        !stdout_agent.contains("deny"),
+        "Agent tool spawning task-verifier must bypass jail (got: {})",
+        stdout_agent
+    );
+    assert!(
+        !env.get_pending_verification(&task_id),
+        "spawning Agent(task-verifier) should clear pending_verification"
+    );
+}
+
 // =============================================================================
 // Worktree Merge Jail Tests
 // =============================================================================

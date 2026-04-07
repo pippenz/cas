@@ -97,6 +97,13 @@ impl PtyConfig {
         let mut env = vec![
             ("CAS_AGENT_NAME".to_string(), name.to_string()),
             ("CAS_AGENT_ROLE".to_string(), role.to_string()),
+            // Mark this process as running inside a factory session.
+            // Read by pre_tool jail, close_ops, mcp server, and task update
+            // to branch factory-vs-standalone behavior. Without this, the
+            // is_factory_worker check in pre_tool.rs fails (it requires both
+            // CAS_AGENT_ROLE=worker AND CAS_FACTORY_MODE), so workers get
+            // jailed on every verification-pending task.
+            ("CAS_FACTORY_MODE".to_string(), "1".to_string()),
             // Provide session ID so CAS MCP server can self-register without hooks
             ("CAS_SESSION_ID".to_string(), session_id.clone()),
             // Set clone path so subagents know the worktree directory
@@ -217,6 +224,11 @@ impl PtyConfig {
         let mut env = vec![
             ("CAS_AGENT_NAME".to_string(), name.to_string()),
             ("CAS_AGENT_ROLE".to_string(), role.to_string()),
+            // Mark this process as running inside a factory session.
+            // See equivalent comment in `claude()` above — without this the
+            // pre_tool verification-jail exemption for factory workers does
+            // not fire and workers get jailed on every pending task.
+            ("CAS_FACTORY_MODE".to_string(), "1".to_string()),
             // Provide session ID so CAS MCP server can self-register without hooks
             ("CAS_SESSION_ID".to_string(), session_id),
             (

@@ -441,6 +441,54 @@ fn test_different_jail_messages() {
     );
 }
 
+/// Regression for cas-c496: factory workers must be exempt from the
+/// verification jail entirely (they may have multiple tasks assigned and
+/// cannot deadlock on one awaiting verification). Exemption requires BOTH
+/// `CAS_AGENT_ROLE=worker` AND `CAS_FACTORY_MODE=1` to be set on the worker
+/// process — previously only CAS_AGENT_ROLE was being propagated by the
+/// PTY builder, so the AND was always false and workers got jailed.
+#[test]
+#[ignore]
+fn test_factory_worker_exempt_from_verification_jail() {
+    let env = HookTestEnv::new();
+
+    let task_id = env.create_task("Task owned by factory worker");
+    env.set_task_assignee(&task_id, HOOK_TEST_SESSION_ID);
+    env.set_pending_verification(&task_id, true);
+
+    // Standalone (no factory env): jail active, Read is blocked.
+    let (_, stdout_jailed) = env.run_pre_tool_use_read("test.txt");
+    assert!(
+        stdout_jailed.contains("deny"),
+        "precondition: without factory env vars the worker should be jailed: {}",
+        stdout_jailed
+    );
+
+    // Factory worker: CAS_AGENT_ROLE=worker AND CAS_FACTORY_MODE=1 → exempt.
+    let (_, stdout_worker) = env.run_pre_tool_use_with_env(
+        "Read",
+        serde_json::json!({ "file_path": "test.txt" }),
+        &[("CAS_AGENT_ROLE", "worker"), ("CAS_FACTORY_MODE", "1")],
+    );
+    assert!(
+        !stdout_worker.contains("deny"),
+        "factory worker with CAS_AGENT_ROLE=worker + CAS_FACTORY_MODE=1 must be exempt from jail: {}",
+        stdout_worker
+    );
+
+    // Only one of the two is not enough — both must be present.
+    let (_, stdout_role_only) = env.run_pre_tool_use_with_env(
+        "Read",
+        serde_json::json!({ "file_path": "test.txt" }),
+        &[("CAS_AGENT_ROLE", "worker")],
+    );
+    assert!(
+        stdout_role_only.contains("deny"),
+        "CAS_AGENT_ROLE=worker alone should NOT exempt (CAS_FACTORY_MODE is also required): {}",
+        stdout_role_only
+    );
+}
+
 // =============================================================================
 // Exit Blocker Tests (CLI-based, no API required)
 // =============================================================================
