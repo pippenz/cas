@@ -643,14 +643,22 @@ impl CasCore {
             return Ok(());
         }
 
-        // Factory workers are exempt — they may have multiple tasks and must continue
-        // working while one awaits verification. close_ops.rs still blocks re-closing
-        // unverified tasks, so data integrity is maintained.
+        // Factory workers are exempt for most mutations — they may have
+        // multiple tasks and must continue working while one awaits
+        // verification. However, `task.close` itself is NOT exempt: that's
+        // the one call where the jail must still fire, because close is
+        // what triggers verifier dispatch. Exempting close here was the
+        // bba6fbf regression that broke dispatch for factory workers
+        // entirely — close_ops.rs emits instructional text but has no
+        // forcing function, so the verifier subagent never gets spawned.
+        // Narrowing the exemption restores the lever for the one action
+        // that needs it while preserving the mutation-cascade fix that
+        // bba6fbf correctly addressed.
         let is_factory_worker = std::env::var("CAS_AGENT_ROLE")
             .map(|r| r.eq_ignore_ascii_case("worker"))
             .unwrap_or(false)
             && std::env::var("CAS_FACTORY_MODE").is_ok();
-        if is_factory_worker {
+        if is_factory_worker && !(tool == "task" && action == "close") {
             return Ok(());
         }
 
