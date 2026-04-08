@@ -59,10 +59,28 @@ async fn test_task_close_blocked_without_verification() {
         text.contains("VERIFICATION REQUIRED"),
         "Close should be blocked without verification: {text}"
     );
+    assert!(
+        text.contains("Task(subagent_type=\"task-verifier\""),
+        "Close warning must include explicit Task() spawn syntax: {text}"
+    );
 
-    // Verify no verification record exists
-    let latest = verification_store.get_latest_for_task(id).unwrap();
-    assert!(latest.is_none(), "No verification should exist yet");
+    // A durable dispatch-request verification row must be persisted so the
+    // close attempt is observable (no more fire-and-forget). The verdict
+    // row will be written later by the task-verifier subagent.
+    let latest = verification_store
+        .get_latest_for_task(id)
+        .unwrap()
+        .expect("dispatch-request verification row should exist after close");
+    assert_eq!(
+        latest.status,
+        cas::types::VerificationStatus::Error,
+        "Dispatch-request row should have Error status until the subagent writes a verdict"
+    );
+    assert!(
+        latest.summary.contains("Dispatch requested"),
+        "Dispatch-request row summary should identify itself: {}",
+        latest.summary
+    );
 }
 
 #[tokio::test]
