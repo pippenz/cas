@@ -43,3 +43,7 @@ Adding CLI commands, MCP tools, migrations, testing setup, skill/rule sync:
 
 Codebase navigation map (breadcrumb index of all modules):
 -> See [.claude/CODEMAP.md](.claude/CODEMAP.md)
+
+## CAS system bugs are in-repo fixes
+
+This repo **is** the CAS source. When a bug is reported in the verifier, hooks, factory orchestration, MCP dispatch, the task-verifier agent, worker prompts, or built-in skills — regardless of which downstream project (gabber-studio, OpenClaw, etc.) surfaced it — the fix lands here as a Rust or markdown change via a task assigned to a worker. Do not file the bug with team-lead, do not "report upstream", do not treat cas-src IS CAS as an external dependency. Other projects consume CAS; they do not modify it. If you catch yourself wanting to escalate a CAS bug, stop and create the fix task in this repo instead.
