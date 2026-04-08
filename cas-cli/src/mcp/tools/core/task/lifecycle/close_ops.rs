@@ -111,6 +111,12 @@ impl CasCore {
                     verification_store.get_latest_for_task(&req.id)
                 };
 
+                // Whether a prior verification row (of any status) already
+                // exists. Used below to decide whether to persist a fresh
+                // dispatch-request marker so the close attempt is durably
+                // observable instead of fire-and-forget.
+                let had_prior_verification = matches!(&latest, Ok(Some(_)));
+
                 match latest {
                     Ok(Some(v)) if v.status == VerificationStatus::Approved => {
                         // Verification approved, proceed with close
@@ -238,9 +244,40 @@ impl CasCore {
                             let _ = crate::mcp::socket::send_event(&self.cas_root, &event);
                         }
 
+                        // Persist a durable dispatch-request row so the close
+                        // attempt is observable (in tests, in the UI, and in
+                        // audit trails) instead of fire-and-forget text. The
+                        // task-verifier subagent will later write its verdict
+                        // as a newer row; get_latest_for_task returns the
+                        // newest, so behavior on retry is unchanged. Only
+                        // create the row on the first attempt — don't
+                        // duplicate on repeated close calls.
+                        if !had_prior_verification {
+                            if let Ok(ver_id) = verification_store.generate_id() {
+                                let mut dispatch_row =
+                                    Verification::new(ver_id, req.id.clone());
+                                dispatch_row.verification_type = verification_type;
+                                dispatch_row.status = VerificationStatus::Error;
+                                if let Ok(agent_id) = self.get_agent_id() {
+                                    dispatch_row.agent_id = Some(agent_id);
+                                }
+                                dispatch_row.summary = format!(
+                                    "Dispatch requested — task-verifier subagent must be spawned via \
+                                     Task(subagent_type=\"task-verifier\", prompt=\"Verify task {}\"). \
+                                     This row will be superseded by the subagent's verdict.",
+                                    req.id
+                                );
+                                let _ = verification_store.add(&dispatch_row);
+                            }
+                        }
+
                         let verification_gate = if is_factory_worker {
-                            "Factory worker flow: verification is pending. Continue with other assigned tasks while waiting."
-                                .to_string()
+                            format!(
+                                "🔒 Factory worker verification gate: this close will only succeed after a task-verifier records a verdict.\n\n\
+                                 Spawn the verifier now (other tools remain available while it runs):\n\n\
+                                 Task(subagent_type=\"{}\", prompt=\"Verify task {}\")",
+                                verifier_agent, req.id
+                            )
                         } else if supervisor_is_assignee {
                             format!(
                                 "You implemented this task yourself. Spawn a task-verifier to review your work:\n\n\
