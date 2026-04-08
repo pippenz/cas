@@ -402,3 +402,92 @@ async fn test_task_close_blocked_with_rejected_verification() {
     );
     assert!(text.contains("1 issue"), "Should show issue count: {text}");
 }
+
+/// Regression test for cas-7de3: `task.close` must either dispatch a verifier
+/// (creating a verification row) or close the task with an explicit skip
+/// reason recorded in notes/metadata. The pre-fix behavior returned a
+/// `⚠️ VERIFICATION REQUIRED` warning string while leaving the task in
+/// `InProgress` with no verification row — a fire-and-forget that silently
+/// drops the close attempt. This test fails on main and passes once the
+/// dispatch/skip path is wired up.
+#[tokio::test]
+async fn test_task_close_runs_verifier_or_skips_cleanly() {
+    let (temp, service) = setup_cas();
+    let cas_dir = temp.path().join(".cas");
+    let task_store = open_task_store(&cas_dir).unwrap();
+    let verification_store = open_verification_store(&cas_dir).unwrap();
+
+    // Create + start a task.
+    let req = TaskCreateRequest {
+        title: "Dispatch-on-close regression task".to_string(),
+        description: None,
+        priority: 2,
+        task_type: "task".to_string(),
+        labels: None,
+        notes: None,
+        blocked_by: None,
+        design: None,
+        acceptance_criteria: None,
+        external_ref: None,
+        assignee: None,
+        demo_statement: None,
+        epic: None,
+    };
+    let result = service
+        .cas_task_create(Parameters(req))
+        .await
+        .expect("task_create should succeed");
+    let id = extract_task_id(&extract_text(result))
+        .expect("should have task ID")
+        .to_string();
+
+    let _ = service
+        .cas_task_start(Parameters(IdRequest { id: id.clone() }))
+        .await
+        .expect("task_start should succeed");
+
+    // Close with a clean, acceptance-criteria-satisfying reason. This is the
+    // exact shape of close call that triggered the cas-7de3 regression: the
+    // handler is supposed to dispatch a verifier (or record a skip), not just
+    // print a warning and leave the task open.
+    let close_req = TaskCloseRequest {
+        id: id.clone(),
+        reason: Some("Completed all acceptance criteria. Deployed to prod.".to_string()),
+    };
+    let result = service
+        .cas_task_close(Parameters(close_req))
+        .await
+        .expect("task_close should return a result");
+    let response_text = extract_text(result);
+
+    // Re-read DB state after the call.
+    let task_after = task_store.get(&id).expect("task should still exist");
+    let verification_row = verification_store
+        .get_latest_for_task(&id)
+        .expect("verification lookup should not error");
+
+    let dispatched_verifier = verification_row.is_some();
+    let closed_with_skip_reason = task_after.status == cas::types::TaskStatus::Closed
+        && (task_after.notes.to_lowercase().contains("verification skipped")
+            || task_after
+                .close_reason
+                .as_deref()
+                .map(|r| r.to_lowercase().contains("verification skipped"))
+                .unwrap_or(false));
+
+    assert!(
+        dispatched_verifier || closed_with_skip_reason,
+        "task.close must either dispatch a verifier (create a verification row) \
+         or close the task with an explicit skip reason. Got:\n\
+         \x20 - response text: {response_text}\n\
+         \x20 - task status after close: {:?}\n\
+         \x20 - verification row present: {dispatched_verifier}\n\
+         \x20 - task notes: {:?}\n\
+         \x20 - task close_reason: {:?}\n\
+         This is the cas-7de3 regression: the handler returned a fire-and-forget \
+         warning without actually running verification or recording a skip.",
+        task_after.status,
+        task_after.notes,
+        task_after.close_reason,
+    );
+}
