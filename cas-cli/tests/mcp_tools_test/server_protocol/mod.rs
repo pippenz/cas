@@ -77,7 +77,9 @@ async fn test_store_operations_work() {
         valid_from: None,
         valid_until: None,
         team_id: None,
+        bypass_overlap: None,
     };
+
     let result = service
         .cas_remember(Parameters(req))
         .await
@@ -102,7 +104,9 @@ async fn test_all_store_types_accessible() {
         valid_from: None,
         valid_until: None,
         team_id: None,
+        bypass_overlap: None,
     };
+
     service
         .cas_remember(Parameters(req))
         .await

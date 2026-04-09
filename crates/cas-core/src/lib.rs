@@ -45,6 +45,7 @@ pub mod dedup;
 pub mod error;
 pub mod extraction;
 pub mod hooks;
+pub mod memory;
 pub mod migration;
 pub mod search;
 pub mod sync;

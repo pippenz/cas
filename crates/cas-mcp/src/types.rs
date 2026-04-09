@@ -73,6 +73,13 @@ pub struct MemoryRequest {
     #[serde(default)]
     pub team_id: Option<String>,
 
+    /// Skip pre-insert overlap detection (bulk imports / tests only).
+    #[schemars(
+        description = "Skip overlap detection on remember (bulk imports / tests only — defaults to false)"
+    )]
+    #[serde(default)]
+    pub bypass_overlap: Option<bool>,
+
     /// Sort field (for list)
     #[schemars(description = "Sort by: 'created', 'updated', 'importance', 'title'")]
     #[serde(default)]

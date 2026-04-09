@@ -16,7 +16,9 @@ async fn test_remember_basic() {
         valid_from: None,
         valid_until: None,
         team_id: None,
+        bypass_overlap: None,
     };
+
 
     let result = service
         .cas_remember(Parameters(req))
@@ -42,7 +44,9 @@ async fn test_remember_with_defaults() {
         valid_from: None,
         valid_until: None,
         team_id: None,
+        bypass_overlap: None,
     };
+
 
     let result = service
         .cas_remember(Parameters(req))
@@ -68,7 +72,9 @@ async fn test_get_entry() {
         valid_from: None,
         valid_until: None,
         team_id: None,
+        bypass_overlap: None,
     };
+
 
     let result = service
         .cas_remember(Parameters(req))
@@ -117,7 +123,9 @@ async fn test_update_entry() {
         valid_from: None,
         valid_until: None,
         team_id: None,
+        bypass_overlap: None,
     };
+
 
     let result = service
         .cas_remember(Parameters(req))
@@ -170,7 +178,9 @@ async fn test_archive_and_unarchive() {
         valid_from: None,
         valid_until: None,
         team_id: None,
+        bypass_overlap: None,
     };
+
 
     let result = service
         .cas_remember(Parameters(req))
@@ -216,7 +226,9 @@ async fn test_helpful_and_harmful() {
         valid_from: None,
         valid_until: None,
         team_id: None,
+        bypass_overlap: None,
     };
+
 
     let result = service
         .cas_remember(Parameters(req))
@@ -263,6 +275,7 @@ async fn test_list_entries() {
             valid_from: None,
             valid_until: None,
             team_id: None,
+            bypass_overlap: None,
         };
         service
             .cas_remember(Parameters(req))
@@ -304,6 +317,7 @@ async fn test_recent_entries() {
             valid_from: None,
             valid_until: None,
             team_id: None,
+            bypass_overlap: None,
         };
         service
             .cas_remember(Parameters(req))
@@ -337,7 +351,9 @@ async fn test_delete_entry() {
         valid_from: None,
         valid_until: None,
         team_id: None,
+        bypass_overlap: None,
     };
+
 
     let result = service
         .cas_remember(Parameters(req))
@@ -378,7 +394,9 @@ async fn test_set_tier() {
         valid_from: None,
         valid_until: None,
         team_id: None,
+        bypass_overlap: None,
     };
+
 
     let result = service
         .cas_remember(Parameters(req))
@@ -400,4 +418,145 @@ async fn test_set_tier() {
 
     let text = extract_text(result);
     assert!(text.contains("cold") || text.contains("tier"));
+}
+
+// ============================================================================
+// Pre-insert overlap detection (cas-4721)
+// ============================================================================
+
+fn frontmatter_memory(title: &str, module: &str, body: &str) -> String {
+    format!(
+        "---\nname: {title}\ndescription: {title}\ntrack: bug\nmodule: {module}\nproblem_type: runtime_error\nseverity: high\nroot_cause: race_condition\ndate: 2026-04-09\n---\n\n## Problem\n{body}\n"
+    )
+}
+
+#[tokio::test]
+async fn test_overlap_blocks_duplicate_insert() {
+    let (_temp, service) = setup_cas();
+
+    let body = "sqlite wal hangs on ntfs3 in cas-mcp/src/server.rs due to posix_lock incompatibility";
+    let content = frontmatter_memory("sqlite wal ntfs3 timeout", "cas-mcp", body);
+
+    let first = RememberRequest {
+        scope: "project".to_string(),
+        content: content.clone(),
+        entry_type: "learning".to_string(),
+        tags: Some("sqlite-wal,ntfs3-fs,mcp-timeout".to_string()),
+        title: Some("sqlite wal ntfs3 timeout".to_string()),
+        importance: 0.7,
+        valid_from: None,
+        valid_until: None,
+        team_id: None,
+        bypass_overlap: Some(true),
+    };
+    service
+        .cas_remember(Parameters(first))
+        .await
+        .expect("first insert should succeed (bypass_overlap=true)");
+
+    // Second insert — identical content, no bypass. Should be blocked.
+    let second = RememberRequest {
+        scope: "project".to_string(),
+        content,
+        entry_type: "learning".to_string(),
+        tags: Some("sqlite-wal,ntfs3-fs,mcp-timeout".to_string()),
+        title: Some("sqlite wal ntfs3 timeout".to_string()),
+        importance: 0.7,
+        valid_from: None,
+        valid_until: None,
+        team_id: None,
+        bypass_overlap: None,
+    };
+    let err = service
+        .cas_remember(Parameters(second))
+        .await
+        .expect_err("duplicate should be blocked");
+    let msg = err.message.to_string();
+    assert!(
+        msg.contains("Overlap detected"),
+        "expected overlap error, got: {msg}"
+    );
+    assert!(
+        msg.contains("Existing slug:"),
+        "expected slug in error, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn test_bypass_overlap_allows_duplicate() {
+    let (_temp, service) = setup_cas();
+
+    let content = frontmatter_memory(
+        "duplicate memory",
+        "cas-core",
+        "identical body referencing cas-core/src/dedup.rs and search_candidates_by_module",
+    );
+
+    for _ in 0..2 {
+        let req = RememberRequest {
+            scope: "project".to_string(),
+            content: content.clone(),
+            entry_type: "learning".to_string(),
+            tags: Some("sqlite-wal,ntfs3-fs".to_string()),
+            title: Some("duplicate memory".to_string()),
+            importance: 0.5,
+            valid_from: None,
+            valid_until: None,
+            team_id: None,
+            bypass_overlap: Some(true),
+        };
+        service
+            .cas_remember(Parameters(req))
+            .await
+            .expect("bypass=true should always succeed");
+    }
+}
+
+#[tokio::test]
+async fn test_unrelated_memory_inserts_normally() {
+    let (_temp, service) = setup_cas();
+
+    let first = RememberRequest {
+        scope: "project".to_string(),
+        content: frontmatter_memory(
+            "first topic",
+            "cas-mcp",
+            "unrelated problem about tantivy index shards",
+        ),
+        entry_type: "learning".to_string(),
+        tags: Some("tantivy-index".to_string()),
+        title: Some("first topic".to_string()),
+        importance: 0.5,
+        valid_from: None,
+        valid_until: None,
+        team_id: None,
+        bypass_overlap: Some(true),
+    };
+    service
+        .cas_remember(Parameters(first))
+        .await
+        .expect("first insert should succeed");
+
+    let second = RememberRequest {
+        scope: "project".to_string(),
+        content: frontmatter_memory(
+            "completely different subject",
+            "cas-core",
+            "entirely different problem about hook context building",
+        ),
+        entry_type: "learning".to_string(),
+        tags: Some("hook-context".to_string()),
+        title: Some("completely different subject".to_string()),
+        importance: 0.5,
+        valid_from: None,
+        valid_until: None,
+        team_id: None,
+        bypass_overlap: None,
+    };
+    let result = service
+        .cas_remember(Parameters(second))
+        .await
+        .expect("unrelated insert should succeed");
+    let text = extract_text(result);
+    assert!(text.contains("Created entry"), "expected success, got: {text}");
 }

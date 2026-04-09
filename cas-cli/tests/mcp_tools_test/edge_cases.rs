@@ -16,7 +16,9 @@ async fn test_empty_content_rejected() {
         valid_from: None,
         valid_until: None,
         team_id: None,
+        bypass_overlap: None,
     };
+
 
     // Should fail or handle gracefully
     let result = service.cas_remember(Parameters(req)).await;
@@ -43,7 +45,9 @@ async fn test_very_long_content() {
         valid_from: None,
         valid_until: None,
         team_id: None,
+        bypass_overlap: None,
     };
+
 
     let result = service
         .cas_remember(Parameters(req))
@@ -69,7 +73,9 @@ async fn test_special_characters_in_content() {
         valid_from: None,
         valid_until: None,
         team_id: None,
+        bypass_overlap: None,
     };
+
 
     let result = service
         .cas_remember(Parameters(req))
@@ -94,7 +100,9 @@ async fn test_invalid_entry_type() {
         valid_from: None,
         valid_until: None,
         team_id: None,
+        bypass_overlap: None,
     };
+
 
     // Should use default type
     let result = service
@@ -121,7 +129,9 @@ async fn test_importance_clamping() {
         valid_from: None,
         valid_until: None,
         team_id: None,
+        bypass_overlap: None,
     };
+
 
     let result = service
         .cas_remember(Parameters(req))

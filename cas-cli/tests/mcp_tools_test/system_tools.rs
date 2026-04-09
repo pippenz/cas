@@ -17,7 +17,9 @@ async fn test_context() {
         valid_from: None,
         valid_until: None,
         team_id: None,
+        bypass_overlap: None,
     };
+
     service
         .cas_remember(Parameters(req))
         .await

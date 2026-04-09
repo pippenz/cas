@@ -1,6 +1,218 @@
 use crate::mcp::tools::core::imports::*;
 
+use cas_core::memory::{
+    CandidateFacets, NewMemoryFacets, OverlapDecision, OverlapMatch, OverlapRecommendation,
+    check_overlap, extract_facets_from_body,
+};
+use cas_store::Store;
+use cas_types::Entry;
+
+/// Outcome of [`CasCore::run_overlap_check`] translated into the three
+/// actions cas_remember needs to take. `None` means "no candidates /
+/// nothing to do", equivalent to `LowOverlap`.
+enum OverlapOutcome {
+    Block {
+        best: OverlapMatch,
+        all_high_scoring: Vec<OverlapMatch>,
+        recommendation: OverlapRecommendation,
+    },
+    CrossRef {
+        links: Vec<OverlapMatch>,
+        refresh: bool,
+    },
+}
+
+/// Minimal frontmatter view used by the overlap check — mirrors the 4
+/// fields that influence scoring (module, track, root_cause) plus the
+/// legacy `name`/`description` if the caller embedded them.
+#[derive(Default, serde::Deserialize)]
+struct OverlapFrontmatter {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    module: Option<String>,
+    #[serde(default)]
+    track: Option<String>,
+    #[serde(default)]
+    root_cause: Option<String>,
+}
+
+fn parse_overlap_frontmatter(body: &str) -> OverlapFrontmatter {
+    let trimmed = body.trim_start();
+    if !trimmed.starts_with("---") {
+        return OverlapFrontmatter::default();
+    }
+    let parts: Vec<&str> = trimmed.splitn(3, "---").collect();
+    if parts.len() < 3 {
+        return OverlapFrontmatter::default();
+    }
+    serde_yaml::from_str::<OverlapFrontmatter>(parts[1].trim()).unwrap_or_default()
+}
+
+/// Build [`NewMemoryFacets`] for the memory about to be stored. The title
+/// override wins over frontmatter `name`; tags come from the request
+/// (request tags are authoritative). Cross-reference tags from a previous
+/// remember loop are filtered out so they don't inflate overlap scores.
+fn build_new_facets(
+    body: &str,
+    req_title: Option<&str>,
+    req_tags: &[String],
+) -> (NewMemoryFacets, OverlapFrontmatter) {
+    let fm = parse_overlap_frontmatter(body);
+    let (body_tokens, file_refs) = extract_facets_from_body(body);
+    let title = req_title
+        .map(|s| s.to_string())
+        .or_else(|| fm.name.clone())
+        .unwrap_or_default()
+        .to_lowercase();
+    let description = fm.description.clone().unwrap_or_default().to_lowercase();
+    let tags: std::collections::HashSet<String> = req_tags
+        .iter()
+        .filter(|t| !t.starts_with("related:"))
+        .map(|t| t.to_lowercase())
+        .collect();
+    (
+        NewMemoryFacets {
+            title,
+            description,
+            module: fm.module.clone(),
+            track: fm.track.clone(),
+            root_cause: fm.root_cause.clone(),
+            tags,
+            file_refs,
+            body_tokens,
+        },
+        fm,
+    )
+}
+
+/// Build [`CandidateFacets`] for an existing entry. Structured fields come
+/// from frontmatter if the entry's body carries it; tags come from
+/// `entry.tags` (already split). `related_count` counts existing
+/// `related:*` tags for the cap check.
+/// Build a short BM25 query string from the new memory's facets. Prefers
+/// reference symbols (most discriminating), then title tokens. Keeps the
+/// query small so search stays fast — overlap budget is <500ms.
+fn build_overlap_query(new: &NewMemoryFacets) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for r in new.file_refs.iter().take(5) {
+        parts.push(r);
+    }
+    for t in new.title.split_whitespace().take(5) {
+        if t.len() >= 3 {
+            parts.push(t);
+        }
+    }
+    parts.join(" ")
+}
+
+fn build_candidate_facets(entry: &Entry) -> CandidateFacets {
+    let fm = parse_overlap_frontmatter(&entry.content);
+    let (body_tokens, file_refs) = extract_facets_from_body(&entry.content);
+    let tags: std::collections::HashSet<String> = entry
+        .tags
+        .iter()
+        .filter(|t| !t.starts_with("related:"))
+        .map(|t| t.to_lowercase())
+        .collect();
+    let related_count = entry
+        .tags
+        .iter()
+        .filter(|t| t.starts_with("related:"))
+        .count();
+    let title = entry
+        .title
+        .clone()
+        .or(fm.name)
+        .unwrap_or_default()
+        .to_lowercase();
+    CandidateFacets {
+        slug: entry.id.clone(),
+        title,
+        description: fm.description.unwrap_or_default().to_lowercase(),
+        module: fm.module,
+        track: fm.track,
+        root_cause: fm.root_cause,
+        tags,
+        file_refs,
+        body_tokens,
+        related_count,
+    }
+}
+
 impl CasCore {
+    /// Run the pre-insert overlap check for a new memory. Returns
+    /// `Some(OverlapOutcome)` when the decision requires action, or `None`
+    /// when no candidates were found / the decision was LowOverlap.
+    ///
+    /// Errors are reported through `Result` but callers treat them as
+    /// best-effort — overlap detection must never fail a legitimate write.
+    fn run_overlap_check(
+        &self,
+        store: &dyn Store,
+        content: &str,
+        title: Option<&str>,
+        tags: &[String],
+        _new_id: &str,
+    ) -> Result<Option<OverlapOutcome>, String> {
+        let (new_facets, _fm) = build_new_facets(content, title, tags);
+
+        // Fetch candidates via BM25 over the project's current memory set.
+        // The same-module preference from R13 is applied at scoring time
+        // via `build_candidate_facets` / `score_candidate` (mismatched
+        // modules incur a -1 penalty that pushes them down). The MCP
+        // server's cached search index only implements `search_for_dedup`
+        // today; when a cas-cli-backed SearchIndex with
+        // `search_candidates_by_module` is plumbed through, the hard
+        // module filter can live here instead.
+        use cas_core::SearchIndexTrait;
+        let search = self
+            .open_search_index()
+            .map_err(|e| format!("open_search_index: {e:?}"))?;
+        let query = build_overlap_query(&new_facets);
+        let all = store.list().map_err(|e| format!("store.list: {e}"))?;
+        let hits = search
+            .search_for_dedup(&query, 5, &all)
+            .map_err(|e| format!("search_for_dedup: {e}"))?;
+        let candidates: Vec<Entry> = hits
+            .into_iter()
+            .filter_map(|h| store.get(&h.id).ok())
+            .collect();
+
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+
+        let cand_facets: Vec<CandidateFacets> =
+            candidates.iter().map(build_candidate_facets).collect();
+
+        // Interactive mode flag: MCP callers are agents (non-interactive)
+        // unless a future request opts in. Headless default per R7.
+        let interactive = false;
+
+        match check_overlap(&new_facets, &cand_facets, interactive) {
+            OverlapDecision::LowOverlap => Ok(None),
+            OverlapDecision::ModerateOverlap {
+                links,
+                refresh_recommended,
+            } => Ok(Some(OverlapOutcome::CrossRef {
+                links,
+                refresh: refresh_recommended,
+            })),
+            OverlapDecision::HighOverlap {
+                best,
+                all_high_scoring,
+                recommendation,
+            } => Ok(Some(OverlapOutcome::Block {
+                best,
+                all_high_scoring,
+                recommendation,
+            })),
+        }
+    }
+
     /// Create a new CAS service with daemon support
     pub fn with_daemon(
         cas_root: std::path::PathBuf,
@@ -70,7 +282,7 @@ impl CasCore {
             data: None,
         })?;
 
-        let tags: Vec<String> = req
+        let mut tags: Vec<String> = req
             .tags
             .map(|t| {
                 t.split(',')
@@ -94,6 +306,98 @@ impl CasCore {
                 .map(|dt| dt.with_timezone(&chrono::Utc))
                 .ok()
         });
+
+        // ====================================================================
+        // Pre-insert overlap detection (cas-4721)
+        //
+        // Runs by default on every remember call. `bypass_overlap=true` skips
+        // it for bulk imports and tests. The check has three outcomes:
+        //   - HighOverlap  → block the insert, return an error pointing at
+        //                    the existing memory (caller updates in place).
+        //   - ModerateOverlap → proceed, but bidirectionally add `related:*`
+        //                    tags between the new memory and its matches.
+        //   - LowOverlap   → proceed normally.
+        // ====================================================================
+        let bypass = req.bypass_overlap.unwrap_or(false);
+        let mut refresh_recommended = false;
+        let mut linked_slugs: Vec<String> = Vec::new();
+        if !bypass {
+            match self.run_overlap_check(
+                store.as_ref(),
+                &req.content,
+                req.title.as_deref(),
+                &tags,
+                &id,
+            ) {
+                Ok(Some(OverlapOutcome::Block { best, all_high_scoring, recommendation })) => {
+                    let mut msg = format!(
+                        "Overlap detected: this memory duplicates an existing entry.\n\
+                         Existing slug: {}\n\
+                         Score: {}/5 (problem={}, root_cause={}, solution={}, files={}, tags={}, penalty={})\n\
+                         Recommendation: {}\n",
+                        best.slug,
+                        best.scores.net(),
+                        best.scores.problem_statement,
+                        best.scores.root_cause,
+                        best.scores.solution_approach,
+                        best.scores.referenced_files,
+                        best.scores.tags,
+                        best.scores.penalty,
+                        match recommendation {
+                            cas_core::memory::OverlapRecommendation::UpdateExisting =>
+                                "update the existing memory in place",
+                            cas_core::memory::OverlapRecommendation::SurfaceForUserDecision =>
+                                "confirm with user before creating",
+                        },
+                    );
+                    if all_high_scoring.len() > 1 {
+                        msg.push_str(&format!(
+                            "Other high-scoring candidates ({}): {}\n",
+                            all_high_scoring.len() - 1,
+                            all_high_scoring
+                                .iter()
+                                .skip(1)
+                                .map(|m| m.slug.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ));
+                        msg.push_str("Consider running a refresh on this module.\n");
+                    }
+                    msg.push_str(
+                        "To override (bulk imports / tests only), set bypass_overlap=true.",
+                    );
+                    return Err(McpError {
+                        code: ErrorCode::INVALID_REQUEST,
+                        message: Cow::from(msg),
+                        data: None,
+                    });
+                }
+                Ok(Some(OverlapOutcome::CrossRef { links, refresh })) => {
+                    refresh_recommended = refresh;
+                    for link in &links {
+                        if !link.cap_reached {
+                            tags.push(format!("related:{}", link.slug));
+                            linked_slugs.push(link.slug.clone());
+                            // Bidirectional: append related:<new-id> to the
+                            // existing entry's tags.
+                            if let Ok(mut other) = store.get(&link.slug) {
+                                let marker = format!("related:{id}");
+                                if !other.tags.contains(&marker) {
+                                    other.tags.push(marker);
+                                    let _ = store.update(&other);
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    // Overlap detection is best-effort — never fail the write
+                    // because the search index hiccuped. Log and proceed.
+                    tracing::warn!("overlap detection failed: {e}; proceeding with insert");
+                }
+            }
+        }
 
         let entry = Entry {
             id: id.clone(),
@@ -139,7 +443,20 @@ impl CasCore {
             let _ = search.index_entry(&entry);
         }
 
-        Ok(Self::success(format!("Created entry: {id}")))
+        let mut msg = format!("Created entry: {id}");
+        if !linked_slugs.is_empty() {
+            msg.push_str(&format!(
+                "\nCross-referenced with: {}",
+                linked_slugs.join(", ")
+            ));
+        }
+        if refresh_recommended {
+            msg.push_str(
+                "\nNote: one or more candidates are at the cross-reference cap — \
+                 consider running a memory refresh on this module.",
+            );
+        }
+        Ok(Self::success(msg))
     }
 
     /// Get an entry by ID

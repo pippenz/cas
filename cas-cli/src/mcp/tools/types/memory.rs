@@ -58,6 +58,15 @@ pub struct RememberRequest {
     #[schemars(description = "Team ID to share this entry with a team")]
     #[serde(default)]
     pub team_id: Option<String>,
+
+    /// Skip pre-insert overlap detection. Reserved for bulk imports and
+    /// tests that intentionally create overlapping memories. Normal callers
+    /// should leave this unset so duplicates are caught at creation time.
+    #[schemars(
+        description = "Skip overlap detection (bulk imports / tests only — defaults to false)"
+    )]
+    #[serde(default)]
+    pub bypass_overlap: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

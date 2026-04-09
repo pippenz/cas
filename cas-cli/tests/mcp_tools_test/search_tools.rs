@@ -39,7 +39,9 @@ async fn test_search_with_content() {
         valid_from: None,
         valid_until: None,
         team_id: None,
+        bypass_overlap: None,
     };
+
     service
         .cas_remember(Parameters(req))
         .await
@@ -79,7 +81,9 @@ async fn test_search_filter_by_type() {
         valid_from: None,
         valid_until: None,
         team_id: None,
+        bypass_overlap: None,
     };
+
     service
         .cas_remember(Parameters(req))
         .await
