@@ -257,6 +257,13 @@ impl CasService {
             "high" | "1" => cas_store::NotificationPriority::High,
             _ => cas_store::NotificationPriority::Normal,
         });
+        // cas-f9e8 telemetry: measure the wall-clock spent inside the DB
+        // insert and log it alongside the caller-visible message id, so a
+        // future investigator can bisect whether stalls live in send-side
+        // persistence, daemon wake, daemon poll, or downstream inject. Logged
+        // at debug so normal sessions stay quiet; enable via
+        // `RUST_LOG=cas::coordination=debug`.
+        let enqueue_started = std::time::Instant::now();
         let message_id = queue
             .enqueue_full(
                 &display_name,
@@ -272,13 +279,47 @@ impl CasService {
                     format!("Failed to queue message: {error}"),
                 )
             })?;
+        let persist_latency_ms = enqueue_started.elapsed().as_secs_f64() * 1000.0;
+        tracing::debug!(
+            target: "cas::coordination",
+            stage = "enqueue",
+            channel = "prompt_queue",
+            message_id,
+            source = %display_name,
+            target_agent = %resolved_target,
+            priority = ?priority,
+            persist_ms = persist_latency_ms,
+            "prompt_queue message enqueued"
+        );
 
         // Notify daemon that prompt queue has new data (best-effort)
-        if let Err(e) = cas_factory::notify_daemon(&self.inner.cas_root) {
-            tracing::debug!(
-                "Prompt queue notification failed (daemon may not be running): {}",
-                e
-            );
+        let notify_started = std::time::Instant::now();
+        let notify_outcome = cas_factory::notify_daemon(&self.inner.cas_root);
+        let notify_latency_ms = notify_started.elapsed().as_secs_f64() * 1000.0;
+        match notify_outcome {
+            Ok(()) => {
+                tracing::debug!(
+                    target: "cas::coordination",
+                    stage = "notify",
+                    channel = "prompt_queue",
+                    message_id,
+                    notify_ms = notify_latency_ms,
+                    "daemon wakeup signal sent"
+                );
+            }
+            Err(ref e) => {
+                // Kept as debug because this is expected when the daemon is
+                // not running (e.g. `cas serve` standalone sessions).
+                tracing::debug!(
+                    target: "cas::coordination",
+                    stage = "notify",
+                    channel = "prompt_queue",
+                    message_id,
+                    notify_ms = notify_latency_ms,
+                    error = %e,
+                    "daemon wakeup signal failed (daemon may not be running)"
+                );
+            }
         }
 
         Ok(Self::success(format!(

@@ -254,7 +254,24 @@ impl FactoryDaemon {
             // Periodic CAS data refresh
             let mut refreshed = false;
             if last_refresh.elapsed() >= refresh_interval {
+                // cas-f9e8 telemetry: the gap between the previous refresh
+                // and this one is Channel C's worst-case delivery latency
+                // for director-generated events. Logged at debug; enable
+                // via `RUST_LOG=cas::coordination=debug`.
+                let refresh_started = std::time::Instant::now();
+                let tick_interval_ms =
+                    last_refresh.elapsed().as_secs_f64() * 1000.0;
                 if let Ok((prompts, events)) = self.app.refresh_data() {
+                    tracing::debug!(
+                        target: "cas::coordination",
+                        stage = "director_refresh",
+                        channel = "director_events",
+                        event_count = events.len(),
+                        prompt_count = prompts.len(),
+                        tick_interval_ms,
+                        "director refresh tick processed"
+                    );
+
                     // Record events for export
                     self.app.record_events(&events);
 
@@ -276,16 +293,53 @@ impl FactoryDaemon {
 
                     // Inject prompts (config already checked in generate_prompt)
                     for prompt in prompts {
-                        if let Some(ref teams) = self.teams {
-                            let _ = teams.write_to_inbox(
-                                &prompt.target,
-                                super::teams::DIRECTOR_AGENT_NAME,
-                                &prompt.text,
-                                None,
-                                None,
-                            );
+                        // cas-f9e8 telemetry: measure director prompt
+                        // injection latency from the start of this refresh
+                        // tick to the completion of the inbox write. This
+                        // is Channel C's send→deliver envelope and is the
+                        // number that tells us whether refresh_interval
+                        // needs to be lowered for the P99 SLO.
+                        let inject_started = std::time::Instant::now();
+                        let inject_result: anyhow::Result<()> = if let Some(ref teams) = self.teams {
+                            teams
+                                .write_to_inbox(
+                                    &prompt.target,
+                                    super::teams::DIRECTOR_AGENT_NAME,
+                                    &prompt.text,
+                                    None,
+                                    None,
+                                )
+                                .map_err(Into::into)
                         } else {
-                            let _ = self.app.mux.inject(&prompt.target, &prompt.text).await;
+                            self.app
+                                .mux
+                                .inject(&prompt.target, &prompt.text)
+                                .await
+                                .map_err(Into::into)
+                        };
+                        let inject_ms =
+                            inject_started.elapsed().as_secs_f64() * 1000.0;
+                        let total_ms =
+                            refresh_started.elapsed().as_secs_f64() * 1000.0;
+                        match inject_result {
+                            Ok(()) => tracing::info!(
+                                target: "cas::coordination",
+                                stage = "delivered",
+                                channel = "director_events",
+                                target_agent = %prompt.target,
+                                inject_ms,
+                                refresh_to_deliver_ms = total_ms,
+                                "director prompt delivered to inbox"
+                            ),
+                            Err(e) => tracing::warn!(
+                                target: "cas::coordination",
+                                stage = "deliver_failed",
+                                channel = "director_events",
+                                target_agent = %prompt.target,
+                                inject_ms,
+                                error = %e,
+                                "director prompt inject failed"
+                            ),
                         }
                     }
                 }

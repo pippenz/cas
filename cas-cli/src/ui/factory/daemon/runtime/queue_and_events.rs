@@ -144,6 +144,27 @@ impl FactoryDaemon {
 
         if !prompts.is_empty() {
             tracing::info!("Processing {} prompts from queue", prompts.len());
+
+            // cas-f9e8 telemetry: record the wait each message spent in the
+            // queue before the daemon picked it up. The gap between `now`
+            // and `queued.created_at` is the queue→deliver latency, which
+            // is what the P99 SLO targets. Logged at debug; enable via
+            // `RUST_LOG=cas::coordination=debug`.
+            let now = chrono::Utc::now();
+            for queued in &prompts {
+                let wait_ms = (now - queued.created_at).num_milliseconds();
+                tracing::debug!(
+                    target: "cas::coordination",
+                    stage = "daemon_pickup",
+                    channel = "prompt_queue",
+                    message_id = queued.id,
+                    source = %queued.source,
+                    target_agent = %queued.target,
+                    priority = ?queued.priority,
+                    wait_ms,
+                    "prompt_queue message picked up by daemon"
+                );
+            }
         }
 
         // Best-effort event recording (for external tooling acks, activity feed, playback).
@@ -365,7 +386,22 @@ impl FactoryDaemon {
                 match inject_result {
                     Ok(_) => {
                         success = true;
-                        tracing::info!("Injected to '{}'", pane_target);
+                        // cas-f9e8 telemetry: end-to-end delivery latency
+                        // measured from the sender-assigned `created_at` to
+                        // the moment the daemon completed the inbox write.
+                        // This is the number the P99 SLO tracks.
+                        let deliver_ms = (chrono::Utc::now() - queued.created_at)
+                            .num_milliseconds();
+                        tracing::info!(
+                            target: "cas::coordination",
+                            stage = "delivered",
+                            channel = "prompt_queue",
+                            message_id = queued.id,
+                            source = %queued.source,
+                            target_agent = %pane_target,
+                            deliver_ms,
+                            "prompt_queue message delivered to inbox"
+                        );
                         if let Some(ref store) = event_store {
                             record_injection(
                                 store,
