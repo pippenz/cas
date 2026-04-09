@@ -34,7 +34,7 @@
 //! not the symbolic name, so downstream consumers can diff
 //! deterministically even if refs move.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 use thiserror::Error;
@@ -261,13 +261,6 @@ fn gh_default_branch(dir: &Path) -> Option<String> {
     }
     let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if name.is_empty() { None } else { Some(name) }
-}
-
-// Exposed so tests can reference the module path consistently even if
-// the public API is later narrowed.
-#[allow(dead_code)]
-pub(crate) fn _project_root(p: &Path) -> PathBuf {
-    p.to_path_buf()
 }
 
 #[cfg(test)]
