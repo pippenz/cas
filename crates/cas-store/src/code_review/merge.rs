@@ -310,10 +310,13 @@ fn merge_cluster(cluster: Cluster) -> (Finding, Vec<MergeDiagnostic>) {
         .expect("cluster non-empty");
 
     let anchor_finding = &anchor.1;
-    let suggested_fix = entries
-        .iter()
-        .find_map(|(_, f)| f.suggested_fix.clone())
-        .or_else(|| anchor_finding.suggested_fix.clone());
+    // Prefer the anchor's suggested_fix to stay consistent with how
+    // title/file/line/why_it_matters are picked; fall back to the first
+    // contributor that offered one.
+    let suggested_fix = anchor_finding
+        .suggested_fix
+        .clone()
+        .or_else(|| entries.iter().find_map(|(_, f)| f.suggested_fix.clone()));
 
     let merged = Finding {
         title: anchor_finding.title.clone(),
