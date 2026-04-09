@@ -199,6 +199,27 @@ Certain files must change together. Flag as **blocking** if missing:
 # If they exist but weren't changed, investigate whether they should have been
 ```
 
+### Step 8.11: Honor the Task's `execution_note` Posture
+
+Read the `execution_note` field from `mcp__cas__task action=show id=<task-id>`. If set, it declares the execution methodology the worker chose and the verifier must enforce the corresponding check. Reject and name the posture in the rejection so the worker understands why the check fired.
+
+- **`execution_note=test-first`** — advisory. The diff MUST contain at least one **new** test file that exercises the change. "Test file" means files matching `*_test.rs`, `tests/*.rs`, `*.test.ts`, `*.spec.ts`, `test_*.py`, `*_test.py`, or anything under a `tests/` / `__tests__/` directory. Check with:
+  ```bash
+  git diff --name-status HEAD~10 | rg -E '^A\s+.*(_test\.rs|tests/.*\.rs|\.test\.tsx?$|\.spec\.tsx?$|test_.*\.py|_test\.py|tests?/|__tests__/)'
+  ```
+  If zero new test files found, reject with:
+  > "REJECTED (test-first posture): Task was declared `execution_note=test-first` but the diff contains no new test files. Expected at least one new test exercising the change. Add the test or ask the supervisor to downgrade the execution_note."
+
+- **`execution_note=characterization-first`** — advisory. Look for new tests that capture CURRENT behavior before modification. These are typically assertion-heavy with no new production code paths exercised alongside them. If the diff modifies existing logic but contains no new tests that look characterization-shaped (new test file + assertions pinning existing behavior), reject with:
+  > "REJECTED (characterization-first posture): Task was declared `execution_note=characterization-first` but no characterization tests found. Characterization tests should pin current behavior before modification. Add a test that exercises the existing code path before the change."
+  Do NOT attempt a mechanical git-history ordering check — just confirm the tests plausibly capture existing behavior.
+
+- **`execution_note=additive-only`** — SKIP this advisory check. `additive-only` is hard-enforced by `close_ops.rs` (cas-e235). If the worker got this far with additive-only, the close-gate already verified no M/D/R files in the diff. Nothing to do here.
+
+- **`execution_note=null` or missing** — SKIP this check. No posture was declared, no posture applies.
+
+Cite the posture name explicitly in any rejection message so the worker can immediately tell which check fired.
+
 ---
 
 # Phase 2: Quality Assessment
