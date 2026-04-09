@@ -123,6 +123,13 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "net
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 futures-util = "0.3"
 
+# rustls: needed so we can explicitly install a process-level CryptoProvider
+# at startup. rustls 0.23 refuses to auto-select a provider from feature flags
+# in some dep-graph unifications, panicking inside tokio-tungstenite's TLS
+# handshake. Installing `ring` once in main() prevents the daemon from
+# crashing on its first cloud WebSocket connect.
+rustls = { version = "0.23", features = ["ring"] }
+
 # LRU cache (for playback engine)
 lru = "0.12"
 

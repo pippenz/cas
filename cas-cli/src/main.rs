@@ -16,6 +16,14 @@ fn main() -> ExitCode {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
 
+    // Install rustls' default CryptoProvider before anything touches TLS.
+    // tokio-tungstenite 0.24 + rustls 0.23 otherwise panic inside the daemon's
+    // cloud-client worker with "Could not automatically determine the
+    // process-level CryptoProvider from Rustls crate features", which crashes
+    // the factory daemon after it has already bound its unix socket — leaving
+    // clients with a confusing "Connection refused" error.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     // Initialize Sentry crash reporting (respects telemetry config)
     let _sentry_guard = sentry::init(sentry::is_sentry_enabled());
 
