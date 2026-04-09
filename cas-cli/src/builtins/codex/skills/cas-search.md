@@ -25,6 +25,8 @@ mcp__cs__search action=search query="track:bug problem_type:runtime_error"
 
 Recognized filter keys: `module`, `track`, `problem_type`, `severity`, `root_cause`, `date`. Unknown `key:value` tokens pass through as raw keyword text. Legacy memories (no structured frontmatter) still match keyword queries but are excluded from any filter that references a structured field.
 
+Phase 1 grammar limitation: values cannot contain whitespace and there is no quoting or escaping — tokens split on whitespace and the first `:` separates key from value. `module:"cas mcp"` and escaped colons are not supported.
+
 **`code_search`** — Find code symbols by what they do, not exact names:
 ```
 mcp__cs__search action=code_search query="user authentication" kind=function language=rust
