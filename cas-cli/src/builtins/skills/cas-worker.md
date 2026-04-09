@@ -34,6 +34,10 @@ Use CAS coordination for messages:
 mcp__cas__coordination action=message target=supervisor message="<response>" summary="<brief summary>"
 ```
 
+**You may ONLY message the supervisor.** Do not try to message peer workers by name, even if you know their names — the coordination layer rejects peer messaging with `"Workers can only message their supervisor"`. `target` must be `supervisor` (or your supervisor's exact agent name if you know it). If you need something from another worker, ask the supervisor to relay it.
+
+Do not use the built-in `SendMessage` tool — it is disabled in factory mode. Use `mcp__cas__coordination action=message` instead.
+
 Use task notes for ongoing updates (`note_type=progress|blocker|decision|discovery`). The supervisor sees these in the TUI.
 
 Message the supervisor when you complete a task or need help.
