@@ -470,6 +470,31 @@ impl CasCore {
             }
         }
 
+        // cas-e235: additive-only execution_note backstop.
+        // If the worker declared `execution_note=additive-only`, reject the
+        // close if git sees any modified, deleted, or renamed files in the
+        // project tree. This only fires when the project root is a git
+        // repository; in non-git contexts the check silently no-ops so the
+        // gate never blocks closes it can't reason about.
+        if task.execution_note.as_deref() == Some("additive-only") {
+            let project_root = self.cas_root.parent().unwrap_or(&self.cas_root);
+            let violations = check_additive_only_violations(project_root);
+            if !violations.is_empty() {
+                let file_list = violations
+                    .iter()
+                    .map(|v| format!("  {} ({})", v.path, v.status))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                return Ok(Self::tool_error(format!(
+                    "⚠️ ADDITIVE-ONLY VIOLATION\n\n\
+                    task close rejected: execution_note=additive-only but diff contains \
+                    modifications.\n\n\
+                    Modified/deleted/renamed files:\n{file_list}\n\n\
+                    Use execution_note=null or test-first to modify existing files."
+                )));
+            }
+        }
+
         // Proceed with close
         let mut task = task;
         let now = chrono::Utc::now();
@@ -774,5 +799,181 @@ impl CasCore {
             "Reopened task: {} - {}",
             req.id, task.title
         )))
+    }
+}
+
+/// A single additive-only violation: a file whose git status indicates it
+/// was modified, deleted, or renamed relative to HEAD.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AdditiveOnlyViolation {
+    pub status: String,
+    pub path: String,
+}
+
+/// Check whether the working tree at `project_root` contains any files that
+/// violate the `additive-only` execution posture. A violation is any file
+/// whose `git diff --name-status HEAD` (committed-against-HEAD plus
+/// uncommitted) reports a status starting with `M`, `D`, or `R`.
+///
+/// Only new files (status `A`) are allowed under additive-only. `??`
+/// untracked files are ignored because they are additive by definition.
+///
+/// If `project_root` is not a git repository, or git fails for any reason,
+/// this returns an empty vec so the gate never blocks closes in contexts
+/// where it cannot reason about the diff. The backstop is advisory when git
+/// state is unknowable.
+pub(crate) fn check_additive_only_violations(
+    project_root: &std::path::Path,
+) -> Vec<AdditiveOnlyViolation> {
+    use std::process::Command;
+
+    let mut violations = Vec::new();
+
+    // 1. Uncommitted (staged + unstaged) changes vs HEAD.
+    if let Ok(output) = Command::new("git")
+        .args(["diff", "--name-status", "HEAD"])
+        .current_dir(project_root)
+        .output()
+    {
+        if output.status.success() {
+            violations.extend(parse_name_status(&String::from_utf8_lossy(&output.stdout)));
+        } else {
+            // Not a git repo, or HEAD doesn't exist — treat as no-op.
+            return Vec::new();
+        }
+    } else {
+        return Vec::new();
+    }
+
+    violations
+}
+
+/// Parse the output of `git diff --name-status` into violations. Only rows
+/// whose status starts with M, D, or R are returned. A, C, T, U, and ?? are
+/// considered additive or uninteresting.
+fn parse_name_status(output: &str) -> Vec<AdditiveOnlyViolation> {
+    let mut violations = Vec::new();
+    for line in output.lines() {
+        let line = line.trim_end();
+        if line.is_empty() {
+            continue;
+        }
+        // Format: "<STATUS>\t<PATH>" or for renames "R100\t<OLD>\t<NEW>"
+        let mut parts = line.splitn(3, '\t');
+        let Some(status) = parts.next() else {
+            continue;
+        };
+        let Some(first_path) = parts.next() else {
+            continue;
+        };
+        let second_path = parts.next();
+        let first_char = status.chars().next().unwrap_or(' ');
+        match first_char {
+            'M' | 'D' => violations.push(AdditiveOnlyViolation {
+                status: status.to_string(),
+                path: first_path.to_string(),
+            }),
+            'R' => {
+                let path = second_path.unwrap_or(first_path).to_string();
+                violations.push(AdditiveOnlyViolation {
+                    status: status.to_string(),
+                    path,
+                });
+            }
+            _ => {}
+        }
+    }
+    violations
+}
+
+#[cfg(test)]
+mod additive_only_tests {
+    use super::*;
+    use std::process::Command;
+    use tempfile::tempdir;
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@test")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@test")
+            .status()
+            .expect("git");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    fn init_repo() -> tempfile::TempDir {
+        let dir = tempdir().unwrap();
+        let p = dir.path();
+        git(p, &["init", "-q", "-b", "main"]);
+        std::fs::write(p.join("existing.txt"), "original\n").unwrap();
+        git(p, &["add", "existing.txt"]);
+        git(p, &["commit", "-q", "-m", "initial"]);
+        dir
+    }
+
+    #[test]
+    fn non_git_dir_returns_no_violations() {
+        let dir = tempdir().unwrap();
+        assert!(check_additive_only_violations(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn clean_repo_returns_no_violations() {
+        let dir = init_repo();
+        assert!(check_additive_only_violations(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn new_file_is_not_a_violation() {
+        let dir = init_repo();
+        std::fs::write(dir.path().join("new.txt"), "hello\n").unwrap();
+        git(dir.path(), &["add", "new.txt"]);
+        let v = check_additive_only_violations(dir.path());
+        assert!(v.is_empty(), "new file must be allowed, got: {v:?}");
+    }
+
+    #[test]
+    fn modified_file_is_violation() {
+        let dir = init_repo();
+        std::fs::write(dir.path().join("existing.txt"), "changed\n").unwrap();
+        let v = check_additive_only_violations(dir.path());
+        assert_eq!(v.len(), 1);
+        assert!(v[0].status.starts_with('M'));
+        assert_eq!(v[0].path, "existing.txt");
+    }
+
+    #[test]
+    fn deleted_file_is_violation() {
+        let dir = init_repo();
+        std::fs::remove_file(dir.path().join("existing.txt")).unwrap();
+        let v = check_additive_only_violations(dir.path());
+        assert_eq!(v.len(), 1);
+        assert!(v[0].status.starts_with('D'));
+        assert_eq!(v[0].path, "existing.txt");
+    }
+
+    #[test]
+    fn renamed_file_is_violation() {
+        let dir = init_repo();
+        git(dir.path(), &["mv", "existing.txt", "renamed.txt"]);
+        let v = check_additive_only_violations(dir.path());
+        assert_eq!(v.len(), 1);
+        assert!(v[0].status.starts_with('R'));
+        assert_eq!(v[0].path, "renamed.txt");
+    }
+
+    #[test]
+    fn parse_name_status_mixed() {
+        let out = "A\tadded.txt\nM\tmodified.txt\nD\tdeleted.txt\nR100\told.txt\tnew.txt\n";
+        let v = parse_name_status(out);
+        assert_eq!(v.len(), 3);
+        assert_eq!(v[0].path, "modified.txt");
+        assert_eq!(v[1].path, "deleted.txt");
+        assert_eq!(v[2].path, "new.txt");
+        assert!(v[2].status.starts_with('R'));
     }
 }
