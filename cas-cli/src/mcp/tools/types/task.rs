@@ -118,6 +118,23 @@ pub struct TaskCloseRequest {
     #[schemars(description = "Reason for closing (resolution notes)")]
     #[serde(default)]
     pub reason: Option<String>,
+
+    /// Supervisor override for the cas-code-review P0 close gate (cas-b39f).
+    ///
+    /// When `true`, the close path skips the multi-persona code-review
+    /// gate that would otherwise hard-block on P0 findings. Only honored
+    /// when the caller runs under a supervisor role
+    /// (`CAS_AGENT_ROLE=supervisor`); non-supervisor callers that set
+    /// this flag get an explicit rejection. The override is logged as a
+    /// decision note on the task so the audit trail captures who
+    /// downgraded a P0 block and why.
+    #[schemars(
+        description = "Supervisor override for the code-review P0 gate. \
+                       Only honored when the caller is a supervisor; other \
+                       roles are rejected. Logs a decision note on the task."
+    )]
+    #[serde(default)]
+    pub bypass_code_review: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

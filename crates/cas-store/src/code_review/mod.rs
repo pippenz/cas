@@ -7,10 +7,12 @@
 
 pub mod autofix;
 pub mod base_sha;
+pub mod close_gate;
 pub mod merge;
 pub mod review_to_task;
 
 pub use autofix::{AutofixOutcome, ExitReason, FixerResult, MAX_ROUNDS, autofix_loop};
+pub use close_gate::{GateDecision, evaluate_gate, format_block_message};
 pub use base_sha::{BaseShaError, resolve as resolve_base_sha};
 pub use merge::{
     AGREEMENT_BOOST, CONFIDENCE_GATE, LINE_BUCKET_RADIUS, MergeDiagnostic, MergeError,

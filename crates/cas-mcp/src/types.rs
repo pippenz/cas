@@ -175,6 +175,20 @@ pub struct TaskRequest {
     #[serde(default)]
     pub reason: Option<String>,
 
+    /// Supervisor override for the cas-code-review P0 close gate (cas-b39f, Unit 9).
+    ///
+    /// When `true`, the close path skips the multi-persona code-review
+    /// gate that would otherwise hard-block on P0 findings. Only honored
+    /// when the caller runs under a supervisor role; other callers get
+    /// an explicit rejection. Logs a decision note on the task.
+    #[schemars(
+        description = "Supervisor override for the code-review P0 gate. \
+                       Only honored when the caller is a supervisor; other \
+                       roles are rejected. Logs a decision note on the task."
+    )]
+    #[serde(default, deserialize_with = "deser::option_bool")]
+    pub bypass_code_review: Option<bool>,
+
     /// Include dependencies (for show)
     #[schemars(description = "Include dependency information")]
     #[serde(default, deserialize_with = "deser::option_bool")]
