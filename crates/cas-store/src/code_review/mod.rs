@@ -6,5 +6,10 @@
 //! against which a review diff should be computed.
 
 pub mod base_sha;
+pub mod merge;
 
 pub use base_sha::{BaseShaError, resolve as resolve_base_sha};
+pub use merge::{
+    AGREEMENT_BOOST, CONFIDENCE_GATE, LINE_BUCKET_RADIUS, MergeDiagnostic, MergeError,
+    MergedFindings, P0_CONFIDENCE_FLOOR, merge_findings,
+};
