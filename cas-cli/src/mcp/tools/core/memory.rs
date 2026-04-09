@@ -1,4 +1,7 @@
 use crate::mcp::tools::core::imports::*;
+use crate::mcp::tools::types::{
+    BlockReason, DimensionBreakdown, MemoryRememberResponse, RecommendedAction,
+};
 
 use cas_core::memory::{
     CandidateFacets, NewMemoryFacets, OverlapDecision, OverlapMatch, OverlapRecommendation,
@@ -6,6 +9,47 @@ use cas_core::memory::{
 };
 use cas_store::Store;
 use cas_types::Entry;
+
+impl From<&OverlapMatch> for DimensionBreakdown {
+    fn from(m: &OverlapMatch) -> Self {
+        DimensionBreakdown {
+            problem_statement: m.scores.problem_statement,
+            root_cause: m.scores.root_cause,
+            solution_approach: m.scores.solution_approach,
+            referenced_files: m.scores.referenced_files,
+            tags: m.scores.tags,
+            penalty: m.scores.penalty,
+            net: m.scores.net(),
+        }
+    }
+}
+
+impl From<OverlapRecommendation> for RecommendedAction {
+    fn from(r: OverlapRecommendation) -> Self {
+        match r {
+            OverlapRecommendation::UpdateExisting => RecommendedAction::UpdateExisting,
+            OverlapRecommendation::SurfaceForUserDecision => RecommendedAction::SurfaceForUserDecision,
+        }
+    }
+}
+
+/// Build a [`CallToolResult`] that carries a [`MemoryRememberResponse`] as
+/// `structured_content` plus a human-readable text block. When
+/// `is_error=true`, `CallToolResult::is_error` is set so agents parsing the
+/// response know the tool call did not create a memory.
+pub(crate) fn build_remember_result(
+    response: &MemoryRememberResponse,
+    text: String,
+    is_error: bool,
+) -> CallToolResult {
+    let value = serde_json::to_value(response).unwrap_or(serde_json::Value::Null);
+    CallToolResult {
+        content: vec![Content::text(text)],
+        structured_content: Some(value),
+        is_error: Some(is_error),
+        meta: None,
+    }
+}
 
 /// Outcome of [`CasCore::run_overlap_check`] translated into the three
 /// actions cas_remember needs to take. `None` means "no candidates /
@@ -273,6 +317,34 @@ impl CasCore {
         &self,
         Parameters(req): Parameters<RememberRequest>,
     ) -> Result<CallToolResult, McpError> {
+        // `mode` contract (cas-e382): Phase 1 accepts `None` and
+        // `"interactive"` (treated identically). `"autofix"` is reserved
+        // for Phase 2 and returns an explicit error rather than silently
+        // degrading — callers should fail loudly if they ask for a feature
+        // that does not exist yet.
+        match req.mode.as_deref() {
+            None | Some("interactive") => {}
+            Some("autofix") => {
+                return Err(McpError {
+                    code: ErrorCode::INVALID_REQUEST,
+                    message: Cow::from(
+                        "mode=autofix is reserved for Phase 2 and is not supported in Phase 1. \
+                         Use mode=interactive (default) and act on a Blocked response yourself.",
+                    ),
+                    data: None,
+                });
+            }
+            Some(other) => {
+                return Err(McpError {
+                    code: ErrorCode::INVALID_REQUEST,
+                    message: Cow::from(format!(
+                        "unknown mode '{other}'. Valid modes: 'interactive' (default). 'autofix' is reserved for Phase 2."
+                    )),
+                    data: None,
+                });
+            }
+        }
+
         let store = self.open_store()?;
 
         let entry_type: EntryType = req.entry_type.parse().unwrap_or(EntryType::Learning);
@@ -330,6 +402,24 @@ impl CasCore {
                 &id,
             ) {
                 Ok(Some(OverlapOutcome::Block { best, all_high_scoring, recommendation })) => {
+                    // Build the structured Blocked response (cas-e382).
+                    // The tool call returns Ok(CallToolResult) with
+                    // is_error=true so agents can parse `structured_content`
+                    // and decide how to proceed. Legacy text-only clients
+                    // still get a readable message in the content block.
+                    let other_high_scoring: Vec<String> = all_high_scoring
+                        .iter()
+                        .skip(1)
+                        .map(|m| m.slug.clone())
+                        .collect();
+                    let recommendation_action = RecommendedAction::from(recommendation);
+                    let response = MemoryRememberResponse::Blocked {
+                        reason: BlockReason::HighOverlap,
+                        existing_slug: best.slug.clone(),
+                        dimension_scores: DimensionBreakdown::from(&best),
+                        recommended_action: recommendation_action,
+                        other_high_scoring: other_high_scoring.clone(),
+                    };
                     let mut msg = format!(
                         "Overlap detected: this memory duplicates an existing entry.\n\
                          Existing slug: {}\n\
@@ -343,34 +433,25 @@ impl CasCore {
                         best.scores.referenced_files,
                         best.scores.tags,
                         best.scores.penalty,
-                        match recommendation {
-                            cas_core::memory::OverlapRecommendation::UpdateExisting =>
+                        match recommendation_action {
+                            RecommendedAction::UpdateExisting =>
                                 "update the existing memory in place",
-                            cas_core::memory::OverlapRecommendation::SurfaceForUserDecision =>
+                            RecommendedAction::SurfaceForUserDecision =>
                                 "confirm with user before creating",
                         },
                     );
-                    if all_high_scoring.len() > 1 {
+                    if !other_high_scoring.is_empty() {
                         msg.push_str(&format!(
                             "Other high-scoring candidates ({}): {}\n",
-                            all_high_scoring.len() - 1,
-                            all_high_scoring
-                                .iter()
-                                .skip(1)
-                                .map(|m| m.slug.as_str())
-                                .collect::<Vec<_>>()
-                                .join(", ")
+                            other_high_scoring.len(),
+                            other_high_scoring.join(", ")
                         ));
                         msg.push_str("Consider running a refresh on this module.\n");
                     }
                     msg.push_str(
                         "To override (bulk imports / tests only), set bypass_overlap=true.",
                     );
-                    return Err(McpError {
-                        code: ErrorCode::INVALID_REQUEST,
-                        message: Cow::from(msg),
-                        data: None,
-                    });
+                    return Ok(build_remember_result(&response, msg, true));
                 }
                 Ok(Some(OverlapOutcome::CrossRef { links, refresh })) => {
                     refresh_recommended = refresh;
@@ -456,7 +537,12 @@ impl CasCore {
                  consider running a memory refresh on this module.",
             );
         }
-        Ok(Self::success(msg))
+        let response = MemoryRememberResponse::Created {
+            slug: id.clone(),
+            related_memories: linked_slugs,
+            refresh_recommended,
+        };
+        Ok(build_remember_result(&response, msg, false))
     }
 
     /// Get an entry by ID

@@ -17,6 +17,7 @@ async fn test_remember_basic() {
         valid_until: None,
         team_id: None,
         bypass_overlap: None,
+        mode: None,
     };
 
 
@@ -45,6 +46,7 @@ async fn test_remember_with_defaults() {
         valid_until: None,
         team_id: None,
         bypass_overlap: None,
+        mode: None,
     };
 
 
@@ -73,6 +75,7 @@ async fn test_get_entry() {
         valid_until: None,
         team_id: None,
         bypass_overlap: None,
+        mode: None,
     };
 
 
@@ -124,6 +127,7 @@ async fn test_update_entry() {
         valid_until: None,
         team_id: None,
         bypass_overlap: None,
+        mode: None,
     };
 
 
@@ -179,6 +183,7 @@ async fn test_archive_and_unarchive() {
         valid_until: None,
         team_id: None,
         bypass_overlap: None,
+        mode: None,
     };
 
 
@@ -227,6 +232,7 @@ async fn test_helpful_and_harmful() {
         valid_until: None,
         team_id: None,
         bypass_overlap: None,
+        mode: None,
     };
 
 
@@ -276,6 +282,7 @@ async fn test_list_entries() {
             valid_until: None,
             team_id: None,
             bypass_overlap: None,
+        mode: None,
         };
         service
             .cas_remember(Parameters(req))
@@ -318,6 +325,7 @@ async fn test_recent_entries() {
             valid_until: None,
             team_id: None,
             bypass_overlap: None,
+        mode: None,
         };
         service
             .cas_remember(Parameters(req))
@@ -352,6 +360,7 @@ async fn test_delete_entry() {
         valid_until: None,
         team_id: None,
         bypass_overlap: None,
+        mode: None,
     };
 
 
@@ -395,6 +404,7 @@ async fn test_set_tier() {
         valid_until: None,
         team_id: None,
         bypass_overlap: None,
+        mode: None,
     };
 
 
@@ -448,6 +458,7 @@ async fn test_overlap_blocks_duplicate_insert() {
         valid_until: None,
         team_id: None,
         bypass_overlap: Some(true),
+        mode: None,
     };
     service
         .cas_remember(Parameters(first))
@@ -466,20 +477,28 @@ async fn test_overlap_blocks_duplicate_insert() {
         valid_until: None,
         team_id: None,
         bypass_overlap: None,
+        mode: None,
     };
-    let err = service
+    let result = service
         .cas_remember(Parameters(second))
         .await
-        .expect_err("duplicate should be blocked");
-    let msg = err.message.to_string();
-    assert!(
-        msg.contains("Overlap detected"),
-        "expected overlap error, got: {msg}"
+        .expect("duplicate block is now returned as Ok(CallToolResult{is_error:true}) (cas-e382)");
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "block result must carry is_error=true"
     );
-    assert!(
-        msg.contains("Existing slug:"),
-        "expected slug in error, got: {msg}"
-    );
+    let structured = result
+        .structured_content
+        .as_ref()
+        .expect("blocked response must carry structured_content");
+    assert_eq!(structured["status"], "blocked");
+    assert_eq!(structured["reason"], "high_overlap");
+    assert!(structured["existing_slug"].as_str().is_some());
+    assert!(structured["dimension_scores"]["net"].as_u64().unwrap() >= 4);
+    let text = extract_text(result);
+    assert!(text.contains("Overlap detected"), "text fallback preserved: {text}");
+    assert!(text.contains("Existing slug:"), "text fallback preserved: {text}");
 }
 
 #[tokio::test]
@@ -504,6 +523,7 @@ async fn test_bypass_overlap_allows_duplicate() {
             valid_until: None,
             team_id: None,
             bypass_overlap: Some(true),
+        mode: None,
         };
         service
             .cas_remember(Parameters(req))
@@ -531,6 +551,7 @@ async fn test_unrelated_memory_inserts_normally() {
         valid_until: None,
         team_id: None,
         bypass_overlap: Some(true),
+        mode: None,
     };
     service
         .cas_remember(Parameters(first))
@@ -552,6 +573,7 @@ async fn test_unrelated_memory_inserts_normally() {
         valid_until: None,
         team_id: None,
         bypass_overlap: None,
+        mode: None,
     };
     let result = service
         .cas_remember(Parameters(second))

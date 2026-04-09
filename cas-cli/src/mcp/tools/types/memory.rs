@@ -1,5 +1,5 @@
 use rmcp::schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::mcp::tools::types::defaults::{
     default_entry_type, default_importance, default_recent, default_scope_project,
@@ -67,6 +67,105 @@ pub struct RememberRequest {
     )]
     #[serde(default)]
     pub bypass_overlap: Option<bool>,
+
+    /// Overlap-handling mode. Phase 1 supports `"interactive"` (default) —
+    /// on high-overlap the call returns a structured `Blocked` response and
+    /// the caller decides what to do. `"autofix"` is reserved for Phase 2
+    /// (auto-update of the existing memory) and currently returns an
+    /// explicit "not supported" error.
+    #[schemars(description = "Overlap handling mode: 'interactive' (default) | 'autofix' (reserved, Phase 2)")]
+    #[serde(default)]
+    pub mode: Option<String>,
+}
+
+// ============================================================================
+// MemoryRememberResponse (cas-e382)
+//
+// Structured response returned by `mcp__cas__memory action=remember`. The
+// JSON payload is carried on `CallToolResult::structured_content` so that
+// agents can pattern-match on the tagged `status` field without parsing the
+// free-text message. A human-readable text block is also included for
+// legacy text-only clients.
+// ============================================================================
+
+/// Per-dimension overlap score breakdown returned inside `Blocked`.
+/// Mirrors [`cas_core::memory::DimensionScores`] but lives in the MCP
+/// response layer so the public wire format is decoupled from the internal
+/// scoring type.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DimensionBreakdown {
+    pub problem_statement: u8,
+    pub root_cause: u8,
+    pub solution_approach: u8,
+    pub referenced_files: u8,
+    pub tags: u8,
+    /// Combined module + track mismatch penalty. Always ≤ 0.
+    pub penalty: i8,
+    /// Net score after penalty, floored at 0. Ranges 0..=5.
+    pub net: u8,
+}
+
+/// Tagged-union response shape for `action=remember`.
+///
+/// Phase 1 emits `Created` and `Blocked`. `BlockedRefreshRecommended` is
+/// defined so that callers can pattern-match exhaustively and so the wire
+/// format is forward-stable; it is reserved for Phase 2 `mode=autofix`
+/// semantics (block when every cross-ref candidate has reached the cap).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum MemoryRememberResponse {
+    /// The memory was successfully inserted. `related_memories` is empty
+    /// for a low-overlap insert, or populated with the slugs of each
+    /// cross-referenced match on a moderate-overlap insert. When at least
+    /// one of those matches has already hit the 3-link cap, the
+    /// `refresh_recommended` flag is set so the caller knows to surface a
+    /// refresh prompt.
+    Created {
+        slug: String,
+        related_memories: Vec<String>,
+        refresh_recommended: bool,
+    },
+
+    /// The memory was blocked because a high-overlap match (score 4–5)
+    /// already exists. The caller should follow `recommendation` (typically
+    /// update the existing entry in place). `other_high_scoring` carries
+    /// any additional slugs that also scored 4+ (empty in the common case).
+    Blocked {
+        reason: BlockReason,
+        existing_slug: String,
+        dimension_scores: DimensionBreakdown,
+        recommended_action: RecommendedAction,
+        other_high_scoring: Vec<String>,
+    },
+
+    /// Reserved for Phase 2 `mode=autofix`. Indicates that every candidate
+    /// that would have been cross-referenced has already hit the 3-link cap,
+    /// so the caller should run a memory refresh before retrying. Phase 1
+    /// never emits this variant (it emits `Created { refresh_recommended:
+    /// true }` instead), but it is defined here so the wire format does not
+    /// need to change when Phase 2 lands.
+    BlockedRefreshRecommended {
+        existing_slug: String,
+        related_memories_full: bool,
+    },
+}
+
+/// Reason a memory insert was blocked. Currently only `HighOverlap` is
+/// emitted; the enum exists so future block reasons (e.g. quota, validation)
+/// fit the same wire shape.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BlockReason {
+    HighOverlap,
+}
+
+/// Recommended follow-up action when a block is returned. Mirrors
+/// [`cas_core::memory::OverlapRecommendation`] with a stable wire name.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RecommendedAction {
+    UpdateExisting,
+    SurfaceForUserDecision,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

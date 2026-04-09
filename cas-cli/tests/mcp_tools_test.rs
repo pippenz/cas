@@ -9,6 +9,8 @@ mod entity_handler_tests;
 mod field_coverage_tests;
 #[path = "mcp_tools_test/memory_tools.rs"]
 mod memory_tools;
+#[path = "mcp_tools_test/memory_remember_contract.rs"]
+mod memory_remember_contract;
 #[path = "mcp_tools_test/rule_tools.rs"]
 mod rule_tools;
 #[path = "mcp_tools_test/search_tools.rs"]

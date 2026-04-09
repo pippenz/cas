@@ -40,6 +40,7 @@ async fn test_search_with_content() {
         valid_until: None,
         team_id: None,
         bypass_overlap: None,
+        mode: None,
     };
 
     service
@@ -82,6 +83,7 @@ async fn test_search_filter_by_type() {
         valid_until: None,
         team_id: None,
         bypass_overlap: None,
+        mode: None,
     };
 
     service

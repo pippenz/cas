@@ -80,6 +80,14 @@ pub struct MemoryRequest {
     #[serde(default)]
     pub bypass_overlap: Option<bool>,
 
+    /// Overlap handling mode for `remember` (Phase 1: 'interactive' default;
+    /// 'autofix' reserved for Phase 2).
+    #[schemars(
+        description = "Overlap handling mode: 'interactive' (default) | 'autofix' (reserved, Phase 2)"
+    )]
+    #[serde(default)]
+    pub mode: Option<String>,
+
     /// Sort field (for list)
     #[schemars(description = "Sort by: 'created', 'updated', 'importance', 'title'")]
     #[serde(default)]

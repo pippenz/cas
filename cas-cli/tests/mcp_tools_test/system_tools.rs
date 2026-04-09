@@ -18,6 +18,7 @@ async fn test_context() {
         valid_until: None,
         team_id: None,
         bypass_overlap: None,
+        mode: None,
     };
 
     service

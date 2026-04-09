@@ -85,7 +85,69 @@ High-level workflow:
 
 Full workflow — scoring rules, update/cross-reference flows, edge cases (stale candidates, `supersedes`, legacy memories with no `module`), and the interactive vs headless modes — lives in **[references/overlap-detection.md](references/overlap-detection.md)**.
 
-Phase 1 will enforce the overlap check in Rust at the `action=remember` entry point; until then, run the workflow yourself as a skill-level discipline when creating non-trivial memories. A `--no-overlap-check` flag is reserved for bulk imports and tests.
+Phase 1 enforces the overlap check in Rust at the `action=remember` entry point (shipped in cas-4721). The check runs automatically on every call; pass `bypass_overlap=true` only for bulk imports and tests.
+
+## `action=remember` response shape
+
+`mcp__cas__memory action=remember` returns a structured response on `CallToolResult.structured_content` in addition to the legacy free-text block. Agents should pattern-match on the tagged `status` field rather than parsing the text. The three response variants are:
+
+### `Created` — the memory was inserted
+
+```json
+{
+  "status": "created",
+  "slug": "cas-abcd",
+  "related_memories": [],
+  "refresh_recommended": false
+}
+```
+
+- `related_memories` is empty on a low-overlap insert or populated with the slugs of every cross-referenced match on a moderate-overlap (score 2–3) insert.
+- `refresh_recommended` is `true` when at least one of those matches has already hit the 3-link cross-reference cap. When you see this, run a refresh on the module before creating more memories on the same topic.
+- `CallToolResult.is_error` is `false`.
+
+### `Blocked` — the insert was rejected (high overlap, score 4–5)
+
+```json
+{
+  "status": "blocked",
+  "reason": "high_overlap",
+  "existing_slug": "cas-xxxx",
+  "dimension_scores": {
+    "problem_statement": 1,
+    "root_cause": 1,
+    "solution_approach": 1,
+    "referenced_files": 1,
+    "tags": 0,
+    "penalty": 0,
+    "net": 4
+  },
+  "recommended_action": "update_existing",
+  "other_high_scoring": ["cas-yyyy"]
+}
+```
+
+- Do NOT retry the insert. Update the existing memory at `existing_slug` in place (or surface the match to the user, depending on your interaction model).
+- `recommended_action` is either `"update_existing"` (headless callers should apply automatically) or `"surface_for_user_decision"` (interactive callers should ask first).
+- `other_high_scoring` lists additional slugs that also scored ≥4 — rare, but a signal that the module needs a refresh pass.
+- `CallToolResult.is_error` is `true`. The tool call itself returns `Ok`; only the `is_error` flag signals failure so structured_content is always parseable.
+
+### `BlockedRefreshRecommended` — reserved for Phase 2
+
+```json
+{
+  "status": "blocked_refresh_recommended",
+  "existing_slug": "cas-xxxx",
+  "related_memories_full": true
+}
+```
+
+Reserved for `mode=autofix` in Phase 2. Phase 1 never emits this variant; on the cap-hit scenario it returns `Created { refresh_recommended: true }` instead so the insert still proceeds. The variant is defined now so the wire format does not need to change when autofix mode lands.
+
+### `mode` parameter
+
+- `mode=interactive` (default, or omitted) — the behavior documented above. On a high-overlap match, return `Blocked` so the caller decides.
+- `mode=autofix` — reserved for Phase 2. Passing it today returns an explicit `"mode=autofix is reserved for Phase 2"` error rather than silently falling back.
 
 ## References
 

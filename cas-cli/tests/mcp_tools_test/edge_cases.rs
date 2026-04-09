@@ -17,6 +17,7 @@ async fn test_empty_content_rejected() {
         valid_until: None,
         team_id: None,
         bypass_overlap: None,
+        mode: None,
     };
 
 
@@ -46,6 +47,7 @@ async fn test_very_long_content() {
         valid_until: None,
         team_id: None,
         bypass_overlap: None,
+        mode: None,
     };
 
 
@@ -74,6 +76,7 @@ async fn test_special_characters_in_content() {
         valid_until: None,
         team_id: None,
         bypass_overlap: None,
+        mode: None,
     };
 
 
@@ -101,6 +104,7 @@ async fn test_invalid_entry_type() {
         valid_until: None,
         team_id: None,
         bypass_overlap: None,
+        mode: None,
     };
 
 
@@ -130,6 +134,7 @@ async fn test_importance_clamping() {
         valid_until: None,
         team_id: None,
         bypass_overlap: None,
+        mode: None,
     };
 
 
