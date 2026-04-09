@@ -156,55 +156,149 @@ fn test_detect_task_completed() {
     )));
 }
 
+/// Helper: build an idle-agent snapshot with a single factory worker.
+fn idle_data_for(agent_id: &str, agent_name: &str) -> DirectorData {
+    DirectorData {
+        ready_tasks: vec![],
+        in_progress_tasks: vec![],
+        epic_tasks: vec![],
+        agents: vec![make_agent(agent_id, agent_name, None)],
+        activity: vec![],
+        agent_id_to_name: [(agent_id.to_string(), agent_name.to_string())]
+            .into_iter()
+            .collect(),
+        changes: vec![],
+        git_loaded: true,
+        reminders: vec![],
+        epic_closed_counts: HashMap::new(),
+    }
+}
+
+/// Helper: build a working-agent snapshot with one task assigned to a single factory worker.
+fn working_data_for(
+    agent_id: &str,
+    agent_name: &str,
+    task_id: &str,
+    task_title: &str,
+) -> DirectorData {
+    DirectorData {
+        ready_tasks: vec![],
+        in_progress_tasks: vec![make_task(
+            task_id,
+            task_title,
+            TaskStatus::InProgress,
+            Some(agent_id),
+        )],
+        epic_tasks: vec![],
+        agents: vec![make_agent(agent_id, agent_name, Some(task_id))],
+        activity: vec![],
+        agent_id_to_name: [(agent_id.to_string(), agent_name.to_string())]
+            .into_iter()
+            .collect(),
+        changes: vec![],
+        git_loaded: true,
+        reminders: vec![],
+        epic_closed_counts: HashMap::new(),
+    }
+}
+
 #[test]
 fn test_detect_worker_idle() {
     let mut detector =
         DirectorEventDetector::new(vec!["swift-fox".to_string()], "supervisor".to_string());
 
-    // Initial state: worker has task
-    let data1 = DirectorData {
-        ready_tasks: vec![],
-        in_progress_tasks: vec![make_task(
-            "task-1",
-            "Test Task",
-            TaskStatus::InProgress,
-            Some("agent-1"),
-        )],
-        epic_tasks: vec![],
-        agents: vec![make_agent("agent-1", "swift-fox", Some("task-1"))],
-        activity: vec![],
-        agent_id_to_name: [("agent-1".to_string(), "swift-fox".to_string())]
-            .into_iter()
-            .collect(),
-        changes: vec![],
-        git_loaded: true,
-        reminders: vec![],
-        epic_closed_counts: HashMap::new(),
-    };
-    detector.initialize(&data1);
+    // Initial state: worker has task.
+    detector.initialize(&working_data_for("agent-1", "swift-fox", "task-1", "Test Task"));
 
-    // New state: worker idle
-    let data2 = DirectorData {
-        ready_tasks: vec![],
-        in_progress_tasks: vec![],
-        epic_tasks: vec![],
-        agents: vec![make_agent("agent-1", "swift-fox", None)],
-        activity: vec![],
-        agent_id_to_name: [("agent-1".to_string(), "swift-fox".to_string())]
-            .into_iter()
-            .collect(),
-        changes: vec![],
-        git_loaded: true,
-        reminders: vec![],
-        epic_closed_counts: HashMap::new(),
-    };
+    // Tick 1 of sustained idle — must NOT emit (debounce threshold is 2 ticks).
+    let idle = idle_data_for("agent-1", "swift-fox");
+    let events_tick1 = detector.detect_changes(&idle);
+    assert!(
+        !events_tick1
+            .iter()
+            .any(|e| matches!(e, DirectorEvent::WorkerIdle { .. })),
+        "WorkerIdle must not fire after a single idle tick — debouncing prevents spurious \
+         idle prompts during close-X → start-Y transitions"
+    );
 
-    let events = detector.detect_changes(&data2);
+    // Tick 2 of sustained idle — now emit.
+    let events_tick2 = detector.detect_changes(&idle);
+    assert!(
+        events_tick2.iter().any(|e| matches!(
+            e,
+            DirectorEvent::WorkerIdle { worker } if worker == "swift-fox"
+        )),
+        "WorkerIdle must fire once the agent has been idle for the consecutive-tick threshold"
+    );
 
-    assert!(events.iter().any(|e| matches!(
-        e,
-        DirectorEvent::WorkerIdle { worker } if worker == "swift-fox"
-    )));
+    // Tick 3 of sustained idle — already emitted, do not re-emit every tick.
+    let events_tick3 = detector.detect_changes(&idle);
+    assert!(
+        !events_tick3
+            .iter()
+            .any(|e| matches!(e, DirectorEvent::WorkerIdle { .. })),
+        "WorkerIdle must not re-fire on every tick of a sustained idle streak"
+    );
+}
+
+/// Regression test for cas-f9e8.
+///
+/// Reproduces the close-X → start-Y race that caused spurious "Worker X is
+/// idle" prompts: a worker finishes one task and immediately claims another,
+/// but a single director refresh lands inside the sub-second window where
+/// `agent_tasks[worker] = None`. Before the fix, the old transition-based
+/// detector emitted `WorkerIdle` as soon as it observed that None, delivering
+/// a stale "idle" prompt to the supervisor after the worker had already
+/// resumed work. The consecutive-tick debounce must suppress this.
+#[test]
+fn test_no_worker_idle_on_transient_close_then_start() {
+    let mut detector =
+        DirectorEventDetector::new(vec!["swift-fox".to_string()], "supervisor".to_string());
+
+    // Initialize: worker is working on task-1.
+    detector.initialize(&working_data_for(
+        "agent-1",
+        "swift-fox",
+        "task-1",
+        "First task",
+    ));
+
+    // Transient idle: one refresh tick catches the close-X → start-Y gap.
+    let events_transient = detector.detect_changes(&idle_data_for("agent-1", "swift-fox"));
+    assert!(
+        !events_transient
+            .iter()
+            .any(|e| matches!(e, DirectorEvent::WorkerIdle { .. })),
+        "WorkerIdle must not fire from a single transient idle tick — this is exactly the \
+         close-X → start-Y race described in cas-f9e8"
+    );
+
+    // Next refresh: worker has claimed task-2. Idle streak should be reset.
+    let events_claimed = detector.detect_changes(&working_data_for(
+        "agent-1",
+        "swift-fox",
+        "task-2",
+        "Second task",
+    ));
+    assert!(
+        !events_claimed
+            .iter()
+            .any(|e| matches!(e, DirectorEvent::WorkerIdle { .. })),
+        "WorkerIdle must not fire once the worker has resumed work on a new task"
+    );
+
+    // Sanity: a subsequent sustained idle still emits after the threshold,
+    // so the reset didn't break normal idle detection.
+    let idle = idle_data_for("agent-1", "swift-fox");
+    let _ = detector.detect_changes(&idle); // tick 1
+    let events_tick2 = detector.detect_changes(&idle); // tick 2
+    assert!(
+        events_tick2.iter().any(|e| matches!(
+            e,
+            DirectorEvent::WorkerIdle { worker } if worker == "swift-fox"
+        )),
+        "Sustained idle after a reset must still emit WorkerIdle once the threshold is met"
+    );
 }
 
 #[test]
@@ -536,6 +630,8 @@ fn test_idle_events_suppressed_for_removed_workers() {
         epic_closed_counts: HashMap::new(),
     };
 
+    // Two idle ticks are required to cross the consecutive-tick debounce.
+    let _ = detector.detect_changes(&data2);
     let events = detector.detect_changes(&data2);
 
     // calm-owl idle event should be emitted
@@ -602,6 +698,8 @@ fn test_idle_rate_limit_longer_than_general_debounce() {
         epic_closed_counts: HashMap::new(),
     };
 
+    // Two idle ticks are required to cross the consecutive-tick debounce.
+    let _ = detector.detect_changes(&data2);
     let events = detector.detect_changes(&data2);
     assert!(
         events.iter().any(|e| matches!(
@@ -612,8 +710,10 @@ fn test_idle_rate_limit_longer_than_general_debounce() {
     );
 
     // Simulate: worker gets task and goes idle again after 60 seconds
-    // (past the 30s general debounce but within the 5-minute idle rate limit)
-    detector.last_state = DirectorState::from_data(&data1);
+    // (past the 30s general debounce but within the 5-minute idle rate limit).
+    // We drive this through detect_changes rather than poking last_state directly
+    // so the consecutive-idle counters reset the way they would in production.
+    let _ = detector.detect_changes(&data1);
 
     // Manually advance the idle debounce time to 60s ago (past 30s general debounce)
     let key = "idle:swift-fox".to_string();

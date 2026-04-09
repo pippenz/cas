@@ -17,6 +17,24 @@ const DEBOUNCE_DURATION: Duration = Duration::from_secs(30);
 /// workers idle simultaneously.
 const IDLE_RATE_LIMIT: Duration = Duration::from_secs(300);
 
+/// Number of consecutive refresh ticks an agent must appear idle before
+/// WorkerIdle is emitted.
+///
+/// The daemon's `refresh_interval` is 2s (see
+/// `cas-cli/src/ui/factory/daemon/runtime/lifecycle.rs`), so this gives a
+/// sustained-idle window of roughly `2 * refresh_interval = 4s`. The window
+/// is long enough to absorb normal close-X → start-Y transitions (where a
+/// worker finishes one task and immediately claims the next) without
+/// emitting a spurious "worker idle" prompt to the supervisor, and short
+/// enough that genuinely idle workers are still surfaced quickly.
+///
+/// Before this threshold existed, a single refresh landing inside the
+/// sub-second gap between a worker closing task X and starting task Y would
+/// emit `WorkerIdle` immediately, producing apparent out-of-order delivery
+/// ("idle notification arrived before the claim") even though the worker
+/// was already working. See task cas-f9e8.
+const IDLE_CONSECUTIVE_TICKS: u32 = 2;
+
 /// Events detected from CAS state changes
 #[derive(Debug, Clone)]
 pub enum DirectorEvent {
@@ -218,8 +236,6 @@ struct DirectorState {
     task_titles: HashMap<String, String>,
     /// Set of active agent IDs
     active_agents: HashSet<String>,
-    /// Map of agent_id -> current_task_id
-    agent_tasks: HashMap<String, Option<String>>,
     /// Map of epic_id -> (status, has_branch)
     epic_statuses: HashMap<String, (TaskStatus, bool)>,
 }
@@ -243,12 +259,6 @@ impl DirectorState {
 
         let active_agents: HashSet<String> = data.agents.iter().map(|a| a.id.clone()).collect();
 
-        let agent_tasks: HashMap<String, Option<String>> = data
-            .agents
-            .iter()
-            .map(|a| (a.id.clone(), a.current_task.clone()))
-            .collect();
-
         // Track epic statuses and branch presence
         let epic_statuses: HashMap<String, (TaskStatus, bool)> = data
             .epic_tasks
@@ -260,7 +270,6 @@ impl DirectorState {
             tasks,
             task_titles,
             active_agents,
-            agent_tasks,
             epic_statuses,
         }
     }
@@ -278,6 +287,16 @@ pub struct DirectorEventDetector {
     last_prompt_times: HashMap<String, Instant>,
     /// Workers that have been removed (shutdown/crashed) — suppress their events
     removed_workers: HashSet<String>,
+    /// Consecutive refresh ticks each factory agent has appeared idle.
+    /// Used with `IDLE_CONSECUTIVE_TICKS` to debounce `WorkerIdle` so that
+    /// sub-second close-X → start-Y transitions do not generate spurious
+    /// idle prompts. Keyed by agent id.
+    consecutive_idle_ticks: HashMap<String, u32>,
+    /// Agents for whom `WorkerIdle` has already been emitted in the current
+    /// idle streak. Cleared once the agent picks up a task again, so a fresh
+    /// idle streak can trigger another emission (subject to `IDLE_RATE_LIMIT`
+    /// in `debounce_events`). Keyed by agent id.
+    idle_already_emitted: HashSet<String>,
 }
 
 impl DirectorEventDetector {
@@ -289,6 +308,8 @@ impl DirectorEventDetector {
             supervisor_name,
             last_prompt_times: HashMap::new(),
             removed_workers: HashSet::new(),
+            consecutive_idle_ticks: HashMap::new(),
+            idle_already_emitted: HashSet::new(),
         }
     }
 
@@ -403,19 +424,65 @@ impl DirectorEventDetector {
             }
         }
 
-        // Detect idle workers (agent had a task, now doesn't)
-        for (agent_id, old_task) in &self.last_state.agent_tasks {
-            if old_task.is_some() {
-                let new_task = new_state.agent_tasks.get(agent_id);
-                if new_task.map(|t| t.is_none()).unwrap_or(true) {
-                    // Agent had task, now doesn't
-                    let agent_name = self.resolve_agent_name(agent_id, data);
-                    if self.is_factory_agent_name(&agent_name) {
-                        events.push(DirectorEvent::WorkerIdle { worker: agent_name });
-                    }
+        // Detect idle workers using consecutive-tick debouncing.
+        //
+        // Previous logic emitted `WorkerIdle` the moment a worker transitioned
+        // from having a task to having none. In practice that window is often
+        // sub-second (worker closes task X, immediately calls `task start Y`),
+        // and if the 2s director refresh landed inside the gap it emitted a
+        // spurious idle prompt that the supervisor saw as "idle arrived before
+        // the claim." See cas-f9e8.
+        //
+        // We now track how many consecutive refresh ticks each factory agent
+        // has appeared idle and only emit once the count reaches
+        // `IDLE_CONSECUTIVE_TICKS`. A single "has task" observation resets the
+        // streak, so transient None states never accumulate. `idle_already_emitted`
+        // prevents re-emission on every tick of a sustained idle streak; the
+        // existing `IDLE_RATE_LIMIT` debounce at `debounce_events` handles the
+        // cross-streak cooldown.
+        let mut seen_factory_agents: HashSet<String> = HashSet::new();
+        for agent in &data.agents {
+            if !self.is_factory_agent(&agent.id, data) {
+                continue;
+            }
+            seen_factory_agents.insert(agent.id.clone());
+
+            if agent.current_task.is_some() {
+                // Agent is working — reset the idle streak. The next time this
+                // agent's `current_task` goes to `None`, the counter starts
+                // again from zero, which is exactly what we want: sustained idle
+                // from THIS point on, not a stale count from an earlier streak.
+                self.consecutive_idle_ticks.remove(&agent.id);
+                self.idle_already_emitted.remove(&agent.id);
+                continue;
+            }
+
+            let count = self
+                .consecutive_idle_ticks
+                .entry(agent.id.clone())
+                .or_insert(0);
+            *count += 1;
+
+            if *count >= IDLE_CONSECUTIVE_TICKS
+                && !self.idle_already_emitted.contains(&agent.id)
+            {
+                let agent_name = self.resolve_agent_name(&agent.id, data);
+                if self.is_factory_agent_name(&agent_name) {
+                    events.push(DirectorEvent::WorkerIdle {
+                        worker: agent_name,
+                    });
+                    self.idle_already_emitted.insert(agent.id.clone());
                 }
             }
         }
+
+        // Stop tracking idle state for agents that have left the active set
+        // (shutdown, crash, reassigned out of this factory). Without this the
+        // maps would grow unbounded across long sessions.
+        self.consecutive_idle_ticks
+            .retain(|id, _| seen_factory_agents.contains(id));
+        self.idle_already_emitted
+            .retain(|id| seen_factory_agents.contains(id));
 
         // Detect new agent registrations
         for agent_id in &new_state.active_agents {
