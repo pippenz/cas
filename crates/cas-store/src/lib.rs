@@ -60,6 +60,8 @@ pub mod tracing;
 mod verification_store;
 mod worktree_store;
 
+pub mod code_review;
+
 // Mock stores for testing
 #[cfg(test)]
 pub mod mock;
