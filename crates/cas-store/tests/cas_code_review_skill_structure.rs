@@ -177,6 +177,43 @@ fn findings_schema_reference_is_wired_up() {
 }
 
 #[test]
+fn persona_file_references_resolve_on_disk() {
+    // Per supervisor request: catch the case where someone moves or
+    // renames a persona file later without updating the orchestrator
+    // skill. Each of the 7 personas must exist under
+    // references/personas/<name>.md in *both* mirrors.
+    const PERSONAS: &[&str] = &[
+        "correctness",
+        "testing",
+        "maintainability",
+        "project-standards",
+        "security",
+        "performance",
+        "adversarial",
+    ];
+
+    for (label, skill_path) in [
+        ("claude", claude_skill_path()),
+        ("codex", codex_skill_path()),
+    ] {
+        let personas_dir = skill_path
+            .parent()
+            .expect("skill parent")
+            .join("references")
+            .join("personas");
+        for persona in PERSONAS {
+            let p = personas_dir.join(format!("{persona}.md"));
+            assert!(
+                p.exists(),
+                "[{label}] persona file missing at {} — either add it \
+                 or update SKILL.md to stop referencing it",
+                p.display()
+            );
+        }
+    }
+}
+
+#[test]
 fn base_sha_helper_from_unit_3_is_referenced() {
     // Unit 4 consumes Unit 3's output. Pin that the helper is mentioned
     // so the handoff doesn't silently break if base_sha resolution moves.
