@@ -177,6 +177,58 @@ fn findings_schema_reference_is_wired_up() {
 }
 
 #[test]
+fn fixer_prompt_exists_in_both_mirrors() {
+    // Unit 7 (cas-56a2): the autofix loop dispatches a fixer sub-agent
+    // whose prompt is this file. Both mirrors must carry byte-identical
+    // copies so `cas sync` doesn't flap, and the prompt must declare
+    // its safe_auto-only mandate + worker-permission inheritance.
+    for (label, skill_path) in [
+        ("claude", claude_skill_path()),
+        ("codex", codex_skill_path()),
+    ] {
+        let fixer = skill_path
+            .parent()
+            .expect("skill parent")
+            .join("references")
+            .join("fixer.md");
+        assert!(
+            fixer.exists(),
+            "[{label}] fixer.md missing at {}",
+            fixer.display()
+        );
+        let body = read(&fixer);
+        assert!(
+            body.contains("safe_auto"),
+            "[{label}] fixer.md must declare the safe_auto-only mandate"
+        );
+        assert!(
+            body.contains("same tool permissions as the worker"),
+            "[{label}] fixer.md must document worker-permission inheritance \
+             (no elevation) per the cas-56a2 planning decision"
+        );
+        assert!(
+            body.contains("Max 2 rounds") || body.contains("max_rounds=2"),
+            "[{label}] fixer.md must reference the 2-round hard cap so \
+             the prompt and the Rust enforcement stay in sync"
+        );
+    }
+
+    // Both mirrors must be byte-identical.
+    let claude_fixer = read(&claude_skill_path()
+        .parent()
+        .unwrap()
+        .join("references/fixer.md"));
+    let codex_fixer = read(&codex_skill_path()
+        .parent()
+        .unwrap()
+        .join("references/fixer.md"));
+    assert_eq!(
+        claude_fixer, codex_fixer,
+        "claude and codex fixer.md mirrors must be byte-identical"
+    );
+}
+
+#[test]
 fn persona_file_references_resolve_on_disk() {
     // Per supervisor request: catch the case where someone moves or
     // renames a persona file later without updating the orchestrator

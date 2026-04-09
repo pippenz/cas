@@ -5,9 +5,11 @@
 //! [`base_sha::resolve`], a fork-safe helper for picking the base revision
 //! against which a review diff should be computed.
 
+pub mod autofix;
 pub mod base_sha;
 pub mod merge;
 
+pub use autofix::{AutofixOutcome, ExitReason, FixerResult, MAX_ROUNDS, autofix_loop};
 pub use base_sha::{BaseShaError, resolve as resolve_base_sha};
 pub use merge::{
     AGREEMENT_BOOST, CONFIDENCE_GATE, LINE_BUCKET_RADIUS, MergeDiagnostic, MergeError,
