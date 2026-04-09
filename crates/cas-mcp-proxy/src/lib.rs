@@ -725,4 +725,50 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert!(calls[0].args.is_none());
     }
+
+    /// Regression for cas-a62f: the MCP proxy must accept https:// upstream URLs.
+    ///
+    /// Before the fix, rmcp's `transport-streamable-http-client-reqwest` feature pulled in
+    /// `reqwest` with `default-features = false` and no TLS backend, so any https upstream
+    /// (Vercel, Context7, GitHub Copilot, …) failed immediately with
+    /// `invalid URL, scheme is not http`. Enabling rmcp's `reqwest` feature adds rustls and
+    /// lets the transport actually attempt the TLS handshake.
+    ///
+    /// This test points at an unreachable local port so no network is required. It passes as
+    /// long as the error path is a *connection* failure rather than reqwest's scheme
+    /// rejection — i.e. TLS support is compiled in.
+    #[tokio::test(flavor = "current_thread")]
+    async fn https_upstream_is_not_rejected_by_scheme() {
+        let mut configs = HashMap::new();
+        configs.insert(
+            "https-regression".to_string(),
+            ServerConfig::Http {
+                url: "https://127.0.0.1:1/mcp".to_string(),
+                auth: None,
+                headers: Default::default(),
+                oauth: false,
+            },
+        );
+
+        // from_configs swallows per-server errors and logs to stderr, so drive
+        // connect_server directly to inspect the error.
+        let config = configs.remove("https-regression").unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            connect_server("https-regression", &config),
+        )
+        .await
+        .expect("connect attempt should not hang");
+
+        let err = match result {
+            Ok(_) => panic!("connect to 127.0.0.1:1 unexpectedly succeeded"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            !msg.contains("scheme is not http"),
+            "https upstream was rejected by reqwest scheme check — rmcp TLS feature is missing. \
+             error chain: {msg}"
+        );
+    }
 }
