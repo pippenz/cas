@@ -10,7 +10,6 @@
 //! - `mode=autofix` returns a clean "not supported in Phase 1" error
 //! - `mode` with an unknown value errors
 //! - Serde round-trip / snapshot for each runtime variant
-//! - The reserved `BlockedRefreshRecommended` variant round-trips cleanly
 
 use crate::support::*;
 use cas::mcp::tools::*;
@@ -294,27 +293,6 @@ fn snapshot_blocked_high_overlap() {
             },
             "recommended_action": "update_existing",
             "other_high_scoring": ["cas-dddd"],
-        })
-    );
-    let back: MemoryRememberResponse = serde_json::from_value(v).unwrap();
-    assert_eq!(back, r);
-}
-
-#[test]
-fn snapshot_blocked_refresh_recommended_reserved_variant() {
-    // This variant is defined but never emitted in Phase 1. Lock its wire
-    // format so that Phase 2 autofix mode can rely on it.
-    let r = MemoryRememberResponse::BlockedRefreshRecommended {
-        existing_slug: "cas-eeee".to_string(),
-        related_memories_full: true,
-    };
-    let v = serde_json::to_value(&r).unwrap();
-    assert_eq!(
-        v,
-        serde_json::json!({
-            "status": "blocked_refresh_recommended",
-            "existing_slug": "cas-eeee",
-            "related_memories_full": true,
         })
     );
     let back: MemoryRememberResponse = serde_json::from_value(v).unwrap();

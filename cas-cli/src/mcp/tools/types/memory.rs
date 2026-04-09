@@ -107,10 +107,12 @@ pub struct DimensionBreakdown {
 
 /// Tagged-union response shape for `action=remember`.
 ///
-/// Phase 1 emits `Created` and `Blocked`. `BlockedRefreshRecommended` is
-/// defined so that callers can pattern-match exhaustively and so the wire
-/// format is forward-stable; it is reserved for Phase 2 `mode=autofix`
-/// semantics (block when every cross-ref candidate has reached the cap).
+/// Phase 1 emits two variants: `Created` (covers low + moderate overlap,
+/// with `refresh_recommended` as a flag for the cross-ref-cap case) and
+/// `Blocked` (high overlap, score 4–5). Phase 2 may add new variants for
+/// `mode=autofix` outcomes — the serde tagged enum shape makes that
+/// backwards-compatible as long as new variants use new `status` tag
+/// names, so we do not reserve placeholder variants here.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum MemoryRememberResponse {
@@ -136,17 +138,6 @@ pub enum MemoryRememberResponse {
         dimension_scores: DimensionBreakdown,
         recommended_action: RecommendedAction,
         other_high_scoring: Vec<String>,
-    },
-
-    /// Reserved for Phase 2 `mode=autofix`. Indicates that every candidate
-    /// that would have been cross-referenced has already hit the 3-link cap,
-    /// so the caller should run a memory refresh before retrying. Phase 1
-    /// never emits this variant (it emits `Created { refresh_recommended:
-    /// true }` instead), but it is defined here so the wire format does not
-    /// need to change when Phase 2 lands.
-    BlockedRefreshRecommended {
-        existing_slug: String,
-        related_memories_full: bool,
     },
 }
 

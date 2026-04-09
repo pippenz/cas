@@ -89,7 +89,7 @@ Phase 1 enforces the overlap check in Rust at the `action=remember` entry point 
 
 ## `action=remember` response shape
 
-`mcp__cas__memory action=remember` returns a structured response on `CallToolResult.structured_content` in addition to the legacy free-text block. Agents should pattern-match on the tagged `status` field rather than parsing the text. The three response variants are:
+`mcp__cas__memory action=remember` returns a structured response on `CallToolResult.structured_content` in addition to the legacy free-text block. Agents should pattern-match on the tagged `status` field rather than parsing the text. Phase 1 emits two variants (`Created` and `Blocked`); Phase 2 may add additional variants for `mode=autofix` outcomes — the serde-tagged shape makes that backwards-compatible.
 
 ### `Created` — the memory was inserted
 
@@ -131,18 +131,6 @@ Phase 1 enforces the overlap check in Rust at the `action=remember` entry point 
 - `recommended_action` is either `"update_existing"` (headless callers should apply automatically) or `"surface_for_user_decision"` (interactive callers should ask first).
 - `other_high_scoring` lists additional slugs that also scored ≥4 — rare, but a signal that the module needs a refresh pass.
 - `CallToolResult.is_error` is `true`. The tool call itself returns `Ok`; only the `is_error` flag signals failure so structured_content is always parseable.
-
-### `BlockedRefreshRecommended` — reserved for Phase 2
-
-```json
-{
-  "status": "blocked_refresh_recommended",
-  "existing_slug": "cas-xxxx",
-  "related_memories_full": true
-}
-```
-
-Reserved for `mode=autofix` in Phase 2. Phase 1 never emits this variant; on the cap-hit scenario it returns `Created { refresh_recommended: true }` instead so the insert still proceeds. The variant is defined now so the wire format does not need to change when autofix mode lands.
 
 ### `mode` parameter
 
