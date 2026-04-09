@@ -21,3 +21,5 @@ Store memories proactively — don't wait to be asked.
 - **Store**: `mcp__cas__memory action=remember title="..." content="..." entry_type=learning` (types: learning, preference, context, observation)
 - **Find**: `mcp__cas__search action=search query="..." doc_type=entry`
 - **Promote**: `mcp__cas__memory action=helpful id=<id>` — increases priority for future retrieval
+
+**Valid `mcp__cas__memory` actions** (exact list — do not invent others): `remember`, `get`, `list`, `update`, `delete`, `archive`, `unarchive`, `helpful`, `harmful`, `mark_reviewed`, `recent`, `set_tier`, `opinion_reinforce`, `opinion_weaken`, `opinion_contradict`. There is **no `recall` action** — use `get` (by id) or `mcp__cas__search action=search` (by query).
