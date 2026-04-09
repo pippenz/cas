@@ -89,6 +89,68 @@ Every task spec must include:
 - **Explicit non-goals** — What the task deliberately does NOT do, stated to prevent scope creep
 - **Test guidance** — Name the specific scenarios the worker must test, including at least one error path. Don't leave test design entirely to the worker.
 
+For EPIC subtasks specifically, shape the spec prose using the [Implementation Unit Template](#implementation-unit-template) below. `Spec Requirements` enumerates *what must be present*; the template specifies *how the prose is shaped*.
+
+### Implementation Unit Template
+
+Every EPIC subtask (`task_type=task` or `task_type=feature` that is a child of an EPIC) uses this template as the canonical shape of its `description` + companion fields. The goal is predictable structure a worker can parse in five seconds. Standalone bugs, chores, and spikes stay freeform — spike deliverables are *understanding*, not implementation, so the template does not fit.
+
+Canonical template:
+
+```markdown
+- [ ] **Unit N: [Name]**
+
+**Goal:** What this unit accomplishes
+**Requirements:** R1, R2      # only when an EPIC brainstorm doc exists
+**Dependencies:** None | Unit X | cas-<id>
+**Files:**
+  - Create: `path/to/new_file.rs`
+  - Modify: `path/to/existing_file.rs`
+  - Test: `path/to/test_file.rs`
+**Approach:** Key design or sequencing decision
+**Execution note:** test-first | characterization-first | additive-only | (omit)
+**Patterns to follow:** Reference existing code to mirror
+**Test scenarios:**
+  - Happy path: input X -> expected Y
+  - Edge case: empty input -> returns error Z
+  - Error path: network failure -> retries 3x then fails
+**Verification:** Observable outcomes when complete
+```
+
+Field purposes (write decisions, not code — "Approach" is 1–3 sentences of sequencing and design choice, not a diff sketch; "Files" lists paths only):
+
+- **Goal** — one sentence the worker can restate back to you. If you can't state it in one sentence, the unit is too big.
+- **Requirements** — stable R-IDs from the linked brainstorm doc at `docs/brainstorms/YYYY-MM-DD-<topic>-requirements.md`. Convention only, no new field. Omit when no brainstorm exists.
+- **Dependencies** — hard blockers go in `blocked_by`; soft ordering or "after X lands" notes stay as prose.
+- **Files** — the layer boundary. What the worker owns and must not touch outside of. Boundary violation is a rejection condition.
+- **Approach** — the sequencing or design decision already made. Not a code sketch, not a pseudocode draft. If you find yourself writing pseudocode, you are doing the worker's job.
+- **Execution note** — maps 1:1 to the task `execution_note` field. One of `test-first`, `characterization-first`, `additive-only`, or omitted.
+- **Patterns to follow** — pointer to existing code or a prior commit the worker should mirror. Reduces stylistic drift.
+- **Test scenarios** — name the scenarios, including at least one error path. Don't leave test design entirely to the worker.
+- **Verification** — observable outcome. What can be demonstrated when done. Maps to `demo_statement`.
+
+Template → task schema mapping (no new fields; existing schema covers everything):
+
+| Template field | Maps to |
+|---|---|
+| Unit N name | `title` |
+| Goal | first paragraph of `description` |
+| Requirements | prose bullet in `description` (convention) |
+| Dependencies | `blocked_by` (hard) or `description` prose (soft) |
+| Files | `description` prose block |
+| Approach | `design` field |
+| Execution note | `execution_note` field |
+| Patterns to follow | `description` prose |
+| Test scenarios | `acceptance_criteria` field |
+| Verification | `demo_statement` field |
+
+Scope and escape hatches:
+
+- **EPIC subtasks only.** Standalone bugs/chores/spikes stay freeform. Do not force the template on work it does not fit.
+- **Existing open tasks are not migrated.** The template applies to tasks *created after* the skill update lands.
+- **Fields can be marked `N/A` or omitted** when a unit genuinely does not need them (e.g., a cosmetic skill-content edit has no meaningful `Test scenarios` beyond "content renders cleanly"). The intent is structure, not ceremony.
+- **Enforcement is skill guidance only.** No Rust validation, no warnings on `task.create`. Compliance is trust-based, same as the rest of this skill.
+
 ### Assignment Checks
 
 - **Agent-task fit** — Right capability for the job; no generalist on specialist work

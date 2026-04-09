@@ -74,6 +74,60 @@ fn codex_builtin_supervisor_guide_includes_core_workflow() {
 }
 
 #[test]
+fn supervisor_skill_mirrors_include_implementation_unit_template() {
+    let root = repo_root();
+    let claude = load(&root.join("cas-cli/src/builtins/skills/cas-supervisor.md"));
+    let codex = load(&root.join("cas-cli/src/builtins/codex/skills/cas-supervisor.md"));
+
+    for (label, content) in [("claude", &claude), ("codex", &codex)] {
+        assert!(
+            content.contains("### Implementation Unit Template"),
+            "{label} cas-supervisor.md missing '### Implementation Unit Template' heading"
+        );
+        // Canonical template markers (R1)
+        for marker in [
+            "**Unit N: [Name]**",
+            "**Goal:**",
+            "**Requirements:**",
+            "**Dependencies:**",
+            "**Files:**",
+            "**Approach:**",
+            "**Execution note:**",
+            "**Patterns to follow:**",
+            "**Test scenarios:**",
+            "**Verification:**",
+        ] {
+            assert!(
+                content.contains(marker),
+                "{label} cas-supervisor.md template missing marker: {marker}"
+            );
+        }
+        // R4 mapping table
+        assert!(
+            content.contains("| Template field | Maps to |"),
+            "{label} cas-supervisor.md missing template→task schema mapping table"
+        );
+        // R6/R7 scope note
+        assert!(
+            content.contains("EPIC subtasks"),
+            "{label} cas-supervisor.md missing EPIC-subtasks-only scope note"
+        );
+        // R13 cross-link from Spec Requirements
+        let spec_idx = content
+            .find("### Spec Requirements")
+            .unwrap_or_else(|| panic!("{label} missing Spec Requirements heading"));
+        let tmpl_idx = content
+            .find("### Implementation Unit Template")
+            .unwrap_or_else(|| panic!("{label} missing Implementation Unit Template heading"));
+        let spec_block = &content[spec_idx..tmpl_idx];
+        assert!(
+            spec_block.contains("Implementation Unit Template"),
+            "{label} Spec Requirements section missing cross-link to Implementation Unit Template"
+        );
+    }
+}
+
+#[test]
 fn codex_worker_runtime_instruction_allows_close_then_escalate() {
     let root = repo_root();
     let pty_rs = root.join("crates/cas-pty/src/pty.rs");
