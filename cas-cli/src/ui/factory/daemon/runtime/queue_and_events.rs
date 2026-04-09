@@ -77,18 +77,46 @@ impl FactoryDaemon {
 
     /// Detect idle-like messages that don't carry new information.
     ///
-    /// Matches common patterns workers produce when idle: "standing by",
-    /// "ready for task", "MCP tools unavailable", "awaiting instructions", etc.
+    /// The daemon rate-limits these (1 per 5 min per source) and silently
+    /// marks the rest as processed, so any false positive here is a
+    /// *dropped message*, not merely a noisy one.
+    ///
+    /// Matching rules (intentionally strict):
+    ///   1. The message must be short (<= 300 chars). A long message with
+    ///      "standing by" buried in it is almost certainly a real status
+    ///      report, not an idle heartbeat.
+    ///   2. The trimmed, lowercased message must **start with** one of the
+    ///      stock idle phrases. Substring matches were dropping messages
+    ///      like "Fix 1 for the WorkerIdle debounce race" or "the idle
+    ///      detector emits …" — both of which contain the literal word
+    ///      "idle" but are clearly not idle heartbeats.
+    ///
+    /// Previously this used unanchored substring matches including a bare
+    /// `"idle"` and the phrase `"mcp tools unavailable"`, which produced
+    /// false positives on legitimate status/debug messages. See cas-f9e8.
     fn is_idle_message(text: &str) -> bool {
-        let lower = text.to_lowercase();
-        lower.contains("standing by")
-            || lower.contains("ready for task")
-            || lower.contains("awaiting instructions")
-            || lower.contains("awaiting task")
-            || lower.contains("waiting for work")
-            || lower.contains("mcp tools unavailable")
-            || lower.contains("idle")
-            || lower.contains("no task assigned")
+        const MAX_IDLE_LEN: usize = 300;
+
+        // Stock idle heartbeats workers are instructed to send when they
+        // have nothing to do. Must be lowercase and pre-trimmed for the
+        // `starts_with` check below to be meaningful.
+        const IDLE_PREFIXES: &[&str] = &[
+            "standing by",
+            "ready for task",
+            "ready for tasks",
+            "awaiting instructions",
+            "awaiting task",
+            "awaiting tasks",
+            "waiting for work",
+            "no task assigned",
+            "no tasks assigned",
+        ];
+
+        if text.len() > MAX_IDLE_LEN {
+            return false;
+        }
+        let lower = text.trim().to_lowercase();
+        IDLE_PREFIXES.iter().any(|prefix| lower.starts_with(prefix))
     }
 
     /// Process prompt queue
@@ -1092,18 +1120,71 @@ mod tests {
     }
 
     #[test]
-    fn test_is_idle_message_matches_common_patterns() {
-        assert!(FactoryDaemon::is_idle_message("Worker fox-1: Standing by for task details."));
-        assert!(FactoryDaemon::is_idle_message("Worker fox-1: ready for task."));
-        assert!(FactoryDaemon::is_idle_message("MCP tools unavailable. Awaiting instructions."));
-        assert!(FactoryDaemon::is_idle_message("I am idle, waiting for work."));
-        assert!(FactoryDaemon::is_idle_message("No task assigned yet."));
+    fn test_is_idle_message_matches_stock_heartbeats() {
+        // Bare stock phrases.
+        assert!(FactoryDaemon::is_idle_message("Standing by."));
+        assert!(FactoryDaemon::is_idle_message("Ready for task."));
+        assert!(FactoryDaemon::is_idle_message("Ready for tasks."));
+        assert!(FactoryDaemon::is_idle_message("Awaiting instructions."));
+        assert!(FactoryDaemon::is_idle_message("Awaiting task."));
+        assert!(FactoryDaemon::is_idle_message("Waiting for work."));
+        assert!(FactoryDaemon::is_idle_message("No task assigned."));
+        // Case-insensitive and leading whitespace tolerant.
+        assert!(FactoryDaemon::is_idle_message("  STANDING BY."));
+        assert!(FactoryDaemon::is_idle_message("standing by for further direction"));
     }
 
+    /// Regression for cas-f9e8: the old unanchored substring filter silently
+    /// dropped any message containing the literal word "idle" or an idle
+    /// phrase buried mid-message. These are real status/debug messages that
+    /// must flow through to the supervisor.
     #[test]
-    fn test_is_idle_message_does_not_match_real_content() {
-        assert!(!FactoryDaemon::is_idle_message("COMPLETED task cas-1234. Commit: abc123."));
-        assert!(!FactoryDaemon::is_idle_message("Blocked: cannot compile due to missing dep."));
-        assert!(!FactoryDaemon::is_idle_message("Fixed the bug in parser.rs, tests pass."));
+    fn test_is_idle_message_does_not_match_status_reports_containing_idle_words() {
+        // "idle" as a bare substring — the old filter would have dropped this.
+        assert!(!FactoryDaemon::is_idle_message(
+            "Fix 1 for the WorkerIdle debounce race is in HEAD."
+        ));
+        assert!(!FactoryDaemon::is_idle_message(
+            "the idle detector now requires two consecutive ticks"
+        ));
+        assert!(!FactoryDaemon::is_idle_message(
+            "I am idle, waiting for work." // starts with "I am", not a stock phrase
+        ));
+        // Idle phrase buried mid-message, not at the start.
+        assert!(!FactoryDaemon::is_idle_message(
+            "Task cas-1234 closed. Standing by for the next assignment now."
+        ));
+        // Diagnostic message that previously matched "mcp tools unavailable"
+        // as a substring — that phrase has been removed from the filter.
+        assert!(!FactoryDaemon::is_idle_message(
+            "MCP tools unavailable — falling back to direct sqlite; see bugfix memory."
+        ));
+        // Real work reports.
+        assert!(!FactoryDaemon::is_idle_message(
+            "COMPLETED task cas-1234. Commit: abc123."
+        ));
+        assert!(!FactoryDaemon::is_idle_message(
+            "Blocked: cannot compile due to missing dep."
+        ));
+        assert!(!FactoryDaemon::is_idle_message(
+            "Fixed the bug in parser.rs, tests pass."
+        ));
+    }
+
+    /// Regression for cas-f9e8: very long messages that happen to mention an
+    /// idle phrase must never be classified as idle heartbeats, because the
+    /// daemon silently drops rate-limited matches without delivering them.
+    #[test]
+    fn test_is_idle_message_rejects_long_messages_even_when_starting_with_idle_phrase() {
+        let long_report = format!(
+            "Standing by. {}",
+            "x".repeat(320) // pushes total length past MAX_IDLE_LEN
+        );
+        assert!(
+            !FactoryDaemon::is_idle_message(&long_report),
+            "long messages must never be treated as idle heartbeats even when they \
+             start with a stock phrase — idle filter silently drops matches, so a \
+             false positive here would lose the entire report"
+        );
     }
 }
