@@ -1109,3 +1109,116 @@ async fn test_task_close_succeeds_after_verifier_clearance() {
         "task must be persisted as Closed after the successful close"
     );
 }
+
+/// cas-c29a: verification jail within-task deadlock.
+///
+/// A task enters `pending_verification` on the first close attempt and the
+/// dispatch-request row is persisted in `Error` status. If the task-verifier
+/// subagent crashes or is never spawned, that row stays stale forever and
+/// every close retry returns `VERIFICATION REQUIRED` in a loop.
+///
+/// This test fabricates a dispatch-request row with a `created_at` older than
+/// the 10-minute jail timeout, then calls close again. Expected: close
+/// auto-escalates — returns `VERIFICATION TIMED OUT`, clears
+/// `pending_verification`, and replaces the stale row with a timeout diagnostic.
+#[tokio::test]
+async fn test_close_auto_escalates_stale_verification_dispatch() {
+    let _env_lock = env_test_lock();
+    let (temp, service) = setup_cas();
+    let cas_dir = temp.path().join(".cas");
+
+    let verification_store = open_verification_store(&cas_dir).unwrap();
+    let task_store = open_task_store(&cas_dir).unwrap();
+
+    // Create + start task.
+    let req = TaskCreateRequest {
+        title: "Stuck in verification jail".to_string(),
+        description: None,
+        priority: 2,
+        task_type: "task".to_string(),
+        labels: None,
+        notes: None,
+        blocked_by: None,
+        design: None,
+        acceptance_criteria: None,
+        external_ref: None,
+        assignee: None,
+        demo_statement: None,
+        epic: None,
+    };
+    let result = service
+        .cas_task_create(Parameters(req))
+        .await
+        .expect("task_create");
+    let id = extract_task_id(&extract_text(result))
+        .expect("task id")
+        .to_string();
+    let _ = service
+        .cas_task_start(Parameters(IdRequest { id: id.clone() }))
+        .await
+        .expect("task_start");
+
+    // First close — sets pending_verification and writes dispatch-request row.
+    let _ = service
+        .cas_task_close(Parameters(TaskCloseRequest {
+            id: id.clone(),
+            reason: Some("Completed".to_string()),
+        }))
+        .await
+        .expect("first close returns a result");
+
+    let task_after_first = task_store.get(&id).expect("task exists");
+    assert!(
+        task_after_first.pending_verification,
+        "first close must set pending_verification"
+    );
+
+    // Age the dispatch row beyond the 10-minute jail timeout.
+    let mut dispatch = verification_store
+        .get_latest_for_task(&id)
+        .expect("get dispatch row")
+        .expect("dispatch row exists");
+    assert_eq!(dispatch.status, cas::types::VerificationStatus::Error);
+    assert!(dispatch.summary.starts_with("Dispatch requested"));
+    dispatch.created_at = chrono::Utc::now() - chrono::Duration::seconds(700);
+    verification_store
+        .update(&dispatch)
+        .expect("age dispatch row");
+
+    // Second close — should auto-escalate instead of looping.
+    let result = service
+        .cas_task_close(Parameters(TaskCloseRequest {
+            id: id.clone(),
+            reason: Some("Completed".to_string()),
+        }))
+        .await
+        .expect("second close returns a result");
+    let text = extract_text(result);
+    assert!(
+        text.contains("VERIFICATION TIMED OUT"),
+        "retry after timeout must report escalation, got: {text}"
+    );
+    assert!(
+        !text.contains("VERIFICATION REQUIRED"),
+        "escalation must not fall back to the standard jail message"
+    );
+
+    // pending_verification must be cleared so the task is no longer jailed.
+    let task_after_escalation = task_store.get(&id).expect("task exists");
+    assert!(
+        !task_after_escalation.pending_verification,
+        "auto-escalation must clear pending_verification"
+    );
+
+    // The dispatch row should have been updated with a timeout diagnostic.
+    let timed_out = verification_store
+        .get_latest_for_task(&id)
+        .expect("get row")
+        .expect("row exists");
+    assert_eq!(timed_out.status, cas::types::VerificationStatus::Error);
+    assert!(
+        timed_out.summary.contains("timed out"),
+        "stale dispatch row must be rewritten with timeout diagnostic: {}",
+        timed_out.summary
+    );
+}

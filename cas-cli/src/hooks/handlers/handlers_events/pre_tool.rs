@@ -106,6 +106,46 @@ pub fn handle_pre_tool_use(
                     })
                     .collect();
 
+                // cas-c29a: auto-escalate stale verification dispatches. If a task
+                // has been jailed for >VERIFICATION_JAIL_TIMEOUT_SECS with a
+                // dispatch-request row that never got a verdict, the task-verifier
+                // subagent is presumed dead. Clear pending_verification so the jail
+                // releases and the tool call proceeds instead of looping forever.
+                const VERIFICATION_JAIL_TIMEOUT_SECS: i64 = 600;
+                const DISPATCH_SUMMARY_PREFIX: &str = "Dispatch requested";
+                let pending_tasks: Vec<_> = if let Ok(verification_store) =
+                    open_verification_store(cas_root)
+                {
+                    pending_tasks
+                        .into_iter()
+                        .filter(|t| {
+                            let is_stale = matches!(
+                                verification_store.get_latest_for_task(&t.id),
+                                Ok(Some(ref v))
+                                    if v.status == crate::types::VerificationStatus::Error
+                                        && v.summary.starts_with(DISPATCH_SUMMARY_PREFIX)
+                                        && (chrono::Utc::now() - v.created_at).num_seconds()
+                                            > VERIFICATION_JAIL_TIMEOUT_SECS
+                            );
+                            if is_stale {
+                                let mut task_to_update = (*t).clone();
+                                task_to_update.pending_verification = false;
+                                task_to_update.updated_at = chrono::Utc::now();
+                                let _ = task_store.update(&task_to_update);
+                                warn!(
+                                    task_id = %t.id,
+                                    "[VERIFICATION JAIL] auto-escalated stale dispatch — verifier never responded"
+                                );
+                                false
+                            } else {
+                                true
+                            }
+                        })
+                        .collect()
+                } else {
+                    pending_tasks
+                };
+
                 // Check for unjail marker file (backup mechanism)
                 // This marker indicates task-verifier is running and all tools should be allowed
                 let marker_path = cas_root.join(".verifier_unjail_marker");

@@ -11,7 +11,7 @@ use crate::otel::OtelContext;
 use crate::store::{
     RuleStore, SqliteStore, Store, open_agent_store, open_commit_link_store,
     open_file_change_store, open_loop_store, open_prompt_store, open_rule_store, open_store,
-    open_task_store, open_worktree_store,
+    open_task_store, open_verification_store, open_worktree_store,
 };
 use crate::tracing::{DevTracer, ToolTrace, TraceTimer};
 use crate::types::RuleStatus;

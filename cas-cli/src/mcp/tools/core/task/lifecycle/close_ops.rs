@@ -4,6 +4,19 @@ use crate::harness_policy::{
 };
 use crate::mcp::tools::core::imports::*;
 
+/// Maximum time a task may sit in `pending_verification` before the close path
+/// treats the task-verifier subagent as dead, auto-escalates, and releases the
+/// jail. Addresses cas-c29a (within-task verification deadlock): if the
+/// verifier subagent crashes, is never spawned, or fails silently, the
+/// original dispatch-request row stays in `Error` status forever and every
+/// close retry returns `VERIFICATION REQUIRED`.
+const VERIFICATION_JAIL_TIMEOUT_SECS: i64 = 600;
+
+/// Marker prefix used on the dispatch-request verification row (see
+/// lines ~255-272 below). Used to distinguish a stale dispatch from a real
+/// verifier-written Error verdict during auto-escalation.
+const DISPATCH_SUMMARY_PREFIX: &str = "Dispatch requested";
+
 impl CasCore {
     pub async fn cas_task_close(
         &self,
@@ -185,6 +198,73 @@ impl CasCore {
                                     verifier_agent, req.id
                                 )
                             }
+                        )));
+                    }
+                    Ok(Some(ref v))
+                        if v.status == VerificationStatus::Error
+                            && v.summary.starts_with(DISPATCH_SUMMARY_PREFIX)
+                            && (chrono::Utc::now() - v.created_at).num_seconds()
+                                > VERIFICATION_JAIL_TIMEOUT_SECS =>
+                    {
+                        // Stale dispatch-request row: the task-verifier subagent was
+                        // supposed to write a verdict but never did. This is the
+                        // within-task verification deadlock from cas-c29a. Auto-escalate
+                        // so the supervisor sees a clean failure instead of an infinite
+                        // VERIFICATION REQUIRED loop.
+                        let elapsed_mins =
+                            (chrono::Utc::now() - v.created_at).num_seconds() / 60;
+
+                        // Clear pending_verification so the jail releases.
+                        let mut task_to_update = task.clone();
+                        task_to_update.pending_verification = false;
+                        task_to_update.updated_at = chrono::Utc::now();
+                        let _ = task_store.update(&task_to_update);
+
+                        // Release any lease so the supervisor can reclaim the task.
+                        if let Ok(agent_store) = self.open_agent_store() {
+                            let _ = agent_store.release_lease_for_task(&req.id);
+                        }
+
+                        // Replace the stale dispatch row with a timeout diagnostic so
+                        // the audit trail shows escalation instead of a dangling
+                        // "Dispatch requested" row.
+                        let mut timeout_row = v.clone();
+                        timeout_row.summary = format!(
+                            "Verification timed out after {elapsed_mins} minutes — \
+                             task-verifier subagent never recorded a verdict. \
+                             Auto-escalated by cas_task_close: pending_verification cleared, \
+                             lease released. Supervisor must re-dispatch verifier or record \
+                             verdict manually."
+                        );
+                        timeout_row.created_at = chrono::Utc::now();
+                        let _ = verification_store.update(&timeout_row);
+
+                        // Surface an activity event so the TUI shows the escalation.
+                        if let Ok(agent_id) = self.get_agent_id() {
+                            let event = crate::mcp::socket::DaemonEvent::WorkerActivity {
+                                session_id: agent_id,
+                                event_type: "verification_timeout_escalated".to_string(),
+                                description: format!(
+                                    "Verification timed out ({elapsed_mins}m): {}",
+                                    req.id
+                                ),
+                                entity_id: Some(req.id.clone()),
+                            };
+                            let _ = crate::mcp::socket::send_event(&self.cas_root, &event);
+                        }
+
+                        return Ok(Self::tool_error(format!(
+                            "⚠️ VERIFICATION TIMED OUT\n\n\
+                            Task {} was awaiting verification for {} minutes with no verdict \
+                            from the task-verifier subagent. Auto-escalated: verification jail \
+                            released, lease freed.\n\n\
+                            This usually means the task-verifier subagent crashed, was never \
+                            spawned, or failed silently.\n\n\
+                            To proceed:\n\
+                            1. Re-dispatch verifier: Task(subagent_type=\"task-verifier\", prompt=\"Verify task {}\")\n\
+                            2. Or record verdict directly: mcp__cas__verification action=add task_id={} status=approved summary=\"...\"\n\
+                            3. Then call cas_task_close again.",
+                            req.id, elapsed_mins, req.id, req.id
                         )));
                     }
                     Ok(None) | Ok(Some(_)) => {
