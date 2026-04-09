@@ -122,9 +122,13 @@ pub struct TaskRequest {
     #[serde(default)]
     pub description: Option<String>,
 
-    /// Priority 0-4 (for create, update)
-    #[schemars(description = "Priority: 0=Critical, 1=High, 2=Medium, 3=Low, 4=Backlog")]
-    #[serde(default, deserialize_with = "deser::option_u8")]
+    /// Priority 0-4 (for create, update). Accepts numeric (0-4), numeric
+    /// string ("0"-"4"), or named alias (critical, high, medium, low, backlog).
+    #[schemars(
+        description = "Priority: 0=Critical, 1=High, 2=Medium (default), 3=Low, 4=Backlog. \
+                       Accepts numeric (0-4) or named alias (critical/high/medium/low/backlog)."
+    )]
+    #[serde(default, deserialize_with = "deser::option_priority")]
     pub priority: Option<u8>,
 
     /// Task type (for create): task, bug, feature, epic, chore
@@ -158,7 +162,7 @@ pub struct TaskRequest {
 
     /// Include dependencies (for show)
     #[schemars(description = "Include dependency information")]
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deser::option_bool")]
     pub with_deps: Option<bool>,
 
     /// Blocked by task IDs (for create)
@@ -394,7 +398,7 @@ pub struct SkillRequest {
 
     /// Make skill invokable via slash command
     #[schemars(description = "Enable /skill-name invocation")]
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deser::option_bool")]
     pub invokable: Option<bool>,
 
     /// Argument hint for invokable skills
@@ -419,12 +423,12 @@ pub struct SkillRequest {
 
     /// Start as draft
     #[schemars(description = "Create skill as draft (not enabled)")]
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deser::option_bool")]
     pub draft: Option<bool>,
 
     /// Disable model invocation (Claude Code 2.1.3+)
     #[schemars(description = "Prevent skill from invoking the model (for command-only skills)")]
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deser::option_bool")]
     pub disable_model_invocation: Option<bool>,
 }
 
@@ -521,7 +525,7 @@ pub struct SpecRequest {
 
     /// Create new version instead of modifying (for update)
     #[schemars(description = "Create a new version instead of modifying in place")]
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deser::option_bool")]
     pub new_version: Option<bool>,
 
     /// Tags (comma-separated)
@@ -688,9 +692,13 @@ pub struct PatternRequest {
     #[serde(default)]
     pub category: Option<String>,
 
-    /// Priority 0-3 (for create, update, team_create_suggestion)
-    #[schemars(description = "Priority: 0=Critical, 1=High, 2=Medium (default), 3=Low")]
-    #[serde(default, deserialize_with = "deser::option_u8")]
+    /// Priority 0-3 (for create, update, team_create_suggestion). Accepts
+    /// numeric, numeric string, or named alias.
+    #[schemars(
+        description = "Priority: 0=Critical, 1=High, 2=Medium (default), 3=Low. \
+                       Accepts numeric (0-3) or named alias (critical/high/medium/low)."
+    )]
+    #[serde(default, deserialize_with = "deser::option_priority")]
     pub priority: Option<u8>,
 
     /// Propagation mode (for create, update)
@@ -737,12 +745,12 @@ pub struct PatternRequest {
 
     /// Recommended flag (for team_recommend)
     #[schemars(description = "Whether to mark suggestion as recommended (default: true)")]
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deser::option_bool")]
     pub recommended: Option<bool>,
 
     /// Include dismissed suggestions (for team_suggestions)
     #[schemars(description = "Include dismissed suggestions in listing (default: false)")]
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deser::option_bool")]
     pub include_dismissed: Option<bool>,
 }
 

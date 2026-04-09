@@ -560,3 +560,104 @@ fn test_coordination_all_numeric_fields_as_string() {
     assert_eq!(req.remind_ttl_secs, Some(1800));
     assert_eq!(req.limit, Some(25));
 }
+
+// ============================================================================
+// cas-ca63: priority alias + flexible bool deserializers
+// ============================================================================
+
+#[test]
+fn test_priority_accepts_named_aliases() {
+    for (alias, expected) in &[
+        ("critical", 0u8),
+        ("CRITICAL", 0),
+        ("high", 1),
+        ("medium", 2),
+        ("normal", 2),
+        ("low", 3),
+        ("backlog", 4),
+        ("p0", 0),
+        ("p1", 1),
+        ("p4", 4),
+    ] {
+        let json = format!(r#"{{"action":"create","title":"x","priority":"{alias}"}}"#);
+        let req: TaskRequest = serde_json::from_str(&json)
+            .unwrap_or_else(|e| panic!("priority alias '{alias}' should parse: {e}"));
+        assert_eq!(
+            req.priority,
+            Some(*expected),
+            "priority alias '{alias}' should map to {expected}"
+        );
+    }
+}
+
+#[test]
+fn test_priority_accepts_numeric_string() {
+    let req: TaskRequest =
+        serde_json::from_str(r#"{"action":"create","title":"x","priority":"1"}"#).unwrap();
+    assert_eq!(req.priority, Some(1));
+}
+
+#[test]
+fn test_priority_accepts_numeric() {
+    let req: TaskRequest =
+        serde_json::from_str(r#"{"action":"create","title":"x","priority":3}"#).unwrap();
+    assert_eq!(req.priority, Some(3));
+}
+
+#[test]
+fn test_priority_rejects_unknown_alias_with_helpful_error() {
+    let err = serde_json::from_str::<TaskRequest>(
+        r#"{"action":"create","title":"x","priority":"urgent"}"#,
+    )
+    .expect_err("unknown alias must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("critical") && msg.contains("high") && msg.contains("backlog"),
+        "error must list valid aliases so the caller knows what to use: {msg}"
+    );
+}
+
+#[test]
+fn test_priority_rejects_out_of_range_numeric() {
+    let err =
+        serde_json::from_str::<TaskRequest>(r#"{"action":"create","title":"x","priority":9}"#)
+            .expect_err("priority 9 is out of 0-4 range");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("critical") || msg.contains("0-4"),
+        "error must hint at valid range: {msg}"
+    );
+}
+
+#[test]
+fn test_with_deps_accepts_string_bool() {
+    // cas-ca63 Issue 2: boolean as string should be coerced.
+    let req: TaskRequest =
+        serde_json::from_str(r#"{"action":"show","id":"cas-1","with_deps":"true"}"#).unwrap();
+    assert_eq!(req.with_deps, Some(true));
+
+    let req: TaskRequest =
+        serde_json::from_str(r#"{"action":"show","id":"cas-1","with_deps":"false"}"#).unwrap();
+    assert_eq!(req.with_deps, Some(false));
+
+    let req: TaskRequest =
+        serde_json::from_str(r#"{"action":"show","id":"cas-1","with_deps":1}"#).unwrap();
+    assert_eq!(req.with_deps, Some(true));
+
+    let req: TaskRequest =
+        serde_json::from_str(r#"{"action":"show","id":"cas-1","with_deps":true}"#).unwrap();
+    assert_eq!(req.with_deps, Some(true));
+}
+
+#[test]
+fn test_with_deps_rejects_garbage_string_with_helpful_error() {
+    let err = serde_json::from_str::<TaskRequest>(
+        r#"{"action":"show","id":"cas-1","with_deps":"maybe"}"#,
+    )
+    .expect_err("garbage bool string must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("boolean") && msg.contains("true"),
+        "error must show valid values: {msg}"
+    );
+}

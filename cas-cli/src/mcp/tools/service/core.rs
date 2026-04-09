@@ -28,7 +28,7 @@ impl CasService {
         let inner_req = IdRequest {
             id: req
                 .id
-                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required for get"))?,
+                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required for get — pass task ID as `id` (not `task_id`, `taskId`, or `_id`). Example: mcp__cas__task action=get id=cas-abc1"))?,
         };
         self.inner.cas_get(Parameters(inner_req)).await
     }
@@ -53,7 +53,7 @@ impl CasService {
         let inner_req = EntryUpdateRequest {
             id: req
                 .id
-                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required for update"))?,
+                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required for update — pass task ID as `id` (not `task_id`, `taskId`, or `_id`). Example: mcp__cas__task action=update id=cas-abc1"))?,
             content: req.content,
             tags: req.tags,
             importance: req.importance,
@@ -69,7 +69,7 @@ impl CasService {
         let inner_req = IdRequest {
             id: req
                 .id
-                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required for delete"))?,
+                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required for delete — pass task ID as `id` (not `task_id`, `taskId`, or `_id`). Example: mcp__cas__task action=delete id=cas-abc1"))?,
         };
         self.inner.cas_delete(Parameters(inner_req)).await
     }
@@ -82,7 +82,7 @@ impl CasService {
         let inner_req = IdRequest {
             id: req
                 .id
-                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required for archive"))?,
+                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required for archive — pass task ID as `id` (not `task_id`, `taskId`, or `_id`). Example: mcp__cas__task action=archive id=cas-abc1"))?,
         };
         self.inner.cas_archive(Parameters(inner_req)).await
     }
@@ -94,7 +94,7 @@ impl CasService {
         use crate::mcp::tools::IdRequest;
         let inner_req = IdRequest {
             id: req.id.ok_or_else(|| {
-                Self::error(ErrorCode::INVALID_PARAMS, "id required for unarchive")
+                Self::error(ErrorCode::INVALID_PARAMS, "id required for unarchive — pass task ID as `id` (not `task_id`, `taskId`, or `_id`). Example: mcp__cas__task action=unarchive id=cas-abc1")
             })?,
         };
         self.inner.cas_unarchive(Parameters(inner_req)).await
@@ -108,7 +108,7 @@ impl CasService {
         let inner_req = IdRequest {
             id: req
                 .id
-                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required for helpful"))?,
+                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required for helpful — pass task ID as `id` (not `task_id`, `taskId`, or `_id`). Example: mcp__cas__task action=helpful id=cas-abc1"))?,
         };
         self.inner.cas_helpful(Parameters(inner_req)).await
     }
@@ -121,7 +121,7 @@ impl CasService {
         let inner_req = IdRequest {
             id: req
                 .id
-                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required for harmful"))?,
+                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required for harmful — pass task ID as `id` (not `task_id`, `taskId`, or `_id`). Example: mcp__cas__task action=harmful id=cas-abc1"))?,
         };
         self.inner.cas_harmful(Parameters(inner_req)).await
     }
@@ -133,7 +133,7 @@ impl CasService {
         use crate::mcp::tools::IdRequest;
         let inner_req = IdRequest {
             id: req.id.ok_or_else(|| {
-                Self::error(ErrorCode::INVALID_PARAMS, "id required for mark_reviewed")
+                Self::error(ErrorCode::INVALID_PARAMS, "id required for mark_reviewed — pass task ID as `id` (not `task_id`, `taskId`, or `_id`). Example: mcp__cas__task action=mark_reviewed id=cas-abc1")
             })?,
         };
         self.inner.cas_mark_reviewed(Parameters(inner_req)).await
@@ -157,7 +157,7 @@ impl CasService {
         use crate::mcp::tools::MemoryTierRequest;
         let inner_req = MemoryTierRequest {
             id: req.id.ok_or_else(|| {
-                Self::error(ErrorCode::INVALID_PARAMS, "id required for set_tier")
+                Self::error(ErrorCode::INVALID_PARAMS, "id required for set_tier — pass task ID as `id` (not `task_id`, `taskId`, or `_id`). Example: mcp__cas__task action=set_tier id=cas-abc1")
             })?,
             tier: req.tier.ok_or_else(|| {
                 Self::error(ErrorCode::INVALID_PARAMS, "tier required for set_tier")
@@ -174,7 +174,7 @@ impl CasService {
         let inner_req = OpinionReinforceRequest {
             id: req
                 .id
-                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required"))?,
+                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required — pass as `id` (not `task_id`, `taskId`, or `_id`). Example: mcp__cas__task action=<verb> id=cas-abc1"))?,
             evidence: req.content.ok_or_else(|| {
                 Self::error(ErrorCode::INVALID_PARAMS, "content (evidence) required")
             })?,
@@ -192,7 +192,7 @@ impl CasService {
         let inner_req = OpinionWeakenRequest {
             id: req
                 .id
-                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required"))?,
+                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required — pass as `id` (not `task_id`, `taskId`, or `_id`). Example: mcp__cas__task action=<verb> id=cas-abc1"))?,
             evidence: req.content.ok_or_else(|| {
                 Self::error(ErrorCode::INVALID_PARAMS, "content (evidence) required")
             })?,
@@ -208,7 +208,7 @@ impl CasService {
         let inner_req = OpinionContradictRequest {
             id: req
                 .id
-                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required"))?,
+                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required — pass as `id` (not `task_id`, `taskId`, or `_id`). Example: mcp__cas__task action=<verb> id=cas-abc1"))?,
             evidence: req.content.ok_or_else(|| {
                 Self::error(ErrorCode::INVALID_PARAMS, "content (evidence) required")
             })?,
@@ -223,7 +223,11 @@ impl CasService {
         use crate::mcp::tools::TaskCreateRequest;
         let inner_req = TaskCreateRequest {
             title: req.title.ok_or_else(|| {
-                Self::error(ErrorCode::INVALID_PARAMS, "title required for create")
+                Self::error(
+                    ErrorCode::INVALID_PARAMS,
+                    "title required for create — pass a short descriptive title. \
+                     Example: mcp__cas__task action=create title=\"Fix login bug\" priority=1",
+                )
             })?,
             description: req.description,
             priority: req.priority.unwrap_or(2),
@@ -246,7 +250,7 @@ impl CasService {
         let inner_req = TaskShowRequest {
             id: req
                 .id
-                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required for show"))?,
+                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required for show — pass task ID as `id` (not `task_id`, `taskId`, or `_id`). Example: mcp__cas__task action=show id=cas-abc1"))?,
             with_deps: req.with_deps.unwrap_or(true),
         };
         self.inner.cas_task_show(Parameters(inner_req)).await
@@ -257,7 +261,7 @@ impl CasService {
         let inner_req = TaskUpdateRequest {
             id: req
                 .id
-                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required for update"))?,
+                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required for update — pass task ID as `id` (not `task_id`, `taskId`, or `_id`). Example: mcp__cas__task action=update id=cas-abc1"))?,
             title: req.title,
             notes: req.notes,
             priority: req.priority,
@@ -280,7 +284,7 @@ impl CasService {
         let inner_req = IdRequest {
             id: req
                 .id
-                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required for start"))?,
+                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required for start — pass task ID as `id` (not `task_id`, `taskId`, or `_id`). Example: mcp__cas__task action=start id=cas-abc1"))?,
         };
         self.inner.cas_task_start(Parameters(inner_req)).await
     }
@@ -290,7 +294,7 @@ impl CasService {
         let inner_req = TaskCloseRequest {
             id: req
                 .id
-                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required for close"))?,
+                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required for close — pass task ID as `id` (not `task_id`, `taskId`, or `_id`). Example: mcp__cas__task action=close id=cas-abc1"))?,
             reason: req.reason,
         };
         self.inner.cas_task_close(Parameters(inner_req)).await
@@ -301,7 +305,7 @@ impl CasService {
         let inner_req = IdRequest {
             id: req
                 .id
-                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required for reopen"))?,
+                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required for reopen — pass task ID as `id` (not `task_id`, `taskId`, or `_id`). Example: mcp__cas__task action=reopen id=cas-abc1"))?,
         };
         self.inner.cas_task_reopen(Parameters(inner_req)).await
     }
@@ -311,7 +315,7 @@ impl CasService {
         let inner_req = IdRequest {
             id: req
                 .id
-                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required for delete"))?,
+                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required for delete — pass task ID as `id` (not `task_id`, `taskId`, or `_id`). Example: mcp__cas__task action=delete id=cas-abc1"))?,
         };
         self.inner.cas_task_delete(Parameters(inner_req)).await
     }
@@ -361,10 +365,16 @@ impl CasService {
         let inner_req = TaskNotesRequest {
             id: req
                 .id
-                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required for notes"))?,
+                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required for notes — pass task ID as `id` (not `task_id`, `taskId`, or `_id`). Example: mcp__cas__task action=notes id=cas-abc1"))?,
             note: req
                 .notes
-                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "notes required"))?,
+                .ok_or_else(|| {
+                    Self::error(
+                        ErrorCode::INVALID_PARAMS,
+                        "notes required — parameter name is `notes` (plural), not `note`. \
+                         Example: mcp__cas__task action=notes id=cas-abc1 notes=\"progress update\" note_type=\"progress\"",
+                    )
+                })?,
             note_type: req.note_type.unwrap_or_else(|| "progress".to_string()),
         };
         self.inner.cas_task_notes(Parameters(inner_req)).await
@@ -375,7 +385,7 @@ impl CasService {
         let inner_req = DependencyRequest {
             from_id: req
                 .id
-                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required"))?,
+                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required — pass as `id` (not `task_id`, `taskId`, or `_id`). Example: mcp__cas__task action=<verb> id=cas-abc1"))?,
             to_id: req
                 .to_id
                 .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "to_id required"))?,
@@ -392,7 +402,7 @@ impl CasService {
         let inner_req = DependencyRequest {
             from_id: req
                 .id
-                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required"))?,
+                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required — pass as `id` (not `task_id`, `taskId`, or `_id`). Example: mcp__cas__task action=<verb> id=cas-abc1"))?,
             to_id: req
                 .to_id
                 .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "to_id required"))?,
@@ -406,7 +416,7 @@ impl CasService {
         let inner_req = IdRequest {
             id: req
                 .id
-                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required"))?,
+                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required — pass as `id` (not `task_id`, `taskId`, or `_id`). Example: mcp__cas__task action=<verb> id=cas-abc1"))?,
         };
         self.inner.cas_task_dep_list(Parameters(inner_req)).await
     }
@@ -416,7 +426,7 @@ impl CasService {
         let inner_req = TaskClaimRequest {
             task_id: req
                 .id
-                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required"))?,
+                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required — pass as `id` (not `task_id`, `taskId`, or `_id`). Example: mcp__cas__task action=<verb> id=cas-abc1"))?,
             duration_secs: req.duration_secs.unwrap_or(600),
             reason: req.reason,
         };
@@ -428,7 +438,7 @@ impl CasService {
         let inner_req = TaskReleaseRequest {
             task_id: req
                 .id
-                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required"))?,
+                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required — pass as `id` (not `task_id`, `taskId`, or `_id`). Example: mcp__cas__task action=<verb> id=cas-abc1"))?,
         };
         self.inner.cas_task_release(Parameters(inner_req)).await
     }
@@ -438,10 +448,19 @@ impl CasService {
         let inner_req = TaskTransferRequest {
             task_id: req
                 .id
-                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required"))?,
+                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required — pass as `id` (not `task_id`, `taskId`, or `_id`). Example: mcp__cas__task action=<verb> id=cas-abc1"))?,
             to_agent: req
                 .to_agent
-                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "to_agent required"))?,
+                .ok_or_else(|| {
+                    Self::error(
+                        ErrorCode::INVALID_PARAMS,
+                        "to_agent required — for transfer, the target field is `to_agent` \
+                         (not `assignee`). NOTE: `transfer` is for reassigning an ALREADY-CLAIMED \
+                         task between agents. For initial assignment use \
+                         `action=update id=<task> assignee=<worker-name>` instead. \
+                         Example: mcp__cas__task action=transfer id=cas-abc1 to_agent=worker-2",
+                    )
+                })?,
             note: req.notes,
         };
         self.inner.cas_task_transfer(Parameters(inner_req)).await
@@ -495,7 +514,7 @@ impl CasService {
         let inner_req = IdRequest {
             id: req
                 .id
-                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required"))?,
+                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required — pass as `id` (not `task_id`, `taskId`, or `_id`). Example: mcp__cas__task action=<verb> id=cas-abc1"))?,
         };
         self.inner.cas_rule_show(Parameters(inner_req)).await
     }
@@ -505,7 +524,7 @@ impl CasService {
         let inner_req = RuleUpdateRequest {
             id: req
                 .id
-                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required"))?,
+                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required — pass as `id` (not `task_id`, `taskId`, or `_id`). Example: mcp__cas__task action=<verb> id=cas-abc1"))?,
             content: req.content,
             paths: req.paths,
             tags: req.tags,
@@ -520,7 +539,7 @@ impl CasService {
         let inner_req = IdRequest {
             id: req
                 .id
-                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required"))?,
+                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required — pass as `id` (not `task_id`, `taskId`, or `_id`). Example: mcp__cas__task action=<verb> id=cas-abc1"))?,
         };
         self.inner.cas_rule_delete(Parameters(inner_req)).await
     }
@@ -546,7 +565,7 @@ impl CasService {
         let inner_req = IdRequest {
             id: req
                 .id
-                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required"))?,
+                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required — pass as `id` (not `task_id`, `taskId`, or `_id`). Example: mcp__cas__task action=<verb> id=cas-abc1"))?,
         };
         self.inner.cas_rule_helpful(Parameters(inner_req)).await
     }
@@ -556,7 +575,7 @@ impl CasService {
         let inner_req = IdRequest {
             id: req
                 .id
-                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required"))?,
+                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required — pass as `id` (not `task_id`, `taskId`, or `_id`). Example: mcp__cas__task action=<verb> id=cas-abc1"))?,
         };
         self.inner.cas_rule_harmful(Parameters(inner_req)).await
     }
@@ -683,7 +702,7 @@ impl CasService {
         let inner_req = IdRequest {
             id: req
                 .id
-                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required"))?,
+                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required — pass as `id` (not `task_id`, `taskId`, or `_id`). Example: mcp__cas__task action=<verb> id=cas-abc1"))?,
         };
         self.inner.cas_skill_show(Parameters(inner_req)).await
     }
@@ -693,7 +712,7 @@ impl CasService {
         let inner_req = SkillUpdateRequest {
             id: req
                 .id
-                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required"))?,
+                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required — pass as `id` (not `task_id`, `taskId`, or `_id`). Example: mcp__cas__task action=<verb> id=cas-abc1"))?,
             name: req.name,
             description: req.description,
             invocation: req.invocation,
@@ -709,7 +728,7 @@ impl CasService {
         let inner_req = IdRequest {
             id: req
                 .id
-                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required"))?,
+                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required — pass as `id` (not `task_id`, `taskId`, or `_id`). Example: mcp__cas__task action=<verb> id=cas-abc1"))?,
         };
         self.inner.cas_skill_delete(Parameters(inner_req)).await
     }
@@ -738,7 +757,7 @@ impl CasService {
         let inner_req = IdRequest {
             id: req
                 .id
-                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required"))?,
+                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required — pass as `id` (not `task_id`, `taskId`, or `_id`). Example: mcp__cas__task action=<verb> id=cas-abc1"))?,
         };
         self.inner.cas_skill_enable(Parameters(inner_req)).await
     }
@@ -751,7 +770,7 @@ impl CasService {
         let inner_req = IdRequest {
             id: req
                 .id
-                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required"))?,
+                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required — pass as `id` (not `task_id`, `taskId`, or `_id`). Example: mcp__cas__task action=<verb> id=cas-abc1"))?,
         };
         self.inner.cas_skill_disable(Parameters(inner_req)).await
     }
@@ -765,7 +784,7 @@ impl CasService {
         let inner_req = IdRequest {
             id: req
                 .id
-                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required"))?,
+                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required — pass as `id` (not `task_id`, `taskId`, or `_id`). Example: mcp__cas__task action=<verb> id=cas-abc1"))?,
         };
         self.inner.cas_skill_use(Parameters(inner_req)).await
     }

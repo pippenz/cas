@@ -13,13 +13,19 @@ impl CasService {
                 "target required (agent name, 'supervisor', or 'all_workers')",
             )
         })?;
-        let message = req
-            .message
-            .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "message required"))?;
+        let message = req.message.ok_or_else(|| {
+            Self::error(
+                ErrorCode::INVALID_PARAMS,
+                "message required — full message body goes in `message`. \
+                 Example: mcp__cas__coordination action=message target=supervisor \
+                 summary=\"task blocked\" message=\"cas-abc1 needs ...\"",
+            )
+        })?;
         let summary = req.summary.ok_or_else(|| {
             Self::error(
                 ErrorCode::INVALID_PARAMS,
-                "summary required (a short one-line description of the message)",
+                "summary required — a short one-line preview shown in the UI. \
+                 Example: summary=\"task blocked on verification\" (required alongside `message`).",
             )
         })?;
 
