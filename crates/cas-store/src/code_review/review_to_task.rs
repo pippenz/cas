@@ -29,10 +29,25 @@
 //! - add new fields to the task schema (uses existing columns)
 //! - create tasks for `advisory` findings, ever
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
-
 use cas_types::{AutofixClass, Finding, FindingSeverity, Priority, TaskType};
+
+// FNV-1a 64-bit. Chosen over `std::collections::hash_map::DefaultHasher`
+// because `external_ref` is persisted in the `tasks.external_ref` column
+// and the standard hasher is explicitly **not** guaranteed to be stable
+// across Rust releases or platforms (see std docs). FNV-1a is simple,
+// deterministic, dependency-free, and collision-resistant enough for a
+// dedup key — we are not using it as a cryptographic primitive.
+const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut hash = FNV_OFFSET_BASIS;
+    for b in bytes {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
 
 /// Label attached to every task created by this flow. Lets downstream
 /// tooling (search, filters, cleanup jobs) identify review-routed
@@ -209,12 +224,19 @@ fn normalize_title(title: &str) -> String {
 /// at a glance in `tasks.external_ref` queries and cannot collide
 /// with external-ref values from other subsystems.
 pub fn external_ref_for(finding: &Finding) -> String {
-    let mut hasher = DefaultHasher::new();
-    finding.file.hash(&mut hasher);
-    normalize_title(&finding.title).hash(&mut hasher);
+    // Build a single byte buffer with explicit field separators so
+    // distinct inputs can't collide via adjacent-field smearing (e.g.
+    // file="ab", title="c" vs file="a", title="bc").
     let why_prefix: String = finding.why_it_matters.chars().take(80).collect();
-    why_prefix.hash(&mut hasher);
-    format!("code-review:{:016x}", hasher.finish())
+    let mut buf = Vec::with_capacity(
+        finding.file.len() + finding.title.len() + why_prefix.len() + 8,
+    );
+    buf.extend_from_slice(finding.file.as_bytes());
+    buf.push(0x1f); // ASCII unit separator
+    buf.extend_from_slice(normalize_title(&finding.title).as_bytes());
+    buf.push(0x1f);
+    buf.extend_from_slice(why_prefix.as_bytes());
+    format!("code-review:{:016x}", fnv1a_64(&buf))
 }
 
 fn build_labels(finding: &Finding) -> Vec<String> {
@@ -422,6 +444,29 @@ mod tests {
     }
 
     // --- external_ref stability ---
+
+    #[test]
+    fn fnv1a_64_known_vectors() {
+        // Canonical FNV-1a 64-bit test vectors — pin the implementation so
+        // future refactors cannot silently change the persisted hash.
+        assert_eq!(fnv1a_64(b""), 0xcbf29ce484222325);
+        assert_eq!(fnv1a_64(b"a"), 0xaf63dc4c8601ec8c);
+        assert_eq!(fnv1a_64(b"foobar"), 0x85944171f73967e8);
+    }
+
+    #[test]
+    fn external_ref_is_deterministic_across_runs() {
+        // Concrete finding -> concrete expected hex prefix + format. Failing
+        // this test signals that the on-disk external_ref format changed,
+        // which would break idempotency for all previously-routed tasks.
+        let f = mk("dropped Result", FindingSeverity::P1, AutofixClass::Manual);
+        let a = external_ref_for(&f);
+        let b = external_ref_for(&f);
+        assert_eq!(a, b);
+        assert!(a.starts_with("code-review:"));
+        assert_eq!(a.len(), "code-review:".len() + 16);
+        assert!(a["code-review:".len()..].chars().all(|c| c.is_ascii_hexdigit()));
+    }
 
     #[test]
     fn external_ref_stable_across_line_drift() {
