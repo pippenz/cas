@@ -53,6 +53,11 @@ pub const BUILTIN_AGENTS: &[BuiltinFile] = &[
         path: "agents/session-summarizer.md",
         content: include_str!("builtins/agents/session-summarizer.md"),
     },
+    // DEPRECATED (Phase 1 subsystem A, EPIC cas-0750): the legacy
+    // `code-reviewer` agent is replaced by the `cas-code-review` multi-persona
+    // skill. The entry is kept in BUILTIN_AGENTS only so `cas sync` overwrites
+    // any downstream `.claude/agents/code-reviewer.md` with the deprecation
+    // stub checked into the repo. Remove after downstream caches expire.
     BuiltinFile {
         path: "agents/code-reviewer.md",
         content: include_str!("builtins/agents/code-reviewer.md"),
@@ -89,6 +94,9 @@ pub const CODEX_BUILTIN_AGENTS: &[BuiltinFile] = &[
         path: "agents/session-summarizer.md",
         content: include_str!("builtins/codex/agents/session-summarizer.md"),
     },
+    // DEPRECATED (Phase 1 subsystem A, EPIC cas-0750): see the note on the
+    // claude-mirror entry above. Kept only so `cas sync` overwrites stale
+    // downstream copies with the deprecation stub.
     BuiltinFile {
         path: "agents/code-reviewer.md",
         content: include_str!("builtins/codex/agents/code-reviewer.md"),
@@ -165,6 +173,54 @@ pub const BUILTIN_SKILLS: &[BuiltinFile] = &[
         path: "skills/cas-ideate/references/post-ideation-workflow.md",
         content: include_str!("builtins/skills/cas-ideate/references/post-ideation-workflow.md"),
     },
+    // cas-code-review (Phase 1 subsystem A, EPIC cas-0750).
+    // Multi-persona code-review skill that replaces the legacy `code-reviewer`
+    // agent. The old agent entry below is kept only to propagate a deprecation
+    // stub via `cas sync`; all real functionality lives in this skill.
+    BuiltinFile {
+        path: "skills/cas-code-review/SKILL.md",
+        content: include_str!("builtins/skills/cas-code-review/SKILL.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-code-review/references/findings-schema.md",
+        content: include_str!("builtins/skills/cas-code-review/references/findings-schema.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-code-review/references/personas/correctness.md",
+        content: include_str!("builtins/skills/cas-code-review/references/personas/correctness.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-code-review/references/personas/testing.md",
+        content: include_str!("builtins/skills/cas-code-review/references/personas/testing.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-code-review/references/personas/maintainability.md",
+        content: include_str!(
+            "builtins/skills/cas-code-review/references/personas/maintainability.md"
+        ),
+    },
+    BuiltinFile {
+        path: "skills/cas-code-review/references/personas/project-standards.md",
+        content: include_str!(
+            "builtins/skills/cas-code-review/references/personas/project-standards.md"
+        ),
+    },
+    BuiltinFile {
+        path: "skills/cas-code-review/references/personas/security.md",
+        content: include_str!("builtins/skills/cas-code-review/references/personas/security.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-code-review/references/personas/performance.md",
+        content: include_str!(
+            "builtins/skills/cas-code-review/references/personas/performance.md"
+        ),
+    },
+    BuiltinFile {
+        path: "skills/cas-code-review/references/personas/adversarial.md",
+        content: include_str!(
+            "builtins/skills/cas-code-review/references/personas/adversarial.md"
+        ),
+    },
 ];
 
 /// All built-in skills managed by CAS for Codex
@@ -224,6 +280,59 @@ pub const CODEX_BUILTIN_SKILLS: &[BuiltinFile] = &[
     BuiltinFile {
         path: "skills/cas-ideate/references/post-ideation-workflow.md",
         content: include_str!("builtins/codex/skills/cas-ideate/references/post-ideation-workflow.md"),
+    },
+    // cas-code-review (Phase 1 subsystem A, EPIC cas-0750) — codex mirror.
+    BuiltinFile {
+        path: "skills/cas-code-review/SKILL.md",
+        content: include_str!("builtins/codex/skills/cas-code-review/SKILL.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-code-review/references/findings-schema.md",
+        content: include_str!(
+            "builtins/codex/skills/cas-code-review/references/findings-schema.md"
+        ),
+    },
+    BuiltinFile {
+        path: "skills/cas-code-review/references/personas/correctness.md",
+        content: include_str!(
+            "builtins/codex/skills/cas-code-review/references/personas/correctness.md"
+        ),
+    },
+    BuiltinFile {
+        path: "skills/cas-code-review/references/personas/testing.md",
+        content: include_str!(
+            "builtins/codex/skills/cas-code-review/references/personas/testing.md"
+        ),
+    },
+    BuiltinFile {
+        path: "skills/cas-code-review/references/personas/maintainability.md",
+        content: include_str!(
+            "builtins/codex/skills/cas-code-review/references/personas/maintainability.md"
+        ),
+    },
+    BuiltinFile {
+        path: "skills/cas-code-review/references/personas/project-standards.md",
+        content: include_str!(
+            "builtins/codex/skills/cas-code-review/references/personas/project-standards.md"
+        ),
+    },
+    BuiltinFile {
+        path: "skills/cas-code-review/references/personas/security.md",
+        content: include_str!(
+            "builtins/codex/skills/cas-code-review/references/personas/security.md"
+        ),
+    },
+    BuiltinFile {
+        path: "skills/cas-code-review/references/personas/performance.md",
+        content: include_str!(
+            "builtins/codex/skills/cas-code-review/references/personas/performance.md"
+        ),
+    },
+    BuiltinFile {
+        path: "skills/cas-code-review/references/personas/adversarial.md",
+        content: include_str!(
+            "builtins/codex/skills/cas-code-review/references/personas/adversarial.md"
+        ),
     },
 ];
 
@@ -634,6 +743,105 @@ This is the body content."#;
             CODEX_BUILTIN_SKILLS
                 .iter()
                 .any(|b| b.path == "skills/cas-ideate/SKILL.md")
+        );
+    }
+
+    #[test]
+    fn test_builtin_skills_contains_cas_code_review() {
+        // Phase 1 subsystem A (EPIC cas-0750): 9 files per mirror.
+        let expected = [
+            "skills/cas-code-review/SKILL.md",
+            "skills/cas-code-review/references/findings-schema.md",
+            "skills/cas-code-review/references/personas/correctness.md",
+            "skills/cas-code-review/references/personas/testing.md",
+            "skills/cas-code-review/references/personas/maintainability.md",
+            "skills/cas-code-review/references/personas/project-standards.md",
+            "skills/cas-code-review/references/personas/security.md",
+            "skills/cas-code-review/references/personas/performance.md",
+            "skills/cas-code-review/references/personas/adversarial.md",
+        ];
+        for p in expected {
+            assert!(
+                BUILTIN_SKILLS.iter().any(|b| b.path == p),
+                "{p} missing from BUILTIN_SKILLS"
+            );
+            assert!(
+                CODEX_BUILTIN_SKILLS.iter().any(|b| b.path == p),
+                "{p} missing from CODEX_BUILTIN_SKILLS"
+            );
+        }
+    }
+
+    #[test]
+    fn test_code_reviewer_agent_is_deprecation_stub() {
+        // EPIC cas-0750: the legacy code-reviewer agent is replaced by the
+        // cas-code-review skill. The file is kept in BUILTIN_AGENTS only to
+        // propagate a deprecation stub via `cas sync`.
+        for agents in [BUILTIN_AGENTS, CODEX_BUILTIN_AGENTS] {
+            let entry = agents
+                .iter()
+                .find(|b| b.path == "agents/code-reviewer.md")
+                .expect("code-reviewer.md must remain in the builtins list so sync overwrites downstream copies");
+            assert!(
+                entry.content.contains("deprecated: true"),
+                "code-reviewer.md must carry `deprecated: true` in frontmatter"
+            );
+            assert!(
+                entry.content.contains("replaced_by: cas-code-review"),
+                "code-reviewer.md must name its replacement"
+            );
+            assert!(
+                entry.content.contains("managed_by: cas"),
+                "code-reviewer.md must keep `managed_by: cas` so sync overwrites stale copies"
+            );
+            assert!(
+                entry.content.contains("DEPRECATED"),
+                "code-reviewer.md must prominently mark itself as deprecated"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sync_installs_cas_code_review_and_overwrites_code_reviewer() {
+        use tempfile::tempdir;
+        let temp = tempdir().unwrap();
+        let claude_dir = temp.path().join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+
+        // Pre-seed a stale copy of the old agent to prove sync overwrites it.
+        let stale_agent = claude_dir.join("agents/code-reviewer.md");
+        std::fs::create_dir_all(stale_agent.parent().unwrap()).unwrap();
+        std::fs::write(
+            &stale_agent,
+            "---\nname: code-reviewer\nmanaged_by: cas\n---\nold content",
+        )
+        .unwrap();
+
+        sync_all_builtins(&claude_dir).unwrap();
+
+        for p in [
+            "skills/cas-code-review/SKILL.md",
+            "skills/cas-code-review/references/findings-schema.md",
+            "skills/cas-code-review/references/personas/correctness.md",
+            "skills/cas-code-review/references/personas/testing.md",
+            "skills/cas-code-review/references/personas/maintainability.md",
+            "skills/cas-code-review/references/personas/project-standards.md",
+            "skills/cas-code-review/references/personas/security.md",
+            "skills/cas-code-review/references/personas/performance.md",
+            "skills/cas-code-review/references/personas/adversarial.md",
+        ] {
+            let f = claude_dir.join(p);
+            assert!(f.exists(), "{p} not synced");
+        }
+
+        let overwritten = std::fs::read_to_string(&stale_agent).unwrap();
+        assert!(
+            overwritten.contains("DEPRECATED"),
+            "sync must overwrite the stale code-reviewer.md with the deprecation stub"
+        );
+        assert!(
+            overwritten.contains("replaced_by: cas-code-review"),
+            "deprecation stub must name the replacement"
         );
     }
 
