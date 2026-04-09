@@ -150,6 +150,7 @@ async fn test_negative_priority() {
         external_ref: None,
         assignee: None,
         demo_statement: None,
+        execution_note: None,
         epic: None,
     };
 
@@ -176,6 +177,7 @@ async fn test_duplicate_dependency() {
         external_ref: None,
         assignee: None,
         demo_statement: None,
+        execution_note: None,
         epic: None,
     };
 
@@ -200,6 +202,7 @@ async fn test_duplicate_dependency() {
         external_ref: None,
         assignee: None,
         demo_statement: None,
+        execution_note: None,
         epic: None,
     };
 
@@ -251,6 +254,7 @@ async fn test_self_dependency() {
         external_ref: None,
         assignee: None,
         demo_statement: None,
+        execution_note: None,
         epic: None,
     };
 

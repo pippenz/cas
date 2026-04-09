@@ -20,6 +20,7 @@ async fn test_task_create_basic() {
         external_ref: None,
         assignee: None,
         demo_statement: None,
+        execution_note: None,
         epic: None,
     };
 
@@ -51,6 +52,7 @@ async fn test_task_create_and_start() {
         external_ref: None,
         assignee: None,
         demo_statement: None,
+        execution_note: None,
         epic: None,
     };
 
@@ -145,6 +147,7 @@ async fn test_epic_creates_branch_not_worktree() {
         external_ref: None,
         assignee: None,
         demo_statement: None,
+        execution_note: None,
         epic: None,
     };
 
@@ -227,6 +230,7 @@ async fn test_task_create_invalid_epic_does_not_persist_task() {
         external_ref: None,
         assignee: None,
         demo_statement: None,
+        execution_note: None,
         epic: Some("cas-does-not-exist".to_string()),
     };
 
@@ -273,6 +277,7 @@ async fn test_task_create_surfaces_dependency_write_failure() {
             external_ref: None,
             assignee: None,
             demo_statement: None,
+            execution_note: None,
             epic: None,
         }))
         .await
@@ -307,6 +312,7 @@ async fn test_task_create_surfaces_dependency_write_failure() {
             external_ref: None,
             assignee: None,
             demo_statement: None,
+            execution_note: None,
             epic: None,
         }))
         .await;

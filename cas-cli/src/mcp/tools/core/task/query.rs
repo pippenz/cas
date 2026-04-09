@@ -46,6 +46,10 @@ impl CasCore {
             output.push_str(&format!("\nDemo: {}\n", task.demo_statement));
         }
 
+        if let Some(ref execution_note) = task.execution_note {
+            output.push_str(&format!("\nExecution Note: {execution_note}\n"));
+        }
+
         if !task.labels.is_empty() {
             output.push_str(&format!("\nLabels: {}\n", task.labels.join(", ")));
         }

@@ -6,6 +6,30 @@ use crate::mcp::tools::types::defaults::{
     default_task_type, default_true,
 };
 
+/// Allowed values for `execution_note` (cas-7fc1). Validated at the MCP
+/// tool layer rather than via a SQL CHECK constraint so new values can be
+/// added without a schema migration.
+pub const EXECUTION_NOTE_VALUES: &[&str] =
+    &["test-first", "characterization-first", "additive-only"];
+
+/// Validate and normalize an incoming `execution_note` parameter. Returns
+/// - `Ok(None)` if the input is absent or an empty string (clear/omitted)
+/// - `Ok(Some(v))` for an accepted enum value
+/// - `Err(message)` otherwise, with a human-readable hint listing the
+///   allowed values
+pub fn validate_execution_note(value: Option<&str>) -> Result<Option<String>, String> {
+    match value {
+        None => Ok(None),
+        Some(s) if s.is_empty() => Ok(None),
+        Some(s) if EXECUTION_NOTE_VALUES.contains(&s) => Ok(Some(s.to_string())),
+        Some(s) => Err(format!(
+            "Invalid execution_note: '{}'. Must be one of: {} (or empty/absent to clear)",
+            s,
+            EXECUTION_NOTE_VALUES.join(", ")
+        )),
+    }
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct TaskCreateRequest {
     /// Task title
@@ -68,6 +92,13 @@ pub struct TaskCreateRequest {
     )]
     #[serde(default)]
     pub demo_statement: Option<String>,
+
+    /// Execution methodology note
+    #[schemars(
+        description = "Execution methodology for this task. One of: test-first, characterization-first, additive-only. Omit or leave null if no methodology is declared."
+    )]
+    #[serde(default)]
+    pub execution_note: Option<String>,
 
     /// Epic ID to associate with
     #[schemars(
@@ -136,6 +167,13 @@ pub struct TaskUpdateRequest {
     )]
     #[serde(default)]
     pub demo_statement: Option<String>,
+
+    /// Update execution note
+    #[schemars(
+        description = "Execution methodology for this task. One of: test-first, characterization-first, additive-only. Pass an empty string to clear."
+    )]
+    #[serde(default)]
+    pub execution_note: Option<String>,
 
     /// Update external reference
     #[schemars(description = "New external reference")]

@@ -21,6 +21,7 @@ async fn test_task_show() {
         external_ref: None,
         assignee: None,
         demo_statement: None,
+        execution_note: None,
         epic: None,
     };
 
@@ -47,6 +48,212 @@ async fn test_task_show() {
     assert!(text.contains("Detailed description") || text.contains("bug"));
 }
 
+// =============================================================================
+// cas-7fc1: execution_note field end-to-end coverage
+// =============================================================================
+
+fn basic_create(title: &str, execution_note: Option<String>) -> TaskCreateRequest {
+    TaskCreateRequest {
+        title: title.to_string(),
+        description: None,
+        priority: 2,
+        task_type: "task".to_string(),
+        labels: None,
+        notes: None,
+        blocked_by: None,
+        design: None,
+        acceptance_criteria: None,
+        external_ref: None,
+        assignee: None,
+        demo_statement: None,
+        execution_note,
+        epic: None,
+    }
+}
+
+/// Happy path: create a task with an accepted execution_note value and
+/// verify it is persisted + surfaced by `action=show`.
+#[tokio::test]
+async fn test_execution_note_create_and_show_happy_path() {
+    let (_temp, service) = setup_cas();
+
+    let created = service
+        .cas_task_create(Parameters(basic_create(
+            "Task with execution note",
+            Some("test-first".to_string()),
+        )))
+        .await
+        .expect("create should succeed");
+    let id = extract_task_id(&extract_text(created))
+        .expect("id")
+        .to_string();
+
+    let shown = service
+        .cas_task_show(Parameters(TaskShowRequest {
+            id: id.clone(),
+            with_deps: false,
+        }))
+        .await
+        .expect("show should succeed");
+    let text = extract_text(shown);
+    assert!(
+        text.contains("Execution Note: test-first"),
+        "show output must include execution_note line when set, got: {text}"
+    );
+}
+
+/// Null path: create a task WITHOUT execution_note and verify `action=show`
+/// omits the line entirely.
+#[tokio::test]
+async fn test_execution_note_null_omitted_from_show() {
+    let (_temp, service) = setup_cas();
+
+    let created = service
+        .cas_task_create(Parameters(basic_create("Task without execution note", None)))
+        .await
+        .expect("create should succeed");
+    let id = extract_task_id(&extract_text(created))
+        .expect("id")
+        .to_string();
+
+    let shown = service
+        .cas_task_show(Parameters(TaskShowRequest {
+            id,
+            with_deps: false,
+        }))
+        .await
+        .expect("show should succeed");
+    let text = extract_text(shown);
+    assert!(
+        !text.contains("Execution Note"),
+        "show output must omit execution_note line when unset, got: {text}"
+    );
+}
+
+/// Invalid enum: reject unknown values at the MCP tool layer with a clear
+/// error that lists the allowed values.
+#[tokio::test]
+async fn test_execution_note_invalid_enum_rejected() {
+    let (_temp, service) = setup_cas();
+
+    let err = service
+        .cas_task_create(Parameters(basic_create(
+            "Task with garbage execution note",
+            Some("garbage".to_string()),
+        )))
+        .await
+        .expect_err("invalid enum must be rejected at MCP layer");
+    let msg = err.message.to_string();
+    assert!(
+        msg.contains("Invalid execution_note"),
+        "error must name the bad field, got: {msg}"
+    );
+    assert!(
+        msg.contains("test-first")
+            && msg.contains("characterization-first")
+            && msg.contains("additive-only"),
+        "error must list allowed values, got: {msg}"
+    );
+}
+
+/// Update path: create without execution_note, then set it via update.
+#[tokio::test]
+async fn test_execution_note_update_sets_value() {
+    let (_temp, service) = setup_cas();
+
+    let created = service
+        .cas_task_create(Parameters(basic_create("Update target", None)))
+        .await
+        .expect("create");
+    let id = extract_task_id(&extract_text(created))
+        .expect("id")
+        .to_string();
+
+    let updated = service
+        .cas_task_update(Parameters(TaskUpdateRequest {
+            id: id.clone(),
+            title: None,
+            notes: None,
+            priority: None,
+            labels: None,
+            description: None,
+            design: None,
+            acceptance_criteria: None,
+            demo_statement: None,
+            execution_note: Some("additive-only".to_string()),
+            external_ref: None,
+            assignee: None,
+            status: None,
+            epic: None,
+            epic_verification_owner: None,
+        }))
+        .await
+        .expect("update");
+    assert!(
+        extract_text(updated).contains("execution_note"),
+        "update response must list changed field"
+    );
+
+    let shown = service
+        .cas_task_show(Parameters(TaskShowRequest {
+            id,
+            with_deps: false,
+        }))
+        .await
+        .expect("show");
+    assert!(extract_text(shown).contains("Execution Note: additive-only"));
+}
+
+/// Unset path: passing an empty string on update clears the field back to None.
+#[tokio::test]
+async fn test_execution_note_update_empty_string_clears() {
+    let (_temp, service) = setup_cas();
+
+    let created = service
+        .cas_task_create(Parameters(basic_create(
+            "Clear target",
+            Some("characterization-first".to_string()),
+        )))
+        .await
+        .expect("create");
+    let id = extract_task_id(&extract_text(created))
+        .expect("id")
+        .to_string();
+
+    service
+        .cas_task_update(Parameters(TaskUpdateRequest {
+            id: id.clone(),
+            title: None,
+            notes: None,
+            priority: None,
+            labels: None,
+            description: None,
+            design: None,
+            acceptance_criteria: None,
+            demo_statement: None,
+            execution_note: Some(String::new()),
+            external_ref: None,
+            assignee: None,
+            status: None,
+            epic: None,
+            epic_verification_owner: None,
+        }))
+        .await
+        .expect("update clear");
+
+    let shown = service
+        .cas_task_show(Parameters(TaskShowRequest {
+            id,
+            with_deps: false,
+        }))
+        .await
+        .expect("show");
+    assert!(
+        !extract_text(shown).contains("Execution Note"),
+        "empty string must clear the field"
+    );
+}
+
 #[tokio::test]
 async fn test_task_update() {
     let (_temp, service) = setup_cas();
@@ -65,6 +272,7 @@ async fn test_task_update() {
         external_ref: None,
         assignee: None,
         demo_statement: None,
+        execution_note: None,
         epic: None,
     };
 
@@ -87,6 +295,7 @@ async fn test_task_update() {
         design: None,
         acceptance_criteria: None,
         demo_statement: None,
+        execution_note: None,
         external_ref: None,
         assignee: None,
         status: None,
@@ -121,6 +330,7 @@ async fn test_task_update_design_and_acceptance_criteria() {
         external_ref: None,
         assignee: None,
         demo_statement: None,
+        execution_note: None,
         epic: None,
     };
 
@@ -143,6 +353,7 @@ async fn test_task_update_design_and_acceptance_criteria() {
         design: Some("## Technical Spec\nThis is the design.".to_string()),
         acceptance_criteria: Some("- [ ] Criterion 1\n- [ ] Criterion 2".to_string()),
         demo_statement: None,
+        execution_note: None,
         external_ref: None,
         assignee: None,
         status: None,
@@ -201,6 +412,7 @@ async fn test_task_notes() {
         external_ref: None,
         assignee: None,
         demo_statement: None,
+        execution_note: None,
         epic: None,
     };
 
@@ -247,6 +459,7 @@ async fn test_task_list() {
             external_ref: None,
             assignee: None,
             demo_statement: None,
+            execution_note: None,
             epic: None,
         };
         service
@@ -295,6 +508,7 @@ async fn test_task_ready() {
             external_ref: None,
             assignee: None,
             demo_statement: None,
+            execution_note: None,
             epic: None,
         };
         service
@@ -338,6 +552,7 @@ async fn test_task_delete() {
         external_ref: None,
         assignee: None,
         demo_statement: None,
+        execution_note: None,
         epic: None,
     };
 
@@ -378,6 +593,7 @@ async fn test_task_dependencies() {
         external_ref: None,
         assignee: None,
         demo_statement: None,
+        execution_note: None,
         epic: None,
     };
 
@@ -402,6 +618,7 @@ async fn test_task_dependencies() {
         external_ref: None,
         assignee: None,
         demo_statement: None,
+        execution_note: None,
         epic: None,
     };
 
@@ -459,6 +676,7 @@ async fn test_task_show_dependency_direction_labels() {
             external_ref: None,
             assignee: None,
             demo_statement: None,
+            execution_note: None,
             epic: None,
         }))
         .await
@@ -481,6 +699,7 @@ async fn test_task_show_dependency_direction_labels() {
             external_ref: None,
             assignee: None,
             demo_statement: None,
+            execution_note: None,
             epic: None,
         }))
         .await
@@ -534,6 +753,7 @@ async fn test_close_auto_unblocks_blocked_dependents() {
             external_ref: None,
             assignee: None,
             demo_statement: None,
+            execution_note: None,
             epic: None,
         }))
         .await
@@ -556,6 +776,7 @@ async fn test_close_auto_unblocks_blocked_dependents() {
             external_ref: None,
             assignee: None,
             demo_statement: None,
+            execution_note: None,
             epic: None,
         }))
         .await
@@ -575,6 +796,7 @@ async fn test_close_auto_unblocks_blocked_dependents() {
             design: None,
             acceptance_criteria: None,
             demo_statement: None,
+            execution_note: None,
             external_ref: None,
             assignee: None,
             status: Some("blocked".to_string()),
@@ -643,6 +865,7 @@ async fn test_task_update_invalid_epic_keeps_original_parent_dependency() {
             external_ref: None,
             assignee: None,
             demo_statement: None,
+            execution_note: None,
             epic: None,
         }))
         .await
@@ -665,6 +888,7 @@ async fn test_task_update_invalid_epic_keeps_original_parent_dependency() {
             external_ref: None,
             assignee: None,
             demo_statement: None,
+            execution_note: None,
             epic: Some(epic_1_id.clone()),
         }))
         .await
@@ -684,6 +908,7 @@ async fn test_task_update_invalid_epic_keeps_original_parent_dependency() {
             design: None,
             acceptance_criteria: None,
             demo_statement: None,
+            execution_note: None,
             external_ref: None,
             assignee: None,
             status: None,
@@ -735,6 +960,7 @@ async fn test_task_update_surfaces_epic_dependency_delete_failure() {
             external_ref: None,
             assignee: None,
             demo_statement: None,
+            execution_note: None,
             epic: None,
         }))
         .await
@@ -757,6 +983,7 @@ async fn test_task_update_surfaces_epic_dependency_delete_failure() {
             external_ref: None,
             assignee: None,
             demo_statement: None,
+            execution_note: None,
             epic: Some(epic_id),
         }))
         .await
@@ -788,6 +1015,7 @@ async fn test_task_update_surfaces_epic_dependency_delete_failure() {
             design: None,
             acceptance_criteria: None,
             demo_statement: None,
+            execution_note: None,
             external_ref: None,
             assignee: None,
             status: None,
@@ -819,6 +1047,7 @@ async fn test_subtask_start_auto_starts_epic() {
         external_ref: None,
         assignee: None,
         demo_statement: None,
+        execution_note: None,
         epic: None,
     };
 
@@ -859,6 +1088,7 @@ async fn test_subtask_start_auto_starts_epic() {
         external_ref: None,
         assignee: None,
         demo_statement: None,
+        execution_note: None,
         epic: Some(epic_id.to_string()),
     };
 

@@ -46,6 +46,15 @@ impl CasCore {
             .filter(|s| !s.is_empty())
             .map(ToString::to_string);
 
+        let execution_note = crate::mcp::tools::types::validate_execution_note(
+            req.execution_note.as_deref(),
+        )
+        .map_err(|msg| McpError {
+            code: ErrorCode::INVALID_PARAMS,
+            message: Cow::from(msg),
+            data: None,
+        })?;
+
         let now = chrono::Utc::now();
         let task = Task {
             id: id.clone(),
@@ -55,6 +64,7 @@ impl CasCore {
             design: req.design.unwrap_or_default(),
             acceptance_criteria: req.acceptance_criteria.unwrap_or_default(),
             demo_statement: req.demo_statement.unwrap_or_default(),
+            execution_note,
             notes: req.notes.unwrap_or_default(),
             status,
             priority: Priority(req.priority.min(4) as i32),

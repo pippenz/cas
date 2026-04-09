@@ -69,6 +69,17 @@ impl CasCore {
             changes.push("demo_statement");
         }
 
+        if let Some(raw) = req.execution_note.as_deref() {
+            let validated = crate::mcp::tools::types::validate_execution_note(Some(raw))
+                .map_err(|msg| McpError {
+                    code: ErrorCode::INVALID_PARAMS,
+                    message: Cow::from(msg),
+                    data: None,
+                })?;
+            task.execution_note = validated;
+            changes.push("execution_note");
+        }
+
         if let Some(external_ref) = req.external_ref {
             task.external_ref = Some(external_ref);
             changes.push("external_ref");

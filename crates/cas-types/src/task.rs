@@ -274,6 +274,13 @@ pub struct Task {
     /// e.g., "Type a query, results filter live"
     #[serde(default)]
     pub demo_statement: String,
+
+    /// Execution methodology for this task. One of `test-first`,
+    /// `characterization-first`, or `additive-only`. Validated at the MCP
+    /// tool layer rather than the database. None = no methodology declared.
+    /// See cas-7fc1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_note: Option<String>,
 }
 
 impl Task {
@@ -307,6 +314,7 @@ impl Task {
             deliverables: TaskDeliverables::default(),
             team_id: None,
             demo_statement: String::new(),
+            execution_note: None,
         }
     }
 
@@ -368,6 +376,7 @@ impl Default for Task {
             deliverables: TaskDeliverables::default(),
             team_id: None,
             demo_statement: String::new(),
+            execution_note: None,
         }
     }
 }

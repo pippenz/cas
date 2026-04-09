@@ -41,6 +41,7 @@ async fn test_task_close_blocked_without_verification() {
         external_ref: None,
         assignee: None,
         demo_statement: None,
+        execution_note: None,
         epic: None,
     };
 
@@ -129,6 +130,7 @@ require_merge_on_epic_close = true
         external_ref: None,
         assignee: None,
         demo_statement: None,
+        execution_note: None,
         epic: None,
     };
 
@@ -213,6 +215,7 @@ async fn test_epic_close_requires_epic_verification_type() {
         external_ref: None,
         assignee: None,
         demo_statement: None,
+        execution_note: None,
         epic: None,
     };
 
@@ -315,6 +318,7 @@ async fn test_task_lifecycle_with_verification() {
         external_ref: None,
         assignee: None,
         demo_statement: None,
+        execution_note: None,
         epic: None,
     };
 
@@ -390,6 +394,7 @@ async fn test_task_close_blocked_with_rejected_verification() {
         external_ref: None,
         assignee: None,
         demo_statement: None,
+        execution_note: None,
         epic: None,
     };
 
@@ -469,6 +474,7 @@ async fn test_task_close_runs_verifier_or_skips_cleanly() {
         external_ref: None,
         assignee: None,
         demo_statement: None,
+        execution_note: None,
         epic: None,
     };
     let result = service
@@ -603,6 +609,7 @@ async fn test_close_supervisor_bypass_orphaned_task() {
         external_ref: None,
         assignee: None,
         demo_statement: None,
+        execution_note: None,
         epic: None,
     };
     let create_text = extract_text(
@@ -708,6 +715,7 @@ async fn test_close_supervisor_bypass_ghost_assignee() {
         external_ref: None,
         assignee: None,
         demo_statement: None,
+        execution_note: None,
         epic: None,
     };
     let id = extract_task_id(&extract_text(
@@ -794,6 +802,7 @@ async fn test_close_supervisor_no_bypass_when_assignee_alive() {
         external_ref: None,
         assignee: None,
         demo_statement: None,
+        execution_note: None,
         epic: None,
     };
     let id = extract_task_id(&extract_text(
@@ -1223,6 +1232,7 @@ async fn test_close_auto_escalates_stale_verification_dispatch() {
         external_ref: None,
         assignee: None,
         demo_statement: None,
+        execution_note: None,
         epic: None,
     };
     let result = service

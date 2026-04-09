@@ -98,6 +98,7 @@ async fn test_search_filter_by_type() {
         external_ref: None,
         assignee: None,
         demo_statement: None,
+        execution_note: None,
         epic: None,
     };
     service

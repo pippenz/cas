@@ -122,6 +122,7 @@ async fn test_all_store_types_accessible() {
         external_ref: None,
         assignee: None,
         demo_statement: None,
+        execution_note: None,
         epic: None,
     };
     service
@@ -192,6 +193,7 @@ async fn test_start_blocked_with_pending_verification() {
         external_ref: None,
         assignee: None,
         demo_statement: None,
+        execution_note: None,
         epic: None,
     };
 
@@ -242,6 +244,7 @@ async fn test_start_blocked_with_pending_verification() {
         external_ref: None,
         assignee: None,
         demo_statement: None,
+        execution_note: None,
         epic: None,
     };
 
@@ -292,6 +295,7 @@ async fn test_claim_blocked_with_pending_verification() {
         external_ref: None,
         assignee: None,
         demo_statement: None,
+        execution_note: None,
         epic: None,
     };
 
@@ -350,6 +354,7 @@ async fn test_claim_blocked_with_pending_verification() {
                 .unwrap_or_default(),
         ),
         demo_statement: None,
+        execution_note: None,
         epic: None,
     };
 
@@ -403,6 +408,7 @@ async fn test_start_allowed_after_verification_approved() {
         external_ref: None,
         assignee: None,
         demo_statement: None,
+        execution_note: None,
         epic: None,
     };
 
@@ -445,6 +451,7 @@ async fn test_start_allowed_after_verification_approved() {
         external_ref: None,
         assignee: None,
         demo_statement: None,
+        execution_note: None,
         epic: None,
     };
 
@@ -494,6 +501,7 @@ async fn test_start_same_task_allowed_when_pending() {
         external_ref: None,
         assignee: None,
         demo_statement: None,
+        execution_note: None,
         epic: None,
     };
 
@@ -565,6 +573,7 @@ async fn test_task_list_type_filter() {
         external_ref: None,
         assignee: None,
         demo_statement: None,
+        execution_note: None,
         epic: None,
     };
     service
@@ -586,6 +595,7 @@ async fn test_task_list_type_filter() {
         external_ref: None,
         assignee: None,
         demo_statement: None,
+        execution_note: None,
         epic: None,
     };
     service
@@ -637,6 +647,7 @@ async fn test_task_list_epic_filter() {
         external_ref: None,
         assignee: None,
         demo_statement: None,
+        execution_note: None,
         epic: None,
     };
     let result = service
@@ -665,6 +676,7 @@ async fn test_task_list_epic_filter() {
         external_ref: None,
         assignee: None,
         demo_statement: None,
+        execution_note: None,
         epic: Some(epic_id.to_string()),
     };
     service
@@ -686,6 +698,7 @@ async fn test_task_list_epic_filter() {
         external_ref: None,
         assignee: None,
         demo_statement: None,
+        execution_note: None,
         epic: None,
     };
     service

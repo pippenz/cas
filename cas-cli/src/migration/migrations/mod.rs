@@ -164,6 +164,7 @@ mod m186_tasks_idx_team_id;
 mod m187_tasks_idx_assignee;
 mod m188_id_sequences_create_table;
 mod m189_events_friction_type_index;
+mod m190_tasks_add_execution_note;
 
 /// All migrations in order. IDs must be sequential and never reused.
 pub const MIGRATIONS: &[Migration] = &[
@@ -319,6 +320,8 @@ pub const MIGRATIONS: &[Migration] = &[
     m188_id_sequences_create_table::MIGRATION,
     // Events friction_type index
     m189_events_friction_type_index::MIGRATION,
+    // Execution note for task methodology tracking (cas-7fc1)
+    m190_tasks_add_execution_note::MIGRATION,
 ];
 
 #[cfg(test)]

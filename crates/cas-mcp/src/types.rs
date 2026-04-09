@@ -217,6 +217,13 @@ pub struct TaskRequest {
     #[serde(default)]
     pub demo_statement: Option<String>,
 
+    /// Execution note (for create, update) - methodology used to execute this task
+    #[schemars(
+        description = "Execution methodology for this task. One of: test-first, characterization-first, additive-only. Pass empty string to clear on update."
+    )]
+    #[serde(default)]
+    pub execution_note: Option<String>,
+
     /// External reference (for create, update)
     #[schemars(description = "External reference (URL, ticket ID, etc.)")]
     #[serde(default)]
