@@ -57,6 +57,14 @@ pub const BUILTIN_AGENTS: &[BuiltinFile] = &[
         path: "agents/code-reviewer.md",
         content: include_str!("builtins/agents/code-reviewer.md"),
     },
+    BuiltinFile {
+        path: "agents/git-history-analyzer.md",
+        content: include_str!("builtins/agents/git-history-analyzer.md"),
+    },
+    BuiltinFile {
+        path: "agents/issue-intelligence-analyst.md",
+        content: include_str!("builtins/agents/issue-intelligence-analyst.md"),
+    },
 ];
 
 /// All built-in agents managed by CAS for Codex
@@ -89,6 +97,14 @@ pub const CODEX_BUILTIN_AGENTS: &[BuiltinFile] = &[
         path: "agents/factory-supervisor.md",
         content: include_str!("builtins/codex/agents/factory-supervisor.md"),
     },
+    BuiltinFile {
+        path: "agents/git-history-analyzer.md",
+        content: include_str!("builtins/codex/agents/git-history-analyzer.md"),
+    },
+    BuiltinFile {
+        path: "agents/issue-intelligence-analyst.md",
+        content: include_str!("builtins/codex/agents/issue-intelligence-analyst.md"),
+    },
 ];
 
 /// All built-in skills managed by CAS
@@ -117,6 +133,26 @@ pub const BUILTIN_SKILLS: &[BuiltinFile] = &[
         path: "skills/cas-worker/SKILL.md",
         content: include_str!("builtins/skills/cas-worker.md"),
     },
+    BuiltinFile {
+        path: "skills/cas-brainstorm/SKILL.md",
+        content: include_str!("builtins/skills/cas-brainstorm/SKILL.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-brainstorm/references/handoff.md",
+        content: include_str!("builtins/skills/cas-brainstorm/references/handoff.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-brainstorm/references/requirements-capture.md",
+        content: include_str!("builtins/skills/cas-brainstorm/references/requirements-capture.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-ideate/SKILL.md",
+        content: include_str!("builtins/skills/cas-ideate/SKILL.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-ideate/references/post-ideation-workflow.md",
+        content: include_str!("builtins/skills/cas-ideate/references/post-ideation-workflow.md"),
+    },
 ];
 
 /// All built-in skills managed by CAS for Codex
@@ -144,6 +180,26 @@ pub const CODEX_BUILTIN_SKILLS: &[BuiltinFile] = &[
     BuiltinFile {
         path: "skills/cas-worker/SKILL.md",
         content: include_str!("builtins/codex/skills/cas-worker.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-brainstorm/SKILL.md",
+        content: include_str!("builtins/codex/skills/cas-brainstorm/SKILL.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-brainstorm/references/handoff.md",
+        content: include_str!("builtins/codex/skills/cas-brainstorm/references/handoff.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-brainstorm/references/requirements-capture.md",
+        content: include_str!("builtins/codex/skills/cas-brainstorm/references/requirements-capture.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-ideate/SKILL.md",
+        content: include_str!("builtins/codex/skills/cas-ideate/SKILL.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-ideate/references/post-ideation-workflow.md",
+        content: include_str!("builtins/codex/skills/cas-ideate/references/post-ideation-workflow.md"),
     },
 ];
 
@@ -491,6 +547,73 @@ This is the body content."#;
     }
 
     #[test]
+    fn test_builtin_agents_contains_git_history_analyzer() {
+        assert!(
+            BUILTIN_AGENTS
+                .iter()
+                .any(|b| b.path == "agents/git-history-analyzer.md")
+        );
+        assert!(
+            CODEX_BUILTIN_AGENTS
+                .iter()
+                .any(|b| b.path == "agents/git-history-analyzer.md")
+        );
+    }
+
+    #[test]
+    fn test_builtin_agents_contains_issue_intelligence_analyst() {
+        assert!(
+            BUILTIN_AGENTS
+                .iter()
+                .any(|b| b.path == "agents/issue-intelligence-analyst.md")
+        );
+        assert!(
+            CODEX_BUILTIN_AGENTS
+                .iter()
+                .any(|b| b.path == "agents/issue-intelligence-analyst.md")
+        );
+    }
+
+    #[test]
+    fn test_builtin_skills_contains_cas_brainstorm() {
+        assert!(
+            BUILTIN_SKILLS
+                .iter()
+                .any(|b| b.path == "skills/cas-brainstorm/SKILL.md")
+        );
+        assert!(
+            BUILTIN_SKILLS
+                .iter()
+                .any(|b| b.path == "skills/cas-brainstorm/references/handoff.md")
+        );
+        assert!(BUILTIN_SKILLS.iter().any(
+            |b| b.path == "skills/cas-brainstorm/references/requirements-capture.md"
+        ));
+        assert!(
+            CODEX_BUILTIN_SKILLS
+                .iter()
+                .any(|b| b.path == "skills/cas-brainstorm/SKILL.md")
+        );
+    }
+
+    #[test]
+    fn test_builtin_skills_contains_cas_ideate() {
+        assert!(
+            BUILTIN_SKILLS
+                .iter()
+                .any(|b| b.path == "skills/cas-ideate/SKILL.md")
+        );
+        assert!(BUILTIN_SKILLS.iter().any(
+            |b| b.path == "skills/cas-ideate/references/post-ideation-workflow.md"
+        ));
+        assert!(
+            CODEX_BUILTIN_SKILLS
+                .iter()
+                .any(|b| b.path == "skills/cas-ideate/SKILL.md")
+        );
+    }
+
+    #[test]
     fn test_builtin_agents_contains_task_verifier() {
         // Verify task-verifier agent is in BUILTIN_AGENTS and will be synced
         let has_task_verifier = BUILTIN_AGENTS
@@ -522,6 +645,33 @@ This is the body content."#;
             task_verifier.content.contains("description:"),
             "task-verifier must have description"
         );
+    }
+
+    #[test]
+    fn test_sync_all_builtins_includes_compound_engineering() {
+        use tempfile::tempdir;
+        let temp = tempdir().unwrap();
+        let claude_dir = temp.path().join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        sync_all_builtins(&claude_dir).unwrap();
+        for p in [
+            "agents/git-history-analyzer.md",
+            "agents/issue-intelligence-analyst.md",
+            "skills/cas-brainstorm/SKILL.md",
+            "skills/cas-brainstorm/references/handoff.md",
+            "skills/cas-brainstorm/references/requirements-capture.md",
+            "skills/cas-ideate/SKILL.md",
+            "skills/cas-ideate/references/post-ideation-workflow.md",
+        ] {
+            let f = claude_dir.join(p);
+            assert!(f.exists(), "{} not synced", p);
+            let body = std::fs::read_to_string(&f).unwrap();
+            assert!(
+                body.contains("managed_by: cas"),
+                "{} missing managed_by: cas",
+                p
+            );
+        }
     }
 
     #[test]
