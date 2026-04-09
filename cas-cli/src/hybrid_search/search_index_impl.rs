@@ -5,8 +5,41 @@ use tantivy::{Index, IndexWriter};
 use cas_code::CodeSymbol;
 
 use crate::error::MemError;
+use crate::hybrid_search::frontmatter::{FrontmatterFields, extract_frontmatter_fields};
 use crate::hybrid_search::{DEFAULT_WRITER_MEMORY, DocType, EXPECTED_FIELD_COUNT, SearchIndex};
 use crate::types::{Entry, Rule, Skill, Spec, Task};
+
+/// Add memory frontmatter fields to a Tantivy document. Safe to call for
+/// non-memory docs — it will simply no-op when no frontmatter is present.
+fn add_frontmatter_terms(
+    doc: &mut tantivy::TantivyDocument,
+    fields: &FrontmatterFields,
+    module_field: tantivy::schema::Field,
+    track_field: tantivy::schema::Field,
+    problem_type_field: tantivy::schema::Field,
+    severity_field: tantivy::schema::Field,
+    root_cause_field: tantivy::schema::Field,
+    mem_date_field: tantivy::schema::Field,
+) {
+    if let Some(ref v) = fields.module {
+        doc.add_text(module_field, v);
+    }
+    if let Some(ref v) = fields.track {
+        doc.add_text(track_field, v);
+    }
+    if let Some(ref v) = fields.problem_type {
+        doc.add_text(problem_type_field, v);
+    }
+    if let Some(ref v) = fields.severity {
+        doc.add_text(severity_field, v);
+    }
+    if let Some(ref v) = fields.root_cause {
+        doc.add_text(root_cause_field, v);
+    }
+    if let Some(ref v) = fields.date {
+        doc.add_text(mem_date_field, v);
+    }
+}
 impl SearchIndex {
     /// Build the current schema
     fn build_schema() -> Schema {
@@ -21,6 +54,15 @@ impl SearchIndex {
         schema_builder.add_text_field("language", STRING);
         schema_builder.add_text_field("kind", STRING);
         schema_builder.add_text_field("file_path", STRING | STORED);
+        // Memory frontmatter fields (cas-7b1e). All STRING | STORED so they
+        // are term-filterable and retrievable for debugging. Legacy memories
+        // without these fields simply index nothing for these columns.
+        schema_builder.add_text_field("module", STRING | STORED);
+        schema_builder.add_text_field("track", STRING | STORED);
+        schema_builder.add_text_field("problem_type", STRING | STORED);
+        schema_builder.add_text_field("severity", STRING | STORED);
+        schema_builder.add_text_field("root_cause", STRING | STORED);
+        schema_builder.add_text_field("mem_date", STRING | STORED);
         schema_builder.build()
     }
 
@@ -69,6 +111,20 @@ impl SearchIndex {
         let file_path_field = schema
             .get_field("file_path")
             .expect("file_path field missing");
+        let module_field = schema.get_field("module").expect("module field missing");
+        let track_field = schema.get_field("track").expect("track field missing");
+        let problem_type_field = schema
+            .get_field("problem_type")
+            .expect("problem_type field missing");
+        let severity_field = schema
+            .get_field("severity")
+            .expect("severity field missing");
+        let root_cause_field = schema
+            .get_field("root_cause")
+            .expect("root_cause field missing");
+        let mem_date_field = schema
+            .get_field("mem_date")
+            .expect("mem_date field missing");
 
         Ok(Self {
             index,
@@ -82,6 +138,12 @@ impl SearchIndex {
             language_field,
             kind_field,
             file_path_field,
+            module_field,
+            track_field,
+            problem_type_field,
+            severity_field,
+            root_cause_field,
+            mem_date_field,
             writer_memory: DEFAULT_WRITER_MEMORY,
         })
     }
@@ -114,6 +176,20 @@ impl SearchIndex {
         let file_path_field = schema
             .get_field("file_path")
             .expect("file_path field missing");
+        let module_field = schema.get_field("module").expect("module field missing");
+        let track_field = schema.get_field("track").expect("track field missing");
+        let problem_type_field = schema
+            .get_field("problem_type")
+            .expect("problem_type field missing");
+        let severity_field = schema
+            .get_field("severity")
+            .expect("severity field missing");
+        let root_cause_field = schema
+            .get_field("root_cause")
+            .expect("root_cause field missing");
+        let mem_date_field = schema
+            .get_field("mem_date")
+            .expect("mem_date field missing");
 
         Ok(Self {
             index,
@@ -127,6 +203,12 @@ impl SearchIndex {
             language_field,
             kind_field,
             file_path_field,
+            module_field,
+            track_field,
+            problem_type_field,
+            severity_field,
+            root_cause_field,
+            mem_date_field,
             writer_memory: DEFAULT_WRITER_MEMORY,
         })
     }
@@ -167,6 +249,17 @@ impl SearchIndex {
         if let Some(ref title) = entry.title {
             doc.add_text(self.title_field, title);
         }
+        let fm = extract_frontmatter_fields(&entry.content);
+        add_frontmatter_terms(
+            &mut doc,
+            &fm,
+            self.module_field,
+            self.track_field,
+            self.problem_type_field,
+            self.severity_field,
+            self.root_cause_field,
+            self.mem_date_field,
+        );
 
         writer.add_document(doc)?;
         writer.commit()?;
@@ -205,6 +298,17 @@ impl SearchIndex {
             if let Some(ref title) = entry.title {
                 doc.add_text(self.title_field, title);
             }
+            let fm = extract_frontmatter_fields(&entry.content);
+            add_frontmatter_terms(
+                &mut doc,
+                &fm,
+                self.module_field,
+                self.track_field,
+                self.problem_type_field,
+                self.severity_field,
+                self.root_cause_field,
+                self.mem_date_field,
+            );
 
             writer.add_document(doc)?;
             count += 1;
@@ -419,6 +523,17 @@ impl SearchIndex {
             if let Some(ref title) = entry.title {
                 doc.add_text(self.title_field, title);
             }
+            let fm = extract_frontmatter_fields(&entry.content);
+            add_frontmatter_terms(
+                &mut doc,
+                &fm,
+                self.module_field,
+                self.track_field,
+                self.problem_type_field,
+                self.severity_field,
+                self.root_cause_field,
+                self.mem_date_field,
+            );
 
             writer.add_document(doc)?;
         }
@@ -457,6 +572,17 @@ impl SearchIndex {
             if let Some(ref title) = entry.title {
                 doc.add_text(self.title_field, title);
             }
+            let fm = extract_frontmatter_fields(&entry.content);
+            add_frontmatter_terms(
+                &mut doc,
+                &fm,
+                self.module_field,
+                self.track_field,
+                self.problem_type_field,
+                self.severity_field,
+                self.root_cause_field,
+                self.mem_date_field,
+            );
 
             writer.add_document(doc)?;
             count += 1;
@@ -607,6 +733,17 @@ impl SearchIndex {
             if let Some(ref title) = entry.title {
                 doc.add_text(self.title_field, title);
             }
+            let fm = extract_frontmatter_fields(&entry.content);
+            add_frontmatter_terms(
+                &mut doc,
+                &fm,
+                self.module_field,
+                self.track_field,
+                self.problem_type_field,
+                self.severity_field,
+                self.root_cause_field,
+                self.mem_date_field,
+            );
 
             writer.add_document(doc)?;
             count += 1;

@@ -1,18 +1,65 @@
 use chrono::Utc;
 use tantivy::ReloadPolicy;
 use tantivy::collector::TopDocs;
-use tantivy::query::QueryParser;
-use tantivy::schema::Value;
+use tantivy::query::{BooleanQuery, Occur, Query, QueryParser, TermQuery};
+use tantivy::schema::{IndexRecordOption, Value};
 
 use cas_core::dedup::{SearchHit, SearchIndexTrait};
 use cas_core::error::CoreError;
 
 use crate::error::MemError;
+use crate::hybrid_search::filter_grammar::parse_filter_query;
 use crate::hybrid_search::id_utils::path_matches_pattern;
 use crate::hybrid_search::{
     DocType, SearchIndex, SearchOptions, SearchResult, extract_id_patterns, scorer,
 };
 use crate::types::Entry;
+
+impl SearchIndex {
+    /// Resolve a filter key (from [`parse_filter_query`]) to its Tantivy field.
+    /// Returns `None` for unrecognized keys — caller should treat them as
+    /// raw keyword text.
+    fn field_for_filter_key(&self, key: &str) -> Option<tantivy::schema::Field> {
+        match key {
+            "module" => Some(self.module_field),
+            "track" => Some(self.track_field),
+            "problem_type" => Some(self.problem_type_field),
+            "severity" => Some(self.severity_field),
+            "root_cause" => Some(self.root_cause_field),
+            "date" => Some(self.mem_date_field),
+            _ => None,
+        }
+    }
+
+    /// Build a BooleanQuery that AND-combines a text query (optional) with
+    /// a list of term filters. Returns `None` if there are no filters and
+    /// no text — caller should short-circuit.
+    fn build_filtered_query(
+        &self,
+        text_query: Option<Box<dyn Query>>,
+        filters: &[(String, String)],
+    ) -> Option<Box<dyn Query>> {
+        let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+        if let Some(q) = text_query {
+            clauses.push((Occur::Must, q));
+        }
+        for (k, v) in filters {
+            if let Some(field) = self.field_for_filter_key(k) {
+                let term = tantivy::Term::from_field_text(field, v);
+                let tq: Box<dyn Query> =
+                    Box::new(TermQuery::new(term, IndexRecordOption::Basic));
+                clauses.push((Occur::Must, tq));
+            }
+        }
+        if clauses.is_empty() {
+            None
+        } else if clauses.len() == 1 {
+            Some(clauses.into_iter().next().unwrap().1)
+        } else {
+            Some(Box::new(BooleanQuery::new(clauses)))
+        }
+    }
+}
 
 impl SearchIndex {
     pub fn search(
@@ -135,8 +182,14 @@ impl SearchIndex {
             return Ok(Vec::new());
         }
 
-        // Extract ID patterns from query (e.g., "cas-8cb5 cas-4a23")
-        let (id_patterns, remaining_query) = extract_id_patterns(&opts.query);
+        // Parse filter grammar FIRST (cas-7b1e) — `module:cas-mcp` tokens
+        // must not reach the ID pattern extractor, which would otherwise
+        // mistake `cas-mcp` for a CAS ID.
+        let pre_parsed = parse_filter_query(opts.query.trim());
+        let filters = pre_parsed.filters.clone();
+
+        // Extract ID patterns from the residual (e.g., "cas-8cb5 cas-4a23")
+        let (id_patterns, remaining_query) = extract_id_patterns(&pre_parsed.residual);
 
         let mut results = Vec::new();
         let mut seen_ids = std::collections::HashSet::new();
@@ -195,8 +248,17 @@ impl SearchIndex {
             }
         }
 
-        // 2. Text search for remaining query terms (if any)
-        if !remaining_query.is_empty() {
+        // 2. Text search for remaining query terms (if any), with optional
+        //    structured filters parsed from `key:value` tokens (cas-7b1e).
+        //    Sanitize any stray colons from unknown-key tokens so they
+        //    don't trip Tantivy's QueryParser (which interprets `foo:` as
+        //    a field reference).
+        let sanitized_residual = remaining_query.replace(':', " ");
+        let parsed = super::filter_grammar::ParsedQuery {
+            residual: sanitized_residual.split_whitespace().collect::<Vec<_>>().join(" "),
+            filters: filters.clone(),
+        };
+        if !parsed.residual.is_empty() || !parsed.filters.is_empty() {
             let reader = self
                 .index
                 .reader_builder()
@@ -205,19 +267,29 @@ impl SearchIndex {
 
             let searcher = reader.searcher();
 
-            // Parse query - search content, tags, and title
-            let query_parser = QueryParser::for_index(
-                &self.index,
-                vec![self.content_field, self.tags_field, self.title_field],
-            );
+            // Build a text query from the residual (if any) and AND it with
+            // any structured filters.
+            let text_query: Option<Box<dyn Query>> = if parsed.residual.is_empty() {
+                None
+            } else {
+                let query_parser = QueryParser::for_index(
+                    &self.index,
+                    vec![self.content_field, self.tags_field, self.title_field],
+                );
+                Some(
+                    query_parser
+                        .parse_query(&parsed.residual)
+                        .map_err(|e| MemError::Parse(e.to_string()))?,
+                )
+            };
 
-            let query = query_parser
-                .parse_query(&remaining_query)
-                .map_err(|e| MemError::Parse(e.to_string()))?;
+            let Some(query) = self.build_filtered_query(text_query, &parsed.filters) else {
+                return Ok(results);
+            };
 
             // Get more results than needed for post-filtering
             let limit = opts.limit * 3;
-            let top_docs = searcher.search(&query, &TopDocs::with_limit(limit))?;
+            let top_docs = searcher.search(&*query, &TopDocs::with_limit(limit))?;
 
             for (bm25_score, doc_addr) in top_docs {
                 let doc: tantivy::TantivyDocument = searcher.doc(doc_addr)?;
@@ -374,6 +446,77 @@ impl SearchIndex {
     }
 }
 
+impl SearchIndex {
+    /// Retrieve top-N BM25 candidates scoped to a single memory `module`.
+    ///
+    /// This is the load-bearing API for overlap detection (cas-7b1e):
+    /// incoming structured memories must only be compared against other
+    /// memories with the same `module`. Legacy memories (no frontmatter)
+    /// have no module field indexed and are therefore excluded.
+    ///
+    /// Returns hits ranked by BM25 score of the text `query` intersected
+    /// with a hard `module == module` term filter. When `query` is empty,
+    /// returns the top documents in that module unranked (score `0.0`).
+    pub fn search_module_candidates(
+        &self,
+        query: &str,
+        module: &str,
+        limit: usize,
+    ) -> Result<Vec<SearchHit>, MemError> {
+        let reader = self
+            .index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::OnCommitWithDelay)
+            .try_into()?;
+        let searcher = reader.searcher();
+
+        let module_term = tantivy::Term::from_field_text(self.module_field, module);
+        let module_q: Box<dyn Query> =
+            Box::new(TermQuery::new(module_term, IndexRecordOption::Basic));
+
+        let text_q: Option<Box<dyn Query>> = if query.trim().is_empty() {
+            None
+        } else {
+            let parser = QueryParser::for_index(
+                &self.index,
+                vec![self.content_field, self.tags_field, self.title_field],
+            );
+            Some(
+                parser
+                    .parse_query(query)
+                    .map_err(|e| MemError::Parse(e.to_string()))?,
+            )
+        };
+
+        let query: Box<dyn Query> = match text_q {
+            Some(tq) => Box::new(BooleanQuery::new(vec![
+                (Occur::Must, module_q),
+                (Occur::Must, tq),
+            ])),
+            None => module_q,
+        };
+
+        let top_docs = searcher.search(&*query, &TopDocs::with_limit(limit))?;
+        let mut hits = Vec::with_capacity(top_docs.len());
+        for (score, addr) in top_docs {
+            let doc: tantivy::TantivyDocument = searcher.doc(addr)?;
+            let id = doc
+                .get_first(self.id_field)
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            if id.is_empty() {
+                continue;
+            }
+            hits.push(SearchHit {
+                id,
+                bm25_score: score as f64,
+            });
+        }
+        Ok(hits)
+    }
+}
+
 impl SearchIndexTrait for SearchIndex {
     fn search_for_dedup(
         &self,
@@ -397,5 +540,15 @@ impl SearchIndexTrait for SearchIndex {
                 bm25_score: result.bm25_score,
             })
             .collect())
+    }
+
+    fn search_candidates_by_module(
+        &self,
+        query: &str,
+        module: &str,
+        limit: usize,
+    ) -> Result<Vec<SearchHit>, CoreError> {
+        self.search_module_candidates(query, module, limit)
+            .map_err(|e| CoreError::Other(e.to_string()))
     }
 }

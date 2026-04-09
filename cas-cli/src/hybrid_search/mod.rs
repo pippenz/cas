@@ -80,6 +80,8 @@ pub mod scorer;
 pub use hybrid::{HybridSearch, HybridSearchOptions};
 pub use metrics::{LatencyTimer, MetricsStore, SearchEvent, SearchMethod, generate_event_id};
 
+pub mod filter_grammar;
+pub mod frontmatter;
 mod id_utils;
 mod search_index_impl;
 mod search_index_query;
@@ -146,6 +148,13 @@ pub struct SearchIndex {
     language_field: Field,
     kind_field: Field,
     file_path_field: Field,
+    // Memory frontmatter fields (cas-7b1e)
+    module_field: Field,
+    track_field: Field,
+    problem_type_field: Field,
+    severity_field: Field,
+    root_cause_field: Field,
+    mem_date_field: Field,
     // Configuration
     writer_memory: usize,
 }
@@ -219,7 +228,7 @@ pub struct SearchResult {
 
 /// Expected number of fields in the current schema version.
 /// Bump this when adding new fields to trigger automatic index rebuild.
-const EXPECTED_FIELD_COUNT: usize = 9;
+const EXPECTED_FIELD_COUNT: usize = 15;
 
 #[cfg(test)]
 mod tests {

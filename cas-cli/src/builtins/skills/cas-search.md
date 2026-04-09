@@ -16,6 +16,15 @@ mcp__cas__search action=search query="authentication flow" doc_type=entry
 ```
 Filter with `doc_type` (entry, task, rule, skill, code_symbol, code_file) for better relevance.
 
+**Structured memory filters (`key:value` tokens):** For memories with structured frontmatter (see `cas-memory-management`), the query string supports inline filters that AND with keyword terms:
+
+```
+mcp__cas__search action=search query="deadlock module:cas-mcp severity:critical"
+mcp__cas__search action=search query="track:bug problem_type:runtime_error"
+```
+
+Recognized filter keys: `module`, `track`, `problem_type`, `severity`, `root_cause`, `date`. Unknown `key:value` tokens pass through as raw keyword text. Legacy memories (no structured frontmatter) still match keyword queries but are excluded from any filter that references a structured field.
+
 **`code_search`** — Find code symbols by what they do, not exact names:
 ```
 mcp__cas__search action=code_search query="user authentication" kind=function language=rust

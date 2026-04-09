@@ -46,6 +46,23 @@ pub trait SearchIndexTrait: Send + Sync {
         limit: usize,
         entries: &[Entry],
     ) -> Result<Vec<SearchHit>, CoreError>;
+
+    /// Search for top-N BM25 candidates constrained to a single memory
+    /// `module`. Used by overlap detection (cas-7b1e / Unit 3) as the primary
+    /// candidate retrieval path when the incoming memory has a structured
+    /// module field — same-module candidates are the only valid pool.
+    ///
+    /// Implementations that do not index structured frontmatter should
+    /// return `Ok(vec![])` (the default) so overlap detection degrades to
+    /// its legacy dedup path.
+    fn search_candidates_by_module(
+        &self,
+        _query: &str,
+        _module: &str,
+        _limit: usize,
+    ) -> Result<Vec<SearchHit>, CoreError> {
+        Ok(Vec::new())
+    }
 }
 
 /// A search hit from BM25 search
