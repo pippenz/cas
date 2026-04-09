@@ -131,8 +131,13 @@ impl CasCore {
                 let had_prior_verification = matches!(&latest, Ok(Some(_)));
 
                 match latest {
-                    Ok(Some(v)) if v.status == VerificationStatus::Approved => {
-                        // Verification approved, proceed with close
+                    Ok(Some(v))
+                        if v.status == VerificationStatus::Approved
+                            || v.status == VerificationStatus::Skipped =>
+                    {
+                        // Verification approved or explicitly skipped
+                        // (supervisor bypass row from a prior orphaned close) —
+                        // proceed with close. See cas-82d6.
                     }
                     Ok(Some(v)) if v.status == VerificationStatus::Rejected => {
                         // Verification rejected, block close
@@ -484,6 +489,47 @@ impl CasCore {
             }
         }
         task.deliverables = deliverables;
+
+        // When closing via the supervisor bypass (assignee inactive / orphaned),
+        // we skip the verification gate but MUST still write a durable
+        // `Skipped` verification row. Without this row, the MCP jail
+        // (`check_pending_verification`) treats the task as unverified and
+        // blocks every downstream worker that inherits a BlockedBy on this
+        // task. See cas-82d6.
+        if assignee_inactive && verification_enabled {
+            if let Ok(verification_store) = self.open_verification_store() {
+                let needs_row = verification_store
+                    .get_latest_for_task(&req.id)
+                    .map(|v| {
+                        !matches!(
+                            v,
+                            Some(ref r) if r.status == VerificationStatus::Approved
+                                || r.status == VerificationStatus::Skipped
+                        )
+                    })
+                    .unwrap_or(true);
+                if needs_row {
+                    if let Ok(ver_id) = verification_store.generate_id() {
+                        let mut row = Verification::skipped(
+                            ver_id,
+                            req.id.clone(),
+                            "Closed via supervisor bypass — verification not run \
+                             (assignee inactive or orphaned task)."
+                                .to_string(),
+                        );
+                        row.verification_type = if task.task_type == TaskType::Epic {
+                            VerificationType::Epic
+                        } else {
+                            VerificationType::Task
+                        };
+                        if let Ok(agent_id) = self.get_agent_id() {
+                            row.agent_id = Some(agent_id);
+                        }
+                        let _ = verification_store.add(&row);
+                    }
+                }
+            }
+        }
 
         if let Some(reason) = &req.reason {
             task.close_reason = Some(reason.clone());

@@ -736,8 +736,16 @@ impl CasCore {
             // Check if task has approved verification
             if let Ok(verification_store) = self.open_verification_store() {
                 match verification_store.get_latest_for_task(&task.id) {
-                    Ok(Some(v)) if v.status == crate::types::VerificationStatus::Approved => {
-                        // Task is verified, OK to continue
+                    Ok(Some(v))
+                        if v.status == crate::types::VerificationStatus::Approved
+                            || v.status == crate::types::VerificationStatus::Skipped =>
+                    {
+                        // Approved or explicitly skipped (supervisor bypass
+                        // during orphaned-task close) — not jailing. See
+                        // cas-82d6: close_ops writes a Skipped row when
+                        // closing via the assignee-inactive bypass so that
+                        // downstream workers aren't trapped by a task that
+                        // has no verification record at all.
                         continue;
                     }
                     Ok(_) | Err(_) => {

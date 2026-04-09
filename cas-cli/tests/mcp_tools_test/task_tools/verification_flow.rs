@@ -667,15 +667,20 @@ async fn test_close_supervisor_bypass_orphaned_task() {
         task_after.notes
     );
 
-    // No verification row is written by the bypass path — the whole point of
-    // the hatch is to avoid the dispatch/verifier machinery entirely when the
-    // assignee is gone.
+    // Per cas-82d6: the bypass path MUST write a durable `Skipped`
+    // verification row so downstream workers that inherit a BlockedBy on
+    // this task are not jailed by `check_pending_verification` (which used
+    // to only accept `Approved`). The row is the audit trail for "closed
+    // without running the verifier".
     let verification_row = verification_store
         .get_latest_for_task(&id)
-        .expect("verification lookup should not error");
-    assert!(
-        verification_row.is_none(),
-        "supervisor bypass must NOT write a dispatch/verdict row, got {verification_row:?}"
+        .expect("verification lookup should not error")
+        .expect("supervisor bypass must write a Skipped verification row");
+    assert_eq!(
+        verification_row.status,
+        cas::types::VerificationStatus::Skipped,
+        "bypass row must be Skipped, got {:?}",
+        verification_row.status
     );
 }
 
@@ -740,13 +745,13 @@ async fn test_close_supervisor_bypass_ghost_assignee() {
 
     let task_after = task_store.get(&id).expect("task should exist");
     assert_eq!(task_after.status, cas::types::TaskStatus::Closed);
-    assert!(
-        verification_store
-            .get_latest_for_task(&id)
-            .expect("verification lookup should not error")
-            .is_none(),
-        "ghost-assignee bypass must not write a verification row"
-    );
+    // Per cas-82d6: bypass now writes a Skipped row so downstream
+    // BlockedBy consumers don't hit the MCP jail.
+    let row = verification_store
+        .get_latest_for_task(&id)
+        .expect("verification lookup should not error")
+        .expect("ghost-assignee bypass must write a Skipped verification row");
+    assert_eq!(row.status, cas::types::VerificationStatus::Skipped);
 }
 
 /// Negative: supervisor closes a task whose assignee is the currently-alive
@@ -962,6 +967,80 @@ async fn test_factory_worker_close_hits_narrowed_jail() {
     assert!(
         msg.contains("Task(subagent_type=\"task-verifier\""),
         "jail error must include explicit Task() spawn syntax, got: {msg}"
+    );
+}
+
+/// cas-82d6: a `Skipped` verification row (supervisor bypass audit trail)
+/// must satisfy both the MCP jail (`check_pending_verification`) and the
+/// close_ops verification gate. Without this, downstream workers that pick
+/// up the same task via resumption — or anyone re-closing a task already
+/// bypassed — would be trapped by `VERIFICATION_JAIL_BLOCKED`.
+#[tokio::test]
+async fn test_skipped_verification_row_satisfies_jail_and_close() {
+    let _env_lock = env_test_lock();
+    let (temp, core) = setup_cas();
+    let cas_dir = temp.path().join(".cas");
+    let verification_store = open_verification_store(&cas_dir).unwrap();
+    let service = CasService::new(core);
+    let _env = FactoryWorkerEnv::enter();
+
+    // Create + start a task so it's leased + InProgress.
+    let created = service
+        .task(Parameters(task_req(serde_json::json!({
+            "action": "create",
+            "title": "Task with a pre-existing Skipped verification row",
+            "priority": 2,
+            "task_type": "task",
+        }))))
+        .await
+        .expect("create");
+    let id = extract_task_id(&extract_text(created))
+        .expect("id")
+        .to_string();
+    service
+        .task(Parameters(task_req(serde_json::json!({
+            "action": "start",
+            "id": id.clone(),
+        }))))
+        .await
+        .expect("start");
+
+    // Insert a Skipped verification row as if a supervisor had previously
+    // closed this task via the orphaned-assignee bypass and then it got
+    // resumed/reopened.
+    let ver_id = verification_store.generate_id().expect("gen ver id");
+    let mut row = cas::types::Verification::skipped(
+        ver_id,
+        id.clone(),
+        "cas-82d6 test fixture — supervisor bypass audit row".to_string(),
+    );
+    row.verification_type = VerificationType::Task;
+    verification_store.add(&row).expect("add skipped row");
+
+    // Close as factory worker. Without the cas-82d6 fix this would hit the
+    // narrowed MCP jail (check_pending_verification only accepted Approved)
+    // OR the close_ops gate (only accepted Approved). With the fix, Skipped
+    // is treated as "has verification record → proceed".
+    let result = service
+        .task(Parameters(task_req(serde_json::json!({
+            "action": "close",
+            "id": id.clone(),
+            "reason": "Completed all acceptance criteria.",
+        }))))
+        .await
+        .expect("close must succeed when a Skipped row exists");
+    let text = extract_text(result);
+    assert!(
+        text.contains("Closed"),
+        "close should succeed with Skipped row present, got: {text}"
+    );
+    assert!(
+        !text.contains("VERIFICATION REQUIRED"),
+        "Skipped row must satisfy close_ops gate, got: {text}"
+    );
+    assert!(
+        !text.contains("VERIFICATION_JAIL_BLOCKED"),
+        "Skipped row must satisfy MCP jail, got: {text}"
     );
 }
 
