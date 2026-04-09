@@ -64,6 +64,7 @@ async fn test_task_close_blocked_without_verification() {
     let close_req = TaskCloseRequest {
         id: id.to_string(),
         reason: Some("Completed".to_string()),
+        bypass_code_review: None,
     };
     let result = service
         .cas_task_close(Parameters(close_req))
@@ -161,6 +162,7 @@ require_merge_on_epic_close = true
     let close_req = TaskCloseRequest {
         id: task.id.clone(),
         reason: Some("Done".to_string()),
+        bypass_code_review: None,
     };
     let result = service
         .cas_task_close(Parameters(close_req))
@@ -238,6 +240,7 @@ async fn test_epic_close_requires_epic_verification_type() {
     let close_req = TaskCloseRequest {
         id: id.to_string(),
         reason: Some("Completed".to_string()),
+        bypass_code_review: None,
     };
     let result = service
         .cas_task_close(Parameters(close_req))
@@ -260,6 +263,7 @@ async fn test_epic_close_requires_epic_verification_type() {
     let close_req = TaskCloseRequest {
         id: id.to_string(),
         reason: Some("Completed".to_string()),
+        bypass_code_review: None,
     };
     let result = service
         .cas_task_close(Parameters(close_req))
@@ -283,6 +287,7 @@ async fn test_epic_close_requires_epic_verification_type() {
     let close_req = TaskCloseRequest {
         id: id.to_string(),
         reason: Some("Completed".to_string()),
+        bypass_code_review: None,
     };
     let result = service
         .cas_task_close(Parameters(close_req))
@@ -352,6 +357,7 @@ async fn test_task_lifecycle_with_verification() {
     let close_req = TaskCloseRequest {
         id: id.to_string(),
         reason: Some("Completed successfully".to_string()),
+        bypass_code_review: None,
     };
     let result = service
         .cas_task_close(Parameters(close_req))
@@ -431,6 +437,7 @@ async fn test_task_close_blocked_with_rejected_verification() {
     let close_req = TaskCloseRequest {
         id: id.to_string(),
         reason: Some("Completed".to_string()),
+        bypass_code_review: None,
     };
     let result = service
         .cas_task_close(Parameters(close_req))
@@ -497,6 +504,7 @@ async fn test_task_close_runs_verifier_or_skips_cleanly() {
     let close_req = TaskCloseRequest {
         id: id.clone(),
         reason: Some("Completed all acceptance criteria. Deployed to prod.".to_string()),
+        bypass_code_review: None,
     };
     let result = service
         .cas_task_close(Parameters(close_req))
@@ -637,6 +645,7 @@ async fn test_close_supervisor_bypass_orphaned_task() {
     let close_req = TaskCloseRequest {
         id: id.clone(),
         reason: Some("verification skipped — assignee inactive".to_string()),
+        bypass_code_review: None,
     };
     let result = service
         .cas_task_close(Parameters(close_req))
@@ -737,6 +746,7 @@ async fn test_close_supervisor_bypass_ghost_assignee() {
     let close_req = TaskCloseRequest {
         id: id.clone(),
         reason: Some("verification skipped — assignee inactive (ghost agent)".to_string()),
+        bypass_code_review: None,
     };
     let response_text = extract_text(
         service
@@ -827,6 +837,7 @@ async fn test_close_supervisor_no_bypass_when_assignee_alive() {
         // the bypass is structural (assignee state), not reason-driven. Even
         // with this phrase, an alive assignee must keep the jail engaged.
         reason: Some("verification skipped — assignee inactive".to_string()),
+        bypass_code_review: None,
     };
     let response_text = extract_text(
         service
@@ -1252,6 +1263,7 @@ async fn test_close_auto_escalates_stale_verification_dispatch() {
         .cas_task_close(Parameters(TaskCloseRequest {
             id: id.clone(),
             reason: Some("Completed".to_string()),
+            bypass_code_review: None,
         }))
         .await
         .expect("first close returns a result");
@@ -1279,6 +1291,7 @@ async fn test_close_auto_escalates_stale_verification_dispatch() {
         .cas_task_close(Parameters(TaskCloseRequest {
             id: id.clone(),
             reason: Some("Completed".to_string()),
+            bypass_code_review: None,
         }))
         .await
         .expect("second close returns a result");
