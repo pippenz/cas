@@ -149,7 +149,10 @@ async fn blocked_high_overlap_returns_structured_blocked() {
 
     let parsed: MemoryRememberResponse =
         serde_json::from_value(sc.clone()).expect("Blocked deserializes into enum");
-    matches!(parsed, MemoryRememberResponse::Blocked { .. });
+    assert!(
+        matches!(parsed, MemoryRememberResponse::Blocked { .. }),
+        "expected Blocked variant from high-overlap path"
+    );
 
     // Text fallback remains for legacy clients.
     let text = extract_text(result);
