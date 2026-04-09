@@ -19,7 +19,7 @@ pub const WORKER_GUIDE: &str = include_str!("builtins/skills/cas-worker.md");
 
 /// Shared skills preloaded into factory sessions
 pub const TASK_TRACKING_GUIDE: &str = include_str!("builtins/skills/cas-task-tracking.md");
-pub const MEMORY_GUIDE: &str = include_str!("builtins/skills/cas-memory-management.md");
+pub const MEMORY_GUIDE: &str = include_str!("builtins/skills/cas-memory-management/SKILL.md");
 pub const SEARCH_GUIDE: &str = include_str!("builtins/skills/cas-search.md");
 pub const CHECKLIST_GUIDE: &str = include_str!("builtins/skills/cas-supervisor-checklist.md");
 
@@ -111,7 +111,19 @@ pub const CODEX_BUILTIN_AGENTS: &[BuiltinFile] = &[
 pub const BUILTIN_SKILLS: &[BuiltinFile] = &[
     BuiltinFile {
         path: "skills/cas-memory-management/SKILL.md",
-        content: include_str!("builtins/skills/cas-memory-management.md"),
+        content: include_str!("builtins/skills/cas-memory-management/SKILL.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-memory-management/references/schema.yaml",
+        content: include_str!("builtins/skills/cas-memory-management/references/schema.yaml"),
+    },
+    BuiltinFile {
+        path: "skills/cas-memory-management/references/body-templates.md",
+        content: include_str!("builtins/skills/cas-memory-management/references/body-templates.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-memory-management/references/overlap-detection.md",
+        content: include_str!("builtins/skills/cas-memory-management/references/overlap-detection.md"),
     },
     BuiltinFile {
         path: "skills/cas-search/SKILL.md",
@@ -159,7 +171,19 @@ pub const BUILTIN_SKILLS: &[BuiltinFile] = &[
 pub const CODEX_BUILTIN_SKILLS: &[BuiltinFile] = &[
     BuiltinFile {
         path: "skills/cas-memory-management/SKILL.md",
-        content: include_str!("builtins/codex/skills/cas-memory-management.md"),
+        content: include_str!("builtins/codex/skills/cas-memory-management/SKILL.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-memory-management/references/schema.yaml",
+        content: include_str!("builtins/codex/skills/cas-memory-management/references/schema.yaml"),
+    },
+    BuiltinFile {
+        path: "skills/cas-memory-management/references/body-templates.md",
+        content: include_str!("builtins/codex/skills/cas-memory-management/references/body-templates.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-memory-management/references/overlap-detection.md",
+        content: include_str!("builtins/codex/skills/cas-memory-management/references/overlap-detection.md"),
     },
     BuiltinFile {
         path: "skills/cas-search/SKILL.md",
