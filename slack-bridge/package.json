@@ -8,7 +8,9 @@
     "start:router": "node dist/router-main.js",
     "start:daemon": "node dist/daemon-main.js",
     "dev:router": "tsx src/router-main.ts",
-    "dev:daemon": "tsx src/daemon-main.ts"
+    "dev:daemon": "tsx src/daemon-main.ts",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "dependencies": {
     "@slack/bolt": "^4.1.0",
@@ -17,7 +19,8 @@
   "devDependencies": {
     "@types/node": "^22.0.0",
     "tsx": "^4.19.0",
-    "typescript": "^5.7.0"
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
   },
   "engines": {
     "node": ">=22.0.0"
