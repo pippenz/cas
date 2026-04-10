@@ -2,9 +2,8 @@
  * Entry point for a per-user daemon (cas-bridge@<username>).
  *
  * Runs as the target Linux user. Listens on a Unix socket for messages
- * forwarded by the router, injects them into CAS via cas serve HTTP API.
- *
- * Session lifecycle: lazy startup, idle timeout, shutdown/reset commands.
+ * forwarded by the router, injects them into CAS via cas serve HTTP API,
+ * subscribes to SSE for activity/inbox events, and posts updates to Slack threads.
  */
 
 import { WebClient } from "@slack/web-api";
@@ -15,12 +14,45 @@ import {
   type DaemonConfig,
   type MessageHandler,
 } from "./daemon.js";
-import { SessionManager, type SessionEntry } from "./session-manager.js";
-import { detectCommand, executeCommand } from "./commands.js";
 import type { DaemonMessage } from "./router.js";
+import { ThreadOwnershipTracker } from "./user-filter.js";
+import {
+  subscribeToSession,
+  type SseEvent,
+  type SessionSubscription,
+} from "./session-adapter.js";
+import {
+  formatActivityEvent,
+  formatInboxMessage,
+  formatError,
+  formatInjectionConfirm,
+  type CasActivityEvent,
+  type CasInboxNotification,
+} from "./message-formatter.js";
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+
+/** Maps session name → SSE subscription (one per active CAS session). */
+const activeSubscriptions = new Map<string, SessionSubscription>();
+
+/** Maps `slack-{thread_ts}` from-label → { channel, thread_ts, session } for routing responses. */
+const threadRouting = new Map<
+  string,
+  { channel: string; thread_ts: string; session: string }
+>();
+
+/** Maps session name → Set of from-labels for threads listening to that session. */
+const sessionThreads = new Map<string, Set<string>>();
+
+const threadTracker = new ThreadOwnershipTracker();
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
 
 async function main(): Promise<void> {
-  // Load env from ~/.config/cas/env
   const env = loadDaemonEnv();
 
   const username = process.env.CAS_BRIDGE_USER ?? process.env.USER ?? "unknown";
@@ -45,97 +77,152 @@ async function main(): Promise<void> {
 
   const slack = new WebClient(config.slack_bot_token);
 
-  // Parse idle timeout from env (minutes, default 30)
-  const idleTimeoutMin = parseInt(
-    env.CAS_IDLE_TIMEOUT_MIN ?? process.env.CAS_IDLE_TIMEOUT_MIN ?? "30",
-    10,
-  );
-
-  const sessionManager = new SessionManager(config, {
-    idle_timeout_ms: idleTimeoutMin * 60 * 1000,
-  });
-
   console.log(`Per-user daemon for ${username}`);
   console.log(`  Socket: ${config.socket_path}`);
   console.log(`  CAS serve: ${config.cas_serve_url}`);
-  console.log(`  Idle timeout: ${idleTimeoutMin}m`);
 
-  // Startup cleanup: adopt orphaned sessions
-  const cleanup = await sessionManager.cleanupOrphans();
-  if (cleanup.adopted.length > 0) {
-    console.log(`Adopted ${cleanup.adopted.length} orphaned session(s): ${cleanup.adopted.join(", ")}`);
-  }
-  if (cleanup.killed.length > 0) {
-    console.log(`Killed ${cleanup.killed.length} orphaned session(s): ${cleanup.killed.join(", ")}`);
-  }
+  // --- SSE event handler (scoped to a specific session) ---
+  function handleSseEvent(sessionName: string, event: SseEvent): void {
+    if (event.event === "activity") {
+      try {
+        const data = JSON.parse(event.data) as {
+          activity: CasActivityEvent[];
+        };
+        for (const ev of data.activity) {
+          const formatted = formatActivityEvent(ev);
+          if (!formatted) continue;
 
-  // Start idle timeout checker
-  sessionManager.startIdleChecker(async (entry: SessionEntry, warning: boolean) => {
-    // We don't have a channel/thread reference here — log only.
-    // A future iteration could store the last Slack channel+thread per session
-    // and post warnings there.
-    if (warning) {
-      console.log(`Session ${entry.name} idle — will shut down in 5m`);
-    } else {
-      console.log(`Session ${entry.name} timed out — killed`);
-    }
-  });
-
-  const handleMessage: MessageHandler = async (msg: DaemonMessage) => {
-    console.log(
-      `[${msg.project}] Message from ${msg.slack_user}: ${msg.text.slice(0, 80)}...`,
-    );
-
-    // Check for lifecycle commands first
-    const command = detectCommand(msg.text);
-    if (command) {
-      const result = await executeCommand(command, sessionManager, msg.project_dir);
-      if (result.handled) {
-        await slack.chat.postMessage({
-          channel: msg.channel,
-          thread_ts: msg.thread_ts,
-          text: result.reply,
-        });
-        return;
+          // Only post to threads associated with THIS session
+          const labels = sessionThreads.get(sessionName);
+          if (!labels) continue;
+          for (const fromLabel of labels) {
+            const route = threadRouting.get(fromLabel);
+            if (!route) continue;
+            slack.chat
+              .postMessage({
+                channel: route.channel,
+                thread_ts: route.thread_ts,
+                text: formatted.text,
+                blocks: formatted.blocks,
+              })
+              .catch((err) =>
+                console.error(`Failed to post activity to Slack: ${err}`),
+              );
+          }
+        }
+      } catch {
+        // ignore parse errors
       }
     }
 
-    // Ensure a session exists (lazy startup)
-    const session = await sessionManager.ensureSession(msg.project_dir);
-    if (!session) {
+    if (event.event === "inbox") {
+      try {
+        const data = JSON.parse(event.data) as {
+          notifications: CasInboxNotification[];
+        };
+        for (const notif of data.notifications) {
+          // Route response back to the originating Slack thread
+          const route = threadRouting.get(notif.to);
+          if (!route) continue;
+
+          const formatted = formatInboxMessage(notif);
+          slack.chat
+            .postMessage({
+              channel: route.channel,
+              thread_ts: route.thread_ts,
+              text: formatted.text,
+              blocks: formatted.blocks,
+            })
+            .catch((err) =>
+              console.error(`Failed to post inbox reply to Slack: ${err}`),
+            );
+        }
+      } catch {
+        // ignore parse errors
+      }
+    }
+
+    if (event.event === "error") {
+      console.error(`SSE error event: ${event.data}`);
+    }
+  }
+
+  // --- Ensure SSE subscription exists for a session ---
+  function ensureSubscription(sessionName: string): void {
+    if (activeSubscriptions.has(sessionName)) return;
+
+    console.log(`Subscribing to SSE for session ${sessionName}`);
+    const sub = subscribeToSession(
+      config.cas_serve_url,
+      sessionName,
+      config.cas_serve_token,
+      0,
+      (event) => handleSseEvent(sessionName, event),
+      (err) => console.error(`SSE error for ${sessionName}: ${err.message}`),
+    );
+    activeSubscriptions.set(sessionName, sub);
+  }
+
+  // --- Message handler ---
+  const handleMessage: MessageHandler = async (msg: DaemonMessage) => {
+    console.log(
+      `[${msg.project}] Message from ${msg.slack_user}: ${msg.text.slice(0, 80)}`,
+    );
+
+    // Thread ownership: register owner or check
+    const existingOwner = threadTracker.getOwner(msg.thread_ts);
+    if (existingOwner && existingOwner !== msg.slack_user) {
+      // Non-owner — reject politely
       await slack.chat.postMessage({
         channel: msg.channel,
         thread_ts: msg.thread_ts,
-        text: "Failed to start CAS session. Check server logs.",
+        text: `This is <@${existingOwner}>'s CAS session — your messages won't be routed to CAS.`,
       });
       return;
     }
+    threadTracker.registerOwner(msg.thread_ts, msg.slack_user);
 
-    if (session.started) {
-      await slack.chat.postMessage({
-        channel: msg.channel,
-        thread_ts: msg.thread_ts,
-        text: `Starting CAS factory in ${msg.project}... ready. Session: \`${session.name}\``,
-      });
-    }
-
-    // Touch the session to reset idle timer
-    sessionManager.touch(msg.project_dir);
-
-    // Inject the message
+    // Inject message into CAS
     const result = await injectMessage(config, msg);
 
     if (result.ok) {
+      // Register thread routing for responses
+      const fromLabel = `slack-${msg.thread_ts}`;
+      threadRouting.set(fromLabel, {
+        channel: msg.channel,
+        thread_ts: msg.thread_ts,
+        session: result.session!,
+      });
+
+      // Track which threads belong to which session
+      let labels = sessionThreads.get(result.session!);
+      if (!labels) {
+        labels = new Set();
+        sessionThreads.set(result.session!, labels);
+      }
+      labels.add(fromLabel);
+
+      // Start SSE subscription for this session
+      ensureSubscription(result.session!);
+
+      // Post confirmation
+      const confirm = formatInjectionConfirm(
+        result.session!,
+        result.message_id!,
+      );
       await slack.chat.postMessage({
         channel: msg.channel,
         thread_ts: msg.thread_ts,
-        text: `Message sent to CAS session \`${result.session}\` (message #${result.message_id})`,
+        text: confirm.text,
+        blocks: confirm.blocks,
       });
     } else {
+      const err = formatError("inject_failed", result.error ?? "Unknown error");
       await slack.chat.postMessage({
         channel: msg.channel,
         thread_ts: msg.thread_ts,
-        text: `Failed to send to CAS: ${result.error}`,
+        text: err.text,
+        blocks: err.blocks,
       });
     }
   };
@@ -143,9 +230,12 @@ async function main(): Promise<void> {
   const server = startSocketServer(config.socket_path, handleMessage);
 
   // Graceful shutdown
-  const shutdown = async () => {
+  const shutdown = () => {
     console.log("Shutting down...");
-    sessionManager.stopIdleChecker();
+    for (const [name, sub] of activeSubscriptions) {
+      console.log(`Closing SSE for ${name}`);
+      sub.abort();
+    }
     server.close();
     process.exit(0);
   };
