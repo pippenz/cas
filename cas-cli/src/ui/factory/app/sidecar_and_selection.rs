@@ -156,7 +156,8 @@ impl FactoryApp {
                     let all_names = self.layout_worker_names();
                     if !all_names.is_empty() {
                         let tab_width = tab_area.width / all_names.len() as u16;
-                        let clicked_tab = ((col - tab_area.x) / tab_width.max(1)) as usize;
+                        let clicked_tab =
+                            (col.saturating_sub(tab_area.x) / tab_width.max(1)) as usize;
                         if clicked_tab < all_names.len() {
                             self.select_worker_tab(clicked_tab);
                             // Also focus the clicked worker pane
