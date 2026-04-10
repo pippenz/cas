@@ -1,253 +1,123 @@
 #!/usr/bin/env bash
-# provision-hetzner.sh — Idempotent provisioning for Hetzner CCX23 CAS server
-# Server: 87.99.156.244 (ubuntu-16gb-ash-1), Ubuntu 24.04, 16GB RAM, 150GB disk
-# Usage: ssh root@87.99.156.244 'bash -s' < scripts/provision-hetzner.sh
-#
-# Secrets (API keys, tokens) are NOT in this script. After running, manually
-# populate /home/daniel/.zshrc.secrets (sourced by .zshrc) with:
-#   GH_TOKEN, GITHUB_TOKEN, CAS_CLOUD_TOKEN, CAS_CLOUD_ENDPOINT,
-#   CONTEXT7_API_KEY, NEON_API_KEY, VERCEL_TOKEN, BROWSERLESS_API_KEY
+# provision-hetzner.sh — Idempotent provisioning for CAS development server
+# Target: Hetzner CCX23 (Ubuntu, 16GB RAM, 150GB disk)
+# Usage: Run as root on the target server, or via: ssh root@<ip> 'bash -s' < scripts/provision-hetzner.sh
 set -euo pipefail
 
-log() { echo -e "\n==> $1"; }
+DANIEL_SSH_KEY="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGpA1xrG0zl8uYLVriPH4ptQCm98jpZET5pYqb93erqm pippenz@github"
+NVM_VERSION="v0.40.3"
+RUST_MIN="1.85"
+CAS_REPO="https://github.com/pippenz/cas.git"
+SWAP_SIZE="4G"
 
-# ─── 1. System updates & essentials ──────────────────────────────────────────
+log() { echo -e "\n\033[1;34m>>> $1\033[0m"; }
+
+# ── 1. System updates & essentials ──────────────────────────────────────────
 log "System updates & essentials"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get upgrade -y -qq
 apt-get install -y -qq \
-  build-essential git curl wget unzip jq htop tmux \
-  pkg-config libssl-dev ca-certificates gnupg lld \
-  python3 python3-pip python3-venv postgresql-client \
-  zsh fzf \
-  unattended-upgrades apt-listchanges
+  build-essential git curl unzip jq htop tmux \
+  zsh python3 python3-pip python3-venv \
+  postgresql-client \
+  software-properties-common apt-transport-https \
+  lld
 
-# ─── 2. User accounts ────────────────────────────────────────────────────────
-create_user() {
-  local username="$1"
-  if id "$username" &>/dev/null; then
-    log "User $username already exists"
-  else
-    log "Creating user $username"
-    adduser --disabled-password --gecos "" "$username"
-  fi
-  usermod -aG sudo "$username"
-  # Passwordless sudo
-  echo "$username ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/$username"
-  chmod 440 "/etc/sudoers.d/$username"
-  # Copy root's authorized_keys if user doesn't have any yet
-  local ssh_dir="/home/$username/.ssh"
-  mkdir -p "$ssh_dir"
-  if [ ! -s "$ssh_dir/authorized_keys" ] && [ -f /root/.ssh/authorized_keys ]; then
-    cp /root/.ssh/authorized_keys "$ssh_dir/authorized_keys"
-  fi
-  chown -R "$username:$username" "$ssh_dir"
-  chmod 700 "$ssh_dir"
-  chmod 600 "$ssh_dir/authorized_keys"
-}
+# ── 2. Shell tools (system-wide): starship, eza, fzf, zoxide ───────────────
+log "Shell tools"
 
-create_user daniel
-create_user ben
-
-# ─── 3. Disable root password login ──────────────────────────────────────────
-log "Hardening SSH"
-sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
-sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
-sshd -t && systemctl reload sshd
-
-# ─── 4. Firewall (UFW) ───────────────────────────────────────────────────────
-log "Configuring UFW"
-apt-get install -y -qq ufw
-ufw allow OpenSSH
-ufw --force enable
-ufw default deny incoming
-ufw default allow outgoing
-
-# ─── 5. Node.js LTS + pnpm ──────────────────────────────────────────────────
-log "Installing Node.js LTS"
-if ! command -v node &>/dev/null || ! node -v | grep -qE '^v(20|22|24)'; then
-  mkdir -p /etc/apt/keyrings
-  if [ ! -f /etc/apt/keyrings/nodesource.gpg ]; then
-    curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
-      | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
-  fi
-  echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main" \
-    > /etc/apt/sources.list.d/nodesource.list
-  apt-get update -qq
-  apt-get install -y -qq nodejs
+# starship
+if ! command -v starship &>/dev/null; then
+  curl -fsSL https://starship.rs/install.sh | sh -s -- -y
 fi
-echo "Node.js: $(node -v)"
 
-log "Installing pnpm"
-corepack enable
-corepack prepare pnpm@latest --activate 2>/dev/null || npm install -g pnpm
-echo "pnpm: $(pnpm --version)"
-
-# ─── 6. Claude Code ──────────────────────────────────────────────────────────
-log "Installing Claude Code"
-if ! command -v claude &>/dev/null; then
-  npm install -g @anthropic-ai/claude-code
-fi
-echo "Claude Code: $(claude --version 2>/dev/null || echo 'installed')"
-
-# ─── 7. Rust toolchain ───────────────────────────────────────────────────────
-install_rust_for_user() {
-  local username="$1"
-  local home_dir="/home/$username"
-  if [ -f "$home_dir/.cargo/bin/rustc" ]; then
-    local ver
-    ver=$(sudo -u "$username" "$home_dir/.cargo/bin/rustc" --version | awk '{print $2}')
-    log "Rust already installed for $username: $ver"
-  else
-    log "Installing Rust for $username"
-    sudo -u "$username" bash -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable'
-  fi
-}
-
-install_rust_for_user daniel
-install_rust_for_user ben
-
-# Also install for root (for building CAS)
-if [ ! -f /root/.cargo/bin/rustc ]; then
-  log "Installing Rust for root"
-  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
-fi
-export PATH="/root/.cargo/bin:$PATH"
-echo "Rust: $(rustc --version)"
-
-# ─── 8. CAS from source ──────────────────────────────────────────────────────
-log "Building CAS from source"
-CAS_SRC="/opt/cas-src"
-if [ ! -d "$CAS_SRC/.git" ]; then
-  git clone https://github.com/pippenz/cas.git "$CAS_SRC"
-else
-  cd "$CAS_SRC" && git pull --ff-only
-fi
-cd "$CAS_SRC"
-# Bootstrap Zig (required for ghostty_vt_sys)
-bash scripts/bootstrap-zig.sh
-export ZIG="$CAS_SRC/.context/zig/zig"
-/root/.cargo/bin/cargo build --release
-ln -sf "$CAS_SRC/target/release/cas" /usr/local/bin/cas
-echo "CAS: $(cas --version 2>/dev/null || echo 'built')"
-
-# ─── 9. Swap (4GB) ───────────────────────────────────────────────────────────
-log "Configuring swap"
-if ! swapon --show | grep -q /swapfile; then
-  if [ ! -f /swapfile ]; then
-    fallocate -l 4G /swapfile
-    chmod 600 /swapfile
-    mkswap /swapfile
-  fi
-  swapon /swapfile
-  grep -q '/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
-fi
-echo "Swap: $(swapon --show)"
-
-# ─── 10. Sysctl tuning ───────────────────────────────────────────────────────
-log "Sysctl tuning"
-cat > /etc/sysctl.d/99-cas.conf << 'SYSCTL'
-vm.swappiness=10
-fs.file-max=1048576
-net.core.somaxconn=4096
-net.core.netdev_max_backlog=4096
-net.ipv4.tcp_max_syn_backlog=4096
-net.ipv4.tcp_tw_reuse=1
-SYSCTL
-sysctl --system -q
-
-# ─── 11. Timezone ────────────────────────────────────────────────────────────
-log "Setting timezone to US Eastern"
-timedatectl set-timezone America/New_York
-
-# ─── 12. Unattended upgrades ─────────────────────────────────────────────────
-log "Configuring unattended upgrades"
-cat > /etc/apt/apt.conf.d/20auto-upgrades << 'AUTOUPG'
-APT::Periodic::Update-Package-Lists "1";
-APT::Periodic::Unattended-Upgrade "1";
-APT::Periodic::AutocleanInterval "7";
-AUTOUPG
-
-# ─── 13. CLI tools (eza, starship, zoxide) ───────────────────────────────────
-log "Installing CLI tools"
-
-# eza
+# eza (from official apt repo)
 if ! command -v eza &>/dev/null; then
   mkdir -p /etc/apt/keyrings
-  wget -qO- https://raw.githubusercontent.com/eza-community/eza/main/deb.asc \
-    | gpg --dearmor -o /etc/apt/keyrings/gierens.gpg
-  echo "deb [signed-by=/etc/apt/keyrings/gierens.gpg] http://deb.gierens.de stable main" \
-    > /etc/apt/sources.list.d/gierens.list
+  wget -qO- https://raw.githubusercontent.com/eza-community/eza/main/deb.asc | gpg --dearmor -o /etc/apt/keyrings/gierens.gpg 2>/dev/null || true
+  echo "deb [signed-by=/etc/apt/keyrings/gierens.gpg] http://deb.gierens.de stable main" > /etc/apt/sources.list.d/gierens.list
   chmod 644 /etc/apt/keyrings/gierens.gpg /etc/apt/sources.list.d/gierens.list
   apt-get update -qq
   apt-get install -y -qq eza
 fi
 
-# starship
-if ! command -v starship &>/dev/null; then
-  curl -sS https://starship.rs/install.sh | sh -s -- -y
+# fzf
+if ! command -v fzf &>/dev/null; then
+  apt-get install -y -qq fzf
 fi
 
 # zoxide
 if ! command -v zoxide &>/dev/null; then
-  curl -sS https://raw.githubusercontent.com/ajeetdsouza/zoxide/main/install.sh | bash
-  cp /root/.local/bin/zoxide /usr/local/bin/zoxide
-  chmod 755 /usr/local/bin/zoxide
+  curl -fsSL https://raw.githubusercontent.com/ajeetdsouza/zoxide/main/install.sh | bash
+  # zoxide installs to ~/.local/bin by default; move to /usr/local/bin for system-wide
+  if [ -f /root/.local/bin/zoxide ]; then
+    mv /root/.local/bin/zoxide /usr/local/bin/zoxide
+  fi
 fi
 
-# ─── 14. Daniel's shell environment ──────────────────────────────────────────
-log "Setting up daniel's shell"
-chsh -s /usr/bin/zsh daniel
+# ── 3. User accounts ───────────────────────────────────────────────────────
+log "User accounts"
+
+create_user() {
+  local username=$1
+  local ssh_key=${2:-""}
+  if ! id "$username" &>/dev/null; then
+    useradd -m -s /usr/bin/zsh -G sudo,users "$username"
+    echo "$username ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/$username"
+    chmod 440 "/etc/sudoers.d/$username"
+  else
+    chsh -s /usr/bin/zsh "$username" 2>/dev/null || true
+  fi
+  # Ensure user dirs
+  local home="/home/$username"
+  mkdir -p "$home/.ssh" "$home/.cas" "$home/.claude" "$home/projects"
+  if [ -n "$ssh_key" ]; then
+    grep -qF "$ssh_key" "$home/.ssh/authorized_keys" 2>/dev/null || echo "$ssh_key" >> "$home/.ssh/authorized_keys"
+    chmod 700 "$home/.ssh"
+    chmod 600 "$home/.ssh/authorized_keys"
+  fi
+  chown -R "$username:$username" "$home"
+}
+
+create_user daniel "$DANIEL_SSH_KEY"
+create_user ben ""
+
+# ── 4. daniel's shell environment (.zshrc) ─────────────────────────────────
+log "daniel's shell environment"
+
+DANIEL_HOME="/home/daniel"
 
 # oh-my-zsh
-if [ ! -d /home/daniel/.oh-my-zsh ]; then
-  sudo -u daniel sh -c 'RUNZSH=no KEEP_ZSHRC=yes sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)"' || true
+if [ ! -d "$DANIEL_HOME/.oh-my-zsh" ]; then
+  su - daniel -c 'sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended'
 fi
 
-# zsh plugins
-ZSH_CUSTOM="/home/daniel/.oh-my-zsh/custom"
+# oh-my-zsh plugins
+ZSH_CUSTOM="$DANIEL_HOME/.oh-my-zsh/custom"
 if [ ! -d "$ZSH_CUSTOM/plugins/zsh-autosuggestions" ]; then
-  sudo -u daniel git clone https://github.com/zsh-users/zsh-autosuggestions "$ZSH_CUSTOM/plugins/zsh-autosuggestions"
+  su - daniel -c "git clone https://github.com/zsh-users/zsh-autosuggestions $ZSH_CUSTOM/plugins/zsh-autosuggestions"
 fi
 if [ ! -d "$ZSH_CUSTOM/plugins/zsh-syntax-highlighting" ]; then
-  sudo -u daniel git clone https://github.com/zsh-users/zsh-syntax-highlighting "$ZSH_CUSTOM/plugins/zsh-syntax-highlighting"
+  su - daniel -c "git clone https://github.com/zsh-users/zsh-syntax-highlighting $ZSH_CUSTOM/plugins/zsh-syntax-highlighting"
 fi
 
-# .zshrc (secrets loaded from .zshrc.secrets, not committed)
-cat > /home/daniel/.zshrc << 'ZSHRC'
-# ─── Oh My Zsh ────────────────────────────────────────────────────────────────
+# Write .zshrc
+cat > "$DANIEL_HOME/.zshrc" << 'ZSHRC_EOF'
+# ── oh-my-zsh ───────────────────────────────────────────────────────────────
 export ZSH="$HOME/.oh-my-zsh"
-ZSH_THEME=""
-plugins=(git zsh-autosuggestions zsh-syntax-highlighting fzf)
-source $ZSH/oh-my-zsh.sh
+ZSH_THEME=""  # using starship instead
+plugins=(git zsh-autosuggestions zsh-syntax-highlighting)
+source "$ZSH/oh-my-zsh.sh"
 
-# ─── Starship prompt ─────────────────────────────────────────────────────────
+# ── Starship prompt ─────────────────────────────────────────────────────────
 eval "$(starship init zsh)"
 
-# ─── Rust / Cargo ─────────────────────────────────────────────────────────────
-[ -f "$HOME/.cargo/env" ] && source "$HOME/.cargo/env"
+# ── eza aliases ──────────────────────────────────────────────────────────────
+alias ls='eza --icons --color=always'
+alias ll='eza -la --icons --color=always'
 
-# ─── NVM ──────────────────────────────────────────────────────────────────────
-export NVM_DIR="$HOME/.nvm"
-[ -s "$NVM_DIR/nvm.sh" ] && source "$NVM_DIR/nvm.sh"
-[ -s "$NVM_DIR/bash_completion" ] && source "$NVM_DIR/bash_completion"
-
-# ─── eza aliases ──────────────────────────────────────────────────────────────
-alias ls="eza --icons"
-alias ll="eza -la --icons --git"
-alias la="eza -a --icons"
-alias lt="eza --tree --icons -L 3"
-
-# ─── Zoxide / fzf ────────────────────────────────────────────────────────────
-eval "$(zoxide init zsh)"
-[ -f /usr/share/doc/fzf/examples/key-bindings.zsh ] && source /usr/share/doc/fzf/examples/key-bindings.zsh
-[ -f /usr/share/doc/fzf/examples/completion.zsh ] && source /usr/share/doc/fzf/examples/completion.zsh
-
-# ─── Aliases ──────────────────────────────────────────────────────────────────
-alias python=python3
-
-# ─── CAS wrapper ──────────────────────────────────────────────────────────────
+# ── CAS wrapper ──────────────────────────────────────────────────────────────
 cas() {
   if [ $# -eq 0 ]; then
     command cas factory --new
@@ -257,58 +127,290 @@ cas() {
 }
 
 cas-refresh() {
-  cd ~/cas-src && git pull --ff-only && cargo build --release \
-    && sudo ln -sf ~/cas-src/target/release/cas /usr/local/bin/cas && cas --version
+  echo ">>> Updating CAS..."
+  cd ~/projects/cas && git pull && cargo build --release
+  sudo cp target/release/cas /usr/local/bin/cas
+  echo ">>> CAS login..."
+  cas-login
+  echo ">>> Cloud auth..."
+  command cas cloud auth
+  echo ">>> Cloud sync..."
+  command cas cloud sync
+  echo ">>> Starting factory..."
+  command cas factory --new
 }
 
-# ─── SSH agent persistent socket ──────────────────────────────────────────────
+# ── SSH agent persistent socket ──────────────────────────────────────────────
 export SSH_AUTH_SOCK="$HOME/.ssh/agent.sock"
-if ! ss -a | grep -q "$SSH_AUTH_SOCK"; then
+if ! ssh-add -l &>/dev/null 2>&1; then
   rm -f "$SSH_AUTH_SOCK"
-  eval $(ssh-agent -a "$SSH_AUTH_SOCK") > /dev/null
+  eval "$(ssh-agent -a "$SSH_AUTH_SOCK")" >/dev/null 2>&1
+  ssh-add ~/.ssh/id_ed25519 2>/dev/null || true
 fi
 
-# ─── Secrets (not in repo — populate after provisioning) ─────────────────────
-[ -f "$HOME/.zshrc.secrets" ] && source "$HOME/.zshrc.secrets"
+# ── nvm ──────────────────────────────────────────────────────────────────────
+export NVM_DIR="$HOME/.nvm"
+[ -s "$NVM_DIR/nvm.sh" ] && source "$NVM_DIR/nvm.sh"
+[ -s "$NVM_DIR/bash_completion" ] && source "$NVM_DIR/bash_completion"
 
-# ─── CAS login alias + auto-login ────────────────────────────────────────────
-alias cas-login='cas login --token $CAS_CLOUD_TOKEN --endpoint $CAS_CLOUD_ENDPOINT'
-cas auth whoami &>/dev/null 2>&1 || cas login --token "$CAS_CLOUD_TOKEN" --endpoint "$CAS_CLOUD_ENDPOINT" &>/dev/null 2>&1 || true
+# ── fzf ──────────────────────────────────────────────────────────────────────
+[ -f /usr/share/doc/fzf/examples/key-bindings.zsh ] && source /usr/share/doc/fzf/examples/key-bindings.zsh
+[ -f /usr/share/doc/fzf/examples/completion.zsh ] && source /usr/share/doc/fzf/examples/completion.zsh
 
-# ─── Terminal title ───────────────────────────────────────────────────────────
-precmd() { print -Pn "\e]0;%n@%m:%~\a"; }
-ZSHRC
-chown daniel:daniel /home/daniel/.zshrc
+# ── zoxide ───────────────────────────────────────────────────────────────────
+eval "$(zoxide init zsh)"
 
-# ─── 15. Per-user directories ────────────────────────────────────────────────
-setup_user_dirs() {
-  local username="$1"
-  local home_dir="/home/$username"
-  log "Setting up directories for $username"
-  sudo -u "$username" mkdir -p \
-    "$home_dir/.cas" \
-    "$home_dir/.claude" \
-    "$home_dir/projects"
+# ── Python ───────────────────────────────────────────────────────────────────
+alias python=python3
+
+# ── Terminal title ───────────────────────────────────────────────────────────
+precmd() { print -Pn "\e]0;%n@%m: %~\a" }
+
+# ── Environment variables ────────────────────────────────────────────────────
+export GH_TOKEN="YOUR_TOKEN_HERE"
+export GITHUB_TOKEN="$GH_TOKEN"
+export CAS_CLOUD_TOKEN="YOUR_TOKEN_HERE"
+export CAS_CLOUD_ENDPOINT="https://petra-stella-cloud.vercel.app"
+export CONTEXT7_API_KEY="YOUR_TOKEN_HERE"
+export NEON_API_KEY="YOUR_TOKEN_HERE"
+export VERCEL_TOKEN="YOUR_TOKEN_HERE"
+export BROSERLESS_API_KEY="YOUR_TOKEN_HERE"
+
+# ── CAS login ────────────────────────────────────────────────────────────────
+alias cas-login='command cas cloud login --token "$CAS_CLOUD_TOKEN"'
+
+# Auto-login on shell start (silent)
+command cas cloud login --token "$CAS_CLOUD_TOKEN" &>/dev/null || true
+ZSHRC_EOF
+
+chown daniel:daniel "$DANIEL_HOME/.zshrc"
+
+# ── 4b. ben's shell environment (.zshrc) ──────────────────────────────────
+log "ben's shell environment"
+
+BEN_HOME="/home/ben"
+
+# oh-my-zsh
+if [ ! -d "$BEN_HOME/.oh-my-zsh" ]; then
+  su - ben -c 'sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended'
+fi
+
+# oh-my-zsh plugins
+ZSH_CUSTOM_BEN="$BEN_HOME/.oh-my-zsh/custom"
+if [ ! -d "$ZSH_CUSTOM_BEN/plugins/zsh-autosuggestions" ]; then
+  su - ben -c "git clone https://github.com/zsh-users/zsh-autosuggestions $ZSH_CUSTOM_BEN/plugins/zsh-autosuggestions"
+fi
+if [ ! -d "$ZSH_CUSTOM_BEN/plugins/zsh-syntax-highlighting" ]; then
+  su - ben -c "git clone https://github.com/zsh-users/zsh-syntax-highlighting $ZSH_CUSTOM_BEN/plugins/zsh-syntax-highlighting"
+fi
+
+# Write .zshrc (same structure as daniel, placeholder tokens)
+cat > "$BEN_HOME/.zshrc" << 'ZSHRC_BEN_EOF'
+# ── oh-my-zsh ───────────────────────────────────────────────────────────────
+export ZSH="$HOME/.oh-my-zsh"
+ZSH_THEME=""  # using starship instead
+plugins=(git zsh-autosuggestions zsh-syntax-highlighting)
+source "$ZSH/oh-my-zsh.sh"
+
+# ── Starship prompt ─────────────────────────────────────────────────────────
+eval "$(starship init zsh)"
+
+# ── eza aliases ──────────────────────────────────────────────────────────────
+alias ls='eza --icons --color=always'
+alias ll='eza -la --icons --color=always'
+
+# ── CAS wrapper ──────────────────────────────────────────────────────────────
+cas() {
+  if [ $# -eq 0 ]; then
+    command cas factory --new
+  else
+    command cas "$@"
+  fi
 }
 
-setup_user_dirs daniel
-setup_user_dirs ben
+cas-refresh() {
+  echo ">>> Updating CAS..."
+  cd ~/projects/cas && git pull && cargo build --release
+  sudo cp target/release/cas /usr/local/bin/cas
+  echo ">>> CAS login..."
+  cas-login
+  echo ">>> Cloud auth..."
+  command cas cloud auth
+  echo ">>> Cloud sync..."
+  command cas cloud sync
+  echo ">>> Starting factory..."
+  command cas factory --new
+}
 
-# ─── Done ─────────────────────────────────────────────────────────────────────
+# ── SSH agent persistent socket ──────────────────────────────────────────────
+export SSH_AUTH_SOCK="$HOME/.ssh/agent.sock"
+if ! ssh-add -l &>/dev/null 2>&1; then
+  rm -f "$SSH_AUTH_SOCK"
+  eval "$(ssh-agent -a "$SSH_AUTH_SOCK")" >/dev/null 2>&1
+  ssh-add ~/.ssh/id_ed25519 2>/dev/null || true
+fi
+
+# ── nvm ──────────────────────────────────────────────────────────────────────
+export NVM_DIR="$HOME/.nvm"
+[ -s "$NVM_DIR/nvm.sh" ] && source "$NVM_DIR/nvm.sh"
+[ -s "$NVM_DIR/bash_completion" ] && source "$NVM_DIR/bash_completion"
+
+# ── fzf ──────────────────────────────────────────────────────────────────────
+[ -f /usr/share/doc/fzf/examples/key-bindings.zsh ] && source /usr/share/doc/fzf/examples/key-bindings.zsh
+[ -f /usr/share/doc/fzf/examples/completion.zsh ] && source /usr/share/doc/fzf/examples/completion.zsh
+
+# ── zoxide ───────────────────────────────────────────────────────────────────
+eval "$(zoxide init zsh)"
+
+# ── Python ───────────────────────────────────────────────────────────────────
+alias python=python3
+
+# ── Terminal title ───────────────────────────────────────────────────────────
+precmd() { print -Pn "\e]0;%n@%m: %~\a" }
+
+# ── Environment variables (fill in your tokens) ─────────────────────────────
+export GH_TOKEN="YOUR_TOKEN_HERE"
+export GITHUB_TOKEN="$GH_TOKEN"
+export CAS_CLOUD_TOKEN="YOUR_TOKEN_HERE"
+export CAS_CLOUD_ENDPOINT="https://petra-stella-cloud.vercel.app"
+export CONTEXT7_API_KEY="YOUR_TOKEN_HERE"
+export NEON_API_KEY="YOUR_TOKEN_HERE"
+export VERCEL_TOKEN="YOUR_TOKEN_HERE"
+export BROSERLESS_API_KEY="YOUR_TOKEN_HERE"
+
+# ── CAS login ────────────────────────────────────────────────────────────────
+alias cas-login='command cas cloud login --token "$CAS_CLOUD_TOKEN"'
+
+# Auto-login on shell start (silent)
+command cas cloud login --token "$CAS_CLOUD_TOKEN" &>/dev/null || true
+ZSHRC_BEN_EOF
+
+chown ben:ben "$BEN_HOME/.zshrc"
+
+# ── 4c. SSH keypair for ben ───────────────────────────────────────────────
+log "SSH keypair for ben"
+if [ ! -f "$BEN_HOME/.ssh/id_ed25519" ]; then
+  su - ben -c 'ssh-keygen -t ed25519 -C "ben@hetzner-cas" -f ~/.ssh/id_ed25519 -N ""'
+  cat "$BEN_HOME/.ssh/id_ed25519.pub" >> "$BEN_HOME/.ssh/authorized_keys"
+  chmod 600 "$BEN_HOME/.ssh/authorized_keys"
+  chown ben:ben "$BEN_HOME/.ssh/authorized_keys"
+fi
+
+# ── 5. Node.js via nvm + pnpm via corepack ─────────────────────────────────
+log "Node.js (nvm) + pnpm"
+
+for user in daniel ben; do
+  user_home="/home/$user"
+  if [ ! -d "$user_home/.nvm" ]; then
+    su - "$user" -c "curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/$NVM_VERSION/install.sh | bash"
+    su - "$user" -c "source ~/.nvm/nvm.sh && nvm install --lts"
+  fi
+  su - "$user" -c "source ~/.nvm/nvm.sh && corepack enable && corepack prepare pnpm@latest --activate" 2>/dev/null || true
+done
+
+# ── 6. Rust (for all relevant users) ───────────────────────────────────────
+log "Rust toolchain"
+
+install_rust_for_user() {
+  local username=$1
+  local home="/home/$username"
+  if [ ! -d "$home/.rustup" ]; then
+    su - "$username" -c "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable"
+  else
+    su - "$username" -c "source ~/.cargo/env && rustup update stable" 2>/dev/null || true
+  fi
+}
+
+install_rust_for_user daniel
+install_rust_for_user ben
+# root rustup (for building CAS as root if needed)
+if [ ! -d /root/.rustup ]; then
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+fi
+
+# ── 7. Zig bootstrap (required for CAS ghostty_vt_sys build) ───────────────
+log "Zig bootstrap"
+
+if ! command -v zig &>/dev/null; then
+  ZIG_VERSION="0.15.2"
+  ZIG_ARCHIVE="zig-x86_64-linux-${ZIG_VERSION}"
+  ZIG_TAR="${ZIG_ARCHIVE}.tar.xz"
+  cd /tmp
+  curl -fsSLO "https://ziglang.org/download/${ZIG_VERSION}/${ZIG_TAR}"
+  tar xf "$ZIG_TAR"
+  rm -rf /opt/zig
+  mv "$ZIG_ARCHIVE" /opt/zig
+  ln -sf /opt/zig/zig /usr/local/bin/zig
+  rm -f "$ZIG_TAR"
+fi
+
+# ── 8. CAS — clone, build, symlink ─────────────────────────────────────────
+log "CAS binary"
+
+CAS_DIR="$DANIEL_HOME/projects/cas"
+if [ ! -d "$CAS_DIR" ]; then
+  su - daniel -c "git clone $CAS_REPO ~/projects/cas"
+fi
+
+# Build as daniel (has rust toolchain)
+su - daniel -c "cd ~/projects/cas && source ~/.cargo/env && cargo build --release"
+cp "$CAS_DIR/target/release/cas" /usr/local/bin/cas
+chmod 755 /usr/local/bin/cas
+
+# ── 9. Claude Code (global) ────────────────────────────────────────────────
+log "Claude Code"
+
+if ! command -v claude &>/dev/null; then
+  npm install -g @anthropic-ai/claude-code
+fi
+
+# ── 10. Firewall (ufw) ─────────────────────────────────────────────────────
+log "Firewall"
+
+ufw --force enable
+ufw allow OpenSSH
+ufw default deny incoming
+ufw default allow outgoing
+
+# ── 11. Swap ────────────────────────────────────────────────────────────────
+log "Swap ($SWAP_SIZE)"
+
+if ! swapon --show | grep -q /swapfile; then
+  fallocate -l "$SWAP_SIZE" /swapfile
+  chmod 600 /swapfile
+  mkswap /swapfile
+  swapon /swapfile
+  grep -q '/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+fi
+
+# ── 12. sysctl tuning ──────────────────────────────────────────────────────
+log "sysctl tuning"
+
+cat > /etc/sysctl.d/99-cas.conf << 'SYSCTL_EOF'
+vm.swappiness=10
+fs.file-max=2097152
+net.core.somaxconn=65535
+net.ipv4.tcp_max_syn_backlog=65535
+SYSCTL_EOF
+sysctl --system >/dev/null 2>&1
+
+# ── 13. Disable root password login ────────────────────────────────────────
+log "SSH hardening"
+
+sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
+sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
+systemctl reload sshd 2>/dev/null || systemctl reload ssh 2>/dev/null || true
+
+# ── 14. Timezone ────────────────────────────────────────────────────────────
+timedatectl set-timezone America/New_York 2>/dev/null || true
+
+# ── Done ────────────────────────────────────────────────────────────────────
 log "Provisioning complete!"
-echo ""
-echo "Summary:"
-echo "  Users: daniel (sudo+key+zsh), ben (sudo, no key yet)"
-echo "  Node.js: $(node -v), pnpm: $(pnpm --version)"
-echo "  Python: $(python3 --version)"
-echo "  Claude Code: $(claude --version 2>/dev/null || echo 'installed')"
-echo "  Rust: $(rustc --version)"
-echo "  CAS: $(cas --version 2>/dev/null || echo 'built')"
-echo "  UFW: $(ufw status | head -1)"
-echo "  Swap: $(swapon --show --noheadings | awk '{print $3}')"
-echo "  Timezone: $(timedatectl show -p Timezone --value)"
-echo ""
-echo "Next steps:"
-echo "  - Populate /home/daniel/.zshrc.secrets with API tokens"
-echo "  - Add ben's SSH public key to /home/ben/.ssh/authorized_keys"
-echo "  - SSH as daniel: ssh daniel@87.99.156.244"
+echo "  Users: daniel (sudo+ssh), ben (sudo+ssh keypair)"
+echo "  Shell: zsh + oh-my-zsh + starship + eza + fzf + zoxide"
+echo "  Node:  $(su - daniel -c 'source ~/.nvm/nvm.sh && node --version' 2>/dev/null || echo 'check manually')"
+echo "  Rust:  $(su - daniel -c 'source ~/.cargo/env && rustc --version' 2>/dev/null || echo 'check manually')"
+echo "  CAS:   $(cas --version 2>/dev/null || echo 'check manually')"
+echo "  Claude: $(claude --version 2>/dev/null || echo 'check manually')"
+echo "  UFW:   $(ufw status | head -1)"
+echo "  Swap:  $(swapon --show --noheadings | awk '{print $3}')"
