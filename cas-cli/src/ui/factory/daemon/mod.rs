@@ -173,6 +173,8 @@ pub struct FactoryDaemon {
     last_idle_message_times: HashMap<String, std::time::Instant>,
     /// Epic IDs already logged as "resuming" (prevents log spam every refresh cycle)
     resumed_epic_ids: std::collections::HashSet<String>,
+    /// Per-pane timestamp of last plain-text snapshot write (for pane-tail files)
+    last_snapshot_at: HashMap<String, std::time::Instant>,
 }
 
 /// Parsed control events from client

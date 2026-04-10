@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as FmtWrite;
 
 use cas_factory_protocol::{
@@ -58,6 +58,146 @@ impl PaneBuffer {
             let excess = self.data.len() - PANE_BUFFER_CAPACITY;
             self.data.drain(..excess);
         }
+    }
+
+    /// Return the buffer contents as plain text with all ANSI escape sequences stripped.
+    ///
+    /// Handles CSI sequences (ESC[...X), OSC sequences (ESC]...ST/BEL),
+    /// and two-byte ESC+char sequences.
+    pub fn as_plain_text(&self) -> String {
+        let bytes = self.as_bytes();
+        strip_ansi(&bytes)
+    }
+}
+
+/// Strip ANSI escape sequences from raw PTY bytes, returning plain UTF-8 text.
+///
+/// Handles:
+/// - CSI sequences: ESC [ ... (final byte 0x40–0x7E)
+/// - OSC sequences: ESC ] ... (terminated by BEL or ST)
+/// - Two-byte ESC sequences: ESC + single byte
+/// - Bare CR (\r) is consumed (line content replaces itself)
+fn strip_ansi(bytes: &[u8]) -> String {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            0x1b => {
+                i += 1;
+                if i >= bytes.len() {
+                    break;
+                }
+                match bytes[i] {
+                    b'[' => {
+                        // CSI sequence: consume until final byte (0x40–0x7E)
+                        i += 1;
+                        while i < bytes.len() && !(0x40..=0x7E).contains(&bytes[i]) {
+                            i += 1;
+                        }
+                        if i < bytes.len() {
+                            i += 1; // consume final byte
+                        }
+                    }
+                    b']' => {
+                        // OSC sequence: consume until BEL (0x07) or ST (ESC \)
+                        i += 1;
+                        while i < bytes.len() {
+                            if bytes[i] == 0x07 {
+                                i += 1;
+                                break;
+                            }
+                            if bytes[i] == 0x1b
+                                && i + 1 < bytes.len()
+                                && bytes[i + 1] == b'\\'
+                            {
+                                i += 2;
+                                break;
+                            }
+                            i += 1;
+                        }
+                    }
+                    _ => {
+                        // Two-byte escape (e.g. ESC M, ESC 7, ESC 8)
+                        i += 1;
+                    }
+                }
+            }
+            b'\r' => {
+                // Carriage return — skip (newlines are \n)
+                i += 1;
+            }
+            _ => {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+/// Interval between pane-tail snapshot writes.
+const SNAPSHOT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Write ANSI-stripped plain text snapshots to disk for each pane.
+///
+/// Files are written atomically (write to .tmp, then rename) to
+/// `~/.cas/sessions/{session_name}/pane-tail/{pane_id}.txt`.
+pub(in crate::ui::factory::daemon) fn write_pane_snapshots(
+    session_name: &str,
+    pane_buffers: &HashMap<String, PaneBuffer>,
+    last_snapshot_at: &mut HashMap<String, std::time::Instant>,
+) {
+    let now = std::time::Instant::now();
+
+    // Only proceed if at least one pane is due for a snapshot
+    let any_due = pane_buffers.keys().any(|id| {
+        last_snapshot_at
+            .get(id)
+            .map(|t| now.duration_since(*t) >= SNAPSHOT_INTERVAL)
+            .unwrap_or(true)
+    });
+    if !any_due {
+        return;
+    }
+
+    let tail_dir = dirs::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(".cas")
+        .join("sessions")
+        .join(session_name)
+        .join("pane-tail");
+
+    // Create dir once (idempotent)
+    if let Err(e) = std::fs::create_dir_all(&tail_dir) {
+        tracing::warn!("Failed to create pane-tail dir: {e}");
+        return;
+    }
+
+    for (pane_id, buffer) in pane_buffers {
+        let due = last_snapshot_at
+            .get(pane_id)
+            .map(|t| now.duration_since(*t) >= SNAPSHOT_INTERVAL)
+            .unwrap_or(true);
+        if !due {
+            continue;
+        }
+
+        let text = buffer.as_plain_text();
+        let dest = tail_dir.join(format!("{pane_id}.txt"));
+        let tmp = tail_dir.join(format!("{pane_id}.txt.tmp"));
+
+        match std::fs::write(&tmp, text.as_bytes()) {
+            Ok(()) => {
+                if let Err(e) = std::fs::rename(&tmp, &dest) {
+                    tracing::warn!("Failed to rename pane-tail snapshot for {pane_id}: {e}");
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to write pane-tail snapshot for {pane_id}: {e}");
+            }
+        }
+
+        last_snapshot_at.insert(pane_id.clone(), now);
     }
 }
 
@@ -488,5 +628,68 @@ impl FactoryDaemon {
                 handle.send_pane_output(pane_name, data.to_vec());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_ansi_plain_text_unchanged() {
+        assert_eq!(strip_ansi(b"hello world"), "hello world");
+    }
+
+    #[test]
+    fn strip_ansi_removes_sgr() {
+        // ESC[1;31m = bold red, ESC[0m = reset
+        assert_eq!(strip_ansi(b"\x1b[1;31mERROR\x1b[0m: bad"), "ERROR: bad");
+    }
+
+    #[test]
+    fn strip_ansi_removes_csi_cursor() {
+        // ESC[H = cursor home, ESC[2J = clear screen
+        assert_eq!(strip_ansi(b"\x1b[H\x1b[2Jhello"), "hello");
+    }
+
+    #[test]
+    fn strip_ansi_removes_osc_bel() {
+        // OSC terminated by BEL: ESC]0;title BEL
+        let mut input = Vec::new();
+        input.extend_from_slice(b"\x1b]0;my title\x07");
+        input.extend_from_slice(b"content");
+        assert_eq!(strip_ansi(&input), "content");
+    }
+
+    #[test]
+    fn strip_ansi_removes_osc_st() {
+        // OSC terminated by ST (ESC \): ESC]0;title ESC\
+        assert_eq!(strip_ansi(b"\x1b]0;title\x1b\\content"), "content");
+    }
+
+    #[test]
+    fn strip_ansi_removes_two_byte_escapes() {
+        // ESC M = reverse index, ESC 7 = save cursor
+        assert_eq!(strip_ansi(b"\x1bM\x1b7hello"), "hello");
+    }
+
+    #[test]
+    fn strip_ansi_removes_carriage_return() {
+        assert_eq!(strip_ansi(b"hello\r\nworld"), "hello\nworld");
+    }
+
+    #[test]
+    fn strip_ansi_complex_pty_output() {
+        // Simulates real PTY output with mixed sequences
+        let input = b"\x1b[0m\x1b[2J\x1b[H\x1b[1;32m$\x1b[0m cargo build\r\n   \x1b[1;33mCompiling\x1b[0m cas v0.1.0\r\n";
+        let result = strip_ansi(input);
+        assert_eq!(result, "$ cargo build\n   Compiling cas v0.1.0\n");
+    }
+
+    #[test]
+    fn pane_buffer_as_plain_text() {
+        let mut buf = PaneBuffer::default();
+        buf.append(b"\x1b[1;31mhello\x1b[0m world");
+        assert_eq!(buf.as_plain_text(), "hello world");
     }
 }

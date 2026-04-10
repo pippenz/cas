@@ -35,6 +35,12 @@ struct SseSessionStream {
     event_store: Option<Arc<dyn EventStore>>,
     /// Cached supervisor queue store — opened once, reused for all poll cycles
     queue_store: Option<Arc<dyn cas_store::SupervisorQueueStore>>,
+    /// When true, poll pane-tail snapshot files and emit `output` events
+    include_output: bool,
+    /// Which pane to stream output from (None = supervisor)
+    output_pane_id: Option<String>,
+    /// Number of lines already emitted (for diffing against snapshot)
+    last_output_line_count: usize,
 }
 
 impl SseSessionStream {
@@ -50,6 +56,8 @@ impl SseSessionStream {
         inbox_limit: usize,
         status_interval_ms: u64,
         last_activity_id: i64,
+        include_output: bool,
+        output_pane_id: Option<String>,
     ) -> Self {
         // Ensure the response can start immediately (some clients/proxies won't
         // treat the connection as established until at least one byte is sent).
@@ -79,6 +87,9 @@ impl SseSessionStream {
             done: false,
             event_store,
             queue_store,
+            include_output,
+            output_pane_id,
+            last_output_line_count: 0,
         }
     }
 
@@ -231,6 +242,41 @@ impl SseSessionStream {
                 }
             }
 
+            // Pane output: read snapshot file and diff against last emitted line count
+            if self.include_output {
+                let pane_id = self.output_pane_id.clone().unwrap_or_else(|| {
+                    self.session.metadata.supervisor.name.clone()
+                });
+                let tail_dir = dirs::home_dir()
+                    .unwrap_or_else(|| std::path::PathBuf::from("."))
+                    .join(".cas")
+                    .join("sessions")
+                    .join(&self.session.name)
+                    .join("pane-tail");
+                let snapshot_path = tail_dir.join(format!("{pane_id}.txt"));
+
+                if let Ok(content) = std::fs::read_to_string(&snapshot_path) {
+                    let all_lines: Vec<&str> = content.lines().collect();
+                    if all_lines.len() > self.last_output_line_count {
+                        let new_lines: Vec<String> = all_lines[self.last_output_line_count..]
+                            .iter()
+                            .map(|l| l.to_string())
+                            .collect();
+                        self.last_output_line_count = all_lines.len();
+
+                        let payload = serde_json::json!({
+                            "schema_version": 1,
+                            "session": self.session.name,
+                            "pane_id": pane_id,
+                            "lines": new_lines,
+                        });
+                        let s = serde_json::to_string(&payload)
+                            .unwrap_or_else(|_| "{}".to_string());
+                        Self::push_sse_event(&mut out, "output", &s);
+                    }
+                }
+            }
+
             if !out.is_empty() {
                 self.buf = std::io::Cursor::new(out);
                 self.last_emit_at = std::time::Instant::now();
@@ -347,6 +393,8 @@ pub(crate) fn handle_session_events_sse_request(
         0
     };
     let since_id = parse_u64_query(&query, "since_id").unwrap_or(0) as i64;
+    let include_output = parse_bool_query(&query, "include_output").unwrap_or(false);
+    let output_pane_id = parse_string_query(&query, "output_pane_id");
 
     let mut stream = SseSessionStream::new(
         cas_root,
@@ -359,6 +407,8 @@ pub(crate) fn handle_session_events_sse_request(
         inbox_limit,
         status_interval_ms,
         since_id,
+        include_output,
+        output_pane_id,
     );
 
     // NOTE: We cannot use `req.respond(Response::new(...))` for long-lived SSE because

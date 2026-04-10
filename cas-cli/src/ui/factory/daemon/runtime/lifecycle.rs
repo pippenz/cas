@@ -159,6 +159,7 @@ impl FactoryDaemon {
             dead_workers: std::collections::HashSet::new(),
             last_idle_message_times: HashMap::new(),
             resumed_epic_ids: std::collections::HashSet::new(),
+            last_snapshot_at: HashMap::new(),
         })
     }
 
@@ -346,6 +347,13 @@ impl FactoryDaemon {
                 last_refresh = std::time::Instant::now();
                 refreshed = true;
             }
+
+            // Write periodic plain-text pane-tail snapshots to disk
+            super::relay::write_pane_snapshots(
+                &self.session_name,
+                &self.pane_buffers,
+                &mut self.last_snapshot_at,
+            );
 
             // Apply debounced resize after 100ms of no new resize events
             let mut resize_applied = false;

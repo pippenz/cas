@@ -228,6 +228,15 @@ pub(crate) struct MessageResponse {
     pub(crate) ack_event_id: Option<i64>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) struct PaneTailJson {
+    pub(crate) schema_version: u32,
+    pub(crate) session: String,
+    pub(crate) pane_id: String,
+    pub(crate) lines: Vec<String>,
+}
+
 pub(crate) fn session_json(s: &crate::ui::factory::SessionInfo) -> SessionJson {
     SessionJson {
         name: s.name.clone(),

@@ -9,8 +9,8 @@ use crate::bridge::server::session::{
 };
 use crate::bridge::server::types::{
     ActivityJson, AgentLatestActivityJson, AgentSummaryJson, InboxAckJson, InboxAckRequest,
-    InboxCountJson, InboxPeekJson, InboxPollJson, MessageRequest, MessageResponse, PingJson,
-    StatusJson, TargetsJson, TaskSummaryJson, session_json,
+    InboxCountJson, InboxPeekJson, InboxPollJson, MessageRequest, MessageResponse, PaneTailJson,
+    PingJson, StatusJson, TargetsJson, TaskSummaryJson, session_json,
 };
 use crate::store::{open_prompt_queue_store, open_supervisor_queue_store};
 
@@ -49,6 +49,54 @@ pub(crate) fn handle_session_routes(
 
     let session = resolve_session_by_name(session_name)?;
     let sj = session_json(&session);
+
+    // Pane tail routes: /v1/sessions/<name>/panes/<pane_id>/tail
+    if action == "panes" && parts.len() >= 7 && parts[6] == "tail" {
+        let pane_id = parts[5];
+        let mut lines_limit: usize = 50;
+        for pair in query.split('&').filter(|s| !s.is_empty()) {
+            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+            let v = url_decode(v);
+            if k == "lines" {
+                if let Ok(n) = v.parse::<usize>() {
+                    lines_limit = n.clamp(1, 1000);
+                }
+            }
+        }
+
+        let tail_dir = dirs::home_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join(".cas")
+            .join("sessions")
+            .join(session_name)
+            .join("pane-tail");
+        let snapshot_path = tail_dir.join(format!("{pane_id}.txt"));
+
+        let lines = if snapshot_path.exists() {
+            match std::fs::read_to_string(&snapshot_path) {
+                Ok(content) => {
+                    let all_lines: Vec<String> =
+                        content.lines().map(|l| l.to_string()).collect();
+                    let start = all_lines.len().saturating_sub(lines_limit);
+                    all_lines[start..].to_vec()
+                }
+                Err(_) => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+
+        return Ok(json_response(
+            StatusCode(200),
+            &PaneTailJson {
+                schema_version: 1,
+                session: session_name.to_string(),
+                pane_id: pane_id.to_string(),
+                lines,
+            },
+            cors_allow_origin,
+        ));
+    }
 
     // Inbox routes are nested: /v1/sessions/<name>/inbox/<inbox_id>/<op>
     if action == "inbox" {
