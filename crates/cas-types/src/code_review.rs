@@ -336,6 +336,57 @@ pub fn parse_reviewer_output(json: &str) -> Result<ReviewerOutput, Box<dyn std::
     Ok(out)
 }
 
+/// End-to-end review outcome that the cas-code-review skill passes back
+/// to the `task.close` MCP handler via `TaskCloseRequest.code_review_findings`.
+///
+/// This is the structured envelope the worker assembles from the
+/// orchestrator → merge → autofix → review-to-task pipeline before it
+/// retries `task.close`. The close-gate logic in close_ops.rs reads
+/// `residual` to decide whether to P0-block the close.
+///
+/// The shape is intentionally thin — the heavy lifting (dedup, routing,
+/// confidence gating, autofix) is already done by the time the worker
+/// emits this envelope. Here we only need what the gate and the audit
+/// trail depend on.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewOutcome {
+    /// Findings that survived the autofix loop — i.e., anything the
+    /// fixer sub-agent did not resolve within the bounded 2-round
+    /// budget. The close gate blocks on any `severity == P0` entry
+    /// that is not `pre_existing`.
+    #[serde(default)]
+    pub residual: Vec<Finding>,
+    /// Findings that existed on the base ref, surfaced for context but
+    /// never blocking. Separated from `residual` per R4 / R9.
+    #[serde(default)]
+    pub pre_existing: Vec<Finding>,
+    /// Invocation mode the review ran in: `"autofix"`, `"interactive"`,
+    /// `"report-only"`, or `"headless"`. Required so the audit trail
+    /// and downstream consumers can tell whether the envelope came
+    /// from the primary close-gate path or an out-of-band invocation.
+    pub mode: String,
+}
+
+impl ReviewOutcome {
+    /// Validate every contained finding + the mode string. Called by
+    /// the close gate before it trusts the envelope — a malformed
+    /// envelope from the worker is treated like a reviewer error, not
+    /// a free pass.
+    pub fn validate(&self) -> Result<(), FindingValidationError> {
+        if self.mode.trim().is_empty() {
+            return Err(FindingValidationError::EmptyReviewerName);
+        }
+        for f in &self.residual {
+            f.validate()?;
+        }
+        for f in &self.pre_existing {
+            f.validate()?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

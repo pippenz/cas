@@ -825,6 +825,7 @@ async fn test_close_auto_unblocks_blocked_dependents() {
             id: blocker_id,
             reason: Some("done".to_string()),
             bypass_code_review: None,
+code_review_findings: None,
         }))
         .await
         .expect("task close should succeed");

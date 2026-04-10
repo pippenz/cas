@@ -135,6 +135,31 @@ pub struct TaskCloseRequest {
     )]
     #[serde(default)]
     pub bypass_code_review: Option<bool>,
+
+    /// Structured cas-code-review results passed in by the worker
+    /// before it retries close (cas-b39f, option (a)). The worker
+    /// invokes the cas-code-review skill, collects the merged
+    /// ReviewOutcome envelope, serializes it to JSON, and sends it
+    /// here as a string. The close gate parses it via
+    /// `serde_json::from_str::<ReviewOutcome>` and runs validation
+    /// before deciding the P0 block verdict.
+    ///
+    /// A string (instead of a typed struct) is used at the MCP
+    /// boundary because `ReviewOutcome` lives in `cas-types`, which
+    /// intentionally has no `schemars` dependency — taking a JSON
+    /// blob keeps the schema surface narrow. When this field is
+    /// `None` and the task has reviewable code changes (and no
+    /// supervisor override), the gate returns `CODE_REVIEW_REQUIRED`.
+    #[schemars(
+        description = "Serialized ReviewOutcome JSON envelope produced \
+                       by the worker's cas-code-review skill run. \
+                       Required whenever the task has reviewable code \
+                       changes unless bypass_code_review=true or the \
+                       task is additive-only. Shape: \
+                       {residual: Finding[], pre_existing: Finding[], mode: string}."
+    )]
+    #[serde(default)]
+    pub code_review_findings: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

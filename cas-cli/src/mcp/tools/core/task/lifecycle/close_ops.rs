@@ -526,7 +526,8 @@ impl CasCore {
         //     rejection — we do not silently ignore unauthorized
         //     overrides because that would mask a misconfigured
         //     harness.
-        match run_code_review_gate(&task, &req) {
+        let close_project_root = self.cas_root.parent().unwrap_or(&self.cas_root);
+        match run_code_review_gate(&task, &req, close_project_root) {
             CodeReviewGateOutcome::Proceed => {}
             CodeReviewGateOutcome::AppendDecisionNote(note) => {
                 let mut t = task.clone();
@@ -926,35 +927,38 @@ pub(crate) enum CodeReviewGateOutcome {
 /// Decide whether the cas-code-review P0 close gate fires for this
 /// close request.
 ///
+/// Per brainstorm Outstanding Question #1 option (a): the worker runs
+/// the cas-code-review skill *before* calling `task.close` and passes
+/// the structured findings envelope in via
+/// [`TaskCloseRequest::code_review_findings`]. This Rust helper only
+/// enforces the gate on what the worker sends — it does not (and
+/// cannot) invoke the skill itself.
+///
 /// Contract:
 ///
-/// - `execution_note == "additive-only"` → [`Proceed`]. Additive-only
+/// - `execution_note == "additive-only"` → [`Proceed`]. Pure-addition
 ///   closes are new-files-only by definition and already covered by
-///   the cas-e235 gate above; running a multi-persona review on a pure
-///   addition is wasted effort.
+///   the cas-e235 gate above.
 /// - `bypass_code_review == Some(true)` and caller is a supervisor →
-///   [`AppendDecisionNote`] with the override reason. The gate is
-///   skipped and the decision is logged.
+///   [`AppendDecisionNote`] with the override reason. Gate skipped.
 /// - `bypass_code_review == Some(true)` and caller is **not** a
 ///   supervisor → [`Reject`] with an unauthorized-override message.
 ///   Silently ignoring the flag would mask a misconfigured harness.
-/// - Otherwise → look for a residual-finding set to evaluate. In
-///   Phase 1, the dispatch of the review skill and the caching of its
-///   residuals live in the worker's harness (Unit 4 orchestrator skill
-///   + Unit 7 autofix loop) and are not reachable from this Rust
-///   function. When no residual is visible, the gate logs a
-///   `gate_skipped_reason` and returns [`Proceed`] — **the gate must
-///   not become a SPOF for closes**. See the cas-b39f task description
-///   and R9 for the explicit graceful-degrade contract.
-///
-/// The P0-residual blocking path is live and exercised by the pure-Rust
-/// [`cas_store::code_review::close_gate::evaluate_gate`] tests plus the
-/// in-module tests below. The actual dispatch wiring is intentionally
-/// deferred to avoid coupling this Unit to the two-phase marker work
-/// that the worker-side harness owns.
+/// - `has_reviewable_changes(project_root) == false` → [`Proceed`].
+///   Pure docs-only diffs (`*.md` / `docs/**`) and pure test-only
+///   diffs do not require a code review pass.
+/// - `code_review_findings == None` at this point → [`Reject`] with
+///   `CODE_REVIEW_REQUIRED`, pointing the worker at the skill.
+/// - `code_review_findings == Some(envelope)` that fails
+///   [`ReviewOutcome::validate`] → [`Reject`] as a malformed envelope.
+/// - Otherwise → defer to
+///   [`cas_store::code_review::close_gate::evaluate_gate`]. Any
+///   non-pre-existing P0 in `residual` → [`Reject`] with a formatted
+///   block message; else [`Proceed`].
 pub(crate) fn run_code_review_gate(
     task: &Task,
     req: &TaskCloseRequest,
+    project_root: &std::path::Path,
 ) -> CodeReviewGateOutcome {
     // Skip 1: additive-only tasks bypass the gate entirely.
     if task.execution_note.as_deref() == Some("additive-only") {
@@ -989,61 +993,148 @@ pub(crate) fn run_code_review_gate(
         }
     }
 
-    // In Phase 1 the worker-side harness owns the actual
-    // orchestrator dispatch + residual caching. When no residual is
-    // reachable from Rust, honor the "not a SPOF" contract and
-    // allow the close. This keeps the gate integrated structurally
-    // so that as soon as a residual surface is wired (future unit,
-    // not cas-b39f), the blocking path below kicks in automatically.
-    if let Some(residual) = load_cached_review_residual(&task.id) {
-        use cas_store::code_review::close_gate::{GateDecision, evaluate_gate, format_block_message};
-        match evaluate_gate(&residual) {
-            GateDecision::Allow => CodeReviewGateOutcome::Proceed,
-            GateDecision::BlockOnP0(blocking) => {
-                CodeReviewGateOutcome::Reject(format_block_message(&task.id, &blocking))
-            }
+    // Skip 3: docs-only / test-only / empty diffs. The gate is not a
+    // SPOF for changes it cannot meaningfully review.
+    if !has_reviewable_changes(project_root) {
+        return CodeReviewGateOutcome::Proceed;
+    }
+
+    // From here on, we require a findings envelope.
+    let envelope_json = match req.code_review_findings.as_deref() {
+        Some(s) if !s.trim().is_empty() => s,
+        _ => {
+            return CodeReviewGateOutcome::Reject(
+                "⚠️ CODE_REVIEW_REQUIRED\n\n\
+                 task close rejected: this task has reviewable code changes \
+                 and no code_review_findings envelope was provided.\n\n\
+                 To resolve:\n\
+                 1. Invoke the cas-code-review skill via the Skill or Task \
+                    tool with mode=autofix and the current diff.\n\
+                 2. Collect the returned ReviewOutcome envelope (residual, \
+                    pre_existing, mode).\n\
+                 3. Re-call task.close with the envelope JSON-stringified \
+                    in code_review_findings.\n\n\
+                 Supervisors may bypass this gate with \
+                 bypass_code_review=true (logged as a decision note)."
+                    .to_string(),
+            );
         }
-    } else {
-        // Graceful degrade: no cached residual means either the
-        // review skill hasn't run yet for this close attempt, or
-        // it's not wired in this harness. Either way, per R9 +
-        // task description, close must not be SPOF on review.
-        CodeReviewGateOutcome::Proceed
+    };
+
+    let envelope: cas_types::ReviewOutcome = match serde_json::from_str(envelope_json) {
+        Ok(e) => e,
+        Err(e) => {
+            return CodeReviewGateOutcome::Reject(format!(
+                "⚠️ MALFORMED REVIEW ENVELOPE\n\n\
+                 task close rejected: code_review_findings failed to parse \
+                 as ReviewOutcome JSON: {e}\n\n\
+                 Expected shape: {{residual: Finding[], pre_existing: Finding[], mode: string}}."
+            ));
+        }
+    };
+
+    if let Err(e) = envelope.validate() {
+        return CodeReviewGateOutcome::Reject(format!(
+            "⚠️ MALFORMED REVIEW ENVELOPE\n\n\
+             task close rejected: code_review_findings failed validation: {e}\n\n\
+             The worker-side cas-code-review skill returned a structurally \
+             invalid envelope. Re-run the review and retry close."
+        ));
+    }
+
+    use cas_store::code_review::close_gate::{GateDecision, evaluate_gate, format_block_message};
+    match evaluate_gate(&envelope.residual) {
+        GateDecision::Allow => CodeReviewGateOutcome::Proceed,
+        GateDecision::BlockOnP0(blocking) => {
+            CodeReviewGateOutcome::Reject(format_block_message(&task.id, &blocking))
+        }
     }
 }
 
-/// Phase 1 placeholder for reading the residual findings produced by
-/// the cas-code-review autofix loop for a given task. Returns `None`
-/// until the worker-side harness wires the two-phase marker pattern
-/// that actually surfaces residuals into a location this Rust path
-/// can see (planned for a follow-up task — not cas-b39f).
+/// Return `true` if `project_root` has any staged, unstaged, or
+/// committed-since-base changes in files that are worth asking the
+/// multi-persona reviewer about. Returns `false` for docs-only
+/// (`*.md`, anything under `docs/`) and test-only diffs, and for
+/// non-git directories where we cannot reason about the diff.
 ///
-/// Tests in this module substitute a scripted residual via the
-/// `#[cfg(test)]` hook below so the block/allow branches are still
-/// exercised end-to-end without that wiring.
-#[cfg(not(test))]
-fn load_cached_review_residual(
-    _task_id: &str,
-) -> Option<Vec<cas_types::Finding>> {
-    None
+/// The classification is deliberately *loose*: when we cannot tell
+/// whether a change is reviewable, we assume it is, and the worker
+/// runs the review. False positives waste latency; false negatives
+/// silently skip the gate.
+pub(crate) fn has_reviewable_changes(project_root: &std::path::Path) -> bool {
+    use std::process::Command;
+
+    // Collect changed paths from both the index/working-tree diff and
+    // the HEAD diff. Union handles in-flight edits on top of the
+    // already-committed task work.
+    let mut changed: Vec<String> = Vec::new();
+
+    for args in [
+        &["diff", "--name-only", "HEAD"][..],
+        &["diff", "--name-only", "--cached"][..],
+    ] {
+        if let Ok(output) = Command::new("git")
+            .args(args)
+            .current_dir(project_root)
+            .output()
+        {
+            if !output.status.success() {
+                // Not a git repo, or HEAD doesn't exist — we cannot
+                // reason about the diff, so the gate should not block.
+                // Per the "not a SPOF" rule, treat as no-reviewable.
+                return false;
+            }
+            for line in String::from_utf8_lossy(&output.stdout).lines() {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    changed.push(trimmed.to_string());
+                }
+            }
+        } else {
+            return false;
+        }
+    }
+
+    changed.sort();
+    changed.dedup();
+
+    changed.iter().any(|path| is_reviewable_path(path))
 }
 
-#[cfg(test)]
-thread_local! {
-    static TEST_RESIDUAL: std::cell::RefCell<Option<Vec<cas_types::Finding>>> =
-        const { std::cell::RefCell::new(None) };
-}
+/// Classify a single path as "worth running the multi-persona
+/// reviewer on". Docs (`*.md`, anything under `docs/`) and tests
+/// (anything under `tests/`, `test/`, or a file ending in
+/// `_test.rs` / `.test.ts`) are excluded.
+pub(crate) fn is_reviewable_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
 
-#[cfg(test)]
-fn load_cached_review_residual(
-    _task_id: &str,
-) -> Option<Vec<cas_types::Finding>> {
-    TEST_RESIDUAL.with(|cell| cell.borrow().clone())
-}
+    // Docs
+    if lower.ends_with(".md") {
+        return false;
+    }
+    if lower.starts_with("docs/") || lower.contains("/docs/") {
+        return false;
+    }
 
-#[cfg(test)]
-pub(crate) fn _test_set_residual(r: Option<Vec<cas_types::Finding>>) {
-    TEST_RESIDUAL.with(|cell| *cell.borrow_mut() = r);
+    // Tests
+    if lower.starts_with("tests/") || lower.contains("/tests/") {
+        return false;
+    }
+    if lower.starts_with("test/") || lower.contains("/test/") {
+        return false;
+    }
+    if lower.ends_with("_test.rs")
+        || lower.ends_with(".test.ts")
+        || lower.ends_with(".test.tsx")
+        || lower.ends_with(".spec.ts")
+        || lower.ends_with(".spec.tsx")
+        || lower.ends_with("_test.py")
+        || lower.ends_with("_test.go")
+    {
+        return false;
+    }
+
+    true
 }
 
 /// Parse the output of `git diff --name-status` into violations. Only rows
@@ -1178,25 +1269,19 @@ mod additive_only_tests {
 
 #[cfg(test)]
 mod code_review_gate_tests {
-    //! Unit tests for the cas-b39f close gate helper. These cover the
-    //! decision matrix in [`run_code_review_gate`]:
-    //!
-    //!   - additive-only tasks bypass
-    //!   - graceful degrade when no residual is cached
-    //!   - P0 residual hard-blocks
-    //!   - P1/P2 residual does NOT block (routed to Unit 8 instead)
-    //!   - supervisor override with decision note
-    //!   - unauthorized override rejected
+    //! Unit tests for the cas-b39f close gate helper. Covers the full
+    //! decision matrix in [`run_code_review_gate`] under the option-(a)
+    //! architecture where the worker passes findings in via
+    //! `TaskCloseRequest.code_review_findings` before retrying close.
     //!
     //! The pure-Rust decision helper at
     //! `cas_store::code_review::close_gate::evaluate_gate` is already
     //! tested exhaustively in that module; these tests focus on the
-    //! close-side glue (env role check, residual plumbing, override
-    //! path). The scripted residual hook (`_test_set_residual`) lets
-    //! each test inject a fixture without needing a real review
-    //! pipeline.
+    //! close-side glue — env role check, envelope plumbing, override
+    //! path, docs-only skip, CODE_REVIEW_REQUIRED rejection.
     use super::*;
-    use cas_types::{AutofixClass, Finding, FindingSeverity, Owner};
+    use cas_types::{AutofixClass, Finding, FindingSeverity, Owner, ReviewOutcome};
+    use tempfile::TempDir;
 
     fn base_task() -> Task {
         Task {
@@ -1212,6 +1297,7 @@ mod code_review_gate_tests {
             id: id.to_string(),
             reason: None,
             bypass_code_review: None,
+            code_review_findings: None,
         }
     }
 
@@ -1249,72 +1335,206 @@ mod code_review_gate_tests {
         }
     }
 
-    /// Serialize the env-mutating tests so the CAS_AGENT_ROLE changes
-    /// one makes don't leak into another's view.
+    fn autofix_envelope(residual: Vec<Finding>) -> String {
+        let env = ReviewOutcome {
+            residual,
+            pre_existing: Vec::new(),
+            mode: "autofix".to_string(),
+        };
+        serde_json::to_string(&env).expect("serialize ReviewOutcome")
+    }
+
+    /// Build a throwaway git repo with one committed file, then stage
+    /// whatever paths the caller names so `git diff --cached` sees
+    /// them. Returns the tempdir so the caller controls its lifetime.
+    fn repo_with_staged(paths: &[(&str, &str)]) -> TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        use std::process::Command;
+        let git = |args: &[&str]| {
+            let ok = Command::new("git")
+                .args(args)
+                .current_dir(p)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .status()
+                .expect("git")
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(p.join("seed.txt"), "seed\n").unwrap();
+        git(&["add", "seed.txt"]);
+        git(&["commit", "-q", "-m", "seed"]);
+        for (path, contents) in paths {
+            let full = p.join(path);
+            if let Some(parent) = full.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&full, contents).unwrap();
+            git(&["add", path]);
+        }
+        dir
+    }
+
+    /// Serialize env-mutating tests so `CAS_AGENT_ROLE` changes don't
+    /// leak between them.
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         use std::sync::{Mutex, OnceLock};
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
     }
 
+    // --- Path classification ------------------------------------------------
+
     #[test]
-    fn additive_only_task_bypasses_gate() {
-        let _g = env_lock();
-        _test_set_residual(Some(vec![p0_finding()])); // would block if gate ran
-        let mut t = base_task();
-        t.execution_note = Some("additive-only".to_string());
-        let out = run_code_review_gate(&t, &base_req(&t.id));
-        assert!(matches!(out, CodeReviewGateOutcome::Proceed));
-        _test_set_residual(None);
+    fn docs_and_tests_are_not_reviewable() {
+        assert!(!is_reviewable_path("README.md"));
+        assert!(!is_reviewable_path("docs/foo.txt"));
+        assert!(!is_reviewable_path("crates/cas-store/tests/foo.rs"));
+        assert!(!is_reviewable_path("src/foo_test.rs"));
+        assert!(!is_reviewable_path("app/bar.test.tsx"));
+        assert!(!is_reviewable_path("tests/integration.py"));
     }
 
     #[test]
-    fn no_cached_residual_allows_close_graceful_degrade() {
+    fn code_files_are_reviewable() {
+        assert!(is_reviewable_path("src/main.rs"));
+        assert!(is_reviewable_path("app/login.ts"));
+        assert!(is_reviewable_path("pkg/server/handler.go"));
+    }
+
+    // --- run_code_review_gate branches --------------------------------------
+
+    #[test]
+    fn additive_only_task_bypasses_gate() {
         let _g = env_lock();
-        _test_set_residual(None);
+        let dir = repo_with_staged(&[("src/evil.rs", "bad\n")]);
+        let mut t = base_task();
+        t.execution_note = Some("additive-only".to_string());
+        let mut req = base_req(&t.id);
+        req.code_review_findings = Some(autofix_envelope(vec![p0_finding()]));
+        let out = run_code_review_gate(&t, &req, dir.path());
+        assert!(matches!(out, CodeReviewGateOutcome::Proceed));
+    }
+
+    #[test]
+    fn docs_only_diff_skips_gate_without_findings() {
+        let _g = env_lock();
+        let dir = repo_with_staged(&[("README.md", "new content\n"), ("docs/x.md", "x\n")]);
         let t = base_task();
-        let out = run_code_review_gate(&t, &base_req(&t.id));
+        let req = base_req(&t.id); // no findings
+        let out = run_code_review_gate(&t, &req, dir.path());
         assert!(
             matches!(out, CodeReviewGateOutcome::Proceed),
-            "graceful degrade: no residual → Proceed (R9 not-a-SPOF)"
+            "pure-docs diff must skip the review gate"
         );
+    }
+
+    #[test]
+    fn code_change_without_findings_is_rejected_as_required() {
+        let _g = env_lock();
+        let dir = repo_with_staged(&[("src/foo.rs", "fn new() {}\n")]);
+        let t = base_task();
+        let req = base_req(&t.id);
+        let out = run_code_review_gate(&t, &req, dir.path());
+        match out {
+            CodeReviewGateOutcome::Reject(msg) => {
+                assert!(msg.contains("CODE_REVIEW_REQUIRED"));
+                assert!(msg.contains("cas-code-review"));
+                assert!(msg.contains("code_review_findings"));
+            }
+            other => panic!("expected CODE_REVIEW_REQUIRED reject, got {other:?}"),
+        }
     }
 
     #[test]
     fn p0_residual_blocks_close() {
         let _g = env_lock();
-        _test_set_residual(Some(vec![p0_finding()]));
+        let dir = repo_with_staged(&[("src/foo.rs", "fn new() {}\n")]);
         let t = base_task();
-        let out = run_code_review_gate(&t, &base_req(&t.id));
+        let mut req = base_req(&t.id);
+        req.code_review_findings = Some(autofix_envelope(vec![p0_finding()]));
+        let out = run_code_review_gate(&t, &req, dir.path());
         match out {
             CodeReviewGateOutcome::Reject(msg) => {
                 assert!(msg.contains("P0 BLOCK"));
                 assert!(msg.contains("SQL injection"));
                 assert!(msg.contains("bypass_code_review=true"));
             }
-            other => panic!("expected Reject, got {other:?}"),
+            other => panic!("expected P0 block, got {other:?}"),
         }
-        _test_set_residual(None);
     }
 
     #[test]
     fn p2_residual_does_not_block_close() {
         let _g = env_lock();
-        _test_set_residual(Some(vec![p2_finding()]));
+        let dir = repo_with_staged(&[("src/foo.rs", "fn new() {}\n")]);
         let t = base_task();
-        let out = run_code_review_gate(&t, &base_req(&t.id));
+        let mut req = base_req(&t.id);
+        req.code_review_findings = Some(autofix_envelope(vec![p2_finding()]));
+        let out = run_code_review_gate(&t, &req, dir.path());
         assert!(
             matches!(out, CodeReviewGateOutcome::Proceed),
             "P2 residual must route to Unit 8, not block close"
         );
-        _test_set_residual(None);
+    }
+
+    #[test]
+    fn empty_residual_with_envelope_allows_close() {
+        let _g = env_lock();
+        let dir = repo_with_staged(&[("src/foo.rs", "fn ok() {}\n")]);
+        let t = base_task();
+        let mut req = base_req(&t.id);
+        req.code_review_findings = Some(autofix_envelope(Vec::new()));
+        let out = run_code_review_gate(&t, &req, dir.path());
+        assert!(matches!(out, CodeReviewGateOutcome::Proceed));
+    }
+
+    #[test]
+    fn malformed_envelope_validation_failure_is_rejected() {
+        let _g = env_lock();
+        let dir = repo_with_staged(&[("src/foo.rs", "fn ok() {}\n")]);
+        let t = base_task();
+        let mut req = base_req(&t.id);
+        // Whitespace-only mode passes serde but fails validate().
+        req.code_review_findings = Some(
+            r#"{"residual":[],"pre_existing":[],"mode":"   "}"#.to_string(),
+        );
+        let out = run_code_review_gate(&t, &req, dir.path());
+        match out {
+            CodeReviewGateOutcome::Reject(msg) => {
+                assert!(msg.contains("MALFORMED REVIEW ENVELOPE"));
+            }
+            other => panic!("expected malformed-envelope reject, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unparseable_envelope_json_is_rejected() {
+        let _g = env_lock();
+        let dir = repo_with_staged(&[("src/foo.rs", "fn ok() {}\n")]);
+        let t = base_task();
+        let mut req = base_req(&t.id);
+        req.code_review_findings = Some("not json at all".to_string());
+        let out = run_code_review_gate(&t, &req, dir.path());
+        match out {
+            CodeReviewGateOutcome::Reject(msg) => {
+                assert!(msg.contains("MALFORMED REVIEW ENVELOPE"));
+                assert!(msg.contains("failed to parse"));
+            }
+            other => panic!("expected parse reject, got {other:?}"),
+        }
     }
 
     #[test]
     fn supervisor_override_appends_decision_note() {
         let _g = env_lock();
-        _test_set_residual(Some(vec![p0_finding()]));
-        // Simulate supervisor harness.
+        let dir = repo_with_staged(&[("src/foo.rs", "fn new() {}\n")]);
         let prev = std::env::var("CAS_AGENT_ROLE").ok();
         unsafe {
             std::env::set_var("CAS_AGENT_ROLE", "supervisor");
@@ -1325,16 +1545,14 @@ mod code_review_gate_tests {
         req.bypass_code_review = Some(true);
         req.reason = Some("P0 is a false positive, tracked in cas-xyz".to_string());
 
-        let out = run_code_review_gate(&t, &req);
+        let out = run_code_review_gate(&t, &req, dir.path());
 
-        // Restore env before any assertion to avoid leaking on panic.
         unsafe {
             match prev {
                 Some(v) => std::env::set_var("CAS_AGENT_ROLE", v),
                 None => std::env::remove_var("CAS_AGENT_ROLE"),
             }
         }
-        _test_set_residual(None);
 
         match out {
             CodeReviewGateOutcome::AppendDecisionNote(note) => {
@@ -1349,7 +1567,7 @@ mod code_review_gate_tests {
     #[test]
     fn non_supervisor_override_is_rejected() {
         let _g = env_lock();
-        _test_set_residual(Some(vec![p0_finding()]));
+        let dir = repo_with_staged(&[("src/foo.rs", "fn new() {}\n")]);
         let prev = std::env::var("CAS_AGENT_ROLE").ok();
         unsafe {
             std::env::set_var("CAS_AGENT_ROLE", "worker");
@@ -1359,7 +1577,7 @@ mod code_review_gate_tests {
         let mut req = base_req(&t.id);
         req.bypass_code_review = Some(true);
 
-        let out = run_code_review_gate(&t, &req);
+        let out = run_code_review_gate(&t, &req, dir.path());
 
         unsafe {
             match prev {
@@ -1367,7 +1585,6 @@ mod code_review_gate_tests {
                 None => std::env::remove_var("CAS_AGENT_ROLE"),
             }
         }
-        _test_set_residual(None);
 
         match out {
             CodeReviewGateOutcome::Reject(msg) => {
@@ -1378,16 +1595,25 @@ mod code_review_gate_tests {
     }
 
     #[test]
-    fn additive_only_plus_supervisor_override_still_proceeds() {
+    fn additive_only_plus_missing_findings_still_proceeds() {
         let _g = env_lock();
-        _test_set_residual(None);
+        let dir = repo_with_staged(&[("src/evil.rs", "bad\n")]);
         let mut t = base_task();
         t.execution_note = Some("additive-only".to_string());
-        let mut req = base_req(&t.id);
-        req.bypass_code_review = Some(true);
-        // additive-only short-circuits before the override branch, so
-        // the outcome should be Proceed (no note) regardless of role.
-        let out = run_code_review_gate(&t, &req);
+        let req = base_req(&t.id); // no findings, no override
+        // additive-only short-circuits before the findings check.
+        let out = run_code_review_gate(&t, &req, dir.path());
+        assert!(matches!(out, CodeReviewGateOutcome::Proceed));
+    }
+
+    #[test]
+    fn non_git_project_root_skips_gate() {
+        let _g = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let t = base_task();
+        let req = base_req(&t.id);
+        // Non-git dir → has_reviewable_changes returns false → skip.
+        let out = run_code_review_gate(&t, &req, dir.path());
         assert!(matches!(out, CodeReviewGateOutcome::Proceed));
     }
 }

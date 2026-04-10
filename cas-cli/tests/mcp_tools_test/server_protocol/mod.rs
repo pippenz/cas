@@ -225,6 +225,7 @@ async fn test_start_blocked_with_pending_verification() {
         id: first_id.to_string(),
         reason: Some("Completed".to_string()),
         bypass_code_review: None,
+code_review_findings: None,
     };
     let result = service
         .cas_task_close(Parameters(close_req))
@@ -328,6 +329,7 @@ async fn test_claim_blocked_with_pending_verification() {
         id: first_id.to_string(),
         reason: Some("Completed".to_string()),
         bypass_code_review: None,
+code_review_findings: None,
     };
     let result = service
         .cas_task_close(Parameters(close_req))
@@ -535,6 +537,7 @@ async fn test_start_same_task_allowed_when_pending() {
         id: task_id.to_string(),
         reason: Some("Completed".to_string()),
         bypass_code_review: None,
+code_review_findings: None,
     };
     let result = service
         .cas_task_close(Parameters(close_req))

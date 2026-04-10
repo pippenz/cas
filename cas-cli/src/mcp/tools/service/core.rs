@@ -301,6 +301,7 @@ impl CasService {
                 .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required for close — pass task ID as `id` (not `task_id`, `taskId`, or `_id`). Example: mcp__cas__task action=close id=cas-abc1"))?,
             reason: req.reason,
             bypass_code_review: req.bypass_code_review,
+            code_review_findings: req.code_review_findings,
         };
         self.inner.cas_task_close(Parameters(inner_req)).await
     }

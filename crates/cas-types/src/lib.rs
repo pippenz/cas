@@ -59,8 +59,8 @@ pub use agent::{
     DEFAULT_HEARTBEAT_TIMEOUT_SECS, DEFAULT_LEASE_DURATION_SECS, DEFAULT_MAX_CONCURRENT_TASKS,
 };
 pub use code_review::{
-    AutofixClass, Finding, FindingValidationError, MAX_TITLE_LEN, Owner, ReviewerOutput,
-    Severity as FindingSeverity, parse_reviewer_output,
+    AutofixClass, Finding, FindingValidationError, MAX_TITLE_LEN, Owner, ReviewOutcome,
+    ReviewerOutput, Severity as FindingSeverity, parse_reviewer_output,
 };
 pub use commit_link::CommitLink;
 pub use dependency::{Dependency, DependencyType};

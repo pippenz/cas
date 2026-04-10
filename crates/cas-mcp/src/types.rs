@@ -189,6 +189,21 @@ pub struct TaskRequest {
     #[serde(default, deserialize_with = "deser::option_bool")]
     pub bypass_code_review: Option<bool>,
 
+    /// Serialized ReviewOutcome JSON envelope from the worker's
+    /// cas-code-review skill run (cas-b39f option (a)). Forwarded to
+    /// the close handler, where it is parsed and validated before the
+    /// P0 gate decision.
+    #[schemars(
+        description = "Serialized ReviewOutcome JSON envelope produced \
+                       by the worker's cas-code-review skill run. \
+                       Required for tasks with reviewable code changes \
+                       unless bypass_code_review is set or the task is \
+                       additive-only. Shape: \
+                       {residual: Finding[], pre_existing: Finding[], mode: string}."
+    )]
+    #[serde(default)]
+    pub code_review_findings: Option<String>,
+
     /// Include dependencies (for show)
     #[schemars(description = "Include dependency information")]
     #[serde(default, deserialize_with = "deser::option_bool")]
