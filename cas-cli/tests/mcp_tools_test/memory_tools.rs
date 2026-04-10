@@ -582,3 +582,99 @@ async fn test_unrelated_memory_inserts_normally() {
     let text = extract_text(result);
     assert!(text.contains("Created entry"), "expected success, got: {text}");
 }
+
+// ============================================================================
+// cas-442e — End-to-end integration: cross-reference (moderate overlap) path
+//
+// memory_remember_contract.rs already covers Created (low), Blocked (high),
+// bypass_overlap, and the mode parameter. This test exercises the one path
+// those do not: a moderate-overlap insert that proceeds with bidirectional
+// cross-references populated on the Created response's related_memories.
+// ============================================================================
+#[tokio::test]
+async fn test_moderate_overlap_creates_with_crossref() {
+    let (_temp, service) = setup_cas();
+
+    // First memory: a bug-track entry in cas-mcp. Seed with bypass so we
+    // don't race the overlap gate on the first insert.
+    let first_content = frontmatter_memory(
+        "shared tantivy reload behavior",
+        "cas-mcp",
+        "reload_policy matters for cas-mcp/src/server.rs when the writer commits",
+    );
+    let first = RememberRequest {
+        scope: "project".to_string(),
+        content: first_content,
+        entry_type: "learning".to_string(),
+        tags: Some("tantivy-index,reload-policy".to_string()),
+        title: Some("shared tantivy reload behavior".to_string()),
+        importance: 0.5,
+        valid_from: None,
+        valid_until: None,
+        team_id: None,
+        bypass_overlap: Some(true),
+        mode: None,
+    };
+    let first_result = service
+        .cas_remember(Parameters(first))
+        .await
+        .expect("first insert should succeed");
+    let first_slug = first_result
+        .structured_content
+        .as_ref()
+        .expect("Created carries structured_content")
+        .get("slug")
+        .and_then(|v| v.as_str())
+        .expect("slug present")
+        .to_string();
+
+    // Second memory: shares the same title (problem-statement match) and
+    // the same central file ref, but lives in a different module (cas-core)
+    // on a different track (knowledge vs bug) with a different root_cause.
+    // That puts the raw score at ~4 and the two penalties (-1 module, -1
+    // track) drop the net into the 2-3 moderate band.
+    let second_content = format!(
+        "---\nname: shared tantivy reload behavior\ndescription: reload_policy reload behavior\ntrack: knowledge\nmodule: cas-core\nproblem_type: best_practice\nseverity: medium\nroot_cause: config_error\ndate: 2026-04-09\n---\n\n## Guidance\nreload_policy impacts cas-mcp/src/server.rs on concurrent commits\n"
+    );
+    let second = RememberRequest {
+        scope: "project".to_string(),
+        content: second_content,
+        entry_type: "learning".to_string(),
+        tags: Some("tantivy-index,hook-context".to_string()),
+        title: Some("shared tantivy reload behavior".to_string()),
+        importance: 0.5,
+        valid_from: None,
+        valid_until: None,
+        team_id: None,
+        bypass_overlap: None,
+        mode: None,
+    };
+    let second_result = service
+        .cas_remember(Parameters(second))
+        .await
+        .expect("moderate overlap should still succeed");
+
+    assert_eq!(
+        second_result.is_error,
+        Some(false),
+        "moderate overlap is not a block"
+    );
+    let structured = second_result
+        .structured_content
+        .as_ref()
+        .expect("Created carries structured_content");
+    assert_eq!(structured["status"], "created");
+    let related = structured["related_memories"]
+        .as_array()
+        .expect("related_memories is an array");
+    // The moderate-overlap path must populate related_memories with the
+    // existing slug(s) the new entry cross-referenced.
+    assert!(
+        !related.is_empty(),
+        "moderate overlap must record at least one cross-reference (got: {structured:?})"
+    );
+    assert!(
+        related.iter().any(|v| v.as_str() == Some(first_slug.as_str())),
+        "cross-ref should include the first memory's slug {first_slug}"
+    );
+}

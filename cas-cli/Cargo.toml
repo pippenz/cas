@@ -210,3 +210,7 @@ criterion = { version = "0.5", features = ["html_reports"] }
 [[bench]]
 name = "code_indexing"
 harness = false
+
+[[bench]]
+name = "memory_overlap"
+harness = false
