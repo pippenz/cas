@@ -46,6 +46,10 @@ pub struct FactoryArgs {
     #[arg(long = "new", global = true)]
     pub start_new: bool,
 
+    /// Attach to an existing session without prompting (skip confirmation)
+    #[arg(long, global = true)]
+    pub attach: bool,
+
     /// Disable worktree-based worker isolation (all agents share the same directory)
     #[arg(long, global = true)]
     pub no_worktrees: bool,
@@ -106,6 +110,7 @@ impl Default for FactoryArgs {
             workers: 0,
             name: None,
             start_new: false,
+            attach: false,
             no_worktrees: false,
             worktree_root: None,
             cleanup: false,
@@ -531,20 +536,67 @@ pub fn execute(args: &FactoryArgs, cli: &Cli, cas_root: Option<&std::path::Path>
         }
     }
 
-    if !args.legacy && args.name.is_none() && !args.start_new {
+    // Auto-attach to existing session, or kill it if --new
+    if !args.legacy && args.name.is_none() {
         let project_dir = cwd.to_string_lossy();
         if let Ok(Some(session)) = find_session_for_project(&project_dir, None) {
             if session.can_attach() {
-                let theme = crate::ui::theme::ActiveTheme::default();
-                let mut stdout = std::io::stdout();
-                let mut fmt = crate::ui::components::Formatter::stdout(&mut stdout, theme);
-                fmt.info(&format!(
-                    "Found running session for this project: {}",
-                    session.name
-                ))?;
-                fmt.info("Attaching... (use --new to start a fresh session)")?;
-                fmt.newline()?;
-                return attach(Some(session.name));
+                if args.start_new {
+                    // --new: kill existing session before starting fresh
+                    let theme = crate::ui::theme::ActiveTheme::default();
+                    let mut stdout = std::io::stdout();
+                    let mut fmt = crate::ui::components::Formatter::stdout(&mut stdout, theme);
+                    fmt.info(&format!(
+                        "Found running session: {} (workers: {}, pid: {})",
+                        session.name,
+                        session.worker_count(),
+                        session.metadata.daemon_pid
+                    ))?;
+                    if crate::cli::interactive::confirm(
+                        "Kill existing session and start fresh?",
+                        true,
+                    )? {
+                        lifecycle::kill_session_if_running(&session.name)?;
+                        fmt.info("Killed. Starting new session...")?;
+                        fmt.newline()?;
+                    } else {
+                        fmt.info("Attaching to existing session instead.")?;
+                        fmt.newline()?;
+                        return attach(Some(session.name));
+                    }
+                } else if args.attach {
+                    // --attach: skip prompt, attach directly
+                    let theme = crate::ui::theme::ActiveTheme::default();
+                    let mut stdout = std::io::stdout();
+                    let mut fmt = crate::ui::components::Formatter::stdout(&mut stdout, theme);
+                    fmt.info(&format!(
+                        "Attaching to running session: {}",
+                        session.name
+                    ))?;
+                    fmt.newline()?;
+                    return attach(Some(session.name));
+                } else {
+                    // Default: prompt user
+                    let theme = crate::ui::theme::ActiveTheme::default();
+                    let mut stdout = std::io::stdout();
+                    let mut fmt = crate::ui::components::Formatter::stdout(&mut stdout, theme);
+                    fmt.info(&format!(
+                        "Found running session: {} (workers: {}, pid: {})",
+                        session.name,
+                        session.worker_count(),
+                        session.metadata.daemon_pid
+                    ))?;
+                    if crate::cli::interactive::confirm(
+                        "Attach to existing session?",
+                        true,
+                    )? {
+                        fmt.newline()?;
+                        return attach(Some(session.name));
+                    } else {
+                        fmt.info("Starting new session... (use --new to skip this prompt)")?;
+                        fmt.newline()?;
+                    }
+                }
             }
         }
     }
@@ -1063,6 +1115,7 @@ fn preflight_factory_launch(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::ui::factory::FactoryConfig;
 
     #[test]
@@ -1075,5 +1128,36 @@ mod tests {
         assert_eq!(config.worker_cli, cas_mux::SupervisorCli::Claude);
         assert!(config.enable_worktrees);
         assert!(config.worktree_root.is_none());
+    }
+
+    #[test]
+    fn test_factory_args_default_has_attach_false() {
+        let args = FactoryArgs::default();
+        assert!(!args.attach, "--attach should default to false");
+        assert!(!args.start_new, "--new should default to false");
+    }
+
+    #[test]
+    fn test_factory_args_attach_and_new_are_independent() {
+        // Both flags can be set independently
+        let mut args = FactoryArgs::default();
+        args.attach = true;
+        assert!(args.attach);
+        assert!(!args.start_new);
+
+        let mut args = FactoryArgs::default();
+        args.start_new = true;
+        assert!(!args.attach);
+        assert!(args.start_new);
+    }
+
+    #[test]
+    fn test_session_manager_no_sessions() {
+        // Characterization: find_session_for_project returns None when no sessions exist
+        let manager = crate::ui::factory::SessionManager::new();
+        let result = manager
+            .find_session_for_project(None, "/nonexistent/project/path")
+            .unwrap();
+        assert!(result.is_none());
     }
 }
