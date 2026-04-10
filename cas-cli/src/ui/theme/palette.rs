@@ -141,7 +141,7 @@ impl Palette {
 
             border_default: colors.gray_500,
             border_focused: colors.primary_400,
-            border_muted: colors.gray_600,
+            border_muted: colors.gray_500,
 
             // Interactive
             accent: colors.primary_400,
@@ -233,7 +233,7 @@ impl Palette {
             // Contextual hints
             hint_key: colors.gray_400,
             hint_key_primary: colors.primary_400,
-            hint_description: colors.gray_500,
+            hint_description: colors.gray_400,
 
             colors,
         }
