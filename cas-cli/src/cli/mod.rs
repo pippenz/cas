@@ -18,6 +18,7 @@ mod init;
 pub mod interactive;
 mod list;
 mod mcp_cmd;
+mod open;
 mod queue;
 mod status;
 mod statusline;
@@ -43,6 +44,7 @@ pub use list::ListArgs;
 pub use mcp_cmd::McpCommands;
 pub use status::StatusArgs;
 pub use statusline::StatusLineArgs;
+pub use open::OpenArgs;
 pub use update::UpdateArgs;
 
 /// Build version string including git hash and date
@@ -86,6 +88,9 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
+    /// Interactive project picker — scan ~/projects/, select, launch or attach
+    Open(OpenArgs),
+
     /// Initialize CAS in current directory
     Init(InitArgs),
 
@@ -191,6 +196,7 @@ fn auth_requirement(command: &Option<Commands>) -> AuthRequirement {
 
         // Local/offline commands
         Commands::Init(_)
+        | Commands::Open(_)
         | Commands::Doctor(_)
         | Commands::Update(_)
         | Commands::Changelog(_)
@@ -326,6 +332,7 @@ fn get_command_name(cmd: &Option<Commands>) -> String {
         return "factory".to_string();
     };
     match cmd {
+        Commands::Open(_) => "open".to_string(),
         Commands::Init(_) => "init".to_string(),
         Commands::Attach(_) => "attach".to_string(),
         Commands::List(_) => "list".to_string(),
@@ -372,6 +379,7 @@ fn run_command(cli: &Cli, cas_root: Option<&Path>) -> anyhow::Result<()> {
     };
 
     match command {
+        Commands::Open(args) => open::execute(args),
         Commands::Init(args) => init::execute(args, cli),
         Commands::Attach(args) => factory::execute_attach(args),
         Commands::List(args) => factory::execute_list(cli, args),
