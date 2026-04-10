@@ -1,0 +1,55 @@
+# CAS Slack Bridge — Per-User Daemon Template
+#
+# Each instance runs as a specific Linux user:
+#   sudo systemctl start cas-bridge@daniel
+#   sudo systemctl start cas-bridge@ben
+#
+# The daemon listens on /run/cas-bridge/<user>.sock for messages forwarded
+# by the router, then injects them into CAS via `cas serve` HTTP API.
+#
+# Credentials are read from ~<user>/.config/cas/env (not .zshrc).
+#
+# Install: sudo cp cas-bridge@.service /etc/systemd/system/
+#          sudo systemctl daemon-reload
+#          sudo systemctl enable cas-bridge@daniel cas-bridge@ben
+
+[Unit]
+Description=CAS Slack Bridge Daemon for %i
+After=network-online.target
+Wants=network-online.target
+
+# Start after the router so the socket directory exists
+After=cas-bridge-router.service
+
+[Service]
+Type=simple
+User=%i
+Group=%i
+
+# Per-user env file with CAS_SERVE_URL, CAS_SERVE_TOKEN, SLACK_BOT_TOKEN
+Environment=CAS_BRIDGE_ENV=/home/%i/.config/cas/env
+Environment=CAS_BRIDGE_USER=%i
+Environment=CAS_BRIDGE_SOCKET=/run/cas-bridge/%i.sock
+
+ExecStart=/usr/bin/node /opt/cas-bridge/dist/daemon-main.js
+
+Restart=on-failure
+RestartSec=5
+
+# Security — run as the target user, but restrict what they can do
+NoNewPrivileges=yes
+ProtectSystem=strict
+PrivateTmp=yes
+ReadOnlyPaths=/opt/cas-bridge
+
+# Allow writing to the socket directory and user home
+ReadWritePaths=/run/cas-bridge
+ReadWritePaths=/home/%i
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cas-bridge@%i
+
+[Install]
+WantedBy=multi-user.target

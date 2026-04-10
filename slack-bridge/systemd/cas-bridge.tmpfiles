@@ -1,0 +1,4 @@
+# Create the Unix socket directory for cas-bridge on boot.
+# Install: sudo cp cas-bridge.tmpfiles /etc/tmpfiles.d/cas-bridge.conf
+#          sudo systemd-tmpfiles --create
+d /run/cas-bridge 0755 cas-bridge cas-bridge -

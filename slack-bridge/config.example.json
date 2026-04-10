@@ -1,0 +1,18 @@
+{
+  "channels": {
+    "C_GABBER_CHANNEL_ID": {
+      "project": "gabber-studio",
+      "dir_name": "Petrastella/gabber-studio"
+    },
+    "C_CAS_CHANNEL_ID": {
+      "project": "cas-src",
+      "dir_name": "cas-src"
+    }
+  },
+  "users": {
+    "U_BEN_SLACK_ID": "ben",
+    "U_DANIEL_SLACK_ID": "daniel"
+  },
+  "socket_dir": "/run/cas-bridge",
+  "projects_base": "/home"
+}

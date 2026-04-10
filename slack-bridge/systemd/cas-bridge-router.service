@@ -1,0 +1,51 @@
+# CAS Slack Bridge — Router Service
+#
+# Unprivileged event router. Receives Slack events via Socket Mode,
+# forwards to per-user daemons via Unix socket.
+#
+# Runs as the `cas-bridge` system user with NO shell, NO home directory,
+# and NO access to any user credentials.
+#
+# Install: sudo cp cas-bridge-router.service /etc/systemd/system/
+#          sudo systemctl daemon-reload
+#          sudo systemctl enable --now cas-bridge-router
+
+[Unit]
+Description=CAS Slack Bridge Router
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cas-bridge
+Group=cas-bridge
+
+# Slack tokens for the bot — the ONLY secrets this service holds
+EnvironmentFile=/etc/cas-bridge/router.env
+
+# Config file with channel→project and user→Linux mappings
+Environment=CAS_BRIDGE_CONFIG=/etc/cas-bridge/config.json
+
+ExecStart=/usr/bin/node /opt/cas-bridge/dist/router-main.js
+
+Restart=on-failure
+RestartSec=5
+
+# Security hardening — minimal privileges
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadOnlyPaths=/opt/cas-bridge
+ReadOnlyPaths=/etc/cas-bridge
+
+# Allow writing to the socket directory
+ReadWritePaths=/run/cas-bridge
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cas-bridge-router
+
+[Install]
+WantedBy=multi-user.target

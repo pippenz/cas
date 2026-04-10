@@ -1,0 +1,25 @@
+{
+  "name": "cas-slack-bridge",
+  "version": "0.1.0",
+  "description": "Slack bridge for CAS factory sessions — routes Slack messages to per-user CAS daemons",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start:router": "node dist/router-main.js",
+    "start:daemon": "node dist/daemon-main.js",
+    "dev:router": "tsx src/router-main.ts",
+    "dev:daemon": "tsx src/daemon-main.ts"
+  },
+  "dependencies": {
+    "@slack/bolt": "^4.1.0",
+    "@slack/web-api": "^7.8.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}
