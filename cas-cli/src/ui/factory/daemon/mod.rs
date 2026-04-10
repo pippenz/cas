@@ -84,6 +84,21 @@ struct GuiConnection {
     pane_sizes: HashMap<String, (u16, u16)>,
 }
 
+/// A connected WebSocket client using tokio-tungstenite
+struct WsConnection {
+    /// Sink half of the split WebSocketStream (for sending messages)
+    sink: futures_util::stream::SplitSink<
+        tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+        tokio_tungstenite::tungstenite::Message,
+    >,
+    /// Stream half of the split WebSocketStream (for receiving messages)
+    stream: futures_util::stream::SplitStream<
+        tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    >,
+    /// Per-pane dimensions reported by this client (pane_id -> (cols, rows))
+    pane_sizes: HashMap<String, (u16, u16)>,
+}
+
 /// A single pending spawn action (one worker at a time)
 #[derive(Debug)]
 enum PendingSpawn {
@@ -156,6 +171,12 @@ pub struct FactoryDaemon {
     gui_clients: HashMap<usize, GuiConnection>,
     /// Next GUI client ID
     next_gui_client_id: usize,
+    /// WebSocket listener for network clients
+    ws_listener: Option<tokio::net::TcpListener>,
+    /// Connected WebSocket clients
+    ws_clients: HashMap<usize, WsConnection>,
+    /// Next WebSocket client ID
+    next_ws_client_id: usize,
     /// Per-pane sizes allocated by TUI layout (pane_id -> (cols, rows))
     tui_pane_sizes: HashMap<String, (u16, u16)>,
     /// Per-pane sizes reported by web viewers (pane_id -> (cols, rows))
@@ -173,8 +194,6 @@ pub struct FactoryDaemon {
     last_idle_message_times: HashMap<String, std::time::Instant>,
     /// Epic IDs already logged as "resuming" (prevents log spam every refresh cycle)
     resumed_epic_ids: std::collections::HashSet<String>,
-    /// Per-pane timestamp of last plain-text snapshot write (for pane-tail files)
-    last_snapshot_at: HashMap<String, std::time::Instant>,
 }
 
 /// Parsed control events from client

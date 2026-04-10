@@ -312,6 +312,9 @@ pub async fn run_daemon_after_fork(
         gui_listener,
         gui_clients: HashMap::new(),
         next_gui_client_id: 0,
+        ws_listener: None,
+        ws_clients: HashMap::new(),
+        next_ws_client_id: 0,
         tui_pane_sizes: HashMap::new(),
         web_pane_sizes: HashMap::new(),
         teams,
@@ -319,7 +322,6 @@ pub async fn run_daemon_after_fork(
         dead_workers: std::collections::HashSet::new(),
         last_idle_message_times: HashMap::new(),
         resumed_epic_ids: std::collections::HashSet::new(),
-        last_snapshot_at: HashMap::new(),
     };
 
     daemon.run().await

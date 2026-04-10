@@ -28,5 +28,5 @@ pub(super) use crate::ui::factory::set_terminal_title;
 pub(super) use crate::ui::factory::daemon::{
     COMPACT_WIDTH_THRESHOLD, CONTROL_PREFIX, CONTROL_SUFFIX, ClientConnection, ClientViewMode,
     ControlEvent, DaemonConfig, DaemonInitPhase, FactoryDaemon, ForkFirstResult, ForkResult,
-    GuiConnection, INPUT_OWNER_IDLE_SECS, MAX_CLIENT_OUTPUT_BYTES, PendingSpawn,
+    GuiConnection, INPUT_OWNER_IDLE_SECS, MAX_CLIENT_OUTPUT_BYTES, PendingSpawn, WsConnection,
 };

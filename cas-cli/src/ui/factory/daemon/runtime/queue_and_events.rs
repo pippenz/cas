@@ -9,11 +9,12 @@ impl FactoryDaemon {
                 self.buffer_pane_output(&pane_id, &data);
                 // Forward to any active web viewers
                 self.forward_pane_output(&pane_id, &data);
-                // Forward to GUI clients (cas-desktop)
+                // Forward to GUI and WebSocket clients
                 self.forward_pane_output_to_gui(&pane_id, &data);
+                self.forward_pane_output_to_ws(&pane_id, &data);
             }
             cas_mux::MuxEvent::PaneExited { pane_id, exit_code } => {
-                // Notify GUI clients
+                // Notify GUI and WS clients
                 self.gui_notify_pane_exited(&pane_id, exit_code);
                 let is_supervisor = pane_id == self.app.supervisor_name();
                 let is_worker = self.app.worker_names().contains(&pane_id);
@@ -610,7 +611,7 @@ impl FactoryDaemon {
                                 panes.insert(0, self.app.supervisor_name().to_string());
                                 handle.send_pane_list(panes);
                             }
-                            // Notify GUI clients of new worker pane
+                            // Notify GUI and WS clients of new worker pane
                             self.gui_notify_pane_added(&name, cas_mux::PaneKind::Worker);
                         }
                         Err(e) => {
@@ -742,7 +743,7 @@ impl FactoryDaemon {
                             let _ = teams.remove_member(name);
                         }
                     }
-                    // Notify GUI clients that panes were removed
+                    // Notify GUI and WS clients that panes were removed
                     for name in &workers_to_stop {
                         self.gui_notify_pane_removed(name);
                     }

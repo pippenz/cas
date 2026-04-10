@@ -202,9 +202,9 @@ impl FactoryDaemon {
         }
     }
 
-    /// Notify GUI clients that a pane was added.
-    pub(super) fn gui_notify_pane_added(&mut self, pane_id: &str, kind: cas_mux::PaneKind) {
-        if self.gui_clients.is_empty() {
+    /// Notify all protocol clients (GUI + WS) that a pane was added.
+    pub(super) fn notify_pane_added(&mut self, pane_id: &str, kind: cas_mux::PaneKind) {
+        if self.gui_clients.is_empty() && self.ws_clients.is_empty() {
             return;
         }
         let msg = DaemonMessage::PaneAdded {
@@ -216,40 +216,54 @@ impl FactoryDaemon {
                 exited: false,
             },
         };
-        self.gui_broadcast(&msg);
+        self.broadcast_daemon_message(&msg);
     }
 
-    /// Notify GUI clients that a pane was removed.
-    pub(super) fn gui_notify_pane_removed(&mut self, pane_id: &str) {
-        if self.gui_clients.is_empty() {
+    /// Notify all protocol clients (GUI + WS) that a pane was removed.
+    pub(super) fn notify_pane_removed(&mut self, pane_id: &str) {
+        if self.gui_clients.is_empty() && self.ws_clients.is_empty() {
             return;
         }
         let msg = DaemonMessage::PaneRemoved {
             pane_id: pane_id.to_string(),
         };
-        self.gui_broadcast(&msg);
+        self.broadcast_daemon_message(&msg);
     }
 
-    /// Notify GUI clients that a pane exited.
-    pub(super) fn gui_notify_pane_exited(&mut self, pane_id: &str, exit_code: Option<i32>) {
-        if self.gui_clients.is_empty() {
+    /// Notify all protocol clients (GUI + WS) that a pane exited.
+    pub(super) fn notify_pane_exited(&mut self, pane_id: &str, exit_code: Option<i32>) {
+        if self.gui_clients.is_empty() && self.ws_clients.is_empty() {
             return;
         }
         let msg = DaemonMessage::PaneExited {
             pane_id: pane_id.to_string(),
             exit_code,
         };
-        self.gui_broadcast(&msg);
+        self.broadcast_daemon_message(&msg);
     }
 
-    /// Send periodic state updates to GUI clients.
-    pub(super) fn gui_send_state_update(&mut self) {
-        if self.gui_clients.is_empty() {
+    /// Send periodic state updates to all protocol clients (GUI + WS).
+    pub(super) fn send_state_update(&mut self) {
+        if self.gui_clients.is_empty() && self.ws_clients.is_empty() {
             return;
         }
         let state = self.build_session_state();
         let msg = DaemonMessage::StateUpdate { state };
-        self.gui_broadcast(&msg);
+        self.broadcast_daemon_message(&msg);
+    }
+
+    // Legacy aliases for backward compatibility with callers
+    pub(super) fn gui_notify_pane_added(&mut self, pane_id: &str, kind: cas_mux::PaneKind) {
+        self.notify_pane_added(pane_id, kind);
+    }
+    pub(super) fn gui_notify_pane_removed(&mut self, pane_id: &str) {
+        self.notify_pane_removed(pane_id);
+    }
+    pub(super) fn gui_notify_pane_exited(&mut self, pane_id: &str, exit_code: Option<i32>) {
+        self.notify_pane_exited(pane_id, exit_code);
+    }
+    pub(super) fn gui_send_state_update(&mut self) {
+        self.send_state_update();
     }
 
     /// Handle a single ClientMessage from a GUI client.
@@ -393,7 +407,7 @@ impl FactoryDaemon {
     }
 
     /// Build a SessionState snapshot from current daemon state.
-    fn build_session_state(&self) -> SessionState {
+    pub(super) fn build_session_state(&self) -> SessionState {
         let focused = self.app.mux.focused().map(|p| p.id().to_string());
         let mut panes = Vec::new();
 
@@ -431,7 +445,7 @@ impl FactoryDaemon {
     }
 
     /// Build scrollback buffers for all panes from the ring buffers.
-    fn build_scrollback(&self) -> std::collections::HashMap<String, Vec<Vec<u8>>> {
+    pub(super) fn build_scrollback(&self) -> std::collections::HashMap<String, Vec<Vec<u8>>> {
         let mut scrollback = std::collections::HashMap::new();
         for (pane_id, buffer) in &self.pane_buffers {
             let bytes = buffer.as_bytes();
@@ -443,7 +457,7 @@ impl FactoryDaemon {
     }
 
     /// Resolve "supervisor" to the actual pane name.
-    fn resolve_pane_name(&self, name: &str) -> String {
+    pub(super) fn resolve_pane_name(&self, name: &str) -> String {
         if name == "supervisor" {
             self.app.supervisor_name().to_string()
         } else {
@@ -451,7 +465,21 @@ impl FactoryDaemon {
         }
     }
 
-    /// Broadcast a DaemonMessage to all connected GUI clients.
+    /// Broadcast a DaemonMessage to all connected GUI and WebSocket clients.
+    pub(super) fn broadcast_daemon_message(&mut self, msg: &DaemonMessage) {
+        if !self.gui_clients.is_empty() {
+            if let Some(frame) = encode_frame(msg) {
+                for client in self.gui_clients.values_mut() {
+                    queue_frame(client, &frame);
+                }
+            }
+        }
+        if !self.ws_clients.is_empty() {
+            self.ws_broadcast(msg);
+        }
+    }
+
+    /// Broadcast a DaemonMessage to all connected GUI clients only.
     fn gui_broadcast(&mut self, msg: &DaemonMessage) {
         if let Some(frame) = encode_frame(msg) {
             for client in self.gui_clients.values_mut() {
@@ -463,9 +491,12 @@ impl FactoryDaemon {
     /// Recalculate effective pane sizes after a GUI client disconnects.
     /// The disconnected client may have been the smallest, so panes can expand.
     fn reconcile_after_gui_disconnect(&mut self) {
-        // Collect all pane IDs that any remaining GUI client has sizes for
+        // Collect all pane IDs that any remaining GUI or WS client has sizes for
         let mut pane_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
         for client in self.gui_clients.values() {
+            pane_ids.extend(client.pane_sizes.keys().cloned());
+        }
+        for client in self.ws_clients.values() {
             pane_ids.extend(client.pane_sizes.keys().cloned());
         }
         // Also include panes with TUI or web sizes
@@ -496,6 +527,17 @@ impl FactoryDaemon {
 
         // All GUI clients
         for client in self.gui_clients.values() {
+            if let Some(&(cols, rows)) = client.pane_sizes.get(pane_id) {
+                if cols > 0 && rows > 0 {
+                    min_cols = min_cols.min(cols);
+                    min_rows = min_rows.min(rows);
+                    found = true;
+                }
+            }
+        }
+
+        // All WS clients
+        for client in self.ws_clients.values() {
             if let Some(&(cols, rows)) = client.pane_sizes.get(pane_id) {
                 if cols > 0 && rows > 0 {
                     min_cols = min_cols.min(cols);
@@ -555,8 +597,12 @@ impl FactoryDaemon {
                 .gui_clients
                 .values()
                 .any(|c| c.pane_sizes.contains_key(&pane_id));
+            let has_ws = self
+                .ws_clients
+                .values()
+                .any(|c| c.pane_sizes.contains_key(&pane_id));
             let has_web = self.web_pane_sizes.contains_key(&pane_id);
-            if has_gui || has_web {
+            if has_gui || has_ws || has_web {
                 self.apply_effective_pane_size(&pane_id);
             }
         }

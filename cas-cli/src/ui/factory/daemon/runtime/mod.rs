@@ -6,3 +6,4 @@ mod output;
 mod queue_and_events;
 pub(super) mod relay;
 pub(crate) mod teams;
+mod ws_client;

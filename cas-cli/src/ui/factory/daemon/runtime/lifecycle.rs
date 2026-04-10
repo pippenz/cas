@@ -61,6 +61,29 @@ impl FactoryDaemon {
         let gui_listener = UnixListener::bind(&gui_sock_path)?;
         gui_listener.set_nonblocking(true)?;
 
+        // Bind WebSocket listener on localhost with OS-assigned port.
+        // Use std TcpListener first (sync constructor), then convert to tokio in run().
+        let ws_listener = match std::net::TcpListener::bind("127.0.0.1:0") {
+            Ok(l) => {
+                l.set_nonblocking(true)?;
+                match tokio::net::TcpListener::from_std(l) {
+                    Ok(tl) => Some(tl),
+                    Err(e) => {
+                        tracing::warn!("Failed to convert WS listener to tokio: {}", e);
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to bind WS listener: {}", e);
+                None
+            }
+        };
+        let ws_port = ws_listener
+            .as_ref()
+            .and_then(|l| l.local_addr().ok())
+            .map(|a| a.port());
+
         let session_manager = SessionManager::new();
 
         // Optionally start cloud phone-home client
@@ -120,7 +143,7 @@ impl FactoryDaemon {
             app.worker_names(),
             app.epic_state().epic_id(),
             Some(&project_dir),
-            None, // ws_port - Unix socket daemon doesn't use WebSocket
+            ws_port,
         );
         metadata.team_name = teams.as_ref().map(|t| t.team_name().to_string());
         session_manager.save_metadata(&metadata)?;
@@ -152,6 +175,9 @@ impl FactoryDaemon {
             gui_listener,
             gui_clients: HashMap::new(),
             next_gui_client_id: 0,
+            ws_listener,
+            ws_clients: HashMap::new(),
+            next_ws_client_id: 0,
             tui_pane_sizes: HashMap::new(),
             web_pane_sizes: HashMap::new(),
             teams,
@@ -159,7 +185,6 @@ impl FactoryDaemon {
             dead_workers: std::collections::HashSet::new(),
             last_idle_message_times: HashMap::new(),
             resumed_epic_ids: std::collections::HashSet::new(),
-            last_snapshot_at: HashMap::new(),
         })
     }
 
@@ -170,6 +195,43 @@ impl FactoryDaemon {
 
     /// Run the daemon main loop with TUI rendering
     pub async fn run(&mut self) -> anyhow::Result<()> {
+        // Bind WebSocket listener if not already bound (fork-first and legacy paths
+        // set ws_listener=None because they run before the Tokio runtime exists).
+        if self.ws_listener.is_none() {
+            match std::net::TcpListener::bind("127.0.0.1:0") {
+                Ok(l) => {
+                    let _ = l.set_nonblocking(true);
+                    match tokio::net::TcpListener::from_std(l) {
+                        Ok(tl) => {
+                            let port = tl.local_addr().ok().map(|a| a.port());
+                            self.ws_listener = Some(tl);
+                            // Update session metadata with ws_port
+                            if let Some(port) = port {
+                                let meta_path = crate::ui::factory::session::metadata_path(
+                                    &self.session_name,
+                                );
+                                if let Ok(data) = std::fs::read_to_string(&meta_path) {
+                                    if let Ok(mut meta) = serde_json::from_str::<
+                                        crate::ui::factory::protocol::SessionMetadata,
+                                    >(&data) {
+                                        meta.ws_port = Some(port);
+                                        let _ = self.session_manager.save_metadata(&meta);
+                                    }
+                                }
+                                tracing::info!("WS listener bound on 127.0.0.1:{}", port);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to convert WS listener to tokio: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to bind WS listener: {}", e);
+                }
+            }
+        }
+
         // Start deferred cloud phone-home client (fork-first path defers this
         // because run_with_progress() runs before the Tokio runtime exists).
         if self.phone_home && self.cloud_handle.is_none() {
@@ -213,11 +275,17 @@ impl FactoryDaemon {
             // Accept new GUI client connections (non-blocking)
             let new_gui_clients = self.accept_gui_clients();
 
+            // Accept new WebSocket client connections (non-blocking)
+            let new_ws_clients = self.accept_ws_clients().await;
+
             // Read and process input from clients
             let input_activity = self.process_client_input().await?;
 
             // Read and process input from GUI clients
             let gui_activity = self.process_gui_client_input().await;
+
+            // Read and process input from WebSocket clients
+            let ws_activity = self.process_ws_client_input().await;
 
             // Poll PTYs for output using coalesced batch drain (efficient for 6 Claudes generating)
             let (bytes_processed, events) = self.app.mux.poll_batch();
@@ -348,13 +416,6 @@ impl FactoryDaemon {
                 refreshed = true;
             }
 
-            // Write periodic plain-text pane-tail snapshots to disk
-            super::relay::write_pane_snapshots(
-                &self.session_name,
-                &self.pane_buffers,
-                &mut self.last_snapshot_at,
-            );
-
             // Apply debounced resize after 100ms of no new resize events
             let mut resize_applied = false;
             if let Some((cols, rows)) = self.pending_resize {
@@ -475,18 +536,20 @@ impl FactoryDaemon {
             // produces visual garbage. Wait for the debounce to settle.
             let resize_pending = self.pending_resize.is_some();
 
-            // Send periodic state updates to GUI clients on refresh
-            if refreshed && !self.gui_clients.is_empty() {
-                self.gui_send_state_update();
+            // Send periodic state updates to GUI and WS clients on refresh
+            if refreshed && (!self.gui_clients.is_empty() || !self.ws_clients.is_empty()) {
+                self.send_state_update();
             }
 
             let spawning = self.app.spawning_count > 0;
             let dirty = had_output
                 || input_activity
                 || gui_activity
+                || ws_activity
                 || refreshed
                 || new_clients
                 || new_gui_clients
+                || new_ws_clients
                 || needs_full_redraw
                 || needs_compact_redraw
                 || resize_applied
@@ -539,10 +602,16 @@ impl FactoryDaemon {
                 self.flush_gui_client_output();
             }
 
+            // Flush pending WebSocket client output
+            if !self.ws_clients.is_empty() {
+                self.flush_ws_client_output().await;
+            }
+
             // Adaptive sleep: ~120fps when active, ~60fps idle with clients,
             // ~2fps headless (no clients, no GUI) to minimize CPU usage.
             let has_any_client = !self.clients.is_empty()
                 || !self.gui_clients.is_empty()
+                || !self.ws_clients.is_empty()
                 || self.has_relay_clients();
             let sleep_ms = if had_output && has_any_client {
                 4
@@ -648,6 +717,9 @@ impl FactoryDaemon {
         // Clean up GUI socket
         let gui_sock = gui_socket_path(&self.session_name);
         let _ = std::fs::remove_file(&gui_sock);
+
+        // Drop WebSocket clients (connections will close on drop)
+        self.ws_clients.clear();
 
         // Send leave alternate screen to all clients
         let cleanup = b"\x1b[?25h\x1b[?1049l";
