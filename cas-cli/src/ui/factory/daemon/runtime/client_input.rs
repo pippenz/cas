@@ -168,6 +168,9 @@ impl FactoryDaemon {
                                         self.app.handle_scroll_down();
                                     }
                                 }
+                                ControlEvent::MouseClick { col, row } => {
+                                    self.app.handle_mouse_click(col, row);
+                                }
                                 ControlEvent::DropImage { col, row, path } => {
                                     let target = self.resolve_drop_target(col, row);
                                     if let Some(target_pane) = target {
@@ -262,7 +265,14 @@ impl FactoryDaemon {
                                 match parts[1] {
                                     "scroll_up" => events.push(ControlEvent::MouseScrollUp),
                                     "scroll_down" => events.push(ControlEvent::MouseScrollDown),
-                                    _ => {} // Click/drag handled by native terminal selection
+                                    "click" => {
+                                        if let (Ok(col), Ok(row)) =
+                                            (parts[2].parse::<u16>(), parts[3].parse::<u16>())
+                                        {
+                                            events.push(ControlEvent::MouseClick { col, row });
+                                        }
+                                    }
+                                    _ => {}
                                 }
                             }
                         } else if let Some(rest) = cmd_str.strip_prefix("drop_image;") {
@@ -557,6 +567,25 @@ impl FactoryDaemon {
                     _ => {}
                 }
                 i += 1;
+                continue;
+            }
+
+            // Check for Ctrl+Arrow sequences (ESC [ 1 ; 5 C/D) — pane cycling
+            // Must be checked before basic arrow handling since both start with ESC [
+            if byte == 0x1b
+                && i + 5 < input.len()
+                && input[i + 1] == b'['
+                && input[i + 2] == b'1'
+                && input[i + 3] == b';'
+                && input[i + 4] == b'5'
+                && matches!(input[i + 5], b'C' | b'D')
+            {
+                match input[i + 5] {
+                    b'C' => self.app.focus_next_pty_pane(), // Ctrl+Right
+                    b'D' => self.app.focus_prev_pty_pane(), // Ctrl+Left
+                    _ => {}
+                }
+                i += 6;
                 continue;
             }
 

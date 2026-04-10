@@ -159,15 +159,18 @@ fn attach_unix(session: &SessionInfo) -> anyhow::Result<()> {
                     pending_resize_at = std::time::Instant::now();
                 }
                 Event::Mouse(mouse) => {
-                    // Only handle scroll events — clicks/drag are ignored
-                    // so native terminal selection (Shift+click) still works.
-                    let scroll_cmd = match mouse.kind {
+                    // Handle scroll and click events. Drag is ignored so native
+                    // terminal selection (Shift+click/drag) still works.
+                    let mouse_cmd = match mouse.kind {
                         crossterm::event::MouseEventKind::ScrollUp => Some("scroll_up"),
                         crossterm::event::MouseEventKind::ScrollDown => Some("scroll_down"),
+                        crossterm::event::MouseEventKind::Down(
+                            crossterm::event::MouseButton::Left,
+                        ) => Some("click"),
                         _ => None,
                     };
-                    if let Some(dir) = scroll_cmd {
-                        let cmd = format!("mouse;{dir};{};{}", mouse.column, mouse.row);
+                    if let Some(kind) = mouse_cmd {
+                        let cmd = format!("mouse;{kind};{};{}", mouse.column, mouse.row);
                         let mut msg = Vec::new();
                         msg.extend_from_slice(CONTROL_PREFIX);
                         msg.extend_from_slice(cmd.as_bytes());

@@ -182,6 +182,7 @@ enum ControlEvent {
     SetMode(ClientViewMode),
     MouseScrollUp,
     MouseScrollDown,
+    MouseClick { col: u16, row: u16 },
     DropImage { col: u16, row: u16, path: String },
 }
 

@@ -134,6 +134,128 @@ impl FactoryApp {
         }
     }
 
+    /// Handle mouse click at screen coordinates
+    ///
+    /// Resolves which pane was clicked and focuses it. Also handles clicks
+    /// on the worker tab bar to switch worker tabs.
+    pub fn handle_mouse_click(&mut self, col: u16, row: u16) {
+        // Don't handle clicks while modal dialogs are open
+        if self.show_task_dialog
+            || self.show_changes_dialog
+            || self.show_reminder_dialog
+            || self.show_help
+            || self.show_terminal_dialog
+        {
+            return;
+        }
+
+        // Check worker tab bar clicks (switches tab without focusing)
+        if self.is_tabbed {
+            if let Some(tab_area) = self.worker_tab_bar_area {
+                if tab_area.contains((col, row).into()) {
+                    let all_names = self.layout_worker_names();
+                    if !all_names.is_empty() {
+                        let tab_width = tab_area.width / all_names.len() as u16;
+                        let clicked_tab = ((col - tab_area.x) / tab_width.max(1)) as usize;
+                        if clicked_tab < all_names.len() {
+                            self.select_worker_tab(clicked_tab);
+                            // Also focus the clicked worker pane
+                            if let Some(name) = self.worker_names.get(clicked_tab) {
+                                let name = name.clone();
+                                let _ = self.mux.focus(&name);
+                                self.sidecar_focus = SidecarFocus::None;
+                            }
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+
+        // Check sidecar area clicks
+        if let Some(sidecar_area) = self.sidecar_area {
+            if sidecar_area.contains((col, row).into()) {
+                if self.sidecar_focus == SidecarFocus::None {
+                    self.toggle_sidecar_focus();
+                }
+                return;
+            }
+        }
+
+        // Check pane clicks (supervisor + workers)
+        if let Some(pane_name) = self.pane_at_screen(col, row) {
+            let _ = self.mux.focus(&pane_name);
+            self.sidecar_focus = SidecarFocus::None;
+
+            // Update selected worker tab when clicking a worker in tabbed mode
+            if self.is_tabbed {
+                if let Some(idx) = self.worker_names.iter().position(|n| n == &pane_name) {
+                    self.selected_worker_tab = idx;
+                }
+            }
+        }
+    }
+
+    /// Focus the next PTY pane (cycles through supervisor + worker panes only)
+    pub fn focus_next_pty_pane(&mut self) {
+        let pane_names = self.pty_pane_names();
+        if pane_names.is_empty() {
+            return;
+        }
+
+        let current = self.mux.focused_id().map(|s| s.to_string());
+        let current_idx = current
+            .as_ref()
+            .and_then(|c| pane_names.iter().position(|n| n == c))
+            .unwrap_or(0);
+
+        let next_idx = (current_idx + 1) % pane_names.len();
+        let target = pane_names[next_idx].clone();
+        let _ = self.mux.focus(&target);
+        self.sidecar_focus = SidecarFocus::None;
+
+        // Sync worker tab selection
+        if let Some(idx) = self.worker_names.iter().position(|n| n == &target) {
+            self.selected_worker_tab = idx;
+        }
+    }
+
+    /// Focus the previous PTY pane (cycles through supervisor + worker panes only)
+    pub fn focus_prev_pty_pane(&mut self) {
+        let pane_names = self.pty_pane_names();
+        if pane_names.is_empty() {
+            return;
+        }
+
+        let current = self.mux.focused_id().map(|s| s.to_string());
+        let current_idx = current
+            .as_ref()
+            .and_then(|c| pane_names.iter().position(|n| n == c))
+            .unwrap_or(0);
+
+        let prev_idx = if current_idx == 0 {
+            pane_names.len() - 1
+        } else {
+            current_idx - 1
+        };
+        let target = pane_names[prev_idx].clone();
+        let _ = self.mux.focus(&target);
+        self.sidecar_focus = SidecarFocus::None;
+
+        // Sync worker tab selection
+        if let Some(idx) = self.worker_names.iter().position(|n| n == &target) {
+            self.selected_worker_tab = idx;
+        }
+    }
+
+    /// Get ordered list of PTY pane names (supervisor first, then workers)
+    fn pty_pane_names(&self) -> Vec<String> {
+        let mut names = Vec::with_capacity(1 + self.worker_names.len());
+        names.push(self.supervisor_name.clone());
+        names.extend(self.worker_names.iter().cloned());
+        names
+    }
+
     /// Handle mouse scroll up
     pub fn handle_scroll_up(&mut self) {
         if self.show_task_dialog {
