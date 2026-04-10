@@ -113,6 +113,58 @@ For every non-trivial change, trace **2 levels out** from the edited code — ca
 
 Only close after all checks pass. The verifier will catch what you miss — but rejections cost time.
 
+## Close-time code review gate
+
+As of Phase 1 (EPIC cas-0750), a multi-persona code review runs automatically inside `task.close`. You do **not** invoke any review tool yourself. This section describes the flow and, critically, what to do when the gate blocks your close.
+
+### What happens at task.close
+
+When you call `mcp__cas__task action=close`, close_ops dispatches the `cas-code-review` skill against your staged / just-committed diff before the task flips to `closed`. The skill:
+
+1. Extracts the set of changed files + base SHA from the worktree.
+2. Dispatches four always-on reviewer personas in parallel (`correctness`, `testing`, `maintainability`, `project-standards`) plus up to three conditional personas (`security`, `performance`, `adversarial`) activated by the diff shape.
+3. Merges their findings through a confidence gate, fingerprint dedup, and cross-reviewer agreement boost.
+4. Runs a bounded autofix loop (max 2 rounds) that applies `safe_auto` findings automatically and re-reviews.
+5. Routes any non-advisory residual findings to follow-up CAS tasks with stable `external_ref` deduplication.
+6. If any P0 residual remains, blocks the close.
+
+### What you'll see
+
+On a clean pass, `task.close` returns normally with a short summary: rounds run, findings auto-applied, residual follow-up task IDs (P1–P3). Advisory findings appear in the summary for awareness and are **never** converted into tasks.
+
+### If close is blocked on P0
+
+The close returns a `tool_error` whose body begins with `⚠️ CODE REVIEW P0 BLOCK` and lists each P0 finding by `file:line`, `title`, `why_it_matters`, and the first evidence line. Follow this protocol:
+
+1. **Read every P0 finding carefully.** They are code-grounded — the orchestrator suppresses speculative low-confidence output, so anything at P0 has been justified.
+2. **Do not spam-retry close.** The same P0 residual will re-block every retry until you change the code. Retries are cheap for you but expensive for latency; fix first.
+3. **Do not request a supervisor override for convenience.** The bypass exists for emergencies (production incident, unrelated reviewer bug), not to skip work. Workers closing with `bypass_code_review=true` will be rejected — it is a supervisor-only flag.
+4. **If you can fix the finding:** edit, stage the fix, commit, then retry `task.close`. The gate re-runs from scratch on the new diff.
+5. **If you genuinely cannot fix it** (e.g., the finding is in pre-existing adjacent code you did not touch, or fixing it is explicitly out-of-scope for this task), forward the full block message to the supervisor with `mcp__cas__task action=notes note_type=blocker`, cite the finding's file and line, and wait for the supervisor's decision. The supervisor owns the `bypass_code_review=true` override call and any scope adjustments.
+
+### Follow-up tasks
+
+Non-P0 non-advisory residual findings become CAS tasks automatically via the Phase 1 review-to-task flow. Each follow-up carries:
+
+- `title` from the finding
+- `priority` mapped `P0→0`, `P1→1`, `P2→2`, `P3→3`
+- `task_type` `task` (manual) or `bug` (gated_auto)
+- `labels` including `code-review`, `severity:Px`, and `file:<basename>`
+- A stable `external_ref` so re-running the review on the same unchanged defect updates the existing task instead of forking a duplicate
+
+You are **not** responsible for executing these follow-ups unless they are subsequently assigned to you. Your close still succeeds once P0 is clear — the P1–P3 residual does not block.
+
+### Latency expectations
+
+A full orchestrator + seven-persona pass adds noticeable latency to `task.close`. Concrete p50/p95 numbers will be pinned by Unit 11's parity measurement; for now, expect close to take visibly longer than it used to, and do not assume it is hung. Do not bypass the gate to dodge latency — that is what supervisor overrides exist for, and they cost more than waiting.
+
+### What NOT to do
+
+- **Do not manually invoke the legacy `code-reviewer` agent.** It has been replaced by the `cas-code-review` skill and now ships as a deprecation stub (see Unit 6). Calling it does nothing useful and confuses the deprecation signal.
+- **Do not edit `close_ops.rs` or the gate policy** to let your diff through. CAS bugs belong in the repo; scope-escape workarounds do not.
+- **Do not skip the pre-close self-verification above.** The gate is a second pair of eyes, not a replacement for your own discipline — shortcut markers, dead code, and broken callers still need to be caught by you first.
+- **Do not ignore the P1–P3 follow-up task IDs** in the close report. They are real work, even if they did not block your close, and they are searchable with the `code-review` label when the supervisor triages.
+
 ## Task Types
 
 **Spike tasks** (`task_type=spike`) are investigation tasks — they produce understanding, not code. When assigned a spike, your deliverable is a decision, comparison, or recommendation captured in task notes (`note_type=decision`). Spike acceptance criteria are question-based (e.g., "Which approach handles our constraints?").

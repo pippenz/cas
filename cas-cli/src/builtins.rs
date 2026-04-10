@@ -747,6 +747,41 @@ This is the body content."#;
     }
 
     #[test]
+    fn test_cas_worker_skill_documents_code_review_gate() {
+        // Phase 1 Subsystem A Unit 10 (EPIC cas-0750): the cas-worker
+        // skill must document the new close-time code-review gate so
+        // workers know how to read the block message, what happens to
+        // residual findings, and which tools they must NOT fall back
+        // to. Pin the required markers structurally so drift through
+        // cas sync cannot silently delete them.
+        for (label, path, content) in [
+            (
+                "claude",
+                "skills/cas-worker/SKILL.md",
+                include_str!("builtins/skills/cas-worker.md"),
+            ),
+            (
+                "codex",
+                "skills/cas-worker/SKILL.md",
+                include_str!("builtins/codex/skills/cas-worker.md"),
+            ),
+        ] {
+            for required in [
+                "## Close-time code review gate",
+                "### If close is blocked on P0",
+                "cas-code-review",
+                "bypass_code_review",
+                "code-reviewer",
+            ] {
+                assert!(
+                    content.contains(required),
+                    "{label} cas-worker skill ({path}) missing required marker: {required:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_builtin_skills_contains_cas_code_review() {
         // Phase 1 subsystem A (EPIC cas-0750): 9 files per mirror.
         let expected = [
