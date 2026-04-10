@@ -11,16 +11,8 @@ env:
 
 jobs:
   build:
-    name: Build ${{ matrix.target }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: aarch64-apple-darwin
-            os: macos-14
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+    name: Build Linux x86_64
+    runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
@@ -30,10 +22,9 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: x86_64-unknown-linux-gnu
 
       - name: Install Linux linker
-        if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
           sudo apt-get install -y clang lld
@@ -52,22 +43,22 @@ jobs:
       - name: Build
         env:
           ZIG: ${{ github.workspace }}/.context/zig/zig
-        run: cargo build -p cas --release --target ${{ matrix.target }}
+        run: cargo build -p cas --release --target x86_64-unknown-linux-gnu
 
-      - name: Package (Unix)
+      - name: Package
         run: |
           mkdir -p package
-          cp target/${{ matrix.target }}/release/cas package/
+          cp target/x86_64-unknown-linux-gnu/release/cas package/
           cp LICENSE package/
           cd package
-          tar -czvf cas-${{ matrix.target }}.tar.gz cas LICENSE
-          mv cas-${{ matrix.target }}.tar.gz ../
+          tar -czvf cas-x86_64-unknown-linux-gnu.tar.gz cas LICENSE
+          mv cas-x86_64-unknown-linux-gnu.tar.gz ../
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: cas-${{ matrix.target }}
-          path: cas-${{ matrix.target }}.tar.gz
+          name: cas-x86_64-unknown-linux-gnu
+          path: cas-x86_64-unknown-linux-gnu.tar.gz
 
   release:
     name: Create Release
@@ -121,42 +112,3 @@ jobs:
             --title "CAS $VERSION" \
             --notes "${{ steps.notes.outputs.notes }}" \
             release/*
-
-  update-homebrew:
-    name: Update Homebrew Formula
-    needs: release
-    runs-on: ubuntu-latest
-    # Requires HOMEBREW_TAP_TOKEN secret: a PAT with push access to codingagentsystem/homebrew-cas
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Update Homebrew formula
-        env:
-          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-        run: |
-          if [ -z "${GH_TOKEN}" ]; then
-            echo "HOMEBREW_TAP_TOKEN not set, skipping homebrew update"
-            exit 0
-          fi
-
-          VERSION="${GITHUB_REF#refs/tags/v}"
-
-          # Download and compute SHA256 for each platform
-          MACOS_SHA=$(curl -fsSL "https://github.com/${{ github.repository }}/releases/download/v${VERSION}/cas-aarch64-apple-darwin.tar.gz" | shasum -a 256 | cut -d' ' -f1)
-          LINUX_SHA=$(curl -fsSL "https://github.com/${{ github.repository }}/releases/download/v${VERSION}/cas-x86_64-unknown-linux-gnu.tar.gz" | shasum -a 256 | cut -d' ' -f1)
-
-          # Clone homebrew-cas tap
-          git clone https://x-access-token:${GH_TOKEN}@github.com/codingagentsystem/homebrew-cas.git /tmp/homebrew-cas
-          cd /tmp/homebrew-cas
-
-          # Update version and SHA256 hashes in formula
-          sed -i "s/version \"[^\"]*\"/version \"${VERSION}\"/" Formula/cas.rb
-          sed -i "0,/sha256 \"[a-f0-9]\{64\}\"/s/sha256 \"[a-f0-9]\{64\}\"/sha256 \"${MACOS_SHA}\"/" Formula/cas.rb
-          sed -i "/sha256 \"${MACOS_SHA}\"/!s/sha256 \"[a-f0-9]\{64\}\"/sha256 \"${LINUX_SHA}\"/" Formula/cas.rb
-
-          # Commit and push
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Formula/cas.rb
-          git commit -m "Update CAS to ${VERSION}"
-          git push
