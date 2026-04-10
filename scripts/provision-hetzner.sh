@@ -166,15 +166,14 @@ alias python=python3
 # ── Terminal title ───────────────────────────────────────────────────────────
 precmd() { print -Pn "\e]0;%n@%m: %~\a" }
 
-# ── Environment variables ────────────────────────────────────────────────────
-export GH_TOKEN="YOUR_TOKEN_HERE"
-export GITHUB_TOKEN="$GH_TOKEN"
-export CAS_CLOUD_TOKEN="YOUR_TOKEN_HERE"
-export CAS_CLOUD_ENDPOINT="https://petra-stella-cloud.vercel.app"
-export CONTEXT7_API_KEY="YOUR_TOKEN_HERE"
-export NEON_API_KEY="YOUR_TOKEN_HERE"
-export VERCEL_TOKEN="YOUR_TOKEN_HERE"
-export BROSERLESS_API_KEY="YOUR_TOKEN_HERE"
+# ── Environment variables (loaded from ~/.config/cas/env) ────────────────────
+# Tokens are NOT stored in .zshrc — they live in ~/.config/cas/env
+# Format: KEY=VALUE (one per line, # comments allowed)
+if [ -f "$HOME/.config/cas/env" ]; then
+  set -a
+  source "$HOME/.config/cas/env"
+  set +a
+fi
 
 # ── CAS login ────────────────────────────────────────────────────────────────
 alias cas-login='command cas cloud login --token "$CAS_CLOUD_TOKEN"'
@@ -184,6 +183,24 @@ command cas cloud login --token "$CAS_CLOUD_TOKEN" &>/dev/null || true
 ZSHRC_EOF
 
 chown daniel:daniel "$DANIEL_HOME/.zshrc"
+
+# Create env file template for daniel (tokens filled in manually, not in git)
+mkdir -p "$DANIEL_HOME/.config/cas"
+if [ ! -f "$DANIEL_HOME/.config/cas/env" ]; then
+  cat > "$DANIEL_HOME/.config/cas/env" << 'ENV_EOF'
+# CAS environment — tokens and API keys (not committed to git)
+GH_TOKEN=YOUR_TOKEN_HERE
+GITHUB_TOKEN=YOUR_TOKEN_HERE
+CAS_CLOUD_TOKEN=YOUR_TOKEN_HERE
+CAS_CLOUD_ENDPOINT=https://petra-stella-cloud.vercel.app
+CONTEXT7_API_KEY=YOUR_TOKEN_HERE
+NEON_API_KEY=YOUR_TOKEN_HERE
+VERCEL_TOKEN=YOUR_TOKEN_HERE
+BROSERLESS_API_KEY=YOUR_TOKEN_HERE
+ENV_EOF
+  chmod 600 "$DANIEL_HOME/.config/cas/env"
+fi
+chown -R daniel:daniel "$DANIEL_HOME/.config"
 
 # ── 4b. ben's shell environment (.zshrc) ──────────────────────────────────
 log "ben's shell environment"
@@ -268,15 +285,12 @@ alias python=python3
 # ── Terminal title ───────────────────────────────────────────────────────────
 precmd() { print -Pn "\e]0;%n@%m: %~\a" }
 
-# ── Environment variables (fill in your tokens) ─────────────────────────────
-export GH_TOKEN="YOUR_TOKEN_HERE"
-export GITHUB_TOKEN="$GH_TOKEN"
-export CAS_CLOUD_TOKEN="YOUR_TOKEN_HERE"
-export CAS_CLOUD_ENDPOINT="https://petra-stella-cloud.vercel.app"
-export CONTEXT7_API_KEY="YOUR_TOKEN_HERE"
-export NEON_API_KEY="YOUR_TOKEN_HERE"
-export VERCEL_TOKEN="YOUR_TOKEN_HERE"
-export BROSERLESS_API_KEY="YOUR_TOKEN_HERE"
+# ── Environment variables (loaded from ~/.config/cas/env) ────────────────────
+if [ -f "$HOME/.config/cas/env" ]; then
+  set -a
+  source "$HOME/.config/cas/env"
+  set +a
+fi
 
 # ── CAS login ────────────────────────────────────────────────────────────────
 alias cas-login='command cas cloud login --token "$CAS_CLOUD_TOKEN"'
@@ -286,6 +300,24 @@ command cas cloud login --token "$CAS_CLOUD_TOKEN" &>/dev/null || true
 ZSHRC_BEN_EOF
 
 chown ben:ben "$BEN_HOME/.zshrc"
+
+# Create env file template for ben
+mkdir -p "$BEN_HOME/.config/cas"
+if [ ! -f "$BEN_HOME/.config/cas/env" ]; then
+  cat > "$BEN_HOME/.config/cas/env" << 'ENV_EOF'
+# CAS environment — tokens and API keys (not committed to git)
+GH_TOKEN=YOUR_TOKEN_HERE
+GITHUB_TOKEN=YOUR_TOKEN_HERE
+CAS_CLOUD_TOKEN=YOUR_TOKEN_HERE
+CAS_CLOUD_ENDPOINT=https://petra-stella-cloud.vercel.app
+CONTEXT7_API_KEY=YOUR_TOKEN_HERE
+NEON_API_KEY=YOUR_TOKEN_HERE
+VERCEL_TOKEN=YOUR_TOKEN_HERE
+BROSERLESS_API_KEY=YOUR_TOKEN_HERE
+ENV_EOF
+  chmod 600 "$BEN_HOME/.config/cas/env"
+fi
+chown -R ben:ben "$BEN_HOME/.config"
 
 # ── 4c. SSH keypair for ben ───────────────────────────────────────────────
 log "SSH keypair for ben"
