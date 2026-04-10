@@ -115,18 +115,34 @@ Only close after all checks pass. The verifier will catch what you miss — but 
 
 ## Close-time code review gate
 
-As of Phase 1 (EPIC cas-0750), a multi-persona code review runs automatically inside `task.close`. You do **not** invoke any review tool yourself. This section describes the flow and, critically, what to do when the gate blocks your close.
+As of Phase 1 (EPIC cas-0750), a multi-persona code review runs against every non-trivial close. **You** invoke the `cas-code-review` skill *before* calling `task.close` and pass its structured output to the close handler — close_ops then enforces the P0 gate on what you supplied. This section describes the exact sequence and what to do when the gate blocks your close.
 
 ### What happens at task.close
 
-When you call `mcp__cas__task action=close`, close_ops dispatches the `cas-code-review` skill against your staged / just-committed diff before the task flips to `closed`. The skill:
+The flow is two MCP calls in order:
 
-1. Extracts the set of changed files + base SHA from the worktree.
-2. Dispatches four always-on reviewer personas in parallel (`correctness`, `testing`, `maintainability`, `project-standards`) plus up to three conditional personas (`security`, `performance`, `adversarial`) activated by the diff shape.
-3. Merges their findings through a confidence gate, fingerprint dedup, and cross-reviewer agreement boost.
-4. Runs a bounded autofix loop (max 2 rounds) that applies `safe_auto` findings automatically and re-reviews.
-5. Routes any non-advisory residual findings to follow-up CAS tasks with stable `external_ref` deduplication.
-6. If any P0 residual remains, blocks the close.
+1. **Run the review.** Before `task.close`, invoke the `cas-code-review` skill via the Skill or Task tool with `mode=autofix` and the task ID:
+
+   ```
+   Skill(cas-code-review, mode=autofix, task_id=<your task id>)
+   ```
+
+   The skill internally extracts the changed files + base SHA from your worktree, dispatches four always-on reviewer personas in parallel (`correctness`, `testing`, `maintainability`, `project-standards`) plus up to three conditional personas (`security`, `performance`, `adversarial`) activated by the diff shape, merges their findings through a confidence gate, fingerprint dedup, and cross-reviewer agreement boost, runs a bounded autofix loop (max 2 rounds) that applies `safe_auto` findings automatically and re-reviews, and routes any non-advisory residual findings to follow-up CAS tasks with stable `external_ref` deduplication.
+
+2. **Pass the result to close.** The skill returns a `ReviewOutcome` envelope of shape `{residual: Finding[], pre_existing: Finding[], mode: string}`. JSON-serialize it and pass it to `task.close` via the `code_review_findings` parameter:
+
+   ```
+   mcp__cas__task action=close id=<task id> reason=<...> \
+     code_review_findings='<ReviewOutcome JSON>'
+   ```
+
+   close_ops parses the envelope, validates it, and runs `evaluate_gate` against `residual`. If any non-pre-existing P0 finding is present, the close is hard-blocked. Otherwise the close proceeds normally.
+
+3. **What close_ops does on its own.** Two skip conditions short-circuit the gate without requiring you to pass findings:
+   - `execution_note=additive-only` tasks bypass the gate entirely (additive-only is already covered by the cas-e235 backstop).
+   - Pure docs-only / test-only diffs (`*.md`, `docs/**`, `tests/**`, `*_test.rs`, `*.test.ts`, etc.) skip the gate because there is no reviewable code surface to look at.
+
+   Outside those skips, **calling `task.close` without `code_review_findings` returns `⚠️ CODE_REVIEW_REQUIRED`** with instructions pointing back at this protocol. That is the gate telling you to run the review first.
 
 ### What you'll see
 
