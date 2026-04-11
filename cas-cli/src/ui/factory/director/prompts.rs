@@ -7,6 +7,24 @@ use crate::config::AutoPromptConfig;
 use crate::ui::factory::director::data::DirectorData;
 use crate::ui::factory::director::events::DirectorEvent;
 use cas_mux::SupervisorCli;
+use cas_types::TaskStatus;
+
+/// Count tasks that are actually dispatchable to an idle worker.
+///
+/// `DirectorData::ready_tasks` conflates `Open` and `Blocked` (see
+/// `crates/cas-factory/src/director.rs`). Blocked tasks cannot be started, and
+/// Closed tasks never appear in `ready_tasks` at all, but this count is used
+/// in the `WorkerIdle` / `AgentRegistered` prompts to tell the supervisor how
+/// many tasks are available — if we reported the raw length the supervisor
+/// would be told "there are N ready tasks" and then find nothing to assign
+/// when N of them are actually blocked. Count only `Open` and only tasks
+/// without an assignee already set. See cas-177f.
+fn dispatchable_ready_count(data: &DirectorData) -> usize {
+    data.ready_tasks
+        .iter()
+        .filter(|t| t.status == TaskStatus::Open && t.assignee.is_none())
+        .count()
+}
 
 /// A prompt to be injected into an agent's terminal
 #[derive(Debug, Clone)]
@@ -138,8 +156,9 @@ pub fn generate_prompt(
                 return None;
             }
 
-            // Check if there are ready tasks to assign
-            let ready_count = data.ready_tasks.len();
+            // Count only truly-dispatchable tasks (Open + unassigned). See
+            // `dispatchable_ready_count` for why `ready_tasks.len()` is wrong.
+            let ready_count = dispatchable_ready_count(data);
 
             let text = if ready_count > 0 {
                 format!(
@@ -170,7 +189,7 @@ pub fn generate_prompt(
                 return None;
             }
 
-            let ready_count = data.ready_tasks.len();
+            let ready_count = dispatchable_ready_count(data);
 
             let text = if ready_count > 0 {
                 format!(

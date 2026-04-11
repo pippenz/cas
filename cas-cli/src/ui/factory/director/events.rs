@@ -347,9 +347,22 @@ impl DirectorEventDetector {
             .map(|t| (t.id.as_str(), t))
             .collect();
 
-        // Detect task assignments (task now has assignee that it didn't before)
+        // Detect task assignments (task now has assignee that it didn't before).
+        //
+        // Terminal-status guard (cas-177f): only emit `TaskAssigned` when the
+        // new status is actionable. Closed and Blocked tasks must never
+        // generate dispatch prompts, even if they somehow leak into
+        // `new_state.tasks` via a data-loading bug or future refactor. This
+        // also supersedes the older
+        // `bugfix_director_dispatches_blocked_tasks` memory — the `ready_tasks`
+        // bucket in `crates/cas-factory/src/director.rs` still conflates
+        // `Open | Blocked`, so without this guard blocked assignments would
+        // still be dispatched.
         for (task_id, (new_status, new_assignee)) in &new_state.tasks {
             if let Some(assignee) = new_assignee {
+                let dispatchable =
+                    matches!(new_status, TaskStatus::Open | TaskStatus::InProgress);
+
                 // Check if this is a new assignment
                 let was_assigned = self
                     .last_state
@@ -358,7 +371,7 @@ impl DirectorEventDetector {
                     .map(|(_, old_assignee)| old_assignee.as_ref() == Some(assignee))
                     .unwrap_or(false);
 
-                if !was_assigned && self.is_factory_agent(assignee, data) {
+                if dispatchable && !was_assigned && self.is_factory_agent(assignee, data) {
                     let task_title = task_info
                         .get(task_id.as_str())
                         .map(|t| t.title.clone())

@@ -885,3 +885,195 @@ fn test_in_progress_epic_takes_priority_over_open_with_branch() {
         "InProgress epic should take priority over Open-with-branch"
     );
 }
+
+// ---------------------------------------------------------------------------
+// cas-177f: terminal-status guard on TaskAssigned dispatch
+// ---------------------------------------------------------------------------
+
+/// A recently-closed task must not produce a fresh TaskAssigned event, even
+/// when an idle worker happens to appear on the same refresh tick. This is
+/// the exact shape of the cas-177f repro — solid-jay-17 closed cas-953d and
+/// kept getting re-dispatched.
+#[test]
+fn test_closed_task_not_redispatched_to_idle_worker() {
+    let mut detector =
+        DirectorEventDetector::new(vec!["swift-fox".to_string()], "supervisor".to_string());
+
+    // Initial: task in progress for swift-fox
+    let data1 = DirectorData {
+        ready_tasks: vec![],
+        in_progress_tasks: vec![make_task(
+            "task-1",
+            "Closed Task",
+            TaskStatus::InProgress,
+            Some("agent-1"),
+        )],
+        epic_tasks: vec![],
+        agents: vec![make_agent("agent-1", "swift-fox", Some("task-1"))],
+        activity: vec![],
+        agent_id_to_name: [("agent-1".to_string(), "swift-fox".to_string())]
+            .into_iter()
+            .collect(),
+        changes: vec![],
+        git_loaded: true,
+        reminders: vec![],
+        epic_closed_counts: HashMap::new(),
+    };
+    detector.initialize(&data1);
+
+    // Worker closes task → disappears from active sets, worker goes idle
+    let data2 = DirectorData {
+        ready_tasks: vec![],
+        in_progress_tasks: vec![],
+        epic_tasks: vec![],
+        agents: vec![make_agent("agent-1", "swift-fox", None)],
+        activity: vec![],
+        agent_id_to_name: [("agent-1".to_string(), "swift-fox".to_string())]
+            .into_iter()
+            .collect(),
+        changes: vec![],
+        git_loaded: true,
+        reminders: vec![],
+        epic_closed_counts: HashMap::new(),
+    };
+
+    let events = detector.detect_changes(&data2);
+
+    // TaskCompleted is fine and expected; TaskAssigned for task-1 must NOT fire
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            DirectorEvent::TaskAssigned { task_id, .. } if task_id == "task-1"
+        )),
+        "Closed task must not produce a TaskAssigned event: {events:?}"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            DirectorEvent::TaskCompleted { task_id, .. } if task_id == "task-1"
+        )),
+        "Expected TaskCompleted when in-progress task disappears"
+    );
+}
+
+/// Defensive guard: if a Closed task somehow leaks into `ready_tasks` (e.g.
+/// future refactor of the data-loading filter in
+/// `crates/cas-factory/src/director.rs`), `detect_changes` must still refuse
+/// to fire TaskAssigned for it. This is the "belt-and-suspenders" scenario
+/// the cas-177f acceptance criteria asks for.
+#[test]
+fn test_closed_task_leaked_into_ready_tasks_not_dispatched() {
+    let mut detector =
+        DirectorEventDetector::new(vec!["swift-fox".to_string()], "supervisor".to_string());
+
+    // Initial: empty
+    let data1 = DirectorData {
+        ready_tasks: vec![],
+        in_progress_tasks: vec![],
+        epic_tasks: vec![],
+        agents: vec![make_agent("agent-1", "swift-fox", None)],
+        activity: vec![],
+        agent_id_to_name: [("agent-1".to_string(), "swift-fox".to_string())]
+            .into_iter()
+            .collect(),
+        changes: vec![],
+        git_loaded: true,
+        reminders: vec![],
+        epic_closed_counts: HashMap::new(),
+    };
+    detector.initialize(&data1);
+
+    // Synthetic: closed task with an assignee pushed into ready_tasks. In the
+    // current code path this can't happen because the data loader filters by
+    // status, but the events module must not rely on that invariant.
+    let data2 = DirectorData {
+        ready_tasks: vec![make_task(
+            "task-1",
+            "Leaked Closed Task",
+            TaskStatus::Closed,
+            Some("agent-1"),
+        )],
+        in_progress_tasks: vec![],
+        epic_tasks: vec![],
+        agents: vec![make_agent("agent-1", "swift-fox", None)],
+        activity: vec![],
+        agent_id_to_name: [("agent-1".to_string(), "swift-fox".to_string())]
+            .into_iter()
+            .collect(),
+        changes: vec![],
+        git_loaded: true,
+        reminders: vec![],
+        epic_closed_counts: HashMap::new(),
+    };
+
+    let events = detector.detect_changes(&data2);
+
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            DirectorEvent::TaskAssigned { task_id, .. } if task_id == "task-1"
+        )),
+        "Closed task in ready_tasks must not produce TaskAssigned: {events:?}"
+    );
+}
+
+/// A Blocked task (which currently shares the `ready_tasks` bucket with Open
+/// per `crates/cas-factory/src/director.rs:228`) must not be dispatched to a
+/// worker. This extends the older `bugfix_director_dispatches_blocked_tasks`
+/// memory by pinning the behavior in the events module.
+#[test]
+fn test_blocked_task_not_dispatched() {
+    let mut detector =
+        DirectorEventDetector::new(vec!["swift-fox".to_string()], "supervisor".to_string());
+
+    let data1 = DirectorData {
+        ready_tasks: vec![],
+        in_progress_tasks: vec![],
+        epic_tasks: vec![],
+        agents: vec![make_agent("agent-1", "swift-fox", None)],
+        activity: vec![],
+        agent_id_to_name: [("agent-1".to_string(), "swift-fox".to_string())]
+            .into_iter()
+            .collect(),
+        changes: vec![],
+        git_loaded: true,
+        reminders: vec![],
+        epic_closed_counts: HashMap::new(),
+    };
+    detector.initialize(&data1);
+
+    // Supervisor sets a Blocked task's assignee to swift-fox. The data loader
+    // puts blocked tasks into `ready_tasks`, which is how they reach the
+    // detector today.
+    let data2 = DirectorData {
+        ready_tasks: vec![make_task(
+            "task-1",
+            "Blocked Task",
+            TaskStatus::Blocked,
+            Some("agent-1"),
+        )],
+        in_progress_tasks: vec![],
+        epic_tasks: vec![],
+        agents: vec![make_agent("agent-1", "swift-fox", None)],
+        activity: vec![],
+        agent_id_to_name: [("agent-1".to_string(), "swift-fox".to_string())]
+            .into_iter()
+            .collect(),
+        changes: vec![],
+        git_loaded: true,
+        reminders: vec![],
+        epic_closed_counts: HashMap::new(),
+    };
+
+    let events = detector.detect_changes(&data2);
+
+    // TaskBlocked is expected (separate dispatch concern, routed to
+    // supervisor not worker); TaskAssigned must NOT fire.
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            DirectorEvent::TaskAssigned { task_id, .. } if task_id == "task-1"
+        )),
+        "Blocked task must not produce TaskAssigned: {events:?}"
+    );
+}
