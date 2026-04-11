@@ -1,0 +1,3200 @@
+{
+  "generated_at": "2026-04-11T12:32:19Z",
+  "inventory_script_version": "1.0.0",
+  "source_root": "/home/pippenz/Petrastella",
+  "target_root": "daniel@87.99.156.244:~/projects",
+  "docker_daemon_available": false,
+  "totals": {
+    "project_count": 26,
+    "total_bytes": 36755540195,
+    "total_bytes_excluding_regenerable": 5781841923,
+    "regenerable_bytes": 30973698272
+  },
+  "projects": [
+    {
+      "name": "abundant-mines",
+      "path": "/home/pippenz/Petrastella/abundant-mines",
+      "size_bytes": 3187791294,
+      "size_bytes_excluding_regenerable": 167593183,
+      "regenerable_bytes_total": 3020198111,
+      "regenerable_dirs_standalone_bytes": {
+        ".cas/worktrees": 1465395830,
+        ".next": 0,
+        ".nuxt": 0,
+        ".output": 0,
+        ".pnpm-store": 0,
+        ".svelte-kit": 0,
+        ".turbo": 0,
+        "build": 0,
+        "coverage": 0,
+        "dist": 0,
+        "node_modules": 1353343136,
+        "playwright-report": 17134731,
+        "target": 0,
+        "test-results": 21540675
+      },
+      "git": {
+        "is_repo": true,
+        "current_branch": "fix/billing-cancel-stamp-all-recurring-items",
+        "head_sha": "213e0503b0cb260298c674e1a2b0b922ebe98f94",
+        "remote_urls": [
+          "git@github.com:Richards-LLC/abundant-mines.git",
+          "https://github.com/Richards-LLC/rocketship-template.git"
+        ],
+        "dirty_files": 16,
+        "untracked_files": 9,
+        "stash_count": 12,
+        "unpushed_commits": 0
+      },
+      "cas_db": {
+        "present": true,
+        "path": ".cas/cas.db",
+        "size_bytes": 4423680,
+        "wal_present": true,
+        "shm_present": true,
+        "integrity_check": "ok",
+        "tables": [
+          "agents",
+          "cas_migrations",
+          "code_files",
+          "code_memory_links",
+          "code_relationships",
+          "code_symbols",
+          "commit_links",
+          "daemon_instances",
+          "dependencies",
+          "entities",
+          "entity_mentions",
+          "entries",
+          "events",
+          "file_changes",
+          "file_snapshots",
+          "id_sequences",
+          "line_attributions",
+          "loops",
+          "metadata",
+          "prompt_queue",
+          "prompts",
+          "recording_agents",
+          "recording_events",
+          "recording_text",
+          "recording_text_fts",
+          "recording_text_fts_config",
+          "recording_text_fts_data",
+          "recording_text_fts_docsize",
+          "recording_text_fts_idx",
+          "recordings",
+          "recordings_fts",
+          "recordings_fts_config",
+          "recordings_fts_content",
+          "recordings_fts_data",
+          "recordings_fts_docsize",
+          "recordings_fts_idx",
+          "relationships",
+          "reminders",
+          "rules",
+          "sessions",
+          "skills",
+          "spawn_queue",
+          "specs",
+          "sqlite_sequence",
+          "supervisor_queue",
+          "sync_metadata",
+          "sync_queue",
+          "task_lease_history",
+          "task_leases",
+          "tasks",
+          "verification_issues",
+          "verifications",
+          "working_epics",
+          "worktree_leases",
+          "worktrees"
+        ],
+        "task_counts": {
+          "closed": 160,
+          "open": 54
+        }
+      },
+      "docker": {
+        "bind_mounts": [
+          "./apps/backend",
+          "./apps/frontend",
+          "/app/node_modules"
+        ],
+        "compose_file": "docker-compose.yml",
+        "images": [
+          "postgres:15-alpine",
+          "redis:7-alpine"
+        ],
+        "named_volumes": [
+          "postgres_data",
+          "redis_data"
+        ],
+        "services": [
+          "backend",
+          "frontend",
+          "postgres",
+          "redis"
+        ],
+        "running_containers": [],
+        "volume_sizes": {}
+      },
+      "env_files": [
+        {
+          "path": ".env.graphiti",
+          "size": 294,
+          "modes": "-rwxr-xr-x",
+          "has_localhost_refs": true,
+          "localhost_ref_count": 1,
+          "keys_with_localhost_refs": [
+            "NEO4J_URI"
+          ],
+          "env_keys": [
+            "GRAPHITI_TELEMETRY_ENABLED",
+            "NEO4J_PASSWORD",
+            "NEO4J_URI",
+            "NEO4J_USERNAME"
+          ]
+        },
+        {
+          "path": ".env.playwright",
+          "size": 3685,
+          "modes": "-rwxr-xr-x",
+          "has_localhost_refs": true,
+          "localhost_ref_count": 1,
+          "keys_with_localhost_refs": [
+            "TEST_BACKEND_URL"
+          ],
+          "env_keys": [
+            "DATABASE_URL",
+            "FIREBASE_ADMIN_CLIENT_EMAIL",
+            "FIREBASE_ADMIN_PRIVATE_KEY",
+            "FIREBASE_ADMIN_PROJECT_ID",
+            "FIREBASE_API_KEY",
+            "FIREBASE_AUTH_DOMAIN",
+            "FIREBASE_PROJECT_ID",
+            "TEST_ACCOUNTING_EMAIL",
+            "TEST_ACCOUNTING_PASSWORD",
+            "TEST_BACKEND_URL",
+            "TEST_LEADERSHIP_EMAIL",
+            "TEST_LEADERSHIP_PASSWORD",
+            "TEST_SALES_EMAIL",
+            "TEST_SALES_PASSWORD",
+            "TEST_SUPER_ADMIN_EMAIL",
+            "TEST_SUPER_ADMIN_PASSWORD",
+            "TEST_USER_EMAIL",
+            "TEST_USER_PASSWORD"
+          ]
+        },
+        {
+          "path": ".env.worktree.template",
+          "size": 687,
+          "modes": "-rw-rw-r--",
+          "has_localhost_refs": false,
+          "localhost_ref_count": 0,
+          "keys_with_localhost_refs": [],
+          "env_keys": [
+            "SLOT"
+          ]
+        }
+      ],
+      "package_managers": [
+        "pnpm"
+      ],
+      "languages": [
+        "javascript"
+      ]
+    },
+    {
+      "name": "closure-club",
+      "path": "/home/pippenz/Petrastella/closure-club",
+      "size_bytes": 1099782445,
+      "size_bytes_excluding_regenerable": 21600774,
+      "regenerable_bytes_total": 1078181671,
+      "regenerable_dirs_standalone_bytes": {
+        ".cas/worktrees": 1078181671,
+        ".next": 0,
+        ".nuxt": 0,
+        ".output": 0,
+        ".pnpm-store": 0,
+        ".svelte-kit": 0,
+        ".turbo": 0,
+        "build": 0,
+        "coverage": 0,
+        "dist": 0,
+        "node_modules": 0,
+        "playwright-report": 0,
+        "target": 0,
+        "test-results": 0
+      },
+      "git": {
+        "is_repo": true,
+        "current_branch": "develop",
+        "head_sha": "d3354e04e598c209bfba6e9728062c6d6a8f1e39",
+        "remote_urls": [
+          "git@github.com:Richards-LLC/closure-club.git"
+        ],
+        "dirty_files": 8,
+        "untracked_files": 6,
+        "stash_count": 0,
+        "unpushed_commits": 0
+      },
+      "cas_db": {
+        "present": true,
+        "path": ".cas/cas.db",
+        "size_bytes": 1753088,
+        "wal_present": true,
+        "shm_present": true,
+        "integrity_check": "ok",
+        "tables": [
+          "agents",
+          "cas_migrations",
+          "code_files",
+          "code_memory_links",
+          "code_relationships",
+          "code_symbols",
+          "commit_links",
+          "daemon_instances",
+          "dependencies",
+          "entities",
+          "entity_mentions",
+          "entries",
+          "events",
+          "file_changes",
+          "file_snapshots",
+          "id_sequences",
+          "line_attributions",
+          "loops",
+          "metadata",
+          "prompt_queue",
+          "prompts",
+          "recording_agents",
+          "recording_events",
+          "recording_text",
+          "recording_text_fts",
+          "recording_text_fts_config",
+          "recording_text_fts_data",
+          "recording_text_fts_docsize",
+          "recording_text_fts_idx",
+          "recordings",
+          "recordings_fts",
+          "recordings_fts_config",
+          "recordings_fts_content",
+          "recordings_fts_data",
+          "recordings_fts_docsize",
+          "recordings_fts_idx",
+          "relationships",
+          "reminders",
+          "rules",
+          "sessions",
+          "skills",
+          "spawn_queue",
+          "specs",
+          "sqlite_sequence",
+          "supervisor_queue",
+          "sync_metadata",
+          "sync_queue",
+          "task_lease_history",
+          "task_leases",
+          "tasks",
+          "verification_issues",
+          "verifications",
+          "working_epics",
+          "worktree_leases",
+          "worktrees"
+        ],
+        "task_counts": {
+          "closed": 11,
+          "open": 2
+        }
+      },
+      "docker": {
+        "compose_file": null,
+        "services": [],
+        "images": [],
+        "named_volumes": [],
+        "bind_mounts": [],
+        "running_containers": [],
+        "volume_sizes": {}
+      },
+      "env_files": [
+        {
+          "path": ".env.worktree.template",
+          "size": 687,
+          "modes": "-rw-rw-r--",
+          "has_localhost_refs": false,
+          "localhost_ref_count": 0,
+          "keys_with_localhost_refs": [],
+          "env_keys": [
+            "SLOT"
+          ]
+        }
+      ],
+      "package_managers": [],
+      "languages": []
+    },
+    {
+      "name": "country-liberty",
+      "path": "/home/pippenz/Petrastella/country-liberty",
+      "size_bytes": 1110646,
+      "size_bytes_excluding_regenerable": 1110646,
+      "regenerable_bytes_total": 0,
+      "regenerable_dirs_standalone_bytes": {
+        ".cas/worktrees": 0,
+        ".next": 0,
+        ".nuxt": 0,
+        ".output": 0,
+        ".pnpm-store": 0,
+        ".svelte-kit": 0,
+        ".turbo": 0,
+        "build": 0,
+        "coverage": 0,
+        "dist": 0,
+        "node_modules": 0,
+        "playwright-report": 0,
+        "target": 0,
+        "test-results": 0
+      },
+      "git": {
+        "is_repo": true,
+        "current_branch": "main",
+        "head_sha": "aceca4d79a4018dfb3b2de86af1887fea853a476",
+        "remote_urls": [
+          "https://github.com/Richards-LLC/country-liberty-shopify-admin.git"
+        ],
+        "dirty_files": 46,
+        "untracked_files": 2,
+        "stash_count": 0,
+        "unpushed_commits": 0
+      },
+      "cas_db": {
+        "present": false
+      },
+      "docker": {
+        "compose_file": null,
+        "services": [],
+        "images": [],
+        "named_volumes": [],
+        "bind_mounts": [],
+        "running_containers": [],
+        "volume_sizes": {}
+      },
+      "env_files": [],
+      "package_managers": [
+        "npm"
+      ],
+      "languages": [
+        "javascript",
+        "typescript"
+      ]
+    },
+    {
+      "name": "domdms",
+      "path": "/home/pippenz/Petrastella/domdms",
+      "size_bytes": 4157378492,
+      "size_bytes_excluding_regenerable": 263843157,
+      "regenerable_bytes_total": 3893535335,
+      "regenerable_dirs_standalone_bytes": {
+        ".cas/worktrees": 3603131772,
+        ".next": 0,
+        ".nuxt": 0,
+        ".output": 0,
+        ".pnpm-store": 0,
+        ".svelte-kit": 0,
+        ".turbo": 0,
+        "build": 0,
+        "coverage": 0,
+        "dist": 0,
+        "node_modules": 1312424205,
+        "playwright-report": 0,
+        "target": 0,
+        "test-results": 0
+      },
+      "git": {
+        "is_repo": true,
+        "current_branch": "cas-3c5e-dom2-toggle-ui",
+        "head_sha": "2fa139bf13c21771a10a92e6274697c42968f95a",
+        "remote_urls": [
+          "git@github.com:Richards-LLC/domdms.git",
+          "git@github.com:Richards-LLC/rocketship-template.git"
+        ],
+        "dirty_files": 9,
+        "untracked_files": 25,
+        "stash_count": 5,
+        "unpushed_commits": 0
+      },
+      "cas_db": {
+        "present": true,
+        "path": ".cas/cas.db",
+        "size_bytes": 12365824,
+        "wal_present": true,
+        "shm_present": true,
+        "integrity_check": "ok",
+        "tables": [
+          "agents",
+          "cas_migrations",
+          "code_files",
+          "code_memory_links",
+          "code_relationships",
+          "code_symbols",
+          "commit_links",
+          "daemon_instances",
+          "dependencies",
+          "entities",
+          "entity_mentions",
+          "entries",
+          "events",
+          "file_changes",
+          "file_snapshots",
+          "id_sequences",
+          "line_attributions",
+          "loops",
+          "metadata",
+          "prompt_queue",
+          "prompts",
+          "recording_agents",
+          "recording_events",
+          "recording_text",
+          "recording_text_fts",
+          "recording_text_fts_config",
+          "recording_text_fts_data",
+          "recording_text_fts_docsize",
+          "recording_text_fts_idx",
+          "recordings",
+          "recordings_fts",
+          "recordings_fts_config",
+          "recordings_fts_content",
+          "recordings_fts_data",
+          "recordings_fts_docsize",
+          "recordings_fts_idx",
+          "relationships",
+          "reminders",
+          "rules",
+          "sessions",
+          "skills",
+          "spawn_queue",
+          "specs",
+          "sqlite_sequence",
+          "supervisor_queue",
+          "sync_metadata",
+          "sync_queue",
+          "task_lease_history",
+          "task_leases",
+          "tasks",
+          "verification_issues",
+          "verifications",
+          "working_epics",
+          "worktree_leases",
+          "worktrees"
+        ],
+        "task_counts": {
+          "blocked": 1,
+          "closed": 312,
+          "open": 107
+        }
+      },
+      "docker": {
+        "bind_mounts": [
+          "./apps/backend",
+          "./apps/frontend",
+          "/app/node_modules"
+        ],
+        "compose_file": "docker-compose.yml",
+        "images": [
+          "postgres:15-alpine",
+          "redis:7-alpine"
+        ],
+        "named_volumes": [
+          "postgres_data",
+          "redis_data"
+        ],
+        "services": [
+          "backend",
+          "frontend",
+          "postgres",
+          "redis"
+        ],
+        "running_containers": [],
+        "volume_sizes": {}
+      },
+      "env_files": [
+        {
+          "path": ".env.graphiti",
+          "size": 294,
+          "modes": "-rwxr-xr-x",
+          "has_localhost_refs": true,
+          "localhost_ref_count": 1,
+          "keys_with_localhost_refs": [
+            "NEO4J_URI"
+          ],
+          "env_keys": [
+            "GRAPHITI_TELEMETRY_ENABLED",
+            "NEO4J_PASSWORD",
+            "NEO4J_URI",
+            "NEO4J_USERNAME"
+          ]
+        },
+        {
+          "path": ".env.worktree.template",
+          "size": 687,
+          "modes": "-rw-rw-r--",
+          "has_localhost_refs": false,
+          "localhost_ref_count": 0,
+          "keys_with_localhost_refs": [],
+          "env_keys": [
+            "SLOT"
+          ]
+        }
+      ],
+      "package_managers": [
+        "pnpm"
+      ],
+      "languages": [
+        "javascript"
+      ]
+    },
+    {
+      "name": "edws",
+      "path": "/home/pippenz/Petrastella/edws",
+      "size_bytes": 652074638,
+      "size_bytes_excluding_regenerable": 50859497,
+      "regenerable_bytes_total": 601215141,
+      "regenerable_dirs_standalone_bytes": {
+        ".cas/worktrees": 0,
+        ".next": 0,
+        ".nuxt": 0,
+        ".output": 0,
+        ".pnpm-store": 0,
+        ".svelte-kit": 0,
+        ".turbo": 0,
+        "build": 0,
+        "coverage": 0,
+        "dist": 0,
+        "node_modules": 0,
+        "playwright-report": 0,
+        "target": 0,
+        "test-results": 0
+      },
+      "git": {
+        "is_repo": true,
+        "current_branch": "main",
+        "head_sha": "1ade88d54c58aa00d2e8692f0d181500bc0de8ed",
+        "remote_urls": [
+          "https://github.com/Richards-LLC/edws.git"
+        ],
+        "dirty_files": 201,
+        "untracked_files": 3,
+        "stash_count": 0,
+        "unpushed_commits": 4
+      },
+      "cas_db": {
+        "present": false
+      },
+      "docker": {
+        "compose_file": null,
+        "services": [],
+        "images": [],
+        "named_volumes": [],
+        "bind_mounts": [],
+        "running_containers": [],
+        "volume_sizes": {}
+      },
+      "env_files": [],
+      "package_managers": [],
+      "languages": []
+    },
+    {
+      "name": "fixy-quasar",
+      "path": "/home/pippenz/Petrastella/fixy-quasar",
+      "size_bytes": 144576927,
+      "size_bytes_excluding_regenerable": 144576927,
+      "regenerable_bytes_total": 0,
+      "regenerable_dirs_standalone_bytes": {
+        ".cas/worktrees": 0,
+        ".next": 0,
+        ".nuxt": 0,
+        ".output": 0,
+        ".pnpm-store": 0,
+        ".svelte-kit": 0,
+        ".turbo": 0,
+        "build": 0,
+        "coverage": 0,
+        "dist": 0,
+        "node_modules": 0,
+        "playwright-report": 0,
+        "target": 0,
+        "test-results": 0
+      },
+      "git": {
+        "is_repo": true,
+        "current_branch": "main",
+        "head_sha": "1b8a0ce742155993f4d70a7e42fc94d822d023d7",
+        "remote_urls": [
+          "https://github.com/Richards-LLC/fixy-quasar.git"
+        ],
+        "dirty_files": 664,
+        "untracked_files": 2,
+        "stash_count": 0,
+        "unpushed_commits": 0
+      },
+      "cas_db": {
+        "present": false
+      },
+      "docker": {
+        "compose_file": null,
+        "services": [],
+        "images": [],
+        "named_volumes": [],
+        "bind_mounts": [],
+        "running_containers": [],
+        "volume_sizes": {}
+      },
+      "env_files": [],
+      "package_managers": [
+        "yarn"
+      ],
+      "languages": [
+        "javascript"
+      ]
+    },
+    {
+      "name": "fixyrs",
+      "path": "/home/pippenz/Petrastella/fixyrs",
+      "size_bytes": 1410811095,
+      "size_bytes_excluding_regenerable": 24683329,
+      "regenerable_bytes_total": 1386127766,
+      "regenerable_dirs_standalone_bytes": {
+        ".cas/worktrees": 0,
+        ".next": 0,
+        ".nuxt": 0,
+        ".output": 0,
+        ".pnpm-store": 0,
+        ".svelte-kit": 0,
+        ".turbo": 0,
+        "build": 0,
+        "coverage": 0,
+        "dist": 0,
+        "node_modules": 1296661947,
+        "playwright-report": 0,
+        "target": 0,
+        "test-results": 0
+      },
+      "git": {
+        "is_repo": true,
+        "current_branch": "develop",
+        "head_sha": "e255b0646334f6fac3c09b69c439b0d70b7dba9e",
+        "remote_urls": [
+          "https://github.com/Richards-LLC/fixyrs.git",
+          "https://github.com/Richards-LLC/rocketship-template.git"
+        ],
+        "dirty_files": 310,
+        "untracked_files": 2,
+        "stash_count": 0,
+        "unpushed_commits": 0
+      },
+      "cas_db": {
+        "present": false
+      },
+      "docker": {
+        "bind_mounts": [
+          "./apps/backend",
+          "./apps/frontend",
+          "/app/node_modules"
+        ],
+        "compose_file": "docker-compose.yml",
+        "images": [
+          "postgres:15-alpine",
+          "redis:7-alpine"
+        ],
+        "named_volumes": [
+          "postgres_data",
+          "redis_data"
+        ],
+        "services": [
+          "backend",
+          "frontend",
+          "postgres",
+          "redis"
+        ],
+        "running_containers": [],
+        "volume_sizes": {}
+      },
+      "env_files": [
+        {
+          "path": ".env.graphiti",
+          "size": 305,
+          "modes": "-rwxr-xr-x",
+          "has_localhost_refs": true,
+          "localhost_ref_count": 1,
+          "keys_with_localhost_refs": [
+            "NEO4J_URI"
+          ],
+          "env_keys": [
+            "GRAPHITI_TELEMETRY_ENABLED",
+            "NEO4J_PASSWORD",
+            "NEO4J_URI",
+            "NEO4J_USERNAME"
+          ]
+        }
+      ],
+      "package_managers": [
+        "pnpm"
+      ],
+      "languages": [
+        "javascript"
+      ]
+    },
+    {
+      "name": "full-package-media",
+      "path": "/home/pippenz/Petrastella/full-package-media",
+      "size_bytes": 14940147,
+      "size_bytes_excluding_regenerable": 14940147,
+      "regenerable_bytes_total": 0,
+      "regenerable_dirs_standalone_bytes": {
+        ".cas/worktrees": 0,
+        ".next": 0,
+        ".nuxt": 0,
+        ".output": 0,
+        ".pnpm-store": 0,
+        ".svelte-kit": 0,
+        ".turbo": 0,
+        "build": 0,
+        "coverage": 0,
+        "dist": 0,
+        "node_modules": 0,
+        "playwright-report": 0,
+        "target": 0,
+        "test-results": 0
+      },
+      "git": {
+        "is_repo": true,
+        "current_branch": "develop",
+        "head_sha": "384768fab058835095674086b685b97d970dd618",
+        "remote_urls": [
+          "https://github.com/Richards-LLC/full-package-media"
+        ],
+        "dirty_files": 0,
+        "untracked_files": 2,
+        "stash_count": 0,
+        "unpushed_commits": 0
+      },
+      "cas_db": {
+        "present": false
+      },
+      "docker": {
+        "compose_file": null,
+        "services": [],
+        "images": [],
+        "named_volumes": [],
+        "bind_mounts": [],
+        "running_containers": [],
+        "volume_sizes": {}
+      },
+      "env_files": [],
+      "package_managers": [],
+      "languages": []
+    },
+    {
+      "name": "gabber-studio",
+      "path": "/home/pippenz/Petrastella/gabber-studio",
+      "size_bytes": 3936889854,
+      "size_bytes_excluding_regenerable": 539143034,
+      "regenerable_bytes_total": 3397746820,
+      "regenerable_dirs_standalone_bytes": {
+        ".cas/worktrees": 2525423314,
+        ".next": 0,
+        ".nuxt": 0,
+        ".output": 0,
+        ".pnpm-store": 0,
+        ".svelte-kit": 0,
+        ".turbo": 0,
+        "build": 0,
+        "coverage": 0,
+        "dist": 0,
+        "node_modules": 1913587336,
+        "playwright-report": 517128,
+        "target": 0,
+        "test-results": 46291
+      },
+      "git": {
+        "is_repo": true,
+        "current_branch": "fix/invite-dto-import",
+        "head_sha": "0dc4a3fab53e53abce83cd815b131a2ccf9c0e17",
+        "remote_urls": [
+          "git@github.com:Richards-LLC/gabber-studio.git",
+          "https://github.com/Richards-LLC/rocketship-template.git"
+        ],
+        "dirty_files": 0,
+        "untracked_files": 7,
+        "stash_count": 16,
+        "unpushed_commits": 0
+      },
+      "cas_db": {
+        "present": true,
+        "path": ".cas/cas.db",
+        "size_bytes": 21889024,
+        "wal_present": true,
+        "shm_present": true,
+        "integrity_check": "ok",
+        "tables": [
+          "agents",
+          "cas_migrations",
+          "code_files",
+          "code_memory_links",
+          "code_relationships",
+          "code_symbols",
+          "commit_links",
+          "daemon_instances",
+          "dependencies",
+          "entities",
+          "entity_mentions",
+          "entries",
+          "events",
+          "file_changes",
+          "file_snapshots",
+          "id_sequences",
+          "line_attributions",
+          "loops",
+          "metadata",
+          "prompt_queue",
+          "prompts",
+          "recording_agents",
+          "recording_events",
+          "recording_text",
+          "recording_text_fts",
+          "recording_text_fts_config",
+          "recording_text_fts_data",
+          "recording_text_fts_docsize",
+          "recording_text_fts_idx",
+          "recordings",
+          "recordings_fts",
+          "recordings_fts_config",
+          "recordings_fts_content",
+          "recordings_fts_data",
+          "recordings_fts_docsize",
+          "recordings_fts_idx",
+          "relationships",
+          "reminders",
+          "rules",
+          "sessions",
+          "skills",
+          "spawn_queue",
+          "specs",
+          "sqlite_sequence",
+          "supervisor_queue",
+          "sync_metadata",
+          "sync_queue",
+          "task_lease_history",
+          "task_leases",
+          "tasks",
+          "verification_issues",
+          "verifications",
+          "working_epics",
+          "worktree_leases",
+          "worktrees"
+        ],
+        "task_counts": {
+          "closed": 840,
+          "open": 66
+        }
+      },
+      "docker": {
+        "bind_mounts": [
+          "./apps/backend",
+          "./apps/frontend",
+          "/app/node_modules"
+        ],
+        "compose_file": "docker-compose.yml",
+        "images": [
+          "postgres:15-alpine",
+          "redis:7-alpine"
+        ],
+        "named_volumes": [
+          "postgres_data",
+          "redis_data"
+        ],
+        "services": [
+          "backend",
+          "frontend",
+          "postgres",
+          "redis"
+        ],
+        "running_containers": [],
+        "volume_sizes": {}
+      },
+      "env_files": [
+        {
+          "path": ".env.graphiti",
+          "size": 294,
+          "modes": "-rwxr-xr-x",
+          "has_localhost_refs": true,
+          "localhost_ref_count": 1,
+          "keys_with_localhost_refs": [
+            "NEO4J_URI"
+          ],
+          "env_keys": [
+            "GRAPHITI_TELEMETRY_ENABLED",
+            "NEO4J_PASSWORD",
+            "NEO4J_URI",
+            "NEO4J_USERNAME"
+          ]
+        },
+        {
+          "path": ".env.local",
+          "size": 2941,
+          "modes": "-rwxr-xr-x",
+          "has_localhost_refs": false,
+          "localhost_ref_count": 0,
+          "keys_with_localhost_refs": [],
+          "env_keys": [
+            "API_BASE",
+            "CRON_SECRET",
+            "FIREBASE_API_KEY",
+            "FIREBASE_APP_ID",
+            "FIREBASE_AUTH_DOMAIN",
+            "FIREBASE_MESSAGING_SENDER_ID",
+            "FIREBASE_PROJECT_ID",
+            "FIREBASE_STORAGE_BUCKET",
+            "NODE_ENV",
+            "NUXT_PUBLIC_API_BASE",
+            "NUXT_PUBLIC_APP_DESCRIPTION",
+            "NUXT_PUBLIC_APP_NAME",
+            "NUXT_PUBLIC_CAPACITOR_APP_ID",
+            "NUXT_PUBLIC_CAPACITOR_APP_NAME",
+            "NUXT_PUBLIC_FIREBASE_API_KEY",
+            "NUXT_PUBLIC_FIREBASE_APP_ID",
+            "NUXT_PUBLIC_FIREBASE_AUTH_DOMAIN",
+            "NUXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID",
+            "NUXT_PUBLIC_FIREBASE_PROJECT_ID",
+            "NUXT_PUBLIC_FIREBASE_STORAGE_BUCKET",
+            "NUXT_PUBLIC_SITE_URL",
+            "NUXT_PUBLIC_STRIPE_PUBLISHABLE_KEY",
+            "NX_DAEMON",
+            "TURBO_CACHE",
+            "TURBO_DOWNLOAD_LOCAL_ENABLED",
+            "TURBO_REMOTE_ONLY",
+            "TURBO_RUN_SUMMARY",
+            "VERCEL",
+            "VERCEL_ENV",
+            "VERCEL_GIT_COMMIT_AUTHOR_LOGIN",
+            "VERCEL_GIT_COMMIT_AUTHOR_NAME",
+            "VERCEL_GIT_COMMIT_MESSAGE",
+            "VERCEL_GIT_COMMIT_REF",
+            "VERCEL_GIT_COMMIT_SHA",
+            "VERCEL_GIT_PREVIOUS_SHA",
+            "VERCEL_GIT_PROVIDER",
+            "VERCEL_GIT_PULL_REQUEST_ID",
+            "VERCEL_GIT_REPO_ID",
+            "VERCEL_GIT_REPO_OWNER",
+            "VERCEL_GIT_REPO_SLUG",
+            "VERCEL_OIDC_TOKEN",
+            "VERCEL_TARGET_ENV",
+            "VERCEL_URL"
+          ]
+        },
+        {
+          "path": ".env.worktree.template",
+          "size": 687,
+          "modes": "-rw-rw-r--",
+          "has_localhost_refs": false,
+          "localhost_ref_count": 0,
+          "keys_with_localhost_refs": [],
+          "env_keys": [
+            "SLOT"
+          ]
+        }
+      ],
+      "package_managers": [
+        "pnpm"
+      ],
+      "languages": [
+        "javascript"
+      ]
+    },
+    {
+      "name": "git-mcp-server",
+      "path": "/home/pippenz/Petrastella/git-mcp-server",
+      "size_bytes": 193689848,
+      "size_bytes_excluding_regenerable": 2128558,
+      "regenerable_bytes_total": 191561290,
+      "regenerable_dirs_standalone_bytes": {
+        ".cas/worktrees": 0,
+        ".next": 0,
+        ".nuxt": 0,
+        ".output": 0,
+        ".pnpm-store": 0,
+        ".svelte-kit": 0,
+        ".turbo": 0,
+        "build": 0,
+        "coverage": 0,
+        "dist": 918360,
+        "node_modules": 190642930,
+        "playwright-report": 0,
+        "target": 0,
+        "test-results": 0
+      },
+      "git": {
+        "is_repo": true,
+        "current_branch": "main",
+        "head_sha": "d83775a60bedd7ee095a79d89c0c63f00dd82ebd",
+        "remote_urls": [
+          "https://github.com/cyanheads/git-mcp-server.git"
+        ],
+        "dirty_files": 161,
+        "untracked_files": 1,
+        "stash_count": 0,
+        "unpushed_commits": 0
+      },
+      "cas_db": {
+        "present": false
+      },
+      "docker": {
+        "compose_file": null,
+        "services": [],
+        "images": [],
+        "named_volumes": [],
+        "bind_mounts": [],
+        "running_containers": [],
+        "volume_sizes": {}
+      },
+      "env_files": [
+        {
+          "path": ".env.example",
+          "size": 1096,
+          "modes": "-rwxr-xr-x",
+          "has_localhost_refs": false,
+          "localhost_ref_count": 0,
+          "keys_with_localhost_refs": [],
+          "env_keys": []
+        }
+      ],
+      "package_managers": [
+        "npm"
+      ],
+      "languages": [
+        "javascript",
+        "typescript"
+      ]
+    },
+    {
+      "name": "homeschool-whisper",
+      "path": "/home/pippenz/Petrastella/homeschool-whisper",
+      "size_bytes": 2171234135,
+      "size_bytes_excluding_regenerable": 39217907,
+      "regenerable_bytes_total": 2132016228,
+      "regenerable_dirs_standalone_bytes": {
+        ".cas/worktrees": 0,
+        ".next": 0,
+        ".nuxt": 0,
+        ".output": 0,
+        ".pnpm-store": 1876035709,
+        ".svelte-kit": 0,
+        ".turbo": 0,
+        "build": 0,
+        "coverage": 0,
+        "dist": 0,
+        "node_modules": 1960262934,
+        "playwright-report": 0,
+        "target": 0,
+        "test-results": 0
+      },
+      "git": {
+        "is_repo": true,
+        "current_branch": "develop",
+        "head_sha": "1aed3b5ab8e807c8cafb3ea94feba90ad8345778",
+        "remote_urls": [
+          "git@github.com:Richards-LLC/homeschool-whisper.git",
+          "https://github.com/Richards-LLC/rocketship-template.git"
+        ],
+        "dirty_files": 1,
+        "untracked_files": 5,
+        "stash_count": 0,
+        "unpushed_commits": 0
+      },
+      "cas_db": {
+        "present": true,
+        "path": ".cas/cas.db",
+        "size_bytes": 909312,
+        "wal_present": true,
+        "shm_present": true,
+        "integrity_check": "ok",
+        "tables": [
+          "agents",
+          "cas_migrations",
+          "code_files",
+          "code_memory_links",
+          "code_relationships",
+          "code_symbols",
+          "commit_links",
+          "daemon_instances",
+          "dependencies",
+          "entities",
+          "entity_mentions",
+          "entries",
+          "events",
+          "file_changes",
+          "file_snapshots",
+          "id_sequences",
+          "line_attributions",
+          "loops",
+          "metadata",
+          "prompts",
+          "recording_agents",
+          "recording_events",
+          "recording_text",
+          "recording_text_fts",
+          "recording_text_fts_config",
+          "recording_text_fts_data",
+          "recording_text_fts_docsize",
+          "recording_text_fts_idx",
+          "recordings",
+          "recordings_fts",
+          "recordings_fts_config",
+          "recordings_fts_content",
+          "recordings_fts_data",
+          "recordings_fts_docsize",
+          "recordings_fts_idx",
+          "relationships",
+          "rules",
+          "sessions",
+          "skills",
+          "specs",
+          "sqlite_sequence",
+          "supervisor_queue",
+          "sync_metadata",
+          "sync_queue",
+          "task_lease_history",
+          "task_leases",
+          "tasks",
+          "verification_issues",
+          "verifications",
+          "working_epics",
+          "worktree_leases",
+          "worktrees"
+        ],
+        "task_counts": {}
+      },
+      "docker": {
+        "bind_mounts": [
+          "./apps/backend",
+          "./apps/frontend",
+          "/app/node_modules"
+        ],
+        "compose_file": "docker-compose.yml",
+        "images": [
+          "postgres:15-alpine",
+          "redis:7-alpine"
+        ],
+        "named_volumes": [
+          "postgres_data",
+          "redis_data"
+        ],
+        "services": [
+          "backend",
+          "frontend",
+          "postgres",
+          "redis"
+        ],
+        "running_containers": [],
+        "volume_sizes": {}
+      },
+      "env_files": [
+        {
+          "path": ".env.graphiti",
+          "size": 294,
+          "modes": "-rw-rw-r--",
+          "has_localhost_refs": true,
+          "localhost_ref_count": 1,
+          "keys_with_localhost_refs": [
+            "NEO4J_URI"
+          ],
+          "env_keys": [
+            "GRAPHITI_TELEMETRY_ENABLED",
+            "NEO4J_PASSWORD",
+            "NEO4J_URI",
+            "NEO4J_USERNAME"
+          ]
+        },
+        {
+          "path": ".env.worktree.template",
+          "size": 687,
+          "modes": "-rw-rw-r--",
+          "has_localhost_refs": false,
+          "localhost_ref_count": 0,
+          "keys_with_localhost_refs": [],
+          "env_keys": [
+            "SLOT"
+          ]
+        }
+      ],
+      "package_managers": [
+        "pnpm"
+      ],
+      "languages": [
+        "javascript"
+      ]
+    },
+    {
+      "name": "logging",
+      "path": "/home/pippenz/Petrastella/logging",
+      "size_bytes": 103260,
+      "size_bytes_excluding_regenerable": 103260,
+      "regenerable_bytes_total": 0,
+      "regenerable_dirs_standalone_bytes": {
+        ".cas/worktrees": 0,
+        ".next": 0,
+        ".nuxt": 0,
+        ".output": 0,
+        ".pnpm-store": 0,
+        ".svelte-kit": 0,
+        ".turbo": 0,
+        "build": 0,
+        "coverage": 0,
+        "dist": 0,
+        "node_modules": 0,
+        "playwright-report": 0,
+        "target": 0,
+        "test-results": 0
+      },
+      "git": {
+        "is_repo": false
+      },
+      "cas_db": {
+        "present": false
+      },
+      "docker": {
+        "compose_file": null,
+        "services": [],
+        "images": [],
+        "named_volumes": [],
+        "bind_mounts": [],
+        "running_containers": [],
+        "volume_sizes": {}
+      },
+      "env_files": [
+        {
+          "path": ".env.example",
+          "size": 298,
+          "modes": "-rwxr-xr-x",
+          "has_localhost_refs": false,
+          "localhost_ref_count": 0,
+          "keys_with_localhost_refs": [],
+          "env_keys": [
+            "ADMIN_TOKEN",
+            "DATABASE_URL",
+            "LOGGING_API_KEYS",
+            "NEXT_PUBLIC_LOGGING_API_KEY",
+            "NEXT_PUBLIC_LOGGING_API_URL",
+            "NODE_ENV",
+            "RATE_LIMIT_PER_MIN",
+            "REDACT_PATTERNS",
+            "RETENTION_DAYS",
+            "VERCEL_TOKEN",
+            "VIEWER_TOKEN"
+          ]
+        }
+      ],
+      "package_managers": [],
+      "languages": [
+        "javascript"
+      ]
+    },
+    {
+      "name": "memory-lane",
+      "path": "/home/pippenz/Petrastella/memory-lane",
+      "size_bytes": 1783151,
+      "size_bytes_excluding_regenerable": 1783151,
+      "regenerable_bytes_total": 0,
+      "regenerable_dirs_standalone_bytes": {
+        ".cas/worktrees": 0,
+        ".next": 0,
+        ".nuxt": 0,
+        ".output": 0,
+        ".pnpm-store": 0,
+        ".svelte-kit": 0,
+        ".turbo": 0,
+        "build": 0,
+        "coverage": 0,
+        "dist": 0,
+        "node_modules": 0,
+        "playwright-report": 0,
+        "target": 0,
+        "test-results": 0
+      },
+      "git": {
+        "is_repo": false
+      },
+      "cas_db": {
+        "present": false
+      },
+      "docker": {
+        "compose_file": null,
+        "services": [],
+        "images": [],
+        "named_volumes": [],
+        "bind_mounts": [],
+        "running_containers": [],
+        "volume_sizes": {}
+      },
+      "env_files": [
+        {
+          "path": ".env",
+          "size": 443,
+          "modes": "-rwxr-xr-x",
+          "has_localhost_refs": false,
+          "localhost_ref_count": 0,
+          "keys_with_localhost_refs": [],
+          "env_keys": [
+            "OPENAI_API_KEY"
+          ]
+        }
+      ],
+      "package_managers": [
+        "pip"
+      ],
+      "languages": [
+        "python"
+      ]
+    },
+    {
+      "name": "memory-lane-cloud",
+      "path": "/home/pippenz/Petrastella/memory-lane-cloud",
+      "size_bytes": 2623540775,
+      "size_bytes_excluding_regenerable": 72660552,
+      "regenerable_bytes_total": 2550880223,
+      "regenerable_dirs_standalone_bytes": {
+        ".cas/worktrees": 0,
+        ".next": 0,
+        ".nuxt": 0,
+        ".output": 0,
+        ".pnpm-store": 0,
+        ".svelte-kit": 0,
+        ".turbo": 225174560,
+        "build": 0,
+        "coverage": 0,
+        "dist": 0,
+        "node_modules": 1891837841,
+        "playwright-report": 0,
+        "target": 0,
+        "test-results": 0
+      },
+      "git": {
+        "is_repo": true,
+        "current_branch": "main",
+        "head_sha": "e44d7119715031fb1f5de4f478aaadb1a0d6adc9",
+        "remote_urls": [
+          "https://github.com/Richards-LLC/memory-lane-cloud.git"
+        ],
+        "dirty_files": 0,
+        "untracked_files": 2,
+        "stash_count": 0,
+        "unpushed_commits": 0
+      },
+      "cas_db": {
+        "present": false
+      },
+      "docker": {
+        "compose_file": null,
+        "services": [],
+        "images": [],
+        "named_volumes": [],
+        "bind_mounts": [],
+        "running_containers": [],
+        "volume_sizes": {}
+      },
+      "env_files": [],
+      "package_managers": [
+        "pnpm"
+      ],
+      "languages": [
+        "javascript",
+        "typescript"
+      ]
+    },
+    {
+      "name": "ozer",
+      "path": "/home/pippenz/Petrastella/ozer",
+      "size_bytes": 2737251464,
+      "size_bytes_excluding_regenerable": 214169066,
+      "regenerable_bytes_total": 2523082398,
+      "regenerable_dirs_standalone_bytes": {
+        ".cas/worktrees": 0,
+        ".next": 0,
+        ".nuxt": 0,
+        ".output": 0,
+        ".pnpm-store": 0,
+        ".svelte-kit": 0,
+        ".turbo": 0,
+        "build": 0,
+        "coverage": 0,
+        "dist": 0,
+        "node_modules": 20006980,
+        "playwright-report": 533524,
+        "target": 0,
+        "test-results": 194
+      },
+      "git": {
+        "is_repo": true,
+        "current_branch": "main",
+        "head_sha": "8b6b1be10bf439cf939552ad1a83d5d6ddbd9737",
+        "remote_urls": [
+          "git@github.com:Richards-LLC/ozer-health.git"
+        ],
+        "dirty_files": 5,
+        "untracked_files": 19,
+        "stash_count": 9,
+        "unpushed_commits": 0
+      },
+      "cas_db": {
+        "present": true,
+        "path": ".cas/cas.db",
+        "size_bytes": 17338368,
+        "wal_present": true,
+        "shm_present": true,
+        "integrity_check": "ok",
+        "tables": [
+          "agents",
+          "cas_migrations",
+          "code_files",
+          "code_memory_links",
+          "code_relationships",
+          "code_symbols",
+          "commit_links",
+          "daemon_instances",
+          "dependencies",
+          "entities",
+          "entity_mentions",
+          "entries",
+          "events",
+          "file_changes",
+          "file_snapshots",
+          "id_sequences",
+          "line_attributions",
+          "loops",
+          "metadata",
+          "prompt_queue",
+          "prompts",
+          "recording_agents",
+          "recording_events",
+          "recording_text",
+          "recording_text_fts",
+          "recording_text_fts_config",
+          "recording_text_fts_data",
+          "recording_text_fts_docsize",
+          "recording_text_fts_idx",
+          "recordings",
+          "recordings_fts",
+          "recordings_fts_config",
+          "recordings_fts_content",
+          "recordings_fts_data",
+          "recordings_fts_docsize",
+          "recordings_fts_idx",
+          "relationships",
+          "reminders",
+          "rules",
+          "sessions",
+          "skills",
+          "spawn_queue",
+          "specs",
+          "sqlite_sequence",
+          "supervisor_queue",
+          "sync_metadata",
+          "sync_queue",
+          "task_lease_history",
+          "task_leases",
+          "tasks",
+          "verification_issues",
+          "verifications",
+          "working_epics",
+          "worktree_leases",
+          "worktrees"
+        ],
+        "task_counts": {
+          "closed": 313,
+          "open": 110
+        }
+      },
+      "docker": {
+        "compose_file": null,
+        "services": [],
+        "images": [],
+        "named_volumes": [],
+        "bind_mounts": [],
+        "running_containers": [],
+        "volume_sizes": {}
+      },
+      "env_files": [
+        {
+          "path": ".env.worktree.template",
+          "size": 687,
+          "modes": "-rw-rw-r--",
+          "has_localhost_refs": false,
+          "localhost_ref_count": 0,
+          "keys_with_localhost_refs": [],
+          "env_keys": [
+            "SLOT"
+          ]
+        }
+      ],
+      "package_managers": [
+        "npm",
+        "yarn"
+      ],
+      "languages": [
+        "javascript"
+      ]
+    },
+    {
+      "name": "pantheon",
+      "path": "/home/pippenz/Petrastella/pantheon",
+      "size_bytes": 1649151985,
+      "size_bytes_excluding_regenerable": 44193730,
+      "regenerable_bytes_total": 1604958255,
+      "regenerable_dirs_standalone_bytes": {
+        ".cas/worktrees": 36343497,
+        ".next": 0,
+        ".nuxt": 0,
+        ".output": 0,
+        ".pnpm-store": 0,
+        ".svelte-kit": 0,
+        ".turbo": 0,
+        "build": 0,
+        "coverage": 0,
+        "dist": 0,
+        "node_modules": 1512139608,
+        "playwright-report": 532648,
+        "target": 0,
+        "test-results": 45
+      },
+      "git": {
+        "is_repo": true,
+        "current_branch": "develop",
+        "head_sha": "7de68dd03da8527d1fa4536f9ca0f437b46a877a",
+        "remote_urls": [
+          "git@github.com:Richards-LLC/pantheon.git",
+          "https://github.com/Richards-LLC/rocketship-template.git"
+        ],
+        "dirty_files": 0,
+        "untracked_files": 12,
+        "stash_count": 0,
+        "unpushed_commits": 0
+      },
+      "cas_db": {
+        "present": true,
+        "path": ".cas/cas.db",
+        "size_bytes": 1138688,
+        "wal_present": true,
+        "shm_present": true,
+        "integrity_check": "ok",
+        "tables": [
+          "agents",
+          "cas_migrations",
+          "code_files",
+          "code_memory_links",
+          "code_relationships",
+          "code_symbols",
+          "commit_links",
+          "daemon_instances",
+          "dependencies",
+          "entities",
+          "entity_mentions",
+          "entries",
+          "events",
+          "file_changes",
+          "file_snapshots",
+          "id_sequences",
+          "line_attributions",
+          "loops",
+          "metadata",
+          "prompt_queue",
+          "prompts",
+          "recording_agents",
+          "recording_events",
+          "recording_text",
+          "recording_text_fts",
+          "recording_text_fts_config",
+          "recording_text_fts_data",
+          "recording_text_fts_docsize",
+          "recording_text_fts_idx",
+          "recordings",
+          "recordings_fts",
+          "recordings_fts_config",
+          "recordings_fts_content",
+          "recordings_fts_data",
+          "recordings_fts_docsize",
+          "recordings_fts_idx",
+          "relationships",
+          "reminders",
+          "rules",
+          "sessions",
+          "skills",
+          "spawn_queue",
+          "specs",
+          "sqlite_sequence",
+          "supervisor_queue",
+          "sync_metadata",
+          "sync_queue",
+          "task_lease_history",
+          "task_leases",
+          "tasks",
+          "verification_issues",
+          "verifications",
+          "working_epics",
+          "worktree_leases",
+          "worktrees"
+        ],
+        "task_counts": {
+          "closed": 8,
+          "open": 14
+        }
+      },
+      "docker": {
+        "bind_mounts": [
+          "./apps/backend",
+          "./apps/frontend",
+          "/app/node_modules"
+        ],
+        "compose_file": "docker-compose.yml",
+        "images": [
+          "postgres:15-alpine",
+          "redis:7-alpine"
+        ],
+        "named_volumes": [
+          "postgres_data",
+          "redis_data"
+        ],
+        "services": [
+          "backend",
+          "frontend",
+          "postgres",
+          "redis"
+        ],
+        "running_containers": [],
+        "volume_sizes": {}
+      },
+      "env_files": [
+        {
+          "path": ".env.worktree.template",
+          "size": 687,
+          "modes": "-rw-rw-r--",
+          "has_localhost_refs": false,
+          "localhost_ref_count": 0,
+          "keys_with_localhost_refs": [],
+          "env_keys": [
+            "SLOT"
+          ]
+        }
+      ],
+      "package_managers": [
+        "pnpm"
+      ],
+      "languages": [
+        "javascript"
+      ]
+    },
+    {
+      "name": "petra-stella-cloud",
+      "path": "/home/pippenz/Petrastella/petra-stella-cloud",
+      "size_bytes": 774647134,
+      "size_bytes_excluding_regenerable": 23777624,
+      "regenerable_bytes_total": 750869510,
+      "regenerable_dirs_standalone_bytes": {
+        ".cas/worktrees": 584836091,
+        ".next": 164526038,
+        ".nuxt": 0,
+        ".output": 0,
+        ".pnpm-store": 0,
+        ".svelte-kit": 0,
+        ".turbo": 0,
+        "build": 0,
+        "coverage": 0,
+        "dist": 0,
+        "node_modules": 501856102,
+        "playwright-report": 0,
+        "target": 0,
+        "test-results": 0
+      },
+      "git": {
+        "is_repo": true,
+        "current_branch": "main",
+        "head_sha": "999ebd966927f339b5639ff979efba8a31f9d0d0",
+        "remote_urls": [
+          "git@github.com:Richards-LLC/petra-stella-cloud.git"
+        ],
+        "dirty_files": 8,
+        "untracked_files": 9,
+        "stash_count": 0,
+        "unpushed_commits": 1
+      },
+      "cas_db": {
+        "present": true,
+        "path": ".cas/cas.db",
+        "size_bytes": 20684800,
+        "wal_present": true,
+        "shm_present": true,
+        "integrity_check": "ok",
+        "tables": [
+          "agents",
+          "cas_migrations",
+          "code_files",
+          "code_memory_links",
+          "code_relationships",
+          "code_symbols",
+          "commit_links",
+          "daemon_instances",
+          "dependencies",
+          "entities",
+          "entity_mentions",
+          "entries",
+          "events",
+          "file_changes",
+          "file_snapshots",
+          "id_sequences",
+          "line_attributions",
+          "loops",
+          "metadata",
+          "prompt_queue",
+          "prompts",
+          "recording_agents",
+          "recording_events",
+          "recording_text",
+          "recording_text_fts",
+          "recording_text_fts_config",
+          "recording_text_fts_data",
+          "recording_text_fts_docsize",
+          "recording_text_fts_idx",
+          "recordings",
+          "recordings_fts",
+          "recordings_fts_config",
+          "recordings_fts_content",
+          "recordings_fts_data",
+          "recordings_fts_docsize",
+          "recordings_fts_idx",
+          "relationships",
+          "reminders",
+          "rules",
+          "sessions",
+          "skills",
+          "spawn_queue",
+          "specs",
+          "sqlite_sequence",
+          "supervisor_queue",
+          "sync_metadata",
+          "sync_queue",
+          "task_lease_history",
+          "task_leases",
+          "tasks",
+          "verification_issues",
+          "verifications",
+          "working_epics",
+          "worktree_leases",
+          "worktrees"
+        ],
+        "task_counts": {
+          "closed": 715,
+          "open": 55
+        }
+      },
+      "docker": {
+        "compose_file": null,
+        "services": [],
+        "images": [],
+        "named_volumes": [],
+        "bind_mounts": [],
+        "running_containers": [],
+        "volume_sizes": {}
+      },
+      "env_files": [
+        {
+          "path": ".env",
+          "size": 262,
+          "modes": "-rw-rw-r--",
+          "has_localhost_refs": false,
+          "localhost_ref_count": 0,
+          "keys_with_localhost_refs": [],
+          "env_keys": [
+            "DATABASE_URL",
+            "DIRECT_URL"
+          ]
+        },
+        {
+          "path": ".env.example",
+          "size": 134,
+          "modes": "-rw-rw-r--",
+          "has_localhost_refs": false,
+          "localhost_ref_count": 0,
+          "keys_with_localhost_refs": [],
+          "env_keys": [
+            "DATABASE_URL",
+            "DIRECT_URL"
+          ]
+        },
+        {
+          "path": ".env.worktree.template",
+          "size": 687,
+          "modes": "-rw-rw-r--",
+          "has_localhost_refs": false,
+          "localhost_ref_count": 0,
+          "keys_with_localhost_refs": [],
+          "env_keys": [
+            "SLOT"
+          ]
+        }
+      ],
+      "package_managers": [
+        "pnpm"
+      ],
+      "languages": [
+        "javascript",
+        "nextjs",
+        "typescript"
+      ]
+    },
+    {
+      "name": "petrastella-aws",
+      "path": "/home/pippenz/Petrastella/petrastella-aws",
+      "size_bytes": 3860213186,
+      "size_bytes_excluding_regenerable": 3603098602,
+      "regenerable_bytes_total": 257114584,
+      "regenerable_dirs_standalone_bytes": {
+        ".cas/worktrees": 0,
+        ".next": 0,
+        ".nuxt": 0,
+        ".output": 0,
+        ".pnpm-store": 0,
+        ".svelte-kit": 0,
+        ".turbo": 0,
+        "build": 0,
+        "coverage": 0,
+        "dist": 0,
+        "node_modules": 206471341,
+        "playwright-report": 0,
+        "target": 0,
+        "test-results": 0
+      },
+      "git": {
+        "is_repo": true,
+        "current_branch": "main",
+        "head_sha": "940790ecc9b8a7c7e3876ff5d7455f0d2c5c7c64",
+        "remote_urls": [],
+        "dirty_files": 143,
+        "untracked_files": 248,
+        "stash_count": 0,
+        "unpushed_commits": 0
+      },
+      "cas_db": {
+        "present": true,
+        "path": ".cas/cas.db",
+        "size_bytes": 921600,
+        "wal_present": true,
+        "shm_present": true,
+        "integrity_check": "ok",
+        "tables": [
+          "agents",
+          "cas_migrations",
+          "code_files",
+          "code_memory_links",
+          "code_relationships",
+          "code_symbols",
+          "commit_links",
+          "daemon_instances",
+          "dependencies",
+          "entities",
+          "entity_mentions",
+          "entries",
+          "events",
+          "file_changes",
+          "file_snapshots",
+          "id_sequences",
+          "line_attributions",
+          "loops",
+          "metadata",
+          "prompt_queue",
+          "prompts",
+          "recording_agents",
+          "recording_events",
+          "recording_text",
+          "recording_text_fts",
+          "recording_text_fts_config",
+          "recording_text_fts_data",
+          "recording_text_fts_docsize",
+          "recording_text_fts_idx",
+          "recordings",
+          "recordings_fts",
+          "recordings_fts_config",
+          "recordings_fts_content",
+          "recordings_fts_data",
+          "recordings_fts_docsize",
+          "recordings_fts_idx",
+          "relationships",
+          "reminders",
+          "rules",
+          "sessions",
+          "skills",
+          "spawn_queue",
+          "sqlite_sequence",
+          "supervisor_queue",
+          "sync_metadata",
+          "sync_queue",
+          "task_lease_history",
+          "task_leases",
+          "tasks",
+          "verification_issues",
+          "verifications",
+          "working_epics",
+          "worktree_leases",
+          "worktrees"
+        ],
+        "task_counts": {}
+      },
+      "docker": {
+        "compose_file": null,
+        "services": [],
+        "images": [],
+        "named_volumes": [],
+        "bind_mounts": [],
+        "running_containers": [],
+        "volume_sizes": {}
+      },
+      "env_files": [
+        {
+          "path": ".env.worktree.template",
+          "size": 687,
+          "modes": "-rw-rw-r--",
+          "has_localhost_refs": false,
+          "localhost_ref_count": 0,
+          "keys_with_localhost_refs": [],
+          "env_keys": [
+            "SLOT"
+          ]
+        }
+      ],
+      "package_managers": [
+        "npm",
+        "pip"
+      ],
+      "languages": [
+        "javascript",
+        "python"
+      ]
+    },
+    {
+      "name": "pixel-hive",
+      "path": "/home/pippenz/Petrastella/pixel-hive",
+      "size_bytes": 1359934512,
+      "size_bytes_excluding_regenerable": 83627898,
+      "regenerable_bytes_total": 1276306614,
+      "regenerable_dirs_standalone_bytes": {
+        ".cas/worktrees": 0,
+        ".next": 0,
+        ".nuxt": 0,
+        ".output": 0,
+        ".pnpm-store": 0,
+        ".svelte-kit": 0,
+        ".turbo": 0,
+        "build": 0,
+        "coverage": 0,
+        "dist": 0,
+        "node_modules": 1219828044,
+        "playwright-report": 0,
+        "target": 0,
+        "test-results": 0
+      },
+      "git": {
+        "is_repo": true,
+        "current_branch": "feat/gemini-presigned-url",
+        "head_sha": "ffaa59a143ff30d2363361a3b51a862a23bbc3a2",
+        "remote_urls": [
+          "https://github.com/Richards-LLC/pixel-hive.git",
+          "https://github.com/Richards-LLC/rocketship-template.git"
+        ],
+        "dirty_files": 3,
+        "untracked_files": 3,
+        "stash_count": 3,
+        "unpushed_commits": 0
+      },
+      "cas_db": {
+        "present": false
+      },
+      "docker": {
+        "compose_file": null,
+        "services": [],
+        "images": [],
+        "named_volumes": [],
+        "bind_mounts": [],
+        "running_containers": [],
+        "volume_sizes": {}
+      },
+      "env_files": [
+        {
+          "path": ".env.graphiti",
+          "size": 294,
+          "modes": "-rwxr-xr-x",
+          "has_localhost_refs": true,
+          "localhost_ref_count": 1,
+          "keys_with_localhost_refs": [
+            "NEO4J_URI"
+          ],
+          "env_keys": [
+            "GRAPHITI_TELEMETRY_ENABLED",
+            "NEO4J_PASSWORD",
+            "NEO4J_URI",
+            "NEO4J_USERNAME"
+          ]
+        }
+      ],
+      "package_managers": [
+        "pnpm"
+      ],
+      "languages": [
+        "javascript"
+      ]
+    },
+    {
+      "name": "prospect_path",
+      "path": "/home/pippenz/Petrastella/prospect_path",
+      "size_bytes": 1821206707,
+      "size_bytes_excluding_regenerable": 87112922,
+      "regenerable_bytes_total": 1734093785,
+      "regenerable_dirs_standalone_bytes": {
+        ".cas/worktrees": 0,
+        ".next": 0,
+        ".nuxt": 0,
+        ".output": 0,
+        ".pnpm-store": 0,
+        ".svelte-kit": 0,
+        ".turbo": 0,
+        "build": 0,
+        "coverage": 0,
+        "dist": 0,
+        "node_modules": 1527685211,
+        "playwright-report": 0,
+        "target": 0,
+        "test-results": 0
+      },
+      "git": {
+        "is_repo": true,
+        "current_branch": "main",
+        "head_sha": "23d6bf86e83ef8d520e5c2b7f4e6d8c8d14e1a41",
+        "remote_urls": [
+          "git@github.com:Richards-LLC/prospect_path.git",
+          "https://github.com/richards-llc/rocketship-template.git"
+        ],
+        "dirty_files": 726,
+        "untracked_files": 3,
+        "stash_count": 4,
+        "unpushed_commits": 0
+      },
+      "cas_db": {
+        "present": false
+      },
+      "docker": {
+        "bind_mounts": [
+          "./apps/backend",
+          "./apps/frontend",
+          "/app/node_modules"
+        ],
+        "compose_file": "docker-compose.yml",
+        "images": [
+          "postgres:15-alpine",
+          "redis:7-alpine"
+        ],
+        "named_volumes": [
+          "postgres_data",
+          "redis_data"
+        ],
+        "services": [
+          "backend",
+          "frontend",
+          "postgres",
+          "redis"
+        ],
+        "running_containers": [],
+        "volume_sizes": {}
+      },
+      "env_files": [
+        {
+          "path": ".env.graphiti",
+          "size": 305,
+          "modes": "-rwxr-xr-x",
+          "has_localhost_refs": true,
+          "localhost_ref_count": 1,
+          "keys_with_localhost_refs": [
+            "NEO4J_URI"
+          ],
+          "env_keys": [
+            "GRAPHITI_TELEMETRY_ENABLED",
+            "NEO4J_PASSWORD",
+            "NEO4J_URI",
+            "NEO4J_USERNAME"
+          ]
+        }
+      ],
+      "package_managers": [
+        "pnpm"
+      ],
+      "languages": [
+        "javascript"
+      ]
+    },
+    {
+      "name": "pulse-card",
+      "path": "/home/pippenz/Petrastella/pulse-card",
+      "size_bytes": 1598878656,
+      "size_bytes_excluding_regenerable": 39665591,
+      "regenerable_bytes_total": 1559213065,
+      "regenerable_dirs_standalone_bytes": {
+        ".cas/worktrees": 889282836,
+        ".next": 0,
+        ".nuxt": 0,
+        ".output": 0,
+        ".pnpm-store": 0,
+        ".svelte-kit": 0,
+        ".turbo": 0,
+        "build": 0,
+        "coverage": 0,
+        "dist": 0,
+        "node_modules": 1193729507,
+        "playwright-report": 0,
+        "target": 0,
+        "test-results": 281079
+      },
+      "git": {
+        "is_repo": true,
+        "current_branch": "develop",
+        "head_sha": "ae966ba2702254f56473756caf6676305fa26275",
+        "remote_urls": [
+          "git@github.com:Richards-LLC/pulse-card.git",
+          "git@github.com:Richards-LLC/rocketship-template.git"
+        ],
+        "dirty_files": 4,
+        "untracked_files": 13,
+        "stash_count": 0,
+        "unpushed_commits": 0
+      },
+      "cas_db": {
+        "present": true,
+        "path": ".cas/cas.db",
+        "size_bytes": 1400832,
+        "wal_present": true,
+        "shm_present": true,
+        "integrity_check": "ok",
+        "tables": [
+          "agents",
+          "cas_migrations",
+          "code_files",
+          "code_memory_links",
+          "code_relationships",
+          "code_symbols",
+          "commit_links",
+          "daemon_instances",
+          "dependencies",
+          "entities",
+          "entity_mentions",
+          "entries",
+          "events",
+          "file_changes",
+          "file_snapshots",
+          "id_sequences",
+          "line_attributions",
+          "loops",
+          "metadata",
+          "prompt_queue",
+          "prompts",
+          "recording_agents",
+          "recording_events",
+          "recording_text",
+          "recording_text_fts",
+          "recording_text_fts_config",
+          "recording_text_fts_data",
+          "recording_text_fts_docsize",
+          "recording_text_fts_idx",
+          "recordings",
+          "recordings_fts",
+          "recordings_fts_config",
+          "recordings_fts_content",
+          "recordings_fts_data",
+          "recordings_fts_docsize",
+          "recordings_fts_idx",
+          "relationships",
+          "reminders",
+          "rules",
+          "sessions",
+          "skills",
+          "spawn_queue",
+          "specs",
+          "sqlite_sequence",
+          "supervisor_queue",
+          "sync_metadata",
+          "sync_queue",
+          "task_lease_history",
+          "task_leases",
+          "tasks",
+          "verification_issues",
+          "verifications",
+          "working_epics",
+          "worktree_leases",
+          "worktrees"
+        ],
+        "task_counts": {
+          "closed": 24
+        }
+      },
+      "docker": {
+        "bind_mounts": [
+          "./apps/backend",
+          "./apps/frontend",
+          "/app/node_modules"
+        ],
+        "compose_file": "docker-compose.yml",
+        "images": [
+          "postgres:15-alpine",
+          "redis:7-alpine"
+        ],
+        "named_volumes": [
+          "postgres_data",
+          "redis_data"
+        ],
+        "services": [
+          "backend",
+          "frontend",
+          "postgres",
+          "redis"
+        ],
+        "running_containers": [],
+        "volume_sizes": {}
+      },
+      "env_files": [
+        {
+          "path": ".env.graphiti",
+          "size": 305,
+          "modes": "-rwxr-xr-x",
+          "has_localhost_refs": true,
+          "localhost_ref_count": 1,
+          "keys_with_localhost_refs": [
+            "NEO4J_URI"
+          ],
+          "env_keys": [
+            "GRAPHITI_TELEMETRY_ENABLED",
+            "NEO4J_PASSWORD",
+            "NEO4J_URI",
+            "NEO4J_USERNAME"
+          ]
+        },
+        {
+          "path": ".env.worktree.template",
+          "size": 687,
+          "modes": "-rw-rw-r--",
+          "has_localhost_refs": false,
+          "localhost_ref_count": 0,
+          "keys_with_localhost_refs": [],
+          "env_keys": [
+            "SLOT"
+          ]
+        }
+      ],
+      "package_managers": [
+        "pnpm"
+      ],
+      "languages": [
+        "javascript"
+      ]
+    },
+    {
+      "name": "rocketship-template-new-instance",
+      "path": "/home/pippenz/Petrastella/rocketship-template-new-instance",
+      "size_bytes": 30893702,
+      "size_bytes_excluding_regenerable": 4759545,
+      "regenerable_bytes_total": 26134157,
+      "regenerable_dirs_standalone_bytes": {
+        ".cas/worktrees": 0,
+        ".next": 0,
+        ".nuxt": 0,
+        ".output": 0,
+        ".pnpm-store": 0,
+        ".svelte-kit": 0,
+        ".turbo": 0,
+        "build": 0,
+        "coverage": 2926863,
+        "dist": 0,
+        "node_modules": 23207294,
+        "playwright-report": 0,
+        "target": 0,
+        "test-results": 0
+      },
+      "git": {
+        "is_repo": true,
+        "current_branch": "main",
+        "head_sha": "66b72d7720258a2a7be7d0a5983320e241e74628",
+        "remote_urls": [],
+        "dirty_files": 18,
+        "untracked_files": 47,
+        "stash_count": 0,
+        "unpushed_commits": 0
+      },
+      "cas_db": {
+        "present": false
+      },
+      "docker": {
+        "compose_file": null,
+        "services": [],
+        "images": [],
+        "named_volumes": [],
+        "bind_mounts": [],
+        "running_containers": [],
+        "volume_sizes": {}
+      },
+      "env_files": [
+        {
+          "path": ".env",
+          "size": 1306,
+          "modes": "-rwxr-xr-x",
+          "has_localhost_refs": false,
+          "localhost_ref_count": 0,
+          "keys_with_localhost_refs": [],
+          "env_keys": [
+            "DEFAULT_AUTHOR_EMAIL",
+            "DEFAULT_AUTHOR_NAME",
+            "DEFAULT_GITHUB_ORG",
+            "DEFAULT_SUPPORT_EMAIL",
+            "GCLOUD_SDK_PATH",
+            "NEON_API_TOKEN",
+            "VERCEL_ORG_ID",
+            "VERCEL_TOKEN"
+          ]
+        }
+      ],
+      "package_managers": [
+        "npm"
+      ],
+      "languages": [
+        "javascript"
+      ]
+    },
+    {
+      "name": "spaceship_template",
+      "path": "/home/pippenz/Petrastella/spaceship_template",
+      "size_bytes": 1589138775,
+      "size_bytes_excluding_regenerable": 103684184,
+      "regenerable_bytes_total": 1485454591,
+      "regenerable_dirs_standalone_bytes": {
+        ".cas/worktrees": 0,
+        ".next": 0,
+        ".nuxt": 0,
+        ".output": 0,
+        ".pnpm-store": 0,
+        ".svelte-kit": 0,
+        ".turbo": 0,
+        "build": 0,
+        "coverage": 0,
+        "dist": 0,
+        "node_modules": 1327834710,
+        "playwright-report": 0,
+        "target": 0,
+        "test-results": 0
+      },
+      "git": {
+        "is_repo": true,
+        "current_branch": "main",
+        "head_sha": "849acf137652ae1915ff3aed2fa20cc8a9158e5a",
+        "remote_urls": [
+          "https://github.com/Richards-LLC/rocketship-template.git"
+        ],
+        "dirty_files": 74,
+        "untracked_files": 7,
+        "stash_count": 8,
+        "unpushed_commits": 0
+      },
+      "cas_db": {
+        "present": false
+      },
+      "docker": {
+        "bind_mounts": [
+          "./apps/backend",
+          "./apps/frontend",
+          "/app/node_modules"
+        ],
+        "compose_file": "docker-compose.yml",
+        "images": [
+          "postgres:15-alpine",
+          "redis:7-alpine"
+        ],
+        "named_volumes": [
+          "postgres_data",
+          "redis_data"
+        ],
+        "services": [
+          "backend",
+          "frontend",
+          "postgres",
+          "redis"
+        ],
+        "running_containers": [],
+        "volume_sizes": {}
+      },
+      "env_files": [
+        {
+          "path": ".env.graphiti",
+          "size": 294,
+          "modes": "-rwxr-xr-x",
+          "has_localhost_refs": true,
+          "localhost_ref_count": 1,
+          "keys_with_localhost_refs": [
+            "NEO4J_URI"
+          ],
+          "env_keys": [
+            "GRAPHITI_TELEMETRY_ENABLED",
+            "NEO4J_PASSWORD",
+            "NEO4J_URI",
+            "NEO4J_USERNAME"
+          ]
+        }
+      ],
+      "package_managers": [
+        "pnpm"
+      ],
+      "languages": [
+        "javascript"
+      ]
+    },
+    {
+      "name": "tooling",
+      "path": "/home/pippenz/Petrastella/tooling",
+      "size_bytes": 45111,
+      "size_bytes_excluding_regenerable": 45111,
+      "regenerable_bytes_total": 0,
+      "regenerable_dirs_standalone_bytes": {
+        ".cas/worktrees": 0,
+        ".next": 0,
+        ".nuxt": 0,
+        ".output": 0,
+        ".pnpm-store": 0,
+        ".svelte-kit": 0,
+        ".turbo": 0,
+        "build": 0,
+        "coverage": 0,
+        "dist": 0,
+        "node_modules": 0,
+        "playwright-report": 0,
+        "target": 0,
+        "test-results": 0
+      },
+      "git": {
+        "is_repo": false
+      },
+      "cas_db": {
+        "present": false
+      },
+      "docker": {
+        "compose_file": null,
+        "services": [],
+        "images": [],
+        "named_volumes": [],
+        "bind_mounts": [],
+        "running_containers": [],
+        "volume_sizes": {}
+      },
+      "env_files": [],
+      "package_managers": [],
+      "languages": []
+    },
+    {
+      "name": "tracetix",
+      "path": "/home/pippenz/Petrastella/tracetix",
+      "size_bytes": 1738347350,
+      "size_bytes_excluding_regenerable": 233338622,
+      "regenerable_bytes_total": 1505008728,
+      "regenerable_dirs_standalone_bytes": {
+        ".cas/worktrees": 0,
+        ".next": 0,
+        ".nuxt": 0,
+        ".output": 0,
+        ".pnpm-store": 0,
+        ".svelte-kit": 0,
+        ".turbo": 0,
+        "build": 0,
+        "coverage": 0,
+        "dist": 0,
+        "node_modules": 0,
+        "playwright-report": 0,
+        "target": 0,
+        "test-results": 0
+      },
+      "git": {
+        "is_repo": true,
+        "current_branch": "scraper-optimizations",
+        "head_sha": "22b4d1cbb73601a6714f82043d9c415c2ce495e8",
+        "remote_urls": [
+          "https://github.com/Richards-LLC/tracetix.git"
+        ],
+        "dirty_files": 233,
+        "untracked_files": 530,
+        "stash_count": 0,
+        "unpushed_commits": 0
+      },
+      "cas_db": {
+        "present": false
+      },
+      "docker": {
+        "compose_file": null,
+        "services": [],
+        "images": [],
+        "named_volumes": [],
+        "bind_mounts": [],
+        "running_containers": [],
+        "volume_sizes": {}
+      },
+      "env_files": [],
+      "package_managers": [],
+      "languages": []
+    },
+    {
+      "name": "verified-path",
+      "path": "/home/pippenz/Petrastella/verified-path",
+      "size_bytes": 124906,
+      "size_bytes_excluding_regenerable": 124906,
+      "regenerable_bytes_total": 0,
+      "regenerable_dirs_standalone_bytes": {
+        ".cas/worktrees": 0,
+        ".next": 0,
+        ".nuxt": 0,
+        ".output": 0,
+        ".pnpm-store": 0,
+        ".svelte-kit": 0,
+        ".turbo": 0,
+        "build": 0,
+        "coverage": 0,
+        "dist": 0,
+        "node_modules": 0,
+        "playwright-report": 0,
+        "target": 0,
+        "test-results": 0
+      },
+      "git": {
+        "is_repo": false
+      },
+      "cas_db": {
+        "present": false
+      },
+      "docker": {
+        "compose_file": null,
+        "services": [],
+        "images": [],
+        "named_volumes": [],
+        "bind_mounts": [],
+        "running_containers": [],
+        "volume_sizes": {}
+      },
+      "env_files": [],
+      "package_managers": [],
+      "languages": []
+    }
+  ],
+  "global_state": {
+    "cas_global_db": {
+      "path": "~/.cas/cas.db",
+      "present": true,
+      "size_bytes": 17043456
+    },
+    "claude_projects_memory": {
+      "path": "~/.claude/projects/",
+      "present": true,
+      "project_count": 270,
+      "size_bytes_note": "omitted — directory is continuously written by factory sessions; take a snapshot with factory stopped if a byte count is required"
+    },
+    "claude_settings": {
+      "path": "~/.claude/settings.json",
+      "present": true
+    },
+    "config_cas_env": {
+      "path": "~/.config/cas/env",
+      "present": false
+    }
+  },
+  "secrets_summary": {
+    "env_file_count": 27,
+    "projects_with_env": [
+      "abundant-mines",
+      "closure-club",
+      "domdms",
+      "fixyrs",
+      "gabber-studio",
+      "git-mcp-server",
+      "homeschool-whisper",
+      "logging",
+      "memory-lane",
+      "ozer",
+      "pantheon",
+      "petra-stella-cloud",
+      "petrastella-aws",
+      "pixel-hive",
+      "prospect_path",
+      "pulse-card",
+      "rocketship-template-new-instance",
+      "spaceship_template"
+    ],
+    "projects_with_localhost_refs": [
+      "abundant-mines",
+      "domdms",
+      "fixyrs",
+      "gabber-studio",
+      "homeschool-whisper",
+      "pixel-hive",
+      "prospect_path",
+      "pulse-card",
+      "spaceship_template"
+    ]
+  },
+  "docker_summary": {
+    "projects_with_compose": [
+      "abundant-mines",
+      "domdms",
+      "fixyrs",
+      "gabber-studio",
+      "homeschool-whisper",
+      "pantheon",
+      "prospect_path",
+      "pulse-card",
+      "spaceship_template"
+    ],
+    "total_named_volumes": 18,
+    "total_volume_bytes": 0,
+    "currently_running_containers": []
+  },
+  "risk_flags": [
+    {
+      "severity": "high",
+      "project": "abundant-mines",
+      "kind": "docker_named_volumes",
+      "issue": "docker named volumes [\"postgres_data\",\"redis_data\"] — require explicit volume dump/restore, not just rsync"
+    },
+    {
+      "severity": "high",
+      "project": "abundant-mines",
+      "kind": "git_stash_present",
+      "issue": "12 stash entries — will be lost if not handled explicitly before cutover"
+    },
+    {
+      "severity": "high",
+      "project": "abundant-mines",
+      "kind": "localhost_env_refs",
+      "issue": "env files contain localhost/127.0.0.1/0.0.0.0/pippenz references — will need rewriting for remote host"
+    },
+    {
+      "severity": "high",
+      "project": "abundant-mines",
+      "kind": "uncommitted_wip",
+      "issue": "dirty=16, untracked=9 — uncommitted WIP at risk during migration"
+    },
+    {
+      "severity": "high",
+      "project": "closure-club",
+      "kind": "uncommitted_wip",
+      "issue": "dirty=8, untracked=6 — uncommitted WIP at risk during migration"
+    },
+    {
+      "severity": "high",
+      "project": "country-liberty",
+      "kind": "uncommitted_wip",
+      "issue": "dirty=46, untracked=2 — uncommitted WIP at risk during migration"
+    },
+    {
+      "severity": "high",
+      "project": "domdms",
+      "kind": "docker_named_volumes",
+      "issue": "docker named volumes [\"postgres_data\",\"redis_data\"] — require explicit volume dump/restore, not just rsync"
+    },
+    {
+      "severity": "high",
+      "project": "domdms",
+      "kind": "git_stash_present",
+      "issue": "5 stash entries — will be lost if not handled explicitly before cutover"
+    },
+    {
+      "severity": "high",
+      "project": "domdms",
+      "kind": "localhost_env_refs",
+      "issue": "env files contain localhost/127.0.0.1/0.0.0.0/pippenz references — will need rewriting for remote host"
+    },
+    {
+      "severity": "high",
+      "project": "domdms",
+      "kind": "uncommitted_wip",
+      "issue": "dirty=9, untracked=25 — uncommitted WIP at risk during migration"
+    },
+    {
+      "severity": "high",
+      "project": "edws",
+      "kind": "uncommitted_wip",
+      "issue": "dirty=201, untracked=3 — uncommitted WIP at risk during migration"
+    },
+    {
+      "severity": "high",
+      "project": "edws",
+      "kind": "unpushed_commits",
+      "issue": "4 local commits not pushed to upstream — push or cherry-pick before decommissioning source"
+    },
+    {
+      "severity": "high",
+      "project": "fixy-quasar",
+      "kind": "uncommitted_wip",
+      "issue": "dirty=664, untracked=2 — uncommitted WIP at risk during migration"
+    },
+    {
+      "severity": "high",
+      "project": "fixyrs",
+      "kind": "docker_named_volumes",
+      "issue": "docker named volumes [\"postgres_data\",\"redis_data\"] — require explicit volume dump/restore, not just rsync"
+    },
+    {
+      "severity": "high",
+      "project": "fixyrs",
+      "kind": "localhost_env_refs",
+      "issue": "env files contain localhost/127.0.0.1/0.0.0.0/pippenz references — will need rewriting for remote host"
+    },
+    {
+      "severity": "high",
+      "project": "fixyrs",
+      "kind": "uncommitted_wip",
+      "issue": "dirty=310, untracked=2 — uncommitted WIP at risk during migration"
+    },
+    {
+      "severity": "high",
+      "project": "full-package-media",
+      "kind": "uncommitted_wip",
+      "issue": "dirty=0, untracked=2 — uncommitted WIP at risk during migration"
+    },
+    {
+      "severity": "high",
+      "project": "gabber-studio",
+      "kind": "docker_named_volumes",
+      "issue": "docker named volumes [\"postgres_data\",\"redis_data\"] — require explicit volume dump/restore, not just rsync"
+    },
+    {
+      "severity": "high",
+      "project": "gabber-studio",
+      "kind": "git_stash_present",
+      "issue": "16 stash entries — will be lost if not handled explicitly before cutover"
+    },
+    {
+      "severity": "high",
+      "project": "gabber-studio",
+      "kind": "localhost_env_refs",
+      "issue": "env files contain localhost/127.0.0.1/0.0.0.0/pippenz references — will need rewriting for remote host"
+    },
+    {
+      "severity": "high",
+      "project": "gabber-studio",
+      "kind": "uncommitted_wip",
+      "issue": "dirty=0, untracked=7 — uncommitted WIP at risk during migration"
+    },
+    {
+      "severity": "high",
+      "project": "git-mcp-server",
+      "kind": "uncommitted_wip",
+      "issue": "dirty=161, untracked=1 — uncommitted WIP at risk during migration"
+    },
+    {
+      "severity": "high",
+      "project": "homeschool-whisper",
+      "kind": "docker_named_volumes",
+      "issue": "docker named volumes [\"postgres_data\",\"redis_data\"] — require explicit volume dump/restore, not just rsync"
+    },
+    {
+      "severity": "high",
+      "project": "homeschool-whisper",
+      "kind": "localhost_env_refs",
+      "issue": "env files contain localhost/127.0.0.1/0.0.0.0/pippenz references — will need rewriting for remote host"
+    },
+    {
+      "severity": "high",
+      "project": "homeschool-whisper",
+      "kind": "uncommitted_wip",
+      "issue": "dirty=1, untracked=5 — uncommitted WIP at risk during migration"
+    },
+    {
+      "severity": "high",
+      "project": "memory-lane-cloud",
+      "kind": "uncommitted_wip",
+      "issue": "dirty=0, untracked=2 — uncommitted WIP at risk during migration"
+    },
+    {
+      "severity": "high",
+      "project": "ozer",
+      "kind": "git_stash_present",
+      "issue": "9 stash entries — will be lost if not handled explicitly before cutover"
+    },
+    {
+      "severity": "high",
+      "project": "ozer",
+      "kind": "uncommitted_wip",
+      "issue": "dirty=5, untracked=19 — uncommitted WIP at risk during migration"
+    },
+    {
+      "severity": "high",
+      "project": "pantheon",
+      "kind": "docker_named_volumes",
+      "issue": "docker named volumes [\"postgres_data\",\"redis_data\"] — require explicit volume dump/restore, not just rsync"
+    },
+    {
+      "severity": "high",
+      "project": "pantheon",
+      "kind": "uncommitted_wip",
+      "issue": "dirty=0, untracked=12 — uncommitted WIP at risk during migration"
+    },
+    {
+      "severity": "high",
+      "project": "petra-stella-cloud",
+      "kind": "uncommitted_wip",
+      "issue": "dirty=8, untracked=9 — uncommitted WIP at risk during migration"
+    },
+    {
+      "severity": "high",
+      "project": "petra-stella-cloud",
+      "kind": "unpushed_commits",
+      "issue": "1 local commits not pushed to upstream — push or cherry-pick before decommissioning source"
+    },
+    {
+      "severity": "high",
+      "project": "petrastella-aws",
+      "kind": "uncommitted_wip",
+      "issue": "dirty=143, untracked=248 — uncommitted WIP at risk during migration"
+    },
+    {
+      "severity": "high",
+      "project": "pixel-hive",
+      "kind": "git_stash_present",
+      "issue": "3 stash entries — will be lost if not handled explicitly before cutover"
+    },
+    {
+      "severity": "high",
+      "project": "pixel-hive",
+      "kind": "localhost_env_refs",
+      "issue": "env files contain localhost/127.0.0.1/0.0.0.0/pippenz references — will need rewriting for remote host"
+    },
+    {
+      "severity": "high",
+      "project": "pixel-hive",
+      "kind": "uncommitted_wip",
+      "issue": "dirty=3, untracked=3 — uncommitted WIP at risk during migration"
+    },
+    {
+      "severity": "high",
+      "project": "prospect_path",
+      "kind": "docker_named_volumes",
+      "issue": "docker named volumes [\"postgres_data\",\"redis_data\"] — require explicit volume dump/restore, not just rsync"
+    },
+    {
+      "severity": "high",
+      "project": "prospect_path",
+      "kind": "git_stash_present",
+      "issue": "4 stash entries — will be lost if not handled explicitly before cutover"
+    },
+    {
+      "severity": "high",
+      "project": "prospect_path",
+      "kind": "localhost_env_refs",
+      "issue": "env files contain localhost/127.0.0.1/0.0.0.0/pippenz references — will need rewriting for remote host"
+    },
+    {
+      "severity": "high",
+      "project": "prospect_path",
+      "kind": "uncommitted_wip",
+      "issue": "dirty=726, untracked=3 — uncommitted WIP at risk during migration"
+    },
+    {
+      "severity": "high",
+      "project": "pulse-card",
+      "kind": "docker_named_volumes",
+      "issue": "docker named volumes [\"postgres_data\",\"redis_data\"] — require explicit volume dump/restore, not just rsync"
+    },
+    {
+      "severity": "high",
+      "project": "pulse-card",
+      "kind": "localhost_env_refs",
+      "issue": "env files contain localhost/127.0.0.1/0.0.0.0/pippenz references — will need rewriting for remote host"
+    },
+    {
+      "severity": "high",
+      "project": "pulse-card",
+      "kind": "uncommitted_wip",
+      "issue": "dirty=4, untracked=13 — uncommitted WIP at risk during migration"
+    },
+    {
+      "severity": "high",
+      "project": "rocketship-template-new-instance",
+      "kind": "uncommitted_wip",
+      "issue": "dirty=18, untracked=47 — uncommitted WIP at risk during migration"
+    },
+    {
+      "severity": "high",
+      "project": "spaceship_template",
+      "kind": "docker_named_volumes",
+      "issue": "docker named volumes [\"postgres_data\",\"redis_data\"] — require explicit volume dump/restore, not just rsync"
+    },
+    {
+      "severity": "high",
+      "project": "spaceship_template",
+      "kind": "git_stash_present",
+      "issue": "8 stash entries — will be lost if not handled explicitly before cutover"
+    },
+    {
+      "severity": "high",
+      "project": "spaceship_template",
+      "kind": "localhost_env_refs",
+      "issue": "env files contain localhost/127.0.0.1/0.0.0.0/pippenz references — will need rewriting for remote host"
+    },
+    {
+      "severity": "high",
+      "project": "spaceship_template",
+      "kind": "uncommitted_wip",
+      "issue": "dirty=74, untracked=7 — uncommitted WIP at risk during migration"
+    },
+    {
+      "severity": "high",
+      "project": "tracetix",
+      "kind": "uncommitted_wip",
+      "issue": "dirty=233, untracked=530 — uncommitted WIP at risk during migration"
+    },
+    {
+      "severity": "medium",
+      "project": "(global)",
+      "kind": "docker_daemon_unavailable",
+      "issue": "docker daemon not running or not reachable from inventory script — runtime state (containers, volume sizes) not captured. Re-run with daemon up before cutover decisions."
+    },
+    {
+      "severity": "medium",
+      "project": "abundant-mines",
+      "kind": "cas_db_wal",
+      "issue": "cas.db WAL file present — checkpoint before transfer to avoid inconsistent copy"
+    },
+    {
+      "severity": "medium",
+      "project": "abundant-mines",
+      "kind": "docker_bind_mounts",
+      "issue": "docker bind mounts [\"./apps/backend\",\"./apps/frontend\",\"/app/node_modules\"] — verify host paths on target match"
+    },
+    {
+      "severity": "medium",
+      "project": "abundant-mines",
+      "kind": "native_module_rebuild",
+      "issue": "node project — native modules (better-sqlite3, bcrypt, etc.) may need rebuild on target architecture"
+    },
+    {
+      "severity": "medium",
+      "project": "closure-club",
+      "kind": "cas_db_wal",
+      "issue": "cas.db WAL file present — checkpoint before transfer to avoid inconsistent copy"
+    },
+    {
+      "severity": "medium",
+      "project": "country-liberty",
+      "kind": "native_module_rebuild",
+      "issue": "node project — native modules (better-sqlite3, bcrypt, etc.) may need rebuild on target architecture"
+    },
+    {
+      "severity": "medium",
+      "project": "domdms",
+      "kind": "cas_db_wal",
+      "issue": "cas.db WAL file present — checkpoint before transfer to avoid inconsistent copy"
+    },
+    {
+      "severity": "medium",
+      "project": "domdms",
+      "kind": "docker_bind_mounts",
+      "issue": "docker bind mounts [\"./apps/backend\",\"./apps/frontend\",\"/app/node_modules\"] — verify host paths on target match"
+    },
+    {
+      "severity": "medium",
+      "project": "domdms",
+      "kind": "native_module_rebuild",
+      "issue": "node project — native modules (better-sqlite3, bcrypt, etc.) may need rebuild on target architecture"
+    },
+    {
+      "severity": "medium",
+      "project": "fixy-quasar",
+      "kind": "native_module_rebuild",
+      "issue": "node project — native modules (better-sqlite3, bcrypt, etc.) may need rebuild on target architecture"
+    },
+    {
+      "severity": "medium",
+      "project": "fixyrs",
+      "kind": "docker_bind_mounts",
+      "issue": "docker bind mounts [\"./apps/backend\",\"./apps/frontend\",\"/app/node_modules\"] — verify host paths on target match"
+    },
+    {
+      "severity": "medium",
+      "project": "fixyrs",
+      "kind": "native_module_rebuild",
+      "issue": "node project — native modules (better-sqlite3, bcrypt, etc.) may need rebuild on target architecture"
+    },
+    {
+      "severity": "medium",
+      "project": "gabber-studio",
+      "kind": "cas_db_wal",
+      "issue": "cas.db WAL file present — checkpoint before transfer to avoid inconsistent copy"
+    },
+    {
+      "severity": "medium",
+      "project": "gabber-studio",
+      "kind": "docker_bind_mounts",
+      "issue": "docker bind mounts [\"./apps/backend\",\"./apps/frontend\",\"/app/node_modules\"] — verify host paths on target match"
+    },
+    {
+      "severity": "medium",
+      "project": "gabber-studio",
+      "kind": "native_module_rebuild",
+      "issue": "node project — native modules (better-sqlite3, bcrypt, etc.) may need rebuild on target architecture"
+    },
+    {
+      "severity": "medium",
+      "project": "git-mcp-server",
+      "kind": "native_module_rebuild",
+      "issue": "node project — native modules (better-sqlite3, bcrypt, etc.) may need rebuild on target architecture"
+    },
+    {
+      "severity": "medium",
+      "project": "homeschool-whisper",
+      "kind": "cas_db_wal",
+      "issue": "cas.db WAL file present — checkpoint before transfer to avoid inconsistent copy"
+    },
+    {
+      "severity": "medium",
+      "project": "homeschool-whisper",
+      "kind": "docker_bind_mounts",
+      "issue": "docker bind mounts [\"./apps/backend\",\"./apps/frontend\",\"/app/node_modules\"] — verify host paths on target match"
+    },
+    {
+      "severity": "medium",
+      "project": "homeschool-whisper",
+      "kind": "native_module_rebuild",
+      "issue": "node project — native modules (better-sqlite3, bcrypt, etc.) may need rebuild on target architecture"
+    },
+    {
+      "severity": "medium",
+      "project": "memory-lane-cloud",
+      "kind": "native_module_rebuild",
+      "issue": "node project — native modules (better-sqlite3, bcrypt, etc.) may need rebuild on target architecture"
+    },
+    {
+      "severity": "medium",
+      "project": "ozer",
+      "kind": "cas_db_wal",
+      "issue": "cas.db WAL file present — checkpoint before transfer to avoid inconsistent copy"
+    },
+    {
+      "severity": "medium",
+      "project": "ozer",
+      "kind": "native_module_rebuild",
+      "issue": "node project — native modules (better-sqlite3, bcrypt, etc.) may need rebuild on target architecture"
+    },
+    {
+      "severity": "medium",
+      "project": "pantheon",
+      "kind": "cas_db_wal",
+      "issue": "cas.db WAL file present — checkpoint before transfer to avoid inconsistent copy"
+    },
+    {
+      "severity": "medium",
+      "project": "pantheon",
+      "kind": "docker_bind_mounts",
+      "issue": "docker bind mounts [\"./apps/backend\",\"./apps/frontend\",\"/app/node_modules\"] — verify host paths on target match"
+    },
+    {
+      "severity": "medium",
+      "project": "pantheon",
+      "kind": "native_module_rebuild",
+      "issue": "node project — native modules (better-sqlite3, bcrypt, etc.) may need rebuild on target architecture"
+    },
+    {
+      "severity": "medium",
+      "project": "petra-stella-cloud",
+      "kind": "cas_db_wal",
+      "issue": "cas.db WAL file present — checkpoint before transfer to avoid inconsistent copy"
+    },
+    {
+      "severity": "medium",
+      "project": "petra-stella-cloud",
+      "kind": "native_module_rebuild",
+      "issue": "node project — native modules (better-sqlite3, bcrypt, etc.) may need rebuild on target architecture"
+    },
+    {
+      "severity": "medium",
+      "project": "petrastella-aws",
+      "kind": "cas_db_wal",
+      "issue": "cas.db WAL file present — checkpoint before transfer to avoid inconsistent copy"
+    },
+    {
+      "severity": "medium",
+      "project": "petrastella-aws",
+      "kind": "native_module_rebuild",
+      "issue": "node project — native modules (better-sqlite3, bcrypt, etc.) may need rebuild on target architecture"
+    },
+    {
+      "severity": "medium",
+      "project": "petrastella-aws",
+      "kind": "no_git_remote",
+      "issue": "git repo has no remotes — nothing to clone from; must rsync or push a new origin before migration"
+    },
+    {
+      "severity": "medium",
+      "project": "pixel-hive",
+      "kind": "native_module_rebuild",
+      "issue": "node project — native modules (better-sqlite3, bcrypt, etc.) may need rebuild on target architecture"
+    },
+    {
+      "severity": "medium",
+      "project": "prospect_path",
+      "kind": "docker_bind_mounts",
+      "issue": "docker bind mounts [\"./apps/backend\",\"./apps/frontend\",\"/app/node_modules\"] — verify host paths on target match"
+    },
+    {
+      "severity": "medium",
+      "project": "prospect_path",
+      "kind": "native_module_rebuild",
+      "issue": "node project — native modules (better-sqlite3, bcrypt, etc.) may need rebuild on target architecture"
+    },
+    {
+      "severity": "medium",
+      "project": "pulse-card",
+      "kind": "cas_db_wal",
+      "issue": "cas.db WAL file present — checkpoint before transfer to avoid inconsistent copy"
+    },
+    {
+      "severity": "medium",
+      "project": "pulse-card",
+      "kind": "docker_bind_mounts",
+      "issue": "docker bind mounts [\"./apps/backend\",\"./apps/frontend\",\"/app/node_modules\"] — verify host paths on target match"
+    },
+    {
+      "severity": "medium",
+      "project": "pulse-card",
+      "kind": "native_module_rebuild",
+      "issue": "node project — native modules (better-sqlite3, bcrypt, etc.) may need rebuild on target architecture"
+    },
+    {
+      "severity": "medium",
+      "project": "rocketship-template-new-instance",
+      "kind": "native_module_rebuild",
+      "issue": "node project — native modules (better-sqlite3, bcrypt, etc.) may need rebuild on target architecture"
+    },
+    {
+      "severity": "medium",
+      "project": "rocketship-template-new-instance",
+      "kind": "no_git_remote",
+      "issue": "git repo has no remotes — nothing to clone from; must rsync or push a new origin before migration"
+    },
+    {
+      "severity": "medium",
+      "project": "spaceship_template",
+      "kind": "docker_bind_mounts",
+      "issue": "docker bind mounts [\"./apps/backend\",\"./apps/frontend\",\"/app/node_modules\"] — verify host paths on target match"
+    },
+    {
+      "severity": "medium",
+      "project": "spaceship_template",
+      "kind": "native_module_rebuild",
+      "issue": "node project — native modules (better-sqlite3, bcrypt, etc.) may need rebuild on target architecture"
+    }
+  ]
+}
