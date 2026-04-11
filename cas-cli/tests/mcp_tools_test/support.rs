@@ -1,3 +1,4 @@
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use tempfile::TempDir;
 
 use cas::mcp::CasCore;
@@ -6,18 +7,59 @@ use cas::store::{
 };
 use cas::types::Agent;
 
+/// Shared process-wide lock for tests that mutate environment variables
+/// (`CAS_AGENT_ROLE`, factory harness vars, etc.). Cargo runs integration
+/// tests concurrently by default and env vars are a global, so without
+/// this lock one test's `ScopedSupervisorEnv::new()` can be clobbered by
+/// another test's `setup_cas()` mid-flight, silently flipping the first
+/// test into the non-supervisor branch and producing nondeterministic
+/// failures (cas-3bd4: the bypass close test was flaking as the Skipped
+/// verification row lost the race to the dispatch Error row).
+///
+/// All env-sensitive tests must acquire this guard for the full duration
+/// of their test body, **after** calling `setup_cas` — see the doc on
+/// [`setup_cas`] for the ordering contract.
+///
+/// The guard also recovers from poisoning: a prior panic must not prevent
+/// subsequent tests from acquiring the lock.
+pub(crate) fn env_test_lock() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Helper to create an initialized CAS environment.
+///
+/// **Ordering contract with `env_test_lock()`:** Tests that need to hold
+/// the env lock MUST call `setup_cas()` first and acquire
+/// `env_test_lock()` immediately afterwards. `setup_cas` briefly acquires
+/// the lock itself for its env mutations, so acquiring it in the test
+/// body before calling `setup_cas` would deadlock (std `Mutex` is not
+/// re-entrant). With the setup-then-lock order, the two acquisitions
+/// happen in series and tests composing `setup_cas` with
+/// `ScopedSupervisorEnv` stay race-free relative to other tests that
+/// also call `setup_cas`.
 pub(crate) fn setup_cas() -> (TempDir, CasCore) {
     // Clear factory env vars that leak from parent process (e.g., running
     // inside a factory supervisor session). Without this, is_supervisor_from_env()
     // returns true and the assignee_inactive bypass skips verification checks.
-    // SAFETY: Tests are run with --test-threads=1 or accept the race; no other
-    // thread reads these vars concurrently during setup_cas().
-    unsafe {
-        std::env::remove_var("CAS_AGENT_ROLE");
-        std::env::remove_var("CAS_FACTORY_MODE");
-        std::env::remove_var("CAS_FACTORY_SUPERVISOR_CLI");
-        std::env::remove_var("CAS_FACTORY_WORKER_CLI");
+    //
+    // cas-3bd4: acquire the shared env lock for the duration of these
+    // mutations. Other tests that also call `setup_cas` will serialize
+    // through this brief critical section, and any test that holds the
+    // lock for its body (see `env_test_lock` docs) will block a
+    // competing `setup_cas` from clearing env vars mid-test.
+    {
+        let _env_guard = env_test_lock();
+        // SAFETY: we hold the process-wide env lock for the duration of
+        // this block; no other test thread can observe a torn env read.
+        unsafe {
+            std::env::remove_var("CAS_AGENT_ROLE");
+            std::env::remove_var("CAS_FACTORY_MODE");
+            std::env::remove_var("CAS_FACTORY_SUPERVISOR_CLI");
+            std::env::remove_var("CAS_FACTORY_WORKER_CLI");
+        }
     }
 
     let temp = TempDir::new().expect("temp dir should be created");

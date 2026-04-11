@@ -346,16 +346,25 @@ impl VerificationStore for SqliteVerificationStore {
     fn generate_id(&self) -> Result<String> {
         use std::time::{SystemTime, UNIX_EPOCH};
 
-        let timestamp = SystemTime::now()
+        // The pre-cas-3bd4 implementation used `timestamp_millis & 0xffff`
+        // (last 4 hex chars), which collides for any two calls landing
+        // in the same millisecond — exactly what happens when a task
+        // racks up a dispatch row and a skip row back-to-back during a
+        // single close path. The collision triggers
+        // `UNIQUE constraint failed: verifications.id` and silently
+        // drops the newer row.
+        //
+        // Mix nanoseconds with a per-process random seed so rapid
+        // successive calls produce distinct ids even inside the same
+        // millisecond.
+        let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis();
-
-        // Generate a short hash from timestamp
-        let hash = format!("{timestamp:x}");
-        let short_hash = &hash[hash.len().saturating_sub(4)..];
-
-        Ok(format!("ver-{short_hash}"))
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let rand: u32 = rand::random();
+        // 8 hex chars from nanos + 4 from randomness = 48 bits of
+        // collision surface, plenty for in-process use.
+        Ok(format!("ver-{:08x}{:04x}", (nanos as u64) & 0xffff_ffff, rand & 0xffff))
     }
 
     fn add(&self, verification: &Verification) -> Result<()> {

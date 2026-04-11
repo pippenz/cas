@@ -3,25 +3,18 @@ use cas::mcp::tools::*;
 use cas::store::{open_agent_store, open_task_store, open_verification_store, open_worktree_store};
 use cas::types::{Verification, VerificationType, Worktree};
 use rmcp::handler::server::wrapper::Parameters;
-use std::sync::{Mutex, OnceLock};
 
-/// Serializes tests in this file that depend on the process-wide
-/// `CAS_AGENT_ROLE` env var (set by cas-26e1's supervisor-bypass tests and
-/// cleared by `setup_cas`). Without this lock, cargo's default parallel
-/// runner lets a supervisor-bypass test set `CAS_AGENT_ROLE=supervisor`
-/// while a sibling close-path test is mid-flight, which silently flips the
-/// sibling into the bypass branch and asserts fail on cross-talk.
-fn env_test_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
+// cas-3bd4: env_test_lock() now lives in `support.rs` so `setup_cas()`
+// can hold it while clearing factory env vars. Tests that need to set
+// `CAS_AGENT_ROLE=supervisor` via `ScopedSupervisorEnv` MUST call
+// `setup_cas()` FIRST and then acquire `env_test_lock()` — see the
+// support.rs docs. Acquiring before calling `setup_cas` would deadlock
+// because std `Mutex` is not re-entrant.
 
 #[tokio::test]
 async fn test_task_close_blocked_without_verification() {
-    let _env_lock = env_test_lock();
     let (temp, service) = setup_cas();
+    let _env_lock = env_test_lock();
     let cas_dir = temp.path().join(".cas");
 
     // Initialize verification store
@@ -103,8 +96,8 @@ code_review_findings: None,
 
 #[tokio::test]
 async fn test_task_close_sets_assignee_for_worktree_merge_jail() {
-    let _env_lock = env_test_lock();
     let (temp, service) = setup_cas();
+    let _env_lock = env_test_lock();
     let cas_dir = temp.path().join(".cas");
 
     std::fs::write(
@@ -199,8 +192,8 @@ code_review_findings: None,
 
 #[tokio::test]
 async fn test_epic_close_requires_epic_verification_type() {
-    let _env_lock = env_test_lock();
     let (temp, service) = setup_cas();
+    let _env_lock = env_test_lock();
     let cas_dir = temp.path().join(".cas");
 
     let verification_store = open_verification_store(&cas_dir).unwrap();
@@ -307,8 +300,8 @@ code_review_findings: None,
 
 #[tokio::test]
 async fn test_task_lifecycle_with_verification() {
-    let _env_lock = env_test_lock();
     let (temp, service) = setup_cas();
+    let _env_lock = env_test_lock();
     let cas_dir = temp.path().join(".cas");
 
     // Initialize verification store
@@ -385,8 +378,8 @@ code_review_findings: None,
 async fn test_task_close_blocked_with_rejected_verification() {
     use cas::types::VerificationIssue;
 
-    let _env_lock = env_test_lock();
     let (temp, service) = setup_cas();
+    let _env_lock = env_test_lock();
     let cas_dir = temp.path().join(".cas");
 
     // Initialize verification store
@@ -468,8 +461,8 @@ code_review_findings: None,
 /// dispatch/skip path is wired up.
 #[tokio::test]
 async fn test_task_close_runs_verifier_or_skips_cleanly() {
-    let _env_lock = env_test_lock();
     let (temp, service) = setup_cas();
+    let _env_lock = env_test_lock();
     let cas_dir = temp.path().join(".cas");
     let task_store = open_task_store(&cas_dir).unwrap();
     let verification_store = open_verification_store(&cas_dir).unwrap();
@@ -604,8 +597,8 @@ impl Drop for ScopedSupervisorEnv {
 /// "(verification skipped — assignee inactive)" marker.
 #[tokio::test]
 async fn test_close_supervisor_bypass_orphaned_task() {
-    let _env_lock = env_test_lock();
     let (temp, service) = setup_cas();
+    let _env_lock = env_test_lock();
     let cas_dir = temp.path().join(".cas");
     let task_store = open_task_store(&cas_dir).unwrap();
     let verification_store = open_verification_store(&cas_dir).unwrap();
@@ -718,8 +711,8 @@ code_review_findings: None,
 /// treat as inactive" branch distinct from the None-assignee branch above.
 #[tokio::test]
 async fn test_close_supervisor_bypass_ghost_assignee() {
-    let _env_lock = env_test_lock();
     let (temp, service) = setup_cas();
+    let _env_lock = env_test_lock();
     let cas_dir = temp.path().join(".cas");
     let task_store = open_task_store(&cas_dir).unwrap();
     let verification_store = open_verification_store(&cas_dir).unwrap();
@@ -807,8 +800,8 @@ code_review_findings: None,
 /// "assignee inactive".
 #[tokio::test]
 async fn test_close_supervisor_active_worker_assignee_by_name() {
-    let _env_lock = env_test_lock();
     let (temp, service) = setup_cas();
+    let _env_lock = env_test_lock();
     let cas_dir = temp.path().join(".cas");
     let task_store = open_task_store(&cas_dir).unwrap();
     let verification_store = open_verification_store(&cas_dir).unwrap();
@@ -963,8 +956,8 @@ async fn test_close_supervisor_active_worker_assignee_by_name() {
 /// comes from `close_ops.rs` (VERIFICATION REQUIRED) — exactly what we assert.
 #[tokio::test]
 async fn test_close_supervisor_no_bypass_when_assignee_alive() {
-    let _env_lock = env_test_lock();
     let (temp, service) = setup_cas();
+    let _env_lock = env_test_lock();
     let cas_dir = temp.path().join(".cas");
     let task_store = open_task_store(&cas_dir).unwrap();
     let verification_store = open_verification_store(&cas_dir).unwrap();
@@ -1121,8 +1114,8 @@ fn task_req(value: serde_json::Value) -> cas_mcp::TaskRequest {
 /// explicit Task() spawn instructions.
 #[tokio::test]
 async fn test_factory_worker_close_hits_narrowed_jail() {
-    let _env_lock = env_test_lock();
     let (temp, core) = setup_cas();
+    let _env_lock = env_test_lock();
     let _cas_dir = temp.path().join(".cas");
     let service = CasService::new(core);
     let _env = FactoryWorkerEnv::enter();
@@ -1177,8 +1170,8 @@ async fn test_factory_worker_close_hits_narrowed_jail() {
 /// bypassed — would be trapped by `VERIFICATION_JAIL_BLOCKED`.
 #[tokio::test]
 async fn test_skipped_verification_row_satisfies_jail_and_close() {
-    let _env_lock = env_test_lock();
     let (temp, core) = setup_cas();
+    let _env_lock = env_test_lock();
     let cas_dir = temp.path().join(".cas");
     let verification_store = open_verification_store(&cas_dir).unwrap();
     let service = CasService::new(core);
@@ -1251,8 +1244,8 @@ async fn test_skipped_verification_row_satisfies_jail_and_close() {
 /// Only `task.close` triggers the jail now.
 #[tokio::test]
 async fn test_factory_worker_non_close_mutation_still_exempt() {
-    let _env_lock = env_test_lock();
     let (_temp, core) = setup_cas();
+    let _env_lock = env_test_lock();
     let service = CasService::new(core);
     let _env = FactoryWorkerEnv::enter();
 
@@ -1318,8 +1311,8 @@ async fn test_factory_worker_non_close_mutation_still_exempt() {
 /// completes the close cleanly.
 #[tokio::test]
 async fn test_task_close_succeeds_after_verifier_clearance() {
-    let _env_lock = env_test_lock();
     let (temp, core) = setup_cas();
+    let _env_lock = env_test_lock();
     let cas_dir = temp.path().join(".cas");
     let task_store = open_task_store(&cas_dir).unwrap();
     let verification_store = open_verification_store(&cas_dir).unwrap();
@@ -1402,8 +1395,8 @@ async fn test_task_close_succeeds_after_verifier_clearance() {
 /// `pending_verification`, and replaces the stale row with a timeout diagnostic.
 #[tokio::test]
 async fn test_close_auto_escalates_stale_verification_dispatch() {
-    let _env_lock = env_test_lock();
     let (temp, service) = setup_cas();
+    let _env_lock = env_test_lock();
     let cas_dir = temp.path().join(".cas");
 
     let verification_store = open_verification_store(&cas_dir).unwrap();
