@@ -1077,3 +1077,68 @@ fn test_blocked_task_not_dispatched() {
         "Blocked task must not produce TaskAssigned: {events:?}"
     );
 }
+
+/// Covariance with cas-3bd4: a Closed task can still carry a stale
+/// `assignee` field (supervisor-close path historically didn't clear it).
+/// If that task ever reaches the event detector — via a future refactor of
+/// the ready_tasks filter, a stale cache, or a cross-session data race —
+/// the terminal-status guard must fire BEFORE the lingering assignee is
+/// reinterpreted as an active assignment. Explicitly pin that behavior.
+#[test]
+fn test_closed_task_with_stale_assignee_not_redispatched() {
+    let mut detector =
+        DirectorEventDetector::new(vec!["swift-fox".to_string()], "supervisor".to_string());
+
+    // Initial: empty. Detector's last_state has no knowledge of task-1.
+    let data1 = DirectorData {
+        ready_tasks: vec![],
+        in_progress_tasks: vec![],
+        epic_tasks: vec![],
+        agents: vec![make_agent("agent-1", "swift-fox", None)],
+        activity: vec![],
+        agent_id_to_name: [("agent-1".to_string(), "swift-fox".to_string())]
+            .into_iter()
+            .collect(),
+        changes: vec![],
+        git_loaded: true,
+        reminders: vec![],
+        epic_closed_counts: HashMap::new(),
+    };
+    detector.initialize(&data1);
+
+    // A Closed task is synthesized into ready_tasks with a stale assignee
+    // (matches the cas-3bd4 close-path condition). The data loader should
+    // never produce this, but the detector must not depend on that —
+    // specifically because supervisor-close once left assignee populated
+    // on Closed rows. The guard must fire regardless of what last_state
+    // looked like before the task appeared.
+    let data2 = DirectorData {
+        ready_tasks: vec![make_task(
+            "task-1",
+            "Closed With Stale Assignee",
+            TaskStatus::Closed,
+            Some("agent-1"),
+        )],
+        in_progress_tasks: vec![],
+        epic_tasks: vec![],
+        agents: vec![make_agent("agent-1", "swift-fox", None)],
+        activity: vec![],
+        agent_id_to_name: [("agent-1".to_string(), "swift-fox".to_string())]
+            .into_iter()
+            .collect(),
+        changes: vec![],
+        git_loaded: true,
+        reminders: vec![],
+        epic_closed_counts: HashMap::new(),
+    };
+
+    let events = detector.detect_changes(&data2);
+
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            DirectorEvent::TaskAssigned { task_id, .. } if task_id == "task-1"
+        )),
+        "Closed task with stale assignee must not produce TaskAssigned: {events:?}"
+    );
+}
