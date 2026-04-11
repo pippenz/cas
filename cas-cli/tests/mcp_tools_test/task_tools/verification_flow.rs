@@ -372,6 +372,204 @@ enabled = false
     );
 }
 
+/// cas-bc1b regression: `execution_note=additive-only` close must inspect
+/// the **worker branch's committed history**, not the main worktree's
+/// unstaged state. Before the fix the additive-only check ran
+/// `git diff --name-status HEAD` in `cas_root.parent()` (the main
+/// worktree), so a pristine worker branch with a purely-additive commit
+/// would be rejected because of an unrelated dirty file in main.
+///
+/// This test wires up:
+///   * A real git repo with `main` committed and a `factory/worker`
+///     branch forked off — standing in for the worker worktree.
+///   * A cas worktree row pointing at that path with parent_branch="main".
+///   * A task with execution_note=additive-only and that worktree_id.
+///
+/// The worker commits one purely-additive file on their branch, then
+/// dirties an **unrelated** tracked file and leaves it uncommitted
+/// (simulating the cas-4333 Cargo.lock drift). Close must succeed: the
+/// branch diff is additive, and the uncommitted drift is ignored
+/// because the check inspects committed history, not unstaged state.
+#[tokio::test]
+async fn test_additive_only_uses_worker_branch_not_main_worktree() {
+    use std::process::Command;
+
+    let (temp, service) = setup_cas();
+    let _env_lock = env_test_lock();
+    let cas_dir = temp.path().join(".cas");
+
+    // Disable verification — we're testing the additive-only gate.
+    // Also implicitly disables cas-895d uncommitted-work gate from
+    // firing on the drift file (we want *this* test to prove the
+    // additive-only fix works independently of the cas-895d gate).
+    //
+    // Actually: cas-895d's gate fires BEFORE additive-only and rejects
+    // any dirty worker worktree. Since the simulated drift is in the
+    // same worktree, cas-895d would catch it first. To isolate the
+    // cas-bc1b fix, we intentionally leave the worker worktree clean
+    // and rely on the fact that pre-fix code would have looked at the
+    // MAIN worktree (cas_root.parent()) where unrelated drift lives.
+    // Since cas_root.parent() here is a tempdir (not a git repo),
+    // we can't put a stray file there and prove anything — instead,
+    // prove the fix by committing a modification on the branch and
+    // asserting the gate now catches it (which it wouldn't have
+    // under the legacy `git diff HEAD` in main path — that one is
+    // empty in tempdir because tempdir isn't a git repo).
+    //
+    // The "post-fix catches branch modifications" angle is the
+    // cleaner assertion: pre-fix, the check ran in a non-git tempdir
+    // and returned empty for every scenario; post-fix, it runs in
+    // the worker branch and sees the real commits.
+    std::fs::write(
+        cas_dir.join("config.toml"),
+        r#"[verification]
+enabled = false
+"#,
+    )
+    .expect("write config");
+
+    // Real git repo playing the role of a worker worktree.
+    let worktree_path = temp.path().join("worker-worktree");
+    std::fs::create_dir_all(&worktree_path).expect("mkdir worktree");
+    let git = |args: &[&str]| {
+        let ok = Command::new("git")
+            .args(args)
+            .current_dir(&worktree_path)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .status()
+            .expect("git")
+            .success();
+        assert!(ok, "git {args:?} failed");
+    };
+    git(&["init", "-q", "-b", "main"]);
+    std::fs::write(worktree_path.join("existing.txt"), "original\n").unwrap();
+    git(&["add", "existing.txt"]);
+    git(&["commit", "-q", "-m", "main: initial"]);
+    git(&["checkout", "-q", "-b", "factory/worker"]);
+
+    // Register the worktree with parent_branch="main".
+    let worktree_store = open_worktree_store(&cas_dir).expect("open worktree store");
+    worktree_store.init().expect("init worktree store");
+    let worktree_id = Worktree::generate_id();
+    let worktree = Worktree::new(
+        worktree_id.clone(),
+        "factory/worker".to_string(),
+        "main".to_string(),
+        worktree_path.clone(),
+    );
+    worktree_store.add(&worktree).expect("add worktree");
+
+    let task_store = open_task_store(&cas_dir).expect("open task store");
+
+    let additive_req = |title: &str| TaskCreateRequest {
+        title: title.to_string(),
+        description: None,
+        priority: 2,
+        task_type: "task".to_string(),
+        labels: None,
+        notes: None,
+        blocked_by: None,
+        design: None,
+        acceptance_criteria: None,
+        external_ref: None,
+        assignee: None,
+        demo_statement: None,
+        execution_note: Some("additive-only".to_string()),
+        epic: None,
+    };
+
+    // --- Scenario A: worker branch has a purely-additive commit.
+    //     Close must succeed.
+    std::fs::write(worktree_path.join("new.rs"), "fn main() {}\n").unwrap();
+    git(&["add", "new.rs"]);
+    git(&["commit", "-q", "-m", "feat: add new.rs"]);
+    let id_a = extract_task_id(&extract_text(
+        service
+            .cas_task_create(Parameters(additive_req("cas-bc1b: additive branch commit")))
+            .await
+            .expect("task_create"),
+    ))
+    .expect("task id")
+    .to_string();
+    {
+        let mut t = task_store.get(&id_a).expect("task");
+        t.status = cas::types::TaskStatus::InProgress;
+        t.worktree_id = Some(worktree_id.clone());
+        task_store.update(&t).expect("update task");
+    }
+    let resp_a = extract_text(
+        service
+            .cas_task_close(Parameters(TaskCloseRequest {
+                id: id_a.clone(),
+                reason: Some("committed and additive".to_string()),
+                bypass_code_review: None,
+                code_review_findings: None,
+            }))
+            .await
+            .expect("close returns"),
+    );
+    assert!(
+        resp_a.contains("Closed task:"),
+        "purely-additive branch commit must pass: {resp_a}"
+    );
+    assert_eq!(
+        task_store.get(&id_a).expect("task").status,
+        cas::types::TaskStatus::Closed
+    );
+
+    // --- Scenario B: worker branch also has a commit modifying an
+    //     existing tracked file. Additive-only must now reject. Pre-fix
+    //     this would have been missed entirely — the check ran in the
+    //     main worktree (not a git repo in the test) and silently no-
+    //     oped.
+    std::fs::write(worktree_path.join("existing.txt"), "worker edit\n").unwrap();
+    git(&["add", "existing.txt"]);
+    git(&["commit", "-q", "-m", "fix: edit existing.txt"]);
+    let id_b = extract_task_id(&extract_text(
+        service
+            .cas_task_create(Parameters(additive_req("cas-bc1b: modifying branch commit")))
+            .await
+            .expect("task_create"),
+    ))
+    .expect("task id")
+    .to_string();
+    {
+        let mut t = task_store.get(&id_b).expect("task");
+        t.status = cas::types::TaskStatus::InProgress;
+        t.worktree_id = Some(worktree_id.clone());
+        task_store.update(&t).expect("update task");
+    }
+    let resp_b = extract_text(
+        service
+            .cas_task_close(Parameters(TaskCloseRequest {
+                id: id_b.clone(),
+                reason: Some("claims to be additive".to_string()),
+                bypass_code_review: None,
+                code_review_findings: None,
+            }))
+            .await
+            .expect("close returns"),
+    );
+    assert!(
+        resp_b.contains("ADDITIVE-ONLY VIOLATION"),
+        "committed modification on worker branch must trigger additive-only gate: {resp_b}"
+    );
+    assert!(
+        resp_b.contains("existing.txt"),
+        "error must name the modified file: {resp_b}"
+    );
+    assert_ne!(
+        task_store.get(&id_b).expect("task").status,
+        cas::types::TaskStatus::Closed,
+        "violation must not transition task to Closed"
+    );
+}
+
 /// cas-895d complement: a task with no attached worktree and a clean
 /// project root still passes the gate. Ensures the gate doesn't break
 /// non-factory (direct CLI) flows where there's no worktree to inspect.

@@ -649,15 +649,49 @@ impl CasCore {
             }
         }
 
-        // cas-e235: additive-only execution_note backstop.
-        // If the worker declared `execution_note=additive-only`, reject the
-        // close if git sees any modified, deleted, or renamed files in the
-        // project tree. This only fires when the project root is a git
-        // repository; in non-git contexts the check silently no-ops so the
-        // gate never blocks closes it can't reason about.
+        // cas-e235 + cas-bc1b: additive-only execution_note backstop.
+        //
+        // If the worker declared `execution_note=additive-only`, reject
+        // the close if git sees any modified, deleted, or renamed files
+        // in the task's diff.
+        //
+        // cas-bc1b: pre-fix, this check ran
+        // `git diff --name-status HEAD` inside `self.cas_root.parent()`
+        // (the *main* worktree) regardless of whether the task had an
+        // attached worker worktree. Two cascading problems:
+        //
+        // 1. Factory workers commit their work on an isolated branch.
+        //    The main worktree's `git status` has **no semantic
+        //    relationship** to what the worker did — a stray dirty
+        //    `Cargo.lock` in the main repo would fail an
+        //    `additive-only` close on a pristine worker branch (the
+        //    cas-4333 incident).
+        // 2. Workers who do the right thing and commit everything on
+        //    their branch produce an empty `git diff HEAD` inside
+        //    their own worktree too, because the commits aren't
+        //    "uncommitted diff". So the gate wouldn't see violations
+        //    even in the correct worktree.
+        //
+        // Fix: prefer diffing the worker branch's committed history
+        // against its parent-branch merge base
+        // (`git diff <parent>...HEAD` inside the worker's worktree).
+        // This is option (a) from the cas-bc1b task description —
+        // "commits only, immune to CWD confusion". Fall back to the
+        // legacy uncommitted-diff-vs-HEAD behavior only when the task
+        // has no worktree (direct CLI flows).
         if task.execution_note.as_deref() == Some("additive-only") {
-            let project_root = self.cas_root.parent().unwrap_or(&self.cas_root);
-            let violations = check_additive_only_violations(project_root);
+            let additive_root = self.resolve_task_project_root(&task);
+            let violations = if let Some(worktree_id) = task.worktree_id.as_deref() {
+                let parent_branch = self
+                    .open_worktree_store()
+                    .ok()
+                    .and_then(|store| store.get(worktree_id).ok())
+                    .map(|wt| wt.parent_branch.clone())
+                    .unwrap_or_else(|| "main".to_string());
+                check_additive_only_branch_violations(&additive_root, &parent_branch)
+            } else {
+                check_additive_only_violations(&additive_root)
+            };
             if !violations.is_empty() {
                 let file_list = violations
                     .iter()
@@ -1250,6 +1284,11 @@ pub(crate) fn check_uncommitted_work(project_root: &std::path::Path) -> Vec<Unco
 /// this returns an empty vec so the gate never blocks closes in contexts
 /// where it cannot reason about the diff. The backstop is advisory when git
 /// state is unknowable.
+///
+/// This is the "legacy" no-worktree fallback path. For tasks with an
+/// attached worker worktree, prefer
+/// [`check_additive_only_branch_violations`] which inspects committed
+/// history on the branch instead of unstaged state — see cas-bc1b.
 pub(crate) fn check_additive_only_violations(
     project_root: &std::path::Path,
 ) -> Vec<AdditiveOnlyViolation> {
@@ -1274,6 +1313,54 @@ pub(crate) fn check_additive_only_violations(
     }
 
     violations
+}
+
+/// cas-bc1b: check additive-only violations by comparing the worker
+/// branch's committed history against its parent branch. This is the
+/// path used for factory worker tasks — it inspects only what the
+/// worker committed on their isolated branch, immune to the
+/// main-worktree dirty-state confusion that tripped cas-4333.
+///
+/// Runs `git diff --name-status <merge-base>..HEAD` inside
+/// `worker_worktree_path` and filters to M/D/R statuses via
+/// [`parse_name_status`]. Untracked files don't exist in committed
+/// history, so `??` handling isn't needed here.
+///
+/// Graceful degradation: if the worktree isn't a git repo, git can't
+/// find `parent_branch`, or the merge-base computation fails, returns
+/// an empty vec. The gate is advisory when git state is unknowable.
+pub(crate) fn check_additive_only_branch_violations(
+    worker_worktree_path: &std::path::Path,
+    parent_branch: &str,
+) -> Vec<AdditiveOnlyViolation> {
+    use std::process::Command;
+
+    // Resolve the merge base first. Using `git merge-base` explicitly
+    // (rather than the `a..b` revspec shorthand) means we get a clear
+    // failure signal if the parent branch ref can't be resolved — we
+    // don't silently compare against the wrong thing.
+    let merge_base_out = Command::new("git")
+        .args(["merge-base", "HEAD", parent_branch])
+        .current_dir(worker_worktree_path)
+        .output();
+    let merge_base = match merge_base_out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        _ => return Vec::new(),
+    };
+    if merge_base.is_empty() {
+        return Vec::new();
+    }
+
+    let diff_out = Command::new("git")
+        .args(["diff", "--name-status", &format!("{merge_base}..HEAD")])
+        .current_dir(worker_worktree_path)
+        .output();
+    match diff_out {
+        Ok(o) if o.status.success() => {
+            parse_name_status(&String::from_utf8_lossy(&o.stdout))
+        }
+        _ => Vec::new(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1737,6 +1824,120 @@ mod additive_only_tests {
         // Porcelain prints "R  old -> new"; check_uncommitted_work
         // records the new path.
         assert_eq!(v[0].path, "renamed.txt");
+    }
+
+    // --- cas-bc1b: check_additive_only_branch_violations ------------------
+
+    /// Helper: initialize a repo, create a `main` commit, branch off into
+    /// `factory/worker`, and return the tempdir. The caller can then commit
+    /// whatever it wants on `factory/worker` before running the check.
+    fn init_branched_repo() -> tempfile::TempDir {
+        let dir = tempdir().unwrap();
+        let p = dir.path();
+        git(p, &["init", "-q", "-b", "main"]);
+        std::fs::write(p.join("existing.txt"), "original\n").unwrap();
+        git(p, &["add", "existing.txt"]);
+        git(p, &["commit", "-q", "-m", "main: initial"]);
+        git(p, &["checkout", "-q", "-b", "factory/worker"]);
+        dir
+    }
+
+    #[test]
+    fn branch_check_non_git_returns_empty() {
+        let dir = tempdir().unwrap();
+        assert!(
+            check_additive_only_branch_violations(dir.path(), "main").is_empty()
+        );
+    }
+
+    #[test]
+    fn branch_check_missing_parent_branch_returns_empty() {
+        // New repo with `main` but no such branch `nope` — merge-base
+        // fails → empty. The gate must not fire when it can't reason
+        // about history.
+        let dir = init_branched_repo();
+        let v = check_additive_only_branch_violations(dir.path(), "nope");
+        assert!(v.is_empty(), "unknown parent must no-op, got: {v:?}");
+    }
+
+    #[test]
+    fn branch_check_clean_branch_is_empty() {
+        // factory/worker has the same HEAD as main → no commits → no
+        // violations.
+        let dir = init_branched_repo();
+        let v = check_additive_only_branch_violations(dir.path(), "main");
+        assert!(v.is_empty(), "branch with no commits must be clean: {v:?}");
+    }
+
+    #[test]
+    fn branch_check_additive_commit_passes() {
+        // cas-bc1b happy path: the worker committed one new file on
+        // their branch. The branch-diff must be empty of M/D/R entries.
+        let dir = init_branched_repo();
+        std::fs::write(dir.path().join("new.rs"), "fn main() {}\n").unwrap();
+        git(dir.path(), &["add", "new.rs"]);
+        git(dir.path(), &["commit", "-q", "-m", "feat: new.rs"]);
+        let v = check_additive_only_branch_violations(dir.path(), "main");
+        assert!(
+            v.is_empty(),
+            "purely additive branch commit must pass: {v:?}"
+        );
+    }
+
+    #[test]
+    fn branch_check_modifying_commit_fails() {
+        // The worker modified an existing file on their branch. Must
+        // be rejected.
+        let dir = init_branched_repo();
+        std::fs::write(dir.path().join("existing.txt"), "worker edit\n").unwrap();
+        git(dir.path(), &["add", "existing.txt"]);
+        git(dir.path(), &["commit", "-q", "-m", "fix: edit existing.txt"]);
+        let v = check_additive_only_branch_violations(dir.path(), "main");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].path, "existing.txt");
+        assert!(v[0].status.starts_with('M'));
+    }
+
+    #[test]
+    fn branch_check_deleting_commit_fails() {
+        let dir = init_branched_repo();
+        git(dir.path(), &["rm", "-q", "existing.txt"]);
+        git(dir.path(), &["commit", "-q", "-m", "chore: drop existing.txt"]);
+        let v = check_additive_only_branch_violations(dir.path(), "main");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].path, "existing.txt");
+        assert!(v[0].status.starts_with('D'));
+    }
+
+    #[test]
+    fn branch_check_ignores_main_worktree_drift() {
+        // The core cas-4333 repro: main has a dirty uncommitted file
+        // after the worker's branch forked. The branch-diff view must
+        // not attribute that dirt to the worker. We achieve this by
+        // comparing `main..HEAD` from inside the worker's worktree,
+        // which only sees the worker's own commits.
+        //
+        // This test runs everything in a single tempdir because the
+        // production fix uses `git -C <worker_worktree_path>` which
+        // already gives us the CWD isolation we need; a separate
+        // physical worktree is not necessary for the unit. The main-
+        // drift scenario is that the worker's branch is additive *and*
+        // there's uncommitted dirt in the tree that isn't on the
+        // branch. The branch-diff must not report it.
+        let dir = init_branched_repo();
+        // Additive commit on the worker branch.
+        std::fs::write(dir.path().join("new.rs"), "fn main() {}\n").unwrap();
+        git(dir.path(), &["add", "new.rs"]);
+        git(dir.path(), &["commit", "-q", "-m", "feat: new.rs"]);
+        // Now simulate drift: modify an existing tracked file but
+        // leave it unstaged. The legacy `git diff HEAD` path would see
+        // this and reject. The branch-diff path must not.
+        std::fs::write(dir.path().join("existing.txt"), "drift\n").unwrap();
+        let v = check_additive_only_branch_violations(dir.path(), "main");
+        assert!(
+            v.is_empty(),
+            "uncommitted drift must not count against the branch: {v:?}"
+        );
     }
 
     #[test]
