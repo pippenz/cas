@@ -1,0 +1,54 @@
+# migration/systemd/cas-serve@.service
+#
+# Versioned systemd unit template for the cas HTTP bridge server. Phase 2
+# of the Petrastella → Hetzner migration (cas-b5f1) installs this file to
+# /etc/systemd/system/cas-serve@.service on daniel@87.99.156.244 and enables
+# cas-serve@daniel. Edit this file in cas-src; re-run
+# migration/phase2-prepare-target.sh to push updates to the server.
+#
+# Spec deviation: the task spec originally called for
+#   EnvironmentFile=/home/%i/.config/cas/env
+# but on the target server `.config/cas/env` is already occupied by
+# cas-fb43's user-level token vault (GH_TOKEN, VERCEL_TOKEN, NEON_API_KEY,
+# etc. — login-shell CLI creds). Per supervisor's option-(b) resolution on
+# cas-b5f1, this unit uses a separate file `serve.env` scoped strictly
+# to the systemd service so principle of least privilege is honored
+# (cas-serve never inherits user CLI tokens) and future vault edits don't
+# implicitly mutate the service environment.
+#
+# ExecStart uses `cas bridge serve` (not `cas serve`, which is the
+# stdio MCP subcommand) and reads the bearer token from serve.env via
+# systemd's ${VAR} expansion so the token is never literalized into
+# this committed file.
+
+[Unit]
+Description=CAS HTTP bridge server for %i
+After=network.target
+AssertPathExists=/home/%i/.config/cas/serve.env
+
+[Service]
+Type=simple
+User=%i
+Group=%i
+WorkingDirectory=/home/%i
+EnvironmentFile=/home/%i/.config/cas/serve.env
+ExecStart=/usr/local/bin/cas bridge serve --bind 127.0.0.1 --port 18999 --token ${CAS_SERVE_TOKEN}
+Restart=on-failure
+RestartSec=5
+
+# Discard stdout so the cas startup banner's 'Token: <value>' line does NOT
+# land in the systemd journal. The banner is informational and the token is
+# already in serve.env for anyone who needs it. Errors still flow through
+# stderr → journal for real operational signal.
+#
+# NOTE: /proc/<pid>/cmdline still exposes the token via systemd's
+# ${CAS_SERVE_TOKEN} argv expansion. That's a cas-cli limitation (the
+# --token flag is the only auth mechanism the binary accepts). On a
+# single-user server (daniel only), the exposure is bounded to daniel +
+# root. A cas-binary follow-up to add CAS_SERVE_TOKEN env-var reading would
+# close this hole completely.
+StandardOutput=null
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
