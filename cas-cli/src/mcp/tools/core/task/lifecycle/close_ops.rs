@@ -588,6 +588,67 @@ impl CasCore {
             }
         }
 
+        // cas-895d: uncommitted work gate.
+        //
+        // The pre-cas-895d close path had no backstop checking that the
+        // worker's claimed deliverables were actually committed. A
+        // worker could complete a task, run tests, hit `task.close`, pass
+        // verification, and successfully close — all while leaving the
+        // actual edits **uncommitted** in the working tree. When the
+        // worker's isolated worktree was later GC'd, the work was lost.
+        //
+        // The gate runs `git status --porcelain` scoped to the worker's
+        // own worktree (resolved from `task.worktree_id` when present;
+        // otherwise the project root, which is correct for non-factory
+        // tasks). Any non-`??` status line counts as uncommitted tracked
+        // work — untracked files (`??`) are ignored because they never
+        // belonged to the task in the first place.
+        //
+        // Supervisors can bypass this gate with `bypass_code_review=true`,
+        // matching the same "trust me" pattern used by the cas-b39f
+        // code-review gate. Non-supervisors get a hard reject pointing
+        // them at the dirty files.
+        //
+        // Graceful degradation: if the project directory is not a git
+        // repo or git fails, the check silently no-ops. The gate is
+        // advisory when git state is unknowable.
+        let bypass_close_gates =
+            req.bypass_code_review.unwrap_or(false) && is_supervisor_from_env();
+        if !bypass_close_gates {
+            let worktree_project_root = self.resolve_task_project_root(&task);
+            let uncommitted = check_uncommitted_work(&worktree_project_root);
+            if !uncommitted.is_empty() {
+                let file_list = uncommitted
+                    .iter()
+                    .map(|u| format!("  {}  {}", u.status, u.path))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let worktree_hint = if task.worktree_id.is_some() {
+                    format!(
+                        "📂 Checked worktree: {}\n\n",
+                        worktree_project_root.display()
+                    )
+                } else {
+                    String::new()
+                };
+                return Ok(Self::tool_error(format!(
+                    "⚠️ UNCOMMITTED WORK\n\n\
+                    task close rejected: the worker's tree has uncommitted tracked \
+                    changes. Closing now would lose the work when the worktree is \
+                    cleaned up.\n\n\
+                    {worktree_hint}Dirty files:\n{file_list}\n\n\
+                    To resolve:\n\
+                    1. Review the diff: `git status`\n\
+                    2. Stage and commit your changes with a meaningful message.\n\
+                    3. Re-run `mcp__cas__task action=close id={}`.\n\n\
+                    Supervisors may bypass this gate with bypass_code_review=true \
+                    (logged as a decision note) when the worker is stuck and the \
+                    work on disk is genuinely disposable.",
+                    req.id
+                )));
+            }
+        }
+
         // cas-e235: additive-only execution_note backstop.
         // If the worker declared `execution_note=additive-only`, reject the
         // close if git sees any modified, deleted, or renamed files in the
@@ -929,6 +990,39 @@ impl CasCore {
         )))
     }
 
+    /// Resolve the filesystem path that git operations for this task
+    /// should run in.
+    ///
+    /// For factory worker tasks with an attached worktree, this is the
+    /// worker's isolated worktree path — `git status` in the main
+    /// project root would see state that has no semantic relationship
+    /// to the worker's work (see cas-bc1b: main-worktree Cargo.lock
+    /// drift tripping the additive-only gate on a clean worker branch).
+    ///
+    /// For tasks without a worktree (direct CLI work, non-factory
+    /// flows), falls back to the project root (`cas_root.parent()`),
+    /// which preserves the pre-cas-895d/cas-bc1b behavior for those
+    /// paths. Also falls back when the worktree row has been removed
+    /// or can't be opened — the gate is advisory and should not crash
+    /// closes because of worktree-store flakes.
+    pub(crate) fn resolve_task_project_root(&self, task: &cas_types::Task) -> std::path::PathBuf {
+        let project_root = self
+            .cas_root
+            .parent()
+            .unwrap_or(self.cas_root.as_path())
+            .to_path_buf();
+        let Some(worktree_id) = task.worktree_id.as_deref() else {
+            return project_root;
+        };
+        let Ok(wt_store) = self.open_worktree_store() else {
+            return project_root;
+        };
+        match wt_store.get(worktree_id) {
+            Ok(wt) if wt.removed_at.is_none() && wt.path.exists() => wt.path.clone(),
+            _ => project_root,
+        }
+    }
+
     /// Compute why (if at all) the task-verifier step should be skipped
     /// for this close attempt.
     ///
@@ -1073,6 +1167,75 @@ impl CasCore {
 pub(crate) struct AdditiveOnlyViolation {
     pub status: String,
     pub path: String,
+}
+
+/// A single uncommitted-work entry: a tracked file that `git status` reports
+/// as modified, deleted, added-but-not-committed, renamed, or copied.
+///
+/// `status` is the raw two-char porcelain field (e.g. ` M`, `M `, `A `,
+/// `D `, `R `) and `path` is the workspace-relative path git reported.
+/// Untracked (`??`) entries are excluded by [`check_uncommitted_work`];
+/// they never belonged to the task in the first place so they cannot
+/// represent lost work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UncommittedEntry {
+    pub status: String,
+    pub path: String,
+}
+
+/// Return tracked files that are modified, staged, or otherwise in a
+/// non-committed state relative to HEAD in the git repo at
+/// `project_root`. Returns an empty vec for non-git directories or if
+/// the `git` subprocess fails — the gate is advisory and must not
+/// block closes it cannot reason about.
+///
+/// The check is deliberately scoped to **tracked** files. Untracked
+/// files (`??`) are allowed through because:
+///   * They're safe to delete if the task is disposable.
+///   * They're often scratch output (`*.log`, `target/`) that the
+///     worker had no intention of committing.
+///   * If the worker *did* intend to commit them, they would have run
+///     `git add` first, which promotes them to the `A ` status and the
+///     gate catches them.
+pub(crate) fn check_uncommitted_work(project_root: &std::path::Path) -> Vec<UncommittedEntry> {
+    use std::process::Command;
+
+    let Ok(output) = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(project_root)
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+
+    let mut entries = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        // Porcelain format: "XY path" where XY is a 2-char status.
+        // Short lines, empty lines → skip.
+        if line.len() < 4 {
+            continue;
+        }
+        let (status, rest) = line.split_at(2);
+        // Skip untracked entries (`??`). They're additive by nature
+        // and never represent a lost commit.
+        if status == "??" {
+            continue;
+        }
+        // Rename format: "R  old -> new". Record the new path.
+        let path = if let Some((_, new)) = rest.trim_start().split_once(" -> ") {
+            new.to_string()
+        } else {
+            rest.trim_start().to_string()
+        };
+        entries.push(UncommittedEntry {
+            status: status.to_string(),
+            path,
+        });
+    }
+    entries
 }
 
 /// Check whether the working tree at `project_root` contains any files that
@@ -1480,6 +1643,118 @@ mod additive_only_tests {
         assert_eq!(v[1].path, "deleted.txt");
         assert_eq!(v[2].path, "new.txt");
         assert!(v[2].status.starts_with('R'));
+    }
+
+    // --- cas-895d: check_uncommitted_work ---------------------------------
+
+    #[test]
+    fn uncommitted_non_git_dir_is_empty() {
+        let dir = tempdir().unwrap();
+        assert!(check_uncommitted_work(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn uncommitted_clean_repo_is_empty() {
+        let dir = init_repo();
+        assert!(check_uncommitted_work(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn uncommitted_untracked_file_is_ignored() {
+        let dir = init_repo();
+        std::fs::write(dir.path().join("scratch.log"), "noise\n").unwrap();
+        let v = check_uncommitted_work(dir.path());
+        assert!(
+            v.is_empty(),
+            "untracked files must not count as lost work, got: {v:?}"
+        );
+    }
+
+    #[test]
+    fn uncommitted_staged_new_file_is_caught() {
+        // cas-895d core scenario: the worker wrote a new file and staged
+        // it, but never committed. This is EXACTLY the cas-953d miss —
+        // the work exists on disk but would be GC'd with the worktree.
+        let dir = init_repo();
+        std::fs::write(dir.path().join("new.rs"), "fn main() {}\n").unwrap();
+        git(dir.path(), &["add", "new.rs"]);
+        let v = check_uncommitted_work(dir.path());
+        assert_eq!(v.len(), 1, "staged-but-uncommitted must block: {v:?}");
+        assert_eq!(v[0].path, "new.rs");
+        assert!(
+            v[0].status.starts_with('A'),
+            "staged-new status should start with A, got {}",
+            v[0].status
+        );
+    }
+
+    #[test]
+    fn uncommitted_unstaged_modification_is_caught() {
+        let dir = init_repo();
+        std::fs::write(dir.path().join("existing.txt"), "changed\n").unwrap();
+        let v = check_uncommitted_work(dir.path());
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].path, "existing.txt");
+        assert!(
+            v[0].status.contains('M'),
+            "modified status should contain M, got {}",
+            v[0].status
+        );
+    }
+
+    #[test]
+    fn uncommitted_staged_modification_is_caught() {
+        let dir = init_repo();
+        std::fs::write(dir.path().join("existing.txt"), "changed\n").unwrap();
+        git(dir.path(), &["add", "existing.txt"]);
+        let v = check_uncommitted_work(dir.path());
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].path, "existing.txt");
+        assert!(v[0].status.contains('M'));
+    }
+
+    #[test]
+    fn uncommitted_deleted_tracked_file_is_caught() {
+        let dir = init_repo();
+        std::fs::remove_file(dir.path().join("existing.txt")).unwrap();
+        let v = check_uncommitted_work(dir.path());
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].path, "existing.txt");
+        assert!(v[0].status.contains('D'));
+    }
+
+    #[test]
+    fn uncommitted_renamed_tracked_file_is_caught() {
+        let dir = init_repo();
+        git(dir.path(), &["mv", "existing.txt", "renamed.txt"]);
+        let v = check_uncommitted_work(dir.path());
+        assert_eq!(v.len(), 1);
+        assert!(
+            v[0].status.contains('R'),
+            "renamed status should contain R, got {}",
+            v[0].status
+        );
+        // Porcelain prints "R  old -> new"; check_uncommitted_work
+        // records the new path.
+        assert_eq!(v[0].path, "renamed.txt");
+    }
+
+    #[test]
+    fn uncommitted_after_commit_is_empty() {
+        // Complement scenario: the worker commits their work before
+        // calling close. The gate must not fire.
+        let dir = init_repo();
+        std::fs::write(dir.path().join("new.rs"), "fn main() {}\n").unwrap();
+        git(dir.path(), &["add", "new.rs"]);
+        git(
+            dir.path(),
+            &["commit", "-q", "-m", "feat: add new.rs"],
+        );
+        let v = check_uncommitted_work(dir.path());
+        assert!(
+            v.is_empty(),
+            "committed work must pass the gate: {v:?}"
+        );
     }
 }
 

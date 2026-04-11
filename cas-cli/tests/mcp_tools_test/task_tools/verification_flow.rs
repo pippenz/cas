@@ -190,6 +190,255 @@ code_review_findings: None,
     );
 }
 
+/// cas-895d: a worker completes their work, writes tests, runs build, and
+/// calls `task.close` — all while leaving the actual edits uncommitted in
+/// their worktree. The pre-fix close path accepted this because
+/// verification and the additive-only gate never looked at working-tree
+/// state; the work got GC'd with the worktree.
+///
+/// Post-fix, the close path runs `git status --porcelain` against the
+/// worker's worktree and rejects closes with any tracked modifications,
+/// staged-but-uncommitted additions, deletes, or renames. Only committed
+/// work — or genuinely scratch untracked files — may pass.
+///
+/// This test wires up a real git repo as the "worker worktree", attaches
+/// it to a task via `task.worktree_id`, and exercises the close path
+/// directly. verification_enabled=false so the test isolates the new
+/// gate from the task-verifier flow.
+#[tokio::test]
+async fn test_task_close_blocks_on_uncommitted_worker_worktree() {
+    use std::process::Command;
+
+    let (temp, service) = setup_cas();
+    let _env_lock = env_test_lock();
+    let cas_dir = temp.path().join(".cas");
+
+    // Disable verification so we isolate the cas-895d uncommitted-work
+    // gate from the task-verifier jail.
+    std::fs::write(
+        cas_dir.join("config.toml"),
+        r#"[verification]
+enabled = false
+"#,
+    )
+    .expect("write config");
+
+    // Create a real git repo in a tempdir to play the role of a worker
+    // worktree. One committed file, so HEAD exists and `git status`
+    // behaves normally.
+    let worktree_path = temp.path().join("worker-worktree");
+    std::fs::create_dir_all(&worktree_path).expect("mkdir worktree");
+    let git = |args: &[&str]| {
+        let ok = Command::new("git")
+            .args(args)
+            .current_dir(&worktree_path)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .status()
+            .expect("git")
+            .success();
+        assert!(ok, "git {args:?} failed");
+    };
+    git(&["init", "-q", "-b", "main"]);
+    std::fs::write(worktree_path.join("seed.txt"), "seed\n").unwrap();
+    git(&["add", "seed.txt"]);
+    git(&["commit", "-q", "-m", "seed"]);
+
+    // Register the worktree in cas and attach it to a task.
+    let worktree_store = open_worktree_store(&cas_dir).expect("open worktree store");
+    worktree_store.init().expect("init worktree store");
+    let worktree_id = Worktree::generate_id();
+    let worktree = Worktree::new(
+        worktree_id.clone(),
+        "cas/895d-worker".to_string(),
+        "main".to_string(),
+        worktree_path.clone(),
+    );
+    worktree_store.add(&worktree).expect("add worktree");
+
+    let create_req = TaskCreateRequest {
+        title: "cas-895d regression: committed-state close gate".to_string(),
+        description: None,
+        priority: 2,
+        task_type: "task".to_string(),
+        labels: None,
+        notes: None,
+        blocked_by: None,
+        design: None,
+        acceptance_criteria: None,
+        external_ref: None,
+        assignee: None,
+        demo_statement: None,
+        execution_note: None,
+        epic: None,
+    };
+    let id = extract_task_id(&extract_text(
+        service
+            .cas_task_create(Parameters(create_req))
+            .await
+            .expect("task_create"),
+    ))
+    .expect("task id")
+    .to_string();
+
+    let task_store = open_task_store(&cas_dir).expect("open task store");
+    let mut task = task_store.get(&id).expect("task exists");
+    task.status = cas::types::TaskStatus::InProgress;
+    task.worktree_id = Some(worktree_id.clone());
+    task_store.update(&task).expect("update task");
+
+    // Scenario A: worker modified an existing tracked file but never
+    // committed. Closing must fail with UNCOMMITTED WORK.
+    std::fs::write(worktree_path.join("seed.txt"), "worker edit\n").unwrap();
+    let close_req = TaskCloseRequest {
+        id: id.clone(),
+        reason: Some("claims to be done".to_string()),
+        bypass_code_review: None,
+        code_review_findings: None,
+    };
+    let resp = extract_text(
+        service
+            .cas_task_close(Parameters(close_req))
+            .await
+            .expect("close returns result"),
+    );
+    assert!(
+        resp.contains("UNCOMMITTED WORK"),
+        "uncommitted tracked edit must reject close: {resp}"
+    );
+    assert!(
+        resp.contains("seed.txt"),
+        "error must name the dirty file: {resp}"
+    );
+    assert_ne!(
+        task_store.get(&id).expect("task exists").status,
+        cas::types::TaskStatus::Closed,
+        "rejected close must not transition task to Closed"
+    );
+
+    // Scenario B: worker staged a new file but never committed. Same
+    // lost-work scenario — must still block (status `A `).
+    std::fs::write(worktree_path.join("seed.txt"), "seed\n").unwrap(); // revert
+    std::fs::write(worktree_path.join("new.rs"), "fn main() {}\n").unwrap();
+    git(&["add", "new.rs"]);
+    let close_req = TaskCloseRequest {
+        id: id.clone(),
+        reason: Some("claims to be done".to_string()),
+        bypass_code_review: None,
+        code_review_findings: None,
+    };
+    let resp = extract_text(
+        service
+            .cas_task_close(Parameters(close_req))
+            .await
+            .expect("close returns result"),
+    );
+    assert!(
+        resp.contains("UNCOMMITTED WORK"),
+        "staged-but-uncommitted must reject close: {resp}"
+    );
+    assert!(
+        resp.contains("new.rs"),
+        "error must name the new file: {resp}"
+    );
+
+    // Scenario C: worker actually commits their work. Close must now
+    // succeed (verification is disabled in this test's config).
+    git(&["commit", "-q", "-m", "feat: add new.rs"]);
+    let close_req = TaskCloseRequest {
+        id: id.clone(),
+        reason: Some("Committed and ready".to_string()),
+        bypass_code_review: None,
+        code_review_findings: None,
+    };
+    let resp = extract_text(
+        service
+            .cas_task_close(Parameters(close_req))
+            .await
+            .expect("close returns result"),
+    );
+    assert!(
+        resp.contains("Closed task:"),
+        "committed work must pass the gate: {resp}"
+    );
+    assert_eq!(
+        task_store.get(&id).expect("task exists").status,
+        cas::types::TaskStatus::Closed,
+        "committed close must transition task to Closed"
+    );
+}
+
+/// cas-895d complement: a task with no attached worktree and a clean
+/// project root still passes the gate. Ensures the gate doesn't break
+/// non-factory (direct CLI) flows where there's no worktree to inspect.
+#[tokio::test]
+async fn test_task_close_passes_without_worktree_and_clean_cwd() {
+    let (temp, service) = setup_cas();
+    let _env_lock = env_test_lock();
+    let cas_dir = temp.path().join(".cas");
+
+    std::fs::write(
+        cas_dir.join("config.toml"),
+        r#"[verification]
+enabled = false
+"#,
+    )
+    .expect("write config");
+
+    let create_req = TaskCreateRequest {
+        title: "Notes-only task".to_string(),
+        description: None,
+        priority: 2,
+        task_type: "task".to_string(),
+        labels: None,
+        notes: None,
+        blocked_by: None,
+        design: None,
+        acceptance_criteria: None,
+        external_ref: None,
+        assignee: None,
+        demo_statement: None,
+        execution_note: None,
+        epic: None,
+    };
+    let id = extract_task_id(&extract_text(
+        service
+            .cas_task_create(Parameters(create_req))
+            .await
+            .expect("task_create"),
+    ))
+    .expect("task id")
+    .to_string();
+
+    let _ = service
+        .cas_task_start(Parameters(IdRequest { id: id.clone() }))
+        .await
+        .expect("start");
+
+    // cas_root.parent() for the test is the temp dir which is not a
+    // git repo → check_uncommitted_work returns empty → close passes.
+    let close_req = TaskCloseRequest {
+        id: id.clone(),
+        reason: Some("done, no files touched".to_string()),
+        bypass_code_review: None,
+        code_review_findings: None,
+    };
+    let resp = extract_text(
+        service
+            .cas_task_close(Parameters(close_req))
+            .await
+            .expect("close returns result"),
+    );
+    assert!(
+        resp.contains("Closed task:"),
+        "non-git project root must not block close: {resp}"
+    );
+}
+
 #[tokio::test]
 async fn test_epic_close_requires_epic_verification_type() {
     let (temp, service) = setup_cas();
