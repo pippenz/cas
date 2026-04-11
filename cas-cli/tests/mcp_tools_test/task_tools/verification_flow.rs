@@ -666,9 +666,13 @@ code_review_findings: None,
         response_text.contains("Closed"),
         "bypass close should report success: {response_text}"
     );
+    // cas-3bd4: orphaned (no-assignee) closes now cite the accurate
+    // reason — "orphaned task, no assignee" — instead of the catch-all
+    // "assignee inactive" phrase that was always emitted regardless of
+    // actual assignee state.
     assert!(
-        response_text.contains("verification skipped — assignee inactive"),
-        "response must carry the bypass marker: {response_text}"
+        response_text.contains("verification skipped — orphaned task, no assignee"),
+        "response must carry the orphaned-task bypass marker: {response_text}"
     );
     assert!(
         !response_text.contains("VERIFICATION REQUIRED"),
@@ -765,9 +769,15 @@ code_review_findings: None,
             .expect("task_close should succeed via supervisor bypass"),
     );
 
+    // cas-3bd4: a ghost assignee (agent row missing from the store) is
+    // now reported as "assignee unknown" — the pre-cas-3bd4 path
+    // always said "assignee inactive" regardless of the true state,
+    // because `agent_store.get(name)` unwrap_or(true) collapsed every
+    // lookup failure into the same bucket. The new path keeps the
+    // supervisor bypass behavior but cites the real reason.
     assert!(
         response_text.contains("Closed")
-            && response_text.contains("verification skipped — assignee inactive"),
+            && response_text.contains("verification skipped — assignee unknown"),
         "ghost-assignee bypass should close and mark skipped: {response_text}"
     );
 
@@ -780,6 +790,165 @@ code_review_findings: None,
         .expect("verification lookup should not error")
         .expect("ghost-assignee bypass must write a Skipped verification row");
     assert_eq!(row.status, cas::types::VerificationStatus::Skipped);
+}
+
+/// cas-3bd4 regression: a factory worker's `task.assignee` stores the agent's
+/// display *name* (e.g. `"mighty-viper-52"`), not its session id. The pre-fix
+/// `agent_store.get(task.assignee)` therefore always failed, `unwrap_or(true)`
+/// treated the assignee as inactive, and supervisor closes silently succeeded
+/// with the misleading message `"verification skipped — assignee inactive"`
+/// even when the worker was demonstrably alive and holding a fresh lease.
+///
+/// Post-fix, the close path resolves liveness from the task's active lease
+/// (`TaskLease.agent_id` is the real session id), which survives the name/id
+/// mismatch. A supervisor closing such a task without `bypass_code_review=true`
+/// must now drop into the normal verification path; with the flag set, the
+/// close proceeds but the audit message cites "supervisor bypass", never
+/// "assignee inactive".
+#[tokio::test]
+async fn test_close_supervisor_active_worker_assignee_by_name() {
+    let _env_lock = env_test_lock();
+    let (temp, service) = setup_cas();
+    let cas_dir = temp.path().join(".cas");
+    let task_store = open_task_store(&cas_dir).unwrap();
+    let verification_store = open_verification_store(&cas_dir).unwrap();
+    let agent_store = open_agent_store(&cas_dir).expect("open agent store");
+
+    // Register a fresh, alive agent with a distinct display name so the
+    // id-vs-name mismatch is unambiguous.
+    let mut worker = cas::types::Agent::new(
+        "test-worker-by-name".to_string(),
+        "mighty-viper-99".to_string(),
+    );
+    worker.agent_type = cas::types::AgentType::Worker;
+    worker.role = cas::types::AgentRole::Worker;
+    worker.heartbeat(); // ensure fresh last_heartbeat + Active status
+    agent_store.register(&worker).expect("register worker");
+
+    let create_req = TaskCreateRequest {
+        title: "Task held by a by-name assignee".to_string(),
+        description: None,
+        priority: 2,
+        task_type: "task".to_string(),
+        labels: None,
+        notes: None,
+        blocked_by: None,
+        design: None,
+        acceptance_criteria: None,
+        external_ref: None,
+        assignee: None,
+        demo_statement: None,
+        execution_note: None,
+        epic: None,
+    };
+    let id = extract_task_id(&extract_text(
+        service
+            .cas_task_create(Parameters(create_req))
+            .await
+            .expect("task_create should succeed"),
+    ))
+    .expect("task id")
+    .to_string();
+
+    // Store the assignee as the NAME (production bug shape) and put the
+    // task in-progress, then claim it on behalf of the worker so the lease
+    // carries the real session id.
+    let mut task = task_store.get(&id).expect("task exists");
+    task.status = cas::types::TaskStatus::InProgress;
+    task.assignee = Some("mighty-viper-99".to_string());
+    task_store.update(&task).expect("update task");
+    agent_store
+        .try_claim(&id, &worker.id, 600, Some("worker lease for cas-3bd4 repro"))
+        .expect("worker claim should succeed");
+
+    // Flip the caller to supervisor for the close attempt.
+    let _guard = ScopedSupervisorEnv::new();
+
+    // --- Attempt 1: no bypass flag. The close MUST drop into the normal
+    //     verification path (worker is alive + holding a lease), not the
+    //     bypass branch. Pre-fix this path falsely reported the worker as
+    //     inactive and closed the task.
+    let close_req = TaskCloseRequest {
+        id: id.clone(),
+        reason: Some("worker finished, asking supervisor to close".to_string()),
+        bypass_code_review: None,
+        code_review_findings: None,
+    };
+    let response_text = extract_text(
+        service
+            .cas_task_close(Parameters(close_req))
+            .await
+            .expect("task_close returns a result"),
+    );
+    assert!(
+        response_text.contains("VERIFICATION REQUIRED"),
+        "active-by-name assignee must NOT trigger inactive bypass — got: {response_text}"
+    );
+    assert!(
+        !response_text.contains("Closed task:"),
+        "no bypass flag + active assignee must not transition to Closed: {response_text}"
+    );
+    assert!(
+        !response_text.contains("assignee inactive"),
+        "active assignee must never be reported as inactive: {response_text}"
+    );
+    assert_ne!(
+        task_store.get(&id).expect("task exists").status,
+        cas::types::TaskStatus::Closed,
+        "active assignee + no bypass must leave the task open"
+    );
+
+    // --- Attempt 2: with bypass_code_review=true. The close proceeds but
+    //     the audit message must cite "supervisor bypass", not "assignee
+    //     inactive".
+    let close_req = TaskCloseRequest {
+        id: id.clone(),
+        reason: Some("supervisor forced close after alignment".to_string()),
+        bypass_code_review: Some(true),
+        code_review_findings: None,
+    };
+    let response_text = extract_text(
+        service
+            .cas_task_close(Parameters(close_req))
+            .await
+            .expect("task_close returns a result"),
+    );
+    assert!(
+        response_text.contains("Closed task:"),
+        "supervisor + bypass_code_review must close the task: {response_text}"
+    );
+    assert!(
+        response_text.contains("verification skipped — supervisor bypass"),
+        "audit suffix must cite supervisor bypass, not assignee inactive: {response_text}"
+    );
+    assert!(
+        !response_text.contains("assignee inactive"),
+        "active assignee must never be reported as inactive even with bypass: {response_text}"
+    );
+    assert_eq!(
+        task_store.get(&id).expect("task exists").status,
+        cas::types::TaskStatus::Closed,
+        "supervisor bypass must transition task to Closed"
+    );
+
+    // Audit trail: the Skipped verification row must record the real
+    // reason, not the legacy "assignee inactive or orphaned task" string.
+    let row = verification_store
+        .get_latest_for_task(&id)
+        .expect("verification lookup")
+        .expect("supervisor bypass must write a Skipped row");
+    assert_eq!(row.status, cas::types::VerificationStatus::Skipped);
+    let summary_lc = row.summary.to_lowercase();
+    assert!(
+        summary_lc.contains("supervisor bypass") && summary_lc.contains("bypass_code_review"),
+        "Skipped row summary must name the real reason: {}",
+        row.summary
+    );
+    assert!(
+        !summary_lc.contains("inactive") && !summary_lc.contains("orphaned"),
+        "Skipped row summary must not inherit the legacy inactive/orphaned wording: {}",
+        row.summary
+    );
 }
 
 /// Negative: supervisor closes a task whose assignee is the currently-alive

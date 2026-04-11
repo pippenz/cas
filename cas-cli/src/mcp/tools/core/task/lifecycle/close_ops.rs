@@ -12,10 +12,136 @@ use crate::mcp::tools::core::imports::*;
 /// close retry returns `VERIFICATION REQUIRED`.
 const VERIFICATION_JAIL_TIMEOUT_SECS: i64 = 600;
 
+/// Heartbeat staleness threshold (seconds) for deciding whether an assignee
+/// is still considered active for verification-skip purposes. Aligned with
+/// the same 5-minute window used by task-claim reclaim.
+const ASSIGNEE_STALE_SECS: i64 = 300;
+
 /// Marker prefix used on the dispatch-request verification row (see
 /// lines ~255-272 below). Used to distinguish a stale dispatch from a real
 /// verifier-written Error verdict during auto-escalation.
 const DISPATCH_SUMMARY_PREFIX: &str = "Dispatch requested";
+
+/// Why the close path decided to skip (or not skip) the task-verifier step
+/// for a given close attempt.
+///
+/// Carried through to the response message so the audit trail cites the
+/// real reason instead of the catch-all "assignee inactive" phrase that
+/// surfaced cas-3bd4.
+///
+/// The pre-cas-3bd4 implementation represented this as a single
+/// `assignee_inactive: bool`. Every lookup failure — including the
+/// very-common name-vs-id mismatch described below — defaulted to `true`
+/// and the success message confidently lied that the assignee was inactive.
+/// This enum preserves the same skip *behavior* (supervisor still closes
+/// orphaned or genuinely-stale tasks without a verifier hop) but forces
+/// every skip reason to be named.
+///
+/// ## Why the old `agent_store.get(task.assignee)` kept returning "inactive"
+///
+/// `task.assignee` is set by `task_claiming.rs:89` to
+/// `Some(agent_name.clone())` — the human-readable display name, e.g.
+/// `"mighty-viper-52"`. But `AgentStore::get(id)` runs `WHERE id = ?` in
+/// `ops_agent.rs:79`, and `id` is the session-id (a UUID-like
+/// identifier), not the name. The lookup never found the row, so
+/// `unwrap_or(true)` treated the worker as inactive even though it was
+/// actively holding a fresh lease. `compute_verification_skip_reason`
+/// fixes this by consulting the task's active lease first — `TaskLease`
+/// stores the real `agent_id`, not the name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum VerificationSkipReason {
+    /// The assignee is alive and no bypass flag was set. Verification
+    /// runs normally; this is *not* a skip.
+    None,
+    /// The task has no assignee at all. Treated as orphaned; legacy
+    /// callers reached this via the same skip path.
+    NoAssignee,
+    /// The assignee exists and is registered, but their heartbeat or
+    /// lease is stale. `minutes_stale` is the observed staleness if we
+    /// could measure it.
+    AssigneeInactive { minutes_stale: Option<i64> },
+    /// `task.assignee` is set but we cannot resolve it through the
+    /// lease *or* a direct id lookup. The agent may have been GC'd or
+    /// the assignee row holds an old display name no longer in the
+    /// agent store. Skip verification and cite the real reason.
+    AssigneeUnknown,
+    /// Supervisor is closing a task whose assignee is still alive and
+    /// has explicitly requested a verification skip via
+    /// `bypass_code_review=true`. Separate from `AssigneeInactive` so
+    /// the audit note reflects supervisor intent, not worker state.
+    SupervisorBypass,
+}
+
+impl VerificationSkipReason {
+    /// Whether this reason short-circuits the verification gate.
+    pub(crate) fn is_skip(&self) -> bool {
+        !matches!(self, VerificationSkipReason::None)
+    }
+
+    /// Short human-readable suffix appended to the `Closed task:` line.
+    /// Must start with a leading space so it slots cleanly into the
+    /// format string.
+    pub(crate) fn response_suffix(&self, verification_enabled: bool) -> String {
+        match self {
+            VerificationSkipReason::None => {
+                if verification_enabled {
+                    " (verified)".to_string()
+                } else {
+                    String::new()
+                }
+            }
+            VerificationSkipReason::NoAssignee => {
+                " (verification skipped — orphaned task, no assignee)".to_string()
+            }
+            VerificationSkipReason::AssigneeInactive {
+                minutes_stale: Some(m),
+            } => {
+                format!(" (verification skipped — assignee inactive for {m}m)")
+            }
+            VerificationSkipReason::AssigneeInactive { minutes_stale: None } => {
+                " (verification skipped — assignee lease expired)".to_string()
+            }
+            VerificationSkipReason::AssigneeUnknown => {
+                " (verification skipped — assignee unknown)".to_string()
+            }
+            VerificationSkipReason::SupervisorBypass => {
+                " (verification skipped — supervisor bypass via bypass_code_review=true)"
+                    .to_string()
+            }
+        }
+    }
+
+    /// Reason text written to the `Skipped` verification row so the
+    /// audit trail records the accurate reason alongside the row, not
+    /// just in the response text.
+    pub(crate) fn audit_reason(&self) -> String {
+        match self {
+            VerificationSkipReason::None => String::new(),
+            VerificationSkipReason::NoAssignee => {
+                "Closed via supervisor bypass — task had no assignee (orphaned).".to_string()
+            }
+            VerificationSkipReason::AssigneeInactive {
+                minutes_stale: Some(m),
+            } => format!(
+                "Closed via supervisor bypass — assignee inactive for {m} minute(s) at close time."
+            ),
+            VerificationSkipReason::AssigneeInactive { minutes_stale: None } => {
+                "Closed via supervisor bypass — assignee lease had expired at close time."
+                    .to_string()
+            }
+            VerificationSkipReason::AssigneeUnknown => {
+                "Closed via supervisor bypass — assignee row not found in agent store (likely \
+                 a stale or renamed agent)."
+                    .to_string()
+            }
+            VerificationSkipReason::SupervisorBypass => {
+                "Closed via supervisor bypass — bypass_code_review=true explicitly set by \
+                 supervisor while assignee was still active."
+                    .to_string()
+            }
+        }
+    }
+}
 
 impl CasCore {
     pub async fn cas_task_close(
@@ -75,24 +201,16 @@ impl CasCore {
             };
 
         // Skip verification for orphaned tasks: if caller is supervisor and the
-        // task's assignee is inactive (heartbeat expired), allow close without verification.
-        let assignee_inactive = if verification_enabled && is_supervisor_from_env() {
-            if let Some(assignee_id) = task.assignee.as_deref() {
-                if let Ok(agent_store) = self.open_agent_store() {
-                    agent_store
-                        .get(assignee_id)
-                        .map(|agent| !agent.is_alive() || agent.is_heartbeat_expired(300))
-                        .unwrap_or(true) // assignee not found → treat as inactive
-                } else {
-                    false
-                }
-            } else {
-                // No assignee at all → orphaned
-                true
-            }
+        // task's assignee is inactive (heartbeat expired or lease gone), allow
+        // close without verification. cas-3bd4: compute the reason as a typed
+        // enum so the response message cites the actual state instead of
+        // defaulting to "assignee inactive" for every lookup failure.
+        let skip_reason = if verification_enabled && is_supervisor_from_env() {
+            self.compute_verification_skip_reason(&task, &req)
         } else {
-            false
+            VerificationSkipReason::None
         };
+        let skip_verification = skip_reason.is_skip();
 
         // Also allow supervisor to skip verification jail when they are the
         // task assignee for a non-epic task (fixes supervisor self-close deadlock).
@@ -104,7 +222,7 @@ impl CasCore {
                 .map(|aid| task.assignee.as_deref() == Some(aid.as_str()))
                 .unwrap_or(false);
 
-        if verification_enabled && !assignee_inactive {
+        if verification_enabled && !skip_verification {
             let is_worker_without_subagents = is_worker_without_subagents_from_env();
 
             // Check for approved verification
@@ -564,13 +682,17 @@ impl CasCore {
         }
         task.deliverables = deliverables;
 
-        // When closing via the supervisor bypass (assignee inactive / orphaned),
-        // we skip the verification gate but MUST still write a durable
-        // `Skipped` verification row. Without this row, the MCP jail
-        // (`check_pending_verification`) treats the task as unverified and
-        // blocks every downstream worker that inherits a BlockedBy on this
-        // task. See cas-82d6.
-        if assignee_inactive && verification_enabled {
+        // When closing via the supervisor bypass (assignee inactive / orphaned /
+        // supervisor-forced), we skip the verification gate but MUST still
+        // write a durable `Skipped` verification row. Without this row, the
+        // MCP jail (`check_pending_verification`) treats the task as
+        // unverified and blocks every downstream worker that inherits a
+        // BlockedBy on this task. See cas-82d6.
+        //
+        // cas-3bd4: the Skipped row now records the *actual* skip reason
+        // (from `VerificationSkipReason::audit_reason`) instead of the
+        // catch-all "assignee inactive or orphaned task" string.
+        if skip_verification && verification_enabled {
             if let Ok(verification_store) = self.open_verification_store() {
                 let needs_row = verification_store
                     .get_latest_for_task(&req.id)
@@ -587,9 +709,7 @@ impl CasCore {
                         let mut row = Verification::skipped(
                             ver_id,
                             req.id.clone(),
-                            "Closed via supervisor bypass — verification not run \
-                             (assignee inactive or orphaned task)."
-                                .to_string(),
+                            skip_reason.audit_reason(),
                         );
                         row.verification_type = if task.task_type == TaskType::Epic {
                             VerificationType::Epic
@@ -683,13 +803,11 @@ impl CasCore {
             ""
         };
 
-        let verification_note = if assignee_inactive {
-            " (verification skipped — assignee inactive)"
-        } else if verification_enabled {
-            " (verified)"
-        } else {
-            ""
-        };
+        // cas-3bd4: use the typed skip reason so the audit suffix cites
+        // the real reason (e.g. "assignee unknown" for name/id mismatches,
+        // "supervisor bypass" for explicit overrides) instead of always
+        // saying "assignee inactive".
+        let verification_note = skip_reason.response_suffix(verification_enabled);
 
         // Note about worktree status (merge already handled by worktree-merger agent)
         let worktree_msg = if let Some(worktree_id) = &task.worktree_id {
@@ -809,6 +927,104 @@ impl CasCore {
             commit_nudge_msg,
             auto_unblock_msg
         )))
+    }
+
+    /// Compute why (if at all) the task-verifier step should be skipped
+    /// for this close attempt.
+    ///
+    /// Only invoked after the caller has been identified as a supervisor
+    /// and `verification_enabled` is true — the `VerificationSkipReason::None`
+    /// cases here represent "supervisor is closing, but the assignee is
+    /// still alive and no bypass flag was set, so run the verifier".
+    ///
+    /// Resolution order:
+    ///
+    /// 1. No assignee at all → `NoAssignee`.
+    /// 2. Consult the task's active lease via `agent_store.get_lease`.
+    ///    `TaskLease.agent_id` is the real session-id even when
+    ///    `task.assignee` stores a display name, so this is the most
+    ///    reliable liveness source. If the lease is valid and the
+    ///    referenced agent is alive+fresh → not a skip (unless the
+    ///    supervisor passed `bypass_code_review=true`, in which case
+    ///    we honor it as `SupervisorBypass`). If the lease is stale or
+    ///    the referenced agent is dead → `AssigneeInactive`.
+    /// 3. No lease — try a direct `agent_store.get(task.assignee)` for
+    ///    legacy tasks whose assignee field may hold an agent_id. Same
+    ///    liveness logic as above.
+    /// 4. Everything failed → `AssigneeUnknown` (never falsely reported
+    ///    as "assignee inactive" — the agent row is simply missing).
+    pub(crate) fn compute_verification_skip_reason(
+        &self,
+        task: &cas_types::Task,
+        req: &TaskCloseRequest,
+    ) -> VerificationSkipReason {
+        let Some(assignee) = task.assignee.as_deref() else {
+            return VerificationSkipReason::NoAssignee;
+        };
+
+        let Ok(agent_store) = self.open_agent_store() else {
+            // Can't reach the agent store at all — be conservative and
+            // let verification run (None is the safe default).
+            return VerificationSkipReason::None;
+        };
+
+        let bypass_requested = req.bypass_code_review.unwrap_or(false);
+        let alive_result = |agent: &cas_types::Agent| {
+            agent.is_alive() && !agent.is_heartbeat_expired(ASSIGNEE_STALE_SECS)
+        };
+        let stale_minutes = |agent: &cas_types::Agent| {
+            chrono::Utc::now()
+                .signed_duration_since(agent.last_heartbeat)
+                .num_minutes()
+        };
+
+        // 1) Lease-based path. TaskLease.agent_id always holds the real
+        //    session id, so this survives the name-vs-id mismatch that
+        //    broke the pre-cas-3bd4 path.
+        if let Ok(Some(lease)) = agent_store.get_lease(&task.id) {
+            if lease.is_valid() {
+                if let Ok(agent) = agent_store.get(&lease.agent_id) {
+                    return if alive_result(&agent) {
+                        if bypass_requested {
+                            VerificationSkipReason::SupervisorBypass
+                        } else {
+                            VerificationSkipReason::None
+                        }
+                    } else {
+                        VerificationSkipReason::AssigneeInactive {
+                            minutes_stale: Some(stale_minutes(&agent)),
+                        }
+                    };
+                }
+                // Lease is valid but the referenced agent row is gone —
+                // agent was unregistered but the lease wasn't cleaned up.
+                return VerificationSkipReason::AssigneeUnknown;
+            }
+            // Lease exists but expired.
+            return VerificationSkipReason::AssigneeInactive {
+                minutes_stale: None,
+            };
+        }
+
+        // 2) No lease — try the legacy direct-id lookup. Works only when
+        //    task.assignee holds an agent_id, not a display name.
+        if let Ok(agent) = agent_store.get(assignee) {
+            return if alive_result(&agent) {
+                if bypass_requested {
+                    VerificationSkipReason::SupervisorBypass
+                } else {
+                    VerificationSkipReason::None
+                }
+            } else {
+                VerificationSkipReason::AssigneeInactive {
+                    minutes_stale: Some(stale_minutes(&agent)),
+                }
+            };
+        }
+
+        // 3) No lease, no matching agent row. The assignee is unknown
+        //    to the store — do not falsely report "inactive".
+        VerificationSkipReason::AssigneeUnknown
     }
 
     /// Reopen a closed task
