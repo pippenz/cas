@@ -78,6 +78,31 @@ existing Postgres default (NULLs are distinct) is actually safer during
 the backfill period — legacy NULL-project rows don't collide with
 themselves.
 
+### Four-case SQL trace for the cas-0bdc setWhere guard
+
+The full setWhere on both push routes (`app/api/sync/push/route.ts` and
+`app/api/teams/[teamId]/sync/push/route.ts`) after the fix:
+
+```sql
+excluded.updated_at > sync_entities.updated_at
+AND (sync_entities.project_id IS NULL OR sync_entities.project_id = excluded.project_id)
+```
+
+| Existing `project_id` | Incoming `project_id` | setWhere evaluates | Effect |
+|---|---|---|---|
+| `'A'` | `'A'` | `false OR true` → true | Update runs. `project_id` stays `'A'` because it is no longer in the `set` clause. Row content refreshes normally. |
+| `'A'` | `'B'` | `false OR false` → false | **Skip entirely.** No data, no teamId, no ownership change. This is the primary contamination vector blocked. |
+| `NULL` | `'A'` | `true OR …` → true | Update runs. `project_id` stays `NULL`. Legacy row data refreshes but ownership is never promoted automatically. Explicit promotion is a separate migration (part of cas-d656's scope). |
+| `'A'` | `NULL` | `false OR (A = NULL)` → `false OR NULL` → NULL → treated as false in WHERE | **Skip.** A client that somehow pushes without a `project_canonical_id` cannot clobber a project-owned row. |
+
+The Postgres three-valued logic on the last row is load-bearing:
+`projectId = NULL` evaluates to `NULL` (not `false`), but a WHERE clause
+treats `NULL` as "not true", so the row is correctly skipped. Worth
+keeping in the doc explicitly because a future refactor to
+`projectId = excluded.project_id` alone (dropping the `IS NULL`
+disjunct) would break case 3 (legacy NULL rows) without breaking the
+other three — a reviewer who only tests the A→B case wouldn't catch it.
+
 ## Downstream follow-up bugs (filed under cas-2eb3)
 
 Code review during this work surfaced three additional P1 bugs that must
