@@ -588,6 +588,29 @@ impl CasCore {
             }
         }
 
+        // cas-895d + cas-bc1b (follow-up): close-gate checks that inspect
+        // the worker's worktree are scoped *only* to tasks with an
+        // isolated worker worktree (`task.worktree_id` set).
+        //
+        // Non-isolated tasks (`isolate=false` in spawn_workers) run
+        // directly in the main cas-src worktree, which is routinely
+        // dirty during an active session: supervisor edits in flight,
+        // shared ops editing shared files, or simply unrelated drift.
+        // Running either close gate against the main worktree would
+        // reject every close in that mode and reintroduce the exact
+        // wrong-worktree-scope bug cas-bc1b was filed to fix.
+        //
+        // `resolve_worker_worktree_path` returns `None` for non-isolated
+        // tasks, and both gates below key off that Option to decide
+        // whether to fire at all. For non-isolated tasks the close
+        // path relies on cas-code-review (cas-b39f) + verification
+        // (task-verifier) as the quality bar — those gates operate on
+        // commits / review envelopes, not on working-tree state, so
+        // they're safe to run in a shared worktree.
+        let bypass_close_gates =
+            req.bypass_code_review.unwrap_or(false) && is_supervisor_from_env();
+        let worker_worktree_path = self.resolve_worker_worktree_path(&task);
+
         // cas-895d: uncommitted work gate.
         //
         // The pre-cas-895d close path had no backstop checking that the
@@ -598,54 +621,48 @@ impl CasCore {
         // worker's isolated worktree was later GC'd, the work was lost.
         //
         // The gate runs `git status --porcelain` scoped to the worker's
-        // own worktree (resolved from `task.worktree_id` when present;
-        // otherwise the project root, which is correct for non-factory
-        // tasks). Any non-`??` status line counts as uncommitted tracked
-        // work — untracked files (`??`) are ignored because they never
-        // belonged to the task in the first place.
+        // own worktree. Any non-`??` status line counts as uncommitted
+        // tracked work — untracked files (`??`) are ignored because
+        // they never belonged to the task in the first place.
+        //
+        // Scope: tasks with a resolved worker worktree only. Non-
+        // isolated tasks skip this gate entirely per the comment above.
         //
         // Supervisors can bypass this gate with `bypass_code_review=true`,
         // matching the same "trust me" pattern used by the cas-b39f
         // code-review gate. Non-supervisors get a hard reject pointing
         // them at the dirty files.
         //
-        // Graceful degradation: if the project directory is not a git
-        // repo or git fails, the check silently no-ops. The gate is
-        // advisory when git state is unknowable.
-        let bypass_close_gates =
-            req.bypass_code_review.unwrap_or(false) && is_supervisor_from_env();
+        // Graceful degradation: if the worktree path is not a git repo
+        // or git fails, the check silently no-ops. The gate is advisory
+        // when git state is unknowable.
         if !bypass_close_gates {
-            let worktree_project_root = self.resolve_task_project_root(&task);
-            let uncommitted = check_uncommitted_work(&worktree_project_root);
-            if !uncommitted.is_empty() {
-                let file_list = uncommitted
-                    .iter()
-                    .map(|u| format!("  {}  {}", u.status, u.path))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let worktree_hint = if task.worktree_id.is_some() {
-                    format!(
-                        "📂 Checked worktree: {}\n\n",
-                        worktree_project_root.display()
-                    )
-                } else {
-                    String::new()
-                };
-                return Ok(Self::tool_error(format!(
-                    "⚠️ UNCOMMITTED WORK\n\n\
-                    task close rejected: the worker's tree has uncommitted tracked \
-                    changes. Closing now would lose the work when the worktree is \
-                    cleaned up.\n\n\
-                    {worktree_hint}Dirty files:\n{file_list}\n\n\
-                    To resolve:\n\
-                    1. Review the diff: `git status`\n\
-                    2. Stage and commit your changes with a meaningful message.\n\
-                    3. Re-run `mcp__cas__task action=close id={}`.\n\n\
-                    Supervisors may bypass this gate with bypass_code_review=true \
-                    (logged as a decision note) when the worker is stuck and the \
-                    work on disk is genuinely disposable.",
-                    req.id
-                )));
+            if let Some(worker_wt) = worker_worktree_path.as_ref() {
+                let uncommitted = check_uncommitted_work(worker_wt);
+                if !uncommitted.is_empty() {
+                    let file_list = uncommitted
+                        .iter()
+                        .map(|u| format!("  {}  {}", u.status, u.path))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    return Ok(Self::tool_error(format!(
+                        "⚠️ UNCOMMITTED WORK\n\n\
+                        task close rejected: the worker's tree has uncommitted tracked \
+                        changes. Closing now would lose the work when the worktree is \
+                        cleaned up.\n\n\
+                        📂 Checked worktree: {}\n\n\
+                        Dirty files:\n{file_list}\n\n\
+                        To resolve:\n\
+                        1. Review the diff: `git status`\n\
+                        2. Stage and commit your changes with a meaningful message.\n\
+                        3. Re-run `mcp__cas__task action=close id={}`.\n\n\
+                        Supervisors may bypass this gate with bypass_code_review=true \
+                        (logged as a decision note) when the worker is stuck and the \
+                        work on disk is genuinely disposable.",
+                        worker_wt.display(),
+                        req.id
+                    )));
+                }
             }
         }
 
@@ -653,7 +670,7 @@ impl CasCore {
         //
         // If the worker declared `execution_note=additive-only`, reject
         // the close if git sees any modified, deleted, or renamed files
-        // in the task's diff.
+        // in the task's committed history.
         //
         // cas-bc1b: pre-fix, this check ran
         // `git diff --name-status HEAD` inside `self.cas_root.parent()`
@@ -672,39 +689,45 @@ impl CasCore {
         //    "uncommitted diff". So the gate wouldn't see violations
         //    even in the correct worktree.
         //
-        // Fix: prefer diffing the worker branch's committed history
-        // against its parent-branch merge base
-        // (`git diff <parent>...HEAD` inside the worker's worktree).
-        // This is option (a) from the cas-bc1b task description —
-        // "commits only, immune to CWD confusion". Fall back to the
-        // legacy uncommitted-diff-vs-HEAD behavior only when the task
-        // has no worktree (direct CLI flows).
+        // Fix (option (a) from the task description): diff the worker
+        // branch's committed history against its parent-branch merge
+        // base (`git diff <parent>...HEAD` inside the worker's
+        // worktree). Commits only — immune to CWD confusion.
+        //
+        // Non-isolated tasks skip this gate entirely: there's no
+        // distinct worker branch to diff against `main`, so the check
+        // has nothing to reason about. Earlier iterations fell through
+        // to a legacy `git diff HEAD` path on the main worktree — that
+        // path has been deleted in this commit because it reintroduced
+        // the exact wrong-worktree-scope bug cas-bc1b was filed to fix.
         if task.execution_note.as_deref() == Some("additive-only") {
-            let additive_root = self.resolve_task_project_root(&task);
-            let violations = if let Some(worktree_id) = task.worktree_id.as_deref() {
-                let parent_branch = self
-                    .open_worktree_store()
-                    .ok()
-                    .and_then(|store| store.get(worktree_id).ok())
-                    .map(|wt| wt.parent_branch.clone())
+            if let Some(worker_wt) = worker_worktree_path.as_ref() {
+                let parent_branch = task
+                    .worktree_id
+                    .as_deref()
+                    .and_then(|wt_id| {
+                        self.open_worktree_store()
+                            .ok()
+                            .and_then(|store| store.get(wt_id).ok())
+                            .map(|wt| wt.parent_branch.clone())
+                    })
                     .unwrap_or_else(|| "main".to_string());
-                check_additive_only_branch_violations(&additive_root, &parent_branch)
-            } else {
-                check_additive_only_violations(&additive_root)
-            };
-            if !violations.is_empty() {
-                let file_list = violations
-                    .iter()
-                    .map(|v| format!("  {} ({})", v.path, v.status))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                return Ok(Self::tool_error(format!(
-                    "⚠️ ADDITIVE-ONLY VIOLATION\n\n\
-                    task close rejected: execution_note=additive-only but diff contains \
-                    modifications.\n\n\
-                    Modified/deleted/renamed files:\n{file_list}\n\n\
-                    Use execution_note=null or test-first to modify existing files."
-                )));
+                let violations =
+                    check_additive_only_branch_violations(worker_wt, &parent_branch);
+                if !violations.is_empty() {
+                    let file_list = violations
+                        .iter()
+                        .map(|v| format!("  {} ({})", v.path, v.status))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    return Ok(Self::tool_error(format!(
+                        "⚠️ ADDITIVE-ONLY VIOLATION\n\n\
+                        task close rejected: execution_note=additive-only but diff contains \
+                        modifications.\n\n\
+                        Modified/deleted/renamed files:\n{file_list}\n\n\
+                        Use execution_note=null or test-first to modify existing files."
+                    )));
+                }
             }
         }
 
@@ -1024,37 +1047,49 @@ impl CasCore {
         )))
     }
 
-    /// Resolve the filesystem path that git operations for this task
-    /// should run in.
+    /// Resolve the filesystem path for the **worker's isolated
+    /// worktree**, if this task has one.
     ///
-    /// For factory worker tasks with an attached worktree, this is the
-    /// worker's isolated worktree path — `git status` in the main
-    /// project root would see state that has no semantic relationship
-    /// to the worker's work (see cas-bc1b: main-worktree Cargo.lock
-    /// drift tripping the additive-only gate on a clean worker branch).
+    /// Returns `Some(worktree_path)` for factory tasks spawned with
+    /// `isolate=true` — there's a distinct git worktree per worker,
+    /// resolved from `task.worktree_id` → `WorktreeStore`. This is the
+    /// only surface where worktree-scoped close gates
+    /// (cas-895d uncommitted-work, cas-bc1b additive-only) should fire.
     ///
-    /// For tasks without a worktree (direct CLI work, non-factory
-    /// flows), falls back to the project root (`cas_root.parent()`),
-    /// which preserves the pre-cas-895d/cas-bc1b behavior for those
-    /// paths. Also falls back when the worktree row has been removed
-    /// or can't be opened — the gate is advisory and should not crash
-    /// closes because of worktree-store flakes.
-    pub(crate) fn resolve_task_project_root(&self, task: &cas_types::Task) -> std::path::PathBuf {
-        let project_root = self
-            .cas_root
-            .parent()
-            .unwrap_or(self.cas_root.as_path())
-            .to_path_buf();
-        let Some(worktree_id) = task.worktree_id.as_deref() else {
-            return project_root;
-        };
-        let Ok(wt_store) = self.open_worktree_store() else {
-            return project_root;
-        };
-        match wt_store.get(worktree_id) {
-            Ok(wt) if wt.removed_at.is_none() && wt.path.exists() => wt.path.clone(),
-            _ => project_root,
+    /// Returns `None` in three cases, all of which mean "this task does
+    /// not have a worker-owned worktree to check":
+    ///
+    /// 1. `task.worktree_id` is absent entirely — the task ran directly
+    ///    in the main cas-src worktree (`isolate=false`), which is
+    ///    routinely dirty during an active session. The close gates
+    ///    must skip such tasks; checking the main worktree would
+    ///    reject every close because of unrelated in-flight work from
+    ///    the supervisor or other non-isolated workers. This was the
+    ///    pre-cas-895d/cas-bc1b follow-up bug.
+    /// 2. The worktree store can't be opened — treat as unknown state
+    ///    rather than falling back to the main worktree.
+    /// 3. The worktree row exists but has been `removed_at` or its
+    ///    on-disk path no longer exists — the worktree was already
+    ///    cleaned up, so there's nothing to inspect.
+    ///
+    /// Callers MUST NOT fall back to `self.cas_root.parent()` on
+    /// `None`. The whole point of returning Option is that "no worker
+    /// worktree" is different from "the main repo". Any gate that
+    /// can't reason without a worker worktree should skip itself.
+    pub(crate) fn resolve_worker_worktree_path(
+        &self,
+        task: &cas_types::Task,
+    ) -> Option<std::path::PathBuf> {
+        let worktree_id = task.worktree_id.as_deref()?;
+        let wt_store = self.open_worktree_store().ok()?;
+        let wt = wt_store.get(worktree_id).ok()?;
+        if wt.removed_at.is_some() {
+            return None;
         }
+        if !wt.path.exists() {
+            return None;
+        }
+        Some(wt.path.clone())
     }
 
     /// Compute why (if at all) the task-verifier step should be skipped
@@ -1270,49 +1305,6 @@ pub(crate) fn check_uncommitted_work(project_root: &std::path::Path) -> Vec<Unco
         });
     }
     entries
-}
-
-/// Check whether the working tree at `project_root` contains any files that
-/// violate the `additive-only` execution posture. A violation is any file
-/// whose `git diff --name-status HEAD` (committed-against-HEAD plus
-/// uncommitted) reports a status starting with `M`, `D`, or `R`.
-///
-/// Only new files (status `A`) are allowed under additive-only. `??`
-/// untracked files are ignored because they are additive by definition.
-///
-/// If `project_root` is not a git repository, or git fails for any reason,
-/// this returns an empty vec so the gate never blocks closes in contexts
-/// where it cannot reason about the diff. The backstop is advisory when git
-/// state is unknowable.
-///
-/// This is the "legacy" no-worktree fallback path. For tasks with an
-/// attached worker worktree, prefer
-/// [`check_additive_only_branch_violations`] which inspects committed
-/// history on the branch instead of unstaged state — see cas-bc1b.
-pub(crate) fn check_additive_only_violations(
-    project_root: &std::path::Path,
-) -> Vec<AdditiveOnlyViolation> {
-    use std::process::Command;
-
-    let mut violations = Vec::new();
-
-    // 1. Uncommitted (staged + unstaged) changes vs HEAD.
-    if let Ok(output) = Command::new("git")
-        .args(["diff", "--name-status", "HEAD"])
-        .current_dir(project_root)
-        .output()
-    {
-        if output.status.success() {
-            violations.extend(parse_name_status(&String::from_utf8_lossy(&output.stdout)));
-        } else {
-            // Not a git repo, or HEAD doesn't exist — treat as no-op.
-            return Vec::new();
-        }
-    } else {
-        return Vec::new();
-    }
-
-    violations
 }
 
 /// cas-bc1b: check additive-only violations by comparing the worker
@@ -1670,56 +1662,10 @@ mod additive_only_tests {
         dir
     }
 
-    #[test]
-    fn non_git_dir_returns_no_violations() {
-        let dir = tempdir().unwrap();
-        assert!(check_additive_only_violations(dir.path()).is_empty());
-    }
-
-    #[test]
-    fn clean_repo_returns_no_violations() {
-        let dir = init_repo();
-        assert!(check_additive_only_violations(dir.path()).is_empty());
-    }
-
-    #[test]
-    fn new_file_is_not_a_violation() {
-        let dir = init_repo();
-        std::fs::write(dir.path().join("new.txt"), "hello\n").unwrap();
-        git(dir.path(), &["add", "new.txt"]);
-        let v = check_additive_only_violations(dir.path());
-        assert!(v.is_empty(), "new file must be allowed, got: {v:?}");
-    }
-
-    #[test]
-    fn modified_file_is_violation() {
-        let dir = init_repo();
-        std::fs::write(dir.path().join("existing.txt"), "changed\n").unwrap();
-        let v = check_additive_only_violations(dir.path());
-        assert_eq!(v.len(), 1);
-        assert!(v[0].status.starts_with('M'));
-        assert_eq!(v[0].path, "existing.txt");
-    }
-
-    #[test]
-    fn deleted_file_is_violation() {
-        let dir = init_repo();
-        std::fs::remove_file(dir.path().join("existing.txt")).unwrap();
-        let v = check_additive_only_violations(dir.path());
-        assert_eq!(v.len(), 1);
-        assert!(v[0].status.starts_with('D'));
-        assert_eq!(v[0].path, "existing.txt");
-    }
-
-    #[test]
-    fn renamed_file_is_violation() {
-        let dir = init_repo();
-        git(dir.path(), &["mv", "existing.txt", "renamed.txt"]);
-        let v = check_additive_only_violations(dir.path());
-        assert_eq!(v.len(), 1);
-        assert!(v[0].status.starts_with('R'));
-        assert_eq!(v[0].path, "renamed.txt");
-    }
+    // Legacy `check_additive_only_violations` unit tests (non_git_dir,
+    // clean_repo, new_file, modified_file, deleted_file, renamed_file)
+    // were removed alongside the function itself. The `branch_check_*`
+    // tests below cover the replacement path — see cas-bc1b follow-up.
 
     #[test]
     fn parse_name_status_mixed() {

@@ -570,6 +570,226 @@ enabled = false
     );
 }
 
+/// cas-895d + cas-bc1b follow-up regression: a task with `worktree_id = None`
+/// (non-isolated worker, or direct CLI flow) must skip the close gates
+/// entirely, even when the main repo is a live git repo with dirty state.
+///
+/// This plugs the test-harness hole the earlier cas-895d and cas-bc1b
+/// tests created: they both used non-git tempdirs as `cas_root.parent()`,
+/// so the gates silently no-oped regardless of whether they had the
+/// worktree-scoping logic right. Production use has a real git repo
+/// with active drift, and running either gate there would reject every
+/// close of a non-isolated task.
+///
+/// Scenarios:
+///   * Uncommitted-work gate (cas-895d) — must not fire.
+///   * Additive-only gate (cas-bc1b) — must not fire even with
+///     `execution_note=additive-only` and committed modifications on
+///     the main branch.
+#[tokio::test]
+async fn test_close_gates_skipped_for_non_isolated_task_with_dirty_main() {
+    use std::process::Command;
+
+    let (temp, service) = setup_cas();
+    let _env_lock = env_test_lock();
+    let cas_dir = temp.path().join(".cas");
+
+    // Disable verification so we isolate the close gates.
+    std::fs::write(
+        cas_dir.join("config.toml"),
+        r#"[verification]
+enabled = false
+"#,
+    )
+    .expect("write config");
+
+    // Turn the directory containing `.cas/` into a real git repo with
+    // an active session's worth of dirty state:
+    //   * one committed file on main
+    //   * one modified tracked file (simulates supervisor mid-edit)
+    //   * one staged new file (simulates another non-isolated worker)
+    //   * one modification to an existing file committed on main but
+    //     not on this task's branch (simulates cas-bc1b scenario on
+    //     a non-isolated worker — there IS no branch, so the check
+    //     must not fire)
+    //
+    // Pre-refinement cas-895d+cas-bc1b, both gates would run against
+    // this tree and reject the close because of the dirty/staged
+    // state that has nothing to do with the task. Post-refinement,
+    // both gates skip entirely because `task.worktree_id == None`.
+    let project_root = temp.path();
+    let git = |args: &[&str]| {
+        let ok = Command::new("git")
+            .args(args)
+            .current_dir(project_root)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .status()
+            .expect("git")
+            .success();
+        assert!(ok, "git {args:?} failed");
+    };
+    // Initialize with .cas ignored so the cas metadata doesn't show up
+    // as dirt (it isn't what we're testing here).
+    //
+    // The drift files are deliberately docs-only (`.md`) so they don't
+    // also trip the cas-b39f code-review gate — that gate correctly
+    // scans the main tree for reviewable changes and would require a
+    // findings envelope. It's an independent concern from the
+    // cas-895d/cas-bc1b fix this test is validating, so we pick
+    // non-reviewable content for the drift. The cas-895d gate itself
+    // checks every non-`??` status line regardless of file type, so
+    // `.md` dirt exercises it just as well as `.rs`.
+    git(&["init", "-q", "-b", "main"]);
+    std::fs::write(project_root.join(".gitignore"), ".cas/\n").unwrap();
+    std::fs::write(project_root.join("shared.md"), "# shared\n\n- one\n").unwrap();
+    git(&["add", ".gitignore", "shared.md"]);
+    git(&["commit", "-q", "-m", "main: initial"]);
+
+    // Now dirty the main tree the way a live session would:
+    //   - modify shared.md (unstaged)
+    //   - stage a brand-new file
+    std::fs::write(
+        project_root.join("shared.md"),
+        "# shared\n\n- one\n- two\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project_root.join("supervisor_wip.md"),
+        "# in flight\n",
+    )
+    .unwrap();
+    git(&["add", "supervisor_wip.md"]);
+
+    // --- Scenario A: uncommitted-work gate (cas-895d) MUST NOT fire
+    //     for a task with no worktree_id, even with the above drift.
+    let task_store = open_task_store(&cas_dir).expect("open task store");
+
+    let create_req = TaskCreateRequest {
+        title: "Non-isolated task over dirty main (cas-895d skip)".to_string(),
+        description: None,
+        priority: 2,
+        task_type: "task".to_string(),
+        labels: None,
+        notes: None,
+        blocked_by: None,
+        design: None,
+        acceptance_criteria: None,
+        external_ref: None,
+        assignee: None,
+        demo_statement: None,
+        execution_note: None,
+        epic: None,
+    };
+    let id = extract_task_id(&extract_text(
+        service
+            .cas_task_create(Parameters(create_req))
+            .await
+            .expect("task_create"),
+    ))
+    .expect("task id")
+    .to_string();
+    let _ = service
+        .cas_task_start(Parameters(IdRequest { id: id.clone() }))
+        .await
+        .expect("start");
+
+    let close_req = TaskCloseRequest {
+        id: id.clone(),
+        reason: Some("non-isolated direct CLI flow".to_string()),
+        bypass_code_review: None,
+        code_review_findings: None,
+    };
+    let resp = extract_text(
+        service
+            .cas_task_close(Parameters(close_req))
+            .await
+            .expect("close returns"),
+    );
+    assert!(
+        resp.contains("Closed task:"),
+        "non-isolated task must not be rejected by cas-895d gate on \
+         dirty main worktree: {resp}"
+    );
+    assert!(
+        !resp.contains("UNCOMMITTED WORK"),
+        "cas-895d gate must not fire for non-isolated tasks: {resp}"
+    );
+    assert_eq!(
+        task_store.get(&id).expect("task").status,
+        cas::types::TaskStatus::Closed
+    );
+
+    // --- Scenario B: additive-only gate (cas-bc1b) MUST NOT fire for a
+    //     non-isolated task, even with execution_note=additive-only.
+    //     For this we also commit a *modification* on main to prove
+    //     the gate isn't running a branch-diff against the working
+    //     tree's history either — the task has no branch of its own.
+    git(&["add", "shared.md"]);
+    git(&["commit", "-q", "-m", "main: extend shared.md"]);
+
+    let create_additive_req = TaskCreateRequest {
+        title: "Non-isolated additive-only task (cas-bc1b skip)".to_string(),
+        description: None,
+        priority: 2,
+        task_type: "task".to_string(),
+        labels: None,
+        notes: None,
+        blocked_by: None,
+        design: None,
+        acceptance_criteria: None,
+        external_ref: None,
+        assignee: None,
+        demo_statement: None,
+        execution_note: Some("additive-only".to_string()),
+        epic: None,
+    };
+    let additive_id = extract_task_id(&extract_text(
+        service
+            .cas_task_create(Parameters(create_additive_req))
+            .await
+            .expect("task_create"),
+    ))
+    .expect("task id")
+    .to_string();
+    let _ = service
+        .cas_task_start(Parameters(IdRequest {
+            id: additive_id.clone(),
+        }))
+        .await
+        .expect("start");
+
+    let close_req = TaskCloseRequest {
+        id: additive_id.clone(),
+        reason: Some("additive-only non-isolated".to_string()),
+        bypass_code_review: None,
+        code_review_findings: None,
+    };
+    let resp = extract_text(
+        service
+            .cas_task_close(Parameters(close_req))
+            .await
+            .expect("close returns"),
+    );
+    assert!(
+        resp.contains("Closed task:"),
+        "non-isolated additive-only task must not be rejected by \
+         cas-bc1b gate on dirty main worktree: {resp}"
+    );
+    assert!(
+        !resp.contains("ADDITIVE-ONLY VIOLATION"),
+        "cas-bc1b gate must not fire for non-isolated tasks: {resp}"
+    );
+    assert_eq!(
+        task_store.get(&additive_id).expect("task").status,
+        cas::types::TaskStatus::Closed
+    );
+}
+
 /// cas-895d complement: a task with no attached worktree and a clean
 /// project root still passes the gate. Ensures the gate doesn't break
 /// non-factory (direct CLI) flows where there's no worktree to inspect.
