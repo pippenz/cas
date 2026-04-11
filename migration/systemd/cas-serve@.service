@@ -17,9 +17,12 @@
 # implicitly mutate the service environment.
 #
 # ExecStart uses `cas bridge serve` (not `cas serve`, which is the
-# stdio MCP subcommand) and reads the bearer token from serve.env via
-# systemd's ${VAR} expansion so the token is never literalized into
-# this committed file.
+# stdio MCP subcommand). The bearer token is read from CAS_SERVE_TOKEN in
+# serve.env via clap's env-var binding — the token never appears in argv,
+# so /proc/<pid>/cmdline, `systemctl status`, and `ps -ef` no longer expose
+# it. Requires cas-cli from commit adding env = "CAS_SERVE_TOKEN" to
+# ServeArgs::token (cas-2aa6 fix, 2026-04-11). Older cas binaries required
+# --token ${CAS_SERVE_TOKEN} on the ExecStart line; that is no longer safe.
 
 [Unit]
 Description=CAS HTTP bridge server for %i
@@ -32,7 +35,7 @@ User=%i
 Group=%i
 WorkingDirectory=/home/%i
 EnvironmentFile=/home/%i/.config/cas/serve.env
-ExecStart=/usr/local/bin/cas bridge serve --bind 127.0.0.1 --port 18999 --token ${CAS_SERVE_TOKEN}
+ExecStart=/usr/local/bin/cas bridge serve --bind 127.0.0.1 --port 18999
 Restart=on-failure
 RestartSec=5
 
@@ -40,13 +43,6 @@ RestartSec=5
 # land in the systemd journal. The banner is informational and the token is
 # already in serve.env for anyone who needs it. Errors still flow through
 # stderr → journal for real operational signal.
-#
-# NOTE: /proc/<pid>/cmdline still exposes the token via systemd's
-# ${CAS_SERVE_TOKEN} argv expansion. That's a cas-cli limitation (the
-# --token flag is the only auth mechanism the binary accepts). On a
-# single-user server (daniel only), the exposure is bounded to daniel +
-# root. A cas-binary follow-up to add CAS_SERVE_TOKEN env-var reading would
-# close this hole completely.
 StandardOutput=null
 StandardError=journal
 

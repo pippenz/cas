@@ -34,8 +34,12 @@ pub struct ServeArgs {
     #[arg(long)]
     pub cas_root: Option<std::path::PathBuf>,
 
-    /// Bearer token for authorization (default: auto-generate)
-    #[arg(long)]
+    /// Bearer token for authorization (default: auto-generate).
+    ///
+    /// Reads from the `CAS_SERVE_TOKEN` env var if not passed on argv. Prefer
+    /// the env var: passing the token on argv exposes it via `/proc/<pid>/cmdline`,
+    /// `systemctl status`, and `ps -ef`.
+    #[arg(long, env = "CAS_SERVE_TOKEN")]
     pub token: Option<String>,
 
     /// Disable authorization (not recommended; still binds to localhost by default)
