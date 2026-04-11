@@ -33,15 +33,27 @@ static CACHED_PROJECT_ID: OnceLock<Option<String>> = OnceLock::new();
 /// - `/home/user/cas-src/.cas/` → `cas-src`
 /// - `/home/user/gabber-studio/.cas/` → `gabber-studio`
 ///
-/// Returns `None` only if not inside a CAS project directory.
+/// If the folder name cannot be derived (e.g. `.cas/` lives at the filesystem root
+/// and its parent has no file name), falls back to a deterministic `local:<sha256>`
+/// hash of the canonicalized project path. This guarantees every valid CAS project
+/// has a stable, unique `project_id` for cloud sync scoping.
+///
+/// Returns `None` only if not inside a CAS project directory at all.
 /// The result is cached for the lifetime of the process.
 pub fn get_project_canonical_id() -> Option<String> {
     CACHED_PROJECT_ID
         .get_or_init(|| {
             let cas_root = find_cas_root().ok()?;
-            canonical_id_from_cas_root(&cas_root)
+            resolve_canonical_id(&cas_root)
         })
         .clone()
+}
+
+/// Pure composition of the folder-name derivation and the path-hash fallback.
+/// Extracted from `get_project_canonical_id` so the `.or_else` chain is testable
+/// without the `OnceLock` static — callers should prefer the cached public API.
+pub fn resolve_canonical_id(cas_root: &Path) -> Option<String> {
+    canonical_id_from_cas_root(cas_root).or_else(|| fallback_project_id_from_path(cas_root))
 }
 
 /// Derive the canonical project ID from a `.cas` directory path.
@@ -53,6 +65,39 @@ pub fn canonical_id_from_cas_root(cas_root: &Path) -> Option<String> {
     project_dir
         .file_name()
         .map(|name| name.to_string_lossy().to_string())
+}
+
+/// Fallback project ID derived from a deterministic sha256 hash of the canonical
+/// project path. Used when `canonical_id_from_cas_root` cannot produce a folder
+/// name (e.g. `.cas/` at the filesystem root).
+///
+/// Format: `local:<first 16 hex chars of sha256(canonical_path)>` — 8 bytes of
+/// entropy, more than enough to avoid collisions on a single machine while staying
+/// compact in URLs and logs.
+///
+/// The input is the parent of `cas_root` (the project directory), canonicalized
+/// via `std::fs::canonicalize` when possible so symlinked and renamed paths
+/// produce the same ID. Falls back to the lexical path if canonicalization fails
+/// (e.g. the directory no longer exists on disk — should not happen in practice
+/// since we just resolved it via `find_cas_root`, but we stay defensive).
+///
+/// Returns `None` only if both the canonical and lexical paths fail to produce
+/// any bytes to hash — practically unreachable.
+pub fn fallback_project_id_from_path(cas_root: &Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+
+    let project_dir = cas_root.parent().unwrap_or(cas_root);
+    let canonical = std::fs::canonicalize(project_dir).unwrap_or_else(|_| project_dir.to_path_buf());
+    let path_bytes = canonical.as_os_str().as_encoded_bytes();
+    if path_bytes.is_empty() {
+        return None;
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(path_bytes);
+    let digest = hasher.finalize();
+    let hex: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
+    Some(format!("local:{hex}"))
 }
 
 /// Cloud configuration stored in .cas/cloud.json
@@ -421,6 +466,135 @@ mod tests {
         use std::path::Path;
         let root_cas = Path::new("/.cas");
         assert_eq!(canonical_id_from_cas_root(root_cas), None);
+    }
+
+    #[test]
+    fn test_fallback_project_id_from_path_is_deterministic() {
+        // Same input path produces the same hash across repeated invocations,
+        // and the format is `local:` + 16 lowercase-hex chars (8 bytes of sha256).
+        let temp = TempDir::new().unwrap();
+        let project_dir = temp.path().join("some-project");
+        let cas_dir = project_dir.join(".cas");
+        std::fs::create_dir_all(&cas_dir).unwrap();
+
+        let first = fallback_project_id_from_path(&cas_dir).unwrap();
+        let second = fallback_project_id_from_path(&cas_dir).unwrap();
+        assert_eq!(first, second);
+        assert!(first.starts_with("local:"));
+        // local: + 16 hex chars = 22 chars total
+        assert_eq!(first.len(), 22);
+        // Every char after the `local:` prefix must be a lowercase ASCII hex digit.
+        let suffix = &first[6..];
+        assert!(
+            suffix.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "fallback suffix should be lowercase hex, got {suffix:?}"
+        );
+    }
+
+    #[test]
+    fn test_fallback_project_id_from_path_is_unique_per_path() {
+        // Different project paths must produce different hashes — otherwise two
+        // projects at different locations would still collide.
+        let temp = TempDir::new().unwrap();
+
+        let project_a = temp.path().join("project-a");
+        let cas_a = project_a.join(".cas");
+        std::fs::create_dir_all(&cas_a).unwrap();
+
+        let project_b = temp.path().join("project-b");
+        let cas_b = project_b.join(".cas");
+        std::fs::create_dir_all(&cas_b).unwrap();
+
+        let id_a = fallback_project_id_from_path(&cas_a).unwrap();
+        let id_b = fallback_project_id_from_path(&cas_b).unwrap();
+        assert_ne!(id_a, id_b);
+    }
+
+    #[test]
+    fn test_fallback_project_id_handles_filesystem_root() {
+        // The whole point of the fallback: at filesystem root,
+        // canonical_id_from_cas_root returns None; fallback must still produce a value.
+        use std::path::Path;
+        let root_cas = Path::new("/.cas");
+        assert_eq!(canonical_id_from_cas_root(root_cas), None);
+
+        let fallback = fallback_project_id_from_path(root_cas);
+        assert!(fallback.is_some());
+        let id = fallback.unwrap();
+        assert!(id.starts_with("local:"));
+        assert_eq!(id.len(), 22);
+    }
+
+    #[test]
+    fn test_resolve_canonical_id_prefers_folder_name() {
+        // End-to-end coverage of the .or_else chain: when the folder name is
+        // available, resolve_canonical_id returns it unchanged — the fallback
+        // must not fire on the happy path.
+        let temp = TempDir::new().unwrap();
+        let project_dir = temp.path().join("my-project");
+        let cas_dir = project_dir.join(".cas");
+        std::fs::create_dir_all(&cas_dir).unwrap();
+
+        let id = resolve_canonical_id(&cas_dir).unwrap();
+        assert_eq!(id, "my-project");
+        assert!(!id.starts_with("local:"));
+    }
+
+    #[test]
+    fn test_resolve_canonical_id_falls_back_at_filesystem_root() {
+        // End-to-end: when folder name is unavailable (filesystem root),
+        // resolve_canonical_id returns Some("local:...") instead of None.
+        // A regression that dropped the `.or_else` would turn this back into None.
+        use std::path::Path;
+        let root_cas = Path::new("/.cas");
+        let id = resolve_canonical_id(root_cas).expect("fallback should fire at fs root");
+        assert!(id.starts_with("local:"));
+        assert_eq!(id.len(), 22);
+    }
+
+    #[test]
+    fn test_fallback_lexical_branch_when_canonicalize_fails() {
+        // `fallback_project_id_from_path` falls back to the lexical path when
+        // `std::fs::canonicalize` fails (e.g., the directory does not exist on
+        // disk). Point it at a non-existent path and verify we still get a
+        // stable `local:<hex>` value rather than a panic or None.
+        let temp = TempDir::new().unwrap();
+        let nonexistent_cas = temp.path().join("never-created").join(".cas");
+        // Intentionally do NOT create the directory.
+
+        let id = fallback_project_id_from_path(&nonexistent_cas)
+            .expect("fallback must tolerate non-canonicalizable paths");
+        assert!(id.starts_with("local:"));
+        assert_eq!(id.len(), 22);
+
+        // Deterministic: same non-existent path produces the same hash.
+        let id2 = fallback_project_id_from_path(&nonexistent_cas).unwrap();
+        assert_eq!(id, id2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_fallback_resolves_symlinks_to_same_id() {
+        // Documented contract: "symlinked and renamed paths produce the same ID"
+        // via `std::fs::canonicalize`. Create a real project, symlink to it,
+        // and assert both paths produce the same fallback hash.
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let real_project = temp.path().join("real-project");
+        let real_cas = real_project.join(".cas");
+        std::fs::create_dir_all(&real_cas).unwrap();
+
+        let link_project = temp.path().join("link-to-project");
+        symlink(&real_project, &link_project).unwrap();
+        let link_cas = link_project.join(".cas");
+
+        let id_real = fallback_project_id_from_path(&real_cas).unwrap();
+        let id_link = fallback_project_id_from_path(&link_cas).unwrap();
+        assert_eq!(
+            id_real, id_link,
+            "symlinked and real paths should hash to the same ID after canonicalization"
+        );
     }
 
     #[test]
