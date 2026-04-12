@@ -287,7 +287,7 @@ pub struct CloudSyncConfig {
 }
 
 fn default_cloud_sync_interval() -> u64 {
-    300 // 5 minutes
+    60 // 1 minute
 }
 
 fn default_max_retries() -> i32 {

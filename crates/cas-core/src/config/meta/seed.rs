@@ -77,8 +77,8 @@ impl ConfigRegistry {
             name: "Sync Interval",
             description: "How often to sync with CAS Cloud, in seconds. Lower values provide faster sync but more network usage.",
             value_type: ConfigType::Int,
-            default: "300",
-            constraint: Constraint::Range(30, 3600),
+            default: "60",
+            constraint: Constraint::Range(10, 3600),
             advanced: false,
             requires_feature: None,
         });

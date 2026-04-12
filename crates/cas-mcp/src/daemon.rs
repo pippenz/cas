@@ -129,7 +129,7 @@ impl Default for EmbeddedDaemonConfig {
         Self {
             cas_root: std::path::PathBuf::new(),
             maintenance_interval_secs: 30 * 60, // 30 minutes
-            cloud_sync_interval_secs: 5 * 60,   // 5 minutes
+            cloud_sync_interval_secs: 60,        // 1 minute
             min_idle_secs: 60,                  // 1 minute idle before maintenance
             cloud_sync_idle_secs: 10,           // 10s idle before cloud sync (lightweight)
             apply_decay: true,

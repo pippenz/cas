@@ -60,7 +60,7 @@ fn test_embedded_daemon_status_default() {
 fn test_embedded_daemon_config_default() {
     let config = EmbeddedDaemonConfig::default();
     assert_eq!(config.maintenance_interval_secs, 30 * 60);
-    assert_eq!(config.cloud_sync_interval_secs, 5 * 60);
+    assert_eq!(config.cloud_sync_interval_secs, 60);
     assert_eq!(config.min_idle_secs, 60);
     assert!(config.apply_decay);
     assert!(config.process_observations);
