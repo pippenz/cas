@@ -1,5 +1,7 @@
+use std::collections::HashMap;
+
 use chrono::Utc;
-use tantivy::ReloadPolicy;
+use tantivy::{IndexReader, ReloadPolicy};
 use tantivy::collector::TopDocs;
 use tantivy::query::{BooleanQuery, Occur, Query, QueryParser, TermQuery};
 use tantivy::schema::{IndexRecordOption, Value};
@@ -14,6 +16,42 @@ use crate::hybrid_search::{
     DocType, SearchIndex, SearchOptions, SearchResult, extract_id_patterns, scorer,
 };
 use crate::types::Entry;
+
+impl SearchIndex {
+    /// Get or create a cached IndexReader.
+    /// The reader uses `ReloadPolicy::OnCommitWithDelay` so it automatically
+    /// picks up new segments after writes without manual invalidation.
+    fn reader(&self) -> Result<IndexReader, MemError> {
+        let mut guard = self.cached_reader.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(ref reader) = *guard {
+            return Ok(reader.clone());
+        }
+        let reader: IndexReader = self
+            .index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::OnCommitWithDelay)
+            .try_into()?;
+        *guard = Some(reader.clone());
+        Ok(reader)
+    }
+
+    /// Get or create a cached QueryParser for the standard search fields.
+    fn query_parser(&self) -> QueryParser {
+        let mut guard = self
+            .cached_query_parser
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if let Some(ref parser) = *guard {
+            return parser.clone();
+        }
+        let parser = QueryParser::for_index(
+            &self.index,
+            vec![self.content_field, self.tags_field, self.title_field],
+        );
+        *guard = Some(parser.clone());
+        parser
+    }
+}
 
 impl SearchIndex {
     /// Resolve a filter key (from [`parse_filter_query`]) to its Tantivy field.
@@ -71,20 +109,10 @@ impl SearchIndex {
             return Ok(Vec::new());
         }
 
-        let reader = self
-            .index
-            .reader_builder()
-            .reload_policy(ReloadPolicy::OnCommitWithDelay)
-            .try_into()?;
-
+        let reader = self.reader()?;
         let searcher = reader.searcher();
 
-        // Parse query - search content, tags, and title
-        let query_parser = QueryParser::for_index(
-            &self.index,
-            vec![self.content_field, self.tags_field, self.title_field],
-        );
-
+        let query_parser = self.query_parser();
         let query = query_parser
             .parse_query(&opts.query)
             .map_err(|e| MemError::Parse(e.to_string()))?;
@@ -92,6 +120,10 @@ impl SearchIndex {
         // Get more results than needed for post-filtering
         let limit = opts.limit * 3;
         let top_docs = searcher.search(&query, &TopDocs::with_limit(limit))?;
+
+        // Build a HashMap for O(1) entry lookup instead of O(n) per result
+        let entry_map: HashMap<&str, &Entry> =
+            entries.iter().map(|e| (e.id.as_str(), e)).collect();
 
         let mut results = Vec::new();
 
@@ -105,7 +137,7 @@ impl SearchIndex {
                 .to_string();
 
             // Find the entry for boosting
-            let entry = entries.iter().find(|e| e.id == id);
+            let entry = entry_map.get(id.as_str()).copied();
 
             // Skip if entry not found or doesn't match filters
             let Some(entry) = entry else {
@@ -196,12 +228,7 @@ impl SearchIndex {
 
         // 1. Direct ID lookups for extracted patterns (score = 1.0 for exact matches)
         if !id_patterns.is_empty() {
-            let reader = self
-                .index
-                .reader_builder()
-                .reload_policy(ReloadPolicy::OnCommitWithDelay)
-                .try_into()?;
-
+            let reader = self.reader()?;
             let searcher = reader.searcher();
 
             for id_pattern in &id_patterns {
@@ -259,12 +286,7 @@ impl SearchIndex {
             filters: filters.clone(),
         };
         if !parsed.residual.is_empty() || !parsed.filters.is_empty() {
-            let reader = self
-                .index
-                .reader_builder()
-                .reload_policy(ReloadPolicy::OnCommitWithDelay)
-                .try_into()?;
-
+            let reader = self.reader()?;
             let searcher = reader.searcher();
 
             // Build a text query from the residual (if any) and AND it with
@@ -272,10 +294,7 @@ impl SearchIndex {
             let text_query: Option<Box<dyn Query>> = if parsed.residual.is_empty() {
                 None
             } else {
-                let query_parser = QueryParser::for_index(
-                    &self.index,
-                    vec![self.content_field, self.tags_field, self.title_field],
-                );
+                let query_parser = self.query_parser();
                 Some(
                     query_parser
                         .parse_query(&parsed.residual)
@@ -463,11 +482,7 @@ impl SearchIndex {
         module: &str,
         limit: usize,
     ) -> Result<Vec<SearchHit>, MemError> {
-        let reader = self
-            .index
-            .reader_builder()
-            .reload_policy(ReloadPolicy::OnCommitWithDelay)
-            .try_into()?;
+        let reader = self.reader()?;
         let searcher = reader.searcher();
 
         let module_term = tantivy::Term::from_field_text(self.module_field, module);
@@ -477,10 +492,7 @@ impl SearchIndex {
         let text_q: Option<Box<dyn Query>> = if query.trim().is_empty() {
             None
         } else {
-            let parser = QueryParser::for_index(
-                &self.index,
-                vec![self.content_field, self.tags_field, self.title_field],
-            );
+            let parser = self.query_parser();
             Some(
                 parser
                     .parse_query(query)

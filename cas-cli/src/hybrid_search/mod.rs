@@ -86,8 +86,11 @@ mod id_utils;
 mod search_index_impl;
 mod search_index_query;
 
+use std::sync::Mutex;
+
 use chrono::Duration;
-use tantivy::Index;
+use tantivy::{Index, IndexReader};
+use tantivy::query::QueryParser;
 use tantivy::schema::*;
 
 pub use id_utils::extract_id_patterns;
@@ -157,6 +160,10 @@ pub struct SearchIndex {
     mem_date_field: Field,
     // Configuration
     writer_memory: usize,
+    // Cached IndexReader (auto-reloads on commit via ReloadPolicy)
+    cached_reader: Mutex<Option<IndexReader>>,
+    // Cached QueryParser (index + fields don't change)
+    cached_query_parser: Mutex<Option<QueryParser>>,
 }
 
 /// Options for search queries

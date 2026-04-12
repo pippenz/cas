@@ -417,8 +417,8 @@ impl HybridSearch {
 
         // 6. Combine scores using the new scoring system
         let semantic_f64: Vec<(String, f64)> = semantic_scores
-            .iter()
-            .map(|(id, s)| (id.clone(), *s as f64))
+            .into_iter()
+            .map(|(id, s)| (id, s as f64))
             .collect();
 
         let combined = if opts.use_rrf {
@@ -498,8 +498,8 @@ impl HybridSearch {
         for (id, score) in &bm25_scores {
             score_map.entry(id.clone()).or_default().bm25 = *score;
         }
-        for (id, score) in &semantic_scores {
-            score_map.entry(id.clone()).or_default().semantic = *score as f64;
+        for (id, score) in &semantic_f64 {
+            score_map.entry(id.clone()).or_default().semantic = *score;
         }
         for (id, score) in &temporal_scores {
             score_map.entry(id.clone()).or_default().temporal = *score;

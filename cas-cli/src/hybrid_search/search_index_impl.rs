@@ -145,6 +145,8 @@ impl SearchIndex {
             root_cause_field,
             mem_date_field,
             writer_memory: DEFAULT_WRITER_MEMORY,
+            cached_reader: std::sync::Mutex::new(None),
+            cached_query_parser: std::sync::Mutex::new(None),
         })
     }
 
@@ -210,6 +212,8 @@ impl SearchIndex {
             root_cause_field,
             mem_date_field,
             writer_memory: DEFAULT_WRITER_MEMORY,
+            cached_reader: std::sync::Mutex::new(None),
+            cached_query_parser: std::sync::Mutex::new(None),
         })
     }
 
