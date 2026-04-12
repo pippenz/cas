@@ -141,6 +141,11 @@ rg 'changed_function' src/
 # Examples: cargo test, pnpm test, pytest, npm test
 ```
 
+If tests fail in code you didn't modify:
+1. Re-run to check if flaky (transient failures happen).
+2. If consistent, report as blocker with the specific test name and error output.
+3. Do NOT try to fix other people's tests — that's out of scope.
+
 ### 5. No dead code left behind
 Check for language-specific dead code markers on your new code:
 - **TypeScript**: `// @ts-ignore` without justification
