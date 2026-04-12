@@ -99,6 +99,7 @@ impl SqliteAgentStore {
         .ok_or_else(|| StoreError::NotFound(format!("Agent not found: {id}")))
     }
     pub(crate) fn agent_update(&self, agent: &Agent) -> Result<()> {
+        crate::shared_db::with_write_retry(|| {
         let conn = self.lock_conn()?;
         let metadata_json =
             serde_json::to_string(&agent.metadata).unwrap_or_else(|_| "{}".to_string());
@@ -132,8 +133,10 @@ impl SqliteAgentStore {
             )));
         }
         Ok(())
+        }) // with_write_retry
     }
     pub(crate) fn agent_unregister(&self, id: &str) -> Result<()> {
+        crate::shared_db::with_write_retry(|| {
         let conn = self.lock_conn()?;
         let tx = ImmediateTx::new(&conn)?;
 
@@ -172,6 +175,7 @@ impl SqliteAgentStore {
 
         tx.commit()?;
         Ok(())
+        }) // with_write_retry
     }
     pub(crate) fn agent_list(&self, status: Option<AgentStatus>) -> Result<Vec<Agent>> {
         let conn = self.lock_conn()?;
@@ -266,6 +270,7 @@ impl SqliteAgentStore {
         }) // with_write_retry
     }
     pub(crate) fn agent_mark_stale(&self, id: &str) -> Result<()> {
+        crate::shared_db::with_write_retry(|| {
         let conn = self.lock_conn()?;
         let tx = ImmediateTx::new(&conn)?;
 
@@ -313,8 +318,10 @@ impl SqliteAgentStore {
 
         tx.commit()?;
         Ok(())
+        }) // with_write_retry
     }
     pub(crate) fn agent_revive(&self, id: &str) -> Result<()> {
+        crate::shared_db::with_write_retry(|| {
         let conn = self.lock_conn()?;
         let now = Utc::now().to_rfc3339();
 
@@ -335,6 +342,7 @@ impl SqliteAgentStore {
         }
 
         Ok(())
+        }) // with_write_retry
     }
     pub(crate) fn agent_list_failed_startup(&self, timeout_secs: i64) -> Result<Vec<Agent>> {
         let conn = self.lock_conn()?;

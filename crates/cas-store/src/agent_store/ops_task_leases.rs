@@ -14,6 +14,7 @@ impl SqliteAgentStore {
         duration_secs: i64,
         reason: Option<&str>,
     ) -> Result<ClaimResult> {
+        crate::shared_db::with_write_retry(|| {
         let conn = self.lock_conn()?;
         let tx = ImmediateTx::new(&conn)?;
         let now = Utc::now();
@@ -151,8 +152,10 @@ impl SqliteAgentStore {
 
         tx.commit()?;
         Ok(ClaimResult::Success(lease))
+        }) // with_write_retry
     }
     pub(crate) fn lease_release_lease(&self, task_id: &str, agent_id: &str) -> Result<()> {
+        crate::shared_db::with_write_retry(|| {
         let conn = self.lock_conn()?;
         let tx = ImmediateTx::new(&conn)?;
 
@@ -200,8 +203,10 @@ impl SqliteAgentStore {
                 "No active lease found for task {task_id}"
             ))),
         }
+        }) // with_write_retry
     }
     pub(crate) fn lease_release_lease_for_task(&self, task_id: &str) -> Result<bool> {
+        crate::shared_db::with_write_retry(|| {
         let conn = self.lock_conn()?;
         let tx = ImmediateTx::new(&conn)?;
 
@@ -244,6 +249,7 @@ impl SqliteAgentStore {
             // No active lease to release
             Ok(false)
         }
+        }) // with_write_retry
     }
     pub(crate) fn lease_renew_lease(
         &self,
@@ -251,6 +257,7 @@ impl SqliteAgentStore {
         agent_id: &str,
         duration_secs: i64,
     ) -> Result<()> {
+        crate::shared_db::with_write_retry(|| {
         let conn = self.lock_conn()?;
         let now = Utc::now();
         let expires_at = now + chrono::Duration::seconds(duration_secs);
@@ -291,6 +298,7 @@ impl SqliteAgentStore {
         }
 
         Ok(())
+        }) // with_write_retry
     }
     pub(crate) fn lease_get_lease(&self, task_id: &str) -> Result<Option<TaskLease>> {
         let conn = self.lock_conn()?;
@@ -336,6 +344,7 @@ impl SqliteAgentStore {
         Ok(leases)
     }
     pub(crate) fn lease_reclaim_expired_leases(&self) -> Result<usize> {
+        crate::shared_db::with_write_retry(|| {
         let conn = self.lock_conn()?;
         let now = Utc::now().to_rfc3339();
 
@@ -389,6 +398,7 @@ impl SqliteAgentStore {
         }
 
         Ok(count)
+        }) // with_write_retry
     }
     pub(crate) fn lease_get_lease_history(
         &self,
@@ -458,6 +468,7 @@ impl SqliteAgentStore {
     }
 
     pub(crate) fn lease_cleanup_lease_history(&self, older_than_days: i64) -> Result<usize> {
+        crate::shared_db::with_write_retry(|| {
         let conn = self.lock_conn()?;
         let cutoff = (Utc::now() - chrono::Duration::days(older_than_days)).to_rfc3339();
 
@@ -467,5 +478,6 @@ impl SqliteAgentStore {
         )?;
 
         Ok(rows)
+        }) // with_write_retry
     }
 }

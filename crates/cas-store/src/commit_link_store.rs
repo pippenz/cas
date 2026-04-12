@@ -83,15 +83,6 @@ impl SqliteCommitLinkStore {
         Ok(store)
     }
 
-    /// Create from an existing connection (for use within other stores)
-    pub fn from_connection(conn: Connection) -> Result<Self> {
-        let store = Self {
-            conn: Arc::new(Mutex::new(conn)),
-        };
-        store.init()?;
-        Ok(store)
-    }
-
     /// Parse a row into a CommitLink
     fn row_to_commit_link(row: &rusqlite::Row) -> rusqlite::Result<CommitLink> {
         let committed_at_str: String = row.get("committed_at")?;

@@ -115,15 +115,6 @@ impl SqliteFileChangeStore {
         Ok(store)
     }
 
-    /// Create from an existing connection (for use within other stores)
-    pub fn from_connection(conn: Connection) -> Result<Self> {
-        let store = Self {
-            conn: Arc::new(Mutex::new(conn)),
-        };
-        store.init()?;
-        Ok(store)
-    }
-
     /// Parse a row into a FileChange
     fn row_to_file_change(row: &rusqlite::Row) -> rusqlite::Result<FileChange> {
         let change_type_str: String = row.get("change_type")?;

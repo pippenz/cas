@@ -170,6 +170,7 @@ impl SupervisorQueueStore for SqliteSupervisorQueueStore {
         payload: &str,
         priority: NotificationPriority,
     ) -> Result<i64> {
+        crate::shared_db::with_write_retry(|| {
         let conn = self.conn.lock().unwrap();
         let now = Utc::now().to_rfc3339();
 
@@ -181,9 +182,11 @@ impl SupervisorQueueStore for SqliteSupervisorQueueStore {
 
         let id = conn.last_insert_rowid();
         Ok(id)
+        }) // with_write_retry
     }
 
     fn poll(&self, supervisor_id: &str, limit: usize) -> Result<Vec<SupervisorNotification>> {
+        crate::shared_db::with_write_retry(|| {
         let conn = self.conn.lock().unwrap();
         let now = Utc::now().to_rfc3339();
 
@@ -224,6 +227,7 @@ impl SupervisorQueueStore for SqliteSupervisorQueueStore {
         }
 
         Ok(notifications)
+        }) // with_write_retry
     }
 
     fn peek(&self, supervisor_id: &str, limit: usize) -> Result<Vec<SupervisorNotification>> {
@@ -248,6 +252,7 @@ impl SupervisorQueueStore for SqliteSupervisorQueueStore {
     }
 
     fn ack(&self, notification_id: i64) -> Result<()> {
+        crate::shared_db::with_write_retry(|| {
         let conn = self.conn.lock().unwrap();
         let now = Utc::now().to_rfc3339();
 
@@ -263,6 +268,7 @@ impl SupervisorQueueStore for SqliteSupervisorQueueStore {
         }
 
         Ok(())
+        }) // with_write_retry
     }
 
     fn pending_count(&self, supervisor_id: &str) -> Result<usize> {
@@ -295,6 +301,7 @@ impl SupervisorQueueStore for SqliteSupervisorQueueStore {
     }
 
     fn clear(&self, supervisor_id: &str) -> Result<usize> {
+        crate::shared_db::with_write_retry(|| {
         let conn = self.conn.lock().unwrap();
 
         let rows = conn.execute(
@@ -303,9 +310,11 @@ impl SupervisorQueueStore for SqliteSupervisorQueueStore {
         )?;
 
         Ok(rows)
+        }) // with_write_retry
     }
 
     fn cleanup_old(&self, older_than_secs: i64) -> Result<usize> {
+        crate::shared_db::with_write_retry(|| {
         let conn = self.conn.lock().unwrap();
         let cutoff = (Utc::now() - chrono::Duration::seconds(older_than_secs)).to_rfc3339();
 
@@ -315,6 +324,7 @@ impl SupervisorQueueStore for SqliteSupervisorQueueStore {
         )?;
 
         Ok(rows)
+        }) // with_write_retry
     }
 
     fn close(&self) -> Result<()> {

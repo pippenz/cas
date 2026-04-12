@@ -102,15 +102,6 @@ impl SqlitePromptStore {
         Ok(store)
     }
 
-    /// Create from an existing connection (for use within other stores)
-    pub fn from_connection(conn: Connection) -> Result<Self> {
-        let store = Self {
-            conn: Arc::new(Mutex::new(conn)),
-        };
-        store.init()?;
-        Ok(store)
-    }
-
     /// Parse a row into a Prompt
     fn row_to_prompt(row: &rusqlite::Row) -> rusqlite::Result<Prompt> {
         let timestamp_str: String = row.get("timestamp")?;

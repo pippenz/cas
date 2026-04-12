@@ -89,15 +89,6 @@ impl SqliteEventStore {
         Ok(store)
     }
 
-    /// Create from an existing connection (for use within other stores)
-    pub fn from_connection(conn: Connection) -> Result<Self> {
-        let store = Self {
-            conn: Arc::new(Mutex::new(conn)),
-        };
-        store.init()?;
-        Ok(store)
-    }
-
     /// Parse a row into an Event
     fn row_to_event(row: &rusqlite::Row) -> rusqlite::Result<Event> {
         let event_type_str: String = row.get("event_type")?;

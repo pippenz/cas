@@ -574,6 +574,7 @@ impl TaskStore for SqliteTaskStore {
     }
 
     fn delete(&self, id: &str) -> Result<()> {
+        crate::shared_db::with_write_retry(|| {
         let conn = self.conn.lock().unwrap();
         let tx = crate::shared_db::ImmediateTx::new(&conn)?;
 
@@ -612,6 +613,7 @@ impl TaskStore for SqliteTaskStore {
 
         tx.commit()?;
         Ok(())
+        }) // with_write_retry
     }
 
     fn list(&self, status: Option<TaskStatus>) -> Result<Vec<Task>> {

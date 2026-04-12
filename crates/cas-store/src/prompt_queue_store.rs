@@ -289,6 +289,7 @@ impl PromptQueueStore for SqlitePromptQueueStore {
         summary: Option<&str>,
         priority: Option<NotificationPriority>,
     ) -> Result<i64> {
+        crate::shared_db::with_write_retry(|| {
         let conn = self.conn.lock().unwrap();
         let now = Utc::now().to_rfc3339();
         let prio: i32 = priority.unwrap_or(NotificationPriority::Normal).into();
@@ -301,9 +302,11 @@ impl PromptQueueStore for SqlitePromptQueueStore {
         let id = conn.last_insert_rowid();
         let _ = capture_message_event(&conn, source, target);
         Ok(id)
+        }) // with_write_retry
     }
 
     fn poll_for_target(&self, target: &str, limit: usize) -> Result<Vec<QueuedPrompt>> {
+        crate::shared_db::with_write_retry(|| {
         let conn = self.conn.lock().unwrap();
         let now = Utc::now().to_rfc3339();
 
@@ -341,9 +344,11 @@ impl PromptQueueStore for SqlitePromptQueueStore {
         }
 
         Ok(prompts)
+        }) // with_write_retry
     }
 
     fn poll_all(&self, limit: usize) -> Result<Vec<QueuedPrompt>> {
+        crate::shared_db::with_write_retry(|| {
         let conn = self.conn.lock().unwrap();
         let now = Utc::now().to_rfc3339();
 
@@ -380,6 +385,7 @@ impl PromptQueueStore for SqlitePromptQueueStore {
         }
 
         Ok(prompts)
+        }) // with_write_retry
     }
 
     fn peek_all(&self, limit: usize) -> Result<Vec<QueuedPrompt>> {
@@ -455,6 +461,7 @@ impl PromptQueueStore for SqlitePromptQueueStore {
     }
 
     fn mark_processed(&self, prompt_id: i64) -> Result<()> {
+        crate::shared_db::with_write_retry(|| {
         let conn = self.conn.lock().unwrap();
         let now = Utc::now().to_rfc3339();
 
@@ -464,9 +471,11 @@ impl PromptQueueStore for SqlitePromptQueueStore {
         )?;
 
         Ok(())
+        }) // with_write_retry
     }
 
     fn ack(&self, prompt_id: i64) -> Result<()> {
+        crate::shared_db::with_write_retry(|| {
         let conn = self.conn.lock().unwrap();
         let now = Utc::now().to_rfc3339();
 
@@ -477,6 +486,7 @@ impl PromptQueueStore for SqlitePromptQueueStore {
 
         // rows_affected == 0 means either not found or already acked — both idempotent
         Ok(())
+        }) // with_write_retry
     }
 
     fn unacked(&self, timeout_secs: i64, limit: usize) -> Result<Vec<QueuedPrompt>> {
@@ -535,12 +545,15 @@ impl PromptQueueStore for SqlitePromptQueueStore {
     }
 
     fn clear(&self) -> Result<usize> {
+        crate::shared_db::with_write_retry(|| {
         let conn = self.conn.lock().unwrap();
         let rows = conn.execute("DELETE FROM prompt_queue", [])?;
         Ok(rows)
+        }) // with_write_retry
     }
 
     fn cleanup_old(&self, older_than_secs: i64) -> Result<usize> {
+        crate::shared_db::with_write_retry(|| {
         let conn = self.conn.lock().unwrap();
         let cutoff = (Utc::now() - chrono::Duration::seconds(older_than_secs)).to_rfc3339();
 
@@ -550,6 +563,7 @@ impl PromptQueueStore for SqlitePromptQueueStore {
         )?;
 
         Ok(rows)
+        }) // with_write_retry
     }
 
     fn close(&self) -> Result<()> {

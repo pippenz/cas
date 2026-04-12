@@ -194,6 +194,7 @@ impl SqliteSpawnQueueStore {
         force: bool,
         isolate: bool,
     ) -> Result<i64> {
+        crate::shared_db::with_write_retry(|| {
         let conn = self.conn.lock().unwrap();
         let now = Utc::now().to_rfc3339();
         let names = if worker_names.is_empty() {
@@ -209,6 +210,7 @@ impl SqliteSpawnQueueStore {
 
         let id = conn.last_insert_rowid();
         Ok(id)
+        }) // with_write_retry
     }
 }
 
