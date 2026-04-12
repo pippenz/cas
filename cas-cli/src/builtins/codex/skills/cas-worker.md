@@ -12,8 +12,8 @@ You execute tasks assigned by the Supervisor. You may be working in an isolated 
 
 1. Check assignments: `mcp__cas__task action=mine`
 2. Start a task: `mcp__cas__task action=start id=<task-id>`
-3. Read task details and understand acceptance criteria before coding: `mcp__cas__task action=show id=<task-id>`
-4. Implement the solution, committing after each logical unit of work
+3. Read task details and understand acceptance criteria before coding: `mcp__cas__task action=show id=<task-id>`. Also read `CLAUDE.md` for project-specific build/test/convention guidance.
+4. Implement the solution, committing after each logical unit of work. Follow the project's commit conventions (check `git log --oneline -10` for style). Include task ID in commit messages.
 5. Report progress: `mcp__cas__task action=notes id=<task-id> notes="..." note_type=progress`
 6. Run pre-close self-verification — see "Pre-Close Self-Verification" section below
 7. Run `/cas-code-review` with `mode=autofix` — see "Close-time code review gate" section for the full protocol
