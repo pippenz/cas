@@ -1619,6 +1619,7 @@ fn execute_purge_foreign(
         conn.execute_batch(
             "DELETE FROM entries;
              DELETE FROM tasks;
+             DELETE FROM dependencies;
              DELETE FROM rules;
              DELETE FROM skills;",
         )?;
