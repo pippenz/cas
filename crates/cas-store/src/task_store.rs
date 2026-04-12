@@ -41,7 +41,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     team_id TEXT,
     deliverables TEXT NOT NULL DEFAULT '{}',
     demo_statement TEXT NOT NULL DEFAULT '',
-    execution_note TEXT
+    execution_note TEXT,
+    owner_id TEXT,
+    visibility TEXT NOT NULL DEFAULT 'private',
+    collaborators TEXT NOT NULL DEFAULT '[]'
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);

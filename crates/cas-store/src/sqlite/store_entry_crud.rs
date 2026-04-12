@@ -28,7 +28,12 @@ impl SqliteStore {
                 tasks_closed INTEGER NOT NULL DEFAULT 0,
                 tool_uses INTEGER NOT NULL DEFAULT 0,
                 team_id TEXT,
-                title TEXT
+                title TEXT,
+                branch TEXT,
+                worktree_id TEXT,
+                outcome TEXT,
+                friction_score REAL,
+                delight_count INTEGER DEFAULT 0
             )",
             [],
         )?;

@@ -80,16 +80,6 @@ CREATE TABLE IF NOT EXISTS spawn_queue (
 CREATE INDEX IF NOT EXISTS idx_spawn_queue_pending ON spawn_queue(action) WHERE processed_at IS NULL;
 "#;
 
-/// Migration to add force column
-const SPAWN_QUEUE_MIGRATION_FORCE: &str = r#"
-ALTER TABLE spawn_queue ADD COLUMN force INTEGER NOT NULL DEFAULT 0;
-"#;
-
-/// Migration to add isolate column
-const SPAWN_QUEUE_MIGRATION_ISOLATE: &str = r#"
-ALTER TABLE spawn_queue ADD COLUMN isolate INTEGER NOT NULL DEFAULT 0;
-"#;
-
 /// Trait for spawn queue operations
 pub trait SpawnQueueStore: Send + Sync {
     /// Initialize the store (create tables)
@@ -218,35 +208,8 @@ impl SpawnQueueStore for SqliteSpawnQueueStore {
     fn init(&self) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch(SPAWN_QUEUE_SCHEMA)?;
-
-        // Migration: add force column if missing
-        let has_force: bool = conn
-            .query_row(
-                "SELECT COUNT(*) FROM pragma_table_info('spawn_queue') WHERE name = 'force'",
-                [],
-                |row| row.get::<_, i32>(0),
-            )
-            .map(|c| c > 0)
-            .unwrap_or(false);
-
-        if !has_force {
-            let _ = conn.execute_batch(SPAWN_QUEUE_MIGRATION_FORCE);
-        }
-
-        // Migration: add isolate column if missing
-        let has_isolate: bool = conn
-            .query_row(
-                "SELECT COUNT(*) FROM pragma_table_info('spawn_queue') WHERE name = 'isolate'",
-                [],
-                |row| row.get::<_, i32>(0),
-            )
-            .map(|c| c > 0)
-            .unwrap_or(false);
-
-        if !has_isolate {
-            let _ = conn.execute_batch(SPAWN_QUEUE_MIGRATION_ISOLATE);
-        }
-
+        // Note: force/isolate columns are now in SPAWN_QUEUE_SCHEMA inline.
+        // Old DBs are upgraded via migration m193_spawn_queue_force_isolate.
         Ok(())
     }
 
