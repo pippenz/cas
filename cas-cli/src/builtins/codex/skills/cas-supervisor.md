@@ -226,12 +226,13 @@ Supervisor has rejection authority. Work is sent back with specific, actionable 
 - **Flag obvious SOLID violations** — with specifics; don't rubber-stamp "SOLID compliance verified"
 - **Verify, don't trust** — Read the actual diff or run tests yourself before accepting. Worker self-reports are inputs, not verdicts.
 - **Rejection format** — Every rejection names: (1) which gate failed, (2) the specific code/file, (3) what needs to change. "SRP violation" alone is not actionable; "SRP violation: `handle_request()` in `router.rs` handles both auth and routing — split into two functions" is.
+- **Automated gate complement** — Workers run `/cas-code-review` before close (multi-persona automated review covering correctness, testing, maintainability, and project standards). Your manual review complements the automated gate — focus on architectural fit, scope compliance, and domain knowledge the automated reviewers can't assess. Don't re-check what the automated gate already covers.
 
 ### Ongoing Discipline
 
 - **Pattern consistency** — New work matches established conventions; deviations require explicit justification
 - **Debt tagging** — Log deliberate shortcuts with reason and remediation plan; unlogged shortcuts are violations
-- **Search before planning** — Always search CAS memories, prior tasks, and codebase before creating new work
+- **Search before planning** — Use `mcp__cs__search` for semantic search across memories and tasks, `mcp__cs__memory` for storing learnings. Always search before creating new work to avoid duplicating prior solutions or contradicting past decisions.
 
 ## Worker Modes
 
