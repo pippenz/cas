@@ -607,10 +607,10 @@ impl Pane {
             }
         }
 
-        // Put the buffer back for reuse (capacity preserved across calls)
-        self.drain_buf = coalesced;
-        let result = self.drain_buf.clone();
-        (result, other_events)
+        // Return the coalesced data directly — no clone needed since take()
+        // already moved ownership out. drain_buf capacity is donated to the
+        // caller but re-grows cheaply on the next cycle.
+        (coalesced, other_events)
     }
 
     pub async fn write(&self, data: &[u8]) -> Result<()> {
