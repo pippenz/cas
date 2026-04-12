@@ -346,3 +346,62 @@ When workers share the main directory, there's no branch merging — workers com
    git branch -d epic/<slug>
    ```
 4. Shutdown workers: `mcp__cs__coordination action=shutdown_workers count=0`
+
+## Worker Failure Recovery
+
+Workers fail in production. These are the three observed failure modes and their recovery procedures. All three have occurred in real factory sessions.
+
+### Dead or Silent Worker
+
+**Signature:** Worker stops responding to messages. No progress notes, no commits, no heartbeat updates. Task stays `in_progress` indefinitely.
+
+**Diagnosis:**
+1. Check worker status: `mcp__cs__coordination action=worker_status`
+2. Look for stale heartbeat (last activity timestamp far in the past) or missing entry
+3. Check worker activity log: `mcp__cs__coordination action=worker_activity`
+
+**Recovery:**
+1. Check the worker's worktree for partial work: `git -C .cas/worktrees/<worker> log --oneline main..HEAD`
+2. If commits exist, cherry-pick salvageable work to the base branch before cleanup
+3. Release the dead worker's lease: `mcp__cs__task action=release id=<task-id>`
+4. Shut down the dead worker: `mcp__cs__coordination action=shutdown_workers count=0` (then respawn the count you need)
+5. Spawn a fresh worker: `mcp__cs__coordination action=spawn_workers count=1 isolate=true`
+6. Reassign the task to the new worker. If partial work was cherry-picked, include that context in the assignment message so the new worker builds on it rather than redoing it.
+
+### Garbage Output (Context Exhaustion)
+
+**Signature:** Worker output degrades into garbled multi-language text (Russian/Chinese characters mixed with English, repeating pseudo-words like "updofficial/action/official", BPE fragment nonsense). May be followed by a generic "violates Usage Policy" API error. This is token sampling collapse from an exhausted context window, not a real policy violation.
+
+**Triggering conditions:** Long iterative fix-test-rerun loops, heavy stack trace volume in tool results, extended sessions with rapid context churn (20+ file edits in a short window).
+
+**Recovery:**
+1. **Do NOT send revision instructions.** The worker's context is poisoned — any further messages make it worse, not better.
+2. Shut down the affected worker immediately. Do not attempt to salvage the session.
+3. Check the worker's worktree for any commits made before degradation: `git -C .cas/worktrees/<worker> log --oneline main..HEAD`
+4. Cherry-pick any good commits. Discard anything committed after degradation began (inspect diffs carefully — degraded output may have produced syntactically plausible but semantically wrong code).
+5. Spawn a fresh worker with a clean context.
+6. Reassign the task. If the task involves iterative test-fix loops, add guidance to the assignment: "periodically commit working state" so partial progress survives if degradation recurs.
+
+### Verification Jail Deadlock
+
+**Signature:** Worker reports `VERIFICATION_JAIL_BLOCKED` and cannot close tasks or use tools. The jail check fires agent-wide — one task's pending verification blocks ALL tool usage across all tasks for that worker.
+
+**Note:** Factory workers are exempt from verification jail as of commit `bba6fbf`. If this failure mode appears, the running CAS binary is older than that fix.
+
+**Diagnosis:**
+1. Confirm the worker is actually jailed (not just reporting a stale error)
+2. Check whether the running `cas` binary includes the jail exemption fix: verify the binary was rebuilt after `bba6fbf` landed
+
+**Recovery (binary is current — exemption should apply):**
+1. Rebuild CAS: `~/.cargo/bin/cargo build --release` and restart the `cas serve` process
+2. Respawn workers — they will pick up the new binary
+
+**Recovery (binary is outdated or rebuild is not feasible mid-session):**
+1. Close the jailed task with an audit trail: `mcp__cs__task action=close id=<task-id> reason="Supervisor close — verification jail deadlock. Work verified at <commit-sha>. Worker jailed, CAS binary predates bba6fbf exemption fix."`
+2. If `close` is also blocked, use direct sqlite as last resort:
+   ```sql
+   UPDATE tasks SET status='closed', pending_verification=0 WHERE id='cas-XXXX';
+   UPDATE task_leases SET status='released' WHERE task_id='cas-XXXX' AND status='active';
+   ```
+3. After clearing the jail, message the worker that they can proceed with remaining tasks.
+4. File a note on the epic that the binary needs rebuilding before the next session.
