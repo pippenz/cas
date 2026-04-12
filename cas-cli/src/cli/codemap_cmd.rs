@@ -68,11 +68,15 @@ fn execute_status(cas_root: &Path) -> anyhow::Result<()> {
     }
 
     // Also show the hook-level freshness check for completeness
-    if let Some(msg) = check_codemap_freshness(cas_root) {
+    if let Some(staleness) = check_codemap_freshness(cas_root) {
         // Strip XML tags for CLI display
-        let clean = msg
-            .replace("<codemap-freshness>\n", "")
-            .replace("\n</codemap-freshness>", "");
+        let injection = staleness.format_injection(false);
+        // Strip XML wrapper tags (with any attributes) for CLI display
+        let clean = injection
+            .lines()
+            .filter(|l| !l.starts_with("<codemap-freshness") && !l.starts_with("</codemap-freshness"))
+            .collect::<Vec<_>>()
+            .join("\n");
         println!("\n  Hook message: {clean}");
     }
 

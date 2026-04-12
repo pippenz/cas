@@ -12,7 +12,7 @@ fn test_daemon_config_default() {
     let config = DaemonConfig::default();
     assert_eq!(config.interval_minutes, 30);
     assert_eq!(config.model, "haiku");
-    assert!(!config.auto_prune);
+    assert!(config.auto_prune);
 }
 
 #[test]
@@ -301,4 +301,37 @@ fn test_watch_event_variants() {
         WatchEvent::Error(message) => assert_eq!(message, "test error"),
         _ => panic!("Expected Error variant"),
     }
+}
+
+#[test]
+fn test_maintenance_cycle_runs_pruning_and_checkpoint() {
+    use crate::daemon::maintenance::run_once;
+    use tempfile::TempDir;
+
+    let temp = TempDir::new().unwrap();
+    let cas_root = temp.path().to_path_buf();
+
+    // Initialize the stores so tables exist
+    let _store = crate::store::open_store(&cas_root).unwrap();
+    let _event_store = crate::store::open_event_store(&cas_root).unwrap();
+    let _agent_store = crate::store::open_agent_store(&cas_root).unwrap();
+
+    let config = DaemonConfig {
+        cas_root: cas_root.clone(),
+        auto_prune: true,
+        process_observations: false,
+        consolidate_memories: false,
+        apply_decay: false,
+        index_bm25: false,
+        update_entity_summaries: false,
+        agent_purge_age_hours: 0,
+        ..DaemonConfig::default()
+    };
+
+    let result = run_once(&config).expect("maintenance cycle should succeed");
+
+    // With empty tables, pruning should complete without error and prune 0 rows
+    assert_eq!(result.events_pruned, 0);
+    assert_eq!(result.lease_history_pruned, 0);
+    assert!(result.errors.is_empty(), "unexpected errors: {:?}", result.errors);
 }

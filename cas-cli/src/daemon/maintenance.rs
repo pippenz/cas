@@ -10,7 +10,7 @@ use crate::error::CasError;
 
 /// Run a single maintenance cycle.
 pub fn run_maintenance(config: &DaemonConfig) -> Result<DaemonRunResult, CasError> {
-    use crate::store::{open_agent_store, open_store, open_task_store};
+    use crate::store::{open_agent_store, open_event_store, open_store, open_task_store};
     use crate::types::TaskStatus;
 
     let started_at = Utc::now();
@@ -25,6 +25,8 @@ pub fn run_maintenance(config: &DaemonConfig) -> Result<DaemonRunResult, CasErro
     let mut agents_purged = 0;
     let mut tasks_interrupted = 0;
     let mut worktrees_cleaned = 0;
+    let mut events_pruned = 0;
+    let mut lease_history_pruned = 0;
 
     let store = open_store(&config.cas_root)?;
 
@@ -184,6 +186,45 @@ pub fn run_maintenance(config: &DaemonConfig) -> Result<DaemonRunResult, CasErro
         }
     }
 
+    // Prune old events (30-day retention)
+    if config.auto_prune {
+        if let Ok(event_store) = open_event_store(&config.cas_root) {
+            match event_store.prune(30) {
+                Ok(count) => events_pruned = count,
+                Err(error) => errors.push(format!("Event pruning failed: {error}")),
+            }
+        }
+    }
+
+    // Clean up old lease history (30-day retention)
+    if config.auto_prune {
+        if let Ok(agent_store) = open_agent_store(&config.cas_root) {
+            match agent_store.cleanup_lease_history(30) {
+                Ok(count) => lease_history_pruned = count,
+                Err(error) => errors.push(format!("Lease history cleanup failed: {error}")),
+            }
+        }
+    }
+
+    // WAL checkpoint to prevent unbounded WAL file growth
+    {
+        let db_path = config.cas_root.join("cas.db");
+        if db_path.exists() {
+            match cas_store::shared_db::shared_connection(&db_path) {
+                Ok(conn) => {
+                    if let Ok(conn) = conn.lock() {
+                        if let Err(error) =
+                            conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")
+                        {
+                            errors.push(format!("WAL checkpoint failed: {error}"));
+                        }
+                    }
+                }
+                Err(error) => errors.push(format!("WAL checkpoint connection failed: {error}")),
+            }
+        }
+    }
+
     match cleanup_orphaned_worktrees(config) {
         Ok(count) => worktrees_cleaned = count,
         Err(error) => errors.push(format!("Worktree cleanup failed: {error}")),
@@ -203,6 +244,8 @@ pub fn run_maintenance(config: &DaemonConfig) -> Result<DaemonRunResult, CasErro
         entries_indexed,
         indexing_errors,
         entity_summaries_updated,
+        events_pruned,
+        lease_history_pruned,
         agents_cleaned,
         agents_purged,
         tasks_interrupted,

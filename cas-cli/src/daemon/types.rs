@@ -51,7 +51,7 @@ impl Default for DaemonConfig {
             batch_size: 20,
             process_observations: true,
             consolidate_memories: true,
-            auto_prune: false,
+            auto_prune: true,
             apply_decay: true,
             model: "haiku".to_string(),
             cas_root: PathBuf::new(),
@@ -112,6 +112,10 @@ pub struct DaemonRunResult {
     pub indexing_errors: Vec<String>,
     /// Entity summaries updated
     pub entity_summaries_updated: usize,
+    /// Events pruned (older than retention period)
+    pub events_pruned: usize,
+    /// Lease history entries pruned
+    pub lease_history_pruned: usize,
     /// Stale agents cleaned (marked dead and leases reclaimed)
     pub agents_cleaned: usize,
     /// Old stale/shutdown agents permanently deleted
