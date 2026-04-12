@@ -40,6 +40,12 @@ If **every** MCP tool call fails with a jail/blocked error (not just `close`), t
 2. **Report to supervisor immediately** via `mcp__cas__coordination action=message` with the exact error message and your agent name.
 3. **Supervisor will rebuild CAS and respawn you.** This is not something you can fix from inside your session.
 
+## Context Exhaustion
+
+If your output degrades to garbled multi-language text, or you find yourself repeating the same fix in a loop, this is context exhaustion (attention collapse from a long session). You cannot self-recover from this state.
+
+Message supervisor immediately: "Context exhausted, need respawn." Do not attempt to continue working.
+
 ## Blockers
 
 Report immediately — don't spend time stuck:
@@ -384,3 +390,5 @@ Only report to supervisor after completing at least steps 1-2. Include the error
 3. **Do NOT attempt sqlite surgery.** Direct database edits from a worker session risk corrupting shared state.
 
 4. **Report to supervisor** via `mcp__cas__coordination action=message` with the error and diagnostic output. Supervisor will fix the MCP connection or respawn you.
+
+**Known-fixed CAS bug reappears**: If a bug that was supposedly fixed in the source code still manifests, the running CAS binary may be outdated (not rebuilt after the fix). Report to supervisor — don't file a duplicate bug or attempt your own fix.
