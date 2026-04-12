@@ -65,6 +65,11 @@ impl Notifier {
                 icon: "emblem-synchronizing",
                 urgency: Urgency::Low,
             }),
+            DirectorEvent::EpicAllSubtasksClosed { .. } => Some(NotificationMeta {
+                title: "Epic Ready to Close",
+                icon: "starred",
+                urgency: Urgency::Normal,
+            }),
             // Don't notify for these events
             DirectorEvent::TaskAssigned { .. } | DirectorEvent::AgentRegistered { .. } => None,
         }

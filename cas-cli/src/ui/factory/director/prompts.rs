@@ -220,6 +220,29 @@ pub fn generate_prompt(
             // completion (closed tasks, merged branches, shut down workers)
             None
         }
+
+        DirectorEvent::EpicAllSubtasksClosed {
+            epic_id,
+            epic_title,
+        } => {
+            if !config.on_epic_completed {
+                return None;
+            }
+
+            let text = format!(
+                "🎉 All subtasks of epic '{epic_title}' ({epic_id}) are now closed!\n\n\
+                 Next steps:\n\
+                 - Cherry-pick worker commits to main\n\
+                 - Verify the integrated result\n\
+                 - Close the epic: {supervisor_prefix}task action=close id={epic_id} reason=\"All subtasks complete\"\n\
+                 - Shut down idle workers if no more work"
+            );
+
+            Some(Prompt {
+                target: supervisor_name.to_string(),
+                text,
+            })
+        }
     }
 }
 

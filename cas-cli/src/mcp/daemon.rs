@@ -631,6 +631,7 @@ impl EmbeddedDaemon {
                         "worker_verification_blocked" => CasEventType::WorkerVerificationBlocked,
                         "verification_started" => CasEventType::VerificationStarted,
                         "verification_added" => CasEventType::VerificationAdded,
+                        "epic_subtasks_complete" => CasEventType::EpicSubtasksComplete,
                         _ => CasEventType::WorkerSubagentSpawned, // Fallback
                     };
 

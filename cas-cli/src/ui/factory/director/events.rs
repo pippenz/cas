@@ -67,6 +67,11 @@ pub enum DirectorEvent {
     EpicStarted { epic_id: String, epic_title: String },
     /// All tasks in an epic are complete
     EpicCompleted { epic_id: String },
+    /// All subtasks of an epic are closed but the epic itself is still open
+    EpicAllSubtasksClosed {
+        epic_id: String,
+        epic_title: String,
+    },
 }
 
 impl DirectorEvent {
@@ -80,6 +85,7 @@ impl DirectorEvent {
             Self::AgentRegistered { agent_name, .. } => Some(agent_name),
             Self::EpicStarted { .. } => None, // Broadcast or supervisor
             Self::EpicCompleted { .. } => None,
+            Self::EpicAllSubtasksClosed { .. } => None, // Targets supervisor
         }
     }
 
@@ -122,6 +128,12 @@ impl DirectorEvent {
             Self::EpicCompleted { epic_id } => {
                 format!("Epic {epic_id} completed")
             }
+            Self::EpicAllSubtasksClosed {
+                epic_id,
+                epic_title,
+            } => {
+                format!("All subtasks of epic '{epic_title}' ({epic_id}) are closed — ready to close epic")
+            }
         }
     }
 
@@ -157,6 +169,9 @@ impl DirectorEvent {
             Self::EpicCompleted { epic_id } => {
                 format!("epic_completed:{epic_id}")
             }
+            Self::EpicAllSubtasksClosed { epic_id, .. } => {
+                format!("epic_all_subtasks_closed:{epic_id}")
+            }
         }
     }
 
@@ -170,6 +185,7 @@ impl DirectorEvent {
             Self::AgentRegistered { .. } => "agent_registered",
             Self::EpicStarted { .. } => "epic_started",
             Self::EpicCompleted { .. } => "epic_completed",
+            Self::EpicAllSubtasksClosed { .. } => "epic_all_subtasks_closed",
         }
     }
 
@@ -223,6 +239,13 @@ impl DirectorEvent {
             Self::EpicCompleted { epic_id } => serde_json::json!({
                 "epic_id": epic_id,
             }),
+            Self::EpicAllSubtasksClosed {
+                epic_id,
+                epic_title,
+            } => serde_json::json!({
+                "epic_id": epic_id,
+                "epic_title": epic_title,
+            }),
         }
     }
 }
@@ -238,6 +261,8 @@ struct DirectorState {
     active_agents: HashSet<String>,
     /// Map of epic_id -> (status, has_branch)
     epic_statuses: HashMap<String, (TaskStatus, bool)>,
+    /// Map of epic_id -> count of active (non-closed) subtasks
+    epic_active_subtask_counts: HashMap<String, usize>,
 }
 
 impl DirectorState {
@@ -266,11 +291,21 @@ impl DirectorState {
             .map(|e| (e.id.clone(), (e.status, e.branch.is_some())))
             .collect();
 
+        // Count active (non-closed) subtasks per epic.
+        // Tasks in ready_tasks or in_progress_tasks are active by definition.
+        let mut epic_active_subtask_counts: HashMap<String, usize> = HashMap::new();
+        for task in data.ready_tasks.iter().chain(data.in_progress_tasks.iter()) {
+            if let Some(ref epic_id) = task.epic {
+                *epic_active_subtask_counts.entry(epic_id.clone()).or_insert(0) += 1;
+            }
+        }
+
         Self {
             tasks,
             task_titles,
             active_agents,
             epic_statuses,
+            epic_active_subtask_counts,
         }
     }
 }
@@ -577,6 +612,31 @@ impl DirectorEventDetector {
                 if !was_closed {
                     events.push(DirectorEvent::EpicCompleted {
                         epic_id: epic.id.clone(),
+                    });
+                }
+            }
+        }
+
+        // EpicAllSubtasksClosed: All subtasks of a non-closed epic just became closed.
+        // Detected when active subtask count drops to 0 from a previous count > 0.
+        for epic in &data.epic_tasks {
+            if epic.status != TaskStatus::Closed {
+                let current_count = new_state
+                    .epic_active_subtask_counts
+                    .get(&epic.id)
+                    .copied()
+                    .unwrap_or(0);
+                let previous_count = self
+                    .last_state
+                    .epic_active_subtask_counts
+                    .get(&epic.id)
+                    .copied()
+                    .unwrap_or(0);
+
+                if current_count == 0 && previous_count > 0 {
+                    events.push(DirectorEvent::EpicAllSubtasksClosed {
+                        epic_id: epic.id.clone(),
+                        epic_title: epic.title.clone(),
                     });
                 }
             }

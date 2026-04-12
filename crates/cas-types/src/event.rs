@@ -67,6 +67,9 @@ pub enum EventType {
     /// Worker blocked waiting for verification
     WorkerVerificationBlocked,
 
+    /// All subtasks of an epic are closed — epic ready to close
+    EpicSubtasksComplete,
+
     // Verification lifecycle events
     /// Verification started (task-verifier spawned for a task)
     VerificationStarted,
@@ -101,6 +104,7 @@ impl fmt::Display for EventType {
             EventType::WorkerFileEdited => write!(f, "worker_file_edited"),
             EventType::WorkerGitCommit => write!(f, "worker_git_commit"),
             EventType::WorkerVerificationBlocked => write!(f, "worker_verification_blocked"),
+            EventType::EpicSubtasksComplete => write!(f, "epic_subtasks_complete"),
             EventType::VerificationStarted => write!(f, "verification_started"),
             EventType::VerificationAdded => write!(f, "verification_added"),
         }
@@ -136,6 +140,7 @@ impl FromStr for EventType {
             "worker_file_edited" => Ok(EventType::WorkerFileEdited),
             "worker_git_commit" => Ok(EventType::WorkerGitCommit),
             "worker_verification_blocked" => Ok(EventType::WorkerVerificationBlocked),
+            "epic_subtasks_complete" => Ok(EventType::EpicSubtasksComplete),
             "verification_started" => Ok(EventType::VerificationStarted),
             "verification_added" => Ok(EventType::VerificationAdded),
             _ => Err(TypeError::Parse(format!("invalid event type: {s}"))),
@@ -269,6 +274,7 @@ impl Event {
             EventType::WorkerFileEdited => "✎",           // Pencil (edited)
             EventType::WorkerGitCommit => "⬆",            // Up arrow (commit)
             EventType::WorkerVerificationBlocked => "🔒", // Lock (blocked)
+            EventType::EpicSubtasksComplete => "🎉",       // Party (all subtasks done)
             EventType::VerificationStarted => "🔍",       // Magnifying glass (verifying)
             EventType::VerificationAdded => "📋",         // Clipboard (result recorded)
         }
