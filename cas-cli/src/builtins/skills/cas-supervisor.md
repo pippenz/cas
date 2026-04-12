@@ -50,6 +50,16 @@ After you assign tasks and send context to workers, **produce no more output**. 
 
 Your next action should ONLY happen in response to a worker message or a user prompt. Between those events, you are idle. This is correct behavior — you are not "waiting", you are done until someone contacts you.
 
+## Quick Start
+
+New session? Run these 5 steps in order. Detailed guidance for each is in the sections below.
+
+1. **Load context** — Run `/cas-supervisor-checklist` for session-start checklist, open EPICs, and worker availability
+2. **Intake gate** — Assess the user's request against all 8 intake checks (see [Intake Gate](#intake-gate))
+3. **Create EPIC** — `mcp__cas__task action=create task_type=epic title="..." description="..."`
+4. **Spawn workers** — `mcp__cas__coordination action=spawn_workers count=N isolate=true`
+5. **Assign and end turn** — Assign tasks, send context messages, then stop. Wait for worker messages.
+
 ## Adversarial Posture
 
 Your default stance is skeptical AND constructive. The gates below are not advisory — they fire on every user request and every piece of worker output. The posture has two halves: **gatekeeping** (reject work that fails quality checks) and **partnership** (propose better paths when you see them). Do both.
@@ -243,10 +253,16 @@ In shared mode, file-overlap analysis is even more critical — two workers edit
 
 ### Phase 1: Plan
 
-1. Search prior learnings before creating the epic:
+1. Search before planning — check all three sources for prior art:
    ```
+   # Similar past EPICs (patterns, sizing, what worked)
    mcp__cas__task action=list task_type=epic status=closed
+
+   # CAS memories for learnings, bugfixes, architectural decisions
    mcp__cas__search action=search query="<keywords>" doc_type=entry limit=10
+
+   # Codebase for existing implementations you might duplicate or conflict with
+   Grep pattern="<feature-name>" or mcp__cas__search action=search query="<keywords>" scope=code
    ```
 2. Create EPIC: `mcp__cas__task action=create task_type=epic title="..." description="..."`
 3. Gather spec with `/epic-spec`, break down with `/epic-breakdown`
@@ -339,6 +355,7 @@ When workers share the main directory, there's no branch merging — workers com
 
 - Workers set status to blocked and add a blocker note
 - Help resolve or reassign the task
+- **Race condition warning:** Task state updates are not atomic across supervisor and worker. After closing a task (especially via the escape hatch), verify it stayed closed before proceeding — a worker's stale `status=blocked` update can overwrite the close. If a worker resurrects a closed task, re-close with an audit trail noting the race.
 
 **Multiple workers complete simultaneously:**
 - Run verification calls in parallel (single response turn)
