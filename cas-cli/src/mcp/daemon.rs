@@ -444,6 +444,30 @@ impl EmbeddedDaemon {
             }
         }
 
+        // Final cloud sync: drain any pending items before shutdown
+        if self.cloud_syncer.is_some() {
+            eprintln!("[CAS] Running final cloud sync before shutdown...");
+            match tokio::time::timeout(Duration::from_secs(10), self.run_cloud_sync()).await {
+                Ok(Ok(result)) => {
+                    let pushed = result.total_pushed();
+                    let pulled = result.total_pulled();
+                    if pushed > 0 || pulled > 0 {
+                        eprintln!(
+                            "[CAS] Final cloud sync complete: {pushed} pushed, {pulled} pulled"
+                        );
+                    } else {
+                        eprintln!("[CAS] Final cloud sync complete (nothing pending)");
+                    }
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %e, "Final cloud sync failed — items may sync next startup");
+                }
+                Err(_) => {
+                    tracing::warn!("Final cloud sync timed out after 10s — items may sync next startup");
+                }
+            }
+        }
+
         // Abort socket listener task
         if let Some(task) = _socket_task {
             task.abort();
