@@ -340,7 +340,8 @@ base branch ────────────────────► (sta
 **Worker completes a task:**
 1. Worker closes their own task
 2. Review changes in the worker worktree: `git -C .cas/worktrees/<worker> log --oneline main..HEAD`
-3. Cherry-pick to base branch: `git cherry-pick <commit-sha>` (one per commit; resolve conflicts if needed)
+3. Cherry-pick to base branch: `git cherry-pick <commit-sha>` (one per commit)
+   - **If conflicts arise:** (a) non-overlapping additions (e.g., both workers added to Cargo.toml) — keep both entries, (b) semantic conflicts — review both changes and pick the correct merge, (c) if unsure — message the worker who committed for context before resolving
 4. Verify build after cherry-pick: `~/.cargo/bin/cargo build --quiet`
 5. Message other active workers to sync onto the **local** branch (not `origin/`):
    ```
