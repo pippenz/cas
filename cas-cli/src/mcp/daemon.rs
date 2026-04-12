@@ -406,9 +406,9 @@ impl EmbeddedDaemon {
                     }
                 }
 
-                // Cloud sync - runs when idle
+                // Cloud sync - runs after short idle (lighter threshold than maintenance)
                 _ = cloud_sync_interval.tick() => {
-                    if self.cloud_syncer.is_some() && self.activity.is_idle() {
+                    if self.cloud_syncer.is_some() && self.activity.idle_seconds() >= self.config.cloud_sync_idle_secs {
                         match self.run_cloud_sync().await {
                             Ok(result) => {
                                 let mut status = self.status.write().await;

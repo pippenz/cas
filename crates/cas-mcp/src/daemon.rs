@@ -98,6 +98,9 @@ pub struct EmbeddedDaemonConfig {
     pub cloud_sync_interval_secs: u64,
     /// Minimum idle time before maintenance (seconds)
     pub min_idle_secs: u64,
+    /// Minimum idle time before cloud sync (seconds) — lower than maintenance
+    /// because cloud sync is lightweight (gzipped HTTP POST in spawn_blocking)
+    pub cloud_sync_idle_secs: u64,
     /// Enable memory decay
     pub apply_decay: bool,
     /// Enable observation processing
@@ -128,6 +131,7 @@ impl Default for EmbeddedDaemonConfig {
             maintenance_interval_secs: 30 * 60, // 30 minutes
             cloud_sync_interval_secs: 5 * 60,   // 5 minutes
             min_idle_secs: 60,                  // 1 minute idle before maintenance
+            cloud_sync_idle_secs: 10,           // 10s idle before cloud sync (lightweight)
             apply_decay: true,
             process_observations: true,
             cloud_sync_enabled: true, // Auto-sync enabled by default
