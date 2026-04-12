@@ -139,9 +139,9 @@ impl Palette {
             text_muted: colors.gray_400,
             text_disabled: colors.gray_500,
 
-            border_default: colors.gray_500,
+            border_default: colors.gray_400,
             border_focused: colors.primary_400,
-            border_muted: colors.gray_500,
+            border_muted: colors.gray_400,
 
             // Interactive
             accent: colors.primary_400,
