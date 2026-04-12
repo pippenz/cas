@@ -32,6 +32,14 @@ You execute tasks assigned by the Supervisor. You may be working in an isolated 
 4. **If still InProgress after 5 minutes of idle**, send ONE follow-up to the supervisor with note_type=blocker. Then continue to re-poll DB only.
 5. **Never spam idle notifications as a substitute for work.** If you are idle waiting on verification, stay silent until (a) the DB shows closed and you proceed to the next task, or (b) 5 minutes have elapsed and you send the one follow-up.
 
+## ALL tools blocked (universal jail)
+
+If **every** MCP tool call fails with a jail/blocked error (not just `close`), this is different from the close-specific VERIFICATION_JAIL_BLOCKED above. This indicates a CAS build issue — the running binary likely predates the factory-mode jail exemption fix.
+
+1. **Do NOT attempt workarounds** — no sqlite edits, no env var hacks, no retries.
+2. **Report to supervisor immediately** via `mcp__cas__coordination action=message` with the exact error message and your agent name.
+3. **Supervisor will rebuild CAS and respawn you.** This is not something you can fix from inside your session.
+
 ## Blockers
 
 Report immediately — don't spend time stuck:
