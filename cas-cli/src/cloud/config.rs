@@ -12,13 +12,17 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::Mutex;
 
 use crate::error::CasError;
 use crate::store::find_cas_root;
 
-/// Cached project canonical ID. The folder name doesn't change during a process lifetime.
-static CACHED_PROJECT_ID: OnceLock<Option<String>> = OnceLock::new();
+/// Cached project canonical ID. Only `Some` results are cached; if resolution
+/// returns `None` (e.g. `find_cas_root()` fails because the process started
+/// outside a CAS project), the next call retries instead of locking in `None`
+/// for the process lifetime. This prevents transient failures during daemon
+/// startup or early session hooks from permanently disabling project scoping.
+static CACHED_PROJECT_ID: Mutex<Option<String>> = Mutex::new(None);
 
 /// Get the canonical project ID for the current CAS project.
 ///
@@ -39,14 +43,19 @@ static CACHED_PROJECT_ID: OnceLock<Option<String>> = OnceLock::new();
 /// has a stable, unique `project_id` for cloud sync scoping.
 ///
 /// Returns `None` only if not inside a CAS project directory at all.
-/// The result is cached for the lifetime of the process.
+/// Successful results are cached for the process lifetime; `None` results
+/// are retried on each call so transient failures don't stick.
 pub fn get_project_canonical_id() -> Option<String> {
-    CACHED_PROJECT_ID
-        .get_or_init(|| {
-            let cas_root = find_cas_root().ok()?;
-            resolve_canonical_id(&cas_root)
-        })
-        .clone()
+    let mut cached = CACHED_PROJECT_ID.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(ref id) = *cached {
+        return Some(id.clone());
+    }
+    // Not yet resolved — try now. Only cache Some results.
+    let result = find_cas_root().ok().and_then(|root| resolve_canonical_id(&root));
+    if result.is_some() {
+        *cached = result.clone();
+    }
+    result
 }
 
 /// Pure composition of the folder-name derivation and the path-hash fallback.
@@ -595,6 +604,57 @@ mod tests {
             id_real, id_link,
             "symlinked and real paths should hash to the same ID after canonicalization"
         );
+    }
+
+    /// Regression test for cas-2c77: OnceLock cached None permanently, so a
+    /// transient `find_cas_root()` failure during daemon startup locked out
+    /// project scoping for the entire process lifetime.
+    ///
+    /// This test reproduces the exact contract using the same Mutex<Option>
+    /// pattern as the production code. We can't safely test the process-global
+    /// static (env var mutations race with parallel tests), so we verify the
+    /// pattern in isolation: None results are retried, Some results are cached.
+    #[test]
+    fn test_mutex_cache_retries_none_but_caches_some() {
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let cache: Mutex<Option<String>> = Mutex::new(None);
+        let call_count = AtomicU32::new(0);
+
+        // Simulate the get_project_canonical_id pattern with a controllable resolver
+        let get_id = |resolver: &dyn Fn() -> Option<String>| -> Option<String> {
+            let mut cached = cache.lock().unwrap();
+            if let Some(ref id) = *cached {
+                return Some(id.clone());
+            }
+            call_count.fetch_add(1, Ordering::SeqCst);
+            let result = resolver();
+            if result.is_some() {
+                *cached = result.clone();
+            }
+            result
+        };
+
+        // First call: resolver returns None (simulates find_cas_root failing)
+        let result1 = get_id(&|| None);
+        assert_eq!(result1, None);
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+
+        // Second call: resolver still returns None — should retry (not return cached None)
+        let result2 = get_id(&|| None);
+        assert_eq!(result2, None);
+        assert_eq!(call_count.load(Ordering::SeqCst), 2, "None must not be cached — resolver should be called again");
+
+        // Third call: resolver now succeeds (simulates cwd moved into a CAS project)
+        let result3 = get_id(&|| Some("my-project".to_string()));
+        assert_eq!(result3, Some("my-project".to_string()));
+        assert_eq!(call_count.load(Ordering::SeqCst), 3);
+
+        // Fourth call: should return cached value without calling resolver
+        let result4 = get_id(&|| panic!("resolver should not be called when cache has Some"));
+        assert_eq!(result4, Some("my-project".to_string()));
+        assert_eq!(call_count.load(Ordering::SeqCst), 3, "Some must be cached — resolver should not be called again");
     }
 
     #[test]

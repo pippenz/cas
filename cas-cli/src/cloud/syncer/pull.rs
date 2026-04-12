@@ -78,9 +78,9 @@ impl CloudSyncer {
         if let Some(since) = &since {
             params.push(format!("since={since}"));
         }
-        if let Some(project_id) = get_project_canonical_id() {
-            params.push(format!("project_id={}", project_id.replace('/', "%2F")));
-        }
+        let project_id = get_project_canonical_id()
+            .ok_or_else(|| CasError::Other("Cannot pull: not inside a CAS project directory".to_string()))?;
+        params.push(format!("project_id={}", project_id.replace('/', "%2F")));
         if !params.is_empty() {
             pull_url = format!("{pull_url}?{}", params.join("&"));
         }
@@ -105,9 +105,8 @@ impl CloudSyncer {
             }
         };
 
-        // Get the current project ID once — used for client-side entity validation
-        let current_project_id = get_project_canonical_id()
-            .unwrap_or_else(|| "unknown".to_string());
+        // Use the already-resolved project ID for client-side entity validation
+        let current_project_id = &project_id;
 
         // Process entries
         for raw_entry in body.entries.unwrap_or_default() {
@@ -512,9 +511,9 @@ impl CloudSyncer {
         if let Some(since) = &since {
             params.push(format!("since={since}"));
         }
-        if let Some(project_id) = get_project_canonical_id() {
-            params.push(format!("project_id={}", project_id.replace('/', "%2F")));
-        }
+        let project_id = get_project_canonical_id()
+            .ok_or_else(|| CasError::Other("Cannot pull: not inside a CAS project directory".to_string()))?;
+        params.push(format!("project_id={}", project_id.replace('/', "%2F")));
         if !params.is_empty() {
             pull_url = format!("{pull_url}?{}", params.join("&"));
         }
@@ -544,9 +543,8 @@ impl CloudSyncer {
         #[cfg(debug_assertions)]
         eprintln!("[CAS sync] Starting team pull: team={team_id} strategy={strategy:?}");
 
-        // Get the current project ID for client-side validation
-        let current_project_id = get_project_canonical_id()
-            .unwrap_or_else(|| "unknown".to_string());
+        // Use the already-resolved project ID for client-side validation
+        let current_project_id = &project_id;
 
         // Process entries
         for raw_entry in body.entries.unwrap_or_default() {
