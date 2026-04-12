@@ -192,7 +192,7 @@ impl CasService {
                 "issue",
                 "create",
                 "--repo",
-                "codingagentsystem/cas",
+                "pippenz/cas",
                 "--title",
                 &title,
                 "--body",

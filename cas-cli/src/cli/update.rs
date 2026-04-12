@@ -24,7 +24,7 @@ use crate::ui::theme::ActiveTheme;
 mod preview;
 
 /// GitHub repository owner
-const REPO_OWNER: &str = "codingagentsystem";
+const REPO_OWNER: &str = "pippenz";
 
 /// GitHub repository name
 const REPO_NAME: &str = "cas";
