@@ -28,12 +28,27 @@ impl SqliteAgentStore {
                 .optional()?
                 .is_some();
 
-            // Use INSERT OR REPLACE for idempotent registration
-            // This allows SessionStart hook and MCP to both register without conflict
+            // Use INSERT ... ON CONFLICT for idempotent registration.
+            // This allows SessionStart hook and MCP to both register without conflict.
+            // On conflict (re-registration), we preserve startup_confirmed so that a
+            // live agent that re-registers doesn't get falsely detected as failed-startup.
             conn.execute(
-            "INSERT OR REPLACE INTO agents (id, name, agent_type, role, status, pid, ppid, cc_session_id, parent_id,
+            "INSERT INTO agents (id, name, agent_type, role, status, pid, ppid, cc_session_id, parent_id,
              machine_id, registered_at, last_heartbeat, active_tasks, metadata, startup_confirmed)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 0)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 0)
+             ON CONFLICT(id) DO UPDATE SET
+                name = excluded.name,
+                agent_type = excluded.agent_type,
+                role = excluded.role,
+                status = excluded.status,
+                pid = excluded.pid,
+                ppid = excluded.ppid,
+                cc_session_id = excluded.cc_session_id,
+                parent_id = excluded.parent_id,
+                machine_id = excluded.machine_id,
+                last_heartbeat = excluded.last_heartbeat,
+                active_tasks = excluded.active_tasks,
+                metadata = excluded.metadata",
             params![
                 agent.id,
                 agent.name,
@@ -301,10 +316,12 @@ impl SqliteAgentStore {
         let conn = self.lock_conn()?;
         let now = Utc::now().to_rfc3339();
 
-        // Revive agent: set status to active and update heartbeat
-        // Only works if agent exists and is in stale/shutdown/dead state
+        // Revive agent: set status to active, update heartbeat, and confirm startup.
+        // Only works if agent exists and is in stale/shutdown/dead state.
+        // Setting startup_confirmed = 1 prevents the agent from being immediately
+        // re-detected as failed-startup after revival.
         let rows = conn.execute(
-            "UPDATE agents SET status = 'active', last_heartbeat = ?
+            "UPDATE agents SET status = 'active', last_heartbeat = ?, startup_confirmed = 1
              WHERE id = ? AND status IN ('dead', 'shutdown', 'stale')",
             params![now, id],
         )?;

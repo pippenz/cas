@@ -77,12 +77,22 @@ pub fn run_maintenance(config: &DaemonConfig) -> Result<DaemonRunResult, CasErro
     }
 
     if let Ok(agent_store) = open_agent_store(&config.cas_root) {
-        // Detect agents that registered but never confirmed startup (60s grace period).
+        // Detect agents that registered but never confirmed startup (90s grace period).
         // These are agents where the MCP server registered in the DB but the Claude Code
         // process never actually started (worktree setup failure, spawn crash, etc.).
-        if let Ok(failed_startup_agents) = agent_store.list_failed_startup(60) {
+        // Grace period is 90s (not 60s) to accommodate the known first-MCP-call timeout.
+        if let Ok(failed_startup_agents) = agent_store.list_failed_startup(90) {
             for agent in &failed_startup_agents {
                 let agent_id = agent.id.clone();
+
+                // Re-check: a heartbeat may have arrived between list_failed_startup
+                // and now, confirming the agent. Skip if it's no longer unconfirmed.
+                if let Ok(fresh) = agent_store.get(&agent_id) {
+                    if !fresh.is_alive() {
+                        continue; // Already stale/shutdown
+                    }
+                }
+
                 if agent_store.mark_stale(&agent_id).is_ok() {
                     agents_cleaned += 1;
 

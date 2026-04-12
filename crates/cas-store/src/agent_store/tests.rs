@@ -632,3 +632,82 @@ fn test_heartbeat_sets_startup_confirmed() {
         .unwrap();
     assert_eq!(confirmed, 1);
 }
+
+#[test]
+fn test_re_registration_preserves_startup_confirmed() {
+    let (temp, store) = create_test_store();
+
+    // Register agent, heartbeat to confirm startup
+    let agent = Agent::new("agent-reregister".to_string(), "ReRegister Test".to_string());
+    store.register(&agent).unwrap();
+    store.heartbeat("agent-reregister").unwrap();
+
+    // Verify startup_confirmed = 1
+    let conn = rusqlite::Connection::open(temp.path().join("cas.db")).unwrap();
+    let confirmed: i64 = conn
+        .query_row(
+            "SELECT startup_confirmed FROM agents WHERE id = ?",
+            params!["agent-reregister"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(confirmed, 1);
+
+    // Re-register (simulates SessionStart hook re-firing)
+    let agent2 = Agent::new("agent-reregister".to_string(), "ReRegister Test v2".to_string());
+    store.register(&agent2).unwrap();
+
+    // startup_confirmed must still be 1 (not reset to 0)
+    let confirmed: i64 = conn
+        .query_row(
+            "SELECT startup_confirmed FROM agents WHERE id = ?",
+            params!["agent-reregister"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(confirmed, 1, "Re-registration must not reset startup_confirmed");
+
+    // Backdate registered_at and verify NOT detected as failed startup
+    let old_time = (Utc::now() - Duration::seconds(120)).to_rfc3339();
+    conn.execute(
+        "UPDATE agents SET registered_at = ? WHERE id = ?",
+        params![old_time, "agent-reregister"],
+    )
+    .unwrap();
+    let failed = store.list_failed_startup(60).unwrap();
+    assert!(failed.is_empty(), "Confirmed agent must not appear as failed startup after re-registration");
+}
+
+#[test]
+fn test_revive_sets_startup_confirmed() {
+    let (temp, store) = create_test_store();
+
+    let agent = Agent::new("agent-revive".to_string(), "Revive Test".to_string());
+    store.register(&agent).unwrap();
+
+    // Mark stale (startup_confirmed stays 0)
+    store.mark_stale("agent-revive").unwrap();
+
+    // Revive — should set startup_confirmed = 1
+    store.revive("agent-revive").unwrap();
+
+    let conn = rusqlite::Connection::open(temp.path().join("cas.db")).unwrap();
+    let confirmed: i64 = conn
+        .query_row(
+            "SELECT startup_confirmed FROM agents WHERE id = ?",
+            params!["agent-revive"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(confirmed, 1, "Revived agent must have startup_confirmed = 1");
+
+    // Backdate and verify NOT detected as failed startup
+    let old_time = (Utc::now() - Duration::seconds(120)).to_rfc3339();
+    conn.execute(
+        "UPDATE agents SET registered_at = ? WHERE id = ?",
+        params![old_time, "agent-revive"],
+    )
+    .unwrap();
+    let failed = store.list_failed_startup(60).unwrap();
+    assert!(failed.is_empty(), "Revived agent must not be detected as failed startup");
+}
