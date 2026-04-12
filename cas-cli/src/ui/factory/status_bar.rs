@@ -564,21 +564,34 @@ impl StatusBar {
             return;
         }
 
-        while Self::spans_display_width(spans) > max_width {
-            if spans.is_empty() {
-                break;
+        // Find how many spans to drop from the front so total width fits.
+        // Walk forward accumulating widths until removing that prefix brings us under max.
+        let total_width: usize = spans.iter().map(Span::width).sum();
+        if total_width <= max_width {
+            // Already fits, nothing to trim
+        } else {
+            let excess = total_width - max_width;
+            let mut removed_width = 0usize;
+            let mut drop_count = 0usize;
+            for span in spans.iter() {
+                if removed_width >= excess {
+                    break;
+                }
+                removed_width += span.width();
+                drop_count += 1;
             }
-            spans.remove(0);
+            spans.drain(..drop_count);
         }
 
-        // Remove stray separators/spaces if the first/last visible hint was trimmed.
-        while spans
-            .first()
-            .map(|s| Self::is_divider_or_space(s.content.as_ref()))
-            .unwrap_or(false)
-        {
-            spans.remove(0);
+        // Remove stray separators/spaces at the front after trimming.
+        let front_trim = spans
+            .iter()
+            .take_while(|s| Self::is_divider_or_space(s.content.as_ref()))
+            .count();
+        if front_trim > 0 {
+            spans.drain(..front_trim);
         }
+
         while spans
             .last()
             .map(|s| Self::is_divider_or_space(s.content.as_ref()))

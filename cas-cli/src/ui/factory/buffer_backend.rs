@@ -23,6 +23,8 @@ use std::io;
 pub struct BufferBackend {
     /// Output buffer
     buffer: Vec<u8>,
+    /// Reusable scratch buffer for crossterm command serialization
+    scratch: Vec<u8>,
     /// Terminal size
     width: u16,
     height: u16,
@@ -33,6 +35,7 @@ impl BufferBackend {
     pub fn new(width: u16, height: u16) -> Self {
         Self {
             buffer: Vec::with_capacity(16384),
+            scratch: Vec::with_capacity(64),
             width,
             height,
         }
@@ -49,11 +52,11 @@ impl BufferBackend {
         self.height = height;
     }
 
-    /// Write a crossterm command to the buffer
+    /// Write a crossterm command to the buffer (reuses scratch Vec to avoid per-call allocation)
     fn write_command(&mut self, cmd: impl Command) -> io::Result<()> {
-        let mut tmp = Vec::new();
-        crossterm::execute!(tmp, cmd)?;
-        self.buffer.extend_from_slice(&tmp);
+        self.scratch.clear();
+        crossterm::execute!(self.scratch, cmd)?;
+        self.buffer.extend_from_slice(&self.scratch);
         Ok(())
     }
 

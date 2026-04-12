@@ -20,25 +20,72 @@ impl Pane {
     }
 
     /// Get a full terminal snapshot for the current viewport
+    ///
+    /// Uses row_style_runs() (one FFI call per row) instead of the old
+    /// dump_row() + row_styles() (two FFI calls per row) + per-cell iteration.
     pub fn get_full_snapshot(&self) -> Result<TerminalSnapshot> {
-        let mut cells = Vec::with_capacity((self.rows as usize) * (self.cols as usize));
+        let total_cells = (self.rows as usize) * (self.cols as usize);
+        let mut cells = Vec::with_capacity(total_cells);
 
         for row in 0..self.rows {
             let text = self.dump_row(row).unwrap_or_default();
-            let styles = self.row_styles(row).unwrap_or_default();
+            let style_runs = self
+                .terminal
+                .row_style_runs(row)
+                .map_err(|e| Error::terminal(e.to_string()))?;
+
+            // Convert style runs to per-cell TerminalCell entries
+            let cols = self.cols as usize;
             let chars: Vec<char> = text.chars().collect();
+            let mut col = 0usize;
+            for run in &style_runs {
+                let start = run.start_col as usize;
+                let end = (run.end_col as usize).min(cols);
+                let fg = (run.style.fg.r, run.style.fg.g, run.style.fg.b);
+                let bg = (run.style.bg.r, run.style.bg.g, run.style.bg.b);
+                let flags = cell_style_to_flags(&run.style);
 
-            for col in 0..self.cols as usize {
+                // Fill gap before this run with default cells
+                while col < start && col < cols {
+                    let ch = chars.get(col).copied().unwrap_or(' ');
+                    cells.push(TerminalCell {
+                        codepoint: ch as u32,
+                        fg: (0, 0, 0),
+                        bg: (0, 0, 0),
+                        flags: 0,
+                        width: 1,
+                    });
+                    col += 1;
+                }
+
+                // Fill this run's cells
+                for c in start..end {
+                    if c >= cols {
+                        break;
+                    }
+                    let ch = chars.get(c).copied().unwrap_or(' ');
+                    cells.push(TerminalCell {
+                        codepoint: ch as u32,
+                        fg,
+                        bg,
+                        flags,
+                        width: 1,
+                    });
+                    col = c + 1;
+                }
+            }
+
+            // Fill remaining columns with default cells
+            while col < cols {
                 let ch = chars.get(col).copied().unwrap_or(' ');
-                let style = styles.get(col).cloned().unwrap_or_default();
-
                 cells.push(TerminalCell {
                     codepoint: ch as u32,
-                    fg: (style.fg.r, style.fg.g, style.fg.b),
-                    bg: (style.bg.r, style.bg.g, style.bg.b),
-                    flags: cell_style_to_flags(&style),
+                    fg: (0, 0, 0),
+                    bg: (0, 0, 0),
+                    flags: 0,
                     width: 1,
                 });
+                col += 1;
             }
         }
 
