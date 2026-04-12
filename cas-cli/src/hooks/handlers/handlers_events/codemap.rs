@@ -201,7 +201,93 @@ fn parse_diff_tree_output(output: &str) -> Option<Vec<CodemapChange>> {
     Some(changes)
 }
 
-/// Check for codemap freshness and return context injection string.
+/// Staleness severity for codemap freshness checks.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CodemapStaleness {
+    /// CODEMAP.md does not exist at all
+    Missing,
+    /// Stale with fewer than 10 structural changes (informational)
+    Stale {
+        total_changes: usize,
+        file_list: Vec<String>,
+        commit_info: String,
+    },
+    /// Stale with 10+ structural changes (urgent)
+    SignificantlyStale {
+        total_changes: usize,
+        file_list: Vec<String>,
+        commit_info: String,
+    },
+}
+
+/// Threshold for "significantly stale" — 10+ structural changes warrants urgent messaging.
+const SIGNIFICANT_STALENESS_THRESHOLD: usize = 10;
+
+impl CodemapStaleness {
+    /// Format as a context injection string for SessionStart.
+    ///
+    /// If `is_supervisor` is true, always uses strong language regardless of severity.
+    pub fn format_injection(&self, is_supervisor: bool) -> String {
+        match self {
+            CodemapStaleness::Missing => {
+                "<codemap-freshness severity=\"high\">\n\
+                 CODEMAP.md is missing. Run `/codemap` before planning any work — \
+                 agents waste significant tokens exploring without it.\n\
+                 </codemap-freshness>"
+                    .to_string()
+            }
+            CodemapStaleness::Stale {
+                total_changes,
+                file_list,
+                commit_info,
+            } => {
+                let files = file_list.join(", ");
+                let truncated = if *total_changes > 10 {
+                    format!(" (+{} more)", total_changes - 10)
+                } else {
+                    String::new()
+                };
+
+                if is_supervisor {
+                    format!(
+                        "<codemap-freshness severity=\"high\">\n\
+                         CODEMAP.md has {total_changes} structural change(s){commit_info} since last update: \
+                         {files}{truncated}. Run `/codemap` to update before assigning work.\n\
+                         </codemap-freshness>"
+                    )
+                } else {
+                    format!(
+                        "<codemap-freshness severity=\"info\">\n\
+                         CODEMAP.md has {total_changes} pending structural change(s){commit_info}: \
+                         {files}{truncated}.\n\
+                         </codemap-freshness>"
+                    )
+                }
+            }
+            CodemapStaleness::SignificantlyStale {
+                total_changes,
+                file_list,
+                commit_info,
+            } => {
+                let files = file_list.join(", ");
+                let truncated = if *total_changes > 10 {
+                    format!(" (+{} more)", total_changes - 10)
+                } else {
+                    String::new()
+                };
+
+                format!(
+                    "<codemap-freshness severity=\"high\">\n\
+                     CODEMAP.md is significantly out of date ({total_changes} structural changes{commit_info}): \
+                     {files}{truncated}. Run `/codemap` to update before assigning work.\n\
+                     </codemap-freshness>"
+                )
+            }
+        }
+    }
+}
+
+/// Check for codemap freshness and return staleness info.
 ///
 /// Called from SessionStart to inform the agent about:
 /// 1. Missing CODEMAP.md
@@ -209,25 +295,20 @@ fn parse_diff_tree_output(output: &str) -> Option<Vec<CodemapChange>> {
 /// 3. Structural changes detected via git history (primary mechanism)
 ///
 /// Returns None if no action needed.
-pub fn check_codemap_freshness(cas_root: &Path) -> Option<String> {
+pub fn check_codemap_freshness(cas_root: &Path) -> Option<CodemapStaleness> {
     let project_root = cas_root.parent()?;
 
     let codemap_path = project_root.join(".claude/CODEMAP.md");
     let pending_path = cas_root.join(CODEMAP_PENDING_FILE);
 
     if !codemap_path.exists() {
-        return Some(
-            "<codemap-freshness>\n\
-             No CODEMAP.md found. Run the codemap skill to generate one.\n\
-             </codemap-freshness>"
-                .to_string(),
-        );
+        return Some(CodemapStaleness::Missing);
     }
 
     // Check pending file first (supplement — catches in-session uncommitted changes)
     if pending_path.exists() {
-        if let Some(msg) = check_staleness_from_pending(&pending_path) {
-            return Some(msg);
+        if let Some(staleness) = check_staleness_from_pending(&pending_path) {
+            return Some(staleness);
         }
     }
 
@@ -237,7 +318,7 @@ pub fn check_codemap_freshness(cas_root: &Path) -> Option<String> {
 }
 
 /// Check staleness using the pending file (supplement for in-session changes).
-fn check_staleness_from_pending(pending_path: &Path) -> Option<String> {
+fn check_staleness_from_pending(pending_path: &Path) -> Option<CodemapStaleness> {
     let content = std::fs::read_to_string(pending_path).ok()?;
     let mut total_changes = 0;
     let mut file_list = Vec::new();
@@ -275,7 +356,7 @@ fn check_staleness_from_pending(pending_path: &Path) -> Option<String> {
         .map(|c| format!(" since {}", &c[..7.min(c.len())]))
         .unwrap_or_default();
 
-    Some(format_staleness_message(total_changes, &file_list, &commit_info))
+    Some(make_staleness(total_changes, file_list, commit_info))
 }
 
 /// Check staleness by comparing CODEMAP.md's last commit timestamp against
@@ -283,7 +364,7 @@ fn check_staleness_from_pending(pending_path: &Path) -> Option<String> {
 ///
 /// This is the primary detection mechanism — it works regardless of how commits
 /// were made (terminal, worker, cherry-pick, etc.).
-fn check_staleness_from_git(project_root: &Path) -> Option<String> {
+fn check_staleness_from_git(project_root: &Path) -> Option<CodemapStaleness> {
     // Get the timestamp of the last commit that touched CODEMAP.md
     let codemap_timestamp = get_codemap_last_commit_timestamp(project_root)?;
 
@@ -309,7 +390,7 @@ fn check_staleness_from_git(project_root: &Path) -> Option<String> {
         })
         .collect();
 
-    Some(format_staleness_message(total_changes, &file_list, ""))
+    Some(make_staleness(total_changes, file_list, String::new()))
 }
 
 /// Get the ISO timestamp of the last commit that modified .claude/CODEMAP.md.
@@ -442,21 +523,21 @@ fn parse_git_log_nul_output(raw: &str) -> Option<Vec<CodemapChange>> {
     Some(changes)
 }
 
-/// Format the staleness message consistently for both detection mechanisms.
-fn format_staleness_message(total_changes: usize, file_list: &[String], commit_info: &str) -> String {
-    let files = file_list.join(", ");
-    let truncated = if total_changes > 10 {
-        format!(" (+{} more)", total_changes - 10)
+/// Create the appropriate staleness variant based on change count.
+fn make_staleness(total_changes: usize, file_list: Vec<String>, commit_info: String) -> CodemapStaleness {
+    if total_changes >= SIGNIFICANT_STALENESS_THRESHOLD {
+        CodemapStaleness::SignificantlyStale {
+            total_changes,
+            file_list,
+            commit_info,
+        }
     } else {
-        String::new()
-    };
-
-    format!(
-        "<codemap-freshness>\n\
-         CODEMAP.md has {total_changes} pending structural change(s){commit_info}: {files}{truncated}. \
-         Update CODEMAP.md or spawn docs-writer to refresh.\n\
-         </codemap-freshness>"
-    )
+        CodemapStaleness::Stale {
+            total_changes,
+            file_list,
+            commit_info,
+        }
+    }
 }
 
 /// Best-effort codemap reminder for Stop hook.
@@ -643,22 +724,72 @@ mod tests {
     }
 
     #[test]
-    fn test_format_staleness_message_basic() {
-        let files = vec!["+src/new.rs".to_string(), "-src/old.rs".to_string()];
-        let msg = format_staleness_message(2, &files, "");
-        assert!(msg.contains("2 pending structural change(s)"));
-        assert!(msg.contains("+src/new.rs"));
-        assert!(msg.contains("-src/old.rs"));
-        assert!(msg.contains("<codemap-freshness>"));
+    fn test_make_staleness_below_threshold() {
+        let staleness = make_staleness(
+            3,
+            vec!["+a.rs".to_string()],
+            String::new(),
+        );
+        assert!(matches!(staleness, CodemapStaleness::Stale { .. }));
     }
 
     #[test]
-    fn test_format_staleness_message_truncated() {
-        let files: Vec<String> = (0..10).map(|i| format!("+src/file{i}.rs")).collect();
-        let msg = format_staleness_message(15, &files, " since abc1234");
-        assert!(msg.contains("15 pending structural change(s)"));
+    fn test_make_staleness_at_threshold() {
+        let staleness = make_staleness(
+            10,
+            vec!["+a.rs".to_string()],
+            String::new(),
+        );
+        assert!(matches!(staleness, CodemapStaleness::SignificantlyStale { .. }));
+    }
+
+    #[test]
+    fn test_missing_injection_is_urgent() {
+        let msg = CodemapStaleness::Missing.format_injection(false);
+        assert!(msg.contains("severity=\"high\""));
+        assert!(msg.contains("CODEMAP.md is missing"));
+        assert!(msg.contains("/codemap"));
+    }
+
+    #[test]
+    fn test_stale_injection_info_for_regular_session() {
+        let staleness = CodemapStaleness::Stale {
+            total_changes: 3,
+            file_list: vec!["+src/a.rs".to_string(), "-src/b.rs".to_string()],
+            commit_info: String::new(),
+        };
+        let msg = staleness.format_injection(false);
+        assert!(msg.contains("severity=\"info\""));
+        assert!(msg.contains("3 pending structural change(s)"));
+        assert!(!msg.contains("Run `/codemap`"));
+    }
+
+    #[test]
+    fn test_stale_injection_urgent_for_supervisor() {
+        let staleness = CodemapStaleness::Stale {
+            total_changes: 3,
+            file_list: vec!["+src/a.rs".to_string()],
+            commit_info: String::new(),
+        };
+        let msg = staleness.format_injection(true);
+        assert!(msg.contains("severity=\"high\""));
+        assert!(msg.contains("Run `/codemap`"));
+    }
+
+    #[test]
+    fn test_significantly_stale_injection_always_urgent() {
+        let staleness = CodemapStaleness::SignificantlyStale {
+            total_changes: 15,
+            file_list: (0..10).map(|i| format!("+src/file{i}.rs")).collect(),
+            commit_info: " since abc1234".to_string(),
+        };
+        // Urgent even for non-supervisor
+        let msg = staleness.format_injection(false);
+        assert!(msg.contains("severity=\"high\""));
+        assert!(msg.contains("significantly out of date"));
+        assert!(msg.contains("15 structural changes"));
         assert!(msg.contains("(+5 more)"));
-        assert!(msg.contains(" since abc1234"));
+        assert!(msg.contains("Run `/codemap`"));
     }
 
     #[test]

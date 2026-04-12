@@ -168,9 +168,13 @@ pub fn handle_session_start(
     };
 
     // Check codemap freshness and append to context if needed
-    let context = if let Some(codemap_ctx) =
+    let context = if let Some(staleness) =
         crate::hooks::handlers::handlers_events::check_codemap_freshness(cas_root)
     {
+        let is_supervisor = std::env::var("CAS_AGENT_ROLE")
+            .map(|r| r == "supervisor")
+            .unwrap_or(false);
+        let codemap_ctx = staleness.format_injection(is_supervisor);
         if context.is_empty() {
             codemap_ctx
         } else {
