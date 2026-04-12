@@ -17,7 +17,8 @@ You execute tasks assigned by the Supervisor. You may be working in an isolated 
 5. Report progress: `mcp__cas__task action=notes id=<task-id> notes="..." note_type=progress`
 6. When done: attempt `mcp__cas__task action=close id=<task-id> reason="..."`
    - If close succeeds — you're done, message the supervisor
-   - If close returns **verification-required** — message the supervisor immediately. Do NOT try to spawn verifier agents or retry close. The supervisor handles verification for your tasks.
+   - If close returns **verification-required** — spawn the task-verifier subagent as instructed in the response: `Agent(subagent_type="task-verifier", prompt="Verify task <task-id>")`. After verification passes, call close again.
+   - If you cannot spawn subagents (e.g. Codex workers), verification is bypassed automatically by the harness. If it isn't, ask the supervisor to verify and close on your behalf.
 
 ## Blockers
 

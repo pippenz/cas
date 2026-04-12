@@ -302,7 +302,7 @@ impl CasCore {
                             v.summary,
                             if is_worker_without_subagents {
                                 "To fix: Address the issues in this worker.\n\
-                                    Then ask supervisor to run verification (task-verifier or direct mcp__cs__verification) and close the task on your behalf."
+                                    Then ask supervisor to run verification (task-verifier or direct mcp__cas__verification) and close the task on your behalf."
                                     .to_string()
                             } else {
                                 format!(
@@ -312,7 +312,7 @@ impl CasCore {
                             close_reason_note,
                             if is_worker_without_subagents {
                                 format!(
-                                    "Suggested message: mcp__cs__coordination action=message target=supervisor message=\"Task {} is ready for re-verification. Please verify (task-verifier or direct mcp__cs__verification) and close if approved.\"",
+                                    "Suggested message: mcp__cas__coordination action=message target=supervisor message=\"Task {} is ready for re-verification. Please verify (task-verifier or direct mcp__cas__verification) and close if approved.\"",
                                     req.id
                                 )
                             } else {
@@ -510,7 +510,7 @@ impl CasCore {
                             close_reason_section.as_str(),
                             if is_worker_without_subagents {
                                 format!(
-                                    "Ask supervisor to run verification (task-verifier or direct mcp__cs__verification) and close task {} on your behalf.",
+                                    "Ask supervisor to run verification (task-verifier or direct mcp__cas__verification) and close task {} on your behalf.",
                                     req.id
                                 )
                             } else {
@@ -518,7 +518,7 @@ impl CasCore {
                             },
                             if is_worker_without_subagents {
                                 format!(
-                                    "Suggested message: mcp__cs__coordination action=message target=supervisor message=\"Please verify task {} (task-verifier or direct mcp__cs__verification) and close it if approved.\"",
+                                    "Suggested message: mcp__cas__coordination action=message target=supervisor message=\"Please verify task {} (task-verifier or direct mcp__cas__verification) and close it if approved.\"",
                                     req.id
                                 )
                             } else {
