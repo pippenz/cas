@@ -235,19 +235,13 @@ The simplify pass should produce visible output — a commit, a task note, or an
 
 Your scope is locked at assignment. The supervisor will reject work that violates these:
 
+- **One task at a time** — Complete your current task before taking another.
 - **Scope is frozen** — Build exactly what the spec says. If you see "related" improvements, note them but don't build them.
 - **Non-goals are real** — If the spec lists non-goals, do not touch those areas regardless of how easy the fix looks.
 - **Stay in your layer** — Only modify files/modules declared in your assignment. Crossing the boundary is an automatic rejection.
 - **Match existing patterns** — Follow established conventions in the codebase. Don't introduce new patterns without asking.
 - **No config surprises** — Don't hardcode values that should be configurable. Don't add config that wasn't requested.
-
-## Rules
-
-- One task at a time — complete current before taking another
-- Test before closing
-- No TODO/FIXME/placeholder code in completed work
-- Verify all new code is wired up before closing
-- Document important choices with `note_type=decision`
+- **Document important choices** — Use `mcp__cas__task action=notes note_type=decision` for non-obvious decisions.
 
 ## Syncing (Isolated Mode)
 
@@ -263,13 +257,7 @@ git stash pop               # restore WIP
 
 If the rebase has conflicts, resolve them before popping the stash. Message the supervisor if you're stuck.
 
-## Valid Actions
-
-**Valid `mcp__cas__task` actions** (exact list — do not invent others): `create`, `show`, `update`, `start`, `close`, `reopen`, `delete`, `list`, `ready`, `blocked`, `notes`, `dep_add`, `dep_remove`, `dep_list`, `claim`, `release`, `transfer`, `available`, `mine`.
-
-**Valid `mcp__cas__coordination` actions you will actually use** (exact names — do not invent others): `message`, `message_ack`, `message_status`, `whoami`, `heartbeat`, `queue_poll`, `queue_ack`. Factory/worktree/spawn actions are supervisor-only — do not call them.
-
-## Schema Cheat Sheet (exact field names)
+## Schema Cheat Sheet (exact field names and valid actions)
 
 Wrong field names are rejected. These are the **exact** names for the calls workers make most often.
 
@@ -302,6 +290,10 @@ mcp__cas__coordination action=message target=supervisor \
 ```
 
 Sending `message` alone without `summary` is rejected. `summary` is the one-line preview shown in the UI.
+
+**Valid `mcp__cas__task` actions** (do not invent others): `create`, `show`, `update`, `start`, `close`, `reopen`, `delete`, `list`, `ready`, `blocked`, `notes`, `dep_add`, `dep_remove`, `dep_list`, `claim`, `release`, `transfer`, `available`, `mine`.
+
+**Valid `mcp__cas__coordination` actions for workers**: `message`, `message_ack`, `message_status`, `whoami`, `heartbeat`, `queue_poll`, `queue_ack`. Factory/worktree/spawn actions are supervisor-only.
 
 ## Worktree Issues (Isolated Mode)
 
