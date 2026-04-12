@@ -374,6 +374,29 @@ impl EmbeddedDaemon {
             }
         }
 
+        // Initial cloud sync: push any stale items from previous sessions, then pull
+        if self.cloud_syncer.is_some() {
+            eprintln!("[CAS] Running initial cloud sync (push stale + pull)...");
+            match self.run_cloud_sync().await {
+                Ok(result) => {
+                    let pushed = result.total_pushed();
+                    let pulled = result.total_pulled();
+                    if pushed > 0 || pulled > 0 {
+                        eprintln!(
+                            "[CAS] Initial cloud sync complete: {pushed} pushed, {pulled} pulled"
+                        );
+                    }
+                    let mut status = self.status.write().await;
+                    status.cloud_items_pushed += pushed;
+                    status.cloud_items_pulled += pulled;
+                    status.last_cloud_sync = Some(Utc::now());
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Initial cloud sync failed — will retry on next interval");
+                }
+            }
+        }
+
         loop {
             tokio::select! {
                 // Shutdown signal
