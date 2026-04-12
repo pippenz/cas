@@ -311,7 +311,7 @@ base branch ────────────────────► (sta
 4. Verify build after cherry-pick: `~/.cargo/bin/cargo build --quiet`
 5. Message other active workers to sync onto the **local** branch (not `origin/`):
    ```
-   mcp__cs__coordination action=message target=<other-worker> message="Branch updated after merge. Sync: git stash && git rebase <base-branch> && git stash pop"
+   mcp__cs__coordination action=message target=<other-worker> message="Branch updated after cherry-pick. Sync: git stash && git rebase <base-branch> && git stash pop"
    ```
 6. Clear completed worker's context: `mcp__cs__coordination action=clear_context target=<worker>`
 7. Assign next task
