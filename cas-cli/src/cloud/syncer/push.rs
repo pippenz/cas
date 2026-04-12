@@ -209,6 +209,9 @@ impl CloudSyncer {
             serde_json::json!(project_id),
         );
 
+        // Include client version info for server-side compatibility checks
+        Self::insert_client_version(&mut payload);
+
         let json_bytes = serde_json::to_vec(&payload)
             .map_err(|e| CasError::Other(format!("JSON serialization failed: {e}")))?;
         let compressed = Self::gzip_json(&json_bytes)?;
@@ -414,6 +417,9 @@ impl CloudSyncer {
             serde_json::json!(project_id),
         );
 
+        // Include client version info for server-side compatibility checks
+        Self::insert_client_version(&mut payload);
+
         // Serialize and compress the payload
         let json_bytes = serde_json::to_vec(&payload)
             .map_err(|e| CasError::Other(format!("JSON serialization failed: {e}")))?;
@@ -469,5 +475,17 @@ impl CloudSyncer {
         for item in items {
             let _ = self.queue.mark_failed(item.id, error);
         }
+    }
+
+    /// Insert client version fields into a push payload.
+    pub(crate) fn insert_client_version(payload: &mut serde_json::Map<String, serde_json::Value>) {
+        payload.insert(
+            "client_version".to_string(),
+            serde_json::json!(env!("CARGO_PKG_VERSION")),
+        );
+        payload.insert(
+            "client_build".to_string(),
+            serde_json::json!(option_env!("CAS_GIT_HASH").unwrap_or("unknown")),
+        );
     }
 }

@@ -108,6 +108,9 @@ impl CloudSyncer {
             serde_json::json!(project_id),
         );
 
+        // Include client version info for server-side compatibility checks
+        Self::insert_client_version(&mut payload);
+
         // Track if we have upserts to push
         let has_upserts = !grouped.upsert_entries.is_empty()
             || !grouped.upsert_tasks.is_empty()
