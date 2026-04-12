@@ -596,7 +596,7 @@ impl FactoryApp {
     }
 
     /// Get a status icon for a worker based on their CAS task state
-    fn get_worker_status_icon(&self, worker_name: &str) -> &'static str {
+    pub(crate) fn get_worker_status_icon(&self, worker_name: &str) -> &'static str {
         // Check if worker has an in-progress task
         for task in &self.director_data.in_progress_tasks {
             if let Some(assignee) = &task.assignee {

@@ -155,10 +155,31 @@ impl FactoryApp {
                 if tab_area.contains((col, row).into()) {
                     let all_names = self.layout_worker_names();
                     if !all_names.is_empty() {
-                        let tab_width = tab_area.width / all_names.len() as u16;
-                        let clicked_tab =
-                            (col.saturating_sub(tab_area.x) / tab_width.max(1)) as usize;
-                        if clicked_tab < all_names.len() {
+                        let click_x = col.saturating_sub(tab_area.x) as usize;
+                        // Account for 1-char left padding before first tab
+                        let mut pos: usize = 1;
+                        let mut clicked_tab: Option<usize> = None;
+                        for (i, name) in all_names.iter().enumerate() {
+                            let number = i + 1;
+                            let status_icon = if self.is_pending_worker(name) {
+                                " \u{2801}" // spinner placeholder — 2 chars, same width as any frame
+                            } else {
+                                self.get_worker_status_icon(name)
+                            };
+                            // Must match renderer: format!(" {number} {name}{status_icon} ")
+                            let label_width =
+                                3 + number.to_string().len() + name.len() + status_icon.len();
+                            if click_x >= pos && click_x < pos + label_width {
+                                clicked_tab = Some(i);
+                                break;
+                            }
+                            pos += label_width;
+                            // 1-char separator between tabs
+                            if i < all_names.len() - 1 {
+                                pos += 1;
+                            }
+                        }
+                        if let Some(clicked_tab) = clicked_tab {
                             self.select_worker_tab(clicked_tab);
                             // Also focus the clicked worker pane
                             if let Some(name) = self.worker_names.get(clicked_tab) {
