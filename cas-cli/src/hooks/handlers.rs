@@ -167,7 +167,7 @@ pub use handlers_state::{get_session_files, handle_subagent_start, handle_subage
 mod handlers_middle;
 pub use handlers_middle::{handle_post_tool_use, handle_stop, handle_user_prompt_submit};
 
-mod handlers_events;
+pub(crate) mod handlers_events;
 pub use handlers_events::{
     handle_notification, handle_permission_request, handle_pre_compact, handle_pre_tool_use,
 };

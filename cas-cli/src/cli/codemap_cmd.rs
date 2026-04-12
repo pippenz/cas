@@ -1,0 +1,258 @@
+use std::path::Path;
+
+use clap::Subcommand;
+
+use crate::hooks::handlers::handlers_events::codemap::{
+    check_codemap_freshness, CodemapPending,
+};
+
+use super::Cli;
+
+#[derive(Subcommand)]
+pub enum CodemapCommands {
+    /// Show codemap staleness info (last updated, pending changes)
+    Status,
+    /// List specific pending structural changes
+    Pending,
+    /// Clear codemap-pending.json after manual update
+    Clear,
+}
+
+const CODEMAP_PENDING_FILE: &str = "codemap-pending.json";
+
+pub fn execute(cmd: &CodemapCommands, _cli: &Cli, cas_root: &Path) -> anyhow::Result<()> {
+    match cmd {
+        CodemapCommands::Status => execute_status(cas_root),
+        CodemapCommands::Pending => execute_pending(cas_root),
+        CodemapCommands::Clear => execute_clear(cas_root),
+    }
+}
+
+fn execute_status(cas_root: &Path) -> anyhow::Result<()> {
+    let project_root = cas_root
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Cannot determine project root from CAS directory"))?;
+
+    let codemap_path = project_root.join(".claude/CODEMAP.md");
+    let pending_path = cas_root.join(CODEMAP_PENDING_FILE);
+
+    // Check CODEMAP.md existence and last modified time
+    if !codemap_path.exists() {
+        println!("CODEMAP.md: not found");
+        println!("  Run the /codemap skill to generate one.");
+        return Ok(());
+    }
+
+    // Get last modified time from git or filesystem
+    let last_updated = get_codemap_last_updated(&codemap_path);
+    println!("CODEMAP.md: {}", codemap_path.display());
+    println!("  Last updated: {last_updated}");
+
+    // Check pending changes from file
+    let pending_count = count_pending_changes(&pending_path);
+
+    // Check git-based staleness
+    let git_changes = get_git_structural_changes_since(project_root, &codemap_path);
+
+    let total = pending_count + git_changes;
+    if total == 0 {
+        println!("  Status: up to date");
+    } else {
+        println!("  Pending changes: {total}");
+        if pending_count > 0 {
+            println!("    From pending file: {pending_count}");
+        }
+        if git_changes > 0 {
+            println!("    From git history: {git_changes}");
+        }
+    }
+
+    // Also show the hook-level freshness check for completeness
+    if let Some(msg) = check_codemap_freshness(cas_root) {
+        // Strip XML tags for CLI display
+        let clean = msg
+            .replace("<codemap-freshness>\n", "")
+            .replace("\n</codemap-freshness>", "");
+        println!("\n  Hook message: {clean}");
+    }
+
+    Ok(())
+}
+
+fn execute_pending(cas_root: &Path) -> anyhow::Result<()> {
+    let project_root = cas_root
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Cannot determine project root from CAS directory"))?;
+
+    let codemap_path = project_root.join(".claude/CODEMAP.md");
+    let pending_path = cas_root.join(CODEMAP_PENDING_FILE);
+
+    let mut has_changes = false;
+
+    // Show pending file changes
+    if pending_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&pending_path) {
+            for line in content.lines() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                if let Ok(pending) = serde_json::from_str::<CodemapPending>(line) {
+                    for change in &pending.changes {
+                        let prefix = match change.change_type.as_str() {
+                            "A" => "  + ",
+                            "D" => "  - ",
+                            "R" => "  ~ ",
+                            _ => "  ? ",
+                        };
+                        if let Some(old) = &change.old_path {
+                            println!("{prefix}{old} → {}", change.path);
+                        } else {
+                            println!("{prefix}{}", change.path);
+                        }
+                        has_changes = true;
+                    }
+                }
+            }
+        }
+    }
+
+    // Show git-based structural changes
+    if codemap_path.exists() {
+        let git_changes = get_git_structural_change_list(project_root, &codemap_path);
+        for line in &git_changes {
+            let (status, path) = line.split_at(1);
+            let path = path.trim();
+            let prefix = match status {
+                "A" => "  + ",
+                "D" => "  - ",
+                "R" => "  ~ ",
+                _ => "  ? ",
+            };
+            println!("{prefix}{path} (git)");
+            has_changes = true;
+        }
+    }
+
+    if !has_changes {
+        println!("No pending structural changes.");
+    }
+
+    Ok(())
+}
+
+fn execute_clear(cas_root: &Path) -> anyhow::Result<()> {
+    let pending_path = cas_root.join(CODEMAP_PENDING_FILE);
+
+    if pending_path.exists() {
+        std::fs::remove_file(&pending_path)?;
+        println!("Cleared {}", pending_path.display());
+    } else {
+        println!("No pending file to clear.");
+    }
+
+    Ok(())
+}
+
+/// Count total structural changes in the pending file.
+fn count_pending_changes(pending_path: &Path) -> usize {
+    if !pending_path.exists() {
+        return 0;
+    }
+    let content = match std::fs::read_to_string(pending_path) {
+        Ok(c) => c,
+        Err(_) => return 0,
+    };
+    content
+        .lines()
+        .filter_map(|line| serde_json::from_str::<CodemapPending>(line.trim()).ok())
+        .map(|p| p.changes.len())
+        .sum()
+}
+
+/// Get last updated time for CODEMAP.md (from git log or file mtime).
+fn get_codemap_last_updated(codemap_path: &Path) -> String {
+    // Try git log first
+    let output = std::process::Command::new("git")
+        .args(["log", "-1", "--format=%ci", "--"])
+        .arg(codemap_path)
+        .output();
+
+    if let Ok(output) = output {
+        if output.status.success() {
+            let date = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !date.is_empty() {
+                return date;
+            }
+        }
+    }
+
+    // Fallback to file mtime
+    if let Ok(metadata) = std::fs::metadata(codemap_path) {
+        if let Ok(modified) = metadata.modified() {
+            let dt: chrono::DateTime<chrono::Utc> = modified.into();
+            return dt.format("%Y-%m-%d %H:%M:%S %z").to_string();
+        }
+    }
+
+    "unknown".to_string()
+}
+
+/// Count structural changes from git history since CODEMAP.md was last updated.
+fn get_git_structural_changes_since(project_root: &Path, codemap_path: &Path) -> usize {
+    get_git_structural_change_list(project_root, codemap_path).len()
+}
+
+/// Get structural change lines from git since CODEMAP.md was last updated.
+fn get_git_structural_change_list(project_root: &Path, codemap_path: &Path) -> Vec<String> {
+    // Get CODEMAP.md's last commit timestamp
+    let since = get_codemap_git_timestamp(codemap_path);
+    let since = match since {
+        Some(s) => s,
+        None => return Vec::new(),
+    };
+
+    // Find structural changes (A/D/R) since that timestamp
+    let output = std::process::Command::new("git")
+        .current_dir(project_root)
+        .args([
+            "log",
+            "--diff-filter=ADR",
+            "--name-status",
+            "--no-renames",
+            "--format=",
+            &format!("--since={since}"),
+        ])
+        .output();
+
+    let output = match output {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .filter(|l| {
+            let l = l.trim();
+            !l.is_empty() && (l.starts_with('A') || l.starts_with('D') || l.starts_with('R'))
+        })
+        .map(|l| l.trim().to_string())
+        .collect()
+}
+
+/// Get the ISO timestamp of CODEMAP.md's last commit.
+fn get_codemap_git_timestamp(codemap_path: &Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["log", "-1", "--format=%cI", "--"])
+        .arg(codemap_path)
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let ts = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if ts.is_empty() { None } else { Some(ts) }
+}

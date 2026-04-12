@@ -24,7 +24,7 @@
 //! ```
 
 mod context;
-mod handlers;
+pub(crate) mod handlers;
 pub mod scorer;
 pub mod transcript;
 mod types;

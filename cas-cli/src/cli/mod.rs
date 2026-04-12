@@ -6,6 +6,7 @@ mod auth;
 pub(crate) mod bridge;
 mod changelog;
 mod claude_md;
+mod codemap_cmd;
 mod cloud;
 mod config;
 mod config_tui;
@@ -172,6 +173,10 @@ pub enum Commands {
     /// Evaluate and optimize CLAUDE.md files for token efficiency
     #[command(name = "claude-md")]
     ClaudeMd(ClaudeMdArgs),
+
+    /// Codemap staleness info and pending changes
+    #[command(subcommand)]
+    Codemap(codemap_cmd::CodemapCommands),
 }
 
 /// Authentication requirement for a command.
@@ -212,7 +217,8 @@ fn auth_requirement(command: &Option<Commands>) -> AuthRequirement {
         | Commands::StatusLine(_)
         | Commands::Mcp(_)
         | Commands::Queue(_)
-        | Commands::ClaudeMd(_) => AuthRequirement::NotRequired,
+        | Commands::ClaudeMd(_)
+        | Commands::Codemap(_) => AuthRequirement::NotRequired,
 
         #[cfg(feature = "mcp-server")]
         Commands::Serve => AuthRequirement::NotRequired,
@@ -358,6 +364,7 @@ fn get_command_name(cmd: &Option<Commands>) -> String {
         Commands::Cloud(_) => "cloud".to_string(),
         Commands::Device(_) => "device".to_string(),
         Commands::ClaudeMd(_) => "claude-md".to_string(),
+        Commands::Codemap(_) => "codemap".to_string(),
     }
 }
 
@@ -405,6 +412,7 @@ fn run_command(cli: &Cli, cas_root: Option<&Path>) -> anyhow::Result<()> {
         Commands::Cloud(cmd) => cloud::execute(cmd, cli, require_cas_root(cas_root)?),
         Commands::Device(cmd) => device::execute(cmd, cli),
         Commands::ClaudeMd(args) => claude_md::execute(args, cli),
+        Commands::Codemap(cmd) => codemap_cmd::execute(cmd, cli, require_cas_root(cas_root)?),
     }
 }
 
