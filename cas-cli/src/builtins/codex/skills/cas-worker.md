@@ -327,3 +327,20 @@ ln -s /path/to/main/repo/vendor/<submodule> vendor/<submodule>
    - If it passes on main → the conflict is between your changes and another worker's recent commit. Report as **cross-worker conflict** with both commit hashes.
 
 Only report to supervisor after completing at least steps 1-2. Include the error output and which step identified the cause.
+
+**MCP connectivity failure** (`mcp__cas__*` tools stop responding or return connection errors):
+
+1. **Check the symlink**: Worktrees get MCP config via symlink, not a copy.
+   ```bash
+   ls -la .mcp.json  # Should be a symlink to main repo's .mcp.json
+   ```
+   If the symlink is broken or missing, the MCP server can't start.
+
+2. **Check the CAS server process**: The `cas serve` process may have crashed.
+   ```bash
+   ps aux | grep 'cas serve'
+   ```
+
+3. **Do NOT attempt sqlite surgery.** Direct database edits from a worker session risk corrupting shared state.
+
+4. **Report to supervisor** via `mcp__cas__coordination action=message` with the error and diagnostic output. Supervisor will fix the MCP connection or respawn you.
