@@ -291,4 +291,31 @@ Sending `message` alone without `summary` is rejected. `summary` is the one-line
 ln -s /path/to/main/repo/vendor/<submodule> vendor/<submodule>
 ```
 
-**Build errors in code you didn't touch**: Another worker may be changing related files. Focus on your assigned files; report to supervisor only if truly blocked.
+**Build errors in code you didn't touch**: Triage before reporting to supervisor:
+
+1. **Merge conflict from another worker?** Pull latest from main and rebase:
+   ```bash
+   git fetch origin main && git rebase origin/main
+   ```
+   If conflicts appear in files you own, resolve them. If in files you don't own, report to supervisor.
+
+2. **Missing dependency or new module?** Check if another worker added dependencies:
+   ```bash
+   git diff origin/main -- Cargo.toml Cargo.lock package.json pnpm-lock.yaml
+   ```
+   If new crates/packages were added, pull main and rebuild.
+
+3. **Environment issue?** Verify tool versions and env vars match what the project expects:
+   ```bash
+   rustc --version && cargo --version  # Check Rust toolchain
+   node --version                       # Check Node if applicable
+   ```
+
+4. **Reproducible on main?** Test whether the failure is pre-existing:
+   ```bash
+   git stash && git checkout origin/main && cargo build  # or npm run build
+   ```
+   - If it fails on main too → report to supervisor as **pre-existing** (not your blocker).
+   - If it passes on main → the conflict is between your changes and another worker's recent commit. Report as **cross-worker conflict** with both commit hashes.
+
+Only report to supervisor after completing at least steps 1-2. Include the error output and which step identified the cause.
