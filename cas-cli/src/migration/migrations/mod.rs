@@ -166,6 +166,7 @@ mod m188_id_sequences_create_table;
 mod m189_events_friction_type_index;
 mod m190_tasks_add_execution_note;
 mod m191_agents_add_startup_confirmed;
+mod m192_perf_indexes;
 
 /// All migrations in order. IDs must be sequential and never reused.
 pub const MIGRATIONS: &[Migration] = &[
@@ -325,6 +326,8 @@ pub const MIGRATIONS: &[Migration] = &[
     m190_tasks_add_execution_note::MIGRATION,
     // Agent startup confirmation for crash-on-startup detection (cas-714d)
     m191_agents_add_startup_confirmed::MIGRATION,
+    // Performance indexes for hot polling paths (cas-aee3)
+    m192_perf_indexes::MIGRATION,
 ];
 
 #[cfg(test)]
