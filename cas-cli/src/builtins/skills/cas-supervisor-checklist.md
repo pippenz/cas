@@ -19,7 +19,11 @@ managed_by: cas
    ```
    mcp__cas__search action=search query="<keywords>" doc_type=entry limit=5
    ```
-4. Check worker availability: `mcp__cas__coordination action=worker_status`
+4. Check codemap freshness:
+   - If `.claude/CODEMAP.md` is missing → run `/codemap` to generate it.
+   - If it exists but is stale (structural changes since last update) → run `/codemap` to refresh.
+   - Workers reference CODEMAP for codebase orientation — ensure it's current before spawning them.
+5. Check worker availability: `mcp__cas__coordination action=worker_status`
 
 ## Intake Gate (Before Planning)
 
