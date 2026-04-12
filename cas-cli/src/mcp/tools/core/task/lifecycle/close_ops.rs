@@ -341,7 +341,9 @@ impl CasCore {
                         let mut task_to_update = task.clone();
                         task_to_update.pending_verification = false;
                         task_to_update.updated_at = chrono::Utc::now();
-                        let _ = task_store.update(&task_to_update);
+                        if let Err(e) = task_store.update(&task_to_update) {
+                            tracing::warn!(task_id = %req.id, error = %e, "failed to clear pending_verification on task");
+                        }
 
                         // Release any lease so the supervisor can reclaim the task.
                         if let Ok(agent_store) = self.open_agent_store() {
@@ -360,7 +362,9 @@ impl CasCore {
                              verdict manually."
                         );
                         timeout_row.created_at = chrono::Utc::now();
-                        let _ = verification_store.update(&timeout_row);
+                        if let Err(e) = verification_store.update(&timeout_row) {
+                            tracing::warn!(task_id = %req.id, error = %e, "failed to update verification timeout row");
+                        }
 
                         // Surface an activity event so the TUI shows the escalation.
                         if let Ok(agent_id) = self.get_agent_id() {
@@ -413,7 +417,9 @@ impl CasCore {
                             }
                         }
                         task_to_update.updated_at = chrono::Utc::now();
-                        let _ = task_store.update(&task_to_update);
+                        if let Err(e) = task_store.update(&task_to_update) {
+                            tracing::warn!(task_id = %req.id, error = %e, "failed to set pending_verification on task");
+                        }
 
                         // Include close reason in the message so verifier can check it
                         let close_reason_section = if let Some(ref reason) = req.reason {
@@ -470,7 +476,9 @@ impl CasCore {
                                      This row will be superseded by the subagent's verdict.",
                                     req.id
                                 );
-                                let _ = verification_store.add(&dispatch_row);
+                                if let Err(e) = verification_store.add(&dispatch_row) {
+                                    tracing::warn!(task_id = %req.id, error = %e, "failed to persist verification dispatch row");
+                                }
                             }
                         }
 
@@ -564,7 +572,9 @@ impl CasCore {
                                 }
                             }
                             task_to_update.updated_at = chrono::Utc::now();
-                            let _ = task_store.update(&task_to_update);
+                            if let Err(e) = task_store.update(&task_to_update) {
+                                tracing::warn!(task_id = %req.id, error = %e, "failed to set pending_worktree_merge on task");
+                            }
 
                             return Ok(Self::tool_error(format!(
                                 "⚠️ WORKTREE MERGE REQUIRED\n\n\
@@ -773,7 +783,9 @@ impl CasCore {
                     t.notes = format!("{}\n\n{}", t.notes, note);
                 }
                 t.updated_at = chrono::Utc::now();
-                let _ = task_store.update(&t);
+                if let Err(e) = task_store.update(&t) {
+                    tracing::warn!(task_id = %req.id, error = %e, "failed to append code review decision note");
+                }
             }
             CodeReviewGateOutcome::Reject(msg) => {
                 return Ok(Self::tool_error(msg));
@@ -837,7 +849,9 @@ impl CasCore {
                         if let Ok(agent_id) = self.get_agent_id() {
                             row.agent_id = Some(agent_id);
                         }
-                        let _ = verification_store.add(&row);
+                        if let Err(e) = verification_store.add(&row) {
+                            tracing::warn!(task_id = %req.id, error = %e, "failed to persist verification skip row");
+                        }
                     }
                 }
             }
