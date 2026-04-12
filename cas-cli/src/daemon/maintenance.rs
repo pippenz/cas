@@ -77,6 +77,46 @@ pub fn run_maintenance(config: &DaemonConfig) -> Result<DaemonRunResult, CasErro
     }
 
     if let Ok(agent_store) = open_agent_store(&config.cas_root) {
+        // Detect agents that registered but never confirmed startup (60s grace period).
+        // These are agents where the MCP server registered in the DB but the Claude Code
+        // process never actually started (worktree setup failure, spawn crash, etc.).
+        if let Ok(failed_startup_agents) = agent_store.list_failed_startup(60) {
+            for agent in &failed_startup_agents {
+                let agent_id = agent.id.clone();
+                if agent_store.mark_stale(&agent_id).is_ok() {
+                    agents_cleaned += 1;
+
+                    // Release any tasks that were assigned but never worked on
+                    let held_tasks = agent_store.list_agent_leases(&agent_id).unwrap_or_default();
+                    if !held_tasks.is_empty() {
+                        if let Ok(task_store) = open_task_store(&config.cas_root) {
+                            for lease in &held_tasks {
+                                if let Ok(mut task) = task_store.get(&lease.task_id) {
+                                    if task.status == TaskStatus::InProgress {
+                                        let timestamp = Utc::now().format("%Y-%m-%d %H:%M");
+                                        let note = format!(
+                                            "[{}] ⚠️ FAILED_STARTUP Agent {} registered but never confirmed startup — marking stale",
+                                            timestamp,
+                                            &agent_id[..12.min(agent_id.len())]
+                                        );
+                                        if task.notes.is_empty() {
+                                            task.notes = note;
+                                        } else {
+                                            task.notes = format!("{}\n\n{}", task.notes, note);
+                                        }
+                                        task.updated_at = Utc::now();
+                                        if task_store.update(&task).is_ok() {
+                                            tasks_interrupted += 1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         if let Ok(stale_agents) = agent_store.list_stale(600) {
             for agent in &stale_agents {
                 let held_tasks = agent_store.list_agent_leases(&agent.id).unwrap_or_default();

@@ -1,6 +1,7 @@
 use crate::AgentStore;
 use crate::agent_store::SqliteAgentStore;
 use cas_types::{Agent, AgentStatus, ClaimResult};
+use chrono::{Duration, Utc};
 use rusqlite::params;
 use tempfile::TempDir;
 
@@ -541,4 +542,93 @@ fn test_non_child_cannot_takeover_task() {
     // Verify agent 1 still has the lease
     let lease = store.get_lease("task-1").unwrap().unwrap();
     assert_eq!(lease.agent_id, "agent-1");
+}
+
+#[test]
+fn test_list_failed_startup_detects_unconfirmed_agents() {
+    let (temp, store) = create_test_store();
+
+    // Register an agent (startup_confirmed defaults to 0)
+    let agent = Agent::new("agent-crashed".to_string(), "Crashed Worker".to_string());
+    store.register(&agent).unwrap();
+
+    // Backdate registered_at so the agent appears old enough to be detected
+    let conn = rusqlite::Connection::open(temp.path().join("cas.db")).unwrap();
+    let old_time = (Utc::now() - Duration::seconds(120)).to_rfc3339();
+    conn.execute(
+        "UPDATE agents SET registered_at = ?, last_heartbeat = ? WHERE id = ?",
+        params![old_time, old_time, "agent-crashed"],
+    )
+    .unwrap();
+
+    // Should appear as failed startup (registered > 60s ago, never heartbeated)
+    let failed = store.list_failed_startup(60).unwrap();
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].id, "agent-crashed");
+}
+
+#[test]
+fn test_list_failed_startup_ignores_confirmed_agents() {
+    let (temp, store) = create_test_store();
+
+    // Register and heartbeat (confirms startup)
+    let agent = Agent::new("agent-alive".to_string(), "Alive Worker".to_string());
+    store.register(&agent).unwrap();
+    store.heartbeat("agent-alive").unwrap();
+
+    // Backdate registered_at
+    let conn = rusqlite::Connection::open(temp.path().join("cas.db")).unwrap();
+    let old_time = (Utc::now() - Duration::seconds(120)).to_rfc3339();
+    conn.execute(
+        "UPDATE agents SET registered_at = ? WHERE id = ?",
+        params![old_time, "agent-alive"],
+    )
+    .unwrap();
+
+    // Should NOT appear as failed startup (heartbeat confirmed startup)
+    let failed = store.list_failed_startup(60).unwrap();
+    assert!(failed.is_empty());
+}
+
+#[test]
+fn test_list_failed_startup_ignores_recent_registrations() {
+    let (_temp, store) = create_test_store();
+
+    // Register an agent just now (no heartbeat yet, but within grace period)
+    let agent = Agent::new("agent-new".to_string(), "New Worker".to_string());
+    store.register(&agent).unwrap();
+
+    // Should NOT appear (registered less than 60s ago — still within grace period)
+    let failed = store.list_failed_startup(60).unwrap();
+    assert!(failed.is_empty());
+}
+
+#[test]
+fn test_heartbeat_sets_startup_confirmed() {
+    let (temp, store) = create_test_store();
+
+    let agent = Agent::new("agent-confirm".to_string(), "Confirm Test".to_string());
+    store.register(&agent).unwrap();
+
+    // Before heartbeat: startup_confirmed = 0
+    let conn = rusqlite::Connection::open(temp.path().join("cas.db")).unwrap();
+    let confirmed: i64 = conn
+        .query_row(
+            "SELECT startup_confirmed FROM agents WHERE id = ?",
+            params!["agent-confirm"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(confirmed, 0);
+
+    // After heartbeat: startup_confirmed = 1
+    store.heartbeat("agent-confirm").unwrap();
+    let confirmed: i64 = conn
+        .query_row(
+            "SELECT startup_confirmed FROM agents WHERE id = ?",
+            params!["agent-confirm"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(confirmed, 1);
 }

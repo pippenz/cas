@@ -24,6 +24,9 @@ impl AgentStore for SqliteAgentStore {
     fn list_stale(&self, timeout_secs: i64) -> Result<Vec<Agent>> {
         self.agent_list_stale(timeout_secs)
     }
+    fn list_failed_startup(&self, timeout_secs: i64) -> Result<Vec<Agent>> {
+        self.agent_list_failed_startup(timeout_secs)
+    }
     fn heartbeat(&self, id: &str) -> Result<()> {
         self.agent_heartbeat(id)
     }

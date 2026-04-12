@@ -32,8 +32,8 @@ impl SqliteAgentStore {
             // This allows SessionStart hook and MCP to both register without conflict
             conn.execute(
             "INSERT OR REPLACE INTO agents (id, name, agent_type, role, status, pid, ppid, cc_session_id, parent_id,
-             machine_id, registered_at, last_heartbeat, active_tasks, metadata)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+             machine_id, registered_at, last_heartbeat, active_tasks, metadata, startup_confirmed)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 0)",
             params![
                 agent.id,
                 agent.name,
@@ -211,8 +211,9 @@ impl SqliteAgentStore {
             // Only heartbeat agents in live states (active/idle). Agents that have been
             // explicitly shut down or marked stale should not be revived by a heartbeat —
             // their daemon may still be running briefly after the process was killed.
+            // Also confirm startup on first heartbeat (startup_confirmed = 1).
             let rows = conn.execute(
-            "UPDATE agents SET last_heartbeat = ?, status = 'active' WHERE id = ? AND status IN ('active', 'idle')",
+            "UPDATE agents SET last_heartbeat = ?, status = 'active', startup_confirmed = 1 WHERE id = ? AND status IN ('active', 'idle')",
             params![now, id],
         )?;
 
@@ -316,6 +317,25 @@ impl SqliteAgentStore {
 
         Ok(())
     }
+    pub(crate) fn agent_list_failed_startup(&self, timeout_secs: i64) -> Result<Vec<Agent>> {
+        let conn = self.lock_conn()?;
+        let cutoff = (Utc::now() - chrono::Duration::seconds(timeout_secs)).to_rfc3339();
+
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, name, agent_type, role, status, pid, ppid, cc_session_id, parent_id,
+             machine_id, registered_at, last_heartbeat, active_tasks, metadata
+             FROM agents
+             WHERE status IN ('active', 'idle') AND startup_confirmed = 0 AND registered_at < ?
+             ORDER BY registered_at ASC",
+        )?;
+
+        let agents = stmt
+            .query_map(params![cutoff], Self::agent_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        Ok(agents)
+    }
+
     pub(crate) fn agent_get_by_cc_pid(&self, cc_pid: u32) -> Result<Option<Agent>> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare_cached(

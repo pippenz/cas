@@ -55,7 +55,8 @@ CREATE TABLE IF NOT EXISTS agents (
     registered_at TEXT NOT NULL,
     last_heartbeat TEXT NOT NULL,
     active_tasks INTEGER NOT NULL DEFAULT 0,
-    metadata TEXT NOT NULL DEFAULT '{}'
+    metadata TEXT NOT NULL DEFAULT '{}',
+    startup_confirmed INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_agents_status ON agents(status);
@@ -162,6 +163,10 @@ pub trait AgentStore: Send + Sync {
 
     /// List agents that need heartbeat check (idle or potentially dead)
     fn list_stale(&self, timeout_secs: i64) -> Result<Vec<Agent>>;
+
+    /// List agents that registered but never confirmed startup (no heartbeat received)
+    /// Returns agents where startup_confirmed = 0 and registered more than timeout_secs ago
+    fn list_failed_startup(&self, timeout_secs: i64) -> Result<Vec<Agent>>;
 
     /// Update agent heartbeat
     fn heartbeat(&self, id: &str) -> Result<()>;

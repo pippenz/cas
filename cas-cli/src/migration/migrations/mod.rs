@@ -165,6 +165,7 @@ mod m187_tasks_idx_assignee;
 mod m188_id_sequences_create_table;
 mod m189_events_friction_type_index;
 mod m190_tasks_add_execution_note;
+mod m191_agents_add_startup_confirmed;
 
 /// All migrations in order. IDs must be sequential and never reused.
 pub const MIGRATIONS: &[Migration] = &[
@@ -322,6 +323,8 @@ pub const MIGRATIONS: &[Migration] = &[
     m189_events_friction_type_index::MIGRATION,
     // Execution note for task methodology tracking (cas-7fc1)
     m190_tasks_add_execution_note::MIGRATION,
+    // Agent startup confirmation for crash-on-startup detection (cas-714d)
+    m191_agents_add_startup_confirmed::MIGRATION,
 ];
 
 #[cfg(test)]

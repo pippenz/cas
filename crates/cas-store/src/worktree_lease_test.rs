@@ -38,7 +38,8 @@ mod tests {
                 registered_at TEXT NOT NULL,
                 last_heartbeat TEXT NOT NULL,
                 active_tasks INTEGER NOT NULL DEFAULT 0,
-                metadata TEXT NOT NULL DEFAULT '{}'
+                metadata TEXT NOT NULL DEFAULT '{}',
+                startup_confirmed INTEGER NOT NULL DEFAULT 0
             );
 
             -- Task leases table
