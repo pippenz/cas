@@ -309,6 +309,44 @@ impl SqliteStore {
 
         Ok(entries)
     }
+    pub(crate) fn store_list_decayable(&self) -> Result<Vec<Entry>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, type, tags, created, content, title, helpful_count,
+             harmful_count, last_accessed, archived, session_id, source_tool,
+             pending_extraction, observation_type, stability, access_count,
+             raw_content, compressed, memory_tier, importance, valid_from, valid_until, review_after, last_reviewed, pending_embedding,
+             belief_type, confidence, domain, branch, scope, team_id
+             FROM entries WHERE archived = 0 AND memory_tier NOT IN ('in_context', 'archive')
+             ORDER BY created DESC LIMIT 10000",
+        )?;
+
+        let entries = stmt
+            .query_map([], Self::row_to_entry)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        Ok(entries)
+    }
+
+    pub(crate) fn store_list_prunable(&self, stability_threshold: f32) -> Result<Vec<Entry>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, type, tags, created, content, title, helpful_count,
+             harmful_count, last_accessed, archived, session_id, source_tool,
+             pending_extraction, observation_type, stability, access_count,
+             raw_content, compressed, memory_tier, importance, valid_from, valid_until, review_after, last_reviewed, pending_embedding,
+             belief_type, confidence, domain, branch, scope, team_id
+             FROM entries WHERE archived = 0 AND stability < ?
+             ORDER BY stability ASC LIMIT 10000",
+        )?;
+
+        let entries = stmt
+            .query_map(rusqlite::params![stability_threshold], Self::row_to_entry)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        Ok(entries)
+    }
+
     pub(crate) fn store_recent(&self, n: usize) -> Result<Vec<Entry>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare_cached(

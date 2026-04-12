@@ -11,7 +11,7 @@ use crate::store::Store;
 pub(crate) fn apply_memory_decay(store: &Arc<dyn Store>) -> Result<usize, CasError> {
     use crate::types::{EntryType, MemoryTier};
 
-    let entries = store.list()?;
+    let entries = store.list_decayable()?;
     let now = Utc::now();
     let mut count = 0;
 
@@ -19,9 +19,7 @@ pub(crate) fn apply_memory_decay(store: &Arc<dyn Store>) -> Result<usize, CasErr
         let mut updated = entry.clone();
         let mut needs_update = false;
 
-        if updated.memory_tier == MemoryTier::InContext {
-            continue;
-        }
+        // InContext and Archive entries already filtered out by list_decayable()
 
         if updated.entry_type == EntryType::Observation
             && updated.memory_tier == MemoryTier::Working
@@ -149,7 +147,7 @@ pub(crate) fn run_consolidation(
 
 /// Auto-prune stale entries.
 pub(crate) fn auto_prune(store: &Arc<dyn Store>) -> Result<usize, CasError> {
-    let entries = store.list()?;
+    let entries = store.list_prunable(0.1)?;
     let mut pruned = 0;
 
     for entry in entries {

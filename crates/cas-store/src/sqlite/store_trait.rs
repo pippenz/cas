@@ -36,6 +36,14 @@ impl Store for SqliteStore {
         self.store_list()
     }
 
+    fn list_decayable(&self) -> Result<Vec<Entry>> {
+        self.store_list_decayable()
+    }
+
+    fn list_prunable(&self, stability_threshold: f32) -> Result<Vec<Entry>> {
+        self.store_list_prunable(stability_threshold)
+    }
+
     fn recent(&self, n: usize) -> Result<Vec<Entry>> {
         self.store_recent(n)
     }

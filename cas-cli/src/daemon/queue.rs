@@ -171,15 +171,20 @@ impl TaskQueue {
         true
     }
 
-    /// Add a task, replacing lower priority tasks if full
+    /// Add a task, replacing lowest priority task if full
     pub fn push_or_replace(&self, task: MaintenanceTask) {
         let mut queue = self.queue.lock().unwrap();
         if queue.len() >= self.max_size {
-            // Find and remove lowest priority task
-            let tasks: Vec<_> = queue.drain().collect();
-            let mut tasks = tasks;
-            tasks.sort_by(|a, b| a.priority.cmp(&b.priority));
-            tasks.pop(); // Remove lowest priority (highest number)
+            // Drain into a sorted vec (descending priority), pop the lowest, rebuild
+            let mut tasks = queue.drain().collect::<Vec<_>>();
+            // Find the index of the lowest priority (highest priority number) task
+            if let Some((worst_idx, _)) = tasks
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, t)| t.priority)
+            {
+                tasks.swap_remove(worst_idx);
+            }
             for t in tasks {
                 queue.push(t);
             }

@@ -147,14 +147,15 @@ impl CloudSyncer {
                 self.cloud_config.endpoint, team_id
             );
 
+            // Serialize and compress once, reuse across retries
+            let json_bytes = serde_json::to_vec(&payload)
+                .map_err(|e| CasError::Other(format!("JSON serialization failed: {e}")))?;
+            let compressed = Self::gzip_json(&json_bytes)?;
+
             for attempt in 0..3 {
                 if attempt > 0 {
                     std::thread::sleep(self.config.backoff_duration(attempt as u32));
                 }
-
-                let json_bytes = serde_json::to_vec(&payload)
-                    .map_err(|e| CasError::Other(format!("JSON serialization failed: {e}")))?;
-                let compressed = Self::gzip_json(&json_bytes)?;
 
                 let response = ureq::post(&push_url)
                     .timeout(self.config.timeout)

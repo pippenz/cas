@@ -279,16 +279,15 @@ impl CloudSyncer {
 
         let mut synced_count = 0;
 
-        // Split upserts into size-limited sub-batches
+        // Split upserts into size-limited sub-batches (consuming values to avoid cloning)
         if !upsert_entries.is_empty() {
-            let sub_batches = self.split_into_sub_batches(&upsert_entries);
+            let sub_batches = self.split_into_sub_batches(upsert_entries);
 
-            for sub_batch in &sub_batches {
-                let values: Vec<&serde_json::Value> = sub_batch.iter().map(|(_, v)| *v).collect();
-                let batch_items: Vec<&QueuedSync> =
-                    sub_batch.iter().map(|(item, _)| *item).collect();
+            for sub_batch in sub_batches {
+                let (batch_items, values): (Vec<&QueuedSync>, Vec<serde_json::Value>) =
+                    sub_batch.into_iter().unzip();
 
-                match self.push_sub_batch(&values, entity_type, token) {
+                match self.push_sub_batch(values, entity_type, token) {
                     Ok(()) => {
                         for item in &batch_items {
                             let _ = self.queue.mark_synced(item.id);
@@ -345,31 +344,28 @@ impl CloudSyncer {
     }
 
     /// Split upsert entries into sub-batches that each stay under max_payload_bytes.
-    fn split_into_sub_batches<'a, 'b>(
+    /// Takes ownership of entries to avoid cloning serde_json::Value.
+    fn split_into_sub_batches<'a>(
         &self,
-        entries: &'b [(&'a QueuedSync, serde_json::Value)],
-    ) -> Vec<Vec<(&'a QueuedSync, &'b serde_json::Value)>> {
+        entries: Vec<(&'a QueuedSync, serde_json::Value)>,
+    ) -> Vec<Vec<(&'a QueuedSync, serde_json::Value)>> {
         let max_bytes = self.config.max_payload_bytes;
-        // Estimate overhead for the wrapper JSON (entity type key, team_id, project_id, etc.)
         let overhead = 256;
         let mut batches = Vec::new();
-        let mut current_batch: Vec<(&QueuedSync, &serde_json::Value)> = Vec::new();
+        let mut current_batch: Vec<(&QueuedSync, serde_json::Value)> = Vec::new();
         let mut current_size = overhead;
 
         for (item, value) in entries {
-            // Estimate this item's JSON size from the original payload
             let item_size = item.payload.as_ref().map(|p| p.len()).unwrap_or(256);
-            // Account for array separator
             let item_total = item_size + 1;
 
             if !current_batch.is_empty() && current_size + item_total > max_bytes {
-                // Current batch would exceed limit, start a new one
                 batches.push(current_batch);
                 current_batch = Vec::new();
                 current_size = overhead;
             }
 
-            current_batch.push((*item, value));
+            current_batch.push((item, value));
             current_size += item_total;
         }
 
@@ -394,7 +390,7 @@ impl CloudSyncer {
     /// Push a single sub-batch of upsert values with retry.
     fn push_sub_batch(
         &self,
-        values: &[&serde_json::Value],
+        values: Vec<serde_json::Value>,
         entity_type: &str,
         token: &str,
     ) -> Result<(), CasError> {
@@ -403,7 +399,7 @@ impl CloudSyncer {
         let mut payload = serde_json::Map::new();
         payload.insert(
             entity_type.to_string(),
-            serde_json::Value::Array(values.iter().map(|v| (*v).clone()).collect()),
+            serde_json::Value::Array(values.to_vec()),
         );
 
         if let Some(team_id) = &self.cloud_config.team_id {

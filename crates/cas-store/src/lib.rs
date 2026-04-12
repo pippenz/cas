@@ -186,6 +186,29 @@ pub trait Store: Send + Sync {
     /// List all active (non-archived) entries
     fn list(&self) -> Result<Vec<Entry>>;
 
+    /// List entries eligible for memory decay (not InContext or Archive tier).
+    /// Default falls back to list() + filter; SQLite overrides with a filtered query.
+    fn list_decayable(&self) -> Result<Vec<Entry>> {
+        Ok(self
+            .list()?
+            .into_iter()
+            .filter(|e| {
+                e.memory_tier != cas_types::MemoryTier::InContext
+                    && e.memory_tier != cas_types::MemoryTier::Archive
+            })
+            .collect())
+    }
+
+    /// List entries eligible for auto-pruning (low stability, not archived).
+    /// Default falls back to list() + filter; SQLite overrides with a filtered query.
+    fn list_prunable(&self, stability_threshold: f32) -> Result<Vec<Entry>> {
+        Ok(self
+            .list()?
+            .into_iter()
+            .filter(|e| e.stability < stability_threshold)
+            .collect())
+    }
+
     /// Get the N most recent entries
     fn recent(&self, n: usize) -> Result<Vec<Entry>>;
 
