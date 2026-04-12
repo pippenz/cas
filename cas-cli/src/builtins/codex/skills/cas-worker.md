@@ -63,6 +63,20 @@ Use task notes for ongoing updates (`note_type=progress|blocker|decision|discove
 
 Message the supervisor when you complete a task or need help.
 
+## Tool Selection Guide
+
+Pick the right tool for the job:
+
+| Need | Tool | Example |
+|------|------|---------|
+| Conceptual/exploratory query | `mcp__cas__search action=search` | "how does auth work?", "where is X handled?" |
+| Exact symbol or string match | `Grep` | find all callers of `process_task()` |
+| Complex codebase investigation | `Agent` with `subagent_type=Explore` | tracing a data flow across multiple modules |
+| Record a learning or bugfix | `mcp__cas__memory action=remember` | root cause found, pattern discovered |
+| Find files by name/pattern | `Glob` | `**/*.rs`, `src/**/mod.rs` |
+
+See the `cas-search` skill for detailed search guidance including code symbol search and hybrid queries.
+
 ## Pre-Close Self-Verification (REQUIRED before closing)
 
 Before running `mcp__cas__task action=close`, verify your own work. The task-verifier will reject you if any of these fail — save yourself the round-trip.
