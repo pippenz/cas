@@ -50,6 +50,18 @@ mcp__cas__task action=update id=<task-id> status=blocked
 
 **Before setting status=blocked**, re-read the task with `mcp__cas__task action=show id=<task-id>`. If it already shows `Status: Closed`, do not update — the supervisor closed it concurrently. Acknowledge the close and move to your next task. A stale `status=blocked` update can overwrite a completed close.
 
+## Task Reassigned While Working
+
+If the supervisor reassigns your current task to another worker:
+
+1. **Commit or stash WIP immediately** — do not lose work in progress.
+2. **Post progress notes** summarizing what's done and what's left:
+   ```
+   mcp__cas__task action=notes id=<task-id> notes="WIP: <what's done>, remaining: <what's left>" note_type=progress
+   ```
+3. **Message supervisor** with the commit SHA of your WIP so the new assignee can pick it up.
+4. **Stop work on that task immediately** — do not finish "just one more thing." Move to your next assigned task or check `mcp__cas__task action=mine`.
+
 ## Communication
 
 Use CAS coordination for messages:
