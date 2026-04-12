@@ -917,20 +917,40 @@ pub(crate) fn detect_epic_state(
         }
     }
 
-    // Fall back to open epics that have a branch set (auto-created branch)
-    // This allows workers to branch from the epic branch before the epic is started
-    // When multiple qualify, pick the one with the lexicographically greatest ID
-    // for deterministic selection (avoids flip-flopping when list order is unstable)
-    if let Some(epic) = data
-        .epic_tasks
-        .iter()
-        .filter(|e| e.status == TaskStatus::Open && e.branch.is_some())
-        .max_by(|a, b| a.id.cmp(&b.id))
+    // Fall back to open epics that have a branch set (auto-created branch).
+    // Prefer epics with active subtasks (in-progress > ready) over stale ones.
+    // This prevents stale cross-project epics from shadowing the active epic.
     {
-        return EpicState::Active {
-            epic_id: epic.id.clone(),
-            epic_title: epic.title.clone(),
-        };
+        let open_epics: Vec<_> = data
+            .epic_tasks
+            .iter()
+            .filter(|e| e.status == TaskStatus::Open && e.branch.is_some())
+            .collect();
+
+        if !open_epics.is_empty() {
+            // Count in-progress and ready subtasks per epic
+            let count_subtasks = |tasks: &[cas_factory::TaskSummary], epic_id: &str| -> usize {
+                tasks.iter().filter(|t| t.epic.as_deref() == Some(epic_id)).count()
+            };
+
+            if let Some(best) = open_epics.iter().max_by(|a, b| {
+                let a_ip = count_subtasks(&data.in_progress_tasks, &a.id);
+                let b_ip = count_subtasks(&data.in_progress_tasks, &b.id);
+                a_ip.cmp(&b_ip)
+                    .then_with(|| {
+                        let a_ready = count_subtasks(&data.ready_tasks, &a.id);
+                        let b_ready = count_subtasks(&data.ready_tasks, &b.id);
+                        a_ready.cmp(&b_ready)
+                    })
+                    // Deterministic tie-break: greatest ID last resort
+                    .then_with(|| a.id.cmp(&b.id))
+            }) {
+                return EpicState::Active {
+                    epic_id: best.id.clone(),
+                    epic_title: best.title.clone(),
+                };
+            }
+        }
     }
 
     // Completing state is transitioned to via handle_epic_events() when EpicCompleted fires
@@ -1130,5 +1150,198 @@ mod tests {
         assert!(merged.git_loaded);
         assert_eq!(merged.changes.len(), 1);
         assert_eq!(merged.changes[0].source_name, "worker-1");
+    }
+
+    #[test]
+    fn detect_epic_prefers_epic_with_active_subtasks_over_stale() {
+        use cas_factory::{EpicState, TaskSummary};
+        use cas_types::{Priority, TaskStatus, TaskType};
+
+        let active_epic_id = "cas-active";
+        let stale_epic_id = "cas-zzz-stale"; // Higher ID — would win with old heuristic
+
+        let data = DirectorData {
+            ready_tasks: vec![TaskSummary {
+                id: "task-ready".to_string(),
+                title: "Ready subtask".to_string(),
+                status: TaskStatus::Open,
+                priority: Priority::MEDIUM,
+                assignee: None,
+                task_type: TaskType::Task,
+                epic: Some(active_epic_id.to_string()),
+                branch: None,
+            }],
+            in_progress_tasks: vec![TaskSummary {
+                id: "task-ip".to_string(),
+                title: "In-progress subtask".to_string(),
+                status: TaskStatus::InProgress,
+                priority: Priority::MEDIUM,
+                assignee: Some("worker-1".to_string()),
+                task_type: TaskType::Task,
+                epic: Some(active_epic_id.to_string()),
+                branch: None,
+            }],
+            epic_tasks: vec![
+                TaskSummary {
+                    id: stale_epic_id.to_string(),
+                    title: "Stale Epic".to_string(),
+                    status: TaskStatus::Open,
+                    priority: Priority::MEDIUM,
+                    assignee: None,
+                    task_type: TaskType::Epic,
+                    epic: None,
+                    branch: Some("epic/stale".to_string()),
+                },
+                TaskSummary {
+                    id: active_epic_id.to_string(),
+                    title: "Active Epic".to_string(),
+                    status: TaskStatus::Open,
+                    priority: Priority::MEDIUM,
+                    assignee: None,
+                    task_type: TaskType::Epic,
+                    epic: None,
+                    branch: Some("epic/active".to_string()),
+                },
+            ],
+            agents: Vec::new(),
+            activity: Vec::new(),
+            agent_id_to_name: HashMap::new(),
+            changes: Vec::new(),
+            git_loaded: false,
+            reminders: Vec::new(),
+            epic_closed_counts: HashMap::new(),
+        };
+
+        let state = super::detect_epic_state(&data, None);
+        match state {
+            EpicState::Active { epic_id, .. } => {
+                assert_eq!(epic_id, active_epic_id,
+                    "Should prefer epic with in-progress subtasks, not stale epic with higher ID");
+            }
+            other => panic!("Expected Active, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn detect_epic_falls_back_to_ready_subtasks_when_no_in_progress() {
+        use cas_factory::{EpicState, TaskSummary};
+        use cas_types::{Priority, TaskStatus, TaskType};
+
+        let active_epic_id = "cas-active";
+        let stale_epic_id = "cas-zzz-stale";
+
+        let data = DirectorData {
+            ready_tasks: vec![TaskSummary {
+                id: "task-ready".to_string(),
+                title: "Ready subtask".to_string(),
+                status: TaskStatus::Open,
+                priority: Priority::MEDIUM,
+                assignee: None,
+                task_type: TaskType::Task,
+                epic: Some(active_epic_id.to_string()),
+                branch: None,
+            }],
+            in_progress_tasks: Vec::new(),
+            epic_tasks: vec![
+                TaskSummary {
+                    id: stale_epic_id.to_string(),
+                    title: "Stale Epic".to_string(),
+                    status: TaskStatus::Open,
+                    priority: Priority::MEDIUM,
+                    assignee: None,
+                    task_type: TaskType::Epic,
+                    epic: None,
+                    branch: Some("epic/stale".to_string()),
+                },
+                TaskSummary {
+                    id: active_epic_id.to_string(),
+                    title: "Active Epic".to_string(),
+                    status: TaskStatus::Open,
+                    priority: Priority::MEDIUM,
+                    assignee: None,
+                    task_type: TaskType::Epic,
+                    epic: None,
+                    branch: Some("epic/active".to_string()),
+                },
+            ],
+            agents: Vec::new(),
+            activity: Vec::new(),
+            agent_id_to_name: HashMap::new(),
+            changes: Vec::new(),
+            git_loaded: false,
+            reminders: Vec::new(),
+            epic_closed_counts: HashMap::new(),
+        };
+
+        let state = super::detect_epic_state(&data, None);
+        match state {
+            EpicState::Active { epic_id, .. } => {
+                assert_eq!(epic_id, active_epic_id,
+                    "Should prefer epic with ready subtasks over stale epic with no subtasks");
+            }
+            other => panic!("Expected Active, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn detect_epic_preferred_id_takes_priority_over_heuristic() {
+        use cas_factory::{EpicState, TaskSummary};
+        use cas_types::{Priority, TaskStatus, TaskType};
+
+        let preferred_id = "cas-preferred";
+        let active_id = "cas-active";
+
+        let data = DirectorData {
+            ready_tasks: Vec::new(),
+            in_progress_tasks: vec![TaskSummary {
+                id: "task-ip".to_string(),
+                title: "In-progress subtask".to_string(),
+                status: TaskStatus::InProgress,
+                priority: Priority::MEDIUM,
+                assignee: None,
+                task_type: TaskType::Task,
+                epic: Some(active_id.to_string()),
+                branch: None,
+            }],
+            epic_tasks: vec![
+                TaskSummary {
+                    id: preferred_id.to_string(),
+                    title: "Preferred Epic".to_string(),
+                    status: TaskStatus::Open,
+                    priority: Priority::MEDIUM,
+                    assignee: None,
+                    task_type: TaskType::Epic,
+                    epic: None,
+                    branch: Some("epic/preferred".to_string()),
+                },
+                TaskSummary {
+                    id: active_id.to_string(),
+                    title: "Active Epic".to_string(),
+                    status: TaskStatus::Open,
+                    priority: Priority::MEDIUM,
+                    assignee: None,
+                    task_type: TaskType::Epic,
+                    epic: None,
+                    branch: Some("epic/active".to_string()),
+                },
+            ],
+            agents: Vec::new(),
+            activity: Vec::new(),
+            agent_id_to_name: HashMap::new(),
+            changes: Vec::new(),
+            git_loaded: false,
+            reminders: Vec::new(),
+            epic_closed_counts: HashMap::new(),
+        };
+
+        // Preferred epic should win even though active_id has in-progress subtasks
+        let state = super::detect_epic_state(&data, Some(preferred_id));
+        match state {
+            EpicState::Active { epic_id, .. } => {
+                assert_eq!(epic_id, preferred_id,
+                    "preferred_epic_id should take priority over subtask heuristic");
+            }
+            other => panic!("Expected Active, got {other:?}"),
+        }
     }
 }
