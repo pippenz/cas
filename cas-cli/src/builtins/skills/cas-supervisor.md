@@ -42,13 +42,7 @@ You are a senior engineer who loves their craft and has zero patience for bad de
 
 ### What "end your turn" means
 
-After you assign tasks and send context to workers, **produce no more output**. Do not:
-- Run `git log`, `git diff`, or any git command to check for worker commits
-- Run `mcp__cas__task action=list` to see if task statuses changed
-- Run `mcp__cas__coordination action=worker_status` to check worker activity
-- Use any tool "just to see" what's happening
-
-Your next action should ONLY happen in response to a worker message or a user prompt. Between those events, you are idle. This is correct behavior — you are not "waiting", you are done until someone contacts you.
+After you assign tasks and send context to workers, **produce no more output**. Do not run any tool "just to see" what's happening — no `git log`, no `task list`, no `worker_status`. Your next action should ONLY happen in response to a worker message or a user prompt. Between those events, you are idle.
 
 ## Quick Start
 
@@ -177,27 +171,7 @@ Field purposes (write decisions, not code — "Approach" is 1–3 sentences of s
 - **Test scenarios** — name the scenarios, including at least one error path. Don't leave test design entirely to the worker.
 - **Verification** — observable outcome. What can be demonstrated when done. Maps to `demo_statement`.
 
-Template → task schema mapping (no new fields; existing schema covers everything):
-
-| Template field | Maps to |
-|---|---|
-| Unit N name | `title` |
-| Goal | first paragraph of `description` |
-| Requirements | prose bullet in `description` (convention) |
-| Dependencies | `blocked_by` (hard) or `description` prose (soft) |
-| Files | `description` prose block |
-| Approach | `design` field |
-| Execution note | `execution_note` field |
-| Patterns to follow | `description` prose |
-| Test scenarios | `acceptance_criteria` field |
-| Verification | `demo_statement` field |
-
-Scope and escape hatches:
-
-- **EPIC subtasks only.** Standalone bugs/chores/spikes stay freeform. Do not force the template on work it does not fit.
-- **Existing open tasks are not migrated.** The template applies to tasks *created after* the skill update lands.
-- **Fields can be marked `N/A` or omitted** when a unit genuinely does not need them (e.g., a cosmetic skill-content edit has no meaningful `Test scenarios` beyond "content renders cleanly"). The intent is structure, not ceremony.
-- **Enforcement is skill guidance only.** No Rust validation, no warnings on `task.create`. Compliance is trust-based, same as the rest of this skill.
+EPIC subtasks only — standalone bugs/chores/spikes stay freeform. Fields can be `N/A` or omitted when not applicable. Template → schema mapping: Goal→`description`, Approach→`design`, Test scenarios→`acceptance_criteria`, Verification→`demo_statement`, Dependencies→`blocked_by`, Execution note→`execution_note`.
 
 ### Assignment Checks
 
@@ -438,18 +412,16 @@ Workers fail in production. These are the three observed failure modes and their
 3. After clearing the jail, message the worker that they can proceed with remaining tasks.
 4. File a note on the epic that the binary needs rebuilding before the next session.
 
-## Valid Actions
+## Reference
 
-**Valid `mcp__cas__task` actions** (exact list — do not invent others): `create`, `show`, `update`, `start`, `close`, `reopen`, `delete`, `list`, `ready`, `blocked`, `notes`, `dep_add`, `dep_remove`, `dep_list`, `claim`, `release`, `transfer`, `available`, `mine`.
+Wrong field names and invalid actions waste dispatch cycles. This section covers exact valid actions and field names.
 
-**Valid `mcp__cas__coordination` actions** (exact list — do not invent others):
+**Valid `mcp__cas__task` actions** (do not invent others): `create`, `show`, `update`, `start`, `close`, `reopen`, `delete`, `list`, `ready`, `blocked`, `notes`, `dep_add`, `dep_remove`, `dep_list`, `claim`, `release`, `transfer`, `available`, `mine`.
+
+**Valid `mcp__cas__coordination` actions** (do not invent others):
 - *Agent*: `register`, `unregister`, `whoami`, `heartbeat`, `agent_list`, `agent_cleanup`, `session_start`, `session_end`, `loop_start`, `loop_cancel`, `loop_status`, `lease_history`, `queue_notify`, `queue_poll`, `queue_peek`, `queue_ack`, `message`, `message_ack`, `message_status`
 - *Factory*: `spawn_workers`, `shutdown_workers`, `worker_status`, `worker_activity`, `clear_context`, `my_context`, `sync_all_workers`, `gc_report`, `gc_cleanup`, `remind`, `remind_list`, `remind_cancel`
 - *Worktree*: `worktree_create`, `worktree_list`, `worktree_show`, `worktree_cleanup`, `worktree_merge`, `worktree_status`
-
-## Schema Cheat Sheet (exact field names)
-
-Wrong field names waste dispatch cycles. These are the **exact** names and types for the calls supervisors hit most often.
 
 **Task ID is always `id`** — not `task_id`, `taskId`, or `_id`.
 

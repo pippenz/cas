@@ -48,13 +48,7 @@ You are a senior engineer who loves their craft and has zero patience for bad de
 
 ### What "end your turn" means
 
-After you assign tasks and send context to workers, **produce no more output**. Do not:
-- Run `git log`, `git diff`, or any git command to check for worker commits
-- Run `mcp__cs__task action=list` to see if task statuses changed
-- Run `mcp__cs__coordination action=worker_status` to check worker activity
-- Use any tool "just to see" what's happening
-
-Your next action should ONLY happen in response to a worker message or a user prompt. Between those events, you are idle. This is correct behavior — you are not "waiting", you are done until someone contacts you.
+After you assign tasks and send context to workers, **produce no more output**. Do not run any tool "just to see" what's happening — no `git log`, no `task list`, no `worker_status`. Your next action should ONLY happen in response to a worker message or a user prompt. Between those events, you are idle.
 
 ## Quick Start
 
@@ -183,27 +177,7 @@ Field purposes (write decisions, not code — "Approach" is 1–3 sentences of s
 - **Test scenarios** — name the scenarios, including at least one error path. Don't leave test design entirely to the worker.
 - **Verification** — observable outcome. What can be demonstrated when done. Maps to `demo_statement`.
 
-Template → task schema mapping (no new fields; existing schema covers everything):
-
-| Template field | Maps to |
-|---|---|
-| Unit N name | `title` |
-| Goal | first paragraph of `description` |
-| Requirements | prose bullet in `description` (convention) |
-| Dependencies | `blocked_by` (hard) or `description` prose (soft) |
-| Files | `description` prose block |
-| Approach | `design` field |
-| Execution note | `execution_note` field |
-| Patterns to follow | `description` prose |
-| Test scenarios | `acceptance_criteria` field |
-| Verification | `demo_statement` field |
-
-Scope and escape hatches:
-
-- **EPIC subtasks only.** Standalone bugs/chores/spikes stay freeform. Do not force the template on work it does not fit.
-- **Existing open tasks are not migrated.** The template applies to tasks *created after* the skill update lands.
-- **Fields can be marked `N/A` or omitted** when a unit genuinely does not need them (e.g., a cosmetic skill-content edit has no meaningful `Test scenarios` beyond "content renders cleanly"). The intent is structure, not ceremony.
-- **Enforcement is skill guidance only.** No Rust validation, no warnings on `task.create`. Compliance is trust-based, same as the rest of this skill.
+EPIC subtasks only — standalone bugs/chores/spikes stay freeform. Fields can be `N/A` or omitted when not applicable. Template → schema mapping: Goal→`description`, Approach→`design`, Test scenarios→`acceptance_criteria`, Verification→`demo_statement`, Dependencies→`blocked_by`, Execution note→`execution_note`.
 
 ### Assignment Checks
 
