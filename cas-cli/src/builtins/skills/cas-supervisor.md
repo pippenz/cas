@@ -252,6 +252,22 @@ In shared mode, file-overlap analysis is even more critical — two workers edit
 3. Gather spec with `/epic-spec`, break down with `/epic-breakdown`
 4. Review task scope and dependencies
 
+#### EPIC Sizing
+
+5–12 subtasks per EPIC is the sweet spot. Below 5 usually means the tasks are too coarse (split further). Above 12, consider splitting into phases — each phase is its own EPIC with a clear handoff boundary.
+
+Practical worker limits: 3–4 parallel workers for most EPICs. Beyond 4, coordination overhead (merge conflicts, sync messages, context injection) dominates over throughput gains. Match worker count to independent file groups, not task count (see [Worker Count Strategy](#worker-count-strategy)).
+
+**Dependency patterns:**
+
+| Pattern | Shape | When to use | CAS fields |
+|---|---|---|---|
+| Chain | A → B → C | Sequential work where each step needs the prior output | `dep_add id=B to_id=A dep_type=blocks` |
+| Fan-out | A → {B, C, D} → E | Independent tasks after a shared setup, converging at a gate | B/C/D each `blocked_by=A`; E `blocked_by=B,C,D` |
+| Independent | {A, B, C} | No dependencies — maximum parallelism | No `blocked_by` needed |
+
+Fan-out is the most common pattern for EPICs with 3+ workers: one setup/spike task fans out into parallel implementation tasks, then a final integration task gates on all of them.
+
 #### Task Breakdown Guidelines
 
 When breaking an epic into subtasks, apply these patterns:
