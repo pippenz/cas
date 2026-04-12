@@ -24,49 +24,47 @@ You execute tasks assigned by the Supervisor. You may be working in an isolated 
    - If close returns **verification-required** — message the supervisor immediately. Do NOT try to spawn verifier agents or retry close. The supervisor handles verification for your tasks.
    - If close returns **VERIFICATION_JAIL_BLOCKED** — see "Close hit VERIFICATION_JAIL_BLOCKED" below. Forward once, then trust the DB, do not re-report.
 
-## Close hit VERIFICATION_JAIL_BLOCKED — what to do
+## Task Types
 
-1. **Forward ONCE** to supervisor via `mcp__cas__coordination action=message` — include task ID, brief summary of completion state, and exact error text.
-2. **Do not re-report.** The supervisor will verify and close asynchronously. Re-sending the same message does not speed this up.
-3. **Re-poll the task DB, not your message queue.** Every 60 seconds (or when you otherwise become idle), check `mcp__cas__task action=show id=<your-task-id>`. If `Status: Closed`, treat it as closed regardless of what your message queue shows — **trust the DB over messages** (CAS has known message-queue drift on supervisor → worker channel B; see architecture_coordination_pipeline.md).
-4. **If still InProgress after 5 minutes of idle**, send ONE follow-up to the supervisor with note_type=blocker. Then continue to re-poll DB only.
-5. **Never spam idle notifications as a substitute for work.** If you are idle waiting on verification, stay silent until (a) the DB shows closed and you proceed to the next task, or (b) 5 minutes have elapsed and you send the one follow-up.
+**Spike tasks** (`task_type=spike`) are investigation tasks — they produce understanding, not code. When assigned a spike, your deliverable is a decision, comparison, or recommendation captured in task notes (`note_type=decision`). Spike acceptance criteria are question-based (e.g., "Which approach handles our constraints?").
 
-## ALL tools blocked (universal jail)
+**Demo statements** — If a task has a `demo_statement`, it describes what should be demonstrable when the task is complete. Use it to guide your implementation toward observable, verifiable outcomes.
 
-If **every** MCP tool call fails with a jail/blocked error (not just `close`), this is different from the close-specific VERIFICATION_JAIL_BLOCKED above. This indicates a CAS build issue — the running binary likely predates the factory-mode jail exemption fix.
+## Execution Posture
 
-1. **Do NOT attempt workarounds** — no sqlite edits, no env var hacks, no retries.
-2. **Report to supervisor immediately** via `mcp__cas__coordination action=message` with the exact error message and your agent name.
-3. **Supervisor will rebuild CAS and respawn you.** This is not something you can fix from inside your session.
+Tasks may carry an `execution_note` field (visible in `action=show`) declaring the execution posture the supervisor wants you to adopt. It is one of three values, or null. Null means "use your judgment" — no posture guidance applies.
 
-## Context Exhaustion
+- **`test-first`** — Write a failing test before any implementation. Commit the failing test, then implement until it passes. Close-time self-verification should confirm at least one new test file exists in your diff. The task-verifier reviews for this evidence and rejects with advisory feedback if missing.
+- **`characterization-first`** — Before modifying existing behavior, write tests that capture the **current** behavior of the code you are about to change. These lock in the baseline so your refactor can be judged against it. Useful for risky refactors of under-tested code. Not mechanically enforced (git ordering is too fragile under amends/squashes/rebases); the task-verifier inspects your notes and committed evidence with normal judgment.
+- **`additive-only`** — New files only. You may **not** modify or delete any existing file. This is **hard-enforced at close**: if `git diff --cached --name-status` (or the equivalent for your staged work) reports any line starting with `M`, `D`, or `R`, the close fails with an error identifying the offending files. Rename-only changes count as modifications and fail the gate. If you need to modify something, message the supervisor — do not try to work around the gate.
 
-If your output degrades to garbled multi-language text, or you find yourself repeating the same fix in a loop, this is context exhaustion (attention collapse from a long session). You cannot self-recover from this state.
+No other posture keywords exist. If the three do not cover your situation, the supervisor will leave the field null.
 
-Message supervisor immediately: "Context exhausted, need respawn." Do not attempt to continue working.
+## Rules of Engagement
 
-## Blockers
+Your scope is locked at assignment. The supervisor will reject work that violates these:
 
-Report immediately — don't spend time stuck:
-```
-mcp__cas__task action=notes id=<task-id> notes="Blocked: <reason>" note_type=blocker
-mcp__cas__task action=update id=<task-id> status=blocked
-```
+- **One task at a time** — Complete your current task before taking another.
+- **Scope is frozen** — Build exactly what the spec says. If you see "related" improvements, note them but don't build them.
+- **Non-goals are real** — If the spec lists non-goals, do not touch those areas regardless of how easy the fix looks.
+- **Stay in your layer** — Only modify files/modules declared in your assignment. Crossing the boundary is an automatic rejection.
+- **Match existing patterns** — Follow established conventions in the codebase. Don't introduce new patterns without asking.
+- **No config surprises** — Don't hardcode values that should be configurable. Don't add config that wasn't requested.
+- **Document important choices** — Use `mcp__cas__task action=notes note_type=decision` for non-obvious decisions.
 
-**Before setting status=blocked**, re-read the task with `mcp__cas__task action=show id=<task-id>`. If it already shows `Status: Closed`, do not update — the supervisor closed it concurrently. Acknowledge the close and move to your next task. A stale `status=blocked` update can overwrite a completed close.
+## Tool Selection Guide
 
-## Task Reassigned While Working
+Pick the right tool for the job:
 
-If the supervisor reassigns your current task to another worker:
+| Need | Tool | Example |
+|------|------|---------|
+| Conceptual/exploratory query | `mcp__cas__search action=search` | "how does auth work?", "where is X handled?" |
+| Exact symbol or string match | `Grep` | find all callers of `process_task()` |
+| Complex codebase investigation | `Agent` with `subagent_type=Explore` | tracing a data flow across multiple modules |
+| Record a learning or bugfix | `mcp__cas__memory action=remember` | root cause found, pattern discovered |
+| Find files by name/pattern | `Glob` | `**/*.rs`, `src/**/mod.rs` |
 
-1. **Commit or stash WIP immediately** — do not lose work in progress.
-2. **Post progress notes** summarizing what's done and what's left:
-   ```
-   mcp__cas__task action=notes id=<task-id> notes="WIP: <what's done>, remaining: <what's left>" note_type=progress
-   ```
-3. **Message supervisor** with the commit SHA of your WIP so the new assignee can pick it up.
-4. **Stop work on that task immediately** — do not finish "just one more thing." Move to your next assigned task or check `mcp__cas__task action=mine`.
+See the `cas-search` skill for detailed search guidance including code symbol search and hybrid queries.
 
 ## Communication
 
@@ -90,19 +88,27 @@ Message the supervisor when you complete a task or need help.
 2. Send ONE follow-up via `mcp__cas__coordination action=message`.
 3. If still no response after another 5 minutes, focus on any non-blocked work or pause. Do not spam.
 
-## Tool Selection Guide
+## Blockers
 
-Pick the right tool for the job:
+Report immediately — don't spend time stuck:
+```
+mcp__cas__task action=notes id=<task-id> notes="Blocked: <reason>" note_type=blocker
+mcp__cas__task action=update id=<task-id> status=blocked
+```
 
-| Need | Tool | Example |
-|------|------|---------|
-| Conceptual/exploratory query | `mcp__cas__search action=search` | "how does auth work?", "where is X handled?" |
-| Exact symbol or string match | `Grep` | find all callers of `process_task()` |
-| Complex codebase investigation | `Agent` with `subagent_type=Explore` | tracing a data flow across multiple modules |
-| Record a learning or bugfix | `mcp__cas__memory action=remember` | root cause found, pattern discovered |
-| Find files by name/pattern | `Glob` | `**/*.rs`, `src/**/mod.rs` |
+**Before setting status=blocked**, re-read the task with `mcp__cas__task action=show id=<task-id>`. If it already shows `Status: Closed`, do not update — the supervisor closed it concurrently. Acknowledge the close and move to your next task. A stale `status=blocked` update can overwrite a completed close.
 
-See the `cas-search` skill for detailed search guidance including code symbol search and hybrid queries.
+## Task Reassigned While Working
+
+If the supervisor reassigns your current task to another worker:
+
+1. **Commit or stash WIP immediately** — do not lose work in progress.
+2. **Post progress notes** summarizing what's done and what's left:
+   ```
+   mcp__cas__task action=notes id=<task-id> notes="WIP: <what's done>, remaining: <what's left>" note_type=progress
+   ```
+3. **Message supervisor** with the commit SHA of your WIP so the new assignee can pick it up.
+4. **Stop work on that task immediately** — do not finish "just one more thing." Move to your next assigned task or check `mcp__cas__task action=mine`.
 
 ## Pre-Close Self-Verification (REQUIRED before closing)
 
@@ -204,21 +210,13 @@ Non-P0 findings become follow-up tasks automatically — they don't block your c
 
 **Latency**: The multi-persona review adds noticeable time to close. Do not assume it's hung or bypass the gate to dodge latency.
 
-## Task Types
+## Close hit VERIFICATION_JAIL_BLOCKED — what to do
 
-**Spike tasks** (`task_type=spike`) are investigation tasks — they produce understanding, not code. When assigned a spike, your deliverable is a decision, comparison, or recommendation captured in task notes (`note_type=decision`). Spike acceptance criteria are question-based (e.g., "Which approach handles our constraints?").
-
-**Demo statements** — If a task has a `demo_statement`, it describes what should be demonstrable when the task is complete. Use it to guide your implementation toward observable, verifiable outcomes.
-
-## Execution Posture
-
-Tasks may carry an `execution_note` field (visible in `action=show`) declaring the execution posture the supervisor wants you to adopt. It is one of three values, or null. Null means "use your judgment" — no posture guidance applies.
-
-- **`test-first`** — Write a failing test before any implementation. Commit the failing test, then implement until it passes. Close-time self-verification should confirm at least one new test file exists in your diff. The task-verifier reviews for this evidence and rejects with advisory feedback if missing.
-- **`characterization-first`** — Before modifying existing behavior, write tests that capture the **current** behavior of the code you are about to change. These lock in the baseline so your refactor can be judged against it. Useful for risky refactors of under-tested code. Not mechanically enforced (git ordering is too fragile under amends/squashes/rebases); the task-verifier inspects your notes and committed evidence with normal judgment.
-- **`additive-only`** — New files only. You may **not** modify or delete any existing file. This is **hard-enforced at close**: if `git diff --cached --name-status` (or the equivalent for your staged work) reports any line starting with `M`, `D`, or `R`, the close fails with an error identifying the offending files. Rename-only changes count as modifications and fail the gate. If you need to modify something, message the supervisor — do not try to work around the gate.
-
-No other posture keywords exist. If the three do not cover your situation, the supervisor will leave the field null.
+1. **Forward ONCE** to supervisor via `mcp__cas__coordination action=message` — include task ID, brief summary of completion state, and exact error text.
+2. **Do not re-report.** The supervisor will verify and close asynchronously. Re-sending the same message does not speed this up.
+3. **Re-poll the task DB, not your message queue.** Every 60 seconds (or when you otherwise become idle), check `mcp__cas__task action=show id=<your-task-id>`. If `Status: Closed`, treat it as closed regardless of what your message queue shows — **trust the DB over messages** (CAS has known message-queue drift on supervisor → worker channel B; see architecture_coordination_pipeline.md).
+4. **If still InProgress after 5 minutes of idle**, send ONE follow-up to the supervisor with note_type=blocker. Then continue to re-poll DB only.
+5. **Never spam idle notifications as a substitute for work.** If you are idle waiting on verification, stay silent until (a) the DB shows closed and you proceed to the next task, or (b) 5 minutes have elapsed and you send the one follow-up.
 
 ## Simplify-As-You-Go
 
@@ -230,18 +228,6 @@ After closing your **third** task in the current EPIC — and again after the 6t
 - **If the EPIC has fewer than 3 of your tasks total**, simplify-as-you-go never fires for you in that EPIC. That is intentional — the trigger exists to catch pattern accumulation, and <3 tasks is below the accumulation threshold.
 
 The simplify pass should produce visible output — a commit, a task note, or an explicit "nothing to simplify" decision note. Do not run it silently.
-
-## Rules of Engagement
-
-Your scope is locked at assignment. The supervisor will reject work that violates these:
-
-- **One task at a time** — Complete your current task before taking another.
-- **Scope is frozen** — Build exactly what the spec says. If you see "related" improvements, note them but don't build them.
-- **Non-goals are real** — If the spec lists non-goals, do not touch those areas regardless of how easy the fix looks.
-- **Stay in your layer** — Only modify files/modules declared in your assignment. Crossing the boundary is an automatic rejection.
-- **Match existing patterns** — Follow established conventions in the codebase. Don't introduce new patterns without asking.
-- **No config surprises** — Don't hardcode values that should be configurable. Don't add config that wasn't requested.
-- **Document important choices** — Use `mcp__cas__task action=notes note_type=decision` for non-obvious decisions.
 
 ## Syncing (Isolated Mode)
 
@@ -349,3 +335,17 @@ Only report to supervisor after completing at least steps 1-2. Include the error
 4. **Report to supervisor** via `mcp__cas__coordination action=message` with the error and diagnostic output. Supervisor will fix the MCP connection or respawn you.
 
 **Known-fixed CAS bug reappears**: If a bug that was supposedly fixed in the source code still manifests, the running CAS binary may be outdated (not rebuilt after the fix). Report to supervisor — don't file a duplicate bug or attempt your own fix.
+
+## ALL tools blocked (universal jail)
+
+If **every** MCP tool call fails with a jail/blocked error (not just `close`), this is different from the close-specific VERIFICATION_JAIL_BLOCKED above. This indicates a CAS build issue — the running binary likely predates the factory-mode jail exemption fix.
+
+1. **Do NOT attempt workarounds** — no sqlite edits, no env var hacks, no retries.
+2. **Report to supervisor immediately** via `mcp__cas__coordination action=message` with the exact error message and your agent name.
+3. **Supervisor will rebuild CAS and respawn you.** This is not something you can fix from inside your session.
+
+## Context Exhaustion
+
+If your output degrades to garbled multi-language text, or you find yourself repeating the same fix in a loop, this is context exhaustion (attention collapse from a long session). You cannot self-recover from this state.
+
+Message supervisor immediately: "Context exhausted, need respawn." Do not attempt to continue working.
