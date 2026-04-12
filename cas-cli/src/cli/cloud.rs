@@ -8,7 +8,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::cli::Cli;
-use crate::cloud::CloudConfig;
+use crate::cloud::{CloudConfig, get_project_canonical_id};
 use crate::ui::components::Formatter;
 use crate::ui::theme::ActiveTheme;
 
@@ -622,6 +622,9 @@ fn execute_push(args: &CloudPushArgs, cli: &Cli, cas_root: &Path) -> anyhow::Res
             .unwrap_or(1)
             .max(1);
 
+        let project_id = get_project_canonical_id()
+            .ok_or_else(|| anyhow::anyhow!("Cannot sync: not inside a CAS project directory"))?;
+
         for chunk_idx in 0..max_chunks {
             let start = chunk_idx * BATCH_SIZE;
             let mut payload = serde_json::Map::new();
@@ -634,6 +637,25 @@ fn execute_push(args: &CloudPushArgs, cli: &Cli, cas_root: &Path) -> anyhow::Res
                     &[]
                 };
                 payload.insert(name.to_string(), serde_json::json!(chunk));
+            }
+
+            // Required by server for project scoping
+            payload.insert(
+                "project_canonical_id".to_string(),
+                serde_json::json!(project_id),
+            );
+            // Client version for server-side compatibility checks
+            payload.insert(
+                "client_version".to_string(),
+                serde_json::json!(env!("CARGO_PKG_VERSION")),
+            );
+            payload.insert(
+                "client_build".to_string(),
+                serde_json::json!(option_env!("CAS_GIT_HASH").unwrap_or("unknown")),
+            );
+            // Include team_id if configured
+            if let Some(team_id) = &config.team_id {
+                payload.insert("team_id".to_string(), serde_json::json!(team_id));
             }
 
             batches.push(serde_json::Value::Object(payload));
