@@ -135,21 +135,22 @@ impl SqliteAgentStore {
     }
     pub(crate) fn agent_unregister(&self, id: &str) -> Result<()> {
         let conn = self.lock_conn()?;
+        let tx = ImmediateTx::new(&conn)?;
 
         // Get agent name before deleting (for event summary)
-        let agent_name: Option<String> = conn
+        let agent_name: Option<String> = tx
             .query_row("SELECT name FROM agents WHERE id = ?", params![id], |row| {
                 row.get(0)
             })
             .optional()?;
 
         // Release all leases first (due to foreign key)
-        conn.execute(
+        tx.execute(
             "UPDATE task_leases SET status = 'released' WHERE agent_id = ?",
             params![id],
         )?;
 
-        let rows = conn.execute("DELETE FROM agents WHERE id = ?", params![id])?;
+        let rows = tx.execute("DELETE FROM agents WHERE id = ?", params![id])?;
         if rows == 0 {
             return Err(StoreError::NotFound(format!("Agent not found: {id}")));
         }
@@ -164,11 +165,12 @@ impl SqliteAgentStore {
             id,
             format!("Agent unregistered: {display_name}"),
         );
-        let _ = record_event_with_conn(&conn, &event);
+        let _ = record_event_with_conn(&tx, &event);
 
         // Capture event for recording playback
-        let _ = capture_agent_event(&conn, RecordingEventType::AgentLeft, id, None);
+        let _ = capture_agent_event(&tx, RecordingEventType::AgentLeft, id, None);
 
+        tx.commit()?;
         Ok(())
     }
     pub(crate) fn agent_list(&self, status: Option<AgentStatus>) -> Result<Vec<Agent>> {

@@ -578,20 +578,20 @@ impl TaskStore for SqliteTaskStore {
         let tx = crate::shared_db::ImmediateTx::new(&conn)?;
 
         // Get task title before deleting for event summary
-        let title: Option<String> = conn
+        let title: Option<String> = tx
             .query_row("SELECT title FROM tasks WHERE id = ?", params![id], |row| {
                 row.get(0)
             })
             .optional()?;
 
         // Delete associated dependencies first
-        conn.execute(
+        tx.execute(
             "DELETE FROM dependencies WHERE from_id = ? OR to_id = ?",
             params![id, id],
         )?;
         // Delete associated task leases
-        conn.execute("DELETE FROM task_leases WHERE task_id = ?", params![id])?;
-        let rows = conn.execute("DELETE FROM tasks WHERE id = ?", params![id])?;
+        tx.execute("DELETE FROM task_leases WHERE task_id = ?", params![id])?;
+        let rows = tx.execute("DELETE FROM tasks WHERE id = ?", params![id])?;
         if rows == 0 {
             return Err(StoreError::TaskNotFound(id.to_string()));
         }
@@ -604,11 +604,11 @@ impl TaskStore for SqliteTaskStore {
                 id,
                 format!("Task deleted: {title}"),
             );
-            let _ = record_event_with_conn(&conn, &event);
+            let _ = record_event_with_conn(&tx, &event);
         }
 
         // Capture event for recording playback
-        let _ = capture_task_event(&conn, RecordingEventType::TaskDeleted, id, None);
+        let _ = capture_task_event(&tx, RecordingEventType::TaskDeleted, id, None);
 
         tx.commit()?;
         Ok(())

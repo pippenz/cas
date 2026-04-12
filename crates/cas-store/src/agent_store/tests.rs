@@ -711,3 +711,95 @@ fn test_revive_sets_startup_confirmed() {
     let failed = store.list_failed_startup(60).unwrap();
     assert!(failed.is_empty(), "Revived agent must not be detected as failed startup");
 }
+
+#[test]
+fn test_lease_release_atomically_decrements_active_tasks() {
+    let (_temp, store) = create_test_store();
+
+    let agent = Agent::new("agent-atomic".to_string(), "Atomic Test".to_string());
+    store.register(&agent).unwrap();
+
+    // Claim two tasks
+    store
+        .try_claim("task-a", "agent-atomic", 600, None)
+        .unwrap();
+    store
+        .try_claim("task-b", "agent-atomic", 600, None)
+        .unwrap();
+
+    let agent = store.get("agent-atomic").unwrap();
+    assert_eq!(agent.active_tasks, 2);
+
+    // Release one lease — should atomically decrement active_tasks
+    store.release_lease("task-a", "agent-atomic").unwrap();
+
+    let agent = store.get("agent-atomic").unwrap();
+    assert_eq!(agent.active_tasks, 1, "active_tasks should decrement atomically on release");
+
+    // Verify lease status changed
+    let lease = store.get_lease("task-a").unwrap();
+    assert!(lease.is_none(), "Released lease should not be active");
+
+    // Verify release was logged
+    let history = store.get_lease_history("task-a", Some(1)).unwrap();
+    assert_eq!(history[0].event_type, "released");
+}
+
+#[test]
+fn test_lease_release_for_task_atomically_decrements_active_tasks() {
+    let (_temp, store) = create_test_store();
+
+    let agent = Agent::new("agent-fortask".to_string(), "ForTask Test".to_string());
+    store.register(&agent).unwrap();
+
+    // Claim a task
+    store
+        .try_claim("task-close", "agent-fortask", 600, None)
+        .unwrap();
+
+    let agent = store.get("agent-fortask").unwrap();
+    assert_eq!(agent.active_tasks, 1);
+
+    // Release via release_lease_for_task (used when closing tasks)
+    let released = store.release_lease_for_task("task-close").unwrap();
+    assert!(released, "Should return true when a lease was released");
+
+    let agent = store.get("agent-fortask").unwrap();
+    assert_eq!(agent.active_tasks, 0, "active_tasks should decrement atomically on task-close release");
+
+    // Verify release was logged with "Task closed" note
+    let history = store.get_lease_history("task-close", Some(1)).unwrap();
+    assert_eq!(history[0].event_type, "released");
+
+    // Release again — should return false (no active lease)
+    let released = store.release_lease_for_task("task-close").unwrap();
+    assert!(!released, "Should return false when no active lease exists");
+}
+
+#[test]
+fn test_agent_unregister_releases_leases_atomically() {
+    let (_temp, store) = create_test_store();
+
+    let agent = Agent::new("agent-unreg".to_string(), "Unreg Test".to_string());
+    store.register(&agent).unwrap();
+
+    // Claim tasks
+    store
+        .try_claim("task-u1", "agent-unreg", 600, None)
+        .unwrap();
+    store
+        .try_claim("task-u2", "agent-unreg", 600, None)
+        .unwrap();
+
+    // Unregister — should atomically release leases and delete agent
+    store.unregister("agent-unreg").unwrap();
+
+    // Agent should be gone
+    assert!(store.get("agent-unreg").is_err());
+
+    // Leases should be released (not active)
+    let lease1 = store.get_lease("task-u1").unwrap();
+    assert!(lease1.is_none(), "Lease should be released after unregister");
+    let lease2 = store.get_lease("task-u2").unwrap();
+    assert!(lease2.is_none(), "Lease should be released after unregister");
+}

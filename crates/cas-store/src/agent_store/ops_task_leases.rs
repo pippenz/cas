@@ -154,9 +154,10 @@ impl SqliteAgentStore {
     }
     pub(crate) fn lease_release_lease(&self, task_id: &str, agent_id: &str) -> Result<()> {
         let conn = self.lock_conn()?;
+        let tx = ImmediateTx::new(&conn)?;
 
         // Verify the agent owns this lease and get epoch
-        let lease_info: Option<(String, i64)> = conn
+        let lease_info: Option<(String, i64)> = tx
             .query_row(
                 "SELECT agent_id, epoch FROM task_leases WHERE task_id = ? AND status = 'active'",
                 params![task_id],
@@ -167,20 +168,20 @@ impl SqliteAgentStore {
         match lease_info {
             Some((owner_id, epoch)) if owner_id == agent_id => {
                 // Release the lease
-                conn.execute(
+                tx.execute(
                     "UPDATE task_leases SET status = 'released' WHERE task_id = ?",
                     params![task_id],
                 )?;
 
                 // Decrement agent's active task count
-                conn.execute(
+                tx.execute(
                     "UPDATE agents SET active_tasks = MAX(0, active_tasks - 1) WHERE id = ?",
                     params![agent_id],
                 )?;
 
                 // Log the release event
                 Self::log_lease_event(
-                    &conn,
+                    &tx,
                     task_id,
                     agent_id,
                     "released",
@@ -189,6 +190,7 @@ impl SqliteAgentStore {
                     None,
                 )?;
 
+                tx.commit()?;
                 Ok(())
             }
             Some(_) => Err(StoreError::Parse(format!(
@@ -201,9 +203,10 @@ impl SqliteAgentStore {
     }
     pub(crate) fn lease_release_lease_for_task(&self, task_id: &str) -> Result<bool> {
         let conn = self.lock_conn()?;
+        let tx = ImmediateTx::new(&conn)?;
 
         // Get lease info if it exists
-        let lease_info: Option<(String, i64)> = conn
+        let lease_info: Option<(String, i64)> = tx
             .query_row(
                 "SELECT agent_id, epoch FROM task_leases WHERE task_id = ? AND status = 'active'",
                 params![task_id],
@@ -213,20 +216,20 @@ impl SqliteAgentStore {
 
         if let Some((agent_id, epoch)) = lease_info {
             // Release the lease
-            conn.execute(
+            tx.execute(
                 "UPDATE task_leases SET status = 'released' WHERE task_id = ?",
                 params![task_id],
             )?;
 
             // Decrement agent's active task count
-            conn.execute(
+            tx.execute(
                 "UPDATE agents SET active_tasks = MAX(0, active_tasks - 1) WHERE id = ?",
                 params![agent_id],
             )?;
 
             // Log the release event
             Self::log_lease_event(
-                &conn,
+                &tx,
                 task_id,
                 &agent_id,
                 "released",
@@ -235,6 +238,7 @@ impl SqliteAgentStore {
                 Some("Task closed"),
             )?;
 
+            tx.commit()?;
             Ok(true)
         } else {
             // No active lease to release

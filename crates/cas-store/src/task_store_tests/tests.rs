@@ -202,3 +202,35 @@ fn test_sibling_notes_and_parent_epic() {
     let no_parent = store.get_parent_epic(&epic.id).unwrap();
     assert!(no_parent.is_none());
 }
+
+#[test]
+fn test_delete_rolls_back_on_missing_task() {
+    let (_temp, store) = create_test_store();
+
+    // Create a task and add a dependency to it
+    let task1 = Task::new(store.generate_id().unwrap(), "Task 1".to_string());
+    let task2 = Task::new(store.generate_id().unwrap(), "Task 2".to_string());
+    store.add(&task1).unwrap();
+    store.add(&task2).unwrap();
+
+    let dep = Dependency::new(task1.id.clone(), task2.id.clone(), DependencyType::Blocks);
+    store.add_dependency(&dep).unwrap();
+
+    // Delete task1 — should atomically remove task + dependencies
+    store.delete(&task1.id).unwrap();
+
+    // Task should be gone
+    assert!(store.get(&task1.id).is_err());
+
+    // Dependencies referencing task1 should also be gone
+    let deps = store.get_dependents(&task2.id).unwrap();
+    assert!(deps.is_empty(), "Dependencies should be cleaned up atomically with task delete");
+
+    // Deleting non-existent task should error (and not corrupt anything)
+    let result = store.delete("non-existent");
+    assert!(result.is_err());
+
+    // task2 should still be intact
+    let task2_check = store.get(&task2.id).unwrap();
+    assert_eq!(task2_check.title, "Task 2");
+}
