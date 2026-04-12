@@ -205,7 +205,8 @@ fn parse_diff_tree_output(output: &str) -> Option<Vec<CodemapChange>> {
 ///
 /// Called from SessionStart to inform the agent about:
 /// 1. Missing CODEMAP.md
-/// 2. Pending structural changes since last codemap update
+/// 2. Pending structural changes since last codemap update (from pending file)
+/// 3. Structural changes detected via git history (primary mechanism)
 ///
 /// Returns None if no action needed.
 pub fn check_codemap_freshness(cas_root: &Path) -> Option<String> {
@@ -214,14 +215,7 @@ pub fn check_codemap_freshness(cas_root: &Path) -> Option<String> {
     let codemap_path = project_root.join(".claude/CODEMAP.md");
     let pending_path = cas_root.join(CODEMAP_PENDING_FILE);
 
-    let codemap_exists = codemap_path.exists();
-    let pending_exists = pending_path.exists();
-
-    if codemap_exists && !pending_exists {
-        return None; // CODEMAP exists and no pending changes
-    }
-
-    if !codemap_exists {
+    if !codemap_path.exists() {
         return Some(
             "<codemap-freshness>\n\
              No CODEMAP.md found. Run the codemap skill to generate one.\n\
@@ -230,88 +224,280 @@ pub fn check_codemap_freshness(cas_root: &Path) -> Option<String> {
         );
     }
 
-    // CODEMAP exists but there are pending changes
-    if pending_exists {
-        // Read pending file and count changes
-        let content = std::fs::read_to_string(&pending_path).ok()?;
-        let mut total_changes = 0;
-        let mut file_list = Vec::new();
-        let mut first_commit = None;
-
-        for line in content.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            if let Ok(pending) = serde_json::from_str::<CodemapPending>(line) {
-                if first_commit.is_none() {
-                    first_commit = Some(pending.commit.clone());
-                }
-                for change in &pending.changes {
-                    total_changes += 1;
-                    if file_list.len() < 10 {
-                        let prefix = match change.change_type.as_str() {
-                            "A" => "+",
-                            "D" => "-",
-                            "R" => "~",
-                            _ => "?",
-                        };
-                        file_list.push(format!("{prefix}{}", change.path));
-                    }
-                }
-            }
+    // Check pending file first (supplement — catches in-session uncommitted changes)
+    if pending_path.exists() {
+        if let Some(msg) = check_staleness_from_pending(&pending_path) {
+            return Some(msg);
         }
-
-        if total_changes == 0 {
-            return None;
-        }
-
-        let commit_info = first_commit
-            .map(|c| format!(" since {}", &c[..7.min(c.len())]))
-            .unwrap_or_default();
-
-        let files = file_list.join(", ");
-        let truncated = if total_changes > 10 {
-            format!(" (+{} more)", total_changes - 10)
-        } else {
-            String::new()
-        };
-
-        return Some(format!(
-            "<codemap-freshness>\n\
-             CODEMAP.md has {total_changes} pending structural change(s){commit_info}: {files}{truncated}. \
-             Update CODEMAP.md or spawn docs-writer to refresh.\n\
-             </codemap-freshness>"
-        ));
     }
 
-    None
+    // Primary mechanism: git-based staleness detection
+    // Works for terminal commits, worker commits, cherry-picks — any commit source
+    check_staleness_from_git(project_root)
+}
+
+/// Check staleness using the pending file (supplement for in-session changes).
+fn check_staleness_from_pending(pending_path: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(pending_path).ok()?;
+    let mut total_changes = 0;
+    let mut file_list = Vec::new();
+    let mut first_commit = None;
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(pending) = serde_json::from_str::<CodemapPending>(line) {
+            if first_commit.is_none() {
+                first_commit = Some(pending.commit.clone());
+            }
+            for change in &pending.changes {
+                total_changes += 1;
+                if file_list.len() < 10 {
+                    let prefix = match change.change_type.as_str() {
+                        "A" => "+",
+                        "D" => "-",
+                        "R" => "~",
+                        _ => "?",
+                    };
+                    file_list.push(format!("{prefix}{}", change.path));
+                }
+            }
+        }
+    }
+
+    if total_changes == 0 {
+        return None;
+    }
+
+    let commit_info = first_commit
+        .map(|c| format!(" since {}", &c[..7.min(c.len())]))
+        .unwrap_or_default();
+
+    Some(format_staleness_message(total_changes, &file_list, &commit_info))
+}
+
+/// Check staleness by comparing CODEMAP.md's last commit timestamp against
+/// subsequent structural changes (A/D/R) in git history.
+///
+/// This is the primary detection mechanism — it works regardless of how commits
+/// were made (terminal, worker, cherry-pick, etc.).
+fn check_staleness_from_git(project_root: &Path) -> Option<String> {
+    // Get the timestamp of the last commit that touched CODEMAP.md
+    let codemap_timestamp = get_codemap_last_commit_timestamp(project_root)?;
+
+    // Find structural changes (A/D/R) since that timestamp
+    let changes = get_structural_changes_since(project_root, &codemap_timestamp)?;
+
+    if changes.is_empty() {
+        return None;
+    }
+
+    let total_changes = changes.len();
+    let file_list: Vec<String> = changes
+        .iter()
+        .take(10)
+        .map(|c| {
+            let prefix = match c.change_type.as_str() {
+                "A" => "+",
+                "D" => "-",
+                "R" => "~",
+                _ => "?",
+            };
+            format!("{prefix}{}", c.path)
+        })
+        .collect();
+
+    Some(format_staleness_message(total_changes, &file_list, ""))
+}
+
+/// Get the ISO timestamp of the last commit that modified .claude/CODEMAP.md.
+///
+/// Returns None if CODEMAP.md has never been committed or git fails.
+fn get_codemap_last_commit_timestamp(project_root: &Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["log", "-1", "--format=%cI", "--", ".claude/CODEMAP.md"])
+        .current_dir(project_root)
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let timestamp = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if timestamp.is_empty() {
+        // CODEMAP.md exists on disk but was never committed — treat as stale
+        // Fall back to file mtime
+        return get_codemap_mtime_timestamp(project_root);
+    }
+
+    Some(timestamp)
+}
+
+/// Fallback: get CODEMAP.md's file modification time as an ISO timestamp.
+fn get_codemap_mtime_timestamp(project_root: &Path) -> Option<String> {
+    let codemap_path = project_root.join(".claude/CODEMAP.md");
+    let metadata = std::fs::metadata(&codemap_path).ok()?;
+    let mtime = metadata.modified().ok()?;
+    let datetime: chrono::DateTime<chrono::Utc> = mtime.into();
+    Some(datetime.to_rfc3339())
+}
+
+/// Find structural file changes (A/D/R) in git history since the given timestamp.
+///
+/// Uses `git log --diff-filter=ADR --name-status --since=<timestamp>` bounded
+/// by the timestamp for performance (<500ms).
+fn get_structural_changes_since(
+    project_root: &Path,
+    since: &str,
+) -> Option<Vec<CodemapChange>> {
+    let output = std::process::Command::new("git")
+        .args([
+            "log",
+            "--diff-filter=ADR",
+            "--name-status",
+            &format!("--since={since}"),
+            "--format=",
+            "--no-renames",       // show as A+D instead of R for simplicity
+            "-z",                 // NUL-delimited for safety with special chars
+        ])
+        .current_dir(project_root)
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let raw = String::from_utf8_lossy(&output.stdout);
+    parse_git_log_nul_output(&raw)
+}
+
+/// Parse NUL-delimited `git log --name-status -z` output.
+///
+/// Format: status\0path\0 (repeated), with empty lines between commits.
+/// Only keeps A (added) and D (deleted) entries. Renames show as A+D
+/// because we pass --no-renames.
+fn parse_git_log_nul_output(raw: &str) -> Option<Vec<CodemapChange>> {
+    let mut changes = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    // Split on NUL; entries come in pairs: status, path
+    let parts: Vec<&str> = raw.split('\0').collect();
+    let mut i = 0;
+
+    while i < parts.len() {
+        let status = parts[i].trim_matches(|c: char| c == '\n' || c == '\r');
+        if status.is_empty() {
+            i += 1;
+            continue;
+        }
+
+        // We need at least one more part for the path
+        if i + 1 >= parts.len() {
+            break;
+        }
+
+        let path = parts[i + 1].trim();
+        if path.is_empty() {
+            i += 2;
+            continue;
+        }
+
+        // Deduplicate (same file may appear in multiple commits)
+        let key = format!("{status}:{path}");
+        if !seen.contains(&key) {
+            seen.insert(key);
+            match status {
+                "A" => {
+                    changes.push(CodemapChange {
+                        change_type: "A".to_string(),
+                        path: path.to_string(),
+                        old_path: None,
+                    });
+                }
+                "D" => {
+                    changes.push(CodemapChange {
+                        change_type: "D".to_string(),
+                        path: path.to_string(),
+                        old_path: None,
+                    });
+                }
+                s if s.starts_with('R') => {
+                    changes.push(CodemapChange {
+                        change_type: "R".to_string(),
+                        path: path.to_string(),
+                        old_path: None,
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        i += 2;
+    }
+
+    Some(changes)
+}
+
+/// Format the staleness message consistently for both detection mechanisms.
+fn format_staleness_message(total_changes: usize, file_list: &[String], commit_info: &str) -> String {
+    let files = file_list.join(", ");
+    let truncated = if total_changes > 10 {
+        format!(" (+{} more)", total_changes - 10)
+    } else {
+        String::new()
+    };
+
+    format!(
+        "<codemap-freshness>\n\
+         CODEMAP.md has {total_changes} pending structural change(s){commit_info}: {files}{truncated}. \
+         Update CODEMAP.md or spawn docs-writer to refresh.\n\
+         </codemap-freshness>"
+    )
 }
 
 /// Best-effort codemap reminder for Stop hook.
 ///
 /// Returns a reminder string if there are pending structural changes.
+/// Checks both pending file and git history.
 pub fn codemap_stop_reminder(cas_root: &Path) -> Option<String> {
     let pending_path = cas_root.join(CODEMAP_PENDING_FILE);
 
-    if !pending_path.exists() {
+    // Check pending file first
+    if pending_path.exists() {
+        let content = std::fs::read_to_string(&pending_path).ok()?;
+        let total: usize = content
+            .lines()
+            .filter_map(|line| serde_json::from_str::<CodemapPending>(line.trim()).ok())
+            .map(|p| p.changes.len())
+            .sum();
+
+        if total > 0 {
+            return Some(format!(
+                "Note: CODEMAP.md has {total} pending structural change(s) that should be updated."
+            ));
+        }
+    }
+
+    // Fall back to git-based check
+    let project_root = cas_root.parent()?;
+    let codemap_path = project_root.join(".claude/CODEMAP.md");
+    if !codemap_path.exists() {
         return None;
     }
 
-    // Count pending changes (best-effort)
-    let content = std::fs::read_to_string(&pending_path).ok()?;
-    let total: usize = content
-        .lines()
-        .filter_map(|line| serde_json::from_str::<CodemapPending>(line.trim()).ok())
-        .map(|p| p.changes.len())
-        .sum();
-
-    if total == 0 {
+    let timestamp = get_codemap_last_commit_timestamp(project_root)?;
+    let changes = get_structural_changes_since(project_root, &timestamp)?;
+    if changes.is_empty() {
         return None;
     }
 
     Some(format!(
-        "Note: CODEMAP.md has {total} pending structural change(s) that should be updated."
+        "Note: CODEMAP.md has {} pending structural change(s) that should be updated.",
+        changes.len()
     ))
 }
 
@@ -410,6 +596,68 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].commit, "abc1234");
         assert_eq!(entries[1].commit, "def5678");
+    }
+
+    #[test]
+    fn test_parse_git_log_nul_output_added_and_deleted() {
+        // Simulates: git log --diff-filter=ADR --name-status -z --format= output
+        // NUL-separated: status\0path\0
+        let raw = "A\0src/new_file.rs\0D\0src/removed.rs\0";
+        let changes = parse_git_log_nul_output(raw).unwrap();
+        assert_eq!(changes.len(), 2);
+        assert_eq!(changes[0].change_type, "A");
+        assert_eq!(changes[0].path, "src/new_file.rs");
+        assert_eq!(changes[1].change_type, "D");
+        assert_eq!(changes[1].path, "src/removed.rs");
+    }
+
+    #[test]
+    fn test_parse_git_log_nul_output_deduplicates() {
+        // Same file added in two commits should appear once
+        let raw = "A\0src/file.rs\0A\0src/file.rs\0";
+        let changes = parse_git_log_nul_output(raw).unwrap();
+        assert_eq!(changes.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_git_log_nul_output_empty() {
+        let changes = parse_git_log_nul_output("").unwrap();
+        assert!(changes.is_empty());
+    }
+
+    #[test]
+    fn test_parse_git_log_nul_output_ignores_modified() {
+        let raw = "M\0src/modified.rs\0A\0src/new.rs\0";
+        let changes = parse_git_log_nul_output(raw).unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].change_type, "A");
+    }
+
+    #[test]
+    fn test_parse_git_log_nul_output_with_newlines_between_commits() {
+        // git log output may have newlines between commit boundaries
+        let raw = "A\0src/a.rs\0\nD\0src/b.rs\0";
+        let changes = parse_git_log_nul_output(raw).unwrap();
+        assert_eq!(changes.len(), 2);
+    }
+
+    #[test]
+    fn test_format_staleness_message_basic() {
+        let files = vec!["+src/new.rs".to_string(), "-src/old.rs".to_string()];
+        let msg = format_staleness_message(2, &files, "");
+        assert!(msg.contains("2 pending structural change(s)"));
+        assert!(msg.contains("+src/new.rs"));
+        assert!(msg.contains("-src/old.rs"));
+        assert!(msg.contains("<codemap-freshness>"));
+    }
+
+    #[test]
+    fn test_format_staleness_message_truncated() {
+        let files: Vec<String> = (0..10).map(|i| format!("+src/file{i}.rs")).collect();
+        let msg = format_staleness_message(15, &files, " since abc1234");
+        assert!(msg.contains("15 pending structural change(s)"));
+        assert!(msg.contains("(+5 more)"));
+        assert!(msg.contains(" since abc1234"));
     }
 
     #[test]
