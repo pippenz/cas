@@ -225,12 +225,8 @@ fn render_task_item(
     let priority_str = format!("P{}", task.priority.0);
     let priority_col = priority_color(task.priority, palette);
 
-    // Worker badge for in_progress tasks
-    let worker_badge = if task.status == TaskStatus::InProgress {
-        agent_name.map(|name| format!(" [{name}]"))
-    } else {
-        None
-    };
+    // Assignee badge — shown for all tasks with an assignee, not just in-progress
+    let worker_badge = agent_name.map(|name| format!(" [{name}]"));
 
     let indent = if indented { "  " } else { "" };
     let indent_len = if indented { 2 } else { 0 };
@@ -250,7 +246,7 @@ fn render_task_item(
         Span::styled(title_truncated, Style::default().fg(task_color)),
     ];
 
-    // Add worker badge for in_progress tasks
+    // Add assignee badge
     if let Some(badge) = worker_badge {
         spans.push(Span::styled(
             badge,
