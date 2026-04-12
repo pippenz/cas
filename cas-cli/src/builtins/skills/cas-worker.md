@@ -48,6 +48,8 @@ mcp__cas__task action=notes id=<task-id> notes="Blocked: <reason>" note_type=blo
 mcp__cas__task action=update id=<task-id> status=blocked
 ```
 
+**Before setting status=blocked**, re-read the task with `mcp__cas__task action=show id=<task-id>`. If it already shows `Status: Closed`, do not update — the supervisor closed it concurrently. Acknowledge the close and move to your next task. A stale `status=blocked` update can overwrite a completed close.
+
 ## Communication
 
 Use CAS coordination for messages:
