@@ -15,6 +15,9 @@ pub fn handle_post_tool_use(
         None => return Ok(HookOutput::empty()),
     };
 
+    // Create shared store cache — Config and stores opened once, reused across checks
+    let mut stores = ToolHookStores::new(cas_root);
+
     // === WORKER ACTIVITY TRACKING (for supervisor visibility) ===
     // Send activity events for significant tools to the daemon
     #[cfg(feature = "mcp-server")]
@@ -32,7 +35,7 @@ pub fn handle_post_tool_use(
     // === RIPPLE CHECK (file-to-task/spec consistency reminder) ===
     // When a file linked to a task or spec is modified, remind agent to check consistency
     if tool_name == "Write" || tool_name == "Edit" {
-        if let Some(reminder) = check_ripple_consistency(cas_root, input) {
+        if let Some(reminder) = check_ripple_consistency(&mut stores, input) {
             return Ok(HookOutput::with_context("PostToolUse", reminder));
         }
     }
@@ -45,8 +48,8 @@ pub fn handle_post_tool_use(
     // Initialize dev tracer for rich tool tracing
     let _ = DevTracer::init_global(cas_root);
 
-    // Check config for capture settings
-    let config = Config::load(cas_root).unwrap_or_default();
+    // Check config for capture settings (uses cached Config)
+    let config = stores.config().clone();
     if let Some(ref hooks_config) = config.hooks {
         if !hooks_config.capture_enabled {
             return Ok(HookOutput::empty());
@@ -546,7 +549,7 @@ pub fn format_file_read(
 /// Check if a modified file is referenced by any active task or spec.
 /// Returns a reminder string if matches are found, None otherwise.
 /// Designed to be lightweight (< 50ms) — fails silently on any error.
-fn check_ripple_consistency(cas_root: &Path, input: &HookInput) -> Option<String> {
+fn check_ripple_consistency(stores: &mut ToolHookStores, input: &HookInput) -> Option<String> {
     let file_path = input.tool_input.as_ref()?.get("file_path")?.as_str()?;
 
     let path = std::path::Path::new(file_path);
@@ -566,31 +569,30 @@ fn check_ripple_consistency(cas_root: &Path, input: &HookInput) -> Option<String
             .map(|parent| format!("{}/{}", parent.to_string_lossy(), f.to_string_lossy()))
     });
 
-    // Open task store (best-effort, fail silently)
-    let task_store = open_task_store(cas_root).ok()?;
-
+    // Check tasks using cached store
     let mut matching_task_ids = Vec::new();
 
-    // Check open and in_progress tasks for file path references
-    for status in [TaskStatus::Open, TaskStatus::InProgress] {
-        if let Ok(tasks) = task_store.list(Some(status)) {
-            for task in &tasks {
-                if task_references_file(task, relative, short_path.as_deref()) {
-                    matching_task_ids.push(task.id.clone());
-                    if matching_task_ids.len() >= 5 {
-                        break;
+    if let Some(task_store) = stores.tasks().cloned() {
+        for status in [TaskStatus::Open, TaskStatus::InProgress] {
+            if let Ok(tasks) = task_store.list(Some(status)) {
+                for task in &tasks {
+                    if task_references_file(task, relative, short_path.as_deref()) {
+                        matching_task_ids.push(task.id.clone());
+                        if matching_task_ids.len() >= 5 {
+                            break;
+                        }
                     }
                 }
             }
-        }
-        if matching_task_ids.len() >= 5 {
-            break;
+            if matching_task_ids.len() >= 5 {
+                break;
+            }
         }
     }
 
-    // Also check active specs (best-effort, separate store)
+    // Also check active specs using cached store
     let mut matching_spec_ids = Vec::new();
-    if let Ok(spec_store) = crate::store::open_spec_store(cas_root) {
+    if let Some(spec_store) = stores.specs().cloned() {
         if let Ok(specs) = spec_store.list(None) {
             for spec in &specs {
                 // Skip superseded/rejected specs

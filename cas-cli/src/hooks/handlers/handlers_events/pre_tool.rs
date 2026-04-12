@@ -27,12 +27,16 @@ pub fn handle_pre_tool_use(
         None => return Ok(HookOutput::empty()),
     };
 
+    // Create shared store cache — all store accesses below go through this
+    // instead of calling open_*() directly, reducing ~11 SQLite connections to ~3-4.
+    let mut stores = ToolHookStores::new(cas_root);
+
     // Compute current agent's task IDs (via leases) once for all jail checks.
     // This prevents cross-agent jail contamination where Agent A's pending tasks
     // block Agent B in a different session.
     let current_agent_id = current_agent_id(input);
-    let agent_task_ids: std::collections::HashSet<String> = open_agent_store(cas_root)
-        .ok()
+    let agent_task_ids: std::collections::HashSet<String> = stores
+        .agents()
         .and_then(|store| store.list_agent_leases(&current_agent_id).ok())
         .map(|leases| leases.into_iter().map(|l| l.task_id).collect())
         .unwrap_or_default();
@@ -83,7 +87,7 @@ pub fn handle_pre_tool_use(
 
     // Verification jail is only relevant when worker harness supports subagents.
     if worker_supports_subagents && !is_supervisor && !is_factory_worker {
-        if let Ok(task_store) = open_task_store(cas_root) {
+        if let Some(task_store) = stores.tasks().cloned() {
             if let Ok(tasks) = task_store.list_pending_verification() {
                 // Filter to tasks owned by the current agent:
                 //    a. The current agent has an active lease on them (regular tasks), OR
@@ -113,38 +117,37 @@ pub fn handle_pre_tool_use(
                 // releases and the tool call proceeds instead of looping forever.
                 const VERIFICATION_JAIL_TIMEOUT_SECS: i64 = 600;
                 const DISPATCH_SUMMARY_PREFIX: &str = "Dispatch requested";
-                let pending_tasks: Vec<_> = if let Ok(verification_store) =
-                    open_verification_store(cas_root)
-                {
-                    pending_tasks
-                        .into_iter()
-                        .filter(|t| {
-                            let is_stale = matches!(
-                                verification_store.get_latest_for_task(&t.id),
-                                Ok(Some(ref v))
-                                    if v.status == crate::types::VerificationStatus::Error
-                                        && v.summary.starts_with(DISPATCH_SUMMARY_PREFIX)
-                                        && (chrono::Utc::now() - v.created_at).num_seconds()
-                                            > VERIFICATION_JAIL_TIMEOUT_SECS
-                            );
-                            if is_stale {
-                                let mut task_to_update = (*t).clone();
-                                task_to_update.pending_verification = false;
-                                task_to_update.updated_at = chrono::Utc::now();
-                                let _ = task_store.update(&task_to_update);
-                                warn!(
-                                    task_id = %t.id,
-                                    "[VERIFICATION JAIL] auto-escalated stale dispatch — verifier never responded"
+                let pending_tasks: Vec<_> =
+                    if let Some(verification_store) = stores.verification().cloned() {
+                        pending_tasks
+                            .into_iter()
+                            .filter(|t| {
+                                let is_stale = matches!(
+                                    verification_store.get_latest_for_task(&t.id),
+                                    Ok(Some(ref v))
+                                        if v.status == crate::types::VerificationStatus::Error
+                                            && v.summary.starts_with(DISPATCH_SUMMARY_PREFIX)
+                                            && (chrono::Utc::now() - v.created_at).num_seconds()
+                                                > VERIFICATION_JAIL_TIMEOUT_SECS
                                 );
-                                false
-                            } else {
-                                true
-                            }
-                        })
-                        .collect()
-                } else {
-                    pending_tasks
-                };
+                                if is_stale {
+                                    let mut task_to_update = (*t).clone();
+                                    task_to_update.pending_verification = false;
+                                    task_to_update.updated_at = chrono::Utc::now();
+                                    let _ = task_store.update(&task_to_update);
+                                    warn!(
+                                        task_id = %t.id,
+                                        "[VERIFICATION JAIL] auto-escalated stale dispatch — verifier never responded"
+                                    );
+                                    false
+                                } else {
+                                    true
+                                }
+                            })
+                            .collect()
+                    } else {
+                        pending_tasks
+                    };
 
                 // Check for unjail marker file (backup mechanism)
                 // This marker indicates task-verifier is running and all tools should be allowed
@@ -327,7 +330,7 @@ pub fn handle_pre_tool_use(
             let _ = std::fs::write(&marker_path, &marker_content);
 
             // Clear pending_verification for tasks assigned to this supervisor
-            if let Ok(task_store) = open_task_store(cas_root) {
+            if let Some(task_store) = stores.tasks().cloned() {
                 if let Ok(tasks) = task_store.list_pending_verification() {
                     for task in &tasks {
                         let is_owned = task
@@ -364,9 +367,7 @@ pub fn handle_pre_tool_use(
     //
     // Only jail the agent that owns the tasks (via leases), not all agents.
     // ========================================================================
-    let worktrees_enabled = Config::load(cas_root)
-        .map(|c| c.worktrees_enabled())
-        .unwrap_or(false);
+    let worktrees_enabled = stores.config().worktrees_enabled();
 
     // Factory workers manage their own worktrees — skip CAS worktree enforcement
     // to avoid conflicting redirects (factory uses per-worker worktrees, CAS uses per-epic)
@@ -375,7 +376,7 @@ pub fn handle_pre_tool_use(
         .unwrap_or(false);
 
     if worktrees_enabled && !is_factory_worker_for_wt {
-        if let Ok(task_store) = open_task_store(cas_root) {
+        if let Some(task_store) = stores.tasks().cloned() {
             if let Ok(tasks) = task_store.list_pending_worktree_merge() {
                 // Only consider tasks the current agent owns (reuses agent_task_ids from above)
                 let pending_merge_tasks: Vec<_> = tasks
@@ -453,8 +454,8 @@ pub fn handle_pre_tool_use(
 
             if let Some(file_path) = tool_file_path {
                 // Check if agent has tasks in epics with worktrees
-                if let Ok(agent_store) = open_agent_store(cas_root) {
-                    if let Ok(task_store) = open_task_store(cas_root) {
+                if let Some(agent_store) = stores.agents().cloned() {
+                    if let Some(task_store) = stores.tasks().cloned() {
                         if let Ok(leases) = agent_store.list_agent_leases(&current_agent_id) {
                             for lease in &leases {
                                 if let Ok(task) = task_store.get(&lease.task_id) {
@@ -468,8 +469,8 @@ pub fn handle_pre_tool_use(
                                                             parent.worktree_id
                                                         {
                                                             // Epic has a worktree - check if file is in main repo
-                                                            if let Ok(wt_store) =
-                                                                open_worktree_store(cas_root)
+                                                            if let Some(wt_store) =
+                                                                stores.worktrees().cloned()
                                                             {
                                                                 if let Ok(worktree) =
                                                                     wt_store.get(worktree_id)
@@ -544,8 +545,8 @@ pub fn handle_pre_tool_use(
                 // If the file path is in a worktree directory and another agent holds
                 // the lease, warn the user (coordination-level, not blocking)
                 // ========================================================================
-                if let Ok(wt_store) = open_worktree_store(cas_root) {
-                    if let Ok(agent_store) = open_agent_store(cas_root) {
+                if let Some(wt_store) = stores.worktrees().cloned() {
+                    if let Some(agent_store) = stores.agents().cloned() {
                         // Get all active worktrees and check if file is in any of them
                         if let Ok(worktrees) = wt_store.list_active() {
                             for worktree in worktrees {
@@ -582,7 +583,7 @@ pub fn handle_pre_tool_use(
         .and_then(|ti| ti.get("file_path").and_then(|v| v.as_str()));
 
     // Load proven rules with auto-approve configuration
-    let rule_store = open_rule_store(cas_root)?;
+    let rule_store = stores.rules()?;
     let rules = rule_store.list_proven()?;
 
     // Check if any rule auto-approves this tool call
@@ -629,8 +630,7 @@ pub fn handle_pre_tool_use(
     }
 
     // Check for protected paths that should be blocked (configurable)
-    let config = Config::load(cas_root).unwrap_or_default();
-    let protection = &config.hooks().pre_tool_use.protection;
+    let protection = &stores.config().hooks().pre_tool_use.protection;
 
     if protection.enabled {
         if let Some(path) = file_path {

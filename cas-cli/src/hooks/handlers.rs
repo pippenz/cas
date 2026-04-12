@@ -9,9 +9,10 @@ use crate::config::Config;
 use crate::error::MemError;
 use crate::otel::OtelContext;
 use crate::store::{
-    RuleStore, SqliteStore, Store, open_agent_store, open_commit_link_store,
-    open_file_change_store, open_loop_store, open_prompt_store, open_rule_store, open_store,
-    open_task_store, open_verification_store, open_worktree_store,
+    RuleStore, SqliteStore, Store, VerificationStore, WorktreeStore, open_agent_store,
+    open_commit_link_store, open_file_change_store, open_loop_store, open_prompt_store,
+    open_rule_store, open_spec_store, open_store, open_task_store, open_verification_store,
+    open_worktree_store,
 };
 use crate::tracing::{DevTracer, ToolTrace, TraceTimer};
 use crate::types::RuleStatus;
@@ -25,7 +26,7 @@ use crate::hooks::transcript::check_promise_in_transcript;
 
 use crate::hooks::context::{build_context, build_context_ai, build_plan_context};
 use crate::hooks::types::{HookInput, HookOutput};
-use crate::store::{AgentStore, TaskStore};
+use crate::store::{AgentStore, SpecStore, TaskStore};
 use std::sync::Arc;
 
 /// Shared store context for hook handlers.
@@ -88,6 +89,94 @@ impl<'a> HookStores<'a> {
             }
         }
         self.agent_store.as_ref()
+    }
+}
+
+/// Shared store context for PreToolUse/PostToolUse hook handlers.
+///
+/// Opens each store lazily on first use and caches it, avoiding redundant
+/// `open_*()` calls per tool invocation (each of which runs `.init()` migrations
+/// and `Config::load()`). Without caching, a single PreToolUse fires up to ~11
+/// separate SQLite connections.
+pub(crate) struct ToolHookStores<'a> {
+    cas_root: &'a Path,
+    config: Option<Config>,
+    task_store: Option<Arc<dyn TaskStore>>,
+    agent_store: Option<Arc<dyn AgentStore>>,
+    verification_store: Option<Arc<dyn VerificationStore>>,
+    worktree_store: Option<Arc<dyn WorktreeStore>>,
+    rule_store: Option<Arc<dyn RuleStore>>,
+    spec_store: Option<Arc<dyn SpecStore>>,
+}
+
+impl<'a> ToolHookStores<'a> {
+    pub fn new(cas_root: &'a Path) -> Self {
+        Self {
+            cas_root,
+            config: None,
+            task_store: None,
+            agent_store: None,
+            verification_store: None,
+            worktree_store: None,
+            rule_store: None,
+            spec_store: None,
+        }
+    }
+
+    /// Get or load Config (cached)
+    pub fn config(&mut self) -> &Config {
+        if self.config.is_none() {
+            self.config = Some(Config::load(self.cas_root).unwrap_or_default());
+        }
+        self.config.as_ref().unwrap()
+    }
+
+    /// Get the task store (lazy)
+    pub fn tasks(&mut self) -> Option<&Arc<dyn TaskStore>> {
+        if self.task_store.is_none() {
+            self.task_store = open_task_store(self.cas_root).ok();
+        }
+        self.task_store.as_ref()
+    }
+
+    /// Get the agent store (lazy)
+    pub fn agents(&mut self) -> Option<&Arc<dyn AgentStore>> {
+        if self.agent_store.is_none() {
+            self.agent_store = open_agent_store(self.cas_root).ok();
+        }
+        self.agent_store.as_ref()
+    }
+
+    /// Get the verification store (lazy)
+    pub fn verification(&mut self) -> Option<&Arc<dyn VerificationStore>> {
+        if self.verification_store.is_none() {
+            self.verification_store = open_verification_store(self.cas_root).ok();
+        }
+        self.verification_store.as_ref()
+    }
+
+    /// Get the worktree store (lazy)
+    pub fn worktrees(&mut self) -> Option<&Arc<dyn WorktreeStore>> {
+        if self.worktree_store.is_none() {
+            self.worktree_store = open_worktree_store(self.cas_root).ok();
+        }
+        self.worktree_store.as_ref()
+    }
+
+    /// Get the rule store (lazy)
+    pub fn rules(&mut self) -> Result<&Arc<dyn RuleStore>, MemError> {
+        if self.rule_store.is_none() {
+            self.rule_store = Some(open_rule_store(self.cas_root)?);
+        }
+        Ok(self.rule_store.as_ref().unwrap())
+    }
+
+    /// Get the spec store (lazy)
+    pub fn specs(&mut self) -> Option<&Arc<dyn SpecStore>> {
+        if self.spec_store.is_none() {
+            self.spec_store = open_spec_store(self.cas_root).ok();
+        }
+        self.spec_store.as_ref()
     }
 }
 
