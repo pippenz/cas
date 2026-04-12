@@ -34,6 +34,8 @@ pub enum CloudCommands {
     Projects(CloudProjectsArgs),
     /// Pull team memories for the current project
     TeamMemories(CloudTeamMemoriesArgs),
+    /// Remove foreign-project entities from local DB and re-pull
+    PurgeForeign(CloudPurgeForeignArgs),
 }
 
 #[derive(Parser)]
@@ -92,6 +94,13 @@ pub struct CloudTeamMemoriesArgs {
 }
 
 #[derive(Parser)]
+pub struct CloudPurgeForeignArgs {
+    /// Preview what would be purged without deleting
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Parser)]
 pub struct CloudQueueArgs {
     /// Show detailed list of queued items
     #[arg(long, short)]
@@ -119,6 +128,7 @@ pub fn execute(cmd: &CloudCommands, cli: &Cli, cas_root: &Path) -> anyhow::Resul
         CloudCommands::Sync(args) => execute_sync(args, cli, cas_root),
         CloudCommands::Projects(args) => execute_projects(args, cli),
         CloudCommands::TeamMemories(args) => execute_team_memories(args, cli, cas_root),
+        CloudCommands::PurgeForeign(args) => execute_purge_foreign(args, cli, cas_root),
     }
 }
 
@@ -1519,6 +1529,176 @@ fn execute_team_memories(
             ))?;
             fmt.newline()?;
         }
+    }
+
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PURGE-FOREIGN - Remove foreign-project entities and re-pull
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn execute_purge_foreign(
+    args: &CloudPurgeForeignArgs,
+    cli: &Cli,
+    cas_root: &Path,
+) -> anyhow::Result<()> {
+    use std::sync::Arc;
+
+    use crate::cloud::{CloudSyncer, CloudSyncerConfig, SyncQueue, get_project_canonical_id};
+
+    let config = CloudConfig::load()?;
+    if config.token.is_none() {
+        anyhow::bail!("Not logged in. Run 'cas login' first");
+    }
+
+    let project_id = get_project_canonical_id()
+        .ok_or_else(|| anyhow::anyhow!("Cannot determine project ID. Not inside a CAS project?"))?;
+
+    let store = open_store(cas_root)?;
+    let task_store = open_task_store(cas_root)?;
+    let rule_store = open_rule_store(cas_root)?;
+    let skill_store = open_skill_store(cas_root)?;
+
+    // Count entities before purge
+    let entries_before = store.list().map(|v| v.len()).unwrap_or(0);
+    let tasks_before = task_store.list(None).map(|v| v.len()).unwrap_or(0);
+    let rules_before = rule_store.list().map(|v| v.len()).unwrap_or(0);
+    let skills_before = skill_store.list(None).map(|v| v.len()).unwrap_or(0);
+    let total_before = entries_before + tasks_before + rules_before + skills_before;
+
+    if cli.json {
+        if args.dry_run {
+            println!(
+                r#"{{"dry_run":true,"project_id":"{}","entities_before":{{"entries":{},"tasks":{},"rules":{},"skills":{},"total":{}}}}}"#,
+                project_id, entries_before, tasks_before, rules_before, skills_before, total_before,
+            );
+            return Ok(());
+        }
+    } else {
+        let theme = ActiveTheme::default();
+        let mut out = io::stdout();
+        let mut fmt = Formatter::stdout(&mut out, theme);
+        fmt.newline()?;
+        fmt.write_accent("  Purge Foreign Entities")?;
+        fmt.newline()?;
+        fmt.newline()?;
+        fmt.write_muted("  Project: ")?;
+        fmt.write_raw(&project_id)?;
+        fmt.newline()?;
+        fmt.write_muted("  Before:  ")?;
+        fmt.write_raw(&format!(
+            "{} entries, {} tasks, {} rules, {} skills ({} total)",
+            entries_before, tasks_before, rules_before, skills_before, total_before,
+        ))?;
+        fmt.newline()?;
+
+        if args.dry_run {
+            fmt.newline()?;
+            fmt.write_muted("  (dry run — no changes made)")?;
+            fmt.newline()?;
+            fmt.write_raw("  Run without --dry-run to purge and re-pull.")?;
+            fmt.newline()?;
+            return Ok(());
+        }
+    }
+
+    // Step 1: Back up the database
+    let db_path = cas_root.join("cas.db");
+    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+    let backup_path = cas_root.join(format!("cas.db.pre-purge-{timestamp}"));
+    if db_path.exists() {
+        std::fs::copy(&db_path, &backup_path)?;
+    }
+
+    // Step 2: Delete all content entities via direct SQL
+    // (Preserves: sync_queue, sync_metadata, agents, sessions, verifications,
+    //  events, prompts, file_changes, commit_links, worktrees, dependencies, task_leases)
+    {
+        let conn = rusqlite::Connection::open(&db_path)?;
+        conn.execute_batch(
+            "DELETE FROM entries;
+             DELETE FROM tasks;
+             DELETE FROM rules;
+             DELETE FROM skills;",
+        )?;
+        // Reset last_pull_at so re-pull fetches everything
+        conn.execute(
+            "DELETE FROM sync_metadata WHERE key = 'last_pull_at'",
+            [],
+        )?;
+    }
+
+    // Step 3: Re-pull from cloud with project-scoped filtering
+    let queue = SyncQueue::open(cas_root)?;
+    queue.init()?;
+    let syncer = CloudSyncer::new(
+        Arc::new(queue),
+        config,
+        CloudSyncerConfig::default(),
+    );
+
+    let pull_result = syncer.pull(
+        store.as_ref(),
+        task_store.as_ref(),
+        rule_store.as_ref(),
+        skill_store.as_ref(),
+    )?;
+
+    // Count entities after re-pull
+    let entries_after = store.list().map(|v| v.len()).unwrap_or(0);
+    let tasks_after = task_store.list(None).map(|v| v.len()).unwrap_or(0);
+    let rules_after = rule_store.list().map(|v| v.len()).unwrap_or(0);
+    let skills_after = skill_store.list(None).map(|v| v.len()).unwrap_or(0);
+    let total_after = entries_after + tasks_after + rules_after + skills_after;
+
+    let purged = total_before.saturating_sub(total_after);
+
+    if cli.json {
+        println!(
+            r#"{{"project_id":"{}","backup":"{}","entities_before":{{"entries":{},"tasks":{},"rules":{},"skills":{},"total":{}}},"entities_after":{{"entries":{},"tasks":{},"rules":{},"skills":{},"total":{}}},"purged":{},"pull_errors":{}}}"#,
+            project_id,
+            backup_path.display(),
+            entries_before, tasks_before, rules_before, skills_before, total_before,
+            entries_after, tasks_after, rules_after, skills_after, total_after,
+            purged,
+            serde_json::to_string(&pull_result.errors).unwrap_or_default(),
+        );
+    } else {
+        let theme = ActiveTheme::default();
+        let mut out = io::stdout();
+        let mut fmt = Formatter::stdout(&mut out, theme);
+        fmt.write_muted("  After:   ")?;
+        fmt.write_raw(&format!(
+            "{} entries, {} tasks, {} rules, {} skills ({} total)",
+            entries_after, tasks_after, rules_after, skills_after, total_after,
+        ))?;
+        fmt.newline()?;
+        fmt.write_muted("  Purged:  ")?;
+        fmt.write_raw(&format!("{} foreign entities removed", purged))?;
+        fmt.newline()?;
+        fmt.write_muted("  Backup:  ")?;
+        fmt.write_raw(&backup_path.to_string_lossy())?;
+        fmt.newline()?;
+
+        if !pull_result.errors.is_empty() {
+            fmt.newline()?;
+            let warning_color = fmt.theme().palette.status_warning;
+            fmt.write_colored("  \u{26A0} ", warning_color)?;
+            fmt.write_raw(&format!("{} pull errors:", pull_result.errors.len()))?;
+            fmt.newline()?;
+            for err in &pull_result.errors {
+                fmt.write_muted("    - ")?;
+                fmt.write_raw(err)?;
+                fmt.newline()?;
+            }
+        }
+
+        fmt.newline()?;
+        let success_color = fmt.theme().palette.status_success;
+        fmt.write_colored("  \u{2713} ", success_color)?;
+        fmt.write_raw("Purge complete. Pending local changes in sync queue are preserved.")?;
+        fmt.newline()?;
     }
 
     Ok(())
