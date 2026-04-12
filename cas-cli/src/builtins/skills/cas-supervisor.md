@@ -53,6 +53,29 @@ Before planning begins, every request must pass:
   - **Counter-proposal** — "you said X; I think Y is a better approach, here are three anchors" — per the counter-propose rule above.
   Permission-seeking is deference with nothing to offer; the forbidden pattern is "should I do X?" when the answer is obviously yes. Clarification and counter-proposal are substantive input and remain encouraged.
 
+### Skill Triggers: Brainstorm and Ideate
+
+Before jumping to EPIC planning, check whether the request needs exploration first. These two skills fire during intake — not after planning begins.
+
+**`/cas-ideate` — fire BEFORE the user has a specific idea:**
+- Trigger when: user asks "what should I improve", "surprise me", "give me ideas", any greenfield exploration request, or you're starting a new project phase with no clear next priority
+- Skip when: user already has a specific feature, bug, or task in mind
+- Output: ranked survivor list at `docs/ideation/`. Does NOT produce requirements or plans
+- Handoff: user picks a survivor → `/cas-brainstorm` refines it into requirements. Never skip from ideation directly to planning
+
+**`/cas-brainstorm` — fire BEFORE planning when the request is under-specified:**
+- Trigger when: user request is vague ("make it better"), acceptance criteria are unclear, scope is ambiguous, multiple valid approaches exist, or you would have to invent assumptions to proceed
+- Skip when: request has specific acceptance criteria, is a well-defined bug report with clear fix, user explicitly says "just do X", or there's an existing pattern to follow with no ambiguity
+- Output: requirements doc at `docs/brainstorms/YYYY-MM-DD-<topic>-requirements.md` with stable R-IDs that feed EPIC task specs
+- Handoff: requirements doc feeds the Implementation Unit Template's `**Requirements:** R1, R2` field
+
+**Decision tree at intake:**
+1. User has no specific idea → `/cas-ideate` → user picks survivor → `/cas-brainstorm` → requirements → EPIC planning
+2. User has a vague idea → `/cas-brainstorm` → requirements → EPIC planning
+3. User has a clear, well-specified request → skip both → EPIC planning directly
+
+These are not "consider using" suggestions. If the trigger conditions match, invoke the skill before creating the EPIC. If the skip conditions match, proceed without it.
+
 ### Planning Gates
 
 Before work is assigned:
