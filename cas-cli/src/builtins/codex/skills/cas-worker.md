@@ -15,8 +15,12 @@ You execute tasks assigned by the Supervisor. You may be working in an isolated 
 3. Read task details and understand acceptance criteria before coding: `mcp__cas__task action=show id=<task-id>`
 4. Implement the solution, committing after each logical unit of work
 5. Report progress: `mcp__cas__task action=notes id=<task-id> notes="..." note_type=progress`
-6. When done: attempt `mcp__cas__task action=close id=<task-id> reason="..."`
+6. Run pre-close self-verification — see "Pre-Close Self-Verification" section below
+7. Run `/cas-code-review` with `mode=autofix` — see "Close-time code review gate" section for the full protocol
+8. Close with the ReviewOutcome from step 7: `mcp__cas__task action=close id=<task-id> reason="..." code_review_findings='<ReviewOutcome JSON>'`
    - If close succeeds — you're done, message the supervisor
+   - If close returns **CODE_REVIEW_REQUIRED** — you skipped step 7, go back and run the review
+   - If close returns **P0 BLOCK** — fix the P0 findings, re-run step 7, retry close
    - If close returns **verification-required** — message the supervisor immediately. Do NOT try to spawn verifier agents or retry close. The supervisor handles verification for your tasks.
    - If close returns **VERIFICATION_JAIL_BLOCKED** — see "Close hit VERIFICATION_JAIL_BLOCKED" below. Forward once, then trust the DB, do not re-report.
 
