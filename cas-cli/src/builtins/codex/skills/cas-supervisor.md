@@ -306,14 +306,15 @@ base branch ────────────────────► (sta
 
 **Worker completes a task:**
 1. Worker closes their own task
-2. Review changes in the worker worktree
-3. Merge to epic/main: `git checkout <base-branch> && git merge <worker-branch>`
-4. Message other active workers to sync onto the **local** branch (not `origin/`):
+2. Review changes in the worker worktree: `git -C .cas/worktrees/<worker> log --oneline main..HEAD`
+3. Cherry-pick to base branch: `git cherry-pick <commit-sha>` (one per commit; resolve conflicts if needed)
+4. Verify build after cherry-pick: `~/.cargo/bin/cargo build --quiet`
+5. Message other active workers to sync onto the **local** branch (not `origin/`):
    ```
    mcp__cs__coordination action=message target=<other-worker> message="Branch updated after merge. Sync: git stash && git rebase <base-branch> && git stash pop"
    ```
-5. Clear completed worker's context: `mcp__cs__coordination action=clear_context target=<worker>`
-6. Assign next task
+6. Clear completed worker's context: `mcp__cs__coordination action=clear_context target=<worker>`
+7. Assign next task
 
 ### Phase 3: Review (Shared Mode)
 
