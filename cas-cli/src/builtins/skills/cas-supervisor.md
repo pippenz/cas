@@ -172,7 +172,7 @@ Field purposes (write decisions, not code — "Approach" is 1–3 sentences of s
 - **Dependencies** — hard blockers go in `blocked_by`; soft ordering or "after X lands" notes stay as prose.
 - **Files** — the layer boundary. What the worker owns and must not touch outside of. Boundary violation is a rejection condition.
 - **Approach** — the sequencing or design decision already made. Not a code sketch, not a pseudocode draft. If you find yourself writing pseudocode, you are doing the worker's job.
-- **Execution note** — maps 1:1 to the task `execution_note` field. One of `test-first`, `characterization-first`, `additive-only`, or omitted.
+- **Execution note** — maps 1:1 to the task `execution_note` field. One of `test-first`, `characterization-first`, `additive-only`, or omitted. **Warning:** `additive-only` hard-blocks close on ANY file modification (M/D/R in git status). Only use for truly new-file-only tasks. If a task needs to edit existing files, do not set `additive-only`.
 - **Patterns to follow** — pointer to existing code or a prior commit the worker should mirror. Reduces stylistic drift.
 - **Test scenarios** — name the scenarios, including at least one error path. Don't leave test design entirely to the worker.
 - **Verification** — observable outcome. What can be demonstrated when done. Maps to `demo_statement`.
@@ -314,9 +314,10 @@ When breaking an epic into subtasks, apply these patterns:
 
 Workers from previous sessions are gone. Stale DB records are not live processes.
 
-1. Spawn fresh workers
-2. Verify they appear in TUI
-3. Assign open tasks to the new workers
+1. **Check for binary/source drift** — fixes merged to main since last session don't take effect until rebuild. Run `~/.cargo/bin/cargo build --release` if CAS source changed, then restart `cas serve`. If a "fixed" bug reappears, this is the first thing to check.
+2. Spawn fresh workers
+3. Verify they appear in TUI
+4. Assign open tasks to the new workers
 
 ### Phase 3: Merge and Sync (Isolated Mode)
 
@@ -358,6 +359,7 @@ When workers share the main directory, there's no branch merging — workers com
 - Workers set status to blocked and add a blocker note
 - Help resolve or reassign the task
 - **Race condition warning:** Task state updates are not atomic across supervisor and worker. After closing a task (especially via the escape hatch), verify it stayed closed before proceeding — a worker's stale `status=blocked` update can overwrite the close. If a worker resurrects a closed task, re-close with an audit trail noting the race.
+- **Stale outbox replays:** Workers may send duplicate stale messages due to outbox replay. Before acting on a blocker notification or status change, check the task's current state with `mcp__cas__task action=show` — the message may be outdated.
 
 **Multiple workers complete simultaneously:**
 - Run verification calls in parallel (single response turn)
