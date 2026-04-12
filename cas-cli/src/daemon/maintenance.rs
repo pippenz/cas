@@ -10,7 +10,9 @@ use crate::error::CasError;
 
 /// Run a single maintenance cycle.
 pub fn run_maintenance(config: &DaemonConfig) -> Result<DaemonRunResult, CasError> {
-    use crate::store::{open_agent_store, open_event_store, open_store, open_task_store};
+    use crate::store::{
+        open_agent_store, open_event_store, open_recording_store, open_store, open_task_store,
+    };
     use crate::types::TaskStatus;
 
     let started_at = Utc::now();
@@ -27,6 +29,7 @@ pub fn run_maintenance(config: &DaemonConfig) -> Result<DaemonRunResult, CasErro
     let mut worktrees_cleaned = 0;
     let mut events_pruned = 0;
     let mut lease_history_pruned = 0;
+    let mut recordings_pruned = 0;
 
     let store = open_store(&config.cas_root)?;
 
@@ -206,6 +209,16 @@ pub fn run_maintenance(config: &DaemonConfig) -> Result<DaemonRunResult, CasErro
         }
     }
 
+    // Prune old recordings (30-day retention, cascades to agents/events)
+    if config.auto_prune {
+        if let Ok(recording_store) = open_recording_store(&config.cas_root) {
+            match recording_store.prune(30) {
+                Ok(count) => recordings_pruned = count,
+                Err(error) => errors.push(format!("Recording pruning failed: {error}")),
+            }
+        }
+    }
+
     // WAL checkpoint to prevent unbounded WAL file growth
     {
         let db_path = config.cas_root.join("cas.db");
@@ -246,6 +259,7 @@ pub fn run_maintenance(config: &DaemonConfig) -> Result<DaemonRunResult, CasErro
         entity_summaries_updated,
         events_pruned,
         lease_history_pruned,
+        recordings_pruned,
         agents_cleaned,
         agents_purged,
         tasks_interrupted,

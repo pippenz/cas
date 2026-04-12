@@ -103,6 +103,9 @@ pub trait RecordingStore: Send + Sync {
     /// Delete FTS content for a recording
     fn delete_fts_content(&self, recording_id: &str) -> Result<()>;
 
+    /// Delete recordings older than the given number of days (cascades to agents/events)
+    fn prune(&self, older_than_days: i64) -> Result<usize>;
+
     /// Close connection
     fn close(&self) -> Result<()>;
 }

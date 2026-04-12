@@ -385,6 +385,43 @@ impl RecordingStore for SqliteRecordingStore {
         Ok(())
     }
 
+    fn prune(&self, older_than_days: i64) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+
+        // Check if recordings table exists (schema comes from migrations)
+        let table_exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='recordings'",
+                [],
+                |row| row.get::<_, i32>(0),
+            )
+            .map(|c| c > 0)
+            .unwrap_or(false);
+
+        if !table_exists {
+            return Ok(0);
+        }
+
+        let cutoff = (Utc::now() - chrono::Duration::days(older_than_days)).to_rfc3339();
+
+        // Delete FTS content for old recordings first (no CASCADE on virtual tables).
+        // Ignore errors — FTS table may not exist in all environments.
+        let _ = conn.execute(
+            "DELETE FROM recordings_fts WHERE recording_id IN (
+                SELECT id FROM recordings WHERE created_at < ?1
+            )",
+            params![cutoff],
+        );
+
+        // Delete recordings — CASCADE handles recording_agents and recording_events
+        let deleted = conn.execute(
+            "DELETE FROM recordings WHERE created_at < ?",
+            params![cutoff],
+        )?;
+
+        Ok(deleted)
+    }
+
     fn close(&self) -> Result<()> {
         Ok(())
     }

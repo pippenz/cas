@@ -720,7 +720,7 @@ impl TaskStore for SqliteTaskStore {
              AND t.status != 'closed'"
         );
 
-        let mut blocker_stmt = conn.prepare_cached(&sql)?;
+        let mut blocker_stmt = conn.prepare(&sql)?;
         let params: Vec<&dyn rusqlite::types::ToSql> =
             task_ids.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
         let rows = blocker_stmt.query_map(params.as_slice(), |row| {

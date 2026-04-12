@@ -116,6 +116,8 @@ pub struct DaemonRunResult {
     pub events_pruned: usize,
     /// Lease history entries pruned
     pub lease_history_pruned: usize,
+    /// Recordings pruned (older than retention period)
+    pub recordings_pruned: usize,
     /// Stale agents cleaned (marked dead and leases reclaimed)
     pub agents_cleaned: usize,
     /// Old stale/shutdown agents permanently deleted

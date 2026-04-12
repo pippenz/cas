@@ -460,3 +460,80 @@ fn test_record_message_event() {
     assert_eq!(meta["from"], "swift-fox");
     assert_eq!(meta["to"], "proud-finch");
 }
+
+#[test]
+fn test_recording_prune() {
+    let (temp, store) = create_test_store();
+
+    // Insert an old recording with a backdated created_at
+    let old_created = (Utc::now() - chrono::Duration::days(40)).to_rfc3339();
+    let new_created = Utc::now().to_rfc3339();
+
+    let conn = Connection::open(temp.path().join("cas.db")).unwrap();
+    conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+    conn.execute(
+        "INSERT INTO recordings (id, session_id, started_at, file_path, created_at)
+         VALUES ('old-rec', 'sess-1', ?1, '/old.bin', ?2)",
+        params![old_created, old_created],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO recording_agents (recording_id, agent_name, agent_type, file_path, created_at)
+         VALUES ('old-rec', 'worker-1', 'worker', '/w1.bin', ?1)",
+        params![old_created],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO recording_events (recording_id, timestamp_ms, event_type)
+         VALUES ('old-rec', 1000, 'task_created')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO recordings_fts (recording_id, content, content_type, timestamp_ms)
+         VALUES ('old-rec', 'test content', 'text', '1000')",
+        [],
+    )
+    .unwrap();
+
+    // Insert a recent recording
+    conn.execute(
+        "INSERT INTO recordings (id, session_id, started_at, file_path, created_at)
+         VALUES ('new-rec', 'sess-2', ?1, '/new.bin', ?2)",
+        params![new_created, new_created],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO recording_agents (recording_id, agent_name, agent_type, file_path, created_at)
+         VALUES ('new-rec', 'worker-2', 'worker', '/w2.bin', ?1)",
+        params![new_created],
+    )
+    .unwrap();
+    drop(conn);
+
+    // Prune recordings older than 30 days
+    let pruned = store.prune(30).unwrap();
+    assert_eq!(pruned, 1, "should prune exactly 1 old recording");
+
+    // Old recording gone
+    assert!(store.get("old-rec").is_err());
+
+    // New recording still exists
+    let new = store.get("new-rec").unwrap();
+    assert_eq!(new.id, "new-rec");
+
+    // New recording's agents still exist
+    let agents = store.get_agents("new-rec").unwrap();
+    assert_eq!(agents.len(), 1);
+
+    // Old recording's agents were cascaded
+    let old_agents = store.get_agents("old-rec").unwrap();
+    assert_eq!(old_agents.len(), 0);
+}
+
+#[test]
+fn test_recording_prune_empty_table() {
+    let (_temp, store) = create_test_store();
+    let pruned = store.prune(30).unwrap();
+    assert_eq!(pruned, 0);
+}
