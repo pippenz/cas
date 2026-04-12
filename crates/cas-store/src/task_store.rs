@@ -317,6 +317,39 @@ impl SqliteTaskStore {
         )?;
         Ok(())
     }
+
+    /// Atomically load all tasks and parent-child dependencies in a single lock hold.
+    ///
+    /// Prevents read skew where a task exists but its epic link is invisible (or vice
+    /// versa) due to a concurrent write between two separate queries.
+    pub fn list_with_parent_deps(&self) -> Result<(Vec<Task>, Vec<Dependency>)> {
+        let conn = self.conn.lock().unwrap();
+
+        // Both queries run under the same mutex hold, guaranteeing a consistent snapshot
+        let tasks = {
+            let mut stmt = conn.prepare_cached(
+                "SELECT id, title, description, design, acceptance_criteria, notes,
+                 status, priority, task_type, assignee, labels, created_at, updated_at,
+                 closed_at, close_reason, external_ref, content_hash, branch, worktree_id,
+                 pending_verification, pending_worktree_merge, epic_verification_owner, team_id, deliverables, demo_statement, execution_note
+                 FROM tasks ORDER BY priority, created_at DESC",
+            )?;
+            stmt.query_map([], Self::task_from_row)?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+
+        let deps = {
+            let dep_type_str = DependencyType::ParentChild.to_string();
+            let mut stmt = conn.prepare_cached(
+                "SELECT from_id, to_id, dep_type, created_at, created_by
+                 FROM dependencies WHERE dep_type = ? ORDER BY created_at DESC",
+            )?;
+            stmt.query_map(params![dep_type_str], Self::dep_from_row)?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+
+        Ok((tasks, deps))
+    }
 }
 
 /// Clear the pending_verification flag on a task using an existing connection.

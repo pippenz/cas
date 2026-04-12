@@ -9,10 +9,10 @@ use std::process::Command;
 
 use cas_store::{
     AgentStore, EventStore, Reminder, ReminderStore, SqliteAgentStore, SqliteEventStore,
-    SqliteReminderStore, SqliteTaskStore, SqliteWorktreeStore, TaskStore, WorktreeStore,
+    SqliteReminderStore, SqliteTaskStore, SqliteWorktreeStore, WorktreeStore,
 };
 use cas_types::{
-    AgentRole, AgentStatus, DependencyType, Event, EventType, Priority, Task, TaskStatus, TaskType,
+    AgentRole, AgentStatus, Event, EventType, Priority, Task, TaskStatus, TaskType,
     WorktreeStatus,
 };
 
@@ -179,7 +179,9 @@ impl DirectorData {
             owned_task = SqliteTaskStore::open(cas_dir)?;
             &owned_task
         };
-        let tasks: Vec<Task> = TaskStore::list(task_store, None)?;
+        // Atomically load tasks + parent-child deps in a single lock hold to prevent
+        // read skew where a task exists but its epic link is invisible (causes panel flicker)
+        let (tasks, parent_child_deps) = task_store.list_with_parent_deps()?;
 
         // Build assignee to task map for looking up current tasks
         let mut assignee_tasks: HashMap<String, String> = HashMap::new();
@@ -190,9 +192,6 @@ impl DirectorData {
                 assignee_tasks.insert(assignee.clone(), task.id.clone());
             }
         }
-
-        // Load parent-child dependencies to find epic relationships
-        let parent_child_deps = task_store.list_dependencies(Some(DependencyType::ParentChild))?;
 
         // Build map: child_id -> parent_epic_id
         let child_to_epic: HashMap<String, String> = parent_child_deps
