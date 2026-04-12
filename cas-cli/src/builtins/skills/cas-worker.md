@@ -77,6 +77,13 @@ Use task notes for ongoing updates (`note_type=progress|blocker|decision|discove
 
 Message the supervisor when you complete a task or need help.
 
+**Outbox replay**: Your outbox may replay stale messages after task state changes (delivery-layer artifact). Before re-sending a blocker or completion notification, re-check task state with `mcp__cas__task action=show` — the issue may already be resolved.
+
+**Supervisor goes silent**: If the supervisor hasn't responded after 5 minutes on any blocking question:
+1. Re-read task state with `action=show` — supervisor may have acted without messaging back.
+2. Send ONE follow-up via `mcp__cas__coordination action=message`.
+3. If still no response after another 5 minutes, focus on any non-blocked work or pause. Do not spam.
+
 ## Tool Selection Guide
 
 Pick the right tool for the job:
