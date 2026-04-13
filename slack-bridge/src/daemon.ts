@@ -77,20 +77,43 @@ export function loadDaemonEnv(
  * process and captures its output. This bypasses the factory/PTY pipeline
  * which has timing issues with Claude Code's TUI initialization.
  */
+/** Track which Slack threads already have a Claude session started. */
+const threadSessions = new Set<string>();
+
+/**
+ * Convert a Slack thread_ts to a deterministic UUID-like session ID.
+ * Claude Code requires a valid UUID format for --session-id.
+ */
+function threadTsToSessionId(threadTs: string): string {
+  // Pad/hash the thread_ts into a stable 32-hex-char string
+  const hex = Buffer.from(threadTs.padEnd(32, "0")).toString("hex").slice(0, 32);
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+}
+
 export async function injectMessage(
   config: DaemonConfig,
   msg: DaemonMessage,
 ): Promise<{ ok: boolean; session?: string; message_id?: number; response?: string; error?: string }> {
   return new Promise((resolve) => {
+    const sessionId = threadTsToSessionId(msg.thread_ts);
+    const isResume = threadSessions.has(msg.thread_ts);
+
     const args = [
       "--dangerously-skip-permissions",
-      "-p",
-      msg.text,
+      "-p", msg.text,
       "--effort", "high",
-      "--max-turns", "5",
+      "--max-turns", "20",
     ];
 
-    console.log(`Spawning claude in ${msg.project_dir}: ${msg.text.slice(0, 60)}`);
+    if (isResume) {
+      // Resume existing session — adds new message to the conversation
+      args.push("--resume", sessionId);
+    } else {
+      // New session — set session ID so we can resume later
+      args.push("--session-id", sessionId);
+    }
+
+    console.log(`Spawning claude [${isResume ? "resume" : "new"}] in ${msg.project_dir}: ${msg.text.slice(0, 60)}`);
 
     const child = spawnChild("claude", args, {
       cwd: msg.project_dir,
@@ -98,6 +121,9 @@ export async function injectMessage(
       stdio: ["ignore", "pipe", "pipe"],
       timeout: 300_000, // 5 minute timeout
     });
+
+    // Track this thread for future resume
+    threadSessions.add(msg.thread_ts);
 
     let stdout = "";
     let stderr = "";
