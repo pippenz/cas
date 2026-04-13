@@ -294,6 +294,29 @@ mod tests {
     }
 
     #[test]
+    fn test_with_system_context_has_no_hook_specific_output() {
+        // Stop / SubagentStop / PreCompact / SessionEnd must route context via
+        // `systemMessage`, NOT `hookSpecificOutput.additionalContext` — the
+        // latter is rejected by Claude Code's schema for these events and
+        // causes the entire hook output to be discarded. Regression guard for
+        // cas-8299.
+        let output = HookOutput::with_system_context("codemap is stale".to_string());
+        let json = serde_json::to_string(&output).unwrap();
+        assert!(
+            json.contains("\"systemMessage\":\"codemap is stale\""),
+            "Expected systemMessage in output: {json}"
+        );
+        assert!(
+            !json.contains("hookSpecificOutput"),
+            "with_system_context must NOT emit hookSpecificOutput: {json}"
+        );
+        assert!(
+            !json.contains("additionalContext"),
+            "with_system_context must NOT emit additionalContext: {json}"
+        );
+    }
+
+    #[test]
     fn test_block_stop_output() {
         let output = HookOutput::block_stop("Continue working on remaining tasks".to_string());
         let json = serde_json::to_string(&output).unwrap();
