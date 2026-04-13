@@ -75,8 +75,8 @@ pub(crate) fn handle_factory_start(
         .clone()
         .unwrap_or_else(|| "claude".to_string());
 
-    // Spawn the internal daemon command. When `--foreground` is not set, the daemon
-    // will detach and this subprocess should exit quickly.
+    // Spawn the internal daemon command as a detached child process.
+    // We use .spawn() (not .status()) because the daemon is long-running.
     let exe = std::env::current_exe()?;
     let mut cmd = Command::new(&exe);
     cmd.arg("factory")
@@ -111,17 +111,9 @@ pub(crate) fn handle_factory_start(
         cmd.arg("--record");
     }
 
-    let status = cmd
-        .status()
+    let _child = cmd
+        .spawn()
         .with_context(|| "Failed to spawn factory daemon")?;
-    if !status.success() {
-        return Ok(error_response(
-            tiny_http::StatusCode(500),
-            "factory_start_failed",
-            "cas factory daemon failed to start",
-            cors_allow_origin,
-        ));
-    }
 
     // Wait briefly for session metadata + socket to appear.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);

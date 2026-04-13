@@ -9,7 +9,7 @@
  */
 
 import { createServer, type Server, type Socket } from "node:net";
-import { readFileSync, existsSync, mkdirSync, unlinkSync } from "node:fs";
+import { readFileSync, existsSync, mkdirSync, unlinkSync, chmodSync } from "node:fs";
 import { resolve } from "node:path";
 import type { DaemonMessage } from "./router.js";
 
@@ -202,7 +202,6 @@ export function startSocketServer(
 
   // Make socket world-writable so the unprivileged router can connect
   server.on("listening", () => {
-    const { chmodSync } = require("node:fs") as typeof import("node:fs");
     chmodSync(socketPath, 0o777);
   });
 
