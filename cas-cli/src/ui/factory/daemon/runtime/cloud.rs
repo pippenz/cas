@@ -274,13 +274,23 @@ mod tests {
     #[test]
     fn flag_on_but_not_logged_in_does_not_spawn() {
         // Anonymous users must never spawn, even if the flag is flipped on —
-        // the WS client needs a token.
-        let cfg = CloudConfig {
+        // the WS client needs a token. Cover both the missing-token case
+        // (`None`) and the empty-string case — `is_logged_in()` treats both
+        // as not-logged-in, and a regression that relaxed that would silently
+        // enable the WS client for empty-tokened users.
+        let missing = CloudConfig {
             factory_cloud_client_enabled: true,
             token: None,
             ..CloudConfig::default()
         };
-        assert!(!should_spawn_cloud_client(&cfg));
+        assert!(!should_spawn_cloud_client(&missing));
+
+        let empty = CloudConfig {
+            factory_cloud_client_enabled: true,
+            token: Some(String::new()),
+            ..CloudConfig::default()
+        };
+        assert!(!should_spawn_cloud_client(&empty));
     }
 
     #[test]
