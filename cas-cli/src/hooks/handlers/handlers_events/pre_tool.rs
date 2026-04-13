@@ -76,6 +76,46 @@ pub fn handle_pre_tool_use(
     let is_supervisor = crate::harness_policy::is_supervisor_from_env();
     let worker_supports_subagents = worker_harness_from_env().capabilities().supports_subagents;
 
+    // ========================================================================
+    // CODEMAP FRESHNESS GATE: Block supervisor from creating tasks / spawning
+    // workers while CODEMAP.md is significantly out of date.
+    //
+    // Workers use CODEMAP for codebase orientation. Dispatching them against a
+    // stale map wastes tokens and produces drift. The SessionStart warning is
+    // informational; this gate enforces "update before assigning work".
+    //
+    // Only fires for supervisors, only on the two dispatch tools, only when
+    // staleness >= SIGNIFICANT_STALENESS_THRESHOLD. Running `/codemap` bumps
+    // CODEMAP.md's mtime and clears the gate on the next call.
+    // ========================================================================
+    if is_supervisor {
+        let action = input
+            .tool_input
+            .as_ref()
+            .and_then(|ti| ti.get("action").and_then(|v| v.as_str()));
+        let is_gated = matches!(
+            (tool_name, action),
+            ("mcp__cas__task", Some("create"))
+                | ("mcp__cas__coordination", Some("spawn_workers"))
+                | ("mcp__cas__coordination", Some("spawn_worker"))
+        );
+        if is_gated {
+            if let Some(crate::hooks::handlers::handlers_events::CodemapStaleness::SignificantlyStale { total_changes, .. }) =
+                crate::hooks::handlers::handlers_events::check_codemap_freshness(cas_root)
+            {
+                return Ok(HookOutput::with_permission_decision(
+                    "PreToolUse",
+                    "deny",
+                    &format!(
+                        "🗺️  CODEMAP.md is significantly out of date ({total_changes} structural changes).\n\n\
+                        Workers rely on CODEMAP for codebase orientation — dispatching against a stale map wastes tokens.\n\n\
+                        Run `/codemap` to refresh, then retry."
+                    ),
+                ));
+            }
+        }
+    }
+
     // Factory workers are exempt from verification jail — they may have multiple
     // tasks assigned and must be able to continue working on other tasks while
     // one awaits verification. The pending_verification flag on the task itself

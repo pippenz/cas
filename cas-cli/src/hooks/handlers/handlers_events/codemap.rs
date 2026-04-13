@@ -224,6 +224,17 @@ pub enum CodemapStaleness {
 const SIGNIFICANT_STALENESS_THRESHOLD: usize = 10;
 
 impl CodemapStaleness {
+    /// Return true when this staleness level warrants `severity="high"` in the
+    /// SessionStart injection. Callers use this to decide whether the injection
+    /// should be *prepended* (so it lands in the visible preview) or appended.
+    pub fn is_high_severity(&self, is_supervisor: bool) -> bool {
+        match self {
+            CodemapStaleness::Missing => true,
+            CodemapStaleness::SignificantlyStale { .. } => true,
+            CodemapStaleness::Stale { .. } => is_supervisor,
+        }
+    }
+
     /// Format as a context injection string for SessionStart.
     ///
     /// If `is_supervisor` is true, always uses strong language regardless of severity.
@@ -721,6 +732,34 @@ mod tests {
         let raw = "A\0src/a.rs\0\nD\0src/b.rs\0";
         let changes = parse_git_log_nul_output(raw).unwrap();
         assert_eq!(changes.len(), 2);
+    }
+
+    #[test]
+    fn test_is_high_severity_missing_always_high() {
+        assert!(CodemapStaleness::Missing.is_high_severity(false));
+        assert!(CodemapStaleness::Missing.is_high_severity(true));
+    }
+
+    #[test]
+    fn test_is_high_severity_significantly_stale_always_high() {
+        let staleness = CodemapStaleness::SignificantlyStale {
+            total_changes: 20,
+            file_list: vec![],
+            commit_info: String::new(),
+        };
+        assert!(staleness.is_high_severity(false));
+        assert!(staleness.is_high_severity(true));
+    }
+
+    #[test]
+    fn test_is_high_severity_stale_supervisor_only() {
+        let staleness = CodemapStaleness::Stale {
+            total_changes: 3,
+            file_list: vec![],
+            commit_info: String::new(),
+        };
+        assert!(!staleness.is_high_severity(false));
+        assert!(staleness.is_high_severity(true));
     }
 
     #[test]

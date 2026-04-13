@@ -167,7 +167,12 @@ pub fn handle_session_start(
         build_context(input, 5, cas_root)?
     };
 
-    // Check codemap freshness and append to context if needed
+    // Inject codemap freshness warning.
+    //
+    // High-severity warnings (missing / significantly stale / any staleness for
+    // supervisors) are **prepended** so they land inside the truncated
+    // SessionStart preview window the agent skims first. Info-level warnings
+    // are appended as before.
     let context = if let Some(staleness) =
         crate::hooks::handlers::handlers_events::check_codemap_freshness(cas_root)
     {
@@ -177,6 +182,8 @@ pub fn handle_session_start(
         let codemap_ctx = staleness.format_injection(is_supervisor);
         if context.is_empty() {
             codemap_ctx
+        } else if staleness.is_high_severity(is_supervisor) {
+            format!("{codemap_ctx}\n{context}")
         } else {
             format!("{context}\n{codemap_ctx}")
         }
