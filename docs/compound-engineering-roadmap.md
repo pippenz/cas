@@ -1,8 +1,10 @@
 # Compound Engineering Roadmap
 
-> **Status (2026-04-09)**
-> - **Phase 0 shipped** (EPIC cas-ada0): 2 skills + 2 agents moved into the CAS distribution — `cas-brainstorm`, `cas-ideate`, `git-history-analyzer`, `issue-intelligence-analyst`.
-> - **Phase 1+**: all other items in this document remain open / unbuilt. See the Implementation Priority table at the bottom for per-item status.
+> **Status (2026-04-13)**
+> - **Phase 0 shipped** (EPIC cas-ada0): 2 skills + 2 agents — `cas-brainstorm`, `cas-ideate`, `git-history-analyzer`, `issue-intelligence-analyst`.
+> - **Phase 1 shipped 2026-04-09** (EPICs cas-3444 / cas-2c1c / cas-b4d1 / cas-0750): multi-persona code review pipeline (1.1), memory schema + overlap detection (1.2.1, 1.2.2), implementation unit template (1.3.2), worker execution methodology (incl. execution-posture signals 3.1).
+> - **Phase 1.5 shipped 2026-04-12**: skill hardening EPIC (47 findings, 24 tasks) + compound wiring (brainstorm/ideate triggers, sassy supervisor personality).
+> - **Phase 2+**: see Implementation Priority table for per-item status.
 > - **Original source:** [EveryInc/compound-engineering-plugin](https://github.com/EveryInc/compound-engineering-plugin)
 
 **Source:** [EveryInc/compound-engineering-plugin](https://github.com/EveryInc/compound-engineering-plugin)
@@ -553,25 +555,27 @@ Suggested order based on effort vs. impact:
 
 | Priority | Item | Effort | Impact | Status |
 |----------|------|--------|--------|--------|
-| 1 | 1.1 Multi-persona review pipeline | Large | Very High | Pending (Phase 1+) |
-| 2 | 1.5 Review-to-task flow | Small | High | Pending (Phase 1+) |
-| 3 | 3.1 Execution posture signals | Tiny | Medium | Pending (Phase 1+) |
-| 4 | 1.2.1 Structured frontmatter schema | Small | High | Pending (Phase 1+) |
-| 5 | 1.2.2 Overlap detection | Medium | High | Pending (Phase 1+) |
-| 6 | 1.4 PR feedback resolution | Medium | High | Pending (Phase 1+) |
-| 7 | 1.3.2 Implementation unit template | Small | Medium | Pending (Phase 1+) |
-| 8 | 3.2 System-wide test check | Small | Medium | Pending (Phase 1+) |
-| 9 | 2.2 Document review for specs | Medium | Medium | Pending (Phase 1+) |
+| 1 | 1.1 Multi-persona review pipeline | Large | Very High | **Shipped (Phase 1, cas-3444)** — multi-persona reviewer pipeline on main |
+| 2 | 1.5 Review-to-task flow | Small | High | Pending (Phase 2) |
+| 3 | 3.1 Execution posture signals | Tiny | Medium | **Shipped (Phase 1, cas-0750)** — `execution_note` in use (test-first / characterization-first / additive-only) |
+| 4 | 1.2.1 Structured frontmatter schema | Small | High | **Shipped (Phase 1, cas-2c1c)** — memory schema with typed frontmatter |
+| 5 | 1.2.2 Overlap detection | Medium | High | **Shipped (Phase 1, cas-2c1c)** — overlap detection in `cas-core/src/memory/` |
+| 6 | 1.4 PR feedback resolution | Medium | High | Pending (Phase 2) |
+| 7 | 1.3.2 Implementation unit template | Small | Medium | **Shipped (Phase 1, cas-b4d1)** — template live in supervisor skill |
+| 8 | 3.2 System-wide test check | Small | Medium | Pending (Phase 2) |
+| 9 | 2.2 Document review for specs | Medium | Medium | Pending (Phase 2) |
 | 10 | 2.1.1 Git history analyzer | Small | Medium | **Shipped (Phase 0, cas-ada0)** — `git-history-analyzer` agent |
-| 11 | 1.2.4 Memory refresh | Medium | Medium | Pending (Phase 1+) |
-| 12 | 2.3 Operational validation | Tiny | Medium | Pending (Phase 1+) |
-| 13 | 3.5 Model tiering | Small | Medium | Pending (Phase 1+) |
+| 11 | 1.2.4 Memory refresh | Medium | Medium | Pending (Phase 2) |
+| 12 | 2.3 Operational validation | Tiny | Medium | Pending (Phase 2) |
+| 13 | 3.5 Model tiering | Small | Medium | Pending (Phase 2) |
 | 14 | 2.4 Adversarial ideation | Medium | Medium | **Shipped (Phase 0, cas-ada0)** — `cas-ideate` skill |
-| 15 | 2.5 Onboarding skill | Small | Low | Pending (Phase 1+) |
-| 16 | 2.6 Bug reproduction skill | Small | Low | Pending (Phase 1+) |
-| 17 | 1.3.3 Confidence-check deepening | Medium | Medium | Pending (Phase 1+) |
-| 18 | 3.3 Simplify-as-you-go | Tiny | Low | Pending (Phase 1+) |
-| 19 | Remaining Tier 3 items | Tiny each | Low each | Pending (Phase 1+) |
+| 15 | 2.5 Onboarding skill | Small | Low | Pending (Phase 2) |
+| 16 | 2.6 Bug reproduction skill | Small | Low | Pending (Phase 2) |
+| 17 | 1.3.3 Confidence-check deepening | Medium | Medium | Pending (Phase 2) |
+| 18 | 3.3 Simplify-as-you-go | Tiny | Low | Pending (Phase 2) — `simplify` skill exists, auto-trigger mid-EPIC not wired |
+| 19 | Remaining Tier 3 items | Tiny each | Low each | Pending (Phase 2) |
+
+**Phase 2 candidates (roughly in priority order):** 1.5 review-to-task flow, 1.4 PR feedback resolution, 3.2 system-wide test check, 2.2 document review for specs, 1.2.4 memory refresh, 2.3 operational validation, 3.5 model tiering.
 
 **Also shipped in Phase 0 (cas-ada0) but not listed as standalone rows above:**
 - `cas-brainstorm` skill — interactive Q&A requirements gathering (related to 1.3 Structured Planning Pipeline)
