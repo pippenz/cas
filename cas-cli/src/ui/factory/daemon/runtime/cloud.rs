@@ -39,14 +39,14 @@ impl FactoryDaemon {
             }
         };
 
-        if !cloud_config.is_logged_in() {
-            tracing::info!("Cloud phone-home skipped: not logged in");
-            return None;
-        }
-        if !cloud_config.factory_cloud_client_enabled {
-            tracing::info!(
-                "factory cloud client disabled (set factory_cloud_client_enabled=true in .cas/cloud.json to re-enable — see cas-4244)"
-            );
+        if !should_spawn_cloud_client(&cloud_config) {
+            if !cloud_config.is_logged_in() {
+                tracing::info!("Cloud phone-home skipped: not logged in");
+            } else {
+                tracing::info!(
+                    "factory cloud client disabled (set factory_cloud_client_enabled=true in .cas/cloud.json to re-enable — see cas-4244)"
+                );
+            }
             return None;
         }
 
