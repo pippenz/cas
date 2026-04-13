@@ -53,6 +53,8 @@ pub struct TeamsSpawnConfig {
     pub agent_type: String,
     /// Parent session ID for analytics correlation (workers only)
     pub parent_session_id: Option<String>,
+    /// Lead session ID — set for the team lead so --session-id matches leadSessionId
+    pub lead_session_id: Option<String>,
 }
 
 impl Default for PtyConfig {
@@ -89,10 +91,12 @@ impl PtyConfig {
         model: Option<&str>,
         teams: Option<&TeamsSpawnConfig>,
     ) -> Self {
-        // Generate a stable session ID for this agent so the MCP server can
-        // auto-register even when Claude Code hooks don't fire (e.g. in
-        // worktree-isolated workers on Claude Code ≥2.1.58).
-        let session_id = uuid::Uuid::new_v4().to_string();
+        // Use the lead_session_id for the team lead so leadSessionId in the
+        // team config matches the supervisor's --session-id. Without this,
+        // Claude Code thinks it's not the leader and won't process inbox.
+        let session_id = teams
+            .and_then(|t| t.lead_session_id.clone())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
         let mut env = vec![
             ("CAS_AGENT_NAME".to_string(), name.to_string()),

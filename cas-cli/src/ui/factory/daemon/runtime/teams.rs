@@ -129,6 +129,7 @@ impl TeamsManager {
                 agent_color: "green".to_string(),
                 agent_type: "team-lead".to_string(),
                 parent_session_id: None,
+                lead_session_id: Some(lead_session_id.clone()),
             },
         );
 
@@ -143,6 +144,7 @@ impl TeamsManager {
                     agent_color: Self::color_for_index(i).to_string(),
                     agent_type: "general-purpose".to_string(),
                     parent_session_id: Some(lead_session_id.clone()),
+                    lead_session_id: None,
                 },
             );
         }
@@ -472,6 +474,7 @@ impl TeamsManager {
             agent_color: color.to_string(),
             agent_type: agent_type.to_string(),
             parent_session_id: parent_session_id.map(|s| s.to_string()),
+            lead_session_id: None,
         }
     }
 }

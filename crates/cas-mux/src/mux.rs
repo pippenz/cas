@@ -494,6 +494,14 @@ impl Mux {
         self.panes_by_kind(PaneKind::Director).next()
     }
 
+    /// Check whether a pane is ready to accept prompt injection.
+    pub fn pane_ready_for_injection(&self, pane_id: &str) -> bool {
+        self.panes
+            .get(pane_id)
+            .map(|p| p.ready_for_injection())
+            .unwrap_or(false)
+    }
+
     /// Inject a prompt into a specific pane
     pub async fn inject(&self, pane_id: &str, prompt: &str) -> Result<()> {
         let pane = self

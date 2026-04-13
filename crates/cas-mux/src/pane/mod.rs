@@ -96,6 +96,10 @@ pub struct Pane {
     new_lines_below: u32,
     /// Reusable scratch buffer for drain_output (avoids 65KB alloc per poll)
     drain_buf: Vec<u8>,
+    /// Total bytes of output received from the process (for readiness detection)
+    total_bytes_received: u64,
+    /// When this pane was created (for startup grace period)
+    created_at: std::time::Instant,
 }
 
 impl Pane {
@@ -131,6 +135,8 @@ impl Pane {
             user_scrolled: false,
             new_lines_below: 0,
             drain_buf: Vec::with_capacity(65536),
+            total_bytes_received: 0,
+            created_at: std::time::Instant::now(),
         })
     }
 
@@ -597,6 +603,7 @@ impl Pane {
         let coalesced = std::mem::take(&mut self.drain_buf);
 
         if !coalesced.is_empty() {
+            self.total_bytes_received += coalesced.len() as u64;
             let feed_data = Self::strip_literal_cursor_reports(&coalesced);
             if let Err(e) = self.feed(feed_data.as_ref()) {
                 tracing::warn!(
@@ -631,6 +638,15 @@ impl Pane {
             }
             PaneBackend::None => Err(Error::pty("Pane has no backend")),
         }
+    }
+
+    /// Whether this pane is ready to accept prompt injection.
+    /// Claude Code flushes the PTY input buffer during startup, so text
+    /// written before readline initialization is silently lost. We require
+    /// both output (Claude has booted) AND a 5-second grace period.
+    pub fn ready_for_injection(&self) -> bool {
+        self.total_bytes_received > 0
+            && self.created_at.elapsed() >= std::time::Duration::from_secs(5)
     }
 
     pub async fn inject_prompt(&self, prompt: &str) -> Result<()> {

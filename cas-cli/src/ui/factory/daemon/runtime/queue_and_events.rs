@@ -235,6 +235,22 @@ impl FactoryDaemon {
                 continue;
             }
 
+            // Gate PTY injection on pane readiness: Claude Code flushes the PTY
+            // input buffer during startup, so text written before readline
+            // initialization is silently lost. Wait for output + a 5s grace
+            // period before injecting. Teams-mode uses inbox files, not PTY.
+            if self.teams.is_none() {
+                let pane_target = if target == "supervisor" {
+                    self.app.supervisor_name()
+                } else {
+                    target.as_str()
+                };
+                if !self.app.mux.pane_ready_for_injection(pane_target) {
+                    // Don't ack — the prompt stays in the queue for the next tick.
+                    continue;
+                }
+            }
+
             let prompt_with_instructions = queued.prompt.clone();
             let preview: String = queued.prompt.chars().take(50).collect();
 

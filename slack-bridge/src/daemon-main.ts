@@ -182,40 +182,29 @@ async function main(): Promise<void> {
     }
     threadTracker.registerOwner(msg.thread_ts, msg.slack_user);
 
-    // Inject message into CAS
+    // Post a "thinking" indicator
+    await slack.chat.postMessage({
+      channel: msg.channel,
+      thread_ts: msg.thread_ts,
+      text: `:hourglass_flowing_sand: Processing...`,
+    });
+
+    // Execute Claude directly and get the response
     const result = await injectMessage(config, msg);
 
-    if (result.ok) {
-      // Register thread routing for responses
-      const fromLabel = `slack-${msg.thread_ts}`;
-      threadRouting.set(fromLabel, {
-        channel: msg.channel,
-        thread_ts: msg.thread_ts,
-        session: result.session!,
-      });
-
-      // Track which threads belong to which session
-      let labels = sessionThreads.get(result.session!);
-      if (!labels) {
-        labels = new Set();
-        sessionThreads.set(result.session!, labels);
+    if (result.ok && result.response) {
+      // Post Claude's response directly to the thread
+      // Split long responses into chunks (Slack limit is ~4000 chars per message)
+      const maxLen = 3900;
+      const response = result.response;
+      for (let i = 0; i < response.length; i += maxLen) {
+        const chunk = response.slice(i, i + maxLen);
+        await slack.chat.postMessage({
+          channel: msg.channel,
+          thread_ts: msg.thread_ts,
+          text: chunk,
+        });
       }
-      labels.add(fromLabel);
-
-      // Start SSE subscription for this session
-      ensureSubscription(result.session!);
-
-      // Post confirmation
-      const confirm = formatInjectionConfirm(
-        result.session!,
-        result.message_id!,
-      );
-      await slack.chat.postMessage({
-        channel: msg.channel,
-        thread_ts: msg.thread_ts,
-        text: confirm.text,
-        blocks: confirm.blocks,
-      });
     } else {
       const err = formatError("inject_failed", result.error ?? "Unknown error");
       await slack.chat.postMessage({

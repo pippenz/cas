@@ -36,18 +36,24 @@ pub(super) fn execute_daemon(
 
     let llm = cas_config.llm();
 
+    // Resolve supervisor name up front so teams_configs and FactoryConfig agree.
+    // When the caller doesn't provide a name, generate one so the teams config
+    // key matches the Mux pane name (app/init.rs uses generate_unique for this).
+    let resolved_supervisor_name = supervisor_name.unwrap_or_else(|| {
+        crate::orchestration::names::generate_unique(1).remove(0)
+    });
+
     // Build native Agent Teams spawn configs so agents start with Teams CLI flags.
     let (teams_configs, lead_session_id) = {
         use crate::ui::factory::daemon::runtime::teams::TeamsManager;
-        let sup = supervisor_name.as_deref().unwrap_or("supervisor");
-        TeamsManager::build_configs_for_mux(session, sup, &worker_names)
+        TeamsManager::build_configs_for_mux(session, &resolved_supervisor_name, &worker_names)
     };
 
     let config = FactoryConfig {
         cwd: cwd.to_path_buf(),
         workers: effective_workers,
         worker_names,
-        supervisor_name,
+        supervisor_name: Some(resolved_supervisor_name),
         supervisor_cli,
         worker_cli,
         supervisor_model: llm.model_for_role("supervisor").map(String::from),

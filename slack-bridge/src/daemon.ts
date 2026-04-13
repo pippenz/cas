@@ -11,6 +11,7 @@
 import { createServer, type Server, type Socket } from "node:net";
 import { readFileSync, existsSync, mkdirSync, unlinkSync, chmodSync } from "node:fs";
 import { resolve } from "node:path";
+import { spawn as spawnChild } from "node:child_process";
 import type { DaemonMessage } from "./router.js";
 
 // ---------------------------------------------------------------------------
@@ -70,79 +71,68 @@ export function loadDaemonEnv(
 // ---------------------------------------------------------------------------
 
 /**
- * Inject a message into a CAS factory session via the cas serve HTTP API.
+ * Execute a Claude Code command directly in the project directory.
  *
- * Uses: POST /v1/sessions/<session>/message
- *   { target: "supervisor", message: text, from: "slack-<thread_ts>" }
- *
- * If no session exists for the project, tries to start one via:
- *   POST /v1/factory/start { project_dir, reuse_existing: true }
+ * Spawns `claude -p "message" --dangerously-skip-permissions` as a child
+ * process and captures its output. This bypasses the factory/PTY pipeline
+ * which has timing issues with Claude Code's TUI initialization.
  */
 export async function injectMessage(
   config: DaemonConfig,
   msg: DaemonMessage,
-): Promise<{ ok: boolean; session?: string; message_id?: number; error?: string }> {
-  const headers: Record<string, string> = {
-    "Content-Type": "application/json",
-  };
-  if (config.cas_serve_token) {
-    headers["Authorization"] = `Bearer ${config.cas_serve_token}`;
-  }
+): Promise<{ ok: boolean; session?: string; message_id?: number; response?: string; error?: string }> {
+  return new Promise((resolve) => {
+    const args = [
+      "--dangerously-skip-permissions",
+      "-p",
+      msg.text,
+      "--effort", "high",
+      "--max-turns", "5",
+    ];
 
-  // Step 1: Find or start a session for this project
-  const startRes = await fetch(`${config.cas_serve_url}/v1/factory/start`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({
-      project_dir: msg.project_dir,
-      reuse_existing: true,
-      workers: 0, // supervisor-only for now
-    }),
+    console.log(`Spawning claude in ${msg.project_dir}: ${msg.text.slice(0, 60)}`);
+
+    const child = spawnChild("claude", args, {
+      cwd: msg.project_dir,
+      env: { ...process.env, HOME: process.env.HOME },
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 300_000, // 5 minute timeout
+    });
+
+    let stdout = "";
+    let stderr = "";
+
+    child.stdout?.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString();
+    });
+
+    child.stderr?.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString();
+    });
+
+    child.on("close", (code) => {
+      if (code === 0 && stdout.trim()) {
+        resolve({
+          ok: true,
+          session: "direct",
+          message_id: Date.now(),
+          response: stdout.trim(),
+        });
+      } else {
+        resolve({
+          ok: false,
+          error: `claude exited ${code}: ${stderr.slice(0, 200) || stdout.slice(0, 200) || "no output"}`,
+        });
+      }
+    });
+
+    child.on("error", (err) => {
+      resolve({
+        ok: false,
+        error: `spawn failed: ${err.message}`,
+      });
+    });
   });
-
-  if (!startRes.ok) {
-    const body = await startRes.text();
-    return { ok: false, error: `factory/start failed: ${startRes.status} ${body}` };
-  }
-
-  const startData = (await startRes.json()) as {
-    session: { name: string };
-    started: boolean;
-    reused_existing: boolean;
-  };
-  const sessionName = startData.session.name;
-
-  // Step 2: Inject the message
-  const msgRes = await fetch(
-    `${config.cas_serve_url}/v1/sessions/${sessionName}/message`,
-    {
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        target: "supervisor",
-        message: msg.text,
-        from: `slack-${msg.thread_ts}`,
-        no_wrap: false,
-        wait_ack: false,
-      }),
-    },
-  );
-
-  if (!msgRes.ok) {
-    const body = await msgRes.text();
-    return { ok: false, session: sessionName, error: `message inject failed: ${msgRes.status} ${body}` };
-  }
-
-  const msgData = (await msgRes.json()) as {
-    message_id: number;
-    enqueued: boolean;
-  };
-
-  return {
-    ok: true,
-    session: sessionName,
-    message_id: msgData.message_id,
-  };
 }
 
 // ---------------------------------------------------------------------------
