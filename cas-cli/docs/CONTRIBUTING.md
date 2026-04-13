@@ -1,5 +1,23 @@
 # Contributing to CAS
 
+## Canonical install path
+
+CAS must be installed to **one** location: `~/.local/bin/cas`. Any other
+location (`/usr/local/bin`, `/usr/bin`, `~/.cargo/bin`) creates silent
+duplicates: PATH-order changes (interactive zsh vs. a systemd service, or a
+subagent invoking `cas` via absolute path) can promote a stale copy and
+silently reintroduce fixed bugs.
+
+- `scripts/cas-install.sh` installs to `~/.local/bin/cas` and warns about any
+  other `cas` binaries it finds on PATH.
+- On startup, `cas` itself scans PATH and emits a single-line stderr warning
+  when duplicates with diverging mtimes are present. Silence it with
+  `CAS_SUPPRESS_DUPLICATE_WARNING=1`, or force it on in non-TTY contexts with
+  `CAS_WARN_DUPLICATES=1`. Hooks, `cas serve`, and `cas factory` are never
+  warned.
+- If you previously installed via `cargo install cas` or a distro package,
+  remove those copies so only `~/.local/bin/cas` remains.
+
 ## Adding Features
 
 **New CLI command**: Add variant to `Commands` enum in `cas-cli/src/cli/mod.rs`, create handler file in `cli/`, add integration test in `tests/cli_test.rs`.

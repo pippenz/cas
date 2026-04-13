@@ -15,6 +15,7 @@ pub mod cloud;
 pub mod config;
 pub mod consolidation;
 pub mod daemon;
+pub mod duplicate_check;
 pub mod error;
 pub mod extraction;
 pub mod harness_policy;

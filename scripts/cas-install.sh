@@ -5,7 +5,7 @@
 #   curl -fsSL https://raw.githubusercontent.com/pippenz/cas/main/scripts/cas-install.sh | bash
 #
 # Options (via env vars):
-#   CAS_INSTALL_DIR   Override install directory (default: /usr/local/bin or ~/.local/bin)
+#   CAS_INSTALL_DIR   Override install directory (default: ~/.local/bin — the canonical location)
 #   CAS_VERSION       Install a specific version (default: latest)
 #   CAS_REPO          Override GitHub repo (default: pippenz/cas)
 
@@ -80,12 +80,10 @@ resolve_install_dir() {
     return
   fi
 
-  # Prefer /usr/local/bin if writable (with or without sudo)
-  if [ -w /usr/local/bin ] || command -v sudo &>/dev/null; then
-    INSTALL_DIR="/usr/local/bin"
-  else
-    INSTALL_DIR="$HOME/.local/bin"
-  fi
+  # Canonical install location is $HOME/.local/bin. Installing system-wide to
+  # /usr/local/bin creates silent duplicates that diverge from per-user dev
+  # builds — see docs/requests/completed/BUG-stale-cas-binaries-on-path.md.
+  INSTALL_DIR="$HOME/.local/bin"
 }
 
 ensure_install_dir() {
@@ -107,6 +105,18 @@ ensure_install_dir() {
       warn "  export PATH=\"$INSTALL_DIR:\$PATH\""
       ;;
   esac
+
+  # Flag other cas binaries on PATH that will silently shadow (or be shadowed
+  # by) the one we're about to install.
+  if command -v which >/dev/null 2>&1; then
+    local others
+    others="$(which -a cas 2>/dev/null | grep -v "^${INSTALL_DIR}/cas$" || true)"
+    if [ -n "$others" ]; then
+      warn "Other cas binaries on PATH (these will diverge from the canonical install):"
+      echo "$others" | sed 's/^/  /' >&2
+      warn "Remove them to avoid silent staleness — see docs/requests/completed/BUG-stale-cas-binaries-on-path.md"
+    fi
+  fi
 }
 
 # ---------------------------------------------------------------------------

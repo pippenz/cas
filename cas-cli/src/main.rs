@@ -6,7 +6,7 @@ use clap::Parser;
 use std::process::ExitCode;
 
 // Use the library crate
-use cas::{cli, config, error, logging, sentry, store};
+use cas::{cli, config, duplicate_check, error, logging, sentry, store};
 
 fn main() -> ExitCode {
     // Reset SIGPIPE to default behavior so broken pipes cause a clean exit
@@ -28,6 +28,11 @@ fn main() -> ExitCode {
     let _sentry_guard = sentry::init(sentry::is_sentry_enabled());
 
     let raw_args: Vec<String> = std::env::args().collect();
+
+    // Warn if multiple `cas` binaries on PATH have diverging mtimes. Best-effort,
+    // gated to interactive terminals + non-silent subcommands. See duplicate_check.
+    duplicate_check::check_and_warn(&raw_args);
+
     let parse_args = maybe_rewrite_factory_args(raw_args);
 
     // Use try_parse to capture argument errors for tracing
