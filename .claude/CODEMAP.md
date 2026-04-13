@@ -54,6 +54,7 @@ builtins/agents/     — Built-in subagent defs (git-history-analyzer, issue-int
 builtins/skills/     — Built-in skill templates (cas-brainstorm, cas-ideate, cas-code-review, cas-memory-management, etc.)
 builtins/codex/      — Codex-flavored agent + skill mirrors of the above
 harness_policy.rs    — Worker harness capability detection (subagents support, etc.)
+duplicate_check.rs   — Stale `cas` binary detection on PATH; warns once at startup if mtimes diverge
 
 ### crates/ — Workspace library crates
 
