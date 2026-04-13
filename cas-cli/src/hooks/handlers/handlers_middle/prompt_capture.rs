@@ -102,7 +102,7 @@ pub fn handle_user_prompt_submit(
                         "\n<system-reminder>\n📝 Auto-detected preference from your message: \"{}\"\n   Created rule {} (scope: {}). Use `mcp__cas__rule action=helpful id={}` to confirm and promote to active.\n</system-reminder>",
                         preference.content, rule_id, preference.scope, rule_id
                     );
-                    return Ok(HookOutput::with_context("UserPromptSubmit", msg));
+                    return Ok(HookOutput::with_user_prompt_context(msg));
                 }
             }
         }

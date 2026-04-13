@@ -50,8 +50,7 @@ pub fn handle_pre_tool_use(
     // ========================================================================
     let is_factory_agent = std::env::var("CAS_AGENT_ROLE").is_ok();
     if is_factory_agent && tool_name == "SendMessage" {
-        return Ok(HookOutput::with_permission_decision(
-            "PreToolUse",
+        return Ok(HookOutput::with_pre_tool_permission(
             "deny",
             "🚫 SendMessage is disabled in factory mode.\n\n\
             Use CAS coordination instead:\n\
@@ -103,8 +102,7 @@ pub fn handle_pre_tool_use(
             if let Some(crate::hooks::handlers::handlers_events::CodemapStaleness::SignificantlyStale { total_changes, .. }) =
                 crate::hooks::handlers::handlers_events::check_codemap_freshness(cas_root)
             {
-                return Ok(HookOutput::with_permission_decision(
-                    "PreToolUse",
+                return Ok(HookOutput::with_pre_tool_permission(
                     "deny",
                     &format!(
                         "🗺️  CODEMAP.md is significantly out of date ({total_changes} structural changes).\n\n\
@@ -329,8 +327,7 @@ pub fn handle_pre_tool_use(
                             ""
                         };
 
-                        return Ok(HookOutput::with_permission_decision(
-                            "PreToolUse",
+                        return Ok(HookOutput::with_pre_tool_permission(
                             "deny",
                             &format!(
                                 "🔒 VERIFICATION JAIL: Task(s) {task_list} require verification before you can continue.\n\n\
@@ -462,8 +459,7 @@ pub fn handle_pre_tool_use(
                             pending_merge_tasks.iter().map(|t| t.id.as_str()).collect();
                         let task_list = task_ids.join(", ");
 
-                        return Ok(HookOutput::with_permission_decision(
-                            "PreToolUse",
+                        return Ok(HookOutput::with_pre_tool_permission(
                             "deny",
                             &format!(
                                 "🔒 WORKTREE MERGE JAIL: Task(s) {task_list} require worktree merge before you can continue.\n\n\
@@ -548,8 +544,7 @@ pub fn handle_pre_tool_use(
                                                                             "{worktree_path}/{relative_path}"
                                                                         );
 
-                                                                        return Ok(HookOutput::with_permission_decision(
-                                                                        "PreToolUse",
+                                                                        return Ok(HookOutput::with_pre_tool_permission(
                                                                         "deny",
                                                                         &format!(
                                                                             "🌳 WORKTREE REDIRECT: You're working on epic [{}] \"{}\" which has a dedicated worktree.\n\n\
@@ -644,8 +639,7 @@ pub fn handle_pre_tool_use(
                     "cas: PreToolUse auto-approved {} on {} via rule {}",
                     tool_name, path, &rule.id
                 );
-                return Ok(HookOutput::with_permission_decision(
-                    "PreToolUse",
+                return Ok(HookOutput::with_pre_tool_permission(
                     "allow",
                     &format!("Auto-approved by rule {}: {}", rule.id, rule.preview(50)),
                 ));
@@ -660,8 +654,7 @@ pub fn handle_pre_tool_use(
                     "cas: PreToolUse auto-approved {} (safe tool) via rule {}",
                     tool_name, &rule.id
                 );
-                return Ok(HookOutput::with_permission_decision(
-                    "PreToolUse",
+                return Ok(HookOutput::with_pre_tool_permission(
                     "allow",
                     &format!("Auto-approved safe tool by rule {}", rule.id),
                 ));
@@ -677,8 +670,7 @@ pub fn handle_pre_tool_use(
             // Block access to protected files (e.g., .env files)
             for pattern in &protection.files {
                 if path.ends_with(pattern) || path.contains(&format!("/{pattern}")) {
-                    return Ok(HookOutput::with_permission_decision(
-                        "PreToolUse",
+                    return Ok(HookOutput::with_pre_tool_permission(
                         "deny",
                         &format!("Protected file: {pattern} files may contain secrets"),
                     ));
@@ -688,8 +680,7 @@ pub fn handle_pre_tool_use(
             // Block access to credential files
             for pattern in &protection.patterns {
                 if path.ends_with(pattern) || path.contains(pattern) {
-                    return Ok(HookOutput::with_permission_decision(
-                        "PreToolUse",
+                    return Ok(HookOutput::with_pre_tool_permission(
                         "deny",
                         "Protected file: may contain credentials or private keys",
                     ));

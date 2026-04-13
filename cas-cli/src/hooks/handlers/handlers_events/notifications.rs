@@ -50,8 +50,7 @@ pub fn handle_permission_request(
                     "cas: PermissionRequest auto-approved {} for task {}",
                     tool_name, &task.id
                 );
-                return Ok(HookOutput::with_permission_decision(
-                    "PermissionRequest",
+                return Ok(HookOutput::with_permission_request(
                     "allow",
                     &format!("Agent has claimed task: {}", task.title),
                 ));
@@ -70,8 +69,7 @@ pub fn handle_permission_request(
                     eprintln!(
                         "cas: PermissionRequest auto-approved {tool_name} on {path} (task context match)"
                     );
-                    return Ok(HookOutput::with_permission_decision(
-                        "PermissionRequest",
+                    return Ok(HookOutput::with_permission_request(
                         "allow",
                         &format!("File mentioned in claimed task: {}", task.title),
                     ));

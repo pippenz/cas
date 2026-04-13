@@ -194,7 +194,7 @@ pub fn handle_session_start(
     let output = if context.is_empty() {
         HookOutput::empty()
     } else {
-        HookOutput::with_context("SessionStart", context.clone())
+        HookOutput::with_session_start_context(context.clone())
     };
 
     // Record trace if dev mode is enabled

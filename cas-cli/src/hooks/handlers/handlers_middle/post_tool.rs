@@ -36,7 +36,7 @@ pub fn handle_post_tool_use(
     // When a file linked to a task or spec is modified, remind agent to check consistency
     if tool_name == "Write" || tool_name == "Edit" {
         if let Some(reminder) = check_ripple_consistency(&mut stores, input) {
-            return Ok(HookOutput::with_context("PostToolUse", reminder));
+            return Ok(HookOutput::with_post_tool_context(reminder));
         }
     }
 

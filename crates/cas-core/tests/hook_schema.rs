@@ -119,7 +119,7 @@ fn assert_hook_specific_keys_subset(
 #[test]
 fn pretooluse_permission_decision_output_schema() {
     // Shape: { hookEventName, permissionDecision, permissionDecisionReason }
-    let output = HookOutput::with_permission_decision("PreToolUse", "allow", "auto-approved");
+    let output = HookOutput::with_pre_tool_permission("allow", "auto-approved");
     let value = to_value(&output);
 
     assert_only_allowed_top_level(&value);
@@ -160,7 +160,7 @@ fn pretooluse_permission_decision_valid_enum() {
     // value we emit must round-trip as one of those — catch regressions that
     // introduce a misspelled / new variant.
     for decision in ["allow", "deny", "ask"] {
-        let output = HookOutput::with_permission_decision("PreToolUse", decision, "reason");
+        let output = HookOutput::with_pre_tool_permission(decision, "reason");
         let value = to_value(&output);
         let hso = hook_specific(&value, "PreToolUse.enum");
         assert_eq!(
@@ -174,10 +174,7 @@ fn pretooluse_permission_decision_valid_enum() {
 fn pretooluse_updated_input_output_schema() {
     // PreToolUse with_updated_input must carry updatedInput and nothing else
     // beyond hookEventName.
-    let output = HookOutput::with_updated_input(
-        "PreToolUse",
-        serde_json::json!({ "command": "ls -la" }),
-    );
+    let output = HookOutput::with_pre_tool_updated_input(serde_json::json!({ "command": "ls -la" }));
     let value = to_value(&output);
     assert_only_allowed_top_level(&value);
     let hso = hook_specific(&value, "PreToolUse.updatedInput");
@@ -199,7 +196,7 @@ fn userpromptsubmit_requires_additional_context() {
     // additionalContext is REQUIRED (per Claude Code schema) when emitting
     // hookSpecificOutput for UserPromptSubmit. with_context is the correct
     // builder; it must produce a non-null string.
-    let output = HookOutput::with_context("UserPromptSubmit", "recall: user prefers X".into());
+    let output = HookOutput::with_user_prompt_context("recall: user prefers X".into());
     let value = to_value(&output);
 
     assert_only_allowed_top_level(&value);
@@ -238,7 +235,7 @@ fn posttooluse_additional_context_optional_both_shapes_valid() {
     assert!(value.get("hookSpecificOutput").is_none());
 
     // Case B: PostToolUse with additionalContext — must be a valid shape.
-    let with_ctx = HookOutput::with_context("PostToolUse", "tool observation".into());
+    let with_ctx = HookOutput::with_post_tool_context("tool observation".into());
     let value = to_value(&with_ctx);
     assert_only_allowed_top_level(&value);
     let hso = hook_specific(&value, "PostToolUse.withContext");
@@ -283,7 +280,6 @@ fn stop_output_never_has_hook_specific_output() {
         (
             "block_stop_with_context",
             HookOutput::block_stop_with_context(
-                "Stop",
                 "keep working".into(),
                 "pending review context".into(),
             ),
@@ -308,7 +304,6 @@ fn stop_block_stop_with_context_routes_via_system_message() {
     // hookSpecificOutput.additionalContext — the entire output was rejected.
     // The correct path is `systemMessage` + `decision: block` + `reason`.
     let out = HookOutput::block_stop_with_context(
-        "Stop",
         "continue working on reviews".into(),
         "<system-reminder>2 learnings pending</system-reminder>".into(),
     );
@@ -396,7 +391,7 @@ fn stop_family_constructors_never_emit_hook_specific_output() {
         ("block_stop", HookOutput::block_stop("x".into())),
         (
             "block_stop_with_context",
-            HookOutput::block_stop_with_context("Stop", "x".into(), "y".into()),
+            HookOutput::block_stop_with_context("x".into(), "y".into()),
         ),
         ("blocking_error", HookOutput::blocking_error("x".into())),
     ];
@@ -417,7 +412,7 @@ fn stop_family_constructors_never_emit_hook_specific_output() {
 fn sessionstart_output_schema() {
     // SessionStart is one of the events that DOES accept hookSpecificOutput.
     // Shape: { hookEventName, additionalContext }.
-    let out = HookOutput::with_context("SessionStart", "CAS active: 3 open tasks".into());
+    let out = HookOutput::with_session_start_context("CAS active: 3 open tasks".into());
     let value = to_value(&out);
     assert_only_allowed_top_level(&value);
 
@@ -459,25 +454,21 @@ fn subagentstart_output_schema() {
     // handle_subagent_start currently returns empty(); cover the context path
     // too in case future logic attaches context. The key invariant is the
     // event name matches.
+    // SubagentStart has NO HookSpecificOutput variant — the typed enum makes
+    // it unrepresentable, mirroring the Stop-family rule. Any context for a
+    // SubagentStart hook routes through systemMessage instead.
     let out = HookOutput::empty();
     let value = to_value(&out);
     assert_only_allowed_top_level(&value);
     assert!(value.as_object().unwrap().is_empty());
 
-    let with_ctx = HookOutput::with_context("SubagentStart", "subagent role: reviewer".into());
-    let value = to_value(&with_ctx);
+    let with_msg = HookOutput::with_system_context("subagent role: reviewer".into());
+    let value = to_value(&with_msg);
     assert_only_allowed_top_level(&value);
-    let hso = hook_specific(&value, "SubagentStart");
-    // hookEventName must round-trip exactly — Claude Code's validator rejects
-    // hookSpecificOutput when the name disagrees with the event being handled.
+    assert!(value.get("hookSpecificOutput").is_none());
     assert_eq!(
-        hso.get("hookEventName").and_then(Value::as_str),
-        Some("SubagentStart")
-    );
-    assert!(
-        hso.get("additionalContext")
-            .and_then(Value::as_str)
-            .is_some_and(|s| !s.is_empty())
+        value.get("systemMessage").and_then(Value::as_str),
+        Some("subagent role: reviewer")
     );
 }
 
@@ -502,11 +493,7 @@ fn notification_output_schema() {
 #[test]
 fn permissionrequest_output_schema() {
     // PermissionRequest shares the PreToolUse shape for permission decisions.
-    let out = HookOutput::with_permission_decision(
-        "PermissionRequest",
-        "deny",
-        "blocked by policy",
-    );
+    let out = HookOutput::with_permission_request("deny", "blocked by policy");
     let value = to_value(&out);
     assert_only_allowed_top_level(&value);
     let hso = hook_specific(&value, "PermissionRequest");

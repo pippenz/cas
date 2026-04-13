@@ -123,21 +123,13 @@ pub fn handle_loop_iteration(
         }
     }
 
-    // Return output that blocks exit and injects the prompt.
-    // Using decision: "block" prevents Claude from stopping (Claude continues
-    // working) and the `reason` text is delivered to Claude. Stop hooks don't
-    // support hookSpecificOutput.additionalContext in Claude Code's schema, so
-    // we do NOT set hook_specific_output here — the iteration prompt goes
-    // through `reason`, and user-visible status through `system_message`.
-    Ok(HookOutput {
-        decision: Some("block".to_string()),
-        reason: Some(iteration_msg),
-        system_message: Some(format!(
-            "Loop iteration {} continuing",
-            active_loop.iteration
-        )),
-        ..Default::default()
-    })
+    // Block exit (decision=block + reason for Claude) and surface user-visible
+    // status via systemMessage. The named constructor enforces the Stop-family
+    // schema invariant — hookSpecificOutput is unrepresentable here by type.
+    Ok(HookOutput::block_stop_with_context(
+        iteration_msg,
+        format!("Loop iteration {} continuing", active_loop.iteration),
+    ))
 }
 
 /// Default limit for learnings shown in review context

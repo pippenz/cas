@@ -476,7 +476,6 @@ pub fn handle_stop(input: &HookInput, cas_root: Option<&Path>) -> Result<HookOut
         if let Some(review_context) = build_learning_review_context(store.as_ref(), &config) {
             eprintln!("cas: Blocking stop - unreviewed learnings need review");
             return Ok(HookOutput::block_stop_with_context(
-                "Stop",
                 "You have unreviewed learnings that should be analyzed. Please spawn a learning-reviewer subagent to process them before stopping.".to_string(),
                 review_context,
             ));
@@ -487,7 +486,6 @@ pub fn handle_stop(input: &HookInput, cas_root: Option<&Path>) -> Result<HookOut
             if let Some(review_context) = build_rule_review_context(rule_store.as_ref(), &config) {
                 eprintln!("cas: Blocking stop - draft rules need review");
                 return Ok(HookOutput::block_stop_with_context(
-                    "Stop",
                     "You have draft rules that should be reviewed. Please spawn a rule-reviewer subagent to process them before stopping.".to_string(),
                     review_context,
                 ));
@@ -498,7 +496,6 @@ pub fn handle_stop(input: &HookInput, cas_root: Option<&Path>) -> Result<HookOut
         if let Some(cleanup_context) = build_duplicate_detection_context(store.as_ref(), &config) {
             eprintln!("cas: Blocking stop - duplicate detection recommended");
             return Ok(HookOutput::block_stop_with_context(
-                "Stop",
                 "You have accumulated many entries that may contain duplicates. Please spawn a duplicate-detector subagent to consolidate them before stopping.".to_string(),
                 cleanup_context,
             ));
@@ -510,7 +507,6 @@ pub fn handle_stop(input: &HookInput, cas_root: Option<&Path>) -> Result<HookOut
         {
             eprintln!("cas: Blocking stop - session summary required");
             return Ok(HookOutput::block_stop_with_context(
-                "Stop",
                 "Session summary generation is enabled. Please spawn a session-summarizer subagent to create a summary before stopping.".to_string(),
                 summary_context,
             ));

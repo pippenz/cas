@@ -98,31 +98,77 @@ pub struct HookOutput {
     pub hook_specific_output: Option<HookSpecificOutput>,
 }
 
-/// Hook-specific output variants
+/// Hook-specific output — tagged by the event it belongs to.
+///
+/// Each variant models one of the events that Claude Code's schema permits on
+/// `hookSpecificOutput`. Events that the schema *forbids* here
+/// (Stop / SubagentStop / PreCompact / SessionEnd / SubagentStart /
+/// Notification) intentionally have NO variant — it is a compile-time error
+/// to construct one. Those events route context through
+/// `HookOutput::system_message` instead.
+///
+/// The doc-tests below are the type-system regression guard. They use the
+/// `Variant { .. }` shape so a compile failure can ONLY mean "no variant named
+/// X" — a false pass via wrong-field-name is not possible. (rustdoc
+/// compile_fail only asserts *some* compile error fires; the shape below
+/// leaves no other failure mode.)
+///
+/// ```compile_fail
+/// use cas_core::hooks::HookSpecificOutput;
+/// let _: HookSpecificOutput = HookSpecificOutput::Stop { .. };
+/// ```
+///
+/// ```compile_fail
+/// use cas_core::hooks::HookSpecificOutput;
+/// let _: HookSpecificOutput = HookSpecificOutput::SubagentStop { .. };
+/// ```
+///
+/// ```compile_fail
+/// use cas_core::hooks::HookSpecificOutput;
+/// let _: HookSpecificOutput = HookSpecificOutput::PreCompact { .. };
+/// ```
+///
+/// ```compile_fail
+/// use cas_core::hooks::HookSpecificOutput;
+/// let _: HookSpecificOutput = HookSpecificOutput::SessionEnd { .. };
+/// ```
 #[derive(Debug, Clone, Serialize)]
-pub struct HookSpecificOutput {
-    /// Hook event name (must match input)
-    #[serde(rename = "hookEventName")]
-    pub hook_event_name: String,
-
-    /// Additional context to inject (SessionStart, UserPromptSubmit)
-    #[serde(skip_serializing_if = "Option::is_none", rename = "additionalContext")]
-    pub additional_context: Option<String>,
-
-    /// Permission decision (PreToolUse only)
-    #[serde(skip_serializing_if = "Option::is_none", rename = "permissionDecision")]
-    pub permission_decision: Option<String>,
-
-    /// Reason for permission decision
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        rename = "permissionDecisionReason"
-    )]
-    pub permission_decision_reason: Option<String>,
-
-    /// Modified input (PreToolUse only)
-    #[serde(skip_serializing_if = "Option::is_none", rename = "updatedInput")]
-    pub updated_input: Option<serde_json::Value>,
+#[serde(tag = "hookEventName")]
+pub enum HookSpecificOutput {
+    PreToolUse {
+        #[serde(rename = "permissionDecision", skip_serializing_if = "Option::is_none")]
+        permission_decision: Option<String>,
+        #[serde(
+            rename = "permissionDecisionReason",
+            skip_serializing_if = "Option::is_none"
+        )]
+        permission_decision_reason: Option<String>,
+        #[serde(rename = "updatedInput", skip_serializing_if = "Option::is_none")]
+        updated_input: Option<serde_json::Value>,
+    },
+    UserPromptSubmit {
+        /// Required by Claude Code's schema — a UserPromptSubmit
+        /// hookSpecificOutput without `additionalContext` is rejected.
+        #[serde(rename = "additionalContext")]
+        additional_context: String,
+    },
+    PostToolUse {
+        #[serde(rename = "additionalContext", skip_serializing_if = "Option::is_none")]
+        additional_context: Option<String>,
+    },
+    SessionStart {
+        #[serde(rename = "additionalContext")]
+        additional_context: String,
+    },
+    PermissionRequest {
+        #[serde(rename = "permissionDecision")]
+        permission_decision: String,
+        #[serde(
+            rename = "permissionDecisionReason",
+            skip_serializing_if = "Option::is_none"
+        )]
+        permission_decision_reason: Option<String>,
+    },
 }
 
 impl HookOutput {
@@ -131,24 +177,96 @@ impl HookOutput {
         Self::default()
     }
 
-    /// Create output with context injection
-    ///
-    /// Only valid for PreToolUse, UserPromptSubmit, PostToolUse — these are the
-    /// only events that accept `hookSpecificOutput.additionalContext` in Claude
-    /// Code's schema. For Stop / SubagentStop / PreCompact / SessionEnd use
-    /// [`with_system_context`] instead (routes via `systemMessage`).
-    pub fn with_context(event_name: &str, context: String) -> Self {
+    // ---- Typed builders for hookSpecificOutput ---------------------------
+    //
+    // One builder per schema-valid (event, shape) pair. The string-keyed
+    // `with_context` / `with_permission_decision` / `with_updated_input` that
+    // existed before the enum refactor are intentionally gone: a runtime
+    // string argument cannot be validated against the schema at the call site,
+    // which is exactly the hole baa540b fell through. Each builder below is
+    // callable only for events whose schema allows the shape it produces.
+
+    /// UserPromptSubmit hookSpecificOutput — `additionalContext` is required.
+    pub fn with_user_prompt_context(context: String) -> Self {
         Self {
-            hook_specific_output: Some(HookSpecificOutput {
-                hook_event_name: event_name.to_string(),
+            hook_specific_output: Some(HookSpecificOutput::UserPromptSubmit {
+                additional_context: context,
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// PostToolUse hookSpecificOutput — `additionalContext` is optional.
+    pub fn with_post_tool_context(context: String) -> Self {
+        Self {
+            hook_specific_output: Some(HookSpecificOutput::PostToolUse {
                 additional_context: Some(context),
-                permission_decision: None,
-                permission_decision_reason: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// SessionStart hookSpecificOutput — `additionalContext` injects into the
+    /// agent's context window.
+    pub fn with_session_start_context(context: String) -> Self {
+        Self {
+            hook_specific_output: Some(HookSpecificOutput::SessionStart {
+                additional_context: context,
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// PreToolUse permission decision. `decision` must be `"allow"`, `"deny"`,
+    /// or `"ask"` per Claude Code's schema. TODO(cas-e55b follow-up): tighten
+    /// `decision: &str` to a typed `PermissionDecision` enum so invalid values
+    /// fail to compile. Current callers all pass string literals so the
+    /// migration is trivial; deferred from the enum refactor to keep that diff
+    /// focused.
+    pub fn with_pre_tool_permission(decision: &str, reason: &str) -> Self {
+        Self {
+            hook_specific_output: Some(HookSpecificOutput::PreToolUse {
+                permission_decision: Some(decision.to_string()),
+                permission_decision_reason: Some(reason.to_string()),
                 updated_input: None,
             }),
             ..Default::default()
         }
     }
+
+    /// PreToolUse with a modified tool input. Claude Code applies the updated
+    /// input in place of the original before the tool runs.
+    pub fn with_pre_tool_updated_input(updated_input: serde_json::Value) -> Self {
+        Self {
+            hook_specific_output: Some(HookSpecificOutput::PreToolUse {
+                permission_decision: None,
+                permission_decision_reason: None,
+                updated_input: Some(updated_input),
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// PermissionRequest decision — `decision` is `"allow"` / `"deny"` /
+    /// `"ask"`.
+    ///
+    /// Note: `permissionDecision` appears both at the top level of HookOutput
+    /// (universal schema field) and inside hookSpecificOutput for
+    /// PermissionRequest. Claude Code reads the hookSpecificOutput form for
+    /// PermissionRequest events; the top-level field is for other event
+    /// surfaces. This builder writes the hookSpecificOutput form only, which
+    /// matches historical behavior from before the enum refactor.
+    pub fn with_permission_request(decision: &str, reason: &str) -> Self {
+        Self {
+            hook_specific_output: Some(HookSpecificOutput::PermissionRequest {
+                permission_decision: decision.to_string(),
+                permission_decision_reason: Some(reason.to_string()),
+            }),
+            ..Default::default()
+        }
+    }
+
+    // ---- Non-hookSpecificOutput builders ---------------------------------
 
     /// Create output that injects context via `systemMessage` for events that
     /// don't support `hookSpecificOutput.additionalContext` (Stop, SubagentStop,
@@ -179,45 +297,16 @@ impl HookOutput {
         }
     }
 
-    /// Create output that blocks Stop and also injects context
+    /// Create output that blocks Stop and also injects context.
     ///
-    /// Note: Stop hooks don't support hookSpecificOutput in Claude Code's schema.
-    /// Context is passed via systemMessage instead.
-    pub fn block_stop_with_context(_event_name: &str, reason: String, context: String) -> Self {
+    /// Stop-family events must route context through `systemMessage`, never
+    /// through hookSpecificOutput. The typed enum makes the latter
+    /// unrepresentable; this helper makes the former easy.
+    pub fn block_stop_with_context(reason: String, context: String) -> Self {
         Self {
             decision: Some("block".to_string()),
             reason: Some(reason),
             system_message: Some(context),
-            ..Default::default()
-        }
-    }
-
-    /// Create output with permission decision (for PreToolUse/PermissionRequest)
-    ///
-    /// Use "allow" to auto-approve, "deny" to block, or return empty() to ask user.
-    pub fn with_permission_decision(event_name: &str, decision: &str, reason: &str) -> Self {
-        Self {
-            hook_specific_output: Some(HookSpecificOutput {
-                hook_event_name: event_name.to_string(),
-                additional_context: None,
-                permission_decision: Some(decision.to_string()),
-                permission_decision_reason: Some(reason.to_string()),
-                updated_input: None,
-            }),
-            ..Default::default()
-        }
-    }
-
-    /// Create output with modified tool input (for PreToolUse)
-    pub fn with_updated_input(event_name: &str, updated_input: serde_json::Value) -> Self {
-        Self {
-            hook_specific_output: Some(HookSpecificOutput {
-                hook_event_name: event_name.to_string(),
-                additional_context: None,
-                permission_decision: None,
-                permission_decision_reason: None,
-                updated_input: Some(updated_input),
-            }),
             ..Default::default()
         }
     }
@@ -260,7 +349,7 @@ mod tests {
 
     #[test]
     fn test_hook_output_serialization() {
-        let output = HookOutput::with_context("SessionStart", "Test context".to_string());
+        let output = HookOutput::with_session_start_context("Test context".to_string());
         let json = serde_json::to_string(&output).unwrap();
 
         assert!(json.contains("hookSpecificOutput"));
@@ -327,6 +416,90 @@ mod tests {
         assert!(
             json.contains("\"reason\":\"Continue working"),
             "Expected reason but got: {json}"
+        );
+    }
+
+    #[test]
+    fn pretooluse_serializes_with_event_tag() {
+        // The #[serde(tag = "hookEventName")] directive must produce the same
+        // wire shape the old flat-struct code emitted: hookEventName as a
+        // sibling key inside the hookSpecificOutput object, alongside the
+        // permission fields.
+        let out = HookOutput::with_pre_tool_permission("allow", "ok");
+        let json = serde_json::to_string(&out).unwrap();
+        assert_eq!(
+            json,
+            r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","permissionDecisionReason":"ok"}}"#,
+            "PreToolUse wire shape regressed: {json}"
+        );
+    }
+
+    #[test]
+    fn userpromptsubmit_serializes_with_event_tag() {
+        let out = HookOutput::with_user_prompt_context("ctx".into());
+        let json = serde_json::to_string(&out).unwrap();
+        assert_eq!(
+            json,
+            r#"{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"ctx"}}"#,
+            "UserPromptSubmit wire shape regressed: {json}"
+        );
+    }
+
+    #[test]
+    fn posttooluse_serializes_with_event_tag() {
+        // PostToolUse's additionalContext is Option — when present it emits
+        // the field, when None it must be ABSENT (not `"additionalContext":null`)
+        // per `skip_serializing_if = "Option::is_none"`.
+        let with_ctx = HookOutput::with_post_tool_context("ripple reminder".into());
+        let json = serde_json::to_string(&with_ctx).unwrap();
+        assert_eq!(
+            json,
+            r#"{"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":"ripple reminder"}}"#,
+            "PostToolUse wire shape regressed: {json}"
+        );
+    }
+
+    #[test]
+    fn sessionstart_serializes_with_event_tag() {
+        let out = HookOutput::with_session_start_context("CAS active: 3 tasks".into());
+        let json = serde_json::to_string(&out).unwrap();
+        assert_eq!(
+            json,
+            r#"{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"CAS active: 3 tasks"}}"#,
+            "SessionStart wire shape regressed: {json}"
+        );
+    }
+
+    #[test]
+    fn pretooluse_skips_missing_optional_fields() {
+        // Guard against serde enum-tagging regression: fields with
+        // skip_serializing_if must still be omitted (not null) inside a
+        // tagged-enum variant. Old flat-struct code had this behavior;
+        // regressing would introduce stray null keys that validators reject.
+        let with_input = HookOutput::with_pre_tool_updated_input(serde_json::json!({"x": 1}));
+        let json = serde_json::to_string(&with_input).unwrap();
+        assert!(
+            !json.contains("null"),
+            "PreToolUse updated-input output must not serialize any null-valued key: {json}"
+        );
+        assert!(
+            !json.contains("permissionDecision"),
+            "with_pre_tool_updated_input must not emit permissionDecision key: {json}"
+        );
+    }
+
+    #[test]
+    fn permissionrequest_serializes_with_event_tag() {
+        // PermissionRequest's permissionDecision lives INSIDE hookSpecificOutput
+        // (per Claude Code's PermissionRequest event surface), not at the top
+        // level. The top-level `permissionDecision` field on HookOutput is for
+        // separate event surfaces and is not set here. Confirms no shadow.
+        let out = HookOutput::with_permission_request("deny", "blocked");
+        let json = serde_json::to_string(&out).unwrap();
+        assert_eq!(
+            json,
+            r#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","permissionDecision":"deny","permissionDecisionReason":"blocked"}}"#,
+            "PermissionRequest wire shape regressed: {json}"
         );
     }
 }

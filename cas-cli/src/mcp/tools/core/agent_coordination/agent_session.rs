@@ -118,10 +118,26 @@ impl CasCore {
             data: None,
         })?;
 
-        let context = output
-            .hook_specific_output
-            .and_then(|o| o.additional_context)
-            .filter(|c| !c.is_empty())
+        // SessionStart is the only variant handle_session_start can legitimately
+        // produce on its context-injection path. Match exhaustively so the
+        // compiler forces a decision if a new variant is ever added — a
+        // wildcard `_` arm here would silently drop context on a future
+        // mis-wire, which is exactly the class of bug cas-e55b was meant to
+        // eliminate.
+        use crate::hooks::HookSpecificOutput;
+        let context = match output.hook_specific_output {
+            Some(HookSpecificOutput::SessionStart { additional_context }) => Some(additional_context),
+            // None variants below are unreachable in practice (handle_session_start
+            // never emits these shapes), but pattern-matching them explicitly
+            // makes the invariant load-bearing on the type system rather than on
+            // a comment.
+            Some(HookSpecificOutput::PreToolUse { .. })
+            | Some(HookSpecificOutput::UserPromptSubmit { .. })
+            | Some(HookSpecificOutput::PostToolUse { .. })
+            | Some(HookSpecificOutput::PermissionRequest { .. })
+            | None => None,
+        }
+        .filter(|c| !c.is_empty())
             .unwrap_or_else(|| {
                 build_context(&input, req.limit.unwrap_or(5), &self.cas_root)
                     .unwrap_or_else(|_| String::new())
