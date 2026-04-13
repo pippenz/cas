@@ -160,6 +160,23 @@ pub struct CloudConfig {
 
     /// Last sync timestamp for skills
     pub last_skill_sync: Option<String>,
+
+    /// Whether the factory daemon should spawn its live-stream WebSocket
+    /// client (phone-home / relay / pane-watch).
+    ///
+    /// Default: `false`. The client targets a Phoenix-framework WebSocket
+    /// endpoint (`/socket/websocket`) that the current Next.js cloud backend
+    /// does not implement and cannot host on Vercel. Leaving the client off
+    /// by default avoids the 10-retry 404 storm (~4 min of log noise per
+    /// factory session) that cas-4244 documented.
+    ///
+    /// Re-enable by setting this field to `true` in `.cas/cloud.json` once a
+    /// Phoenix-capable backend is reachable (e.g. when the Hetzner Slack
+    /// bridge is re-deployed — see `project_claude_code_account_banned`).
+    /// The REST-based cloud syncer (`cas-cli/src/cloud/syncer/`) is
+    /// independent of this flag and always runs when logged in.
+    #[serde(default)]
+    pub factory_cloud_client_enabled: bool,
 }
 
 fn default_endpoint() -> String {
@@ -183,6 +200,7 @@ impl Default for CloudConfig {
             last_task_sync: None,
             last_rule_sync: None,
             last_skill_sync: None,
+            factory_cloud_client_enabled: false,
         }
     }
 }

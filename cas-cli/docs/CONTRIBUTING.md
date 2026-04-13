@@ -1,5 +1,30 @@
 # Contributing to CAS
 
+## Factory cloud client (disabled by default)
+
+The factory daemon ships with a live-stream WebSocket client
+(`cas-cli/src/ui/factory/daemon/cloud_client.rs`) that pushes factory state,
+events, and pane output to a Phoenix-framework endpoint
+(`/socket/websocket`). That endpoint is **not** implemented on the current
+cloud backend (petra-stella-cloud is Next.js on Vercel, which can't host
+long-lived Phoenix channels) and the feature it fronts — the Hetzner Slack
+bridge / web terminal — is paused (see `project_claude_code_account_banned`).
+
+The client is therefore gated behind a config flag and **disabled by
+default**. Flip it on in `.cas/cloud.json`:
+
+```json
+{
+  "endpoint": "https://your-phoenix-capable-host",
+  "token": "…",
+  "factory_cloud_client_enabled": true
+}
+```
+
+Re-enable only when a Phoenix-capable backend is reachable. The REST-based
+cloud syncer (`cas-cli/src/cloud/syncer/`) is independent of this flag and
+always runs when logged in.
+
 ## Canonical install path
 
 CAS must be installed to **one** location: `~/.local/bin/cas`. Any other

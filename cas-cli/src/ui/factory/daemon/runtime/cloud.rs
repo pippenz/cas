@@ -1,23 +1,35 @@
+use crate::cloud::CloudConfig;
 use crate::ui::factory::daemon::FactoryDaemon;
 use crate::ui::factory::daemon::cloud_client::{CloudClientHandle, serialize_factory_state};
 use crate::ui::factory::director::DirectorEvent;
 use std::path::Path;
 
+/// Decide whether to spawn the factory live-stream WebSocket client for the
+/// given cloud config. Returns `false` when the user is not logged in or when
+/// the factory cloud client is disabled in `.cas/cloud.json`.
+///
+/// Extracted from [`FactoryDaemon::try_start_cloud_client`] so it can be unit
+/// tested without touching the filesystem.
+pub(crate) fn should_spawn_cloud_client(cfg: &CloudConfig) -> bool {
+    if !cfg.is_logged_in() {
+        return false;
+    }
+    cfg.factory_cloud_client_enabled
+}
+
 impl FactoryDaemon {
     /// Try to start the cloud phone-home client.
     ///
     /// Reads CloudConfig (for endpoint + token) and DeviceConfig (for device_id).
-    /// Returns None if not authenticated or on any error (phone-home is best-effort).
+    /// Returns None if not authenticated, if the factory cloud client is
+    /// disabled in `.cas/cloud.json` (the default — see cas-4244), or on any
+    /// error (phone-home is best-effort).
     pub(crate) fn try_start_cloud_client(session_name: &str) -> Option<CloudClientHandle> {
-        use crate::cloud::{CloudConfig, DeviceConfig};
+        use crate::cloud::DeviceConfig;
         use crate::ui::factory::daemon::cloud_client::{self, CloudClientConfig};
 
         let cloud_config = match CloudConfig::load() {
-            Ok(c) if c.is_logged_in() => c,
-            Ok(_) => {
-                tracing::info!("Cloud phone-home skipped: not logged in");
-                return None;
-            }
+            Ok(c) => c,
             Err(e) => {
                 tracing::debug!(
                     "Cloud phone-home skipped: failed to load cloud config: {}",
@@ -26,6 +38,17 @@ impl FactoryDaemon {
                 return None;
             }
         };
+
+        if !cloud_config.is_logged_in() {
+            tracing::info!("Cloud phone-home skipped: not logged in");
+            return None;
+        }
+        if !cloud_config.factory_cloud_client_enabled {
+            tracing::info!(
+                "factory cloud client disabled (set factory_cloud_client_enabled=true in .cas/cloud.json to re-enable — see cas-4244)"
+            );
+            return None;
+        }
 
         let token = cloud_config.token.unwrap_or_default();
         let endpoint = cloud_config.endpoint;
@@ -211,4 +234,70 @@ fn upload_single_recording(
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn logged_in_config() -> CloudConfig {
+        CloudConfig {
+            token: Some("t".to_string()),
+            ..CloudConfig::default()
+        }
+    }
+
+    #[test]
+    fn default_config_does_not_spawn() {
+        // Fresh install: not logged in AND flag off. Don't spawn.
+        assert!(!should_spawn_cloud_client(&CloudConfig::default()));
+    }
+
+    #[test]
+    fn logged_in_but_flag_off_does_not_spawn() {
+        // cas-4244: even authenticated users must not spawn the WS client
+        // while the endpoint returns 404. This is the common case today.
+        let cfg = logged_in_config();
+        assert!(!cfg.factory_cloud_client_enabled);
+        assert!(!should_spawn_cloud_client(&cfg));
+    }
+
+    #[test]
+    fn logged_in_and_flag_on_spawns() {
+        let cfg = CloudConfig {
+            factory_cloud_client_enabled: true,
+            ..logged_in_config()
+        };
+        assert!(should_spawn_cloud_client(&cfg));
+    }
+
+    #[test]
+    fn flag_on_but_not_logged_in_does_not_spawn() {
+        // Anonymous users must never spawn, even if the flag is flipped on —
+        // the WS client needs a token.
+        let cfg = CloudConfig {
+            factory_cloud_client_enabled: true,
+            token: None,
+            ..CloudConfig::default()
+        };
+        assert!(!should_spawn_cloud_client(&cfg));
+    }
+
+    #[test]
+    fn flag_persists_through_serde() {
+        // Roundtripping through JSON (the on-disk form) must preserve the
+        // flag, and a cloud.json written before this field existed must
+        // deserialize cleanly with the flag defaulted off.
+        let cfg = CloudConfig {
+            factory_cloud_client_enabled: true,
+            ..logged_in_config()
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let roundtripped: CloudConfig = serde_json::from_str(&json).unwrap();
+        assert!(roundtripped.factory_cloud_client_enabled);
+
+        let legacy = r#"{"endpoint":"https://cas.dev","token":"t"}"#;
+        let parsed: CloudConfig = serde_json::from_str(legacy).unwrap();
+        assert!(!parsed.factory_cloud_client_enabled);
+    }
 }
