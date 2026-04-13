@@ -132,6 +132,11 @@ impl HookOutput {
     }
 
     /// Create output with context injection
+    ///
+    /// Only valid for PreToolUse, UserPromptSubmit, PostToolUse — these are the
+    /// only events that accept `hookSpecificOutput.additionalContext` in Claude
+    /// Code's schema. For Stop / SubagentStop / PreCompact / SessionEnd use
+    /// [`with_system_context`] instead (routes via `systemMessage`).
     pub fn with_context(event_name: &str, context: String) -> Self {
         Self {
             hook_specific_output: Some(HookSpecificOutput {
@@ -141,6 +146,16 @@ impl HookOutput {
                 permission_decision_reason: None,
                 updated_input: None,
             }),
+            ..Default::default()
+        }
+    }
+
+    /// Create output that injects context via `systemMessage` for events that
+    /// don't support `hookSpecificOutput.additionalContext` (Stop, SubagentStop,
+    /// PreCompact, SessionEnd).
+    pub fn with_system_context(context: String) -> Self {
+        Self {
+            system_message: Some(context),
             ..Default::default()
         }
     }

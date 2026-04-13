@@ -34,8 +34,6 @@ pub fn handle_loop_iteration(
     loop_store: std::sync::Arc<dyn crate::store::LoopStore>,
     active_loop: &mut crate::types::Loop,
 ) -> Result<HookOutput, MemError> {
-    use crate::hooks::types::HookSpecificOutput;
-
     // Check for completion promise in transcript
     if let Some(ref promise) = active_loop.completion_promise {
         if let Some(ref transcript_path) = input.transcript_path {
@@ -125,22 +123,19 @@ pub fn handle_loop_iteration(
         }
     }
 
-    // Return output that blocks exit and injects the prompt
-    // Using decision: "block" prevents Claude from stopping (Claude continues working)
+    // Return output that blocks exit and injects the prompt.
+    // Using decision: "block" prevents Claude from stopping (Claude continues
+    // working) and the `reason` text is delivered to Claude. Stop hooks don't
+    // support hookSpecificOutput.additionalContext in Claude Code's schema, so
+    // we do NOT set hook_specific_output here — the iteration prompt goes
+    // through `reason`, and user-visible status through `system_message`.
     Ok(HookOutput {
         decision: Some("block".to_string()),
-        reason: Some(iteration_msg.clone()),
+        reason: Some(iteration_msg),
         system_message: Some(format!(
             "Loop iteration {} continuing",
             active_loop.iteration
         )),
-        hook_specific_output: Some(HookSpecificOutput {
-            hook_event_name: "Stop".to_string(),
-            additional_context: Some(iteration_msg),
-            permission_decision: None,
-            permission_decision_reason: None,
-            updated_input: None,
-        }),
         ..Default::default()
     })
 }

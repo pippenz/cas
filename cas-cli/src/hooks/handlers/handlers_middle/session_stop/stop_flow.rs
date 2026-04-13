@@ -532,9 +532,13 @@ pub fn handle_stop(input: &HookInput, cas_root: Option<&Path>) -> Result<HookOut
     clear_session_files(cas_root);
     let _ = std::fs::remove_file(cas_root.join(".verifier_unjail_marker"));
 
-    // Return codemap reminder as context if present, otherwise empty
+    // Return codemap reminder as context if present, otherwise empty.
+    // Stop hooks don't support hookSpecificOutput.additionalContext in Claude
+    // Code's schema — route via systemMessage instead.
     if let Some(reminder) = codemap_reminder {
-        Ok(HookOutput::with_context("Stop", format!("<system-reminder>{reminder}</system-reminder>")))
+        Ok(HookOutput::with_system_context(format!(
+            "<system-reminder>{reminder}</system-reminder>"
+        )))
     } else {
         Ok(HookOutput::empty())
     }
