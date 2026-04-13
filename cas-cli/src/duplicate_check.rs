@@ -7,23 +7,64 @@
 //! duplicates with different mtimes are found.
 //!
 //! Gating (see [`should_run`]):
-//! * Skipped for `hook`, `serve`, and `factory` subcommands — they must stay
-//!   silent per `feedback_hook_performance`.
+//! * Skipped for `hook`, `serve`, `factory`, and `bridge` subcommands — they
+//!   must stay silent per `feedback_hook_performance`.
+//! * Skipped when no user-visible subcommand is present and factory-launch
+//!   flags (`--new`, `--workers`, etc.) are — the factory alias rewrite in
+//!   `main.rs` injects the `factory` token after this check runs, so the gate
+//!   must spot the alias on its own.
 //! * Skipped when stderr is not a TTY unless `CAS_WARN_DUPLICATES=1`.
 //! * Unconditionally silenced when `CAS_SUPPRESS_DUPLICATE_WARNING=1`.
+//!
+//! Env var semantics: both `CAS_WARN_DUPLICATES` and `CAS_SUPPRESS_DUPLICATE_WARNING`
+//! require a truthy value (non-empty and not `"0"` / `"false"`). Setting them
+//! to `0` or an empty string does **not** enable the gate.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-/// Subcommands that must stay silent (hooks, long-running servers, factory TUI).
-const QUIET_SUBCOMMANDS: &[&str] = &["hook", "serve", "factory"];
+/// Subcommands that must stay silent (hooks, long-running servers, factory TUI,
+/// Slack bridge daemon).
+const QUIET_SUBCOMMANDS: &[&str] = &["hook", "serve", "factory", "bridge"];
+
+/// Flags that imply factory launch without an explicit `factory` subcommand
+/// token (see `main::maybe_rewrite_factory_args`).
+const FACTORY_LAUNCH_FLAGS: &[&str] = &[
+    "--new",
+    "--workers",
+    "-w",
+    "--name",
+    "-n",
+    "--no-worktrees",
+    "--worktree-root",
+    "--tabbed",
+    "--record",
+    "--legacy",
+];
+
+/// Read a boolean-ish env var. Returns `true` when the var is set to a value
+/// that is neither empty nor `"0"` / `"false"`. Plain `is_some()` would treat
+/// `FOO=0` as "set" and force the feature on, contradicting the docs.
+fn env_flag(name: &str) -> bool {
+    let Some(raw) = std::env::var_os(name) else {
+        return false;
+    };
+    let Some(s) = raw.to_str() else {
+        // Non-UTF-8 content. Treat any non-empty exotic value as truthy.
+        return !raw.is_empty();
+    };
+    match s.trim() {
+        "" | "0" | "false" | "FALSE" | "False" => false,
+        _ => true,
+    }
+}
 
 /// Decide whether the duplicate check should run for this invocation.
 ///
 /// `args` is the full argv (including argv[0]).
 pub fn should_run(args: &[String]) -> bool {
-    if std::env::var_os("CAS_SUPPRESS_DUPLICATE_WARNING").is_some() {
+    if env_flag("CAS_SUPPRESS_DUPLICATE_WARNING") {
         return false;
     }
 
@@ -32,10 +73,15 @@ pub fn should_run(args: &[String]) -> bool {
         if QUIET_SUBCOMMANDS.contains(&sub.as_str()) {
             return false;
         }
+    } else if contains_factory_launch_flag(args) {
+        // No subcommand token but factory-launch flags present: `cas --new -w4`
+        // will be rewritten to `cas factory --new -w4` after this check. Treat
+        // it as the factory subcommand for gating purposes.
+        return false;
     }
 
     // Force-on override bypasses the TTY gate.
-    if std::env::var_os("CAS_WARN_DUPLICATES").is_some() {
+    if env_flag("CAS_WARN_DUPLICATES") {
         return true;
     }
 
@@ -51,6 +97,20 @@ fn first_subcommand(args: &[String]) -> Option<String> {
         return Some(token.clone());
     }
     None
+}
+
+/// True when argv (past argv[0]) contains a factory-launch flag. Kept
+/// deliberately narrow — mirrors `main::contains_factory_launch_flag` only for
+/// the subset of flags that can appear without an explicit subcommand.
+fn contains_factory_launch_flag(args: &[String]) -> bool {
+    args.iter().skip(1).any(|t| {
+        FACTORY_LAUNCH_FLAGS.contains(&t.as_str())
+            || t.starts_with("--workers=")
+            || t.starts_with("--name=")
+            || t.starts_with("--worktree-root=")
+            || (t.starts_with("-w") && t.len() > 2)
+            || (t.starts_with("-n") && t.len() > 2)
+    })
 }
 
 #[cfg(unix)]
@@ -73,7 +133,8 @@ pub fn find_cas_binaries_on_path() -> Vec<PathBuf> {
         None => return Vec::new(),
     };
 
-    let mut seen: Vec<PathBuf> = Vec::new();
+    let mut seen_user_visible: Vec<PathBuf> = Vec::new();
+    let mut seen_canonical: Vec<PathBuf> = Vec::new();
     for dir in std::env::split_paths(&path_var) {
         if dir.as_os_str().is_empty() {
             continue;
@@ -83,24 +144,13 @@ pub fn find_cas_binaries_on_path() -> Vec<PathBuf> {
             continue;
         }
         let canonical = std::fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone());
-        // Fast path: if a previously-seen user-visible path already matches the
-        // canonical form, skip without re-canonicalising the whole `seen` list.
-        if seen.iter().any(|p| p == &canonical) {
+        if seen_canonical.iter().any(|c| c == &canonical) {
             continue;
         }
-        // Slow path: dedupe via canonicalisation so `/usr/bin/cas -> /usr/local/bin/cas`
-        // is not double-counted. Store the original user-visible path for warnings.
-        if seen.iter().all(|p| {
-            std::fs::canonicalize(p)
-                .ok()
-                .as_deref()
-                .map(|c| c != canonical)
-                .unwrap_or(true)
-        }) {
-            seen.push(candidate);
-        }
+        seen_canonical.push(canonical);
+        seen_user_visible.push(candidate);
     }
-    seen
+    seen_user_visible
 }
 
 fn is_executable_file(p: &Path) -> bool {
@@ -150,9 +200,16 @@ impl DuplicateWarning {
 
 /// Given a list of `cas` binaries on PATH and the active binary path, build a
 /// warning if any of the others have an mtime that differs from the active one.
-/// Returns `None` if only one binary exists or all mtimes match.
+/// Returns `None` if only one binary exists, all mtimes match, or the active
+/// binary is not present on PATH (we can't tell which copy is "correct").
 pub fn build_warning(binaries: &[PathBuf], active: &Path) -> Option<DuplicateWarning> {
     if binaries.len() < 2 {
+        return None;
+    }
+    // Don't emit a misleading "stale" list when the running binary was
+    // launched from outside PATH — we have no ground truth to pick the active
+    // one against.
+    if !binaries.iter().any(|b| same_path(b, active)) {
         return None;
     }
     let active_mtime = mtime_of(active)?;
@@ -213,34 +270,121 @@ pub fn check_and_warn(args: &[String]) {
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::Mutex;
     use std::time::{Duration, SystemTime};
 
-    #[test]
-    fn should_run_skips_hook_subcommand() {
-        let args = vec!["cas".to_string(), "hook".to_string(), "PreToolUse".to_string()];
-        // Even if a TTY would say yes, the subcommand veto wins.
-        // Force-enable via env to isolate the subcommand gate.
-        // SAFETY: test-only single-threaded env write.
-        unsafe {
-            std::env::set_var("CAS_WARN_DUPLICATES", "1");
-            std::env::remove_var("CAS_SUPPRESS_DUPLICATE_WARNING");
+    /// Serialize all tests that mutate process-wide env vars. cargo test runs
+    /// tests in parallel by default; without this lock, env writes from one
+    /// test can leak into another and mask or fabricate failures (see
+    /// `bugfix_test_env_leak`).
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Guard that clears the two gate env vars on drop so a test failure can't
+    /// leave residue for the next test in the same process.
+    struct EnvGuard(std::sync::MutexGuard<'static, ()>);
+    impl EnvGuard {
+        fn new() -> Self {
+            let g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            // SAFETY: serialized via ENV_LOCK — no other test mutates these
+            // while we hold the guard.
+            unsafe {
+                std::env::remove_var("CAS_WARN_DUPLICATES");
+                std::env::remove_var("CAS_SUPPRESS_DUPLICATE_WARNING");
+            }
+            EnvGuard(g)
         }
-        assert!(!should_run(&args));
-        unsafe {
-            std::env::remove_var("CAS_WARN_DUPLICATES");
+        fn set(&self, k: &str, v: &str) {
+            unsafe {
+                std::env::set_var(k, v);
+            }
+        }
+        fn unset(&self, k: &str) {
+            unsafe {
+                std::env::remove_var(k);
+            }
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                std::env::remove_var("CAS_WARN_DUPLICATES");
+                std::env::remove_var("CAS_SUPPRESS_DUPLICATE_WARNING");
+            }
         }
     }
 
     #[test]
-    fn should_run_respects_suppress_env() {
-        let args = vec!["cas".to_string(), "memory".to_string()];
-        unsafe {
-            std::env::set_var("CAS_SUPPRESS_DUPLICATE_WARNING", "1");
-        }
+    fn should_run_skips_hook_subcommand() {
+        let g = EnvGuard::new();
+        g.set("CAS_WARN_DUPLICATES", "1");
+        let args = vec!["cas".to_string(), "hook".to_string(), "PreToolUse".to_string()];
         assert!(!should_run(&args));
-        unsafe {
-            std::env::remove_var("CAS_SUPPRESS_DUPLICATE_WARNING");
-        }
+    }
+
+    #[test]
+    fn should_run_skips_serve_subcommand() {
+        let g = EnvGuard::new();
+        g.set("CAS_WARN_DUPLICATES", "1");
+        let args = vec!["cas".to_string(), "serve".to_string()];
+        assert!(!should_run(&args));
+    }
+
+    #[test]
+    fn should_run_skips_factory_subcommand() {
+        let g = EnvGuard::new();
+        g.set("CAS_WARN_DUPLICATES", "1");
+        let args = vec!["cas".to_string(), "factory".to_string(), "--new".to_string()];
+        assert!(!should_run(&args));
+    }
+
+    #[test]
+    fn should_run_skips_bridge_subcommand() {
+        let g = EnvGuard::new();
+        g.set("CAS_WARN_DUPLICATES", "1");
+        let args = vec!["cas".to_string(), "bridge".to_string(), "serve".to_string()];
+        assert!(!should_run(&args));
+    }
+
+    #[test]
+    fn should_run_skips_implicit_factory_launch() {
+        // `cas --new -w4` gets rewritten to `cas factory --new -w4` in main.rs,
+        // but the check fires on raw_args before that rewrite. The gate must
+        // still suppress it.
+        let g = EnvGuard::new();
+        g.set("CAS_WARN_DUPLICATES", "1");
+        let args = vec!["cas".to_string(), "--new".to_string(), "-w4".to_string()];
+        assert!(!should_run(&args));
+    }
+
+    #[test]
+    fn should_run_force_on_with_warn_duplicates() {
+        let g = EnvGuard::new();
+        g.set("CAS_WARN_DUPLICATES", "1");
+        let args = vec!["cas".to_string(), "memory".to_string(), "list".to_string()];
+        assert!(should_run(&args));
+    }
+
+    #[test]
+    fn should_run_respects_suppress_env() {
+        let g = EnvGuard::new();
+        g.set("CAS_SUPPRESS_DUPLICATE_WARNING", "1");
+        let args = vec!["cas".to_string(), "memory".to_string()];
+        assert!(!should_run(&args));
+    }
+
+    #[test]
+    fn env_flag_ignores_zero_and_empty() {
+        let g = EnvGuard::new();
+        g.set("CAS_WARN_DUPLICATES", "0");
+        assert!(!env_flag("CAS_WARN_DUPLICATES"));
+        g.set("CAS_WARN_DUPLICATES", "");
+        assert!(!env_flag("CAS_WARN_DUPLICATES"));
+        g.set("CAS_WARN_DUPLICATES", "false");
+        assert!(!env_flag("CAS_WARN_DUPLICATES"));
+        g.set("CAS_WARN_DUPLICATES", "1");
+        assert!(env_flag("CAS_WARN_DUPLICATES"));
+        g.unset("CAS_WARN_DUPLICATES");
+        assert!(!env_flag("CAS_WARN_DUPLICATES"));
     }
 
     #[test]
@@ -255,6 +399,34 @@ mod tests {
     }
 
     #[test]
+    fn first_subcommand_none_for_flags_only() {
+        let args = vec!["cas".to_string(), "--version".to_string()];
+        assert_eq!(first_subcommand(&args), None);
+        let bare = vec!["cas".to_string()];
+        assert_eq!(first_subcommand(&bare), None);
+    }
+
+    #[test]
+    fn contains_factory_launch_flag_matches_forms() {
+        assert!(contains_factory_launch_flag(&[
+            "cas".to_string(),
+            "--new".to_string()
+        ]));
+        assert!(contains_factory_launch_flag(&[
+            "cas".to_string(),
+            "--workers=4".to_string()
+        ]));
+        assert!(contains_factory_launch_flag(&[
+            "cas".to_string(),
+            "-w4".to_string()
+        ]));
+        assert!(!contains_factory_launch_flag(&[
+            "cas".to_string(),
+            "--verbose".to_string()
+        ]));
+    }
+
+    #[test]
     fn build_warning_none_for_single_binary() {
         let tmp = tempfile::tempdir().unwrap();
         let a = tmp.path().join("cas");
@@ -262,9 +434,13 @@ mod tests {
         assert!(build_warning(std::slice::from_ref(&a), &a).is_none());
     }
 
-    fn set_mtime(p: &Path, t: SystemTime) {
+    fn set_mtime(p: &Path, t: SystemTime) -> SystemTime {
         let f = fs::OpenOptions::new().write(true).open(p).unwrap();
         f.set_modified(t).unwrap();
+        // Read back — filesystem mtime resolution may round (e.g., 2s on FAT32,
+        // 1s on ext3), and we want tests to compare stored values, not the
+        // in-memory value we handed to the kernel.
+        fs::metadata(p).unwrap().modified().unwrap()
     }
 
     #[test]
@@ -275,8 +451,9 @@ mod tests {
         fs::write(&a, b"a").unwrap();
         fs::write(&b, b"b").unwrap();
         let t = SystemTime::now();
-        set_mtime(&a, t);
-        set_mtime(&b, t);
+        let ma = set_mtime(&a, t);
+        let mb = set_mtime(&b, t);
+        assert_eq!(ma, mb);
         assert!(build_warning(&[a.clone(), b.clone()], &a).is_none());
     }
 
@@ -297,5 +474,25 @@ mod tests {
         assert!(rendered.contains("active:"));
         assert!(rendered.contains("stale:"));
         assert!(rendered.contains("CAS_SUPPRESS_DUPLICATE_WARNING"));
+    }
+
+    #[test]
+    fn build_warning_none_when_active_not_in_binaries() {
+        // When cas is invoked via an absolute path that doesn't appear in PATH
+        // (e.g., a systemd unit pointing at /opt/cas/cas), we can't pick a
+        // "correct" copy, so we stay silent rather than mislabel fresher PATH
+        // entries as "stale".
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a_cas");
+        let b = tmp.path().join("b_cas");
+        let outside = tmp.path().join("outside_cas");
+        fs::write(&a, b"a").unwrap();
+        fs::write(&b, b"b").unwrap();
+        fs::write(&outside, b"o").unwrap();
+        let t = SystemTime::now();
+        set_mtime(&a, t);
+        set_mtime(&b, t - Duration::from_secs(3600));
+        set_mtime(&outside, t - Duration::from_secs(7200));
+        assert!(build_warning(&[a, b], &outside).is_none());
     }
 }

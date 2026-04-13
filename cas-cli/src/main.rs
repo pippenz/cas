@@ -28,12 +28,14 @@ fn main() -> ExitCode {
     let _sentry_guard = sentry::init(sentry::is_sentry_enabled());
 
     let raw_args: Vec<String> = std::env::args().collect();
+    let parse_args = maybe_rewrite_factory_args(raw_args);
 
     // Warn if multiple `cas` binaries on PATH have diverging mtimes. Best-effort,
-    // gated to interactive terminals + non-silent subcommands. See duplicate_check.
-    duplicate_check::check_and_warn(&raw_args);
-
-    let parse_args = maybe_rewrite_factory_args(raw_args);
+    // gated to interactive terminals + non-silent subcommands. Runs AFTER the
+    // factory-alias rewrite so `cas --new -w4` (which is rewritten to
+    // `cas factory --new -w4`) is recognized as the factory subcommand and
+    // stays silent. See `duplicate_check::should_run`.
+    duplicate_check::check_and_warn(&parse_args);
 
     // Use try_parse to capture argument errors for tracing
     let cli = match cli::Cli::try_parse_from(parse_args) {

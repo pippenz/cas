@@ -107,15 +107,24 @@ ensure_install_dir() {
   esac
 
   # Flag other cas binaries on PATH that will silently shadow (or be shadowed
-  # by) the one we're about to install.
-  if command -v which >/dev/null 2>&1; then
-    local others
-    others="$(which -a cas 2>/dev/null | grep -v "^${INSTALL_DIR}/cas$" || true)"
-    if [ -n "$others" ]; then
-      warn "Other cas binaries on PATH (these will diverge from the canonical install):"
-      echo "$others" | sed 's/^/  /' >&2
-      warn "Remove them to avoid silent staleness — see docs/requests/completed/BUG-stale-cas-binaries-on-path.md"
+  # by) the one we're about to install. Scan PATH directly rather than relying
+  # on `which -a` — the -a flag is a GNU/macOS extension that busybox `which`
+  # (common on Alpine/CI images) does not support.
+  local others=""
+  local IFS_BACKUP="$IFS"
+  IFS=':'
+  for dir in $PATH; do
+    [ -z "$dir" ] && continue
+    if [ -x "$dir/cas" ] && [ "$dir/cas" != "$INSTALL_DIR/cas" ]; then
+      others="${others}${dir}/cas
+"
     fi
+  done
+  IFS="$IFS_BACKUP"
+  if [ -n "$others" ]; then
+    warn "Other cas binaries on PATH (these will diverge from the canonical install):"
+    printf '%s' "$others" | sed 's/^/  /' >&2
+    warn "Remove them to avoid silent staleness — see cas-cli/docs/CONTRIBUTING.md (\"Canonical install path\")"
   fi
 }
 
