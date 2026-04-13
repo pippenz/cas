@@ -83,10 +83,13 @@ pub fn find_cas_binaries_on_path() -> Vec<PathBuf> {
             continue;
         }
         let canonical = std::fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone());
+        // Fast path: if a previously-seen user-visible path already matches the
+        // canonical form, skip without re-canonicalising the whole `seen` list.
         if seen.iter().any(|p| p == &canonical) {
             continue;
         }
-        // Store the original (user-visible) path, but de-dupe via canonical.
+        // Slow path: dedupe via canonicalisation so `/usr/bin/cas -> /usr/local/bin/cas`
+        // is not double-counted. Store the original user-visible path for warnings.
         if seen.iter().all(|p| {
             std::fs::canonicalize(p)
                 .ok()
@@ -223,6 +226,9 @@ mod tests {
             std::env::remove_var("CAS_SUPPRESS_DUPLICATE_WARNING");
         }
         assert!(!should_run(&args));
+        unsafe {
+            std::env::remove_var("CAS_WARN_DUPLICATES");
+        }
     }
 
     #[test]
