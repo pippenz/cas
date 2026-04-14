@@ -107,6 +107,9 @@ fn attach_unix(session: &SessionInfo) -> anyhow::Result<()> {
     // Client-side resize debounce: coalesce rapid resize events before sending
     let mut pending_resize: Option<(u16, u16)> = None;
     let mut pending_resize_at = std::time::Instant::now();
+
+    // Mouse capture toggle (F10). When off, native terminal drag-selection works.
+    let mut mouse_captured = true;
     const CLIENT_RESIZE_DEBOUNCE_MS: u64 = 50;
     // Main loop
     while !quit.load(std::sync::atomic::Ordering::Relaxed) {
@@ -145,6 +148,24 @@ fn attach_unix(session: &SessionInfo) -> anyhow::Result<()> {
                         msg.push(CONTROL_SUFFIX);
                         let _ = stream.write_all(&msg);
                         break;
+                    }
+
+                    // F10 toggles mouse capture so native terminal selection works.
+                    if matches!(key.code, KeyCode::F(10)) {
+                        mouse_captured = !mouse_captured;
+                        let mode_cmd: &[u8] = if mouse_captured {
+                            let _ = execute!(stdout, crossterm::event::EnableMouseCapture);
+                            b"mode;select_off"
+                        } else {
+                            let _ = execute!(stdout, crossterm::event::DisableMouseCapture);
+                            b"mode;select_on"
+                        };
+                        let mut msg = Vec::new();
+                        msg.extend_from_slice(CONTROL_PREFIX);
+                        msg.extend_from_slice(mode_cmd);
+                        msg.push(CONTROL_SUFFIX);
+                        let _ = stream.write_all(&msg);
+                        continue;
                     }
 
                     // Convert key to bytes and send

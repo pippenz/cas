@@ -82,6 +82,18 @@ impl StatusBar {
         left_spans.push(mode);
         left_spans.push(Span::raw(" "));
 
+        // SELECT MODE indicator (mouse capture disabled for native drag-select)
+        if app.select_mode {
+            left_spans.push(Span::styled(
+                " SELECT MODE — F10 to exit ",
+                Style::default()
+                    .fg(palette.text_primary)
+                    .bg(palette.status_warning)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            left_spans.push(Span::raw(" "));
+        }
+
         // Update indicator (if cached check says update is available)
         if area.width >= 70 {
             if let Some(update_label) = Self::update_badge(app.cas_dir()) {

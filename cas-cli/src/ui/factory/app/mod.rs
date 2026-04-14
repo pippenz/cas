@@ -206,6 +206,9 @@ pub struct FactoryApp {
     pub error_message: Option<String>,
     /// Number of workers currently being spawned (for loading indicator)
     pub spawning_count: usize,
+    /// SELECT mode: client has disabled mouse capture so native terminal
+    /// text selection works. Set via F10 toggle on the client.
+    pub select_mode: bool,
     /// Workers currently in the spawning pipeline (after prepare, before finish).
     /// These appear as booting placeholder panes in the layout.
     pub pending_workers: Vec<PendingWorkerState>,

@@ -171,6 +171,9 @@ impl FactoryDaemon {
                                 ControlEvent::MouseClick { col, row } => {
                                     self.app.handle_mouse_click(col, row);
                                 }
+                                ControlEvent::SetSelectMode(on) => {
+                                    self.app.select_mode = on;
+                                }
                                 ControlEvent::DropImage { col, row, path } => {
                                     let target = self.resolve_drop_target(col, row);
                                     if let Some(target_pane) = target {
@@ -299,6 +302,8 @@ impl FactoryDaemon {
                                     events.push(ControlEvent::SetMode(ClientViewMode::Compact))
                                 }
                                 "full" => events.push(ControlEvent::SetMode(ClientViewMode::Full)),
+                                "select_on" => events.push(ControlEvent::SetSelectMode(true)),
+                                "select_off" => events.push(ControlEvent::SetSelectMode(false)),
                                 _ => {}
                             }
                         } else if cmd_str == "detach" {

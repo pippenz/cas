@@ -205,6 +205,7 @@ enum ControlEvent {
     MouseScrollDown,
     MouseClick { col: u16, row: u16 },
     DropImage { col: u16, row: u16, path: String },
+    SetSelectMode(bool),
 }
 
 pub mod cloud_client;
