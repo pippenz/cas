@@ -18,7 +18,7 @@ docs/                — Roadmaps, brainstorms, spikes, cross-team requests inbo
 
 ### cas-cli/src/ — Main binary modules
 
-cli/                 — Clap command definitions and handlers (incl. codemap_cmd, open)
+cli/                 — Clap command definitions and handlers (incl. codemap_cmd, project_overview_cmd, open)
 mcp/server/          — CasCore MCP server with cached OnceLock stores
 mcp/tools/           — 55+ MCP tool handlers split into core/ and service/
 mcp/daemon.rs        — Embedded background maintenance (embeddings, cleanup)

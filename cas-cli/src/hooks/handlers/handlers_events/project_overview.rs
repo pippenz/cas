@@ -32,7 +32,7 @@ pub struct ProjectOverviewPending {
 const PENDING_FILE: &str = "project-overview-pending.json";
 
 /// Path to the target doc, relative to project root.
-const DOC_PATH: &str = "docs/PRODUCT_OVERVIEW.md";
+pub(crate) const DOC_PATH: &str = "docs/PRODUCT_OVERVIEW.md";
 
 /// Stale at or above this change count → `SignificantlyStale`.
 /// Lower than codemap's 10 because schema/layout changes are more impactful.
