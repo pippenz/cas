@@ -167,15 +167,18 @@ pub fn handle_session_start(
         build_context(input, 5, cas_root)?
     };
 
-    // Inject codemap freshness warning.
+    // Inject codemap + project-overview freshness warnings.
     //
     // High-severity warnings (missing / significantly stale / any staleness for
     // supervisors) are **prepended** so they land inside the truncated
     // SessionStart preview window the agent skims first. Info-level warnings
-    // are appended as before.
-    let is_supervisor = std::env::var("CAS_AGENT_ROLE")
-        .map(|r| r == "supervisor")
-        .unwrap_or(false);
+    // are appended.
+    //
+    // Codemap runs first and wins the top slot when both would prepend;
+    // project-overview always appends to preserve codemap's ordering dominance
+    // when both are high-severity.
+    let agent_role = std::env::var("CAS_AGENT_ROLE").ok();
+    let is_supervisor = agent_role.as_deref() == Some("supervisor");
 
     let context = if let Some(staleness) =
         crate::hooks::handlers::handlers_events::check_codemap_freshness(cas_root)
@@ -192,11 +195,7 @@ pub fn handle_session_start(
         context
     };
 
-    // Inject project-overview freshness warning (same prepend-on-high rule).
-    // project_overview::check_freshness takes repo_root (the parent of .cas/),
-    // matching codemap's semantics.
     let context = if let Some(repo_root) = cas_root.parent() {
-        let agent_role = std::env::var("CAS_AGENT_ROLE").ok();
         match crate::hooks::handlers::handlers_events::project_overview::check_freshness(
             repo_root,
             agent_role.as_deref(),
@@ -205,13 +204,17 @@ pub fn handle_session_start(
                 let overview_ctx = staleness.format_injection(is_supervisor);
                 if context.is_empty() {
                     overview_ctx
-                } else if staleness.is_high_severity(is_supervisor) {
-                    format!("{overview_ctx}\n{context}")
                 } else {
+                    // Always append so codemap retains the preview top slot
+                    // when both modules report high severity.
                     format!("{context}\n{overview_ctx}")
                 }
             }
-            _ => context,
+            Ok(None) => context,
+            Err(e) => {
+                eprintln!("cas: project-overview freshness check failed: {e}");
+                context
+            }
         }
     } else {
         context

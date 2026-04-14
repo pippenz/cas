@@ -95,9 +95,11 @@ pub fn handle_post_tool_use(
         if is_successful_git_commit(input) {
             if let Some(repo_root) = cas_root.parent() {
                 with_pending_file_lock(cas_root, || {
-                    let _ = crate::hooks::handlers::handlers_events::project_overview::detect_structural_changes(
+                    if let Err(e) = crate::hooks::handlers::handlers_events::project_overview::detect_structural_changes(
                         repo_root,
-                    );
+                    ) {
+                        eprintln!("cas: project-overview detect error: {e}");
+                    }
                 });
             }
         }
@@ -690,35 +692,44 @@ fn task_references_file(task: &Task, relative: &str, short_path: Option<&str>) -
 /// `<cas_root>/project-overview-pending.lock`.
 ///
 /// Prevents two concurrent PostToolUse hook processes from interleaving appends
-/// to `project-overview-pending.json`. Failure to acquire the lock (missing
-/// lock support on the underlying FS, or I/O error) falls through and runs the
-/// closure unprotected — strictly worse than no fix on pathological FS, but
-/// preserving the write is more important than strict serialization.
+/// to `project-overview-pending.json`. Unlock is RAII — even if `f` panics the
+/// guard's Drop releases the lock on scope exit. Lock acquisition failure
+/// (filesystems without advisory-lock support, e.g. NTFS3 per MEMORY.md) falls
+/// through and runs the closure unprotected; preserving the write is more
+/// important than strict serialization on those platforms.
 fn with_pending_file_lock(cas_root: &Path, f: impl FnOnce()) {
     use fs2::FileExt;
+
+    struct LockGuard(std::fs::File, bool);
+    impl Drop for LockGuard {
+        fn drop(&mut self) {
+            if self.1 {
+                let _ = FileExt::unlock(&self.0);
+            }
+        }
+    }
+
     let lock_path = cas_root.join("project-overview-pending.lock");
-    if let Ok(file) = std::fs::OpenOptions::new()
+    let _guard = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(false)
         .open(&lock_path)
-    {
-        let locked = file.lock_exclusive().is_ok();
-        f();
-        if locked {
-            let _ = FileExt::unlock(&file);
-        }
-    } else {
-        f();
-    }
+        .ok()
+        .map(|file| {
+            let locked = file.lock_exclusive().is_ok();
+            LockGuard(file, locked)
+        });
+    f();
 }
 
-/// True when the PostToolUse input represents a successful `git commit` Bash call.
+/// True when the PostToolUse input represents a successful `git commit` Bash
+/// call that creates a new commit.
 ///
-/// Inlined here (rather than re-exporting `attribution::is_git_commit_command`)
-/// to keep post-tool wiring free of additional module couplings. The check is
-/// deliberately loose — any Bash command whose text contains `git commit` with
-/// exit code 0 counts. This matches the codemap/attribution triggers.
+/// `--dry-run` is excluded (mirrors `attribution::is_git_commit_command`).
+/// `--amend` is excluded because it rewrites HEAD in place — firing
+/// `detect_structural_changes` on an amended commit would re-record the same
+/// logical change set and inflate pending-file totals past threshold.
 fn is_successful_git_commit(input: &HookInput) -> bool {
     let Some(tool_input) = input.tool_input.as_ref() else {
         return false;
@@ -726,7 +737,11 @@ fn is_successful_git_commit(input: &HookInput) -> bool {
     let Some(command) = tool_input.get("command").and_then(|v| v.as_str()) else {
         return false;
     };
-    if !command.contains("git commit") {
+    let cmd_lower = command.to_lowercase();
+    if !cmd_lower.contains("git commit")
+        || cmd_lower.contains("--dry-run")
+        || cmd_lower.contains("--amend")
+    {
         return false;
     }
     let exit_code = input
@@ -811,5 +826,72 @@ mod post_tool_wiring_tests {
             ..Default::default()
         };
         assert!(!is_successful_git_commit(&input));
+    }
+
+    #[test]
+    fn is_successful_git_commit_rejects_amend() {
+        assert!(!is_successful_git_commit(&bash_input(
+            "git commit --amend -m x",
+            0
+        )));
+    }
+
+    #[test]
+    fn is_successful_git_commit_rejects_dry_run() {
+        assert!(!is_successful_git_commit(&bash_input(
+            "git commit --dry-run",
+            0
+        )));
+    }
+
+    #[test]
+    fn is_successful_git_commit_rejects_missing_exitcode_key() {
+        let input = HookInput {
+            tool_name: Some("Bash".to_string()),
+            tool_input: Some(json!({ "command": "git commit" })),
+            tool_response: Some(json!({})),
+            ..Default::default()
+        };
+        assert!(!is_successful_git_commit(&input));
+    }
+
+    #[test]
+    fn with_pending_file_lock_runs_closure_and_creates_sentinel() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let tmp = std::env::temp_dir().join(format!(
+            "po_lock_{}_{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let called = std::cell::Cell::new(false);
+        with_pending_file_lock(&tmp, || called.set(true));
+
+        assert!(called.get(), "closure must run");
+        assert!(
+            tmp.join("project-overview-pending.lock").exists(),
+            "sentinel file must be created"
+        );
+        // Second call on same dir must not panic and must re-run closure.
+        let called2 = std::cell::Cell::new(false);
+        with_pending_file_lock(&tmp, || called2.set(true));
+        assert!(called2.get());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn with_pending_file_lock_falls_through_when_cas_root_missing() {
+        // Non-existent parent dir — OpenOptions::create will fail. Closure must
+        // still run (fallthrough behavior), no panic.
+        let tmp = std::env::temp_dir()
+            .join(format!("po_missing_{}", std::process::id()))
+            .join("does-not-exist");
+        let called = std::cell::Cell::new(false);
+        with_pending_file_lock(&tmp, || called.set(true));
+        assert!(called.get(), "fallthrough closure must still run");
     }
 }
