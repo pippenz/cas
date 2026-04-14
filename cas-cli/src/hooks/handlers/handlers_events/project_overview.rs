@@ -109,8 +109,24 @@ pub fn watch_targets(repo_root: &Path) -> WatchTargets {
     let defaults = WatchTargets::defaults();
     WatchTargets {
         domain_paths: po.domain_paths.unwrap_or(defaults.domain_paths),
-        watch_dirs: po.watch_dirs.unwrap_or(defaults.watch_dirs),
+        watch_dirs: po
+            .watch_dirs
+            .map(sanitize_watch_dirs)
+            .unwrap_or(defaults.watch_dirs),
     }
+}
+
+/// Strip degenerate globs like `*` / `**` / empty strings that would match every
+/// path in the repo and turn freshness detection into a full-scan DoS on every
+/// SessionStart. Silent — the caller falls back to the remaining patterns.
+fn sanitize_watch_dirs(patterns: Vec<String>) -> Vec<String> {
+    patterns
+        .into_iter()
+        .filter(|p| {
+            let trimmed = p.trim();
+            !trimmed.is_empty() && trimmed != "*" && trimmed != "**"
+        })
+        .collect()
 }
 
 /// Match a directory glob (like `apps/*/src/components`) against a file path.
@@ -487,13 +503,15 @@ fn change_prefix(c: &ProjectOverviewChange) -> &'static str {
 
 /// Check if PRODUCT_OVERVIEW.md is missing or stale.
 ///
-/// `agent_role` controls the severity of low-count staleness: a supervisor
-/// gets `high` even for `Stale`, a worker gets `info`.
+/// `agent_role` is accepted for API symmetry with downstream hook wiring; the
+/// returned staleness is role-agnostic. Callers drive role-based severity by
+/// passing `is_supervisor` to `ProjectOverviewStaleness::is_high_severity` and
+/// `format_injection` at render time.
 pub fn check_freshness(
     repo_root: &Path,
     agent_role: Option<&str>,
 ) -> Result<Option<ProjectOverviewStaleness>> {
-    let _ = agent_role; // reserved — used at injection time via is_high_severity
+    let _ = agent_role;
     let doc_path = repo_root.join(DOC_PATH);
     if !doc_path.exists() {
         return Ok(Some(ProjectOverviewStaleness::Missing));
@@ -584,8 +602,15 @@ fn check_staleness_from_git(repo_root: &Path) -> Result<Option<ProjectOverviewSt
 }
 
 /// Timestamp (RFC3339) of the last commit that touched `path` (relative to
-/// `repo_root`). Falls back to file mtime if the file exists but isn't
-/// committed.
+/// `repo_root`).
+///
+/// Returns `None` if the file has never been committed. The earlier design
+/// fell back to file mtime, but an uncommitted mtime can be arbitrarily old
+/// (or in the future on skewed clocks), which made `git log --since=<mtime>`
+/// flood every SessionStart with unrelated history and triggered a permanent
+/// `SignificantlyStale` warning until someone committed the file. Returning
+/// `None` lets the pending-file path be the only in-session signal for
+/// uncommitted docs.
 fn last_commit_timestamp(repo_root: &Path, path: &str) -> Option<String> {
     let out = std::process::Command::new("git")
         .args(["log", "-1", "--format=%cI", "--", path])
@@ -596,14 +621,7 @@ fn last_commit_timestamp(repo_root: &Path, path: &str) -> Option<String> {
         return None;
     }
     let ts = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if !ts.is_empty() {
-        return Some(ts);
-    }
-    // Not yet committed — fall back to mtime.
-    let meta = std::fs::metadata(repo_root.join(path)).ok()?;
-    let mtime = meta.modified().ok()?;
-    let dt: chrono::DateTime<chrono::Utc> = mtime.into();
-    Some(dt.to_rfc3339())
+    if ts.is_empty() { None } else { Some(ts) }
 }
 
 /// All changes (M/A/D/R) to a single path since `since`.
@@ -646,8 +664,7 @@ fn changes_for_path_since(
             "A" => "A",
             "D" => "D",
             "M" => "M",
-            s if s.starts_with('R') => "R",
-            _ => continue,
+            _ => continue, // `--no-renames` below means R never appears here
         };
         changes.push(ProjectOverviewChange {
             change_type: ty.to_string(),
@@ -658,7 +675,7 @@ fn changes_for_path_since(
     changes
 }
 
-/// Structural changes (A/D/R) anywhere in the repo since `since`. Renames are
+/// Structural changes (A/D) anywhere in the repo since `since`. Renames are
 /// split to A+D via `--no-renames` (matches codemap behavior).
 fn structural_changes_since(
     repo_root: &Path,
@@ -707,7 +724,7 @@ fn parse_git_log_nul_output(raw: &str) -> Vec<ProjectOverviewChange> {
         let ty = match status {
             "A" => "A",
             "D" => "D",
-            s if s.starts_with('R') => "R",
+            // `--no-renames` in structural_changes_since means R never appears here.
             _ => {
                 i += 2;
                 continue;
@@ -1116,5 +1133,204 @@ domain_paths = ["db/schema.sql"]
         }
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // --- sanitize_watch_dirs ----------------------------------------------
+
+    #[test]
+    fn sanitize_watch_dirs_strips_stars() {
+        let out = sanitize_watch_dirs(vec![
+            "**".into(),
+            "*".into(),
+            " ".into(),
+            "".into(),
+            "apps/*/src".into(),
+        ]);
+        assert_eq!(out, vec!["apps/*/src".to_string()]);
+    }
+
+    #[test]
+    fn watch_targets_sanitizes_dangerous_globs() {
+        let tmp = std::env::temp_dir().join(format!(
+            "po_sanitize_{}_{}",
+            std::process::id(),
+            unique_id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join(".cas")).unwrap();
+        std::fs::write(
+            tmp.join(".cas/config.toml"),
+            r#"
+[project_overview]
+watch_dirs = ["**", "web/src"]
+"#,
+        )
+        .unwrap();
+
+        let t = watch_targets(&tmp);
+        assert_eq!(t.watch_dirs, vec!["web/src".to_string()]);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // --- last_commit_timestamp (no-mtime-fallback contract) ---------------
+
+    #[test]
+    fn last_commit_timestamp_returns_none_when_not_committed() {
+        // Empty tmp dir — no git repo, no file, no history. Must not panic and
+        // must not fabricate an mtime.
+        let tmp = std::env::temp_dir().join(format!(
+            "po_ts_none_{}_{}",
+            std::process::id(),
+            unique_id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        assert!(last_commit_timestamp(&tmp, DOC_PATH).is_none());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // --- parse_git_log_nul_output rename behavior after --no-renames -----
+
+    #[test]
+    fn parse_git_log_nul_skips_rename_status() {
+        // `structural_changes_since` always passes `--no-renames`, so R status
+        // codes never arrive at this parser. Confirm it silently skips them
+        // rather than producing a malformed entry.
+        let raw = "R100\0src/old.rs\0src/new.rs\0A\0src/added.rs\0";
+        let changes = parse_git_log_nul_output(raw);
+        // The 3-token rename is parsed as (R100, src/old.rs) pair [skipped] +
+        // leftover (src/new.rs, A) pair — also skipped because "src/new.rs"
+        // isn't a recognized status. Then (src/added.rs, <nothing>) is the tail
+        // — NUL padding in real git output protects against this. We just
+        // verify no panic and no spurious R entry.
+        assert!(
+            changes.iter().all(|c| c.change_type != "R"),
+            "R status must never appear in parse_git_log_nul_output output"
+        );
+    }
+
+    // --- end-to-end: detect_structural_changes on a real git repo --------
+
+    fn run_git(repo: &Path, args: &[&str]) -> bool {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn detect_structural_changes_writes_pending_for_watched_file() {
+        let tmp = std::env::temp_dir().join(format!(
+            "po_detect_{}_{}",
+            std::process::id(),
+            unique_id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Skip when git isn't on PATH (CI fallback).
+        if !run_git(&tmp, &["init", "-q", "-b", "main"]) {
+            let _ = std::fs::remove_dir_all(&tmp);
+            return;
+        }
+        // Seed config pointing watch_dirs at `watched/`.
+        std::fs::create_dir_all(tmp.join(".cas")).unwrap();
+        std::fs::write(
+            tmp.join(".cas/config.toml"),
+            r#"
+[project_overview]
+domain_paths = []
+watch_dirs = ["watched"]
+"#,
+        )
+        .unwrap();
+
+        // Initial commit (unrelated file) so HEAD~1 exists.
+        std::fs::write(tmp.join("seed.txt"), "seed\n").unwrap();
+        assert!(run_git(&tmp, &["add", "-A"]));
+        assert!(run_git(&tmp, &["commit", "-q", "-m", "seed"]));
+
+        // Add a file inside the watched dir → structural A.
+        std::fs::create_dir_all(tmp.join("watched")).unwrap();
+        std::fs::write(tmp.join("watched/new.rs"), "pub fn x() {}\n").unwrap();
+        assert!(run_git(&tmp, &["add", "-A"]));
+        assert!(run_git(&tmp, &["commit", "-q", "-m", "add watched"]));
+
+        // Act.
+        detect_structural_changes(&tmp).expect("detect must succeed");
+
+        // Assert: pending JSONL contains one entry with the watched path.
+        let entries = read_pending(&tmp).expect("read_pending");
+        assert_eq!(entries.len(), 1, "one pending entry expected");
+        let entry = &entries[0];
+        assert!(!entry.commit.is_empty());
+        assert!(
+            entry
+                .changes
+                .iter()
+                .any(|c| c.change_type == "A" && c.path == "watched/new.rs"),
+            "expected A watched/new.rs in entry, got {:?}",
+            entry.changes
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn detect_structural_changes_skips_unwatched_modifications() {
+        let tmp = std::env::temp_dir().join(format!(
+            "po_detect_skip_{}_{}",
+            std::process::id(),
+            unique_id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        if !run_git(&tmp, &["init", "-q", "-b", "main"]) {
+            let _ = std::fs::remove_dir_all(&tmp);
+            return;
+        }
+        std::fs::create_dir_all(tmp.join(".cas")).unwrap();
+        std::fs::write(
+            tmp.join(".cas/config.toml"),
+            r#"
+[project_overview]
+domain_paths = ["db/schema.sql"]
+watch_dirs = []
+"#,
+        )
+        .unwrap();
+
+        std::fs::write(tmp.join("seed.txt"), "seed\n").unwrap();
+        assert!(run_git(&tmp, &["add", "-A"]));
+        assert!(run_git(&tmp, &["commit", "-q", "-m", "seed"]));
+
+        // Modify an unrelated file → must not produce a pending entry.
+        std::fs::write(tmp.join("seed.txt"), "seed2\n").unwrap();
+        assert!(run_git(&tmp, &["add", "-A"]));
+        assert!(run_git(&tmp, &["commit", "-q", "-m", "noise"]));
+
+        detect_structural_changes(&tmp).unwrap();
+
+        let entries = read_pending(&tmp).unwrap();
+        assert!(
+            entries.is_empty(),
+            "unrelated change must not write a pending entry; got {entries:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Monotonic counter so parallel test threads don't collide on temp paths.
+    fn unique_id() -> u64 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        N.fetch_add(1, Ordering::Relaxed)
     }
 }
