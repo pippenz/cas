@@ -81,6 +81,26 @@ pub fn handle_post_tool_use(
     if tool_name == "Bash" {
         crate::hooks::handlers::handlers_events::detect_and_link_git_commit(cas_root, input);
         crate::hooks::handlers::handlers_events::detect_codemap_structural_changes(cas_root, input);
+
+        // Project-overview pending-file update. Only fires on successful git commits
+        // so detect_structural_changes (which always diffs HEAD~1..HEAD) sees a
+        // fresh commit, not the same previous one on every Bash.
+        //
+        // Advisory flock on a sentinel file serializes concurrent hook processes
+        // so the JSONL append in detect_structural_changes cannot interleave
+        // bytes past PIPE_BUF — addresses the P1 append-race carry-forward from
+        // cas-dcba review. Best-effort: if the lock fails (FS without lock
+        // support, e.g. NTFS3 — see MEMORY.md), we fall through and accept the
+        // pre-existing race rather than dropping the pending write entirely.
+        if is_successful_git_commit(input) {
+            if let Some(repo_root) = cas_root.parent() {
+                with_pending_file_lock(cas_root, || {
+                    let _ = crate::hooks::handlers::handlers_events::project_overview::detect_structural_changes(
+                        repo_root,
+                    );
+                });
+            }
+        }
     }
 
     // === SMART FILTERING ===
@@ -666,6 +686,57 @@ fn task_references_file(task: &Task, relative: &str, short_path: Option<&str>) -
     false
 }
 
+/// Run `f` while holding an exclusive advisory flock on
+/// `<cas_root>/project-overview-pending.lock`.
+///
+/// Prevents two concurrent PostToolUse hook processes from interleaving appends
+/// to `project-overview-pending.json`. Failure to acquire the lock (missing
+/// lock support on the underlying FS, or I/O error) falls through and runs the
+/// closure unprotected — strictly worse than no fix on pathological FS, but
+/// preserving the write is more important than strict serialization.
+fn with_pending_file_lock(cas_root: &Path, f: impl FnOnce()) {
+    use fs2::FileExt;
+    let lock_path = cas_root.join("project-overview-pending.lock");
+    if let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+    {
+        let locked = file.lock_exclusive().is_ok();
+        f();
+        if locked {
+            let _ = FileExt::unlock(&file);
+        }
+    } else {
+        f();
+    }
+}
+
+/// True when the PostToolUse input represents a successful `git commit` Bash call.
+///
+/// Inlined here (rather than re-exporting `attribution::is_git_commit_command`)
+/// to keep post-tool wiring free of additional module couplings. The check is
+/// deliberately loose — any Bash command whose text contains `git commit` with
+/// exit code 0 counts. This matches the codemap/attribution triggers.
+fn is_successful_git_commit(input: &HookInput) -> bool {
+    let Some(tool_input) = input.tool_input.as_ref() else {
+        return false;
+    };
+    let Some(command) = tool_input.get("command").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    if !command.contains("git commit") {
+        return false;
+    }
+    let exit_code = input
+        .tool_response
+        .as_ref()
+        .and_then(|r| r.get("exitCode").and_then(|v| v.as_i64()))
+        .unwrap_or(1);
+    exit_code == 0
+}
+
 /// Check if a spec's text fields reference a given file path.
 fn spec_references_file(
     spec: &crate::types::Spec,
@@ -693,4 +764,52 @@ fn spec_references_file(
     }
 
     false
+}
+
+#[cfg(test)]
+mod post_tool_wiring_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn bash_input(command: &str, exit_code: i64) -> HookInput {
+        HookInput {
+            tool_name: Some("Bash".to_string()),
+            tool_input: Some(json!({ "command": command })),
+            tool_response: Some(json!({ "exitCode": exit_code })),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn is_successful_git_commit_matches_git_commit_exit_0() {
+        assert!(is_successful_git_commit(&bash_input(
+            "git commit -m 'test'",
+            0
+        )));
+    }
+
+    #[test]
+    fn is_successful_git_commit_rejects_non_zero_exit() {
+        assert!(!is_successful_git_commit(&bash_input(
+            "git commit -m 'test'",
+            1
+        )));
+    }
+
+    #[test]
+    fn is_successful_git_commit_rejects_non_commit_commands() {
+        assert!(!is_successful_git_commit(&bash_input("git status", 0)));
+        assert!(!is_successful_git_commit(&bash_input("ls -la", 0)));
+    }
+
+    #[test]
+    fn is_successful_git_commit_rejects_missing_tool_response() {
+        let input = HookInput {
+            tool_name: Some("Bash".to_string()),
+            tool_input: Some(json!({ "command": "git commit" })),
+            tool_response: None,
+            ..Default::default()
+        };
+        assert!(!is_successful_git_commit(&input));
+    }
 }

@@ -173,12 +173,13 @@ pub fn handle_session_start(
     // supervisors) are **prepended** so they land inside the truncated
     // SessionStart preview window the agent skims first. Info-level warnings
     // are appended as before.
+    let is_supervisor = std::env::var("CAS_AGENT_ROLE")
+        .map(|r| r == "supervisor")
+        .unwrap_or(false);
+
     let context = if let Some(staleness) =
         crate::hooks::handlers::handlers_events::check_codemap_freshness(cas_root)
     {
-        let is_supervisor = std::env::var("CAS_AGENT_ROLE")
-            .map(|r| r == "supervisor")
-            .unwrap_or(false);
         let codemap_ctx = staleness.format_injection(is_supervisor);
         if context.is_empty() {
             codemap_ctx
@@ -186,6 +187,31 @@ pub fn handle_session_start(
             format!("{codemap_ctx}\n{context}")
         } else {
             format!("{context}\n{codemap_ctx}")
+        }
+    } else {
+        context
+    };
+
+    // Inject project-overview freshness warning (same prepend-on-high rule).
+    // project_overview::check_freshness takes repo_root (the parent of .cas/),
+    // matching codemap's semantics.
+    let context = if let Some(repo_root) = cas_root.parent() {
+        let agent_role = std::env::var("CAS_AGENT_ROLE").ok();
+        match crate::hooks::handlers::handlers_events::project_overview::check_freshness(
+            repo_root,
+            agent_role.as_deref(),
+        ) {
+            Ok(Some(staleness)) => {
+                let overview_ctx = staleness.format_injection(is_supervisor);
+                if context.is_empty() {
+                    overview_ctx
+                } else if staleness.is_high_severity(is_supervisor) {
+                    format!("{overview_ctx}\n{context}")
+                } else {
+                    format!("{context}\n{overview_ctx}")
+                }
+            }
+            _ => context,
         }
     } else {
         context
