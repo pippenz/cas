@@ -221,6 +221,13 @@ pub const BUILTIN_SKILLS: &[BuiltinFile] = &[
             "builtins/skills/cas-code-review/references/personas/adversarial.md"
         ),
     },
+    // project-overview skill (EPIC cas-19a2b): generates
+    // docs/PRODUCT_OVERVIEW.md for any project and writes a thin memory
+    // pointer so CAS search surfaces the doc.
+    BuiltinFile {
+        path: "skills/project-overview/SKILL.md",
+        content: include_str!("builtins/skills/project-overview/SKILL.md"),
+    },
 ];
 
 /// All built-in skills managed by CAS for Codex
@@ -333,6 +340,11 @@ pub const CODEX_BUILTIN_SKILLS: &[BuiltinFile] = &[
         content: include_str!(
             "builtins/codex/skills/cas-code-review/references/personas/adversarial.md"
         ),
+    },
+    // project-overview skill (EPIC cas-19a2b) — codex mirror.
+    BuiltinFile {
+        path: "skills/project-overview/SKILL.md",
+        content: include_str!("builtins/codex/skills/project-overview/SKILL.md"),
     },
 ];
 
@@ -778,6 +790,44 @@ This is the body content."#;
                     "{label} cas-worker skill ({path}) missing required marker: {required:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn test_builtin_skills_contains_project_overview() {
+        // EPIC cas-19a2b: project-overview SKILL.md must be registered so
+        // `cas sync` installs it at .claude/skills/project-overview/SKILL.md.
+        assert!(
+            BUILTIN_SKILLS
+                .iter()
+                .any(|b| b.path == "skills/project-overview/SKILL.md"),
+            "skills/project-overview/SKILL.md missing from BUILTIN_SKILLS"
+        );
+        assert!(
+            CODEX_BUILTIN_SKILLS
+                .iter()
+                .any(|b| b.path == "skills/project-overview/SKILL.md"),
+            "skills/project-overview/SKILL.md missing from CODEX_BUILTIN_SKILLS"
+        );
+
+        // Content sanity: frontmatter trigger phrases + required post-write
+        // steps (memory pointer + freshness clear) must survive any drift.
+        let entry = BUILTIN_SKILLS
+            .iter()
+            .find(|b| b.path == "skills/project-overview/SKILL.md")
+            .unwrap();
+        for required in [
+            "name: project-overview",
+            "managed_by: cas",
+            "docs/PRODUCT_OVERVIEW.md",
+            "<!-- keep -->",
+            "mcp__cas__memory",
+            "cas project-overview clear",
+        ] {
+            assert!(
+                entry.content.contains(required),
+                "project-overview SKILL.md missing required marker: {required:?}"
+            );
         }
     }
 
