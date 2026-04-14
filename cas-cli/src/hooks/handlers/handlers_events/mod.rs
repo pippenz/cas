@@ -2,6 +2,7 @@ mod attribution;
 pub(crate) mod codemap;
 mod notifications;
 mod pre_tool;
+pub mod project_overview;
 
 pub use attribution::{capture_file_change_for_attribution, detect_and_link_git_commit};
 #[cfg(test)]
