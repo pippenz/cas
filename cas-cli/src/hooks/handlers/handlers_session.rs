@@ -167,18 +167,22 @@ pub fn handle_session_start(
         build_context(input, 5, cas_root)?
     };
 
-    // Inject codemap freshness warning.
+    // Inject codemap + project-overview freshness warnings.
     //
     // High-severity warnings (missing / significantly stale / any staleness for
     // supervisors) are **prepended** so they land inside the truncated
     // SessionStart preview window the agent skims first. Info-level warnings
-    // are appended as before.
+    // are appended.
+    //
+    // Codemap runs first and wins the top slot when both would prepend;
+    // project-overview always appends to preserve codemap's ordering dominance
+    // when both are high-severity.
+    let agent_role = std::env::var("CAS_AGENT_ROLE").ok();
+    let is_supervisor = agent_role.as_deref() == Some("supervisor");
+
     let context = if let Some(staleness) =
         crate::hooks::handlers::handlers_events::check_codemap_freshness(cas_root)
     {
-        let is_supervisor = std::env::var("CAS_AGENT_ROLE")
-            .map(|r| r == "supervisor")
-            .unwrap_or(false);
         let codemap_ctx = staleness.format_injection(is_supervisor);
         if context.is_empty() {
             codemap_ctx
@@ -186,6 +190,31 @@ pub fn handle_session_start(
             format!("{codemap_ctx}\n{context}")
         } else {
             format!("{context}\n{codemap_ctx}")
+        }
+    } else {
+        context
+    };
+
+    let context = if let Some(repo_root) = cas_root.parent() {
+        match crate::hooks::handlers::handlers_events::project_overview::check_freshness(
+            repo_root,
+            agent_role.as_deref(),
+        ) {
+            Ok(Some(staleness)) => {
+                let overview_ctx = staleness.format_injection(is_supervisor);
+                if context.is_empty() {
+                    overview_ctx
+                } else {
+                    // Always append so codemap retains the preview top slot
+                    // when both modules report high severity.
+                    format!("{context}\n{overview_ctx}")
+                }
+            }
+            Ok(None) => context,
+            Err(e) => {
+                eprintln!("cas: project-overview freshness check failed: {e}");
+                context
+            }
         }
     } else {
         context

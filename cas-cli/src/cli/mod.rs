@@ -7,6 +7,7 @@ pub(crate) mod bridge;
 mod changelog;
 mod claude_md;
 mod codemap_cmd;
+mod project_overview_cmd;
 mod cloud;
 mod config;
 mod config_tui;
@@ -177,6 +178,10 @@ pub enum Commands {
     /// Codemap staleness info and pending changes
     #[command(subcommand)]
     Codemap(codemap_cmd::CodemapCommands),
+
+    /// PRODUCT_OVERVIEW.md staleness info and pending changes
+    #[command(subcommand, name = "project-overview")]
+    ProjectOverview(project_overview_cmd::ProjectOverviewCommands),
 }
 
 /// Authentication requirement for a command.
@@ -218,7 +223,8 @@ fn auth_requirement(command: &Option<Commands>) -> AuthRequirement {
         | Commands::Mcp(_)
         | Commands::Queue(_)
         | Commands::ClaudeMd(_)
-        | Commands::Codemap(_) => AuthRequirement::NotRequired,
+        | Commands::Codemap(_)
+        | Commands::ProjectOverview(_) => AuthRequirement::NotRequired,
 
         #[cfg(feature = "mcp-server")]
         Commands::Serve => AuthRequirement::NotRequired,
@@ -365,6 +371,7 @@ fn get_command_name(cmd: &Option<Commands>) -> String {
         Commands::Device(_) => "device".to_string(),
         Commands::ClaudeMd(_) => "claude-md".to_string(),
         Commands::Codemap(_) => "codemap".to_string(),
+        Commands::ProjectOverview(_) => "project-overview".to_string(),
     }
 }
 
@@ -413,6 +420,9 @@ fn run_command(cli: &Cli, cas_root: Option<&Path>) -> anyhow::Result<()> {
         Commands::Device(cmd) => device::execute(cmd, cli),
         Commands::ClaudeMd(args) => claude_md::execute(args, cli),
         Commands::Codemap(cmd) => codemap_cmd::execute(cmd, cli, require_cas_root(cas_root)?),
+        Commands::ProjectOverview(cmd) => {
+            project_overview_cmd::execute(cmd, cli, require_cas_root(cas_root)?)
+        }
     }
 }
 

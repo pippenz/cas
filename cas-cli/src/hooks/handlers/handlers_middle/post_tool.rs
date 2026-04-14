@@ -81,6 +81,28 @@ pub fn handle_post_tool_use(
     if tool_name == "Bash" {
         crate::hooks::handlers::handlers_events::detect_and_link_git_commit(cas_root, input);
         crate::hooks::handlers::handlers_events::detect_codemap_structural_changes(cas_root, input);
+
+        // Project-overview pending-file update. Only fires on successful git commits
+        // so detect_structural_changes (which always diffs HEAD~1..HEAD) sees a
+        // fresh commit, not the same previous one on every Bash.
+        //
+        // Advisory flock on a sentinel file serializes concurrent hook processes
+        // so the JSONL append in detect_structural_changes cannot interleave
+        // bytes past PIPE_BUF — addresses the P1 append-race carry-forward from
+        // cas-dcba review. Best-effort: if the lock fails (FS without lock
+        // support, e.g. NTFS3 — see MEMORY.md), we fall through and accept the
+        // pre-existing race rather than dropping the pending write entirely.
+        if is_successful_git_commit(input) {
+            if let Some(repo_root) = cas_root.parent() {
+                with_pending_file_lock(cas_root, || {
+                    if let Err(e) = crate::hooks::handlers::handlers_events::project_overview::detect_structural_changes(
+                        repo_root,
+                    ) {
+                        eprintln!("cas: project-overview detect error: {e}");
+                    }
+                });
+            }
+        }
     }
 
     // === SMART FILTERING ===
@@ -666,6 +688,70 @@ fn task_references_file(task: &Task, relative: &str, short_path: Option<&str>) -
     false
 }
 
+/// Run `f` while holding an exclusive advisory flock on
+/// `<cas_root>/project-overview-pending.lock`.
+///
+/// Prevents two concurrent PostToolUse hook processes from interleaving appends
+/// to `project-overview-pending.json`. Unlock is RAII — even if `f` panics the
+/// guard's Drop releases the lock on scope exit. Lock acquisition failure
+/// (filesystems without advisory-lock support, e.g. NTFS3 per MEMORY.md) falls
+/// through and runs the closure unprotected; preserving the write is more
+/// important than strict serialization on those platforms.
+fn with_pending_file_lock(cas_root: &Path, f: impl FnOnce()) {
+    use fs2::FileExt;
+
+    struct LockGuard(std::fs::File, bool);
+    impl Drop for LockGuard {
+        fn drop(&mut self) {
+            if self.1 {
+                let _ = FileExt::unlock(&self.0);
+            }
+        }
+    }
+
+    let lock_path = cas_root.join("project-overview-pending.lock");
+    let _guard = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .ok()
+        .map(|file| {
+            let locked = file.lock_exclusive().is_ok();
+            LockGuard(file, locked)
+        });
+    f();
+}
+
+/// True when the PostToolUse input represents a successful `git commit` Bash
+/// call that creates a new commit.
+///
+/// `--dry-run` is excluded (mirrors `attribution::is_git_commit_command`).
+/// `--amend` is excluded because it rewrites HEAD in place — firing
+/// `detect_structural_changes` on an amended commit would re-record the same
+/// logical change set and inflate pending-file totals past threshold.
+fn is_successful_git_commit(input: &HookInput) -> bool {
+    let Some(tool_input) = input.tool_input.as_ref() else {
+        return false;
+    };
+    let Some(command) = tool_input.get("command").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    let cmd_lower = command.to_lowercase();
+    if !cmd_lower.contains("git commit")
+        || cmd_lower.contains("--dry-run")
+        || cmd_lower.contains("--amend")
+    {
+        return false;
+    }
+    let exit_code = input
+        .tool_response
+        .as_ref()
+        .and_then(|r| r.get("exitCode").and_then(|v| v.as_i64()))
+        .unwrap_or(1);
+    exit_code == 0
+}
+
 /// Check if a spec's text fields reference a given file path.
 fn spec_references_file(
     spec: &crate::types::Spec,
@@ -693,4 +779,119 @@ fn spec_references_file(
     }
 
     false
+}
+
+#[cfg(test)]
+mod post_tool_wiring_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn bash_input(command: &str, exit_code: i64) -> HookInput {
+        HookInput {
+            tool_name: Some("Bash".to_string()),
+            tool_input: Some(json!({ "command": command })),
+            tool_response: Some(json!({ "exitCode": exit_code })),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn is_successful_git_commit_matches_git_commit_exit_0() {
+        assert!(is_successful_git_commit(&bash_input(
+            "git commit -m 'test'",
+            0
+        )));
+    }
+
+    #[test]
+    fn is_successful_git_commit_rejects_non_zero_exit() {
+        assert!(!is_successful_git_commit(&bash_input(
+            "git commit -m 'test'",
+            1
+        )));
+    }
+
+    #[test]
+    fn is_successful_git_commit_rejects_non_commit_commands() {
+        assert!(!is_successful_git_commit(&bash_input("git status", 0)));
+        assert!(!is_successful_git_commit(&bash_input("ls -la", 0)));
+    }
+
+    #[test]
+    fn is_successful_git_commit_rejects_missing_tool_response() {
+        let input = HookInput {
+            tool_name: Some("Bash".to_string()),
+            tool_input: Some(json!({ "command": "git commit" })),
+            tool_response: None,
+            ..Default::default()
+        };
+        assert!(!is_successful_git_commit(&input));
+    }
+
+    #[test]
+    fn is_successful_git_commit_rejects_amend() {
+        assert!(!is_successful_git_commit(&bash_input(
+            "git commit --amend -m x",
+            0
+        )));
+    }
+
+    #[test]
+    fn is_successful_git_commit_rejects_dry_run() {
+        assert!(!is_successful_git_commit(&bash_input(
+            "git commit --dry-run",
+            0
+        )));
+    }
+
+    #[test]
+    fn is_successful_git_commit_rejects_missing_exitcode_key() {
+        let input = HookInput {
+            tool_name: Some("Bash".to_string()),
+            tool_input: Some(json!({ "command": "git commit" })),
+            tool_response: Some(json!({})),
+            ..Default::default()
+        };
+        assert!(!is_successful_git_commit(&input));
+    }
+
+    #[test]
+    fn with_pending_file_lock_runs_closure_and_creates_sentinel() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let tmp = std::env::temp_dir().join(format!(
+            "po_lock_{}_{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let called = std::cell::Cell::new(false);
+        with_pending_file_lock(&tmp, || called.set(true));
+
+        assert!(called.get(), "closure must run");
+        assert!(
+            tmp.join("project-overview-pending.lock").exists(),
+            "sentinel file must be created"
+        );
+        // Second call on same dir must not panic and must re-run closure.
+        let called2 = std::cell::Cell::new(false);
+        with_pending_file_lock(&tmp, || called2.set(true));
+        assert!(called2.get());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn with_pending_file_lock_falls_through_when_cas_root_missing() {
+        // Non-existent parent dir — OpenOptions::create will fail. Closure must
+        // still run (fallthrough behavior), no panic.
+        let tmp = std::env::temp_dir()
+            .join(format!("po_missing_{}", std::process::id()))
+            .join("does-not-exist");
+        let called = std::cell::Cell::new(false);
+        with_pending_file_lock(&tmp, || called.set(true));
+        assert!(called.get(), "fallthrough closure must still run");
+    }
 }
