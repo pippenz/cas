@@ -55,6 +55,13 @@ pub struct TeamsSpawnConfig {
     pub parent_session_id: Option<String>,
     /// Lead session ID — set for the team lead so --session-id matches leadSessionId
     pub lead_session_id: Option<String>,
+    /// Optional path to a settings JSON file passed via `--settings <path>`.
+    ///
+    /// Used for the team lead (supervisor) to auto-allow Write/Edit/Bash/NotebookEdit
+    /// so that permission routing does not forward approval requests back to the
+    /// supervisor itself (the team-lead-is-also-member self-leadership deadlock).
+    /// Non-lead workers leave this as `None` and retain normal permission routing.
+    pub settings_path: Option<String>,
 }
 
 impl Default for PtyConfig {
@@ -190,6 +197,14 @@ impl PtyConfig {
             if let Some(ref parent_id) = t.parent_session_id {
                 args.push("--parent-session-id".to_string());
                 args.push(parent_id.clone());
+            }
+            // Per-team settings file — used by the supervisor to auto-allow
+            // Write/Edit/Bash/NotebookEdit so permission routing does not send
+            // approval requests back to the supervisor itself. Workers leave
+            // this as None and keep normal routing.
+            if let Some(ref settings_path) = t.settings_path {
+                args.push("--settings".to_string());
+                args.push(settings_path.clone());
             }
         }
 
@@ -811,6 +826,8 @@ mod tests {
             agent_color: "blue".to_string(),
             agent_type: "general-purpose".to_string(),
             parent_session_id: Some("lead-session-123".to_string()),
+            lead_session_id: None,
+            settings_path: None,
         };
         let config = PtyConfig::claude(
             "worker-1",
@@ -851,6 +868,8 @@ mod tests {
             agent_color: "green".to_string(),
             agent_type: "team-lead".to_string(),
             parent_session_id: None,
+            lead_session_id: None,
+            settings_path: None,
         };
         let config = PtyConfig::claude(
             "supervisor",
@@ -867,5 +886,71 @@ mod tests {
         assert!(config.args.contains(&"tmux".to_string()));
         // No --parent-session-id for the lead
         assert!(!config.args.contains(&"--parent-session-id".to_string()));
+    }
+
+    /// When `TeamsSpawnConfig::settings_path` is set (as it is for the
+    /// supervisor in factory mode), the spawned `claude` invocation must
+    /// include `--settings <path>` so Claude Code loads the allowlist that
+    /// sidesteps the self-leadership routing deadlock. Workers without a
+    /// `settings_path` must not get the flag.
+    #[tokio::test]
+    async fn test_pty_config_claude_teams_supervisor_gets_settings_flag() {
+        let settings_path = "/home/pippenz/.claude/teams/deadlock-team/supervisor-settings.json";
+        let teams = TeamsSpawnConfig {
+            team_name: "deadlock-team".to_string(),
+            agent_id: "supervisor@deadlock-team".to_string(),
+            agent_name: "supervisor".to_string(),
+            agent_color: "green".to_string(),
+            agent_type: "team-lead".to_string(),
+            parent_session_id: None,
+            lead_session_id: None,
+            settings_path: Some(settings_path.to_string()),
+        };
+        let config = PtyConfig::claude(
+            "supervisor",
+            "supervisor",
+            PathBuf::from("/tmp"),
+            None,
+            None,
+            None,
+            None,
+            Some(&teams),
+        );
+        assert!(
+            config.args.contains(&"--settings".to_string()),
+            "supervisor spawn must include --settings flag"
+        );
+        assert!(
+            config.args.contains(&settings_path.to_string()),
+            "supervisor spawn must pass the settings file path"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pty_config_claude_teams_worker_omits_settings_flag() {
+        let teams = TeamsSpawnConfig {
+            team_name: "deadlock-team".to_string(),
+            agent_id: "worker-1@deadlock-team".to_string(),
+            agent_name: "worker-1".to_string(),
+            agent_color: "blue".to_string(),
+            agent_type: "general-purpose".to_string(),
+            parent_session_id: Some("lead-session-xyz".to_string()),
+            lead_session_id: None,
+            settings_path: None,
+        };
+        let config = PtyConfig::claude(
+            "worker-1",
+            "worker",
+            PathBuf::from("/tmp"),
+            None,
+            None,
+            None,
+            None,
+            Some(&teams),
+        );
+        assert!(
+            !config.args.contains(&"--settings".to_string()),
+            "worker spawn must not emit --settings; allowlist is supervisor-only"
+        );
     }
 }

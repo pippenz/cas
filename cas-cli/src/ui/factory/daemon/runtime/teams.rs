@@ -118,6 +118,32 @@ impl TeamsManager {
         let mut configs = std::collections::HashMap::new();
         let lead_session_id = uuid::Uuid::new_v4().to_string();
 
+        // Supervisor settings path — auto-allow Write/Edit/Bash/NotebookEdit so
+        // the supervisor's tool calls don't get forwarded to itself via team
+        // permission routing (self-leadership deadlock). Workers leave this as
+        // None and retain normal routing.
+        //
+        // The file is written *here*, eagerly, because the factory spawns the
+        // supervisor PTY during `FactoryApp::new` — which runs *before*
+        // `init_team_config` in the daemon boot sequence. If we deferred the
+        // write, `claude` would be launched with `--settings <path>` pointing
+        // at a file that doesn't yet exist and would silently skip our
+        // allowlist, recreating the deadlock. Writing here keeps the
+        // invariant "path in TeamsSpawnConfig implies file exists on disk".
+        let supervisor_settings_path_buf = Self::supervisor_settings_path_for(session_name);
+        let supervisor_settings_path = supervisor_settings_path_buf.to_string_lossy().to_string();
+        if let Err(e) = Self::write_supervisor_settings_to(&supervisor_settings_path_buf) {
+            // Downgrade to a warning so the factory still boots on transient
+            // I/O issues; if the write fails the supervisor falls back to
+            // the pre-fix (deadlock-prone) behavior but everything else
+            // proceeds and the log makes post-hoc diagnosis obvious.
+            tracing::warn!(
+                "Failed to pre-write supervisor settings at {:?}: {}",
+                supervisor_settings_path_buf,
+                e
+            );
+        }
+
         // Supervisor — keyed by pane name for PTY lookup, but agent_name is
         // always "supervisor" so Claude identifies as "supervisor" in the team.
         configs.insert(
@@ -130,6 +156,7 @@ impl TeamsManager {
                 agent_type: "team-lead".to_string(),
                 parent_session_id: None,
                 lead_session_id: Some(lead_session_id.clone()),
+                settings_path: Some(supervisor_settings_path),
             },
         );
 
@@ -145,11 +172,63 @@ impl TeamsManager {
                     agent_type: "general-purpose".to_string(),
                     parent_session_id: Some(lead_session_id.clone()),
                     lead_session_id: None,
+                    settings_path: None,
                 },
             );
         }
 
         (configs, lead_session_id)
+    }
+
+    /// Compute the on-disk path of the supervisor-only settings file for a
+    /// given session name. The file lives alongside `config.json` under
+    /// `~/.claude/teams/{session}/supervisor-settings.json` and is written by
+    /// [`Self::build_configs_for_mux`] (eagerly, before PTY spawn) and
+    /// re-written by [`Self::init_team_config`] (idempotent rewrite after the
+    /// team directory is fully populated). See [`supervisor_settings_contents`]
+    /// for the allowlist shape.
+    pub fn supervisor_settings_path_for(session_name: &str) -> PathBuf {
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        home.join(".claude")
+            .join("teams")
+            .join(session_name)
+            .join("supervisor-settings.json")
+    }
+
+    /// Write `supervisor-settings.json` at the given absolute path, creating
+    /// the parent directory if needed. Static variant used by
+    /// [`Self::build_configs_for_mux`], which runs before any instance of
+    /// `TeamsManager` is constructed. Idempotent and safe to call repeatedly.
+    pub fn write_supervisor_settings_to(path: &std::path::Path) -> anyhow::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let body = serde_json::to_string_pretty(&Self::supervisor_settings_contents())?;
+        std::fs::write(path, body)?;
+        tracing::info!("Wrote supervisor settings at {:?}", path);
+        Ok(())
+    }
+
+    /// The JSON body of the supervisor settings file — a Claude Code
+    /// `permissions.allow` list that auto-approves the four tool families
+    /// whose approvals would otherwise route back to the supervisor itself.
+    ///
+    /// Kept tight on purpose: no MCP tools, no network, no shell glob expansion
+    /// beyond the base tool name. The deadlock only fires for tools that are
+    /// not otherwise auto-allowed, and the factory supervisor already runs
+    /// with `--dangerously-skip-permissions`, so this list is the minimum set
+    /// observed to produce the routing-deadlock symptom.
+    pub fn supervisor_settings_contents() -> serde_json::Value {
+        serde_json::json!({
+            "permissions": {
+                "allow": [
+                    "Write",
+                    "Edit",
+                    "Bash",
+                    "NotebookEdit"
+                ]
+            }
+        })
     }
 
     /// Assign a color to an agent based on its index in the team.
@@ -250,6 +329,14 @@ impl TeamsManager {
         let json = serde_json::to_string_pretty(&config)?;
         std::fs::write(&config_path, json)?;
 
+        // Re-write the supervisor-only settings file. `build_configs_for_mux`
+        // already wrote it eagerly (before `FactoryApp::new` spawned the
+        // supervisor PTY, which is when `--settings <path>` needs to resolve).
+        // We rewrite it here defensively so that code paths reaching
+        // `init_team_config` without going through `build_configs_for_mux`
+        // still end up with a valid file on disk. The write is idempotent.
+        self.write_supervisor_settings()?;
+
         // Create empty inbox files for all agents
         self.ensure_inbox("supervisor")?;
         self.ensure_inbox(DIRECTOR_AGENT_NAME)?;
@@ -264,6 +351,14 @@ impl TeamsManager {
         );
 
         Ok(())
+    }
+
+    /// Write `supervisor-settings.json` in the team directory. Safe to call
+    /// multiple times; the content is fixed so repeated writes are idempotent.
+    /// Delegates to [`Self::write_supervisor_settings_to`] so the eager-write
+    /// path and the `init_team_config` rewrite share a single implementation.
+    pub fn write_supervisor_settings(&self) -> anyhow::Result<()> {
+        Self::write_supervisor_settings_to(&self.teams_dir.join("supervisor-settings.json"))
     }
 
     /// Add a new member to the team (e.g., when a worker is spawned dynamically).
@@ -460,6 +555,11 @@ impl TeamsManager {
     }
 
     /// Build a `cas_mux::TeamsSpawnConfig` for spawning a new agent with native teams flags.
+    ///
+    /// This constructor is used for dynamically-added workers (agents added
+    /// after the initial `init_team_config` call). It intentionally leaves
+    /// `settings_path` unset — the supervisor-only settings file is for the
+    /// team lead's self-routing deadlock and is not relevant to workers.
     pub fn spawn_config_for(
         &self,
         name: &str,
@@ -475,6 +575,140 @@ impl TeamsManager {
             agent_type: agent_type.to_string(),
             parent_session_id: parent_session_id.map(|s| s.to_string()),
             lead_session_id: None,
+            settings_path: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Point the manager at a temp directory instead of `~/.claude/teams/...`
+    /// so the test doesn't collide with real factory sessions. We keep the
+    /// production constructor in place and just override the internal paths;
+    /// that also exercises the real file layout the supervisor CLI sees.
+    fn manager_in(tmp: &std::path::Path, name: &str) -> TeamsManager {
+        let teams_dir = tmp.join(".claude").join("teams").join(name);
+        let inboxes_dir = teams_dir.join("inboxes");
+        TeamsManager {
+            team_name: name.to_string(),
+            teams_dir,
+            inboxes_dir,
+        }
+    }
+
+    #[test]
+    fn init_team_config_writes_supervisor_settings_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let tm = manager_in(tmp.path(), "deadlock-test-team");
+        let (_configs, lead_session_id) =
+            TeamsManager::build_configs_for_mux("deadlock-test-team", "supervisor", &[]);
+
+        tm.init_team_config(&[], tmp.path(), &std::collections::HashMap::new(), &lead_session_id)
+            .expect("init");
+
+        let settings_path = tm.teams_dir.join("supervisor-settings.json");
+        assert!(
+            settings_path.exists(),
+            "supervisor-settings.json should be written next to config.json"
+        );
+
+        let body = std::fs::read_to_string(&settings_path).expect("read settings");
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        let allow = parsed
+            .get("permissions")
+            .and_then(|p| p.get("allow"))
+            .and_then(|a| a.as_array())
+            .expect("permissions.allow array present");
+
+        let names: Vec<&str> = allow.iter().filter_map(|v| v.as_str()).collect();
+        // Exactly the four tool families the routing deadlock is observed on.
+        // Keeping this assertion tight catches accidental drift toward
+        // over-permissioning (which would weaken isolation for the supervisor).
+        assert!(names.contains(&"Write"), "allow must include Write");
+        assert!(names.contains(&"Edit"), "allow must include Edit");
+        assert!(names.contains(&"Bash"), "allow must include Bash");
+        assert!(
+            names.contains(&"NotebookEdit"),
+            "allow must include NotebookEdit"
+        );
+        assert_eq!(
+            names.len(),
+            4,
+            "allow should be exactly the four deadlock-prone tool families, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn build_configs_for_mux_sets_settings_path_on_supervisor_only() {
+        let (configs, _lead_session_id) = TeamsManager::build_configs_for_mux(
+            "routing-test-team",
+            "supervisor",
+            &["worker-1".to_string(), "worker-2".to_string()],
+        );
+
+        let sup = configs.get("supervisor").expect("supervisor config");
+        let path = sup
+            .settings_path
+            .as_ref()
+            .expect("supervisor must carry a settings_path so --settings is emitted");
+        assert!(
+            path.ends_with("supervisor-settings.json"),
+            "settings_path should point at supervisor-settings.json, got {path}"
+        );
+        assert!(
+            path.contains("routing-test-team"),
+            "settings_path should live under the session's team dir, got {path}"
+        );
+
+        for worker in ["worker-1", "worker-2"] {
+            let w = configs.get(worker).expect("worker config");
+            assert!(
+                w.settings_path.is_none(),
+                "worker {worker} must not get the supervisor allowlist"
+            );
+        }
+    }
+
+    /// Core invariant: the supervisor settings file must exist on disk by the
+    /// time `build_configs_for_mux` returns, because that's the latest moment
+    /// before the factory calls `FactoryApp::new` → `Mux::factory` and spawns
+    /// the supervisor PTY with `--settings <path>`. A missing file at spawn
+    /// time means `claude` silently falls back to the stock allowlist and the
+    /// deadlock recurs.
+    #[test]
+    fn build_configs_for_mux_writes_settings_file_eagerly() {
+        // Use a unique session name so parallel test runs don't race each
+        // other on the same path in $HOME/.claude/teams/. The test cleans
+        // up after itself at the end.
+        let uniq = format!(
+            "deadlock-eager-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let expected_path = TeamsManager::supervisor_settings_path_for(&uniq);
+        assert!(
+            !expected_path.exists(),
+            "precondition: settings file must not exist before build_configs_for_mux"
+        );
+
+        let (_configs, _lead_id) =
+            TeamsManager::build_configs_for_mux(&uniq, "supervisor", &[]);
+
+        assert!(
+            expected_path.exists(),
+            "build_configs_for_mux must write supervisor-settings.json eagerly; \
+             missing at {expected_path:?} would cause --settings to resolve to \
+             nothing when the supervisor PTY spawns"
+        );
+
+        // Cleanup
+        if let Some(dir) = expected_path.parent() {
+            let _ = std::fs::remove_dir_all(dir);
         }
     }
 }
