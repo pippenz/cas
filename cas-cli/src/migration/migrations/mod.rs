@@ -168,6 +168,7 @@ mod m190_tasks_add_execution_note;
 mod m191_agents_add_startup_confirmed;
 mod m192_perf_indexes;
 mod m193_spawn_queue_force_isolate;
+mod m194_spawn_queue_repair_broken_schema;
 
 /// All migrations in order. IDs must be sequential and never reused.
 pub const MIGRATIONS: &[Migration] = &[
@@ -331,6 +332,8 @@ pub const MIGRATIONS: &[Migration] = &[
     m192_perf_indexes::MIGRATION,
     // Spawn queue force/isolate columns (moved from hand-rolled init, cas-3c74)
     m193_spawn_queue_force_isolate::MIGRATION,
+    // Repair spawn_queue DBs corrupted by earlier m193 revision (cas-a68b)
+    m194_spawn_queue_repair_broken_schema::MIGRATION,
 ];
 
 #[cfg(test)]
