@@ -76,7 +76,7 @@ pub use recording::{
     Recording, RecordingAgent, RecordingEvent, RecordingEventType, RecordingQuery,
 };
 pub use rule::{Rule, RuleCategory, RuleStatus};
-pub use scope::{Scope, ScopeFilter};
+pub use scope::{Scope, ScopeFilter, ShareScope};
 pub use session::{Session, SessionOutcome};
 pub use skill::{Skill, SkillHookConfig, SkillHookEntry, SkillHooks, SkillStatus, SkillType};
 pub use sort::{

@@ -365,6 +365,15 @@ pub struct Entry {
     /// Used for team sync - entries with team_id sync to team repository
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub team_id: Option<String>,
+
+    /// Per-entry opt-out/opt-in override for team auto-promotion at sync
+    /// time. See `ShareScope` + docs/requests/team-memories-filter-policy.md.
+    /// `None` (default) → the project-scope + non-Preference auto-rule applies.
+    /// Not persisted in SQLite in this release — the field round-trips via
+    /// the sync JSON blob and will grow a dedicated column when
+    /// `cas memory share` / `--share` lands (T5, cas-07d7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub share: Option<crate::scope::ShareScope>,
 }
 
 pub(crate) fn default_importance() -> f32 {

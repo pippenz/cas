@@ -222,6 +222,11 @@ impl SqliteStore {
                 .map(|s| Scope::from_str(&s).unwrap_or_default())
                 .unwrap_or_default(),
             team_id: row.get(30)?,
+            // `share` has no SQLite column yet (T5 cas-07d7 adds the
+            // migration + CRUD wire-up). Entries round-trip `share=None`
+            // in this release; the field is populated only at sync
+            // serialization time or via forthcoming T5 primitives.
+            share: None,
         })
     }
 

@@ -169,6 +169,7 @@ impl CasCore {
             confidence: 0.5,
             branch,
             team_id: None,
+            share: None,
         };
 
         store.add(&entry).map_err(|e| McpError {

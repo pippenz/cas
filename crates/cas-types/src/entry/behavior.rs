@@ -46,6 +46,7 @@ impl Entry {
             confidence: default_confidence(),
             branch: None,
             team_id: None,
+            share: None,
         }
     }
 
@@ -83,6 +84,7 @@ impl Entry {
             confidence: confidence.clamp(0.0, 1.0),
             branch: None,
             team_id: None,
+            share: None,
         }
     }
 
@@ -120,6 +122,7 @@ impl Entry {
             confidence: confidence.clamp(0.0, 1.0),
             branch: None,
             team_id: None,
+            share: None,
         }
     }
 
@@ -165,6 +168,7 @@ impl Entry {
             confidence: 0.8,               // Slightly lower confidence for auto-captured
             branch: None,
             team_id: None,
+            share: None,
         }
     }
 
@@ -208,6 +212,7 @@ impl Entry {
             confidence: 0.8,
             branch: None,
             team_id: None,
+            share: None,
         }
     }
 
@@ -523,6 +528,7 @@ impl Default for Entry {
             confidence: default_confidence(),
             branch: None,
             team_id: None,
+            share: None,
         }
     }
 }

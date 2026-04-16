@@ -150,6 +150,49 @@ impl fmt::Display for ScopeFilter {
     }
 }
 
+/// Per-entity override for who can see a memory when syncing to the cloud.
+///
+/// Orthogonal to `Scope` — `Scope` is *where the data lives* locally,
+/// `ShareScope` is *who receives it* at sync time. See
+/// `docs/requests/team-memories-filter-policy.md` for the precedence rules.
+///
+/// When `None` (the default), the CLI's auto-promotion policy applies:
+/// Project-scoped, non-Preference entities dual-enqueue to the team push
+/// queue iff a team is configured. An explicit `Private` suppresses the
+/// team enqueue even for entities that would otherwise auto-promote; an
+/// explicit `Team` force-promotes even Global-scoped or Preference-typed
+/// entities (the server-side pull filter still applies for Preference —
+/// see the filter-policy doc).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ShareScope {
+    /// Never auto-promote to the team queue, regardless of scope / type.
+    Private,
+    /// Force-promote to the team queue, regardless of scope / type.
+    Team,
+}
+
+impl fmt::Display for ShareScope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ShareScope::Private => write!(f, "private"),
+            ShareScope::Team => write!(f, "team"),
+        }
+    }
+}
+
+impl FromStr for ShareScope {
+    type Err = TypeError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "private" | "personal" => Ok(ShareScope::Private),
+            "team" => Ok(ShareScope::Team),
+            _ => Err(TypeError::Parse(format!("Invalid share scope: {s}"))),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::scope::*;
@@ -215,5 +258,42 @@ mod tests {
     fn test_default_scopes() {
         assert_eq!(Scope::default(), Scope::Project);
         assert_eq!(ScopeFilter::default(), ScopeFilter::All);
+    }
+
+    #[test]
+    fn test_share_scope_from_str() {
+        assert_eq!(ShareScope::from_str("private").unwrap(), ShareScope::Private);
+        assert_eq!(ShareScope::from_str("PRIVATE").unwrap(), ShareScope::Private);
+        // "personal" is a user-facing alias — the CLI speaks this word,
+        // the type system stores Private.
+        assert_eq!(
+            ShareScope::from_str("personal").unwrap(),
+            ShareScope::Private
+        );
+        assert_eq!(ShareScope::from_str("team").unwrap(), ShareScope::Team);
+        assert!(ShareScope::from_str("public").is_err());
+        assert!(ShareScope::from_str("").is_err());
+    }
+
+    #[test]
+    fn test_share_scope_display() {
+        assert_eq!(ShareScope::Private.to_string(), "private");
+        assert_eq!(ShareScope::Team.to_string(), "team");
+    }
+
+    #[test]
+    fn test_share_scope_serde_roundtrip() {
+        let private_json = serde_json::to_string(&ShareScope::Private).unwrap();
+        assert_eq!(private_json, r#""private""#);
+        let team_json = serde_json::to_string(&ShareScope::Team).unwrap();
+        assert_eq!(team_json, r#""team""#);
+        assert_eq!(
+            serde_json::from_str::<ShareScope>(r#""private""#).unwrap(),
+            ShareScope::Private
+        );
+        assert_eq!(
+            serde_json::from_str::<ShareScope>(r#""team""#).unwrap(),
+            ShareScope::Team
+        );
     }
 }

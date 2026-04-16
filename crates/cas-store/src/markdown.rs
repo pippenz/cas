@@ -98,6 +98,7 @@ impl MarkdownStore {
             confidence: 1.0,
             branch: None,
             team_id: None,
+            share: None,
         })
     }
 
