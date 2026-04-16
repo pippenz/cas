@@ -2057,6 +2057,14 @@ mod team_cmd_tests {
         assert!(reloaded.team_slug.is_none());
     }
 
+    // These probe_membership tests use `tokio::task::spawn_blocking` to call
+    // the synchronous `ureq`-based `probe_team_membership` from inside
+    // `#[tokio::test]` (which runs on a current-thread runtime). `wiremock`
+    // binds the MockServer on the test's tokio runtime; the blocking call
+    // executes on tokio's separate blocking pool. `await`-ing the join
+    // handle drives the runtime so the mock can serve the request — if you
+    // ever replace this pattern, be sure the HTTP call still has a live
+    // runtime to answer it on the other side.
     #[tokio::test]
     async fn probe_membership_returns_member_on_200() {
         let server = MockServer::start().await;
