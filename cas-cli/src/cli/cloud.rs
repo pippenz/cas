@@ -105,7 +105,7 @@ pub struct CloudSyncArgs {
 
 #[derive(Parser)]
 pub struct CloudProjectsArgs {
-    /// Team UUID override (defaults to the team configured via `cas cloud team set`).
+    /// Team UUID override (defaults to the team configured via `cas cloud team set`)
     #[arg(long)]
     pub team: Option<String>,
 }

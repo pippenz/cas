@@ -255,16 +255,22 @@ created a team in the CAS Cloud dashboard:
 
 ```bash
 # One-time setup per machine — UUID from your team dashboard
+cas login
 cas cloud team set 550e8400-e29b-41d4-a716-446655440000
 
-# Your normal memory capture flows automatically dual-enqueue to the
-# team push queue (Project-scoped, non-Preference entries only)
-cas memory remember "pattern we settled on during auth refactor"
+# From now on, every memory captured via mcp__cas__memory
+# action=remember (Claude Code) in a Project-scoped, non-Preference
+# context automatically dual-enqueues into the team push queue.
 
 # Next sync drains both personal and team queues
 cas cloud sync
+```
 
-# Teammates on a fresh machine pull what you've shared, zero flags:
+Teammates on a fresh machine see what you've shared with the same
+zero-flag setup:
+
+```bash
+cas login
 cas cloud team set 550e8400-e29b-41d4-a716-446655440000
 cas cloud team-memories
 ```
@@ -276,8 +282,8 @@ before the team was configured, promote them retroactively:
 cas memory share --dry-run --all             # preview
 cas memory share --all                       # promote everything eligible
 cas memory share --since 7d                  # or just the last week
-cas memory share <entry-id>                  # or one at a time
-cas memory unshare <entry-id>                # reverse — mark as Private
+cas memory share 2026-03-01-1                # or one at a time, by id
+cas memory unshare 2026-03-01-1              # reverse — mark as Private
 ```
 
 Preference-typed and Global-scoped entries always stay personal. To

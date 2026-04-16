@@ -214,9 +214,9 @@ If a user wants to explicitly exclude a specific memory from team visibility, th
 
 ## Edge Cases to Handle
 
-1. **No team configured** — `cas cloud team-memories` should print: "No team configured. Run `cas cloud team set <slug>` first."
+1. **No team configured** — `cas cloud team-memories` should print: "No team configured. Run `cas cloud team set <uuid>` first." (Slug resolution was deferred when the T2 CLI shipped — see cas-4eed — because petra-stella-cloud has no slug→UUID endpoint.)
 
-2. **Project not found on server** — First team push for this project hasn't happened yet. Print: "This project hasn't been synced to the team yet. Run `cas cloud sync --team` to register it."
+2. **Project not found on server** — First team push for this project hasn't happened yet. Print: "This project hasn't been synced to the team yet. Run `cas cloud sync` while a team is configured (see `cas cloud team set <uuid>`) to register it."
 
 3. **No new memories** — `?since=` returns empty memories. Print: "Team memories are up to date."
 

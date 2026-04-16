@@ -35,7 +35,7 @@ pub enum MemoryCommands {
 
 #[derive(Parser)]
 pub struct ShareArgs {
-    /// Entry id to promote (e.g. 2026-03-01-1).
+    /// Entry id to promote (e.g., 2026-03-01-1).
     ///
     /// Mutually exclusive with --since and --all. Fails if the entry
     /// is a Preference or Global-scoped (stay-personal by default).
@@ -52,8 +52,9 @@ pub struct ShareArgs {
     /// Promote every eligible entry in the store.
     ///
     /// Eligible = Project scope, not Preference-typed, not already
-    /// marked share=Private. This is the "Daniel's 392 entries"
-    /// backfill case for new team setups.
+    /// marked share=Private. Use this for initial team onboarding
+    /// when pre-existing personal memories need to be promoted in
+    /// bulk.
     #[arg(long, conflicts_with_all = ["id", "since"])]
     pub all: bool,
 
