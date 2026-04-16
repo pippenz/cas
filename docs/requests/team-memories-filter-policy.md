@@ -28,9 +28,10 @@ and cas-19e6 (T7 docs).
 The BUG spec uses "personal" informally. In CAS code the scope enum is binary:
 
 - `Scope::Global` — stored under `~/.config/cas/`. User-level preferences,
-  cross-project rules, global skills. ID prefix `g-`.
+  cross-project rules, global skills. ID prefix `g` (full IDs like
+  `g-2025-01-01-001`).
 - `Scope::Project` — stored under `./.cas/`. Codebase-specific learnings,
-  project context, project rules/skills. ID prefix `p-`.
+  project context, project rules/skills. ID prefix `p`.
 
 There is no `Scope::Personal`. In this document and in all derived tasks we
 use the two scope names above. When the BUG spec says "personal stays local"
@@ -68,31 +69,90 @@ Rationale:
 
 ### Implementation target for T3
 
-In `cas-cli/src/store/syncing_*.rs::queue_upsert` / `queue_delete`, after the
-existing personal `enqueue(...)`, call:
+In **each** of `cas-cli/src/store/syncing_entry.rs`, `syncing_task.rs`,
+`syncing_rule.rs`, `syncing_skill.rs`, after the existing personal
+`enqueue(...)` inside `queue_upsert` / `queue_delete`, add a sibling
+`enqueue_for_team(...)` call guarded by the eligibility predicate. The
+`EntityType` passed MUST match the per-store type already used on the
+personal path (Entry / Task / Rule / Skill) — do not copy-paste the
+`EntityType::Entry` literal from the entry-store example below into the
+task or skill stores. Sketch for the entry store:
 
 ```rust
-if let Some(team_id) = active_team_id()
-    && eligible_for_team(entity)
+// in SyncingEntryStore
+if let Some(team_id) = self.cloud_config.active_team_id()
+    && eligible_for_team(entry)
 {
-    let _ = self.queue.enqueue_for_team(
+    if let Err(e) = self.queue.enqueue_for_team(
         EntityType::Entry,
         &entry.id,
         SyncOperation::Upsert,
         Some(&payload),
         &team_id,
-    );
+    ) {
+        tracing::warn!(target: "cas::sync", "team enqueue failed: {e}");
+    }
 }
 ```
 
-`eligible_for_team` is the predicate above. It is local and pure, runs per
-write, never calls out to the network. The unique key
-`(entity_type, entity_id, team_id)` already allows both rows to coexist — see
-`cas-cli/src/cloud/sync_queue/queue_ops.rs:47-55`.
+Structural prerequisites T3 must land first:
 
-`active_team_id()` reads from `CloudConfig` (loaded once per syncing store
-construction; reloaded on `cas cloud team set` via the config writer path —
-see Decision 5).
+1. Extend `SyncingEntryStore` (and its three siblings) to hold
+   `cloud_config: Arc<CloudConfig>`. Their `new(...)` constructors gain a
+   third parameter; update every call site that constructs these wrappers.
+2. Add an `impl CloudConfig { pub fn active_team_id(&self) -> Option<&str> }`
+   accessor that returns `self.team_id.as_deref()` only when
+   `self.team_auto_promote != Some(false)` — this is the Decision 3 coarse
+   kill-switch, enforced at the accessor so every caller sees it.
+3. Add `pub team_auto_promote: Option<bool>` to `CloudConfig`
+   (`cas-cli/src/cloud/config.rs`) with `#[serde(default)]`. `None` and
+   `Some(true)` both mean "enabled"; `Some(false)` disables dual-enqueue.
+   This is part of T3 scope, not a separate task.
+4. `eligible_for_team(entity)` is a local pure predicate — no network, no
+   config read beyond the `share` / `scope` / `entry_type` fields on the
+   entity itself. T3 MUST unit-test the full truth table (see "Testing
+   expectations" below).
+
+The unique key `(entity_type, entity_id, team_id)` already allows personal
+and team rows to coexist — see the `ON CONFLICT` clause at
+`cas-cli/src/cloud/sync_queue/queue_ops.rs:49`.
+
+The `let _ =` pattern used on the personal enqueue path (a documented
+"best-effort" choice) is deliberately not replicated here: team-scope data
+loss is harder to re-derive than personal because it blocks teammates, so
+failures MUST be logged via `tracing::warn!` at minimum.
+
+Condition 1 of the auto-promote rule ("team_id set via `cas cloud team set`")
+depends on T2 (cas-4eed) landing the CLI writer for `team_id`. Until T2
+ships, T3 can exercise the predicate with a manually-populated
+`cloud.json.team_id` for integration smoke tests.
+
+### Testing expectations for T3
+
+`eligible_for_team` is a pure predicate — unit-testable directly. T3 MUST
+include table-driven tests covering every row of the Decision 2 precedence
+table:
+
+| `share`   | `scope`  | `entry_type`    | expected |
+|-----------|----------|-----------------|----------|
+| `Private` | Project  | Learning        | false    |
+| `Private` | Global   | Learning        | false    |
+| `Team`    | Global   | Preference      | true     |
+| `Team`    | Project  | Learning        | true     |
+| None      | Project  | Learning        | true     |
+| None      | Project  | Preference      | false    |
+| None      | Global   | Learning        | false    |
+
+Plus, at the `queue_upsert` integration level:
+
+- `team_auto_promote = Some(false)` → no team row enqueued for any input.
+- `team_id = None` → no team row enqueued.
+- Happy path (Project + Learning, team set, auto-promote enabled) → both
+  personal and team rows present in `sync_queue`.
+
+The `team_auto_promote = Some(false)` kill-switch must have its own
+regression test — a missed `false` branch silently leaks data to the team
+queue.
 
 ## Decision 2 — Per-entry opt-out: `share` field on Entry
 
@@ -130,6 +190,22 @@ on the next update.
 
 `Private` is the escape hatch for users who want a project-scoped learning to
 stay local ("I tried X and it didn't work — keep this to myself").
+
+**Asymmetry with the server's pull-side filter:** the server's team-memories
+endpoint strips `entry_type = Preference` on pull (the privacy model, per
+FEATURE-REQUEST). So the `share = Team, entry_type = Preference` cell of
+the precedence table is "enqueued yes, visible on pull no". To avoid a
+silent CLI/server mismatch — where a user runs `cas memory share <pref-id>`,
+sees success, and teammates never see it — T5 (`cas memory share`) MUST:
+
+- Reject (or loudly warn) when the target entry has `entry_type =
+  Preference`, OR
+- Print "Note: Preference entries are stripped by the server on pull;
+  teammates will not see this entry" after a successful share.
+
+T3's `eligible_for_team` does NOT reject this combo (the row is still
+correctly enqueued for audit / future server-side policy changes); the
+user-facing guard lives in T5 where the user-intent is actually expressed.
 
 ### Why not a boolean `private: bool`?
 
@@ -207,7 +283,11 @@ via `cas memory unshare`.
 
 ## Decision 5 — `cas memory remember --share <scope>` surface
 
-Defer to T2/T5 for final CLI shape, but pin the semantics now:
+Defer to T2 (cas-4eed, registers `cas cloud team set|show|clear` — the CLI
+writer for `cloud.json.team_id` that Decision 1 condition 1 depends on) and
+T5 (cas-07d7, adds `cas memory share|unshare|remember --share` — the
+read/write surface for the `share` field this decision introduces) for
+final CLI shape. Pin the semantics now:
 
 - `cas memory remember --share team "..."` → creates entry with
   `share = Some(Team)` regardless of `--scope`.
