@@ -8,38 +8,23 @@
 //! the handler body to `panic!(...)`, and asserts:
 //!
 //!   * the call surfaces as `McpError{INTERNAL_ERROR, "handler panicked
-//!     in 'system': ..."}` rather than killing the process;
-//!   * a follow-up call on the **same** `CasService` instance succeeds,
-//!     proving the service continues serving after a handler panic;
+//!     in 'system': <payload>..."}` rather than killing the process;
+//!   * a follow-up call on the **same** `CasService` instance succeeds
+//!     and returns non-empty content, proving the service continues
+//!     serving after a handler panic;
 //!   * the pattern holds for 10 consecutive panics.
 //!
-//! ## Why this test fails if A2 is removed
+//! The test fails if A2 is removed, via either of two collapse paths:
+//! deleting `panic_catch::dispatch_with_catch` breaks compilation at
+//! every wrap site in mod.rs; deleting the wrap around `system()` alone
+//! lets the forced panic unwind through the `.await` into the test thread
+//! and the harness records a panicked test. Either shape produces a
+//! concrete failure, satisfying the A3 acceptance criterion.
 //!
-//! "A2 removed" has two meaningful shapes:
-//!
-//!   1. `panic_catch::dispatch_with_catch` deleted / not called by
-//!      `system()`. The `#[cfg(test)]` panic injection then runs on the
-//!      caller's task (the test's own tokio runtime worker). The panic
-//!      unwinds through the `.await` and into the test function, where
-//!      the test harness records a panicked test.
-//!   2. The `#[cfg(test)]` injection branch removed from `system()`. The
-//!      forced action falls through to the handler's `_ =>` arm and
-//!      returns `Err(INVALID_PARAMS)`, which does not contain the
-//!      required `"handler panicked in 'system'"` substring and the
-//!      error-code assertion fails.
-//!
-//! Either collapse produces a concrete test failure, which is what the
-//! A3 acceptance criteria asks for.
-//!
-//! ## Why it lives in the unit-test tree rather than `cas-cli/tests/`
-//!
-//! Integration tests under `cas-cli/tests/` build the lib crate with
-//! `#[cfg(test)]` stripped, so the panic-injection branch inside
-//! `system()` would not be compiled and the test could not reach it.
-//! A unit test inside the crate sees `#[cfg(test)]` turned on, so the
-//! injection compiles and the test can exercise it. The acceptance
-//! criterion "lives under `cas-cli/src/mcp/tools/service/` test tree"
-//! matches this constraint.
+//! The test lives under `cas-cli/src/mcp/tools/service/` rather than
+//! `cas-cli/tests/` because integration tests strip `#[cfg(test)]` from
+//! the lib, making the injection branch in `system()` unreachable from
+//! that tree. A unit test inside the crate sees `#[cfg(test)]` active.
 
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::ErrorCode;
@@ -51,7 +36,8 @@ use crate::mcp::server::CasCore;
 
 /// Construct a fresh `CasService` over a temporary DB. The `TempDir` is
 /// returned so the caller keeps it alive for the duration of the test;
-/// dropping it would delete the backing SQLite file mid-test.
+/// dropping it would delete the backing SQLite file mid-test. Bind the
+/// first tuple element to `_dir` (not bare `_`) to hold the guard.
 fn make_service() -> (TempDir, CasService) {
     let dir = TempDir::new().expect("tempdir");
     let core = CasCore::with_daemon(dir.path().to_path_buf(), None, None);
@@ -71,6 +57,13 @@ fn version_req() -> SystemRequest {
     serde_json::from_value(json!({ "action": "version" }))
         .expect("static JSON must deserialize")
 }
+
+/// The exact payload string the `#[cfg(test)]` injection in `system()`
+/// passes to `panic!(...)`. Kept next to the assertions so the two
+/// stay locked together — if mod.rs changes the payload wording, the
+/// compile-time string match below forces this file to be updated.
+const INJECTED_PANIC_PAYLOAD: &str =
+    "forced test panic from system handler (cas-3b51 regression)";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn panic_in_system_dispatch_returns_internal_error_and_keeps_server_alive() {
@@ -95,12 +88,27 @@ async fn panic_in_system_dispatch_returns_internal_error_and_keeps_server_alive(
         "error message must carry the tool label so the client can diagnose: {}",
         err.message
     );
+    // Assert the payload text is forwarded verbatim — a regression that
+    // dropped or truncated the panic message would still satisfy the
+    // INTERNAL_ERROR + tool-label checks above, so this is the actual
+    // discriminating assertion.
+    assert!(
+        err.message.contains(INJECTED_PANIC_PAYLOAD),
+        "panic payload must reach the client unchanged; got: {}",
+        err.message
+    );
 
     // Same CasService instance must still be usable after a panicked
-    // handler — that is the whole point of A2.
-    svc.system(Parameters(version_req()))
+    // handler — that is the whole point of A2. Content check protects
+    // against a degraded-but-Ok response (empty body, is_error set).
+    let ok = svc
+        .system(Parameters(version_req()))
         .await
         .expect("system('version') must succeed after a panicked dispatch");
+    assert!(
+        !ok.content.is_empty(),
+        "version response must have content; degraded Ok would otherwise pass silently"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -111,7 +119,7 @@ async fn ten_consecutive_dispatch_panics_do_not_kill_service() {
         let err = svc
             .system(Parameters(panic_req()))
             .await
-            .unwrap_err_or_else(|| panic!("iteration {i} unexpectedly succeeded"));
+            .expect_err(&format!("iteration {i} unexpectedly succeeded"));
         assert_eq!(
             err.code,
             ErrorCode::INTERNAL_ERROR,
@@ -123,28 +131,21 @@ async fn ten_consecutive_dispatch_panics_do_not_kill_service() {
             "iteration {i} lost the tool label: {}",
             err.message
         );
+        assert!(
+            err.message.contains(INJECTED_PANIC_PAYLOAD),
+            "iteration {i} lost the panic payload: {}",
+            err.message
+        );
     }
 
     // Service survives the sustained panic storm and still serves a
     // real action.
-    svc.system(Parameters(version_req()))
+    let ok = svc
+        .system(Parameters(version_req()))
         .await
         .expect("service must still serve version after 10 consecutive panics");
-}
-
-/// Tiny extension so the loop body above reads cleanly. `unwrap_err`
-/// panics with the `Ok` Debug-printed, which for `CallToolResult` is
-/// an opaque payload — a short helper lets the caller inject the loop
-/// index into the failure message.
-trait ExpectErrExt<T, E> {
-    fn unwrap_err_or_else<F: FnOnce() -> E>(self, f: F) -> E;
-}
-
-impl<T, E> ExpectErrExt<T, E> for Result<T, E> {
-    fn unwrap_err_or_else<F: FnOnce() -> E>(self, f: F) -> E {
-        match self {
-            Ok(_) => f(),
-            Err(e) => e,
-        }
-    }
+    assert!(
+        !ok.content.is_empty(),
+        "post-storm version response must have content"
+    );
 }

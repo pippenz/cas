@@ -44,6 +44,20 @@
 //! log lines emitted inside the handler carry the MCP request id + tool
 //! name established by `server_handler::call_tool` — otherwise every
 //! panic-path log line under concurrent load would be unattributable.
+//!
+//! ## Runtime model: requires `panic = "unwind"`
+//!
+//! This entire mechanism depends on stack unwinding. `tokio::spawn` +
+//! `JoinError::is_panic()` can only observe a panic if the panicking
+//! thread unwinds its stack; under `panic = "abort"` the process is
+//! terminated before the `JoinHandle` is reachable, and the A2
+//! protection provides nothing. `cargo build` and `cargo build --release`
+//! default to `panic = "unwind"` and are protected. The workspace also
+//! defines `[profile.release-fast]` with `panic = "abort"` (Cargo.toml) —
+//! **do not launch `cas serve` from a `release-fast` build**; a single
+//! handler panic will abort the entire process and the MCP client will
+//! see "Connection closed" with no server-side trace, which is exactly
+//! the failure mode the EPIC cas-c351 exists to prevent.
 
 use std::any::Any;
 use std::borrow::Cow;
