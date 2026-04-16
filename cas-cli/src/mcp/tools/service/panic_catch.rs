@@ -22,6 +22,28 @@
 //! hook runs on the panicking worker thread **before** the `JoinError`
 //! surfaces here, so by the time we synthesize the client-facing error
 //! the forensic trail is already on disk.
+//!
+//! ## Cancellation propagation
+//!
+//! `tokio::spawn` returns a `JoinHandle` whose `Drop` does **not** cancel
+//! the spawned task. Without care, a handler that hangs past the 55 s
+//! timeout in `server_handler::call_tool` would keep running indefinitely
+//! after the outer timeout returned to the client, leaking a runtime
+//! worker thread plus any DB / lock / file resources it held.
+//!
+//! We hold an [`AbortOnDrop`] guard around the [`tokio::task::AbortHandle`]
+//! so that when the caller drops our future (e.g., the outer timeout
+//! fires), the guard drops, calls `abort()`, and cancellation cascades
+//! into the handler. If the handler completes normally first, the
+//! subsequent abort is a no-op per tokio semantics.
+//!
+//! ## Tracing context
+//!
+//! `tokio::spawn` does not forward the current `tracing::Span` into the
+//! spawned task. We explicitly `.instrument(tracing::Span::current())` so
+//! log lines emitted inside the handler carry the MCP request id + tool
+//! name established by `server_handler::call_tool` — otherwise every
+//! panic-path log line under concurrent load would be unattributable.
 
 use std::any::Any;
 use std::borrow::Cow;
@@ -29,6 +51,7 @@ use std::future::Future;
 
 use rmcp::ErrorData as McpError;
 use rmcp::model::{CallToolResult, ErrorCode};
+use tracing::Instrument;
 
 /// Run `fut` on a dedicated tokio task. On success, return the handler's
 /// own result; on panic, return a structured `INTERNAL_ERROR` so the MCP
@@ -44,7 +67,14 @@ pub(super) async fn dispatch_with_catch<F>(
 where
     F: Future<Output = Result<CallToolResult, McpError>> + Send + 'static,
 {
-    match tokio::spawn(fut).await {
+    let handle = tokio::spawn(fut.instrument(tracing::Span::current()));
+    // Dropping `handle` alone does not abort the task. The guard propagates
+    // cancellation from the caller (e.g., server_handler's 55s timeout)
+    // into the spawned task. If the await completes first, abort is a
+    // no-op. See the module doc for why this matters.
+    let _abort_guard = AbortOnDrop(handle.abort_handle());
+
+    match handle.await {
         Ok(inner) => inner,
         Err(join_err) => {
             if join_err.is_panic() {
@@ -63,9 +93,12 @@ where
                     data: None,
                 })
             } else {
-                // No caller in this module aborts its spawned task, so this
-                // branch only fires during runtime shutdown. Surface as an
-                // internal error so the client has something actionable.
+                // Cancellation. Fires during runtime shutdown or when the
+                // abort guard above triggers after our own future was
+                // dropped — in the latter case nobody is awaiting this
+                // branch, so the return value is discarded. Surface as
+                // internal error so the runtime-shutdown case still has
+                // an actionable message.
                 Err(McpError {
                     code: ErrorCode::INTERNAL_ERROR,
                     message: Cow::Owned(format!(
@@ -75,6 +108,18 @@ where
                 })
             }
         }
+    }
+}
+
+/// RAII guard that aborts a spawned tokio task on drop. Paired with
+/// `JoinHandle::abort_handle()` inside [`dispatch_with_catch`] so that
+/// caller-side cancellation (future drop, outer timeout) propagates into
+/// the spawned task instead of leaking it.
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -102,13 +147,29 @@ mod tests {
     use super::*;
     use rmcp::model::Content;
 
+    // The `#[allow(unreachable_code)]` annotations below are required
+    // because rustc cannot prove the async block diverges after
+    // `panic!()`, so the trailing `Ok(...)` is reported as dead code.
+    // The trailing `Ok(...)` is needed purely to fix the async block's
+    // output type; the `panic!()` is what the test actually exercises.
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn successful_handler_passes_through() {
         let result = dispatch_with_catch("ok_tool", async {
             Ok(CallToolResult::success(vec![Content::text("hi")]))
         })
         .await;
-        assert!(result.is_ok(), "expected Ok, got {result:?}");
+        let ok = result.expect("expected Ok");
+        // Strengthened: verify the handler's own payload is forwarded
+        // intact rather than replaced by the wrapper. A regression that
+        // swapped the Ok arm would still have returned Ok(...) with
+        // different content; this assertion catches that.
+        let text = ok
+            .content
+            .iter()
+            .filter_map(|c| c.as_text().map(|t| t.text.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(text, vec!["hi"], "success payload mutated in transit");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -167,6 +228,25 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn panic_with_non_string_payload_returns_fallback_message() {
+        let result = dispatch_with_catch("non_string_tool", async {
+            // panic_any with a value that is neither `&'static str` nor
+            // `String` exercises the fallback arm of `panic_message`.
+            std::panic::panic_any(42u64);
+            #[allow(unreachable_code)]
+            Ok(CallToolResult::success(vec![]))
+        })
+        .await;
+        let err = result.expect_err("expected Err");
+        assert_eq!(err.code, ErrorCode::INTERNAL_ERROR);
+        assert!(
+            err.message.contains("<non-string panic payload>"),
+            "fallback panic-payload message missing: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ten_consecutive_panics_do_not_kill_runtime() {
         for i in 0..10u32 {
             let result = dispatch_with_catch("spam_tool", async move {
@@ -175,9 +255,21 @@ mod tests {
                 Ok(CallToolResult::success(vec![]))
             })
             .await;
+            // Strengthened: verify the per-iteration error is specifically
+            // an INTERNAL_ERROR that carries this iteration's payload. A
+            // bug that returned the wrong error code or dropped the
+            // payload would pass the old `result.is_err()` check.
+            let err = result.unwrap_err();
+            assert_eq!(
+                err.code,
+                ErrorCode::INTERNAL_ERROR,
+                "iteration {i} wrong code: {:?}",
+                err.code
+            );
             assert!(
-                result.is_err(),
-                "iteration {i} should have surfaced the panic as Err"
+                err.message.contains(&format!("boom #{i}")),
+                "iteration {i} payload missing: {}",
+                err.message
             );
         }
 
