@@ -85,8 +85,8 @@ where
 ///   * `panic!("fmt {x}")`      → `String`
 ///   * `panic_any(custom_type)` → the custom type
 ///
-/// We downcast the first two cases. Unknown payload types fall back to a
-/// placeholder so the caller never sees an empty message.
+/// We downcast the first two cases. Unknown payload types return a
+/// fallback string so the caller never sees an empty message.
 fn panic_message(payload: Box<dyn Any + Send>) -> String {
     if let Some(s) = payload.downcast_ref::<String>() {
         return s.clone();
