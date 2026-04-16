@@ -3,6 +3,11 @@ use crate::sqlite::SqliteStore;
 use cas_types::{Entry, ShareScope};
 use tempfile::TempDir;
 
+// Imports used only by the per-entity round-trip tests below.
+use crate::{RuleStore, SkillStore, TaskStore};
+use crate::{SqliteRuleStore, SqliteSkillStore, SqliteTaskStore};
+use cas_types::{Rule, Skill, Task};
+
 #[test]
 fn test_sqlite_store_crud() {
     let temp = TempDir::new().unwrap();
@@ -96,6 +101,84 @@ fn test_entry_share_roundtrip() {
     store.archive(&id_team).unwrap();
     store.unarchive(&id_team).unwrap();
     assert_eq!(store.get(&id_team).unwrap().share, Some(ShareScope::Team));
+}
+
+/// T5 cas-07d7: Rule.share must round-trip. The rule store's INSERT/
+/// UPDATE/SELECT paths were all extended to cover `share` — this test
+/// guards against future column-list drift.
+#[test]
+fn test_rule_share_roundtrip() {
+    let temp = TempDir::new().unwrap();
+    let store = SqliteRuleStore::open(temp.path()).unwrap();
+    store.init().unwrap();
+
+    let mut r = Rule::new("rule-001".to_string(), "test".to_string());
+    r.share = Some(ShareScope::Team);
+    store.add(&r).unwrap();
+    assert_eq!(store.get("rule-001").unwrap().share, Some(ShareScope::Team));
+
+    // Update round-trip
+    let mut loaded = store.get("rule-001").unwrap();
+    loaded.share = Some(ShareScope::Private);
+    store.update(&loaded).unwrap();
+    assert_eq!(
+        store.get("rule-001").unwrap().share,
+        Some(ShareScope::Private)
+    );
+
+    // None round-trip
+    let mut loaded = store.get("rule-001").unwrap();
+    loaded.share = None;
+    store.update(&loaded).unwrap();
+    assert_eq!(store.get("rule-001").unwrap().share, None);
+}
+
+/// T5 cas-07d7: Skill.share must round-trip. First code-review round
+/// found the skill SELECT/INSERT/UPDATE had silently skipped the
+/// `share` column; this test exists to catch that regression class.
+#[test]
+fn test_skill_share_roundtrip() {
+    let temp = TempDir::new().unwrap();
+    let store = SqliteSkillStore::open(temp.path()).unwrap();
+    store.init().unwrap();
+
+    let mut s = Skill::new("sk-share-01".to_string(), "test".to_string());
+    s.share = Some(ShareScope::Team);
+    store.add(&s).unwrap();
+    assert_eq!(
+        store.get("sk-share-01").unwrap().share,
+        Some(ShareScope::Team)
+    );
+
+    let mut loaded = store.get("sk-share-01").unwrap();
+    loaded.share = Some(ShareScope::Private);
+    store.update(&loaded).unwrap();
+    assert_eq!(
+        store.get("sk-share-01").unwrap().share,
+        Some(ShareScope::Private)
+    );
+}
+
+/// T5 cas-07d7: Task.share must round-trip through the many SELECT
+/// sites and the INSERT/UPDATE paths.
+#[test]
+fn test_task_share_roundtrip() {
+    let temp = TempDir::new().unwrap();
+    let store = SqliteTaskStore::open(temp.path()).unwrap();
+    store.init().unwrap();
+
+    let mut t = Task::new("cas-share".to_string(), "test task".to_string());
+    t.share = Some(ShareScope::Team);
+    store.add(&t).unwrap();
+    assert_eq!(store.get("cas-share").unwrap().share, Some(ShareScope::Team));
+
+    let mut loaded = store.get("cas-share").unwrap();
+    loaded.share = Some(ShareScope::Private);
+    store.update(&loaded).unwrap();
+    assert_eq!(
+        store.get("cas-share").unwrap().share,
+        Some(ShareScope::Private)
+    );
 }
 
 /// Helper to add session signal columns for testing

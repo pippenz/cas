@@ -9,13 +9,12 @@
 use std::path::Path;
 
 use anyhow::{Context, anyhow};
-use cas_types::{Entry, ShareScope};
+use cas_types::{Entry, EntryType, Scope, ShareScope};
 use clap::{Parser, Subcommand};
 
 use crate::cli::Cli;
 use crate::cloud::CloudConfig;
 use crate::store::open_store;
-use crate::store::share_policy::eligible_for_team_entry;
 
 #[derive(Subcommand)]
 pub enum MemoryCommands {
@@ -84,6 +83,10 @@ pub fn execute_share(args: &ShareArgs, cas_root: &Path) -> anyhow::Result<()> {
 
     let store = open_store(cas_root).context("failed to open entry store")?;
 
+    // `store.list()` is LIMIT 10000 ORDER BY created DESC. Bulk modes
+    // warn when the cap is hit so users don't silently miss old entries.
+    const LIST_CAP: usize = 10000;
+
     let candidates: Vec<Entry> = if let Some(id) = args.id.as_deref() {
         vec![store
             .get(id)
@@ -91,14 +94,24 @@ pub fn execute_share(args: &ShareArgs, cas_root: &Path) -> anyhow::Result<()> {
     } else if let Some(since) = args.since.as_deref() {
         let duration = parse_duration(since)?;
         let cutoff = chrono::Utc::now() - duration;
-        store
-            .list()?
-            .into_iter()
-            .filter(|e| e.created >= cutoff)
-            .collect()
+        let rows = store.list()?;
+        if rows.len() >= LIST_CAP {
+            eprintln!(
+                "warning: result truncated at {LIST_CAP} entries (ORDER BY created DESC); \
+                 older matches may be missed. Narrow --since or run again after sync."
+            );
+        }
+        rows.into_iter().filter(|e| e.created >= cutoff).collect()
     } else {
         // --all
-        store.list()?
+        let rows = store.list()?;
+        if rows.len() >= LIST_CAP {
+            eprintln!(
+                "warning: result truncated at {LIST_CAP} entries (ORDER BY created DESC); \
+                 older entries may be missed. Use --since to target a specific window."
+            );
+        }
+        rows
     };
 
     let mut promoted = 0usize;
@@ -111,27 +124,26 @@ pub fn execute_share(args: &ShareArgs, cas_root: &Path) -> anyhow::Result<()> {
             continue;
         }
 
-        // Single-id mode is an explicit user decision: we still honor the
-        // T1 filter so accidental promotion of a Preference or Global-scope
-        // entry surfaces as an error rather than silently succeeding. Bulk
-        // modes also filter — `--all` without a predicate would over-share
-        // exactly the entries the filter exists to protect.
-        let eligible = eligible_for_team_entry(&Entry {
-            // Re-evaluate with share cleared so we test the *scope/type*
-            // path, not the already-set override. Private entries still
-            // fail and surface with the reason below.
-            share: None,
-            ..entry.clone()
-        });
+        // Apply the T1 filter directly on scope/type (share is set below);
+        // Private explicitly blocks promotion regardless of scope.
+        let scope_type_eligible =
+            entry.scope == Scope::Project && entry.entry_type != EntryType::Preference;
 
-        if entry.share == Some(ShareScope::Private) || !eligible {
+        if entry.share == Some(ShareScope::Private) || !scope_type_eligible {
             skipped_ineligible += 1;
             if args.id.is_some() {
-                // Single-id mode: surface the reason explicitly so the user
-                // knows why nothing happened.
+                // Single-id mode: surface the reason so the user knows
+                // why nothing happened. Private is terminal — there is
+                // currently no CLI to clear it; flag the dead-end so
+                // the user knows to file for a reset rather than retry.
+                let hint = if entry.share == Some(ShareScope::Private) {
+                    " (share=Private is a hard override set by `cas memory unshare`; \
+                       there is no `--force` override in this release)"
+                } else {
+                    " (Preference-typed or Global-scoped entries stay personal by T1 policy)"
+                };
                 return Err(anyhow!(
-                    "entry {} is not eligible for team share (share={:?}, scope={:?}, type={:?}). \
-                     Preference-typed or Global-scoped entries stay personal.",
+                    "entry {} is not eligible for team share (share={:?}, scope={:?}, type={:?}).{hint}",
                     entry.id,
                     entry.share,
                     entry.scope,
@@ -200,14 +212,14 @@ fn parse_duration(s: &str) -> anyhow::Result<chrono::Duration> {
         .parse()
         .with_context(|| format!("invalid duration number: {num}"))?;
     let d = match unit {
-        "s" => chrono::Duration::seconds(n),
-        "m" => chrono::Duration::minutes(n),
-        "h" => chrono::Duration::hours(n),
-        "d" => chrono::Duration::days(n),
-        "w" => chrono::Duration::weeks(n),
+        "s" => chrono::Duration::try_seconds(n),
+        "m" => chrono::Duration::try_minutes(n),
+        "h" => chrono::Duration::try_hours(n),
+        "d" => chrono::Duration::try_days(n),
+        "w" => chrono::Duration::try_weeks(n),
         other => return Err(anyhow!("unknown duration unit `{other}` (expected s/m/h/d/w)")),
     };
-    Ok(d)
+    d.ok_or_else(|| anyhow!("duration {n}{unit} overflows i64 nanoseconds"))
 }
 
 #[cfg(test)]
