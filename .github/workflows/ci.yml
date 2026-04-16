@@ -55,6 +55,15 @@ jobs:
           ZIG: ${{ github.workspace }}/.context/zig/zig
         run: cargo test -p cas
 
+      # EPIC cas-c351 / cas-9e02: run A2/A3/B3 panic-isolation tests
+      # under --release and --profile release-fast to catch any future
+      # profile change that silently re-introduces panic=abort or any
+      # release-mode codegen that breaks the tokio::spawn panic catcher.
+      - name: Panic-isolation tests (release profiles)
+        env:
+          ZIG: ${{ github.workspace }}/.context/zig/zig
+        run: make -C cas-cli test-release-panic
+
       - name: Clippy (report warnings)
         env:
           ZIG: ${{ github.workspace }}/.context/zig/zig

@@ -5,20 +5,19 @@
 //! This crate provides unified task tracking, memory management, rules, and skills
 //! for AI coding agents.
 
-// The MCP panic catcher in `mcp::tools::service::panic_catch` relies on
-// `tokio::spawn` + `JoinError::is_panic` to convert handler panics into
-// `INTERNAL_ERROR` responses. Under `panic = "abort"` the process is
-// terminated before the `JoinHandle` is reachable, and A2 (EPIC cas-c351
-// / cas-a436) provides no protection — a single handler panic aborts
-// `cas serve`. Rust overrides panic=abort to unwind for `cargo test`
-// automatically, so this guard only fires on non-test builds.
+// Build-time enforcement of the panic=unwind invariant the MCP tool
+// dispatch panic catcher depends on. The `not(test)` exemption exists
+// because Rust forces panic=unwind when compiling the lib under
+// `cargo test --lib`; the guard still fires for `cargo build`,
+// `cargo check`, and integration-test dependency compilations (where
+// cfg(test) is false on the lib).
 #[cfg(all(not(test), panic = "abort"))]
 compile_error!(
-    "cas requires `panic = \"unwind\"` (see EPIC cas-c351). \
-     The MCP dispatch panic catcher in cas::mcp::tools::service::panic_catch \
-     depends on stack unwinding; `panic = \"abort\"` disables it and makes \
-     `cas serve` crash on the first handler panic with no server-side trace. \
-     Remove `panic = \"abort\"` from the build profile."
+    "cas requires `panic = \"unwind\"` (see EPIC cas-c351). The MCP dispatch \
+     panic catcher at cas-cli/src/mcp/tools/service/panic_catch.rs depends \
+     on stack unwinding; `panic = \"abort\"` disables it and makes `cas serve` \
+     crash on the first handler panic with no server-side trace. Remove \
+     `panic = \"abort\"` from the build profile."
 );
 
 // Core modules
