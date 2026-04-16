@@ -95,7 +95,10 @@ async fn retroactive_share_all_then_team_push_surfaces_preexisting_entries() {
 
     // Stage 1: cold start — NO team configured, no cloud.json.
     // Seed two project-scoped learnings (T1 predicate says eligible
-    // for team push once a team is configured).
+    // once a team is configured) plus one Preference entry (which
+    // the T1 predicate MUST exclude, giving us end-to-end evidence
+    // of the Preference carve-out for AC#4 "filter policy from T1
+    // honored in assertions").
     {
         let store = open_store(cas_dir).unwrap();
         store
@@ -113,6 +116,15 @@ async fn retroactive_share_all_then_team_push_surfaces_preexisting_entries() {
                 scope: Scope::Project,
                 entry_type: EntryType::Learning,
                 content: "pre-existing personal entry B".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        store
+            .add(&Entry {
+                id: "2026-03-01-pref".to_string(),
+                scope: Scope::Project,
+                entry_type: EntryType::Preference,
+                content: "dark mode please".to_string(),
                 ..Default::default()
             })
             .unwrap();
@@ -147,20 +159,26 @@ async fn retroactive_share_all_then_team_push_surfaces_preexisting_entries() {
     .await
     .unwrap();
 
-    // Both entries must now carry share=Team on disk AND be in the
-    // team queue. Check both — the store assertion proves T5's
-    // mutation, the queue assertion proves T3's dual-enqueue fired
-    // on the update.
+    // Both Learning entries must now carry share=Team on disk AND
+    // be in the team queue. The Preference entry must stay share=None
+    // (T1 filter policy — AC#4 end-to-end evidence). The store
+    // assertions prove T5's mutation, the queue count proves T3's
+    // dual-enqueue fired on exactly the eligible subset.
     {
         let store = open_store(cas_dir).unwrap();
         assert_eq!(
             store.get("2026-03-01-1").unwrap().share,
             Some(ShareScope::Team),
-            "share --all must mark eligible entries share=Team"
+            "share --all must mark eligible learning entries share=Team"
         );
         assert_eq!(
             store.get("2026-03-01-2").unwrap().share,
             Some(ShareScope::Team),
+        );
+        assert_eq!(
+            store.get("2026-03-01-pref").unwrap().share,
+            None,
+            "T1 Preference carve-out: share --all must NOT promote Preference entries"
         );
 
         let q = SyncQueue::open(cas_dir).unwrap();
@@ -169,7 +187,7 @@ async fn retroactive_share_all_then_team_push_surfaces_preexisting_entries() {
         assert_eq!(
             team_rows.len(),
             2,
-            "both entries must land in the team queue after share --all"
+            "exactly 2 Learning entries in team queue (Preference excluded by T1 filter)"
         );
     }
 
