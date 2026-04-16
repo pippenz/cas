@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::cloud::{CloudConfig, EntityType, SyncOperation, SyncQueue};
-use crate::store::share_policy::eligible_for_team_rule;
+use crate::store::share_policy::{eligible_for_team_rule, resolve_team_id};
 use crate::store::{Result, RuleStore};
 use crate::types::Rule;
 use cas_core::Syncer;
@@ -55,18 +55,17 @@ impl SyncingRuleStore {
 
     /// Attach a cloud config for team auto-promotion. Meaningful only
     /// when `with_cloud_queue` also provided a queue — without a queue
-    /// there is nowhere to enqueue and this call is silently a no-op
-    /// for team dual-enqueue (the debug_assert below fires in debug
-    /// builds to catch the misuse during development).
+    /// the resolved team_id is harmless (queue_upsert/delete early-return
+    /// on `cloud_queue.is_none()`). The `debug_assert` catches the misuse
+    /// in dev builds; release trusts the caller and proceeds, which is
+    /// safe because the downstream guards make it a no-op anyway.
     #[must_use]
     pub fn with_cloud_config(mut self, cloud_config: Arc<CloudConfig>) -> Self {
         debug_assert!(
             self.cloud_queue.is_some(),
             "SyncingRuleStore::with_cloud_config called without with_cloud_queue — team dual-enqueue will silently no-op"
         );
-        if self.cloud_queue.is_some() {
-            self.team_id = cloud_config.active_team_id().map(Arc::from);
-        }
+        self.team_id = resolve_team_id(&cloud_config);
         self
     }
 
@@ -114,11 +113,8 @@ impl SyncingRuleStore {
         };
         let _ = queue.enqueue(EntityType::Rule, id, SyncOperation::Delete, None);
 
-        // Mirror the upsert path's dual-enqueue. We can't consult the
-        // predicate here because we don't have the entity — but deletes
-        // are cheap to over-push (the server has no row to touch), and
-        // under-pushing would leave stale team rows forever. Trade
-        // over-push for correctness. Best-effort matches personal path.
+        // See `share_policy` module docs: delete fans out unconditionally
+        // when a team is configured.
         if let Some(team_id) = self.team_id.as_deref() {
             let _ = queue.enqueue_for_team(
                 EntityType::Rule,
@@ -186,10 +182,9 @@ impl RuleStore for SyncingRuleStore {
 mod tests {
     use super::*;
     use crate::store::SqliteRuleStore;
+    use crate::store::share_policy::TEST_TEAM_UUID as TEST_TEAM;
     use cas_types::Scope;
     use tempfile::TempDir;
-
-    const TEST_TEAM: &str = "550e8400-e29b-41d4-a716-446655440000";
 
     fn create_team_store(team_auto_promote: Option<bool>) -> (TempDir, SyncingRuleStore) {
         let temp = TempDir::new().unwrap();

@@ -185,10 +185,12 @@ impl FromStr for ShareScope {
     type Err = TypeError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "private" | "personal" => Ok(ShareScope::Private),
-            "team" => Ok(ShareScope::Team),
-            _ => Err(TypeError::Parse(format!("Invalid share scope: {s}"))),
+        if s.eq_ignore_ascii_case("private") || s.eq_ignore_ascii_case("personal") {
+            Ok(ShareScope::Private)
+        } else if s.eq_ignore_ascii_case("team") {
+            Ok(ShareScope::Team)
+        } else {
+            Err(TypeError::Parse(format!("Invalid share scope: {s}")))
         }
     }
 }

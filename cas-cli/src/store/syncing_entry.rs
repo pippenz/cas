@@ -10,7 +10,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::cloud::{CloudConfig, EntityType, SyncOperation, SyncQueue};
-use crate::store::share_policy::eligible_for_team_entry;
+use crate::store::share_policy::{eligible_for_team_entry, resolve_team_id};
 use crate::store::{Result, Store};
 use crate::types::Entry;
 
@@ -47,7 +47,7 @@ impl SyncingEntryStore {
     /// existing 2-arg `new` call sites.
     #[must_use]
     pub fn with_cloud_config(mut self, cloud_config: Arc<CloudConfig>) -> Self {
-        self.team_id = cloud_config.active_team_id().map(Arc::from);
+        self.team_id = resolve_team_id(&cloud_config);
         self
     }
 
@@ -89,12 +89,8 @@ impl SyncingEntryStore {
             .queue
             .enqueue(EntityType::Entry, id, SyncOperation::Delete, None);
 
-        // Mirror the upsert path's dual-enqueue. We can't consult the
-        // predicate here because we don't have the entity — but deletes
-        // are cheap to over-push (the server has no row to touch), and
-        // under-pushing would leave stale team rows forever. Trade
-        // over-push for correctness. Best-effort matches the personal
-        // path's contract (see queue_upsert comment).
+        // See `share_policy` module docs: delete fans out unconditionally
+        // when a team is configured (predicate can't run without entity).
         if let Some(team_id) = self.team_id.as_deref() {
             let _ = self.queue.enqueue_for_team(
                 EntityType::Entry,
@@ -319,7 +315,7 @@ mod tests {
 
     use cas_types::{EntryType, Scope, ShareScope};
 
-    const TEST_TEAM: &str = "550e8400-e29b-41d4-a716-446655440000";
+    use crate::store::share_policy::TEST_TEAM_UUID as TEST_TEAM;
 
     /// Build a SyncingEntryStore with a team configured via CloudConfig.
     fn create_team_store(team_auto_promote: Option<bool>) -> (TempDir, SyncingEntryStore) {

@@ -17,8 +17,35 @@
 //! 2. Apply the per-type predicate to the entity. `false` means the rule or
 //!    explicit override says "stay personal".
 //! 3. Only if both pass, enqueue the team row.
+//!
+//! ## Delete fan-out rationale
+//!
+//! `queue_delete` in each syncing wrapper dual-enqueues unconditionally when
+//! a team is configured, bypassing the eligibility predicate. We don't have
+//! the entity at delete time to run the predicate — the caller gave us only
+//! an id. Over-pushing a delete for an entity that was never team-enqueued
+//! is cheap (the server has no row to touch and the DELETE is idempotent);
+//! under-pushing would leave stale team rows forever. Trade over-push for
+//! correctness. Best-effort matches the personal path's contract.
+
+use std::sync::Arc;
 
 use cas_types::{Entry, EntryType, Rule, Scope, ShareScope, Skill, Task};
+
+use crate::cloud::CloudConfig;
+
+/// Resolve the active team UUID for dual-enqueue into a cache-friendly
+/// `Arc<str>` that the syncing wrappers read on every write without
+/// allocating. Returns `None` when no team is configured or the
+/// `team_auto_promote` kill-switch is engaged (`active_team_id` already
+/// handles both).
+///
+/// Centralised so the caching decision — cache at `with_cloud_config` time
+/// instead of re-reading from `Arc<CloudConfig>` per write — lives in one
+/// findable spot. All four syncing store wrappers go through here.
+pub(crate) fn resolve_team_id(cloud_config: &CloudConfig) -> Option<Arc<str>> {
+    cloud_config.active_team_id().map(Arc::from)
+}
 
 /// Filter policy for an `Entry`.
 ///
@@ -61,6 +88,11 @@ pub fn eligible_for_team_skill(skill: &Skill) -> bool {
 pub fn eligible_for_team_task(task: &Task) -> bool {
     task.scope == Scope::Project
 }
+
+/// Fixture UUID used by every syncing wrapper's dual-enqueue test suite.
+/// Centralised so a typo in one file can't silently diverge from another.
+#[cfg(test)]
+pub(crate) const TEST_TEAM_UUID: &str = "550e8400-e29b-41d4-a716-446655440000";
 
 #[cfg(test)]
 mod tests {
