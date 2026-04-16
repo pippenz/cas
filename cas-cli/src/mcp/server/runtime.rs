@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use anyhow::Context;
+
 use crate::mcp::server::CasCore;
 use crate::store::open_agent_store;
 
@@ -115,20 +117,11 @@ async fn run_server_impl() -> anyhow::Result<()> {
     // Eagerly initialize all stores before serving MCP requests.
     // This moves cold-start overhead (connection open, schema init) out of the
     // first tool call path, preventing timeouts on the initial request.
-    {
-        let start = std::time::Instant::now();
-        let _ = core.open_store();
-        let _ = core.open_task_store();
-        let _ = core.open_rule_store();
-        let _ = core.open_skill_store();
-        let _ = core.open_agent_store();
-        let _ = core.open_entity_store();
-        let _ = core.open_verification_store();
-        let _ = core.open_worktree_store();
-        let _ = core.open_search_index();
-        let _ = core.load_config();
-        eprintln!("[CAS] Stores initialized in {}ms", start.elapsed().as_millis());
-    }
+    //
+    // Failure here is fatal: a partially-initialized server would respond to
+    // `tools/list` with the full registry but every call would error, which is
+    // the silent-degradation mode this guard exists to prevent (cas-5c05).
+    eager_init_stores(&core, &cas_root)?;
 
     // Eager auto-registration for factory workers where SessionStart hook may not fire.
     // When CAS_SESSION_ID is set (by PtyConfig::claude()), register immediately so the
@@ -200,18 +193,35 @@ async fn run_server_impl() -> anyhow::Result<()> {
         d.set_proxy(Arc::clone(p)).await;
     }
 
-    eprintln!(
-        "[CAS] Starting MCP server (13 tools{})",
-        if proxy.is_some() {
-            ", proxy active"
-        } else {
-            ""
-        }
-    );
+    #[cfg(feature = "mcp-proxy")]
+    let proxy_active = proxy.is_some();
+    #[cfg(not(feature = "mcp-proxy"))]
+    let proxy_active = false;
+
     #[cfg(feature = "mcp-proxy")]
     let service = CasService::new(core, proxy);
     #[cfg(not(feature = "mcp-proxy"))]
     let service = CasService::new(core);
+
+    // Empty-registry guard — if the tool router somehow ends up empty, refuse
+    // to start. Otherwise the server would respond to `tools/list` with `[]`
+    // and the MCP client (e.g. Claude Code) silently shows zero CAS tools to
+    // the agent with no surfaced error. See cas-5c05.
+    let tool_names = service.registered_tool_names();
+    if tool_names.is_empty() {
+        anyhow::bail!(
+            "MCP tool registry is empty. This is a CAS build bug — refusing to \
+             start a server that would silently expose zero tools to the client. \
+             Rebuild CAS and retry."
+        );
+    }
+    eprintln!(
+        "[CAS] Starting MCP server ({} tools: {}{})",
+        tool_names.len(),
+        tool_names.join(", "),
+        if proxy_active { ", proxy active" } else { "" }
+    );
+
     let server = service.serve(stdio()).await?;
     if let Err(e) = server.waiting().await {
         eprintln!("[CAS] MCP server terminated with error: {e}");
@@ -232,6 +242,91 @@ async fn run_server_impl() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Total time budget for the eager store-init phase before `cas serve` aborts.
+///
+/// Each store open has its own internal SQLite `busy_timeout` (5s today). With
+/// ~10 store types, an unbroken contention scenario could otherwise silently
+/// burn ~50s here while the MCP client (Claude Code) gives up on the
+/// initialize/tools-list handshake. Failing fast surfaces the problem to the
+/// supervisor instead of delivering 0 tools with no error. See cas-5c05.
+const EAGER_INIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Eagerly open every store and the search index before serving MCP requests.
+///
+/// Returns an error (which `cas serve` propagates as a non-zero exit) if any
+/// store fails to open or if the total init phase exceeds `EAGER_INIT_BUDGET`.
+/// This converts the previously silent failure mode (server starts, registry
+/// looks fine to the client, but every tool call later errors) into a loud
+/// startup failure that the parent factory can detect and report.
+fn eager_init_stores(
+    core: &CasCore,
+    cas_root: &std::path::Path,
+) -> anyhow::Result<()> {
+    let start = std::time::Instant::now();
+    let mut last_step: &'static str = "begin";
+
+    let mut step = |name: &'static str,
+                    f: &mut dyn FnMut() -> Result<(), anyhow::Error>|
+     -> anyhow::Result<()> {
+        last_step = name;
+        if start.elapsed() > EAGER_INIT_BUDGET {
+            anyhow::bail!(
+                "store init exceeded {}s budget before reaching '{name}'. \
+                 Likely cause: another process holds a write lock on \
+                 {db}. Inspect with `lsof {db}` or `fuser {db}` and stop \
+                 the offending process before retrying `cas serve`.",
+                EAGER_INIT_BUDGET.as_secs(),
+                db = cas_root.join("cas.db").display()
+            );
+        }
+        f().with_context(|| format!("eager store init failed at '{name}'"))?;
+        Ok(())
+    };
+
+    step("entry_store", &mut || {
+        core.open_store().map(|_| ()).map_err(map_mcp_err)
+    })?;
+    step("task_store", &mut || {
+        core.open_task_store().map(|_| ()).map_err(map_mcp_err)
+    })?;
+    step("rule_store", &mut || {
+        core.open_rule_store().map(|_| ()).map_err(map_mcp_err)
+    })?;
+    step("skill_store", &mut || {
+        core.open_skill_store().map(|_| ()).map_err(map_mcp_err)
+    })?;
+    step("agent_store", &mut || {
+        core.open_agent_store().map(|_| ()).map_err(map_mcp_err)
+    })?;
+    step("entity_store", &mut || {
+        core.open_entity_store().map(|_| ()).map_err(map_mcp_err)
+    })?;
+    step("verification_store", &mut || {
+        core.open_verification_store().map(|_| ()).map_err(map_mcp_err)
+    })?;
+    step("worktree_store", &mut || {
+        core.open_worktree_store().map(|_| ()).map_err(map_mcp_err)
+    })?;
+    step("search_index", &mut || {
+        core.open_search_index().map(|_| ()).map_err(map_mcp_err)
+    })?;
+    step("config", &mut || {
+        let _ = core.load_config();
+        Ok(())
+    })?;
+
+    let _ = last_step; // silence unused-assignment warning when path is happy
+    eprintln!(
+        "[CAS] Stores initialized in {}ms",
+        start.elapsed().as_millis()
+    );
+    Ok(())
+}
+
+fn map_mcp_err(e: rmcp::ErrorData) -> anyhow::Error {
+    anyhow::anyhow!("{}", e.message)
 }
 
 /// Release all tasks claimed by an agent on shutdown and unregister the agent

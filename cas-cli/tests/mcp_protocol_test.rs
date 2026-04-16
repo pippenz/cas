@@ -186,6 +186,13 @@ fn init_cas_dir(dir: &TempDir) {
     let output = Command::new(env!("CARGO_BIN_EXE_cas"))
         .args(["init", "--yes"])
         .current_dir(dir.path())
+        .env_remove("CAS_ROOT")
+        .env_remove("CAS_DIR")
+        .env_remove("CAS_SESSION_ID")
+        .env_remove("CAS_AGENT_NAME")
+        .env_remove("CAS_AGENT_ROLE")
+        .env_remove("CAS_FACTORY_MODE")
+        .env_remove("CAS_CLONE_PATH")
         .output()
         .expect("Failed to init cas");
 
@@ -703,5 +710,163 @@ fn test_mcp_mutation_with_notifications() {
     assert!(
         !resources.is_empty(),
         "Should have resources after mutations: {resources:?}"
+    );
+}
+
+// ============================================================================
+// cas-5c05: Startup must fail loud when stores cannot be opened
+//
+// Regression coverage for the "silent zero-tool mode" failure: a corrupt or
+// unreadable cas.db must cause `cas serve` to exit non-zero with a diagnostic
+// on stderr, NOT silently start a server that responds to tools/list with an
+// empty registry (or hangs the MCP handshake until the client gives up).
+// ============================================================================
+
+#[test]
+#[cfg(unix)]
+fn test_serve_fails_fast_on_unreadable_cas_db() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    init_cas_dir(&dir);
+
+    // Strip every permission from cas.db. The next `Connection::open` from
+    // `cas serve` will fail with EACCES instead of returning a usable handle.
+    // The previous code path swallowed this error with `let _ = core.open_store()`
+    // and continued to "Starting MCP server (13 tools)" — exactly the silent
+    // failure mode this test guards against.
+    //
+    // (We use chmod-0000 rather than corrupt-bytes because SQLite's WAL mode
+    // will happily rewrite a garbage header on first open, masking the error.)
+    let db_path = dir.path().join(".cas").join("cas.db");
+    let mut perms = std::fs::metadata(&db_path).unwrap().permissions();
+    perms.set_mode(0o000);
+    std::fs::set_permissions(&db_path, perms).expect("chmod 000 cas.db");
+
+    // Restore permissions on exit so TempDir cleanup can proceed even if the
+    // assertions below panic.
+    struct RestorePerms(std::path::PathBuf);
+    impl Drop for RestorePerms {
+        fn drop(&mut self) {
+            if let Ok(meta) = std::fs::metadata(&self.0) {
+                let mut p = meta.permissions();
+                p.set_mode(0o644);
+                let _ = std::fs::set_permissions(&self.0, p);
+            }
+        }
+    }
+    let _guard = RestorePerms(db_path.clone());
+
+    // Spawn `cas serve` and wait briefly for it to either fail or print its
+    // startup banner. We send NOTHING on stdin — a healthy server would block
+    // on the JSON-RPC handshake; a fail-fast server exits on its own.
+    //
+    // Scrub inherited CAS_* env vars: when these tests run inside a CAS
+    // factory worker session, the parent's CAS_ROOT would otherwise redirect
+    // every test to the live cas.db instead of the TempDir.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cas"))
+        .arg("serve")
+        .env_remove("CAS_ROOT")
+        .env_remove("CAS_DIR")
+        .env_remove("CAS_SESSION_ID")
+        .env_remove("CAS_AGENT_NAME")
+        .env_remove("CAS_AGENT_ROLE")
+        .env_remove("CAS_FACTORY_MODE")
+        .env_remove("CAS_CLONE_PATH")
+        .current_dir(dir.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn cas serve");
+
+    // The eager-init budget is 15s in production; tests should complete well
+    // before that since the very first store open hits the bad header. Give
+    // the process a generous 25s ceiling to avoid flaking on slow CI.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(25);
+    let exit_status = loop {
+        match child.try_wait().expect("try_wait") {
+            Some(status) => break status,
+            None => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    panic!(
+                        "cas serve did not exit within 25s on unreadable cas.db — \
+                         the silent-zero-tool regression is back. The server should \
+                         abort during eager store init, not hang waiting for stdin."
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+    };
+
+    assert!(
+        !exit_status.success(),
+        "cas serve must exit non-zero when cas.db is unreadable; got success exit"
+    );
+
+    // Drain stderr so the diagnostic is checkable. The new error path mentions
+    // 'eager store init' (or 'store init exceeded ... budget' if the busy
+    // timeout was hit before the header read returned). Either is acceptable
+    // proof that the failure surfaced loudly.
+    let mut stderr = String::new();
+    if let Some(mut s) = child.stderr.take() {
+        use std::io::Read;
+        let _ = s.read_to_string(&mut stderr);
+    }
+    assert!(
+        stderr.contains("store init") || stderr.contains("Failed to open"),
+        "stderr must contain a store-init diagnostic; got: {stderr}"
+    );
+}
+
+#[test]
+fn test_serve_logs_actual_tool_list_on_startup() {
+    // Companion check: in the happy path, `cas serve` must log the *actual*
+    // tool count and tool names, not the historical hard-coded "13 tools"
+    // string. This is what gives a supervisor (or human reading logs) a
+    // chance to notice if the registry shrinks unexpectedly.
+    let dir = TempDir::new().unwrap();
+    init_cas_dir(&dir);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cas"))
+        .arg("serve")
+        .env_remove("CAS_ROOT")
+        .env_remove("CAS_DIR")
+        .env_remove("CAS_SESSION_ID")
+        .env_remove("CAS_AGENT_NAME")
+        .env_remove("CAS_AGENT_ROLE")
+        .env_remove("CAS_FACTORY_MODE")
+        .env_remove("CAS_CLONE_PATH")
+        .current_dir(dir.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn cas serve");
+
+    // Give the server a moment to print its startup banner to stderr.
+    // Then kill it cleanly — we're only inspecting startup logs.
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let mut stderr = String::new();
+    if let Some(mut s) = child.stderr.take() {
+        use std::io::Read;
+        let _ = s.read_to_string(&mut stderr);
+    }
+
+    assert!(
+        stderr.contains("Starting MCP server"),
+        "expected startup banner in stderr; got: {stderr}"
+    );
+    // Banner must include at least one canonical tool name to prove the count
+    // is derived from the live registry, not a string literal.
+    assert!(
+        stderr.contains("memory") && stderr.contains("task"),
+        "startup banner should list registered tool names (memory, task, ...); \
+         got: {stderr}"
     );
 }

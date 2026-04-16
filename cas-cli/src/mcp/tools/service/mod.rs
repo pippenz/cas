@@ -145,6 +145,19 @@ impl CasService {
         }
     }
 
+    /// Names of all MCP tools registered on this service, in router order.
+    ///
+    /// Used by `cas serve` startup to log the actual registered tool set and to
+    /// guard against shipping an empty registry (which would silently surface
+    /// to the MCP client as "0 tools available" with no error). See cas-5c05.
+    pub fn registered_tool_names(&self) -> Vec<String> {
+        self.tool_router
+            .list_all()
+            .into_iter()
+            .map(|t| t.name.into_owned())
+            .collect()
+    }
+
     #[allow(dead_code)]
     fn success(text: impl Into<String>) -> CallToolResult {
         CasCore::success(text)

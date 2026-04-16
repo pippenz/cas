@@ -334,6 +334,21 @@ Only report to supervisor after completing at least steps 1-2. Include the error
 
 4. **Report to supervisor** via `mcp__cas__coordination action=message` with the error and diagnostic output. Supervisor will fix the MCP connection or respawn you.
 
+**Zero CAS tools available** (no `mcp__cas__*` tools surfaced at all — not one call errors, they simply do not exist in your tool set):
+
+This is different from connectivity failure above. Here the MCP handshake completed against *something*, but `cas serve` either crashed during startup or silently degraded before registering its tools. Symptom: `ToolSearch select:mcp__cas__task` returns `"No matching deferred tools found"` even though other MCP servers (e.g. Gmail, Calendar) are present.
+
+**Do not** fall back to running `cas task` as a shell subcommand — it does not exist. **Do not** run `cas init` from inside the worktree (creates a duplicate `.cas/`). **Do not** kill/restart `cas serve` yourself.
+
+Report to supervisor immediately with:
+```
+mcp__cas__coordination action=message target=supervisor \
+  summary="zero cas tools available" \
+  message="loyal-cobra-12: no mcp__cas__* tools in tool set. Need respawn."
+```
+
+If even `mcp__cas__coordination` is missing (so you cannot send that message), you are fully detached. Output a short plain-text report and stop — the supervisor polls your session and will detect the stall. Do not spin attempting workarounds.
+
 **Known-fixed CAS bug reappears**: If a bug that was supposedly fixed in the source code still manifests, the running CAS binary may be outdated (not rebuilt after the fix). Report to supervisor — don't file a duplicate bug or attempt your own fix.
 
 ## ALL tools blocked (universal jail)
