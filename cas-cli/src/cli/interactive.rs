@@ -81,17 +81,41 @@ pub fn prompt_multiline(message: &str) -> io::Result<String> {
 
 /// Present options and get selection
 pub fn select(message: &str, options: &[&str]) -> io::Result<usize> {
-    writeln!(io::stdout(), "{message}:")?;
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    select_from(message, options, &mut stdin.lock(), &mut stdout.lock())
+}
+
+/// Core of `select()` parameterized over reader/writer so the EOF-handling
+/// path can be exercised in unit tests without touching real stdin.
+pub(crate) fn select_from(
+    message: &str,
+    options: &[&str],
+    reader: &mut dyn BufRead,
+    writer: &mut dyn Write,
+) -> io::Result<usize> {
+    writeln!(writer, "{message}:")?;
     for (i, option) in options.iter().enumerate() {
-        writeln!(io::stdout(), "  {}. {}", i + 1, option)?;
+        writeln!(writer, "  {}. {}", i + 1, option)?;
     }
 
     loop {
-        write!(io::stdout(), "Select (1-{}): ", options.len())?;
-        io::stdout().flush()?;
+        write!(writer, "Select (1-{}): ", options.len())?;
+        writer.flush()?;
 
         let mut input = String::new();
-        io::stdin().lock().read_line(&mut input)?;
+        let bytes = reader.read_line(&mut input)?;
+
+        // `read_line` returns Ok(0) on EOF without setting an error. Without
+        // this guard, a closed/EOF'd stdin causes an infinite loop that spins
+        // at 100% CPU, re-printing the prompt and re-reading EOF forever.
+        // Seen in production: `cas init` hang with 0-byte log file (cas-bf06).
+        if bytes == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "select: stdin closed before a selection was made",
+            ));
+        }
 
         if let Ok(n) = input.trim().parse::<usize>() {
             if n >= 1 && n <= options.len() {
@@ -99,7 +123,7 @@ pub fn select(message: &str, options: &[&str]) -> io::Result<usize> {
             }
         }
 
-        writeln!(io::stdout(), "Invalid selection, please try again.")?;
+        writeln!(writer, "Invalid selection, please try again.")?;
     }
 }
 
@@ -376,4 +400,115 @@ fn render_picker(
 
     stdout.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::select_from;
+    use std::io::{self, Cursor};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    /// EOF on stdin must NOT cause `select` to loop forever (cas-bf06).
+    /// Prior to this fix, a closed stdin spun at 100% CPU writing
+    /// "Invalid selection, please try again." in a tight loop.
+    #[test]
+    fn select_returns_error_on_eof() {
+        let mut reader: Cursor<&[u8]> = Cursor::new(b"");
+        let mut writer = Vec::new();
+
+        let result = select_from("pick one", &["A", "B"], &mut reader, &mut writer);
+
+        let err = result.expect_err("select must error on EOF, not loop forever");
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::UnexpectedEof,
+            "EOF on stdin must surface as UnexpectedEof, got {err:?}"
+        );
+    }
+
+    /// A valid selection returns the 0-based index.
+    #[test]
+    fn select_returns_index_on_valid_input() {
+        let mut reader = Cursor::new(b"2\n".as_slice());
+        let mut writer = Vec::new();
+
+        let result = select_from("pick one", &["A", "B"], &mut reader, &mut writer).unwrap();
+
+        assert_eq!(result, 1);
+    }
+
+    /// Invalid input retries, but a follow-up EOF terminates instead of spinning.
+    /// This is the regression test for cas-bf06: even if the user types
+    /// garbage first, an EOF after that must still cause a bounded exit.
+    #[test]
+    fn select_bounded_on_eof_after_invalid_input() {
+        // First a non-numeric line, then EOF.
+        let mut reader = Cursor::new(b"banana\n".as_slice());
+        let mut writer = Vec::new();
+
+        let started = Instant::now();
+        let result = select_from("pick one", &["A", "B"], &mut reader, &mut writer);
+        let elapsed = started.elapsed();
+
+        assert!(result.is_err(), "EOF after bad input must error out");
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "select must exit promptly on EOF, took {elapsed:?}"
+        );
+    }
+
+    /// `read_line` that keeps returning Ok(0) forever (the real OS behavior
+    /// on EOF) must not cause an infinite loop. This reader explicitly counts
+    /// its calls so a regression would make the test hang *and* fail the
+    /// call-count assertion if it ever completed.
+    #[test]
+    fn select_does_not_spin_on_sticky_eof() {
+        struct StickyEof {
+            calls: Arc<AtomicUsize>,
+        }
+        impl io::Read for StickyEof {
+            fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(0)
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let reader = StickyEof {
+            calls: Arc::clone(&calls),
+        };
+        let mut reader = io::BufReader::new(reader);
+        let mut writer = Vec::new();
+
+        // Run in a thread so a regression (infinite loop) can be detected
+        // without hanging the whole test binary.
+        let done = Arc::new(Mutex::new(false));
+        let done_clone = Arc::clone(&done);
+        let handle = std::thread::spawn(move || {
+            let r = select_from("pick one", &["A", "B"], &mut reader, &mut writer);
+            *done_clone.lock().unwrap() = true;
+            r
+        });
+
+        // Give the function 2 seconds to return. Fix returns immediately on
+        // first EOF; regression would loop forever and we'd timeout here.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && !*done.lock().unwrap() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            *done.lock().unwrap(),
+            "select hung on sticky EOF — regression of cas-bf06"
+        );
+
+        let result = handle.join().unwrap();
+        assert!(result.is_err());
+        assert!(
+            calls.load(Ordering::SeqCst) <= 2,
+            "select must not retry EOF reads: {} read calls",
+            calls.load(Ordering::SeqCst)
+        );
+    }
 }

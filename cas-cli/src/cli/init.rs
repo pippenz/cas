@@ -9,13 +9,14 @@ use std::io::{Write, stdout};
 use std::path::Path;
 use std::process::Command;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use crossterm::{
     execute,
     style::{Color, Print, SetForegroundColor},
 };
+use tracing::{error, info, warn};
 
 use crate::builtins::sync_all_builtins_for_harness;
 use crate::config::{Config, HookConfig, SyncConfig, TasksConfig};
@@ -25,6 +26,49 @@ use crate::cli::Cli;
 use crate::cli::factory_tooling;
 use crate::cli::hook::{configure_claude_hooks, configure_codex_mcp_server, configure_mcp_server};
 use crate::cli::interactive;
+
+/// Overall timeout for `cas init`. If init is still running past this, the
+/// watchdog aborts the process with a clear error so a hang never consumes
+/// a CPU core indefinitely (see cas-bf06). Opt out via `CAS_INIT_NO_TIMEOUT=1`.
+const INIT_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Spawn a watchdog thread that aborts the process if init runs longer than
+/// `INIT_TIMEOUT`. The watchdog is purely defensive: normal init completes
+/// in well under a second, so reaching the timeout always indicates a bug.
+///
+/// **Invariant:** this must only ever run in a short-lived process that exits
+/// after `init::execute` returns (i.e., the `cas init` subcommand binary).
+/// The spawned thread is intentionally detached and will call
+/// `std::process::exit(3)` when its sleep elapses — it has no cancel channel.
+/// That is safe today because all current callers (`cas init` CLI,
+/// `bridge::server::factory::handle_factory_start`) invoke init as a
+/// subprocess via `Command::new(...)`, so the process dies naturally on
+/// success and the detached thread dies with it. If `init::execute` is ever
+/// called in-process from a long-lived daemon, refactor this to use a
+/// cancellable channel-based wait first.
+fn spawn_init_watchdog() {
+    if std::env::var("CAS_INIT_NO_TIMEOUT").ok().as_deref() == Some("1") {
+        return;
+    }
+    thread::spawn(|| {
+        thread::sleep(INIT_TIMEOUT);
+        error!(
+            timeout_secs = INIT_TIMEOUT.as_secs(),
+            "cas init watchdog: aborting — init exceeded hard timeout. \
+             Check .cas/logs/ for the last completed phase."
+        );
+        eprintln!(
+            "\n\ncas init: aborting after {}s timeout. \
+             Check .cas/logs/ for the last completed phase.\n\
+             Set CAS_INIT_NO_TIMEOUT=1 to disable this watchdog \
+             (e.g., in slow CI environments).",
+            INIT_TIMEOUT.as_secs()
+        );
+        // Exit code 3 matches CasError::NotInitialized mapping in main.rs,
+        // signalling "init did not complete successfully".
+        std::process::exit(3);
+    });
+}
 
 #[derive(Parser)]
 pub struct InitArgs {
@@ -176,18 +220,40 @@ impl WizardConfig {
 pub fn execute(args: &InitArgs, cli: &Cli) -> anyhow::Result<()> {
     let cwd = std::env::current_dir()?;
 
+    spawn_init_watchdog();
+    info!(
+        cwd = %cwd.display(),
+        pid = std::process::id(),
+        yes = args.yes,
+        force = args.force,
+        json = cli.json,
+        "cas init: starting"
+    );
+    let started = Instant::now();
+
     // JSON mode: non-interactive, use defaults
-    if cli.json {
-        return execute_json(&cwd, args);
-    }
+    let result = if cli.json {
+        execute_json(&cwd, args)
+    } else if args.yes {
+        // Yes mode: non-interactive, use defaults with text output
+        execute_defaults(&cwd, args)
+    } else {
+        // Interactive wizard
+        run_wizard(&cwd, args)
+    };
 
-    // Yes mode: non-interactive, use defaults with text output
-    if args.yes {
-        return execute_defaults(&cwd, args);
+    match &result {
+        Ok(()) => info!(
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "cas init: completed"
+        ),
+        Err(e) => warn!(
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            error = %e,
+            "cas init: aborted with error"
+        ),
     }
-
-    // Interactive wizard
-    run_wizard(&cwd, args)
+    result
 }
 
 // ============================================================================
@@ -664,6 +730,8 @@ where
     F: FnOnce() -> anyhow::Result<String>,
 {
     let mut stdout = stdout();
+    let started = Instant::now();
+    info!(phase = label, "cas init: phase starting");
 
     // Show spinner
     print_colored("  ", colors::WHITE)?;
@@ -698,6 +766,12 @@ where
             print_colored(&" ".repeat(padding), colors::WHITE)?;
             print_colored(&result, colors::GRAY)?;
             println!();
+            info!(
+                phase = label,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                detail = %result,
+                "cas init: phase completed"
+            );
             Ok(())
         }
         Err(e) => {
@@ -708,6 +782,12 @@ where
             print_colored(" — ", colors::GRAY)?;
             print_colored(&format!("{e}"), colors::RED)?;
             println!();
+            error!(
+                phase = label,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                error = %e,
+                "cas init: phase failed"
+            );
             Err(e)
         }
     }

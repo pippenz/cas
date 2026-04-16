@@ -80,6 +80,77 @@ fn test_init_already_initialized() {
         .stdout(predicate::str::contains("already initialized"));
 }
 
+/// Regression test for cas-bf06: a reinit of `cas init` (interactive, no
+/// --yes/--json) with an EOF'd stdin must not hang at 100% CPU. Prior to
+/// the fix in cas-cli/src/cli/interactive.rs, `select()` looped forever
+/// when stdin returned EOF, burning a CPU core and leaving a 0-byte log.
+#[test]
+fn test_init_reinit_with_closed_stdin_does_not_hang() {
+    use std::io::Write;
+    use std::process::{Command as StdCommand, Stdio};
+    use std::time::{Duration, Instant};
+
+    let temp = TempDir::new().unwrap();
+
+    // First init to make the reinit branch active.
+    cas_cmd()
+        .current_dir(&temp)
+        .args(["init", "--yes"])
+        .assert()
+        .success();
+
+    // Now run `cas init` interactively (no --yes / --json / --force) with
+    // stdin closed. This is the exact call shape that hung in production:
+    // `cas init 2>&1 | tail -5` where stdin is the tty but gets EOF'd.
+    let bin = assert_cmd::cargo::cargo_bin!("cas");
+    let started = Instant::now();
+    let mut child = StdCommand::new(bin)
+        .current_dir(&temp)
+        .arg("init")
+        .env_remove("CAS_ROOT")
+        .env("CAS_SKIP_FACTORY_TOOLING", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn cas");
+
+    // Close stdin immediately — the child will see EOF on its first read.
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"")
+        .expect("close stdin");
+
+    // Poll for exit. Fix causes exit within ~1s. Regression would hang
+    // until our watchdog fires (5min) or this loop times out (20s).
+    let deadline = started + Duration::from_secs(20);
+    let status = loop {
+        match child.try_wait().expect("try_wait") {
+            Some(s) => break s,
+            None if Instant::now() > deadline => {
+                let _ = child.kill();
+                panic!(
+                    "cas init hung for more than 20s with closed stdin — \
+                     regression of cas-bf06 (select() infinite loop on EOF)"
+                );
+            }
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    };
+
+    // The process must terminate with an exit code (i.e., ran to completion
+    // and returned), not by signal (SIGKILL/SIGSEGV). Bounded termination
+    // is already proven by the poll loop's deadline panic above; this asserts
+    // that the termination path is clean rather than a crash or external kill.
+    assert!(
+        status.code().is_some(),
+        "cas init was terminated by signal rather than exiting: {:?}",
+        status
+    );
+}
+
 #[test]
 fn test_init_force_reinit() {
     let temp = TempDir::new().unwrap();
