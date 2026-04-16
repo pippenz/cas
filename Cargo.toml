@@ -37,4 +37,8 @@ inherits = "release"
 lto = "thin"
 codegen-units = 16
 strip = "debuginfo"
-panic = "abort"
+# panic = "unwind" is required for the MCP panic catcher (EPIC cas-c351,
+# cas-a436). Do NOT switch to "abort" — a compile-time guard in
+# cas-cli/src/lib.rs refuses non-test builds with panic=abort. The
+# marginal size/compile wins from abort do not justify losing A2.
+panic = "unwind"
