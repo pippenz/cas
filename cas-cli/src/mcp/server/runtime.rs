@@ -25,6 +25,16 @@ async fn run_server_impl() -> anyhow::Result<()> {
         anyhow::anyhow!("CAS not initialized. Run `cas init` in your project first.")
     })?;
 
+    // Install panic hook before anything else can panic. Routes panics to a
+    // dedicated file under `.cas/logs/cas-serve-{date}.log` with timestamp,
+    // PID, and a full backtrace. The default hook still runs so stderr goes
+    // to the MCP client as before.
+    //
+    // Without this, panics in tool handlers kill the process and the crash
+    // output is lost — the MCP client only sees "Connection closed" and the
+    // auto-respawn path gives us no diagnostic trail.
+    install_serve_panic_hook(&cas_root);
+
     // Run startup cloud pull in a background task with a short timeout
     // so a slow/unreachable cloud endpoint never blocks MCP server startup.
     //
@@ -348,6 +358,52 @@ fn eager_init_stores(
 
 fn map_mcp_err(e: rmcp::ErrorData) -> anyhow::Error {
     anyhow::anyhow!("{}", e.message)
+}
+
+/// Install a panic hook that writes panic info + backtrace to a daily log
+/// under `{cas_root}/logs/cas-serve-{date}.log`.
+///
+/// Preserves the previous hook (so Rust's default stderr output still reaches
+/// the MCP client) and appends a timestamped record to the file. Failures
+/// during hook setup or write are swallowed — the hook must never itself
+/// panic or abort serve startup.
+fn install_serve_panic_hook(cas_root: &std::path::Path) {
+    use std::io::Write;
+
+    let log_dir = cas_root.join("logs");
+    if let Err(e) = std::fs::create_dir_all(&log_dir) {
+        eprintln!(
+            "[CAS] Warning: could not create serve log dir {}: {e}",
+            log_dir.display()
+        );
+        return;
+    }
+    let today = chrono::Local::now().format("%Y-%m-%d");
+    let log_path = log_dir.join(format!("cas-serve-{today}.log"));
+    eprintln!("[CAS] Serve panic log: {}", log_path.display());
+
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+        {
+            let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+            let pid = std::process::id();
+            let agent = std::env::var("CAS_AGENT_NAME").unwrap_or_else(|_| "-".to_string());
+            let session = std::env::var("CAS_SESSION_ID").unwrap_or_else(|_| "-".to_string());
+            let _ = writeln!(
+                f,
+                "---\n{ts} pid={pid} agent={agent} session={session} PANIC"
+            );
+            let _ = writeln!(f, "{info}");
+            let bt = std::backtrace::Backtrace::force_capture();
+            let _ = writeln!(f, "{bt}");
+            let _ = f.flush();
+        }
+        default(info);
+    }));
 }
 
 /// Release all tasks claimed by an agent on shutdown and unregister the agent

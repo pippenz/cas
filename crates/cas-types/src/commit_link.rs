@@ -91,7 +91,7 @@ impl CommitLink {
     pub fn preview(&self, max_len: usize) -> String {
         let summary = self.message_summary();
         if summary.len() > max_len {
-            format!("{}...", &summary[..max_len.saturating_sub(3)])
+            crate::preview::truncate_preview(summary, max_len)
         } else {
             summary.to_string()
         }

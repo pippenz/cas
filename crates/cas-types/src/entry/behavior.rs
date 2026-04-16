@@ -302,11 +302,7 @@ impl Entry {
 
     /// Get a short preview of the content
     pub fn preview(&self, max_len: usize) -> String {
-        if self.content.len() <= max_len {
-            self.content.clone()
-        } else {
-            format!("{}...", &self.content[..max_len.saturating_sub(3)])
-        }
+        crate::preview::truncate_preview(&self.content, max_len)
     }
 
     /// Get display title (title or content preview)

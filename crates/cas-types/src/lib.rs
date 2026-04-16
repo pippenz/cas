@@ -50,6 +50,7 @@ mod session;
 mod skill;
 mod sort;
 mod spec;
+mod preview;
 mod task;
 mod verification;
 mod worktree;

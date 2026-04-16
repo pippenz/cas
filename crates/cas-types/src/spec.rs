@@ -261,11 +261,7 @@ impl Spec {
             &self.title
         };
         let first_line = text.lines().next().unwrap_or(text);
-        if first_line.len() <= max_len {
-            first_line.to_string()
-        } else {
-            format!("{}...", &first_line[..max_len.saturating_sub(3)])
-        }
+        crate::preview::truncate_preview(first_line, max_len)
     }
 }
 

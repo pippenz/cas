@@ -355,11 +355,7 @@ impl Rule {
     /// Get a short preview of the content
     pub fn preview(&self, max_len: usize) -> String {
         let first_line = self.content.lines().next().unwrap_or(&self.content);
-        if first_line.len() <= max_len {
-            first_line.to_string()
-        } else {
-            format!("{}...", &first_line[..max_len.saturating_sub(3)])
-        }
+        crate::preview::truncate_preview(first_line, max_len)
     }
 }
 

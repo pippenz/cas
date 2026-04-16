@@ -358,11 +358,7 @@ impl Skill {
 
     /// Get a short preview of the description
     pub fn preview(&self, max_len: usize) -> String {
-        if self.description.len() <= max_len {
-            self.description.clone()
-        } else {
-            format!("{}...", &self.description[..max_len.saturating_sub(3)])
-        }
+        crate::preview::truncate_preview(&self.description, max_len)
     }
 
     /// Record a usage of this skill

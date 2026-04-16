@@ -240,11 +240,7 @@ impl Prompt {
 
     /// Get a preview of the prompt content (first N characters)
     pub fn preview(&self, max_len: usize) -> String {
-        if self.content.len() <= max_len {
-            self.content.clone()
-        } else {
-            format!("{}...", &self.content[..max_len.saturating_sub(3)])
-        }
+        crate::preview::truncate_preview(&self.content, max_len)
     }
 
     /// Mark when response started
