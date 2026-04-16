@@ -1,11 +1,16 @@
 //! Syncing entry store wrapper
 //!
 //! Automatically queues entry changes for cloud sync on add/update/delete.
+//! When a team is configured and the entry passes the T1 filter policy
+//! (see `share_policy::eligible_for_team_entry`), the write is dual-enqueued
+//! to both the personal queue and the team queue so the next
+//! `cas cloud sync` drains both.
 
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::cloud::{EntityType, SyncOperation, SyncQueue};
+use crate::cloud::{CloudConfig, EntityType, SyncOperation, SyncQueue};
+use crate::store::share_policy::eligible_for_team_entry;
 use crate::store::{Result, Store};
 use crate::types::Entry;
 
@@ -13,23 +18,78 @@ use crate::types::Entry;
 pub struct SyncingEntryStore {
     inner: Arc<dyn Store>,
     queue: Arc<SyncQueue>,
+    /// Optional cloud config. When `Some`, writes may be dual-enqueued to
+    /// the team queue per the T1 filter policy. `None` preserves the
+    /// historical personal-only behavior — used by tests and by callers
+    /// that predate the team-memories work.
+    cloud_config: Option<Arc<CloudConfig>>,
 }
 
 impl SyncingEntryStore {
-    /// Create a new syncing entry store
+    /// Create a new syncing entry store with personal-only sync.
     pub fn new(inner: Arc<dyn Store>, queue: Arc<SyncQueue>) -> Self {
-        Self { inner, queue }
+        Self {
+            inner,
+            queue,
+            cloud_config: None,
+        }
+    }
+
+    /// Attach a cloud config so this store can auto-dual-enqueue eligible
+    /// writes to the team queue when a team is configured. No-op when
+    /// the config has no `active_team_id()`. Builder-style to preserve
+    /// existing 2-arg `new` call sites.
+    #[must_use]
+    pub fn with_cloud_config(mut self, cloud_config: Arc<CloudConfig>) -> Self {
+        self.cloud_config = Some(cloud_config);
+        self
+    }
+
+    /// Resolve the target team for dual-enqueue, if any. Returns `None`
+    /// when no cloud config is attached, no team is set, or the
+    /// `team_auto_promote` kill-switch is `Some(false)`.
+    fn active_team_id(&self) -> Option<String> {
+        self.cloud_config
+            .as_ref()
+            .and_then(|c| c.active_team_id().map(|s| s.to_string()))
     }
 
     fn queue_upsert(&self, entry: &Entry) {
-        // Best-effort queuing - don't fail the operation if queue fails
-        if let Ok(payload) = serde_json::to_string(entry) {
-            let _ = self.queue.enqueue(
+        // Serialise once — both enqueues share the same payload.
+        let payload = match serde_json::to_string(entry) {
+            Ok(p) => p,
+            Err(_) => return, // Best-effort: skip on serialisation failure.
+        };
+
+        // Personal enqueue is best-effort (historical behaviour).
+        let _ = self.queue.enqueue(
+            EntityType::Entry,
+            &entry.id,
+            SyncOperation::Upsert,
+            Some(&payload),
+        );
+
+        // Team enqueue: opt-in, predicate-gated. Failures are logged rather
+        // than silently swallowed because team-scope data loss is harder
+        // to re-derive than personal — a teammate may be waiting on this.
+        if let Some(team_id) = self.active_team_id()
+            && eligible_for_team_entry(entry)
+        {
+            if let Err(e) = self.queue.enqueue_for_team(
                 EntityType::Entry,
                 &entry.id,
                 SyncOperation::Upsert,
                 Some(&payload),
-            );
+                &team_id,
+            ) {
+                tracing::warn!(
+                    target: "cas::sync",
+                    entity_id = entry.id,
+                    team_id = team_id,
+                    error = %e,
+                    "team enqueue failed for entry"
+                );
+            }
         }
     }
 
@@ -37,6 +97,29 @@ impl SyncingEntryStore {
         let _ = self
             .queue
             .enqueue(EntityType::Entry, id, SyncOperation::Delete, None);
+
+        // Mirror the upsert path's dual-enqueue. We can't consult the
+        // predicate here because we don't have the entity — but deletes
+        // are cheap to over-push (the server has no row to touch), and
+        // under-pushing would leave stale team rows forever. Trade
+        // over-push for correctness.
+        if let Some(team_id) = self.active_team_id() {
+            if let Err(e) = self.queue.enqueue_for_team(
+                EntityType::Entry,
+                id,
+                SyncOperation::Delete,
+                None,
+                &team_id,
+            ) {
+                tracing::warn!(
+                    target: "cas::sync",
+                    entity_id = id,
+                    team_id = team_id,
+                    error = %e,
+                    "team enqueue failed for entry delete"
+                );
+            }
+        }
     }
 }
 
@@ -246,5 +329,190 @@ mod tests {
         let pending = queue.pending(10, 5).unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].operation, SyncOperation::Delete);
+    }
+
+    // ── Dual-enqueue behaviour (cas-82a1) ────────────────────────────────
+
+    use cas_types::{EntryType, Scope, ShareScope};
+
+    const TEST_TEAM: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    /// Build a SyncingEntryStore with a team configured via CloudConfig.
+    fn create_team_store(team_auto_promote: Option<bool>) -> (TempDir, SyncingEntryStore) {
+        let temp = TempDir::new().unwrap();
+        let cas_dir = temp.path();
+
+        let inner = SqliteStore::open(cas_dir).unwrap();
+        inner.init().unwrap();
+
+        let queue = SyncQueue::open(cas_dir).unwrap();
+        queue.init().unwrap();
+
+        let mut cfg = CloudConfig::default();
+        cfg.set_team(TEST_TEAM, "test-team");
+        cfg.team_auto_promote = team_auto_promote;
+
+        let store = SyncingEntryStore::new(Arc::new(inner), Arc::new(queue))
+            .with_cloud_config(Arc::new(cfg));
+        (temp, store)
+    }
+
+    /// Convenience: count rows in personal queue (team_id = '') and in
+    /// the given team's queue.
+    fn queue_counts(queue: &SyncQueue) -> (usize, usize) {
+        let personal = queue.pending(100, 5).unwrap().len();
+        let team = queue.pending_for_team(TEST_TEAM, 100, 5).unwrap().len();
+        (personal, team)
+    }
+
+    #[test]
+    fn dual_enqueue_when_team_configured_and_entry_eligible() {
+        let (temp, store) = create_team_store(None);
+        let queue = SyncQueue::open(temp.path()).unwrap();
+
+        // Default Entry is Project scope, Learning type, no share override —
+        // passes T1 filter.
+        let entry = Entry::new("p-test-001".to_string(), "team-visible".to_string());
+        store.add(&entry).unwrap();
+
+        let (personal, team) = queue_counts(&queue);
+        assert_eq!(personal, 1, "personal queue should have the entry");
+        assert_eq!(team, 1, "team queue should have the entry (dual-enqueue)");
+    }
+
+    #[test]
+    fn personal_only_when_no_cloud_config_attached() {
+        // No with_cloud_config call — historical behavior preserved.
+        let (temp, store) = create_test_store();
+        let queue = SyncQueue::open(temp.path()).unwrap();
+
+        let entry = Entry::new("p-test-002".to_string(), "no-team".to_string());
+        store.add(&entry).unwrap();
+
+        let (personal, team) = queue_counts(&queue);
+        assert_eq!(personal, 1);
+        assert_eq!(team, 0, "no team configured → no team enqueue");
+    }
+
+    #[test]
+    fn personal_only_when_team_id_unset() {
+        let (temp, store) = {
+            let temp = TempDir::new().unwrap();
+            let cas_dir = temp.path();
+            let inner = SqliteStore::open(cas_dir).unwrap();
+            inner.init().unwrap();
+            let queue = SyncQueue::open(cas_dir).unwrap();
+            queue.init().unwrap();
+            // CloudConfig with no team set.
+            let cfg = CloudConfig::default();
+            let store = SyncingEntryStore::new(Arc::new(inner), Arc::new(queue))
+                .with_cloud_config(Arc::new(cfg));
+            (temp, store)
+        };
+        let queue = SyncQueue::open(temp.path()).unwrap();
+
+        let entry = Entry::new("p-test-003".to_string(), "no-team-id".to_string());
+        store.add(&entry).unwrap();
+
+        let (personal, team) = queue_counts(&queue);
+        assert_eq!(personal, 1);
+        assert_eq!(team, 0);
+    }
+
+    #[test]
+    fn personal_only_when_entry_is_preference_type() {
+        let (temp, store) = create_team_store(None);
+        let queue = SyncQueue::open(temp.path()).unwrap();
+
+        let mut entry = Entry::new("p-pref-001".to_string(), "I use vim".to_string());
+        entry.entry_type = EntryType::Preference;
+        store.add(&entry).unwrap();
+
+        let (personal, team) = queue_counts(&queue);
+        assert_eq!(personal, 1);
+        assert_eq!(team, 0, "Preference type never auto-promotes");
+    }
+
+    #[test]
+    fn personal_only_when_entry_is_global_scope() {
+        let (temp, store) = create_team_store(None);
+        let queue = SyncQueue::open(temp.path()).unwrap();
+
+        let mut entry = Entry::new("g-test-001".to_string(), "global learning".to_string());
+        entry.scope = Scope::Global;
+        store.add(&entry).unwrap();
+
+        let (personal, team) = queue_counts(&queue);
+        assert_eq!(personal, 1);
+        assert_eq!(team, 0, "Global scope never auto-promotes");
+    }
+
+    #[test]
+    fn personal_only_when_share_is_private_override() {
+        let (temp, store) = create_team_store(None);
+        let queue = SyncQueue::open(temp.path()).unwrap();
+
+        let mut entry = Entry::new("p-priv-001".to_string(), "I tried X".to_string());
+        entry.share = Some(ShareScope::Private);
+        store.add(&entry).unwrap();
+
+        let (personal, team) = queue_counts(&queue);
+        assert_eq!(personal, 1);
+        assert_eq!(team, 0, "share=Private overrides auto-rule");
+    }
+
+    #[test]
+    fn dual_enqueue_when_share_is_team_override_even_for_global_preference() {
+        // The most extreme override: Global Preference with share=Team still
+        // dual-enqueues per precedence table row (though server pull-filter
+        // will strip Preference; user warned at T5 CLI time).
+        let (temp, store) = create_team_store(None);
+        let queue = SyncQueue::open(temp.path()).unwrap();
+
+        let mut entry = Entry::new("g-pref-001".to_string(), "team-wide pref".to_string());
+        entry.scope = Scope::Global;
+        entry.entry_type = EntryType::Preference;
+        entry.share = Some(ShareScope::Team);
+        store.add(&entry).unwrap();
+
+        let (personal, team) = queue_counts(&queue);
+        assert_eq!(personal, 1);
+        assert_eq!(team, 1, "share=Team forces promotion even for Global+Preference");
+    }
+
+    #[test]
+    fn personal_only_when_team_auto_promote_disabled() {
+        // team_id is set but the coarse kill-switch is engaged — the
+        // syncing store sees active_team_id() == None and does NOT
+        // dual-enqueue anything.
+        let (temp, store) = create_team_store(Some(false));
+        let queue = SyncQueue::open(temp.path()).unwrap();
+
+        let entry = Entry::new("p-kill-001".to_string(), "should stay local".to_string());
+        store.add(&entry).unwrap();
+
+        let (personal, team) = queue_counts(&queue);
+        assert_eq!(personal, 1);
+        assert_eq!(
+            team, 0,
+            "team_auto_promote=false disables dual-enqueue even with team_id set"
+        );
+    }
+
+    #[test]
+    fn delete_dual_enqueues_when_team_configured() {
+        let (temp, store) = create_team_store(None);
+        let queue = SyncQueue::open(temp.path()).unwrap();
+
+        let entry = Entry::new("p-del-001".to_string(), "to-be-deleted".to_string());
+        store.add(&entry).unwrap();
+        // Clear so we can count the delete alone.
+        queue.clear().unwrap();
+
+        store.delete(&entry.id).unwrap();
+
+        let (personal, team) = queue_counts(&queue);
+        assert_eq!(personal, 1);
+        assert_eq!(team, 1, "delete fans out to team queue too");
     }
 }

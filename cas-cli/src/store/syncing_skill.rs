@@ -1,10 +1,13 @@
 //! Syncing skill store wrapper
 //!
 //! Automatically queues skill changes for cloud sync on add/update/delete.
+//! When a team is configured and the skill passes the T1 filter policy,
+//! the write is dual-enqueued to both the personal queue and the team queue.
 
 use std::sync::Arc;
 
-use crate::cloud::{EntityType, SyncOperation, SyncQueue};
+use crate::cloud::{CloudConfig, EntityType, SyncOperation, SyncQueue};
+use crate::store::share_policy::eligible_for_team_skill;
 use crate::store::{Result, SkillStore};
 use crate::types::{Skill, SkillStatus};
 
@@ -12,23 +15,63 @@ use crate::types::{Skill, SkillStatus};
 pub struct SyncingSkillStore {
     inner: Arc<dyn SkillStore>,
     queue: Arc<SyncQueue>,
+    cloud_config: Option<Arc<CloudConfig>>,
 }
 
 impl SyncingSkillStore {
-    /// Create a new syncing skill store
+    /// Create a new syncing skill store (personal queue only).
     pub fn new(inner: Arc<dyn SkillStore>, queue: Arc<SyncQueue>) -> Self {
-        Self { inner, queue }
+        Self {
+            inner,
+            queue,
+            cloud_config: None,
+        }
+    }
+
+    /// Attach a cloud config for team auto-promotion.
+    #[must_use]
+    pub fn with_cloud_config(mut self, cloud_config: Arc<CloudConfig>) -> Self {
+        self.cloud_config = Some(cloud_config);
+        self
+    }
+
+    fn active_team_id(&self) -> Option<String> {
+        self.cloud_config
+            .as_ref()
+            .and_then(|c| c.active_team_id().map(|s| s.to_string()))
     }
 
     fn queue_upsert(&self, skill: &Skill) {
-        // Best-effort queuing - don't fail the operation if queue fails
-        if let Ok(payload) = serde_json::to_string(skill) {
-            let _ = self.queue.enqueue(
+        let payload = match serde_json::to_string(skill) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+
+        let _ = self.queue.enqueue(
+            EntityType::Skill,
+            &skill.id,
+            SyncOperation::Upsert,
+            Some(&payload),
+        );
+
+        if let Some(team_id) = self.active_team_id()
+            && eligible_for_team_skill(skill)
+        {
+            if let Err(e) = self.queue.enqueue_for_team(
                 EntityType::Skill,
                 &skill.id,
                 SyncOperation::Upsert,
                 Some(&payload),
-            );
+                &team_id,
+            ) {
+                tracing::warn!(
+                    target: "cas::sync",
+                    entity_id = skill.id,
+                    team_id = team_id,
+                    error = %e,
+                    "team enqueue failed for skill"
+                );
+            }
         }
     }
 
@@ -36,6 +79,24 @@ impl SyncingSkillStore {
         let _ = self
             .queue
             .enqueue(EntityType::Skill, id, SyncOperation::Delete, None);
+
+        if let Some(team_id) = self.active_team_id() {
+            if let Err(e) = self.queue.enqueue_for_team(
+                EntityType::Skill,
+                id,
+                SyncOperation::Delete,
+                None,
+                &team_id,
+            ) {
+                tracing::warn!(
+                    target: "cas::sync",
+                    entity_id = id,
+                    team_id = team_id,
+                    error = %e,
+                    "team enqueue failed for skill delete"
+                );
+            }
+        }
     }
 }
 

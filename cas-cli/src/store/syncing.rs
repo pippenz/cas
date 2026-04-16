@@ -1,12 +1,15 @@
 //! Syncing rule store wrapper
 //!
 //! Automatically syncs rules to Claude Code on add/update/delete,
-//! and optionally queues changes for cloud sync.
+//! and optionally queues changes for cloud sync. When a team is configured
+//! and the rule passes the T1 filter policy, the write is dual-enqueued
+//! to both the personal queue and the team queue.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::cloud::{EntityType, SyncOperation, SyncQueue};
+use crate::cloud::{CloudConfig, EntityType, SyncOperation, SyncQueue};
+use crate::store::share_policy::eligible_for_team_rule;
 use crate::store::{Result, RuleStore};
 use crate::types::Rule;
 use cas_core::Syncer;
@@ -17,6 +20,9 @@ pub struct SyncingRuleStore {
     syncer: Syncer,
     /// Optional cloud sync queue
     cloud_queue: Option<Arc<SyncQueue>>,
+    /// Optional cloud config for team auto-promotion. Only used when
+    /// `cloud_queue` is also `Some`.
+    cloud_config: Option<Arc<CloudConfig>>,
 }
 
 impl SyncingRuleStore {
@@ -26,6 +32,7 @@ impl SyncingRuleStore {
             inner,
             syncer: Syncer::new(target_dir, min_helpful),
             cloud_queue: None,
+            cloud_config: None,
         }
     }
 
@@ -40,7 +47,23 @@ impl SyncingRuleStore {
             inner,
             syncer: Syncer::new(target_dir, min_helpful),
             cloud_queue: Some(cloud_queue),
+            cloud_config: None,
         }
+    }
+
+    /// Attach a cloud config for team auto-promotion. Meaningful only
+    /// when `with_cloud_queue` also provided a queue — without a queue
+    /// there is nowhere to enqueue.
+    #[must_use]
+    pub fn with_cloud_config(mut self, cloud_config: Arc<CloudConfig>) -> Self {
+        self.cloud_config = Some(cloud_config);
+        self
+    }
+
+    fn active_team_id(&self) -> Option<String> {
+        self.cloud_config
+            .as_ref()
+            .and_then(|c| c.active_team_id().map(|s| s.to_string()))
     }
 
     fn try_sync(&self, rule: &Rule) {
@@ -53,21 +76,64 @@ impl SyncingRuleStore {
     }
 
     fn queue_upsert(&self, rule: &Rule) {
-        if let Some(queue) = &self.cloud_queue {
-            if let Ok(payload) = serde_json::to_string(rule) {
-                let _ = queue.enqueue(
-                    EntityType::Rule,
-                    &rule.id,
-                    SyncOperation::Upsert,
-                    Some(&payload),
+        let Some(queue) = &self.cloud_queue else {
+            return;
+        };
+        let payload = match serde_json::to_string(rule) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+
+        let _ = queue.enqueue(
+            EntityType::Rule,
+            &rule.id,
+            SyncOperation::Upsert,
+            Some(&payload),
+        );
+
+        if let Some(team_id) = self.active_team_id()
+            && eligible_for_team_rule(rule)
+        {
+            if let Err(e) = queue.enqueue_for_team(
+                EntityType::Rule,
+                &rule.id,
+                SyncOperation::Upsert,
+                Some(&payload),
+                &team_id,
+            ) {
+                tracing::warn!(
+                    target: "cas::sync",
+                    entity_id = rule.id,
+                    team_id = team_id,
+                    error = %e,
+                    "team enqueue failed for rule"
                 );
             }
         }
     }
 
     fn queue_delete(&self, id: &str) {
-        if let Some(queue) = &self.cloud_queue {
-            let _ = queue.enqueue(EntityType::Rule, id, SyncOperation::Delete, None);
+        let Some(queue) = &self.cloud_queue else {
+            return;
+        };
+        let _ = queue.enqueue(EntityType::Rule, id, SyncOperation::Delete, None);
+
+        if let Some(team_id) = self.active_team_id() {
+            if let Err(e) = queue.enqueue_for_team(
+                EntityType::Rule,
+                id,
+                SyncOperation::Delete,
+                None,
+                &team_id,
+            ) {
+                tracing::warn!(
+                    target: "cas::sync",
+                    entity_id = id,
+                    team_id = team_id,
+                    error = %e,
+                    "team enqueue failed for rule delete"
+                );
+            }
         }
     }
 }
