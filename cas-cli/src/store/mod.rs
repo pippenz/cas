@@ -137,11 +137,9 @@ mod notifying_rule;
 mod notifying_skill;
 mod notifying_task;
 // Private in production; `pub(crate)` only for `#[cfg(test)]` so the
-// sibling test modules in `cli/cloud.rs` and `syncing_*.rs` can share
-// `TEST_TEAM_UUID`. No non-test code should import from this module.
-#[cfg(not(test))]
-mod share_policy;
-#[cfg(test)]
+// `cli/memory.rs` (T5 cas-07d7) calls the predicate directly for the
+// retroactive backfill CLI — it must match the syncing-wrapper filter
+// exactly or mutations will diverge from auto-promote.
 pub(crate) mod share_policy;
 mod syncing;
 mod syncing_entry;

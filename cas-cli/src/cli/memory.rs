@@ -1,0 +1,233 @@
+//! `cas memory` CLI — retroactive team-share backfill.
+//!
+//! Provides `share`/`unshare` operations that mutate `Entry.share` and rely
+//! on the `SyncingEntryStore` wrapper to dual-enqueue the resulting write
+//! into the active team's push queue. The predicate used for `--since` and
+//! `--all` is `share_policy::eligible_for_team_entry`, keeping selection
+//! aligned with the T1 auto-promote path.
+
+use std::path::Path;
+
+use anyhow::{Context, anyhow};
+use cas_types::{Entry, ShareScope};
+use clap::{Parser, Subcommand};
+
+use crate::cli::Cli;
+use crate::cloud::CloudConfig;
+use crate::store::open_store;
+use crate::store::share_policy::eligible_for_team_entry;
+
+#[derive(Subcommand)]
+pub enum MemoryCommands {
+    /// Promote entries to the team push queue
+    Share(ShareArgs),
+    /// Demote an entry back to personal-only (`share = Private`)
+    Unshare(UnshareArgs),
+}
+
+#[derive(Parser)]
+pub struct ShareArgs {
+    /// Entry id to promote (e.g. `2026-03-01-1`). Mutually exclusive with
+    /// `--since` and `--all`.
+    #[arg(conflicts_with_all = ["since", "all"])]
+    pub id: Option<String>,
+
+    /// Promote all entries created within the given duration (e.g. `7d`,
+    /// `48h`, `30m`). Filtered through the T1 predicate.
+    #[arg(long, conflicts_with_all = ["id", "all"])]
+    pub since: Option<String>,
+
+    /// Promote every entry passing the T1 filter predicate.
+    #[arg(long, conflicts_with_all = ["id", "since"])]
+    pub all: bool,
+
+    /// Print what would be promoted without mutating the store.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Parser)]
+pub struct UnshareArgs {
+    /// Entry id to demote.
+    pub id: String,
+}
+
+pub fn execute(cmd: &MemoryCommands, _cli: &Cli, cas_root: &Path) -> anyhow::Result<()> {
+    match cmd {
+        MemoryCommands::Share(args) => execute_share(args, cas_root),
+        MemoryCommands::Unshare(args) => execute_unshare(args, cas_root),
+    }
+}
+
+/// Public for integration tests only. Not a stable API.
+#[doc(hidden)]
+pub fn execute_share(args: &ShareArgs, cas_root: &Path) -> anyhow::Result<()> {
+    // Exactly one of id | --since | --all must be supplied. clap's
+    // `conflicts_with_all` prevents combinations; check the empty case here.
+    if args.id.is_none() && args.since.is_none() && !args.all {
+        return Err(anyhow!(
+            "Specify one of <id>, --since <duration>, or --all. See `cas memory share --help`."
+        ));
+    }
+
+    // Warn (but don't block) when no team is configured — the user can still
+    // mark entries as share=Team; dual-enqueue will be a no-op until a team
+    // is set. A silent success would hide the "nothing happened" outcome.
+    let cloud_cfg = CloudConfig::load_from_cas_dir(cas_root).unwrap_or_default();
+    if cloud_cfg.active_team_id().is_none() {
+        eprintln!(
+            "warning: no active team configured (or team_auto_promote disabled). \
+             Entries will be marked share=Team on disk but no team-queue rows will \
+             be enqueued until you run `cas cloud team set <uuid>` and write again."
+        );
+    }
+
+    let store = open_store(cas_root).context("failed to open entry store")?;
+
+    let candidates: Vec<Entry> = if let Some(id) = args.id.as_deref() {
+        vec![store
+            .get(id)
+            .with_context(|| format!("entry {id} not found"))?]
+    } else if let Some(since) = args.since.as_deref() {
+        let duration = parse_duration(since)?;
+        let cutoff = chrono::Utc::now() - duration;
+        store
+            .list()?
+            .into_iter()
+            .filter(|e| e.created >= cutoff)
+            .collect()
+    } else {
+        // --all
+        store.list()?
+    };
+
+    let mut promoted = 0usize;
+    let mut skipped_ineligible = 0usize;
+    let mut already_shared = 0usize;
+
+    for mut entry in candidates {
+        if entry.share == Some(ShareScope::Team) {
+            already_shared += 1;
+            continue;
+        }
+
+        // Single-id mode is an explicit user decision: we still honor the
+        // T1 filter so accidental promotion of a Preference or Global-scope
+        // entry surfaces as an error rather than silently succeeding. Bulk
+        // modes also filter — `--all` without a predicate would over-share
+        // exactly the entries the filter exists to protect.
+        let eligible = eligible_for_team_entry(&Entry {
+            // Re-evaluate with share cleared so we test the *scope/type*
+            // path, not the already-set override. Private entries still
+            // fail and surface with the reason below.
+            share: None,
+            ..entry.clone()
+        });
+
+        if entry.share == Some(ShareScope::Private) || !eligible {
+            skipped_ineligible += 1;
+            if args.id.is_some() {
+                // Single-id mode: surface the reason explicitly so the user
+                // knows why nothing happened.
+                return Err(anyhow!(
+                    "entry {} is not eligible for team share (share={:?}, scope={:?}, type={:?}). \
+                     Preference-typed or Global-scoped entries stay personal.",
+                    entry.id,
+                    entry.share,
+                    entry.scope,
+                    entry.entry_type,
+                ));
+            }
+            continue;
+        }
+
+        if args.dry_run {
+            promoted += 1;
+            continue;
+        }
+
+        entry.share = Some(ShareScope::Team);
+        store
+            .update(&entry)
+            .with_context(|| format!("failed to update entry {}", entry.id))?;
+        promoted += 1;
+    }
+
+    let label = if args.dry_run { "would promote" } else { "promoted" };
+    println!(
+        "{label} {promoted} entries \
+         (skipped {skipped_ineligible} ineligible, \
+         {already_shared} already shared)"
+    );
+
+    Ok(())
+}
+
+/// Public for integration tests only. Not a stable API.
+#[doc(hidden)]
+pub fn execute_unshare(args: &UnshareArgs, cas_root: &Path) -> anyhow::Result<()> {
+    let store = open_store(cas_root).context("failed to open entry store")?;
+    let mut entry = store
+        .get(&args.id)
+        .with_context(|| format!("entry {} not found", args.id))?;
+
+    if entry.share == Some(ShareScope::Private) {
+        println!("entry {} already marked share=Private (no-op)", args.id);
+        return Ok(());
+    }
+
+    entry.share = Some(ShareScope::Private);
+    store
+        .update(&entry)
+        .with_context(|| format!("failed to update entry {}", entry.id))?;
+    println!("entry {} marked share=Private", args.id);
+    Ok(())
+}
+
+/// Parse a duration string like `7d`, `48h`, `30m`, `90s` into a
+/// `chrono::Duration`. Kept deliberately simple — humantime would pull
+/// in a new dep for one call site.
+fn parse_duration(s: &str) -> anyhow::Result<chrono::Duration> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err(anyhow!("duration is empty"));
+    }
+    let (num, unit) = s.split_at(
+        s.find(|c: char| !c.is_ascii_digit())
+            .ok_or_else(|| anyhow!("duration missing unit (e.g. 7d, 48h, 30m)"))?,
+    );
+    let n: i64 = num
+        .parse()
+        .with_context(|| format!("invalid duration number: {num}"))?;
+    let d = match unit {
+        "s" => chrono::Duration::seconds(n),
+        "m" => chrono::Duration::minutes(n),
+        "h" => chrono::Duration::hours(n),
+        "d" => chrono::Duration::days(n),
+        "w" => chrono::Duration::weeks(n),
+        other => return Err(anyhow!("unknown duration unit `{other}` (expected s/m/h/d/w)")),
+    };
+    Ok(d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_duration_accepts_common_units() {
+        assert_eq!(parse_duration("7d").unwrap(), chrono::Duration::days(7));
+        assert_eq!(parse_duration("48h").unwrap(), chrono::Duration::hours(48));
+        assert_eq!(parse_duration("30m").unwrap(), chrono::Duration::minutes(30));
+        assert_eq!(parse_duration("90s").unwrap(), chrono::Duration::seconds(90));
+        assert_eq!(parse_duration("2w").unwrap(), chrono::Duration::weeks(2));
+    }
+
+    #[test]
+    fn parse_duration_rejects_bad_input() {
+        assert!(parse_duration("").is_err());
+        assert!(parse_duration("7").is_err()); // missing unit
+        assert!(parse_duration("abc").is_err());
+        assert!(parse_duration("7y").is_err()); // unknown unit
+    }
+}

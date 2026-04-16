@@ -22,6 +22,7 @@ mod init;
 pub mod interactive;
 mod list;
 mod mcp_cmd;
+pub mod memory;
 mod open;
 mod queue;
 mod status;
@@ -184,6 +185,10 @@ pub enum Commands {
     /// PRODUCT_OVERVIEW.md staleness info and pending changes
     #[command(subcommand, name = "project-overview")]
     ProjectOverview(project_overview_cmd::ProjectOverviewCommands),
+
+    /// Memory operations (share/unshare entries with your team)
+    #[command(subcommand)]
+    Memory(memory::MemoryCommands),
 }
 
 /// Authentication requirement for a command.
@@ -226,7 +231,8 @@ fn auth_requirement(command: &Option<Commands>) -> AuthRequirement {
         | Commands::Queue(_)
         | Commands::ClaudeMd(_)
         | Commands::Codemap(_)
-        | Commands::ProjectOverview(_) => AuthRequirement::NotRequired,
+        | Commands::ProjectOverview(_)
+        | Commands::Memory(_) => AuthRequirement::NotRequired,
 
         #[cfg(feature = "mcp-server")]
         Commands::Serve => AuthRequirement::NotRequired,
@@ -374,6 +380,7 @@ fn get_command_name(cmd: &Option<Commands>) -> String {
         Commands::ClaudeMd(_) => "claude-md".to_string(),
         Commands::Codemap(_) => "codemap".to_string(),
         Commands::ProjectOverview(_) => "project-overview".to_string(),
+        Commands::Memory(_) => "memory".to_string(),
     }
 }
 
@@ -425,6 +432,7 @@ fn run_command(cli: &Cli, cas_root: Option<&Path>) -> anyhow::Result<()> {
         Commands::ProjectOverview(cmd) => {
             project_overview_cmd::execute(cmd, cli, require_cas_root(cas_root)?)
         }
+        Commands::Memory(cmd) => memory::execute(cmd, cli, require_cas_root(cas_root)?),
     }
 }
 
