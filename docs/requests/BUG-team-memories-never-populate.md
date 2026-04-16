@@ -3,9 +3,16 @@ from: Petra Stella Cloud team
 date: 2026-04-16
 priority: P1
 related: completed/FEATURE-REQUEST-TEAM-PROJECT-MEMORIES.md
+decision: team-memories-filter-policy.md
 ---
 
 # BUG: Team memories never populate from normal CLI usage
+
+> **Filter policy pinned:** See [team-memories-filter-policy.md](team-memories-filter-policy.md)
+> for the chosen auto-promotion rule, opt-out surface (`share` field +
+> `team_auto_promote` config), treatment of pre-existing personal entries,
+> and interaction with `cas memory remember --share`. This is the input to
+> tasks T3–T7 under EPIC cas-cf44.
 
 ## TL;DR
 
