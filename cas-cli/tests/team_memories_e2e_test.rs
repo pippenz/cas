@@ -29,10 +29,10 @@ use cas::cli::Cli;
 use cas::cli::cloud::execute_team_push;
 use cas::cli::memory::{ShareArgs, execute_share};
 use cas::cloud::{CloudConfig, CloudSyncer, CloudSyncerConfig, SyncQueue};
-use cas::store::open_store;
+use cas::store::{open_rule_store, open_skill_store, open_store, open_task_store};
 use cas::types::{Entry, EntryType, Scope, ShareScope};
 use tempfile::TempDir;
-use wiremock::matchers::{method, path as path_matcher};
+use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Fixture UUID shared with other team-sync tests.
@@ -61,7 +61,7 @@ fn seed_team_cloud_config_on_disk(cas_dir: &Path, endpoint: String) {
 
 fn mock_push_endpoint() -> Mock {
     Mock::given(method("POST"))
-        .and(path_matcher(format!("/api/teams/{TEST_TEAM}/sync/push")))
+        .and(path(format!("/api/teams/{TEST_TEAM}/sync/push")))
         .respond_with(
             ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "synced": {
@@ -205,12 +205,16 @@ async fn retroactive_share_all_then_team_push_surfaces_preexisting_entries() {
 /// only the recent one gets promoted.
 #[tokio::test]
 async fn share_since_filter_selects_only_recent_entries() {
+    const SINCE_WINDOW: &str = "48h";
+
     let tmp = TempDir::new().unwrap();
     let cas_dir = tmp.path();
 
-    // Configure team so execute_share produces team-queue side-effects
-    // — we're verifying selection, not just mutation.
-    seed_team_cloud_config_on_disk(cas_dir, "http://127.0.0.1:0".to_string());
+    // Match the real retroactive-backfill scenario: entries are
+    // written BEFORE a team is configured, so the initial add path
+    // does NOT dual-enqueue. This keeps the post-share team-queue
+    // assertion honest — any rows there came from --since, not from
+    // the seeding.
 
     // Seed three entries: one recent, one ~3 days old, one ~30 days
     // old. All Project/Learning so the T1 predicate is satisfied;
@@ -246,18 +250,33 @@ async fn share_since_filter_selects_only_recent_entries() {
         store.add(&recent).unwrap();
         store.add(&medium).unwrap();
         store.add(&old).unwrap();
+
+        // Pin the invariant this test rests on: store.add() must
+        // preserve the caller-supplied `created` timestamp. If a
+        // refactor ever overrides this to `Utc::now()`, the --since
+        // cutoff check below becomes meaningless (all three entries
+        // would be effectively "now" and all would pass the filter).
+        assert_eq!(
+            store.get("recent").unwrap().created,
+            recent.created,
+            "store.add must preserve caller-supplied created timestamp"
+        );
     }
+
+    // Configure team AFTER seeding so the initial adds go to the
+    // personal queue only — the retroactive-backfill scenario.
+    seed_team_cloud_config_on_disk(cas_dir, "http://127.0.0.1:0".to_string());
 
     // `--since 48h` should select only the 12-hours-ago entry.
     let args = ShareArgs {
         id: None,
-        since: Some("48h".to_string()),
+        since: Some(SINCE_WINDOW.to_string()),
         all: false,
         dry_run: false,
     };
     let cas_dir_owned = cas_dir.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        execute_share(&args, &cas_dir_owned).expect("share --since 48h")
+        execute_share(&args, &cas_dir_owned).expect("share --since")
     })
     .await
     .unwrap();
@@ -266,17 +285,29 @@ async fn share_since_filter_selects_only_recent_entries() {
     assert_eq!(
         store.get("recent").unwrap().share,
         Some(ShareScope::Team),
-        "entry inside --since 48h window must be promoted"
+        "entry inside --since {SINCE_WINDOW} window must be promoted",
     );
     assert_eq!(
         store.get("medium").unwrap().share,
         None,
-        "entry 3d old must be outside a 48h window"
+        "entry 3d old must be outside a {SINCE_WINDOW} window",
     );
     assert_eq!(
         store.get("old").unwrap().share,
         None,
-        "entry 30d old must be outside a 48h window"
+        "entry 30d old must be outside a {SINCE_WINDOW} window",
+    );
+
+    // Team-queue side-effect: exactly one row should have been
+    // dual-enqueued — the same one that got share=Team. Catches a
+    // regression where the filter is applied to the mutation but
+    // not to the queue enqueue step.
+    let q = SyncQueue::open(cas_dir).unwrap();
+    q.init().unwrap();
+    assert_eq!(
+        q.pending_for_team(TEST_TEAM, 100, 10).unwrap().len(),
+        1,
+        "only the filtered entry must be in the team queue",
     );
 }
 
@@ -290,32 +321,24 @@ async fn share_since_filter_selects_only_recent_entries() {
 async fn fresh_teammate_pull_applies_team_memories_to_local_store() {
     let server = MockServer::start().await;
 
-    // Teammate B's shared memory — arrives via the team pull endpoint.
-    // No `project_canonical_id` / `project_id` field so the filter
-    // `entity_matches_project` accepts it unconditionally (legacy
-    // path). Covered separately by entity_matches_project unit tests.
-    let shared_entry = serde_json::json!({
-        "id": "alice-shared-001",
-        "entry_type": "learning",
-        "scope": "project",
-        "created": chrono::Utc::now().to_rfc3339(),
-        "content": "alice's shared learning",
-        "helpful_count": 0,
-        "harmful_count": 0,
-        "archived": false,
-        "pending_extraction": false,
-        "pending_embedding": false,
-        "stability": 0.5,
-        "access_count": 0,
-        "memory_tier": "working",
-        "importance": 0.5,
-        "belief_type": "fact",
-        "confidence": 1.0,
-        "compressed": false,
-    });
+    // Build the mock payload by serializing a real `Entry`. This keeps
+    // the wire shape in sync with `Entry::serialize` (which uses
+    // `#[serde(rename = "type")]` on `entry_type` — a hand-written
+    // JSON blob using the Rust field name would silently fall through
+    // to the serde default and make entry_type assertions vacuous).
+    // Using `EntryType::Context` (non-default) guarantees any
+    // deserialization regression flips the assertion.
+    let alice_entry = Entry {
+        id: "alice-shared-001".to_string(),
+        scope: Scope::Project,
+        entry_type: EntryType::Context,
+        content: "alice's shared learning".to_string(),
+        ..Default::default()
+    };
+    let shared_entry = serde_json::to_value(&alice_entry).unwrap();
 
     Mock::given(method("GET"))
-        .and(path_matcher(format!("/api/teams/{TEST_TEAM}/sync/pull")))
+        .and(path(format!("/api/teams/{TEST_TEAM}/sync/pull")))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "entries": [shared_entry],
             "tasks": [],
@@ -336,9 +359,9 @@ async fn fresh_teammate_pull_applies_team_memories_to_local_store() {
     let queue = SyncQueue::open(cas_dir).unwrap();
     queue.init().unwrap();
     let entry_store = open_store(cas_dir).unwrap();
-    let task_store = cas::store::open_task_store(cas_dir).unwrap();
-    let rule_store = cas::store::open_rule_store(cas_dir).unwrap();
-    let skill_store = cas::store::open_skill_store(cas_dir).unwrap();
+    let task_store = open_task_store(cas_dir).unwrap();
+    let rule_store = open_rule_store(cas_dir).unwrap();
+    let skill_store = open_skill_store(cas_dir).unwrap();
 
     // No existing entries.
     assert!(entry_store.get("alice-shared-001").is_err());
@@ -369,6 +392,14 @@ async fn fresh_teammate_pull_applies_team_memories_to_local_store() {
         sync_result.pulled_entries, 1,
         "exactly one entry must be applied to the fresh teammate's store"
     );
+    assert_eq!(sync_result.pulled_tasks, 0);
+    assert_eq!(sync_result.pulled_rules, 0);
+    assert_eq!(sync_result.pulled_skills, 0);
+    assert!(
+        sync_result.errors.is_empty(),
+        "unexpected pull errors: {:?}",
+        sync_result.errors,
+    );
 
     // Fresh teammate's local store now has alice's shared memory,
     // with zero flags, zero UUID lookups — AC demo met.
@@ -376,8 +407,16 @@ async fn fresh_teammate_pull_applies_team_memories_to_local_store() {
     let pulled = fresh_store
         .get("alice-shared-001")
         .expect("fresh teammate must see alice's shared memory");
+    assert_eq!(pulled.id, "alice-shared-001");
     assert_eq!(pulled.content, "alice's shared learning");
     assert_eq!(pulled.scope, Scope::Project);
-    assert_eq!(pulled.entry_type, EntryType::Learning);
+    // Non-default entry_type proves the `#[serde(rename = "type")]`
+    // decoded correctly — a hand-written JSON using `entry_type` as
+    // the key would silently fall through to `EntryType::Learning`.
+    assert_eq!(pulled.entry_type, EntryType::Context);
+    assert!(
+        pulled.raw_content.is_none(),
+        "raw_content should be absent from wire payload, not mapped from content",
+    );
     // `wiremock`'s `.expect(1)` asserts the GET actually fired.
 }
