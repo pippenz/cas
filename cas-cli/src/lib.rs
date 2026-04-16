@@ -5,6 +5,22 @@
 //! This crate provides unified task tracking, memory management, rules, and skills
 //! for AI coding agents.
 
+// The MCP panic catcher in `mcp::tools::service::panic_catch` relies on
+// `tokio::spawn` + `JoinError::is_panic` to convert handler panics into
+// `INTERNAL_ERROR` responses. Under `panic = "abort"` the process is
+// terminated before the `JoinHandle` is reachable, and A2 (EPIC cas-c351
+// / cas-a436) provides no protection — a single handler panic aborts
+// `cas serve`. Rust overrides panic=abort to unwind for `cargo test`
+// automatically, so this guard only fires on non-test builds.
+#[cfg(all(not(test), panic = "abort"))]
+compile_error!(
+    "cas requires `panic = \"unwind\"` (see EPIC cas-c351). \
+     The MCP dispatch panic catcher in cas::mcp::tools::service::panic_catch \
+     depends on stack unwinding; `panic = \"abort\"` disables it and makes \
+     `cas serve` crash on the first handler panic with no server-side trace. \
+     Remove `panic = \"abort\"` from the build profile."
+);
+
 // Core modules
 pub mod agent_id;
 pub mod async_runtime;
