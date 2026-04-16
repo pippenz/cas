@@ -94,6 +94,7 @@ pub fn handle_user_prompt_submit(
                     auto_approve_tools: None,
                     auto_approve_paths: None,
                     team_id: None,
+                    share: None,
                 };
 
                 if rule_store.add(&rule).is_ok() {

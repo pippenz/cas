@@ -270,6 +270,12 @@ pub struct Task {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub team_id: Option<String>,
 
+    /// Per-task team-promotion override (T5). See `Rule.share` for
+    /// semantics. Dormant — no CLI currently writes this field for
+    /// tasks — but present to match Entry's shape end-to-end.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub share: Option<crate::scope::ShareScope>,
+
     /// What can be demonstrated when this task is complete
     /// e.g., "Type a query, results filter live"
     #[serde(default)]
@@ -313,6 +319,7 @@ impl Task {
             epic_verification_owner: None,
             deliverables: TaskDeliverables::default(),
             team_id: None,
+            share: None,
             demo_statement: String::new(),
             execution_note: None,
         }
@@ -375,6 +382,7 @@ impl Default for Task {
             epic_verification_owner: None,
             deliverables: TaskDeliverables::default(),
             team_id: None,
+            share: None,
             demo_statement: String::new(),
             execution_note: None,
         }

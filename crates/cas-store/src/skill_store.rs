@@ -42,7 +42,9 @@ CREATE TABLE IF NOT EXISTS skills (
     updated_at TEXT NOT NULL,
     last_used TEXT,
     -- Team collaboration
-    team_id TEXT
+    team_id TEXT,
+    -- Team-promotion share override (private | team)
+    share TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_skills_status ON skills(status);
@@ -183,6 +185,14 @@ impl SqliteSkillStore {
                 .and_then(|s| Self::parse_datetime(&s)),
             // Team collaboration (24)
             team_id: row.get::<_, Option<String>>(24).unwrap_or(None),
+            // T5: share override (25) — added via migration m082.
+            // ShareScope serde lowercase ("private"|"team"); NULL in DB
+            // means T1 auto-rule applies.
+            share: row
+                .get::<_, Option<String>>(25)
+                .unwrap_or(None)
+                .as_deref()
+                .and_then(|s| s.parse().ok()),
         })
     }
 }

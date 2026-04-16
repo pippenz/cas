@@ -42,6 +42,7 @@ mod m033_entries_add_scope;
 mod m034_entries_add_updated_at;
 mod m035_entries_add_indexed_at;
 mod m036_entries_idx_pending_index;
+mod m037_entries_add_share;
 
 // Rules subsystem (51-70)
 mod m051_rules_add_hook_command;
@@ -53,6 +54,7 @@ mod m056_rules_idx_priority;
 mod m057_rules_add_scope;
 mod m058_rules_add_auto_approve_tools;
 mod m059_rules_add_auto_approve_paths;
+mod m060_rules_add_share;
 
 // Skills subsystem (71-90)
 mod m071_skills_add_summary;
@@ -66,6 +68,7 @@ mod m078_skills_add_agent_type;
 mod m079_skills_add_allowed_tools;
 mod m080_skills_add_hooks;
 mod m081_skills_add_disable_model_invocation;
+mod m082_skills_add_share;
 
 // Agents subsystem (91-110)
 mod m091_task_leases_add_epoch;
@@ -83,6 +86,7 @@ mod m117_tasks_add_worktree_id;
 mod m118_tasks_idx_branch;
 mod m119_tasks_idx_worktree;
 mod m120_tasks_add_deliverables;
+mod m121_tasks_add_share;
 
 /// All migrations in order. IDs must be sequential and never reused.
 pub const MIGRATIONS: &[Migration] = &[
@@ -123,6 +127,7 @@ pub const MIGRATIONS: &[Migration] = &[
     m034_entries_add_updated_at::MIGRATION,
     m035_entries_add_indexed_at::MIGRATION,
     m036_entries_idx_pending_index::MIGRATION,
+    m037_entries_add_share::MIGRATION,
     // Rules
     m051_rules_add_hook_command::MIGRATION,
     m052_rules_add_category::MIGRATION,
@@ -133,6 +138,7 @@ pub const MIGRATIONS: &[Migration] = &[
     m057_rules_add_scope::MIGRATION,
     m058_rules_add_auto_approve_tools::MIGRATION,
     m059_rules_add_auto_approve_paths::MIGRATION,
+    m060_rules_add_share::MIGRATION,
     // Skills
     m071_skills_add_summary::MIGRATION,
     m072_skills_add_preconditions::MIGRATION,
@@ -145,6 +151,7 @@ pub const MIGRATIONS: &[Migration] = &[
     m079_skills_add_allowed_tools::MIGRATION,
     m080_skills_add_hooks::MIGRATION,
     m081_skills_add_disable_model_invocation::MIGRATION,
+    m082_skills_add_share::MIGRATION,
     // Agents
     m091_task_leases_add_epoch::MIGRATION,
     m092_agents_add_worktree_id::MIGRATION,
@@ -160,6 +167,7 @@ pub const MIGRATIONS: &[Migration] = &[
     m118_tasks_idx_branch::MIGRATION,
     m119_tasks_idx_worktree::MIGRATION,
     m120_tasks_add_deliverables::MIGRATION,
+    m121_tasks_add_share::MIGRATION,
 ];
 
 #[cfg(test)]

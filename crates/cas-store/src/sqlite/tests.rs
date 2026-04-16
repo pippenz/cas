@@ -1,6 +1,6 @@
 use crate::Store;
 use crate::sqlite::SqliteStore;
-use cas_types::Entry;
+use cas_types::{Entry, ShareScope};
 use tempfile::TempDir;
 
 #[test]
@@ -50,6 +50,52 @@ fn test_sqlite_store_crud() {
     // Delete entry
     store.delete(&id).unwrap();
     assert!(store.get(&id).is_err());
+}
+
+/// T5 cas-07d7: Entry.share must round-trip through SQLite.
+/// Covers the three states — None, Private, Team — across add→get
+/// and update→get, plus archive→unarchive (the P1 residual where
+/// reload was losing share on the rule path).
+#[test]
+fn test_entry_share_roundtrip() {
+    let temp = TempDir::new().unwrap();
+    let store = SqliteStore::open(temp.path()).unwrap();
+    store.init().unwrap();
+
+    // None (default) round-trips
+    let id_none = store.generate_id().unwrap();
+    let e_none = Entry {
+        id: id_none.clone(),
+        content: "no share".to_string(),
+        ..Default::default()
+    };
+    store.add(&e_none).unwrap();
+    assert_eq!(store.get(&id_none).unwrap().share, None);
+
+    // Some(Team) round-trips through add
+    let id_team = store.generate_id().unwrap();
+    let e_team = Entry {
+        id: id_team.clone(),
+        content: "team share".to_string(),
+        share: Some(ShareScope::Team),
+        ..Default::default()
+    };
+    store.add(&e_team).unwrap();
+    assert_eq!(store.get(&id_team).unwrap().share, Some(ShareScope::Team));
+
+    // Some(Private) round-trips through update
+    let mut e_priv = store.get(&id_none).unwrap();
+    e_priv.share = Some(ShareScope::Private);
+    store.update(&e_priv).unwrap();
+    assert_eq!(
+        store.get(&id_none).unwrap().share,
+        Some(ShareScope::Private)
+    );
+
+    // Archive/unarchive preserves share (P1 residual from T3 review)
+    store.archive(&id_team).unwrap();
+    store.unarchive(&id_team).unwrap();
+    assert_eq!(store.get(&id_team).unwrap().share, Some(ShareScope::Team));
 }
 
 /// Helper to add session signal columns for testing

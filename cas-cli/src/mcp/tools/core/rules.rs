@@ -175,6 +175,7 @@ impl CasCore {
             auto_approve_tools: req.auto_approve_tools,
             auto_approve_paths: req.auto_approve_paths,
             team_id: None,
+            share: None,
         };
 
         rule_store.add(&rule).map_err(|e| McpError {

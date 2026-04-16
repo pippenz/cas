@@ -464,6 +464,7 @@ impl MarkdownRuleStore {
             auto_approve_tools: fm.auto_approve_tools,
             auto_approve_paths: fm.auto_approve_paths,
             team_id: None,
+            share: None,
         })
     }
 

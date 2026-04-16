@@ -182,6 +182,14 @@ pub struct Rule {
     /// Team ID this rule belongs to (None = personal/not shared with team)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub team_id: Option<String>,
+
+    /// Per-rule team-promotion override (T5 cas-07d7). `None` = T1
+    /// auto-rule applies (Project-scope rules dual-enqueue);
+    /// `Some(Private)` suppresses the team enqueue; `Some(Team)` force-
+    /// promotes even Global-scope rules. No CLI currently writes this
+    /// field for rules — dormant but wired to match Entry's shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub share: Option<crate::scope::ShareScope>,
 }
 
 fn default_priority() -> u8 {
@@ -216,6 +224,7 @@ impl Rule {
             auto_approve_tools: None,
             auto_approve_paths: None,
             team_id: None,
+            share: None,
         }
     }
 
@@ -381,6 +390,7 @@ impl Default for Rule {
             auto_approve_tools: None,
             auto_approve_paths: None,
             team_id: None,
+            share: None,
         }
     }
 }

@@ -282,6 +282,12 @@ pub struct Skill {
     /// Team ID this skill belongs to (None = personal/not shared with team)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub team_id: Option<String>,
+
+    /// Per-skill team-promotion override (T5). See `Rule.share` for
+    /// semantics. Dormant — no CLI currently writes this field for
+    /// skills — but present to match Entry's shape end-to-end.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub share: Option<crate::scope::ShareScope>,
 }
 
 impl Skill {
@@ -320,6 +326,7 @@ impl Skill {
             updated_at: now,
             last_used: None,
             team_id: None,
+            share: None,
         }
     }
 
