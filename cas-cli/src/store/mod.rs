@@ -136,6 +136,7 @@ mod notifying_entry;
 mod notifying_rule;
 mod notifying_skill;
 mod notifying_task;
+mod share_policy;
 mod syncing;
 mod syncing_entry;
 mod syncing_skill;
