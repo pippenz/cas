@@ -27,7 +27,11 @@ async fn run_server_impl() -> anyhow::Result<()> {
 
     // Run startup cloud pull in a background task with a short timeout
     // so a slow/unreachable cloud endpoint never blocks MCP server startup.
-    {
+    //
+    // Hold the JoinHandle so that if `eager_init_stores` aborts startup we can
+    // cancel this task instead of leaving it racing the dying process to open
+    // the same DB that just refused to open (cas-5c05 review A2).
+    let cloud_sync_handle = {
         let cas_root_bg = cas_root.clone();
         tokio::task::spawn(async move {
             let result = tokio::time::timeout(
@@ -82,8 +86,8 @@ async fn run_server_impl() -> anyhow::Result<()> {
             if result.is_err() {
                 eprintln!("[CAS] Cloud sync timed out (continuing without sync)");
             }
-        });
-    }
+        })
+    };
 
     let (daemon, activity, _handle) = if enable_daemon {
         let cas_config = crate::config::Config::load(&cas_root).unwrap_or_default();
@@ -121,7 +125,12 @@ async fn run_server_impl() -> anyhow::Result<()> {
     // Failure here is fatal: a partially-initialized server would respond to
     // `tools/list` with the full registry but every call would error, which is
     // the silent-degradation mode this guard exists to prevent (cas-5c05).
-    eager_init_stores(&core, &cas_root)?;
+    if let Err(e) = eager_init_stores(&core, &cas_root) {
+        // Cancel the cloud-sync task before bubbling the error so it stops
+        // racing for the same DB during the parent's shutdown window.
+        cloud_sync_handle.abort();
+        return Err(e);
+    }
 
     // Eager auto-registration for factory workers where SessionStart hook may not fire.
     // When CAS_SESSION_ID is set (by PtyConfig::claude()), register immediately so the
@@ -185,7 +194,7 @@ async fn run_server_impl() -> anyhow::Result<()> {
         }
     };
     #[cfg(not(feature = "mcp-proxy"))]
-    let proxy: Option<()> = None;
+    let _proxy: Option<()> = None;
 
     // Register proxy with daemon for hot-reload watching
     #[cfg(feature = "mcp-proxy")]
@@ -265,12 +274,10 @@ fn eager_init_stores(
     cas_root: &std::path::Path,
 ) -> anyhow::Result<()> {
     let start = std::time::Instant::now();
-    let mut last_step: &'static str = "begin";
 
-    let mut step = |name: &'static str,
-                    f: &mut dyn FnMut() -> Result<(), anyhow::Error>|
+    let step = |name: &'static str,
+                f: &mut dyn FnMut() -> Result<(), anyhow::Error>|
      -> anyhow::Result<()> {
-        last_step = name;
         if start.elapsed() > EAGER_INIT_BUDGET {
             anyhow::bail!(
                 "store init exceeded {}s budget before reaching '{name}'. \
@@ -312,12 +319,11 @@ fn eager_init_stores(
     step("search_index", &mut || {
         core.open_search_index().map(|_| ()).map_err(map_mcp_err)
     })?;
-    step("config", &mut || {
-        let _ = core.load_config();
-        Ok(())
-    })?;
+    // Note: `core.load_config()` is intentionally not in the eager-init list.
+    // It returns Config (not Result) and falls back to a default on read
+    // failure, so it cannot signal anything actionable to surface here. It
+    // gets called lazily via the OnceLock cache on first tool dispatch.
 
-    let _ = last_step; // silence unused-assignment warning when path is happy
     eprintln!(
         "[CAS] Stores initialized in {}ms",
         start.elapsed().as_millis()

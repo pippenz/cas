@@ -1002,3 +1002,55 @@ mod pattern_ops;
 mod server_handler;
 mod spec_ops;
 mod worktree_verification_team_ops;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// Guards `cas serve`'s startup banner and empty-registry guard against
+    /// silent registry shrink. If the `#[tool_router]` macro ever stops
+    /// emitting a registration (refactor, feature flag, etc.) and the banner /
+    /// empty-guard regression sneak in, this test fails immediately without
+    /// requiring a full process spawn. See cas-5c05 review T7.
+    #[test]
+    fn registered_tool_names_includes_canonical_meta_tools() {
+        let dir = TempDir::new().unwrap();
+        let core = CasCore::with_daemon(dir.path().to_path_buf(), None, None);
+        #[cfg(feature = "mcp-proxy")]
+        let svc = CasService::new(core, None);
+        #[cfg(not(feature = "mcp-proxy"))]
+        let svc = CasService::new(core);
+
+        let names = svc.registered_tool_names();
+
+        // Sanity floor: 11 CAS meta-tools (without proxy) plus 2 proxy tools
+        // that compile-in regardless of feature gating. If this drops below
+        // 11, the registry shrank and `cas serve`'s empty-registry guard is
+        // the next line of defense.
+        assert!(
+            names.len() >= 11,
+            "registry shrank — expected at least 11 tools, got {}: {:?}",
+            names.len(),
+            names
+        );
+        for required in [
+            "memory",
+            "task",
+            "rule",
+            "skill",
+            "search",
+            "system",
+            "coordination",
+            "verification",
+            "team",
+            "pattern",
+            "spec",
+        ] {
+            assert!(
+                names.iter().any(|n| n == required),
+                "missing canonical tool '{required}' in registry: {names:?}"
+            );
+        }
+    }
+}
