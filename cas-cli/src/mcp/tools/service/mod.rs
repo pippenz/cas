@@ -647,11 +647,8 @@ impl CasService {
     ) -> Result<CallToolResult, McpError> {
         let this = self.clone();
         panic_catch::dispatch_with_catch("system", async move {
-            // Test-only injection site for the cas-3b51 end-to-end
-            // panic-isolation regression. Stripped from release builds
-            // via `#[cfg(test)]`. The magic action name is namespaced
-            // with double underscores so it cannot collide with a real
-            // system action.
+            // cas-3b51 regression seam: double-underscore action cannot
+            // collide with real input; `#[cfg(test)]` strips in release.
             #[cfg(test)]
             if req.action == "__panic_for_test__" {
                 panic!("forced test panic from system handler (cas-3b51 regression)");

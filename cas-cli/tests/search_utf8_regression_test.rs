@@ -1,50 +1,21 @@
 //! Regression test for cas-f5e4 / EPIC cas-c351.
 //!
-//! On 2026-04-16 `cas serve` crashed on every `search` call that surfaced
-//! the "CAS factory daemon boot order" entry. The root cause was six
-//! open-coded `&s[..max_len-3]` preview-truncation paths on `Entry`,
-//! `Rule`, `Skill`, `Spec`, `Prompt`, and `CommitLink`: the cut landed
-//! inside the three bytes of `→` and Rust's string slice panicked
-//! because the byte index was not a char boundary. The panic unwound
-//! the Tokio worker, closed the stdio transport, and the MCP client saw
-//! nothing but "Connection closed". Four auto-respawns later Claude
-//! Code marked `cas serve` dead for the session.
+//! On 2026-04-16 `cas serve` crashed on every `search` call that
+//! surfaced the "CAS factory daemon boot order" entry: six open-coded
+//! `&s[..max_len-3]` preview-truncation paths cut inside the three
+//! bytes of `→`, Rust's string slice panicked, the Tokio worker
+//! unwound, the stdio transport closed, and the MCP client saw only
+//! "Connection closed". The fix (commit ad60df3) centralised truncation
+//! into `cas_types::preview::truncate_preview` with `is_char_boundary`
+//! walkback; unit-tested in the `cas-types` crate against the exact
+//! fixture.
 //!
-//! The fix (commit ad60df3) centralised the truncation into
-//! `cas_types::preview::truncate_preview`, which walks back from the
-//! target index with `is_char_boundary` until it finds a safe cut. The
-//! function itself has unit tests in the `cas-types` crate, including
-//! the exact 2026-04-16 fixture.
+//! This file reproduces the failure end-to-end over MCP stdio against
+//! a real `cas serve` subprocess. Fails if `ad60df3` is reverted —
+//! `search.error` catches the post-cas-a436 INTERNAL_ERROR path, the
+//! liveness probe catches the pre-cas-a436 server-death path.
 //!
-//! This file reproduces the original failure end-to-end over the MCP
-//! stdio transport against a real `cas serve` subprocess. If `ad60df3`
-//! is ever reverted, the preview panic either unwinds the server (pre
-//! cas-a436) or surfaces as an INTERNAL_ERROR from the A2 panic catcher
-//! (post cas-a436). Either way this test fails — the `search.error`
-//! assertion catches the A2-wrapped case; the liveness probe catches
-//! the server-death case.
-//!
-//! # Test shape
-//!
-//! 1. Initialise a fresh `.cas` tempdir.
-//! 2. Spawn `cas serve` and complete the MCP initialize handshake.
-//! 3. Seed the crashing entry via `memory.remember` with
-//!    `bypass_overlap=true` so overlap detection cannot short-circuit
-//!    the store.
-//! 4. Call `search.search`. Assert: no JSON-RPC error, response is not
-//!    an `is_error: true` tool-error envelope, and the content text
-//!    carries a recognisable substring of the seeded fixture — proving
-//!    the BM25 index actually surfaced the entry and `Entry::preview`
-//!    ran.
-//! 5. Call `memory.list` on the **same** stdio pipe as a liveness
-//!    probe for the pre-A2 failure mode (server process death).
-//!
-//! # Scope / acceptance
-//!
-//! - Lives under `cas-cli/tests/` (integration tree) per task spec.
-//! - Runs in default `cargo test`.
-//! - No network, no cloud auth (CAS_* env vars scrubbed on the child).
-//! - Fails if `truncate_preview` reverts to byte-slice-based truncation.
+//! Runs in default `cargo test`, no network / no cloud auth.
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};

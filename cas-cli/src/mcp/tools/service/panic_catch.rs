@@ -23,41 +23,16 @@
 //! surfaces here, so by the time we synthesize the client-facing error
 //! the forensic trail is already on disk.
 //!
-//! ## Cancellation propagation
-//!
-//! `tokio::spawn` returns a `JoinHandle` whose `Drop` does **not** cancel
-//! the spawned task. Without care, a handler that hangs past the 55 s
-//! timeout in `server_handler::call_tool` would keep running indefinitely
-//! after the outer timeout returned to the client, leaking a runtime
-//! worker thread plus any DB / lock / file resources it held.
-//!
-//! We hold an [`AbortOnDrop`] guard around the [`tokio::task::AbortHandle`]
-//! so that when the caller drops our future (e.g., the outer timeout
-//! fires), the guard drops, calls `abort()`, and cancellation cascades
-//! into the handler. If the handler completes normally first, the
-//! subsequent abort is a no-op per tokio semantics.
-//!
-//! ## Tracing context
-//!
-//! `tokio::spawn` does not forward the current `tracing::Span` into the
-//! spawned task. We explicitly `.instrument(tracing::Span::current())` so
-//! log lines emitted inside the handler carry the MCP request id + tool
-//! name established by `server_handler::call_tool` — otherwise every
-//! panic-path log line under concurrent load would be unattributable.
-//!
 //! ## Runtime model: requires `panic = "unwind"`
 //!
-//! This entire mechanism depends on stack unwinding. `tokio::spawn` +
-//! `JoinError::is_panic()` can only observe a panic if the panicking
-//! thread unwinds its stack; under `panic = "abort"` the process is
-//! terminated before the `JoinHandle` is reachable, and the A2
-//! protection provides nothing. `cargo build` and `cargo build --release`
-//! default to `panic = "unwind"` and are protected. The workspace also
-//! defines `[profile.release-fast]` with `panic = "abort"` (Cargo.toml) —
-//! **do not launch `cas serve` from a `release-fast` build**; a single
-//! handler panic will abort the entire process and the MCP client will
-//! see "Connection closed" with no server-side trace, which is exactly
-//! the failure mode the EPIC cas-c351 exists to prevent.
+//! This mechanism depends on stack unwinding. Under `panic = "abort"`
+//! the process is terminated before the `JoinHandle` is reachable, so
+//! the A2 protection provides nothing. `cargo build` and `cargo build
+//! --release` default to `panic = "unwind"`. The workspace also defines
+//! `[profile.release-fast]` with `panic = "abort"` — **do not launch
+//! `cas serve` from a `release-fast` build**; a single handler panic
+//! will abort the process and reproduce the exact failure mode EPIC
+//! cas-c351 exists to prevent.
 
 use std::any::Any;
 use std::borrow::Cow;
@@ -81,11 +56,14 @@ pub(super) async fn dispatch_with_catch<F>(
 where
     F: Future<Output = Result<CallToolResult, McpError>> + Send + 'static,
 {
+    // `.instrument(current())` forwards the MCP request id + tool name
+    // span from the caller into the spawned task — tokio::spawn does
+    // not propagate tracing context automatically.
     let handle = tokio::spawn(fut.instrument(tracing::Span::current()));
-    // Dropping `handle` alone does not abort the task. The guard propagates
-    // cancellation from the caller (e.g., server_handler's 55s timeout)
-    // into the spawned task. If the await completes first, abort is a
-    // no-op. See the module doc for why this matters.
+    // Dropping a JoinHandle does NOT abort the task. This guard makes
+    // caller-side cancellation (future drop, server_handler's 55s
+    // timeout) cascade into the spawned task. No-op if the handler
+    // completes first.
     let _abort_guard = AbortOnDrop(handle.abort_handle());
 
     match handle.await {
@@ -147,13 +125,13 @@ impl Drop for AbortOnDrop {
 /// We downcast the first two cases. Unknown payload types return a
 /// fallback string so the caller never sees an empty message.
 fn panic_message(payload: Box<dyn Any + Send>) -> String {
-    if let Some(s) = payload.downcast_ref::<String>() {
-        return s.clone();
+    match payload.downcast::<String>() {
+        Ok(s) => *s,
+        Err(payload) => match payload.downcast::<&'static str>() {
+            Ok(s) => (*s).to_string(),
+            Err(_) => "<non-string panic payload>".to_string(),
+        },
     }
-    if let Some(s) = payload.downcast_ref::<&'static str>() {
-        return (*s).to_string();
-    }
-    "<non-string panic payload>".to_string()
 }
 
 #[cfg(test)]

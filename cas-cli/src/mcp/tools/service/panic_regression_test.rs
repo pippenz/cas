@@ -1,30 +1,17 @@
 //! End-to-end regression test for cas-3b51 (EPIC cas-c351).
 //!
-//! Verifies that the A2 panic catcher applied to every `#[tool]` method on
-//! [`super::CasService`] is wired through the real dispatch path, not just
-//! the helper module's isolated unit tests. Constructs a real `CasService`
-//! backed by a real `CasCore` over a temporary DB, hits
-//! `CasService::system` with a `#[cfg(test)]`-guarded action that forces
-//! the handler body to `panic!(...)`, and asserts:
+//! Verifies that the A2 panic catcher applied to every `#[tool]` method
+//! on [`super::CasService`] is wired through the real dispatch path, not
+//! just the helper module's unit tests. Hits `CasService::system` with
+//! a `#[cfg(test)]`-guarded action that forces a `panic!(...)` and
+//! asserts the call surfaces as `INTERNAL_ERROR`, the service keeps
+//! serving a second call, and the pattern holds across 10 consecutive
+//! panics.
 //!
-//!   * the call surfaces as `McpError{INTERNAL_ERROR, "handler panicked
-//!     in 'system': <payload>..."}` rather than killing the process;
-//!   * a follow-up call on the **same** `CasService` instance succeeds
-//!     and returns non-empty content, proving the service continues
-//!     serving after a handler panic;
-//!   * the pattern holds for 10 consecutive panics.
-//!
-//! The test fails if A2 is removed, via either of two collapse paths:
-//! deleting `panic_catch::dispatch_with_catch` breaks compilation at
-//! every wrap site in mod.rs; deleting the wrap around `system()` alone
-//! lets the forced panic unwind through the `.await` into the test thread
-//! and the harness records a panicked test. Either shape produces a
-//! concrete failure, satisfying the A3 acceptance criterion.
-//!
-//! The test lives under `cas-cli/src/mcp/tools/service/` rather than
+//! Lives under `cas-cli/src/mcp/tools/service/` rather than
 //! `cas-cli/tests/` because integration tests strip `#[cfg(test)]` from
-//! the lib, making the injection branch in `system()` unreachable from
-//! that tree. A unit test inside the crate sees `#[cfg(test)]` active.
+//! the lib, leaving the injection branch in `system()` unreachable. A
+//! unit test inside the crate sees `#[cfg(test)]` active.
 
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::ErrorCode;
