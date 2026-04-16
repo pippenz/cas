@@ -25,7 +25,7 @@
 # - [ ] Status line updates correctly
 # - [ ] No visual artifacts or flickering
 
-.PHONY: test test-full coverage coverage-html clean build build-full release release-fast check check-full lint dev-build dev-test timings benchmark-build check-build-regression
+.PHONY: test test-full coverage coverage-html clean build build-full release release-fast test-release-panic check check-full lint dev-build dev-test timings benchmark-build check-build-regression
 
 CARGO ?= cargo
 
@@ -112,6 +112,15 @@ release:
 # Build faster release profile for CI/pre-release checks
 release-fast:
 	$(CARGO) build -p cas --profile release-fast
+
+# Run A2/A3/B3 panic-isolation tests under release profiles (EPIC cas-c351).
+# Verifies the MCP panic catcher survives release-mode LTO + inlining and
+# that the release-fast profile has not re-introduced panic=abort.
+test-release-panic:
+	$(CARGO) test -p cas --release --lib panic_regression
+	$(CARGO) test -p cas --release --test search_utf8_regression_test
+	$(CARGO) test -p cas --profile release-fast --lib panic_regression
+	$(CARGO) test -p cas --profile release-fast --test search_utf8_regression_test
 
 # Type check
 check:

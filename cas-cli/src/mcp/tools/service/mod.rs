@@ -181,61 +181,65 @@ impl CasService {
         &self,
         Parameters(req): Parameters<MemoryRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let action = req.action.clone();
-        let is_mutating = matches!(
-            req.action.as_str(),
-            "remember"
-                | "update"
-                | "delete"
-                | "archive"
-                | "unarchive"
-                | "helpful"
-                | "harmful"
-                | "mark_reviewed"
-                | "set_tier"
-                | "opinion_reinforce"
-                | "opinion_weaken"
-                | "opinion_contradict"
-        );
+        let this = self.clone();
+        panic_catch::dispatch_with_catch("memory", async move {
+            let action = req.action.clone();
+            let is_mutating = matches!(
+                req.action.as_str(),
+                "remember"
+                    | "update"
+                    | "delete"
+                    | "archive"
+                    | "unarchive"
+                    | "helpful"
+                    | "harmful"
+                    | "mark_reviewed"
+                    | "set_tier"
+                    | "opinion_reinforce"
+                    | "opinion_weaken"
+                    | "opinion_contradict"
+            );
 
-        // Verification jail check
-        self.inner
-            .authorize_agent_action("memory", &action, is_mutating)?;
+            // Verification jail check
+            this.inner
+                .authorize_agent_action("memory", &action, is_mutating)?;
 
-        let result = match req.action.as_str() {
-            "remember" => self.memory_remember(req).await,
-            "get" => self.memory_get(req).await,
-            "list" => self.memory_list(req).await,
-            "update" => self.memory_update(req).await,
-            "delete" => self.memory_delete(req).await,
-            "archive" => self.memory_archive(req).await,
-            "unarchive" => self.memory_unarchive(req).await,
-            "helpful" => self.memory_helpful(req).await,
-            "harmful" => self.memory_harmful(req).await,
-            "mark_reviewed" => self.memory_mark_reviewed(req).await,
-            "recent" => self.memory_recent(req).await,
-            "set_tier" => self.memory_set_tier(req).await,
-            "opinion_reinforce" => self.memory_opinion_reinforce(req).await,
-            "opinion_weaken" => self.memory_opinion_weaken(req).await,
-            "opinion_contradict" => self.memory_opinion_contradict(req).await,
-            _ => Err(Self::error(
-                ErrorCode::INVALID_PARAMS,
-                format!(
-                    "Unknown memory action: {}. Valid: remember, get, list, update, delete, archive, unarchive, helpful, harmful, mark_reviewed, recent, set_tier, opinion_reinforce, opinion_weaken, opinion_contradict",
-                    req.action
-                ),
-            )),
-        };
+            let result = match req.action.as_str() {
+                "remember" => this.memory_remember(req).await,
+                "get" => this.memory_get(req).await,
+                "list" => this.memory_list(req).await,
+                "update" => this.memory_update(req).await,
+                "delete" => this.memory_delete(req).await,
+                "archive" => this.memory_archive(req).await,
+                "unarchive" => this.memory_unarchive(req).await,
+                "helpful" => this.memory_helpful(req).await,
+                "harmful" => this.memory_harmful(req).await,
+                "mark_reviewed" => this.memory_mark_reviewed(req).await,
+                "recent" => this.memory_recent(req).await,
+                "set_tier" => this.memory_set_tier(req).await,
+                "opinion_reinforce" => this.memory_opinion_reinforce(req).await,
+                "opinion_weaken" => this.memory_opinion_weaken(req).await,
+                "opinion_contradict" => this.memory_opinion_contradict(req).await,
+                _ => Err(Self::error(
+                    ErrorCode::INVALID_PARAMS,
+                    format!(
+                        "Unknown memory action: {}. Valid: remember, get, list, update, delete, archive, unarchive, helpful, harmful, mark_reviewed, recent, set_tier, opinion_reinforce, opinion_weaken, opinion_contradict",
+                        req.action
+                    ),
+                )),
+            };
 
-        // Notify client of resource changes (Claude Code 2.1.0+)
-        if is_mutating && result.is_ok() {
-            self.inner.notify_resources_changed().await;
-        }
+            // Notify client of resource changes (Claude Code 2.1.0+)
+            if is_mutating && result.is_ok() {
+                this.inner.notify_resources_changed().await;
+            }
 
-        // Track MCP tool usage
-        crate::telemetry::track_mcp_tool("memory", &action, result.is_ok());
+            // Track MCP tool usage
+            crate::telemetry::track_mcp_tool("memory", &action, result.is_ok());
 
-        result
+            result
+        })
+        .await
     }
 
     // ========================================================================
@@ -249,65 +253,69 @@ impl CasService {
         &self,
         Parameters(req): Parameters<TaskRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let action = req.action.clone();
-        let is_mutating = matches!(
-            req.action.as_str(),
-            "create"
-                | "update"
-                | "start"
-                | "close"
-                | "reopen"
-                | "delete"
-                | "notes"
-                | "dep_add"
-                | "dep_remove"
-                | "claim"
-                | "release"
-                | "transfer"
-        );
+        let this = self.clone();
+        panic_catch::dispatch_with_catch("task", async move {
+            let action = req.action.clone();
+            let is_mutating = matches!(
+                req.action.as_str(),
+                "create"
+                    | "update"
+                    | "start"
+                    | "close"
+                    | "reopen"
+                    | "delete"
+                    | "notes"
+                    | "dep_add"
+                    | "dep_remove"
+                    | "claim"
+                    | "release"
+                    | "transfer"
+            );
 
-        // Verification jail check
-        self.inner
-            .authorize_agent_action("task", &action, is_mutating)?;
+            // Verification jail check
+            this.inner
+                .authorize_agent_action("task", &action, is_mutating)?;
 
-        let result = match req.action.as_str() {
-            "create" => self.task_create(req).await,
-            "show" => self.task_show(req).await,
-            "update" => self.task_update(req).await,
-            "start" => self.task_start(req).await,
-            "close" => self.task_close(req).await,
-            "reopen" => self.task_reopen(req).await,
-            "delete" => self.task_delete(req).await,
-            "list" => self.task_list(req).await,
-            "ready" => self.task_ready(req).await,
-            "blocked" => self.task_blocked(req).await,
-            "notes" => self.task_notes(req).await,
-            "dep_add" => self.task_dep_add(req).await,
-            "dep_remove" => self.task_dep_remove(req).await,
-            "dep_list" => self.task_dep_list(req).await,
-            "claim" => self.task_claim(req).await,
-            "release" => self.task_release(req).await,
-            "transfer" => self.task_transfer(req).await,
-            "available" => self.task_available(req).await,
-            "mine" => self.task_mine(req).await,
-            _ => Err(Self::error(
-                ErrorCode::INVALID_PARAMS,
-                format!(
-                    "Unknown task action: {}. Valid: create, show, update, start, close, reopen, delete, list, ready, blocked, notes, dep_add, dep_remove, dep_list, claim, release, transfer, available, mine",
-                    req.action
-                ),
-            )),
-        };
+            let result = match req.action.as_str() {
+                "create" => this.task_create(req).await,
+                "show" => this.task_show(req).await,
+                "update" => this.task_update(req).await,
+                "start" => this.task_start(req).await,
+                "close" => this.task_close(req).await,
+                "reopen" => this.task_reopen(req).await,
+                "delete" => this.task_delete(req).await,
+                "list" => this.task_list(req).await,
+                "ready" => this.task_ready(req).await,
+                "blocked" => this.task_blocked(req).await,
+                "notes" => this.task_notes(req).await,
+                "dep_add" => this.task_dep_add(req).await,
+                "dep_remove" => this.task_dep_remove(req).await,
+                "dep_list" => this.task_dep_list(req).await,
+                "claim" => this.task_claim(req).await,
+                "release" => this.task_release(req).await,
+                "transfer" => this.task_transfer(req).await,
+                "available" => this.task_available(req).await,
+                "mine" => this.task_mine(req).await,
+                _ => Err(Self::error(
+                    ErrorCode::INVALID_PARAMS,
+                    format!(
+                        "Unknown task action: {}. Valid: create, show, update, start, close, reopen, delete, list, ready, blocked, notes, dep_add, dep_remove, dep_list, claim, release, transfer, available, mine",
+                        req.action
+                    ),
+                )),
+            };
 
-        // Notify client of resource changes (Claude Code 2.1.0+)
-        if is_mutating && result.is_ok() {
-            self.inner.notify_resources_changed().await;
-        }
+            // Notify client of resource changes (Claude Code 2.1.0+)
+            if is_mutating && result.is_ok() {
+                this.inner.notify_resources_changed().await;
+            }
 
-        // Track MCP tool usage
-        crate::telemetry::track_mcp_tool("task", &action, result.is_ok());
+            // Track MCP tool usage
+            crate::telemetry::track_mcp_tool("task", &action, result.is_ok());
 
-        result
+            result
+        })
+        .await
     }
 
     // ========================================================================
@@ -321,45 +329,49 @@ impl CasService {
         &self,
         Parameters(req): Parameters<RuleRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let action = req.action.clone();
-        let is_mutating = matches!(
-            req.action.as_str(),
-            "create" | "update" | "delete" | "helpful" | "harmful" | "sync"
-        );
+        let this = self.clone();
+        panic_catch::dispatch_with_catch("rule", async move {
+            let action = req.action.clone();
+            let is_mutating = matches!(
+                req.action.as_str(),
+                "create" | "update" | "delete" | "helpful" | "harmful" | "sync"
+            );
 
-        // Verification jail check
-        self.inner
-            .authorize_agent_action("rule", &action, is_mutating)?;
+            // Verification jail check
+            this.inner
+                .authorize_agent_action("rule", &action, is_mutating)?;
 
-        let result = match req.action.as_str() {
-            "create" => self.rule_create(req).await,
-            "show" => self.rule_show(req).await,
-            "update" => self.rule_update(req).await,
-            "delete" => self.rule_delete(req).await,
-            "list" => self.rule_list(req).await,
-            "list_all" => self.rule_list_all(req).await,
-            "helpful" => self.rule_helpful(req).await,
-            "harmful" => self.rule_harmful(req).await,
-            "sync" => self.rule_sync(req).await,
-            "check_similar" => self.rule_check_similar(req).await,
-            _ => Err(Self::error(
-                ErrorCode::INVALID_PARAMS,
-                format!(
-                    "Unknown rule action: {}. Valid: create, show, update, delete, list, list_all, helpful, harmful, sync, check_similar",
-                    req.action
-                ),
-            )),
-        };
+            let result = match req.action.as_str() {
+                "create" => this.rule_create(req).await,
+                "show" => this.rule_show(req).await,
+                "update" => this.rule_update(req).await,
+                "delete" => this.rule_delete(req).await,
+                "list" => this.rule_list(req).await,
+                "list_all" => this.rule_list_all(req).await,
+                "helpful" => this.rule_helpful(req).await,
+                "harmful" => this.rule_harmful(req).await,
+                "sync" => this.rule_sync(req).await,
+                "check_similar" => this.rule_check_similar(req).await,
+                _ => Err(Self::error(
+                    ErrorCode::INVALID_PARAMS,
+                    format!(
+                        "Unknown rule action: {}. Valid: create, show, update, delete, list, list_all, helpful, harmful, sync, check_similar",
+                        req.action
+                    ),
+                )),
+            };
 
-        // Notify client of resource changes (Claude Code 2.1.0+)
-        if is_mutating && result.is_ok() {
-            self.inner.notify_resources_changed().await;
-        }
+            // Notify client of resource changes (Claude Code 2.1.0+)
+            if is_mutating && result.is_ok() {
+                this.inner.notify_resources_changed().await;
+            }
 
-        // Track MCP tool usage
-        crate::telemetry::track_mcp_tool("rule", &action, result.is_ok());
+            // Track MCP tool usage
+            crate::telemetry::track_mcp_tool("rule", &action, result.is_ok());
 
-        result
+            result
+        })
+        .await
     }
 
     // ========================================================================
@@ -373,45 +385,49 @@ impl CasService {
         &self,
         Parameters(req): Parameters<SkillRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let action = req.action.clone();
-        let is_mutating = matches!(
-            req.action.as_str(),
-            "create" | "update" | "delete" | "enable" | "disable" | "sync" | "use"
-        );
+        let this = self.clone();
+        panic_catch::dispatch_with_catch("skill", async move {
+            let action = req.action.clone();
+            let is_mutating = matches!(
+                req.action.as_str(),
+                "create" | "update" | "delete" | "enable" | "disable" | "sync" | "use"
+            );
 
-        // Verification jail check
-        self.inner
-            .authorize_agent_action("skill", &action, is_mutating)?;
+            // Verification jail check
+            this.inner
+                .authorize_agent_action("skill", &action, is_mutating)?;
 
-        let result = match req.action.as_str() {
-            "create" => self.skill_create(req).await,
-            "show" => self.skill_show(req).await,
-            "update" => self.skill_update(req).await,
-            "delete" => self.skill_delete(req).await,
-            "list" => self.skill_list(req).await,
-            "list_all" => self.skill_list_all(req).await,
-            "enable" => self.skill_enable(req).await,
-            "disable" => self.skill_disable(req).await,
-            "sync" => self.skill_sync(req).await,
-            "use" => self.skill_use(req).await,
-            _ => Err(Self::error(
-                ErrorCode::INVALID_PARAMS,
-                format!(
-                    "Unknown skill action: {}. Valid: create, show, update, delete, list, list_all, enable, disable, sync, use",
-                    req.action
-                ),
-            )),
-        };
+            let result = match req.action.as_str() {
+                "create" => this.skill_create(req).await,
+                "show" => this.skill_show(req).await,
+                "update" => this.skill_update(req).await,
+                "delete" => this.skill_delete(req).await,
+                "list" => this.skill_list(req).await,
+                "list_all" => this.skill_list_all(req).await,
+                "enable" => this.skill_enable(req).await,
+                "disable" => this.skill_disable(req).await,
+                "sync" => this.skill_sync(req).await,
+                "use" => this.skill_use(req).await,
+                _ => Err(Self::error(
+                    ErrorCode::INVALID_PARAMS,
+                    format!(
+                        "Unknown skill action: {}. Valid: create, show, update, delete, list, list_all, enable, disable, sync, use",
+                        req.action
+                    ),
+                )),
+            };
 
-        // Notify client of resource changes (Claude Code 2.1.0+)
-        if is_mutating && result.is_ok() {
-            self.inner.notify_resources_changed().await;
-        }
+            // Notify client of resource changes (Claude Code 2.1.0+)
+            if is_mutating && result.is_ok() {
+                this.inner.notify_resources_changed().await;
+            }
 
-        // Track MCP tool usage
-        crate::telemetry::track_mcp_tool("skill", &action, result.is_ok());
+            // Track MCP tool usage
+            crate::telemetry::track_mcp_tool("skill", &action, result.is_ok());
 
-        result
+            result
+        })
+        .await
     }
 
     // ========================================================================
@@ -425,150 +441,154 @@ impl CasService {
         &self,
         Parameters(req): Parameters<CoordinationRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let action = req.action.clone();
+        let this = self.clone();
+        panic_catch::dispatch_with_catch("coordination", async move {
+            let action = req.action.clone();
 
-        let result = match action.as_str() {
-            // ---- Agent domain ----
-            "register" | "unregister" | "whoami" | "heartbeat" | "session_start"
-            | "session_end" | "loop_start" | "loop_cancel" | "loop_status" | "lease_history"
-            | "queue_notify" | "queue_poll" | "queue_peek" | "queue_ack" | "message"
-            | "message_ack" | "message_status" => {
-                let agent_req = req.to_agent_request(&action);
-                match action.as_str() {
-                    "register" => self.agent_register(agent_req).await,
-                    "unregister" => self.agent_unregister(agent_req).await,
-                    "whoami" => self.agent_whoami(agent_req).await,
-                    "heartbeat" => self.agent_heartbeat(agent_req).await,
-                    "session_start" => self.agent_session_start(agent_req).await,
-                    "session_end" => self.agent_session_end(agent_req).await,
-                    "loop_start" => self.loop_start(agent_req).await,
-                    "loop_cancel" => self.loop_cancel(agent_req).await,
-                    "loop_status" => self.loop_status(agent_req).await,
-                    "lease_history" => self.lease_history(agent_req).await,
-                    "queue_notify" => self.queue_notify(agent_req).await,
-                    "queue_poll" => self.queue_poll(agent_req).await,
-                    "queue_peek" => self.queue_peek(agent_req).await,
-                    "queue_ack" => self.queue_ack(agent_req).await,
-                    "message" => self.message_send(agent_req).await,
-                    "message_ack" => self.message_ack(agent_req).await,
-                    "message_status" => self.message_status_query(agent_req).await,
-                    _ => unreachable!(),
+            let result = match action.as_str() {
+                // ---- Agent domain ----
+                "register" | "unregister" | "whoami" | "heartbeat" | "session_start"
+                | "session_end" | "loop_start" | "loop_cancel" | "loop_status"
+                | "lease_history" | "queue_notify" | "queue_poll" | "queue_peek"
+                | "queue_ack" | "message" | "message_ack" | "message_status" => {
+                    let agent_req = req.to_agent_request(&action);
+                    match action.as_str() {
+                        "register" => this.agent_register(agent_req).await,
+                        "unregister" => this.agent_unregister(agent_req).await,
+                        "whoami" => this.agent_whoami(agent_req).await,
+                        "heartbeat" => this.agent_heartbeat(agent_req).await,
+                        "session_start" => this.agent_session_start(agent_req).await,
+                        "session_end" => this.agent_session_end(agent_req).await,
+                        "loop_start" => this.loop_start(agent_req).await,
+                        "loop_cancel" => this.loop_cancel(agent_req).await,
+                        "loop_status" => this.loop_status(agent_req).await,
+                        "lease_history" => this.lease_history(agent_req).await,
+                        "queue_notify" => this.queue_notify(agent_req).await,
+                        "queue_poll" => this.queue_poll(agent_req).await,
+                        "queue_peek" => this.queue_peek(agent_req).await,
+                        "queue_ack" => this.queue_ack(agent_req).await,
+                        "message" => this.message_send(agent_req).await,
+                        "message_ack" => this.message_ack(agent_req).await,
+                        "message_status" => this.message_status_query(agent_req).await,
+                        _ => unreachable!(),
+                    }
                 }
-            }
-            // agent_list and agent_cleanup: prefixed to avoid collision with worktree
-            "agent_list" => {
-                let agent_req = req.to_agent_request("list");
-                self.agent_list(agent_req).await
-            }
-            "agent_cleanup" => {
-                let agent_req = req.to_agent_request("cleanup");
-                self.agent_cleanup(agent_req).await
-            }
-
-            // ---- Factory domain ----
-            "spawn_workers" | "shutdown_workers" | "worker_status" | "worker_activity"
-            | "clear_context" | "my_context" | "sync_all_workers" | "gc_report" | "gc_cleanup"
-            | "remind" | "remind_list" | "remind_cancel" => {
-                let factory_req = req.to_factory_request();
-                match action.as_str() {
-                    "spawn_workers" => self.factory_spawn_workers(factory_req).await,
-                    "shutdown_workers" => self.factory_shutdown_workers(factory_req).await,
-                    "worker_status" => self.factory_worker_status(factory_req).await,
-                    "clear_context" => self.factory_clear_context(factory_req).await,
-                    "my_context" => self.factory_my_context(factory_req).await,
-                    "worker_activity" => self.factory_worker_activity(factory_req).await,
-                    "sync_all_workers" => self.factory_sync_all_workers(factory_req).await,
-                    "gc_report" => self.factory_gc_report(factory_req).await,
-                    "gc_cleanup" => self.factory_gc_cleanup(factory_req).await,
-                    "remind" => self.factory_remind(factory_req).await,
-                    "remind_list" => self.factory_remind_list(factory_req).await,
-                    "remind_cancel" => self.factory_remind_cancel(factory_req).await,
-                    _ => unreachable!(),
+                // agent_list and agent_cleanup: prefixed to avoid collision with worktree
+                "agent_list" => {
+                    let agent_req = req.to_agent_request("list");
+                    this.agent_list(agent_req).await
                 }
-            }
+                "agent_cleanup" => {
+                    let agent_req = req.to_agent_request("cleanup");
+                    this.agent_cleanup(agent_req).await
+                }
 
-            // ---- Worktree domain (prefixed with worktree_) ----
-            "worktree_create" | "worktree_list" | "worktree_show" | "worktree_cleanup"
-            | "worktree_merge" | "worktree_status" => {
-                let wt_action = action.strip_prefix("worktree_").unwrap();
-
-                // Check if worktrees are enabled (status action always allowed)
-                if wt_action != "status" {
-                    let config =
-                        crate::config::Config::load(&self.inner.cas_root).map_err(|e| {
-                            Self::error(
-                                ErrorCode::INTERNAL_ERROR,
-                                format!("Failed to load config: {e}"),
-                            )
-                        })?;
-                    if !config.worktrees_enabled() {
-                        return Ok(Self::success(
-                            "Worktrees are experimental and disabled by default.\n\n\
-                            To enable, add to .cas/config.toml:\n\n\
-                              worktrees:\n\
-                                enabled: true\n\n\
-                            Use `coordination action=worktree_status` to see current configuration.",
-                        ));
+                // ---- Factory domain ----
+                "spawn_workers" | "shutdown_workers" | "worker_status" | "worker_activity"
+                | "clear_context" | "my_context" | "sync_all_workers" | "gc_report"
+                | "gc_cleanup" | "remind" | "remind_list" | "remind_cancel" => {
+                    let factory_req = req.to_factory_request();
+                    match action.as_str() {
+                        "spawn_workers" => this.factory_spawn_workers(factory_req).await,
+                        "shutdown_workers" => this.factory_shutdown_workers(factory_req).await,
+                        "worker_status" => this.factory_worker_status(factory_req).await,
+                        "clear_context" => this.factory_clear_context(factory_req).await,
+                        "my_context" => this.factory_my_context(factory_req).await,
+                        "worker_activity" => this.factory_worker_activity(factory_req).await,
+                        "sync_all_workers" => this.factory_sync_all_workers(factory_req).await,
+                        "gc_report" => this.factory_gc_report(factory_req).await,
+                        "gc_cleanup" => this.factory_gc_cleanup(factory_req).await,
+                        "remind" => this.factory_remind(factory_req).await,
+                        "remind_list" => this.factory_remind_list(factory_req).await,
+                        "remind_cancel" => this.factory_remind_cancel(factory_req).await,
+                        _ => unreachable!(),
                     }
                 }
 
-                let wt_req = WorktreeRequest {
-                    action: wt_action.to_string(),
-                    id: req.id,
-                    task_id: req.task_id,
-                    all: req.all,
-                    status: req.status,
-                    orphans: req.orphans,
-                    dry_run: req.dry_run,
-                    force: req.force,
-                };
-                match wt_action {
-                    "create" => self.worktree_create(wt_req).await,
-                    "list" => self.worktree_list(wt_req).await,
-                    "show" => self.worktree_show(wt_req).await,
-                    "cleanup" => self.worktree_cleanup(wt_req).await,
-                    "merge" => self.worktree_merge(wt_req).await,
-                    "status" => self.worktree_status(wt_req).await,
-                    _ => unreachable!(),
+                // ---- Worktree domain (prefixed with worktree_) ----
+                "worktree_create" | "worktree_list" | "worktree_show" | "worktree_cleanup"
+                | "worktree_merge" | "worktree_status" => {
+                    let wt_action = action.strip_prefix("worktree_").unwrap();
+
+                    // Check if worktrees are enabled (status action always allowed)
+                    if wt_action != "status" {
+                        let config = crate::config::Config::load(&this.inner.cas_root)
+                            .map_err(|e| {
+                                Self::error(
+                                    ErrorCode::INTERNAL_ERROR,
+                                    format!("Failed to load config: {e}"),
+                                )
+                            })?;
+                        if !config.worktrees_enabled() {
+                            return Ok(Self::success(
+                                "Worktrees are experimental and disabled by default.\n\n\
+                                To enable, add to .cas/config.toml:\n\n\
+                                  worktrees:\n\
+                                    enabled: true\n\n\
+                                Use `coordination action=worktree_status` to see current configuration.",
+                            ));
+                        }
+                    }
+
+                    let wt_req = WorktreeRequest {
+                        action: wt_action.to_string(),
+                        id: req.id,
+                        task_id: req.task_id,
+                        all: req.all,
+                        status: req.status,
+                        orphans: req.orphans,
+                        dry_run: req.dry_run,
+                        force: req.force,
+                    };
+                    match wt_action {
+                        "create" => this.worktree_create(wt_req).await,
+                        "list" => this.worktree_list(wt_req).await,
+                        "show" => this.worktree_show(wt_req).await,
+                        "cleanup" => this.worktree_cleanup(wt_req).await,
+                        "merge" => this.worktree_merge(wt_req).await,
+                        "status" => this.worktree_status(wt_req).await,
+                        _ => unreachable!(),
+                    }
                 }
-            }
 
-            _ => Err(Self::error(
-                ErrorCode::INVALID_PARAMS,
-                format!(
-                    "Unknown coordination action: '{action}'. Valid actions:\n\
-                     Agent: register, unregister, whoami, heartbeat, agent_list, agent_cleanup, session_start, session_end, loop_start, loop_cancel, loop_status, lease_history, queue_notify, queue_poll, queue_peek, queue_ack, message, message_ack, message_status\n\
-                     Factory: spawn_workers, shutdown_workers, worker_status, worker_activity, clear_context, my_context, sync_all_workers, gc_report, gc_cleanup, remind, remind_list, remind_cancel\n\
-                     Worktree: worktree_create, worktree_list, worktree_show, worktree_cleanup, worktree_merge, worktree_status"
-                ),
-            )),
-        };
+                _ => Err(Self::error(
+                    ErrorCode::INVALID_PARAMS,
+                    format!(
+                        "Unknown coordination action: '{action}'. Valid actions:\n\
+                         Agent: register, unregister, whoami, heartbeat, agent_list, agent_cleanup, session_start, session_end, loop_start, loop_cancel, loop_status, lease_history, queue_notify, queue_poll, queue_peek, queue_ack, message, message_ack, message_status\n\
+                         Factory: spawn_workers, shutdown_workers, worker_status, worker_activity, clear_context, my_context, sync_all_workers, gc_report, gc_cleanup, remind, remind_list, remind_cancel\n\
+                         Worktree: worktree_create, worktree_list, worktree_show, worktree_cleanup, worktree_merge, worktree_status"
+                    ),
+                )),
+            };
 
-        // Track with domain-specific tool name for backwards-compatible telemetry
-        let domain = if action.starts_with("worktree_") {
-            "worktree"
-        } else if matches!(
-            action.as_str(),
-            "spawn_workers"
-                | "shutdown_workers"
-                | "worker_status"
-                | "worker_activity"
-                | "clear_context"
-                | "my_context"
-                | "sync_all_workers"
-                | "gc_report"
-                | "gc_cleanup"
-                | "remind"
-                | "remind_list"
-                | "remind_cancel"
-        ) {
-            "factory"
-        } else {
-            "agent"
-        };
-        crate::telemetry::track_mcp_tool(domain, &action, result.is_ok());
+            // Track with domain-specific tool name for backwards-compatible telemetry
+            let domain = if action.starts_with("worktree_") {
+                "worktree"
+            } else if matches!(
+                action.as_str(),
+                "spawn_workers"
+                    | "shutdown_workers"
+                    | "worker_status"
+                    | "worker_activity"
+                    | "clear_context"
+                    | "my_context"
+                    | "sync_all_workers"
+                    | "gc_report"
+                    | "gc_cleanup"
+                    | "remind"
+                    | "remind_list"
+                    | "remind_cancel"
+            ) {
+                "factory"
+            } else {
+                "agent"
+            };
+            crate::telemetry::track_mcp_tool(domain, &action, result.is_ok());
 
-        result
+            result
+        })
+        .await
     }
 
     // ========================================================================
@@ -582,32 +602,36 @@ impl CasService {
         &self,
         Parameters(req): Parameters<SearchContextRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let action = req.action.clone();
-        let result = match req.action.as_str() {
-            "search" => self.search_impl(req).await,
-            "context" => self.context_impl(req).await,
-            "context_for_subagent" => self.context_for_subagent_impl(req).await,
-            "observe" => self.observe_impl(req).await,
-            "entity_list" => self.entity_list_impl(req).await,
-            "entity_show" => self.entity_show_impl(req).await,
-            "entity_extract" => self.entity_extract_impl(req).await,
-            "code_search" => self.code_search_impl(req).await,
-            "code_show" => self.code_show_impl(req).await,
-            "grep" => self.grep_impl(req).await,
-            "blame" => self.blame_impl(req).await,
-            _ => Err(Self::error(
-                ErrorCode::INVALID_PARAMS,
-                format!(
-                    "Unknown search action: {}. Valid: search, context, context_for_subagent, observe, entity_list, entity_show, entity_extract, code_search, code_show, grep, blame",
-                    req.action
-                ),
-            )),
-        };
+        let this = self.clone();
+        panic_catch::dispatch_with_catch("search", async move {
+            let action = req.action.clone();
+            let result = match req.action.as_str() {
+                "search" => this.search_impl(req).await,
+                "context" => this.context_impl(req).await,
+                "context_for_subagent" => this.context_for_subagent_impl(req).await,
+                "observe" => this.observe_impl(req).await,
+                "entity_list" => this.entity_list_impl(req).await,
+                "entity_show" => this.entity_show_impl(req).await,
+                "entity_extract" => this.entity_extract_impl(req).await,
+                "code_search" => this.code_search_impl(req).await,
+                "code_show" => this.code_show_impl(req).await,
+                "grep" => this.grep_impl(req).await,
+                "blame" => this.blame_impl(req).await,
+                _ => Err(Self::error(
+                    ErrorCode::INVALID_PARAMS,
+                    format!(
+                        "Unknown search action: {}. Valid: search, context, context_for_subagent, observe, entity_list, entity_show, entity_extract, code_search, code_show, grep, blame",
+                        req.action
+                    ),
+                )),
+            };
 
-        // Track MCP tool usage
-        crate::telemetry::track_mcp_tool("search", &action, result.is_ok());
+            // Track MCP tool usage
+            crate::telemetry::track_mcp_tool("search", &action, result.is_ok());
 
-        result
+            result
+        })
+        .await
     }
 
     // ========================================================================
@@ -621,38 +645,49 @@ impl CasService {
         &self,
         Parameters(req): Parameters<SystemRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let action = req.action.clone();
-        let result = match req.action.as_str() {
-            "version" => self.system_version().await,
-            "doctor" => self.system_doctor(req).await,
-            "stats" => self.system_stats(req).await,
-            "info" => self.system_info(req).await,
-            "reindex" => self.system_reindex(req).await,
-            "maintenance_run" => self.system_maintenance_run(req).await,
-            "maintenance_status" => self.system_maintenance_status(req).await,
-            "config_docs" => self.system_config_docs().await,
-            "config_search" => self.system_config_search(req).await,
-            "report_cas_bug" => self.system_report_cas_bug(req).await,
-            #[cfg(feature = "mcp-proxy")]
-            "proxy_add" => self.system_proxy_add(req).await,
-            #[cfg(feature = "mcp-proxy")]
-            "proxy_remove" => self.system_proxy_remove(req).await,
-            #[cfg(feature = "mcp-proxy")]
-            "proxy_list" => self.system_proxy_list(req).await,
-            _ => Err(Self::error(
-                ErrorCode::INVALID_PARAMS,
-                format!(
-                    "Unknown system action: {}. Valid: version, doctor, stats, info, reindex, maintenance_run, maintenance_status, config_docs, config_search, report_cas_bug{}",
-                    req.action,
-                    if cfg!(feature = "mcp-proxy") { ", proxy_add, proxy_remove, proxy_list" } else { "" }
-                ),
-            )),
-        };
+        let this = self.clone();
+        panic_catch::dispatch_with_catch("system", async move {
+            // cas-3b51 regression seam: double-underscore action cannot
+            // collide with real input; `#[cfg(test)]` strips in release.
+            #[cfg(test)]
+            if req.action == "__panic_for_test__" {
+                panic!("forced test panic from system handler (cas-3b51 regression)");
+            }
 
-        // Track MCP tool usage
-        crate::telemetry::track_mcp_tool("system", &action, result.is_ok());
+            let action = req.action.clone();
+            let result = match req.action.as_str() {
+                "version" => this.system_version().await,
+                "doctor" => this.system_doctor(req).await,
+                "stats" => this.system_stats(req).await,
+                "info" => this.system_info(req).await,
+                "reindex" => this.system_reindex(req).await,
+                "maintenance_run" => this.system_maintenance_run(req).await,
+                "maintenance_status" => this.system_maintenance_status(req).await,
+                "config_docs" => this.system_config_docs().await,
+                "config_search" => this.system_config_search(req).await,
+                "report_cas_bug" => this.system_report_cas_bug(req).await,
+                #[cfg(feature = "mcp-proxy")]
+                "proxy_add" => this.system_proxy_add(req).await,
+                #[cfg(feature = "mcp-proxy")]
+                "proxy_remove" => this.system_proxy_remove(req).await,
+                #[cfg(feature = "mcp-proxy")]
+                "proxy_list" => this.system_proxy_list(req).await,
+                _ => Err(Self::error(
+                    ErrorCode::INVALID_PARAMS,
+                    format!(
+                        "Unknown system action: {}. Valid: version, doctor, stats, info, reindex, maintenance_run, maintenance_status, config_docs, config_search, report_cas_bug{}",
+                        req.action,
+                        if cfg!(feature = "mcp-proxy") { ", proxy_add, proxy_remove, proxy_list" } else { "" }
+                    ),
+                )),
+            };
 
-        result
+            // Track MCP tool usage
+            crate::telemetry::track_mcp_tool("system", &action, result.is_ok());
+
+            result
+        })
+        .await
     }
 
     // ========================================================================
@@ -666,25 +701,29 @@ impl CasService {
         &self,
         Parameters(req): Parameters<VerificationRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let action = req.action.clone();
-        let result = match req.action.as_str() {
-            "add" => self.verification_add(req).await,
-            "show" => self.verification_show(req).await,
-            "list" => self.verification_list(req).await,
-            "latest" => self.verification_latest(req).await,
-            _ => Err(Self::error(
-                ErrorCode::INVALID_PARAMS,
-                format!(
-                    "Unknown verification action: {}. Valid: add, show, list, latest",
-                    req.action
-                ),
-            )),
-        };
+        let this = self.clone();
+        panic_catch::dispatch_with_catch("verification", async move {
+            let action = req.action.clone();
+            let result = match req.action.as_str() {
+                "add" => this.verification_add(req).await,
+                "show" => this.verification_show(req).await,
+                "list" => this.verification_list(req).await,
+                "latest" => this.verification_latest(req).await,
+                _ => Err(Self::error(
+                    ErrorCode::INVALID_PARAMS,
+                    format!(
+                        "Unknown verification action: {}. Valid: add, show, list, latest",
+                        req.action
+                    ),
+                )),
+            };
 
-        // Track MCP tool usage
-        crate::telemetry::track_mcp_tool("verification", &action, result.is_ok());
+            // Track MCP tool usage
+            crate::telemetry::track_mcp_tool("verification", &action, result.is_ok());
 
-        result
+            result
+        })
+        .await
     }
 
     // ========================================================================
@@ -698,25 +737,29 @@ impl CasService {
         &self,
         Parameters(req): Parameters<TeamRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let action = req.action.clone();
-        let result = match req.action.as_str() {
-            "list" => self.team_list(req).await,
-            "show" => self.team_show(req).await,
-            "members" => self.team_members(req).await,
-            "sync" => self.team_sync(req).await,
-            _ => Err(Self::error(
-                ErrorCode::INVALID_PARAMS,
-                format!(
-                    "Unknown team action: {}. Valid: list, show, members, sync",
-                    req.action
-                ),
-            )),
-        };
+        let this = self.clone();
+        panic_catch::dispatch_with_catch("team", async move {
+            let action = req.action.clone();
+            let result = match req.action.as_str() {
+                "list" => this.team_list(req).await,
+                "show" => this.team_show(req).await,
+                "members" => this.team_members(req).await,
+                "sync" => this.team_sync(req).await,
+                _ => Err(Self::error(
+                    ErrorCode::INVALID_PARAMS,
+                    format!(
+                        "Unknown team action: {}. Valid: list, show, members, sync",
+                        req.action
+                    ),
+                )),
+            };
 
-        // Track MCP tool usage
-        crate::telemetry::track_mcp_tool("team", &action, result.is_ok());
+            // Track MCP tool usage
+            crate::telemetry::track_mcp_tool("team", &action, result.is_ok());
 
-        result
+            result
+        })
+        .await
     }
 
     // ========================================================================
@@ -730,58 +773,62 @@ impl CasService {
         &self,
         Parameters(req): Parameters<PatternRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let action = req.action.clone();
-        let is_mutating = matches!(
-            req.action.as_str(),
-            "create"
-                | "update"
-                | "archive"
-                | "adopt"
-                | "helpful"
-                | "harmful"
-                | "team_create_suggestion"
-                | "team_share"
-                | "team_adopt"
-                | "team_dismiss"
-                | "team_recommend"
-                | "team_archive_suggestion"
-        );
+        let this = self.clone();
+        panic_catch::dispatch_with_catch("pattern", async move {
+            let action = req.action.clone();
+            let is_mutating = matches!(
+                req.action.as_str(),
+                "create"
+                    | "update"
+                    | "archive"
+                    | "adopt"
+                    | "helpful"
+                    | "harmful"
+                    | "team_create_suggestion"
+                    | "team_share"
+                    | "team_adopt"
+                    | "team_dismiss"
+                    | "team_recommend"
+                    | "team_archive_suggestion"
+            );
 
-        // Verification jail check
-        self.inner
-            .authorize_agent_action("pattern", &action, is_mutating)?;
+            // Verification jail check
+            this.inner
+                .authorize_agent_action("pattern", &action, is_mutating)?;
 
-        let result = match req.action.as_str() {
-            "create" => self.pattern_create(req).await,
-            "list" => self.pattern_list(req).await,
-            "show" => self.pattern_show(req).await,
-            "update" => self.pattern_update(req).await,
-            "archive" => self.pattern_archive(req).await,
-            "adopt" => self.pattern_adopt(req).await,
-            "helpful" => self.pattern_helpful(req).await,
-            "harmful" => self.pattern_harmful(req).await,
-            "team_suggestions" => self.team_suggestions(req).await,
-            "team_new_suggestions" => self.team_new_suggestions(req).await,
-            "team_create_suggestion" => self.team_create_suggestion(req).await,
-            "team_share" => self.team_share(req).await,
-            "team_adopt" => self.team_adopt_suggestion(req).await,
-            "team_dismiss" => self.team_dismiss_suggestion(req).await,
-            "team_recommend" => self.team_recommend_suggestion(req).await,
-            "team_archive_suggestion" => self.team_archive_suggestion(req).await,
-            "team_suggestion_analytics" => self.team_suggestion_analytics(req).await,
-            _ => Err(Self::error(
-                ErrorCode::INVALID_PARAMS,
-                format!(
-                    "Unknown pattern action: {}. Valid: create, list, show, update, archive, adopt, helpful, harmful, team_suggestions, team_new_suggestions, team_create_suggestion, team_share, team_adopt, team_dismiss, team_recommend, team_archive_suggestion, team_suggestion_analytics",
-                    req.action
-                ),
-            )),
-        };
+            let result = match req.action.as_str() {
+                "create" => this.pattern_create(req).await,
+                "list" => this.pattern_list(req).await,
+                "show" => this.pattern_show(req).await,
+                "update" => this.pattern_update(req).await,
+                "archive" => this.pattern_archive(req).await,
+                "adopt" => this.pattern_adopt(req).await,
+                "helpful" => this.pattern_helpful(req).await,
+                "harmful" => this.pattern_harmful(req).await,
+                "team_suggestions" => this.team_suggestions(req).await,
+                "team_new_suggestions" => this.team_new_suggestions(req).await,
+                "team_create_suggestion" => this.team_create_suggestion(req).await,
+                "team_share" => this.team_share(req).await,
+                "team_adopt" => this.team_adopt_suggestion(req).await,
+                "team_dismiss" => this.team_dismiss_suggestion(req).await,
+                "team_recommend" => this.team_recommend_suggestion(req).await,
+                "team_archive_suggestion" => this.team_archive_suggestion(req).await,
+                "team_suggestion_analytics" => this.team_suggestion_analytics(req).await,
+                _ => Err(Self::error(
+                    ErrorCode::INVALID_PARAMS,
+                    format!(
+                        "Unknown pattern action: {}. Valid: create, list, show, update, archive, adopt, helpful, harmful, team_suggestions, team_new_suggestions, team_create_suggestion, team_share, team_adopt, team_dismiss, team_recommend, team_archive_suggestion, team_suggestion_analytics",
+                        req.action
+                    ),
+                )),
+            };
 
-        // Track MCP tool usage
-        crate::telemetry::track_mcp_tool("pattern", &action, result.is_ok());
+            // Track MCP tool usage
+            crate::telemetry::track_mcp_tool("pattern", &action, result.is_ok());
 
-        result
+            result
+        })
+        .await
     }
 
     // ========================================================================
@@ -795,55 +842,59 @@ impl CasService {
         &self,
         Parameters(req): Parameters<SpecRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let action = req.action.clone();
-        let is_mutating = matches!(
-            req.action.as_str(),
-            "create"
-                | "update"
-                | "delete"
-                | "approve"
-                | "reject"
-                | "supersede"
-                | "link"
-                | "unlink"
-                | "sync"
-        );
+        let this = self.clone();
+        panic_catch::dispatch_with_catch("spec", async move {
+            let action = req.action.clone();
+            let is_mutating = matches!(
+                req.action.as_str(),
+                "create"
+                    | "update"
+                    | "delete"
+                    | "approve"
+                    | "reject"
+                    | "supersede"
+                    | "link"
+                    | "unlink"
+                    | "sync"
+            );
 
-        // Verification jail check
-        self.inner
-            .authorize_agent_action("spec", &action, is_mutating)?;
+            // Verification jail check
+            this.inner
+                .authorize_agent_action("spec", &action, is_mutating)?;
 
-        let result = match req.action.as_str() {
-            "create" => self.spec_create(req).await,
-            "show" => self.spec_show(req).await,
-            "update" => self.spec_update(req).await,
-            "delete" => self.spec_delete(req).await,
-            "list" => self.spec_list(req).await,
-            "approve" => self.spec_approve(req).await,
-            "reject" => self.spec_reject(req).await,
-            "supersede" => self.spec_supersede(req).await,
-            "link" => self.spec_link(req).await,
-            "unlink" => self.spec_unlink(req).await,
-            "sync" => self.spec_sync(req).await,
-            "get_for_task" => self.spec_get_for_task(req).await,
-            _ => Err(Self::error(
-                ErrorCode::INVALID_PARAMS,
-                format!(
-                    "Unknown spec action: {}. Valid: create, show, update, delete, list, approve, reject, supersede, link, unlink, sync, get_for_task",
-                    req.action
-                ),
-            )),
-        };
+            let result = match req.action.as_str() {
+                "create" => this.spec_create(req).await,
+                "show" => this.spec_show(req).await,
+                "update" => this.spec_update(req).await,
+                "delete" => this.spec_delete(req).await,
+                "list" => this.spec_list(req).await,
+                "approve" => this.spec_approve(req).await,
+                "reject" => this.spec_reject(req).await,
+                "supersede" => this.spec_supersede(req).await,
+                "link" => this.spec_link(req).await,
+                "unlink" => this.spec_unlink(req).await,
+                "sync" => this.spec_sync(req).await,
+                "get_for_task" => this.spec_get_for_task(req).await,
+                _ => Err(Self::error(
+                    ErrorCode::INVALID_PARAMS,
+                    format!(
+                        "Unknown spec action: {}. Valid: create, show, update, delete, list, approve, reject, supersede, link, unlink, sync, get_for_task",
+                        req.action
+                    ),
+                )),
+            };
 
-        // Notify client of resource changes (Claude Code 2.1.0+)
-        if is_mutating && result.is_ok() {
-            self.inner.notify_resources_changed().await;
-        }
+            // Notify client of resource changes (Claude Code 2.1.0+)
+            if is_mutating && result.is_ok() {
+                this.inner.notify_resources_changed().await;
+            }
 
-        // Track MCP tool usage
-        crate::telemetry::track_mcp_tool("spec", &action, result.is_ok());
+            // Track MCP tool usage
+            crate::telemetry::track_mcp_tool("spec", &action, result.is_ok());
 
-        result
+            result
+        })
+        .await
     }
 
     // ========================================================================
@@ -998,6 +1049,9 @@ mod agent_search_system;
 mod core;
 mod factory_ops;
 mod factory_remind;
+mod panic_catch;
+#[cfg(test)]
+mod panic_regression_test;
 mod pattern_ops;
 mod server_handler;
 mod spec_ops;

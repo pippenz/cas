@@ -37,4 +37,6 @@ inherits = "release"
 lto = "thin"
 codegen-units = 16
 strip = "debuginfo"
-panic = "abort"
+# Required for the MCP panic catcher; enforced by compile_error! in
+# cas-cli/src/lib.rs.
+panic = "unwind"

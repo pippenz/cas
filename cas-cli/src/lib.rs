@@ -5,6 +5,21 @@
 //! This crate provides unified task tracking, memory management, rules, and skills
 //! for AI coding agents.
 
+// Build-time enforcement of the panic=unwind invariant the MCP tool
+// dispatch panic catcher depends on. The `not(test)` exemption exists
+// because Rust forces panic=unwind when compiling the lib under
+// `cargo test --lib`; the guard still fires for `cargo build`,
+// `cargo check`, and integration-test dependency compilations (where
+// cfg(test) is false on the lib).
+#[cfg(all(not(test), panic = "abort"))]
+compile_error!(
+    "cas requires `panic = \"unwind\"` (see EPIC cas-c351). The MCP dispatch \
+     panic catcher at cas-cli/src/mcp/tools/service/panic_catch.rs depends \
+     on stack unwinding; `panic = \"abort\"` disables it and makes `cas serve` \
+     crash on the first handler panic with no server-side trace. Remove \
+     `panic = \"abort\"` from the build profile."
+);
+
 // Core modules
 pub mod agent_id;
 pub mod async_runtime;
