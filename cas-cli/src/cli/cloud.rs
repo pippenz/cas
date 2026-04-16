@@ -165,24 +165,43 @@ pub fn execute(cmd: &CloudCommands, cli: &Cli, cas_root: &Path) -> anyhow::Resul
 // TEAM — set / show / clear the active team
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Validate a string looks like a canonical UUID (36 chars, 8-4-4-4-12 hex).
+/// HTTP timeout for the pre-flight team-membership probe.
 ///
-/// We accept both upper- and lower-case hex and normalise to lowercase on save.
-/// Non-canonical forms (braces, no-hyphens, urn prefix) are rejected — team
-/// UUIDs are stored elsewhere in canonical form, and accepting variants would
-/// create silent inequality between the CLI and server lookups.
+/// Same magnitude as the coordinator's default — long enough to absorb a cold
+/// Neon/Vercel cache, short enough that a misconfigured endpoint fails
+/// visibly instead of hanging the shell.
+const TEAM_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Validate a string is a canonical UUID (36 chars, 8-4-4-4-12 hex).
+///
+/// Both upper- and lower-case hex are accepted; the value is normalised to
+/// lowercase on return. Non-canonical UUID forms (braces `{...}`,
+/// no-hyphen 32-char, URN `urn:uuid:...`) that the `uuid` crate would
+/// otherwise accept are explicitly rejected — the server stores team UUIDs
+/// in canonical form, and silently accepting variants would let two strings
+/// represent the same team locally while compare-unequal elsewhere.
 fn parse_team_uuid(input: &str) -> Result<String, String> {
+    let err_msg = || {
+        format!(
+            "`{input}` is not a valid team UUID.\n\n  Expected canonical form: 550e8400-e29b-41d4-a716-446655440000\n\n  Slug resolution (e.g., `cas cloud team set petrastella`) is not yet\n  supported — it requires a cloud-side slug→UUID endpoint that is not\n  available in the current CAS Cloud deployment.\n\n  Find your team UUID in the CAS Cloud dashboard under team settings,\n  or run `cas cloud team set --help` for details."
+        )
+    };
+
+    // Canonical hyphenated form is exactly 36 chars; reject braces,
+    // URN-prefixed, and no-hyphen 32-char variants before uuid::try_parse
+    // normalises them silently.
+    if input.len() != 36 {
+        return Err(err_msg());
+    }
     match uuid::Uuid::try_parse(input) {
         Ok(u) => Ok(u.as_hyphenated().to_string()),
-        Err(_) => Err(format!(
-            "`{input}` is not a valid team UUID.\n\n  Expected canonical form: 550e8400-e29b-41d4-a716-446655440000\n\n  Slug resolution (e.g., `cas cloud team set petrastella`) is not yet\n  supported — it requires a cloud-side slug→UUID endpoint that is not\n  available in the current CAS Cloud deployment.\n\n  Find your team UUID in the CAS Cloud dashboard under team settings,\n  or run `cas cloud team set --help` for details."
-        )),
+        Err(_) => Err(err_msg()),
     }
 }
 
 /// Result of probing team membership via `GET /api/teams/{uuid}/projects`.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum TeamProbeOutcome {
+enum TeamProbeOutcome {
     /// Server returned 2xx — user is a member of the team.
     Member,
     /// Server returned 401 — the token is invalid or expired.
@@ -200,13 +219,10 @@ pub(crate) enum TeamProbeOutcome {
 /// This endpoint already enforces `validateTeamMembership` server-side and is
 /// cheap (no body), so it is the natural pre-flight check before persisting
 /// `team_id` to cloud.json. Factored out for testability with wiremock.
-pub(crate) fn probe_team_membership(
-    endpoint: &str,
-    token: &str,
-    team_uuid: &str,
-) -> TeamProbeOutcome {
+fn probe_team_membership(endpoint: &str, token: &str, team_uuid: &str) -> TeamProbeOutcome {
     let url = format!("{endpoint}/api/teams/{team_uuid}/projects");
     match ureq::get(&url)
+        .timeout(TEAM_PROBE_TIMEOUT)
         .set("Authorization", &format!("Bearer {token}"))
         .call()
     {
@@ -241,17 +257,23 @@ fn execute_team_set(args: &CloudTeamSetArgs, cli: &Cli) -> anyhow::Result<()> {
 
     match probe_team_membership(&config.endpoint, &token, &uuid) {
         TeamProbeOutcome::Member => {
-            // Server doesn't return the slug from this endpoint. Store a
-            // placeholder until a cloud-side slug resolver lands; docs/T7
-            // explain the workaround. Users who set_team today see the UUID
-            // echoed back by `cas cloud team show` with slug="<unknown>".
-            config.set_team(&uuid, "<unknown>");
+            // The membership probe endpoint doesn't return the slug. Set
+            // team_id directly and leave team_slug None so downstream
+            // callers (execute_projects, hooks/context.rs) fall through to
+            // their "show UUID" / "your team" default instead of rendering
+            // a sentinel string. A future cloud-side slug resolver (tracked
+            // in T7 docs) can populate team_slug when it lands.
+            config.team_id = Some(uuid.clone());
+            config.team_slug = None;
             config.save()?;
 
             if cli.json {
-                println!(
-                    r#"{{"status":"ok","team_id":"{uuid}","team_slug":"<unknown>"}}"#
-                );
+                let out = serde_json::json!({
+                    "status": "ok",
+                    "team_id": uuid,
+                    "team_slug": serde_json::Value::Null,
+                });
+                println!("{}", out);
             } else {
                 let theme = ActiveTheme::default();
                 let mut out = io::stdout();
@@ -289,11 +311,12 @@ fn execute_team_show(cli: &Cli) -> anyhow::Result<()> {
 
     match (&config.team_id, &config.team_slug) {
         (Some(id), slug) => {
-            let slug = slug.as_deref().unwrap_or("<unknown>");
             if cli.json {
-                println!(
-                    r#"{{"team_id":"{id}","team_slug":"{slug}"}}"#
-                );
+                let out = serde_json::json!({
+                    "team_id": id,
+                    "team_slug": slug,
+                });
+                println!("{}", out);
             } else {
                 let theme = ActiveTheme::default();
                 let mut out = io::stdout();
@@ -303,13 +326,16 @@ fn execute_team_show(cli: &Cli) -> anyhow::Result<()> {
                 fmt.write_raw(id)?;
                 fmt.newline()?;
                 fmt.write_muted("  Team slug: ")?;
-                fmt.write_raw(slug)?;
+                fmt.write_raw(slug.as_deref().unwrap_or("<not resolved>"))?;
                 fmt.newline()?;
             }
         }
         (None, _) => {
             if cli.json {
-                println!(r#"{{"team_id":null}}"#);
+                let out = serde_json::json!({
+                    "team_id": serde_json::Value::Null,
+                });
+                println!("{}", out);
             } else {
                 let theme = ActiveTheme::default();
                 let mut out = io::stdout();
@@ -336,7 +362,8 @@ fn execute_team_clear(cli: &Cli) -> anyhow::Result<()> {
     config.save()?;
 
     if cli.json {
-        println!(r#"{{"status":"ok","was_set":{was_set}}}"#);
+        let out = serde_json::json!({ "status": "ok", "was_set": was_set });
+        println!("{}", out);
     } else {
         let theme = ActiveTheme::default();
         let mut out = io::stdout();
@@ -1986,6 +2013,26 @@ mod team_cmd_tests {
     }
 
     #[test]
+    fn parse_team_uuid_rejects_no_hyphen_form() {
+        // uuid crate would parse this as a simple form; our length gate
+        // rejects it so the stored value never drifts from canonical.
+        let err = parse_team_uuid("550e8400e29b41d4a716446655440000").unwrap_err();
+        assert!(err.contains("not a valid team UUID"));
+    }
+
+    #[test]
+    fn parse_team_uuid_rejects_braced_form() {
+        let err = parse_team_uuid("{550e8400-e29b-41d4-a716-446655440000}").unwrap_err();
+        assert!(err.contains("not a valid team UUID"));
+    }
+
+    #[test]
+    fn parse_team_uuid_rejects_urn_form() {
+        let err = parse_team_uuid("urn:uuid:550e8400-e29b-41d4-a716-446655440000").unwrap_err();
+        assert!(err.contains("not a valid team UUID"));
+    }
+
+    #[test]
     fn config_set_team_roundtrip() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("cloud.json");
@@ -2111,7 +2158,32 @@ mod team_cmd_tests {
         .unwrap();
 
         match outcome {
-            TeamProbeOutcome::Error(msg) => assert!(msg.contains("500"), "got: {msg}"),
+            TeamProbeOutcome::Error(msg) => assert_eq!(msg, "unexpected HTTP 500"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_membership_returns_error_on_network_failure() {
+        // Port 1 is never open on a normal machine; ureq will fail with a
+        // transport error. We don't pin the exact wording because ureq's
+        // Display differs across platforms, but the prefix is ours.
+        let endpoint = "http://127.0.0.1:1".to_string();
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+
+        let outcome = tokio::task::spawn_blocking(move || {
+            probe_team_membership(&endpoint, "test-token", uuid)
+        })
+        .await
+        .unwrap();
+
+        match outcome {
+            TeamProbeOutcome::Error(msg) => {
+                assert!(
+                    msg.starts_with("network error:"),
+                    "expected `network error: ...`, got: {msg}"
+                );
+            }
             other => panic!("expected Error, got {other:?}"),
         }
     }
