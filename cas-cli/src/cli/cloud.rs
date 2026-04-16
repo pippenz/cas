@@ -180,23 +180,30 @@ const TEAM_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1
 /// otherwise accept are explicitly rejected — the server stores team UUIDs
 /// in canonical form, and silently accepting variants would let two strings
 /// represent the same team locally while compare-unequal elsewhere.
+///
+/// Returns a short error (no "find your UUID here" guidance); the CLI
+/// layer wraps that with endpoint-specific help via `format_uuid_error`.
 fn parse_team_uuid(input: &str) -> Result<String, String> {
-    let err_msg = || {
-        format!(
-            "`{input}` is not a valid team UUID.\n\n  Expected canonical form: 550e8400-e29b-41d4-a716-446655440000\n\n  Slug resolution (e.g., `cas cloud team set petrastella`) is not yet\n  supported — it requires a cloud-side slug→UUID endpoint that is not\n  available in the current CAS Cloud deployment.\n\n  Find your team UUID in the CAS Cloud dashboard under team settings,\n  or run `cas cloud team set --help` for details."
-        )
-    };
-
     // Canonical hyphenated form is exactly 36 chars; reject braces,
     // URN-prefixed, and no-hyphen 32-char variants before uuid::try_parse
     // normalises them silently.
     if input.len() != 36 {
-        return Err(err_msg());
+        return Err(format!("expected a team UUID, got `{input}`"));
     }
     match uuid::Uuid::try_parse(input) {
         Ok(u) => Ok(u.as_hyphenated().to_string()),
-        Err(_) => Err(err_msg()),
+        Err(_) => Err(format!("expected a team UUID, got `{input}`")),
     }
+}
+
+/// Wrap a `parse_team_uuid` error with endpoint-aware guidance on where to
+/// find the team UUID. Kept separate so the parser stays pure.
+fn format_uuid_error(short: &str, endpoint: &str) -> String {
+    // Strip any trailing slash so the interpolated URL is clean.
+    let base = endpoint.trim_end_matches('/');
+    format!(
+        "{short}.\n\n  Slug resolution is not yet supported. Find your team UUID at:\n    {base}/dashboard/teams\n\n  If a teammate has already set up cloud sync, check their\n  `~/.cas/cloud.json` for the `team_id` field and pass that UUID to\n  `cas cloud team set <uuid>`."
+    )
 }
 
 /// Result of probing team membership via `GET /api/teams/{uuid}/projects`.
@@ -246,9 +253,14 @@ fn execute_team(cmd: &CloudTeamCommands, cli: &Cli) -> anyhow::Result<()> {
 }
 
 fn execute_team_set(args: &CloudTeamSetArgs, cli: &Cli) -> anyhow::Result<()> {
-    let uuid = parse_team_uuid(&args.id).map_err(|msg| anyhow::anyhow!(msg))?;
-
+    // Load config before parsing so the error path can build an
+    // endpoint-aware dashboard URL ("find your team UUID at …").
     let mut config = CloudConfig::load()?;
+
+    let uuid = parse_team_uuid(&args.id).map_err(|short| {
+        anyhow::anyhow!("{}", format_uuid_error(&short, &config.endpoint))
+    })?;
+
     let token = config
         .token
         .as_ref()
@@ -1998,8 +2010,8 @@ mod team_cmd_tests {
     #[test]
     fn parse_team_uuid_rejects_slug() {
         let err = parse_team_uuid("petra-stella").unwrap_err();
-        assert!(err.contains("not a valid team UUID"));
-        assert!(err.contains("Slug resolution"));
+        assert!(err.contains("expected a team UUID"));
+        assert!(err.contains("petra-stella"));
     }
 
     #[test]
@@ -2017,19 +2029,39 @@ mod team_cmd_tests {
         // uuid crate would parse this as a simple form; our length gate
         // rejects it so the stored value never drifts from canonical.
         let err = parse_team_uuid("550e8400e29b41d4a716446655440000").unwrap_err();
-        assert!(err.contains("not a valid team UUID"));
+        assert!(err.contains("expected a team UUID"));
     }
 
     #[test]
     fn parse_team_uuid_rejects_braced_form() {
         let err = parse_team_uuid("{550e8400-e29b-41d4-a716-446655440000}").unwrap_err();
-        assert!(err.contains("not a valid team UUID"));
+        assert!(err.contains("expected a team UUID"));
     }
 
     #[test]
     fn parse_team_uuid_rejects_urn_form() {
         let err = parse_team_uuid("urn:uuid:550e8400-e29b-41d4-a716-446655440000").unwrap_err();
-        assert!(err.contains("not a valid team UUID"));
+        assert!(err.contains("expected a team UUID"));
+    }
+
+    #[test]
+    fn format_uuid_error_uses_endpoint_dashboard_url() {
+        let msg = format_uuid_error(
+            "expected a team UUID, got `petra-stella`",
+            "https://cas.dev",
+        );
+        assert!(msg.contains("got `petra-stella`"));
+        assert!(msg.contains("https://cas.dev/dashboard/teams"));
+        assert!(msg.contains("Slug resolution is not yet supported"));
+        assert!(msg.contains("cloud.json"));
+    }
+
+    #[test]
+    fn format_uuid_error_strips_trailing_slash_on_endpoint() {
+        let msg = format_uuid_error("expected a team UUID, got `x`", "https://custom.host/");
+        // Should not produce a double-slash in the URL.
+        assert!(msg.contains("https://custom.host/dashboard/teams"));
+        assert!(!msg.contains("//dashboard"));
     }
 
     #[test]
