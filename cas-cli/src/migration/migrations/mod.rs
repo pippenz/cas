@@ -169,6 +169,10 @@ mod m191_agents_add_startup_confirmed;
 mod m192_perf_indexes;
 mod m193_spawn_queue_force_isolate;
 mod m194_spawn_queue_repair_broken_schema;
+mod m195_entries_add_share;
+mod m196_rules_add_share;
+mod m197_skills_add_share;
+mod m198_tasks_add_share;
 
 /// All migrations in order. IDs must be sequential and never reused.
 pub const MIGRATIONS: &[Migration] = &[
@@ -334,6 +338,11 @@ pub const MIGRATIONS: &[Migration] = &[
     m193_spawn_queue_force_isolate::MIGRATION,
     // Repair spawn_queue DBs corrupted by earlier m193 revision (cas-a68b)
     m194_spawn_queue_repair_broken_schema::MIGRATION,
+    // Add share column to entries/rules/skills/tasks for pre-column DBs
+    m195_entries_add_share::MIGRATION,
+    m196_rules_add_share::MIGRATION,
+    m197_skills_add_share::MIGRATION,
+    m198_tasks_add_share::MIGRATION,
 ];
 
 #[cfg(test)]
