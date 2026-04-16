@@ -73,8 +73,8 @@ impl SqliteStore {
              helpful_count, harmful_count, last_accessed, archived,
              session_id, source_tool, pending_extraction, observation_type,
              stability, access_count, raw_content, compressed, memory_tier, importance,
-             valid_from, valid_until, review_after, last_reviewed, pending_embedding, belief_type, confidence, domain, branch, scope, team_id, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32)",
+             valid_from, valid_until, review_after, last_reviewed, pending_embedding, belief_type, confidence, domain, branch, scope, team_id, share, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33)",
             params![
                 entry.id,
                 entry.entry_type.to_string(),
@@ -107,6 +107,7 @@ impl SqliteStore {
                 entry.branch,
                 entry.scope.to_string(),
                 entry.team_id,
+                entry.share.as_ref().map(|s| s.to_string()),
                 now, // updated_at = created time for new entries
             ],
         );
@@ -165,7 +166,7 @@ impl SqliteStore {
                  harmful_count, last_accessed, archived, session_id, source_tool,
                  pending_extraction, observation_type, stability, access_count,
                  raw_content, compressed, memory_tier, importance, valid_from, valid_until, review_after, last_reviewed, pending_embedding,
-                 belief_type, confidence, domain, branch, scope, team_id
+                 belief_type, confidence, domain, branch, scope, team_id, share
                  FROM entries WHERE id = ? AND archived = 0",
                 params![id],
                 Self::row_to_entry,
@@ -182,7 +183,7 @@ impl SqliteStore {
                  harmful_count, last_accessed, archived, session_id, source_tool,
                  pending_extraction, observation_type, stability, access_count,
                  raw_content, compressed, memory_tier, importance, valid_from, valid_until, review_after, last_reviewed, pending_embedding,
-                 belief_type, confidence, domain, branch, scope, team_id
+                 belief_type, confidence, domain, branch, scope, team_id, share
                  FROM entries WHERE id = ? AND archived = 1",
                 params![id],
                 Self::row_to_entry,
@@ -204,8 +205,8 @@ impl SqliteStore {
              stability = ?13, access_count = ?14, raw_content = ?15, compressed = ?16,
              memory_tier = ?17, importance = ?18, valid_from = ?19, valid_until = ?20, review_after = ?21,
              last_reviewed = ?22, pending_embedding = ?23, belief_type = ?24, confidence = ?25, domain = ?26, branch = ?27,
-             updated_at = ?28, scope = ?29
-             WHERE id = ?30",
+             updated_at = ?28, scope = ?29, share = ?30
+             WHERE id = ?31",
             params![
                 entry.entry_type.to_string(),
                 Self::tags_to_string(&entry.tags),
@@ -236,6 +237,7 @@ impl SqliteStore {
                 entry.branch,
                 now, // updated_at = current time on update
                 entry.scope.to_string(),
+                entry.share.as_ref().map(|s| s.to_string()),
                 entry.id,
             ],
         );
@@ -304,7 +306,7 @@ impl SqliteStore {
              harmful_count, last_accessed, archived, session_id, source_tool,
              pending_extraction, observation_type, stability, access_count,
              raw_content, compressed, memory_tier, importance, valid_from, valid_until, review_after, last_reviewed, pending_embedding,
-             belief_type, confidence, domain, branch, scope, team_id
+             belief_type, confidence, domain, branch, scope, team_id, share
              FROM entries WHERE archived = 0 ORDER BY created DESC LIMIT 10000",
         )?;
 
@@ -321,7 +323,7 @@ impl SqliteStore {
              harmful_count, last_accessed, archived, session_id, source_tool,
              pending_extraction, observation_type, stability, access_count,
              raw_content, compressed, memory_tier, importance, valid_from, valid_until, review_after, last_reviewed, pending_embedding,
-             belief_type, confidence, domain, branch, scope, team_id
+             belief_type, confidence, domain, branch, scope, team_id, share
              FROM entries WHERE archived = 0 AND memory_tier NOT IN ('in_context', 'archive')
              ORDER BY created DESC LIMIT 10000",
         )?;
@@ -340,7 +342,7 @@ impl SqliteStore {
              harmful_count, last_accessed, archived, session_id, source_tool,
              pending_extraction, observation_type, stability, access_count,
              raw_content, compressed, memory_tier, importance, valid_from, valid_until, review_after, last_reviewed, pending_embedding,
-             belief_type, confidence, domain, branch, scope, team_id
+             belief_type, confidence, domain, branch, scope, team_id, share
              FROM entries WHERE archived = 0 AND stability < ?
              ORDER BY stability ASC LIMIT 10000",
         )?;
@@ -359,7 +361,7 @@ impl SqliteStore {
              harmful_count, last_accessed, archived, session_id, source_tool,
              pending_extraction, observation_type, stability, access_count,
              raw_content, compressed, memory_tier, importance, valid_from, valid_until, review_after, last_reviewed, pending_embedding,
-             belief_type, confidence, domain, branch, scope, team_id
+             belief_type, confidence, domain, branch, scope, team_id, share
              FROM entries WHERE archived = 0 ORDER BY created DESC LIMIT ?",
         )?;
 
@@ -398,7 +400,7 @@ impl SqliteStore {
              harmful_count, last_accessed, archived, session_id, source_tool,
              pending_extraction, observation_type, stability, access_count,
              raw_content, compressed, memory_tier, importance, valid_from, valid_until, review_after, last_reviewed, pending_embedding,
-             belief_type, confidence, domain, branch, scope, team_id
+             belief_type, confidence, domain, branch, scope, team_id, share
              FROM entries WHERE archived = 1 ORDER BY created DESC LIMIT 10000",
         )?;
 
@@ -416,7 +418,7 @@ impl SqliteStore {
              harmful_count, last_accessed, archived, session_id, source_tool,
              pending_extraction, observation_type, stability, access_count,
              raw_content, compressed, memory_tier, importance, valid_from, valid_until, review_after, last_reviewed, pending_embedding,
-             belief_type, confidence, domain, branch, scope, team_id
+             belief_type, confidence, domain, branch, scope, team_id, share
              FROM entries WHERE branch = ? AND archived = 0 ORDER BY created DESC",
         )?;
 

@@ -136,6 +136,11 @@ mod notifying_entry;
 mod notifying_rule;
 mod notifying_skill;
 mod notifying_task;
+// `cli/memory.rs` (T5 cas-07d7) and the syncing-store wrappers all
+// call the predicate directly — keeping it in one `pub(crate)` module
+// is how the retroactive backfill CLI and the auto-promote write path
+// stay in lockstep.
+pub(crate) mod share_policy;
 mod syncing;
 mod syncing_entry;
 mod syncing_skill;

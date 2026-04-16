@@ -191,6 +191,7 @@ impl CasCore {
             updated_at: chrono::Utc::now(),
             last_used: None,
             team_id: None,
+            share: None,
         };
 
         skill_store.add(&skill).map_err(|e| McpError {

@@ -123,6 +123,7 @@ impl<'a> Extractor<'a> {
             auto_approve_tools: None,
             auto_approve_paths: None,
             team_id: None,
+            share: None,
         };
 
         self.rule_store.add(&rule)?;

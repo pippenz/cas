@@ -251,10 +251,10 @@ pub fn open_store(cas_dir: &Path) -> Result<Arc<dyn Store>> {
         if cloud_config.is_logged_in() {
             if let Ok(queue) = SyncQueue::open(cas_dir) {
                 let _ = queue.init();
-                return Ok(Arc::new(SyncingEntryStore::new(
-                    base_store,
-                    Arc::new(queue),
-                )));
+                return Ok(Arc::new(
+                    SyncingEntryStore::new(base_store, Arc::new(queue))
+                        .with_cloud_config(Arc::new(cloud_config)),
+                ));
             }
         }
     }
@@ -282,7 +282,10 @@ pub fn open_task_store(cas_dir: &Path) -> Result<Arc<dyn TaskStore>> {
         if cloud_config.is_logged_in() {
             if let Ok(queue) = SyncQueue::open(cas_dir) {
                 let _ = queue.init();
-                return Ok(Arc::new(SyncingTaskStore::new(base_store, Arc::new(queue))));
+                return Ok(Arc::new(
+                    SyncingTaskStore::new(base_store, Arc::new(queue))
+                        .with_cloud_config(Arc::new(cloud_config)),
+                ));
             }
         }
     }
@@ -310,10 +313,10 @@ pub fn open_skill_store(cas_dir: &Path) -> Result<Arc<dyn SkillStore>> {
         if cloud_config.is_logged_in() {
             if let Ok(queue) = SyncQueue::open(cas_dir) {
                 let _ = queue.init();
-                return Ok(Arc::new(SyncingSkillStore::new(
-                    base_store,
-                    Arc::new(queue),
-                )));
+                return Ok(Arc::new(
+                    SyncingSkillStore::new(base_store, Arc::new(queue))
+                        .with_cloud_config(Arc::new(cloud_config)),
+                ));
             }
         }
     }
@@ -463,27 +466,32 @@ pub fn open_rule_store(cas_dir: &Path) -> Result<Arc<dyn RuleStore>> {
         let project_root = cas_dir.parent().unwrap_or(Path::new("."));
         let target_dir = project_root.join(&config.sync.target);
 
-        // Check if cloud sync is also enabled
-        let cloud_queue = if let Ok(cloud_config) = CloudConfig::load_from_cas_dir(cas_dir) {
-            if cloud_config.is_logged_in() {
-                SyncQueue::open(cas_dir).ok().map(|q| {
-                    let _ = q.init();
-                    Arc::new(q)
-                })
+        // Check if cloud sync is also enabled. When it is, thread the
+        // CloudConfig through so team auto-promotion is active.
+        let cloud_setup: Option<(Arc<SyncQueue>, Arc<CloudConfig>)> =
+            if let Ok(cloud_config) = CloudConfig::load_from_cas_dir(cas_dir) {
+                if cloud_config.is_logged_in() {
+                    SyncQueue::open(cas_dir).ok().map(|q| {
+                        let _ = q.init();
+                        (Arc::new(q), Arc::new(cloud_config))
+                    })
+                } else {
+                    None
+                }
             } else {
                 None
-            }
-        } else {
-            None
-        };
+            };
 
-        if let Some(queue) = cloud_queue {
-            return Ok(Arc::new(SyncingRuleStore::with_cloud_queue(
-                base_store,
-                target_dir,
-                config.sync.min_helpful,
-                queue,
-            )));
+        if let Some((queue, cloud_config)) = cloud_setup {
+            return Ok(Arc::new(
+                SyncingRuleStore::with_cloud_queue(
+                    base_store,
+                    target_dir,
+                    config.sync.min_helpful,
+                    queue,
+                )
+                .with_cloud_config(cloud_config),
+            ));
         } else {
             return Ok(Arc::new(SyncingRuleStore::new(
                 base_store,

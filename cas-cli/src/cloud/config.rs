@@ -177,6 +177,18 @@ pub struct CloudConfig {
     /// independent of this flag and always runs when logged in.
     #[serde(default)]
     pub factory_cloud_client_enabled: bool,
+
+    /// Whether automatic team auto-promotion is enabled for this folder.
+    ///
+    /// When `None` or `Some(true)` (the default), the syncing store
+    /// wrappers dual-enqueue eligible writes to the team queue whenever
+    /// `team_id` is set. `Some(false)` disables the coarse trigger — only
+    /// explicit `cas memory remember --share team` / `cas memory share`
+    /// primitives (T5) push to the team queue after that.
+    ///
+    /// See `docs/requests/team-memories-filter-policy.md` Decision 3.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_auto_promote: Option<bool>,
 }
 
 fn default_endpoint() -> String {
@@ -201,6 +213,7 @@ impl Default for CloudConfig {
             last_rule_sync: None,
             last_skill_sync: None,
             factory_cloud_client_enabled: false,
+            team_auto_promote: None,
         }
     }
 }
@@ -280,6 +293,21 @@ impl CloudConfig {
     /// Check if user belongs to a team
     pub fn has_team(&self) -> bool {
         self.team_id.is_some()
+    }
+
+    /// Return the team UUID to auto-promote writes to, or `None` if team
+    /// auto-promotion is disabled for this folder.
+    ///
+    /// Distinct from `team_id` directly: this accessor honours the
+    /// `team_auto_promote` coarse kill-switch. `Some(false)` on
+    /// `team_auto_promote` returns `None` here even if `team_id` is set —
+    /// the user has opted out of automatic dual-enqueue. Callers building
+    /// the T1 filter predicate should use this accessor, not `team_id`.
+    pub fn active_team_id(&self) -> Option<&str> {
+        if matches!(self.team_auto_promote, Some(false)) {
+            return None;
+        }
+        self.team_id.as_deref()
     }
 
     /// Set the current team context
@@ -388,6 +416,39 @@ mod tests {
         assert!(!config.has_team());
         assert!(config.team_id.is_none());
         assert!(config.team_slug.is_none());
+    }
+
+    #[test]
+    fn test_active_team_id_returns_none_when_no_team_set() {
+        let config = CloudConfig::default();
+        assert_eq!(config.active_team_id(), None);
+    }
+
+    #[test]
+    fn test_active_team_id_returns_team_when_auto_promote_is_default() {
+        // team_auto_promote=None is the default — auto-promote enabled.
+        let mut config = CloudConfig::default();
+        config.set_team("team-abc", "my-team");
+        assert_eq!(config.active_team_id(), Some("team-abc"));
+        assert!(config.team_auto_promote.is_none());
+    }
+
+    #[test]
+    fn test_active_team_id_returns_team_when_auto_promote_is_true() {
+        let mut config = CloudConfig::default();
+        config.set_team("team-abc", "my-team");
+        config.team_auto_promote = Some(true);
+        assert_eq!(config.active_team_id(), Some("team-abc"));
+    }
+
+    #[test]
+    fn test_active_team_id_suppressed_by_auto_promote_false() {
+        // The coarse kill-switch from Decision 3 of filter-policy.md —
+        // team_id still set, but dual-enqueue is disabled.
+        let mut config = CloudConfig::default();
+        config.set_team("team-abc", "my-team");
+        config.team_auto_promote = Some(false);
+        assert_eq!(config.active_team_id(), None);
     }
 
     #[test]

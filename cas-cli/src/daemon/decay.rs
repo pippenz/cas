@@ -135,6 +135,7 @@ pub(crate) fn run_consolidation(
                 confidence: 1.0,
                 branch: None,
                 team_id: None,
+                share: None,
             };
 
             store.add(&entry)?;

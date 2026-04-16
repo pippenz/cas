@@ -27,8 +27,8 @@ impl RuleStore for SqliteRuleStore {
         let result = conn.execute(
             "INSERT INTO rules (id, created, source_ids, helpful_count, harmful_count,
              tags, paths, content, status, last_accessed, review_after, hook_command,
-             category, priority, surface_count, scope, auto_approve_tools, auto_approve_paths, team_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+             category, priority, surface_count, scope, auto_approve_tools, auto_approve_paths, team_id, share)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
             params![
                 rule.id,
                 rule.created.to_rfc3339(),
@@ -49,6 +49,7 @@ impl RuleStore for SqliteRuleStore {
                 rule.auto_approve_tools.as_ref(),
                 rule.auto_approve_paths.as_ref(),
                 rule.team_id.as_ref(),
+                rule.share.as_ref().map(|s| s.to_string()),
             ],
         );
 
@@ -79,7 +80,7 @@ impl RuleStore for SqliteRuleStore {
             .query_row(
                 "SELECT id, created, source_ids, helpful_count, harmful_count,
                  tags, paths, content, status, last_accessed, review_after, hook_command,
-                 category, priority, surface_count, scope, auto_approve_tools, auto_approve_paths, team_id
+                 category, priority, surface_count, scope, auto_approve_tools, auto_approve_paths, team_id, share
                  FROM rules WHERE id = ?",
                 params![id],
                 |row| {
@@ -113,7 +114,11 @@ impl RuleStore for SqliteRuleStore {
                         surface_count: row.get::<_, Option<i32>>(14)?.unwrap_or(0),
                         auto_approve_tools: row.get(16)?,
                         auto_approve_paths: row.get(17)?,
-                    team_id: row.get(18)?,
+                        team_id: row.get(18)?,
+                        share: row
+                            .get::<_, Option<String>>(19)?
+                            .as_deref()
+                            .and_then(|s| s.parse().ok()),
                     })
                 },
             )
@@ -129,8 +134,8 @@ impl RuleStore for SqliteRuleStore {
             "UPDATE rules SET source_ids = ?1, helpful_count = ?2, harmful_count = ?3,
              tags = ?4, paths = ?5, content = ?6, status = ?7, last_accessed = ?8,
              review_after = ?9, hook_command = ?10, category = ?11, priority = ?12,
-             surface_count = ?13, scope = ?14, auto_approve_tools = ?15, auto_approve_paths = ?16, team_id = ?17
-             WHERE id = ?18",
+             surface_count = ?13, scope = ?14, auto_approve_tools = ?15, auto_approve_paths = ?16, team_id = ?17, share = ?18
+             WHERE id = ?19",
             params![
                 Self::source_ids_to_string(&rule.source_ids),
                 rule.helpful_count,
@@ -149,6 +154,7 @@ impl RuleStore for SqliteRuleStore {
                 rule.auto_approve_tools.as_ref(),
                 rule.auto_approve_paths.as_ref(),
                 rule.team_id.as_ref(),
+                rule.share.as_ref().map(|s| s.to_string()),
                 rule.id,
             ],
         );
@@ -211,7 +217,7 @@ impl RuleStore for SqliteRuleStore {
         let mut stmt = conn.prepare_cached(
             "SELECT id, created, source_ids, helpful_count, harmful_count,
              tags, paths, content, status, last_accessed, review_after, hook_command,
-             category, priority, surface_count, scope, auto_approve_tools, auto_approve_paths, team_id
+             category, priority, surface_count, scope, auto_approve_tools, auto_approve_paths, team_id, share
              FROM rules ORDER BY priority ASC, created DESC",
         )?;
 
@@ -248,6 +254,10 @@ impl RuleStore for SqliteRuleStore {
                     auto_approve_tools: row.get(16)?,
                     auto_approve_paths: row.get(17)?,
                     team_id: row.get(18)?,
+                    share: row
+                        .get::<_, Option<String>>(19)?
+                        .as_deref()
+                        .and_then(|s| s.parse().ok()),
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;

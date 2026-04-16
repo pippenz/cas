@@ -84,6 +84,7 @@ impl CasCore {
             pending_verification: false,
             pending_worktree_merge: false,
             epic_verification_owner: None,
+            share: None,
         };
 
         task_store

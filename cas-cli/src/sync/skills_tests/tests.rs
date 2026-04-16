@@ -34,6 +34,7 @@ fn create_test_skill(name: &str, enabled: bool) -> Skill {
         updated_at: chrono::Utc::now(),
         last_used: None,
         team_id: None,
+        share: None,
     }
 }
 

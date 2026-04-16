@@ -512,6 +512,7 @@ impl CasCore {
             confidence: 1.0,
             branch,
             team_id: req.team_id.clone(),
+            share: None,
         };
 
         store.add(&entry).map_err(|e| McpError {

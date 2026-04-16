@@ -44,7 +44,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     execution_note TEXT,
     owner_id TEXT,
     visibility TEXT NOT NULL DEFAULT 'private',
-    collaborators TEXT NOT NULL DEFAULT '[]'
+    collaborators TEXT NOT NULL DEFAULT '[]',
+    share TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
@@ -192,6 +193,10 @@ impl SqliteTaskStore {
             deliverables: Self::parse_deliverables(&row.get::<_, String>(23)?),
             demo_statement: row.get::<_, String>(24)?,
             execution_note: row.get::<_, Option<String>>(25)?,
+            share: row
+                .get::<_, Option<String>>(26)?
+                .as_deref()
+                .and_then(|s| s.parse().ok()),
         })
     }
 
@@ -227,8 +232,8 @@ impl SqliteTaskStore {
             "INSERT INTO tasks (id, title, description, design, acceptance_criteria, notes,
              status, priority, task_type, assignee, labels, created_at, updated_at,
              closed_at, close_reason, external_ref, content_hash, branch, worktree_id,
-             pending_verification, pending_worktree_merge, epic_verification_owner, team_id, deliverables, demo_statement, execution_note)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
+             pending_verification, pending_worktree_merge, epic_verification_owner, team_id, deliverables, demo_statement, execution_note, share)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)",
             params![
                 task.id,
                 task.title,
@@ -256,6 +261,7 @@ impl SqliteTaskStore {
                 Self::deliverables_to_string(&task.deliverables),
                 task.demo_statement,
                 task.execution_note,
+                task.share.as_ref().map(|s| s.to_string()),
             ],
         )?;
 
@@ -334,7 +340,7 @@ impl SqliteTaskStore {
                 "SELECT id, title, description, design, acceptance_criteria, notes,
                  status, priority, task_type, assignee, labels, created_at, updated_at,
                  closed_at, close_reason, external_ref, content_hash, branch, worktree_id,
-                 pending_verification, pending_worktree_merge, epic_verification_owner, team_id, deliverables, demo_statement, execution_note
+                 pending_verification, pending_worktree_merge, epic_verification_owner, team_id, deliverables, demo_statement, execution_note, share
                  FROM tasks ORDER BY priority, created_at DESC",
             )?;
             stmt.query_map([], Self::task_from_row)?
@@ -471,7 +477,7 @@ impl TaskStore for SqliteTaskStore {
             "SELECT id, title, description, design, acceptance_criteria, notes,
              status, priority, task_type, assignee, labels, created_at, updated_at,
              closed_at, close_reason, external_ref, content_hash, branch, worktree_id,
-             pending_verification, pending_worktree_merge, epic_verification_owner, team_id, deliverables, demo_statement, execution_note
+             pending_verification, pending_worktree_merge, epic_verification_owner, team_id, deliverables, demo_statement, execution_note, share
              FROM tasks WHERE id = ?",
             params![id],
             Self::task_from_row,
@@ -503,8 +509,8 @@ impl TaskStore for SqliteTaskStore {
              closed_at = ?12, close_reason = ?13, external_ref = ?14, content_hash = ?15,
              branch = ?16, worktree_id = ?17,
              pending_verification = ?18, pending_worktree_merge = ?19, epic_verification_owner = ?20, team_id = ?21,
-             deliverables = ?22, demo_statement = ?23, execution_note = ?24
-             WHERE id = ?25",
+             deliverables = ?22, demo_statement = ?23, execution_note = ?24, share = ?25
+             WHERE id = ?26",
             params![
                 task.title,
                 task.description,
@@ -530,6 +536,7 @@ impl TaskStore for SqliteTaskStore {
                 Self::deliverables_to_string(&task.deliverables),
                 task.demo_statement,
                 task.execution_note,
+                task.share.as_ref().map(|s| s.to_string()),
                 task.id,
             ],
         )?;
@@ -627,7 +634,7 @@ impl TaskStore for SqliteTaskStore {
                 "SELECT id, title, description, design, acceptance_criteria, notes,
                  status, priority, task_type, assignee, labels, created_at, updated_at,
                  closed_at, close_reason, external_ref, content_hash, branch, worktree_id,
-                 pending_verification, pending_worktree_merge, epic_verification_owner, team_id, deliverables, demo_statement, execution_note
+                 pending_verification, pending_worktree_merge, epic_verification_owner, team_id, deliverables, demo_statement, execution_note, share
                  FROM tasks WHERE status = ? ORDER BY priority, created_at DESC",
                 vec![s.to_string()],
             ),
@@ -635,7 +642,7 @@ impl TaskStore for SqliteTaskStore {
                 "SELECT id, title, description, design, acceptance_criteria, notes,
                  status, priority, task_type, assignee, labels, created_at, updated_at,
                  closed_at, close_reason, external_ref, content_hash, branch, worktree_id,
-                 pending_verification, pending_worktree_merge, epic_verification_owner, team_id, deliverables, demo_statement, execution_note
+                 pending_verification, pending_worktree_merge, epic_verification_owner, team_id, deliverables, demo_statement, execution_note, share
                  FROM tasks ORDER BY priority, created_at DESC",
                 vec![],
             ),
@@ -661,7 +668,7 @@ impl TaskStore for SqliteTaskStore {
             "SELECT t.id, t.title, t.description, t.design, t.acceptance_criteria, t.notes,
              t.status, t.priority, t.task_type, t.assignee, t.labels, t.created_at, t.updated_at,
              t.closed_at, t.close_reason, t.external_ref, t.content_hash, t.branch, t.worktree_id,
-             t.pending_verification, t.pending_worktree_merge, t.epic_verification_owner, t.team_id, t.deliverables, t.demo_statement, t.execution_note
+             t.pending_verification, t.pending_worktree_merge, t.epic_verification_owner, t.team_id, t.deliverables, t.demo_statement, t.execution_note, t.share
              FROM tasks t
              WHERE t.status = 'open'
              AND NOT EXISTS (
@@ -689,7 +696,7 @@ impl TaskStore for SqliteTaskStore {
             "SELECT DISTINCT t.id, t.title, t.description, t.design, t.acceptance_criteria, t.notes,
              t.status, t.priority, t.task_type, t.assignee, t.labels, t.created_at, t.updated_at,
              t.closed_at, t.close_reason, t.external_ref, t.content_hash, t.branch, t.worktree_id,
-             t.pending_verification, t.pending_worktree_merge, t.epic_verification_owner, t.team_id, t.deliverables, t.demo_statement, t.execution_note
+             t.pending_verification, t.pending_worktree_merge, t.epic_verification_owner, t.team_id, t.deliverables, t.demo_statement, t.execution_note, t.share
              FROM tasks t
              JOIN dependencies d ON d.from_id = t.id
              JOIN tasks blocker ON d.to_id = blocker.id
@@ -715,7 +722,7 @@ impl TaskStore for SqliteTaskStore {
              t.id, t.title, t.description, t.design, t.acceptance_criteria, t.notes,
              t.status, t.priority, t.task_type, t.assignee, t.labels, t.created_at, t.updated_at,
              t.closed_at, t.close_reason, t.external_ref, t.content_hash, t.branch, t.worktree_id,
-             t.pending_verification, t.pending_worktree_merge, t.epic_verification_owner, t.team_id, t.deliverables, t.demo_statement, t.execution_note
+             t.pending_verification, t.pending_worktree_merge, t.epic_verification_owner, t.team_id, t.deliverables, t.demo_statement, t.execution_note, t.share
              FROM dependencies d
              JOIN tasks t ON d.to_id = t.id
              WHERE d.from_id IN ({placeholders})
@@ -759,6 +766,10 @@ impl TaskStore for SqliteTaskStore {
                 deliverables: Self::parse_deliverables(&row.get::<_, String>(24)?),
                 demo_statement: row.get::<_, String>(25)?,
                 execution_note: row.get::<_, Option<String>>(26)?,
+                share: row
+                    .get::<_, Option<String>>(27)?
+                    .as_deref()
+                    .and_then(|s| s.parse().ok()),
             };
             Ok((from_id, task))
         })?;
@@ -788,7 +799,7 @@ impl TaskStore for SqliteTaskStore {
             "SELECT id, title, description, design, acceptance_criteria, notes,
              status, priority, task_type, assignee, labels, created_at, updated_at,
              closed_at, close_reason, external_ref, content_hash, branch, worktree_id,
-             pending_verification, pending_worktree_merge, epic_verification_owner, team_id, deliverables, demo_statement, execution_note
+             pending_verification, pending_worktree_merge, epic_verification_owner, team_id, deliverables, demo_statement, execution_note, share
              FROM tasks WHERE pending_verification = 1",
         )?;
         let tasks = stmt
@@ -803,7 +814,7 @@ impl TaskStore for SqliteTaskStore {
             "SELECT id, title, description, design, acceptance_criteria, notes,
              status, priority, task_type, assignee, labels, created_at, updated_at,
              closed_at, close_reason, external_ref, content_hash, branch, worktree_id,
-             pending_verification, pending_worktree_merge, epic_verification_owner, team_id, deliverables, demo_statement, execution_note
+             pending_verification, pending_worktree_merge, epic_verification_owner, team_id, deliverables, demo_statement, execution_note, share
              FROM tasks WHERE pending_worktree_merge = 1",
         )?;
         let tasks = stmt
@@ -866,7 +877,7 @@ impl TaskStore for SqliteTaskStore {
             "SELECT t.id, t.title, t.description, t.design, t.acceptance_criteria, t.notes,
              t.status, t.priority, t.task_type, t.assignee, t.labels, t.created_at, t.updated_at,
              t.closed_at, t.close_reason, t.external_ref, t.content_hash, t.branch, t.worktree_id,
-             t.pending_verification, t.pending_worktree_merge, t.epic_verification_owner, t.team_id, t.deliverables, t.demo_statement, t.execution_note
+             t.pending_verification, t.pending_worktree_merge, t.epic_verification_owner, t.team_id, t.deliverables, t.demo_statement, t.execution_note, t.share
              FROM tasks t
              JOIN dependencies d ON d.to_id = t.id
              WHERE d.from_id = ? AND d.dep_type = 'blocks' AND t.status != 'closed'",
@@ -941,7 +952,7 @@ impl TaskStore for SqliteTaskStore {
              SELECT t.id, t.title, t.description, t.design, t.acceptance_criteria, t.notes,
              t.status, t.priority, t.task_type, t.assignee, t.labels, t.created_at, t.updated_at,
              t.closed_at, t.close_reason, t.external_ref, t.content_hash, t.branch, t.worktree_id,
-             t.pending_verification, t.pending_worktree_merge, t.epic_verification_owner, t.team_id, t.deliverables, t.demo_statement, t.execution_note
+             t.pending_verification, t.pending_worktree_merge, t.epic_verification_owner, t.team_id, t.deliverables, t.demo_statement, t.execution_note, t.share
              FROM tasks t
              JOIN subtree s ON t.id = s.task_id",
         )?;
@@ -994,7 +1005,7 @@ impl TaskStore for SqliteTaskStore {
             "SELECT t.id, t.title, t.description, t.design, t.acceptance_criteria, t.notes,
              t.status, t.priority, t.task_type, t.assignee, t.labels, t.created_at, t.updated_at,
              t.closed_at, t.close_reason, t.external_ref, t.content_hash, t.branch, t.worktree_id,
-             t.pending_verification, t.pending_worktree_merge, t.epic_verification_owner, t.team_id, t.deliverables, t.demo_statement, t.execution_note
+             t.pending_verification, t.pending_worktree_merge, t.epic_verification_owner, t.team_id, t.deliverables, t.demo_statement, t.execution_note, t.share
              FROM tasks t
              JOIN dependencies d ON d.to_id = t.id
              WHERE d.from_id = ? AND d.dep_type = 'parent-child' AND t.task_type = 'epic'

@@ -56,6 +56,8 @@ CREATE TABLE IF NOT EXISTS entries (
     scope TEXT NOT NULL DEFAULT 'project',
     -- Team collaboration
     team_id TEXT,
+    -- Team-promotion share override (private | team)
+    share TEXT,
     -- Incremental indexing tracking
     updated_at TEXT,
     indexed_at TEXT
@@ -100,7 +102,9 @@ CREATE TABLE IF NOT EXISTS rules (
     -- Path patterns for auto-approval (comma-separated globs)
     auto_approve_paths TEXT,
     -- Team collaboration
-    team_id TEXT
+    team_id TEXT,
+    -- Team-promotion share override (private | team)
+    share TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_rules_created ON rules(created DESC);
@@ -164,15 +168,15 @@ impl SqliteStore {
         }
     }
 
-    /// Construct an `Entry` from a row selected with the standard 31-column projection.
+    /// Construct an `Entry` from a row selected with the standard 32-column projection.
     ///
-    /// Expected column order (indices 0–30):
+    /// Expected column order (indices 0–31):
     ///   id, type, tags, created, content, title, helpful_count,
     ///   harmful_count, last_accessed, archived, session_id, source_tool,
     ///   pending_extraction, observation_type, stability, access_count,
     ///   raw_content, compressed, memory_tier, importance, valid_from, valid_until,
     ///   review_after, last_reviewed, pending_embedding, belief_type, confidence,
-    ///   domain, branch, scope, team_id
+    ///   domain, branch, scope, team_id, share
     fn row_to_entry(row: &rusqlite::Row) -> rusqlite::Result<Entry> {
         Ok(Entry {
             id: row.get(0)?,
@@ -222,6 +226,10 @@ impl SqliteStore {
                 .map(|s| Scope::from_str(&s).unwrap_or_default())
                 .unwrap_or_default(),
             team_id: row.get(30)?,
+            share: row
+                .get::<_, Option<String>>(31)?
+                .as_deref()
+                .and_then(|s| s.parse().ok()),
         })
     }
 
@@ -720,7 +728,7 @@ impl SqliteRuleStore {
         let mut stmt = conn.prepare_cached(
             "SELECT id, created, source_ids, helpful_count, harmful_count,
              tags, paths, content, status, last_accessed, review_after, hook_command,
-             category, priority, surface_count, scope, auto_approve_tools, auto_approve_paths, team_id
+             category, priority, surface_count, scope, auto_approve_tools, auto_approve_paths, team_id, share
              FROM rules WHERE status = 'proven' ORDER BY priority ASC, created DESC",
         )?;
 
@@ -757,6 +765,10 @@ impl SqliteRuleStore {
                     auto_approve_tools: row.get(16)?,
                     auto_approve_paths: row.get(17)?,
                     team_id: row.get(18)?,
+                    share: row
+                        .get::<_, Option<String>>(19)?
+                        .as_deref()
+                        .and_then(|s| s.parse().ok()),
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -770,7 +782,7 @@ impl SqliteRuleStore {
         let mut stmt = conn.prepare_cached(
             "SELECT id, created, source_ids, helpful_count, harmful_count,
              tags, paths, content, status, last_accessed, review_after, hook_command,
-             category, priority, surface_count, scope, auto_approve_tools, auto_approve_paths, team_id
+             category, priority, surface_count, scope, auto_approve_tools, auto_approve_paths, team_id, share
              FROM rules WHERE priority = 0 AND status IN ('proven', 'draft') ORDER BY created DESC",
         )?;
 
@@ -807,6 +819,10 @@ impl SqliteRuleStore {
                     auto_approve_tools: row.get(16)?,
                     auto_approve_paths: row.get(17)?,
                     team_id: row.get(18)?,
+                    share: row
+                        .get::<_, Option<String>>(19)?
+                        .as_deref()
+                        .and_then(|s| s.parse().ok()),
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;

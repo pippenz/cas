@@ -30,12 +30,40 @@ pub enum CloudCommands {
     Pull(CloudPullArgs),
     /// Full sync (push then pull)
     Sync(CloudSyncArgs),
+    /// Configure the active team for team-scoped sync operations
+    #[command(subcommand)]
+    Team(CloudTeamCommands),
     /// List team projects in cloud
     Projects(CloudProjectsArgs),
     /// Pull team memories for the current project
     TeamMemories(CloudTeamMemoriesArgs),
     /// Remove foreign-project entities from local DB and re-pull
     PurgeForeign(CloudPurgeForeignArgs),
+}
+
+/// Subcommands for `cas cloud team`
+#[derive(Subcommand)]
+pub enum CloudTeamCommands {
+    /// Set the active team by UUID
+    ///
+    /// The team is persisted in `~/.cas/cloud.json` and used by team-scoped
+    /// sync operations (push to `/api/teams/{uuid}/sync/push`, pull via
+    /// `cas cloud team-memories`).
+    ///
+    /// Only UUID input is supported today — slug resolution requires a
+    /// cloud-side endpoint that is not yet available. Find your team UUID
+    /// in the CAS Cloud dashboard under team settings.
+    Set(CloudTeamSetArgs),
+    /// Show the currently configured team
+    Show,
+    /// Clear the configured team (no more team-scoped sync)
+    Clear,
+}
+
+#[derive(Parser)]
+pub struct CloudTeamSetArgs {
+    /// Team UUID (e.g., 550e8400-e29b-41d4-a716-446655440000)
+    pub id: String,
 }
 
 #[derive(Parser)]
@@ -77,7 +105,7 @@ pub struct CloudSyncArgs {
 
 #[derive(Parser)]
 pub struct CloudProjectsArgs {
-    /// Specify team slug (defaults to active team)
+    /// Team UUID override (defaults to the team configured via `cas cloud team set`)
     #[arg(long)]
     pub team: Option<String>,
 }
@@ -126,10 +154,243 @@ pub fn execute(cmd: &CloudCommands, cli: &Cli, cas_root: &Path) -> anyhow::Resul
         CloudCommands::Push(args) => execute_push(args, cli, cas_root),
         CloudCommands::Pull(args) => execute_pull(args, cli, cas_root),
         CloudCommands::Sync(args) => execute_sync(args, cli, cas_root),
+        CloudCommands::Team(cmd) => execute_team(cmd, cli),
         CloudCommands::Projects(args) => execute_projects(args, cli),
         CloudCommands::TeamMemories(args) => execute_team_memories(args, cli, cas_root),
         CloudCommands::PurgeForeign(args) => execute_purge_foreign(args, cli, cas_root),
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TEAM — set / show / clear the active team
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// HTTP timeout for the pre-flight team-membership probe.
+///
+/// Same magnitude as the coordinator's default — long enough to absorb a cold
+/// Neon/Vercel cache, short enough that a misconfigured endpoint fails
+/// visibly instead of hanging the shell.
+const TEAM_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Validate a string is a canonical UUID (36 chars, 8-4-4-4-12 hex).
+///
+/// Both upper- and lower-case hex are accepted; the value is normalised to
+/// lowercase on return. Non-canonical UUID forms (braces `{...}`,
+/// no-hyphen 32-char, URN `urn:uuid:...`) that the `uuid` crate would
+/// otherwise accept are explicitly rejected — the server stores team UUIDs
+/// in canonical form, and silently accepting variants would let two strings
+/// represent the same team locally while compare-unequal elsewhere.
+///
+/// Returns a short error (no "find your UUID here" guidance); the CLI
+/// layer wraps that with endpoint-specific help via `format_uuid_error`.
+fn parse_team_uuid(input: &str) -> Result<String, String> {
+    // Canonical hyphenated form is exactly 36 chars; reject braces,
+    // URN-prefixed, and no-hyphen 32-char variants before uuid::try_parse
+    // normalises them silently.
+    if input.len() != 36 {
+        return Err(format!("expected a team UUID, got `{input}`"));
+    }
+    match uuid::Uuid::try_parse(input) {
+        Ok(u) => Ok(u.as_hyphenated().to_string()),
+        Err(_) => Err(format!("expected a team UUID, got `{input}`")),
+    }
+}
+
+/// Wrap a `parse_team_uuid` error with endpoint-aware guidance on where to
+/// find the team UUID. Kept separate so the parser stays pure.
+fn format_uuid_error(short: &str, endpoint: &str) -> String {
+    // Strip any trailing slash so the interpolated URL is clean.
+    let base = endpoint.trim_end_matches('/');
+    format!(
+        "{short}.\n\n  Slug resolution is not yet supported. Find your team UUID at:\n    {base}/dashboard/teams\n\n  If a teammate has already set up cloud sync, check their\n  `~/.cas/cloud.json` for the `team_id` field and pass that UUID to\n  `cas cloud team set <uuid>`."
+    )
+}
+
+/// Result of probing team membership via `GET /api/teams/{uuid}/projects`.
+#[derive(Debug, PartialEq, Eq)]
+enum TeamProbeOutcome {
+    /// Server returned 2xx — user is a member of the team.
+    Member,
+    /// Server returned 401 — the token is invalid or expired.
+    Unauthorized,
+    /// Server returned 403 — valid token, but user is not a team member.
+    NotAMember,
+    /// Server returned 404 — team UUID does not exist.
+    NotFound,
+    /// Network error or unexpected status code.
+    Error(String),
+}
+
+/// Probe team membership by hitting `GET /api/teams/{uuid}/projects`.
+///
+/// This endpoint already enforces `validateTeamMembership` server-side and is
+/// cheap (no body), so it is the natural pre-flight check before persisting
+/// `team_id` to cloud.json. Factored out for testability with wiremock.
+fn probe_team_membership(endpoint: &str, token: &str, team_uuid: &str) -> TeamProbeOutcome {
+    let url = format!("{endpoint}/api/teams/{team_uuid}/projects");
+    match ureq::get(&url)
+        .timeout(TEAM_PROBE_TIMEOUT)
+        .set("Authorization", &format!("Bearer {token}"))
+        .call()
+    {
+        Ok(_) => TeamProbeOutcome::Member,
+        Err(ureq::Error::Status(401, _)) => TeamProbeOutcome::Unauthorized,
+        Err(ureq::Error::Status(403, _)) => TeamProbeOutcome::NotAMember,
+        Err(ureq::Error::Status(404, _)) => TeamProbeOutcome::NotFound,
+        Err(ureq::Error::Status(code, _)) => {
+            TeamProbeOutcome::Error(format!("unexpected HTTP {code}"))
+        }
+        Err(e) => TeamProbeOutcome::Error(format!("network error: {e}")),
+    }
+}
+
+fn execute_team(cmd: &CloudTeamCommands, cli: &Cli) -> anyhow::Result<()> {
+    match cmd {
+        CloudTeamCommands::Set(args) => execute_team_set(args, cli),
+        CloudTeamCommands::Show => execute_team_show(cli),
+        CloudTeamCommands::Clear => execute_team_clear(cli),
+    }
+}
+
+fn execute_team_set(args: &CloudTeamSetArgs, cli: &Cli) -> anyhow::Result<()> {
+    // Load config before parsing so the error path can build an
+    // endpoint-aware dashboard URL ("find your team UUID at …").
+    let mut config = CloudConfig::load()?;
+
+    let uuid = parse_team_uuid(&args.id).map_err(|short| {
+        anyhow::anyhow!("{}", format_uuid_error(&short, &config.endpoint))
+    })?;
+
+    let token = config
+        .token
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Not logged in. Run 'cas login' first."))?
+        .clone();
+
+    match probe_team_membership(&config.endpoint, &token, &uuid) {
+        TeamProbeOutcome::Member => {
+            // The membership probe endpoint doesn't return the slug. Set
+            // team_id directly and leave team_slug None so downstream
+            // callers (execute_projects, hooks/context.rs) fall through to
+            // their "show UUID" / "your team" default instead of rendering
+            // a sentinel string. A future cloud-side slug resolver (tracked
+            // in T7 docs) can populate team_slug when it lands.
+            config.team_id = Some(uuid.clone());
+            config.team_slug = None;
+            config.save()?;
+
+            if cli.json {
+                let out = serde_json::json!({
+                    "status": "ok",
+                    "team_id": uuid,
+                    "team_slug": serde_json::Value::Null,
+                });
+                println!("{}", out);
+            } else {
+                let theme = ActiveTheme::default();
+                let mut out = io::stdout();
+                let mut fmt = Formatter::stdout(&mut out, theme);
+                let success_color = fmt.theme().palette.status_success;
+                fmt.newline()?;
+                fmt.write_colored("  \u{2713} ", success_color)?;
+                fmt.write_raw("Active team set")?;
+                fmt.newline()?;
+                fmt.write_muted("  UUID: ")?;
+                fmt.write_raw(&uuid)?;
+                fmt.newline()?;
+                fmt.write_muted("  Slug resolution deferred — see `cas cloud team show`")?;
+                fmt.newline()?;
+            }
+            Ok(())
+        }
+        TeamProbeOutcome::Unauthorized => {
+            anyhow::bail!("Token invalid or expired. Run 'cas login' to re-authenticate.")
+        }
+        TeamProbeOutcome::NotAMember => {
+            anyhow::bail!("You are not a member of team {uuid}.")
+        }
+        TeamProbeOutcome::NotFound => {
+            anyhow::bail!("Team {uuid} not found on {}.", config.endpoint)
+        }
+        TeamProbeOutcome::Error(msg) => {
+            anyhow::bail!("Failed to verify team membership: {msg}")
+        }
+    }
+}
+
+fn execute_team_show(cli: &Cli) -> anyhow::Result<()> {
+    let config = CloudConfig::load()?;
+
+    match (&config.team_id, &config.team_slug) {
+        (Some(id), slug) => {
+            if cli.json {
+                let out = serde_json::json!({
+                    "team_id": id,
+                    "team_slug": slug,
+                });
+                println!("{}", out);
+            } else {
+                let theme = ActiveTheme::default();
+                let mut out = io::stdout();
+                let mut fmt = Formatter::stdout(&mut out, theme);
+                fmt.newline()?;
+                fmt.write_muted("  Team ID:   ")?;
+                fmt.write_raw(id)?;
+                fmt.newline()?;
+                fmt.write_muted("  Team slug: ")?;
+                fmt.write_raw(slug.as_deref().unwrap_or("<not resolved>"))?;
+                fmt.newline()?;
+            }
+        }
+        (None, _) => {
+            if cli.json {
+                let out = serde_json::json!({
+                    "team_id": serde_json::Value::Null,
+                });
+                println!("{}", out);
+            } else {
+                let theme = ActiveTheme::default();
+                let mut out = io::stdout();
+                let mut fmt = Formatter::stdout(&mut out, theme);
+                let warning_color = fmt.theme().palette.status_warning;
+                fmt.newline()?;
+                fmt.write_colored("  \u{25CF} ", warning_color)?;
+                fmt.write_raw("No team configured")?;
+                fmt.newline()?;
+                fmt.write_raw("  Run ")?;
+                fmt.write_accent("cas cloud team set <uuid>")?;
+                fmt.write_raw(" to set the active team.")?;
+                fmt.newline()?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn execute_team_clear(cli: &Cli) -> anyhow::Result<()> {
+    let mut config = CloudConfig::load()?;
+    let was_set = config.team_id.is_some();
+    config.clear_team();
+    config.save()?;
+
+    if cli.json {
+        let out = serde_json::json!({ "status": "ok", "was_set": was_set });
+        println!("{}", out);
+    } else {
+        let theme = ActiveTheme::default();
+        let mut out = io::stdout();
+        let mut fmt = Formatter::stdout(&mut out, theme);
+        let success_color = fmt.theme().palette.status_success;
+        fmt.newline()?;
+        fmt.write_colored("  \u{2713} ", success_color)?;
+        fmt.write_raw(if was_set {
+            "Active team cleared"
+        } else {
+            "No team was configured"
+        })?;
+        fmt.newline()?;
+    }
+    Ok(())
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1098,6 +1359,14 @@ fn execute_sync(args: &CloudSyncArgs, cli: &Cli, cas_root: &Path) -> anyhow::Res
     )?;
 
     if !args.dry_run {
+        // Drain the team queue before pulling — when a team is configured,
+        // writes since the last sync were dual-enqueued by T3's syncing
+        // wrappers; this is where the team rows reach the server. Team
+        // push failure is isolated from the personal drain above (which
+        // already succeeded by now) and from the pull below (best-effort).
+        let cloud_config = CloudConfig::load()?;
+        execute_team_push(&cloud_config, cas_root, cli)?;
+
         execute_pull(
             &CloudPullArgs {
                 entries_only: false,
@@ -1109,6 +1378,185 @@ fn execute_sync(args: &CloudSyncArgs, cli: &Cli, cas_root: &Path) -> anyhow::Res
         )?;
     }
 
+    Ok(())
+}
+
+/// Drain the team queue into `POST /api/teams/{uuid}/sync/push` when a
+/// team is configured. No-op when no active team.
+///
+/// Contract: always returns `Ok(())` — team-push failures are reported
+/// via `report_team_push_*` and isolated from the surrounding sync so
+/// the personal drain already done stays, and the pull that follows
+/// still runs. Items that fail to push remain in the team queue
+/// (re-enqueued by `push_team` itself) for the next sync cycle.
+///
+/// `pub` so `cas-cli/tests/team_sync_test.rs` can exercise the helper
+/// directly with a wiremock server. Not intended for external use.
+#[doc(hidden)]
+pub fn execute_team_push(
+    cloud_config: &CloudConfig,
+    cas_root: &Path,
+    cli: &Cli,
+) -> anyhow::Result<()> {
+    let Some(team_id) = cloud_config.active_team_id() else {
+        return Ok(());
+    };
+    let team_id = team_id.to_string();
+
+    let queue = match crate::cloud::SyncQueue::open(cas_root) {
+        Ok(q) => {
+            if let Err(e) = q.init() {
+                tracing::warn!(
+                    target: "cas::sync",
+                    error = %e,
+                    "team sync queue init failed; draining aborted",
+                );
+                // Isolation contract: reporter errors must not escape.
+                let _ = report_team_push_error(cli, &format!("Team sync queue init failed: {e}"));
+                return Ok(());
+            }
+            q
+        }
+        Err(e) => {
+            let _ = report_team_push_error(cli, &format!("Could not open sync queue: {e}"));
+            return Ok(());
+        }
+    };
+
+    let syncer = crate::cloud::CloudSyncer::new(
+        std::sync::Arc::new(queue),
+        cloud_config.clone(),
+        crate::cloud::CloudSyncerConfig::default(),
+    );
+
+    // `let _ =` on reporter calls: a formatter/IO error from the display
+    // path must not propagate out and block the caller's pull step.
+    match syncer.push_team(&team_id) {
+        Ok(result) => {
+            if result.errors.is_empty() {
+                let _ = report_team_push_result(cli, &team_id, &result);
+            } else {
+                let _ = report_team_push_partial(cli, &team_id, &result);
+            }
+        }
+        Err(e) => {
+            let _ = report_team_push_error(cli, &format!("Team push failed: {e}"));
+        }
+    }
+    Ok(())
+}
+
+fn report_team_push_result(
+    cli: &Cli,
+    team_id: &str,
+    result: &crate::cloud::SyncResult,
+) -> anyhow::Result<()> {
+    if cli.json {
+        println!("{}", team_push_json(team_id, result, &[]));
+    } else {
+        // `total_pushed()` sums all 12 entity types — not just
+        // entries/tasks/rules/skills — so a sync that only pushes
+        // sessions/events/prompts still surfaces in the human output.
+        if result.total_pushed() > 0 {
+            let theme = ActiveTheme::default();
+            let mut out = io::stdout();
+            let mut fmt = Formatter::stdout(&mut out, theme);
+            let success_color = fmt.theme().palette.status_success;
+            fmt.write_colored("  \u{2713} ", success_color)?;
+            fmt.write_raw(&format!(
+                "Team push: {} entries, {} tasks, {} rules, {} skills ({} total)",
+                result.pushed_entries,
+                result.pushed_tasks,
+                result.pushed_rules,
+                result.pushed_skills,
+                result.total_pushed(),
+            ))?;
+            fmt.newline()?;
+        }
+    }
+    Ok(())
+}
+
+/// Shared JSON shape for `report_team_push_{result,partial}` — consumers
+/// see a consistent `{team_push: {...}}` object whether the push fully
+/// succeeded or partially failed. `errors` is always present (empty for
+/// full success), and every `pushed_*` count is always present.
+fn team_push_json(
+    team_id: &str,
+    result: &crate::cloud::SyncResult,
+    extra_errors: &[String],
+) -> serde_json::Value {
+    let mut errors = result.errors.clone();
+    errors.extend(extra_errors.iter().cloned());
+    serde_json::json!({
+        "team_push": {
+            "team_id": team_id,
+            "pushed_entries": result.pushed_entries,
+            "pushed_tasks": result.pushed_tasks,
+            "pushed_rules": result.pushed_rules,
+            "pushed_skills": result.pushed_skills,
+            "pushed_sessions": result.pushed_sessions,
+            "pushed_verifications": result.pushed_verifications,
+            "pushed_events": result.pushed_events,
+            "pushed_prompts": result.pushed_prompts,
+            "pushed_file_changes": result.pushed_file_changes,
+            "pushed_commit_links": result.pushed_commit_links,
+            "pushed_agents": result.pushed_agents,
+            "pushed_worktrees": result.pushed_worktrees,
+            "total_pushed": result.total_pushed(),
+            "duration_ms": result.duration_ms,
+            "errors": errors,
+        }
+    })
+}
+
+fn report_team_push_partial(
+    cli: &Cli,
+    team_id: &str,
+    result: &crate::cloud::SyncResult,
+) -> anyhow::Result<()> {
+    if cli.json {
+        // Same shape as the full-success path so JSON consumers can
+        // always read pushed counts regardless of outcome.
+        println!("{}", team_push_json(team_id, result, &[]));
+    } else {
+        let theme = ActiveTheme::default();
+        let mut out = io::stdout();
+        let mut fmt = Formatter::stdout(&mut out, theme);
+        let warning_color = fmt.theme().palette.status_warning;
+        fmt.write_colored("  \u{26A0} ", warning_color)?;
+        fmt.write_raw(&format!(
+            "Team push encountered {} error(s); items re-queued for next sync",
+            result.errors.len()
+        ))?;
+        fmt.newline()?;
+        for err in &result.errors {
+            fmt.write_muted("    - ")?;
+            fmt.write_raw(err)?;
+            fmt.newline()?;
+        }
+    }
+    Ok(())
+}
+
+fn report_team_push_error(cli: &Cli, msg: &str) -> anyhow::Result<()> {
+    if cli.json {
+        // Empty SyncResult + the single fatal error as a string — keeps
+        // shape consistent with success/partial paths.
+        let empty = crate::cloud::SyncResult::default();
+        println!(
+            "{}",
+            team_push_json("", &empty, std::slice::from_ref(&msg.to_string()))
+        );
+    } else {
+        let theme = ActiveTheme::default();
+        let mut out = io::stdout();
+        let mut fmt = Formatter::stdout(&mut out, theme);
+        let warning_color = fmt.theme().palette.status_warning;
+        fmt.write_colored("  \u{26A0} ", warning_color)?;
+        fmt.write_raw(msg)?;
+        fmt.newline()?;
+    }
     Ok(())
 }
 
@@ -1142,7 +1590,7 @@ fn execute_projects(args: &CloudProjectsArgs, cli: &Cli) -> anyhow::Result<()> {
                 let warning_color = fmt.theme().palette.status_warning;
                 fmt.write_colored("  \u{25CF} ", warning_color)?;
                 fmt.write_raw("No team configured. Run ")?;
-                fmt.write_accent("cas cloud team set <slug>")?;
+                fmt.write_accent("cas cloud team set <uuid>")?;
                 fmt.write_raw(" first.")?;
                 fmt.newline()?;
             }
@@ -1271,7 +1719,7 @@ fn execute_team_memories(
         .team_id
         .as_ref()
         .ok_or_else(|| {
-            anyhow::anyhow!("No team configured. Run `cas cloud team set <slug>` first.")
+            anyhow::anyhow!("No team configured. Run `cas cloud team set <uuid>` first.")
         })?
         .clone();
 
@@ -1334,7 +1782,7 @@ fn execute_team_memories(
                 clear_inline(prev_lines)?;
             }
             anyhow::bail!(
-                "This project hasn't been synced to the team yet. Run `cas cloud sync --team` to register it."
+                "This project hasn't been synced to the team yet. Run `cas cloud sync` while a team is configured (see `cas cloud team set <uuid>`) to register it."
             );
         }
     };
@@ -1726,3 +2174,250 @@ fn execute_purge_foreign(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod team_cmd_tests {
+    use super::*;
+    use tempfile::TempDir;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn parse_team_uuid_accepts_canonical() {
+        let uuid = parse_team_uuid("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        assert_eq!(uuid, "550e8400-e29b-41d4-a716-446655440000");
+    }
+
+    #[test]
+    fn parse_team_uuid_normalises_uppercase() {
+        let uuid = parse_team_uuid("550E8400-E29B-41D4-A716-446655440000").unwrap();
+        assert_eq!(uuid, "550e8400-e29b-41d4-a716-446655440000");
+    }
+
+    #[test]
+    fn parse_team_uuid_rejects_slug() {
+        let err = parse_team_uuid("petra-stella").unwrap_err();
+        assert!(err.contains("expected a team UUID"));
+        assert!(err.contains("petra-stella"));
+    }
+
+    #[test]
+    fn parse_team_uuid_rejects_empty() {
+        assert!(parse_team_uuid("").is_err());
+    }
+
+    #[test]
+    fn parse_team_uuid_rejects_too_short() {
+        assert!(parse_team_uuid("abc-123").is_err());
+    }
+
+    #[test]
+    fn parse_team_uuid_rejects_no_hyphen_form() {
+        // uuid crate would parse this as a simple form; our length gate
+        // rejects it so the stored value never drifts from canonical.
+        let err = parse_team_uuid("550e8400e29b41d4a716446655440000").unwrap_err();
+        assert!(err.contains("expected a team UUID"));
+    }
+
+    #[test]
+    fn parse_team_uuid_rejects_braced_form() {
+        let err = parse_team_uuid("{550e8400-e29b-41d4-a716-446655440000}").unwrap_err();
+        assert!(err.contains("expected a team UUID"));
+    }
+
+    #[test]
+    fn parse_team_uuid_rejects_urn_form() {
+        let err = parse_team_uuid("urn:uuid:550e8400-e29b-41d4-a716-446655440000").unwrap_err();
+        assert!(err.contains("expected a team UUID"));
+    }
+
+    #[test]
+    fn format_uuid_error_uses_endpoint_dashboard_url() {
+        let msg = format_uuid_error(
+            "expected a team UUID, got `petra-stella`",
+            "https://cas.dev",
+        );
+        assert!(msg.contains("got `petra-stella`"));
+        assert!(msg.contains("https://cas.dev/dashboard/teams"));
+        assert!(msg.contains("Slug resolution is not yet supported"));
+        assert!(msg.contains("cloud.json"));
+    }
+
+    #[test]
+    fn format_uuid_error_strips_trailing_slash_on_endpoint() {
+        let msg = format_uuid_error("expected a team UUID, got `x`", "https://custom.host/");
+        // Should not produce a double-slash in the URL.
+        assert!(msg.contains("https://custom.host/dashboard/teams"));
+        assert!(!msg.contains("//dashboard"));
+    }
+
+    #[test]
+    fn config_set_team_roundtrip() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("cloud.json");
+
+        let mut config = CloudConfig::default();
+        config.set_team("550e8400-e29b-41d4-a716-446655440000", "<unknown>");
+        config.save_to(&path).unwrap();
+
+        let loaded = CloudConfig::load_from(&path).unwrap();
+        assert_eq!(
+            loaded.team_id.as_deref(),
+            Some("550e8400-e29b-41d4-a716-446655440000")
+        );
+        assert_eq!(loaded.team_slug.as_deref(), Some("<unknown>"));
+
+        let mut loaded = loaded;
+        loaded.clear_team();
+        loaded.save_to(&path).unwrap();
+
+        let reloaded = CloudConfig::load_from(&path).unwrap();
+        assert!(reloaded.team_id.is_none());
+        assert!(reloaded.team_slug.is_none());
+    }
+
+    // These probe_membership tests use `tokio::task::spawn_blocking` to call
+    // the synchronous `ureq`-based `probe_team_membership` from inside
+    // `#[tokio::test]` (which runs on a current-thread runtime). `wiremock`
+    // binds the MockServer on the test's tokio runtime; the blocking call
+    // executes on tokio's separate blocking pool. `await`-ing the join
+    // handle drives the runtime so the mock can serve the request — if you
+    // ever replace this pattern, be sure the HTTP call still has a live
+    // runtime to answer it on the other side.
+    #[tokio::test]
+    async fn probe_membership_returns_member_on_200() {
+        let server = MockServer::start().await;
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+        Mock::given(method("GET"))
+            .and(path(format!("/api/teams/{uuid}/projects")))
+            .and(header("Authorization", "Bearer test-token"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "projects": [] })),
+            )
+            .mount(&server)
+            .await;
+        let endpoint = server.uri();
+
+        let outcome = tokio::task::spawn_blocking(move || {
+            probe_team_membership(&endpoint, "test-token", uuid)
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, TeamProbeOutcome::Member);
+    }
+
+    #[tokio::test]
+    async fn probe_membership_returns_unauthorized_on_401() {
+        let server = MockServer::start().await;
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+        Mock::given(method("GET"))
+            .and(path(format!("/api/teams/{uuid}/projects")))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+        let endpoint = server.uri();
+
+        let outcome = tokio::task::spawn_blocking(move || {
+            probe_team_membership(&endpoint, "bad-token", uuid)
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, TeamProbeOutcome::Unauthorized);
+    }
+
+    #[tokio::test]
+    async fn probe_membership_returns_not_a_member_on_403() {
+        let server = MockServer::start().await;
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+        Mock::given(method("GET"))
+            .and(path(format!("/api/teams/{uuid}/projects")))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+        let endpoint = server.uri();
+
+        let outcome = tokio::task::spawn_blocking(move || {
+            probe_team_membership(&endpoint, "test-token", uuid)
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, TeamProbeOutcome::NotAMember);
+    }
+
+    #[tokio::test]
+    async fn probe_membership_returns_not_found_on_404() {
+        let server = MockServer::start().await;
+        let uuid = "00000000-0000-0000-0000-000000000000";
+        Mock::given(method("GET"))
+            .and(path(format!("/api/teams/{uuid}/projects")))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let endpoint = server.uri();
+
+        let outcome = tokio::task::spawn_blocking(move || {
+            probe_team_membership(&endpoint, "test-token", uuid)
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, TeamProbeOutcome::NotFound);
+    }
+
+    #[tokio::test]
+    async fn probe_membership_returns_error_on_500() {
+        let server = MockServer::start().await;
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+        Mock::given(method("GET"))
+            .and(path(format!("/api/teams/{uuid}/projects")))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let endpoint = server.uri();
+
+        let outcome = tokio::task::spawn_blocking(move || {
+            probe_team_membership(&endpoint, "test-token", uuid)
+        })
+        .await
+        .unwrap();
+
+        match outcome {
+            TeamProbeOutcome::Error(msg) => assert_eq!(msg, "unexpected HTTP 500"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_membership_returns_error_on_network_failure() {
+        // Port 1 is never open on a normal machine; ureq will fail with a
+        // transport error. We don't pin the exact wording because ureq's
+        // Display differs across platforms, but the prefix is ours.
+        let endpoint = "http://127.0.0.1:1".to_string();
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+
+        let outcome = tokio::task::spawn_blocking(move || {
+            probe_team_membership(&endpoint, "test-token", uuid)
+        })
+        .await
+        .unwrap();
+
+        match outcome {
+            TeamProbeOutcome::Error(msg) => {
+                assert!(
+                    msg.starts_with("network error:"),
+                    "expected `network error: ...`, got: {msg}"
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+}
+
+// T4 team-sync tests now live in `cas-cli/tests/team_sync_test.rs` — an
+// integration-test binary that exercises `execute_team_push` end-to-end
+// with wiremock. Extracted per the task-verifier feedback on cas-1f44:
+// tests are easier to find in the integration tree than buried in this
+// 2.4k-line CLI file.
