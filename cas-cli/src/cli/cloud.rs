@@ -1359,6 +1359,14 @@ fn execute_sync(args: &CloudSyncArgs, cli: &Cli, cas_root: &Path) -> anyhow::Res
     )?;
 
     if !args.dry_run {
+        // Drain the team queue before pulling — when a team is configured,
+        // writes since the last sync were dual-enqueued by T3's syncing
+        // wrappers; this is where the team rows reach the server. Team
+        // push failure is isolated from the personal drain above (which
+        // already succeeded by now) and from the pull below (best-effort).
+        let cloud_config = CloudConfig::load()?;
+        execute_team_push(&cloud_config, cas_root, cli)?;
+
         execute_pull(
             &CloudPullArgs {
                 entries_only: false,
@@ -1370,6 +1378,151 @@ fn execute_sync(args: &CloudSyncArgs, cli: &Cli, cas_root: &Path) -> anyhow::Res
         )?;
     }
 
+    Ok(())
+}
+
+/// Drain the team queue into `POST /api/teams/{uuid}/sync/push` when a
+/// team is configured. No-op when no active team (returns Ok).
+///
+/// Per T4 acceptance criteria:
+/// - Team push failure is isolated: errors are reported but `Ok(())` is
+///   returned so the caller's personal drain and subsequent pull are not
+///   affected. Items that fail to push remain in the team queue
+///   (re-enqueued by `push_team` itself) for the next sync.
+/// - `project_canonical_id` is included in the POST payload (handled by
+///   `CloudSyncer::push_team`).
+/// - Per-queue stats are reported on success.
+fn execute_team_push(
+    cloud_config: &CloudConfig,
+    cas_root: &Path,
+    cli: &Cli,
+) -> anyhow::Result<()> {
+    let Some(team_id) = cloud_config.active_team_id() else {
+        return Ok(());
+    };
+    let team_id = team_id.to_string();
+
+    let queue = match crate::cloud::SyncQueue::open(cas_root) {
+        Ok(q) => {
+            let _ = q.init();
+            q
+        }
+        Err(e) => {
+            report_team_push_error(cli, &format!("Could not open sync queue: {e}"))?;
+            return Ok(());
+        }
+    };
+
+    let syncer = crate::cloud::CloudSyncer::new(
+        std::sync::Arc::new(queue),
+        cloud_config.clone(),
+        crate::cloud::CloudSyncerConfig::default(),
+    );
+
+    match syncer.push_team(&team_id) {
+        Ok(result) => {
+            if result.errors.is_empty() {
+                report_team_push_result(cli, &team_id, &result)?;
+            } else {
+                report_team_push_partial(cli, &team_id, &result)?;
+            }
+        }
+        Err(e) => {
+            report_team_push_error(cli, &format!("Team push failed: {e}"))?;
+        }
+    }
+    Ok(())
+}
+
+fn report_team_push_result(
+    cli: &Cli,
+    team_id: &str,
+    result: &crate::cloud::SyncResult,
+) -> anyhow::Result<()> {
+    if cli.json {
+        let out = serde_json::json!({
+            "team_push": {
+                "team_id": team_id,
+                "pushed_entries": result.pushed_entries,
+                "pushed_tasks": result.pushed_tasks,
+                "pushed_rules": result.pushed_rules,
+                "pushed_skills": result.pushed_skills,
+                "duration_ms": result.duration_ms,
+            }
+        });
+        println!("{}", out);
+    } else {
+        // Only print a summary when we actually pushed something — a
+        // no-team-queued-rows sync shouldn't add noise to `cas cloud sync`.
+        let total = result.pushed_entries
+            + result.pushed_tasks
+            + result.pushed_rules
+            + result.pushed_skills;
+        if total > 0 {
+            let theme = ActiveTheme::default();
+            let mut out = io::stdout();
+            let mut fmt = Formatter::stdout(&mut out, theme);
+            let success_color = fmt.theme().palette.status_success;
+            fmt.write_colored("  \u{2713} ", success_color)?;
+            fmt.write_raw(&format!(
+                "Team push: {} entries, {} tasks, {} rules, {} skills",
+                result.pushed_entries,
+                result.pushed_tasks,
+                result.pushed_rules,
+                result.pushed_skills,
+            ))?;
+            fmt.newline()?;
+        }
+    }
+    Ok(())
+}
+
+fn report_team_push_partial(
+    cli: &Cli,
+    team_id: &str,
+    result: &crate::cloud::SyncResult,
+) -> anyhow::Result<()> {
+    if cli.json {
+        let out = serde_json::json!({
+            "team_push": {
+                "team_id": team_id,
+                "errors": result.errors,
+            }
+        });
+        println!("{}", out);
+    } else {
+        let theme = ActiveTheme::default();
+        let mut out = io::stdout();
+        let mut fmt = Formatter::stdout(&mut out, theme);
+        let warning_color = fmt.theme().palette.status_warning;
+        fmt.write_colored("  \u{26A0} ", warning_color)?;
+        fmt.write_raw(&format!(
+            "Team push encountered {} error(s); items re-queued for next sync",
+            result.errors.len()
+        ))?;
+        fmt.newline()?;
+        for err in &result.errors {
+            fmt.write_muted("    - ")?;
+            fmt.write_raw(err)?;
+            fmt.newline()?;
+        }
+    }
+    Ok(())
+}
+
+fn report_team_push_error(cli: &Cli, msg: &str) -> anyhow::Result<()> {
+    if cli.json {
+        let out = serde_json::json!({ "team_push": { "error": msg }});
+        println!("{}", out);
+    } else {
+        let theme = ActiveTheme::default();
+        let mut out = io::stdout();
+        let mut fmt = Formatter::stdout(&mut out, theme);
+        let warning_color = fmt.theme().palette.status_warning;
+        fmt.write_colored("  \u{26A0} ", warning_color)?;
+        fmt.write_raw(msg)?;
+        fmt.newline()?;
+    }
     Ok(())
 }
 
@@ -2226,5 +2379,174 @@ mod team_cmd_tests {
             }
             other => panic!("expected Error, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod team_sync_tests {
+    //! T4: exercise `execute_team_push` — the helper that drains the team
+    //! queue into `POST /api/teams/{uuid}/sync/push` when a team is
+    //! configured. Uses wiremock to stub the cloud endpoint and validates:
+    //! - no-team → early return, no HTTP request
+    //! - team configured + queued items → POST fires, queue drained
+    //! - team push HTTP failure → helper returns Ok (partial-failure
+    //!   isolation), items re-enqueued by `push_team` for next sync.
+
+    use super::*;
+    use crate::cloud::{EntityType, SyncOperation, SyncQueue};
+    use tempfile::TempDir;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use crate::store::share_policy::TEST_TEAM_UUID as TEST_TEAM;
+
+    /// Build a CloudConfig pointed at the given mock server, with a team
+    /// UUID set and a token so `push_team` accepts the Bearer header.
+    fn make_cloud_config(endpoint: String) -> CloudConfig {
+        let mut cfg = CloudConfig::default();
+        cfg.endpoint = endpoint;
+        cfg.token = Some("test-token".to_string());
+        cfg.set_team(TEST_TEAM, "test-team");
+        cfg
+    }
+
+    /// Create a `.cas`-style directory and seed the sync queue with one
+    /// team-tagged entry upsert, returning the TempDir owning the files.
+    fn make_cas_root_with_team_item() -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        let queue = SyncQueue::open(tmp.path()).unwrap();
+        queue.init().unwrap();
+        queue
+            .enqueue_for_team(
+                EntityType::Entry,
+                "p-test-001",
+                SyncOperation::Upsert,
+                Some(r#"{"id":"p-test-001","scope":"project","content":"hi"}"#),
+                TEST_TEAM,
+            )
+            .unwrap();
+        tmp
+    }
+
+    /// Minimal `Cli` for JSON-output tests.
+    fn make_cli_json() -> Cli {
+        Cli {
+            json: true,
+            full: false,
+            verbose: false,
+            command: None,
+        }
+    }
+
+    /// Stub the cas-serve push endpoint and verify `execute_team_push`
+    /// fires a POST against `/api/teams/{uuid}/sync/push`. The exact
+    /// response body shape is what `push_team` expects — see
+    /// `team_push.rs::TeamPushResponse`.
+    #[tokio::test]
+    async fn team_push_drains_queue_when_team_configured() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(format!("/api/teams/{TEST_TEAM}/sync/push")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "synced": {
+                        "entries": 1,
+                        "tasks": 0, "rules": 0, "skills": 0,
+                        "sessions": 0, "verifications": 0, "events": 0,
+                        "prompts": 0, "file_changes": 0, "commit_links": 0,
+                        "agents": 0, "worktrees": 0,
+                    }
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let cfg = make_cloud_config(server.uri());
+        let tmp = make_cas_root_with_team_item();
+        let cas_root = tmp.path().to_path_buf();
+        let cli = make_cli_json();
+
+        // execute_team_push is sync and uses ureq; run on blocking pool
+        // so the wiremock tokio runtime can serve the request.
+        let result = tokio::task::spawn_blocking(move || {
+            execute_team_push(&cfg, &cas_root, &cli)
+        })
+        .await
+        .unwrap();
+
+        assert!(result.is_ok(), "execute_team_push returned Err: {result:?}");
+
+        // Queue should be drained — the one team item we enqueued is gone.
+        let queue = SyncQueue::open(tmp.path()).unwrap();
+        let remaining = queue.pending_for_team(TEST_TEAM, 100, 5).unwrap();
+        assert_eq!(remaining.len(), 0, "team queue should be drained");
+    }
+
+    /// No team configured → early return, zero HTTP traffic, zero error.
+    #[tokio::test]
+    async fn team_push_no_op_when_no_team_configured() {
+        let server = MockServer::start().await;
+        // Mount a catch-all that would fail if hit — if the helper
+        // incorrectly fires a request, the test panics on verify.
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let mut cfg = CloudConfig::default();
+        cfg.endpoint = server.uri();
+        cfg.token = Some("test-token".to_string());
+        // NOTE: deliberately no set_team — active_team_id() returns None.
+
+        let tmp = TempDir::new().unwrap();
+        let cas_root = tmp.path().to_path_buf();
+        let cli = make_cli_json();
+
+        let result =
+            tokio::task::spawn_blocking(move || execute_team_push(&cfg, &cas_root, &cli))
+                .await
+                .unwrap();
+        assert!(result.is_ok());
+    }
+
+    /// Team push HTTP failure must be isolated — helper returns Ok so the
+    /// enclosing `execute_sync` can proceed to the pull step. `push_team`
+    /// re-enqueues the items internally so they survive the failed attempt.
+    #[tokio::test]
+    async fn team_push_http_failure_is_isolated() {
+        let server = MockServer::start().await;
+        // Server returns 500 on every push attempt. push_team retries 3
+        // times internally, so expect up to 3 hits.
+        Mock::given(method("POST"))
+            .and(path(format!("/api/teams/{TEST_TEAM}/sync/push")))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let cfg = make_cloud_config(server.uri());
+        let tmp = make_cas_root_with_team_item();
+        let cas_root = tmp.path().to_path_buf();
+        let cli = make_cli_json();
+
+        let result =
+            tokio::task::spawn_blocking(move || execute_team_push(&cfg, &cas_root, &cli))
+                .await
+                .unwrap();
+        assert!(
+            result.is_ok(),
+            "helper must return Ok even when team push fails (partial-failure isolation): {result:?}"
+        );
+
+        // Item should have been re-enqueued by push_team on error, so it's
+        // still in the queue for the next sync.
+        let queue = SyncQueue::open(tmp.path()).unwrap();
+        let remaining = queue.pending_for_team(TEST_TEAM, 100, 5).unwrap();
+        assert_eq!(
+            remaining.len(),
+            1,
+            "team items re-enqueued on http failure (preserves data for next sync)"
+        );
     }
 }
