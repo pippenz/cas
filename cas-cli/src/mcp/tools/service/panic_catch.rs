@@ -44,10 +44,38 @@ pub(super) async fn dispatch_with_catch<F>(
 where
     F: Future<Output = Result<CallToolResult, McpError>> + Send + 'static,
 {
-    // Stub: not yet panic-catching. Tests in this module are expected to
-    // fail until dispatch_with_catch is implemented for real in the next
-    // commit (cas-a436 test-first).
-    fut.await
+    match tokio::spawn(fut).await {
+        Ok(inner) => inner,
+        Err(join_err) => {
+            if join_err.is_panic() {
+                let msg = panic_message(join_err.into_panic());
+                // Mirror a single stderr line so operators tailing the MCP
+                // server see the panic without having to open the log file.
+                // The full backtrace is already in cas-serve-*.log via the
+                // serve startup panic hook.
+                eprintln!("[CAS] tool '{tool_name}' handler panicked: {msg}");
+                Err(McpError {
+                    code: ErrorCode::INTERNAL_ERROR,
+                    message: Cow::Owned(format!(
+                        "handler panicked in '{tool_name}': {msg}. \
+                         See .cas/logs/cas-serve-*.log for backtrace."
+                    )),
+                    data: None,
+                })
+            } else {
+                // No caller in this module aborts its spawned task, so this
+                // branch only fires during runtime shutdown. Surface as an
+                // internal error so the client has something actionable.
+                Err(McpError {
+                    code: ErrorCode::INTERNAL_ERROR,
+                    message: Cow::Owned(format!(
+                        "handler task cancelled in '{tool_name}': {join_err}"
+                    )),
+                    data: None,
+                })
+            }
+        }
+    }
 }
 
 /// Best-effort extraction of a message from a panic payload. Rust stores
@@ -59,7 +87,6 @@ where
 ///
 /// We downcast the first two cases. Unknown payload types fall back to a
 /// placeholder so the caller never sees an empty message.
-#[allow(dead_code)]
 fn panic_message(payload: Box<dyn Any + Send>) -> String {
     if let Some(s) = payload.downcast_ref::<String>() {
         return s.clone();
