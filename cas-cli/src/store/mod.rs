@@ -136,6 +136,12 @@ mod notifying_entry;
 mod notifying_rule;
 mod notifying_skill;
 mod notifying_task;
+// Private in production; `pub(crate)` only for `#[cfg(test)]` so the
+// sibling test modules in `cli/cloud.rs` and `syncing_*.rs` can share
+// `TEST_TEAM_UUID`. No non-test code should import from this module.
+#[cfg(not(test))]
+mod share_policy;
+#[cfg(test)]
 pub(crate) mod share_policy;
 mod syncing;
 mod syncing_entry;

@@ -1382,16 +1382,13 @@ fn execute_sync(args: &CloudSyncArgs, cli: &Cli, cas_root: &Path) -> anyhow::Res
 }
 
 /// Drain the team queue into `POST /api/teams/{uuid}/sync/push` when a
-/// team is configured. No-op when no active team (returns Ok).
+/// team is configured. No-op when no active team.
 ///
-/// Per T4 acceptance criteria:
-/// - Team push failure is isolated: errors are reported but `Ok(())` is
-///   returned so the caller's personal drain and subsequent pull are not
-///   affected. Items that fail to push remain in the team queue
-///   (re-enqueued by `push_team` itself) for the next sync.
-/// - `project_canonical_id` is included in the POST payload (handled by
-///   `CloudSyncer::push_team`).
-/// - Per-queue stats are reported on success.
+/// Contract: always returns `Ok(())` — team-push failures are reported
+/// via `report_team_push_*` and isolated from the surrounding sync so
+/// the personal drain already done stays, and the pull that follows
+/// still runs. Items that fail to push remain in the team queue
+/// (re-enqueued by `push_team` itself) for the next sync cycle.
 fn execute_team_push(
     cloud_config: &CloudConfig,
     cas_root: &Path,
@@ -1404,11 +1401,20 @@ fn execute_team_push(
 
     let queue = match crate::cloud::SyncQueue::open(cas_root) {
         Ok(q) => {
-            let _ = q.init();
+            if let Err(e) = q.init() {
+                tracing::warn!(
+                    target: "cas::sync",
+                    error = %e,
+                    "team sync queue init failed; draining aborted",
+                );
+                // Isolation contract: reporter errors must not escape.
+                let _ = report_team_push_error(cli, &format!("Team sync queue init failed: {e}"));
+                return Ok(());
+            }
             q
         }
         Err(e) => {
-            report_team_push_error(cli, &format!("Could not open sync queue: {e}"))?;
+            let _ = report_team_push_error(cli, &format!("Could not open sync queue: {e}"));
             return Ok(());
         }
     };
@@ -1419,16 +1425,18 @@ fn execute_team_push(
         crate::cloud::CloudSyncerConfig::default(),
     );
 
+    // `let _ =` on reporter calls: a formatter/IO error from the display
+    // path must not propagate out and block the caller's pull step.
     match syncer.push_team(&team_id) {
         Ok(result) => {
             if result.errors.is_empty() {
-                report_team_push_result(cli, &team_id, &result)?;
+                let _ = report_team_push_result(cli, &team_id, &result);
             } else {
-                report_team_push_partial(cli, &team_id, &result)?;
+                let _ = report_team_push_partial(cli, &team_id, &result);
             }
         }
         Err(e) => {
-            report_team_push_error(cli, &format!("Team push failed: {e}"))?;
+            let _ = report_team_push_error(cli, &format!("Team push failed: {e}"));
         }
     }
     Ok(())
@@ -1440,41 +1448,62 @@ fn report_team_push_result(
     result: &crate::cloud::SyncResult,
 ) -> anyhow::Result<()> {
     if cli.json {
-        let out = serde_json::json!({
-            "team_push": {
-                "team_id": team_id,
-                "pushed_entries": result.pushed_entries,
-                "pushed_tasks": result.pushed_tasks,
-                "pushed_rules": result.pushed_rules,
-                "pushed_skills": result.pushed_skills,
-                "duration_ms": result.duration_ms,
-            }
-        });
-        println!("{}", out);
+        println!("{}", team_push_json(team_id, result, &[]));
     } else {
-        // Only print a summary when we actually pushed something — a
-        // no-team-queued-rows sync shouldn't add noise to `cas cloud sync`.
-        let total = result.pushed_entries
-            + result.pushed_tasks
-            + result.pushed_rules
-            + result.pushed_skills;
-        if total > 0 {
+        // `total_pushed()` sums all 12 entity types — not just
+        // entries/tasks/rules/skills — so a sync that only pushes
+        // sessions/events/prompts still surfaces in the human output.
+        if result.total_pushed() > 0 {
             let theme = ActiveTheme::default();
             let mut out = io::stdout();
             let mut fmt = Formatter::stdout(&mut out, theme);
             let success_color = fmt.theme().palette.status_success;
             fmt.write_colored("  \u{2713} ", success_color)?;
             fmt.write_raw(&format!(
-                "Team push: {} entries, {} tasks, {} rules, {} skills",
+                "Team push: {} entries, {} tasks, {} rules, {} skills ({} total)",
                 result.pushed_entries,
                 result.pushed_tasks,
                 result.pushed_rules,
                 result.pushed_skills,
+                result.total_pushed(),
             ))?;
             fmt.newline()?;
         }
     }
     Ok(())
+}
+
+/// Shared JSON shape for `report_team_push_{result,partial}` — consumers
+/// see a consistent `{team_push: {...}}` object whether the push fully
+/// succeeded or partially failed. `errors` is always present (empty for
+/// full success), and every `pushed_*` count is always present.
+fn team_push_json(
+    team_id: &str,
+    result: &crate::cloud::SyncResult,
+    extra_errors: &[String],
+) -> serde_json::Value {
+    let mut errors = result.errors.clone();
+    errors.extend(extra_errors.iter().cloned());
+    serde_json::json!({
+        "team_push": {
+            "team_id": team_id,
+            "pushed_entries": result.pushed_entries,
+            "pushed_tasks": result.pushed_tasks,
+            "pushed_rules": result.pushed_rules,
+            "pushed_skills": result.pushed_skills,
+            "pushed_sessions": result.pushed_sessions,
+            "pushed_verifications": result.pushed_verifications,
+            "pushed_events": result.pushed_events,
+            "pushed_prompts": result.pushed_prompts,
+            "pushed_file_changes": result.pushed_file_changes,
+            "pushed_commit_links": result.pushed_commit_links,
+            "pushed_agents": result.pushed_agents,
+            "pushed_worktrees": result.pushed_worktrees,
+            "total_pushed": result.total_pushed(),
+            "duration_ms": result.duration_ms,
+            "errors": errors,
+        }
+    })
 }
 
 fn report_team_push_partial(
@@ -1483,13 +1512,9 @@ fn report_team_push_partial(
     result: &crate::cloud::SyncResult,
 ) -> anyhow::Result<()> {
     if cli.json {
-        let out = serde_json::json!({
-            "team_push": {
-                "team_id": team_id,
-                "errors": result.errors,
-            }
-        });
-        println!("{}", out);
+        // Same shape as the full-success path so JSON consumers can
+        // always read pushed counts regardless of outcome.
+        println!("{}", team_push_json(team_id, result, &[]));
     } else {
         let theme = ActiveTheme::default();
         let mut out = io::stdout();
@@ -1512,8 +1537,13 @@ fn report_team_push_partial(
 
 fn report_team_push_error(cli: &Cli, msg: &str) -> anyhow::Result<()> {
     if cli.json {
-        let out = serde_json::json!({ "team_push": { "error": msg }});
-        println!("{}", out);
+        // Empty SyncResult + the single fatal error as a string — keeps
+        // shape consistent with success/partial paths.
+        let empty = crate::cloud::SyncResult::default();
+        println!(
+            "{}",
+            team_push_json("", &empty, std::slice::from_ref(&msg.to_string()))
+        );
     } else {
         let theme = ActiveTheme::default();
         let mut out = io::stdout();
@@ -2394,11 +2424,10 @@ mod team_sync_tests {
 
     use super::*;
     use crate::cloud::{EntityType, SyncOperation, SyncQueue};
+    use crate::store::share_policy::TEST_TEAM_UUID as TEST_TEAM;
     use tempfile::TempDir;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    use crate::store::share_policy::TEST_TEAM_UUID as TEST_TEAM;
 
     /// Build a CloudConfig pointed at the given mock server, with a team
     /// UUID set and a token so `push_team` accepts the Bearer header.
@@ -2444,6 +2473,11 @@ mod team_sync_tests {
     /// `team_push.rs::TeamPushResponse`.
     #[tokio::test]
     async fn team_push_drains_queue_when_team_configured() {
+        // NOTE: server contract — push_team includes `project_canonical_id`
+        // in the payload so the server can auto-register the project. The
+        // payload is gzip-compressed before send so wiremock matchers
+        // can't cheaply verify the field; this is instead covered by the
+        // push_team unit tests in cas-cli/src/cloud/syncer/team_push.rs.
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path(format!("/api/teams/{TEST_TEAM}/sync/push")))
@@ -2501,6 +2535,61 @@ mod team_sync_tests {
         // NOTE: deliberately no set_team — active_team_id() returns None.
 
         let tmp = TempDir::new().unwrap();
+        let cas_root = tmp.path().to_path_buf();
+        let cli = make_cli_json();
+
+        let result =
+            tokio::task::spawn_blocking(move || execute_team_push(&cfg, &cas_root, &cli))
+                .await
+                .unwrap();
+        assert!(result.is_ok());
+    }
+
+    /// Kill-switch: `team_auto_promote=Some(false)` must suppress team
+    /// push exactly like no-team-configured does — regardless of whether
+    /// team_id is set. Active accessor semantics (CloudConfig::active_team_id)
+    /// are tested in isolation, but pinning the end-to-end behaviour here
+    /// guards against the helper accidentally reading team_id directly.
+    #[tokio::test]
+    async fn team_push_suppressed_by_auto_promote_kill_switch() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let mut cfg = make_cloud_config(server.uri());
+        cfg.team_auto_promote = Some(false);
+
+        let tmp = make_cas_root_with_team_item();
+        let cas_root = tmp.path().to_path_buf();
+        let cli = make_cli_json();
+
+        let result =
+            tokio::task::spawn_blocking(move || execute_team_push(&cfg, &cas_root, &cli))
+                .await
+                .unwrap();
+        assert!(result.is_ok());
+    }
+
+    /// Empty team queue with a team configured — steady state after a
+    /// full sync — must not produce output noise or error.
+    #[tokio::test]
+    async fn team_push_silent_when_queue_empty() {
+        let server = MockServer::start().await;
+        // push_team short-circuits before any HTTP when drain is empty.
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let cfg = make_cloud_config(server.uri());
+        let tmp = TempDir::new().unwrap();
+        let queue = SyncQueue::open(tmp.path()).unwrap();
+        queue.init().unwrap();
+        // Deliberately no enqueue_for_team — queue is empty.
         let cas_root = tmp.path().to_path_buf();
         let cli = make_cli_json();
 
