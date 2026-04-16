@@ -97,9 +97,14 @@ if let Some(team_id) = self.cloud_config.active_team_id()
 
 Structural prerequisites T3 must land first:
 
-1. Extend `SyncingEntryStore` (and its three siblings) to hold
-   `cloud_config: Arc<CloudConfig>`. Their `new(...)` constructors gain a
-   third parameter; update every call site that constructs these wrappers.
+1. Extend `SyncingEntryStore` (and its three siblings) to hold a
+   pre-resolved `team_id: Option<Arc<str>>`. Attach it via a builder
+   method `with_cloud_config(cloud_config: Arc<CloudConfig>) -> Self`
+   so existing `new(...)` call sites keep working (personal-only) and
+   only the `detect.rs` production paths opt in. The team_id is
+   pre-resolved once at `with_cloud_config` time rather than looked up
+   per-write — the tradeoff is that `cas cloud team set|clear` in
+   another process only takes effect when this store is reconstructed.
 2. Add an `impl CloudConfig { pub fn active_team_id(&self) -> Option<&str> }`
    accessor that returns `self.team_id.as_deref()` only when
    `self.team_auto_promote != Some(false)` — this is the Decision 3 coarse

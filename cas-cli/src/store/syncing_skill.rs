@@ -15,7 +15,10 @@ use crate::types::{Skill, SkillStatus};
 pub struct SyncingSkillStore {
     inner: Arc<dyn SkillStore>,
     queue: Arc<SyncQueue>,
-    cloud_config: Option<Arc<CloudConfig>>,
+    /// Pre-resolved team UUID for dual-enqueue; see
+    /// `SyncingEntryStore::team_id` for the protocol. `None` preserves
+    /// personal-only behaviour.
+    team_id: Option<Arc<str>>,
 }
 
 impl SyncingSkillStore {
@@ -24,21 +27,15 @@ impl SyncingSkillStore {
         Self {
             inner,
             queue,
-            cloud_config: None,
+            team_id: None,
         }
     }
 
     /// Attach a cloud config for team auto-promotion.
     #[must_use]
     pub fn with_cloud_config(mut self, cloud_config: Arc<CloudConfig>) -> Self {
-        self.cloud_config = Some(cloud_config);
+        self.team_id = cloud_config.active_team_id().map(Arc::from);
         self
-    }
-
-    fn active_team_id(&self) -> Option<String> {
-        self.cloud_config
-            .as_ref()
-            .and_then(|c| c.active_team_id().map(|s| s.to_string()))
     }
 
     fn queue_upsert(&self, skill: &Skill) {
@@ -54,7 +51,7 @@ impl SyncingSkillStore {
             Some(&payload),
         );
 
-        if let Some(team_id) = self.active_team_id()
+        if let Some(team_id) = self.team_id.as_deref()
             && eligible_for_team_skill(skill)
         {
             if let Err(e) = self.queue.enqueue_for_team(
@@ -62,7 +59,7 @@ impl SyncingSkillStore {
                 &skill.id,
                 SyncOperation::Upsert,
                 Some(&payload),
-                &team_id,
+                team_id,
             ) {
                 tracing::warn!(
                     target: "cas::sync",
@@ -80,13 +77,18 @@ impl SyncingSkillStore {
             .queue
             .enqueue(EntityType::Skill, id, SyncOperation::Delete, None);
 
-        if let Some(team_id) = self.active_team_id() {
+        // Mirror the upsert path's dual-enqueue. We can't consult the
+        // predicate here because we don't have the entity — but deletes
+        // are cheap to over-push (the server has no row to touch), and
+        // under-pushing would leave stale team rows forever. Trade
+        // over-push for correctness.
+        if let Some(team_id) = self.team_id.as_deref() {
             if let Err(e) = self.queue.enqueue_for_team(
                 EntityType::Skill,
                 id,
                 SyncOperation::Delete,
                 None,
-                &team_id,
+                team_id,
             ) {
                 tracing::warn!(
                     target: "cas::sync",
@@ -206,5 +208,104 @@ mod tests {
         let pending = queue.pending(10, 5).unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].operation, SyncOperation::Delete);
+    }
+
+    // ── Dual-enqueue behaviour (cas-82a1) ────────────────────────────────
+
+    use cas_types::Scope;
+
+    const TEST_TEAM: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn create_team_store(team_auto_promote: Option<bool>) -> (TempDir, SyncingSkillStore) {
+        let temp = TempDir::new().unwrap();
+        let cas_dir = temp.path();
+        let inner = SqliteSkillStore::open(cas_dir).unwrap();
+        inner.init().unwrap();
+        let queue = SyncQueue::open(cas_dir).unwrap();
+        queue.init().unwrap();
+        let mut cfg = CloudConfig::default();
+        cfg.set_team(TEST_TEAM, "test-team");
+        cfg.team_auto_promote = team_auto_promote;
+        let store = SyncingSkillStore::new(Arc::new(inner), Arc::new(queue))
+            .with_cloud_config(Arc::new(cfg));
+        (temp, store)
+    }
+
+    fn make_skill(id: &str) -> Skill {
+        let mut skill = Skill::new(id.to_string(), "Test Skill".to_string());
+        skill.description = "A test skill".to_string();
+        skill.invocation = "test".to_string();
+        skill.skill_type = SkillType::Command;
+        skill
+    }
+
+    fn queue_counts(queue: &SyncQueue) -> (usize, usize) {
+        let personal = queue.pending(100, 5).unwrap().len();
+        let team = queue.pending_for_team(TEST_TEAM, 100, 5).unwrap().len();
+        (personal, team)
+    }
+
+    #[test]
+    fn skill_dual_enqueue_when_team_configured_and_project_scope() {
+        let (temp, store) = create_team_store(None);
+        let queue = SyncQueue::open(temp.path()).unwrap();
+
+        // Skill::new defaults to Global scope; explicitly set Project for
+        // the auto-promote path (Skill type has no Preference analogue,
+        // so scope is the only predicate input).
+        let mut skill = make_skill("p-skill-001");
+        skill.scope = Scope::Project;
+        store.add(&skill).unwrap();
+
+        let (personal, team) = queue_counts(&queue);
+        assert_eq!(personal, 1);
+        assert_eq!(team, 1);
+    }
+
+    #[test]
+    fn skill_personal_only_when_global_scope() {
+        let (temp, store) = create_team_store(None);
+        let queue = SyncQueue::open(temp.path()).unwrap();
+
+        let mut skill = make_skill("g-skill-001");
+        skill.scope = Scope::Global;
+        store.add(&skill).unwrap();
+
+        let (personal, team) = queue_counts(&queue);
+        assert_eq!(personal, 1);
+        assert_eq!(team, 0);
+    }
+
+    #[test]
+    fn skill_personal_only_when_kill_switch_engaged() {
+        let (temp, store) = create_team_store(Some(false));
+        let queue = SyncQueue::open(temp.path()).unwrap();
+
+        // Project scope so we'd otherwise dual-enqueue; kill-switch must
+        // still suppress it.
+        let mut skill = make_skill("p-skill-002");
+        skill.scope = Scope::Project;
+        store.add(&skill).unwrap();
+
+        let (personal, team) = queue_counts(&queue);
+        assert_eq!(personal, 1);
+        assert_eq!(team, 0);
+    }
+
+    #[test]
+    fn skill_delete_dual_enqueues_when_team_configured() {
+        let (temp, store) = create_team_store(None);
+        let queue = SyncQueue::open(temp.path()).unwrap();
+
+        let mut skill = make_skill("p-skill-003");
+        skill.scope = Scope::Project;
+        store.add(&skill).unwrap();
+        queue.clear().unwrap();
+
+        store.delete(&skill.id).unwrap();
+
+        let (personal, team) = queue_counts(&queue);
+        assert_eq!(personal, 1);
+        assert_eq!(team, 1);
     }
 }

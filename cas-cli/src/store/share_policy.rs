@@ -65,7 +65,7 @@ pub fn eligible_for_team_task(task: &Task) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cas_types::{BeliefType, MemoryTier, RuleCategory, RuleStatus, SkillStatus, SkillType};
+    use cas_types::{BeliefType, MemoryTier};
     use chrono::Utc;
 
     fn entry_with(scope: Scope, entry_type: EntryType, share: Option<ShareScope>) -> Entry {
@@ -199,17 +199,5 @@ mod tests {
 
         t.scope = Scope::Global;
         assert!(!eligible_for_team_task(&t));
-    }
-
-    // ── Suppress unused-import warnings for the imported enums used in
-    //    construction helpers above.
-    #[test]
-    fn imported_enums_are_used() {
-        let _ = BeliefType::Fact;
-        let _ = MemoryTier::Working;
-        let _ = RuleStatus::default();
-        let _ = RuleCategory::default();
-        let _ = SkillStatus::default();
-        let _ = SkillType::default();
     }
 }

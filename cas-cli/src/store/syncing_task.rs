@@ -15,7 +15,10 @@ use crate::types::{Dependency, DependencyType, Task, TaskStatus};
 pub struct SyncingTaskStore {
     inner: Arc<dyn TaskStore>,
     queue: Arc<SyncQueue>,
-    cloud_config: Option<Arc<CloudConfig>>,
+    /// Pre-resolved team UUID for dual-enqueue; see
+    /// `SyncingEntryStore::team_id` for the protocol. `None` preserves
+    /// personal-only behaviour.
+    team_id: Option<Arc<str>>,
 }
 
 impl SyncingTaskStore {
@@ -24,7 +27,7 @@ impl SyncingTaskStore {
         Self {
             inner,
             queue,
-            cloud_config: None,
+            team_id: None,
         }
     }
 
@@ -32,14 +35,8 @@ impl SyncingTaskStore {
     /// `SyncingEntryStore::with_cloud_config` for the protocol.
     #[must_use]
     pub fn with_cloud_config(mut self, cloud_config: Arc<CloudConfig>) -> Self {
-        self.cloud_config = Some(cloud_config);
+        self.team_id = cloud_config.active_team_id().map(Arc::from);
         self
-    }
-
-    fn active_team_id(&self) -> Option<String> {
-        self.cloud_config
-            .as_ref()
-            .and_then(|c| c.active_team_id().map(|s| s.to_string()))
     }
 
     fn queue_upsert(&self, task: &Task) {
@@ -55,7 +52,7 @@ impl SyncingTaskStore {
             Some(&payload),
         );
 
-        if let Some(team_id) = self.active_team_id()
+        if let Some(team_id) = self.team_id.as_deref()
             && eligible_for_team_task(task)
         {
             if let Err(e) = self.queue.enqueue_for_team(
@@ -63,7 +60,7 @@ impl SyncingTaskStore {
                 &task.id,
                 SyncOperation::Upsert,
                 Some(&payload),
-                &team_id,
+                team_id,
             ) {
                 tracing::warn!(
                     target: "cas::sync",
@@ -81,13 +78,18 @@ impl SyncingTaskStore {
             .queue
             .enqueue(EntityType::Task, id, SyncOperation::Delete, None);
 
-        if let Some(team_id) = self.active_team_id() {
+        // Mirror the upsert path's dual-enqueue. We can't consult the
+        // predicate here because we don't have the entity — but deletes
+        // are cheap to over-push (the server has no row to touch), and
+        // under-pushing would leave stale team rows forever. Trade
+        // over-push for correctness.
+        if let Some(team_id) = self.team_id.as_deref() {
             if let Err(e) = self.queue.enqueue_for_team(
                 EntityType::Task,
                 id,
                 SyncOperation::Delete,
                 None,
-                &team_id,
+                team_id,
             ) {
                 tracing::warn!(
                     target: "cas::sync",
@@ -291,5 +293,105 @@ mod tests {
         let pending = queue.pending(10, 5).unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].operation, SyncOperation::Delete);
+    }
+
+    // ── Dual-enqueue behaviour (cas-82a1) ────────────────────────────────
+
+    use cas_types::Scope;
+
+    const TEST_TEAM: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn create_team_store(team_auto_promote: Option<bool>) -> (TempDir, SyncingTaskStore) {
+        let temp = TempDir::new().unwrap();
+        let cas_dir = temp.path();
+        let inner = SqliteTaskStore::open(cas_dir).unwrap();
+        inner.init().unwrap();
+        let queue = SyncQueue::open(cas_dir).unwrap();
+        queue.init().unwrap();
+        let mut cfg = CloudConfig::default();
+        cfg.set_team(TEST_TEAM, "test-team");
+        cfg.team_auto_promote = team_auto_promote;
+        let store = SyncingTaskStore::new(Arc::new(inner), Arc::new(queue))
+            .with_cloud_config(Arc::new(cfg));
+        (temp, store)
+    }
+
+    fn queue_counts(queue: &SyncQueue) -> (usize, usize) {
+        let personal = queue.pending(100, 5).unwrap().len();
+        let team = queue.pending_for_team(TEST_TEAM, 100, 5).unwrap().len();
+        (personal, team)
+    }
+
+    #[test]
+    fn task_dual_enqueue_when_team_configured_and_project_scope() {
+        let (temp, store) = create_team_store(None);
+        let queue = SyncQueue::open(temp.path()).unwrap();
+
+        // Default task is Project scope — passes T1 filter.
+        let task = Task::new("p-task-001".to_string(), "team task".to_string());
+        store.add(&task).unwrap();
+
+        let (personal, team) = queue_counts(&queue);
+        assert_eq!(personal, 1);
+        assert_eq!(team, 1, "team queue should have the task");
+    }
+
+    #[test]
+    fn task_personal_only_when_global_scope() {
+        let (temp, store) = create_team_store(None);
+        let queue = SyncQueue::open(temp.path()).unwrap();
+
+        let mut task = Task::new("g-task-001".to_string(), "global task".to_string());
+        task.scope = Scope::Global;
+        store.add(&task).unwrap();
+
+        let (personal, team) = queue_counts(&queue);
+        assert_eq!(personal, 1);
+        assert_eq!(team, 0, "Global scope does not auto-promote");
+    }
+
+    #[test]
+    fn task_personal_only_when_kill_switch_engaged() {
+        let (temp, store) = create_team_store(Some(false));
+        let queue = SyncQueue::open(temp.path()).unwrap();
+
+        let task = Task::new("p-task-002".to_string(), "kill-switched".to_string());
+        store.add(&task).unwrap();
+
+        let (personal, team) = queue_counts(&queue);
+        assert_eq!(personal, 1);
+        assert_eq!(team, 0, "team_auto_promote=false disables dual-enqueue");
+    }
+
+    #[test]
+    fn task_delete_dual_enqueues_when_team_configured() {
+        let (temp, store) = create_team_store(None);
+        let queue = SyncQueue::open(temp.path()).unwrap();
+
+        let task = Task::new("p-task-003".to_string(), "to-delete".to_string());
+        store.add(&task).unwrap();
+        queue.clear().unwrap();
+
+        store.delete(&task.id).unwrap();
+
+        let (personal, team) = queue_counts(&queue);
+        assert_eq!(personal, 1);
+        assert_eq!(team, 1);
+    }
+
+    #[test]
+    fn task_delete_personal_only_when_kill_switch_engaged() {
+        let (temp, store) = create_team_store(Some(false));
+        let queue = SyncQueue::open(temp.path()).unwrap();
+
+        let task = Task::new("p-task-004".to_string(), "to-delete".to_string());
+        store.add(&task).unwrap();
+        queue.clear().unwrap();
+
+        store.delete(&task.id).unwrap();
+
+        let (personal, team) = queue_counts(&queue);
+        assert_eq!(personal, 1);
+        assert_eq!(team, 0, "kill-switch also silences delete fan-out");
     }
 }

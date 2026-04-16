@@ -18,11 +18,17 @@ use crate::types::Entry;
 pub struct SyncingEntryStore {
     inner: Arc<dyn Store>,
     queue: Arc<SyncQueue>,
-    /// Optional cloud config. When `Some`, writes may be dual-enqueued to
-    /// the team queue per the T1 filter policy. `None` preserves the
-    /// historical personal-only behavior — used by tests and by callers
-    /// that predate the team-memories work.
-    cloud_config: Option<Arc<CloudConfig>>,
+    /// Pre-resolved team UUID for dual-enqueue. Cached at
+    /// `with_cloud_config` time rather than resolved per-write so the
+    /// hot write path does zero heap allocations to read it. `None`
+    /// preserves the historical personal-only behavior — used by tests
+    /// and callers that predate the team-memories work.
+    ///
+    /// Known tradeoff: CloudConfig is snapshotted at store-open; an
+    /// on-disk `cas cloud team set|clear` in another process only
+    /// takes effect when this store is reconstructed. Documented in
+    /// docs/requests/team-memories-filter-policy.md Decision 1.
+    team_id: Option<Arc<str>>,
 }
 
 impl SyncingEntryStore {
@@ -31,7 +37,7 @@ impl SyncingEntryStore {
         Self {
             inner,
             queue,
-            cloud_config: None,
+            team_id: None,
         }
     }
 
@@ -41,17 +47,8 @@ impl SyncingEntryStore {
     /// existing 2-arg `new` call sites.
     #[must_use]
     pub fn with_cloud_config(mut self, cloud_config: Arc<CloudConfig>) -> Self {
-        self.cloud_config = Some(cloud_config);
+        self.team_id = cloud_config.active_team_id().map(Arc::from);
         self
-    }
-
-    /// Resolve the target team for dual-enqueue, if any. Returns `None`
-    /// when no cloud config is attached, no team is set, or the
-    /// `team_auto_promote` kill-switch is `Some(false)`.
-    fn active_team_id(&self) -> Option<String> {
-        self.cloud_config
-            .as_ref()
-            .and_then(|c| c.active_team_id().map(|s| s.to_string()))
     }
 
     fn queue_upsert(&self, entry: &Entry) {
@@ -72,7 +69,7 @@ impl SyncingEntryStore {
         // Team enqueue: opt-in, predicate-gated. Failures are logged rather
         // than silently swallowed because team-scope data loss is harder
         // to re-derive than personal — a teammate may be waiting on this.
-        if let Some(team_id) = self.active_team_id()
+        if let Some(team_id) = self.team_id.as_deref()
             && eligible_for_team_entry(entry)
         {
             if let Err(e) = self.queue.enqueue_for_team(
@@ -80,7 +77,7 @@ impl SyncingEntryStore {
                 &entry.id,
                 SyncOperation::Upsert,
                 Some(&payload),
-                &team_id,
+                team_id,
             ) {
                 tracing::warn!(
                     target: "cas::sync",
@@ -103,13 +100,13 @@ impl SyncingEntryStore {
         // are cheap to over-push (the server has no row to touch), and
         // under-pushing would leave stale team rows forever. Trade
         // over-push for correctness.
-        if let Some(team_id) = self.active_team_id() {
+        if let Some(team_id) = self.team_id.as_deref() {
             if let Err(e) = self.queue.enqueue_for_team(
                 EntityType::Entry,
                 id,
                 SyncOperation::Delete,
                 None,
-                &team_id,
+                team_id,
             ) {
                 tracing::warn!(
                     target: "cas::sync",
@@ -514,5 +511,25 @@ mod tests {
         let (personal, team) = queue_counts(&queue);
         assert_eq!(personal, 1);
         assert_eq!(team, 1, "delete fans out to team queue too");
+    }
+
+    #[test]
+    fn delete_personal_only_when_kill_switch_engaged() {
+        // Regression guard for the kill-switch: team_auto_promote=false
+        // must silence both upsert AND delete team enqueues. A future
+        // refactor that drops active_team_id() from queue_delete would
+        // leak deletes to the team queue when the user has opted out.
+        let (temp, store) = create_team_store(Some(false));
+        let queue = SyncQueue::open(temp.path()).unwrap();
+
+        let entry = Entry::new("p-del-002".to_string(), "kill-switched delete".to_string());
+        store.add(&entry).unwrap();
+        queue.clear().unwrap();
+
+        store.delete(&entry.id).unwrap();
+
+        let (personal, team) = queue_counts(&queue);
+        assert_eq!(personal, 1);
+        assert_eq!(team, 0, "kill-switch silences delete fan-out");
     }
 }
