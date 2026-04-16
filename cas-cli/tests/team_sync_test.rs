@@ -19,28 +19,14 @@
 //! `#[cfg(test)] mod` as a test-first posture concern — tests are easier
 //! to find in the integration tree than buried in a 2400-line impl file.
 
-use cas::cli::Cli;
+mod common;
+use common::{TEST_TEAM, make_cli_json, make_cloud_config};
+
 use cas::cli::cloud::execute_team_push;
 use cas::cloud::{CloudConfig, EntityType, SyncOperation, SyncQueue};
 use tempfile::TempDir;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
-
-/// Fixture UUID shared across all team-sync tests. Kept local (rather
-/// than imported from `store::share_policy`) because that module is
-/// `#[cfg(test)]`-gated for unit-test builds only; integration tests
-/// here compile as a separate binary where that cfg does not apply.
-const TEST_TEAM: &str = "550e8400-e29b-41d4-a716-446655440000";
-
-/// Build a CloudConfig pointed at the given mock server, with a team
-/// UUID set and a token so `push_team` accepts the Bearer header.
-fn make_cloud_config(endpoint: String) -> CloudConfig {
-    let mut cfg = CloudConfig::default();
-    cfg.endpoint = endpoint;
-    cfg.token = Some("test-token".to_string());
-    cfg.set_team(TEST_TEAM, "test-team");
-    cfg
-}
 
 /// Create a `.cas`-style directory and seed the sync queue with one
 /// team-tagged entry upsert, returning the TempDir owning the files.
@@ -58,16 +44,6 @@ fn make_cas_root_with_team_item() -> TempDir {
         )
         .unwrap();
     tmp
-}
-
-/// Minimal `Cli` for JSON-output tests.
-fn make_cli_json() -> Cli {
-    Cli {
-        json: true,
-        full: false,
-        verbose: false,
-        command: None,
-    }
 }
 
 /// Happy path: team configured + queued items → POST fires against

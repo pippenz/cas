@@ -13,22 +13,24 @@
 
 use std::path::Path;
 
+mod common;
+use common::TEST_TEAM;
+
 use cas::cli::memory::{ShareArgs, UnshareArgs, execute_share, execute_unshare};
-use cas::cloud::{CloudConfig, SyncQueue};
+use cas::cloud::SyncQueue;
 use cas::store::open_store;
 use cas::types::{Entry, EntryType, Scope, ShareScope};
 use tempfile::TempDir;
 
-/// Fixture UUID shared with other team-sync tests.
-const TEST_TEAM: &str = "550e8400-e29b-41d4-a716-446655440000";
-
+/// Writes a minimal team-configured CloudConfig to disk so `open_store`
+/// wraps the SqliteStore in a SyncingEntryStore with dual-enqueue active.
+/// Uses an unconnectable `localhost:0` endpoint on purpose — these tests
+/// only verify local state (store + queue) and must not reach out
+/// over HTTP.
 fn seed_team_cloud_config(cas_dir: &Path) {
-    let mut cfg = CloudConfig::default();
-    cfg.endpoint = "http://localhost:0".to_string();
-    cfg.token = Some("test-token".to_string());
-    cfg.team_id = Some(TEST_TEAM.to_string());
-    cfg.team_slug = Some("test-team".to_string());
-    cfg.save_to_cas_dir(cas_dir).unwrap();
+    common::make_cloud_config("http://localhost:0")
+        .save_to_cas_dir(cas_dir)
+        .unwrap();
 }
 
 fn seed_entry(cas_dir: &Path, id: &str, entry_type: EntryType, scope: Scope) {

@@ -25,38 +25,20 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use cas::cli::Cli;
+mod common;
+use common::{TEST_TEAM, make_cli_json, make_cloud_config};
+
 use cas::cli::cloud::execute_team_push;
 use cas::cli::memory::{ShareArgs, execute_share};
-use cas::cloud::{CloudConfig, CloudSyncer, CloudSyncerConfig, SyncQueue};
+use cas::cloud::{CloudSyncer, CloudSyncerConfig, SyncQueue};
 use cas::store::{open_rule_store, open_skill_store, open_store, open_task_store};
 use cas::types::{Entry, EntryType, Scope, ShareScope};
 use tempfile::TempDir;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-/// Fixture UUID shared with other team-sync tests.
-const TEST_TEAM: &str = "550e8400-e29b-41d4-a716-446655440000";
-
-fn make_cli_json() -> Cli {
-    Cli {
-        json: true,
-        full: false,
-        verbose: false,
-        command: None,
-    }
-}
-
-fn team_cloud_config(endpoint: String) -> CloudConfig {
-    let mut cfg = CloudConfig::default();
-    cfg.endpoint = endpoint;
-    cfg.token = Some("test-token".to_string());
-    cfg.set_team(TEST_TEAM, "test-team");
-    cfg
-}
-
 fn seed_team_cloud_config_on_disk(cas_dir: &Path, endpoint: String) {
-    team_cloud_config(endpoint).save_to_cas_dir(cas_dir).unwrap();
+    make_cloud_config(endpoint).save_to_cas_dir(cas_dir).unwrap();
 }
 
 fn mock_push_endpoint() -> Mock {
@@ -192,7 +174,7 @@ async fn retroactive_share_all_then_team_push_surfaces_preexisting_entries() {
     }
 
     // Stage 4: team push drains the queue.
-    let cfg = team_cloud_config(server.uri());
+    let cfg = make_cloud_config(server.uri());
     let cas_dir_owned = cas_dir.to_path_buf();
     let cli = make_cli_json();
     tokio::task::spawn_blocking(move || {
@@ -384,7 +366,7 @@ async fn fresh_teammate_pull_applies_team_memories_to_local_store() {
     // No existing entries.
     assert!(entry_store.get("alice-shared-001").is_err());
 
-    let cfg = team_cloud_config(server.uri());
+    let cfg = make_cloud_config(server.uri());
     let syncer_config = CloudSyncerConfig {
         timeout: Duration::from_secs(5),
         ..Default::default()
