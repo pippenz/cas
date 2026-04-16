@@ -23,16 +23,11 @@
 //! surfaces here, so by the time we synthesize the client-facing error
 //! the forensic trail is already on disk.
 //!
-//! ## Runtime model: requires `panic = "unwind"`
-//!
-//! This mechanism depends on stack unwinding. Under `panic = "abort"`
-//! the process is terminated before the `JoinHandle` is reachable, so
-//! the A2 protection provides nothing. `cargo build` and `cargo build
-//! --release` default to `panic = "unwind"`. The workspace also defines
-//! `[profile.release-fast]` with `panic = "abort"` — **do not launch
-//! `cas serve` from a `release-fast` build**; a single handler panic
-//! will abort the process and reproduce the exact failure mode EPIC
-//! cas-c351 exists to prevent.
+//! This mechanism depends on stack unwinding. A compile-time guard in
+//! `cas-cli/src/lib.rs` (`#[cfg(all(not(test), panic = "abort"))]
+//! compile_error!`) refuses non-test builds with `panic = "abort"`, so
+//! the A2 invariant cannot be silently defeated by a future build
+//! profile.
 
 use std::any::Any;
 use std::borrow::Cow;

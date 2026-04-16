@@ -25,9 +25,12 @@ cargo test                           # All tests
 cargo test test_name                 # Single test by name
 cargo test --test cli_test           # Tests in a specific file
 cargo bench --bench code_indexing    # Benchmarks
+make test-release-panic              # Verify A2/A3/B3 panic isolation under release profiles
 ```
 
 The `mcp-server` feature is enabled by default. Binary is `cas` (lib + bin in `cas-cli/`). Build script embeds git hash and build date.
+
+**Build profiles must use `panic = "unwind"`.** The MCP tool-dispatch panic catcher (EPIC cas-c351) relies on `tokio::spawn` + `JoinError::is_panic`, which only observes a panic if the worker thread unwinds. A compile-time guard in `cas-cli/src/lib.rs` refuses non-test builds with `panic = "abort"` — do not work around it; the entire point of that catcher is to keep `cas serve` alive across handler bugs.
 
 ## Rust Version
 
