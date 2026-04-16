@@ -1043,6 +1043,8 @@ mod core;
 mod factory_ops;
 mod factory_remind;
 mod panic_catch;
+#[cfg(test)]
+mod panic_regression_test;
 mod pattern_ops;
 mod server_handler;
 mod spec_ops;
