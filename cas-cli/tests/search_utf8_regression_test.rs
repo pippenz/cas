@@ -4,11 +4,11 @@
 //! the "CAS factory daemon boot order" entry. The root cause was six
 //! open-coded `&s[..max_len-3]` preview-truncation paths on `Entry`,
 //! `Rule`, `Skill`, `Spec`, `Prompt`, and `CommitLink`: the cut landed
-//! inside the three bytes of `→` (U+2192, bytes 55..58) and Rust's string
-//! slice panicked because index 57 is not a char boundary. The panic
-//! unwound the Tokio worker, closed the stdio transport, and the MCP
-//! client saw nothing but "Connection closed". Four auto-respawns later
-//! Claude Code marked `cas serve` dead for the session.
+//! inside the three bytes of `→` and Rust's string slice panicked
+//! because the byte index was not a char boundary. The panic unwound
+//! the Tokio worker, closed the stdio transport, and the MCP client saw
+//! nothing but "Connection closed". Four auto-respawns later Claude
+//! Code marked `cas serve` dead for the session.
 //!
 //! The fix (commit ad60df3) centralised the truncation into
 //! `cas_types::preview::truncate_preview`, which walks back from the
@@ -16,25 +16,28 @@
 //! function itself has unit tests in the `cas-types` crate, including
 //! the exact 2026-04-16 fixture.
 //!
-//! This file goes one layer further and reproduces the original failure
-//! end-to-end over the MCP stdio transport against a real `cas serve`
-//! subprocess. If `ad60df3` is ever reverted, the preview panic unwinds
-//! the server, the stdio pipe closes, the follow-up call errors, and
-//! this test fails loudly. A unit test on `truncate_preview` alone would
-//! not catch a re-introduction in, say, a new `*::preview` method that
-//! bypassed the helper.
+//! This file reproduces the original failure end-to-end over the MCP
+//! stdio transport against a real `cas serve` subprocess. If `ad60df3`
+//! is ever reverted, the preview panic either unwinds the server (pre
+//! cas-a436) or surfaces as an INTERNAL_ERROR from the A2 panic catcher
+//! (post cas-a436). Either way this test fails — the `search.error`
+//! assertion catches the A2-wrapped case; the liveness probe catches
+//! the server-death case.
 //!
 //! # Test shape
 //!
 //! 1. Initialise a fresh `.cas` tempdir.
 //! 2. Spawn `cas serve` and complete the MCP initialize handshake.
-//! 3. Seed the crashing entry content via `memory.remember`.
-//! 4. Call `search.search` with a query that matches — this triggers
-//!    the `Entry::preview(60)` call that used to panic.
-//! 5. Assert the search response is a clean non-error result.
-//! 6. Call `memory.list` on the **same** stdio pipe as a liveness probe.
-//!    If step 4 crashed the server, the pipe is closed and this call
-//!    errors — which is the discriminating assertion.
+//! 3. Seed the crashing entry via `memory.remember` with
+//!    `bypass_overlap=true` so overlap detection cannot short-circuit
+//!    the store.
+//! 4. Call `search.search`. Assert: no JSON-RPC error, response is not
+//!    an `is_error: true` tool-error envelope, and the content text
+//!    carries a recognisable substring of the seeded fixture — proving
+//!    the BM25 index actually surfaced the entry and `Entry::preview`
+//!    ran.
+//! 5. Call `memory.list` on the **same** stdio pipe as a liveness
+//!    probe for the pre-A2 failure mode (server process death).
 //!
 //! # Scope / acceptance
 //!
@@ -51,11 +54,18 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 
 /// The exact entry content that crashed `cas serve` on 2026-04-16. Byte
-/// index 57 lands inside `→` (bytes 55..58) when preview(60) runs.
-/// Changing this string means you are no longer reproducing the real
-/// regression — introduce a second fixture instead of mutating this one.
+/// index 57 lands inside the three bytes of `→`. Changing this string
+/// means you are no longer reproducing the real regression — introduce
+/// a second fixture instead of mutating this one.
 const CRASH_FIXTURE: &str =
     "CAS factory daemon boot order: `build_configs_for_mux` → `FactoryApp::new` (spawns PTYs)";
+
+/// ASCII substring of [`CRASH_FIXTURE`] that the BM25 preview must
+/// include when the entry is surfaced. Sits before the multi-byte cut
+/// so it survives any `truncate_preview(..., 60)` output, and is
+/// distinctive enough that a stray "no results found" response cannot
+/// contain it by accident.
+const FIXTURE_PREVIEW_MARKER: &str = "build_configs_for_mux";
 
 // ============================================================================
 // JSON-RPC plumbing (copied from mcp_protocol_test.rs to keep this
@@ -73,7 +83,9 @@ struct JsonRpcRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)] // fields are consumed by {:?} in assertion messages
 struct JsonRpcResponse {
+    jsonrpc: String,
     id: Option<u64>,
     #[serde(default)]
     result: Option<Value>,
@@ -82,13 +94,11 @@ struct JsonRpcResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)] // fields are consumed by {:?} in assertion messages
 struct JsonRpcError {
-    #[allow(dead_code)]
     code: i64,
-    #[allow(dead_code)]
     message: String,
     #[serde(default)]
-    #[allow(dead_code)]
     data: Option<Value>,
 }
 
@@ -100,10 +110,13 @@ struct McpClient {
 }
 
 impl McpClient {
+    /// Spawn `cas serve` in `cas_dir`. Isolation from the host `.cas`
+    /// relies on `current_dir` + `scrub_cas_env` — the server does a
+    /// cwd walk via `find_cas_root` after the inherited CAS_* env vars
+    /// are cleared, so only the child's tempdir is reachable.
     fn spawn(cas_dir: &std::path::Path) -> Self {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_cas"));
         cmd.arg("serve")
-            .env("CAS_DIR", cas_dir)
             .current_dir(cas_dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -140,7 +153,9 @@ impl McpClient {
         writeln!(self.stdin, "{line}").expect("write stdin — server pipe closed?");
         self.stdin.flush().expect("flush stdin — server pipe closed?");
 
-        // Skip notifications (no id) until we see our matching response.
+        // Skip notifications (no id) and any non-matching responses
+        // (e.g., server-initiated requests per later MCP spec
+        // revisions) until we see our matching response.
         loop {
             let mut line = String::new();
             let n = self
@@ -151,11 +166,11 @@ impl McpClient {
 
             let resp: JsonRpcResponse = serde_json::from_str(&line)
                 .unwrap_or_else(|e| panic!("parse response '{line}': {e}"));
-            if let Some(resp_id) = resp.id {
-                assert_eq!(resp_id, id, "mismatched response id");
-                return resp;
+            assert_eq!(resp.jsonrpc, "2.0", "invalid JSON-RPC version");
+            match resp.id {
+                Some(rid) if rid == id => return resp,
+                Some(_) | None => continue,
             }
-            // notification — keep reading.
         }
     }
 
@@ -205,6 +220,10 @@ impl Drop for McpClient {
 /// Scrub CAS_* env vars so the child `cas serve` does not hijack the
 /// host cas.db (e.g., when the test harness runs inside a factory
 /// worker session that inherited CAS_ROOT).
+///
+/// Intentionally duplicated from mcp_protocol_test.rs — a shared
+/// test-util module is a follow-up refactor on EPIC cas-c351. Keep
+/// both lists in sync when adding new CAS_* vars.
 fn scrub_cas_env(cmd: &mut Command) -> &mut Command {
     cmd.env_remove("CAS_ROOT")
         .env_remove("CAS_DIR")
@@ -227,16 +246,38 @@ fn init_cas_dir(dir: &TempDir) {
     );
 }
 
+/// Collect the concatenated `text` from every text-content block in a
+/// `tools/call` result. Used to assert that the BM25-surfaced preview
+/// actually contains the fixture marker — the discriminating signal
+/// that proves `Entry::preview(60)` ran on our seeded entry.
+fn collect_response_text(result: &Value) -> String {
+    let Some(arr) = result.get("content").and_then(|c| c.as_array()) else {
+        return String::new();
+    };
+    arr.iter()
+        .filter_map(|c| c.get("text").and_then(|t| t.as_str()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Check the `is_error: true` flag that the tool-call result envelope
+/// uses to signal tool-level failures (distinct from JSON-RPC errors,
+/// which surface in the `.error` field).
+fn is_tool_error(result: &Value) -> bool {
+    result.get("isError").and_then(|v| v.as_bool()).unwrap_or(false)
+}
+
 // ============================================================================
 // The regression
 // ============================================================================
 
 #[test]
 fn search_with_multibyte_boundary_content_does_not_crash_server() {
-    // Sanity: confirm the fixture actually lands a multi-byte char across
-    // the byte-57 cut, so this test stays grounded in the real bug. If
-    // the constant drifts and byte 57 becomes an ASCII boundary, the
-    // panic path is not being exercised and the test is worthless.
+    // Sanity: confirm the fixture actually lands a multi-byte char
+    // across the byte-57 cut, so this test stays grounded in the real
+    // bug. If the constant drifts and byte 57 becomes an ASCII
+    // boundary, the panic path is not being exercised and the test
+    // would be worthless.
     assert!(
         !CRASH_FIXTURE.is_char_boundary(57),
         "fixture lost its mid-char cut; test no longer reproduces the 2026-04-16 crash"
@@ -245,6 +286,19 @@ fn search_with_multibyte_boundary_content_does_not_crash_server() {
         CRASH_FIXTURE.len() > 60,
         "fixture shorter than 60 bytes — preview(60) would return it unchanged"
     );
+    // FIXTURE_PREVIEW_MARKER must appear in the pre-cut prefix so a
+    // well-behaved `truncate_preview(..., 60)` still surfaces it.
+    let prefix_end = {
+        let mut e = 57usize.min(CRASH_FIXTURE.len());
+        while e > 0 && !CRASH_FIXTURE.is_char_boundary(e) {
+            e -= 1;
+        }
+        e
+    };
+    assert!(
+        CRASH_FIXTURE[..prefix_end].contains(FIXTURE_PREVIEW_MARKER),
+        "preview marker not in pre-cut prefix — assertion would miss even on a correct preview"
+    );
 
     let dir = TempDir::new().expect("tempdir");
     init_cas_dir(&dir);
@@ -252,27 +306,41 @@ fn search_with_multibyte_boundary_content_does_not_crash_server() {
     let mut client = McpClient::spawn(dir.path());
     client.initialize();
 
-    // Step 1: seed the crashing entry. This call does not itself run
-    // preview(60) — remember() only validates and stores.
+    // Step 1: seed the crashing entry. `bypass_overlap=true` keeps the
+    // test focused on the preview regression — without the bypass, an
+    // overlap check could in principle short-circuit the store with
+    // an `is_error: true` tool-result envelope that carries no
+    // JSON-RPC error, making the seed silently no-op.
     let remember = client.call_tool(
         "memory",
         json!({
             "action": "remember",
             "content": CRASH_FIXTURE,
             "entry_type": "learning",
-            "tags": "cas-f5e4,regression,factory"
+            "tags": "cas-f5e4,regression,factory",
+            "bypass_overlap": true
         }),
     );
     assert!(
         remember.error.is_none(),
-        "memory.remember failed: {:?}",
+        "memory.remember failed at JSON-RPC layer: {:?}",
         remember.error
+    );
+    let remember_result = remember
+        .result
+        .as_ref()
+        .expect("memory.remember must return a result");
+    assert!(
+        !is_tool_error(remember_result),
+        "memory.remember returned a tool-level error: {}",
+        collect_response_text(remember_result)
     );
 
     // Step 2: trigger the panic path. Before ad60df3, this call would
-    // crash the server inside entry.preview(60) and the MCP client would
-    // see the stdio pipe close. After the fix, truncate_preview walks
-    // back to byte 55 and returns cleanly.
+    // crash the server inside entry.preview(60). After ad60df3, the
+    // truncate walks back to byte 55 and returns cleanly. If cas-a436
+    // is in place but ad60df3 is reverted, the panic is caught and
+    // surfaced as INTERNAL_ERROR — still a test failure.
     let search = client.call_tool(
         "search",
         json!({
@@ -282,29 +350,42 @@ fn search_with_multibyte_boundary_content_does_not_crash_server() {
     );
     assert!(
         search.error.is_none(),
-        "search.search must not error (preview truncation regression?): {:?}",
+        "search.search errored at JSON-RPC layer (preview truncation regression?): {:?}",
         search.error
     );
-    let result = search.result.expect("search.search must return a result");
-    let content = result
-        .get("content")
-        .and_then(|c| c.as_array())
-        .expect("search result must carry a content array");
+    let search_result = search
+        .result
+        .as_ref()
+        .expect("search.search must return a result");
     assert!(
-        !content.is_empty(),
-        "search result content must be non-empty; preview truncation may have returned early"
+        !is_tool_error(search_result),
+        "search.search returned a tool-level error: {}",
+        collect_response_text(search_result)
     );
 
-    // Step 3: server-liveness probe on the SAME pipe. If the preview
-    // panic killed the worker, the pipe is already closed and
-    // send_request will panic from the read side. A Result-based call
-    // chain wrapped in catch_unwind would let us turn that into a
-    // clean failure message; the simpler contract (test panics with a
-    // pipe-closed message) is enough for regression signal.
+    // Discriminating assertion: the BM25 index must have surfaced our
+    // seeded entry and `Entry::preview(60)` must have emitted text
+    // containing the fixture marker. Without this, a "no results
+    // found" success response would pass the earlier checks and the
+    // preview path would never run — the regression would not be
+    // caught even if introduced.
+    let search_text = collect_response_text(search_result);
+    assert!(
+        search_text.contains(FIXTURE_PREVIEW_MARKER),
+        "search result did not surface the seeded fixture — BM25 miss or reader-lag; \
+         preview() was not exercised, test is vacuously green. Response text:\n{search_text}"
+    );
+
+    // Step 3: server-liveness probe on the SAME pipe. With the A2
+    // panic catcher shipped (cas-a436), a preview panic no longer
+    // closes the pipe, so this probe is a belt-and-suspenders check
+    // for the pre-A2 failure mode (worker panic crashes the whole
+    // server). If cas-a436 were removed AND ad60df3 were reverted,
+    // the pipe would be dead and this call would error from the read
+    // side of send_request.
     let list = client.call_tool("memory", json!({ "action": "list", "limit": 1 }));
     assert!(
         list.error.is_none(),
         "memory.list after search must succeed — server appears to have died"
     );
 }
-
