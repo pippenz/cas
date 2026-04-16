@@ -8,7 +8,9 @@ mod changelog;
 mod claude_md;
 mod codemap_cmd;
 mod project_overview_cmd;
-mod cloud;
+// `pub` so integration tests in `cas-cli/tests/` can reach
+// `cli::cloud::execute_team_push` (cas-1f44 T4). Internal; no stable API.
+pub mod cloud;
 mod config;
 mod config_tui;
 mod device;
