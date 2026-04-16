@@ -186,7 +186,7 @@ pub enum Commands {
     #[command(subcommand, name = "project-overview")]
     ProjectOverview(project_overview_cmd::ProjectOverviewCommands),
 
-    /// Memory operations (share/unshare entries with your team)
+    /// Share or unshare personal memories with your team (retroactive)
     #[command(subcommand)]
     Memory(memory::MemoryCommands),
 }

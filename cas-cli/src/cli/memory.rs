@@ -18,36 +18,53 @@ use crate::store::open_store;
 
 #[derive(Subcommand)]
 pub enum MemoryCommands {
-    /// Promote entries to the team push queue
+    /// Share personal memories with your team (retroactive backfill)
+    ///
+    /// Sets `share = Team` on selected entries and enqueues them for
+    /// the next `cas cloud sync`. Requires a team to be configured
+    /// via `cas cloud team set <uuid>`; without one, entries are
+    /// marked on disk but no team-queue rows are written.
     Share(ShareArgs),
-    /// Demote an entry back to personal-only (`share = Private`)
+    /// Unshare a memory from the team (sets `share = Private`)
+    ///
+    /// Blocks future team dual-enqueue for this entry. Note: this
+    /// only affects local promotion — entries already synced to the
+    /// cloud team store are not retracted by this command.
     Unshare(UnshareArgs),
 }
 
 #[derive(Parser)]
 pub struct ShareArgs {
-    /// Entry id to promote (e.g. `2026-03-01-1`). Mutually exclusive with
-    /// `--since` and `--all`.
+    /// Entry id to promote (e.g. 2026-03-01-1).
+    ///
+    /// Mutually exclusive with --since and --all. Fails if the entry
+    /// is a Preference or Global-scoped (stay-personal by default).
     #[arg(conflicts_with_all = ["since", "all"])]
     pub id: Option<String>,
 
-    /// Promote all entries created within the given duration (e.g. `7d`,
-    /// `48h`, `30m`). Filtered through the T1 predicate.
+    /// Promote all entries created within the given duration.
+    ///
+    /// Examples: 7d, 48h, 30m, 90s, 2w. Preference-typed and
+    /// Global-scoped entries are skipped automatically.
     #[arg(long, conflicts_with_all = ["id", "all"])]
     pub since: Option<String>,
 
-    /// Promote every entry passing the T1 filter predicate.
+    /// Promote every eligible entry in the store.
+    ///
+    /// Eligible = Project scope, not Preference-typed, not already
+    /// marked share=Private. This is the "Daniel's 392 entries"
+    /// backfill case for new team setups.
     #[arg(long, conflicts_with_all = ["id", "since"])]
     pub all: bool,
 
-    /// Print what would be promoted without mutating the store.
+    /// Preview what would be promoted without mutating the store.
     #[arg(long)]
     pub dry_run: bool,
 }
 
 #[derive(Parser)]
 pub struct UnshareArgs {
-    /// Entry id to demote.
+    /// Entry id to demote back to personal-only.
     pub id: String,
 }
 

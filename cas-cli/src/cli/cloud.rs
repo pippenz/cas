@@ -105,7 +105,7 @@ pub struct CloudSyncArgs {
 
 #[derive(Parser)]
 pub struct CloudProjectsArgs {
-    /// Specify team slug (defaults to active team)
+    /// Team UUID override (defaults to the team configured via `cas cloud team set`).
     #[arg(long)]
     pub team: Option<String>,
 }
@@ -1782,7 +1782,7 @@ fn execute_team_memories(
                 clear_inline(prev_lines)?;
             }
             anyhow::bail!(
-                "This project hasn't been synced to the team yet. Run `cas cloud sync --team` to register it."
+                "This project hasn't been synced to the team yet. Run `cas cloud sync` while a team is configured (see `cas cloud team set <uuid>`) to register it."
             );
         }
     };

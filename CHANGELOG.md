@@ -7,6 +7,32 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Added
+
+#### Team Memories
+- `cas cloud team set|show|clear` subcommands to configure the active team
+  (UUID input; slug resolution deferred pending cloud-side endpoint).
+- `cas memory share <id>|--since <duration>|--all [--dry-run]` for retroactive
+  backfill of pre-existing personal memories to the team push queue.
+- `cas memory unshare <id>` to mark a memory `share=Private` (blocks future
+  team dual-enqueue; does not retract cloud-side copies).
+- `share: Option<ShareScope>` (`Private`/`Team`) persisted on Entry, Rule,
+  Skill, and Task via SQLite migrations `m037`/`m060`/`m082`/`m121`.
+- Automatic dual-enqueue: when a team is configured via
+  `cas cloud team set`, `cas memory remember` in any Project-scoped
+  non-Preference context queues the entry to both personal and team
+  push queues. `cas cloud sync` drains both.
+- Coarse kill-switch: `cloud.json.team_auto_promote: false` disables the
+  automatic promotion without requiring the team to be cleared.
+- Integration test suite: `team_sync_test.rs`, `memory_share_test.rs`,
+  `team_memories_e2e_test.rs` cover the full push → pull pipeline.
+
+### Changed
+
+- `cas cloud team-memories`'s "no team configured" error now correctly
+  directs users to `cas cloud team set <uuid>` (previously referenced a
+  non-existent subcommand with `<slug>` argument).
+
 ## [2.0.0] - 2026-04-12
 
 ### Added

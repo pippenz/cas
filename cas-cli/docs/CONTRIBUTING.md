@@ -45,7 +45,7 @@ silently reintroduce fixed bugs.
 
 ## Adding Features
 
-**New CLI command**: Add variant to `Commands` enum in `cas-cli/src/cli/mod.rs`, create handler file in `cli/`, add integration test in `tests/cli_test.rs`.
+**New CLI command**: Add variant to `Commands` enum in `cas-cli/src/cli/mod.rs`, create handler file in `cli/`. Prefer a dedicated integration test file at `tests/<feature>_test.rs` (e.g. `team_sync_test.rs`, `memory_share_test.rs`, `team_memories_e2e_test.rs`) over piling into `cli_test.rs` — isolated files surface regressions per-feature and keep compile times down.
 
 **New MCP tool**: Add handler in `cas-cli/src/mcp/tools/core/` (data tools) or `cas-cli/src/mcp/tools/service/` (orchestration tools). Request types go in `cas-cli/src/mcp/tools/types/`. Register in the tool list via the `CasService` impl.
 
@@ -61,6 +61,9 @@ Integration tests are in `cas-cli/tests/`. Key test files:
 - `distributed_factory_test.rs` — Multi-agent factory tests
 - `proptest_test.rs` — Property-based tests
 - `e2e_test.rs` / `e2e/` — End-to-end tests
+- `team_sync_test.rs` — `cas cloud sync` team-queue drain path
+- `memory_share_test.rs` — `cas memory share|unshare` CLI behavior
+- `team_memories_e2e_test.rs` — end-to-end team-memories flow (share → push → pull)
 
 Dev dependencies include: `insta` (snapshot testing), `wiremock` (HTTP mocking), `rstest` (parametrized tests), `proptest` (property-based), `criterion` (benchmarks), `cas-tui-test` (TUI testing).
 

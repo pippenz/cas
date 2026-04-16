@@ -248,6 +248,42 @@ cas cloud sync
 
 Cloud sync is not required — all core features work locally with SQLite.
 
+### Team Memories (optional)
+
+Share learnings across a team without manual flags. After an admin has
+created a team in the CAS Cloud dashboard:
+
+```bash
+# One-time setup per machine — UUID from your team dashboard
+cas cloud team set 550e8400-e29b-41d4-a716-446655440000
+
+# Your normal memory capture flows automatically dual-enqueue to the
+# team push queue (Project-scoped, non-Preference entries only)
+cas memory remember "pattern we settled on during auth refactor"
+
+# Next sync drains both personal and team queues
+cas cloud sync
+
+# Teammates on a fresh machine pull what you've shared, zero flags:
+cas cloud team set 550e8400-e29b-41d4-a716-446655440000
+cas cloud team-memories
+```
+
+**Backfilling pre-existing memories.** If you had personal entries
+before the team was configured, promote them retroactively:
+
+```bash
+cas memory share --dry-run --all             # preview
+cas memory share --all                       # promote everything eligible
+cas memory share --since 7d                  # or just the last week
+cas memory share <entry-id>                  # or one at a time
+cas memory unshare <entry-id>                # reverse — mark as Private
+```
+
+Preference-typed and Global-scoped entries always stay personal. To
+pause automatic promotion without clearing the team, set
+`team_auto_promote: false` in `~/.cas/cloud.json`.
+
 ## Contributing
 
 CAS is source-available under the MIT license. We welcome bug reports and feature suggestions through [Issues](https://github.com/codingagentsystem/cas/issues) and [Discussions](https://github.com/codingagentsystem/cas/discussions).
