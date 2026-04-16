@@ -30,12 +30,40 @@ pub enum CloudCommands {
     Pull(CloudPullArgs),
     /// Full sync (push then pull)
     Sync(CloudSyncArgs),
+    /// Configure the active team for team-scoped sync operations
+    #[command(subcommand)]
+    Team(CloudTeamCommands),
     /// List team projects in cloud
     Projects(CloudProjectsArgs),
     /// Pull team memories for the current project
     TeamMemories(CloudTeamMemoriesArgs),
     /// Remove foreign-project entities from local DB and re-pull
     PurgeForeign(CloudPurgeForeignArgs),
+}
+
+/// Subcommands for `cas cloud team`
+#[derive(Subcommand)]
+pub enum CloudTeamCommands {
+    /// Set the active team by UUID
+    ///
+    /// The team is persisted in `~/.cas/cloud.json` and used by team-scoped
+    /// sync operations (push to `/api/teams/{uuid}/sync/push`, pull via
+    /// `cas cloud team-memories`).
+    ///
+    /// Only UUID input is supported today — slug resolution requires a
+    /// cloud-side endpoint that is not yet available. Find your team UUID
+    /// in the CAS Cloud dashboard under team settings.
+    Set(CloudTeamSetArgs),
+    /// Show the currently configured team
+    Show,
+    /// Clear the configured team (no more team-scoped sync)
+    Clear,
+}
+
+#[derive(Parser)]
+pub struct CloudTeamSetArgs {
+    /// Team UUID (e.g., 550e8400-e29b-41d4-a716-446655440000)
+    pub id: String,
 }
 
 #[derive(Parser)]
@@ -126,10 +154,204 @@ pub fn execute(cmd: &CloudCommands, cli: &Cli, cas_root: &Path) -> anyhow::Resul
         CloudCommands::Push(args) => execute_push(args, cli, cas_root),
         CloudCommands::Pull(args) => execute_pull(args, cli, cas_root),
         CloudCommands::Sync(args) => execute_sync(args, cli, cas_root),
+        CloudCommands::Team(cmd) => execute_team(cmd, cli),
         CloudCommands::Projects(args) => execute_projects(args, cli),
         CloudCommands::TeamMemories(args) => execute_team_memories(args, cli, cas_root),
         CloudCommands::PurgeForeign(args) => execute_purge_foreign(args, cli, cas_root),
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TEAM — set / show / clear the active team
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Validate a string looks like a canonical UUID (36 chars, 8-4-4-4-12 hex).
+///
+/// We accept both upper- and lower-case hex and normalise to lowercase on save.
+/// Non-canonical forms (braces, no-hyphens, urn prefix) are rejected — team
+/// UUIDs are stored elsewhere in canonical form, and accepting variants would
+/// create silent inequality between the CLI and server lookups.
+fn parse_team_uuid(input: &str) -> Result<String, String> {
+    match uuid::Uuid::try_parse(input) {
+        Ok(u) => Ok(u.as_hyphenated().to_string()),
+        Err(_) => Err(format!(
+            "`{input}` is not a valid team UUID.\n\n  Expected canonical form: 550e8400-e29b-41d4-a716-446655440000\n\n  Slug resolution (e.g., `cas cloud team set petrastella`) is not yet\n  supported — it requires a cloud-side slug→UUID endpoint that is not\n  available in the current CAS Cloud deployment.\n\n  Find your team UUID in the CAS Cloud dashboard under team settings,\n  or run `cas cloud team set --help` for details."
+        )),
+    }
+}
+
+/// Result of probing team membership via `GET /api/teams/{uuid}/projects`.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TeamProbeOutcome {
+    /// Server returned 2xx — user is a member of the team.
+    Member,
+    /// Server returned 401 — the token is invalid or expired.
+    Unauthorized,
+    /// Server returned 403 — valid token, but user is not a team member.
+    NotAMember,
+    /// Server returned 404 — team UUID does not exist.
+    NotFound,
+    /// Network error or unexpected status code.
+    Error(String),
+}
+
+/// Probe team membership by hitting `GET /api/teams/{uuid}/projects`.
+///
+/// This endpoint already enforces `validateTeamMembership` server-side and is
+/// cheap (no body), so it is the natural pre-flight check before persisting
+/// `team_id` to cloud.json. Factored out for testability with wiremock.
+pub(crate) fn probe_team_membership(
+    endpoint: &str,
+    token: &str,
+    team_uuid: &str,
+) -> TeamProbeOutcome {
+    let url = format!("{endpoint}/api/teams/{team_uuid}/projects");
+    match ureq::get(&url)
+        .set("Authorization", &format!("Bearer {token}"))
+        .call()
+    {
+        Ok(_) => TeamProbeOutcome::Member,
+        Err(ureq::Error::Status(401, _)) => TeamProbeOutcome::Unauthorized,
+        Err(ureq::Error::Status(403, _)) => TeamProbeOutcome::NotAMember,
+        Err(ureq::Error::Status(404, _)) => TeamProbeOutcome::NotFound,
+        Err(ureq::Error::Status(code, _)) => {
+            TeamProbeOutcome::Error(format!("unexpected HTTP {code}"))
+        }
+        Err(e) => TeamProbeOutcome::Error(format!("network error: {e}")),
+    }
+}
+
+fn execute_team(cmd: &CloudTeamCommands, cli: &Cli) -> anyhow::Result<()> {
+    match cmd {
+        CloudTeamCommands::Set(args) => execute_team_set(args, cli),
+        CloudTeamCommands::Show => execute_team_show(cli),
+        CloudTeamCommands::Clear => execute_team_clear(cli),
+    }
+}
+
+fn execute_team_set(args: &CloudTeamSetArgs, cli: &Cli) -> anyhow::Result<()> {
+    let uuid = parse_team_uuid(&args.id).map_err(|msg| anyhow::anyhow!(msg))?;
+
+    let mut config = CloudConfig::load()?;
+    let token = config
+        .token
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Not logged in. Run 'cas login' first."))?
+        .clone();
+
+    match probe_team_membership(&config.endpoint, &token, &uuid) {
+        TeamProbeOutcome::Member => {
+            // Server doesn't return the slug from this endpoint. Store a
+            // placeholder until a cloud-side slug resolver lands; docs/T7
+            // explain the workaround. Users who set_team today see the UUID
+            // echoed back by `cas cloud team show` with slug="<unknown>".
+            config.set_team(&uuid, "<unknown>");
+            config.save()?;
+
+            if cli.json {
+                println!(
+                    r#"{{"status":"ok","team_id":"{uuid}","team_slug":"<unknown>"}}"#
+                );
+            } else {
+                let theme = ActiveTheme::default();
+                let mut out = io::stdout();
+                let mut fmt = Formatter::stdout(&mut out, theme);
+                let success_color = fmt.theme().palette.status_success;
+                fmt.newline()?;
+                fmt.write_colored("  \u{2713} ", success_color)?;
+                fmt.write_raw("Active team set")?;
+                fmt.newline()?;
+                fmt.write_muted("  UUID: ")?;
+                fmt.write_raw(&uuid)?;
+                fmt.newline()?;
+                fmt.write_muted("  Slug resolution deferred — see `cas cloud team show`")?;
+                fmt.newline()?;
+            }
+            Ok(())
+        }
+        TeamProbeOutcome::Unauthorized => {
+            anyhow::bail!("Token invalid or expired. Run 'cas login' to re-authenticate.")
+        }
+        TeamProbeOutcome::NotAMember => {
+            anyhow::bail!("You are not a member of team {uuid}.")
+        }
+        TeamProbeOutcome::NotFound => {
+            anyhow::bail!("Team {uuid} not found on {}.", config.endpoint)
+        }
+        TeamProbeOutcome::Error(msg) => {
+            anyhow::bail!("Failed to verify team membership: {msg}")
+        }
+    }
+}
+
+fn execute_team_show(cli: &Cli) -> anyhow::Result<()> {
+    let config = CloudConfig::load()?;
+
+    match (&config.team_id, &config.team_slug) {
+        (Some(id), slug) => {
+            let slug = slug.as_deref().unwrap_or("<unknown>");
+            if cli.json {
+                println!(
+                    r#"{{"team_id":"{id}","team_slug":"{slug}"}}"#
+                );
+            } else {
+                let theme = ActiveTheme::default();
+                let mut out = io::stdout();
+                let mut fmt = Formatter::stdout(&mut out, theme);
+                fmt.newline()?;
+                fmt.write_muted("  Team ID:   ")?;
+                fmt.write_raw(id)?;
+                fmt.newline()?;
+                fmt.write_muted("  Team slug: ")?;
+                fmt.write_raw(slug)?;
+                fmt.newline()?;
+            }
+        }
+        (None, _) => {
+            if cli.json {
+                println!(r#"{{"team_id":null}}"#);
+            } else {
+                let theme = ActiveTheme::default();
+                let mut out = io::stdout();
+                let mut fmt = Formatter::stdout(&mut out, theme);
+                let warning_color = fmt.theme().palette.status_warning;
+                fmt.newline()?;
+                fmt.write_colored("  \u{25CF} ", warning_color)?;
+                fmt.write_raw("No team configured")?;
+                fmt.newline()?;
+                fmt.write_raw("  Run ")?;
+                fmt.write_accent("cas cloud team set <uuid>")?;
+                fmt.write_raw(" to set the active team.")?;
+                fmt.newline()?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn execute_team_clear(cli: &Cli) -> anyhow::Result<()> {
+    let mut config = CloudConfig::load()?;
+    let was_set = config.team_id.is_some();
+    config.clear_team();
+    config.save()?;
+
+    if cli.json {
+        println!(r#"{{"status":"ok","was_set":{was_set}}}"#);
+    } else {
+        let theme = ActiveTheme::default();
+        let mut out = io::stdout();
+        let mut fmt = Formatter::stdout(&mut out, theme);
+        let success_color = fmt.theme().palette.status_success;
+        fmt.newline()?;
+        fmt.write_colored("  \u{2713} ", success_color)?;
+        fmt.write_raw(if was_set {
+            "Active team cleared"
+        } else {
+            "No team was configured"
+        })?;
+        fmt.newline()?;
+    }
+    Ok(())
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1142,7 +1364,7 @@ fn execute_projects(args: &CloudProjectsArgs, cli: &Cli) -> anyhow::Result<()> {
                 let warning_color = fmt.theme().palette.status_warning;
                 fmt.write_colored("  \u{25CF} ", warning_color)?;
                 fmt.write_raw("No team configured. Run ")?;
-                fmt.write_accent("cas cloud team set <slug>")?;
+                fmt.write_accent("cas cloud team set <uuid>")?;
                 fmt.write_raw(" first.")?;
                 fmt.newline()?;
             }
@@ -1271,7 +1493,7 @@ fn execute_team_memories(
         .team_id
         .as_ref()
         .ok_or_else(|| {
-            anyhow::anyhow!("No team configured. Run `cas cloud team set <slug>` first.")
+            anyhow::anyhow!("No team configured. Run `cas cloud team set <uuid>` first.")
         })?
         .clone();
 
@@ -1725,4 +1947,172 @@ fn execute_purge_foreign(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod team_cmd_tests {
+    use super::*;
+    use tempfile::TempDir;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn parse_team_uuid_accepts_canonical() {
+        let uuid = parse_team_uuid("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        assert_eq!(uuid, "550e8400-e29b-41d4-a716-446655440000");
+    }
+
+    #[test]
+    fn parse_team_uuid_normalises_uppercase() {
+        let uuid = parse_team_uuid("550E8400-E29B-41D4-A716-446655440000").unwrap();
+        assert_eq!(uuid, "550e8400-e29b-41d4-a716-446655440000");
+    }
+
+    #[test]
+    fn parse_team_uuid_rejects_slug() {
+        let err = parse_team_uuid("petra-stella").unwrap_err();
+        assert!(err.contains("not a valid team UUID"));
+        assert!(err.contains("Slug resolution"));
+    }
+
+    #[test]
+    fn parse_team_uuid_rejects_empty() {
+        assert!(parse_team_uuid("").is_err());
+    }
+
+    #[test]
+    fn parse_team_uuid_rejects_too_short() {
+        assert!(parse_team_uuid("abc-123").is_err());
+    }
+
+    #[test]
+    fn config_set_team_roundtrip() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("cloud.json");
+
+        let mut config = CloudConfig::default();
+        config.set_team("550e8400-e29b-41d4-a716-446655440000", "<unknown>");
+        config.save_to(&path).unwrap();
+
+        let loaded = CloudConfig::load_from(&path).unwrap();
+        assert_eq!(
+            loaded.team_id.as_deref(),
+            Some("550e8400-e29b-41d4-a716-446655440000")
+        );
+        assert_eq!(loaded.team_slug.as_deref(), Some("<unknown>"));
+
+        let mut loaded = loaded;
+        loaded.clear_team();
+        loaded.save_to(&path).unwrap();
+
+        let reloaded = CloudConfig::load_from(&path).unwrap();
+        assert!(reloaded.team_id.is_none());
+        assert!(reloaded.team_slug.is_none());
+    }
+
+    #[tokio::test]
+    async fn probe_membership_returns_member_on_200() {
+        let server = MockServer::start().await;
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+        Mock::given(method("GET"))
+            .and(path(format!("/api/teams/{uuid}/projects")))
+            .and(header("Authorization", "Bearer test-token"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "projects": [] })),
+            )
+            .mount(&server)
+            .await;
+        let endpoint = server.uri();
+
+        let outcome = tokio::task::spawn_blocking(move || {
+            probe_team_membership(&endpoint, "test-token", uuid)
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, TeamProbeOutcome::Member);
+    }
+
+    #[tokio::test]
+    async fn probe_membership_returns_unauthorized_on_401() {
+        let server = MockServer::start().await;
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+        Mock::given(method("GET"))
+            .and(path(format!("/api/teams/{uuid}/projects")))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+        let endpoint = server.uri();
+
+        let outcome = tokio::task::spawn_blocking(move || {
+            probe_team_membership(&endpoint, "bad-token", uuid)
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, TeamProbeOutcome::Unauthorized);
+    }
+
+    #[tokio::test]
+    async fn probe_membership_returns_not_a_member_on_403() {
+        let server = MockServer::start().await;
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+        Mock::given(method("GET"))
+            .and(path(format!("/api/teams/{uuid}/projects")))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+        let endpoint = server.uri();
+
+        let outcome = tokio::task::spawn_blocking(move || {
+            probe_team_membership(&endpoint, "test-token", uuid)
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, TeamProbeOutcome::NotAMember);
+    }
+
+    #[tokio::test]
+    async fn probe_membership_returns_not_found_on_404() {
+        let server = MockServer::start().await;
+        let uuid = "00000000-0000-0000-0000-000000000000";
+        Mock::given(method("GET"))
+            .and(path(format!("/api/teams/{uuid}/projects")))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let endpoint = server.uri();
+
+        let outcome = tokio::task::spawn_blocking(move || {
+            probe_team_membership(&endpoint, "test-token", uuid)
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, TeamProbeOutcome::NotFound);
+    }
+
+    #[tokio::test]
+    async fn probe_membership_returns_error_on_500() {
+        let server = MockServer::start().await;
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+        Mock::given(method("GET"))
+            .and(path(format!("/api/teams/{uuid}/projects")))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let endpoint = server.uri();
+
+        let outcome = tokio::task::spawn_blocking(move || {
+            probe_team_membership(&endpoint, "test-token", uuid)
+        })
+        .await
+        .unwrap();
+
+        match outcome {
+            TeamProbeOutcome::Error(msg) => assert!(msg.contains("500"), "got: {msg}"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
 }
