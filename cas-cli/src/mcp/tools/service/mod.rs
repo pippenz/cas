@@ -998,6 +998,7 @@ mod agent_search_system;
 mod core;
 mod factory_ops;
 mod factory_remind;
+mod panic_catch;
 mod pattern_ops;
 mod server_handler;
 mod spec_ops;
