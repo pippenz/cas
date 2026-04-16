@@ -55,21 +55,13 @@ impl SyncingTaskStore {
         if let Some(team_id) = self.team_id.as_deref()
             && eligible_for_team_task(task)
         {
-            if let Err(e) = self.queue.enqueue_for_team(
+            let _ = self.queue.enqueue_for_team(
                 EntityType::Task,
                 &task.id,
                 SyncOperation::Upsert,
                 Some(&payload),
                 team_id,
-            ) {
-                tracing::warn!(
-                    target: "cas::sync",
-                    entity_id = task.id,
-                    team_id = team_id,
-                    error = %e,
-                    "team enqueue failed for task"
-                );
-            }
+            );
         }
     }
 
@@ -82,23 +74,15 @@ impl SyncingTaskStore {
         // predicate here because we don't have the entity — but deletes
         // are cheap to over-push (the server has no row to touch), and
         // under-pushing would leave stale team rows forever. Trade
-        // over-push for correctness.
+        // over-push for correctness. Best-effort matches personal path.
         if let Some(team_id) = self.team_id.as_deref() {
-            if let Err(e) = self.queue.enqueue_for_team(
+            let _ = self.queue.enqueue_for_team(
                 EntityType::Task,
                 id,
                 SyncOperation::Delete,
                 None,
                 team_id,
-            ) {
-                tracing::warn!(
-                    target: "cas::sync",
-                    entity_id = id,
-                    team_id = team_id,
-                    error = %e,
-                    "team enqueue failed for task delete"
-                );
-            }
+            );
         }
     }
 }

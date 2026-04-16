@@ -66,27 +66,21 @@ impl SyncingEntryStore {
             Some(&payload),
         );
 
-        // Team enqueue: opt-in, predicate-gated. Failures are logged rather
-        // than silently swallowed because team-scope data loss is harder
-        // to re-derive than personal — a teammate may be waiting on this.
+        // Team enqueue: opt-in, predicate-gated. Best-effort (let _ = ...)
+        // matches the personal path's historical contract — a SQLite
+        // failure here silently drops the team row, same as it silently
+        // drops the personal row. Symmetric. Propagating the error would
+        // require changing the Store trait signature; out of scope.
         if let Some(team_id) = self.team_id.as_deref()
             && eligible_for_team_entry(entry)
         {
-            if let Err(e) = self.queue.enqueue_for_team(
+            let _ = self.queue.enqueue_for_team(
                 EntityType::Entry,
                 &entry.id,
                 SyncOperation::Upsert,
                 Some(&payload),
                 team_id,
-            ) {
-                tracing::warn!(
-                    target: "cas::sync",
-                    entity_id = entry.id,
-                    team_id = team_id,
-                    error = %e,
-                    "team enqueue failed for entry"
-                );
-            }
+            );
         }
     }
 
@@ -99,23 +93,16 @@ impl SyncingEntryStore {
         // predicate here because we don't have the entity — but deletes
         // are cheap to over-push (the server has no row to touch), and
         // under-pushing would leave stale team rows forever. Trade
-        // over-push for correctness.
+        // over-push for correctness. Best-effort matches the personal
+        // path's contract (see queue_upsert comment).
         if let Some(team_id) = self.team_id.as_deref() {
-            if let Err(e) = self.queue.enqueue_for_team(
+            let _ = self.queue.enqueue_for_team(
                 EntityType::Entry,
                 id,
                 SyncOperation::Delete,
                 None,
                 team_id,
-            ) {
-                tracing::warn!(
-                    target: "cas::sync",
-                    entity_id = id,
-                    team_id = team_id,
-                    error = %e,
-                    "team enqueue failed for entry delete"
-                );
-            }
+            );
         }
     }
 }
