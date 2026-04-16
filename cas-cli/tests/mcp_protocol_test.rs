@@ -779,9 +779,12 @@ fn test_serve_fails_fast_on_unreadable_cas_db() {
     scrub_cas_env(&mut cmd);
     let mut child = cmd.spawn().expect("spawn cas serve");
 
-    // The eager-init budget is 15s in production; tests should complete well
-    // before that since the very first store open hits EACCES. Give the
-    // process a generous 25s ceiling to avoid flaking on slow CI.
+    // EACCES is returned synchronously by the very first store open — well
+    // inside the production EAGER_INIT_BUDGET (45s) and orders of magnitude
+    // faster than the budget itself would fire. Give the process a generous
+    // 25s ceiling to avoid flaking on slow CI while still staying under the
+    // budget so a regression that changed the *budget* path (rather than the
+    // EACCES path) would be visible as a different failure shape.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(25);
     let exit_status = loop {
         match child.try_wait().expect("try_wait") {

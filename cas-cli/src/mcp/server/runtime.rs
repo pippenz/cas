@@ -255,12 +255,27 @@ async fn run_server_impl() -> anyhow::Result<()> {
 
 /// Total time budget for the eager store-init phase before `cas serve` aborts.
 ///
-/// Each store open has its own internal SQLite `busy_timeout` (5s today). With
-/// ~10 store types, an unbroken contention scenario could otherwise silently
-/// burn ~50s here while the MCP client (Claude Code) gives up on the
-/// initialize/tools-list handshake. Failing fast surfaces the problem to the
-/// supervisor instead of delivering 0 tools with no error. See cas-5c05.
-const EAGER_INIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
+/// This budget exists to convert silent zero-tools mode into a loud failure —
+/// not to time-police healthy startup. Three forces set its value:
+///
+/// 1. **Real-incident floor.** The cas-5c05 trigger was a 15-hour `cas init`
+///    hang on the same project. Anything in the seconds-to-minute range
+///    catches that with massive headroom.
+/// 2. **Thundering-herd ceiling.** investigation-mcp-worktree.md (cas-09f1,
+///    2026-03-25) documents 6 concurrent `cas serve` processes opening the
+///    same `cas.db`. Each store has a 5s SQLite `busy_timeout`, so realistic
+///    cross-process contention can stack to a low-tens-of-seconds for a
+///    legitimate factory startup. The budget must tolerate that.
+/// 3. **MCP client deadline.** Claude Code's `initialize`/`tools/list`
+///    handshake gives up around 60s. The budget must be strictly less so the
+///    abort surfaces as a visible error to the client rather than racing the
+///    client's own timeout.
+///
+/// 45s sits comfortably between all three: ~1200× the realistic contention
+/// floor, ~15s margin under the MCP client deadline, and orders of magnitude
+/// shorter than any pathological hang the original incident exhibited.
+/// Tuned per cas-5c05 review (supervisor verification).
+const EAGER_INIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(45);
 
 /// Eagerly open every store and the search index before serving MCP requests.
 ///
