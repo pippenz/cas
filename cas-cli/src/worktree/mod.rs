@@ -26,6 +26,7 @@
 //! The `ghostty_vt_sys/build.rs` will provide a clear error message if vendor
 //! files are missing.
 
+pub mod discovery;
 pub mod git;
 mod manager;
 pub mod salvage;
