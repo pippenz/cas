@@ -118,10 +118,11 @@ impl TeamsManager {
         let mut configs = std::collections::HashMap::new();
         let lead_session_id = uuid::Uuid::new_v4().to_string();
 
-        // Supervisor settings path — auto-allow Write/Edit/Bash/NotebookEdit so
-        // the supervisor's tool calls don't get forwarded to itself via team
-        // permission routing (self-leadership deadlock). Workers leave this as
-        // None and retain normal routing.
+        // Supervisor settings path — auto-allow the filesystem tool families
+        // so the supervisor's tool calls don't get forwarded to itself via
+        // team permission routing (self-leadership deadlock). Workers get
+        // the same treatment below via per-worker settings files (cas-e15d)
+        // to avoid the symmetric phantom `team-lead` hang.
         //
         // The file is written *here*, eagerly, because the factory spawns the
         // supervisor PTY during `FactoryApp::new` — which runs *before*
@@ -160,8 +161,25 @@ impl TeamsManager {
             },
         );
 
-        // Workers
+        // Workers — each gets its own per-worker settings file so
+        // filesystem tool calls auto-approve instead of escalating to the
+        // phantom `team-lead` mailbox. Same eager-write invariant as the
+        // supervisor: the file must exist on disk *before* the PTY spawns
+        // with `--settings <path>` or claude silently falls back to the
+        // stock allowlist.
         for (i, name) in worker_names.iter().enumerate() {
+            let worker_settings_path_buf = Self::worker_settings_path_for(session_name, name);
+            let worker_settings_path =
+                worker_settings_path_buf.to_string_lossy().to_string();
+            if let Err(e) = Self::write_worker_settings_to(&worker_settings_path_buf) {
+                tracing::warn!(
+                    "Failed to pre-write worker settings for {} at {:?}: {}",
+                    name,
+                    worker_settings_path_buf,
+                    e
+                );
+            }
+
             configs.insert(
                 name.clone(),
                 cas_mux::TeamsSpawnConfig {
@@ -172,7 +190,7 @@ impl TeamsManager {
                     agent_type: "general-purpose".to_string(),
                     parent_session_id: Some(lead_session_id.clone()),
                     lead_session_id: None,
-                    settings_path: None,
+                    settings_path: Some(worker_settings_path),
                 },
             );
         }
@@ -222,8 +240,59 @@ impl TeamsManager {
         serde_json::json!({
             "permissions": {
                 "allow": [
+                    "Read",
                     "Write",
                     "Edit",
+                    "Glob",
+                    "Grep",
+                    "Bash",
+                    "NotebookEdit"
+                ]
+            }
+        })
+    }
+
+    /// Compute the on-disk path of a worker's settings file. Lives alongside
+    /// `config.json` under `~/.claude/teams/{session}/{worker_name}-settings.json`.
+    /// Mirrors [`Self::supervisor_settings_path_for`] — same eager-write
+    /// invariant applies.
+    pub fn worker_settings_path_for(session_name: &str, worker_name: &str) -> PathBuf {
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        home.join(".claude")
+            .join("teams")
+            .join(session_name)
+            .join(format!("{worker_name}-settings.json"))
+    }
+
+    /// Write a worker settings file at the given absolute path, creating the
+    /// parent directory if needed. Idempotent.
+    pub fn write_worker_settings_to(path: &std::path::Path) -> anyhow::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let body = serde_json::to_string_pretty(&Self::worker_settings_contents())?;
+        std::fs::write(path, body)?;
+        tracing::info!("Wrote worker settings at {:?}", path);
+        Ok(())
+    }
+
+    /// JSON body of a worker settings file. Covers the filesystem tool
+    /// families whose approvals would otherwise escalate to the phantom
+    /// `team-lead` mailbox (agentType misread as name, upstream) and hang.
+    ///
+    /// Kept to the same shape as [`Self::supervisor_settings_contents`] so
+    /// both roles share one surface area review. Any tool added here should
+    /// also be added to the supervisor list unless we have a specific reason
+    /// to diverge.
+    pub fn worker_settings_contents() -> serde_json::Value {
+        serde_json::json!({
+            "permissions": {
+                "allow": [
+                    "Read",
+                    "Write",
+                    "Edit",
+                    "Glob",
+                    "Grep",
                     "Bash",
                     "NotebookEdit"
                 ]
@@ -556,10 +625,11 @@ impl TeamsManager {
 
     /// Build a `cas_mux::TeamsSpawnConfig` for spawning a new agent with native teams flags.
     ///
-    /// This constructor is used for dynamically-added workers (agents added
-    /// after the initial `init_team_config` call). It intentionally leaves
-    /// `settings_path` unset — the supervisor-only settings file is for the
-    /// team lead's self-routing deadlock and is not relevant to workers.
+    /// Used for dynamically-added workers (agents added after the initial
+    /// `init_team_config` call). Eagerly writes the per-worker settings file
+    /// into `self.teams_dir` so the spawned `claude` invocation's
+    /// `--settings <path>` resolves at PTY start — same invariant as the
+    /// eager-write path in [`Self::build_configs_for_mux`].
     pub fn spawn_config_for(
         &self,
         name: &str,
@@ -567,6 +637,18 @@ impl TeamsManager {
         color: &str,
         parent_session_id: Option<&str>,
     ) -> cas_mux::TeamsSpawnConfig {
+        let worker_settings_path = self
+            .teams_dir
+            .join(format!("{name}-settings.json"));
+        if let Err(e) = Self::write_worker_settings_to(&worker_settings_path) {
+            tracing::warn!(
+                "Failed to write worker settings for {} at {:?}: {}",
+                name,
+                worker_settings_path,
+                e
+            );
+        }
+
         cas_mux::TeamsSpawnConfig {
             team_name: self.team_name.clone(),
             agent_id: self.agent_id_for(name),
@@ -575,7 +657,7 @@ impl TeamsManager {
             agent_type: agent_type.to_string(),
             parent_session_id: parent_session_id.map(|s| s.to_string()),
             lead_session_id: None,
-            settings_path: None,
+            settings_path: Some(worker_settings_path.to_string_lossy().to_string()),
         }
     }
 }
@@ -596,6 +678,157 @@ mod tests {
             teams_dir,
             inboxes_dir,
         }
+    }
+
+    /// `supervisor_settings_contents()` must cover every tool family whose
+    /// approvals would otherwise hang on the phantom `team-lead` mailbox.
+    /// Workers learned the same lesson (Read/Glob/Grep were the original
+    /// screenshot's blockers), and the supervisor hits the same ops while
+    /// auditing its own `.claude/settings.json`.
+    #[test]
+    fn supervisor_settings_contents_covers_expected_tools() {
+        let body = TeamsManager::supervisor_settings_contents();
+        let allow = body
+            .get("permissions")
+            .and_then(|p| p.get("allow"))
+            .and_then(|a| a.as_array())
+            .expect("permissions.allow present");
+        let names: Vec<&str> = allow.iter().filter_map(|v| v.as_str()).collect();
+        for tool in ["Read", "Write", "Edit", "Glob", "Grep", "Bash", "NotebookEdit"] {
+            assert!(
+                names.contains(&tool),
+                "supervisor allowlist must include {tool}, got {names:?}"
+            );
+        }
+    }
+
+    /// Worker allowlist must cover the same filesystem tool families so
+    /// every Write/Edit/Read/Glob/Grep/Bash op auto-approves instead of
+    /// escalating to the phantom `team-lead`.
+    #[test]
+    fn worker_settings_contents_covers_expected_tools() {
+        let body = TeamsManager::worker_settings_contents();
+        let allow = body
+            .get("permissions")
+            .and_then(|p| p.get("allow"))
+            .and_then(|a| a.as_array())
+            .expect("permissions.allow present");
+        let names: Vec<&str> = allow.iter().filter_map(|v| v.as_str()).collect();
+        for tool in ["Read", "Write", "Edit", "Glob", "Grep", "Bash", "NotebookEdit"] {
+            assert!(
+                names.contains(&tool),
+                "worker allowlist must include {tool}, got {names:?}"
+            );
+        }
+    }
+
+    /// `build_configs_for_mux` must populate `settings_path` on every worker
+    /// entry (not just the supervisor). Before this fix workers got `None` and
+    /// every filesystem tool call escalated to `team-lead`, a mailbox that
+    /// doesn't exist, and hung forever.
+    #[test]
+    fn build_configs_for_mux_sets_settings_path_on_every_worker() {
+        // Use unique session name so parallel test runs don't race.
+        let uniq = format!(
+            "worker-allowlist-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let (configs, _lead) = TeamsManager::build_configs_for_mux(
+            &uniq,
+            "supervisor",
+            &["worker-a".to_string(), "worker-b".to_string()],
+        );
+
+        for worker in ["worker-a", "worker-b"] {
+            let w = configs.get(worker).expect("worker config");
+            let path = w
+                .settings_path
+                .as_ref()
+                .unwrap_or_else(|| panic!("worker {worker} must carry settings_path"));
+            assert!(
+                path.ends_with(&format!("{worker}-settings.json")),
+                "worker {worker} settings_path should end with {worker}-settings.json, got {path}"
+            );
+            assert!(
+                path.contains(&uniq),
+                "worker {worker} settings_path must live under session dir, got {path}"
+            );
+        }
+
+        // Cleanup
+        let root = TeamsManager::supervisor_settings_path_for(&uniq);
+        if let Some(dir) = root.parent() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// Worker settings files must be written to disk at the moment
+    /// `build_configs_for_mux` returns — before any worker PTY is spawned.
+    /// A missing file at spawn time means `claude --settings <path>` silently
+    /// falls back to the stock allowlist, recreating the hang.
+    #[test]
+    fn build_configs_for_mux_writes_worker_settings_files_eagerly() {
+        let uniq = format!(
+            "worker-eager-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let worker_a_path = TeamsManager::worker_settings_path_for(&uniq, "worker-a");
+        let worker_b_path = TeamsManager::worker_settings_path_for(&uniq, "worker-b");
+        assert!(!worker_a_path.exists(), "precondition: worker-a settings file absent");
+        assert!(!worker_b_path.exists(), "precondition: worker-b settings file absent");
+
+        let _ = TeamsManager::build_configs_for_mux(
+            &uniq,
+            "supervisor",
+            &["worker-a".to_string(), "worker-b".to_string()],
+        );
+
+        assert!(
+            worker_a_path.exists(),
+            "worker-a settings must be written eagerly at {worker_a_path:?}"
+        );
+        assert!(
+            worker_b_path.exists(),
+            "worker-b settings must be written eagerly at {worker_b_path:?}"
+        );
+
+        // Cleanup
+        if let Some(dir) = worker_a_path.parent() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// Dynamically-spawned workers go through `spawn_config_for` instead of
+    /// `build_configs_for_mux`; that path must also write + populate
+    /// `settings_path` or the deadlock recurs for runtime-added workers.
+    #[test]
+    fn spawn_config_for_writes_worker_settings_and_populates_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let uniq = "dynamic-worker-test";
+        let tm = manager_in(tmp.path(), uniq);
+
+        let config =
+            tm.spawn_config_for("late-joiner", "general-purpose", "blue", Some("lead-xyz"));
+
+        let path = config
+            .settings_path
+            .as_ref()
+            .expect("spawn_config_for must populate settings_path for workers");
+        assert!(path.ends_with("late-joiner-settings.json"));
+
+        let on_disk = std::path::PathBuf::from(path);
+        assert!(
+            on_disk.exists(),
+            "spawn_config_for must eagerly write the worker settings file at {on_disk:?}"
+        );
     }
 
     #[test]
@@ -623,27 +856,30 @@ mod tests {
             .expect("permissions.allow array present");
 
         let names: Vec<&str> = allow.iter().filter_map(|v| v.as_str()).collect();
-        // Exactly the four tool families the routing deadlock is observed on.
-        // Keeping this assertion tight catches accidental drift toward
-        // over-permissioning (which would weaken isolation for the supervisor).
-        assert!(names.contains(&"Write"), "allow must include Write");
-        assert!(names.contains(&"Edit"), "allow must include Edit");
-        assert!(names.contains(&"Bash"), "allow must include Bash");
-        assert!(
-            names.contains(&"NotebookEdit"),
-            "allow must include NotebookEdit"
-        );
-        assert_eq!(
-            names.len(),
-            4,
-            "allow should be exactly the four deadlock-prone tool families, got {names:?}"
-        );
+        // Every filesystem tool family the routing deadlock is observed on.
+        // The list was expanded from the original 4 (Write/Edit/Bash/
+        // NotebookEdit) after cas-e15d: Read/Glob/Grep were also hanging
+        // when the supervisor audited `.claude/settings.json`.
+        for tool in ["Read", "Write", "Edit", "Glob", "Grep", "Bash", "NotebookEdit"] {
+            assert!(
+                names.contains(&tool),
+                "supervisor allow must include {tool}, got {names:?}"
+            );
+        }
     }
 
     #[test]
-    fn build_configs_for_mux_sets_settings_path_on_supervisor_only() {
+    fn build_configs_for_mux_sets_supervisor_settings_path() {
+        let uniq = format!(
+            "routing-supervisor-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
         let (configs, _lead_session_id) = TeamsManager::build_configs_for_mux(
-            "routing-test-team",
+            &uniq,
             "supervisor",
             &["worker-1".to_string(), "worker-2".to_string()],
         );
@@ -658,16 +894,14 @@ mod tests {
             "settings_path should point at supervisor-settings.json, got {path}"
         );
         assert!(
-            path.contains("routing-test-team"),
+            path.contains(&uniq),
             "settings_path should live under the session's team dir, got {path}"
         );
 
-        for worker in ["worker-1", "worker-2"] {
-            let w = configs.get(worker).expect("worker config");
-            assert!(
-                w.settings_path.is_none(),
-                "worker {worker} must not get the supervisor allowlist"
-            );
+        // Cleanup
+        let root = TeamsManager::supervisor_settings_path_for(&uniq);
+        if let Some(dir) = root.parent() {
+            let _ = std::fs::remove_dir_all(dir);
         }
     }
 
