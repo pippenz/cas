@@ -99,3 +99,80 @@ fn test_config_get_set() {
     config.set("sync.target", "/custom/path").unwrap();
     assert_eq!(config.get("sync.target"), Some("/custom/path".to_string()));
 }
+
+#[test]
+fn test_worktrees_abandon_ttl_hours_default() {
+    let config = Config::default();
+    assert_eq!(
+        config.get("worktrees.abandon_ttl_hours"),
+        Some("24".to_string())
+    );
+    assert_eq!(config.worktrees().abandon_ttl_hours, 24);
+}
+
+#[test]
+fn test_worktrees_abandon_ttl_hours_roundtrip() {
+    let temp = TempDir::new().unwrap();
+    let mut config = Config::default();
+
+    config.set("worktrees.abandon_ttl_hours", "72").unwrap();
+    assert_eq!(
+        config.get("worktrees.abandon_ttl_hours"),
+        Some("72".to_string())
+    );
+
+    config.save(temp.path()).unwrap();
+    let loaded = Config::load(temp.path()).unwrap();
+    assert_eq!(loaded.worktrees().abandon_ttl_hours, 72);
+}
+
+#[test]
+fn test_worktrees_abandon_ttl_hours_invalid() {
+    let mut config = Config::default();
+    assert!(
+        config
+            .set("worktrees.abandon_ttl_hours", "not-a-number")
+            .is_err()
+    );
+    // Value must be unchanged after a rejected set.
+    assert_eq!(config.worktrees().abandon_ttl_hours, 24);
+}
+
+#[test]
+fn test_worktrees_global_sweep_debounce_secs_default() {
+    let config = Config::default();
+    assert_eq!(
+        config.get("worktrees.global_sweep_debounce_secs"),
+        Some("3600".to_string())
+    );
+    assert_eq!(config.worktrees().global_sweep_debounce_secs, 3600);
+}
+
+#[test]
+fn test_worktrees_global_sweep_debounce_secs_roundtrip() {
+    let temp = TempDir::new().unwrap();
+    let mut config = Config::default();
+
+    config
+        .set("worktrees.global_sweep_debounce_secs", "900")
+        .unwrap();
+    assert_eq!(
+        config.get("worktrees.global_sweep_debounce_secs"),
+        Some("900".to_string())
+    );
+
+    config.save(temp.path()).unwrap();
+    let loaded = Config::load(temp.path()).unwrap();
+    assert_eq!(loaded.worktrees().global_sweep_debounce_secs, 900);
+}
+
+#[test]
+fn test_worktrees_global_sweep_debounce_secs_invalid() {
+    let mut config = Config::default();
+    assert!(
+        config
+            .set("worktrees.global_sweep_debounce_secs", "nope")
+            .is_err()
+    );
+    assert_eq!(config.worktrees().global_sweep_debounce_secs, 3600);
+}
