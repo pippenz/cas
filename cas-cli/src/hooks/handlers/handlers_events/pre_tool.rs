@@ -21,6 +21,40 @@ pub fn handle_pre_tool_use(
         None => return Ok(HookOutput::empty()),
     };
 
+    // ========================================================================
+    // FACTORY AUTO-APPROVE — HOISTED ABOVE cas_root check (cas-7f33)
+    //
+    // The factory filesystem auto-approve also runs below, AFTER all
+    // protection gates, for the cas_root=Some case. But that path is
+    // unreachable when `cas_root` is `None` because of the early return
+    // immediately following this block. Since `is_factory_agent` derives
+    // purely from the `CAS_AGENT_ROLE` env var (no store access required),
+    // we fire the allow here to rescue the cas_root=None case — the
+    // scenario the user hit in the BUG-factory-write-permission-deadlock
+    // report where a supervisor session runs the hook without a CAS root
+    // resolved at dispatch time.
+    //
+    // Invariant preservation: protection gates (.env deny, credential
+    // patterns) live inside the `cas_root=Some` section below. When
+    // `cas_root` is `None` those gates cannot run anyway (they read
+    // config via `stores.config()`), so hoisting here does not widen the
+    // surface on any path where the guard previously applied. When
+    // `cas_root` is `Some`, this block is a no-op — we fall through to
+    // the normal flow where the post-protection auto-approve still fires.
+    // ========================================================================
+    let is_factory_agent = std::env::var("CAS_AGENT_ROLE").is_ok();
+    if cas_root.is_none()
+        && is_factory_agent
+        && FACTORY_AUTO_APPROVE_TOOLS.contains(&tool_name)
+    {
+        return Ok(HookOutput::with_pre_tool_permission(
+            "allow",
+            &format!(
+                "Factory agent auto-approve ({tool_name}) — bypasses Claude Code team-mode leader-escalation deadlock (UG9 bug); cas_root=None path"
+            ),
+        ));
+    }
+
     // Check if CAS is initialized
     let cas_root = match cas_root {
         Some(root) => root,
@@ -48,7 +82,8 @@ pub fn handle_pre_tool_use(
     // via the Director/TUI). The built-in SendMessage tool bypasses this system
     // and causes messages to be lost. Redirect to mcp__cas__coordination.
     // ========================================================================
-    let is_factory_agent = std::env::var("CAS_AGENT_ROLE").is_ok();
+    // `is_factory_agent` already computed above for the hoisted
+    // cas_root=None auto-approve check (cas-7f33).
     if is_factory_agent && tool_name == "SendMessage" {
         return Ok(HookOutput::with_pre_tool_permission(
             "deny",
@@ -725,6 +760,13 @@ pub fn handle_pre_tool_use(
     // keeps working. Protection gates above (this block runs AFTER) still
     // win — .env / credential writes are denied before we reach here.
     //
+    // cas-7f33: a second copy of this gate runs ABOVE the cas_root=None
+    // early return to rescue factory sessions where CAS isn't initialized
+    // in the supervisor's cwd at hook-dispatch time. That hoisted copy
+    // fires only when cas_root is None (so no protection gates apply
+    // anyway). When cas_root is Some the flow reaches HERE, preserving
+    // the .env-deny-before-auto-approve invariant.
+    //
     // See: project_cas_team_permission_escalation_bug memory for the
     // full disassembly that identified the upstream root cause.
     // ========================================================================
@@ -746,7 +788,15 @@ pub fn handle_pre_tool_use(
 /// `cas-cli/src/ui/factory/daemon/runtime/teams.rs::worker_settings_contents`
 /// and `supervisor_settings_contents` — keep the two lists in sync or the
 /// belt-and-suspenders settings-file path diverges from the hook path.
-const FACTORY_AUTO_APPROVE_TOOLS: &[&str] = &[
+///
+/// Consumers in this crate (keep all in sync when editing membership):
+/// - `handle_pre_tool_use` (this file) — PreToolUse auto-approve. Two
+///   copies: hoisted `cas_root=None` rescue and the post-protection
+///   `cas_root=Some` path.
+/// - `super::notifications::handle_permission_request` — the cas-7f33
+///   PermissionRequest belt #3 that covers Claude Code 2.1.x builds where
+///   PreToolUse `allow` doesn't pre-empt team-mode leader escalation.
+pub(crate) const FACTORY_AUTO_APPROVE_TOOLS: &[&str] = &[
     "Read",
     "Write",
     "Edit",

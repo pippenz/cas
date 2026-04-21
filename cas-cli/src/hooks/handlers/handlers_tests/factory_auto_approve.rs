@@ -121,6 +121,58 @@ fn supervisor_notebook_edit_is_auto_approved() {
 }
 
 // ============================================================================
+// cas_root=None path — the case the deadlock reporter was hitting.
+//
+// When CAS is not initialized in the supervisor's cwd at hook-dispatch time,
+// `handle_pre_tool_use(&input, None)` is invoked. Prior to cas-7f33 this
+// returned `HookOutput::empty()` immediately, causing Claude Code's classifier
+// to fall through to team-mode leader-escalation (UG9 bug) and self-deadlock.
+// The factory auto-approve must fire even without a CAS root.
+// ============================================================================
+
+#[test]
+fn supervisor_write_is_auto_approved_without_cas_root() {
+    let _g = env_lock();
+    let _role = set_role_env(Some("supervisor"));
+    let input = input_for("Write", Some("/tmp/foo.txt"));
+    let out = handle_pre_tool_use(&input, None).expect("handler ok");
+    let reason = allow_reason(&out).expect(
+        "supervisor Write must auto-approve even when cas_root is None (deadlock case)",
+    );
+    assert!(
+        reason.contains("Factory agent auto-approve"),
+        "allow reason should identify the factory bypass: {reason}"
+    );
+}
+
+#[test]
+fn worker_edit_is_auto_approved_without_cas_root() {
+    let _g = env_lock();
+    let _role = set_role_env(Some("worker"));
+    let input = input_for("Edit", Some("/tmp/foo.txt"));
+    let out = handle_pre_tool_use(&input, None).expect("handler ok");
+    assert!(
+        allow_reason(&out).is_some(),
+        "worker Edit must auto-approve even when cas_root is None (deadlock case)"
+    );
+}
+
+#[test]
+fn solo_user_write_without_cas_root_is_not_auto_approved() {
+    // When CAS_AGENT_ROLE is unset AND cas_root is None, we must still
+    // fall through to Claude Code's normal flow — the bypass is strictly
+    // scoped to factory agents.
+    let _g = env_lock();
+    let _role = set_role_env(None);
+    let input = input_for("Write", Some("/tmp/foo.txt"));
+    let out = handle_pre_tool_use(&input, None).expect("handler ok");
+    assert!(
+        allow_reason(&out).is_none(),
+        "standalone sessions with no cas_root must not get the factory auto-approve"
+    );
+}
+
+// ============================================================================
 // Negatives: must NOT auto-approve outside scope.
 // ============================================================================
 
@@ -154,20 +206,54 @@ fn factory_agent_unknown_tool_is_not_auto_approved() {
     );
 }
 
+#[test]
+fn factory_agent_unknown_tool_without_cas_root_is_not_auto_approved() {
+    // Mirror of `factory_agent_unknown_tool_is_not_auto_approved` for the
+    // hoisted `cas_root=None` path. Locks in the allowlist guard on the
+    // rescue branch so a future refactor that drops the `contains()`
+    // check fails the suite instead of silently broadening the bypass.
+    let _g = env_lock();
+    let _role = set_role_env(Some("worker"));
+    let input = input_for("WebFetch", None);
+    let out = handle_pre_tool_use(&input, None).expect("handler ok");
+    assert!(
+        allow_reason(&out).is_none(),
+        "WebFetch is not in the factory auto-approve list (cas_root=None path)"
+    );
+}
+
 // ============================================================================
 // Structural invariants documented — not exercised directly in unit tests.
 // ============================================================================
 //
-// The factory auto-approve gate lives AFTER the protection block in
-// `handle_pre_tool_use`. That ordering is load-bearing: writing a `.env`
-// file (or any file matched by `hooks.pre_tool_use.protection.files` /
-// `.patterns`) returns a deny BEFORE the factory auto-approve can fire,
-// so the bypass can never silently allow a secret-file write.
+// The factory auto-approve gate appears TWICE in `handle_pre_tool_use`
+// after cas-7f33:
+//
+//   1. A HOISTED copy above the `cas_root` early return. Fires only when
+//      `cas_root is None` (i.e. CAS not initialized in cwd). This rescues
+//      the deadlock case the bug reporter hit, where the supervisor
+//      session had no CAS root resolved at hook-dispatch time and the
+//      hook was returning empty, letting Claude Code's team-mode
+//      classifier escalate to the non-existent leader.
+//
+//   2. The original copy AFTER the protection block. Fires only on the
+//      `cas_root is Some` path. This ordering is load-bearing for the
+//      `.env` deny invariant: writing a `.env` file (or any file
+//      matched by `hooks.pre_tool_use.protection.files` / `.patterns`)
+//      returns a deny BEFORE the factory auto-approve can fire, so the
+//      bypass can never silently allow a secret-file write.
+//
+// The invariant is preserved because protection gates live INSIDE the
+// cas_root=Some section — they read config via `stores.config()` and
+// cannot run when cas_root is None. Hoisting the auto-approve above the
+// cas_root check therefore does not widen the surface on any path where
+// the .env guard previously applied.
 //
 // The gate also runs AFTER the verification jail, the factory
 // `SendMessage` block, the codemap freshness gate, and the
-// worktrees_enabled block. All of those short-circuit with deny, so the
-// auto-approve never overrides them either.
+// worktrees_enabled block — all of which are inside the cas_root=Some
+// section. All of those short-circuit with deny, so the auto-approve
+// never overrides them either.
 
 // ----------------------------------------------------------------------------
 // Env helpers — mirror the pattern in agent_worktree_block.rs. Required

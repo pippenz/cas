@@ -1,4 +1,5 @@
 use crate::hooks::handlers::*;
+use super::pre_tool::FACTORY_AUTO_APPROVE_TOOLS;
 
 pub fn handle_permission_request(
     input: &HookInput,
@@ -8,6 +9,50 @@ pub fn handle_permission_request(
         Some(name) => name.as_str(),
         None => return Ok(HookOutput::empty()),
     };
+
+    // ========================================================================
+    // FACTORY PERMISSION-REQUEST AUTO-APPROVE — belt #3 (cas-7f33)
+    //
+    // In some Claude Code 2.1.x builds, PreToolUse `permissionDecision:"allow"`
+    // does not pre-empt team-mode leader-escalation cleanly, and the decision
+    // flow falls through to a PermissionRequest notification. The UG9 self-
+    // check bug (see pre_tool.rs) then escalates to the team leader for
+    // every filesystem write — self-deadlock for supervisors.
+    //
+    // Scope and structural asymmetry with pre_tool.rs (INTENTIONAL):
+    //   - The PreToolUse hoist is gated on `cas_root.is_none()` because a
+    //     second copy exists below the protection block to handle the
+    //     `cas_root=Some` case after `.env`/credential denies have run.
+    //   - This handler has NO protection gates today (pre-cas-7f33 code
+    //     only did task-context/lease-based auto-approve). There is no
+    //     deny-first invariant to preserve, so the belt fires
+    //     unconditionally for factory agents — both `cas_root=None` and
+    //     `cas_root=Some` need the deadlock bypass whenever the
+    //     PermissionRequest path is reached.
+    //   - Trade-off: the prior lease/task-context auto-approve (below)
+    //     is short-circuited for factory agents on the 7 allowlisted
+    //     tools. Factory agents are already privileged via the PreToolUse
+    //     auto-approve; this does not materially change their write surface.
+    //   - If a future contributor adds a protection gate (e.g., `.env`
+    //     deny) to this handler, it MUST be hoisted above this belt or
+    //     factory agents will bypass it. See FACTORY_AUTO_APPROVE_TOOLS
+    //     doc comment in pre_tool.rs for the full consumer list.
+    //
+    // Runs BEFORE the cas_root check because CAS_AGENT_ROLE is pure env,
+    // no store access required.
+    // ========================================================================
+    let is_factory_agent = std::env::var("CAS_AGENT_ROLE").is_ok();
+    if is_factory_agent && FACTORY_AUTO_APPROVE_TOOLS.contains(&tool_name) {
+        eprintln!(
+            "cas: PermissionRequest factory auto-approve for {tool_name}"
+        );
+        return Ok(HookOutput::with_permission_request(
+            "allow",
+            &format!(
+                "Factory agent auto-approve ({tool_name}) — bypasses Claude Code team-mode leader-escalation deadlock (UG9 bug)"
+            ),
+        ));
+    }
 
     // Check if CAS is initialized
     let cas_root = match cas_root {
