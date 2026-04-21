@@ -35,6 +35,14 @@ async fn run_server_impl() -> anyhow::Result<()> {
     // auto-respawn path gives us no diagnostic trail.
     install_serve_panic_hook(&cas_root);
 
+    // Register this repo in the host-scoped known_repos registry. Fires
+    // every time `cas serve` starts in a directory with `.cas/`, catching
+    // repos that pre-date the `cas init` registration hook. Non-fatal:
+    // failure here must not block MCP serve startup.
+    if let Some(repo_root) = cas_root.parent() {
+        crate::store::known_repos::register_repo(repo_root);
+    }
+
     // Run startup cloud pull in a background task with a short timeout
     // so a slow/unreachable cloud endpoint never blocks MCP server startup.
     //

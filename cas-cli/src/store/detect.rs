@@ -552,6 +552,12 @@ pub fn init_cas_dir(path: &Path) -> Result<PathBuf> {
     // Fail init if migrations fail to avoid partial/unsafe schema state.
     run_migrations(&cas_dir, false)?;
 
+    // Register this repo in the host-scoped known_repos registry so
+    // cross-repo sweep tooling can discover it without a filesystem scan.
+    // Non-fatal: init must still succeed if the host registry cannot be
+    // written (unusual permissions, readonly HOME).
+    crate::store::known_repos::register_repo(path);
+
     Ok(cas_dir)
 }
 

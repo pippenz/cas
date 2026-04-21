@@ -108,6 +108,10 @@ pub use cas_store::{
     SqliteTaskStore,
     SqliteVerificationStore,
     SqliteWorktreeStore,
+    // Known-repo registry (host-scoped cross-repo discovery, EPIC cas-7c88)
+    KnownRepo,
+    KnownRepoStore,
+    SqliteKnownRepoStore,
     // Traits
     Store,
     // Error types
@@ -132,6 +136,7 @@ pub use cas_store::{
 
 // Local modules (not in cas-store)
 pub mod detect;
+pub mod known_repos;
 mod notifying_entry;
 mod notifying_rule;
 mod notifying_skill;

@@ -28,6 +28,13 @@ pub(super) fn execute_daemon(
     let cas_root = find_cas_root()?;
     let cas_config = Config::load(&cas_root).unwrap_or_default();
 
+    // Register the project root in the host-scoped known_repos registry so
+    // a later `cas sweep-all` can discover it. Non-fatal best-effort upsert.
+    // `cas_root` is the `.cas` dir; the repo root is its parent.
+    if let Some(repo_root) = cas_root.parent() {
+        crate::store::known_repos::register_repo(repo_root);
+    }
+
     let effective_workers = if worker_names.is_empty() {
         workers as usize
     } else {
