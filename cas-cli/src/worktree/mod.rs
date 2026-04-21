@@ -31,5 +31,8 @@ mod manager;
 pub mod salvage;
 
 pub use git::{GitError, GitOperations};
-pub use manager::{WorktreeConfig, WorktreeManager, WorktreeResult, symlink_project_config};
+pub use manager::{
+    CleanupReport, DirtyWorktreeWarning, RemoveOutcome, WorktreeConfig, WorktreeManager,
+    WorktreeResult, symlink_project_config,
+};
 pub use salvage::{salvage, SalvageError, SalvageOutcome, SkipReason};

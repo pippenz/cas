@@ -5,6 +5,35 @@ use crate::types::Worktree;
 use crate::worktree::git::GitOperations;
 use crate::worktree::manager::{WorktreeError, WorktreeManager, WorktreeResult, symlink_project_config};
 
+/// Describes a worker worktree that was left on disk because it held uncommitted work.
+///
+/// Surfaced to the factory UI so dirty teardowns are loud, and to the daemon reaper
+/// (Unit 3) via the agent metadata flag for eventual TTL-based salvage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirtyWorktreeWarning {
+    pub worker_name: String,
+    pub path: PathBuf,
+    pub file_count: usize,
+}
+
+/// Outcome of attempting a non-force shutdown of a single worker worktree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoveOutcome {
+    /// Worker wasn't tracked by the manager (no worktree in the map).
+    NotTracked,
+    /// Worktree was clean and has been removed; branch deleted best-effort.
+    Removed,
+    /// Worktree had uncommitted work; left on disk for deferred salvage.
+    DirtyDeferred(DirtyWorktreeWarning),
+}
+
+/// Result of `cleanup_workers` — both what was removed and what was deferred.
+#[derive(Debug, Clone, Default)]
+pub struct CleanupReport {
+    pub cleaned: Vec<String>,
+    pub dirty_deferred: Vec<DirtyWorktreeWarning>,
+}
+
 impl WorktreeManager {
     /// Calculate the worktree path for a factory worker
     pub fn worktree_path_for_worker(&self, worker_name: &str) -> PathBuf {
@@ -180,16 +209,31 @@ impl WorktreeManager {
         &self.git
     }
 
-    /// Cleanup worker worktrees
-    pub fn cleanup_workers(&mut self, force: bool) -> WorktreeResult<Vec<String>> {
-        let mut cleaned = Vec::new();
+    /// Cleanup worker worktrees.
+    ///
+    /// With `force = true`, every tracked worktree is removed regardless of
+    /// state. With `force = false`, dirty worktrees are left on disk and
+    /// reported via [`CleanupReport::dirty_deferred`] so the caller can warn
+    /// the operator — callers must no longer silently treat dirty trees as
+    /// "removed and forgotten".
+    pub fn cleanup_workers(&mut self, force: bool) -> WorktreeResult<CleanupReport> {
+        let mut report = CleanupReport::default();
 
         let worker_names: Vec<String> = self.workers.keys().cloned().collect();
 
         for name in worker_names {
             if let Some(mut worktree) = self.workers.remove(&name) {
                 if !force && worktree.path.exists() {
-                    if let Ok(true) = self.git.has_uncommitted_changes(&worktree.path) {
+                    let file_count = self
+                        .git
+                        .uncommitted_file_count(&worktree.path)
+                        .unwrap_or(0);
+                    if file_count > 0 {
+                        report.dirty_deferred.push(DirtyWorktreeWarning {
+                            worker_name: name.clone(),
+                            path: worktree.path.clone(),
+                            file_count,
+                        });
                         self.workers.insert(name, worktree);
                         continue;
                     }
@@ -204,11 +248,11 @@ impl WorktreeManager {
                 worktree.mark_abandoned();
                 worktree.mark_removed();
 
-                cleaned.push(name);
+                report.cleaned.push(name);
             }
         }
 
-        Ok(cleaned)
+        Ok(report)
     }
 
     /// Remove a single worker's worktree
@@ -233,5 +277,47 @@ impl WorktreeManager {
         }
 
         Ok(())
+    }
+
+    /// Attempt to remove a single worker's worktree on graceful shutdown.
+    ///
+    /// Non-force semantics: clean trees are removed and the branch is deleted
+    /// best-effort; dirty trees are left on disk and described in
+    /// [`RemoveOutcome::DirtyDeferred`] so the caller can warn and mark the
+    /// worker for later salvage. Callers who need to force-remove a dirty
+    /// tree should use [`WorktreeManager::remove_worker`] with `force = true`.
+    pub fn attempt_remove_worker(
+        &mut self,
+        worker_name: &str,
+    ) -> WorktreeResult<RemoveOutcome> {
+        let mut worktree = match self.workers.remove(worker_name) {
+            Some(wt) => wt,
+            None => return Ok(RemoveOutcome::NotTracked),
+        };
+
+        if worktree.path.exists() {
+            let file_count = self
+                .git
+                .uncommitted_file_count(&worktree.path)
+                .unwrap_or(0);
+            if file_count > 0 {
+                let warning = DirtyWorktreeWarning {
+                    worker_name: worker_name.to_string(),
+                    path: worktree.path.clone(),
+                    file_count,
+                };
+                self.workers.insert(worker_name.to_string(), worktree);
+                return Ok(RemoveOutcome::DirtyDeferred(warning));
+            }
+
+            self.git.remove_worktree(&worktree.path, false)?;
+        }
+
+        let _ = self.git.delete_branch(&worktree.branch, true);
+
+        worktree.mark_abandoned();
+        worktree.mark_removed();
+
+        Ok(RemoveOutcome::Removed)
     }
 }

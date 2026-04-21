@@ -94,7 +94,9 @@ pub struct WorktreeManager {
 }
 
 mod epic_ops;
-mod worker_ops;
+pub mod worker_ops;
+
+pub use worker_ops::{CleanupReport, DirtyWorktreeWarning, RemoveOutcome};
 
 impl WorktreeManager {
     fn worker_ref(&self, worker_name: &str) -> WorktreeResult<&Worktree> {
