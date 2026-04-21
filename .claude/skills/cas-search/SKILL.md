@@ -16,6 +16,17 @@ mcp__cas__search action=search query="authentication flow" doc_type=entry
 ```
 Filter with `doc_type` (entry, task, rule, skill, code_symbol, code_file) for better relevance.
 
+**Structured memory filters (`key:value` tokens):** For memories with structured frontmatter (see `cas-memory-management`), the query string supports inline filters that AND with keyword terms:
+
+```
+mcp__cas__search action=search query="deadlock module:cas-mcp severity:critical"
+mcp__cas__search action=search query="track:bug problem_type:runtime_error"
+```
+
+Recognized filter keys: `module`, `track`, `problem_type`, `severity`, `root_cause`, `date`. Unknown `key:value` tokens pass through as raw keyword text. Legacy memories (no structured frontmatter) still match keyword queries but are excluded from any filter that references a structured field.
+
+Phase 1 grammar limitation: values cannot contain whitespace and there is no quoting or escaping — tokens split on whitespace and the first `:` separates key from value. `module:"cas mcp"` and escaped colons are not supported.
+
 **`code_search`** — Find code symbols by what they do, not exact names:
 ```
 mcp__cas__search action=code_search query="user authentication" kind=function language=rust
@@ -46,3 +57,7 @@ Prefer the built-in Grep tool for simple patterns where you already know file pa
 - **`entity_list`** / **`entity_show`** — Browse extracted entities (person, project, technology, etc.)
 - **`code_show`** — Full details for a specific code symbol by ID
 - **`blame`** — Git blame with optional AI-line filtering (`file_path`, `line_start`, `line_end`)
+
+## Valid Actions
+
+**Valid `mcp__cas__search` actions** (exact list — do not invent others): `search`, `context`, `context_for_subagent`, `observe`, `entity_list`, `entity_show`, `entity_extract`, `code_search`, `code_show`, `grep`, `blame`.

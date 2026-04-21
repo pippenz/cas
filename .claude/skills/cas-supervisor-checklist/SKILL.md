@@ -19,7 +19,20 @@ managed_by: cas
    ```
    mcp__cas__search action=search query="<keywords>" doc_type=entry limit=5
    ```
-4. Check worker availability: `mcp__cas__coordination action=worker_status`
+4. Check codemap freshness:
+   - If `.claude/CODEMAP.md` is missing → run `/codemap` to generate it.
+   - If it exists but is stale (structural changes since last update) → run `/codemap` to refresh.
+   - Workers reference CODEMAP for codebase orientation — ensure it's current before spawning them.
+5. Check worker availability: `mcp__cas__coordination action=worker_status`
+
+## Intake Gate (Before Planning)
+
+- [ ] "What does done look like?" has a measurable answer
+- [ ] No vague terms — "better/faster/cleaner" replaced with testable criteria
+- [ ] All assumptions stated and confirmed
+- [ ] Scope broken into discrete chunks if sprawling
+- [ ] No conflicts with existing architecture or prior decisions
+- [ ] User override logged if any challenge was overridden
 
 ## During Coordination
 
@@ -33,6 +46,15 @@ mcp__cas__memory action=remember title="..." content="..." tags="decision"
 - Every subtask has a `demo_statement` (if not, it may be a horizontal slice — restructure)
 - Investigation tasks use `task_type=spike` with question-based acceptance criteria
 - When multiple approaches exist, a spike with a fit check comparison in `design_notes` precedes implementation tasks
+
+## Review Gate (Per Task Completion)
+
+- [ ] Tests exist and pass (including failure paths)
+- [ ] No DRY violations or SRP violations
+- [ ] No work outside declared layer boundary
+- [ ] Output matches declared interface
+- [ ] No magic numbers that should be configurable
+- [ ] Obvious SOLID violations flagged with specifics
 
 ## Before Closing an EPIC
 

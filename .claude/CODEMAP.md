@@ -19,12 +19,15 @@ docs/                — Roadmaps, brainstorms, spikes, cross-team requests inbo
 ### cas-cli/src/ — Main binary modules
 
 cli/                 — Clap command definitions and handlers (incl. codemap_cmd, project_overview_cmd, open)
+cli/known_repos.rs   — `cas known-repos list/seed` — host repo registry CLI
+cli/sweep.rs         — `cas sweep-all` + `cas worktree sweep [--all-repos] [--dry-run] [--salvage-dirty]`
+cli/worktree.rs      — Worktree subcommand grouping (sweep, status, cleanup)
 mcp/server/          — CasCore MCP server with cached OnceLock stores
 mcp/tools/           — 55+ MCP tool handlers split into core/ and service/
 mcp/daemon.rs        — Embedded background maintenance (embeddings, cleanup)
 mcp/socket.rs        — Unix socket for agent notification events
 store/               — Store wrappers: notifying_*, syncing_*, layered, detect
-hooks/handlers/handlers_events/  — Event-time handlers (pre_tool, codemap, notifications, attribution)
+hooks/handlers/handlers_events/  — Event-time handlers (pre_tool incl. supervisor Agent(isolation:worktree) block, codemap, notifications, attribution)
 hooks/handlers/handlers_middle/  — Mid-flow handlers (post_tool, prompt_capture, session_stop/)
 hooks/handlers/handlers_session.rs — SessionStart/SessionEnd handlers
 hooks/handlers/handlers_state.rs   — Per-session state tracking
@@ -32,13 +35,17 @@ hooks/handlers/handlers_tests/     — Hook handler test suite
 hooks/scorer.rs      — Context item ranking for SessionStart injection
 hooks/context.rs     — Context building strategies (standard, AI-powered, plan)
 hooks/types.rs       — HookOutput / HookSpecificOutput schema types
-migration/           — Forward-only schema migrations (m001-m193+)
+migration/           — Forward-only schema migrations (m001-m199+); m199_known_repos = host repo registry table
 ui/factory/          — Ratatui TUI for factory supervisor view
 ui/factory/daemon/   — Daemon runtime: relay, ws_client, pane snapshots
 ui/components/       — Reusable TUI widgets (panels, tables, markdown)
 config/              — Configuration loading from .cas/config.yaml
 orchestration/       — Agent name generation and orchestration logic
 worktree/            — Git worktree management for factory workers
+worktree/salvage.rs  — Tracked-diff + untracked patch writer for dirty-worktree reclaim
+worktree/discovery.rs — Cross-repo discovery via host KnownRepoStore
+worktree/sweep.rs    — Multi-repo sweep loop (used by cli/sweep.rs; opportunistic daemon trigger pending U3)
+store/known_repos.rs — CLI-side glue opening the host-scoped KnownRepoStore
 cloud/               — CAS Cloud sync (optional remote backup)
 sync/                — Filesystem sync to .claude/rules/ and .claude/skills/
 consolidation/       — Memory consolidation and decay
@@ -60,6 +67,7 @@ duplicate_check.rs   — Stale `cas` binary detection on PATH; warns once at sta
 
 cas-types/           — Entry, Task, Rule, Skill, Agent, Session, Spec, Loop, CodeReview types
 cas-store/           — Store/TaskStore/RuleStore/SkillStore traits + SqliteStore
+cas-store/src/known_repo_store.rs — Host-scoped `known_repos` table (~/.cas/cas.db); upsert/list API
 cas-store/src/code_review/ — Code-review pipeline: autofix, base_sha, close_gate, merge, review_to_task
 cas-core/            — Hooks framework, memory module (overlap detection), search index, skill/rule sync
 cas-core/src/memory/ — Memory model + overlap detection for dedup

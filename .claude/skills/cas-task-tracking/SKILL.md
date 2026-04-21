@@ -25,3 +25,7 @@ Use `mcp__cas__task` instead of built-in TodoWrite. CAS tasks persist across ses
 ## Note Types
 
 `progress`, `blocker`, `decision`, `discovery` — use the right type so notes are meaningful in context.
+
+## Valid Actions
+
+**Valid `mcp__cas__task` actions** (exact list — do not invent others): `create`, `show`, `update`, `start`, `close`, `reopen`, `delete`, `list`, `ready`, `blocked`, `notes`, `dep_add`, `dep_remove`, `dep_list`, `claim`, `release`, `transfer`, `available`, `mine`.
