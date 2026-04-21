@@ -57,10 +57,16 @@ pub struct TeamsSpawnConfig {
     pub lead_session_id: Option<String>,
     /// Optional path to a settings JSON file passed via `--settings <path>`.
     ///
-    /// Used for the team lead (supervisor) to auto-allow Write/Edit/Bash/NotebookEdit
-    /// so that permission routing does not forward approval requests back to the
-    /// supervisor itself (the team-lead-is-also-member self-leadership deadlock).
-    /// Non-lead workers leave this as `None` and retain normal permission routing.
+    /// Populated for both the supervisor (`supervisor-settings.json`) and for
+    /// every worker (`{worker-name}-settings.json`) so filesystem tool calls
+    /// auto-approve from the per-role allowlist instead of escalating through
+    /// the team-approval channel. Workers without this file hang on the
+    /// phantom `team-lead` mailbox because Claude Code's harness misreads
+    /// `agentType="team-lead"` as the lead's display name (upstream bug);
+    /// shipping the allowlist eliminates the trigger even while that misread
+    /// remains unfixed. See `cas-cli/src/ui/factory/daemon/runtime/teams.rs`
+    /// (`supervisor_settings_contents` / `worker_settings_contents`) for the
+    /// shape of each file.
     pub settings_path: Option<String>,
 }
 
@@ -198,10 +204,13 @@ impl PtyConfig {
                 args.push("--parent-session-id".to_string());
                 args.push(parent_id.clone());
             }
-            // Per-team settings file — used by the supervisor to auto-allow
-            // Write/Edit/Bash/NotebookEdit so permission routing does not send
-            // approval requests back to the supervisor itself. Workers leave
-            // this as None and keep normal routing.
+            // Per-role settings file — both supervisor and workers ship a
+            // `permissions.allow` list via `--settings` so Read/Write/Edit/
+            // Glob/Grep/Bash/NotebookEdit auto-approve instead of escalating
+            // through team-approval routing (the phantom `team-lead` hang).
+            // If the caller leaves `settings_path` as None (CLI usage,
+            // standalone claude invocations, or tests that deliberately
+            // opt out), no flag is emitted — that's a valid fallback.
             if let Some(ref settings_path) = t.settings_path {
                 args.push("--settings".to_string());
                 args.push(settings_path.clone());
@@ -926,8 +935,13 @@ mod tests {
         );
     }
 
+    /// Workers now ship their own settings file (cas-e15d). When
+    /// `settings_path` is populated, the `--settings <path>` flag must
+    /// appear in argv so `claude` loads the per-worker allowlist and the
+    /// phantom `team-lead` escalation cannot fire.
     #[tokio::test]
-    async fn test_pty_config_claude_teams_worker_omits_settings_flag() {
+    async fn test_pty_config_claude_teams_worker_gets_settings_flag() {
+        let settings_path = "/home/pippenz/.claude/teams/deadlock-team/worker-1-settings.json";
         let teams = TeamsSpawnConfig {
             team_name: "deadlock-team".to_string(),
             agent_id: "worker-1@deadlock-team".to_string(),
@@ -936,7 +950,7 @@ mod tests {
             agent_type: "general-purpose".to_string(),
             parent_session_id: Some("lead-session-xyz".to_string()),
             lead_session_id: None,
-            settings_path: None,
+            settings_path: Some(settings_path.to_string()),
         };
         let config = PtyConfig::claude(
             "worker-1",
@@ -949,8 +963,44 @@ mod tests {
             Some(&teams),
         );
         assert!(
+            config.args.contains(&"--settings".to_string()),
+            "worker spawn must include --settings flag"
+        );
+        assert!(
+            config.args.contains(&settings_path.to_string()),
+            "worker spawn must pass the worker settings file path"
+        );
+    }
+
+    /// Argv builder contract: when `settings_path` is deliberately left as
+    /// `None` (CLI usage, tests that opt out), the flag must be absent. This
+    /// is the correctness gate for the `if let Some(..)` branch — not a
+    /// statement about worker doctrine (workers get a path in production).
+    #[tokio::test]
+    async fn test_pty_config_claude_teams_no_settings_path_omits_flag() {
+        let teams = TeamsSpawnConfig {
+            team_name: "no-settings-team".to_string(),
+            agent_id: "worker-bare@no-settings-team".to_string(),
+            agent_name: "worker-bare".to_string(),
+            agent_color: "blue".to_string(),
+            agent_type: "general-purpose".to_string(),
+            parent_session_id: Some("lead-session-xyz".to_string()),
+            lead_session_id: None,
+            settings_path: None,
+        };
+        let config = PtyConfig::claude(
+            "worker-bare",
+            "worker",
+            PathBuf::from("/tmp"),
+            None,
+            None,
+            None,
+            None,
+            Some(&teams),
+        );
+        assert!(
             !config.args.contains(&"--settings".to_string()),
-            "worker spawn must not emit --settings; allowlist is supervisor-only"
+            "no settings_path → argv must omit --settings"
         );
     }
 }
