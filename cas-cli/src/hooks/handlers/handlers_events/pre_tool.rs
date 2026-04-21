@@ -441,7 +441,12 @@ pub fn handle_pre_tool_use(
     let worktrees_enabled = stores.config().worktrees_enabled();
 
     // Factory workers manage their own worktrees — skip CAS worktree enforcement
-    // to avoid conflicting redirects (factory uses per-worker worktrees, CAS uses per-epic)
+    // to avoid conflicting redirects (factory uses per-worker worktrees, CAS uses per-epic).
+    //
+    // Role alone is sufficient here (unlike the verification-jail check above,
+    // which also requires `CAS_FACTORY_MODE`): if a process identifies as a
+    // worker it's always the factory runtime managing its own worktree, even
+    // in the degraded-state where `CAS_FACTORY_MODE` was never set.
     let is_factory_worker_for_wt = crate::harness_policy::is_worker(input);
 
     if worktrees_enabled && !is_factory_worker_for_wt {
