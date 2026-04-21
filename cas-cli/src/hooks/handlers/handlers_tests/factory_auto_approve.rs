@@ -210,16 +210,34 @@ fn factory_agent_unknown_tool_is_not_auto_approved() {
 // Structural invariants documented — not exercised directly in unit tests.
 // ============================================================================
 //
-// The factory auto-approve gate lives AFTER the protection block in
-// `handle_pre_tool_use`. That ordering is load-bearing: writing a `.env`
-// file (or any file matched by `hooks.pre_tool_use.protection.files` /
-// `.patterns`) returns a deny BEFORE the factory auto-approve can fire,
-// so the bypass can never silently allow a secret-file write.
+// The factory auto-approve gate appears TWICE in `handle_pre_tool_use`
+// after cas-7f33:
+//
+//   1. A HOISTED copy above the `cas_root` early return. Fires only when
+//      `cas_root is None` (i.e. CAS not initialized in cwd). This rescues
+//      the deadlock case the bug reporter hit, where the supervisor
+//      session had no CAS root resolved at hook-dispatch time and the
+//      hook was returning empty, letting Claude Code's team-mode
+//      classifier escalate to the non-existent leader.
+//
+//   2. The original copy AFTER the protection block. Fires only on the
+//      `cas_root is Some` path. This ordering is load-bearing for the
+//      `.env` deny invariant: writing a `.env` file (or any file
+//      matched by `hooks.pre_tool_use.protection.files` / `.patterns`)
+//      returns a deny BEFORE the factory auto-approve can fire, so the
+//      bypass can never silently allow a secret-file write.
+//
+// The invariant is preserved because protection gates live INSIDE the
+// cas_root=Some section — they read config via `stores.config()` and
+// cannot run when cas_root is None. Hoisting the auto-approve above the
+// cas_root check therefore does not widen the surface on any path where
+// the .env guard previously applied.
 //
 // The gate also runs AFTER the verification jail, the factory
 // `SendMessage` block, the codemap freshness gate, and the
-// worktrees_enabled block. All of those short-circuit with deny, so the
-// auto-approve never overrides them either.
+// worktrees_enabled block — all of which are inside the cas_root=Some
+// section. All of those short-circuit with deny, so the auto-approve
+// never overrides them either.
 
 // ----------------------------------------------------------------------------
 // Env helpers — mirror the pattern in agent_worktree_block.rs. Required

@@ -1,4 +1,5 @@
 use crate::hooks::handlers::*;
+use super::pre_tool::FACTORY_AUTO_APPROVE_TOOLS;
 
 pub fn handle_permission_request(
     input: &HookInput,
@@ -8,6 +9,37 @@ pub fn handle_permission_request(
         Some(name) => name.as_str(),
         None => return Ok(HookOutput::empty()),
     };
+
+    // ========================================================================
+    // FACTORY PERMISSION-REQUEST AUTO-APPROVE — belt #3 (cas-7f33)
+    //
+    // In some Claude Code 2.1.x builds, PreToolUse `permissionDecision:"allow"`
+    // does not pre-empt team-mode leader-escalation cleanly, and the decision
+    // flow falls through to a PermissionRequest notification. The UG9 self-
+    // check bug (see pre_tool.rs) then escalates to the team leader for
+    // every filesystem write — self-deadlock for supervisors.
+    //
+    // This gate mirrors the PreToolUse factory auto-approve: if the caller
+    // is a factory agent and the tool is in the shared filesystem allowlist,
+    // emit an explicit allow so the PermissionRequest short-circuits before
+    // any team-mode escalation logic runs. Deliberately narrow — only the
+    // exact same tool list that PreToolUse handles.
+    //
+    // Runs BEFORE the cas_root check because CAS_AGENT_ROLE is pure env,
+    // no store access required — same rationale as the PreToolUse hoist.
+    // ========================================================================
+    let is_factory_agent = std::env::var("CAS_AGENT_ROLE").is_ok();
+    if is_factory_agent && FACTORY_AUTO_APPROVE_TOOLS.contains(&tool_name) {
+        eprintln!(
+            "cas: PermissionRequest factory auto-approve for {tool_name}"
+        );
+        return Ok(HookOutput::with_permission_request(
+            "allow",
+            &format!(
+                "Factory agent auto-approve ({tool_name}) — bypasses Claude Code team-mode leader-escalation deadlock (UG9 bug)"
+            ),
+        ));
+    }
 
     // Check if CAS is initialized
     let cas_root = match cas_root {
