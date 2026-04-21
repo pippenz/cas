@@ -121,6 +121,58 @@ fn supervisor_notebook_edit_is_auto_approved() {
 }
 
 // ============================================================================
+// cas_root=None path — the case the deadlock reporter was hitting.
+//
+// When CAS is not initialized in the supervisor's cwd at hook-dispatch time,
+// `handle_pre_tool_use(&input, None)` is invoked. Prior to cas-7f33 this
+// returned `HookOutput::empty()` immediately, causing Claude Code's classifier
+// to fall through to team-mode leader-escalation (UG9 bug) and self-deadlock.
+// The factory auto-approve must fire even without a CAS root.
+// ============================================================================
+
+#[test]
+fn supervisor_write_is_auto_approved_without_cas_root() {
+    let _g = env_lock();
+    let _role = set_role_env(Some("supervisor"));
+    let input = input_for("Write", Some("/tmp/foo.txt"));
+    let out = handle_pre_tool_use(&input, None).expect("handler ok");
+    let reason = allow_reason(&out).expect(
+        "supervisor Write must auto-approve even when cas_root is None (deadlock case)",
+    );
+    assert!(
+        reason.contains("Factory agent auto-approve"),
+        "allow reason should identify the factory bypass: {reason}"
+    );
+}
+
+#[test]
+fn worker_edit_is_auto_approved_without_cas_root() {
+    let _g = env_lock();
+    let _role = set_role_env(Some("worker"));
+    let input = input_for("Edit", Some("/tmp/foo.txt"));
+    let out = handle_pre_tool_use(&input, None).expect("handler ok");
+    assert!(
+        allow_reason(&out).is_some(),
+        "worker Edit must auto-approve even when cas_root is None (deadlock case)"
+    );
+}
+
+#[test]
+fn solo_user_write_without_cas_root_is_not_auto_approved() {
+    // When CAS_AGENT_ROLE is unset AND cas_root is None, we must still
+    // fall through to Claude Code's normal flow — the bypass is strictly
+    // scoped to factory agents.
+    let _g = env_lock();
+    let _role = set_role_env(None);
+    let input = input_for("Write", Some("/tmp/foo.txt"));
+    let out = handle_pre_tool_use(&input, None).expect("handler ok");
+    assert!(
+        allow_reason(&out).is_none(),
+        "standalone sessions with no cas_root must not get the factory auto-approve"
+    );
+}
+
+// ============================================================================
 // Negatives: must NOT auto-approve outside scope.
 // ============================================================================
 
