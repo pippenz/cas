@@ -22,6 +22,42 @@ pub fn handle_pre_tool_use(
     };
 
     // ========================================================================
+    // SUPERVISOR DISCIPLINE: Block Agent(isolation="worktree") for supervisors
+    //
+    // Supervisors must spawn workers via `mcp__cas__coordination spawn_workers`
+    // so worktrees are factory-tracked and garbage-collected. Raw `Agent` calls
+    // with `isolation: "worktree"` create worktrees Claude Code cleans up only
+    // on process exit — which leaks across Petrastella repos when the session
+    // is long-lived (see EPIC cas-7c88 / project_factory_worktree_leak).
+    //
+    // Non-isolation Agent calls (Explore, code-review personas, task-verifier)
+    // stay allowed — they're load-bearing for correctness verification.
+    //
+    // Placed before the cas_root check so the gate fires even if CAS isn't
+    // initialized in the supervisor's cwd (belt-and-suspenders; should never
+    // happen in factory mode).
+    // ========================================================================
+    if tool_name == "Agent" && crate::harness_policy::is_supervisor(input) {
+        let tool_input = input.tool_input.as_ref();
+        let isolation = tool_input.and_then(|ti| ti.get("isolation").and_then(|v| v.as_str()));
+        let subagent_type =
+            tool_input.and_then(|ti| ti.get("subagent_type").and_then(|v| v.as_str()));
+        // Task-verifier is exempt: supervisors legitimately spawn it to unjail
+        // epic verification (see handlers_events/pre_tool.rs task-verifier unjail
+        // block below). Blocking it here would strand supervisors in
+        // pending_verification if a future caller ever pairs it with isolation.
+        let is_verifier_exempt = subagent_type == Some("task-verifier");
+        if isolation == Some("worktree") && !is_verifier_exempt {
+            return Ok(HookOutput::with_pre_tool_permission(
+                "deny",
+                "🚫 Supervisors must not spawn isolated-worktree subagents.\n\
+                Use mcp__cas__coordination action=spawn_workers — factory-managed worktrees get cleaned up; Agent(isolation=\"worktree\") ones leak.\n\
+                If you genuinely need a throwaway subagent, drop `isolation` or run as a worker via `cas factory`.",
+            ));
+        }
+    }
+
+    // ========================================================================
     // FACTORY AUTO-APPROVE — HOISTED ABOVE cas_root check (cas-7f33)
     //
     // The factory filesystem auto-approve also runs below, AFTER all
