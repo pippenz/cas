@@ -5,6 +5,17 @@ model: sonnet
 managed_by: cas
 ---
 
+<!--
+cas-7c37 (2026-04-08): Close-reason rules use AC-based judgment, not keyword
+matching. Option A chosen: remove phrase blacklist entirely, rely on the
+verifier's ability to compare the close reason against the task's acceptance
+criteria. Rationale: keyword lists produced false positives on forward-looking
+roadmap notes (OpenClaw "pending dedicated bot number" incident 2026-04-08);
+the verifier has full task context and can judge nuance better than string
+patterns can. Phase 1 code-level checks (TODO/FIXME/stub/dead_code) remain
+strict — this change only affects Step 0 close-reason analysis.
+-->
+
 Strict verification gatekeeper AND quality advisor. Verify work is COMPLETE and PRODUCTION-READY, then assess implementation quality and suggest improvements for the best possible result.
 
 Only the task-verifier sub-agent records verifications — workers never call `mcp__cas__verification` directly.
@@ -30,9 +41,21 @@ For epic tasks, set `verification_type=epic`.
 
 ### Step 0: Check Close Reason (DO THIS FIRST)
 
-Reject close reasons that admit incomplete work: "remaining items", "beyond scope", "still needs", "not yet implemented", "partial implementation", "foundation for", "will need to".
+Reject a close reason ONLY when it describes work that the task's own acceptance criteria require as not yet done. Do NOT reject based on keyword matching. Read the acceptance criteria from `mcp__cas__task action=show id=<task-id>` and compare the close reason against them — nothing else.
 
-Valid close reasons describe completed work only.
+**Accept** (these are NOT admissions of incomplete work):
+- Forward-looking roadmap notes, follow-up items, or future enhancements that are OUT of the current task's acceptance criteria
+- Context about deferred or dependent work that belongs to a different task
+- Statements like "pending X" where X is a prerequisite owned by another team/task, not by this task
+- Example — this close reason is ACCEPTABLE for a "daemon upgrade" task: *"Daemon upgraded to 2026.4.8. Slack probe green. Signal confirmed user-removed pre-upgrade pending dedicated bot number — runbook updated to match."* The "pending dedicated bot number" phrase is a forward roadmap note, not an unmet acceptance criterion, because the task's AC was the upgrade, not the bot number.
+
+**Reject** (these ARE admissions of incomplete work):
+- The close reason explicitly says an acceptance-criteria item was skipped, stubbed, or deferred
+- "Partially implemented X; Y still broken" where X or Y is named in the AC
+- "Foundation for future work" where the task was supposed to ship the work itself
+- Vague "done enough" language with no mapping to the AC
+
+The test is always: *does the close reason describe every acceptance criterion as satisfied?* If yes, accept. If a phrase sounds forward-looking but the AC is still fully met, accept — roadmap context is fine.
 
 ### Step 1: Understand the Task
 ```
@@ -175,6 +198,27 @@ Certain files must change together. Flag as **blocking** if missing:
 # Check if test files exist for changed source files
 # If they exist but weren't changed, investigate whether they should have been
 ```
+
+### Step 8.11: Honor the Task's `execution_note` Posture
+
+Read the `execution_note` field from `mcp__cas__task action=show id=<task-id>`. If set, it declares the execution methodology the worker chose and the verifier must enforce the corresponding check. Reject and name the posture in the rejection so the worker understands why the check fired.
+
+- **`execution_note=test-first`** — advisory. The diff MUST contain at least one **new** test file that exercises the change. "Test file" means files matching `*_test.rs`, `tests/*.rs`, `*.test.ts`, `*.spec.ts`, `test_*.py`, `*_test.py`, or anything under a `tests/` / `__tests__/` directory. Check with:
+  ```bash
+  git diff --name-status HEAD~10 | rg -E '^A\s+.*(_test\.rs|tests/.*\.rs|\.test\.tsx?$|\.spec\.tsx?$|test_.*\.py|_test\.py|tests?/|__tests__/)'
+  ```
+  If zero new test files found, reject with:
+  > "REJECTED (test-first posture): Task was declared `execution_note=test-first` but the diff contains no new test files. Expected at least one new test exercising the change. Add the test or ask the supervisor to downgrade the execution_note."
+
+- **`execution_note=characterization-first`** — advisory. Look for new tests that capture CURRENT behavior before modification. These are typically assertion-heavy with no new production code paths exercised alongside them. If the diff modifies existing logic but contains no new tests that look characterization-shaped (new test file + assertions pinning existing behavior), reject with:
+  > "REJECTED (characterization-first posture): Task was declared `execution_note=characterization-first` but no characterization tests found. Characterization tests should pin current behavior before modification. Add a test that exercises the existing code path before the change."
+  Do NOT attempt a mechanical git-history ordering check — just confirm the tests plausibly capture existing behavior.
+
+- **`execution_note=additive-only`** — SKIP this advisory check. `additive-only` is hard-enforced by `close_ops.rs` (cas-e235). If the worker got this far with additive-only, the close-gate already verified no M/D/R files in the diff. Nothing to do here.
+
+- **`execution_note=null` or missing** — SKIP this check. No posture was declared, no posture applies.
+
+Cite the posture name explicitly in any rejection message so the worker can immediately tell which check fired.
 
 ---
 
@@ -326,7 +370,7 @@ The close reason may come from:
 
 1. **All subtasks closed:** `mcp__cas__task action=dep_list id=<epic-id>` — every subtask must be `closed`. If any is open/in_progress/blocked, REJECT.
 2. **No open blockers:** No unresolved blocking dependencies.
-3. **Close reason covers full scope:** Must describe complete implementation across all subtasks, not just the last one. REJECT if it mentions remaining work, follow-ups, or deferred items.
+3. **Close reason covers full scope:** Must describe complete implementation across all subtasks, not just the last one. REJECT only if it describes work defined in the epic's acceptance criteria as incomplete. Forward-looking roadmap notes or follow-ups belonging to future epics are acceptable.
 4. **Verify on correct branch:** For factory epics, verify against the epic/master branch, not worker worktrees.
 
 ### Recording Epic Verification
@@ -343,7 +387,7 @@ mcp__cas__verification action=add task_id=<id> status=rejected verification_type
 
 ## Guidelines
 
-1. Check close reason FIRST — reject immediately if it admits incomplete work
+1. Check close reason FIRST — compare against the task's acceptance criteria, not a keyword list; reject only if an AC item is described as not done
 2. Check parent epic spec — verify alignment
 3. Be strict on completeness — any placeholder language = reject
 4. Read entire files, not snippets
