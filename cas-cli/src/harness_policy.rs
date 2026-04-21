@@ -1,5 +1,6 @@
 use std::str::FromStr;
 
+use cas_core::hooks::types::HookInput;
 use cas_mux::SupervisorCli;
 use cas_types::TaskType;
 
@@ -53,6 +54,38 @@ pub fn is_worker_from_env() -> bool {
     std::env::var("CAS_AGENT_ROLE")
         .map(|r| r.eq_ignore_ascii_case("worker"))
         .unwrap_or(false)
+}
+
+/// Prefer the role snapshotted into the `HookInput` by the harness
+/// (`cli/hook.rs`) over re-reading the process env. Falls back to env when
+/// the field is absent — both because legacy call paths haven't been updated
+/// yet and because inline constructors (e.g. tests) often leave it unset.
+pub fn is_supervisor(input: &HookInput) -> bool {
+    match input.agent_role.as_deref() {
+        Some(role) => role.eq_ignore_ascii_case("supervisor"),
+        None => is_supervisor_from_env(),
+    }
+}
+
+/// Worker counterpart of `is_supervisor`. Same env fallback semantics.
+pub fn is_worker(input: &HookInput) -> bool {
+    match input.agent_role.as_deref() {
+        Some(role) => role.eq_ignore_ascii_case("worker"),
+        None => is_worker_from_env(),
+    }
+}
+
+/// True when the input carries *any* factory role (supervisor or worker),
+/// regardless of which. Replaces the pattern
+/// `std::env::var("CAS_AGENT_ROLE").is_ok()` for callers that just need to
+/// know "is this a factory-spawned process?".
+pub fn is_factory_agent(input: &HookInput) -> bool {
+    match input.agent_role.as_deref() {
+        Some(role) => !role.trim().is_empty(),
+        None => std::env::var("CAS_AGENT_ROLE")
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false),
+    }
 }
 
 /// Factory verification matrix.

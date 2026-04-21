@@ -124,6 +124,7 @@ impl CasCore {
                         reason: None,
                         subagent_type: None,
                         subagent_prompt: None,
+                        agent_role: std::env::var("CAS_AGENT_ROLE").ok(),
                     },
                     limit,
                     &self.cas_root,

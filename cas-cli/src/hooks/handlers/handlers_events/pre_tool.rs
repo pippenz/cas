@@ -37,7 +37,7 @@ pub fn handle_pre_tool_use(
     // initialized in the supervisor's cwd (belt-and-suspenders; should never
     // happen in factory mode).
     // ========================================================================
-    if tool_name == "Agent" && crate::harness_policy::is_supervisor_from_env() {
+    if tool_name == "Agent" && crate::harness_policy::is_supervisor(input) {
         let tool_input = input.tool_input.as_ref();
         let isolation = tool_input.and_then(|ti| ti.get("isolation").and_then(|v| v.as_str()));
         let subagent_type =
@@ -84,7 +84,7 @@ pub fn handle_pre_tool_use(
     // via the Director/TUI). The built-in SendMessage tool bypasses this system
     // and causes messages to be lost. Redirect to mcp__cas__coordination.
     // ========================================================================
-    let is_factory_agent = std::env::var("CAS_AGENT_ROLE").is_ok();
+    let is_factory_agent = crate::harness_policy::is_factory_agent(input);
     if is_factory_agent && tool_name == "SendMessage" {
         return Ok(HookOutput::with_pre_tool_permission(
             "deny",
@@ -108,7 +108,7 @@ pub fn handle_pre_tool_use(
     // Only jail the agent that owns the tasks (via leases), not all agents.
     // ========================================================================
     // Supervisors are exempt from verification jail — their job is coordination
-    let is_supervisor = crate::harness_policy::is_supervisor_from_env();
+    let is_supervisor = crate::harness_policy::is_supervisor(input);
     let worker_supports_subagents = worker_harness_from_env().capabilities().supports_subagents;
 
     // ========================================================================
@@ -154,10 +154,8 @@ pub fn handle_pre_tool_use(
     // tasks assigned and must be able to continue working on other tasks while
     // one awaits verification. The pending_verification flag on the task itself
     // still prevents re-closing without verification (enforced in close_ops.rs).
-    let is_factory_worker = std::env::var("CAS_AGENT_ROLE")
-        .map(|role| role.eq_ignore_ascii_case("worker"))
-        .unwrap_or(false)
-        && std::env::var("CAS_FACTORY_MODE").is_ok();
+    let is_factory_worker =
+        crate::harness_policy::is_worker(input) && std::env::var("CAS_FACTORY_MODE").is_ok();
 
     // Verification jail is only relevant when worker harness supports subagents.
     if worker_supports_subagents && !is_supervisor && !is_factory_worker {
@@ -444,9 +442,7 @@ pub fn handle_pre_tool_use(
 
     // Factory workers manage their own worktrees — skip CAS worktree enforcement
     // to avoid conflicting redirects (factory uses per-worker worktrees, CAS uses per-epic)
-    let is_factory_worker_for_wt = std::env::var("CAS_AGENT_ROLE")
-        .map(|role| role.to_lowercase() == "worker")
-        .unwrap_or(false);
+    let is_factory_worker_for_wt = crate::harness_policy::is_worker(input);
 
     if worktrees_enabled && !is_factory_worker_for_wt {
         if let Some(task_store) = stores.tasks().cloned() {
