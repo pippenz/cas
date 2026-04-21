@@ -1,0 +1,248 @@
+//! Host-scoped repo registry helpers.
+//!
+//! Thin glue between callers (`cas init`, factory daemon startup, MCP server
+//! startup, the `cas known-repos ...` subcommand) and [`SqliteKnownRepoStore`]
+//! in `cas-store`. Resolves the host `~/.cas/` directory and exposes
+//! non-fatal `register_repo` + a fallible bootstrap that callers on the
+//! init path can invoke once to install the schema via the migration
+//! machinery.
+//!
+//! **Schema install is single-site.** Only [`ensure_host_schema`] runs
+//! DDL, and it records the m199 migration in `cas_migrations` so the
+//! runner stays in sync. Hot-path callers (factory daemon boot, MCP serve
+//! boot) open the store without DDL; if the host was never `cas init`'d,
+//! the upsert fails silently and the registry stays empty — intended,
+//! because a host that has never run `cas init` has nothing to sweep.
+//!
+//! **Why `dirs::home_dir().join(".cas")` instead of `global_cas_dir()`:**
+//! the latter resolves to `~/.config/cas` on Linux / `Application Support`
+//! on macOS, which is **not** where the live host CAS state actually lives
+//! (sessions, logs, the factory sockets — all under `~/.cas`). Spike A
+//! deferred reconciling that inconsistency; this module picks the de-facto
+//! root per `ui/factory/session.rs:22-26`.
+
+use std::path::{Path, PathBuf};
+
+use rusqlite::params;
+use tracing::{debug, warn};
+
+use crate::migration::migrations::m199_known_repos;
+use crate::migration::{ensure_migrations_table, Migration};
+use crate::store::{KnownRepoStore, SqliteKnownRepoStore};
+
+/// Resolve the host-level `~/.cas/` directory. Falls back to `.cas/` under
+/// the current directory if the user's home directory cannot be determined,
+/// which should only happen in severely sandboxed test environments.
+pub fn host_cas_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".cas")
+}
+
+/// Install the known_repos schema on the host `~/.cas/cas.db` and record
+/// the migration in `cas_migrations` so the migration runner does not see
+/// it as pending on the next run.
+///
+/// This is the **only** code path that issues DDL against the host DB.
+/// Safe to call multiple times — idempotent on both the table creation
+/// (`CREATE TABLE IF NOT EXISTS` in the migration) and the
+/// `cas_migrations` insert (skipped when id=199 is already recorded).
+///
+/// Intended callers: `cas init` (once per repo, via `init_cas_dir`) and
+/// the `cas known-repos` subcommand itself. Hot startup paths (MCP serve,
+/// factory daemon boot) MUST NOT call this — those only upsert.
+pub fn ensure_host_schema() -> anyhow::Result<()> {
+    let cas_dir = host_cas_dir();
+    std::fs::create_dir_all(&cas_dir)?;
+    let db_path = cas_dir.join("cas.db");
+    let conn = cas_store::shared_db::shared_connection(&db_path)?;
+    let conn = conn.lock().unwrap_or_else(|p| p.into_inner());
+
+    ensure_migrations_table(&conn)?;
+
+    let migration: &Migration = &m199_known_repos::MIGRATION;
+    let already_recorded: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM cas_migrations WHERE id = ?1",
+            params![migration.id],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    if already_recorded > 0 {
+        return Ok(());
+    }
+
+    // Detect whether the table already exists (legacy installs created it
+    // directly before this helper existed). If so, backfill the record;
+    // otherwise apply the migration properly.
+    let detect_query = migration
+        .detect
+        .expect("m199 migration must have a detect query");
+    let table_exists: i64 = conn
+        .query_row(detect_query, [], |row| row.get(0))
+        .unwrap_or(0);
+    if table_exists == 0 {
+        for sql in migration.up {
+            conn.execute(sql, [])?;
+        }
+    }
+
+    let ts = if table_exists > 0 {
+        "BOOTSTRAP".to_string()
+    } else {
+        chrono::Utc::now().to_rfc3339()
+    };
+    conn.execute(
+        "INSERT OR IGNORE INTO cas_migrations (id, name, subsystem, applied_at) \
+         VALUES (?1, ?2, ?3, ?4)",
+        params![migration.id, migration.name, migration.subsystem.as_str(), ts],
+    )?;
+    Ok(())
+}
+
+/// Open the host-scoped [`SqliteKnownRepoStore`] **without** running DDL.
+///
+/// Intended for hot startup paths and read-only callers. On a host that has
+/// never been `cas init`'d, the `known_repos` table will be absent and any
+/// subsequent `upsert`/`list` call will fail. Callers use the non-fatal
+/// [`register_repo`] wrapper which swallows those errors; strict callers
+/// (the `cas known-repos` subcommand) run [`ensure_host_schema`] first.
+pub fn open_host_known_repo_store() -> anyhow::Result<SqliteKnownRepoStore> {
+    let cas_dir = host_cas_dir();
+    // Create dir even for the no-DDL path so the DB file has a place to
+    // live the first time a factory worker tries to register. If the dir
+    // already exists this is a no-op.
+    std::fs::create_dir_all(&cas_dir)?;
+    let store = SqliteKnownRepoStore::open(&cas_dir)?;
+    Ok(store)
+}
+
+/// Register `repo_path` in the host registry.
+///
+/// **Non-fatal by design.** Every known call site is a best-effort upsert on
+/// a startup hot path (`cas init`, factory daemon boot, MCP server boot);
+/// losing the upsert must not break the primary operation. Failures are
+/// logged at `warn!` and swallowed. If callers need a fatal variant, use
+/// [`open_host_known_repo_store`] + [`KnownRepoStore::upsert`] directly.
+pub fn register_repo(repo_path: &Path) {
+    if let Err(e) = register_repo_strict(repo_path) {
+        warn!(
+            path = %repo_path.display(),
+            error = %e,
+            "failed to register repo in host known_repos registry (non-fatal)",
+        );
+    } else {
+        debug!(path = %repo_path.display(), "registered repo in host known_repos");
+    }
+}
+
+/// Fallible variant of [`register_repo`]. Use this when you actually want
+/// to propagate the error (e.g. a CLI `cas known-repos add` explicitly run
+/// by the user). Note: does NOT install schema — run
+/// [`ensure_host_schema`] first if the caller is the bootstrap site.
+pub fn register_repo_strict(repo_path: &Path) -> anyhow::Result<()> {
+    let store = open_host_known_repo_store()?;
+    store.upsert(repo_path)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::with_temp_home;
+
+    #[test]
+    fn host_cas_dir_follows_home() {
+        with_temp_home(|home| {
+            let resolved = host_cas_dir();
+            assert_eq!(resolved, home.join(".cas"));
+        });
+    }
+
+    #[test]
+    fn register_repo_strict_creates_host_dir_and_inserts() {
+        with_temp_home(|home| {
+            let repo = home.join("myproject");
+            std::fs::create_dir_all(&repo).unwrap();
+
+            // Bootstrap schema first — mirrors the `cas init` contract.
+            ensure_host_schema().unwrap();
+            register_repo_strict(&repo).unwrap();
+
+            let store = open_host_known_repo_store().unwrap();
+            let list = store.list().unwrap();
+            assert_eq!(list.len(), 1);
+            assert_eq!(list[0].path, repo.canonicalize().unwrap());
+            assert!(home.join(".cas/cas.db").exists());
+        });
+    }
+
+    #[test]
+    fn register_repo_is_non_fatal_on_missing_schema() {
+        // Pre-schema: register_repo must NOT panic and must NOT abort;
+        // the warn-and-swallow contract is what the hot boot path depends on.
+        with_temp_home(|home| {
+            let repo = home.join("pre-init-repo");
+            std::fs::create_dir_all(&repo).unwrap();
+            // Schema intentionally not installed.
+            register_repo(&repo); // expect no panic, no abort
+        });
+    }
+
+    #[test]
+    fn ensure_host_schema_records_migration_and_is_idempotent() {
+        with_temp_home(|home| {
+            ensure_host_schema().unwrap();
+            // m199 row must be present.
+            let db = home.join(".cas/cas.db");
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            let id: i64 = conn
+                .query_row(
+                    "SELECT id FROM cas_migrations WHERE id = 199",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(id, 199);
+
+            // Running twice must not double-insert.
+            ensure_host_schema().unwrap();
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM cas_migrations WHERE id = 199",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "ensure_host_schema must be idempotent");
+        });
+    }
+
+    #[test]
+    fn ensure_host_schema_backfills_when_table_preexists() {
+        // Simulates a host that installed under the pre-fix code which
+        // created the table via raw DDL without the migrations row.
+        with_temp_home(|home| {
+            let cas_dir = home.join(".cas");
+            std::fs::create_dir_all(&cas_dir).unwrap();
+            let db = cas_dir.join("cas.db");
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            for sql in m199_known_repos::MIGRATION.up {
+                conn.execute(sql, []).unwrap();
+            }
+            drop(conn);
+            // Now install the schema via the migration-aware path — it
+            // must see the table, NOT re-run the DDL, AND record the row.
+            ensure_host_schema().unwrap();
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            let applied_at: String = conn
+                .query_row(
+                    "SELECT applied_at FROM cas_migrations WHERE id = 199",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(applied_at, "BOOTSTRAP");
+        });
+    }
+}

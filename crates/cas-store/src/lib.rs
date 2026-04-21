@@ -98,6 +98,9 @@ pub use verification_store::{
 // Worktree store for git worktree tracking
 pub use worktree_store::{SqliteWorktreeStore, WorktreeStore};
 
+mod known_repo_store;
+pub use known_repo_store::{KnownRepo, KnownRepoStore, SqliteKnownRepoStore};
+
 // Recording store for terminal recording metadata
 pub use recording_store::{
     RecordingStore, SqliteRecordingStore, capture_agent_event, capture_memory_event,

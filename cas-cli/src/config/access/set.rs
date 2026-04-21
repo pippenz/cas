@@ -542,6 +542,26 @@ impl Config {
                     .parse()
                     .map_err(|_| MemError::Parse(format!("Invalid boolean value: {value}")))?;
             }
+            "worktrees.abandon_ttl_hours" => {
+                let hours: u32 = value
+                    .parse()
+                    .map_err(|_| MemError::Parse(format!("Invalid integer value: {value}")))?;
+                let worktrees = self.worktrees.get_or_insert_with(WorktreesConfig::default);
+                worktrees.abandon_ttl_hours = hours;
+            }
+            "worktrees.global_sweep_debounce_secs" => {
+                let secs: u64 = value
+                    .parse()
+                    .map_err(|_| MemError::Parse(format!("Invalid integer value: {value}")))?;
+                let worktrees = self.worktrees.get_or_insert_with(WorktreesConfig::default);
+                worktrees.global_sweep_debounce_secs = secs;
+            }
+            "worktrees.sweep_claude_agent_dirs" => {
+                let worktrees = self.worktrees.get_or_insert_with(WorktreesConfig::default);
+                worktrees.sweep_claude_agent_dirs = value
+                    .parse()
+                    .map_err(|_| MemError::Parse(format!("Invalid boolean value: {value}")))?;
+            }
             // Telemetry section
             "telemetry.enabled" => {
                 let telemetry = self.telemetry.get_or_insert_with(TelemetryConfig::default);

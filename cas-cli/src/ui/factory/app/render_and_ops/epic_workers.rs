@@ -1,7 +1,64 @@
 use crate::ui::factory::app::imports::*;
+use crate::store::open_task_store;
+use crate::worktree::RemoveOutcome;
 
 fn bool_prop(value: bool) -> &'static str {
     if value { "true" } else { "false" }
+}
+
+/// Metadata key written on the agent record when shutdown preserved a dirty
+/// worktree. The daemon reaper (Unit 3) reads this to drive TTL-based salvage.
+const DIRTY_ON_SHUTDOWN_KEY: &str = "dirty_on_shutdown";
+
+/// Stamp `dirty_on_shutdown=true` (plus path + file count) onto the agent
+/// record so the daemon reaper (Unit 3) can later salvage and reclaim the
+/// orphaned worktree. Returns error only on store-level failures.
+fn flag_agent_dirty_on_shutdown(
+    agent_store: &dyn cas_store::AgentStore,
+    agent_id: &str,
+    path: &std::path::Path,
+    file_count: usize,
+) -> anyhow::Result<()> {
+    let mut agent = agent_store.get(agent_id)?;
+    agent
+        .metadata
+        .insert(DIRTY_ON_SHUTDOWN_KEY.to_string(), "true".to_string());
+    agent.metadata.insert(
+        "dirty_worktree_path".to_string(),
+        path.display().to_string(),
+    );
+    agent.metadata.insert(
+        "dirty_worktree_files".to_string(),
+        file_count.to_string(),
+    );
+    agent_store.update(&agent)?;
+    Ok(())
+}
+
+/// Does this agent have any non-Closed task assigned? Used to decide whether
+/// graceful shutdown can reclaim the worktree. On lookup failure we err on the
+/// side of caution and treat the worker as still-busy so we never destroy work.
+fn worker_has_open_tasks(cas_dir: &std::path::Path, agent_id: &str) -> bool {
+    match open_task_store(cas_dir) {
+        Ok(store) => match store.list(None) {
+            Ok(tasks) => tasks.iter().any(|t| {
+                t.assignee.as_deref() == Some(agent_id)
+                    && t.status != cas_types::TaskStatus::Closed
+            }),
+            Err(e) => {
+                tracing::warn!(
+                    "worker_has_open_tasks: task list failed for agent '{agent_id}': {e} — assuming busy"
+                );
+                true
+            }
+        },
+        Err(e) => {
+            tracing::warn!(
+                "worker_has_open_tasks: open_task_store failed: {e} — assuming busy"
+            );
+            true
+        }
+    }
 }
 
 fn shutdown_scope(count: Option<usize>, names: &[String]) -> &'static str {
@@ -295,6 +352,12 @@ impl FactoryApp {
             )
         })?;
 
+        // Snapshot task state BEFORE graceful_shutdown() — that call zeroes the
+        // agent's active_tasks counter, which would otherwise mask open work.
+        let agent_id = agent.id.clone();
+        let cas_dir = self.cas_dir().to_path_buf();
+        let has_open_tasks = worker_has_open_tasks(&cas_dir, &agent_id);
+
         if let Err(e) = agent_store.graceful_shutdown(&agent.id) {
             // Best effort fallback to stale state for consistency, but still surface original failure.
             let fallback = agent_store.mark_stale(&agent.id);
@@ -330,8 +393,14 @@ impl FactoryApp {
         // Ensure selected tab is still valid
         self.clamp_selected_worker_tab();
 
-        // Optionally clean up clone
-        // Note: We don't delete clones by default as they may have uncommitted work
+        // Teardown the worker's worktree when it's safe. "Safe" means all of its
+        // tasks are Closed AND the tree is clean — we never destroy in-progress
+        // work. Dirty trees are preserved for the daemon reaper (Unit 3) to
+        // salvage later, and we flag the agent record + warn the supervisor so
+        // nothing is silently abandoned.
+        if !has_open_tasks {
+            self.finalize_worker_worktree(&agent_store, &agent_id, name);
+        }
 
         // Sync pane sizes to adjust layout
         let _ = self.sync_pane_sizes();
@@ -339,11 +408,61 @@ impl FactoryApp {
         Ok(())
     }
 
+    /// Shared teardown: attempt to remove a worker's worktree on graceful close
+    /// (all tasks Closed). Branches: clean → removed + branch deleted; dirty →
+    /// preserved, warning surfaced, agent metadata flagged for later reaper.
+    fn finalize_worker_worktree(
+        &mut self,
+        agent_store: &std::sync::Arc<dyn cas_store::AgentStore>,
+        agent_id: &str,
+        name: &str,
+    ) {
+        let Some(manager) = self.worktree_manager.as_mut() else {
+            return;
+        };
+
+        let outcome = match manager.attempt_remove_worker(name) {
+            Ok(o) => o,
+            Err(e) => {
+                self.set_error(format!(
+                    "Worker '{name}' worktree cleanup failed: {e}"
+                ));
+                return;
+            }
+        };
+
+        match outcome {
+            RemoveOutcome::NotTracked | RemoveOutcome::Removed => {}
+            RemoveOutcome::DirtyDeferred(warning) => {
+                self.set_error(format!(
+                    "Worker '{}' shut down with {} uncommitted file{} at {} — worktree preserved for salvage",
+                    warning.worker_name,
+                    warning.file_count,
+                    if warning.file_count == 1 { "" } else { "s" },
+                    warning.path.display(),
+                ));
+
+                if let Err(e) = flag_agent_dirty_on_shutdown(
+                    agent_store.as_ref(),
+                    agent_id,
+                    &warning.path,
+                    warning.file_count,
+                ) {
+                    tracing::warn!(
+                        "Failed to flag dirty_on_shutdown for agent '{agent_id}': {e}"
+                    );
+                }
+            }
+        }
+    }
+
     /// Mark a worker as crashed (removes from tracking, keeps worktree for respawn)
     ///
-    /// This is called when a worker PTY exits unexpectedly. Unlike `shutdown_worker`,
-    /// this does not try to remove from mux (it's already gone) and preserves the
-    /// worktree directory for potential respawn.
+    /// Called when a worker PTY exits unexpectedly. Unlike `shutdown_worker`,
+    /// we do not remove the pane from mux (already gone). The worktree is
+    /// preserved for respawn *unless* the worker's task has already been closed
+    /// AND the tree is clean — in that case we reclaim it the same way graceful
+    /// shutdown would. Dirty trees are always preserved and flagged for salvage.
     pub fn mark_worker_crashed(&mut self, name: &str) {
         // Remove from worker tracking
         self.worker_names.retain(|n| n != name);
@@ -357,9 +476,20 @@ impl FactoryApp {
         // Ensure selected tab is still valid
         self.clamp_selected_worker_tab();
 
-        // Note: We don't remove from mux here because the pane is already gone
-        // We also don't clean up the worktree - it may have uncommitted work
-        // and can be used for respawn
+        // Determine if this crashed worker can have its worktree reclaimed.
+        // Default: preserve for respawn. Only reclaim when all assigned tasks
+        // are Closed (supervisor has moved on) AND tree is clean.
+        let cas_dir = self.cas_dir().to_path_buf();
+        if let Ok(agent_store) = open_agent_store(&cas_dir) {
+            if let Ok(agents) = agent_store.list(None) {
+                if let Some(agent) = agents.iter().find(|a| a.name == name) {
+                    let agent_id = agent.id.clone();
+                    if !worker_has_open_tasks(&cas_dir, &agent_id) {
+                        self.finalize_worker_worktree(&agent_store, &agent_id, name);
+                    }
+                }
+            }
+        }
 
         // Sync pane sizes to adjust layout
         let _ = self.sync_pane_sizes();
@@ -538,5 +668,74 @@ impl FactoryApp {
         );
 
         Ok(shutdown_count)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cas_store::TaskStore;
+    use cas_types::{Task, TaskStatus};
+    use tempfile::TempDir;
+
+    fn seeded_cas_dir() -> (TempDir, std::path::PathBuf) {
+        let temp = TempDir::new().unwrap();
+        let cas_dir = crate::store::init_cas_dir(temp.path()).unwrap();
+        (temp, cas_dir)
+    }
+
+    fn task_with(id: &str, assignee: Option<&str>, status: TaskStatus) -> Task {
+        let mut t = Task::new(id.to_string(), format!("title {id}"));
+        t.assignee = assignee.map(str::to_string);
+        t.status = status;
+        t
+    }
+
+    #[test]
+    fn worker_has_open_tasks_true_when_assigned_and_not_closed() {
+        let (_temp, cas_dir) = seeded_cas_dir();
+        let store = crate::store::open_task_store(&cas_dir).unwrap();
+        store
+            .add(&task_with("t-open", Some("agent-a"), TaskStatus::Open))
+            .unwrap();
+
+        assert!(worker_has_open_tasks(&cas_dir, "agent-a"));
+    }
+
+    #[test]
+    fn worker_has_open_tasks_true_for_in_progress() {
+        let (_temp, cas_dir) = seeded_cas_dir();
+        let store = crate::store::open_task_store(&cas_dir).unwrap();
+        store
+            .add(&task_with(
+                "t-inprog",
+                Some("agent-b"),
+                TaskStatus::InProgress,
+            ))
+            .unwrap();
+
+        assert!(worker_has_open_tasks(&cas_dir, "agent-b"));
+    }
+
+    #[test]
+    fn worker_has_open_tasks_false_when_only_closed_tasks() {
+        let (_temp, cas_dir) = seeded_cas_dir();
+        let store = crate::store::open_task_store(&cas_dir).unwrap();
+        store
+            .add(&task_with("t-done", Some("agent-c"), TaskStatus::Closed))
+            .unwrap();
+
+        assert!(!worker_has_open_tasks(&cas_dir, "agent-c"));
+    }
+
+    #[test]
+    fn worker_has_open_tasks_false_when_open_task_belongs_to_other_agent() {
+        let (_temp, cas_dir) = seeded_cas_dir();
+        let store = crate::store::open_task_store(&cas_dir).unwrap();
+        store
+            .add(&task_with("t-other", Some("agent-other"), TaskStatus::Open))
+            .unwrap();
+
+        assert!(!worker_has_open_tasks(&cas_dir, "agent-d"));
     }
 }

@@ -173,6 +173,7 @@ mod m195_entries_add_share;
 mod m196_rules_add_share;
 mod m197_skills_add_share;
 mod m198_tasks_add_share;
+pub mod m199_known_repos;
 
 /// All migrations in order. IDs must be sequential and never reused.
 pub const MIGRATIONS: &[Migration] = &[
@@ -343,6 +344,8 @@ pub const MIGRATIONS: &[Migration] = &[
     m196_rules_add_share::MIGRATION,
     m197_skills_add_share::MIGRATION,
     m198_tasks_add_share::MIGRATION,
+    // Host-scoped known_repos registry for cross-repo sweep (EPIC cas-7c88, Unit 4)
+    m199_known_repos::MIGRATION,
 ];
 
 #[cfg(test)]

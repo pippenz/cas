@@ -636,6 +636,30 @@ impl GitOperations {
         Ok(!output.stdout.is_empty())
     }
 
+    /// Count uncommitted entries (modified, staged, and untracked) in the worktree.
+    ///
+    /// Treats untracked files the same as modified/staged ones — both block clean
+    /// teardown. Returns 0 when the worktree is clean.
+    pub fn uncommitted_file_count(&self, path: &Path) -> Result<usize> {
+        let output = Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(path)
+            .output()?;
+
+        if !output.status.success() {
+            return Err(GitError::CommandFailed(
+                String::from_utf8_lossy(&output.stderr).to_string(),
+            ));
+        }
+
+        let count = output
+            .stdout
+            .split(|&b| b == b'\n')
+            .filter(|line| !line.is_empty())
+            .count();
+        Ok(count)
+    }
+
     /// Count commits in worktree HEAD that are not in target branch
     ///
     /// Returns the number of commits that exist on the worktree's current branch

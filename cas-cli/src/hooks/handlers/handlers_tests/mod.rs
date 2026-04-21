@@ -1,3 +1,4 @@
+mod agent_worktree_block;
 mod basic;
 mod factory_auto_approve;
 mod permission_request_factory;

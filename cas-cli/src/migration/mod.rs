@@ -17,7 +17,7 @@
 //! ```
 
 pub mod detector;
-mod migrations;
+pub mod migrations;
 
 pub use detector::detect_applied_migrations;
 pub use migrations::MIGRATIONS;
@@ -155,7 +155,7 @@ CREATE INDEX IF NOT EXISTS idx_migrations_subsystem ON cas_migrations(subsystem)
 "#;
 
 /// Ensure the migrations table exists
-fn ensure_migrations_table(conn: &Connection) -> Result<()> {
+pub fn ensure_migrations_table(conn: &Connection) -> Result<()> {
     conn.execute_batch(MIGRATIONS_TABLE_SCHEMA)?;
     Ok(())
 }

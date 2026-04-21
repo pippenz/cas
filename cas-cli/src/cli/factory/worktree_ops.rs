@@ -137,11 +137,14 @@ pub(super) fn execute_cleanup(args: &FactoryArgs) -> Result<()> {
         }
     }
 
-    let removed = manager.cleanup_workers(true)?;
+    let report = manager.cleanup_workers(true)?;
 
     fmt.newline()?;
-    fmt.info(&format!("Removed {} worktree directories:", removed.len()))?;
-    for name in &removed {
+    fmt.info(&format!(
+        "Removed {} worktree directories:",
+        report.cleaned.len()
+    ))?;
+    for name in &report.cleaned {
         fmt.bullet(name)?;
     }
 

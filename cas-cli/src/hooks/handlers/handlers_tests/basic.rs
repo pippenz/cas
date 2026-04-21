@@ -17,6 +17,7 @@ fn test_format_file_change() {
         reason: None,
         subagent_type: None,
         subagent_prompt: None,
+        agent_role: None,
     };
 
     let observation = format_observation(&input, None);
@@ -40,6 +41,7 @@ fn test_format_bash_skips_simple() {
         reason: None,
         subagent_type: None,
         subagent_prompt: None,
+        agent_role: None,
     };
 
     let observation = format_observation(&input, None);
@@ -63,6 +65,7 @@ fn test_format_bash_captures_cargo() {
         reason: None,
         subagent_type: None,
         subagent_prompt: None,
+        agent_role: None,
     };
 
     let observation = format_observation(&input, None);
@@ -162,6 +165,7 @@ fn make_hook_input(
         reason: None,
         subagent_type: None,
         subagent_prompt: None,
+        agent_role: None,
     }
 }
 
@@ -582,6 +586,7 @@ fn test_format_observation_no_tool_input() {
         reason: None,
         subagent_type: None,
         subagent_prompt: None,
+        agent_role: None,
     };
     let obs = format_observation(&input, None);
     assert!(obs.is_empty());

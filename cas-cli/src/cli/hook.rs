@@ -107,8 +107,17 @@ fn execute_event(event: &str, cli: &Cli) -> anyhow::Result<()> {
     io::stdin().read_to_string(&mut input_json)?;
 
     // Parse the hook input
-    let input: HookInput = serde_json::from_str(&input_json)
+    let mut input: HookInput = serde_json::from_str(&input_json)
         .map_err(|e| anyhow::anyhow!("Failed to parse hook input: {e}"))?;
+
+    // Harness-side population: snapshot CAS_AGENT_ROLE into the HookInput so
+    // downstream handlers read the role explicitly from the request rather
+    // than re-reading process-global env at call time. Makes the contract
+    // robust against inline hook dispatch from long-lived MCP processes
+    // where other tools mutate env concurrently.
+    if input.agent_role.is_none() {
+        input.agent_role = std::env::var("CAS_AGENT_ROLE").ok();
+    }
 
     // Handle the hook event
     let output = handle_hook(event, input)?;

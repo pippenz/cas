@@ -62,6 +62,19 @@ pub struct HookInput {
     /// Subagent prompt (SubagentStart)
     #[serde(default)]
     pub subagent_prompt: Option<String>,
+
+    /// CAS agent role for this hook invocation ("supervisor" / "worker") —
+    /// populated by the harness at dispatch time from the process env var
+    /// `CAS_AGENT_ROLE`. Kept as an explicit field on `HookInput` so hook
+    /// handlers don't have to re-read process-global state at call time;
+    /// this makes the contract explicit and future-proofs against any
+    /// inline hook dispatch (e.g. from an MCP handler in `cas serve`) where
+    /// env mutations from other MCP tools could race with the role read.
+    ///
+    /// Never sent from Claude Code on stdin — `#[serde(default)]` keeps
+    /// deserialization of existing payloads unchanged.
+    #[serde(default)]
+    pub agent_role: Option<String>,
 }
 
 /// Output sent back to Claude Code via stdout (JSON)

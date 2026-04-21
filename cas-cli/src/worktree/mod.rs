@@ -26,8 +26,15 @@
 //! The `ghostty_vt_sys/build.rs` will provide a clear error message if vendor
 //! files are missing.
 
+pub mod discovery;
 pub mod git;
 mod manager;
+pub mod salvage;
+pub mod sweep;
 
 pub use git::{GitError, GitOperations};
-pub use manager::{WorktreeConfig, WorktreeManager, WorktreeResult, symlink_project_config};
+pub use manager::{
+    CleanupReport, DirtyWorktreeWarning, RemoveOutcome, WorktreeConfig, WorktreeManager,
+    WorktreeResult, symlink_project_config,
+};
+pub use salvage::{salvage, SalvageError, SalvageOutcome, SkipReason};

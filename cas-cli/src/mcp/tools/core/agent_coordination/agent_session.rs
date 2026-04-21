@@ -109,6 +109,12 @@ impl CasCore {
             reason: None,
             subagent_type: None,
             subagent_prompt: None,
+            // Carry the role explicitly so downstream handlers don't depend on
+            // the process-global env mutation above (which races under shared
+            // MCP process dispatch).
+            agent_role: requested_role
+                .map(|r| r.to_string())
+                .or_else(|| std::env::var("CAS_AGENT_ROLE").ok()),
         };
 
         // Use hook handler for session start side effects
@@ -216,6 +222,7 @@ impl CasCore {
             reason: req.reason,
             subagent_type: None,
             subagent_prompt: None,
+            agent_role: std::env::var("CAS_AGENT_ROLE").ok(),
         };
 
         handle_session_end(&input, Some(&self.cas_root)).map_err(|e| McpError {

@@ -1,4 +1,5 @@
 use crate::types::WorktreeStatus;
+use crate::worktree::manager::worker_ops::RemoveOutcome;
 use crate::worktree::manager::*;
 use std::path::PathBuf;
 use std::process::Command;
@@ -230,9 +231,10 @@ fn test_cleanup_workers() {
     assert!(path1.exists());
     assert!(path2.exists());
 
-    let cleaned = manager.cleanup_workers(false).unwrap();
+    let report = manager.cleanup_workers(false).unwrap();
 
-    assert_eq!(cleaned.len(), 2);
+    assert_eq!(report.cleaned.len(), 2);
+    assert!(report.dirty_deferred.is_empty());
     assert!(!path1.exists());
     assert!(!path2.exists());
     assert!(manager.worker_cwds().is_empty());
@@ -440,4 +442,127 @@ fn test_is_branch_merged() {
         .unwrap();
 
     assert!(!manager.is_branch_merged("test-unmerged", &current).unwrap());
+}
+
+#[test]
+fn test_attempt_remove_worker_clean_removes_tree_and_branch() {
+    let (_temp, repo_path) = create_test_repo();
+    let config = WorktreeConfig::default();
+
+    let mut manager = WorktreeManager::new(&repo_path, config).unwrap();
+
+    let path = manager
+        .ensure_worker_worktree("clean-wolf")
+        .unwrap()
+        .path
+        .clone();
+    let branch = manager.branch_name_for_worker("clean-wolf");
+
+    assert!(path.exists());
+    assert!(manager.git.branch_exists(&branch).unwrap());
+
+    let outcome = manager.attempt_remove_worker("clean-wolf").unwrap();
+
+    assert_eq!(outcome, RemoveOutcome::Removed);
+    assert!(!path.exists());
+    assert!(!manager.git.branch_exists(&branch).unwrap());
+    assert!(manager.get_worker("clean-wolf").is_none());
+}
+
+#[test]
+fn test_attempt_remove_worker_dirty_modified_defers() {
+    let (_temp, repo_path) = create_test_repo();
+    let config = WorktreeConfig::default();
+
+    let mut manager = WorktreeManager::new(&repo_path, config).unwrap();
+
+    let worktree = manager.ensure_worker_worktree("dirty-hawk").unwrap();
+    let path = worktree.path.clone();
+    let branch = worktree.branch.clone();
+
+    // Modify the tracked README to create an uncommitted change
+    std::fs::write(path.join("README.md"), "# Modified").unwrap();
+
+    let outcome = manager.attempt_remove_worker("dirty-hawk").unwrap();
+
+    match outcome {
+        RemoveOutcome::DirtyDeferred(warning) => {
+            assert_eq!(warning.worker_name, "dirty-hawk");
+            assert_eq!(warning.path, path);
+            assert!(warning.file_count >= 1);
+        }
+        other => panic!("expected DirtyDeferred, got {other:?}"),
+    }
+
+    assert!(path.exists(), "dirty tree must be preserved");
+    assert!(manager.git.branch_exists(&branch).unwrap());
+    assert!(
+        manager.get_worker("dirty-hawk").is_some(),
+        "manager must keep tracking the dirty worker so a reaper can pick it up"
+    );
+}
+
+#[test]
+fn test_attempt_remove_worker_untracked_files_defer() {
+    let (_temp, repo_path) = create_test_repo();
+    let config = WorktreeConfig::default();
+
+    let mut manager = WorktreeManager::new(&repo_path, config).unwrap();
+
+    let worktree = manager.ensure_worker_worktree("spike-lynx").unwrap();
+    let path = worktree.path.clone();
+
+    // Untracked file only
+    std::fs::write(path.join("scratch.txt"), "draft").unwrap();
+
+    let outcome = manager.attempt_remove_worker("spike-lynx").unwrap();
+
+    assert!(
+        matches!(outcome, RemoveOutcome::DirtyDeferred(_)),
+        "untracked-only worktrees must be treated as dirty"
+    );
+    assert!(path.exists());
+}
+
+#[test]
+fn test_attempt_remove_worker_not_tracked() {
+    let (_temp, repo_path) = create_test_repo();
+    let config = WorktreeConfig::default();
+
+    let mut manager = WorktreeManager::new(&repo_path, config).unwrap();
+
+    let outcome = manager.attempt_remove_worker("never-spawned").unwrap();
+    assert_eq!(outcome, RemoveOutcome::NotTracked);
+}
+
+#[test]
+fn test_cleanup_workers_non_force_reports_dirty_deferred() {
+    let (_temp, repo_path) = create_test_repo();
+    let config = WorktreeConfig::default();
+
+    let mut manager = WorktreeManager::new(&repo_path, config).unwrap();
+
+    let clean_path = manager
+        .ensure_worker_worktree("tidy-cat")
+        .unwrap()
+        .path
+        .clone();
+    let dirty_path = manager
+        .ensure_worker_worktree("messy-dog")
+        .unwrap()
+        .path
+        .clone();
+
+    std::fs::write(dirty_path.join("wip.txt"), "in progress").unwrap();
+
+    let report = manager.cleanup_workers(false).unwrap();
+
+    assert_eq!(report.cleaned, vec!["tidy-cat".to_string()]);
+    assert_eq!(report.dirty_deferred.len(), 1);
+    assert_eq!(report.dirty_deferred[0].worker_name, "messy-dog");
+    assert_eq!(report.dirty_deferred[0].path, dirty_path);
+    assert!(report.dirty_deferred[0].file_count >= 1);
+
+    assert!(!clean_path.exists());
+    assert!(dirty_path.exists(), "dirty tree must survive non-force cleanup");
 }
