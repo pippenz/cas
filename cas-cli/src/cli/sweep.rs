@@ -15,12 +15,9 @@ use crate::worktree::sweep::{
     Disposition, RepoSweepReport, SweepOptions, sweep_all_known, sweep_one_repo,
 };
 
+/// Flags shared by `cas worktree sweep` and `cas sweep-all`.
 #[derive(Args, Clone, Debug)]
-pub struct SweepArgs {
-    /// Sweep every repo in the host known_repos registry instead of just the
-    /// current repo.
-    #[arg(long)]
-    pub all_repos: bool,
+pub struct SweepBaseArgs {
     /// Report only — do not remove any worktree or write any patch.
     #[arg(long)]
     pub dry_run: bool,
@@ -32,11 +29,21 @@ pub struct SweepArgs {
     pub salvage_dirty: bool,
 }
 
+#[derive(Args, Clone, Debug)]
+pub struct SweepArgs {
+    /// Sweep every repo in the host known_repos registry instead of just the
+    /// current repo.
+    #[arg(long)]
+    pub all_repos: bool,
+    #[command(flatten)]
+    pub base: SweepBaseArgs,
+}
+
 /// `cas worktree sweep`.
 pub fn execute_sweep(args: &SweepArgs) -> Result<()> {
     let opts = SweepOptions {
-        dry_run: args.dry_run,
-        salvage_dirty: args.salvage_dirty,
+        dry_run: args.base.dry_run,
+        salvage_dirty: args.base.salvage_dirty,
     };
 
     if args.all_repos {
@@ -50,8 +57,9 @@ pub fn execute_sweep(args: &SweepArgs) -> Result<()> {
     Ok(())
 }
 
-/// `cas sweep-all` — shortcut for `cas worktree sweep --all-repos`.
-pub fn execute_sweep_all(args: &SweepArgs) -> Result<()> {
+/// `cas sweep-all` — equivalent to `cas worktree sweep --all-repos`. No
+/// `--all-repos` flag here because it is redundant at this entry point.
+pub fn execute_sweep_all(args: &SweepBaseArgs) -> Result<()> {
     let opts = SweepOptions {
         dry_run: args.dry_run,
         salvage_dirty: args.salvage_dirty,
@@ -96,7 +104,7 @@ fn run_all(opts: SweepOptions) -> Result<()> {
     Ok(())
 }
 
-fn print_repo(report: &RepoSweepReport, opts: SweepOptions) {
+fn print_repo(report: &RepoSweepReport, _opts: SweepOptions) {
     println!("\n{}", report.repo_root.display());
     if let Some(err) = &report.repo_error {
         println!("  ! {err}");
@@ -109,7 +117,7 @@ fn print_repo(report: &RepoSweepReport, opts: SweepOptions) {
     for wt in &report.worktrees {
         println!(
             "  {} {}",
-            badge(&wt.disposition, opts.dry_run),
+            badge(&wt.disposition),
             wt.worktree_path.display()
         );
         if let Some(detail) = detail(&wt.disposition) {
@@ -128,7 +136,7 @@ fn print_repo(report: &RepoSweepReport, opts: SweepOptions) {
     );
 }
 
-fn badge(d: &Disposition, _dry_run: bool) -> &'static str {
+fn badge(d: &Disposition) -> &'static str {
     match d {
         Disposition::Removed => "[removed]       ",
         Disposition::SalvagedAndRemoved { .. } => "[salvaged+rm]   ",
@@ -180,23 +188,19 @@ fn format_bytes(bytes: u64) -> String {
 }
 
 fn find_repo_root(cwd: &std::path::Path) -> Result<PathBuf> {
-    // Walk up looking for a `.cas` dir; if none, bail so the caller can
-    // tell the user to run inside a CAS-initialized repo.
-    let mut cur: &std::path::Path = cwd;
-    loop {
-        if cur.join(".cas").is_dir() {
-            return Ok(cur.to_path_buf());
-        }
-        match cur.parent() {
-            Some(p) => cur = p,
-            None => {
-                anyhow::bail!(
-                    "Not inside a CAS-initialized repo. Run `cas init`, \
-                     or pass --all-repos to sweep every known repo."
-                );
-            }
-        }
-    }
+    // Delegate to the established resolver so we honor CAS_ROOT, factory
+    // worktree detection, and git-file parsing exactly like every other
+    // CAS command. Returns the `.cas` directory; the repo root is its parent.
+    let cas_root = crate::store::find_cas_root_from(cwd).map_err(|_| {
+        anyhow::anyhow!(
+            "Not inside a CAS-initialized repo. Run `cas init`, \
+             or pass --all-repos to sweep every known repo."
+        )
+    })?;
+    cas_root
+        .parent()
+        .map(|p| p.to_path_buf())
+        .ok_or_else(|| anyhow::anyhow!("cannot resolve repo root from {}", cas_root.display()))
 }
 
 fn append_log_line(line: &str) {

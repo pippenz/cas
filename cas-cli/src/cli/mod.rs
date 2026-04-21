@@ -203,7 +203,7 @@ pub enum Commands {
 
     /// Shortcut for `cas worktree sweep --all-repos`
     #[command(name = "sweep-all")]
-    SweepAll(sweep::SweepArgs),
+    SweepAll(sweep::SweepBaseArgs),
 }
 
 /// Authentication requirement for a command.

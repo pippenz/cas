@@ -234,6 +234,146 @@ fn sweep_multiple_worktrees_per_repo() {
 }
 
 #[test]
+fn unknown_parent_branch_produces_error_not_silent_delete() {
+    // Build a repo where `main`, `master`, `develop`, `trunk` all do NOT exist.
+    let temp = TempDir::new().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    git_ok(&repo, &["init", "-q", "-b", "custom-default"]);
+    git_ok(&repo, &["config", "user.email", "t@t.com"]);
+    git_ok(&repo, &["config", "user.name", "Test"]);
+    git_ok(&repo, &["config", "commit.gpgsign", "false"]);
+    fs::write(repo.join("a.txt"), "alpha\n").unwrap();
+    git_ok(&repo, &["add", "."]);
+    git_ok(&repo, &["commit", "-q", "-m", "initial"]);
+
+    // Add a worktree on a branch forked from custom-default with a unique commit.
+    let wt = repo.join(".cas/worktrees/worker");
+    fs::create_dir_all(wt.parent().unwrap()).unwrap();
+    git_ok(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "factory/worker",
+            wt.to_str().unwrap(),
+            "custom-default",
+        ],
+    );
+    fs::write(wt.join("feature.txt"), "committed work\n").unwrap();
+    git_ok(&wt, &["config", "user.email", "t@t.com"]);
+    git_ok(&wt, &["config", "user.name", "Test"]);
+    git_ok(&wt, &["config", "commit.gpgsign", "false"]);
+    git_ok(&wt, &["add", "."]);
+    git_ok(&wt, &["commit", "-q", "-m", "unpushed work"]);
+
+    // Without a resolvable parent branch, sweep MUST refuse to classify
+    // and MUST NOT remove the worktree (committed work would be lost).
+    let report = sweep_one_repo(&repo, SweepOptions::default());
+    assert_eq!(report.worktrees.len(), 1);
+    match &report.worktrees[0].disposition {
+        Disposition::Error { reason } => {
+            assert!(
+                reason.contains("parent branch"),
+                "expected parent-branch error, got {reason}"
+            );
+        }
+        other => panic!(
+            "expected Error(parent branch), got {other:?} — worktree with committed work was classified as something else"
+        ),
+    }
+    assert!(wt.exists(), "worktree with committed work must NOT be removed");
+}
+
+#[test]
+fn symlink_worktree_path_is_refused_not_followed() {
+    use std::os::unix::fs::symlink;
+
+    let temp = TempDir::new().unwrap();
+    let repo = bootstrap_repo(&temp);
+    // A side directory outside .cas/worktrees/ that stands in for a live
+    // worker's checkout. A symlink inside .cas/worktrees/ will point at it.
+    let external = temp.path().join("live-worker-dir");
+    fs::create_dir_all(external.join(".git")).unwrap();
+    fs::write(external.join("precious.txt"), "must not be touched\n").unwrap();
+
+    let wt_root = repo.join(".cas/worktrees");
+    fs::create_dir_all(&wt_root).unwrap();
+    let link = wt_root.join("sneaky");
+    symlink(&external, &link).unwrap();
+
+    let report = sweep_one_repo(&repo, SweepOptions::default());
+    let sneaky_rec = report
+        .worktrees
+        .iter()
+        .find(|r| r.worktree_path == link);
+    if let Some(rec) = sneaky_rec {
+        // If the sweep classified at all, it must be Error("symlink").
+        match &rec.disposition {
+            Disposition::Error { reason } => assert!(
+                reason.contains("symlink"),
+                "expected symlink-refuse reason, got {reason}"
+            ),
+            other => panic!("expected Error(symlink), got {other:?}"),
+        }
+    }
+    // Regardless of classification outcome, the external "live worker"
+    // directory and its files must be untouched.
+    assert!(
+        external.join(".git").exists() && external.join("precious.txt").exists(),
+        "symlink target must not be touched by sweep"
+    );
+    let contents = fs::read_to_string(external.join("precious.txt")).unwrap();
+    assert_eq!(contents, "must not be touched\n");
+}
+
+#[test]
+fn sweep_all_known_iterates_registry_and_flags_unhealthy() {
+    crate::test_support::with_temp_home(|home| {
+        let a = bootstrap_repo_in(home, "a");
+        add_worktree(&a, "w1");
+
+        let b = home.join("b-moved");
+        // b is registered but has no .cas/ → unhealthy
+        use crate::store::KnownRepoStore;
+        let store = crate::store::known_repos::open_host_known_repo_store().unwrap();
+        store.upsert(&a).unwrap();
+        store.upsert(&b).unwrap();
+
+        let report = crate::worktree::sweep::sweep_all_known(SweepOptions::default()).unwrap();
+        assert_eq!(report.repos.len(), 2);
+        let unhealthy = report
+            .repos
+            .iter()
+            .find(|r| r.repo_root.ends_with("b-moved"))
+            .unwrap();
+        assert!(unhealthy.repo_error.is_some());
+        let healthy = report
+            .repos
+            .iter()
+            .find(|r| r.repo_root == a.canonicalize().unwrap() || r.repo_root == a)
+            .unwrap();
+        assert_eq!(healthy.removed_count(), 1);
+    });
+}
+
+fn bootstrap_repo_in(parent: &Path, name: &str) -> PathBuf {
+    let repo = parent.join(name);
+    fs::create_dir_all(&repo).unwrap();
+    git_ok(&repo, &["init", "-q", "-b", "main"]);
+    git_ok(&repo, &["config", "user.email", "t@t.com"]);
+    git_ok(&repo, &["config", "user.name", "Test"]);
+    git_ok(&repo, &["config", "commit.gpgsign", "false"]);
+    fs::write(repo.join("a.txt"), "alpha\n").unwrap();
+    git_ok(&repo, &["add", "."]);
+    git_ok(&repo, &["commit", "-q", "-m", "initial"]);
+    // Mark .cas/ so list_tracked_repos reports it as healthy.
+    fs::create_dir_all(repo.join(".cas")).unwrap();
+    repo
+}
+
+#[test]
 fn non_worktree_subdir_is_ignored() {
     let temp = TempDir::new().unwrap();
     let repo = bootstrap_repo(&temp);

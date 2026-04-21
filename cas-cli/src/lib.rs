@@ -56,10 +56,38 @@ pub mod worktree;
 /// would race against the other's.
 #[cfg(test)]
 pub(crate) mod test_support {
+    use std::path::Path;
     use std::sync::Mutex;
+    use tempfile::TempDir;
+
     /// Serializes tests that mutate `HOME`. `std::env::set_var` is
     /// process-global; parallel tests would otherwise race.
     pub static HOME_MUTEX: Mutex<()> = Mutex::new(());
+
+    /// Run `f` with `HOME` pointed at a fresh `TempDir`, serialized against
+    /// every other HOME-mutating test in the crate. Restores the previous
+    /// `HOME` value on return. Shared by tests in multiple modules so a
+    /// future change to the HOME-isolation protocol lives in one place.
+    pub fn with_temp_home<F: FnOnce(&Path)>(f: F) {
+        let _guard = HOME_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp = TempDir::new().unwrap();
+        let prev = std::env::var_os("HOME");
+        // SAFETY: mutex above serializes concurrent writers within this
+        // test binary. `f` reads HOME at most once per call; we restore
+        // the prior value after `f` returns.
+        unsafe {
+            std::env::set_var("HOME", temp.path());
+        }
+        f(temp.path());
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
 }
 
 // Re-export cas-types as types for backward compatibility

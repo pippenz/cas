@@ -229,6 +229,22 @@ fn sweep_one_worktree(
         bytes_reclaimed: 0,
     };
 
+    // Symlink guard: a symlink under `.cas/worktrees/` is ambiguous —
+    // someone (race, bug, or intent) placed a link pointing at a directory
+    // that probably isn't a real factory worktree. Do not follow it into
+    // any destructive path; refuse and let the operator investigate.
+    if let Ok(md) = std::fs::symlink_metadata(worktree_path) {
+        if md.file_type().is_symlink() {
+            rec.disposition = Disposition::Error {
+                reason: format!(
+                    "refusing to process symlink at {} — resolve manually",
+                    worktree_path.display()
+                ),
+            };
+            return rec;
+        }
+    }
+
     // Classify state.
     let modified_files = match uncommitted_count(worktree_path) {
         Ok(n) => n,
@@ -239,8 +255,24 @@ fn sweep_one_worktree(
             return rec;
         }
     };
-    let parent = resolve_parent_branch(repo_root);
-    let unmerged = unmerged_count(worktree_path, &parent).unwrap_or(0);
+    let parent = match resolve_parent_branch(repo_root) {
+        Some(p) => p,
+        None => {
+            rec.disposition = Disposition::Error {
+                reason: "cannot resolve parent branch (no origin/HEAD or local main/master/develop/trunk) — refusing to classify".into(),
+            };
+            return rec;
+        }
+    };
+    let unmerged = match unmerged_count(worktree_path, &parent) {
+        Ok(n) => n,
+        Err(e) => {
+            rec.disposition = Disposition::Error {
+                reason: format!("unmerged check failed vs '{parent}': {e}"),
+            };
+            return rec;
+        }
+    };
 
     let dirty = modified_files > 0;
     let unmerged_commits = unmerged > 0;
@@ -275,25 +307,27 @@ fn sweep_one_worktree(
                 .unwrap_or("unknown");
             match salvage::salvage(worktree_path, repo_root, worker) {
                 Ok(Some(SalvageOutcome { patch_path, .. })) => {
-                    rec.bytes_reclaimed = dir_size(worktree_path);
+                    let size = dir_size(worktree_path);
                     if let Err(e) = remove_worktree_forced(repo_root, worktree_path) {
                         rec.disposition = Disposition::Error {
                             reason: format!("salvage ok but remove failed: {e}"),
                         };
                         return rec;
                     }
+                    rec.bytes_reclaimed = size;
                     rec.disposition = Disposition::SalvagedAndRemoved { patch_path };
                 }
                 Ok(None) => {
                     // Race: dirty at status time, clean at salvage time.
                     // Proceed with plain remove.
-                    rec.bytes_reclaimed = dir_size(worktree_path);
+                    let size = dir_size(worktree_path);
                     if let Err(e) = remove_worktree_forced(repo_root, worktree_path) {
                         rec.disposition = Disposition::Error {
                             reason: format!("remove failed: {e}"),
                         };
                         return rec;
                     }
+                    rec.bytes_reclaimed = size;
                     rec.disposition = Disposition::Removed;
                 }
                 Err(e) => {
@@ -308,13 +342,14 @@ fn sweep_one_worktree(
                 rec.disposition = Disposition::WouldRemove;
                 return rec;
             }
-            rec.bytes_reclaimed = dir_size(worktree_path);
+            let size = dir_size(worktree_path);
             if let Err(e) = remove_worktree_forced(repo_root, worktree_path) {
                 rec.disposition = Disposition::Error {
                     reason: format!("remove failed: {e}"),
                 };
                 return rec;
             }
+            rec.bytes_reclaimed = size;
             rec.disposition = Disposition::Removed;
         }
     }
@@ -335,19 +370,29 @@ fn uncommitted_count(worktree_path: &Path) -> std::io::Result<usize> {
         .count())
 }
 
+/// Count commits on HEAD that are not yet on `parent`.
+///
+/// Returns `Err` when the parent ref cannot be resolved so the caller treats
+/// "unknown" as "unsafe to classify" rather than "zero unmerged commits" —
+/// otherwise a repo where our parent fallback ("main") doesn't exist as a
+/// local ref would cause committed-but-unmerged worktrees to be silently
+/// classified as mergeable and deleted.
 fn unmerged_count(worktree_path: &Path, parent: &str) -> std::io::Result<usize> {
     let out = Command::new("git")
         .args(["rev-list", "--count", &format!("{parent}..HEAD")])
         .current_dir(worktree_path)
         .output()?;
     if !out.status.success() {
-        // Unknown parent, detached HEAD, etc. — treat as 0 (not a failure).
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
         debug!(
             parent = parent,
-            stderr = %String::from_utf8_lossy(&out.stderr),
-            "unmerged_count: git rev-list exited non-zero; assuming 0"
+            stderr = %stderr,
+            "unmerged_count: git rev-list exited non-zero",
         );
-        return Ok(0);
+        return Err(std::io::Error::other(format!(
+            "git rev-list {parent}..HEAD failed — parent ref likely unknown: {}",
+            stderr.trim()
+        )));
     }
     Ok(String::from_utf8_lossy(&out.stdout)
         .trim()
@@ -355,12 +400,12 @@ fn unmerged_count(worktree_path: &Path, parent: &str) -> std::io::Result<usize> 
         .unwrap_or(0))
 }
 
-/// Resolve the "parent" branch to compare against. Order of preference:
-/// 1. `origin/HEAD` symref target.
-/// 2. `HEAD` symref target on the repo.
-/// 3. First of `main`, `master`, `develop`, `trunk` that exists.
-/// 4. `"main"` as a last resort.
-fn resolve_parent_branch(repo_root: &Path) -> String {
+/// Resolve a parent branch that actually exists as a ref in `repo_root`.
+/// Returns `None` when no local candidate can be verified; the caller
+/// treats this as "cannot classify merge state" and skips the worktree
+/// rather than falling back to a branch that may not exist.
+fn resolve_parent_branch(repo_root: &Path) -> Option<String> {
+    // 1. origin/HEAD symref.
     if let Ok(out) = Command::new("git")
         .args(["symbolic-ref", "refs/remotes/origin/HEAD"])
         .current_dir(repo_root)
@@ -369,25 +414,46 @@ fn resolve_parent_branch(repo_root: &Path) -> String {
         if out.status.success() {
             let r = String::from_utf8_lossy(&out.stdout).trim().to_string();
             if let Some(b) = r.strip_prefix("refs/remotes/origin/") {
-                if !b.is_empty() {
-                    return b.to_string();
+                if !b.is_empty() && branch_exists(repo_root, &format!("origin/{b}")) {
+                    return Some(format!("origin/{b}"));
+                }
+                if !b.is_empty() && branch_exists(repo_root, b) {
+                    return Some(b.to_string());
                 }
             }
         }
     }
+    // 2. Local candidates, verified.
     for candidate in ["main", "master", "develop", "trunk"] {
-        let out = Command::new("git")
-            .args(["rev-parse", "--verify", candidate])
-            .current_dir(repo_root)
-            .output();
-        if matches!(out, Ok(ref o) if o.status.success()) {
-            return candidate.to_string();
+        if branch_exists(repo_root, candidate) {
+            return Some(candidate.to_string());
         }
     }
-    "main".to_string()
+    None
+}
+
+fn branch_exists(repo_root: &Path, reference: &str) -> bool {
+    Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", reference])
+        .current_dir(repo_root)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 fn remove_worktree_forced(repo_root: &Path, worktree_path: &Path) -> std::io::Result<()> {
+    // Symlink guard: `remove_dir_all` follows symlinks on some platforms,
+    // so a worktree path that was replaced by a symlink (race, accidental
+    // `ln -s`) could delete the target instead. Refuse to touch symlinks
+    // outright — the caller can inspect the disposition and decide.
+    if let Ok(md) = std::fs::symlink_metadata(worktree_path) {
+        if md.file_type().is_symlink() {
+            return Err(std::io::Error::other(format!(
+                "refusing to remove symlink at {}",
+                worktree_path.display()
+            )));
+        }
+    }
     let out = Command::new("git")
         .args([
             "worktree",
@@ -402,9 +468,16 @@ fn remove_worktree_forced(repo_root: &Path, worktree_path: &Path) -> std::io::Re
     if out.status.success() {
         return Ok(());
     }
+    let git_stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
     // Fall back to plain directory removal if git refuses (e.g. stale
-    // registration, worktree not tracked by git).
-    let _ = std::fs::remove_dir_all(worktree_path);
+    // registration, worktree not tracked by git). Propagate the fallback
+    // error — silent swallow would hide permanent leaks where both git and
+    // fs::remove_dir_all fail.
+    std::fs::remove_dir_all(worktree_path).map_err(|e| {
+        std::io::Error::other(format!(
+            "git worktree remove failed ({git_stderr}) and fallback remove_dir_all also failed: {e}"
+        ))
+    })?;
     Ok(())
 }
 

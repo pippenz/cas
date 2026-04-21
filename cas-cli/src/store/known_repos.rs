@@ -74,33 +74,7 @@ pub fn register_repo_strict(repo_path: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
-
-    // HOME-mutating tests must not run in parallel. We reuse the
-    // crate-wide mutex in `crate::test_support` so tests in *other*
-    // modules (e.g. worktree::discovery) that also mutate HOME are
-    // serialized against ours — separate per-module mutexes would each
-    // allow entry and the two would clobber each other.
-    fn with_temp_home<F: FnOnce(&Path)>(f: F) {
-        let _guard = crate::test_support::HOME_MUTEX
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let temp = TempDir::new().unwrap();
-        let prev = std::env::var_os("HOME");
-        // SAFETY: the mutex above serializes concurrent writers within this
-        // test binary. `register_repo` (the helper under test) reads HOME at
-        // most once per call; we restore the prior value after `f` returns.
-        unsafe {
-            std::env::set_var("HOME", temp.path());
-        }
-        f(temp.path());
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
-        }
-    }
+    use crate::test_support::with_temp_home;
 
     #[test]
     fn host_cas_dir_follows_home() {

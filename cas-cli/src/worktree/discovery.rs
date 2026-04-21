@@ -196,7 +196,7 @@ fn home_cas_scan() -> Vec<PathBuf> {
 }
 
 fn walk(dir: &Path, depth: usize, max: usize, out: &mut Vec<PathBuf>) {
-    if depth > max {
+    if depth >= max {
         return;
     }
     // Skip obvious speedbumps.
@@ -229,25 +229,7 @@ fn walk(dir: &Path, depth: usize, max: usize, out: &mut Vec<PathBuf>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
-
-    fn with_temp_home<F: FnOnce(&Path)>(f: F) {
-        let _guard = crate::test_support::HOME_MUTEX
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let temp = TempDir::new().unwrap();
-        let prev = std::env::var_os("HOME");
-        unsafe {
-            std::env::set_var("HOME", temp.path());
-        }
-        f(temp.path());
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
-        }
-    }
+    use crate::test_support::with_temp_home;
 
     #[test]
     fn list_tracked_flags_healthy_correctly() {
