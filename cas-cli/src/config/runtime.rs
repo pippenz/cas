@@ -34,6 +34,17 @@ pub struct WorktreesConfig {
     /// epics without merging their worktrees.
     #[serde(default = "default_true")]
     pub require_merge_on_epic_close: bool,
+
+    /// Hours a worktree can sit without heartbeat activity before the daemon
+    /// reaper considers it abandoned and eligible for cleanup.
+    #[serde(default = "default_abandon_ttl_hours")]
+    pub abandon_ttl_hours: u32,
+
+    /// Debounce interval for the opportunistic cross-repo global sweep,
+    /// in seconds. The sweep is skipped if the last successful run is newer
+    /// than this many seconds.
+    #[serde(default = "default_global_sweep_debounce_secs")]
+    pub global_sweep_debounce_secs: u64,
 }
 
 fn default_worktree_base_path() -> String {
@@ -42,6 +53,14 @@ fn default_worktree_base_path() -> String {
 
 fn default_worktree_branch_prefix() -> String {
     "cas/".to_string()
+}
+
+fn default_abandon_ttl_hours() -> u32 {
+    24
+}
+
+fn default_global_sweep_debounce_secs() -> u64 {
+    3600
 }
 
 impl Default for WorktreesConfig {
@@ -54,6 +73,8 @@ impl Default for WorktreesConfig {
             cleanup_on_close: true,
             promote_entries_on_merge: true,
             require_merge_on_epic_close: true, // Require merge by default
+            abandon_ttl_hours: default_abandon_ttl_hours(),
+            global_sweep_debounce_secs: default_global_sweep_debounce_secs(),
         }
     }
 }

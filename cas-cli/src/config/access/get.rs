@@ -252,6 +252,20 @@ impl Config {
                     .promote_entries_on_merge
                     .to_string(),
             ),
+            "worktrees.abandon_ttl_hours" => Some(
+                self.worktrees
+                    .clone()
+                    .unwrap_or_default()
+                    .abandon_ttl_hours
+                    .to_string(),
+            ),
+            "worktrees.global_sweep_debounce_secs" => Some(
+                self.worktrees
+                    .clone()
+                    .unwrap_or_default()
+                    .global_sweep_debounce_secs
+                    .to_string(),
+            ),
             // Telemetry section
             "telemetry.enabled" => Some(
                 self.telemetry
