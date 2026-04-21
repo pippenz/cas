@@ -173,7 +173,7 @@ mod m195_entries_add_share;
 mod m196_rules_add_share;
 mod m197_skills_add_share;
 mod m198_tasks_add_share;
-mod m199_known_repos;
+pub mod m199_known_repos;
 
 /// All migrations in order. IDs must be sequential and never reused.
 pub const MIGRATIONS: &[Migration] = &[
