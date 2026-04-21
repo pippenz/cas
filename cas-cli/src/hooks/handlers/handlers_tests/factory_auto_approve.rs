@@ -206,6 +206,22 @@ fn factory_agent_unknown_tool_is_not_auto_approved() {
     );
 }
 
+#[test]
+fn factory_agent_unknown_tool_without_cas_root_is_not_auto_approved() {
+    // Mirror of `factory_agent_unknown_tool_is_not_auto_approved` for the
+    // hoisted `cas_root=None` path. Locks in the allowlist guard on the
+    // rescue branch so a future refactor that drops the `contains()`
+    // check fails the suite instead of silently broadening the bypass.
+    let _g = env_lock();
+    let _role = set_role_env(Some("worker"));
+    let input = input_for("WebFetch", None);
+    let out = handle_pre_tool_use(&input, None).expect("handler ok");
+    assert!(
+        allow_reason(&out).is_none(),
+        "WebFetch is not in the factory auto-approve list (cas_root=None path)"
+    );
+}
+
 // ============================================================================
 // Structural invariants documented — not exercised directly in unit tests.
 // ============================================================================

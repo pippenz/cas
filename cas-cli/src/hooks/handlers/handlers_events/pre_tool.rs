@@ -788,6 +788,14 @@ pub fn handle_pre_tool_use(
 /// `cas-cli/src/ui/factory/daemon/runtime/teams.rs::worker_settings_contents`
 /// and `supervisor_settings_contents` — keep the two lists in sync or the
 /// belt-and-suspenders settings-file path diverges from the hook path.
+///
+/// Consumers in this crate (keep all in sync when editing membership):
+/// - `handle_pre_tool_use` (this file) — PreToolUse auto-approve. Two
+///   copies: hoisted `cas_root=None` rescue and the post-protection
+///   `cas_root=Some` path.
+/// - `super::notifications::handle_permission_request` — the cas-7f33
+///   PermissionRequest belt #3 that covers Claude Code 2.1.x builds where
+///   PreToolUse `allow` doesn't pre-empt team-mode leader escalation.
 pub(crate) const FACTORY_AUTO_APPROVE_TOOLS: &[&str] = &[
     "Read",
     "Write",

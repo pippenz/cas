@@ -19,14 +19,27 @@ pub fn handle_permission_request(
     // check bug (see pre_tool.rs) then escalates to the team leader for
     // every filesystem write — self-deadlock for supervisors.
     //
-    // This gate mirrors the PreToolUse factory auto-approve: if the caller
-    // is a factory agent and the tool is in the shared filesystem allowlist,
-    // emit an explicit allow so the PermissionRequest short-circuits before
-    // any team-mode escalation logic runs. Deliberately narrow — only the
-    // exact same tool list that PreToolUse handles.
+    // Scope and structural asymmetry with pre_tool.rs (INTENTIONAL):
+    //   - The PreToolUse hoist is gated on `cas_root.is_none()` because a
+    //     second copy exists below the protection block to handle the
+    //     `cas_root=Some` case after `.env`/credential denies have run.
+    //   - This handler has NO protection gates today (pre-cas-7f33 code
+    //     only did task-context/lease-based auto-approve). There is no
+    //     deny-first invariant to preserve, so the belt fires
+    //     unconditionally for factory agents — both `cas_root=None` and
+    //     `cas_root=Some` need the deadlock bypass whenever the
+    //     PermissionRequest path is reached.
+    //   - Trade-off: the prior lease/task-context auto-approve (below)
+    //     is short-circuited for factory agents on the 7 allowlisted
+    //     tools. Factory agents are already privileged via the PreToolUse
+    //     auto-approve; this does not materially change their write surface.
+    //   - If a future contributor adds a protection gate (e.g., `.env`
+    //     deny) to this handler, it MUST be hoisted above this belt or
+    //     factory agents will bypass it. See FACTORY_AUTO_APPROVE_TOOLS
+    //     doc comment in pre_tool.rs for the full consumer list.
     //
     // Runs BEFORE the cas_root check because CAS_AGENT_ROLE is pure env,
-    // no store access required — same rationale as the PreToolUse hoist.
+    // no store access required.
     // ========================================================================
     let is_factory_agent = std::env::var("CAS_AGENT_ROLE").is_ok();
     if is_factory_agent && FACTORY_AUTO_APPROVE_TOOLS.contains(&tool_name) {
