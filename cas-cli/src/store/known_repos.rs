@@ -74,18 +74,15 @@ pub fn register_repo_strict(repo_path: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
     use tempfile::TempDir;
 
-    // HOME-mutating tests must not run in parallel: cargo test uses a thread
-    // pool, and `std::env::set_var` is process-global, so two concurrent
-    // tests would see each other's HOME and the second one's upsert would
-    // land in the first one's DB (or, worse, a race across canonicalize +
-    // shared_db pool keys).
-    static HOME_MUTEX: Mutex<()> = Mutex::new(());
-
+    // HOME-mutating tests must not run in parallel. We reuse the
+    // crate-wide mutex in `crate::test_support` so tests in *other*
+    // modules (e.g. worktree::discovery) that also mutate HOME are
+    // serialized against ours — separate per-module mutexes would each
+    // allow entry and the two would clobber each other.
     fn with_temp_home<F: FnOnce(&Path)>(f: F) {
-        let _guard = HOME_MUTEX
+        let _guard = crate::test_support::HOME_MUTEX
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let temp = TempDir::new().unwrap();

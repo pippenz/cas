@@ -7,7 +7,10 @@ pub(crate) mod bridge;
 mod changelog;
 mod claude_md;
 mod codemap_cmd;
+mod known_repos;
 mod project_overview_cmd;
+mod sweep;
+mod worktree;
 // `pub` so integration tests in `cas-cli/tests/` can reach
 // `cli::cloud::execute_team_push` (cas-1f44 T4). Internal; no stable API.
 pub mod cloud;
@@ -189,6 +192,18 @@ pub enum Commands {
     /// Share or unshare personal memories with your team (retroactive)
     #[command(subcommand)]
     Memory(memory::MemoryCommands),
+
+    /// Inspect and bootstrap the host-scoped known_repos registry
+    #[command(subcommand, name = "known-repos")]
+    KnownRepos(known_repos::KnownReposCommands),
+
+    /// Worktree-scoped diagnostics and maintenance (sweep, ...)
+    #[command(subcommand)]
+    Worktree(worktree::WorktreeCommands),
+
+    /// Shortcut for `cas worktree sweep --all-repos`
+    #[command(name = "sweep-all")]
+    SweepAll(sweep::SweepArgs),
 }
 
 /// Authentication requirement for a command.
@@ -232,7 +247,10 @@ fn auth_requirement(command: &Option<Commands>) -> AuthRequirement {
         | Commands::ClaudeMd(_)
         | Commands::Codemap(_)
         | Commands::ProjectOverview(_)
-        | Commands::Memory(_) => AuthRequirement::NotRequired,
+        | Commands::Memory(_)
+        | Commands::KnownRepos(_)
+        | Commands::Worktree(_)
+        | Commands::SweepAll(_) => AuthRequirement::NotRequired,
 
         #[cfg(feature = "mcp-server")]
         Commands::Serve => AuthRequirement::NotRequired,
@@ -381,6 +399,9 @@ fn get_command_name(cmd: &Option<Commands>) -> String {
         Commands::Codemap(_) => "codemap".to_string(),
         Commands::ProjectOverview(_) => "project-overview".to_string(),
         Commands::Memory(_) => "memory".to_string(),
+        Commands::KnownRepos(_) => "known-repos".to_string(),
+        Commands::Worktree(_) => "worktree".to_string(),
+        Commands::SweepAll(_) => "sweep-all".to_string(),
     }
 }
 
@@ -433,6 +454,9 @@ fn run_command(cli: &Cli, cas_root: Option<&Path>) -> anyhow::Result<()> {
             project_overview_cmd::execute(cmd, cli, require_cas_root(cas_root)?)
         }
         Commands::Memory(cmd) => memory::execute(cmd, cli, require_cas_root(cas_root)?),
+        Commands::KnownRepos(cmd) => known_repos::execute(cmd),
+        Commands::Worktree(cmd) => worktree::execute(cmd),
+        Commands::SweepAll(args) => sweep::execute_sweep_all(args),
     }
 }
 

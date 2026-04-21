@@ -30,6 +30,7 @@ pub mod discovery;
 pub mod git;
 mod manager;
 pub mod salvage;
+pub mod sweep;
 
 pub use git::{GitError, GitOperations};
 pub use manager::{

@@ -50,6 +50,18 @@ pub mod tracing;
 pub mod ui;
 pub mod worktree;
 
+/// Shared test-only utilities. Kept in one place so cross-module statics
+/// (like the HOME env-var mutex used by known_repos + discovery tests)
+/// refer to a single instance; otherwise each test module's own static
+/// would race against the other's.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::Mutex;
+    /// Serializes tests that mutate `HOME`. `std::env::set_var` is
+    /// process-global; parallel tests would otherwise race.
+    pub static HOME_MUTEX: Mutex<()> = Mutex::new(());
+}
+
 // Re-export cas-types as types for backward compatibility
 pub use cas_types as types;
 

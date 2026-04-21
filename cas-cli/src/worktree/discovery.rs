@@ -229,13 +229,10 @@ fn walk(dir: &Path, depth: usize, max: usize, out: &mut Vec<PathBuf>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
     use tempfile::TempDir;
 
-    static HOME_MUTEX: Mutex<()> = Mutex::new(());
-
     fn with_temp_home<F: FnOnce(&Path)>(f: F) {
-        let _guard = HOME_MUTEX
+        let _guard = crate::test_support::HOME_MUTEX
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let temp = TempDir::new().unwrap();
