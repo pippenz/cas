@@ -122,7 +122,10 @@ fn salvage_nonexistent_path_errors_without_panic() {
     let (_temp, repo) = fresh_repo();
     let bogus = repo.join("does-not-exist");
     let err = salvage(&bogus, &repo, "ghost").unwrap_err();
-    matches!(err, SalvageError::WorktreeMissing(_));
+    assert!(
+        matches!(err, SalvageError::WorktreeMissing(_)),
+        "expected WorktreeMissing, got {err:?}",
+    );
 }
 
 #[test]

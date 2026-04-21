@@ -243,10 +243,10 @@ fn run_diff(path: &Path) -> Result<Vec<u8>, SalvageError> {
         .args(["diff", "HEAD", "--binary", "--no-color"])
         .current_dir(path)
         .output()?;
-    // `git diff` exits 0 (no diff) or 1 (diff present) on success; anything
-    // else is a real error.
-    let code = out.status.code().unwrap_or(-1);
-    if code != 0 && code != 1 {
+    // Without `--exit-code`, `git diff` exits 0 on success regardless of
+    // whether a diff is present. Any non-zero exit is a real error.
+    if !out.status.success() {
+        let code = out.status.code().unwrap_or(-1);
         return Err(SalvageError::GitFailed(format!(
             "git diff HEAD failed (exit {code}): {}",
             String::from_utf8_lossy(&out.stderr)
@@ -307,28 +307,36 @@ fn write_atomic(
     skipped: &[(PathBuf, SkipReason)],
 ) -> Result<(), SalvageError> {
     let tmp_path = final_path.with_extension("patch.tmp");
-    {
-        let mut f = fs::File::create(&tmp_path)?;
-        if !skipped.is_empty() {
-            // Leading comment block so readers see elisions immediately.
-            // `git apply` ignores lines before the first `diff --git`.
-            writeln!(f, "# cas salvage: elided untracked files")?;
-            for (path, reason) in skipped {
-                let reason_str = match reason {
-                    SkipReason::TooLarge { bytes } => {
-                        format!("too large ({bytes} bytes > {MAX_UNTRACKED_BYTES} limit)")
-                    }
-                    SkipReason::Vanished => "vanished before snapshot".to_string(),
-                };
-                writeln!(f, "#   {}  — {}", path.display(), reason_str)?;
+    // Cleanup guard: remove tmp on any error path, so a failed write cannot
+    // leave a half-written `.patch.tmp` on disk.
+    let result: Result<(), SalvageError> = (|| {
+        {
+            let mut f = fs::File::create(&tmp_path)?;
+            if !skipped.is_empty() {
+                // Leading comment block so readers see elisions immediately.
+                // `git apply` ignores lines before the first `diff --git`.
+                writeln!(f, "# cas salvage: elided untracked files")?;
+                for (path, reason) in skipped {
+                    let reason_str = match reason {
+                        SkipReason::TooLarge { bytes } => {
+                            format!("too large ({bytes} bytes > {MAX_UNTRACKED_BYTES} limit)")
+                        }
+                        SkipReason::Vanished => "vanished before snapshot".to_string(),
+                    };
+                    writeln!(f, "#   {}  — {}", path.display(), reason_str)?;
+                }
+                writeln!(f, "#")?;
             }
-            writeln!(f, "#")?;
+            f.write_all(patch_bytes)?;
+            f.sync_all()?;
         }
-        f.write_all(patch_bytes)?;
-        f.sync_all()?;
+        fs::rename(&tmp_path, final_path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp_path);
     }
-    fs::rename(&tmp_path, final_path)?;
-    Ok(())
+    result
 }
 
 #[cfg(test)]
