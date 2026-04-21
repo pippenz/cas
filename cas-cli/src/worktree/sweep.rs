@@ -20,6 +20,8 @@ use tracing::{debug, warn};
 
 use crate::worktree::salvage::{self, SalvageOutcome};
 
+pub mod opportunistic;
+
 /// Options controlling what the sweep is allowed to do.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SweepOptions {

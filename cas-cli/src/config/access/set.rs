@@ -556,6 +556,12 @@ impl Config {
                 let worktrees = self.worktrees.get_or_insert_with(WorktreesConfig::default);
                 worktrees.global_sweep_debounce_secs = secs;
             }
+            "worktrees.sweep_claude_agent_dirs" => {
+                let worktrees = self.worktrees.get_or_insert_with(WorktreesConfig::default);
+                worktrees.sweep_claude_agent_dirs = value
+                    .parse()
+                    .map_err(|_| MemError::Parse(format!("Invalid boolean value: {value}")))?;
+            }
             // Telemetry section
             "telemetry.enabled" => {
                 let telemetry = self.telemetry.get_or_insert_with(TelemetryConfig::default);
