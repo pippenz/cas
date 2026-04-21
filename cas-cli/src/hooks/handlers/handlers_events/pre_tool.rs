@@ -726,6 +726,69 @@ pub fn handle_pre_tool_use(
         }
     }
 
+    // ========================================================================
+    // FACTORY MODE: Unconditional auto-approve for filesystem tool families.
+    //
+    // Claude Code 2.1.116's team-mode permission layer escalates any "ask"
+    // decision to the team leader via `Mq4()`, gated on a broken self-check:
+    //
+    //     function UG9(H) {
+    //       let q = hP();                    // self agentId
+    //       return !q || q === "team-lead";  // hardcoded string compare
+    //     }
+    //     function L6$(){ ... return teamName && selfAgentId && !UG9(); }
+    //
+    // CAS gives the supervisor agentId `supervisor@<team>` and workers
+    // `<worker-name>@<team>` — neither is the literal string `"team-lead"`,
+    // so `UG9()` returns false for every factory agent, `L6$()` returns true,
+    // and every Write/Edit/Bash permission check routes to the leader. The
+    // leader IS the supervisor, which has no UX path to self-approve → the
+    // modal `Waiting for team lead approval` hangs forever. Workers hit it
+    // too, escalating to a supervisor that may be busy or idle.
+    //
+    // cas-e15d (ffb76df) tried to bypass this by shipping `--settings`
+    // allowlist files with `permissions.allow: ["Write",...]` for supervisor
+    // and workers, expecting the classifier to return `{behavior:"allow"}`
+    // and skip `Mq4`. Empirically the escalation still fires — the classifier
+    // does not honor bare-toolname allow rules the way we assumed, or merge
+    // precedence clobbers them. We keep those files as belt-and-suspenders
+    // but the real fix lives HERE: a PreToolUse hook runs *before* the
+    // classifier, and an explicit `permissionDecision: "allow"` short-circuits
+    // the entire local-then-team decision flow.
+    //
+    // Scope: only the filesystem tool families whose allowlist matched the
+    // supervisor/worker settings file. MCP tools, Agent, Task, and the rest
+    // still flow through Claude Code's normal paths so their own rule logic
+    // keeps working. Protection gates above (this block runs AFTER) still
+    // win — .env / credential writes are denied before we reach here.
+    //
+    // See: project_cas_team_permission_escalation_bug memory for the
+    // full disassembly that identified the upstream root cause.
+    // ========================================================================
+    if is_factory_agent && FACTORY_AUTO_APPROVE_TOOLS.contains(&tool_name) {
+        return Ok(HookOutput::with_pre_tool_permission(
+            "allow",
+            &format!(
+                "Factory agent auto-approve ({tool_name}) — bypasses Claude Code team-mode leader-escalation deadlock (UG9 bug)"
+            ),
+        ));
+    }
+
     // No rule matched, no protection triggered - let Claude ask the user
     Ok(HookOutput::empty())
 }
+
+/// Filesystem tool families auto-approved for factory agents (supervisor and
+/// workers). Matches the `permissions.allow` list written by
+/// `cas-cli/src/ui/factory/daemon/runtime/teams.rs::worker_settings_contents`
+/// and `supervisor_settings_contents` — keep the two lists in sync or the
+/// belt-and-suspenders settings-file path diverges from the hook path.
+const FACTORY_AUTO_APPROVE_TOOLS: &[&str] = &[
+    "Read",
+    "Write",
+    "Edit",
+    "Glob",
+    "Grep",
+    "Bash",
+    "NotebookEdit",
+];
