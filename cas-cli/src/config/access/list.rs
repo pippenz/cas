@@ -428,6 +428,14 @@ impl Config {
                     .global_sweep_debounce_secs
                     .to_string(),
             ),
+            (
+                "worktrees.sweep_claude_agent_dirs".to_string(),
+                self.worktrees
+                    .clone()
+                    .unwrap_or_default()
+                    .sweep_claude_agent_dirs
+                    .to_string(),
+            ),
             // Telemetry section
             (
                 "telemetry.enabled".to_string(),

@@ -8,6 +8,7 @@
 use anyhow::Result;
 use clap::Subcommand;
 
+use crate::store::known_repos::ensure_host_schema;
 use crate::worktree::discovery::{list_tracked_repos, seed};
 
 #[derive(Subcommand, Clone, Debug)]
@@ -25,6 +26,10 @@ pub enum KnownReposCommands {
 }
 
 pub fn execute(cmd: &KnownReposCommands) -> Result<()> {
+    // `known-repos` is the bootstrap entry point for the registry, so we
+    // install the schema here (idempotent) to cover hosts where `cas init`
+    // predates the registry.
+    ensure_host_schema()?;
     match cmd {
         KnownReposCommands::List => execute_list(),
         KnownReposCommands::Seed { scan_home } => execute_seed(*scan_home),

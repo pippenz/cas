@@ -10,7 +10,6 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use rusqlite::Connection;
 use tracing::debug;
 
 use crate::store::KnownRepoStore;
@@ -125,15 +124,18 @@ pub fn seed(include_home_scan: bool) -> Result<SeedReport> {
     Ok(report)
 }
 
-/// Raw-SQL read of distinct `sessions.cwd` from the host DB. Returns only
-/// values that parse as absolute paths. Schema may have evolved; missing
-/// tables are treated as empty.
+/// Raw-SQL read of distinct `sessions.cwd` from the host DB. Routes through
+/// the shared_db pool so we inherit the 5s busy_timeout + WAL pragmas —
+/// without it, a seed invoked while a factory daemon holds a write lock
+/// would return `SQLITE_BUSY` immediately and silently report zero rows.
+/// Schema may have evolved; a missing `sessions` table is treated as empty.
 fn session_cwds_from_host_db() -> Result<Vec<PathBuf>> {
     let db_path = host_cas_dir().join("cas.db");
     if !db_path.exists() {
         return Ok(Vec::new());
     }
-    let conn = Connection::open(&db_path)?;
+    let conn = cas_store::shared_db::shared_connection(&db_path)?;
+    let conn = conn.lock().unwrap_or_else(|p| p.into_inner());
     // sessions table may not exist on very fresh hosts.
     let has_sessions: i64 = conn
         .query_row(
@@ -229,11 +231,19 @@ fn walk(dir: &Path, depth: usize, max: usize, out: &mut Vec<PathBuf>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::known_repos::ensure_host_schema;
     use crate::test_support::with_temp_home;
+
+    fn with_temp_home_bootstrapped<F: FnOnce(&Path)>(f: F) {
+        with_temp_home(|home| {
+            ensure_host_schema().unwrap();
+            f(home);
+        });
+    }
 
     #[test]
     fn list_tracked_flags_healthy_correctly() {
-        with_temp_home(|home| {
+        with_temp_home_bootstrapped(|home| {
             let healthy = home.join("healthy");
             let moved = home.join("moved");
             std::fs::create_dir_all(healthy.join(".cas")).unwrap();
@@ -254,7 +264,7 @@ mod tests {
 
     #[test]
     fn seed_skips_missing_cas_dir() {
-        with_temp_home(|home| {
+        with_temp_home_bootstrapped(|home| {
             // Seed source: a session JSON pointing at a real repo and a fake one.
             let sessions_dir = home.join(".cas/sessions");
             std::fs::create_dir_all(&sessions_dir).unwrap();
@@ -282,7 +292,7 @@ mod tests {
 
     #[test]
     fn seed_idempotent_second_run_has_no_new() {
-        with_temp_home(|home| {
+        with_temp_home_bootstrapped(|home| {
             let sessions_dir = home.join(".cas/sessions");
             std::fs::create_dir_all(&sessions_dir).unwrap();
             let repo = home.join("repo");
@@ -305,7 +315,7 @@ mod tests {
 
     #[test]
     fn list_empty_registry_returns_empty() {
-        with_temp_home(|_| {
+        with_temp_home_bootstrapped(|_| {
             let list = list_tracked_repos().unwrap();
             assert!(list.is_empty());
         });
@@ -313,7 +323,7 @@ mod tests {
 
     #[test]
     fn seed_ignores_corrupt_session_json() {
-        with_temp_home(|home| {
+        with_temp_home_bootstrapped(|home| {
             let sessions_dir = home.join(".cas/sessions");
             std::fs::create_dir_all(&sessions_dir).unwrap();
             std::fs::write(sessions_dir.join("good.json"), "{}").unwrap(); // no project_dir

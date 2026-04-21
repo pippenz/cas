@@ -35,6 +35,29 @@ pub(super) fn execute_daemon(
         crate::store::known_repos::register_repo(repo_root);
     }
 
+    // Opportunistic cross-repo sweep (EPIC cas-7c88 Unit 3) — debounced
+    // via `~/.cas/last_global_sweep`. Dispatched on a detached OS thread
+    // because execute_daemon runs synchronously before Tokio is available
+    // here. Any panic on the sweep thread is caught; any error is logged.
+    let wt_cfg = cas_config.worktrees().clone();
+    std::thread::spawn(move || {
+        let result = std::panic::catch_unwind(|| {
+            match crate::worktree::sweep::opportunistic::run_if_due(&wt_cfg) {
+                Ok(Some(summary)) => tracing::info!(
+                    repos = summary.repos_visited,
+                    reclaimed = summary.reclaimed,
+                    salvaged = summary.salvaged,
+                    "opportunistic sweep complete"
+                ),
+                Ok(None) => {}
+                Err(e) => tracing::error!(error = %e, "opportunistic sweep failed"),
+            }
+        });
+        if result.is_err() {
+            tracing::error!("opportunistic sweep panicked — swallowed");
+        }
+    });
+
     let effective_workers = if worker_names.is_empty() {
         workers as usize
     } else {

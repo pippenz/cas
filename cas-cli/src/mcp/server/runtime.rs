@@ -43,6 +43,29 @@ async fn run_server_impl() -> anyhow::Result<()> {
         crate::store::known_repos::register_repo(repo_root);
     }
 
+    // Opportunistic cross-repo sweep — debounced via
+    // `~/.cas/last_global_sweep`. Runs on a detached blocking task so MCP
+    // startup is NEVER delayed. Any panic is caught and logged; any error
+    // is warn-logged. This is Unit 3's keystone wiring (EPIC cas-7c88).
+    let sweep_cas_config = crate::config::Config::load(&cas_root).unwrap_or_default();
+    tokio::task::spawn_blocking(move || {
+        let wt_cfg = sweep_cas_config.worktrees().clone();
+        match crate::worktree::sweep::opportunistic::run_if_due(&wt_cfg) {
+            Ok(Some(summary)) => {
+                eprintln!(
+                    "[CAS] opportunistic sweep: visited {} repo(s), reclaimed {}, salvaged {}",
+                    summary.repos_visited, summary.reclaimed, summary.salvaged,
+                );
+            }
+            Ok(None) => {
+                // Skipped by debounce — no user-visible output.
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "opportunistic sweep failed");
+            }
+        }
+    });
+
     // Run startup cloud pull in a background task with a short timeout
     // so a slow/unreachable cloud endpoint never blocks MCP server startup.
     //

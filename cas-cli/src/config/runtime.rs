@@ -45,6 +45,13 @@ pub struct WorktreesConfig {
     /// than this many seconds.
     #[serde(default = "default_global_sweep_debounce_secs")]
     pub global_sweep_debounce_secs: u64,
+
+    /// Whether the opportunistic sweep reclaims `<repo>/.claude/worktrees/agent-*`
+    /// directories in addition to `<repo>/.cas/worktrees/*`. Default: true.
+    /// Set to false if Claude Code's worktree semantics change and you need
+    /// to opt out without rolling CAS back.
+    #[serde(default = "default_true")]
+    pub sweep_claude_agent_dirs: bool,
 }
 
 fn default_worktree_base_path() -> String {
@@ -75,6 +82,7 @@ impl Default for WorktreesConfig {
             require_merge_on_epic_close: true, // Require merge by default
             abandon_ttl_hours: default_abandon_ttl_hours(),
             global_sweep_debounce_secs: default_global_sweep_debounce_secs(),
+            sweep_claude_agent_dirs: true,
         }
     }
 }
