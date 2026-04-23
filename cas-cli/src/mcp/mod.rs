@@ -42,7 +42,7 @@
 //! Use `cas_maintenance_status` to check daemon state and
 //! `cas_maintenance_run` to trigger immediate maintenance.
 
-mod daemon;
+pub(crate) mod daemon;
 mod server;
 pub mod socket;
 pub mod tools;

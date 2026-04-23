@@ -744,6 +744,11 @@ impl EmbeddedDaemon {
             let mut agent = Agent::new(session_id.clone(), name);
             // Use the Claude Code process's PID, not the daemon's PID
             agent.pid = Some(cc_pid);
+            // PID-reuse fingerprint (cas-ea46): pair `agent.pid` with the
+            // /proc/<pid>/stat starttime so the heartbeat liveness gate can
+            // detect kernel PID recycling. Missing fingerprint (non-Linux,
+            // /proc hidden) falls back to pid-only liveness.
+            stamp_pid_fingerprint(&mut agent, cc_pid);
             // PPID is less reliable from the hook, so we skip it for socket-registered agents
             agent.machine_id = Some(Agent::get_or_generate_machine_id());
 
@@ -851,6 +856,76 @@ impl EmbeddedDaemon {
 
             // Send agent heartbeat if registered
             if let Some(id) = self.agent_id.read().await.clone() {
+                // Liveness gate (EPIC cas-9508 / cas-2749): before heartbeating,
+                // verify the Claude Code client process our agent record belongs
+                // to is still alive. In factory mode a shared `cas serve` daemon
+                // can outlive a crashed CC client (e.g. Bun/React-Ink unhandled
+                // rejection keeps the event loop running while the UI is dead),
+                // which previously kept the worker's last_heartbeat fresh
+                // forever — supervisors saw "heartbeat: 13s ago" for zombie
+                // workers and couldn't tell the worker had died.
+                //
+                // If the registered CC pid has exited (ESRCH), mark the agent
+                // stale, clear our local agent_id, and skip heartbeat. Next
+                // tick will no-op.
+                if let Ok(agent) = store.get(&id) {
+                    let short_id = &id[..8.min(id.len())];
+                    match evaluate_liveness(&agent, pid_alive, pid_matches_fingerprint) {
+                        LivenessOutcome::NoPidRecorded => {
+                            // Legacy agents (pre-cas-2749) have no pid. warn! so
+                            // ops investigators see the cohort drain; clears
+                            // naturally as sessions cycle.
+                            tracing::warn!(
+                                agent_id = %short_id,
+                                "Agent has no registered CC pid — liveness gate skipped \
+                                 (cas-2749). Heartbeat continues; consider re-registering \
+                                 the agent to activate the gate."
+                            );
+                        }
+                        LivenessOutcome::Alive {
+                            cc_pid,
+                            fingerprint_checked: true,
+                        } => {
+                            // Strict pid+starttime check passed; gate cleared.
+                            let _ = cc_pid;
+                        }
+                        LivenessOutcome::Alive {
+                            cc_pid,
+                            fingerprint_checked: false,
+                        } => {
+                            // Pre-cas-ea46 agent: pid is tracked but no starttime
+                            // fingerprint stashed. warn! per supervisor feedback on
+                            // cas-ea46 so ops investigators can see PID-reuse
+                            // protection is NOT active for this agent.
+                            tracing::warn!(
+                                agent_id = %short_id,
+                                cc_pid = cc_pid,
+                                "Agent pid registered but no pid_starttime \
+                                 fingerprint — falling back to pid-only liveness \
+                                 (cas-ea46). Recycle the session to activate \
+                                 PID-reuse protection."
+                            );
+                        }
+                        LivenessOutcome::Dead {
+                            cc_pid,
+                            fingerprint_checked,
+                        } => {
+                            tracing::info!(
+                                agent_id = %short_id,
+                                cc_pid = cc_pid,
+                                fingerprint_checked = fingerprint_checked,
+                                "Claude Code client process is gone (or PID recycled to \
+                                 a different process) — marking agent stale and stopping \
+                                 heartbeat (cas-2749/cas-ea46 liveness gate)"
+                            );
+                            let _ = store.mark_stale(&id);
+                            let mut guard = self.agent_id.write().await;
+                            *guard = None;
+                            return;
+                        }
+                    }
+                }
+
                 let mut succeeded = false;
                 let mut terminal = false;
                 for attempt in 0..3 {
@@ -956,6 +1031,212 @@ impl EmbeddedDaemon {
     pub async fn trigger_cloud_sync(&self) -> Result<SyncResult, CasError> {
         self.run_cloud_sync().await
     }
+}
+
+/// Check whether a PID corresponds to a live process.
+///
+/// Used by the agent heartbeat liveness gate (EPIC cas-9508 / cas-2749) so the
+/// shared `cas serve` daemon stops faking fresh heartbeats for a Claude Code
+/// client that has already died.
+///
+/// On Unix, sends signal 0 via `libc::kill` — returns false on ESRCH (no such
+/// process). On non-Unix, falls back to `true` (best-effort; liveness gating
+/// is only observed to matter on Linux factory hosts today).
+#[cfg(unix)]
+pub(crate) fn pid_alive(pid: u32) -> bool {
+    // kill(pid, 0) performs the permission/existence check without delivering
+    // a signal. errno == ESRCH (3) means the process is gone. EPERM means it
+    // exists but we can't signal it — still alive, so return true.
+    // Safety: `libc::kill` with signal 0 has no side effects on the target.
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if rc == 0 {
+        return true;
+    }
+    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    errno != libc::ESRCH
+}
+
+#[cfg(not(unix))]
+pub(crate) fn pid_alive(_pid: u32) -> bool {
+    true
+}
+
+/// Metadata key used to stash a PID's /proc/<pid>/stat starttime fingerprint
+/// (EPIC cas-9508 / cas-ea46). All writers and readers must use this constant
+/// so a typo on one side cannot silently disable the liveness gate.
+pub(crate) const PID_STARTTIME_KEY: &str = "pid_starttime";
+
+/// Outcome of the daemon's agent-liveness evaluation (EPIC cas-9508 / cas-5b1c).
+///
+/// Extracted from the inline `if let` stack in `send_agent_heartbeat` so the
+/// branch selection (fingerprint vs pid-only vs skip) can be unit-tested
+/// without a live daemon, store, or tokio runtime. The caller is responsible
+/// for the side effects (`tracing` + `store.mark_stale` + `self.agent_id`
+/// clear) — the helper itself is pure data.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum LivenessOutcome {
+    /// Agent record has no CC pid. Legacy pre-cas-2749 cohort.
+    /// Caller emits `tracing::warn!` and continues heartbeating.
+    NoPidRecorded,
+    /// CC client is alive. `fingerprint_checked=true` means the strict
+    /// (pid+starttime) check verified the process; `false` means the
+    /// caller fell back to pid-only liveness because no fingerprint
+    /// was stashed at registration (pre-cas-ea46 cohort). The caller
+    /// uses `cc_pid` to emit a diagnostic warn! on the pid-only path so
+    /// operators can see PID-reuse protection is inactive for that agent.
+    Alive {
+        cc_pid: u32,
+        fingerprint_checked: bool,
+    },
+    /// CC client is gone or PID was recycled to a different process. Caller
+    /// marks agent stale, clears `self.agent_id`, and stops heartbeating.
+    /// `fingerprint_checked=true` means the verdict came from the
+    /// pid+starttime check; `false` means pid-only.
+    Dead {
+        cc_pid: u32,
+        fingerprint_checked: bool,
+    },
+}
+
+/// Evaluate the liveness of a Claude Code client from an agent record
+/// (EPIC cas-9508 / cas-5b1c).
+///
+/// Selection logic:
+/// - `agent.pid == None` → `NoPidRecorded` (legacy cas-2749 cohort).
+/// - `agent.pid == Some(pid)` + `metadata[PID_STARTTIME_KEY]` parses as u64:
+///   strict (pid, starttime) check via `fingerprint_matches_fn`.
+/// - `agent.pid == Some(pid)` + no/malformed fingerprint: pid-only liveness
+///   via `pid_alive_fn` → `Alive { fingerprint_checked: false }` or `Dead` with
+///   `fingerprint_checked=false`.
+///
+/// Both probe functions are injected so tests can drive the outcome matrix
+/// without real syscalls — in production the caller passes `pid_alive` and
+/// `pid_matches_fingerprint`.
+pub(crate) fn evaluate_liveness(
+    agent: &crate::types::Agent,
+    pid_alive_fn: impl Fn(u32) -> bool,
+    fingerprint_matches_fn: impl Fn(u32, u64) -> bool,
+) -> LivenessOutcome {
+    let Some(cc_pid) = agent.pid else {
+        return LivenessOutcome::NoPidRecorded;
+    };
+    let expected_starttime = agent
+        .metadata
+        .get(PID_STARTTIME_KEY)
+        .and_then(|s| s.parse::<u64>().ok());
+    match expected_starttime {
+        Some(expected) => {
+            if fingerprint_matches_fn(cc_pid, expected) {
+                LivenessOutcome::Alive {
+                    cc_pid,
+                    fingerprint_checked: true,
+                }
+            } else {
+                LivenessOutcome::Dead {
+                    cc_pid,
+                    fingerprint_checked: true,
+                }
+            }
+        }
+        None => {
+            if pid_alive_fn(cc_pid) {
+                LivenessOutcome::Alive {
+                    cc_pid,
+                    fingerprint_checked: false,
+                }
+            } else {
+                LivenessOutcome::Dead {
+                    cc_pid,
+                    fingerprint_checked: false,
+                }
+            }
+        }
+    }
+}
+
+/// Stamp the (pid, starttime) fingerprint onto an Agent record for use by the
+/// heartbeat liveness gate (EPIC cas-9508 / cas-ea46).
+///
+/// Call sites that set `agent.pid = Some(pid)` should call this helper
+/// immediately after to keep the pair consistent. When `read_pid_starttime`
+/// returns `None` (non-Linux, /proc hidden), no metadata is inserted and the
+/// liveness gate falls back to pid-only liveness for that agent — same as
+/// legacy agents registered before this fix.
+pub(crate) fn stamp_pid_fingerprint(agent: &mut crate::types::Agent, pid: u32) {
+    if let Some(starttime) = read_pid_starttime(pid) {
+        agent
+            .metadata
+            .insert(PID_STARTTIME_KEY.to_string(), starttime.to_string());
+    }
+}
+
+/// Read `/proc/<pid>/stat` field 22 (process start time in clock ticks since
+/// boot) to fingerprint a PID (EPIC cas-9508 / cas-ea46).
+///
+/// The Linux kernel recycles PIDs — `pid_max` defaults to 4_194_304 and a busy
+/// factory host can wrap it within hours. `pid_alive(pid)` alone cannot tell
+/// the difference between "our original Claude Code client is still running"
+/// and "some unrelated process got recycled into that PID slot". The starttime
+/// field is per-process and invariant for the lifetime of that process, so
+/// pairing `(pid, starttime)` gives a collision-resistant fingerprint for the
+/// liveness gate.
+///
+/// Returns `None` when the file cannot be read (process gone, /proc not
+/// mounted, permission denied on a pid_ns/cgroup boundary) or when the parse
+/// fails. See `parse_starttime_from_stat` for the parsing contract.
+#[cfg(target_os = "linux")]
+pub(crate) fn read_pid_starttime(pid: u32) -> Option<u64> {
+    let path = format!("/proc/{pid}/stat");
+    let raw = std::fs::read_to_string(&path).ok()?;
+    parse_starttime_from_stat(&raw)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn read_pid_starttime(_pid: u32) -> Option<u64> {
+    // /proc/<pid>/stat is Linux-specific. On macOS/BSD/Windows we fall back
+    // to pid-only liveness (see pid_matches_fingerprint below).
+    None
+}
+
+/// Parse the `starttime` (field 22) out of a raw `/proc/<pid>/stat` line.
+///
+/// Extracted as a pure function so the parsing contract is testable without
+/// a live PID (EPIC cas-9508 / cas-ea46, testing persona feedback).
+///
+/// Parsing note: field 2 is `comm` wrapped in parens and may itself contain
+/// spaces and parens (e.g., `cc-wrapper (1)`). We split on the *last* `)` in
+/// the file, not the first, before splitting the remainder on whitespace.
+/// Field 22 is then index 19 of that remainder (fields 3–52 become indices
+/// 0–49).
+pub(crate) fn parse_starttime_from_stat(raw: &str) -> Option<u64> {
+    let last_paren = raw.rfind(')')?;
+    // Skip the `)` and the whitespace that follows it, then split the tail.
+    let tail = raw.get(last_paren + 1..)?.trim_start();
+    let fields: Vec<&str> = tail.split_whitespace().collect();
+    // Field 22 = starttime; the tail begins at field 3, so index = 22 - 3 = 19.
+    fields.get(19).and_then(|s| s.parse::<u64>().ok())
+}
+
+/// Verify `(pid, expected_starttime)` still identifies the *same* process that
+/// was fingerprinted at agent registration (EPIC cas-9508 / cas-ea46).
+///
+/// Semantics — STRICT by design (adversarial review feedback):
+/// - `pid` not alive → `false`.
+/// - `pid` alive and starttime matches → `true`.
+/// - `pid` alive but starttime differs OR /proc is unreadable → `false`.
+///
+/// Callers must only invoke this helper when they know a fingerprint was
+/// previously stashed at registration (i.e., `agent.metadata` contains
+/// `PID_STARTTIME_KEY`). If no fingerprint was stashed — the common case on
+/// non-Linux or for legacy agents — the caller should bypass this helper and
+/// use `pid_alive` directly. The strict None→false semantics exists so a
+/// transient /proc read failure on a host where /proc *did* work at
+/// registration is treated as suspicious, not silently trusted.
+pub(crate) fn pid_matches_fingerprint(pid: u32, expected_starttime: u64) -> bool {
+    if !pid_alive(pid) {
+        return false;
+    }
+    matches!(read_pid_starttime(pid), Some(actual) if actual == expected_starttime)
 }
 
 /// Initialize cloud syncer if user is logged in

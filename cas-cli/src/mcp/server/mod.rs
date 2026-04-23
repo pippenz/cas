@@ -449,7 +449,10 @@ impl CasCore {
                     agent_id.to_string(),
                     "Primary (re-registered)".to_string(),
                 );
-                agent.pid = Some(std::process::id());
+                let our_pid = std::process::id();
+                agent.pid = Some(our_pid);
+                // PID-reuse fingerprint (cas-ea46): see daemon::stamp_pid_fingerprint.
+                crate::mcp::daemon::stamp_pid_fingerprint(&mut agent, our_pid);
                 #[cfg(unix)]
                 {
                     agent.ppid = Some(std::os::unix::process::parent_id());
@@ -533,6 +536,8 @@ impl CasCore {
         }
 
         agent.pid = Some(pid);
+        // PID-reuse fingerprint (cas-ea46): see daemon::stamp_pid_fingerprint.
+        crate::mcp::daemon::stamp_pid_fingerprint(&mut agent, pid);
         #[cfg(unix)]
         {
             agent.ppid = Some(std::os::unix::process::parent_id());

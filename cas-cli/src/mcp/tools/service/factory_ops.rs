@@ -217,11 +217,18 @@ impl CasService {
         })?;
 
         // Opportunistically prune stale agents so status output stays actionable.
-        // Skip supervisors/directors — they are long-lived and less chatty, so
-        // transient heartbeat gaps shouldn't cause them to be marked stale by workers.
-        let stale_threshold_secs = 120;
+        // Worker threshold tightened from 120s → 30s per cas-2749 so a dead CC
+        // client is detected within one supervisor poll. Paired with the
+        // daemon-side PID liveness gate in mcp::daemon::send_agent_heartbeat,
+        // a crashed worker stops heartbeating within the 30s daemon tick and
+        // transitions to "dead" in the next status call. Supervisors/directors
+        // are long-lived and less chatty and are filtered out of the prune by
+        // the role check below; they remain visible until their own
+        // daemon-level cleanup eventually removes them.
+        const WORKER_STALE_SECS: i64 = 30;
+        let worker_stale_threshold_secs: i64 = WORKER_STALE_SECS;
         let mut stale_pruned = 0usize;
-        if let Ok(stale_agents) = store.list_stale(stale_threshold_secs) {
+        if let Ok(stale_agents) = store.list_stale(worker_stale_threshold_secs) {
             for agent in stale_agents {
                 if agent.role == AgentRole::Supervisor || agent.role == AgentRole::Director {
                     continue;
@@ -286,21 +293,43 @@ impl CasService {
             for agent in workers {
                 let elapsed = (chrono::Utc::now() - agent.last_heartbeat).num_seconds();
                 let since = format!("{elapsed}s ago");
-                let clone_info = agent
-                    .metadata
-                    .get("clone_path")
+                let liveness_label = if elapsed >= worker_stale_threshold_secs {
+                    " [DEAD]"
+                } else {
+                    ""
+                };
+                let clone_path = agent.metadata.get("clone_path").cloned();
+                let clone_info = clone_path
+                    .as_ref()
                     .map(|p| format!("\n    Clone: {p}"))
                     .unwrap_or_default();
+                // Surface transcript path for stale/dead workers so supervisor
+                // can salvage whatever was in-flight when the CC client died
+                // (cas-2749 AC: transcript-path-surfacing on crash).
+                let transcript_info = if elapsed >= worker_stale_threshold_secs {
+                    let transcript = clone_path
+                        .as_deref()
+                        .map(|p| derive_transcript_path(p, &agent.id))
+                        .unwrap_or_else(|| {
+                            format!(
+                                "~/.claude/projects/<cwd>/{}.jsonl (clone path unknown)",
+                                agent.id
+                            )
+                        });
+                    format!("\n    Transcript: {transcript}")
+                } else {
+                    String::new()
+                };
                 output.push_str(&format!(
-                    "  • {} (heartbeat: {}){}\n",
-                    &agent.name, since, clone_info
+                    "  • {} (heartbeat: {}){}{}{}\n",
+                    &agent.name, since, liveness_label, clone_info, transcript_info
                 ));
             }
         }
 
         if stale_pruned > 0 {
             output.push_str(&format!(
-                "\nFiltered stale agent record(s): {stale_pruned} (>{stale_threshold_secs}s heartbeat age)\n"
+                "\nFiltered stale agent record(s): {stale_pruned} (>{worker_stale_threshold_secs}s heartbeat age)\n"
             ));
         }
 
@@ -951,4 +980,56 @@ fn format_relative_time(dt: chrono::DateTime<chrono::Utc>) -> String {
     }
 
     format!("{}d ago", diff.num_days())
+}
+
+/// Derive the Claude Code transcript path for an agent from its worktree clone
+/// path and session id.
+///
+/// Claude Code persists each session's JSONL transcript under
+/// `~/.claude/projects/<escaped-cwd>/<session-id>.jsonl`, where `<escaped-cwd>`
+/// is the absolute cwd with `/`, `.`, and `_` collapsed to `-`. Surfacing this
+/// path in `worker_status` lets a supervisor open the last in-flight tool call
+/// after a worker dies without manually reconstructing the escape (cas-2749).
+fn derive_transcript_path(clone_path: &str, session_id: &str) -> String {
+    // Claude Code's `cwd` escape observed in the wild: both `/` and `.` are
+    // collapsed to `-`. Example: `/home/a/.cas/worktrees/x` becomes
+    // `-home-a--cas-worktrees-x` (the `-.` pair produces `--`). Underscores
+    // and other characters are preserved.
+    let escaped: String = clone_path
+        .chars()
+        .map(|c| match c {
+            '/' | '.' => '-',
+            other => other,
+        })
+        .collect();
+    // `~` is literal here so the path remains portable across users; the
+    // supervisor resolves it in their shell.
+    format!("~/.claude/projects/{escaped}/{session_id}.jsonl")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn derive_transcript_path_matches_claude_code_escape() {
+        // Observed in the field: worker crisp-badger-65 worktree yields
+        // `-home-pippenz-Petrastella-cas-src--cas-worktrees-crisp-badger-65`.
+        let clone = "/home/pippenz/Petrastella/cas-src/.cas/worktrees/crisp-badger-65";
+        let session = "064e7b23-331d-4dae-9c6a-721cbbe9c024";
+        let got = derive_transcript_path(clone, session);
+        assert_eq!(
+            got,
+            "~/.claude/projects/-home-pippenz-Petrastella-cas-src--cas-worktrees-crisp-badger-65/\
+             064e7b23-331d-4dae-9c6a-721cbbe9c024.jsonl"
+        );
+    }
+
+    #[test]
+    fn derive_transcript_path_escapes_dots_preserves_underscores() {
+        // Dots collapse to '-'; underscores are preserved (observed from
+        // `~/.claude/projects/` layout in field workers).
+        let got = derive_transcript_path("/tmp/my_proj.sub", "abc");
+        assert_eq!(got, "~/.claude/projects/-tmp-my_proj-sub/abc.jsonl");
+    }
 }

@@ -42,6 +42,13 @@ pub fn handle_session_start(
                 let name = agent_name.clone().unwrap_or_else(friendly_names::generate);
                 let mut agent = Agent::new(input.session_id.clone(), name);
                 agent.pid = Some(cc_pid);
+                // PID-reuse fingerprint (cas-ea46 / cas-389c): pair agent.pid
+                // with the /proc/<pid>/stat starttime so the heartbeat liveness
+                // gate can detect kernel PID recycling. Previously missing on
+                // this fallback path — caught by the source-scanning test in
+                // mcp::daemon_tests.
+                #[cfg(feature = "mcp-server")]
+                crate::mcp::daemon::stamp_pid_fingerprint(&mut agent, cc_pid);
                 agent.machine_id = Some(Agent::get_or_generate_machine_id());
 
                 // Set role from environment
