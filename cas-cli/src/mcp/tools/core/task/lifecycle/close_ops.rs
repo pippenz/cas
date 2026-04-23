@@ -799,24 +799,9 @@ impl CasCore {
         // close; running the multi-persona reviewer on the unioned
         // diff is redundant cost and wrong-shape signal.
         let epic_subtask_receipts_cover = if task.task_type == TaskType::Epic {
-            use cas_store::code_review::close_gate::{GateDecision, evaluate_gate};
             match task_store.get_subtasks(&req.id) {
-                Ok(subtasks) if !subtasks.is_empty() => subtasks.iter().all(|t| {
-                    t.deliverables
-                        .review_envelope
-                        .as_deref()
-                        .and_then(|e| serde_json::from_str::<cas_types::ReviewOutcome>(e).ok())
-                        .filter(|o| o.validate().is_ok())
-                        // Defense-in-depth (per verifier): a receipt
-                        // with a residual P0 must not let the epic-close
-                        // bypass the gate, even though such a subtask
-                        // shouldn't have been closed in the first place.
-                        // Guards against direct DB writes or bugs that
-                        // leak P0s past the subtask gate.
-                        .map(|o| matches!(evaluate_gate(&o.residual), GateDecision::Allow))
-                        .unwrap_or(false)
-                }),
-                _ => false,
+                Ok(subtasks) => epic_subtask_receipts_are_clean(&subtasks),
+                Err(_) => false,
             }
         } else {
             false
@@ -1421,6 +1406,75 @@ pub(crate) fn check_additive_only_branch_violations(
         }
         _ => Vec::new(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// cas-3086 + cas-fef4: epic subtask receipts bypass helper
+// ---------------------------------------------------------------------------
+
+/// Decide whether an epic's subtasks collectively carry clean review
+/// receipts that justify skipping the multi-persona close gate on the
+/// union diff.
+///
+/// Returns `true` iff every subtask:
+///   * has a non-empty `deliverables.review_envelope`,
+///   * whose JSON deserializes into a [`cas_types::ReviewOutcome`],
+///   * passes `ReviewOutcome::validate()`,
+///   * has **no PR-introduced P0** in `residual` (cas-3086 defense-in-depth), and
+///   * has **no P0 reclassified into `pre_existing`** (cas-fef4 forgery defense).
+///
+/// Returns `false` when the subtask list is empty — there is nothing to
+/// "cover" the union diff, so fall through to the normal gate.
+///
+/// ## Why both residual- and pre_existing-P0 disqualify the bypass
+///
+/// The bypass treats "every subtask has a clean receipt" as a proof
+/// stand-in that the union diff was already reviewed piece-by-piece. A
+/// worker supplying an envelope of shape `{ residual: [], pre_existing:
+/// [<real_p0>] }` would satisfy the old `evaluate_gate(residual) ==
+/// Allow` check but smuggle a real P0 past the epic-close gate — the
+/// `pre_existing` channel was designed to classify *findings that
+/// predate the change*, not as a free downgrade slot for workers to
+/// drop P0s into. Per cas-fef4, we tighten the clean-receipt semantics
+/// to reject any receipt where a P0 appears anywhere — residual OR
+/// pre_existing. Legitimate pre-existing P0s on a change's diff are
+/// extraordinarily rare; if one genuinely appears post-hoc, re-running
+/// the gate is cheap insurance compared with a silent bypass.
+///
+/// ## Staleness note
+///
+/// This helper still treats the persisted envelopes structurally — it
+/// cannot detect whether the epic branch has commits *not* covered by
+/// any subtask's reviewed diff (supervisor fixups, merge-resolution
+/// commits). That is tracked separately (cas-cc1d staleness follow-up)
+/// and needs a diff-SHA anchor in the envelope schema to close cleanly.
+pub(crate) fn epic_subtask_receipts_are_clean(subtasks: &[Task]) -> bool {
+    use cas_store::code_review::close_gate::{GateDecision, evaluate_gate};
+    use cas_types::FindingSeverity;
+
+    if subtasks.is_empty() {
+        return false;
+    }
+
+    subtasks.iter().all(|t| {
+        t.deliverables
+            .review_envelope
+            .as_deref()
+            .and_then(|e| serde_json::from_str::<cas_types::ReviewOutcome>(e).ok())
+            .filter(|o| o.validate().is_ok())
+            .map(|o| {
+                // cas-3086: no PR-introduced P0 in residual.
+                let residual_clean =
+                    matches!(evaluate_gate(&o.residual), GateDecision::Allow);
+                // cas-fef4: no P0 smuggled through pre_existing.
+                let pre_existing_clean = o
+                    .pre_existing
+                    .iter()
+                    .all(|f| f.severity != FindingSeverity::P0);
+                residual_clean && pre_existing_clean
+            })
+            .unwrap_or(false)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2404,6 +2458,122 @@ mod code_review_gate_tests {
         assert!(
             matches!(out, CodeReviewGateOutcome::Reject(_)),
             "malformed persisted envelope must be rejected, not silently bypassed"
+        );
+    }
+
+    // --- cas-fef4 + cas-3086: epic_subtask_receipts_are_clean ----------------
+
+    /// Build a subtask carrying a specific review envelope (JSON string).
+    fn subtask_with_envelope(id: &str, envelope: Option<String>) -> Task {
+        let mut t = Task {
+            id: id.to_string(),
+            title: format!("subtask {id}"),
+            status: TaskStatus::Closed,
+            ..Default::default()
+        };
+        t.deliverables.review_envelope = envelope;
+        t
+    }
+
+    fn envelope_with_pre_existing(
+        residual: Vec<Finding>,
+        pre_existing: Vec<Finding>,
+    ) -> String {
+        let env = ReviewOutcome {
+            residual,
+            pre_existing,
+            mode: "autofix".to_string(),
+        };
+        serde_json::to_string(&env).expect("serialize ReviewOutcome")
+    }
+
+    #[test]
+    fn epic_receipts_clean_when_all_subtasks_have_empty_envelopes() {
+        let subtasks = vec![
+            subtask_with_envelope("s1", Some(autofix_envelope(Vec::new()))),
+            subtask_with_envelope("s2", Some(autofix_envelope(Vec::new()))),
+        ];
+        assert!(
+            epic_subtask_receipts_are_clean(&subtasks),
+            "two clean subtask envelopes must cover the epic"
+        );
+    }
+
+    #[test]
+    fn epic_receipts_not_clean_when_no_subtasks() {
+        // cas-3086: `_ => false` arm — an epic with zero subtasks has
+        // nothing "covering" the union diff, so fall through to the
+        // normal gate.
+        assert!(!epic_subtask_receipts_are_clean(&[]));
+    }
+
+    #[test]
+    fn epic_receipts_not_clean_when_subtask_has_residual_p0() {
+        // cas-3086 defense-in-depth: a subtask envelope that somehow
+        // leaked a residual P0 past its own close must NOT let the
+        // epic bypass the gate.
+        let subtasks = vec![
+            subtask_with_envelope("s1", Some(autofix_envelope(Vec::new()))),
+            subtask_with_envelope("s2", Some(autofix_envelope(vec![p0_finding()]))),
+        ];
+        assert!(
+            !epic_subtask_receipts_are_clean(&subtasks),
+            "residual-P0 on any subtask must disqualify the bypass"
+        );
+    }
+
+    #[test]
+    fn epic_receipts_not_clean_when_subtask_has_pre_existing_p0() {
+        // cas-fef4 (this task): a worker supplying an envelope of shape
+        // `{ residual: [], pre_existing: [<real_p0>] }` satisfies the
+        // old cas-3086 check (residual is clean) but smuggles a real
+        // P0 past the epic-close gate by reclassifying it as
+        // "pre-existing". The tightened clean-receipt semantics must
+        // reject this forgery and fall through to run_code_review_gate
+        // on the union diff.
+        let forged = envelope_with_pre_existing(Vec::new(), vec![p0_finding()]);
+        let subtasks = vec![
+            subtask_with_envelope("s1", Some(autofix_envelope(Vec::new()))),
+            subtask_with_envelope("s2", Some(forged)),
+        ];
+        assert!(
+            !epic_subtask_receipts_are_clean(&subtasks),
+            "pre_existing-P0 smuggling must disqualify the bypass"
+        );
+    }
+
+    #[test]
+    fn epic_receipts_clean_when_pre_existing_is_only_subp0() {
+        // Sanity check on the tightened check: non-P0 severities in
+        // pre_existing (the normal case — legitimate low-severity
+        // debt classified by the reviewer) must not block the bypass.
+        let clean_with_low_pre = envelope_with_pre_existing(Vec::new(), vec![p2_finding()]);
+        let subtasks = vec![subtask_with_envelope("s1", Some(clean_with_low_pre))];
+        assert!(
+            epic_subtask_receipts_are_clean(&subtasks),
+            "pre_existing with only sub-P0 severities is legitimate and must not block bypass"
+        );
+    }
+
+    #[test]
+    fn epic_receipts_not_clean_when_subtask_envelope_missing_or_malformed() {
+        // Missing envelope on any subtask → no structural proof → bypass declined.
+        let subtasks = vec![
+            subtask_with_envelope("s1", Some(autofix_envelope(Vec::new()))),
+            subtask_with_envelope("s2", None),
+        ];
+        assert!(
+            !epic_subtask_receipts_are_clean(&subtasks),
+            "missing envelope on any subtask must disqualify the bypass"
+        );
+
+        let subtasks = vec![
+            subtask_with_envelope("s1", Some(autofix_envelope(Vec::new()))),
+            subtask_with_envelope("s2", Some("not-json".to_string())),
+        ];
+        assert!(
+            !epic_subtask_receipts_are_clean(&subtasks),
+            "malformed envelope on any subtask must disqualify the bypass"
         );
     }
 }
