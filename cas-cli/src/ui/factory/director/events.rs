@@ -610,7 +610,19 @@ impl DirectorEventDetector {
                     &data.in_progress_tasks,
                     &data.ready_tasks,
                 ) {
-                    let should_fire = match current_epic_id {
+                    // A tracked epic that has since been closed/deleted is
+                        // treated as vacant so a legitimate new Open-with-branch
+                        // epic can take over instead of the UI freezing on a
+                        // ghost id (cas-4181 adversarial finding).
+                        let cur_still_exists = current_epic_id
+                            .map(|cur| data.epic_tasks.iter().any(|e| e.id == cur))
+                            .unwrap_or(false);
+                    let effective_current = if cur_still_exists {
+                        current_epic_id
+                    } else {
+                        None
+                    };
+                    let should_fire = match effective_current {
                         // No active epic yet — any valid candidate wins.
                         None => true,
                         // Same epic already active — no change to announce.
@@ -791,9 +803,9 @@ pub(crate) fn open_branch_epic_score(
 /// final tiebreak.
 ///
 /// Used by both `ui::factory::app::detect_epic_state` (init-time epic
-/// resolution) and `DirectorEventDetector::detect_changes_for_epic`
-/// (runtime `EpicStarted` detection) so the two paths cannot disagree on
-/// which Open-with-branch epic should own the factory panel.
+/// resolution) and `DirectorEventDetector::detect_changes` (runtime
+/// `EpicStarted` detection) so the two paths cannot disagree on which
+/// Open-with-branch epic should own the factory panel.
 ///
 /// Returns `None` if no epic in `epic_tasks` is `Open` with a branch set.
 pub(crate) fn pick_best_open_branch_epic<'a>(

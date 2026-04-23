@@ -1470,6 +1470,84 @@ mod tests {
         );
     }
 
+    /// If the currently-tracked epic is no longer present in `epic_tasks`
+    /// (closed, deleted, or cross-project filter drift) the strict-improvement
+    /// gate must treat the slot as vacant so a legitimate new Open-with-branch
+    /// epic can take over. Regression guard for the cas-4181 adversarial
+    /// "ghost current_epic_id freezes TUI" concern.
+    #[test]
+    fn runtime_detector_recovers_when_tracked_epic_disappears() {
+        use cas_factory::TaskSummary;
+        use cas_types::{Priority, TaskStatus, TaskType};
+
+        use super::{DirectorData, DirectorEvent, DirectorEventDetector};
+
+        let new_id = "epic-new";
+
+        let data = DirectorData {
+            ready_tasks: vec![TaskSummary {
+                id: "task-ready".to_string(),
+                title: "Ready subtask of new epic".to_string(),
+                status: TaskStatus::Open,
+                priority: Priority::MEDIUM,
+                assignee: None,
+                task_type: TaskType::Task,
+                epic: Some(new_id.to_string()),
+                branch: None,
+            }],
+            in_progress_tasks: Vec::new(),
+            epic_tasks: vec![TaskSummary {
+                id: new_id.to_string(),
+                title: "New epic".to_string(),
+                status: TaskStatus::Open,
+                priority: Priority::MEDIUM,
+                assignee: None,
+                task_type: TaskType::Epic,
+                epic: None,
+                branch: Some("epic/new".to_string()),
+            }],
+            agents: Vec::new(),
+            activity: Vec::new(),
+            agent_id_to_name: HashMap::new(),
+            changes: Vec::new(),
+            git_loaded: false,
+            reminders: Vec::new(),
+            epic_closed_counts: HashMap::new(),
+        };
+
+        let mut detector = DirectorEventDetector::new(
+            vec!["worker-1".to_string()],
+            "supervisor".to_string(),
+        );
+        detector.initialize(&DirectorData {
+            ready_tasks: Vec::new(),
+            in_progress_tasks: Vec::new(),
+            epic_tasks: Vec::new(),
+            agents: Vec::new(),
+            activity: Vec::new(),
+            agent_id_to_name: HashMap::new(),
+            changes: Vec::new(),
+            git_loaded: false,
+            reminders: Vec::new(),
+            epic_closed_counts: HashMap::new(),
+        });
+
+        // current_epic_id points at a ghost epic not in data.epic_tasks.
+        let events = detector.detect_changes(&data, Some("epic-ghost"));
+
+        let started_for_new = events.iter().any(|e| {
+            matches!(
+                e,
+                DirectorEvent::EpicStarted { epic_id, .. } if epic_id == new_id
+            )
+        });
+        assert!(
+            started_for_new,
+            "EpicStarted must fire for the legitimate new epic when the \
+             tracked current_epic_id refers to a ghost not in epic_tasks"
+        );
+    }
+
     /// Sibling sanity test: when no epic is currently tracked (init-time
     /// detect_changes), the runtime detector must pick the *same* best
     /// Open-with-branch epic as `detect_epic_state` — not the lex-greatest.
