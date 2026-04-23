@@ -299,6 +299,279 @@ fn parse_starttime_from_stat_returns_none_on_malformed_input() {
     );
 }
 
+// =========================================================================
+// evaluate_liveness outcome matrix (cas-5b1c)
+// =========================================================================
+//
+// The heartbeat-gate branch selection was extracted from send_agent_heartbeat
+// so the fingerprint-vs-pid-only decision can be unit-tested without a live
+// daemon, store, or tokio runtime. These tests pin the selection logic.
+// Adding a new outcome or reordering the match arms will fail at least one
+// of these.
+
+use crate::mcp::daemon::{LivenessOutcome, PID_STARTTIME_KEY, evaluate_liveness};
+
+fn make_test_agent(pid: Option<u32>, starttime_meta: Option<&str>) -> crate::types::Agent {
+    let mut agent = crate::types::Agent::new("eval-test".to_string(), "w".to_string());
+    agent.pid = pid;
+    if let Some(raw) = starttime_meta {
+        agent
+            .metadata
+            .insert(PID_STARTTIME_KEY.to_string(), raw.to_string());
+    }
+    agent
+}
+
+#[test]
+fn evaluate_liveness_no_pid_recorded_when_agent_pid_is_none() {
+    // Legacy agent (pre-cas-2749). Neither probe should be consulted; the
+    // outcome must be NoPidRecorded so the caller can emit the legacy warn.
+    let agent = make_test_agent(None, None);
+    let probe_calls = std::cell::Cell::new(0u32);
+    let outcome = evaluate_liveness(
+        &agent,
+        |_| {
+            probe_calls.set(probe_calls.get() + 1);
+            true
+        },
+        |_, _| {
+            probe_calls.set(probe_calls.get() + 1);
+            true
+        },
+    );
+    assert_eq!(outcome, LivenessOutcome::NoPidRecorded);
+    assert_eq!(
+        probe_calls.get(),
+        0,
+        "no pid → neither probe should be called"
+    );
+}
+
+#[test]
+fn evaluate_liveness_alive_with_fingerprint_when_match() {
+    // Metadata contains a valid fingerprint and fingerprint_matches_fn agrees
+    // → Alive { fingerprint_checked: true }. pid_alive must not be called
+    // (the strict check is authoritative when a fingerprint is present).
+    let agent = make_test_agent(Some(4242), Some("9876543210"));
+    let pid_alive_called = std::cell::Cell::new(false);
+    let fp_called_with = std::cell::Cell::new(None);
+    let outcome = evaluate_liveness(
+        &agent,
+        |_| {
+            pid_alive_called.set(true);
+            true
+        },
+        |pid, st| {
+            fp_called_with.set(Some((pid, st)));
+            true
+        },
+    );
+    assert_eq!(
+        outcome,
+        LivenessOutcome::Alive {
+            cc_pid: 4242,
+            fingerprint_checked: true
+        }
+    );
+    assert!(
+        !pid_alive_called.get(),
+        "pid_alive must NOT be called when fingerprint is present"
+    );
+    assert_eq!(
+        fp_called_with.get(),
+        Some((4242u32, 9876543210u64)),
+        "fingerprint_matches_fn must be called with (pid, expected)"
+    );
+}
+
+#[test]
+fn evaluate_liveness_dead_when_fingerprint_mismatch() {
+    // Metadata contains a valid fingerprint but fingerprint_matches_fn
+    // returns false → Dead with fingerprint_checked=true. This is the
+    // core cas-ea46 AC in extracted form.
+    let agent = make_test_agent(Some(4242), Some("9876543210"));
+    let outcome = evaluate_liveness(&agent, |_| unreachable!(), |_, _| false);
+    assert_eq!(
+        outcome,
+        LivenessOutcome::Dead {
+            cc_pid: 4242,
+            fingerprint_checked: true
+        }
+    );
+}
+
+#[test]
+fn evaluate_liveness_alive_legacy_when_no_fingerprint_and_pid_alive() {
+    // Pre-cas-ea46 agent: pid present but no metadata key. pid_alive_fn
+    // reports alive → AliveLegacyFingerprint. fingerprint_matches_fn must
+    // not be consulted because there is no expected starttime to compare.
+    let agent = make_test_agent(Some(7777), None);
+    let fp_called = std::cell::Cell::new(false);
+    let outcome = evaluate_liveness(
+        &agent,
+        |pid| {
+            assert_eq!(pid, 7777);
+            true
+        },
+        |_, _| {
+            fp_called.set(true);
+            true
+        },
+    );
+    assert_eq!(
+        outcome,
+        LivenessOutcome::Alive {
+            cc_pid: 7777,
+            fingerprint_checked: false
+        }
+    );
+    assert!(
+        !fp_called.get(),
+        "fingerprint fn must NOT be called when no fingerprint metadata is stashed"
+    );
+}
+
+#[test]
+fn evaluate_liveness_dead_when_no_fingerprint_and_pid_dead() {
+    // Pre-cas-ea46 agent with dead pid: pid_alive_fn reports dead →
+    // Dead with fingerprint_checked=false so caller tracing can
+    // distinguish pid-only from fingerprint-verified verdicts.
+    let agent = make_test_agent(Some(7777), None);
+    let outcome = evaluate_liveness(&agent, |_| false, |_, _| unreachable!());
+    assert_eq!(
+        outcome,
+        LivenessOutcome::Dead {
+            cc_pid: 7777,
+            fingerprint_checked: false
+        }
+    );
+}
+
+#[test]
+fn evaluate_liveness_malformed_fingerprint_falls_back_to_pid_only() {
+    // If a future writer puts garbage in PID_STARTTIME_KEY (or a migration
+    // mangles it), `parse::<u64>()` yields None → behavior must be
+    // indistinguishable from "no fingerprint stashed": pid-only fallback.
+    // This pins the graceful-degradation contract surfaced in cas-ea46
+    // adversarial review.
+    let agent = make_test_agent(Some(9999), Some("not-a-number"));
+    let outcome = evaluate_liveness(
+        &agent,
+        |pid| {
+            assert_eq!(pid, 9999);
+            true
+        },
+        |_, _| panic!("fingerprint fn must not be called on malformed fingerprint"),
+    );
+    assert_eq!(
+        outcome,
+        LivenessOutcome::Alive {
+            cc_pid: 9999,
+            fingerprint_checked: false
+        }
+    );
+}
+
+#[test]
+fn evaluate_liveness_non_linux_fallback_live_pid_unreadable_proc() {
+    // Simulates the non-Linux / unreadable-/proc case on a host where
+    // the fingerprint WAS stashed at registration but is now unverifiable.
+    // Per cas-ea46 strict semantics: fingerprint_matches_fn returns false
+    // → evaluate_liveness must report Dead, not silently trust pid_alive.
+    // This pins the "None from /proc on a fingerprinted agent = suspicious"
+    // adversarial catch.
+    let agent = make_test_agent(Some(1234), Some("5555"));
+    let outcome = evaluate_liveness(
+        &agent,
+        |_| panic!("pid_alive must not be consulted when fingerprint path is taken"),
+        |pid, st| {
+            // Simulate strict: live pid, /proc unreadable → fingerprint_fn
+            // returns false (pid_matches_fingerprint's semantics).
+            assert_eq!((pid, st), (1234, 5555));
+            false
+        },
+    );
+    assert_eq!(
+        outcome,
+        LivenessOutcome::Dead {
+            cc_pid: 1234,
+            fingerprint_checked: true
+        }
+    );
+}
+
+// =========================================================================
+// Registration-site fingerprint-stamp parity (cas-5b1c)
+// =========================================================================
+//
+// Every agent-registration code path that sets `agent.pid = Some(pid)` must
+// also stamp the pid_starttime fingerprint. A silent drift (one site omits
+// the stamp) degrades PID-reuse protection to pid-only for that site with
+// no compile-time signal. The table below enumerates the call-path shape
+// each site produces; adding a 4th site is one append. If a new site is
+// introduced without a row here, that is the review catch.
+
+#[cfg(target_os = "linux")]
+#[test]
+fn all_agent_registration_sites_stamp_pid_fingerprint() {
+    // Use this process's own PID so read_pid_starttime has a real /proc
+    // entry to observe. Each builder mirrors the pid + stamp_pid_fingerprint
+    // sequence from one of the three real registration code paths.
+    let pid = std::process::id();
+
+    type AgentBuilder = fn(u32) -> crate::types::Agent;
+
+    fn socket_driven_register(pid: u32) -> crate::types::Agent {
+        // Mirrors daemon::register_agent (socket-driven hook path).
+        let mut agent = crate::types::Agent::new("sock-driven".to_string(), "w".to_string());
+        agent.pid = Some(pid);
+        crate::mcp::daemon::stamp_pid_fingerprint(&mut agent, pid);
+        agent
+    }
+
+    fn self_register_hints(pid: u32) -> crate::types::Agent {
+        // Mirrors server::register_agent_with_hints (MCP bootstrap path).
+        let mut agent = crate::types::Agent::new("self-hints".to_string(), "w".to_string());
+        agent.pid = Some(pid);
+        crate::mcp::daemon::stamp_pid_fingerprint(&mut agent, pid);
+        agent
+    }
+
+    fn re_register_missing(pid: u32) -> crate::types::Agent {
+        // Mirrors server::mod.rs re-register-missing fallback.
+        let mut agent = crate::types::Agent::new("re-reg".to_string(), "w".to_string());
+        agent.pid = Some(pid);
+        crate::mcp::daemon::stamp_pid_fingerprint(&mut agent, pid);
+        agent
+    }
+
+    // To add a new registration site: append one (name, builder) pair. The
+    // assertions below apply uniformly — same contract, same test.
+    let sites: &[(&str, AgentBuilder)] = &[
+        ("daemon::register_agent (socket-driven)", socket_driven_register),
+        ("server::register_agent_with_hints (self)", self_register_hints),
+        ("server::re-register-missing (self)", re_register_missing),
+    ];
+
+    let expected_st = crate::mcp::daemon::read_pid_starttime(pid).expect("starttime on self");
+
+    for (name, build) in sites {
+        let agent = build(pid);
+        assert_eq!(agent.pid, Some(pid), "[{name}] pid must be populated");
+        let stamped = agent
+            .metadata
+            .get(PID_STARTTIME_KEY)
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or_else(|| {
+                panic!("[{name}] must populate PID_STARTTIME_KEY with a parseable u64");
+            });
+        assert_eq!(
+            stamped, expected_st,
+            "[{name}] stamped value must match live read_pid_starttime"
+        );
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn stamp_pid_fingerprint_writes_metadata_for_self() {

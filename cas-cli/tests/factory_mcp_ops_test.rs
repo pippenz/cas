@@ -89,6 +89,38 @@ impl FactoryTestEnv {
         id
     }
 
+    /// Register a worker with its `last_heartbeat` backdated so
+    /// `factory_worker_status` classifies it as DEAD (elapsed > 30s).
+    ///
+    /// Used by the cas-5b1c worker_status integration test to drive the
+    /// `[DEAD]` label + transcript-path surfacing branch without waiting
+    /// 30 seconds of real time.
+    fn register_stale_worker_with_clone_path(
+        &self,
+        name: &str,
+        clone_path: &str,
+        stale_secs: i64,
+    ) -> String {
+        let store = self.agent_store();
+        let id = Agent::generate_fallback_id();
+        let mut agent = Agent::new(id.clone(), name.to_string());
+        agent.role = AgentRole::Worker;
+        agent
+            .metadata
+            .insert("clone_path".to_string(), clone_path.to_string());
+        // Backdate BOTH last_heartbeat and registered_at so this fixture
+        // survives any future change that adds `registered_at` to the
+        // stale-criteria set (adversarial cas-5b1c review A5). Current
+        // `list_stale(threshold_secs)` keys on last_heartbeat only, but the
+        // fixture is a test-stability anchor — backdating both is cheap
+        // insurance against silent regression of the prune criteria.
+        let staleness = chrono::Duration::seconds(stale_secs);
+        agent.last_heartbeat = chrono::Utc::now() - staleness;
+        agent.registered_at = chrono::Utc::now() - staleness;
+        store.register(&agent).expect("register stale worker");
+        id
+    }
+
     fn register_supervisor(&self, name: &str) -> String {
         let store = self.agent_store();
         let id = Agent::generate_fallback_id();
@@ -392,6 +424,70 @@ async fn test_worker_status_shows_agents() {
     assert!(
         text.contains("/tmp/worktree/wolf"),
         "Should show clone path: {text}"
+    );
+}
+
+/// cas-5b1c integration coverage: a worker whose heartbeat is older than
+/// `WORKER_STALE_SECS` (30s) is pruned out of the Active listing on the
+/// next `factory_worker_status` call and reported in the "Filtered stale
+/// agent record(s)" footer, while a live worker from the same call stays
+/// visible. This pins the supervisor-facing UX contract that stale
+/// workers disappear promptly once past the threshold.
+///
+/// Implementation note: `factory_worker_status` does its opportunistic
+/// prune BEFORE rendering the Active list, so in the common path a
+/// stale Worker transitions out of Active and never hits the `[DEAD]`
+/// label / transcript-path render branch. The render-time DEAD branch
+/// only fires when `mark_stale` fails (DB lock, etc.) — that code path
+/// is cheap unit coverage at the `derive_transcript_path` level (see
+/// the `mcp::tools::service::factory_ops::tests` module) and is routed
+/// to cas-900b for full glob-based resolution. Here we test the
+/// prune-success integration.
+#[tokio::test]
+async fn test_worker_status_prunes_stale_worker_and_keeps_live_one() {
+    let _guard = EnvGuard::set(&[]);
+    let env = FactoryTestEnv::new();
+
+    // Live worker: default heartbeat = now, stays in Active.
+    env.register_worker("live-fox");
+    // Stale worker: heartbeat backdated 40s so list_stale(30) catches it.
+    let stale_id = env.register_stale_worker_with_clone_path(
+        "dead-wolf",
+        "/tmp/cas-worktrees/dead-wolf",
+        40,
+    );
+
+    let req = factory_req("worker_status");
+    let result = env
+        .service
+        .factory(Parameters(req))
+        .await
+        .expect("worker_status call should succeed");
+    let text = get_text(&result);
+
+    // Live worker must appear; stale must not.
+    assert!(
+        text.contains("live-fox"),
+        "live worker must appear in Active listing. Got:\n{text}"
+    );
+    assert!(
+        !text.contains("dead-wolf"),
+        "stale worker must be pruned out of the Active listing. Got:\n{text}"
+    );
+    assert!(
+        !text.contains(&stale_id),
+        "stale worker's id must not appear in render. Got:\n{text}"
+    );
+
+    // The footer must account for the prune so operators can see the
+    // pruned count at a glance.
+    assert!(
+        text.contains("Filtered stale agent record(s): 1"),
+        "prune summary must report exactly 1 stale record filtered. Got:\n{text}"
+    );
+    assert!(
+        text.contains("30s heartbeat age"),
+        "footer must reference the 30s worker threshold. Got:\n{text}"
     );
 }
 
