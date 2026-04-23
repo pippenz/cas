@@ -220,6 +220,22 @@ pub fn handle_session_start(
         context
     };
 
+    // Factory session-start hygiene triage (task cas-aeec): for supervisor
+    // sessions, prepend a banner listing uncommitted files in the main
+    // worktree with per-file last-touching-task-id attribution. Visibility
+    // only — the supervisor decides salvage / commit / discard before
+    // spawning workers. Best-effort: git failures, non-supervisor roles,
+    // and clean trees all fall through silently.
+    let context = if is_supervisor {
+        match crate::hooks::handlers::session_hygiene::build_session_start_wip_banner(cas_root) {
+            Some(banner) if context.is_empty() => banner,
+            Some(banner) => format!("{banner}\n{context}"),
+            None => context,
+        }
+    } else {
+        context
+    };
+
     let output = if context.is_empty() {
         HookOutput::empty()
     } else {

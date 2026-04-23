@@ -212,6 +212,128 @@ pub fn wip_candidates(cas_root: &Path) -> Option<WipSummary> {
     })
 }
 
+/// Extract the first `cas-xxxx` task id from `text`, if any.
+///
+/// Task ids in commit messages follow the canonical 4-char hex form used
+/// throughout the codebase (e.g. `cas-4181`, `cas-a9ab`). Anything past 4
+/// lowercase hex chars is rejected so arbitrary strings like `cas-foo`
+/// are not falsely matched.
+pub(crate) fn extract_task_id(text: &str) -> Option<String> {
+    // Tiny hand-rolled scanner to avoid pulling in a regex dep just for one
+    // match. Finds `cas-` then up to 4 hex chars followed by a non-hex
+    // boundary (whitespace, punctuation, end-of-string).
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    let eq_ci = |a: u8, b: u8| a.eq_ignore_ascii_case(&b);
+    while i + 8 <= bytes.len() {
+        if eq_ci(bytes[i], b'c')
+            && eq_ci(bytes[i + 1], b'a')
+            && eq_ci(bytes[i + 2], b's')
+            && bytes[i + 3] == b'-'
+        {
+            let start = i + 4;
+            let mut end = start;
+            while end < bytes.len() && end - start < 4 {
+                let c = bytes[end];
+                let is_hex =
+                    c.is_ascii_digit() || (b'a'..=b'f').contains(&c) || (b'A'..=b'F').contains(&c);
+                if !is_hex {
+                    break;
+                }
+                end += 1;
+            }
+            if end - start == 4 {
+                // Boundary check: next byte must be a non-hex, non-alnum
+                // delimiter (or end of string).
+                let terminates = end == bytes.len() || {
+                    let c = bytes[end];
+                    !(c.is_ascii_digit()
+                        || (b'a'..=b'z').contains(&c)
+                        || (b'A'..=b'Z').contains(&c))
+                };
+                if terminates {
+                    let id = std::str::from_utf8(&bytes[i..end]).ok()?.to_ascii_lowercase();
+                    return Some(id);
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Ask git for the most recent commit that touched `file` and return the
+/// first `cas-xxxx` task id from its subject+body, if any. Used to
+/// attribute a modified WIP file to the task that most likely left it
+/// behind. Returns `None` for untracked files, missing history, or when
+/// the last commit message carries no task id.
+pub fn attribute_file_to_task(repo: &Path, file: &str) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["log", "-1", "--format=%s%n%b", "--", file])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    if text.trim().is_empty() {
+        return None;
+    }
+    extract_task_id(&text)
+}
+
+/// Render the SessionStart triage banner for a supervisor session, or
+/// `None` when the worktree is clean / git is unavailable / cas_root
+/// cannot be resolved. The banner is best-effort and must never fail a
+/// session start.
+///
+/// Output shape (example):
+/// ```text
+/// ⚠ Prior-factory WIP detected in main worktree (3 files, 2 modified, 1 untracked):
+///   [modified]  src/foo.rs                (last touched by cas-a9ab)
+///   [modified]  src/bar.rs                (last touched by cas-4181)
+///   [untracked] src/baz.rs                (unattributed — no git history)
+///
+/// Triage BEFORE spawning workers: decide salvage / commit / discard.
+/// Full history: .cas/logs/factory-session-{date}.log
+/// ```
+pub fn build_session_start_wip_banner(cas_root: &Path) -> Option<String> {
+    let summary = wip_candidates(cas_root)?;
+    if summary.is_clean() {
+        return None;
+    }
+    let mut out = String::new();
+    out.push_str(&format!(
+        "⚠ Prior-factory WIP detected in main worktree ({} files, {} modified, {} untracked):\n",
+        summary.entries.len(),
+        summary.modified_count(),
+        summary.untracked_count(),
+    ));
+    for entry in &summary.entries {
+        let attribution = if entry.is_untracked() {
+            "(unattributed — no git history)".to_string()
+        } else {
+            match attribute_file_to_task(&summary.worktree, &entry.path) {
+                Some(task_id) => format!("(last touched by {task_id})"),
+                None => "(no task id in last commit)".to_string(),
+            }
+        };
+        out.push_str(&format!(
+            "  [{:10}] {}  {}\n",
+            entry.label(),
+            entry.path,
+            attribution,
+        ));
+    }
+    out.push_str(
+        "\nTriage BEFORE spawning workers: decide salvage / commit / discard.\n\
+         Full history: .cas/logs/factory-session-{date}.log (see cas-supervisor-checklist)\n",
+    );
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -455,6 +577,129 @@ mod tests {
             resolved.canonicalize().unwrap(),
             main.canonicalize().unwrap(),
             "linked-worktree cas_root must resolve upward to the main repo, got {resolved:?}"
+        );
+    }
+
+    /// extract_task_id must pick the first canonical `cas-xxxx` (4 hex) token
+    /// and reject non-hex / too-long / non-terminated variants so a commit
+    /// subject like "refactor cas-module" does not falsely attribute.
+    #[test]
+    fn extract_task_id_accepts_canonical_and_rejects_garbage() {
+        // Happy path: first 4-hex token wins, case-insensitive, boundary aware.
+        assert_eq!(
+            extract_task_id("fix(foo): ship cas-a9ab and follow-up cas-4181"),
+            Some("cas-a9ab".to_string())
+        );
+        assert_eq!(
+            extract_task_id("CAS-4181 uppercase"),
+            Some("cas-4181".to_string())
+        );
+        assert_eq!(
+            extract_task_id("see cas-d0f9."),
+            Some("cas-d0f9".to_string())
+        );
+
+        // Non-hex characters in the 4-char window are rejected.
+        assert_eq!(extract_task_id("cas-zzzz is fake"), None);
+        // Too-long hex run (> 4 chars without a boundary) is rejected.
+        assert_eq!(extract_task_id("cas-a9abc is nope"), None);
+        // Non-boundary alphanumeric (e.g. cas-module) is rejected.
+        assert_eq!(extract_task_id("refactor cas-module"), None);
+        assert_eq!(extract_task_id("nothing here"), None);
+    }
+
+    /// attribute_file_to_task must resolve a modified file to the cas-id in
+    /// the last commit that touched it. Confirms the core attribution primitive
+    /// used by the SessionStart banner.
+    #[test]
+    fn attribute_file_to_task_finds_cas_id_in_last_commit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        init_repo(repo);
+        fs::write(repo.join("a.txt"), "v1").unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["add", "a.txt"])
+            .status()
+            .unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["commit", "-q", "-m", "feat(a): initial ship (cas-a9ab)"])
+            .status()
+            .unwrap();
+
+        assert_eq!(
+            attribute_file_to_task(repo, "a.txt"),
+            Some("cas-a9ab".to_string())
+        );
+
+        // An untracked file has no git history → None.
+        fs::write(repo.join("new.txt"), "").unwrap();
+        assert_eq!(attribute_file_to_task(repo, "new.txt"), None);
+
+        // Commit without a cas-id still returns None (no false positives).
+        fs::write(repo.join("b.txt"), "").unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["add", "b.txt"])
+            .status()
+            .unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["commit", "-q", "-m", "chore(b): no task id here"])
+            .status()
+            .unwrap();
+        assert_eq!(attribute_file_to_task(repo, "b.txt"), None);
+    }
+
+    /// The SessionStart banner must surface the attribution line and the
+    /// triage instruction; returning None on a clean tree prevents noise.
+    #[test]
+    fn build_session_start_wip_banner_renders_attribution_and_skips_clean() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        init_repo(repo);
+
+        // Seed + commit + modify: modified entry should carry attribution.
+        fs::write(repo.join("src.rs"), "v1").unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["add", "src.rs"])
+            .status()
+            .unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["commit", "-q", "-m", "feat: ship (cas-4181)"])
+            .status()
+            .unwrap();
+        fs::write(repo.join("src.rs"), "v2").unwrap();
+        // Also drop an untracked file to exercise the unattributed branch.
+        fs::write(repo.join("scratch.tmp"), "").unwrap();
+
+        let cas_root = repo.join(".cas");
+        fs::create_dir_all(&cas_root).unwrap();
+
+        let banner = build_session_start_wip_banner(&cas_root)
+            .expect("banner rendered for dirty worktree");
+        assert!(banner.contains("Prior-factory WIP detected"));
+        assert!(banner.contains("src.rs"));
+        assert!(banner.contains("(last touched by cas-4181)"));
+        assert!(banner.contains("scratch.tmp"));
+        assert!(banner.contains("unattributed"));
+        assert!(banner.contains("Triage BEFORE spawning workers"));
+
+        // Clean the tree → banner suppressed, no noise on normal sessions.
+        fs::remove_file(repo.join("scratch.tmp")).unwrap();
+        fs::write(repo.join("src.rs"), "v1").unwrap();
+        assert!(
+            build_session_start_wip_banner(&cas_root).is_none(),
+            "clean tree must not emit a banner"
         );
     }
 }

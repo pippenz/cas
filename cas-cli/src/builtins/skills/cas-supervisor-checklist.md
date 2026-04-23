@@ -24,14 +24,19 @@ managed_by: cas
    - If it exists but is stale (structural changes since last update) → run `/codemap` to refresh.
    - Workers reference CODEMAP for codebase orientation — ensure it's current before spawning them.
 5. Check worker availability: `mcp__cas__coordination action=worker_status`
-6. **Session hygiene triage** — check for leftover WIP from prior factory sessions:
+6. **Session hygiene triage** — the SessionStart hook prepends a "⚠ Prior-factory
+   WIP detected" banner to the supervisor context when the main worktree has
+   uncommitted changes, with per-file attribution (last `cas-xxxx` commit)
+   where git history permits. If you see that banner, decide salvage / commit /
+   discard **before** spawning workers — otherwise a cherry-pick into `develop`
+   will abort later.
+
+   For a full on-demand report (including stale agents and orphan worktrees):
    ```
    mcp__cas__coordination action=gc_report
    ```
-   The report's "Prior-factory WIP candidates" section lists uncommitted files
-   in the main worktree. Files often survive when a prior session died mid-task
-   without committing. Decide salvage / commit / discard **before** spawning
-   workers — otherwise a cherry-pick into `develop` will abort later.
+   The report's "Prior-factory WIP candidates" section mirrors the banner and
+   is safe to re-run at any time; it never auto-deletes.
 
    For the full history of what prior sessions left behind, see
    `.cas/logs/factory-session-{YYYY-MM-DD}.log` (written automatically on
