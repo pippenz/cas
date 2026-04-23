@@ -1146,3 +1146,200 @@ async fn test_subtask_start_auto_starts_epic() {
         "Epic should be in progress after subtask start: {text}"
     );
 }
+
+// ============================================================================
+// cas-5572 (EPIC cas-9508): Spawn-time `action=mine` race regression
+//
+// Reproduces the factory-session friction described in
+// docs/requests/BUG-factory-session-observations-2026-04-22.md §1: after
+// `coordination spawn_workers` + `task update assignee=<worker-name>`, a
+// freshly-spawned worker's first `action=mine` call was returning "no open
+// tasks" even when `task show` on the supervisor side immediately confirmed
+// the assignment.
+//
+// Root cause: `cas_tasks_mine` previously matched only `assignee == agent_id
+// || agent_name` where `agent_name` was read from the agent-store row. When
+// the worker's agent row has not yet been populated with the final friendly
+// name — or the lookup transiently falls back to `agent_id` — the filter
+// missed name-based assignments. The fix widens the match to also consider
+// `CAS_AGENT_NAME` / `CAS_SESSION_ID` env vars and compares case-insensitively
+// on trimmed values.
+// ============================================================================
+
+#[tokio::test]
+async fn test_task_mine_matches_env_worker_name_during_spawn_race() {
+    let (_temp, service) = setup_cas();
+
+    // Simulate the spawn-race condition: the agent-store row still shows
+    // the default "test-agent" name, but the supervisor has already assigned
+    // the task to the worker's *friendly* name (e.g. "warm-gopher-85"). In
+    // the real factory flow the friendly name arrives via CAS_AGENT_NAME in
+    // the worker process's env.
+    let worker_name = "warm-gopher-85";
+
+    // Acquire the env lock since we're mutating CAS_AGENT_NAME.
+    let _env_guard = env_test_lock();
+    let prev_name = std::env::var("CAS_AGENT_NAME").ok();
+    // SAFETY: env lock is held for the duration of this test body.
+    unsafe {
+        std::env::set_var("CAS_AGENT_NAME", worker_name);
+    }
+
+    // Create a task, then update its assignee to the worker's friendly name —
+    // exactly what a supervisor does via `task update assignee=<worker-name>`.
+    let create_req = TaskCreateRequest {
+        title: "Spawn-race assignment".to_string(),
+        description: None,
+        priority: 1,
+        task_type: "task".to_string(),
+        labels: None,
+        notes: None,
+        blocked_by: None,
+        design: None,
+        acceptance_criteria: None,
+        external_ref: None,
+        assignee: None,
+        demo_statement: None,
+        execution_note: None,
+        epic: None,
+    };
+    let created = service
+        .cas_task_create(Parameters(create_req))
+        .await
+        .expect("task_create should succeed");
+    let id = extract_task_id(&extract_text(created))
+        .expect("task id")
+        .to_string();
+
+    let update_req = TaskUpdateRequest {
+        id: id.clone(),
+        title: None,
+        notes: None,
+        priority: None,
+        labels: None,
+        description: None,
+        design: None,
+        acceptance_criteria: None,
+        demo_statement: None,
+        execution_note: None,
+        external_ref: None,
+        assignee: Some(worker_name.to_string()),
+        status: None,
+        epic: None,
+        epic_verification_owner: None,
+    };
+    service
+        .cas_task_update(Parameters(update_req))
+        .await
+        .expect("task_update should succeed");
+
+    // The worker's first `action=mine` poll — the assignee on the task row
+    // is the friendly `worker_name`, but the agent_store row still carries
+    // the default "test-agent" name from setup_cas(). Before the fix this
+    // returned "No open tasks"; after the fix, CAS_AGENT_NAME bridges the
+    // gap and the task surfaces.
+    let mine_req = LimitRequest {
+        limit: Some(20),
+        scope: "all".to_string(),
+        sort: None,
+        sort_order: None,
+        team_id: None,
+    };
+    let result = service
+        .cas_tasks_mine(Parameters(mine_req))
+        .await
+        .expect("tasks_mine should succeed");
+    let text = extract_text(result);
+
+    // Restore env before any assertion to avoid poisoning sibling tests on
+    // panic. SAFETY: still holding env lock.
+    unsafe {
+        match prev_name {
+            Some(v) => std::env::set_var("CAS_AGENT_NAME", v),
+            None => std::env::remove_var("CAS_AGENT_NAME"),
+        }
+    }
+
+    assert!(
+        text.contains(&id),
+        "cas_tasks_mine must surface tasks assigned by friendly worker-name \
+         (via CAS_AGENT_NAME env) even when the agent-store row still holds \
+         the default name. Got: {text}"
+    );
+    assert!(
+        !text.starts_with("No open tasks"),
+        "cas_tasks_mine should not report empty during spawn-race window. Got: {text}"
+    );
+}
+
+#[tokio::test]
+async fn test_task_mine_matches_case_insensitive_and_trimmed() {
+    let (_temp, service) = setup_cas();
+
+    // Exercise the defensive matching path: assignee spelled with differing
+    // case and surrounding whitespace still matches the current agent.
+    let create_req = TaskCreateRequest {
+        title: "Case-trim mine match".to_string(),
+        description: None,
+        priority: 2,
+        task_type: "task".to_string(),
+        labels: None,
+        notes: None,
+        blocked_by: None,
+        design: None,
+        acceptance_criteria: None,
+        external_ref: None,
+        assignee: None,
+        demo_statement: None,
+        execution_note: None,
+        epic: None,
+    };
+    let created = service
+        .cas_task_create(Parameters(create_req))
+        .await
+        .expect("create");
+    let id = extract_task_id(&extract_text(created))
+        .expect("id")
+        .to_string();
+
+    let update_req = TaskUpdateRequest {
+        id: id.clone(),
+        title: None,
+        notes: None,
+        priority: None,
+        labels: None,
+        description: None,
+        design: None,
+        acceptance_criteria: None,
+        demo_statement: None,
+        execution_note: None,
+        external_ref: None,
+        // The default test-agent name is "test-agent"; assert we still
+        // match when the supervisor sprays mixed case + whitespace.
+        assignee: Some("  TEST-Agent  ".to_string()),
+        status: None,
+        epic: None,
+        epic_verification_owner: None,
+    };
+    service
+        .cas_task_update(Parameters(update_req))
+        .await
+        .expect("update");
+
+    let mine_req = LimitRequest {
+        limit: Some(20),
+        scope: "all".to_string(),
+        sort: None,
+        sort_order: None,
+        team_id: None,
+    };
+    let result = service
+        .cas_tasks_mine(Parameters(mine_req))
+        .await
+        .expect("mine");
+    let text = extract_text(result);
+    assert!(
+        text.contains(&id),
+        "mine should tolerate case + whitespace drift in assignee: {text}"
+    );
+}

@@ -517,6 +517,27 @@ impl CasCore {
     }
 
     /// List tasks claimed by this agent
+    ///
+    /// ### Spawn-time race resilience (EPIC cas-9508 / cas-5572)
+    ///
+    /// Workers are assigned by supervisors via `task update assignee=<worker-name>`.
+    /// At the moment a fresh worker makes its first `action=mine` call, the agent
+    /// store row for that worker may not yet reflect the final worker name
+    /// (agent_name could still be a stale/default value, or the row lookup
+    /// could race eager-registration) — and the task's `assignee` column will
+    /// hold the worker-name string set by the supervisor.
+    ///
+    /// To make the first poll reliably return freshly-assigned tasks without
+    /// requiring a coordination-message kick, this handler matches assignees
+    /// against a **set** of known identifiers for the current agent:
+    ///
+    /// - the canonical `agent_id` (session UUID),
+    /// - the `agent_name` from the agent_store row, if any,
+    /// - the `CAS_AGENT_NAME` env var (set by the factory PTY spawner), and
+    /// - the `CAS_SESSION_ID` env var (belt-and-suspenders for the UUID).
+    ///
+    /// Matching is case-insensitive on trimmed values to tolerate minor
+    /// spelling drift between supervisor and worker views.
     pub async fn cas_tasks_mine(
         &self,
         Parameters(req): Parameters<LimitRequest>,
@@ -531,17 +552,45 @@ impl CasCore {
             .map(|a| a.name)
             .unwrap_or_else(|_| agent_id.clone());
 
+        // Collect all identifiers that may have been used as the `assignee`
+        // value for this agent. Factory workers are frequently assigned by
+        // their friendly worker-name before the agent_store row is fully
+        // populated, so we include the env-provided name/session as well.
+        // See doc-comment above for the spawn-time race this guards against.
+        let mut identities: Vec<String> = Vec::with_capacity(4);
+        let mut push_identity = |s: &str| {
+            let t = s.trim();
+            if !t.is_empty() && !identities.iter().any(|i| i.eq_ignore_ascii_case(t)) {
+                identities.push(t.to_string());
+            }
+        };
+        push_identity(&agent_id);
+        push_identity(&agent_name);
+        if let Ok(env_name) = std::env::var("CAS_AGENT_NAME") {
+            push_identity(&env_name);
+        }
+        if let Ok(env_session) = std::env::var("CAS_SESSION_ID") {
+            push_identity(&env_session);
+        }
+
         let leases = agent_store.list_agent_leases(&agent_id).unwrap_or_default();
         let mut assigned: Vec<Task> = task_store
             .list(None)
             .unwrap_or_default()
             .into_iter()
             .filter(|t| {
-                t.status != TaskStatus::Closed
-                    && matches!(
-                        t.assignee.as_deref(),
-                        Some(a) if a == agent_id || a == agent_name
-                    )
+                if t.status == TaskStatus::Closed {
+                    return false;
+                }
+                match t.assignee.as_deref() {
+                    Some(a) => {
+                        let a_trim = a.trim();
+                        identities
+                            .iter()
+                            .any(|id| id.eq_ignore_ascii_case(a_trim))
+                    }
+                    None => false,
+                }
             })
             .collect();
 
@@ -582,6 +631,15 @@ impl CasCore {
                 lease_info,
                 if task.assignee.as_deref() == Some(agent_id.as_str()) {
                     " (assignee=agent_id)"
+                } else if task
+                    .assignee
+                    .as_deref()
+                    .map(|a| !a.eq_ignore_ascii_case(agent_name.as_str()))
+                    .unwrap_or(false)
+                {
+                    // Matched via a fallback identity (e.g. CAS_AGENT_NAME
+                    // env) — useful signal during the spawn-time race window.
+                    " (assignee=alias)"
                 } else {
                     ""
                 }
