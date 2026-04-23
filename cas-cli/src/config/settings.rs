@@ -77,10 +77,44 @@ pub struct FactoryConfig {
     /// Number of commits behind the sync target before considering a worktree stale
     #[serde(default = "default_stale_threshold")]
     pub stale_threshold_commits: u32,
+
+    /// Cap on `CARGO_BUILD_JOBS` exported into each factory worker's env.
+    ///
+    /// Purpose: prevent the multi-worker cargo thundering-herd that
+    /// saturates the host and wedges Claude Code workers in the JS
+    /// crash-screen state (cas-4513 + cas-0bf4). Each worker runs its
+    /// own `target/` dir and its own rustc jobs; without this cap,
+    /// peak concurrency is `workers × num_cpus` rustc threads.
+    ///
+    /// - `"auto"` (default): cas-pty computes
+    ///   `max(2, available_parallelism() / 4)`. The "÷4" assumes up to
+    ///   4 concurrent workers — the common factory-mode topology on a
+    ///   16-thread dev box. Override via `CAS_FACTORY_CARGO_BUILD_JOBS`
+    ///   if the supervisor's scale differs.
+    /// - Any numeric string (e.g. `"4"`): exported verbatim.
+    #[serde(default = "default_auto")]
+    pub cargo_build_jobs: String,
+
+    /// When true, prefix each worker's spawn command with `nice -n 10`
+    /// so cargo-driven rustc jobs run at a lower scheduling priority
+    /// than the supervisor's Claude Code event loop. Workers still
+    /// contend equally among themselves, but the supervisor pane
+    /// stays responsive under load — which is what keeps the factory
+    /// steerable when a worker storm starts.
+    ///
+    /// Default `true`. Flip to `false` for single-worker sessions or
+    /// when benchmarking, since the priority drop does slow individual
+    /// cargo builds under contention.
+    #[serde(default = "default_true")]
+    pub nice_cargo: bool,
 }
 
 fn default_stale_threshold() -> u32 {
     1
+}
+
+fn default_auto() -> String {
+    "auto".to_string()
 }
 
 impl Default for FactoryConfig {
@@ -89,6 +123,8 @@ impl Default for FactoryConfig {
             warn_stale_assignment: true,
             block_stale_assignment: true,
             stale_threshold_commits: default_stale_threshold(),
+            cargo_build_jobs: default_auto(),
+            nice_cargo: true,
         }
     }
 }
@@ -585,5 +621,42 @@ impl Default for SyncConfig {
             target: ".claude/rules/cas".to_string(),
             min_helpful: 1,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// cas-0bf4: defaults for the two resource-contention knobs must stay
+    /// stable — they ship as the on-by-default mitigation for factory
+    /// worker wedges. A careless refactor that flipped `nice_cargo` to
+    /// `false` or `cargo_build_jobs` to `""` would silently disable the
+    /// cap on every new install.
+    #[test]
+    fn factory_config_defaults_cargo_contention_knobs() {
+        let fc = FactoryConfig::default();
+        assert_eq!(
+            fc.cargo_build_jobs, "auto",
+            "cargo_build_jobs default must be 'auto' so cas-pty computes the cap"
+        );
+        assert!(
+            fc.nice_cargo,
+            "nice_cargo default must be true so workers run niced relative to supervisor"
+        );
+    }
+
+    /// Round-trip: a persisted config with no factory section deserializes
+    /// to the same defaults as `Default::default()`. Guards against a
+    /// future serde attribute mismatch that would change read-vs-default
+    /// divergence (the classic "silent config drift" bug).
+    #[test]
+    fn factory_config_roundtrips_through_toml_empty_section() {
+        let toml_str = "[factory]\n";
+        let parsed: std::collections::HashMap<String, FactoryConfig> =
+            toml::from_str(toml_str).expect("valid toml");
+        let fc = parsed.get("factory").expect("section present");
+        assert_eq!(fc.cargo_build_jobs, FactoryConfig::default().cargo_build_jobs);
+        assert_eq!(fc.nice_cargo, FactoryConfig::default().nice_cargo);
     }
 }

@@ -155,6 +155,18 @@ impl PtyConfig {
             env.push(("CAS_FACTORY_WORKER_CLI".to_string(), worker_cli.to_string()));
         }
 
+        // cas-0bf4: cap cargo parallelism inside factory worker processes
+        // so a 4-worker factory doesn't stack `num_cpus`-way rustc jobs
+        // per worker and wedge the host via scheduler starvation
+        // (cas-4513 Claude Code JS crash-screen symptom). Emitted only
+        // for role="worker"; supervisor stays uncapped. See
+        // `cargo_build_jobs_for_worker` below for precedence rules.
+        if role == "worker" {
+            if let Some(cargo_jobs) = cargo_build_jobs_for_worker() {
+                env.push(("CARGO_BUILD_JOBS".to_string(), cargo_jobs));
+            }
+        }
+
         // Enable native Agent Teams for inter-agent messaging
         if teams.is_some() {
             env.push((
@@ -217,8 +229,14 @@ impl PtyConfig {
             }
         }
 
+        // cas-0bf4: optionally lower the worker's scheduling priority so
+        // the supervisor's Claude Code event loop wins scheduler fights.
+        // Only fires for role="worker" when `CAS_FACTORY_NICE_WORKER=1`
+        // is set by the supervisor-side factory config bridge.
+        let (command, args) = maybe_wrap_with_nice("claude", args, role);
+
         Self {
-            command: "claude".to_string(),
+            command,
             args,
             cwd: Some(cwd),
             env,
@@ -294,6 +312,13 @@ impl PtyConfig {
             env.push(("CAS_FACTORY_WORKER_CLI".to_string(), worker_cli.to_string()));
         }
 
+        // cas-0bf4: see equivalent comment in `claude()`.
+        if role == "worker" {
+            if let Some(cargo_jobs) = cargo_build_jobs_for_worker() {
+                env.push(("CARGO_BUILD_JOBS".to_string(), cargo_jobs));
+            }
+        }
+
         let mut args = vec!["--yolo".to_string(), "--no-alt-screen".to_string()];
         if let Some(m) = model {
             args.push("--model".to_string());
@@ -323,8 +348,11 @@ impl PtyConfig {
             args.push(startup_prompt);
         }
 
+        // cas-0bf4: see equivalent comment in `claude()`.
+        let (command, args) = maybe_wrap_with_nice("codex", args, role);
+
         Self {
-            command: "codex".to_string(),
+            command,
             args,
             cwd: Some(cwd),
             env,
@@ -332,6 +360,69 @@ impl PtyConfig {
             cols: 80,
         }
     }
+}
+
+/// Compute the `CARGO_BUILD_JOBS` value to export into a worker's env.
+///
+/// Precedence (first match wins):
+///   1. `CAS_FACTORY_CARGO_BUILD_JOBS` env — set by the supervisor-side
+///      factory config bridge from `factory.cargo_build_jobs` config.
+///      Empty value or literal `"auto"` means "fall through to 2–4".
+///   2. Auto-compute: `max(2, available_parallelism() / 4)`. The "÷4"
+///      target is up to 4 concurrent factory workers, which has been
+///      the observed host-saturation threshold on 16-thread dev boxes
+///      (soundwave, cas-4513 + cas-0bf4 evidence).
+///
+/// Returns `None` only when auto-compute fails to read CPU topology,
+/// which should be vanishingly rare. In that case we do NOT set
+/// `CARGO_BUILD_JOBS` — cargo's own default (= num_cpus) then applies
+/// and the cap is a no-op rather than misleading.
+fn cargo_build_jobs_for_worker() -> Option<String> {
+    if let Ok(explicit) = std::env::var("CAS_FACTORY_CARGO_BUILD_JOBS") {
+        let trimmed = explicit.trim();
+        if !trimmed.is_empty() && trimmed != "auto" {
+            return Some(trimmed.to_string());
+        }
+    }
+    let cores = std::thread::available_parallelism().ok()?.get();
+    let capped = std::cmp::max(2, cores / 4);
+    Some(capped.to_string())
+}
+
+/// If `CAS_FACTORY_NICE_WORKER=1` is set in the supervisor's env and
+/// `role == "worker"`, wrap the spawn command in `nice -n 10` so the
+/// worker's process tree (including cargo-driven rustc jobs) runs at
+/// a lower scheduling priority than the supervisor. Supervisor panes
+/// stay at nice 0 and therefore win CPU-contention fights, which keeps
+/// the factory steerable when workers start cargo-storming (cas-0bf4).
+///
+/// Non-worker roles and sessions without the sentinel env are passed
+/// through unchanged. `nice` must be on PATH (standard on every Linux
+/// and macOS host CAS supports); if it isn't, the worker will fail to
+/// spawn with a clear "nice not found" error from the PTY layer rather
+/// than silently running unwrapped — that's the safer fallback.
+fn maybe_wrap_with_nice(command: &str, args: Vec<String>, role: &str) -> (String, Vec<String>) {
+    if role != "worker" {
+        return (command.to_string(), args);
+    }
+    if std::env::var("CAS_FACTORY_NICE_WORKER").as_deref() != Ok("1") {
+        return (command.to_string(), args);
+    }
+    // Default niceness increment is 10; honour CAS_FACTORY_NICE_LEVEL
+    // for power users who want a harder or softer cap.
+    let level = std::env::var("CAS_FACTORY_NICE_LEVEL")
+        .ok()
+        .and_then(|s| {
+            let t = s.trim();
+            if t.is_empty() { None } else { Some(t.to_string()) }
+        })
+        .unwrap_or_else(|| "10".to_string());
+    let mut new_args = Vec::with_capacity(args.len() + 3);
+    new_args.push("-n".to_string());
+    new_args.push(level);
+    new_args.push(command.to_string());
+    new_args.extend(args);
+    ("nice".to_string(), new_args)
 }
 
 /// Events emitted by a PTY
@@ -1002,5 +1093,256 @@ mod tests {
             !config.args.contains(&"--settings".to_string()),
             "no settings_path → argv must omit --settings"
         );
+    }
+
+    // cas-0bf4: resource-contention mitigation tests.
+    //
+    // These exercise `cargo_build_jobs_for_worker` and
+    // `maybe_wrap_with_nice` plus their integration with
+    // `PtyConfig::claude`. They poke process-wide env vars, so they
+    // share a serializing mutex to avoid cross-test flakes when the
+    // suite runs with multiple threads. Scope is per-test: each test
+    // clears its own env on entry and on the exit via the guard.
+    mod cas_0bf4_resource_contention {
+        use crate::pty::*;
+        use std::sync::{Mutex, MutexGuard};
+
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+        struct ScopedEnv {
+            _guard: MutexGuard<'static, ()>,
+        }
+
+        impl ScopedEnv {
+            fn new() -> Self {
+                let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+                // SAFETY: mutex serializes env mutation across tests.
+                unsafe {
+                    std::env::remove_var("CAS_FACTORY_CARGO_BUILD_JOBS");
+                    std::env::remove_var("CAS_FACTORY_NICE_WORKER");
+                    std::env::remove_var("CAS_FACTORY_NICE_LEVEL");
+                }
+                Self { _guard: guard }
+            }
+        }
+
+        impl Drop for ScopedEnv {
+            fn drop(&mut self) {
+                // SAFETY: mutex held for duration of this scope.
+                unsafe {
+                    std::env::remove_var("CAS_FACTORY_CARGO_BUILD_JOBS");
+                    std::env::remove_var("CAS_FACTORY_NICE_WORKER");
+                    std::env::remove_var("CAS_FACTORY_NICE_LEVEL");
+                }
+            }
+        }
+
+        #[test]
+        fn cargo_build_jobs_honours_explicit_env_override() {
+            let _e = ScopedEnv::new();
+            // SAFETY: _e holds ENV_LOCK.
+            unsafe {
+                std::env::set_var("CAS_FACTORY_CARGO_BUILD_JOBS", "3");
+            }
+            assert_eq!(cargo_build_jobs_for_worker().as_deref(), Some("3"));
+        }
+
+        #[test]
+        fn cargo_build_jobs_trims_whitespace_override() {
+            let _e = ScopedEnv::new();
+            unsafe {
+                std::env::set_var("CAS_FACTORY_CARGO_BUILD_JOBS", "  6  ");
+            }
+            assert_eq!(cargo_build_jobs_for_worker().as_deref(), Some("6"));
+        }
+
+        #[test]
+        fn cargo_build_jobs_auto_falls_through_to_computed() {
+            let _e = ScopedEnv::new();
+            // Explicit "auto" reads as fallthrough, computed value comes back.
+            unsafe {
+                std::env::set_var("CAS_FACTORY_CARGO_BUILD_JOBS", "auto");
+            }
+            let got = cargo_build_jobs_for_worker()
+                .expect("available_parallelism should succeed on test host");
+            let n: usize = got.parse().expect("computed CARGO_BUILD_JOBS must parse");
+            assert!(n >= 2, "floor of 2 must hold even on 1–4 core hosts: got {n}");
+        }
+
+        #[test]
+        fn cargo_build_jobs_empty_env_falls_through_to_computed() {
+            let _e = ScopedEnv::new();
+            // No env set at all → compute. Same assertion as "auto".
+            let got = cargo_build_jobs_for_worker()
+                .expect("available_parallelism should succeed on test host");
+            let n: usize = got.parse().expect("computed CARGO_BUILD_JOBS must parse");
+            assert!(n >= 2);
+        }
+
+        #[test]
+        fn maybe_wrap_with_nice_is_noop_for_supervisor_role() {
+            let _e = ScopedEnv::new();
+            unsafe {
+                std::env::set_var("CAS_FACTORY_NICE_WORKER", "1");
+            }
+            let (cmd, args) = maybe_wrap_with_nice(
+                "claude",
+                vec!["--session-id".to_string(), "abc".to_string()],
+                "supervisor",
+            );
+            assert_eq!(cmd, "claude");
+            assert_eq!(args, vec!["--session-id".to_string(), "abc".to_string()]);
+        }
+
+        #[test]
+        fn maybe_wrap_with_nice_is_noop_without_env_sentinel() {
+            let _e = ScopedEnv::new();
+            // No CAS_FACTORY_NICE_WORKER set — passthrough for workers too.
+            let (cmd, args) = maybe_wrap_with_nice(
+                "claude",
+                vec!["--foo".to_string()],
+                "worker",
+            );
+            assert_eq!(cmd, "claude");
+            assert_eq!(args, vec!["--foo".to_string()]);
+        }
+
+        #[test]
+        fn maybe_wrap_with_nice_wraps_worker_when_sentinel_set() {
+            let _e = ScopedEnv::new();
+            unsafe {
+                std::env::set_var("CAS_FACTORY_NICE_WORKER", "1");
+            }
+            let (cmd, args) = maybe_wrap_with_nice(
+                "claude",
+                vec!["--session-id".to_string(), "xyz".to_string()],
+                "worker",
+            );
+            assert_eq!(cmd, "nice");
+            // Default level 10, original argv preserved after the wrapped command.
+            assert_eq!(
+                args,
+                vec![
+                    "-n".to_string(),
+                    "10".to_string(),
+                    "claude".to_string(),
+                    "--session-id".to_string(),
+                    "xyz".to_string(),
+                ]
+            );
+        }
+
+        #[test]
+        fn maybe_wrap_with_nice_honours_level_override() {
+            let _e = ScopedEnv::new();
+            unsafe {
+                std::env::set_var("CAS_FACTORY_NICE_WORKER", "1");
+                std::env::set_var("CAS_FACTORY_NICE_LEVEL", "15");
+            }
+            let (cmd, args) = maybe_wrap_with_nice("claude", vec![], "worker");
+            assert_eq!(cmd, "nice");
+            assert_eq!(args[..2], ["-n".to_string(), "15".to_string()]);
+            assert_eq!(args[2], "claude");
+        }
+
+        #[test]
+        fn maybe_wrap_with_nice_rejects_non_1_sentinel_value() {
+            let _e = ScopedEnv::new();
+            unsafe {
+                std::env::set_var("CAS_FACTORY_NICE_WORKER", "true"); // not "1"
+            }
+            let (cmd, _args) = maybe_wrap_with_nice("claude", vec![], "worker");
+            assert_eq!(cmd, "claude", "only the exact value '1' activates nice-wrap");
+        }
+
+        #[test]
+        fn claude_worker_gets_cargo_build_jobs_env() {
+            let _e = ScopedEnv::new();
+            unsafe {
+                std::env::set_var("CAS_FACTORY_CARGO_BUILD_JOBS", "4");
+            }
+            let config = PtyConfig::claude(
+                "w1",
+                "worker",
+                PathBuf::from("/tmp"),
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+            assert!(
+                config
+                    .env
+                    .iter()
+                    .any(|(k, v)| k == "CARGO_BUILD_JOBS" && v == "4"),
+                "worker PtyConfig must export CARGO_BUILD_JOBS when override is set"
+            );
+        }
+
+        #[test]
+        fn claude_supervisor_does_not_get_cargo_build_jobs_env() {
+            let _e = ScopedEnv::new();
+            unsafe {
+                std::env::set_var("CAS_FACTORY_CARGO_BUILD_JOBS", "4");
+            }
+            let config = PtyConfig::claude(
+                "s1",
+                "supervisor",
+                PathBuf::from("/tmp"),
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+            assert!(
+                !config.env.iter().any(|(k, _)| k == "CARGO_BUILD_JOBS"),
+                "supervisor must NOT get CARGO_BUILD_JOBS cap — only workers do"
+            );
+        }
+
+        #[test]
+        fn claude_worker_command_wraps_in_nice_when_sentinel_set() {
+            let _e = ScopedEnv::new();
+            unsafe {
+                std::env::set_var("CAS_FACTORY_NICE_WORKER", "1");
+            }
+            let config = PtyConfig::claude(
+                "w1",
+                "worker",
+                PathBuf::from("/tmp"),
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+            assert_eq!(config.command, "nice");
+            assert_eq!(config.args[0], "-n");
+            assert_eq!(config.args[2], "claude");
+        }
+
+        #[test]
+        fn claude_supervisor_command_unwrapped_even_when_sentinel_set() {
+            let _e = ScopedEnv::new();
+            unsafe {
+                std::env::set_var("CAS_FACTORY_NICE_WORKER", "1");
+            }
+            let config = PtyConfig::claude(
+                "s1",
+                "supervisor",
+                PathBuf::from("/tmp"),
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+            assert_eq!(
+                config.command, "claude",
+                "supervisor must not be niced — the whole point is it stays at nice 0"
+            );
+        }
     }
 }

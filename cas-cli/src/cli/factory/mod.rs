@@ -655,6 +655,35 @@ pub fn execute(args: &FactoryArgs, cli: &Cli, cas_root: Option<&std::path::Path>
     let auto_prompt = cas_config.orchestration().auto_prompt;
     let llm = cas_config.llm();
 
+    // cas-0bf4: bridge factory.cargo_build_jobs + factory.nice_cargo
+    // config knobs through the supervisor's process env so worker PTY
+    // spawns (cas-pty::PtyConfig::{claude,codex}) can read them. Env
+    // is the least-invasive transport — the alternative of threading
+    // these fields through cas-cli → cas-mux → cas-pty signatures
+    // would touch 3 crates for two booleans.
+    //
+    // Only set when the config says non-default, so external overrides
+    // at the shell level (`CAS_FACTORY_CARGO_BUILD_JOBS=N cas factory ...`)
+    // still win.
+    {
+        let fc = cas_config.factory();
+        // SAFETY: std::env::set_var is only unsafe in multi-threaded
+        // contexts; this executes during factory startup before any
+        // worker spawn, still on the main thread. Same contract as
+        // ScopedSupervisorEnv in the test harness.
+        unsafe {
+            if std::env::var("CAS_FACTORY_CARGO_BUILD_JOBS").is_err()
+                && fc.cargo_build_jobs.trim() != "auto"
+                && !fc.cargo_build_jobs.trim().is_empty()
+            {
+                std::env::set_var("CAS_FACTORY_CARGO_BUILD_JOBS", fc.cargo_build_jobs.trim());
+            }
+            if std::env::var("CAS_FACTORY_NICE_WORKER").is_err() && fc.nice_cargo {
+                std::env::set_var("CAS_FACTORY_NICE_WORKER", "1");
+            }
+        }
+    }
+
     // Build native Agent Teams spawn configs so agents start with Teams CLI flags.
     let (teams_configs, lead_session_id) = {
         use crate::ui::factory::daemon::runtime::teams::TeamsManager;
