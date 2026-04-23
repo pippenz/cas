@@ -10,6 +10,7 @@ mod daemon;
 mod lifecycle;
 mod queries;
 mod remote_attach;
+mod wedged;
 mod worktree_ops;
 
 use crate::cli::Cli;
@@ -494,6 +495,63 @@ pub enum FactoryCommands {
         #[arg(long)]
         cas_root: Option<std::path::PathBuf>,
     },
+
+    /// Classify a worker as alive / wedged / starved / dead (cas-4513).
+    ///
+    /// Exit codes (differentiated so supervisor scripts can branch without
+    /// parsing stdout): 0=alive, 1=wedged, 2=starved, 3=dead.
+    IsWedged {
+        /// Worker name (as shown in `cas factory agents`)
+        worker: String,
+
+        /// Emit structured JSON instead of the human-readable block
+        #[arg(long)]
+        json: bool,
+
+        /// Explicit CAS root (.cas directory) to use instead of the default
+        #[arg(long)]
+        cas_root: Option<std::path::PathBuf>,
+    },
+
+    /// Print the tail of a worker's Claude Code transcript (cas-4513).
+    Debug {
+        /// Worker name
+        worker: String,
+
+        /// Number of trailing JSONL lines to print
+        #[arg(long, default_value = "20")]
+        tail: usize,
+
+        /// Explicit CAS root
+        #[arg(long)]
+        cas_root: Option<std::path::PathBuf>,
+    },
+
+    /// SIGKILL a wedged worker and reset its tasks (cas-4513).
+    ///
+    /// SIGTERM is observed to not exit cleanly on the Bun-wedged Claude Code
+    /// process, so this verb uses SIGKILL. Idempotent — an already-dead
+    /// worker still runs the task-reset cleanup.
+    ///
+    /// By default refuses to SIGKILL a PID whose `/proc/<pid>/stat`
+    /// starttime fingerprint does not match what was recorded at
+    /// agent registration (= PID was recycled; killing would hit an
+    /// unrelated process). Pass `--force` to override — only use that
+    /// on legacy agents predating the fingerprint (cas-ea46) or when
+    /// you've independently verified the PID is still the worker.
+    Kill {
+        /// Worker name
+        worker: String,
+
+        /// Override the PID-recycling fingerprint guard. Prints a
+        /// warning in the summary when exercised.
+        #[arg(long)]
+        force: bool,
+
+        /// Explicit CAS root
+        #[arg(long)]
+        cas_root: Option<std::path::PathBuf>,
+    },
 }
 
 pub fn execute(args: &FactoryArgs, cli: &Cli, cas_root: Option<&std::path::Path>) -> Result<()> {
@@ -602,6 +660,33 @@ pub fn execute(args: &FactoryArgs, cli: &Cli, cas_root: Option<&std::path::Path>
                 *wait_ack,
                 *timeout_ms,
                 cas_root.as_deref(),
+            ),
+            FactoryCommands::IsWedged {
+                worker,
+                json,
+                cas_root: sub_cas_root,
+            } => wedged::execute_is_wedged(
+                sub_cas_root.as_deref().or(cas_root),
+                worker,
+                *json,
+            ),
+            FactoryCommands::Debug {
+                worker,
+                tail,
+                cas_root: sub_cas_root,
+            } => wedged::execute_debug(
+                sub_cas_root.as_deref().or(cas_root),
+                worker,
+                *tail,
+            ),
+            FactoryCommands::Kill {
+                worker,
+                force,
+                cas_root: sub_cas_root,
+            } => wedged::execute_kill(
+                sub_cas_root.as_deref().or(cas_root),
+                worker,
+                *force,
             ),
         };
     }

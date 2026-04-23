@@ -1064,7 +1064,7 @@ fn liveness_label_for(elapsed_secs: i64) -> &'static str {
 /// worker's clone_path, which was observed from a single field sample and
 /// breaks on spaces, unicode, colons, and any future CC escape change.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum TranscriptResolution {
+pub(crate) enum TranscriptResolution {
     /// Exactly one `~/.claude/projects/*/<session-id>.jsonl` matched.
     /// The real on-disk path ready for the supervisor to open.
     Resolved(std::path::PathBuf),
@@ -1154,7 +1154,7 @@ fn glob_transcript_candidates(
 /// the `Synthesized` / `Ambiguous` fallback paths omit the reconstructed
 /// legacy escape in that case (there's nothing to reconstruct from), and
 /// the caller must label the output accordingly.
-fn resolve_transcript(
+pub(crate) fn resolve_transcript(
     projects_dir: Option<&std::path::Path>,
     clone_path: Option<&str>,
     session_id: &str,
@@ -1182,7 +1182,7 @@ fn resolve_transcript(
 
 /// `~/.claude/projects` — Claude Code's per-user transcript root.
 /// Returns `None` if the user's home dir isn't resolvable.
-fn default_claude_projects_dir() -> Option<std::path::PathBuf> {
+pub(crate) fn default_claude_projects_dir() -> Option<std::path::PathBuf> {
     dirs::home_dir().map(|h| h.join(".claude").join("projects"))
 }
 
