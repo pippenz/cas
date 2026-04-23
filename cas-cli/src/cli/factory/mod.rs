@@ -42,6 +42,31 @@ pub use queries::execute_list;
 /// Case-insensitive `"auto"` matches pass through to the cas-pty
 /// auto-compute path.
 pub fn apply_resource_contention_env(cas_root: Option<&std::path::Path>) {
+    // cas-c614: enforce the single-thread SAFETY precondition at runtime so a
+    // future refactor that relocates this call (e.g. into a daemon fork path
+    // that is already multi-threaded) cannot silently re-introduce UB.
+    //
+    // Two layers of defence:
+    //   1. `ENV_BRIDGE_INVOKED` hard-fails on the SECOND call, regardless of
+    //      build profile. Two call sites both running after thread-spawn is
+    //      the exact failure mode the task description warns about.
+    //   2. `debug_assert!` on the Linux thread count catches the regression
+    //      under `cargo test` / debug builds without paying a release-build
+    //      /proc/self/stat read on every startup.
+    if ENV_BRIDGE_INVOKED.set(()).is_err() {
+        panic!(
+            "apply_resource_contention_env called more than once; the second \
+             call would std::env::set_var from a potentially multi-threaded \
+             context (UB per Rust 2024). See cas-c614 / cas-0bf4."
+        );
+    }
+    debug_assert!(
+        check_single_threaded_precondition().is_ok(),
+        "apply_resource_contention_env invoked post-thread-spawn; \
+         std::env::set_var is UB in a multi-threaded process (Rust 2024). \
+         See cas-c614 / cas-0bf4."
+    );
+
     let Some(cas_root) = cas_root else {
         return;
     };
@@ -53,7 +78,8 @@ pub fn apply_resource_contention_env(cas_root: Option<&std::path::Path>) {
     // SAFETY: caller (cli::run) invokes this before the telemetry thread is
     // spawned, so the process is still single-threaded. That is the whole
     // reason this function exists as a separate entry point rather than
-    // living inline in `factory::execute`.
+    // living inline in `factory::execute`. The guards above enforce the
+    // invariant at runtime — see cas-c614.
     unsafe {
         if std::env::var("CAS_FACTORY_CARGO_BUILD_JOBS").is_err()
             && !trimmed.is_empty()
@@ -65,6 +91,70 @@ pub fn apply_resource_contention_env(cas_root: Option<&std::path::Path>) {
             std::env::set_var("CAS_FACTORY_NICE_WORKER", "1");
         }
     }
+}
+
+/// cas-c614: detection result for the `apply_resource_contention_env`
+/// single-thread precondition check. `Ok(())` means the precondition holds
+/// (or could not be proven to fail on this platform); `Err(count)` means we
+/// observed >1 OS threads before the env-mutation call.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PreconditionError {
+    /// /proc/self/stat reported `num_threads` > 1.
+    ThreadsAlreadySpawned { count: u32 },
+}
+
+/// Guard latch preventing a second call to `apply_resource_contention_env`.
+/// Separate from thread-count detection: it catches the "two code paths both
+/// invoke the bridge, one of them after thread-spawn" failure mode even on
+/// platforms where `current_num_threads` returns `None`.
+static ENV_BRIDGE_INVOKED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+/// Returns `Ok(())` when the process appears single-threaded (or the thread
+/// count cannot be determined — fail-open on non-Linux). Returns
+/// `Err(PreconditionError::ThreadsAlreadySpawned{..})` when a `/proc/self/stat`
+/// read shows `num_threads` > 1.
+///
+/// Linux-only: on macOS / BSD / Windows we return `Ok(())` because there is
+/// no equally cheap thread-count probe; the guard still catches bugs on the
+/// primary developer + CI platform (Linux), which is the platform that
+/// stamped the adversarial-review P0.
+pub(crate) fn check_single_threaded_precondition() -> Result<(), PreconditionError> {
+    match current_num_threads() {
+        Some(n) if n > 1 => Err(PreconditionError::ThreadsAlreadySpawned { count: n }),
+        _ => Ok(()),
+    }
+}
+
+/// Reads `num_threads` from `/proc/self/stat` (field 20). Returns `None` on
+/// non-Linux targets or when the file cannot be read/parsed — callers treat
+/// `None` as "cannot prove a violation" and fall through.
+#[cfg(target_os = "linux")]
+fn current_num_threads() -> Option<u32> {
+    let data = std::fs::read_to_string("/proc/self/stat").ok()?;
+    parse_num_threads_from_proc_stat(&data)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn current_num_threads() -> Option<u32> {
+    None
+}
+
+/// Parses the `num_threads` field from a `/proc/<pid>/stat` line.
+///
+/// /proc/<pid>/stat is a space-separated record where field 2 (`comm`) is
+/// parenthesised and may itself contain spaces and parentheses. We split on
+/// the **last** `)` so anything after is safely whitespace-delimited.
+/// `num_threads` is field 20 in the overall record (4th after `comm`), which
+/// is index 17 after the split since the trailing fields start at index 0 =
+/// field 3 (`state`).
+fn parse_num_threads_from_proc_stat(data: &str) -> Option<u32> {
+    let after_comm = data.rsplit_once(')')?.1.trim_start();
+    // Index map (0-based, relative to after_comm):
+    //   0 -> field 3 (state)
+    //   1 -> field 4 (ppid)
+    //   ...
+    //   17 -> field 20 (num_threads)
+    after_comm.split_ascii_whitespace().nth(17)?.parse().ok()
 }
 
 /// Launch hierarchical multi-agent factory session
@@ -1208,5 +1298,115 @@ mod tests {
             .find_session_for_project(None, "/nonexistent/project/path")
             .unwrap();
         assert!(result.is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // cas-c614: single-thread precondition guard tests
+    // ------------------------------------------------------------------
+    //
+    // Scope: `check_single_threaded_precondition` and its parser helper.
+    // We do **not** exercise `apply_resource_contention_env` directly
+    // here because the `ENV_BRIDGE_INVOKED` OnceLock is process-global
+    // and the real `cli::run` call site may already have latched it in
+    // other test-harness configurations. The helper-level tests are
+    // sufficient to prove that a post-thread-spawn invocation would
+    // trip the debug-assert.
+
+    /// Fixture mirroring the shape of a real /proc/<pid>/stat line with
+    /// `num_threads = 1`. Field 20 (num_threads) is the fourth numeric
+    /// after the closing `)` in this layout.
+    const PROC_STAT_FIXTURE_1_THREAD: &str = "12345 (cas) S 1 12345 12345 \
+        0 -1 4194304 100 0 0 0 10 20 0 0 20 0 1 0 1000000 123456789 1024 \
+        18446744073709551615 1 1 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 \
+        0 0 0 0 0 0 0\n";
+
+    /// Same shape but with `num_threads = 4`.
+    const PROC_STAT_FIXTURE_4_THREADS: &str = "12345 (cas) S 1 12345 12345 \
+        0 -1 4194304 100 0 0 0 10 20 0 0 20 0 4 0 1000000 123456789 1024 \
+        18446744073709551615 1 1 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 \
+        0 0 0 0 0 0 0\n";
+
+    /// Fixture with a comm field containing spaces and inner parens,
+    /// which must be handled by splitting on the **last** `)`.
+    const PROC_STAT_FIXTURE_COMM_WITH_PARENS: &str = "42 (cas (factory)) S \
+        1 42 42 0 -1 4194304 100 0 0 0 10 20 0 0 20 0 2 0 1000000 123456789 \
+        1024 18446744073709551615 1 1 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 \
+        0 0 0 0 0 0 0 0\n";
+
+    #[test]
+    fn parse_num_threads_from_proc_stat_reads_field_20_when_one() {
+        assert_eq!(
+            parse_num_threads_from_proc_stat(PROC_STAT_FIXTURE_1_THREAD),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn parse_num_threads_from_proc_stat_reads_field_20_when_many() {
+        assert_eq!(
+            parse_num_threads_from_proc_stat(PROC_STAT_FIXTURE_4_THREADS),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn parse_num_threads_from_proc_stat_handles_comm_with_spaces_and_parens() {
+        assert_eq!(
+            parse_num_threads_from_proc_stat(PROC_STAT_FIXTURE_COMM_WITH_PARENS),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn parse_num_threads_from_proc_stat_rejects_malformed() {
+        assert_eq!(parse_num_threads_from_proc_stat(""), None);
+        assert_eq!(parse_num_threads_from_proc_stat("no closing paren"), None);
+        // Truncated after comm — no field 20.
+        assert_eq!(parse_num_threads_from_proc_stat("1 (cas) S 1 1"), None);
+    }
+
+    /// CORE AC: the guard trips when invoked from a context that has
+    /// already spawned a thread. Because the test harness itself may be
+    /// multi-threaded (cargo runs tests on a thread pool), asserting
+    /// from the test function's own thread is already sufficient proof
+    /// that `>= 2` threads visibly trips the check. On non-Linux
+    /// `current_num_threads` returns `None` and the helper is
+    /// fail-open — in that case the invariant still holds vacuously.
+    #[test]
+    fn check_single_threaded_precondition_trips_when_threads_spawned() {
+        // Spawn and join a helper thread to guarantee at least one
+        // additional thread existed while the probe was inflight. On
+        // Linux this deterministically produces num_threads >= 2 in
+        // /proc/self/stat for the duration of the spawn.
+        let handle = std::thread::spawn(|| check_single_threaded_precondition());
+        let from_spawned = handle.join().expect("helper thread must join");
+
+        #[cfg(target_os = "linux")]
+        {
+            // The helper thread itself runs inside a test harness that
+            // has >1 OS threads (cargo's test runner + rayon + tokio
+            // pools depending on features). So the probe from the
+            // spawned worker must observe >1 threads.
+            assert!(
+                matches!(
+                    from_spawned,
+                    Err(PreconditionError::ThreadsAlreadySpawned { count }) if count > 1
+                ),
+                "expected ThreadsAlreadySpawned from spawned thread, got {:?}",
+                from_spawned,
+            );
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            // On non-Linux the helper is fail-open; documenting that
+            // explicitly so a future port knows it needs a platform-
+            // specific probe.
+            assert!(
+                from_spawned.is_ok(),
+                "non-Linux platforms fail-open: check_single_threaded_precondition \
+                 must not invent errors it cannot prove",
+            );
+        }
     }
 }
