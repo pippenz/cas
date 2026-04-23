@@ -362,16 +362,25 @@ impl PtyConfig {
     }
 }
 
+/// Expected number of concurrent factory workers the CPU is being
+/// shared among when auto-computing `CARGO_BUILD_JOBS`. On a 16-thread
+/// dev box (soundwave, reference host for cas-4513 + cas-0bf4 evidence)
+/// this divides the CPU budget into 4 × 4-thread slices, which kept the
+/// host below scheduler saturation in the sessions where we observed
+/// the Claude Code JS crash-screen wedges.
+///
+/// Override the assumption by setting `CAS_FACTORY_CARGO_BUILD_JOBS`
+/// explicitly — e.g., a supervisor running 8 workers on a 16-thread
+/// host should export `CAS_FACTORY_CARGO_BUILD_JOBS=2`.
+const DEFAULT_WORKER_CONCURRENCY_ASSUMPTION: usize = 4;
+
 /// Compute the `CARGO_BUILD_JOBS` value to export into a worker's env.
 ///
 /// Precedence (first match wins):
 ///   1. `CAS_FACTORY_CARGO_BUILD_JOBS` env — set by the supervisor-side
 ///      factory config bridge from `factory.cargo_build_jobs` config.
 ///      Empty value or literal `"auto"` means "fall through to 2–4".
-///   2. Auto-compute: `max(2, available_parallelism() / 4)`. The "÷4"
-///      target is up to 4 concurrent factory workers, which has been
-///      the observed host-saturation threshold on 16-thread dev boxes
-///      (soundwave, cas-4513 + cas-0bf4 evidence).
+///   2. Auto-compute: `max(2, available_parallelism() / DEFAULT_WORKER_CONCURRENCY_ASSUMPTION)`.
 ///
 /// Returns `None` only when auto-compute fails to read CPU topology,
 /// which should be vanishingly rare. In that case we do NOT set
@@ -385,7 +394,7 @@ fn cargo_build_jobs_for_worker() -> Option<String> {
         }
     }
     let cores = std::thread::available_parallelism().ok()?.get();
-    let capped = std::cmp::max(2, cores / 4);
+    let capped = std::cmp::max(2, cores / DEFAULT_WORKER_CONCURRENCY_ASSUMPTION);
     Some(capped.to_string())
 }
 
