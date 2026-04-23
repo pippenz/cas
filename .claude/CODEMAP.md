@@ -30,8 +30,9 @@ store/               — Store wrappers: notifying_*, syncing_*, layered, detect
 hooks/handlers/handlers_events/  — Event-time handlers (pre_tool incl. supervisor Agent(isolation:worktree) block, codemap, notifications, attribution)
 hooks/handlers/handlers_middle/  — Mid-flow handlers (post_tool, prompt_capture, session_stop/)
 hooks/handlers/handlers_session.rs — SessionStart/SessionEnd handlers
+hooks/handlers/session_hygiene.rs  — Prior-factory WIP detection + banner injection (cas-aeec)
 hooks/handlers/handlers_state.rs   — Per-session state tracking
-hooks/handlers/handlers_tests/     — Hook handler test suite
+hooks/handlers/handlers_tests/     — Hook handler test suite (incl. send_message_autoroute, permission_request_factory, factory_auto_approve)
 hooks/scorer.rs      — Context item ranking for SessionStart injection
 hooks/context.rs     — Context building strategies (standard, AI-powered, plan)
 hooks/types.rs       — HookOutput / HookSpecificOutput schema types
