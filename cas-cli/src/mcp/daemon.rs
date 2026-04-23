@@ -884,7 +884,23 @@ impl EmbeddedDaemon {
                                 .and_then(|s| s.parse::<u64>().ok());
                             let alive = match expected_starttime {
                                 Some(expected) => pid_matches_fingerprint(cc_pid, expected),
-                                None => pid_alive(cc_pid),
+                                None => {
+                                    // Legacy fallback (supervisor feedback on cas-ea46):
+                                    // emit at warn! so ops investigators can spot
+                                    // agents registered before the pid_starttime
+                                    // fingerprint landed. These clear naturally as
+                                    // sessions cycle; a few days of noise is worth
+                                    // the visibility while the cohort drains.
+                                    tracing::warn!(
+                                        agent_id = %&id[..8.min(id.len())],
+                                        cc_pid = cc_pid,
+                                        "Agent pid registered but no pid_starttime \
+                                         fingerprint — falling back to pid-only liveness \
+                                         (cas-ea46). Recycle the session to activate \
+                                         PID-reuse protection."
+                                    );
+                                    pid_alive(cc_pid)
+                                }
                             };
                             if !alive {
                                 tracing::info!(
@@ -903,9 +919,10 @@ impl EmbeddedDaemon {
                         }
                         None => {
                             // Legacy agents registered before pid tracking fall through
-                            // to heartbeat; surface the gap at debug-level so it's
-                            // visible when diagnosing zombie-heartbeat cases.
-                            tracing::debug!(
+                            // to heartbeat; emit at warn! per supervisor feedback on
+                            // cas-ea46 so ops investigators can spot pre-cas-2749
+                            // agents. These clear naturally as sessions cycle.
+                            tracing::warn!(
                                 agent_id = %&id[..8.min(id.len())],
                                 "Agent has no registered CC pid — liveness gate skipped \
                                  (cas-2749). Heartbeat continues; consider re-registering \
