@@ -1049,7 +1049,7 @@ impl CasService {
 
 mod agent_search_system;
 mod core;
-mod factory_ops;
+pub(crate) mod factory_ops;
 mod factory_remind;
 mod panic_catch;
 #[cfg(test)]

@@ -380,6 +380,31 @@ When workers share the main directory, there's no branch merging — workers com
    ```
 4. Shutdown workers: `mcp__cas__coordination action=shutdown_workers count=0`
 
+## Is the worker actually dead? (cas-4513 triage)
+
+Before you run `shutdown_workers` on a pane that *looks* broken, spend 60 seconds on triage. The supervisor TUI is not ground truth for worker liveness — the most common false-positive failure mode is a worker that's mid-way through a long tool call or showing Claude Code's Bun/React-Ink crash screen (which leaves the process alive with an unresponsive UI). Destructive recovery on a live worker rips its worktree out from under itself and turns a recoverable hang into a real crash.
+
+**Step 1: classify.** `cas factory is-wedged <worker>` returns one of four states plus evidence and exits with a differentiated code:
+
+| Exit | State | What it means | Recovery |
+|---|---|---|---|
+| 0 | `alive` | PID up, transcript fresh, no crash signature — worker is running. | Wait. |
+| 1 | `wedged` | PID up, transcript fresh, Bun/React-Ink crash signature matched. | `cas factory kill` + respawn. |
+| 2 | `starved` | PID up, transcript cold (>60s since last write). Likely scheduler-starved or hung on a tool call. | Wait another 2 minutes, then re-classify. |
+| 3 | `dead` | PID gone. | Cleanup only — no kill needed. |
+
+The Bun/React-Ink crash signature is the visual fingerprint captured in the cas-4513 discovery note 2026-04-23 15:11 UTC: the pane fills with minified source paths like `/$bunfs/root/src/entrypoints/cli.js`, React-Ink `createElement("ink-box", ...)` enumerations, and a JS stack trace. The Bun event loop does NOT exit on unhandled rejection, so the PID stays alive and a daemon-faked heartbeat stays fresh — without the transcript grep you cannot distinguish this from a live worker mid-call.
+
+**Step 2: read the transcript tail.** `cas factory debug <worker> --tail 20` prints the last N JSONL entries from `~/.claude/projects/*/<session>.jsonl` without touching the TUI. This is the canonical "what did the worker just do" signal — use it to decide whether the wedged state has salvageable in-flight work before killing.
+
+**Step 3: recovery.** Only after `is-wedged` reports `wedged` or `dead`:
+
+- **Wedged:** `cas factory kill <worker>` — SIGKILL (SIGTERM is observed not to exit cleanly on the Bun wedge) and release the CAS lease. Idempotent on an already-dead process. Then respawn.
+- **Starved:** do not kill. Come back in 2 minutes; if it re-classifies as `wedged`, proceed to the kill path.
+- **Dead:** no kill needed. Run `mcp__cas__task action=reset id=<task>` on any leased task to hand it to a fresh worker.
+
+**Anti-pattern:** "pane looks broken → `shutdown_workers`". That pathway has destroyed in-progress work multiple times (silent-owl-56 2026-04-23 shipped cas-4181 through what looked like a crashed pane). The `is-wedged` / `debug` / `kill` triad replaces it.
+
 ## Worker Failure Recovery
 
 Workers fail in production. These are the three observed failure modes and their recovery procedures. All three have occurred in real factory sessions.
