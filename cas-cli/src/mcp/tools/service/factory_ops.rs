@@ -1021,14 +1021,6 @@ fn format_relative_time(dt: chrono::DateTime<chrono::Utc>) -> String {
     format!("{}d ago", diff.num_days())
 }
 
-/// Derive the Claude Code transcript path for an agent from its worktree clone
-/// path and session id.
-///
-/// Claude Code persists each session's JSONL transcript under
-/// `~/.claude/projects/<escaped-cwd>/<session-id>.jsonl`, where `<escaped-cwd>`
-/// is the absolute cwd with `/`, `.`, and `_` collapsed to `-`. Surfacing this
-/// path in `worker_status` lets a supervisor open the last in-flight tool call
-/// after a worker dies without manually reconstructing the escape (cas-2749).
 /// cas-8240 two-band liveness label for `factory_worker_status`:
 ///
 /// * `elapsed >= WORKER_DEAD_SECS` → `" [DEAD]"` (hard escalation —
@@ -1053,6 +1045,14 @@ fn liveness_label_for(elapsed_secs: i64) -> &'static str {
     }
 }
 
+/// Derive the Claude Code transcript path for an agent from its worktree clone
+/// path and session id.
+///
+/// Claude Code persists each session's JSONL transcript under
+/// `~/.claude/projects/<escaped-cwd>/<session-id>.jsonl`, where `<escaped-cwd>`
+/// is the absolute cwd with `/`, `.`, and `_` collapsed to `-`. Surfacing this
+/// path in `worker_status` lets a supervisor open the last in-flight tool call
+/// after a worker dies without manually reconstructing the escape (cas-2749).
 fn derive_transcript_path(clone_path: &str, session_id: &str) -> String {
     // Claude Code's `cwd` escape observed in the wild: both `/` and `.` are
     // collapsed to `-`. Example: `/home/a/.cas/worktrees/x` becomes
