@@ -42,6 +42,73 @@ fn test_agent_crud() {
     assert!(store.get("agent-test").is_err());
 }
 
+// --- cas-b157: typed pid_starttime field round-trips through INSERT/UPDATE/SELECT
+
+#[test]
+fn test_agent_pid_starttime_round_trips_through_register_and_update() {
+    let (_temp, store) = create_test_store();
+
+    // Register with pid_starttime set — INSERT path.
+    let mut agent = Agent::new("agent-pidrs".to_string(), "pid-rs".to_string());
+    agent.pid = Some(1234);
+    agent.pid_starttime = Some(1_616_103);
+    store.register(&agent).unwrap();
+
+    let retrieved = store.get("agent-pidrs").unwrap();
+    assert_eq!(
+        retrieved.pid_starttime,
+        Some(1_616_103),
+        "INSERT must persist pid_starttime and SELECT must read it back"
+    );
+
+    // Update path — different value.
+    let mut updated = retrieved;
+    updated.pid_starttime = Some(2_000_000);
+    store.update(&updated).unwrap();
+
+    let re_retrieved = store.get("agent-pidrs").unwrap();
+    assert_eq!(
+        re_retrieved.pid_starttime,
+        Some(2_000_000),
+        "UPDATE must overwrite pid_starttime"
+    );
+}
+
+#[test]
+fn test_agent_pid_starttime_none_round_trips_as_null() {
+    // Legacy / non-Linux path: no fingerprint → column is NULL → typed
+    // field reads back as None (not Some(0) or a parse-defaulted value).
+    let (_temp, store) = create_test_store();
+
+    let agent = Agent::new("agent-no-fp".to_string(), "no fingerprint".to_string());
+    assert!(agent.pid_starttime.is_none());
+    store.register(&agent).unwrap();
+
+    let retrieved = store.get("agent-no-fp").unwrap();
+    assert!(
+        retrieved.pid_starttime.is_none(),
+        "None must round-trip as SQL NULL, not coerced to Some(0)"
+    );
+}
+
+#[test]
+fn test_agent_pid_starttime_cleared_on_update_to_none() {
+    // Regression: an UPDATE that sets pid_starttime back to None must
+    // null the column — otherwise a worker that replaced its process
+    // would carry a stale fingerprint forever.
+    let (_temp, store) = create_test_store();
+
+    let mut agent = Agent::new("agent-clr".to_string(), "clear".to_string());
+    agent.pid_starttime = Some(42);
+    store.register(&agent).unwrap();
+    assert_eq!(store.get("agent-clr").unwrap().pid_starttime, Some(42));
+
+    let mut updated = agent.clone();
+    updated.pid_starttime = None;
+    store.update(&updated).unwrap();
+    assert!(store.get("agent-clr").unwrap().pid_starttime.is_none());
+}
+
 #[test]
 fn test_heartbeat() {
     let (_temp, store) = create_test_store();

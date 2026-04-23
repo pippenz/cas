@@ -10,7 +10,7 @@ impl SqliteAgentStore {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare_cached(
             "SELECT id, name, agent_type, role, status, pid, ppid, cc_session_id, parent_id,
-             machine_id, registered_at, last_heartbeat, active_tasks, metadata
+             machine_id, registered_at, last_heartbeat, active_tasks, metadata, pid_starttime
              FROM agents WHERE parent_id = ? AND status = 'active'
              ORDER BY registered_at DESC",
         )?;

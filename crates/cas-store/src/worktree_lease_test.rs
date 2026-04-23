@@ -39,7 +39,8 @@ mod tests {
                 last_heartbeat TEXT NOT NULL,
                 active_tasks INTEGER NOT NULL DEFAULT 0,
                 metadata TEXT NOT NULL DEFAULT '{}',
-                startup_confirmed INTEGER NOT NULL DEFAULT 0
+                startup_confirmed INTEGER NOT NULL DEFAULT 0,
+                pid_starttime INTEGER
             );
 
             -- Task leases table

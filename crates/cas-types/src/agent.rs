@@ -197,6 +197,28 @@ pub struct Agent {
     #[serde(default)]
     pub active_tasks: u32,
 
+    /// PID-reuse fingerprint — the `starttime` field (field 22) from
+    /// `/proc/<pid>/stat`, clock ticks since boot. Paired with
+    /// [`Agent::pid`] (and used by the daemon's liveness gate) to
+    /// distinguish "our PID is still alive" from "our PID died and the
+    /// kernel recycled it to an unrelated process".
+    ///
+    /// Promoted from `metadata[PID_STARTTIME_KEY]` to a typed field
+    /// (cas-b157 / EPIC cas-9508). The metadata key is still written as
+    /// a shadow entry for one release so agents registered on an older
+    /// binary and revived mid-flight keep working; the liveness gate
+    /// prefers this typed field and falls back to metadata when it is
+    /// `None`. Callers should populate via
+    /// `cas_cli::mcp::daemon::stamp_pid_fingerprint(&mut agent, pid)`,
+    /// which updates both the typed field and the metadata shadow
+    /// atomically.
+    ///
+    /// Linux-only in practice. `None` on non-Linux hosts (the daemon's
+    /// `read_pid_starttime` helper returns `None` there) and on
+    /// pre-migration legacy agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid_starttime: Option<u64>,
+
     /// Optional metadata (capabilities, version, etc.)
     #[serde(default)]
     pub metadata: std::collections::HashMap<String, String>,
@@ -223,6 +245,7 @@ impl Agent {
             registered_at: now,
             last_heartbeat: now,
             active_tasks: 0,
+            pid_starttime: None,
             metadata: std::collections::HashMap::new(),
         }
     }
