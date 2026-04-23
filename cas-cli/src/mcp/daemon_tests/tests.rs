@@ -545,8 +545,11 @@ fn all_agent_registration_sites_stamp_pid_fingerprint() {
         agent
     }
 
-    // To add a new registration site: append one (name, builder) pair. The
+    // CONTRACT: adding a row here is the ONLY thing you need to do when you
+    // add a new registration site. Append one (name, builder) pair; the
     // assertions below apply uniformly — same contract, same test.
+    // (See cas-389c for the real-fn-invocation follow-up that will make
+    // this catch a real site that forgets to stamp, not just a mirror.)
     let sites: &[(&str, AgentBuilder)] = &[
         ("daemon::register_agent (socket-driven)", socket_driven_register),
         ("server::register_agent_with_hints (self)", self_register_hints),
