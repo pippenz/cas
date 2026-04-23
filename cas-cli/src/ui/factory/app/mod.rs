@@ -470,7 +470,12 @@ impl FactoryApp {
         // Detect state changes BEFORE filtering so new epics are visible to the
         // event detector. This allows EpicStarted to fire and update epic_state,
         // which the filter depends on for subsequent refresh cycles.
-        let events = self.event_detector.detect_changes(&self.director_data);
+        // Pass the currently-tracked epic id so `EpicStarted` is gated on
+        // strict improvement: a stray zero-subtask Open-with-branch epic
+        // cannot hijack `epic_state` mid-session (see task cas-4181).
+        let events = self
+            .event_detector
+            .detect_changes(&self.director_data, self.epic_state.epic_id());
 
         // Update epic_state immediately from detected events so the filter below
         // uses the correct epic_id (otherwise a new epic's tasks get filtered out)
@@ -923,37 +928,18 @@ pub(crate) fn detect_epic_state(
     // Fall back to open epics that have a branch set (auto-created branch).
     // Prefer epics with active subtasks (in-progress > ready) over stale ones.
     // This prevents stale cross-project epics from shadowing the active epic.
-    {
-        let open_epics: Vec<_> = data
-            .epic_tasks
-            .iter()
-            .filter(|e| e.status == TaskStatus::Open && e.branch.is_some())
-            .collect();
-
-        if !open_epics.is_empty() {
-            // Count in-progress and ready subtasks per epic
-            let count_subtasks = |tasks: &[cas_factory::TaskSummary], epic_id: &str| -> usize {
-                tasks.iter().filter(|t| t.epic.as_deref() == Some(epic_id)).count()
-            };
-
-            if let Some(best) = open_epics.iter().max_by(|a, b| {
-                let a_ip = count_subtasks(&data.in_progress_tasks, &a.id);
-                let b_ip = count_subtasks(&data.in_progress_tasks, &b.id);
-                a_ip.cmp(&b_ip)
-                    .then_with(|| {
-                        let a_ready = count_subtasks(&data.ready_tasks, &a.id);
-                        let b_ready = count_subtasks(&data.ready_tasks, &b.id);
-                        a_ready.cmp(&b_ready)
-                    })
-                    // Deterministic tie-break: greatest ID last resort
-                    .then_with(|| a.id.cmp(&b.id))
-            }) {
-                return EpicState::Active {
-                    epic_id: best.id.clone(),
-                    epic_title: best.title.clone(),
-                };
-            }
-        }
+    // The picker is shared with the runtime EpicStarted event detector so the
+    // two paths cannot disagree on which Open-with-branch epic is "best" —
+    // divergence there caused a mid-session hijack bug (see task cas-4181).
+    if let Some(best) = crate::ui::factory::director::pick_best_open_branch_epic(
+        &data.epic_tasks,
+        &data.in_progress_tasks,
+        &data.ready_tasks,
+    ) {
+        return EpicState::Active {
+            epic_id: best.id.clone(),
+            epic_title: best.title.clone(),
+        };
     }
 
     // Completing state is transitioned to via handle_epic_events() when EpicCompleted fires
@@ -1061,7 +1047,7 @@ mod tests {
             epic_closed_counts: HashMap::new(),
         });
 
-        let events = detector.detect_changes(&data);
+        let events = detector.detect_changes(&data, None);
 
         // Verify EpicStarted was fired
         let epic_started = events.iter().any(|e| {
@@ -1346,5 +1332,309 @@ mod tests {
             }
             other => panic!("Expected Active, got {other:?}"),
         }
+    }
+
+    /// Regression test for cas-4181: factory TUI epic hijack.
+    ///
+    /// Two Open-with-branch epics exist:
+    ///   - `epic-aaa` — lex-earlier, has both in-progress and ready subtasks.
+    ///   - `epic-zzz` — lex-later, zero subtasks (the would-be hijacker).
+    ///
+    /// Before this fix, the runtime `EpicStarted` detector used a
+    /// "greatest-lex-ID wins" tiebreak that disagreed with the init path's
+    /// subtask-count heuristic. That caused `epic-zzz` to hijack the factory
+    /// panel mid-session. After the fix both paths share
+    /// `pick_best_open_branch_epic` and the active `epic-aaa` wins init;
+    /// the strict-improvement gate then blocks `epic-zzz` from firing
+    /// `EpicStarted` at all while `epic-aaa` is already the tracked epic.
+    #[test]
+    fn runtime_detector_does_not_hijack_active_epic_with_stray_open_branch_epic() {
+        use cas_factory::{EpicState, TaskSummary};
+        use cas_types::{Priority, TaskStatus, TaskType};
+
+        use super::{DirectorData, DirectorEvent, DirectorEventDetector};
+
+        let active_id = "epic-aaa";
+        let hijacker_id = "epic-zzz";
+
+        let data = DirectorData {
+            ready_tasks: vec![TaskSummary {
+                id: "task-ready".to_string(),
+                title: "Ready subtask of active epic".to_string(),
+                status: TaskStatus::Open,
+                priority: Priority::MEDIUM,
+                assignee: None,
+                task_type: TaskType::Task,
+                epic: Some(active_id.to_string()),
+                branch: None,
+            }],
+            in_progress_tasks: vec![TaskSummary {
+                id: "task-ip".to_string(),
+                title: "In-progress subtask of active epic".to_string(),
+                status: TaskStatus::InProgress,
+                priority: Priority::MEDIUM,
+                assignee: Some("worker-1".to_string()),
+                task_type: TaskType::Task,
+                epic: Some(active_id.to_string()),
+                branch: None,
+            }],
+            epic_tasks: vec![
+                TaskSummary {
+                    id: active_id.to_string(),
+                    title: "Active epic".to_string(),
+                    status: TaskStatus::Open,
+                    priority: Priority::MEDIUM,
+                    assignee: None,
+                    task_type: TaskType::Epic,
+                    epic: None,
+                    branch: Some("epic/active".to_string()),
+                },
+                TaskSummary {
+                    id: hijacker_id.to_string(),
+                    title: "Stray zero-subtask epic".to_string(),
+                    status: TaskStatus::Open,
+                    priority: Priority::MEDIUM,
+                    assignee: None,
+                    task_type: TaskType::Epic,
+                    epic: None,
+                    branch: Some("epic/hijacker".to_string()),
+                },
+            ],
+            agents: Vec::new(),
+            activity: Vec::new(),
+            agent_id_to_name: HashMap::new(),
+            changes: Vec::new(),
+            git_loaded: false,
+            reminders: Vec::new(),
+            epic_closed_counts: HashMap::new(),
+        };
+
+        // Init path: detect_epic_state must prefer the active (lex-earlier,
+        // has subtasks) epic over the stray lex-later one.
+        let state = super::detect_epic_state(&data, None);
+        match &state {
+            EpicState::Active { epic_id, .. } => {
+                assert_eq!(
+                    epic_id, active_id,
+                    "detect_epic_state must prefer the epic with active subtasks \
+                     regardless of lex-ID order (cas-4181 init path)"
+                );
+            }
+            other => panic!("Expected Active, got {other:?}"),
+        }
+
+        // Runtime path: event detector sees both epics as new Open-with-branch.
+        // With current_epic_id pointing at the active epic, the strict-improvement
+        // gate must suppress any EpicStarted for the stray hijacker.
+        let mut detector = DirectorEventDetector::new(
+            vec!["worker-1".to_string()],
+            "supervisor".to_string(),
+        );
+        detector.initialize(&DirectorData {
+            ready_tasks: Vec::new(),
+            in_progress_tasks: Vec::new(),
+            epic_tasks: Vec::new(),
+            agents: Vec::new(),
+            activity: Vec::new(),
+            agent_id_to_name: HashMap::new(),
+            changes: Vec::new(),
+            git_loaded: false,
+            reminders: Vec::new(),
+            epic_closed_counts: HashMap::new(),
+        });
+
+        let events = detector.detect_changes(&data, state.epic_id());
+
+        let hijack_started = events.iter().any(|e| {
+            matches!(
+                e,
+                DirectorEvent::EpicStarted { epic_id, .. } if epic_id == hijacker_id
+            )
+        });
+        assert!(
+            !hijack_started,
+            "EpicStarted must NOT fire for the zero-subtask hijacker epic \
+             while an active epic is already tracked (cas-4181 runtime path)"
+        );
+
+        // And the active epic itself should also not re-fire — it's already tracked.
+        let active_refired = events.iter().any(|e| {
+            matches!(
+                e,
+                DirectorEvent::EpicStarted { epic_id, .. } if epic_id == active_id
+            )
+        });
+        assert!(
+            !active_refired,
+            "EpicStarted must not refire for the already-tracked active epic"
+        );
+    }
+
+    /// If the currently-tracked epic is no longer present in `epic_tasks`
+    /// (closed, deleted, or cross-project filter drift) the strict-improvement
+    /// gate must treat the slot as vacant so a legitimate new Open-with-branch
+    /// epic can take over. Regression guard for the cas-4181 adversarial
+    /// "ghost current_epic_id freezes TUI" concern.
+    #[test]
+    fn runtime_detector_recovers_when_tracked_epic_disappears() {
+        use cas_factory::TaskSummary;
+        use cas_types::{Priority, TaskStatus, TaskType};
+
+        use super::{DirectorData, DirectorEvent, DirectorEventDetector};
+
+        let new_id = "epic-new";
+
+        let data = DirectorData {
+            ready_tasks: vec![TaskSummary {
+                id: "task-ready".to_string(),
+                title: "Ready subtask of new epic".to_string(),
+                status: TaskStatus::Open,
+                priority: Priority::MEDIUM,
+                assignee: None,
+                task_type: TaskType::Task,
+                epic: Some(new_id.to_string()),
+                branch: None,
+            }],
+            in_progress_tasks: Vec::new(),
+            epic_tasks: vec![TaskSummary {
+                id: new_id.to_string(),
+                title: "New epic".to_string(),
+                status: TaskStatus::Open,
+                priority: Priority::MEDIUM,
+                assignee: None,
+                task_type: TaskType::Epic,
+                epic: None,
+                branch: Some("epic/new".to_string()),
+            }],
+            agents: Vec::new(),
+            activity: Vec::new(),
+            agent_id_to_name: HashMap::new(),
+            changes: Vec::new(),
+            git_loaded: false,
+            reminders: Vec::new(),
+            epic_closed_counts: HashMap::new(),
+        };
+
+        let mut detector = DirectorEventDetector::new(
+            vec!["worker-1".to_string()],
+            "supervisor".to_string(),
+        );
+        detector.initialize(&DirectorData {
+            ready_tasks: Vec::new(),
+            in_progress_tasks: Vec::new(),
+            epic_tasks: Vec::new(),
+            agents: Vec::new(),
+            activity: Vec::new(),
+            agent_id_to_name: HashMap::new(),
+            changes: Vec::new(),
+            git_loaded: false,
+            reminders: Vec::new(),
+            epic_closed_counts: HashMap::new(),
+        });
+
+        // current_epic_id points at a ghost epic not in data.epic_tasks.
+        let events = detector.detect_changes(&data, Some("epic-ghost"));
+
+        let started_for_new = events.iter().any(|e| {
+            matches!(
+                e,
+                DirectorEvent::EpicStarted { epic_id, .. } if epic_id == new_id
+            )
+        });
+        assert!(
+            started_for_new,
+            "EpicStarted must fire for the legitimate new epic when the \
+             tracked current_epic_id refers to a ghost not in epic_tasks"
+        );
+    }
+
+    /// Sibling sanity test: when no epic is currently tracked (init-time
+    /// detect_changes), the runtime detector must pick the *same* best
+    /// Open-with-branch epic as `detect_epic_state` — not the lex-greatest.
+    #[test]
+    fn runtime_detector_picks_same_epic_as_init_when_no_current_epic() {
+        use cas_factory::TaskSummary;
+        use cas_types::{Priority, TaskStatus, TaskType};
+
+        use super::{DirectorData, DirectorEvent, DirectorEventDetector};
+
+        let active_id = "epic-aaa";
+        let hijacker_id = "epic-zzz";
+
+        let data = DirectorData {
+            ready_tasks: vec![TaskSummary {
+                id: "task-ready".to_string(),
+                title: "Ready subtask".to_string(),
+                status: TaskStatus::Open,
+                priority: Priority::MEDIUM,
+                assignee: None,
+                task_type: TaskType::Task,
+                epic: Some(active_id.to_string()),
+                branch: None,
+            }],
+            in_progress_tasks: Vec::new(),
+            epic_tasks: vec![
+                TaskSummary {
+                    id: active_id.to_string(),
+                    title: "Active epic".to_string(),
+                    status: TaskStatus::Open,
+                    priority: Priority::MEDIUM,
+                    assignee: None,
+                    task_type: TaskType::Epic,
+                    epic: None,
+                    branch: Some("epic/active".to_string()),
+                },
+                TaskSummary {
+                    id: hijacker_id.to_string(),
+                    title: "Stray epic".to_string(),
+                    status: TaskStatus::Open,
+                    priority: Priority::MEDIUM,
+                    assignee: None,
+                    task_type: TaskType::Epic,
+                    epic: None,
+                    branch: Some("epic/hijacker".to_string()),
+                },
+            ],
+            agents: Vec::new(),
+            activity: Vec::new(),
+            agent_id_to_name: HashMap::new(),
+            changes: Vec::new(),
+            git_loaded: false,
+            reminders: Vec::new(),
+            epic_closed_counts: HashMap::new(),
+        };
+
+        let mut detector = DirectorEventDetector::new(
+            vec!["worker-1".to_string()],
+            "supervisor".to_string(),
+        );
+        detector.initialize(&DirectorData {
+            ready_tasks: Vec::new(),
+            in_progress_tasks: Vec::new(),
+            epic_tasks: Vec::new(),
+            agents: Vec::new(),
+            activity: Vec::new(),
+            agent_id_to_name: HashMap::new(),
+            changes: Vec::new(),
+            git_loaded: false,
+            reminders: Vec::new(),
+            epic_closed_counts: HashMap::new(),
+        });
+
+        let events = detector.detect_changes(&data, None);
+
+        let started_for: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                DirectorEvent::EpicStarted { epic_id, .. } => Some(epic_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            started_for,
+            vec![active_id],
+            "with no current epic, EpicStarted must fire for the subtask-winning \
+             epic, not the lex-greatest one (cas-4181)"
+        );
     }
 }

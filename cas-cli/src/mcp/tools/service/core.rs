@@ -449,6 +449,16 @@ impl CasService {
         self.inner.cas_task_release(Parameters(inner_req)).await
     }
 
+    pub(super) async fn task_reset(&self, req: TaskRequest) -> Result<CallToolResult, McpError> {
+        use crate::mcp::tools::TaskReleaseRequest;
+        let inner_req = TaskReleaseRequest {
+            task_id: req
+                .id
+                .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required — pass as `id` (not `task_id`, `taskId`, or `_id`). Example: mcp__cas__task action=reset id=cas-abc1"))?,
+        };
+        self.inner.cas_task_reset(Parameters(inner_req)).await
+    }
+
     pub(super) async fn task_transfer(&self, req: TaskRequest) -> Result<CallToolResult, McpError> {
         use crate::mcp::tools::TaskTransferRequest;
         let inner_req = TaskTransferRequest {

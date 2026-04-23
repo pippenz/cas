@@ -773,7 +773,43 @@ impl CasCore {
         //     overrides because that would mask a misconfigured
         //     harness.
         let close_project_root = self.cas_root.parent().unwrap_or(&self.cas_root);
-        match run_code_review_gate(&task, &req, close_project_root) {
+
+        // cas-3086: Epic-close should not re-gate on the union diff
+        // when every subtask already carries a valid ReviewOutcome
+        // receipt (persisted on deliverables.review_envelope). The
+        // subtasks were each individually reviewed before their own
+        // close; running the multi-persona reviewer on the unioned
+        // diff is redundant cost and wrong-shape signal.
+        let epic_subtask_receipts_cover = if task.task_type == TaskType::Epic {
+            use cas_store::code_review::close_gate::{GateDecision, evaluate_gate};
+            match task_store.get_subtasks(&req.id) {
+                Ok(subtasks) if !subtasks.is_empty() => subtasks.iter().all(|t| {
+                    t.deliverables
+                        .review_envelope
+                        .as_deref()
+                        .and_then(|e| serde_json::from_str::<cas_types::ReviewOutcome>(e).ok())
+                        .filter(|o| o.validate().is_ok())
+                        // Defense-in-depth (per verifier): a receipt
+                        // with a residual P0 must not let the epic-close
+                        // bypass the gate, even though such a subtask
+                        // shouldn't have been closed in the first place.
+                        // Guards against direct DB writes or bugs that
+                        // leak P0s past the subtask gate.
+                        .map(|o| matches!(evaluate_gate(&o.residual), GateDecision::Allow))
+                        .unwrap_or(false)
+                }),
+                _ => false,
+            }
+        } else {
+            false
+        };
+
+        let gate_outcome = if epic_subtask_receipts_cover {
+            CodeReviewGateOutcome::Proceed
+        } else {
+            run_code_review_gate(&task, &req, close_project_root)
+        };
+        match gate_outcome {
             CodeReviewGateOutcome::Proceed => {}
             CodeReviewGateOutcome::AppendDecisionNote(note) => {
                 let mut t = task.clone();
@@ -2267,5 +2303,75 @@ mod code_review_gate_tests {
         // Non-git dir → has_reviewable_changes returns false → skip.
         let out = run_code_review_gate(&t, &req, dir.path());
         assert!(matches!(out, CodeReviewGateOutcome::Proceed));
+    }
+
+    // --- cas-3086: persisted-envelope fallback ------------------------------
+
+    #[test]
+    fn persisted_envelope_satisfies_gate_when_req_missing() {
+        // Simulates supervisor-close: the worker persisted a clean
+        // envelope on a prior (jailed) close attempt; supervisor
+        // calls close without re-running review and without
+        // bypass_code_review=true.
+        let _g = env_lock();
+        let dir = repo_with_staged(&[("src/foo.rs", "fn new() {}\n")]);
+        let mut t = base_task();
+        t.deliverables.review_envelope = Some(autofix_envelope(Vec::new()));
+        let req = base_req(&t.id); // no findings in request
+        let out = run_code_review_gate(&t, &req, dir.path());
+        assert!(
+            matches!(out, CodeReviewGateOutcome::Proceed),
+            "persisted clean envelope must let supervisor-close proceed without bypass"
+        );
+    }
+
+    #[test]
+    fn persisted_envelope_with_p0_still_blocks() {
+        // Forwarding a receipt does not weaken the P0 gate.
+        let _g = env_lock();
+        let dir = repo_with_staged(&[("src/foo.rs", "fn new() {}\n")]);
+        let mut t = base_task();
+        t.deliverables.review_envelope = Some(autofix_envelope(vec![p0_finding()]));
+        let req = base_req(&t.id);
+        let out = run_code_review_gate(&t, &req, dir.path());
+        match out {
+            CodeReviewGateOutcome::Reject(msg) => {
+                assert!(msg.contains("P0 BLOCK"), "P0 must still block: {msg}");
+            }
+            other => panic!("expected P0 block on persisted envelope, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn request_envelope_takes_precedence_over_persisted() {
+        // If the caller sends a fresh envelope, that's what the gate
+        // sees — the persisted one is a fallback, not a merge.
+        let _g = env_lock();
+        let dir = repo_with_staged(&[("src/foo.rs", "fn new() {}\n")]);
+        let mut t = base_task();
+        // Persisted envelope has a P0 — would block if chosen.
+        t.deliverables.review_envelope = Some(autofix_envelope(vec![p0_finding()]));
+        let mut req = base_req(&t.id);
+        // Request envelope is clean — should let the close proceed.
+        req.code_review_findings = Some(autofix_envelope(Vec::new()));
+        let out = run_code_review_gate(&t, &req, dir.path());
+        assert!(
+            matches!(out, CodeReviewGateOutcome::Proceed),
+            "explicit request envelope must win over persisted fallback"
+        );
+    }
+
+    #[test]
+    fn persisted_malformed_envelope_is_rejected() {
+        let _g = env_lock();
+        let dir = repo_with_staged(&[("src/foo.rs", "fn new() {}\n")]);
+        let mut t = base_task();
+        t.deliverables.review_envelope = Some("not-json".to_string());
+        let req = base_req(&t.id);
+        let out = run_code_review_gate(&t, &req, dir.path());
+        assert!(
+            matches!(out, CodeReviewGateOutcome::Reject(_)),
+            "malformed persisted envelope must be rejected, not silently bypassed"
+        );
     }
 }

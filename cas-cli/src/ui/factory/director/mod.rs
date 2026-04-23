@@ -19,6 +19,7 @@ pub(crate) mod tasks;
 
 pub use data::{AgentSummary, DirectorData, DirectorStores, TaskSummary};
 pub use events::{DirectorEvent, DirectorEventDetector};
+pub(crate) use events::pick_best_open_branch_epic;
 pub use panel::PanelRegistry;
 pub use prompts::{Prompt, generate_prompt, with_response_instructions};
 // PanelAreas, SidecarFocus, SidecarState, ViewMode, DiffLine, DiffLineType, render, render_with_state are already public in this module

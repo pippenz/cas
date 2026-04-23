@@ -220,6 +220,27 @@ pub fn handle_session_start(
         context
     };
 
+    // Factory session-start hygiene triage (task cas-aeec): for supervisor
+    // sessions, append a banner listing uncommitted files in the main
+    // worktree with per-file last-touching-task-id attribution. Visibility
+    // only — the supervisor decides salvage / commit / discard before
+    // spawning workers. Best-effort: git failures, non-supervisor roles,
+    // and clean trees all fall through silently.
+    //
+    // Appended (not prepended) so codemap and project-overview retain the
+    // preview top slot they are explicitly engineered to land in (see
+    // comments above). The banner is not severity-ranked against those
+    // modules, so it sits below them in the supervisor's initial view.
+    let context = if is_supervisor {
+        match crate::hooks::handlers::session_hygiene::build_session_start_wip_banner(cas_root) {
+            Some(banner) if context.is_empty() => banner,
+            Some(banner) => format!("{context}\n{banner}"),
+            None => context,
+        }
+    } else {
+        context
+    };
+
     let output = if context.is_empty() {
         HookOutput::empty()
     } else {
@@ -291,6 +312,26 @@ pub fn handle_session_end(
 
     // Clean up agent leases and reset task status - ALWAYS do this regardless of observation count
     cleanup_agent_leases(cas_root, &input.session_id);
+
+    // Factory session hygiene (task cas-a9ab): append a durable manifest of
+    // the main worktree's uncommitted state so the next supervisor can see
+    // what was left behind if this session died mid-task. Best-effort —
+    // never let hygiene logging break session-end.
+    {
+        let agent_name = std::env::var("CAS_AGENT_NAME").ok();
+        let agent_role = std::env::var("CAS_AGENT_ROLE").ok();
+        if let Some(path) = crate::hooks::handlers::session_hygiene::write_session_end_manifest(
+            cas_root,
+            &input.session_id,
+            agent_name.as_deref(),
+            agent_role.as_deref(),
+        ) {
+            eprintln!(
+                "cas: Wrote session-end manifest to {}",
+                path.display()
+            );
+        }
+    }
 
     // Notify daemon via socket that session ended
     #[cfg(feature = "mcp-server")]

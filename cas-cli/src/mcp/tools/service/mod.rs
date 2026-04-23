@@ -247,7 +247,7 @@ impl CasService {
     // ========================================================================
 
     #[tool(
-        description = "Task operations. Actions: create, show, update, start, close, reopen, delete, list, ready (actionable), blocked, notes (add progress), dep_add, dep_remove, dep_list, claim, release, transfer, available, mine. Prefer `start` for normal worker execution; use `claim` for manual lease control/recovery. IMPORTANT for 'close': verification must pass first. Workers should attempt close; if close returns verification-required guidance, follow the indicated verifier ownership workflow."
+        description = "Task operations. Actions: create, show, update, start, close, reopen, delete, list, ready (actionable), blocked, notes (add progress), dep_add, dep_remove, dep_list, claim, release, reset, transfer, available, mine. Prefer `start` for normal worker execution; use `claim` for manual lease control/recovery; use `reset` to revive a task orphaned by a dead session (atomic: force-releases lease, clears assignee, forces status=open). IMPORTANT for 'close': verification must pass first. Workers should attempt close; if close returns verification-required guidance, follow the indicated verifier ownership workflow."
     )]
     pub async fn task(
         &self,
@@ -269,6 +269,7 @@ impl CasService {
                     | "dep_remove"
                     | "claim"
                     | "release"
+                    | "reset"
                     | "transfer"
             );
 
@@ -293,13 +294,14 @@ impl CasService {
                 "dep_list" => this.task_dep_list(req).await,
                 "claim" => this.task_claim(req).await,
                 "release" => this.task_release(req).await,
+                "reset" => this.task_reset(req).await,
                 "transfer" => this.task_transfer(req).await,
                 "available" => this.task_available(req).await,
                 "mine" => this.task_mine(req).await,
                 _ => Err(Self::error(
                     ErrorCode::INVALID_PARAMS,
                     format!(
-                        "Unknown task action: {}. Valid: create, show, update, start, close, reopen, delete, list, ready, blocked, notes, dep_add, dep_remove, dep_list, claim, release, transfer, available, mine",
+                        "Unknown task action: {}. Valid: create, show, update, start, close, reopen, delete, list, ready, blocked, notes, dep_add, dep_remove, dep_list, claim, release, reset, transfer, available, mine",
                         req.action
                     ),
                 )),
