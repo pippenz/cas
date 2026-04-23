@@ -575,6 +575,142 @@ fn all_agent_registration_sites_stamp_pid_fingerprint() {
     }
 }
 
+// =========================================================================
+// Source-scanning invariant: every real `agent.pid = Some(...)` must be
+// followed by a `stamp_pid_fingerprint` call (cas-389c)
+// =========================================================================
+//
+// The table-driven registration-site parity test above uses mirror builders
+// that reimplement the (pid + stamp) shape locally. If a real site drops
+// the stamp, the mirror still passes — exactly the antipattern cas-389c
+// exists to close (per MEMORY.md feedback_verify_writer_and_reader, same
+// class of gap that shipped cas-3086 with reader+tests but no writer).
+//
+// This test scans cas-cli/src recursively for every `agent.pid = Some(`
+// line in PRODUCTION code (skipping test files, doc comments, and the
+// helper itself) and asserts that `stamp_pid_fingerprint` appears within
+// a short window of lines below it. A real site that forgets to stamp
+// fails this test at compile+run time, giving us the writer-exists guard
+// the mirror test cannot provide.
+//
+// AC from cas-389c: "temporarily comment the stamp at one real site → the
+// new test must fail." Verified before ship.
+
+#[test]
+fn every_production_agent_pid_assignment_has_nearby_fingerprint_stamp() {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    /// Recursively collect all .rs files under `dir`.
+    fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_rs_files(&path, out);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    // Resolve cas-cli/src relative to this file. CARGO_MANIFEST_DIR points at
+    // cas-cli/ so append `src/`.
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
+        .expect("CARGO_MANIFEST_DIR must be set in cargo test context");
+    let src_root = PathBuf::from(manifest_dir).join("src");
+    assert!(
+        src_root.exists(),
+        "cas-cli/src must exist at {}",
+        src_root.display()
+    );
+
+    let mut rs_files = Vec::new();
+    collect_rs_files(&src_root, &mut rs_files);
+    assert!(
+        !rs_files.is_empty(),
+        "source walk must find .rs files under {}",
+        src_root.display()
+    );
+
+    // How many lines AFTER an `agent.pid = Some(` line can the stamp call
+    // appear? 10 is comfortable — real sites today stamp within 2 lines.
+    const WINDOW: usize = 10;
+    // The regex-free needle we search for. Exact spelling tolerates
+    // trailing whitespace but nothing else. If the helper is ever renamed,
+    // update this constant and the test message.
+    const STAMP_NEEDLE: &str = "stamp_pid_fingerprint";
+    const PID_NEEDLE: &str = "agent.pid = Some(";
+
+    let mut violations: Vec<String> = Vec::new();
+    let mut sites_checked = 0usize;
+
+    for path in &rs_files {
+        // Skip test modules and the source-scanning test itself — the
+        // invariant applies to production registration sites only.
+        let path_str = path.to_string_lossy();
+        let is_test_file = path_str.contains("_tests/") || path_str.ends_with("_tests.rs");
+        if is_test_file {
+            continue;
+        }
+
+        let Ok(contents) = fs::read_to_string(path) else {
+            continue;
+        };
+        let lines: Vec<&str> = contents.lines().collect();
+        for (lineno, line) in lines.iter().enumerate() {
+            // Strip leading whitespace to match indentation-invariant. Skip
+            // lines that begin with `//` so doc/comment mentions of the
+            // pattern don't trip the scan.
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            if !line.contains(PID_NEEDLE) {
+                continue;
+            }
+            sites_checked += 1;
+
+            // Look at this line and the next WINDOW lines for the stamp
+            // call. This tolerates a few intervening fields being set
+            // between `agent.pid = Some(...)` and the stamp.
+            let stamp_found = lines
+                .iter()
+                .skip(lineno)
+                .take(WINDOW + 1)
+                .any(|l| l.contains(STAMP_NEEDLE));
+            if !stamp_found {
+                violations.push(format!(
+                    "{}:{} — `{PID_NEEDLE}` without `{STAMP_NEEDLE}` within {WINDOW} lines below",
+                    path.strip_prefix(&src_root).unwrap_or(path).display(),
+                    lineno + 1,
+                ));
+            }
+        }
+    }
+
+    assert!(
+        sites_checked > 0,
+        "scan must find at least one `{PID_NEEDLE}` occurrence — either the \
+         needle drifted (rename?), the scan path is wrong, or all sites were \
+         refactored out (update this test)"
+    );
+
+    assert!(
+        violations.is_empty(),
+        "cas-389c invariant violated: {} production site(s) set `agent.pid` \
+         without a nearby `{STAMP_NEEDLE}` call — adding a pid without a \
+         fingerprint silently disables PID-reuse protection for that agent. \
+         Violations:\n  {}\n\n\
+         Fix: call `crate::mcp::daemon::stamp_pid_fingerprint(&mut agent, pid)` \
+         immediately after the `agent.pid = Some(pid);` line.",
+        violations.len(),
+        violations.join("\n  ")
+    );
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn stamp_pid_fingerprint_writes_metadata_for_self() {
