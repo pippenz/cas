@@ -2166,3 +2166,162 @@ code_review_findings: None,
         timed_out.summary
     );
 }
+
+/// cas-3086: end-to-end. A worker runs cas-code-review, passes the clean
+/// ReviewOutcome envelope into `task.close`, and the close is rejected on
+/// the verification jail. The envelope must be persisted on the task's
+/// deliverables. A follow-up supervisor close — verification already
+/// approved, **no** `bypass_code_review=true`, **no** `code_review_findings`
+/// replayed — must succeed because the persisted receipt is forwarded
+/// into the gate.
+///
+/// This is the expensive-bypass cycle Report §7 is killing: before this
+/// fix, supervisor-close had to either set `bypass_code_review=true`
+/// (wrong-shape audit) or re-invoke the multi-persona reviewer ($0.30–0.50
+/// per retry) even though the worker had already run the review.
+#[tokio::test]
+async fn test_close_forwards_persisted_review_envelope_after_jail() {
+    use std::process::Command;
+
+    let (temp, service) = setup_cas();
+    let _env_lock = env_test_lock();
+    let cas_dir = temp.path().join(".cas");
+    let task_store = open_task_store(&cas_dir).unwrap();
+    let verification_store = open_verification_store(&cas_dir).unwrap();
+
+    // Make the project root (cas_root.parent()) a real git repo with
+    // staged code changes so the cas-code-review gate actually fires —
+    // otherwise `has_reviewable_changes` returns false and the gate
+    // silently skips, which would mask the forwarded-envelope logic.
+    let project_root = temp.path();
+    let git = |args: &[&str]| {
+        let ok = Command::new("git")
+            .args(args)
+            .current_dir(project_root)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .status()
+            .expect("git")
+            .success();
+        assert!(ok, "git {args:?} failed");
+    };
+    git(&["init", "-q", "-b", "main"]);
+    std::fs::write(project_root.join("seed.txt"), "seed\n").unwrap();
+    git(&["add", "seed.txt"]);
+    git(&["commit", "-q", "-m", "seed"]);
+    // Stage a real code change so is_reviewable_path returns true.
+    std::fs::create_dir_all(project_root.join("src")).unwrap();
+    std::fs::write(project_root.join("src/lib.rs"), "fn f() {}\n").unwrap();
+    git(&["add", "src/lib.rs"]);
+
+    let req = TaskCreateRequest {
+        title: "cas-3086: persisted-envelope forwarding".to_string(),
+        description: None,
+        priority: 2,
+        task_type: "task".to_string(),
+        labels: None,
+        notes: None,
+        blocked_by: None,
+        design: None,
+        acceptance_criteria: None,
+        external_ref: None,
+        assignee: None,
+        demo_statement: None,
+        execution_note: None,
+        epic: None,
+    };
+    let id = extract_task_id(&extract_text(
+        service
+            .cas_task_create(Parameters(req))
+            .await
+            .expect("task_create"),
+    ))
+    .expect("task id")
+    .to_string();
+
+    {
+        let mut t = task_store.get(&id).expect("task exists");
+        t.status = cas::types::TaskStatus::InProgress;
+        task_store.update(&t).expect("update");
+    }
+
+    // Worker builds a clean envelope (zero residual findings) and hands
+    // it in on the first close attempt.
+    let clean_envelope = serde_json::json!({
+        "residual": [],
+        "pre_existing": [],
+        "mode": "autofix",
+    })
+    .to_string();
+
+    let first_close_text = extract_text(
+        service
+            .cas_task_close(Parameters(TaskCloseRequest {
+                id: id.clone(),
+                reason: Some("worker ran review, retrying close".to_string()),
+                bypass_code_review: None,
+                code_review_findings: Some(clean_envelope.clone()),
+            }))
+            .await
+            .expect("close returns"),
+    );
+    assert!(
+        first_close_text.contains("VERIFICATION REQUIRED"),
+        "first close must hit verification jail: {first_close_text}"
+    );
+
+    // The envelope must have been persisted on the task BEFORE the jail
+    // rejection ran. This is the cas-3086 invariant: worker's review
+    // receipt survives unrelated close-gate rejections.
+    let after_jail = task_store.get(&id).expect("task exists");
+    assert_eq!(
+        after_jail.deliverables.review_envelope.as_deref(),
+        Some(clean_envelope.as_str()),
+        "envelope must be persisted even when close is rejected on the verification jail"
+    );
+
+    // Simulate the task-verifier subagent writing an approved verdict.
+    let ver = Verification::approved(
+        "ver-cas-3086".to_string(),
+        id.clone(),
+        "verified".to_string(),
+    );
+    verification_store.add(&ver).expect("add verification");
+
+    // Supervisor closes — no bypass_code_review, no code_review_findings.
+    // Pre-fix: gate would return CODE_REVIEW_REQUIRED because the
+    // request has no envelope and nothing was persisted. Post-fix: the
+    // persisted envelope is forwarded, the gate proceeds.
+    let _guard = ScopedSupervisorEnv::new();
+    let supervisor_close_text = extract_text(
+        service
+            .cas_task_close(Parameters(TaskCloseRequest {
+                id: id.clone(),
+                reason: Some("closing on worker's behalf; review already passed".to_string()),
+                bypass_code_review: None,
+                code_review_findings: None,
+            }))
+            .await
+            .expect("supervisor close returns"),
+    );
+
+    assert!(
+        supervisor_close_text.contains("Closed"),
+        "supervisor close must succeed via forwarded envelope: {supervisor_close_text}"
+    );
+    assert!(
+        !supervisor_close_text.contains("CODE_REVIEW_REQUIRED"),
+        "supervisor close must NOT demand a fresh envelope: {supervisor_close_text}"
+    );
+    assert!(
+        !supervisor_close_text.contains("bypass_code_review"),
+        "supervisor close should not have needed the bypass path: {supervisor_close_text}"
+    );
+
+    let closed = task_store.get(&id).expect("task exists");
+    assert_eq!(closed.status, cas::types::TaskStatus::Closed);
+}

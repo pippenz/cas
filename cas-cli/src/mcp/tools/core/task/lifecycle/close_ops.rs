@@ -2268,4 +2268,74 @@ mod code_review_gate_tests {
         let out = run_code_review_gate(&t, &req, dir.path());
         assert!(matches!(out, CodeReviewGateOutcome::Proceed));
     }
+
+    // --- cas-3086: persisted-envelope fallback ------------------------------
+
+    #[test]
+    fn persisted_envelope_satisfies_gate_when_req_missing() {
+        // Simulates supervisor-close: the worker persisted a clean
+        // envelope on a prior (jailed) close attempt; supervisor
+        // calls close without re-running review and without
+        // bypass_code_review=true.
+        let _g = env_lock();
+        let dir = repo_with_staged(&[("src/foo.rs", "fn new() {}\n")]);
+        let mut t = base_task();
+        t.deliverables.review_envelope = Some(autofix_envelope(Vec::new()));
+        let req = base_req(&t.id); // no findings in request
+        let out = run_code_review_gate(&t, &req, dir.path());
+        assert!(
+            matches!(out, CodeReviewGateOutcome::Proceed),
+            "persisted clean envelope must let supervisor-close proceed without bypass"
+        );
+    }
+
+    #[test]
+    fn persisted_envelope_with_p0_still_blocks() {
+        // Forwarding a receipt does not weaken the P0 gate.
+        let _g = env_lock();
+        let dir = repo_with_staged(&[("src/foo.rs", "fn new() {}\n")]);
+        let mut t = base_task();
+        t.deliverables.review_envelope = Some(autofix_envelope(vec![p0_finding()]));
+        let req = base_req(&t.id);
+        let out = run_code_review_gate(&t, &req, dir.path());
+        match out {
+            CodeReviewGateOutcome::Reject(msg) => {
+                assert!(msg.contains("P0 BLOCK"), "P0 must still block: {msg}");
+            }
+            other => panic!("expected P0 block on persisted envelope, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn request_envelope_takes_precedence_over_persisted() {
+        // If the caller sends a fresh envelope, that's what the gate
+        // sees — the persisted one is a fallback, not a merge.
+        let _g = env_lock();
+        let dir = repo_with_staged(&[("src/foo.rs", "fn new() {}\n")]);
+        let mut t = base_task();
+        // Persisted envelope has a P0 — would block if chosen.
+        t.deliverables.review_envelope = Some(autofix_envelope(vec![p0_finding()]));
+        let mut req = base_req(&t.id);
+        // Request envelope is clean — should let the close proceed.
+        req.code_review_findings = Some(autofix_envelope(Vec::new()));
+        let out = run_code_review_gate(&t, &req, dir.path());
+        assert!(
+            matches!(out, CodeReviewGateOutcome::Proceed),
+            "explicit request envelope must win over persisted fallback"
+        );
+    }
+
+    #[test]
+    fn persisted_malformed_envelope_is_rejected() {
+        let _g = env_lock();
+        let dir = repo_with_staged(&[("src/foo.rs", "fn new() {}\n")]);
+        let mut t = base_task();
+        t.deliverables.review_envelope = Some("not-json".to_string());
+        let req = base_req(&t.id);
+        let out = run_code_review_gate(&t, &req, dir.path());
+        assert!(
+            matches!(out, CodeReviewGateOutcome::Reject(_)),
+            "malformed persisted envelope must be rejected, not silently bypassed"
+        );
+    }
 }
