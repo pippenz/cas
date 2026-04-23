@@ -493,6 +493,109 @@ fn evaluate_liveness_non_linux_fallback_live_pid_unreadable_proc() {
     );
 }
 
+// --- cas-b157: typed pid_starttime preferred, metadata fallback kept ----
+
+#[test]
+fn evaluate_liveness_prefers_typed_pid_starttime_over_metadata() {
+    // cas-b157: when BOTH the typed field and the legacy metadata key
+    // are present, the typed field wins. The fingerprint fn must be
+    // called with the TYPED value, not the metadata value — otherwise
+    // a worker that upgraded mid-flight would still rely on whatever
+    // the legacy metadata held, defeating the typed promotion.
+    let mut agent = make_test_agent(Some(5555), Some("11111"));
+    agent.pid_starttime = Some(22222);
+
+    let outcome = evaluate_liveness(
+        &agent,
+        |_| panic!("pid_alive must not be consulted when a fingerprint is present"),
+        |pid, st| {
+            assert_eq!((pid, st), (5555u32, 22222u64), "typed field must take precedence over metadata");
+            true
+        },
+    );
+    assert_eq!(
+        outcome,
+        LivenessOutcome::Alive {
+            cc_pid: 5555,
+            fingerprint_checked: true
+        }
+    );
+}
+
+#[test]
+fn evaluate_liveness_falls_back_to_metadata_when_typed_is_none() {
+    // cas-b157: legacy agents registered before the typed-field
+    // migration still carry their fingerprint in `metadata`. When
+    // `pid_starttime` is None but the metadata key parses, the gate
+    // must still perform the strict check against the metadata value.
+    let mut agent = make_test_agent(Some(7777), Some("33333"));
+    agent.pid_starttime = None;
+
+    let outcome = evaluate_liveness(
+        &agent,
+        |_| panic!("pid_alive must not be consulted when metadata fingerprint parses"),
+        |pid, st| {
+            assert_eq!((pid, st), (7777u32, 33333u64), "metadata fallback must drive fingerprint fn");
+            true
+        },
+    );
+    assert_eq!(
+        outcome,
+        LivenessOutcome::Alive {
+            cc_pid: 7777,
+            fingerprint_checked: true
+        }
+    );
+}
+
+#[test]
+fn evaluate_liveness_typed_none_with_malformed_metadata_pid_only() {
+    // cas-b157: neither source yields a usable fingerprint (typed is
+    // None, metadata is garbage). Gate degrades to pid-only as before.
+    let mut agent = make_test_agent(Some(9999), Some("not-a-number"));
+    agent.pid_starttime = None;
+
+    let outcome = evaluate_liveness(
+        &agent,
+        |pid| {
+            assert_eq!(pid, 9999);
+            true
+        },
+        |_, _| panic!("fingerprint fn must not be called without a parseable fingerprint"),
+    );
+    assert_eq!(
+        outcome,
+        LivenessOutcome::Alive {
+            cc_pid: 9999,
+            fingerprint_checked: false
+        }
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn stamp_pid_fingerprint_writes_both_typed_and_metadata_shadow() {
+    // cas-b157: stamp must populate BOTH the typed field AND the
+    // metadata shadow entry so legacy readers on an older binary that
+    // restart the daemon mid-flight still see the fingerprint.
+    let mut agent = crate::types::Agent::new("a".to_string(), "a".to_string());
+    let pid = std::process::id();
+
+    crate::mcp::daemon::stamp_pid_fingerprint(&mut agent, pid);
+
+    let typed = agent.pid_starttime.expect("typed field must be populated");
+    let meta: u64 = agent
+        .metadata
+        .get(crate::mcp::daemon::PID_STARTTIME_KEY)
+        .expect("metadata shadow must be populated")
+        .parse()
+        .expect("metadata shadow must parse as u64");
+    assert_eq!(
+        typed, meta,
+        "typed field and metadata shadow must agree on the same starttime"
+    );
+}
+
 // =========================================================================
 // Registration-site fingerprint-stamp parity (cas-5b1c)
 // =========================================================================

@@ -1103,11 +1103,20 @@ pub(crate) enum LivenessOutcome {
 ///
 /// Selection logic:
 /// - `agent.pid == None` → `NoPidRecorded` (legacy cas-2749 cohort).
-/// - `agent.pid == Some(pid)` + `metadata[PID_STARTTIME_KEY]` parses as u64:
+/// - `agent.pid == Some(pid)` + fingerprint resolvable (see below):
 ///   strict (pid, starttime) check via `fingerprint_matches_fn`.
 /// - `agent.pid == Some(pid)` + no/malformed fingerprint: pid-only liveness
 ///   via `pid_alive_fn` → `Alive { fingerprint_checked: false }` or `Dead` with
 ///   `fingerprint_checked=false`.
+///
+/// Fingerprint resolution order (cas-b157 typed promotion):
+/// 1. `agent.pid_starttime: Option<u64>` — the first-class typed field.
+///    Preferred because non-numeric writers cannot stomp it and a future
+///    migration-forgot-to-backfill bug would surface as `None` rather
+///    than as a parse-failure that silently disables the gate.
+/// 2. `agent.metadata[PID_STARTTIME_KEY]` — legacy fallback, kept for
+///    one release so agents registered on an older binary and revived
+///    mid-flight still benefit from the strong check.
 ///
 /// Both probe functions are injected so tests can drive the outcome matrix
 /// without real syscalls — in production the caller passes `pid_alive` and
@@ -1120,10 +1129,16 @@ pub(crate) fn evaluate_liveness(
     let Some(cc_pid) = agent.pid else {
         return LivenessOutcome::NoPidRecorded;
     };
-    let expected_starttime = agent
-        .metadata
-        .get(PID_STARTTIME_KEY)
-        .and_then(|s| s.parse::<u64>().ok());
+    let expected_starttime = agent.pid_starttime.or_else(|| {
+        // cas-b157 fallback: legacy agents registered pre-migration
+        // still have their fingerprint in metadata. Drop this branch
+        // after one release when the fleet has churned through the
+        // shadow-write window.
+        agent
+            .metadata
+            .get(PID_STARTTIME_KEY)
+            .and_then(|s| s.parse::<u64>().ok())
+    });
     match expected_starttime {
         Some(expected) => {
             if fingerprint_matches_fn(cc_pid, expected) {
@@ -1155,15 +1170,24 @@ pub(crate) fn evaluate_liveness(
 }
 
 /// Stamp the (pid, starttime) fingerprint onto an Agent record for use by the
-/// heartbeat liveness gate (EPIC cas-9508 / cas-ea46).
+/// heartbeat liveness gate (EPIC cas-9508 / cas-ea46 + cas-b157 typed
+/// promotion).
 ///
 /// Call sites that set `agent.pid = Some(pid)` should call this helper
 /// immediately after to keep the pair consistent. When `read_pid_starttime`
-/// returns `None` (non-Linux, /proc hidden), no metadata is inserted and the
+/// returns `None` (non-Linux, /proc hidden), nothing is written and the
 /// liveness gate falls back to pid-only liveness for that agent — same as
 /// legacy agents registered before this fix.
+///
+/// cas-b157: writes BOTH the typed `agent.pid_starttime` field AND the
+/// legacy `metadata[PID_STARTTIME_KEY]` shadow entry for one release.
+/// The typed field is the source of truth for the liveness gate; the
+/// metadata shadow protects agents registered on an older binary that
+/// get revived through the upgraded reader path. Drop the shadow after
+/// fleet rollout confirms zero reliance on it.
 pub(crate) fn stamp_pid_fingerprint(agent: &mut crate::types::Agent, pid: u32) {
     if let Some(starttime) = read_pid_starttime(pid) {
+        agent.pid_starttime = Some(starttime);
         agent
             .metadata
             .insert(PID_STARTTIME_KEY.to_string(), starttime.to_string());

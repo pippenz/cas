@@ -56,7 +56,12 @@ CREATE TABLE IF NOT EXISTS agents (
     last_heartbeat TEXT NOT NULL,
     active_tasks INTEGER NOT NULL DEFAULT 0,
     metadata TEXT NOT NULL DEFAULT '{}',
-    startup_confirmed INTEGER NOT NULL DEFAULT 0
+    startup_confirmed INTEGER NOT NULL DEFAULT 0,
+    -- PID-reuse fingerprint (Linux /proc/<pid>/stat field 22). Typed
+    -- counterpart to metadata[PID_STARTTIME_KEY]; see cas-b157 +
+    -- migration m200. Nullable because non-Linux hosts and pre-migration
+    -- legacy rows have no value.
+    pid_starttime INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_agents_status ON agents(status);
@@ -359,6 +364,14 @@ impl SqliteAgentStore {
             .get_ref(12)
             .map(Self::parse_active_tasks)
             .unwrap_or_default();
+        // cas-b157: typed pid_starttime at column 14. Nullable, so any
+        // SELECT that forgot to project the column (or pre-migration
+        // rows) falls back to None and the liveness gate picks up the
+        // legacy metadata fallback in the daemon.
+        let pid_starttime = row
+            .get_ref(14)
+            .ok()
+            .and_then(Self::parse_optional_u64_from_value);
 
         Ok(Agent {
             id: row.get(0)?,
@@ -391,6 +404,7 @@ impl SqliteAgentStore {
             last_heartbeat: Self::parse_datetime(&row.get::<_, String>(11)?)
                 .unwrap_or_else(Utc::now),
             active_tasks,
+            pid_starttime,
             metadata,
         })
     }
@@ -464,6 +478,19 @@ impl SqliteAgentStore {
 
     fn parse_optional_u32_from_value(value: ValueRef<'_>) -> Option<u32> {
         Self::parse_non_negative_i64_from_value(value).map(|n| n as u32)
+    }
+
+    /// Parse a nullable non-negative integer column into `Option<u64>`.
+    ///
+    /// Used for the typed `pid_starttime` column (cas-b157) — Linux
+    /// `/proc/<pid>/stat` field 22 is a `u64` in clock ticks since boot.
+    /// Storing it as SQLite `INTEGER` (i64) loses the top bit, but real
+    /// boot uptimes never approach 2^63 ticks, so the round-trip is
+    /// safe in practice. We normalise via
+    /// [`parse_non_negative_i64_from_value`] to share the malformed-row
+    /// defensive handling with the `u32` path.
+    fn parse_optional_u64_from_value(value: ValueRef<'_>) -> Option<u64> {
+        Self::parse_non_negative_i64_from_value(value).map(|n| n as u64)
     }
 
     fn parse_non_negative_i64_from_value(value: ValueRef<'_>) -> Option<i64> {

@@ -174,6 +174,7 @@ mod m196_rules_add_share;
 mod m197_skills_add_share;
 mod m198_tasks_add_share;
 pub mod m199_known_repos;
+mod m200_agents_add_pid_starttime;
 
 /// All migrations in order. IDs must be sequential and never reused.
 pub const MIGRATIONS: &[Migration] = &[
@@ -346,6 +347,8 @@ pub const MIGRATIONS: &[Migration] = &[
     m198_tasks_add_share::MIGRATION,
     // Host-scoped known_repos registry for cross-repo sweep (EPIC cas-7c88, Unit 4)
     m199_known_repos::MIGRATION,
+    // Typed PID-reuse fingerprint on agents (EPIC cas-9508 / cas-b157)
+    m200_agents_add_pid_starttime::MIGRATION,
 ];
 
 #[cfg(test)]

@@ -551,6 +551,7 @@ fn agent_info_to_agent(info: AgentInfo) -> Agent {
         registered_at: last_heartbeat,
         last_heartbeat,
         active_tasks: info.active_tasks,
+        pid_starttime: None,
         metadata: info.metadata,
     }
 }

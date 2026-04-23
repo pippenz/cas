@@ -77,6 +77,7 @@ fn create_test_agent(id: &str, name: &str, role: AgentRole, status: AgentStatus)
         registered_at: now,
         last_heartbeat: now,
         active_tasks: 0,
+        pid_starttime: None,
         metadata: std::collections::HashMap::new(),
     }
 }
@@ -304,6 +305,7 @@ fn test_director_data_filters_inactive_agents() {
         registered_at: now,
         last_heartbeat: now,
         active_tasks: 0,
+        pid_starttime: None,
         metadata: std::collections::HashMap::new(),
     };
 

@@ -34,8 +34,8 @@ impl SqliteAgentStore {
             // live agent that re-registers doesn't get falsely detected as failed-startup.
             conn.execute(
             "INSERT INTO agents (id, name, agent_type, role, status, pid, ppid, cc_session_id, parent_id,
-             machine_id, registered_at, last_heartbeat, active_tasks, metadata, startup_confirmed)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 0)
+             machine_id, registered_at, last_heartbeat, active_tasks, metadata, pid_starttime, startup_confirmed)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, 0)
              ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
                 agent_type = excluded.agent_type,
@@ -48,7 +48,8 @@ impl SqliteAgentStore {
                 machine_id = excluded.machine_id,
                 last_heartbeat = excluded.last_heartbeat,
                 active_tasks = excluded.active_tasks,
-                metadata = excluded.metadata",
+                metadata = excluded.metadata,
+                pid_starttime = excluded.pid_starttime",
             params![
                 agent.id,
                 agent.name,
@@ -64,6 +65,7 @@ impl SqliteAgentStore {
                 agent.last_heartbeat.to_rfc3339(),
                 agent.active_tasks,
                 metadata_json,
+                agent.pid_starttime.map(|v| v as i64),
             ],
         )?;
 
@@ -90,7 +92,7 @@ impl SqliteAgentStore {
         let conn = self.lock_conn()?;
         conn.query_row(
             "SELECT id, name, agent_type, role, status, pid, ppid, cc_session_id, parent_id,
-             machine_id, registered_at, last_heartbeat, active_tasks, metadata
+             machine_id, registered_at, last_heartbeat, active_tasks, metadata, pid_starttime
              FROM agents WHERE id = ?",
             params![id],
             Self::agent_from_row,
@@ -107,8 +109,8 @@ impl SqliteAgentStore {
         let rows = conn.execute(
             "UPDATE agents SET name = ?1, agent_type = ?2, role = ?3, status = ?4, pid = ?5,
              ppid = ?6, cc_session_id = ?7, parent_id = ?8, machine_id = ?9, last_heartbeat = ?10,
-             active_tasks = ?11, metadata = ?12
-             WHERE id = ?13",
+             active_tasks = ?11, metadata = ?12, pid_starttime = ?13
+             WHERE id = ?14",
             params![
                 agent.name,
                 agent.agent_type.to_string(),
@@ -122,6 +124,7 @@ impl SqliteAgentStore {
                 agent.last_heartbeat.to_rfc3339(),
                 agent.active_tasks,
                 metadata_json,
+                agent.pid_starttime.map(|v| v as i64),
                 agent.id,
             ],
         )?;
@@ -183,13 +186,13 @@ impl SqliteAgentStore {
         let (sql, params): (&str, Vec<String>) = match status {
             Some(s) => (
                 "SELECT id, name, agent_type, role, status, pid, ppid, cc_session_id, parent_id,
-                 machine_id, registered_at, last_heartbeat, active_tasks, metadata
+                 machine_id, registered_at, last_heartbeat, active_tasks, metadata, pid_starttime
                  FROM agents WHERE status = ? ORDER BY registered_at DESC",
                 vec![s.to_string()],
             ),
             None => (
                 "SELECT id, name, agent_type, role, status, pid, ppid, cc_session_id, parent_id,
-                 machine_id, registered_at, last_heartbeat, active_tasks, metadata
+                 machine_id, registered_at, last_heartbeat, active_tasks, metadata, pid_starttime
                  FROM agents ORDER BY registered_at DESC",
                 vec![],
             ),
@@ -212,7 +215,7 @@ impl SqliteAgentStore {
 
         let mut stmt = conn.prepare_cached(
             "SELECT id, name, agent_type, role, status, pid, ppid, cc_session_id, parent_id,
-             machine_id, registered_at, last_heartbeat, active_tasks, metadata
+             machine_id, registered_at, last_heartbeat, active_tasks, metadata, pid_starttime
              FROM agents
              WHERE status IN ('active', 'idle') AND last_heartbeat < ?
              ORDER BY last_heartbeat ASC",
@@ -350,7 +353,7 @@ impl SqliteAgentStore {
 
         let mut stmt = conn.prepare_cached(
             "SELECT id, name, agent_type, role, status, pid, ppid, cc_session_id, parent_id,
-             machine_id, registered_at, last_heartbeat, active_tasks, metadata
+             machine_id, registered_at, last_heartbeat, active_tasks, metadata, pid_starttime
              FROM agents
              WHERE status IN ('active', 'idle') AND startup_confirmed = 0 AND registered_at < ?
              ORDER BY registered_at ASC",
@@ -367,7 +370,7 @@ impl SqliteAgentStore {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare_cached(
             "SELECT id, name, agent_type, role, status, pid, ppid, cc_session_id, parent_id,
-             machine_id, registered_at, last_heartbeat, active_tasks, metadata
+             machine_id, registered_at, last_heartbeat, active_tasks, metadata, pid_starttime
              FROM agents WHERE ppid = ? AND status IN ('active', 'idle', 'stale', 'dead', 'shutdown')
              ORDER BY last_heartbeat DESC LIMIT 1",
         )?;
@@ -381,7 +384,7 @@ impl SqliteAgentStore {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare_cached(
             "SELECT id, name, agent_type, role, status, pid, ppid, cc_session_id, parent_id,
-             machine_id, registered_at, last_heartbeat, active_tasks, metadata
+             machine_id, registered_at, last_heartbeat, active_tasks, metadata, pid_starttime
              FROM agents WHERE pid = ? AND status IN ('active', 'idle', 'stale', 'dead', 'shutdown')
              ORDER BY last_heartbeat DESC LIMIT 1",
         )?;
