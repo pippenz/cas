@@ -292,6 +292,26 @@ pub fn handle_session_end(
     // Clean up agent leases and reset task status - ALWAYS do this regardless of observation count
     cleanup_agent_leases(cas_root, &input.session_id);
 
+    // Factory session hygiene (task cas-a9ab): append a durable manifest of
+    // the main worktree's uncommitted state so the next supervisor can see
+    // what was left behind if this session died mid-task. Best-effort —
+    // never let hygiene logging break session-end.
+    {
+        let agent_name = std::env::var("CAS_AGENT_NAME").ok();
+        let agent_role = std::env::var("CAS_AGENT_ROLE").ok();
+        if let Some(path) = crate::hooks::handlers::session_hygiene::write_session_end_manifest(
+            cas_root,
+            &input.session_id,
+            agent_name.as_deref(),
+            agent_role.as_deref(),
+        ) {
+            eprintln!(
+                "cas: Wrote session-end manifest to {}",
+                path.display()
+            );
+        }
+    }
+
     // Notify daemon via socket that session ended
     #[cfg(feature = "mcp-server")]
     {

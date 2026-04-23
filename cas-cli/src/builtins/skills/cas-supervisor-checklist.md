@@ -24,6 +24,19 @@ managed_by: cas
    - If it exists but is stale (structural changes since last update) → run `/codemap` to refresh.
    - Workers reference CODEMAP for codebase orientation — ensure it's current before spawning them.
 5. Check worker availability: `mcp__cas__coordination action=worker_status`
+6. **Session hygiene triage** — check for leftover WIP from prior factory sessions:
+   ```
+   mcp__cas__coordination action=gc_report
+   ```
+   The report's "Prior-factory WIP candidates" section lists uncommitted files
+   in the main worktree. Files often survive when a prior session died mid-task
+   without committing. Decide salvage / commit / discard **before** spawning
+   workers — otherwise a cherry-pick into `develop` will abort later.
+
+   For the full history of what prior sessions left behind, see
+   `.cas/logs/factory-session-{YYYY-MM-DD}.log` (written automatically on
+   `SessionEnd`; each block records session id, agent, worktree, and a
+   `git status --porcelain` snapshot).
 
 ## Intake Gate (Before Planning)
 
