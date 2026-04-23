@@ -159,11 +159,19 @@ pub struct TaskDeliverables {
     /// Merge commit hash for associated worktree (if any)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merge_commit: Option<String>,
+    /// Persisted review envelope captured on verification-jail close so a later
+    /// supervisor close can forward the prior code-review outcome without
+    /// re-running the gate. Serialized as a JSON string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_envelope: Option<String>,
 }
 
 impl TaskDeliverables {
     pub fn is_empty(&self) -> bool {
-        self.files_changed.is_empty() && self.commit_hash.is_none() && self.merge_commit.is_none()
+        self.files_changed.is_empty()
+            && self.commit_hash.is_none()
+            && self.merge_commit.is_none()
+            && self.review_envelope.is_none()
     }
 }
 
