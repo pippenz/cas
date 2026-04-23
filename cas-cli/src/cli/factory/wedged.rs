@@ -116,9 +116,23 @@ impl WorkerLivenessState {
 /// transcript's last [`CRASH_SIGNATURE_TAIL_LINES`] lines is sufficient —
 /// each one independently identifies the crash-screen (cas-4513 discovery
 /// note 2026-04-23 15:11 UTC captured all three in one pane).
+///
+/// Ordered most-specific-first: the literal Ink guard-text is a near-zero
+/// false-positive signal and lives at the front. The bundler-path signals
+/// (`/$bunfs/root`, `createInstance (/`) could, hypothetically, appear in
+/// legitimate diagnostic output — hitting them alone is still a strong
+/// enough signal to classify Wedged, but if the cheaper string match up
+/// front catches the common case that's a clear win.
 const CRASH_SIGNATURE_NEEDLES: &[&str] = &[
-    "/$bunfs/root",
+    // Literal React-Ink runtime invariant — when this renders, the UI is
+    // guaranteed wedged (upstream: anthropics/claude-code#52337).
+    "<Box> can't be nested inside <Text>",
+    // React-Ink element construction leaking through the error handler.
     "createElement(\"ink-",
+    "ink-box",
+    // Bun single-file-bundle prefix — only appears in stack frames dumped
+    // by the error handler, never in normal transcripts.
+    "/$bunfs/root",
     "createInstance (/",
 ];
 
@@ -568,6 +582,18 @@ mod tests {
         let transcript = r#"{"type":"assistant","text":"..."}
 {"type":"tool_use","name":"Bash"}
 {"error":"at createInstance (/$bunfs/root/src/entrypoints/cli.js:496:249)"}"#;
+        assert!(has_crash_signature(
+            Cursor::new(transcript),
+            CRASH_SIGNATURE_TAIL_LINES
+        ));
+    }
+
+    #[test]
+    fn crash_signature_matches_literal_ink_guard_text() {
+        // Supervisor's cas-4513 nit: the literal Ink invariant text is a
+        // stronger signal than bundler paths. If this regresses, the whole
+        // crash-screen detection weakens to a path-heuristic only.
+        let transcript = "normal\n{\"error\":\"<Box> can't be nested inside <Text>\"}\nmore";
         assert!(has_crash_signature(
             Cursor::new(transcript),
             CRASH_SIGNATURE_TAIL_LINES
