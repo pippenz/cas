@@ -1,5 +1,38 @@
 use crate::mcp::tools::service::imports::*;
 
+/// Heartbeat age at which a worker is considered **stale** and becomes
+/// eligible for the opportunistic prune in `factory_worker_status`.
+///
+/// A stale worker is dropped from the Active listing on the next status
+/// call (see the `list_stale` + `mark_stale` loop). If the prune succeeds
+/// — the overwhelmingly common path — the worker never reaches the
+/// render-time liveness-label branch at all.
+///
+/// Bumped from 120s to 30s by cas-2749 so a crashed CC client is
+/// detected within roughly one supervisor status poll. The 30s number is
+/// load-bearing: callers in tests assert the exact value via
+/// [`worker_stale_secs_is_pinned_at_30`] (cas-8240 AC anchor) so a drift
+/// fix in one place that forgets to update the other cannot silently
+/// regress the UX.
+pub(crate) const WORKER_STALE_SECS: i64 = 30;
+
+/// Heartbeat age at which a worker is escalated to **dead** in the
+/// supervisor-facing render: hard `[DEAD]` label + transcript-path
+/// surfacing so the supervisor can salvage the last in-flight tool call.
+///
+/// Two-band model (cas-8240): `WORKER_STALE_SECS` (30s) drives the
+/// opportunistic prune and a lighter-weight `[stale]` indicator on any
+/// worker that slipped past the prune (e.g. `mark_stale` hit a DB lock).
+/// `WORKER_DEAD_SECS` (75s) gates the more expensive `[DEAD]` + transcript
+/// emission so tokio scheduler jitter or a missed 30s daemon tick cannot
+/// produce false-positive DEAD labels that train supervisors to distrust
+/// the signal. Picked at 2.5× the stale threshold: gives the daemon one
+/// full heartbeat interval of grace past the prune window before the
+/// render escalates, which in practice means a worker has to have
+/// missed at least two consecutive heartbeats before we surface it as
+/// dead.
+pub(crate) const WORKER_DEAD_SECS: i64 = 75;
+
 impl CasService {
     pub(super) async fn factory_spawn_workers(
         &self,
@@ -225,7 +258,11 @@ impl CasService {
         // are long-lived and less chatty and are filtered out of the prune by
         // the role check below; they remain visible until their own
         // daemon-level cleanup eventually removes them.
-        const WORKER_STALE_SECS: i64 = 30;
+        //
+        // See the module-level `WORKER_STALE_SECS` and `WORKER_DEAD_SECS`
+        // constants (cas-8240) for the two-band model that separates the
+        // prune + `[stale]` indicator (30s) from the hard `[DEAD]` + transcript
+        // surface (75s).
         let worker_stale_threshold_secs: i64 = WORKER_STALE_SECS;
         let mut stale_pruned = 0usize;
         if let Ok(stale_agents) = store.list_stale(worker_stale_threshold_secs) {
@@ -293,20 +330,22 @@ impl CasService {
             for agent in workers {
                 let elapsed = (chrono::Utc::now() - agent.last_heartbeat).num_seconds();
                 let since = format!("{elapsed}s ago");
-                let liveness_label = if elapsed >= worker_stale_threshold_secs {
-                    " [DEAD]"
-                } else {
-                    ""
-                };
+                // cas-8240 two-band model — see `liveness_label_for`.
+                let liveness_label = liveness_label_for(elapsed);
                 let clone_path = agent.metadata.get("clone_path").cloned();
                 let clone_info = clone_path
                     .as_ref()
                     .map(|p| format!("\n    Clone: {p}"))
                     .unwrap_or_default();
-                // Surface transcript path for stale/dead workers so supervisor
-                // can salvage whatever was in-flight when the CC client died
-                // (cas-2749 AC: transcript-path-surfacing on crash).
-                let transcript_info = if elapsed >= worker_stale_threshold_secs {
+                // Surface transcript path only for hard-dead workers so
+                // supervisor can salvage whatever was in-flight when the
+                // CC client died (cas-2749 AC: transcript-path-surfacing
+                // on crash). The `[stale]` tier does NOT emit the
+                // transcript path — a worker lagging past 30s under
+                // scheduler jitter does not need its transcript surfaced
+                // yet, and emitting it there would produce the
+                // false-positive noise cas-8240 is fixing.
+                let transcript_info = if elapsed >= WORKER_DEAD_SECS {
                     let transcript = clone_path
                         .as_deref()
                         .map(|p| derive_transcript_path(p, &agent.id))
@@ -990,6 +1029,30 @@ fn format_relative_time(dt: chrono::DateTime<chrono::Utc>) -> String {
 /// is the absolute cwd with `/`, `.`, and `_` collapsed to `-`. Surfacing this
 /// path in `worker_status` lets a supervisor open the last in-flight tool call
 /// after a worker dies without manually reconstructing the escape (cas-2749).
+/// cas-8240 two-band liveness label for `factory_worker_status`:
+///
+/// * `elapsed >= WORKER_DEAD_SECS` → `" [DEAD]"` (hard escalation —
+///   caller also surfaces the transcript path for salvage).
+/// * `WORKER_STALE_SECS <= elapsed < WORKER_DEAD_SECS` → `" [stale]"`
+///   (grace-window indicator — the worker slipped past the prune
+///   without being `mark_stale`'d, but it's too early to declare it
+///   dead).
+/// * Otherwise → `""` (no label).
+///
+/// Leading space is intentional: the caller concatenates the returned
+/// slice directly after the `heartbeat: <Xs ago>` segment, and an empty
+/// string avoids a trailing space when the worker is fresh. Returning
+/// `&'static str` keeps this allocation-free.
+fn liveness_label_for(elapsed_secs: i64) -> &'static str {
+    if elapsed_secs >= WORKER_DEAD_SECS {
+        " [DEAD]"
+    } else if elapsed_secs >= WORKER_STALE_SECS {
+        " [stale]"
+    } else {
+        ""
+    }
+}
+
 fn derive_transcript_path(clone_path: &str, session_id: &str) -> String {
     // Claude Code's `cwd` escape observed in the wild: both `/` and `.` are
     // collapsed to `-`. Example: `/home/a/.cas/worktrees/x` becomes
@@ -1031,5 +1094,70 @@ mod tests {
         // `~/.claude/projects/` layout in field workers).
         let got = derive_transcript_path("/tmp/my_proj.sub", "abc");
         assert_eq!(got, "~/.claude/projects/-tmp-my_proj-sub/abc.jsonl");
+    }
+
+    // --- cas-8240: two-band stale/dead threshold constants ------------------
+
+    /// AC anchor: `WORKER_STALE_SECS` is pinned at 30. The supervisor-facing
+    /// footer embeds this value as a literal ("30s heartbeat age") and the
+    /// daemon heartbeat tick is tuned against it, so a silent change here
+    /// would desync the prune window from the UX text.
+    #[test]
+    fn worker_stale_secs_is_pinned_at_30() {
+        assert_eq!(WORKER_STALE_SECS, 30);
+    }
+
+    /// AC anchor: `WORKER_DEAD_SECS` is pinned at 75. The two-band model
+    /// requires DEAD to lag STALE by roughly one grace window so scheduler
+    /// jitter and missed ticks do not produce false-positive [DEAD] labels.
+    /// Bumping this silently would regress the cas-8240 fix.
+    #[test]
+    fn worker_dead_secs_is_pinned_at_75() {
+        assert_eq!(WORKER_DEAD_SECS, 75);
+    }
+
+    /// Invariant: the dead threshold must strictly exceed the stale
+    /// threshold. Otherwise the two-band render collapses into one band
+    /// and we reintroduce the false-positive DEAD labeling cas-8240 fixes.
+    #[test]
+    fn worker_dead_secs_exceeds_stale_secs() {
+        assert!(
+            WORKER_DEAD_SECS > WORKER_STALE_SECS,
+            "WORKER_DEAD_SECS ({WORKER_DEAD_SECS}) must exceed WORKER_STALE_SECS ({WORKER_STALE_SECS}) — the two-band model collapses otherwise"
+        );
+    }
+
+    // --- cas-8240: liveness_label_for branch matrix -------------------------
+
+    #[test]
+    fn liveness_label_fresh_worker_is_empty() {
+        assert_eq!(liveness_label_for(0), "");
+        assert_eq!(liveness_label_for(WORKER_STALE_SECS - 1), "");
+    }
+
+    #[test]
+    fn liveness_label_grace_window_is_stale() {
+        // Exactly at STALE → [stale]; just below DEAD → still [stale].
+        assert_eq!(liveness_label_for(WORKER_STALE_SECS), " [stale]");
+        assert_eq!(liveness_label_for(WORKER_DEAD_SECS - 1), " [stale]");
+    }
+
+    #[test]
+    fn liveness_label_past_dead_is_hard_dead() {
+        // Exactly at DEAD → [DEAD]; well past → still [DEAD].
+        assert_eq!(liveness_label_for(WORKER_DEAD_SECS), " [DEAD]");
+        assert_eq!(liveness_label_for(WORKER_DEAD_SECS * 10), " [DEAD]");
+    }
+
+    #[test]
+    fn liveness_label_distinguishes_stale_from_dead() {
+        // The cas-8240 core behavior: stale and DEAD are distinct bands.
+        // A mutation that collapsed the stale branch into " [DEAD]"
+        // would fail here.
+        let stale = liveness_label_for(WORKER_STALE_SECS);
+        let dead = liveness_label_for(WORKER_DEAD_SECS);
+        assert_ne!(stale, dead, "stale and DEAD bands must render distinct labels");
+        assert!(stale.contains("stale"));
+        assert!(dead.contains("DEAD"));
     }
 }

@@ -117,28 +117,21 @@ fn pid_alive_self_is_live() {
 #[test]
 fn pid_alive_dead_child_is_dead() {
     // Spawn a short-lived child, wait for it to exit, then confirm its PID
-    // is reported dead. We poll briefly because `wait()` reaps but the exact
-    // timing of ESRCH visibility can lag on some kernels under load — using
-    // `kill -0` via pid_alive gives us the same signal CAS uses in prod.
+    // is reported dead. `waitpid`/`Child::wait` returning Ok guarantees the
+    // child has been reaped — on Linux the kernel removes the task_struct
+    // synchronously at reap time, so the very next `kill(pid, 0)` sees
+    // ESRCH. No poll loop is needed (cas-8240: the prior 200ms poll was
+    // defensive against a kernel behavior that does not actually occur on
+    // Linux post-reap; the stronger synchronous assertion catches
+    // regressions a forgiving poll would mask).
     let mut child = std::process::Command::new("/bin/true")
         .spawn()
         .expect("spawn /bin/true");
     let pid = child.id();
-    let _ = child.wait().expect("wait for child");
-
-    // After reap, the PID should report dead. Allow a couple polls for the
-    // kernel to flip ESRCH on heavily loaded CI.
-    let mut dead = false;
-    for _ in 0..20 {
-        if !crate::mcp::daemon::pid_alive(pid) {
-            dead = true;
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+    child.wait().expect("wait for child");
     assert!(
-        dead,
-        "reaped child PID {pid} must report dead (ESRCH) after wait"
+        !crate::mcp::daemon::pid_alive(pid),
+        "reaped child PID {pid} must report dead (ESRCH) immediately after wait()"
     );
 }
 
