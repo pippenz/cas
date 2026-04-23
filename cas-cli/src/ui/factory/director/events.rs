@@ -366,10 +366,23 @@ impl DirectorEventDetector {
         self.removed_workers.insert(name.to_string());
     }
 
-    /// Detect changes between the last state and new data
+    /// Detect changes between the last state and new data.
     ///
-    /// Returns a list of detected events. Call this after each refresh.
-    pub fn detect_changes(&mut self, data: &DirectorData) -> Vec<DirectorEvent> {
+    /// Returns a list of detected events. Call after each refresh.
+    ///
+    /// `current_epic_id` is the factory app's currently-tracked epic (pass
+    /// `None` at init time before any epic has been resolved). When `Some`,
+    /// `EpicStarted` for an Open-with-branch epic is only emitted if the
+    /// candidate is **strictly better** than the active epic under the shared
+    /// subtask-count heuristic (see [`pick_best_open_branch_epic`]). This
+    /// prevents a fresh zero-subtask Open-with-branch epic from overwriting
+    /// the active `epic_state` mid-session (see task cas-4181).
+    /// `InProgress` epic transitions still emit unconditionally.
+    pub fn detect_changes(
+        &mut self,
+        data: &DirectorData,
+        current_epic_id: Option<&str>,
+    ) -> Vec<DirectorEvent> {
         let now = Instant::now();
         let new_state = DirectorState::from_data(data);
         let mut events = Vec::new();
@@ -548,13 +561,13 @@ impl DirectorEventDetector {
         // Detect epic state changes
         // EpicStarted fires when:
         // 1. An epic transitions to InProgress (highest priority)
-        // 2. A new Open-with-branch epic appears (mirrors detect_epic_state init logic)
-        //
-        // When multiple qualify, prefer InProgress over Open-with-branch, and among
-        // Open-with-branch pick the lexicographically greatest ID for determinism.
+        // 2. A newly-appearing Open-with-branch epic is strictly better than
+        //    the currently-active epic under the shared subtask-count
+        //    heuristic. The picker and the init-time `detect_epic_state`
+        //    share `pick_best_open_branch_epic` so they cannot diverge.
         {
             let mut in_progress_started: Option<(&str, &str)> = None;
-            let mut open_branch_started: Option<(&str, &str)> = None;
+            let mut saw_new_open_branch = false;
 
             for epic in &data.epic_tasks {
                 if epic.status == TaskStatus::InProgress {
@@ -569,7 +582,6 @@ impl DirectorEventDetector {
                         in_progress_started = Some((&epic.id, &epic.title));
                     }
                 } else if epic.status == TaskStatus::Open && epic.branch.is_some() {
-                    // New Open-with-branch epic that wasn't previously tracked with a branch
                     let was_open_with_branch = self
                         .last_state
                         .epic_statuses
@@ -578,24 +590,57 @@ impl DirectorEventDetector {
                         .unwrap_or(false);
 
                     if !was_open_with_branch {
-                        // Among new Open-with-branch epics, pick greatest ID for stability
-                        if open_branch_started
-                            .map(|(id, _)| epic.id.as_str() > id)
-                            .unwrap_or(true)
-                        {
-                            open_branch_started = Some((&epic.id, &epic.title));
-                        }
+                        saw_new_open_branch = true;
                     }
                 }
             }
 
-            // InProgress takes priority over Open-with-branch
-            let epic_started = in_progress_started.or(open_branch_started);
-            if let Some((id, title)) = epic_started {
+            // InProgress transitions always fire.
+            if let Some((id, title)) = in_progress_started {
                 events.push(DirectorEvent::EpicStarted {
                     epic_id: id.to_string(),
                     epic_title: title.to_string(),
                 });
+            } else if saw_new_open_branch {
+                // Pick the best Open-with-branch epic using the shared
+                // heuristic (subtasks, then lex ID). Applies the
+                // strict-improvement gate when a current epic is known.
+                if let Some(candidate) = pick_best_open_branch_epic(
+                    &data.epic_tasks,
+                    &data.in_progress_tasks,
+                    &data.ready_tasks,
+                ) {
+                    let should_fire = match current_epic_id {
+                        // No active epic yet — any valid candidate wins.
+                        None => true,
+                        // Same epic already active — no change to announce.
+                        Some(cur) if cur == candidate.id => false,
+                        // Different epic — only announce if it is strictly
+                        // better than the currently-active epic under the
+                        // shared heuristic. A zero-subtask fresh epic cannot
+                        // hijack an active one that has subtasks.
+                        Some(cur) => {
+                            let cand_score = open_branch_epic_score(
+                                &candidate.id,
+                                &data.in_progress_tasks,
+                                &data.ready_tasks,
+                            );
+                            let cur_score = open_branch_epic_score(
+                                cur,
+                                &data.in_progress_tasks,
+                                &data.ready_tasks,
+                            );
+                            cand_score > cur_score
+                        }
+                    };
+
+                    if should_fire {
+                        events.push(DirectorEvent::EpicStarted {
+                            epic_id: candidate.id.clone(),
+                            epic_title: candidate.title.clone(),
+                        });
+                    }
+                }
             }
         }
 
@@ -715,6 +760,58 @@ impl DirectorEventDetector {
             .cloned()
             .unwrap_or_else(|| agent_id.to_string())
     }
+}
+
+/// Score an Open-with-branch epic by active-subtask counts.
+///
+/// Returns `(in_progress_count, ready_count)` for subtasks whose `epic`
+/// field matches `epic_id`. The tuple compares lexicographically: an
+/// epic with more in-progress subtasks always outranks one with fewer,
+/// regardless of ready-count. Used by both the init-time picker and the
+/// runtime EpicStarted strict-improvement gate.
+pub(crate) fn open_branch_epic_score(
+    epic_id: &str,
+    in_progress_tasks: &[TaskSummary],
+    ready_tasks: &[TaskSummary],
+) -> (usize, usize) {
+    let ip = in_progress_tasks
+        .iter()
+        .filter(|t| t.epic.as_deref() == Some(epic_id))
+        .count();
+    let ready = ready_tasks
+        .iter()
+        .filter(|t| t.epic.as_deref() == Some(epic_id))
+        .count();
+    (ip, ready)
+}
+
+/// Pick the best Open-with-branch epic from `epic_tasks` using the shared
+/// heuristic: highest in-progress subtask count wins; then highest ready
+/// subtask count; then lexicographically greatest ID as a deterministic
+/// final tiebreak.
+///
+/// Used by both `ui::factory::app::detect_epic_state` (init-time epic
+/// resolution) and `DirectorEventDetector::detect_changes_for_epic`
+/// (runtime `EpicStarted` detection) so the two paths cannot disagree on
+/// which Open-with-branch epic should own the factory panel.
+///
+/// Returns `None` if no epic in `epic_tasks` is `Open` with a branch set.
+pub(crate) fn pick_best_open_branch_epic<'a>(
+    epic_tasks: &'a [TaskSummary],
+    in_progress_tasks: &[TaskSummary],
+    ready_tasks: &[TaskSummary],
+) -> Option<&'a TaskSummary> {
+    epic_tasks
+        .iter()
+        .filter(|e| e.status == TaskStatus::Open && e.branch.is_some())
+        .max_by(|a, b| {
+            let a_score = open_branch_epic_score(&a.id, in_progress_tasks, ready_tasks);
+            let b_score = open_branch_epic_score(&b.id, in_progress_tasks, ready_tasks);
+            a_score
+                .cmp(&b_score)
+                // Deterministic final tiebreak: greatest lex ID wins.
+                .then_with(|| a.id.cmp(&b.id))
+        })
 }
 
 #[cfg(test)]

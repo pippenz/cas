@@ -95,7 +95,7 @@ fn test_detect_task_assigned() {
         epic_closed_counts: HashMap::new(),
     };
 
-    let events = detector.detect_changes(&data2);
+    let events = detector.detect_changes(&data2, None);
 
     assert!(events.iter().any(|e| matches!(
         e,
@@ -147,7 +147,7 @@ fn test_detect_task_completed() {
         epic_closed_counts: HashMap::new(),
     };
 
-    let events = detector.detect_changes(&data2);
+    let events = detector.detect_changes(&data2, None);
 
     assert!(events.iter().any(|e| matches!(
         e,
@@ -212,7 +212,7 @@ fn test_detect_worker_idle() {
 
     // Tick 1 of sustained idle — must NOT emit (debounce threshold is 2 ticks).
     let idle = idle_data_for("agent-1", "swift-fox");
-    let events_tick1 = detector.detect_changes(&idle);
+    let events_tick1 = detector.detect_changes(&idle, None);
     assert!(
         !events_tick1
             .iter()
@@ -222,7 +222,7 @@ fn test_detect_worker_idle() {
     );
 
     // Tick 2 of sustained idle — now emit.
-    let events_tick2 = detector.detect_changes(&idle);
+    let events_tick2 = detector.detect_changes(&idle, None);
     assert!(
         events_tick2.iter().any(|e| matches!(
             e,
@@ -232,7 +232,7 @@ fn test_detect_worker_idle() {
     );
 
     // Tick 3 of sustained idle — already emitted, do not re-emit every tick.
-    let events_tick3 = detector.detect_changes(&idle);
+    let events_tick3 = detector.detect_changes(&idle, None);
     assert!(
         !events_tick3
             .iter()
@@ -264,7 +264,8 @@ fn test_no_worker_idle_on_transient_close_then_start() {
     ));
 
     // Transient idle: one refresh tick catches the close-X → start-Y gap.
-    let events_transient = detector.detect_changes(&idle_data_for("agent-1", "swift-fox"));
+    let events_transient =
+        detector.detect_changes(&idle_data_for("agent-1", "swift-fox"), None);
     assert!(
         !events_transient
             .iter()
@@ -274,12 +275,10 @@ fn test_no_worker_idle_on_transient_close_then_start() {
     );
 
     // Next refresh: worker has claimed task-2. Idle streak should be reset.
-    let events_claimed = detector.detect_changes(&working_data_for(
-        "agent-1",
-        "swift-fox",
-        "task-2",
-        "Second task",
-    ));
+    let events_claimed = detector.detect_changes(
+        &working_data_for("agent-1", "swift-fox", "task-2", "Second task"),
+        None,
+    );
     assert!(
         !events_claimed
             .iter()
@@ -290,8 +289,8 @@ fn test_no_worker_idle_on_transient_close_then_start() {
     // Sanity: a subsequent sustained idle still emits after the threshold,
     // so the reset didn't break normal idle detection.
     let idle = idle_data_for("agent-1", "swift-fox");
-    let _ = detector.detect_changes(&idle); // tick 1
-    let events_tick2 = detector.detect_changes(&idle); // tick 2
+    let _ = detector.detect_changes(&idle, None); // tick 1
+    let events_tick2 = detector.detect_changes(&idle, None); // tick 2
     assert!(
         events_tick2.iter().any(|e| matches!(
             e,
@@ -340,7 +339,7 @@ fn test_ignore_non_factory_agents() {
         epic_closed_counts: HashMap::new(),
     };
 
-    let events = detector.detect_changes(&data2);
+    let events = detector.detect_changes(&data2, None);
 
     // Should not detect assignment since "other-agent" is not in factory
     assert!(
@@ -393,7 +392,7 @@ fn test_debouncing() {
         epic_closed_counts: HashMap::new(),
     };
 
-    let events1 = detector.detect_changes(&data2);
+    let events1 = detector.detect_changes(&data2, None);
     assert_eq!(events1.len(), 1);
     assert!(matches!(
         &events1[0],
@@ -402,7 +401,7 @@ fn test_debouncing() {
 
     // Re-initialize and try again immediately - should be debounced
     detector.last_state = DirectorState::from_data(&data1);
-    let events2 = detector.detect_changes(&data2);
+    let events2 = detector.detect_changes(&data2, None);
     assert!(
         events2.is_empty(),
         "Expected debounced event, but got {events2:?}"
@@ -478,7 +477,7 @@ fn test_detect_epic_started() {
         epic_closed_counts: HashMap::new(),
     };
 
-    let events = detector.detect_changes(&data2);
+    let events = detector.detect_changes(&data2, None);
 
     assert!(events.iter().any(|e| matches!(
         e,
@@ -521,7 +520,7 @@ fn test_detect_epic_completed() {
         epic_closed_counts: HashMap::new(),
     };
 
-    let events = detector.detect_changes(&data2);
+    let events = detector.detect_changes(&data2, None);
 
     assert!(events.iter().any(|e| matches!(
         e,
@@ -563,7 +562,7 @@ fn test_no_epic_event_when_unchanged() {
         epic_closed_counts: HashMap::new(),
     };
 
-    let events = detector.detect_changes(&data2);
+    let events = detector.detect_changes(&data2, None);
 
     // No epic events should be emitted
     assert!(!events.iter().any(|e| matches!(
@@ -631,8 +630,8 @@ fn test_idle_events_suppressed_for_removed_workers() {
     };
 
     // Two idle ticks are required to cross the consecutive-tick debounce.
-    let _ = detector.detect_changes(&data2);
-    let events = detector.detect_changes(&data2);
+    let _ = detector.detect_changes(&data2, None);
+    let events = detector.detect_changes(&data2, None);
 
     // calm-owl idle event should be emitted
     assert!(
@@ -699,8 +698,8 @@ fn test_idle_rate_limit_longer_than_general_debounce() {
     };
 
     // Two idle ticks are required to cross the consecutive-tick debounce.
-    let _ = detector.detect_changes(&data2);
-    let events = detector.detect_changes(&data2);
+    let _ = detector.detect_changes(&data2, None);
+    let events = detector.detect_changes(&data2, None);
     assert!(
         events.iter().any(|e| matches!(
             e,
@@ -713,7 +712,7 @@ fn test_idle_rate_limit_longer_than_general_debounce() {
     // (past the 30s general debounce but within the 5-minute idle rate limit).
     // We drive this through detect_changes rather than poking last_state directly
     // so the consecutive-idle counters reset the way they would in production.
-    let _ = detector.detect_changes(&data1);
+    let _ = detector.detect_changes(&data1, None);
 
     // Manually advance the idle debounce time to 60s ago (past 30s general debounce)
     let key = "idle:swift-fox".to_string();
@@ -721,7 +720,7 @@ fn test_idle_rate_limit_longer_than_general_debounce() {
         *time = std::time::Instant::now() - Duration::from_secs(60);
     }
 
-    let events2 = detector.detect_changes(&data2);
+    let events2 = detector.detect_changes(&data2, None);
     assert!(
         !events2.iter().any(|e| matches!(
             e,
@@ -770,7 +769,7 @@ fn test_detect_epic_started_open_with_branch() {
         epic_closed_counts: HashMap::new(),
     };
 
-    let events = detector.detect_changes(&data2);
+    let events = detector.detect_changes(&data2, None);
 
     assert!(
         events.iter().any(|e| matches!(
@@ -826,7 +825,7 @@ fn test_no_duplicate_epic_started_for_existing_open_with_branch() {
         epic_closed_counts: HashMap::new(),
     };
 
-    let events = detector.detect_changes(&data2);
+    let events = detector.detect_changes(&data2, None);
 
     assert!(
         !events.iter().any(|e| matches!(
@@ -874,7 +873,7 @@ fn test_in_progress_epic_takes_priority_over_open_with_branch() {
         epic_closed_counts: HashMap::new(),
     };
 
-    let events = detector.detect_changes(&data2);
+    let events = detector.detect_changes(&data2, None);
 
     // InProgress should win
     assert!(
@@ -937,7 +936,7 @@ fn test_closed_task_not_redispatched_to_idle_worker() {
         epic_closed_counts: HashMap::new(),
     };
 
-    let events = detector.detect_changes(&data2);
+    let events = detector.detect_changes(&data2, None);
 
     // TaskCompleted is fine and expected; TaskAssigned for task-1 must NOT fire
     assert!(
@@ -1006,7 +1005,7 @@ fn test_closed_task_leaked_into_ready_tasks_not_dispatched() {
         epic_closed_counts: HashMap::new(),
     };
 
-    let events = detector.detect_changes(&data2);
+    let events = detector.detect_changes(&data2, None);
 
     assert!(
         !events.iter().any(|e| matches!(
@@ -1065,7 +1064,7 @@ fn test_blocked_task_not_dispatched() {
         epic_closed_counts: HashMap::new(),
     };
 
-    let events = detector.detect_changes(&data2);
+    let events = detector.detect_changes(&data2, None);
 
     // TaskBlocked is expected (separate dispatch concern, routed to
     // supervisor not worker); TaskAssigned must NOT fire.
@@ -1132,7 +1131,7 @@ fn test_closed_task_with_stale_assignee_not_redispatched() {
         epic_closed_counts: HashMap::new(),
     };
 
-    let events = detector.detect_changes(&data2);
+    let events = detector.detect_changes(&data2, None);
 
     assert!(
         !events.iter().any(|e| matches!(
