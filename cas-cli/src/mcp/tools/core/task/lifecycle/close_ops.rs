@@ -416,6 +416,24 @@ impl CasCore {
                                 task_to_update.assignee = Some(agent_id);
                             }
                         }
+                        // cas-3086: persist the worker's ReviewOutcome envelope on
+                        // the task deliverables so a subsequent supervisor close
+                        // (once verification approves) can forward the prior review
+                        // receipt into the P0 gate instead of re-running the
+                        // multi-persona reviewer or requiring `bypass_code_review`.
+                        // We persist only non-empty envelopes; validation happens
+                        // later in `run_code_review_gate`, which rejects malformed
+                        // persisted envelopes so bad input cannot silently bypass
+                        // the gate.
+                        if let Some(envelope) = req
+                            .code_review_findings
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                        {
+                            task_to_update.deliverables.review_envelope =
+                                Some(envelope.to_string());
+                        }
                         task_to_update.updated_at = chrono::Utc::now();
                         if let Err(e) = task_store.update(&task_to_update) {
                             tracing::warn!(task_id = %req.id, error = %e, "failed to set pending_verification on task");
@@ -1507,26 +1525,40 @@ pub(crate) fn run_code_review_gate(
         return CodeReviewGateOutcome::Proceed;
     }
 
-    // From here on, we require a findings envelope.
+    // From here on, we require a findings envelope. The request's
+    // `code_review_findings` always wins; if it is absent or empty we
+    // fall back to any envelope persisted on the task deliverables
+    // from a prior jailed close (cas-3086). The persisted fallback is
+    // *not* a merge — an explicit request envelope wholly replaces
+    // what the gate sees.
+    let persisted_envelope = task
+        .deliverables
+        .review_envelope
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
     let envelope_json = match req.code_review_findings.as_deref() {
         Some(s) if !s.trim().is_empty() => s,
-        _ => {
-            return CodeReviewGateOutcome::Reject(
-                "⚠️ CODE_REVIEW_REQUIRED\n\n\
-                 task close rejected: this task has reviewable code changes \
-                 and no code_review_findings envelope was provided.\n\n\
-                 To resolve:\n\
-                 1. Invoke the cas-code-review skill via the Skill or Task \
-                    tool with mode=autofix and the current diff.\n\
-                 2. Collect the returned ReviewOutcome envelope (residual, \
-                    pre_existing, mode).\n\
-                 3. Re-call task.close with the envelope JSON-stringified \
-                    in code_review_findings.\n\n\
-                 Supervisors may bypass this gate with \
-                 bypass_code_review=true (logged as a decision note)."
-                    .to_string(),
-            );
-        }
+        _ => match persisted_envelope {
+            Some(s) => s,
+            None => {
+                return CodeReviewGateOutcome::Reject(
+                    "⚠️ CODE_REVIEW_REQUIRED\n\n\
+                     task close rejected: this task has reviewable code changes \
+                     and no code_review_findings envelope was provided.\n\n\
+                     To resolve:\n\
+                     1. Invoke the cas-code-review skill via the Skill or Task \
+                        tool with mode=autofix and the current diff.\n\
+                     2. Collect the returned ReviewOutcome envelope (residual, \
+                        pre_existing, mode).\n\
+                     3. Re-call task.close with the envelope JSON-stringified \
+                        in code_review_findings.\n\n\
+                     Supervisors may bypass this gate with \
+                     bypass_code_review=true (logged as a decision note)."
+                        .to_string(),
+                );
+            }
+        },
     };
 
     let envelope: cas_types::ReviewOutcome = match serde_json::from_str(envelope_json) {
