@@ -413,6 +413,37 @@ Workers fail in production. These are the three observed failure modes and their
 3. After clearing the jail, message the worker that they can proceed with remaining tasks.
 4. File a note on the epic that the binary needs rebuilding before the next session.
 
+### Resource-Contention Worker Crashes (cas-0bf4)
+
+**Signature:** Multiple workers wedge around the same time in the Claude Code JS crash-screen state (Bun/React Ink render exception). Host shows `uptime` load avg well above CPU count (5-min avg > 1.0 × num_cpus on a 16-thread box = saturated). Memory is NOT under pressure — this is CPU scheduler starvation, not OOM.
+
+**Root cause:** Each worker's `cargo` builds a per-worktree `target/` with rustc fanning out to `num_cpus` parallel jobs. 4 workers × 16 rustc threads × an autofix pass = scheduler storm → Claude Code event loop starves → Ink render exception → worker wedged in crash-screen state. See task `cas-0bf4` and discovery in `cas-4513`.
+
+**Built-in mitigation (on by default):** Factory mode exports `CARGO_BUILD_JOBS` into each worker's env at spawn and wraps the worker command with `nice -n 10` so cargo runs at a lower priority than the supervisor. Controlled by two config knobs in `.cas/config.toml`:
+
+```toml
+[factory]
+# Cap on CARGO_BUILD_JOBS exported into workers.
+# "auto" (default) = max(2, num_cpus / 4).
+# Any numeric string like "4" is exported verbatim.
+cargo_build_jobs = "auto"
+
+# When true, prefix each worker spawn with `nice -n 10`.
+# Default true. Flip false for single-worker or benchmarking.
+nice_cargo = true
+```
+
+Shell-level overrides (win over config): `CAS_FACTORY_CARGO_BUILD_JOBS=<N>`, `CAS_FACTORY_NICE_WORKER=1`, `CAS_FACTORY_NICE_LEVEL=<N>`.
+
+**When the defaults are wrong:**
+- Running more than 4 workers on a 16-thread host → set `cargo_build_jobs = "2"` (÷4 assumption no longer holds).
+- Host has 32+ threads → `"auto"` is fine; can push higher if wall-time matters.
+- CPU-bound but not crashing → flip `nice_cargo = false` to let workers and supervisor compete on equal terms.
+
+**Repro runbook (for verifying the cap works on a given host):** spawn 4 workers on this repo, trigger simultaneous cargo builds in all of them (`cargo test` in each worktree), watch `uptime` over 60 s. 5-min load avg should stay below CPU count. If it still saturates, drop `cargo_build_jobs` one step (e.g. `"auto"` → `"2"`) and re-check.
+
+**If workers still wedge under these caps:** the scheduler storm is not the bottleneck. Likely candidates, in order of follow-up cost: (1) `sccache` shared across workers (cas-0bf4 Phase 2), (2) review-persona concurrency cap (cas-0bf4 Phase 3), (3) operational — spawn fewer workers.
+
 ## Reference
 
 Wrong field names and invalid actions waste dispatch cycles. This section covers exact valid actions and field names.
