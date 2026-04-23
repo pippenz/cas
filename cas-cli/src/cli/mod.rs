@@ -278,6 +278,15 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
     let dev_tracing_enabled = initialize_dev_tracer();
     let command_name = get_command_name(&cli.command);
 
+    // cas-0bf4: apply the factory resource-contention env bridge BEFORE
+    // `initialize_telemetry` spawns its background thread. Any
+    // `std::env::set_var` after that spawn is UB in a multi-threaded
+    // process. Only mutates env for the factory command path.
+    if matches!(cli.command, Some(Commands::Factory(_)) | None) {
+        let early_cas_root = find_cas_root().ok();
+        factory::apply_resource_contention_env(early_cas_root.as_deref());
+    }
+
     initialize_telemetry();
 
     let cas_root: Option<PathBuf> = find_cas_root().ok();
