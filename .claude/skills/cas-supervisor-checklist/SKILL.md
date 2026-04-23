@@ -8,6 +8,15 @@ managed_by: cas
 
 ## Session Start
 
+0. **Binary freshness check (cas-d0f9).** Before anything else — confirm the running `cas serve` binary matches HEAD of this repo. If it doesn't and you spawn workers anyway, every close hits `VERIFICATION_JAIL_BLOCKED` and you burn ~8 min per task on manual verifier runs. See the Pre-flight section in the cas-supervisor SKILL for the full command; the 10-second version:
+
+   ```
+   cas --version | awk '{print $NF}'        # hash the running binary was built from
+   git rev-parse --short HEAD               # hash of the repo right now
+   ```
+
+   If they don't match AND `git log --oneline HEAD --not <running-hash> -- cas-cli/src/mcp cas-cli/src/hooks cas-cli/src/cli/factory` returns anything, run `cargo build --release` and restart any live `cas serve` processes before continuing.
+
 1. Identify yourself: `mcp__cas__coordination action=whoami`
 2. Load EPIC/task context:
    ```
