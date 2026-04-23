@@ -112,21 +112,33 @@ pub fn handle_pre_tool_use(
         .unwrap_or_default();
 
     // ========================================================================
-    // FACTORY MODE: Block SendMessage — agents must use coordination message
+    // FACTORY MODE: Auto-route SendMessage → CAS coordination (cas-f32b)
     //
     // In factory mode, agents communicate through CAS coordination (push-based
     // via the Director/TUI). The built-in SendMessage tool bypasses this system
-    // and causes messages to be lost. Redirect to mcp__cas__coordination.
+    // and would cause messages to be lost.
+    //
+    // Claude Code's Team Coordination system-reminder tells agents to use
+    // `SendMessage`, so agents default to it. Previously this hook just
+    // denied-with-guidance, but agents frequently spammed retries before
+    // switching tools — effectively wedging workers on the deny loop
+    // (observed 2026-04-23 in gabber-studio).
+    //
+    // New behaviour: parse the SendMessage call, enqueue the message on the
+    // CAS prompt queue directly (same path `mcp__cas__coordination
+    // action=message` uses), notify the daemon, then return `deny` with an
+    // explicit "already delivered — do not retry" receipt so agents stop.
+    //
+    // On any failure (missing fields, queue open error, enqueue error) we
+    // fall back to the original deny-with-guidance path — never silently drop.
     // ========================================================================
     // `is_factory_agent` already computed above for the hoisted
     // cas_root=None auto-approve check (cas-7f33).
     if is_factory_agent && tool_name == "SendMessage" {
-        return Ok(HookOutput::with_pre_tool_permission(
-            "deny",
-            "🚫 SendMessage is disabled in factory mode.\n\n\
-            Use CAS coordination instead:\n\
-            mcp__cas__coordination action=message target=<agent-name> message=\"...\" summary=\"<brief summary>\"\n\n\
-            This ensures messages are routed through the factory Director.",
+        return Ok(auto_route_send_message(
+            input.tool_input.as_ref(),
+            cas_root,
+            &current_agent_id,
         ));
     }
 
@@ -841,3 +853,131 @@ pub(crate) const FACTORY_AUTO_APPROVE_TOOLS: &[&str] = &[
     "Bash",
     "NotebookEdit",
 ];
+
+/// Auto-route a factory-mode `SendMessage` tool call onto the CAS prompt
+/// queue so the message actually reaches its recipient, then return a
+/// `deny` receipt that tells the agent not to retry. See the `SendMessage`
+/// block in `handle_pre_tool_use` for the why.
+///
+/// On any parse / queue failure, falls back to the original deny-with-
+/// guidance path — we never silently drop the agent's message.
+fn auto_route_send_message(
+    tool_input: Option<&serde_json::Value>,
+    cas_root: &Path,
+    current_agent_id: &str,
+) -> HookOutput {
+    let fallback_guidance = || HookOutput::with_pre_tool_permission(
+        "deny",
+        "🚫 SendMessage is disabled in factory mode.\n\n\
+         Use CAS coordination instead:\n\
+         mcp__cas__coordination action=message target=<agent-name> message=\"...\" summary=\"<brief summary>\"\n\n\
+         This ensures messages are routed through the factory Director.",
+    );
+
+    let Some(ti) = tool_input else {
+        return fallback_guidance();
+    };
+
+    let target = match ti.get("to").and_then(|v| v.as_str()) {
+        Some(s) if !s.trim().is_empty() => s.to_string(),
+        _ => return fallback_guidance(),
+    };
+
+    // SendMessage.message may be a plain string OR a structured object
+    // (shutdown_response, plan_approval_response, etc.). Serialize objects
+    // to JSON so downstream reads still carry the full payload.
+    let body = match ti.get("message") {
+        Some(v) if v.is_string() => v.as_str().unwrap_or("").to_string(),
+        Some(v) => serde_json::to_string(v).unwrap_or_default(),
+        None => return fallback_guidance(),
+    };
+    if body.trim().is_empty() {
+        return fallback_guidance();
+    }
+
+    let summary = ti
+        .get("summary")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            body.lines()
+                .next()
+                .unwrap_or(&body)
+                .chars()
+                .take(80)
+                .collect()
+        });
+
+    // Resolve sender display name — prefer CAS_AGENT_NAME env (set by
+    // factory supervisor/worker spawn), fall back to agent_store lookup by
+    // session id, else "unknown".
+    let display_name = std::env::var("CAS_AGENT_NAME")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            crate::store::open_agent_store(cas_root)
+                .ok()
+                .and_then(|store| store.get(current_agent_id).ok())
+                .map(|agent| {
+                    use cas_types::AgentRole;
+                    if agent.role == AgentRole::Supervisor {
+                        "supervisor".to_string()
+                    } else {
+                        agent.name
+                    }
+                })
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let queue = match crate::store::open_prompt_queue_store(cas_root) {
+        Ok(q) => q,
+        Err(e) => {
+            warn!(
+                error = %e,
+                "SendMessage auto-route: failed to open prompt queue — falling back to deny-with-guidance"
+            );
+            return fallback_guidance();
+        }
+    };
+
+    let factory_session = std::env::var("CAS_FACTORY_SESSION").ok();
+    let message_id = match queue.enqueue_full(
+        &display_name,
+        &target,
+        &body,
+        factory_session.as_deref(),
+        Some(summary.as_str()),
+        None,
+    ) {
+        Ok(id) => id,
+        Err(e) => {
+            warn!(
+                error = %e,
+                target = target.as_str(),
+                "SendMessage auto-route: enqueue_full failed — falling back to deny-with-guidance"
+            );
+            return fallback_guidance();
+        }
+    };
+
+    // Best-effort: wake the daemon so delivery doesn't wait for the next
+    // poll cycle. Failure just means the daemon isn't running — the row
+    // is still persisted and will be picked up.
+    let _ = cas_factory::notify_daemon(cas_root);
+
+    info!(
+        message_id,
+        source = display_name.as_str(),
+        target = target.as_str(),
+        "SendMessage auto-routed onto CAS prompt queue"
+    );
+
+    HookOutput::with_pre_tool_permission(
+        "deny",
+        &format!(
+            "✅ AUTO-ROUTED via CAS coordination (message id {message_id}).\n\n\
+             Message delivered to `{target}`. DO NOT retry this SendMessage call.\n\n\
+             For future messages, call `mcp__cas__coordination action=message target=<name> message=\"...\" summary=\"...\"` directly — skip SendMessage."
+        ),
+    )
+}
