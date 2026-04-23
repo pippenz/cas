@@ -1106,7 +1106,7 @@ pub(crate) enum LivenessOutcome {
 /// - `agent.pid == Some(pid)` + `metadata[PID_STARTTIME_KEY]` parses as u64:
 ///   strict (pid, starttime) check via `fingerprint_matches_fn`.
 /// - `agent.pid == Some(pid)` + no/malformed fingerprint: pid-only liveness
-///   via `pid_alive_fn` → `AliveLegacyFingerprint` or `Dead` with
+///   via `pid_alive_fn` → `Alive { fingerprint_checked: false }` or `Dead` with
 ///   `fingerprint_checked=false`.
 ///
 /// Both probe functions are injected so tests can drive the outcome matrix
