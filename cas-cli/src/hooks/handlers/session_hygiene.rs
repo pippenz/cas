@@ -284,10 +284,30 @@ pub fn attribute_file_to_task(repo: &Path, file: &str) -> Option<String> {
     extract_task_id(&text)
 }
 
+/// Maximum WIP entries the SessionStart banner itself renders inline.
+///
+/// Above this cap we print a "... and N more" suffix and direct the
+/// supervisor to `gc_report` for the full list. The cap exists for two
+/// reasons surfaced in review:
+///
+/// 1. Each tracked entry spawns `git log -1` for attribution. On a
+///    pathological dirty tree (hundreds of files after a prior-session
+///    crash) an uncapped banner turns the SessionStart hook into a
+///    multi-second stall, which the user experiences as Claude Code
+///    hanging on startup. 20 entries ≤ ~1s at 20–50ms per subprocess.
+/// 2. The full SessionStart preview window is limited. Flooding it with
+///    attribution lines buries the codemap/overview signals.
+const WIP_BANNER_MAX_ENTRIES: usize = 20;
+
 /// Render the SessionStart triage banner for a supervisor session, or
 /// `None` when the worktree is clean / git is unavailable / cas_root
 /// cannot be resolved. The banner is best-effort and must never fail a
 /// session start.
+///
+/// The banner caps itself at [`WIP_BANNER_MAX_ENTRIES`] inline rows and
+/// forwards the overflow count to `gc_report` so the supervisor can
+/// paginate on demand — this bounds both `git log` subprocess fan-out
+/// and the token budget the banner eats from the context window.
 ///
 /// Output shape (example):
 /// ```text
@@ -311,7 +331,9 @@ pub fn build_session_start_wip_banner(cas_root: &Path) -> Option<String> {
         summary.modified_count(),
         summary.untracked_count(),
     ));
-    for entry in &summary.entries {
+    let total = summary.entries.len();
+    let shown = total.min(WIP_BANNER_MAX_ENTRIES);
+    for entry in summary.entries.iter().take(shown) {
         let attribution = if entry.is_untracked() {
             "(unattributed — no git history)".to_string()
         } else {
@@ -321,10 +343,16 @@ pub fn build_session_start_wip_banner(cas_root: &Path) -> Option<String> {
             }
         };
         out.push_str(&format!(
-            "  [{:10}] {}  {}\n",
+            "  [{:15}] {}  {}\n",
             entry.label(),
             entry.path,
             attribution,
+        ));
+    }
+    if total > shown {
+        let extra = total - shown;
+        out.push_str(&format!(
+            "  ... and {extra} more — run `mcp__cas__coordination action=gc_report` for the full list.\n",
         ));
     }
     out.push_str(
@@ -654,6 +682,44 @@ mod tests {
             .status()
             .unwrap();
         assert_eq!(attribute_file_to_task(repo, "b.txt"), None);
+    }
+
+    /// On a pathological dirty tree (hundreds of files) the banner must
+    /// cap its inline rows and direct the supervisor to `gc_report` for
+    /// the overflow. Guards against SessionStart latency regressions —
+    /// every rendered row spawns `git log -1`, so an uncapped banner
+    /// stalls session boot (cas-aeec adversarial P1).
+    #[test]
+    fn build_session_start_wip_banner_caps_rows_on_large_wip_trees() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        init_repo(repo);
+        // Untracked files don't need committing — faster than seeding
+        // real history and exercises the 'unattributed' path which
+        // still must be capped.
+        let total = WIP_BANNER_MAX_ENTRIES + 7;
+        for i in 0..total {
+            fs::write(repo.join(format!("wip_{i:03}.tmp")), "").unwrap();
+        }
+        let cas_root = repo.join(".cas");
+        fs::create_dir_all(&cas_root).unwrap();
+
+        let banner =
+            build_session_start_wip_banner(&cas_root).expect("banner for dirty tree");
+        // The "[" opens each inline row. Count occurrences.
+        let rows = banner.matches('[').count();
+        assert_eq!(
+            rows, WIP_BANNER_MAX_ENTRIES,
+            "banner must cap inline rows at WIP_BANNER_MAX_ENTRIES, got {rows}"
+        );
+        assert!(
+            banner.contains(&format!("and {} more", total - WIP_BANNER_MAX_ENTRIES)),
+            "banner must announce the overflow count"
+        );
+        assert!(
+            banner.contains("gc_report"),
+            "overflow line must direct supervisor to gc_report"
+        );
     }
 
     /// The SessionStart banner must surface the attribution line and the

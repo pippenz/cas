@@ -221,15 +221,20 @@ pub fn handle_session_start(
     };
 
     // Factory session-start hygiene triage (task cas-aeec): for supervisor
-    // sessions, prepend a banner listing uncommitted files in the main
+    // sessions, append a banner listing uncommitted files in the main
     // worktree with per-file last-touching-task-id attribution. Visibility
     // only — the supervisor decides salvage / commit / discard before
     // spawning workers. Best-effort: git failures, non-supervisor roles,
     // and clean trees all fall through silently.
+    //
+    // Appended (not prepended) so codemap and project-overview retain the
+    // preview top slot they are explicitly engineered to land in (see
+    // comments above). The banner is not severity-ranked against those
+    // modules, so it sits below them in the supervisor's initial view.
     let context = if is_supervisor {
         match crate::hooks::handlers::session_hygiene::build_session_start_wip_banner(cas_root) {
             Some(banner) if context.is_empty() => banner,
-            Some(banner) => format!("{banner}\n{context}"),
+            Some(banner) => format!("{context}\n{banner}"),
             None => context,
         }
     } else {
