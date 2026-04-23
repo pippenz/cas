@@ -567,13 +567,28 @@ impl TeamsManager {
         // Prune messages older than INBOX_RETENTION so the file cannot grow
         // unbounded across sessions — see cas-7f57 and the comment on
         // INBOX_RETENTION above.
+        //
+        // Unread messages (`read: false`) are preserved regardless of age
+        // so a supervisor's recovery/unblock prompt to a wedged worker
+        // cannot silently evaporate after the 2h window. See
+        // memory `feedback_supervisor_stop_message_latency` — stale
+        // STOP messages are already a known delivery hazard, and age-only
+        // retention would strictly worsen that failure mode.
         let retention_cutoff = now_utc - INBOX_RETENTION;
-        messages.retain(|m| match chrono::DateTime::parse_from_rfc3339(&m.timestamp) {
-            Ok(ts) => ts.with_timezone(&chrono::Utc) >= retention_cutoff,
-            // Unparseable timestamp: keep the message rather than silently
-            // drop real data; a future migration can clean these up.
-            Err(_) => true,
+        let messages_before_retain = messages.len();
+        messages.retain(|m| {
+            if !m.read {
+                return true;
+            }
+            match chrono::DateTime::parse_from_rfc3339(&m.timestamp) {
+                Ok(ts) => ts.with_timezone(&chrono::Utc) >= retention_cutoff,
+                // Unparseable timestamp: keep the message rather than
+                // silently drop real data; a future migration can clean
+                // these up.
+                Err(_) => true,
+            }
         });
+        let retention_pruned = messages.len() != messages_before_retain;
 
         // Dedup guard: if an identical (from, text) message exists within
         // the dedup window, skip the append. This is the coordination
@@ -601,10 +616,13 @@ impl TeamsManager {
                 target_agent = target,
                 "inbox write skipped — identical message within dedup window"
             );
-            // We still need to persist the pruned message list (retention
-            // sweep ran) so the inbox doesn't hoard stale entries.
-            let json = serde_json::to_string_pretty(&messages)?;
-            std::fs::write(&inbox_path, json)?;
+            // Only re-serialize+write if the retention sweep actually
+            // removed anything; otherwise this is a pure no-op and we
+            // avoid a write storm on hot duplicate senders.
+            if retention_pruned {
+                let json = serde_json::to_string_pretty(&messages)?;
+                std::fs::write(&inbox_path, json)?;
+            }
             unsafe { libc::flock(fd, libc::LOCK_UN) };
             return Ok(());
         }
@@ -1087,6 +1105,105 @@ mod tests {
         );
     }
 
+    /// A duplicate write beyond `INBOX_DEDUP_WINDOW` must pass through
+    /// and append — dedup is time-bounded, not permanent. Guards against
+    /// off-by-one sign flips on the cutoff comparison.
+    #[test]
+    fn write_to_inbox_does_not_dedup_past_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = manager_in(tmp.path(), "t_expire");
+        std::fs::create_dir_all(&mgr.inboxes_dir).unwrap();
+
+        // Seed inbox with a 15-minute-old duplicate (beyond 10-min window).
+        let old_ts = (chrono::Utc::now() - chrono::Duration::minutes(15))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let seeded = vec![InboxMessage {
+            from: DIRECTOR_AGENT_NAME.to_string(),
+            text: "ping".to_string(),
+            summary: Some("ping".to_string()),
+            timestamp: old_ts,
+            color: "green".to_string(),
+            // Must be marked read or retention will keep it for
+            // unrelated reasons; we want dedup to be the only variable.
+            read: true,
+        }];
+        let inbox_path = mgr.inboxes_dir.join("swift-fox.json");
+        std::fs::write(&inbox_path, serde_json::to_string_pretty(&seeded).unwrap())
+            .unwrap();
+
+        // Fresh write with identical (from, text). Must pass through.
+        mgr.write_to_inbox("swift-fox", DIRECTOR_AGENT_NAME, "ping", None, None)
+            .unwrap();
+
+        let inbox: Vec<InboxMessage> = serde_json::from_str(
+            &std::fs::read_to_string(&inbox_path).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            inbox.len(),
+            2,
+            "15-minute-old duplicate is beyond dedup window and must not suppress a fresh write"
+        );
+    }
+
+    /// Unread messages (`read: false`) survive the retention sweep even
+    /// when older than `INBOX_RETENTION`. Guards the cas-7f57 adversarial
+    /// P1 finding: a supervisor recovery prompt to a wedged worker must
+    /// not silently evaporate after 2h.
+    #[test]
+    fn write_to_inbox_retention_preserves_unread_messages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = manager_in(tmp.path(), "t_unread");
+        std::fs::create_dir_all(&mgr.inboxes_dir).unwrap();
+
+        // Seed a 3h-old UNREAD message (beyond 2h retention). Also seed
+        // a 3h-old READ message to prove the distinction.
+        let stale_ts = (chrono::Utc::now() - chrono::Duration::hours(3))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let seeded = vec![
+            InboxMessage {
+                from: "supervisor".to_string(),
+                text: "unblock yourself".to_string(),
+                summary: Some("unblock yourself".to_string()),
+                timestamp: stale_ts.clone(),
+                color: "green".to_string(),
+                read: false,
+            },
+            InboxMessage {
+                from: DIRECTOR_AGENT_NAME.to_string(),
+                text: "already-acked nag".to_string(),
+                summary: Some("already-acked nag".to_string()),
+                timestamp: stale_ts,
+                color: "green".to_string(),
+                read: true,
+            },
+        ];
+        let inbox_path = mgr.inboxes_dir.join("swift-fox.json");
+        std::fs::write(&inbox_path, serde_json::to_string_pretty(&seeded).unwrap())
+            .unwrap();
+
+        mgr.write_to_inbox("swift-fox", DIRECTOR_AGENT_NAME, "fresh", None, None)
+            .unwrap();
+
+        let inbox: Vec<InboxMessage> = serde_json::from_str(
+            &std::fs::read_to_string(&inbox_path).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(inbox.len(), 2, "inbox should retain unread + fresh, got {inbox:?}");
+        assert!(
+            inbox.iter().any(|m| m.text == "unblock yourself" && !m.read),
+            "unread supervisor recovery message must survive retention"
+        );
+        assert!(
+            !inbox.iter().any(|m| m.text == "already-acked nag"),
+            "stale read message must still be pruned"
+        );
+        assert!(
+            inbox.iter().any(|m| m.text == "fresh"),
+            "fresh write should have landed"
+        );
+    }
+
     /// Retention sweep: messages older than `INBOX_RETENTION` are dropped
     /// on every write so the inbox file cannot grow unbounded across
     /// sessions. Simulated by seeding a message with an old timestamp and
@@ -1107,7 +1224,9 @@ mod tests {
             summary: Some("ancient history".to_string()),
             timestamp: stale_ts,
             color: "green".to_string(),
-            read: false,
+            // Must be marked read — unread messages are preserved
+            // regardless of age by design.
+            read: true,
         }];
         let inbox_path = mgr.inboxes_dir.join("swift-fox.json");
         std::fs::write(&inbox_path, serde_json::to_string_pretty(&seeded).unwrap()).unwrap();
