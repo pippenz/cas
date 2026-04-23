@@ -748,6 +748,38 @@ impl CasService {
             }
         }
 
+        // Task cas-a9ab: surface uncommitted files in the main worktree as
+        // "likely prior-factory WIP". Informational only — we never auto-delete.
+        if let Some(summary) =
+            crate::hooks::handlers::session_hygiene::wip_candidates(&self.inner.cas_root)
+        {
+            out.push_str(&format!(
+                "\nMain worktree: {}\n",
+                summary.worktree.display()
+            ));
+            if summary.is_clean() {
+                out.push_str("Prior-factory WIP candidates: none (worktree clean)\n");
+            } else {
+                out.push_str(&format!(
+                    "Prior-factory WIP candidates: {} ({} untracked, {} modified)\n",
+                    summary.entries.len(),
+                    summary.untracked_count(),
+                    summary.modified_count(),
+                ));
+                for entry in &summary.entries {
+                    out.push_str(&format!(
+                        "  [{}] {} {}\n",
+                        entry.label(),
+                        entry.status,
+                        entry.path,
+                    ));
+                }
+                out.push_str(
+                    "\nNote: these are not auto-deleted. Inspect, then commit/salvage/discard.\n",
+                );
+            }
+        }
+
         Ok(Self::success(out))
     }
 
