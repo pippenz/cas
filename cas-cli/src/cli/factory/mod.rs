@@ -527,14 +527,26 @@ pub enum FactoryCommands {
         cas_root: Option<std::path::PathBuf>,
     },
 
-    /// SIGKILL a wedged worker and release its CAS lease (cas-4513).
+    /// SIGKILL a wedged worker and reset its tasks (cas-4513).
     ///
     /// SIGTERM is observed to not exit cleanly on the Bun-wedged Claude Code
     /// process, so this verb uses SIGKILL. Idempotent — an already-dead
-    /// worker still triggers the lease-release cleanup.
+    /// worker still runs the task-reset cleanup.
+    ///
+    /// By default refuses to SIGKILL a PID whose `/proc/<pid>/stat`
+    /// starttime fingerprint does not match what was recorded at
+    /// agent registration (= PID was recycled; killing would hit an
+    /// unrelated process). Pass `--force` to override — only use that
+    /// on legacy agents predating the fingerprint (cas-ea46) or when
+    /// you've independently verified the PID is still the worker.
     Kill {
         /// Worker name
         worker: String,
+
+        /// Override the PID-recycling fingerprint guard. Prints a
+        /// warning in the summary when exercised.
+        #[arg(long)]
+        force: bool,
 
         /// Explicit CAS root
         #[arg(long)]
@@ -669,10 +681,12 @@ pub fn execute(args: &FactoryArgs, cli: &Cli, cas_root: Option<&std::path::Path>
             ),
             FactoryCommands::Kill {
                 worker,
+                force,
                 cas_root: sub_cas_root,
             } => wedged::execute_kill(
                 sub_cas_root.as_deref().or(cas_root),
                 worker,
+                *force,
             ),
         };
     }

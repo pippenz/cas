@@ -399,9 +399,11 @@ The Bun/React-Ink crash signature is the visual fingerprint captured in the cas-
 
 **Step 3: recovery.** Only after `is-wedged` reports `wedged` or `dead`:
 
-- **Wedged:** `cas factory kill <worker>` — SIGKILL (SIGTERM is observed not to exit cleanly on the Bun wedge) and release the CAS lease. Idempotent on an already-dead process. Then respawn.
+- **Wedged:** `cas factory kill <worker>` — SIGKILL (SIGTERM is observed not to exit cleanly on the Bun wedge) and reset any leased tasks (release lease + status→Open + clear assignee, same semantics as `mcp__cas__task action=reset`). Idempotent on an already-dead process. Then respawn.
 - **Starved:** do not kill. Come back in 2 minutes; if it re-classifies as `wedged`, proceed to the kill path.
-- **Dead:** no kill needed. Run `mcp__cas__task action=reset id=<task>` on any leased task to hand it to a fresh worker.
+- **Dead:** no kill needed. The `kill` verb is still safe to run (`skipping SIGKILL` + task reset runs); or manually `mcp__cas__task action=reset id=<task>`.
+
+**PID-recycling guard.** `cas factory kill` refuses to SIGKILL unless the `/proc/<pid>/stat` starttime fingerprint recorded at agent registration (cas-ea46 / cas-b157) still matches the process at that PID. On a busy host the kernel can recycle a PID between registration and kill, so without this guard we could SIGKILL an unrelated process. If the fingerprint mismatches, the summary says `pid N SKIPPED: starttime fingerprint mismatch (PID recycled). Pass --force to override.` — investigate before using `--force`. Legacy agents (registered before cas-ea46) have no fingerprint and also require `--force`.
 
 **Anti-pattern:** "pane looks broken → `shutdown_workers`". That pathway has destroyed in-progress work multiple times (silent-owl-56 2026-04-23 shipped cas-4181 through what looked like a crashed pane). The `is-wedged` / `debug` / `kill` triad replaces it.
 
