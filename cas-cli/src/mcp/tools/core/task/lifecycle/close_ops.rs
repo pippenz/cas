@@ -773,7 +773,43 @@ impl CasCore {
         //     overrides because that would mask a misconfigured
         //     harness.
         let close_project_root = self.cas_root.parent().unwrap_or(&self.cas_root);
-        match run_code_review_gate(&task, &req, close_project_root) {
+
+        // cas-3086: Epic-close should not re-gate on the union diff
+        // when every subtask already carries a valid ReviewOutcome
+        // receipt (persisted on deliverables.review_envelope). The
+        // subtasks were each individually reviewed before their own
+        // close; running the multi-persona reviewer on the unioned
+        // diff is redundant cost and wrong-shape signal.
+        let epic_subtask_receipts_cover = if task.task_type == TaskType::Epic {
+            use cas_store::code_review::close_gate::{GateDecision, evaluate_gate};
+            match task_store.get_subtasks(&req.id) {
+                Ok(subtasks) if !subtasks.is_empty() => subtasks.iter().all(|t| {
+                    t.deliverables
+                        .review_envelope
+                        .as_deref()
+                        .and_then(|e| serde_json::from_str::<cas_types::ReviewOutcome>(e).ok())
+                        .filter(|o| o.validate().is_ok())
+                        // Defense-in-depth (per verifier): a receipt
+                        // with a residual P0 must not let the epic-close
+                        // bypass the gate, even though such a subtask
+                        // shouldn't have been closed in the first place.
+                        // Guards against direct DB writes or bugs that
+                        // leak P0s past the subtask gate.
+                        .map(|o| matches!(evaluate_gate(&o.residual), GateDecision::Allow))
+                        .unwrap_or(false)
+                }),
+                _ => false,
+            }
+        } else {
+            false
+        };
+
+        let gate_outcome = if epic_subtask_receipts_cover {
+            CodeReviewGateOutcome::Proceed
+        } else {
+            run_code_review_gate(&task, &req, close_project_root)
+        };
+        match gate_outcome {
             CodeReviewGateOutcome::Proceed => {}
             CodeReviewGateOutcome::AppendDecisionNote(note) => {
                 let mut t = task.clone();
