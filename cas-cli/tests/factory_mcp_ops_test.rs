@@ -439,9 +439,9 @@ async fn test_worker_status_shows_agents() {
 /// stale Worker transitions out of Active and never hits the `[DEAD]`
 /// label / transcript-path render branch. The render-time DEAD branch
 /// only fires when `mark_stale` fails (DB lock, etc.) — that code path
-/// is cheap unit coverage at the `derive_transcript_path` level (see
-/// the `mcp::tools::service::factory_ops::tests` module) and is routed
-/// to cas-900b for full glob-based resolution. Here we test the
+/// is cheap unit coverage at the `resolve_transcript` / `render_transcript_block`
+/// level (see the `mcp::tools::service::factory_ops::tests` module),
+/// now with glob-based resolution landed via cas-900b. Here we test the
 /// prune-success integration.
 #[tokio::test]
 async fn test_worker_status_prunes_stale_worker_and_keeps_live_one() {

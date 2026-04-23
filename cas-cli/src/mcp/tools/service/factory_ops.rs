@@ -307,14 +307,23 @@ impl CasService {
                 // can salvage whatever was in-flight when the CC client died
                 // (cas-2749 AC: transcript-path-surfacing on crash).
                 let transcript_info = if elapsed >= worker_stale_threshold_secs {
-                    // cas-900b: prefer glob-based resolution on session_id
-                    // (agent.id); fall back to reconstructed path only when
-                    // the glob can't find a unique match. Always surfaces
-                    // session_id explicitly so supervisors can grep.
-                    match clone_path.as_deref() {
-                        Some(p) => format_transcript_block(p, &agent.id),
-                        None => format_transcript_block_without_clone_path(&agent.id),
-                    }
+                    // cas-900b: glob ~/.claude/projects/*/<session_id>.jsonl
+                    // for the real on-disk transcript path. Fall back to
+                    // the reconstructed path only when the glob can't find
+                    // a unique match. Always surfaces session_id so a
+                    // supervisor who doesn't trust our resolution can grep.
+                    //
+                    // In factory mode, `agent.id` is the CC SessionStart
+                    // UUID (daemon.rs + server/mod.rs both construct the
+                    // Agent via `Agent::new(session_id, name)`). If
+                    // `cc_session_id` is ever populated separately in the
+                    // future we prefer it — but for now `id` is the right
+                    // key and has been correct since cas-2749.
+                    let session_id = agent
+                        .cc_session_id
+                        .as_deref()
+                        .unwrap_or(&agent.id);
+                    format_transcript_block(clone_path.as_deref(), session_id)
                 } else {
                     String::new()
                 };
@@ -1001,10 +1010,12 @@ enum TranscriptResolution {
     Synthesized(String),
     /// More than one match — should be rare (session_id collisions or a
     /// user who manually copied transcripts between projects). Surface
-    /// all candidates so the supervisor can pick.
+    /// all candidates so the supervisor can pick. `truncated` is true
+    /// when the glob walk hit `MAX_TRANSCRIPT_CANDIDATES`.
     Ambiguous {
         matches: Vec<std::path::PathBuf>,
         synthesized: String,
+        truncated: bool,
     },
 }
 
@@ -1026,48 +1037,81 @@ fn synthesized_transcript_path(clone_path: &str, session_id: &str) -> String {
     format!("~/.claude/projects/{escaped}/{session_id}.jsonl")
 }
 
-/// Glob `<projects_dir>/*/<session-id>.jsonl` and return matches. Pure
-/// function on the filesystem — injectable `projects_dir` lets tests point
-/// at a tempdir. Malformed glob patterns (should never happen given the
-/// session_id UUID shape) silently yield an empty vec; real failure modes
-/// to worry about are I/O errors which we treat as "no match" here because
-/// the caller's fallback path preserves the supervisor's agency.
+/// Hard cap on glob candidate collection to bound the worst-case
+/// `worker_status` latency (adversarial cas-900b P1). On a long-lived
+/// host `~/.claude/projects/` can accumulate thousands of transcripts;
+/// listing more than 50 for a single worker isn't useful anyway — the
+/// supervisor needs to pick one, not read a thousand paths. If the cap
+/// is ever hit the output notes the truncation so the supervisor knows
+/// to grep manually.
+const MAX_TRANSCRIPT_CANDIDATES: usize = 50;
+
+/// Glob `<projects_dir>/*/<session-id>.jsonl` and return up to
+/// `MAX_TRANSCRIPT_CANDIDATES` matches plus a `truncated` flag.
+///
+/// - `session_id` is glob-escaped before interpolation (adversarial
+///   cas-900b P1): an agent that registers with a malicious
+///   `session_id = "*"` must not broaden the search and leak every
+///   transcript on the host into `worker_status` output.
+/// - Malformed glob patterns and I/O errors collapse to an empty vec;
+///   the caller's fallback path preserves supervisor agency.
 fn glob_transcript_candidates(
     projects_dir: &std::path::Path,
     session_id: &str,
-) -> Vec<std::path::PathBuf> {
-    // glob crate wants a pattern string; use `to_string_lossy` because
-    // projects_dir is under the user's home dir and should always be valid
-    // UTF-8, and if it isn't glob will just return no matches.
+) -> (Vec<std::path::PathBuf>, bool) {
+    let escaped_session = glob::Pattern::escape(session_id);
     let pattern = format!(
         "{}/*/{}.jsonl",
         projects_dir.to_string_lossy(),
-        session_id
+        escaped_session
     );
-    match glob::glob(&pattern) {
-        Ok(iter) => iter.filter_map(Result::ok).collect(),
-        Err(_) => Vec::new(),
+    let iter = match glob::glob(&pattern) {
+        Ok(it) => it,
+        Err(_) => return (Vec::new(), false),
+    };
+    let mut out = Vec::new();
+    let mut truncated = false;
+    for result in iter {
+        if let Ok(p) = result {
+            if out.len() >= MAX_TRANSCRIPT_CANDIDATES {
+                truncated = true;
+                break;
+            }
+            out.push(p);
+        }
     }
+    (out, truncated)
 }
 
 /// Resolve the transcript location for a worker. Uses `glob_transcript_candidates`
 /// against `~/.claude/projects/` by default; tests override `projects_dir`.
+///
+/// `clone_path == None` means the worker registered without cwd metadata;
+/// the `Synthesized` / `Ambiguous` fallback paths omit the reconstructed
+/// legacy escape in that case (there's nothing to reconstruct from), and
+/// the caller must label the output accordingly.
 fn resolve_transcript(
     projects_dir: Option<&std::path::Path>,
-    clone_path: &str,
+    clone_path: Option<&str>,
     session_id: &str,
 ) -> TranscriptResolution {
-    let synthesized = synthesized_transcript_path(clone_path, session_id);
+    let synthesized = clone_path.map(|p| synthesized_transcript_path(p, session_id));
     let Some(projects) = projects_dir else {
-        return TranscriptResolution::Synthesized(synthesized);
+        return TranscriptResolution::Synthesized(
+            synthesized.unwrap_or_else(|| synthesized_unknown_clone_path(session_id)),
+        );
     };
-    let mut matches = glob_transcript_candidates(projects, session_id);
+    let (mut matches, truncated) = glob_transcript_candidates(projects, session_id);
     match matches.len() {
-        0 => TranscriptResolution::Synthesized(synthesized),
-        1 => TranscriptResolution::Resolved(matches.pop().expect("len==1")),
+        0 => TranscriptResolution::Synthesized(
+            synthesized.unwrap_or_else(|| synthesized_unknown_clone_path(session_id)),
+        ),
+        1 => TranscriptResolution::Resolved(matches.remove(0)),
         _ => TranscriptResolution::Ambiguous {
             matches,
-            synthesized,
+            synthesized: synthesized
+                .unwrap_or_else(|| synthesized_unknown_clone_path(session_id)),
+            truncated,
         },
     }
 }
@@ -1078,58 +1122,67 @@ fn default_claude_projects_dir() -> Option<std::path::PathBuf> {
     dirs::home_dir().map(|h| h.join(".claude").join("projects"))
 }
 
+/// Placeholder synthesized path used when clone_path metadata is absent.
+/// The label explicitly names the missing input so a supervisor reading
+/// the output sees *why* the synthesized path is a placeholder (adversarial
+/// cas-900b P3: don't conflate clone_path-absent with home_dir-absent).
+fn synthesized_unknown_clone_path(session_id: &str) -> String {
+    format!("~/.claude/projects/<cwd>/{session_id}.jsonl (clone path unknown)")
+}
+
 /// Render the transcript block for `worker_status` output. Always surfaces
-/// the `session_id` explicitly so the supervisor can grep the projects
-/// tree themselves if our resolution ever goes wrong (cas-900b AC).
-fn format_transcript_block(clone_path: &str, session_id: &str) -> String {
-    let resolution = resolve_transcript(
-        default_claude_projects_dir().as_deref(),
-        clone_path,
-        session_id,
-    );
+/// the raw `session_id` so a supervisor who doesn't trust our resolution
+/// can grep the projects tree themselves (cas-900b AC).
+///
+/// `clone_path == None` is handled by the same resolver with a clearly
+/// labelled fallback — no duplicated glob+match dispatch (maintainability
+/// cas-900b P2).
+fn format_transcript_block(clone_path: Option<&str>, session_id: &str) -> String {
+    let projects = default_claude_projects_dir();
+    let resolution = resolve_transcript(projects.as_deref(), clone_path, session_id);
+    render_transcript_block(&resolution, session_id, projects.is_some())
+}
+
+/// Pure string-rendering half of `format_transcript_block`, split out so
+/// tests can drive it against a `TranscriptResolution` built via the
+/// injectable resolver without touching `dirs::home_dir()`.
+fn render_transcript_block(
+    resolution: &TranscriptResolution,
+    session_id: &str,
+    home_resolved: bool,
+) -> String {
     match resolution {
         TranscriptResolution::Resolved(path) => format!(
             "\n    Transcript: {}\n    Session: {session_id}",
             path.display()
         ),
-        TranscriptResolution::Synthesized(path) => format!(
-            "\n    Likely transcript: {path}\n    Session: {session_id}"
-        ),
-        TranscriptResolution::Ambiguous { matches, synthesized } => {
+        TranscriptResolution::Synthesized(path) => {
+            // Distinguish home-dir-unresolvable from "glob returned 0
+            // matches" so a supervisor triaging the output knows which
+            // failure mode to chase (adversarial cas-900b P3).
+            if home_resolved {
+                format!("\n    Likely transcript: {path}\n    Session: {session_id}")
+            } else {
+                format!(
+                    "\n    Likely transcript: {path}\n    (home dir unresolvable — glob skipped)\n    Session: {session_id}"
+                )
+            }
+        }
+        TranscriptResolution::Ambiguous {
+            matches,
+            synthesized,
+            truncated,
+        } => {
             let mut s = format!("\n    Transcript candidates (session {session_id}):");
-            for m in &matches {
+            for m in matches {
                 s.push_str(&format!("\n      - {}", m.display()));
+            }
+            if *truncated {
+                s.push_str(&format!(
+                    "\n      … (truncated at {MAX_TRANSCRIPT_CANDIDATES}; grep ~/.claude/projects for session)"
+                ));
             }
             s.push_str(&format!("\n    Likely synthesized: {synthesized}"));
-            s
-        }
-    }
-}
-
-/// Fallback block when `clone_path` metadata is absent (worker registered
-/// without cwd). We can still glob on session_id alone — the resolution is
-/// often unambiguous even without knowing the escape.
-fn format_transcript_block_without_clone_path(session_id: &str) -> String {
-    // Best-effort: glob for the session anyway.
-    let Some(projects) = default_claude_projects_dir() else {
-        return format!(
-            "\n    Transcript: ~/.claude/projects/<cwd>/{session_id}.jsonl (clone path unknown)\n    Session: {session_id}"
-        );
-    };
-    let matches = glob_transcript_candidates(&projects, session_id);
-    match matches.len() {
-        0 => format!(
-            "\n    Transcript: ~/.claude/projects/<cwd>/{session_id}.jsonl (clone path unknown, no glob match)\n    Session: {session_id}"
-        ),
-        1 => format!(
-            "\n    Transcript: {}\n    Session: {session_id}",
-            matches[0].display()
-        ),
-        _ => {
-            let mut s = format!("\n    Transcript candidates (session {session_id}, clone path unknown):");
-            for m in &matches {
-                s.push_str(&format!("\n      - {}", m.display()));
-            }
             s
         }
     }
@@ -1193,7 +1246,7 @@ mod tests {
         ]);
         let got = resolve_transcript(
             Some(&projects),
-            "/home/alice/workspace/one",
+            Some("/home/alice/workspace/one"),
             TEST_SESSION,
         );
         let expected_path = projects
@@ -1211,7 +1264,7 @@ mod tests {
         ]);
         let got = resolve_transcript(
             Some(&projects),
-            "/home/alice/workspace/one",
+            Some("/home/alice/workspace/one"),
             TEST_SESSION,
         );
         let expected =
@@ -1229,18 +1282,29 @@ mod tests {
         ]);
         let got = resolve_transcript(
             Some(&projects),
-            "/home/alice/workspace/one",
+            Some("/home/alice/workspace/one"),
             TEST_SESSION,
         );
         match got {
             TranscriptResolution::Ambiguous {
-                matches,
+                mut matches,
                 synthesized,
+                truncated,
             } => {
-                assert_eq!(matches.len(), 2, "both fake project dirs should match");
-                assert!(matches.iter().all(|p| p
-                    .to_string_lossy()
-                    .contains(TEST_SESSION)));
+                assert!(!truncated, "2 < MAX_TRANSCRIPT_CANDIDATES");
+                // Sort for deterministic comparison (glob order is
+                // filesystem-dependent — cas-900b testing P3).
+                matches.sort();
+                let mut expected: Vec<_> = vec![
+                    projects
+                        .join("-home-alice-workspace-one")
+                        .join(format!("{TEST_SESSION}.jsonl")),
+                    projects
+                        .join("-home-alice-workspace-two")
+                        .join(format!("{TEST_SESSION}.jsonl")),
+                ];
+                expected.sort();
+                assert_eq!(matches, expected);
                 assert_eq!(
                     synthesized,
                     synthesized_transcript_path("/home/alice/workspace/one", TEST_SESSION)
@@ -1262,7 +1326,7 @@ mod tests {
         ]);
         let got = resolve_transcript(
             Some(&projects),
-            "/home/usér/projet/café",
+            Some("/home/usér/projet/café"),
             TEST_SESSION,
         );
         let expected_path = projects
@@ -1275,8 +1339,19 @@ mod tests {
     fn resolve_transcript_no_projects_dir_is_synthesized() {
         // If we can't resolve the home dir (shouldn't happen in practice),
         // the function still returns a usable Synthesized fallback.
-        let got = resolve_transcript(None, "/home/alice/x", TEST_SESSION);
+        let got = resolve_transcript(None, Some("/home/alice/x"), TEST_SESSION);
         let expected = synthesized_transcript_path("/home/alice/x", TEST_SESSION);
+        assert_eq!(got, TranscriptResolution::Synthesized(expected));
+    }
+
+    #[test]
+    fn resolve_transcript_no_clone_path_falls_back_to_placeholder() {
+        // When clone_path is None (worker registered without cwd metadata),
+        // the Synthesized arm carries the placeholder label instead of a
+        // reconstructed path.
+        let (_tmp, projects) = fake_projects_dir(&[]);
+        let got = resolve_transcript(Some(&projects), None, TEST_SESSION);
+        let expected = synthesized_unknown_clone_path(TEST_SESSION);
         assert_eq!(got, TranscriptResolution::Synthesized(expected));
     }
 
@@ -1284,7 +1359,127 @@ mod tests {
     fn glob_candidates_returns_empty_on_missing_projects_dir() {
         // Glob on a nonexistent path must not panic — just return empty.
         let missing = std::path::Path::new("/tmp/does-not-exist-cas-900b");
-        let got = glob_transcript_candidates(missing, TEST_SESSION);
+        let (got, truncated) = glob_transcript_candidates(missing, TEST_SESSION);
         assert!(got.is_empty());
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn glob_candidates_escapes_session_id_metachars() {
+        // cas-900b adversarial P1: a rogue session_id containing glob
+        // metacharacters (`*`, `?`, `[`) must not broaden the match and
+        // surface unrelated transcripts. We create a "real" file at
+        // `*.jsonl` (by using a sentinel session_id for the fake dir)
+        // plus noise files, and glob for the literal `*` session id;
+        // only a file whose stem is literally `*` should come back, and
+        // in this layout there is none, so the result is empty.
+        let (_tmp, projects) = fake_projects_dir(&[
+            ("-home-alice-one", &[TEST_SESSION, "another-session"]),
+            ("-home-alice-two", &["yet-another"]),
+        ]);
+        // A malicious session_id: `*` would, if unescaped, match every
+        // .jsonl under every project dir. With the fix, glob::Pattern::escape
+        // turns it into `[*]` (glob literal) so it only matches a file
+        // literally named `*.jsonl` — which doesn't exist here.
+        let (got, _) = glob_transcript_candidates(&projects, "*");
+        assert!(
+            got.is_empty(),
+            "escaped `*` must not match arbitrary .jsonl files; got {got:?}"
+        );
+    }
+
+    #[test]
+    fn glob_candidates_truncates_at_max() {
+        // cas-900b adversarial P1: bound latency under high-cardinality
+        // layouts. Build a layout with MAX+5 matches and confirm the
+        // truncated flag fires and the vec length stops at MAX.
+        let tmp = tempfile::tempdir().unwrap();
+        let projects = tmp.path().join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        for i in 0..(MAX_TRANSCRIPT_CANDIDATES + 5) {
+            let d = projects.join(format!("proj-{i}"));
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join(format!("{TEST_SESSION}.jsonl")), b"").unwrap();
+        }
+        let (got, truncated) = glob_transcript_candidates(&projects, TEST_SESSION);
+        assert_eq!(got.len(), MAX_TRANSCRIPT_CANDIDATES);
+        assert!(truncated, "MAX+5 inputs must trip the truncated flag");
+    }
+
+    #[test]
+    fn render_transcript_block_resolved_contains_session_and_path() {
+        let path = std::path::PathBuf::from("/home/u/.claude/projects/x/ses.jsonl");
+        let got = render_transcript_block(
+            &TranscriptResolution::Resolved(path.clone()),
+            TEST_SESSION,
+            true,
+        );
+        assert!(got.contains("Transcript: /home/u/.claude/projects/x/ses.jsonl"));
+        assert!(got.contains(&format!("Session: {TEST_SESSION}")));
+        assert!(!got.contains("Likely"));
+    }
+
+    #[test]
+    fn render_transcript_block_synthesized_labels_likely_and_surfaces_session() {
+        let synth = "~/.claude/projects/-home-x/ses.jsonl".to_string();
+        let got = render_transcript_block(
+            &TranscriptResolution::Synthesized(synth.clone()),
+            TEST_SESSION,
+            true,
+        );
+        assert!(got.contains(&format!("Likely transcript: {synth}")));
+        assert!(got.contains(&format!("Session: {TEST_SESSION}")));
+    }
+
+    #[test]
+    fn render_transcript_block_synthesized_no_home_notes_skipped_glob() {
+        // cas-900b adversarial P3: distinguish home-dir failure from
+        // clone-path failure.
+        let synth = synthesized_unknown_clone_path(TEST_SESSION);
+        let got = render_transcript_block(
+            &TranscriptResolution::Synthesized(synth),
+            TEST_SESSION,
+            false,
+        );
+        assert!(got.contains("home dir unresolvable"));
+        assert!(got.contains("glob skipped"));
+    }
+
+    #[test]
+    fn render_transcript_block_ambiguous_lists_candidates_with_session_and_fallback() {
+        let matches = vec![
+            std::path::PathBuf::from("/p/a/ses.jsonl"),
+            std::path::PathBuf::from("/p/b/ses.jsonl"),
+        ];
+        let synthesized = "~/.claude/projects/-p-a/ses.jsonl".to_string();
+        let got = render_transcript_block(
+            &TranscriptResolution::Ambiguous {
+                matches,
+                synthesized: synthesized.clone(),
+                truncated: false,
+            },
+            TEST_SESSION,
+            true,
+        );
+        assert!(got.contains(&format!("candidates (session {TEST_SESSION})")));
+        assert!(got.contains("- /p/a/ses.jsonl"));
+        assert!(got.contains("- /p/b/ses.jsonl"));
+        assert!(got.contains(&format!("Likely synthesized: {synthesized}")));
+        assert!(!got.contains("truncated"));
+    }
+
+    #[test]
+    fn render_transcript_block_ambiguous_truncated_notes_cap() {
+        let got = render_transcript_block(
+            &TranscriptResolution::Ambiguous {
+                matches: vec![std::path::PathBuf::from("/p/a/ses.jsonl")],
+                synthesized: "<s>".to_string(),
+                truncated: true,
+            },
+            TEST_SESSION,
+            true,
+        );
+        assert!(got.contains("truncated"));
+        assert!(got.contains(&format!("{MAX_TRANSCRIPT_CANDIDATES}")));
     }
 }
