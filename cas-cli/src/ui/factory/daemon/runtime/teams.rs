@@ -19,6 +19,30 @@ const AGENT_COLORS: &[&str] = &["green", "blue", "yellow", "cyan", "magenta", "r
 /// team member.
 pub const DIRECTOR_AGENT_NAME: &str = "director";
 
+/// Dedup window for identical (from, text) inbox writes (task cas-7f57).
+///
+/// The daemon can re-fire the same auto-prompt (e.g. "You have been assigned
+/// cas-X") in a number of documented-but-unintended paths — event-detector
+/// last_state resets across refresh ticks, prompt_queue retry loops on pane
+/// busy, teams-inbox outbox replays on client reconnect. Workers live-reported
+/// receiving dozens of identical assignment messages minutes apart for tasks
+/// that were already Closed, each costing ~100–500 tokens of context per
+/// repeat. This is the coordination-layer guard: if the target's inbox
+/// already contains a message with identical `from` + `text` within the last
+/// `INBOX_DEDUP_WINDOW`, we skip the append and no-op the write. The deeper
+/// causes are left as follow-ups; this stops the bleeding at the delivery
+/// boundary.
+const INBOX_DEDUP_WINDOW: chrono::Duration = chrono::Duration::minutes(10);
+
+/// Retention window for messages in the inbox file (task cas-7f57).
+///
+/// Inbox files are append-only today and `read: false` is never flipped to
+/// true (see history comment on the field). Without pruning, every session
+/// boot replays the entire accumulated history to Claude Code. On every
+/// write we drop messages older than this window so the file stays bounded
+/// and stale messages cannot haunt future sessions.
+const INBOX_RETENTION: chrono::Duration = chrono::Duration::hours(2);
+
 /// A single message in a Teams inbox file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InboxMessage {
@@ -532,13 +556,58 @@ impl TeamsManager {
             serde_json::from_str(&content).unwrap_or_default()
         };
 
-        // Append new message
-        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let now_utc = chrono::Utc::now();
+        let now = now_utc.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         let resolved_color = color.unwrap_or("green").to_string();
 
         // Always set summary — native Claude Code expects it.
         // Fall back to the message text when no explicit summary is provided.
         let resolved_summary = summary.unwrap_or(message).to_string();
+
+        // Prune messages older than INBOX_RETENTION so the file cannot grow
+        // unbounded across sessions — see cas-7f57 and the comment on
+        // INBOX_RETENTION above.
+        let retention_cutoff = now_utc - INBOX_RETENTION;
+        messages.retain(|m| match chrono::DateTime::parse_from_rfc3339(&m.timestamp) {
+            Ok(ts) => ts.with_timezone(&chrono::Utc) >= retention_cutoff,
+            // Unparseable timestamp: keep the message rather than silently
+            // drop real data; a future migration can clean these up.
+            Err(_) => true,
+        });
+
+        // Dedup guard: if an identical (from, text) message exists within
+        // the dedup window, skip the append. This is the coordination
+        // message-dedupe layer called out in the cas-7f57 acceptance
+        // criteria — prevents the director/prompt_queue/outbox replay
+        // paths from writing the same "You have been assigned cas-X"
+        // message to the same worker repeatedly.
+        let dedup_cutoff = now_utc - INBOX_DEDUP_WINDOW;
+        let is_recent_duplicate = messages.iter().rev().any(|m| {
+            if m.from != from || m.text != message {
+                return false;
+            }
+            match chrono::DateTime::parse_from_rfc3339(&m.timestamp) {
+                Ok(ts) => ts.with_timezone(&chrono::Utc) >= dedup_cutoff,
+                Err(_) => false,
+            }
+        });
+
+        if is_recent_duplicate {
+            tracing::debug!(
+                target: "cas::coordination",
+                stage = "dedup_skip",
+                channel = "teams_inbox",
+                from = from,
+                target_agent = target,
+                "inbox write skipped — identical message within dedup window"
+            );
+            // We still need to persist the pruned message list (retention
+            // sweep ran) so the inbox doesn't hoard stale entries.
+            let json = serde_json::to_string_pretty(&messages)?;
+            std::fs::write(&inbox_path, json)?;
+            unsafe { libc::flock(fd, libc::LOCK_UN) };
+            return Ok(());
+        }
 
         messages.push(InboxMessage {
             from: from.to_string(),
@@ -944,5 +1013,115 @@ mod tests {
         if let Some(dir) = expected_path.parent() {
             let _ = std::fs::remove_dir_all(dir);
         }
+    }
+
+    /// Cross-refresh replay: identical (from, text) writes within
+    /// `INBOX_DEDUP_WINDOW` must no-op, dropping the duplicate before it
+    /// reaches the worker. This is the core regression guard for cas-7f57
+    /// — workers observed "You have been assigned cas-X" messages replayed
+    /// minutes apart for tasks that were already Closed.
+    #[test]
+    fn write_to_inbox_dedups_identical_messages_within_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = manager_in(tmp.path(), "t1");
+        std::fs::create_dir_all(&mgr.inboxes_dir).unwrap();
+        mgr.ensure_inbox("swift-fox").unwrap();
+
+        let msg = "You have been assigned cas-7f57\nTask: dup guard";
+        mgr.write_to_inbox("swift-fox", DIRECTOR_AGENT_NAME, msg, None, None)
+            .unwrap();
+        mgr.write_to_inbox("swift-fox", DIRECTOR_AGENT_NAME, msg, None, None)
+            .unwrap();
+        mgr.write_to_inbox("swift-fox", DIRECTOR_AGENT_NAME, msg, None, None)
+            .unwrap();
+
+        let inbox: Vec<InboxMessage> = serde_json::from_str(
+            &std::fs::read_to_string(mgr.inboxes_dir.join("swift-fox.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            inbox.len(),
+            1,
+            "identical within-window writes must dedupe down to one entry; inbox={inbox:?}"
+        );
+
+        // A genuinely different payload still gets through.
+        mgr.write_to_inbox(
+            "swift-fox",
+            DIRECTOR_AGENT_NAME,
+            "Worker is idle — pick up a task",
+            None,
+            None,
+        )
+        .unwrap();
+        let inbox: Vec<InboxMessage> = serde_json::from_str(
+            &std::fs::read_to_string(mgr.inboxes_dir.join("swift-fox.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(inbox.len(), 2, "distinct payload must not be deduped");
+    }
+
+    /// Writes from different senders with the same text are independent —
+    /// dedup keys on (from, text). Guards against overly aggressive
+    /// collapse that would swallow legitimate cross-sender broadcasts.
+    #[test]
+    fn write_to_inbox_dedup_is_per_sender() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = manager_in(tmp.path(), "t2");
+        std::fs::create_dir_all(&mgr.inboxes_dir).unwrap();
+        mgr.ensure_inbox("swift-fox").unwrap();
+
+        mgr.write_to_inbox("swift-fox", DIRECTOR_AGENT_NAME, "ping", None, None)
+            .unwrap();
+        mgr.write_to_inbox("swift-fox", "supervisor", "ping", None, None)
+            .unwrap();
+
+        let inbox: Vec<InboxMessage> = serde_json::from_str(
+            &std::fs::read_to_string(mgr.inboxes_dir.join("swift-fox.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            inbox.len(),
+            2,
+            "same text from different senders must both be retained; inbox={inbox:?}"
+        );
+    }
+
+    /// Retention sweep: messages older than `INBOX_RETENTION` are dropped
+    /// on every write so the inbox file cannot grow unbounded across
+    /// sessions. Simulated by seeding a message with an old timestamp and
+    /// then writing a fresh one.
+    #[test]
+    fn write_to_inbox_prunes_messages_older_than_retention() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = manager_in(tmp.path(), "t3");
+        std::fs::create_dir_all(&mgr.inboxes_dir).unwrap();
+
+        // Seed an inbox file with a stale message (3h ago, beyond the 2h
+        // retention window).
+        let stale_ts = (chrono::Utc::now() - chrono::Duration::hours(3))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let seeded = vec![InboxMessage {
+            from: DIRECTOR_AGENT_NAME.to_string(),
+            text: "ancient history".to_string(),
+            summary: Some("ancient history".to_string()),
+            timestamp: stale_ts,
+            color: "green".to_string(),
+            read: false,
+        }];
+        let inbox_path = mgr.inboxes_dir.join("swift-fox.json");
+        std::fs::write(&inbox_path, serde_json::to_string_pretty(&seeded).unwrap()).unwrap();
+
+        // One fresh write — the stale message should be swept on the same
+        // lock pass.
+        mgr.write_to_inbox("swift-fox", DIRECTOR_AGENT_NAME, "fresh", None, None)
+            .unwrap();
+
+        let inbox: Vec<InboxMessage> = serde_json::from_str(
+            &std::fs::read_to_string(&inbox_path).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].text, "fresh");
     }
 }
