@@ -1272,6 +1272,386 @@ async fn test_task_mine_matches_env_worker_name_during_spawn_race() {
     );
 }
 
+// ============================================================================
+// cas-1a7c (EPIC cas-9508): task lease + status divergence recovery.
+//
+// Acceptance criteria:
+//   - `action=release` on a lease-less InProgress task clears status to open
+//     with an audit trail.
+//   - `action=reset` verb exists and is tested for dead-session recovery.
+//   - `action=show` called immediately after `action=update` reflects the
+//     updated status.
+// ============================================================================
+
+#[tokio::test]
+async fn test_release_autorecovers_lease_less_in_progress_task() {
+    let (_temp, service) = setup_cas();
+
+    // Seed: create task and move it to InProgress without a live lease
+    // (simulating a dead-session orphan where status diverged from lease).
+    let created = service
+        .cas_task_create(Parameters(TaskCreateRequest {
+            title: "Orphaned in-progress".to_string(),
+            description: None,
+            priority: 2,
+            task_type: "task".to_string(),
+            labels: None,
+            notes: None,
+            blocked_by: None,
+            design: None,
+            acceptance_criteria: None,
+            external_ref: None,
+            assignee: Some("dead-worker".to_string()),
+            demo_statement: None,
+            execution_note: None,
+            epic: None,
+        }))
+        .await
+        .expect("create");
+    let id = extract_task_id(&extract_text(created))
+        .expect("id")
+        .to_string();
+
+    service
+        .cas_task_update(Parameters(TaskUpdateRequest {
+            id: id.clone(),
+            title: None,
+            notes: None,
+            priority: None,
+            labels: None,
+            description: None,
+            design: None,
+            acceptance_criteria: None,
+            demo_statement: None,
+            execution_note: None,
+            external_ref: None,
+            assignee: None,
+            status: Some("in_progress".to_string()),
+            epic: None,
+            epic_verification_owner: None,
+        }))
+        .await
+        .expect("status update");
+
+    // Call release — no active lease exists for this agent, and the task is
+    // InProgress. The handler must auto-recover instead of surfacing the raw
+    // "No active lease found" error.
+    let released = service
+        .cas_task_release(Parameters(cas::mcp::tools::TaskReleaseRequest {
+            task_id: id.clone(),
+        }))
+        .await
+        .expect("release auto-recovery must succeed for lease-less InProgress");
+    let text = extract_text(released);
+    assert!(
+        text.contains("auto-recovered") || text.contains("Released"),
+        "release output should acknowledge auto-recovery: {text}"
+    );
+
+    // Show must reflect Open status immediately after release.
+    let shown = service
+        .cas_task_show(Parameters(TaskShowRequest {
+            id: id.clone(),
+            with_deps: false,
+        }))
+        .await
+        .expect("show");
+    let text = extract_text(shown);
+    assert!(
+        text.contains("Open") || text.contains("open"),
+        "task must be Open after release auto-recovery: {text}"
+    );
+    assert!(
+        text.contains("auto-recovered") || text.contains("assumed orphaned"),
+        "task notes must contain audit trail: {text}"
+    );
+}
+
+#[tokio::test]
+async fn test_release_still_errors_when_no_lease_and_task_already_open() {
+    let (_temp, service) = setup_cas();
+
+    // Baseline: no lease, status=Open. Release should NOT silently succeed —
+    // there's nothing to recover, surface the underlying error.
+    let created = service
+        .cas_task_create(Parameters(TaskCreateRequest {
+            title: "Plain open task".to_string(),
+            description: None,
+            priority: 2,
+            task_type: "task".to_string(),
+            labels: None,
+            notes: None,
+            blocked_by: None,
+            design: None,
+            acceptance_criteria: None,
+            external_ref: None,
+            assignee: None,
+            demo_statement: None,
+            execution_note: None,
+            epic: None,
+        }))
+        .await
+        .expect("create");
+    let id = extract_task_id(&extract_text(created))
+        .expect("id")
+        .to_string();
+
+    let res = service
+        .cas_task_release(Parameters(cas::mcp::tools::TaskReleaseRequest {
+            task_id: id.clone(),
+        }))
+        .await;
+    assert!(
+        res.is_err(),
+        "release on a plain Open task without a lease should error"
+    );
+}
+
+#[tokio::test]
+async fn test_reset_clears_lease_assignee_and_forces_open() {
+    let (_temp, service) = setup_cas();
+
+    let created = service
+        .cas_task_create(Parameters(TaskCreateRequest {
+            title: "Needs reset".to_string(),
+            description: None,
+            priority: 1,
+            task_type: "task".to_string(),
+            labels: None,
+            notes: None,
+            blocked_by: None,
+            design: None,
+            acceptance_criteria: None,
+            external_ref: None,
+            assignee: Some("dead-worker".to_string()),
+            demo_statement: None,
+            execution_note: None,
+            epic: None,
+        }))
+        .await
+        .expect("create");
+    let id = extract_task_id(&extract_text(created))
+        .expect("id")
+        .to_string();
+
+    service
+        .cas_task_update(Parameters(TaskUpdateRequest {
+            id: id.clone(),
+            title: None,
+            notes: None,
+            priority: None,
+            labels: None,
+            description: None,
+            design: None,
+            acceptance_criteria: None,
+            demo_statement: None,
+            execution_note: None,
+            external_ref: None,
+            assignee: None,
+            status: Some("in_progress".to_string()),
+            epic: None,
+            epic_verification_owner: None,
+        }))
+        .await
+        .expect("status update");
+
+    let res = service
+        .cas_task_reset(Parameters(cas::mcp::tools::TaskReleaseRequest {
+            task_id: id.clone(),
+        }))
+        .await
+        .expect("reset must succeed");
+    let text = extract_text(res);
+    assert!(
+        text.contains("Reset task"),
+        "reset output must confirm: {text}"
+    );
+
+    // Show must reflect the reset: Open, no assignee, audit note present.
+    let shown = service
+        .cas_task_show(Parameters(TaskShowRequest {
+            id: id.clone(),
+            with_deps: false,
+        }))
+        .await
+        .expect("show");
+    let text = extract_text(shown);
+    assert!(
+        text.contains("Open") || text.contains("open"),
+        "status must be Open after reset: {text}"
+    );
+    assert!(
+        text.contains("reset:") || text.contains("dead-session"),
+        "reset audit note must be present: {text}"
+    );
+}
+
+#[tokio::test]
+async fn test_reset_refuses_closed_task() {
+    let (_temp, service) = setup_cas();
+
+    let created = service
+        .cas_task_create(Parameters(TaskCreateRequest {
+            title: "Already closed".to_string(),
+            description: None,
+            priority: 2,
+            task_type: "task".to_string(),
+            labels: None,
+            notes: None,
+            blocked_by: None,
+            design: None,
+            acceptance_criteria: None,
+            external_ref: None,
+            assignee: None,
+            demo_statement: None,
+            execution_note: None,
+            epic: None,
+        }))
+        .await
+        .expect("create");
+    let id = extract_task_id(&extract_text(created))
+        .expect("id")
+        .to_string();
+
+    service
+        .cas_task_update(Parameters(TaskUpdateRequest {
+            id: id.clone(),
+            title: None,
+            notes: None,
+            priority: None,
+            labels: None,
+            description: None,
+            design: None,
+            acceptance_criteria: None,
+            demo_statement: None,
+            execution_note: None,
+            external_ref: None,
+            assignee: None,
+            status: Some("closed".to_string()),
+            epic: None,
+            epic_verification_owner: None,
+        }))
+        .await
+        .expect("close via update");
+
+    let err = service
+        .cas_task_reset(Parameters(cas::mcp::tools::TaskReleaseRequest {
+            task_id: id.clone(),
+        }))
+        .await;
+    assert!(
+        err.is_err(),
+        "reset must refuse to operate on closed tasks — use reopen instead"
+    );
+}
+
+/// cas-1a7c AC3: `action=show` immediately after `action=update` must reflect
+/// the updated status. Asserts there's no read-after-write snapshot lag in
+/// the MCP task store path.
+#[tokio::test]
+async fn test_show_after_update_reflects_new_status_without_lag() {
+    let (_temp, service) = setup_cas();
+
+    let created = service
+        .cas_task_create(Parameters(TaskCreateRequest {
+            title: "Status readback".to_string(),
+            description: None,
+            priority: 2,
+            task_type: "task".to_string(),
+            labels: None,
+            notes: None,
+            blocked_by: None,
+            design: None,
+            acceptance_criteria: None,
+            external_ref: None,
+            assignee: None,
+            demo_statement: None,
+            execution_note: None,
+            epic: None,
+        }))
+        .await
+        .expect("create");
+    let id = extract_task_id(&extract_text(created))
+        .expect("id")
+        .to_string();
+
+    // Move to InProgress.
+    service
+        .cas_task_update(Parameters(TaskUpdateRequest {
+            id: id.clone(),
+            title: None,
+            notes: None,
+            priority: None,
+            labels: None,
+            description: None,
+            design: None,
+            acceptance_criteria: None,
+            demo_statement: None,
+            execution_note: None,
+            external_ref: None,
+            assignee: None,
+            status: Some("in_progress".to_string()),
+            epic: None,
+            epic_verification_owner: None,
+        }))
+        .await
+        .expect("update to in_progress");
+
+    let shown = service
+        .cas_task_show(Parameters(TaskShowRequest {
+            id: id.clone(),
+            with_deps: false,
+        }))
+        .await
+        .expect("show");
+    let text = extract_text(shown);
+    assert!(
+        text.contains("InProgress")
+            || text.contains("In Progress")
+            || text.contains("in_progress"),
+        "show immediately after update must return InProgress: {text}"
+    );
+
+    // Now flip back to Open. Show must reflect Open, not a cached InProgress.
+    service
+        .cas_task_update(Parameters(TaskUpdateRequest {
+            id: id.clone(),
+            title: None,
+            notes: None,
+            priority: None,
+            labels: None,
+            description: None,
+            design: None,
+            acceptance_criteria: None,
+            demo_statement: None,
+            execution_note: None,
+            external_ref: None,
+            assignee: Some("new-worker".to_string()),
+            status: Some("open".to_string()),
+            epic: None,
+            epic_verification_owner: None,
+        }))
+        .await
+        .expect("update back to open");
+
+    let shown = service
+        .cas_task_show(Parameters(TaskShowRequest {
+            id: id.clone(),
+            with_deps: false,
+        }))
+        .await
+        .expect("show");
+    let text = extract_text(shown);
+    assert!(
+        text.contains("Open") || text.contains("open"),
+        "show immediately after update back to open must not return stale InProgress: {text}"
+    );
+    assert!(
+        !text.contains("InProgress") && !text.contains("In Progress"),
+        "show output must not contain stale InProgress status after update to Open: {text}"
+    );
+}
+
 #[tokio::test]
 async fn test_task_mine_matches_case_insensitive_and_trimmed() {
     let (_temp, service) = setup_cas();

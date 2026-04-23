@@ -313,24 +313,155 @@ impl CasCore {
     }
 
     /// Release a claimed task
+    /// Release a task lease, with auto-recovery for dead-session orphans.
+    ///
+    /// ### Dead-session auto-recovery (EPIC cas-9508 / cas-1a7c)
+    ///
+    /// Previously, `release` returned `"No active lease found"` when the task
+    /// row was `InProgress` but the lease had been garbage-collected (e.g. the
+    /// worker session died without cleanly releasing). The status stayed
+    /// `InProgress` forever, and callers had to manually `update status=open`
+    /// to recover. This divergence between lease state and task status was a
+    /// persistent source of factory-session friction.
+    ///
+    /// Release now detects the "no active lease + status != Closed/Open"
+    /// case, transitions the task to `Open`, clears the assignee, appends an
+    /// audit note to `task.notes`, and returns success. The message reflects
+    /// whether a real lease was released or the task was auto-recovered so
+    /// callers can act accordingly.
     pub async fn cas_task_release(
         &self,
         Parameters(req): Parameters<TaskReleaseRequest>,
     ) -> Result<CallToolResult, McpError> {
         let agent_store = self.open_agent_store()?;
+        let task_store = self.open_task_store()?;
 
         // Get the registered agent ID (matches how claim works)
         let agent_id = self.get_agent_id()?;
 
-        agent_store
-            .release_lease(&req.task_id, &agent_id)
-            .map_err(|e| McpError {
-                code: ErrorCode::INVALID_PARAMS,
-                message: Cow::from(format!("Failed to release task: {e}")),
-                data: None,
-            })?;
+        match agent_store.release_lease(&req.task_id, &agent_id) {
+            Ok(()) => Ok(Self::success(format!("Released task: {}", req.task_id))),
+            Err(e) => {
+                // Auto-recovery path: no active lease but the task row may
+                // still be in a non-open state from a dead session. Flip it
+                // back to Open with an audit note rather than surfacing the
+                // raw "no lease" error to the caller.
+                let err_str = e.to_string();
+                let is_not_found = err_str.contains("No active lease found");
 
-        Ok(Self::success(format!("Released task: {}", req.task_id)))
+                if is_not_found {
+                    if let Ok(mut task) = task_store.get(&req.task_id) {
+                        if task.status != TaskStatus::Closed
+                            && task.status != TaskStatus::Open
+                        {
+                            let prior_status = task.status;
+                            let prior_assignee = task.assignee.clone();
+                            task.status = TaskStatus::Open;
+                            task.assignee = None;
+                            let ts = chrono::Utc::now().format("%Y-%m-%d %H:%M");
+                            let audit = format!(
+                                "[{ts}] release: lease absent; auto-recovered from {prior_status:?} (prior assignee: {}) to Open — assumed orphaned by dead session",
+                                prior_assignee.as_deref().unwrap_or("<none>")
+                            );
+                            task.notes = if task.notes.is_empty() {
+                                audit
+                            } else {
+                                format!("{}\n\n{}", task.notes, audit)
+                            };
+                            task.updated_at = chrono::Utc::now();
+                            task_store.update(&task).map_err(|upd_err| McpError {
+                                code: ErrorCode::INTERNAL_ERROR,
+                                message: Cow::from(format!(
+                                    "Release auto-recovery: failed to update task: {upd_err}"
+                                )),
+                                data: None,
+                            })?;
+                            return Ok(Self::success(format!(
+                                "Released task: {} (auto-recovered from {:?} — lease was absent; status reset to Open)",
+                                req.task_id, prior_status
+                            )));
+                        }
+                    }
+                }
+
+                Err(McpError {
+                    code: ErrorCode::INVALID_PARAMS,
+                    message: Cow::from(format!("Failed to release task: {e}")),
+                    data: None,
+                })
+            }
+        }
+    }
+
+    /// Reset a task to a clean Open state, clearing any lease + assignee.
+    ///
+    /// ### Dead-session recovery verb (EPIC cas-9508 / cas-1a7c)
+    ///
+    /// `reset` is the atomic "revive this task from a dead session" verb.
+    /// Unlike `release`, it does not require the caller to own the lease —
+    /// it force-releases any active lease on the task, clears the assignee,
+    /// transitions the status to `Open`, and records an audit note. Intended
+    /// for supervisor / operator use when a worker died mid-task and left
+    /// orphaned lease + InProgress rows behind.
+    ///
+    /// Safety: refuses to reset a `Closed` task (use `reopen` instead).
+    pub async fn cas_task_reset(
+        &self,
+        Parameters(req): Parameters<TaskReleaseRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let agent_store = self.open_agent_store()?;
+        let task_store = self.open_task_store()?;
+
+        let mut task = task_store.get(&req.task_id).map_err(|e| McpError {
+            code: ErrorCode::INVALID_PARAMS,
+            message: Cow::from(format!("Task not found: {e}")),
+            data: None,
+        })?;
+
+        if task.status == TaskStatus::Closed {
+            return Err(McpError {
+                code: ErrorCode::INVALID_PARAMS,
+                message: Cow::from(format!(
+                    "Cannot reset closed task {} — use `action=reopen` instead",
+                    req.task_id
+                )),
+                data: None,
+            });
+        }
+
+        // Force-release any active lease on the task (no ownership check).
+        // `release_lease_for_task` returns Ok(true) if a lease was released,
+        // Ok(false) if none existed — either is fine here.
+        let lease_released = agent_store
+            .release_lease_for_task(&req.task_id)
+            .unwrap_or(false);
+
+        let prior_status = task.status;
+        let prior_assignee = task.assignee.clone();
+        task.status = TaskStatus::Open;
+        task.assignee = None;
+        let ts = chrono::Utc::now().format("%Y-%m-%d %H:%M");
+        let audit = format!(
+            "[{ts}] reset: force-transitioned {prior_status:?}→Open (prior assignee: {}, lease released: {lease_released}) — dead-session recovery",
+            prior_assignee.as_deref().unwrap_or("<none>")
+        );
+        task.notes = if task.notes.is_empty() {
+            audit
+        } else {
+            format!("{}\n\n{}", task.notes, audit)
+        };
+        task.updated_at = chrono::Utc::now();
+
+        task_store.update(&task).map_err(|e| McpError {
+            code: ErrorCode::INTERNAL_ERROR,
+            message: Cow::from(format!("reset: failed to update task: {e}")),
+            data: None,
+        })?;
+
+        Ok(Self::success(format!(
+            "Reset task: {} (was {:?}, assignee cleared, lease released: {})",
+            req.task_id, prior_status, lease_released
+        )))
     }
 
     /// List tasks available for claiming
