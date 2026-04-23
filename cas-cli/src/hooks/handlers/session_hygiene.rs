@@ -56,7 +56,36 @@ impl PorcelainEntry {
 /// worktree is its parent directory. Returns `None` if the layout is
 /// unexpected.
 pub fn main_worktree_path(cas_root: &Path) -> Option<PathBuf> {
-    cas_root.parent().map(PathBuf::from)
+    let repo_adjacent = cas_root.parent()?;
+
+    // Ask git for the *common* git dir; in a linked worktree this points at
+    // the main repo's `.git`, whereas `--git-dir` would point at
+    // `.git/worktrees/<name>`. The main worktree then lives one dir above
+    // the common dir (assuming the normal `<repo>/.git` layout). Falls
+    // back to `cas_root.parent()` when git is unavailable or the layout is
+    // unexpected, preserving the prior best-effort behaviour.
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo_adjacent)
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return Some(repo_adjacent.to_path_buf());
+    }
+    let common = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if common.is_empty() {
+        return Some(repo_adjacent.to_path_buf());
+    }
+    let common_path = PathBuf::from(common);
+    // `.git` common dir → main worktree is its parent.
+    if common_path.file_name().and_then(|s| s.to_str()) == Some(".git") {
+        if let Some(parent) = common_path.parent() {
+            return Some(parent.to_path_buf());
+        }
+    }
+    // Bare repo or unusual layout — give up safely.
+    Some(repo_adjacent.to_path_buf())
 }
 
 /// Run `git status --porcelain=v1` in `repo` and parse the output.
@@ -287,5 +316,145 @@ mod tests {
         assert!(!summary.is_clean());
         assert_eq!(summary.untracked_count(), 1);
         assert_eq!(summary.modified_count(), 0);
+    }
+
+    /// Table-drive `label()` across every documented porcelain code so a silent
+    /// rename of an arm (e.g. 'modified-staged' → 'staged') fails loudly.
+    #[test]
+    fn porcelain_entry_label_covers_documented_codes() {
+        let cases: &[(&str, &str)] = &[
+            ("??", "untracked"),
+            (" M", "modified"),
+            ("M ", "modified-staged"),
+            ("MM", "modified-staged"),
+            ("AM", "modified-staged"),
+            ("A ", "added"),
+            ("D ", "deleted"),
+            (" D", "deleted"),
+            ("R ", "changed"), // Rename falls through today; guard arm.
+            ("UU", "changed"), // Unmerged falls through today.
+        ];
+        for (code, expected) in cases {
+            let entry = PorcelainEntry {
+                status: (*code).to_string(),
+                path: "x".into(),
+            };
+            assert_eq!(
+                entry.label(),
+                *expected,
+                "label mismatch for porcelain code {code:?}"
+            );
+        }
+    }
+
+    /// Multiple `write_session_end_manifest` calls in the same day must append
+    /// rather than overwrite — the daily log is the cross-session breadcrumb
+    /// trail; losing history silently defeats the feature.
+    #[test]
+    fn manifest_is_append_only_across_multiple_sessions_same_day() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        init_repo(repo);
+        let cas_root = repo.join(".cas");
+        fs::create_dir_all(&cas_root).unwrap();
+
+        let p1 = write_session_end_manifest(&cas_root, "sess-one", None, None)
+            .expect("first manifest");
+        let p2 = write_session_end_manifest(&cas_root, "sess-two", Some("worker-b"), Some("worker"))
+            .expect("second manifest");
+        assert_eq!(p1, p2, "same daily log path expected");
+
+        let body = fs::read_to_string(&p1).unwrap();
+        assert!(body.contains("session_id: sess-one"));
+        assert!(body.contains("session_id: sess-two"));
+        assert!(body.contains("agent: unknown (unknown)")); // first call, None/None
+        assert!(body.contains("agent: worker-b (worker)")); // second call
+        assert_eq!(
+            body.matches("---").count(),
+            2,
+            "each session-end must produce its own '---' block"
+        );
+    }
+
+    /// A clean worktree records `git_status: (clean)` so audits can tell the
+    /// difference between "nothing was wrong" and "manifest never wrote".
+    #[test]
+    fn manifest_records_clean_tree_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        init_repo(repo);
+        // Commit so the tree is fully clean (empty repo also counts, but
+        // committing exercises the "tree exists + clean" code path).
+        fs::write(repo.join(".gitkeep"), "").unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["add", ".gitkeep"])
+            .status()
+            .unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["commit", "-q", "-m", "init"])
+            .status()
+            .unwrap();
+
+        let cas_root = repo.join(".cas");
+        fs::create_dir_all(&cas_root).unwrap();
+        let log = write_session_end_manifest(&cas_root, "sess-clean", None, None)
+            .expect("manifest written");
+        let body = fs::read_to_string(&log).unwrap();
+        assert!(
+            body.contains("git_status: (clean)"),
+            "clean worktree should be recorded, got: {body}"
+        );
+    }
+
+    /// When `cas_root` lives under a linked worktree (the factory layout:
+    /// `<repo>/.cas/worktrees/<name>/.cas`), `main_worktree_path` must resolve
+    /// to the main repo — not the linked worktree — otherwise the hygiene
+    /// manifest attributes the worker's own WIP as "main worktree" and
+    /// inverts the supervisor triage promise (cas-a9ab adversarial finding).
+    #[test]
+    fn main_worktree_path_resolves_to_main_repo_from_linked_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main = tmp.path().join("main");
+        fs::create_dir_all(&main).unwrap();
+        init_repo(&main);
+        // A commit is required so the repo has HEAD before linking a worktree.
+        fs::write(main.join("seed.txt"), "").unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(&main)
+            .args(["add", "seed.txt"])
+            .status()
+            .unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(&main)
+            .args(["commit", "-q", "-m", "seed"])
+            .status()
+            .unwrap();
+
+        let linked = tmp.path().join("linked");
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&main)
+            .args(["worktree", "add", "-b", "feature"])
+            .arg(&linked)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git worktree add must succeed for this test");
+
+        // Worker-style layout: cas_root is <linked>/.cas.
+        let linked_cas = linked.join(".cas");
+        fs::create_dir_all(&linked_cas).unwrap();
+
+        let resolved = main_worktree_path(&linked_cas).expect("main path resolved");
+        assert_eq!(
+            resolved.canonicalize().unwrap(),
+            main.canonicalize().unwrap(),
+            "linked-worktree cas_root must resolve upward to the main repo, got {resolved:?}"
+        );
     }
 }
