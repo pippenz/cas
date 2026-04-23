@@ -27,6 +27,46 @@ use std::io::IsTerminal;
 pub use lifecycle::{execute_kill, execute_kill_all};
 pub use queries::execute_list;
 
+/// cas-0bf4: bridge the `[factory]` `cargo_build_jobs` + `nice_cargo` config
+/// knobs into process env so that worker PTY spawns (see `cas-pty`
+/// `PtyConfig::{claude,codex}`) read them.
+///
+/// This runs from `cli::run` *before* `initialize_telemetry()` spawns its
+/// background PostHog thread. That is load-bearing: `std::env::set_var`
+/// in a multi-threaded process is undefined behaviour (Rust edition 2024
+/// gated it behind `unsafe` precisely for this reason). Keep the call
+/// site single-threaded.
+///
+/// Shell-level overrides already present in the parent env always win:
+/// `CAS_FACTORY_CARGO_BUILD_JOBS=<N>` and `CAS_FACTORY_NICE_WORKER=1`.
+/// Case-insensitive `"auto"` matches pass through to the cas-pty
+/// auto-compute path.
+pub fn apply_resource_contention_env(cas_root: Option<&std::path::Path>) {
+    let Some(cas_root) = cas_root else {
+        return;
+    };
+    let Ok(cfg) = Config::load(cas_root) else {
+        return;
+    };
+    let fc = cfg.factory();
+    let trimmed = fc.cargo_build_jobs.trim();
+    // SAFETY: caller (cli::run) invokes this before the telemetry thread is
+    // spawned, so the process is still single-threaded. That is the whole
+    // reason this function exists as a separate entry point rather than
+    // living inline in `factory::execute`.
+    unsafe {
+        if std::env::var("CAS_FACTORY_CARGO_BUILD_JOBS").is_err()
+            && !trimmed.is_empty()
+            && !trimmed.eq_ignore_ascii_case("auto")
+        {
+            std::env::set_var("CAS_FACTORY_CARGO_BUILD_JOBS", trimmed);
+        }
+        if std::env::var("CAS_FACTORY_NICE_WORKER").is_err() && fc.nice_cargo {
+            std::env::set_var("CAS_FACTORY_NICE_WORKER", "1");
+        }
+    }
+}
+
 /// Launch hierarchical multi-agent factory session
 #[derive(Args, Debug, Clone)]
 pub struct FactoryArgs {
@@ -655,34 +695,14 @@ pub fn execute(args: &FactoryArgs, cli: &Cli, cas_root: Option<&std::path::Path>
     let auto_prompt = cas_config.orchestration().auto_prompt;
     let llm = cas_config.llm();
 
-    // cas-0bf4: bridge factory.cargo_build_jobs + factory.nice_cargo
-    // config knobs through the supervisor's process env so worker PTY
-    // spawns (cas-pty::PtyConfig::{claude,codex}) can read them. Env
-    // is the least-invasive transport — the alternative of threading
-    // these fields through cas-cli → cas-mux → cas-pty signatures
-    // would touch 3 crates for two booleans.
-    //
-    // Only set when the config says non-default, so external overrides
-    // at the shell level (`CAS_FACTORY_CARGO_BUILD_JOBS=N cas factory ...`)
-    // still win.
-    {
-        let fc = cas_config.factory();
-        // SAFETY: std::env::set_var is only unsafe in multi-threaded
-        // contexts; this executes during factory startup before any
-        // worker spawn, still on the main thread. Same contract as
-        // ScopedSupervisorEnv in the test harness.
-        unsafe {
-            if std::env::var("CAS_FACTORY_CARGO_BUILD_JOBS").is_err()
-                && fc.cargo_build_jobs.trim() != "auto"
-                && !fc.cargo_build_jobs.trim().is_empty()
-            {
-                std::env::set_var("CAS_FACTORY_CARGO_BUILD_JOBS", fc.cargo_build_jobs.trim());
-            }
-            if std::env::var("CAS_FACTORY_NICE_WORKER").is_err() && fc.nice_cargo {
-                std::env::set_var("CAS_FACTORY_NICE_WORKER", "1");
-            }
-        }
-    }
+    // cas-0bf4: the factory.cargo_build_jobs + factory.nice_cargo config
+    // bridge now fires in cli::run BEFORE the telemetry background thread
+    // is spawned (see `apply_resource_contention_env` below + its call
+    // site in `cli::run`). Doing the `std::env::set_var` here is UB in a
+    // multi-threaded process — adversarial review cas-0bf4 P0 flagged
+    // that `initialize_telemetry` spawns a PostHog thread before this
+    // point. No-op at this site; the env is already set by the time
+    // worker PTYs spawn.
 
     // Build native Agent Teams spawn configs so agents start with Teams CLI flags.
     let (teams_configs, lead_session_id) = {

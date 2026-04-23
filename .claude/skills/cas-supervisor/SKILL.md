@@ -437,6 +437,7 @@ Shell-level overrides (win over config): `CAS_FACTORY_CARGO_BUILD_JOBS=<N>`, `CA
 
 **When the defaults are wrong:**
 - Running more than 4 workers on a 16-thread host → set `cargo_build_jobs = "2"` (÷4 assumption no longer holds).
+- Host has 4–8 cores → the auto-cap floors at 2, which is still `workers × 2` rustc threads; on a 4-worker factory with 4 cores consider `cargo_build_jobs = "1"` manually.
 - Host has 32+ threads → `"auto"` is fine; can push higher if wall-time matters.
 - CPU-bound but not crashing → flip `nice_cargo = false` to let workers and supervisor compete on equal terms.
 
