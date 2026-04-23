@@ -851,6 +851,48 @@ impl EmbeddedDaemon {
 
             // Send agent heartbeat if registered
             if let Some(id) = self.agent_id.read().await.clone() {
+                // Liveness gate (EPIC cas-9508 / cas-2749): before heartbeating,
+                // verify the Claude Code client process our agent record belongs
+                // to is still alive. In factory mode a shared `cas serve` daemon
+                // can outlive a crashed CC client (e.g. Bun/React-Ink unhandled
+                // rejection keeps the event loop running while the UI is dead),
+                // which previously kept the worker's last_heartbeat fresh
+                // forever — supervisors saw "heartbeat: 13s ago" for zombie
+                // workers and couldn't tell the worker had died.
+                //
+                // If the registered CC pid has exited (ESRCH), mark the agent
+                // stale, clear our local agent_id, and skip heartbeat. Next
+                // tick will no-op.
+                if let Ok(agent) = store.get(&id) {
+                    match agent.pid {
+                        Some(cc_pid) => {
+                            if !pid_alive(cc_pid) {
+                                tracing::info!(
+                                    agent_id = %&id[..8.min(id.len())],
+                                    cc_pid = cc_pid,
+                                    "Claude Code client process is gone — marking agent stale \
+                                     and stopping heartbeat (cas-2749 liveness gate)"
+                                );
+                                let _ = store.mark_stale(&id);
+                                let mut guard = self.agent_id.write().await;
+                                *guard = None;
+                                return;
+                            }
+                        }
+                        None => {
+                            // Legacy agents registered before pid tracking fall through
+                            // to heartbeat; surface the gap at debug-level so it's
+                            // visible when diagnosing zombie-heartbeat cases.
+                            tracing::debug!(
+                                agent_id = %&id[..8.min(id.len())],
+                                "Agent has no registered CC pid — liveness gate skipped \
+                                 (cas-2749). Heartbeat continues; consider re-registering \
+                                 the agent to activate the gate."
+                            );
+                        }
+                    }
+                }
+
                 let mut succeeded = false;
                 let mut terminal = false;
                 for attempt in 0..3 {
@@ -956,6 +998,34 @@ impl EmbeddedDaemon {
     pub async fn trigger_cloud_sync(&self) -> Result<SyncResult, CasError> {
         self.run_cloud_sync().await
     }
+}
+
+/// Check whether a PID corresponds to a live process.
+///
+/// Used by the agent heartbeat liveness gate (EPIC cas-9508 / cas-2749) so the
+/// shared `cas serve` daemon stops faking fresh heartbeats for a Claude Code
+/// client that has already died.
+///
+/// On Unix, sends signal 0 via `libc::kill` — returns false on ESRCH (no such
+/// process). On non-Unix, falls back to `true` (best-effort; liveness gating
+/// is only observed to matter on Linux factory hosts today).
+#[cfg(unix)]
+pub(crate) fn pid_alive(pid: u32) -> bool {
+    // kill(pid, 0) performs the permission/existence check without delivering
+    // a signal. errno == ESRCH (3) means the process is gone. EPERM means it
+    // exists but we can't signal it — still alive, so return true.
+    // Safety: `libc::kill` with signal 0 has no side effects on the target.
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if rc == 0 {
+        return true;
+    }
+    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    errno != libc::ESRCH
+}
+
+#[cfg(not(unix))]
+pub(crate) fn pid_alive(_pid: u32) -> bool {
+    true
 }
 
 /// Initialize cloud syncer if user is logged in
