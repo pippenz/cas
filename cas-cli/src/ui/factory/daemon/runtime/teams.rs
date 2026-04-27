@@ -253,27 +253,29 @@ impl TeamsManager {
 
     /// The JSON body of the supervisor settings file — a Claude Code
     /// `permissions.allow` list that auto-approves the four tool families
-    /// whose approvals would otherwise route back to the supervisor itself.
+    /// whose approvals would otherwise route back to the supervisor itself,
+    /// plus a `hooks` block wiring `PreToolUse` and `PermissionRequest` to
+    /// `cas hook` so the factory auto-approve handlers actually run.
     ///
     /// Kept tight on purpose: no MCP tools, no network, no shell glob expansion
     /// beyond the base tool name. The deadlock only fires for tools that are
     /// not otherwise auto-allowed, and the factory supervisor already runs
     /// with `--dangerously-skip-permissions`, so this list is the minimum set
     /// observed to produce the routing-deadlock symptom.
+    ///
+    /// The `hooks` block is the load-bearing belt under Claude Code 2.1.x:
+    /// the `permissions.allow` list alone does NOT short-circuit the
+    /// team-mode UG9 escalation (see `pre_tool.rs` for the disassembly), so
+    /// without these hook entries the supervisor self-deadlocks on every
+    /// permission gate that is not otherwise auto-approved.
     pub fn supervisor_settings_contents() -> serde_json::Value {
-        serde_json::json!({
-            "permissions": {
-                "allow": [
-                    "Read",
-                    "Write",
-                    "Edit",
-                    "Glob",
-                    "Grep",
-                    "Bash",
-                    "NotebookEdit"
-                ]
-            }
-        })
+        let mut body = serde_json::json!({
+            "permissions": { "allow": Self::factory_allow_list() },
+        });
+        body.as_object_mut()
+            .expect("object literal")
+            .insert("hooks".to_string(), Self::factory_hooks_block());
+        body
     }
 
     /// Compute the on-disk path of a worker's settings file. Lives alongside
@@ -309,18 +311,65 @@ impl TeamsManager {
     /// also be added to the supervisor list unless we have a specific reason
     /// to diverge.
     pub fn worker_settings_contents() -> serde_json::Value {
+        let mut body = serde_json::json!({
+            "permissions": { "allow": Self::factory_allow_list() },
+        });
+        body.as_object_mut()
+            .expect("object literal")
+            .insert("hooks".to_string(), Self::factory_hooks_block());
+        body
+    }
+
+    /// Filesystem tool families whose approval would otherwise route to the
+    /// phantom `team-lead` mailbox under Claude Code 2.1.x (see UG9 bug in
+    /// `pre_tool.rs`). Used by both the `permissions.allow` list and the
+    /// `PreToolUse` hook matcher in the per-role settings file.
+    ///
+    /// MUST stay in sync with `FACTORY_AUTO_APPROVE_TOOLS` in
+    /// `cas-cli/src/hooks/handlers/handlers_events/pre_tool.rs` — the hook
+    /// handler reads that list to decide whether to auto-approve. If they
+    /// diverge, ops in this list (but not the hook list) will hang anyway,
+    /// and ops in the hook list (but not this matcher) will fire the hook
+    /// for nothing.
+    fn factory_allow_list() -> &'static [&'static str] {
+        &["Read", "Write", "Edit", "Glob", "Grep", "Bash", "NotebookEdit"]
+    }
+
+    /// `hooks` block for per-role settings files. Wires `PreToolUse` (belt
+    /// #2) and `PermissionRequest` (belt #3) to `cas hook <event>`, which is
+    /// what actually short-circuits the team-mode leader-escalation deadlock
+    /// on Claude Code 2.1.x — the `permissions.allow` list alone does not.
+    ///
+    /// Defaults mirror `cli/hook/config_gen.rs`: 2000ms timeout for both.
+    /// `PreToolUse` matcher is the filesystem tool list so we don't fire
+    /// the hook on unrelated tools (MCP, Agent, etc. still flow through
+    /// Claude Code's normal paths).
+    fn factory_hooks_block() -> serde_json::Value {
+        let matcher = Self::factory_allow_list().join("|");
         serde_json::json!({
-            "permissions": {
-                "allow": [
-                    "Read",
-                    "Write",
-                    "Edit",
-                    "Glob",
-                    "Grep",
-                    "Bash",
-                    "NotebookEdit"
-                ]
-            }
+            "PreToolUse": [
+                {
+                    "matcher": matcher,
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": "cas hook PreToolUse",
+                            "timeout": 2000
+                        }
+                    ]
+                }
+            ],
+            "PermissionRequest": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": "cas hook PermissionRequest",
+                            "timeout": 2000
+                        }
+                    ]
+                }
+            ]
         })
     }
 
@@ -805,6 +854,69 @@ mod tests {
             assert!(
                 names.contains(&tool),
                 "worker allowlist must include {tool}, got {names:?}"
+            );
+        }
+    }
+
+    /// Both per-role settings bodies must wire the factory auto-approve
+    /// hooks. Without these entries, `cas hook PreToolUse` and
+    /// `cas hook PermissionRequest` are never invoked and the team-mode
+    /// UG9 escalation self-deadlocks on every permission gate (the bug that
+    /// regressed when `715891c` stripped project-level hooks expecting them
+    /// to live in per-member settings, but the per-member settings writer
+    /// never had them).
+    #[test]
+    fn settings_contents_wire_factory_auto_approve_hooks() {
+        for (role, body) in [
+            ("supervisor", TeamsManager::supervisor_settings_contents()),
+            ("worker", TeamsManager::worker_settings_contents()),
+        ] {
+            let hooks = body
+                .get("hooks")
+                .unwrap_or_else(|| panic!("{role} settings missing `hooks` block: {body}"));
+
+            let pre = hooks
+                .get("PreToolUse")
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.first())
+                .unwrap_or_else(|| panic!("{role} hooks missing PreToolUse entry: {hooks}"));
+            let pre_cmd = pre
+                .get("hooks")
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.first())
+                .and_then(|h| h.get("command"))
+                .and_then(|c| c.as_str())
+                .unwrap_or_else(|| panic!("{role} PreToolUse missing command: {pre}"));
+            assert_eq!(
+                pre_cmd, "cas hook PreToolUse",
+                "{role} PreToolUse must invoke `cas hook PreToolUse`"
+            );
+            let matcher = pre
+                .get("matcher")
+                .and_then(|v| v.as_str())
+                .unwrap_or_else(|| panic!("{role} PreToolUse missing matcher: {pre}"));
+            for tool in ["Read", "Write", "Edit", "Glob", "Grep", "Bash", "NotebookEdit"] {
+                assert!(
+                    matcher.contains(tool),
+                    "{role} PreToolUse matcher must cover {tool}, got {matcher:?}"
+                );
+            }
+
+            let perm = hooks
+                .get("PermissionRequest")
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.first())
+                .unwrap_or_else(|| panic!("{role} hooks missing PermissionRequest entry: {hooks}"));
+            let perm_cmd = perm
+                .get("hooks")
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.first())
+                .and_then(|h| h.get("command"))
+                .and_then(|c| c.as_str())
+                .unwrap_or_else(|| panic!("{role} PermissionRequest missing command: {perm}"));
+            assert_eq!(
+                perm_cmd, "cas hook PermissionRequest",
+                "{role} PermissionRequest must invoke `cas hook PermissionRequest`"
             );
         }
     }
