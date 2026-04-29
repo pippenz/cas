@@ -71,10 +71,10 @@ fn parse_list_organizations_bails_on_unknown_wrapper_key() {
     // masquerade as an empty org list.
     let v = serde_json::json!({"items": [{"id": "org-1", "name": "X"}]});
     let err = parse_list_organizations(&v).unwrap_err();
-    assert!(
-        err.to_string().contains("no `organizations` array"),
-        "got: {err}"
-    );
+    let s = err.to_string();
+    assert!(s.contains("no `organizations` array"), "got: {s}");
+    // Bail message must include a recovery hint citing cas-36fd0.
+    assert!(s.contains("cas-36fd0"), "missing recovery hint: {s}");
 }
 
 #[test]
@@ -118,10 +118,9 @@ fn parse_list_projects_propagates_is_error_envelope() {
 fn parse_list_projects_bails_on_unknown_wrapper_key() {
     let v = serde_json::json!({"items": [{"id": "p1", "name": "x"}]});
     let err = parse_list_projects(&v).unwrap_err();
-    assert!(
-        err.to_string().contains("no `projects` array"),
-        "got: {err}"
-    );
+    let s = err.to_string();
+    assert!(s.contains("no `projects` array"), "got: {s}");
+    assert!(s.contains("cas-36fd0"), "missing recovery hint: {s}");
 }
 
 // --- describe_project -------------------------------------------------------
@@ -164,9 +163,12 @@ fn parse_describe_project_bails_when_no_default_database_name_is_resolvable() {
         "branches": []
     });
     let err = parse_describe_project(&v).unwrap_err();
+    let s = err.to_string();
+    assert!(s.contains("no default database name"), "got: {s}");
+    // Bail message must point at the freshly-created-project recovery.
     assert!(
-        err.to_string().contains("no default database name"),
-        "got: {err}"
+        s.contains("freshly-created project") || s.contains("provisioned"),
+        "missing provisioning recovery hint: {s}"
     );
 }
 

@@ -287,11 +287,15 @@ pub fn parse_list_organizations(value: &serde_json::Value) -> Result<Vec<NeonOrg
             .cloned()
             .ok_or_else(|| {
                 anyhow!(
-                    "list_organizations: response had no `organizations` array: \
-                     {inner}"
+                    "list_organizations: response had no `organizations` array. \
+                     cas-36fd0 dropped speculative tolerance for `orgs` and \
+                     unrecognized wrapper keys; if Neon's MCP rolled out a new \
+                     shape, please file a bug with this payload: {inner}"
                 )
             })?,
-        _ => anyhow::bail!("unexpected list_organizations shape: {inner}"),
+        _ => anyhow::bail!(
+            "list_organizations: unexpected shape (expected array or `{{ organizations: [...] }}`): {inner}"
+        ),
     };
     let mut out = Vec::with_capacity(array.len());
     for v in array {
@@ -321,10 +325,15 @@ pub fn parse_list_projects(value: &serde_json::Value) -> Result<Vec<NeonProject>
             .cloned()
             .ok_or_else(|| {
                 anyhow!(
-                    "list_projects: response had no `projects` array: {inner}"
+                    "list_projects: response had no `projects` array. cas-36fd0 \
+                     dropped speculative tolerance for `data` and unrecognized \
+                     wrapper keys; if Neon's MCP rolled out a new shape, please \
+                     file a bug with this payload: {inner}"
                 )
             })?,
-        _ => anyhow::bail!("unexpected list_projects shape: {inner}"),
+        _ => anyhow::bail!(
+            "list_projects: unexpected shape (expected array or `{{ projects: [...] }}`): {inner}"
+        ),
     };
     let mut out = Vec::with_capacity(array.len());
     for v in array {
@@ -384,7 +393,14 @@ pub fn parse_describe_project(value: &serde_json::Value) -> Result<NeonProjectDe
             anyhow!(
                 "describe_project: no default database name found. Looked at \
                  `project.default_database_name`, top-level `default_database`, \
-                 and `databases[0].name`. Response: {inner}"
+                 and `databases[0].name`. \
+                 \n\
+                 If this is a freshly-created project, the default database may \
+                 not have provisioned yet — wait a few seconds and re-run \
+                 `cas integrate neon refresh --update-ids`. Otherwise pass \
+                 `InitChoices.database_name = Some(...)` (or open a bug). \
+                 \n\
+                 Response: {inner}"
             )
         })?
         .to_string();

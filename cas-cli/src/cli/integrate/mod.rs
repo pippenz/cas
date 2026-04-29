@@ -34,6 +34,18 @@
 //! block in a future template revision does not silently misroute user
 //! content. See [`keep_block::merge`] and [`keep_block::orphaned_existing`]
 //! for the merge semantics and the recommended call shape for handlers.
+//!
+//! ## Live MCP transport
+//!
+//! Platform handlers backed by an upstream MCP server (vercel, neon,
+//! and any future github-with-API client) wrap [`proxy::ProxyClient`]
+//! rather than reimplementing the runtime + engine lifecycle. The shared
+//! module owns config loading, lazy engine init, call dispatch, envelope
+//! unwrap, and Drop-time shutdown (cas-36fd0). New live clients should
+//! follow the `vercel::mcp_proxy_client::ProxyVercelClient` /
+//! `neon::LiveNeonClient` shape: a thin wrapper over
+//! `ProxyClient::new("<server>")` that maps trait calls onto
+//! `ProxyClient::call(tool, args)` and a per-platform parser.
 
 pub mod doctor;
 pub mod fs;

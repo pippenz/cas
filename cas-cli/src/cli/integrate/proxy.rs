@@ -89,15 +89,32 @@ type ProxyState = (Runtime, cmcp_core::ProxyEngine);
 /// Lazily-initialized MCP proxy client. Construct one per upstream server
 /// name; reuse across calls. `Drop` shuts down the engine and joins the
 /// runtime.
+///
+/// # Drop discipline
+///
+/// **Must NOT be dropped from inside an active tokio runtime.**
+/// `Drop` calls `rt.block_on(engine.shutdown())` on the cached
+/// current-thread runtime, which panics with "Cannot start a runtime
+/// from within a runtime" when invoked while another runtime is
+/// already executing on the thread. Future async callers must call
+/// the explicit shutdown path (TODO: expose a `close(self)`) before
+/// the value drops, or construct the client in a sync scope and
+/// arrange for it to drop there.
 pub struct ProxyClient {
-    server_name: String,
+    /// Upstream MCP server identifier (e.g. `"vercel"`, `"neon"`). Stored
+    /// as `&'static str` since every call site passes a string literal.
+    server_name: &'static str,
     state: Mutex<Option<ProxyState>>,
 }
 
 impl ProxyClient {
-    pub fn new(server_name: impl Into<String>) -> Self {
+    /// Construct a new proxy client for the named upstream server.
+    ///
+    /// **See [Drop discipline](Self#drop-discipline) before storing the
+    /// returned value in async-owned state.**
+    pub fn new(server_name: &'static str) -> Self {
         Self {
-            server_name: server_name.into(),
+            server_name,
             state: Mutex::new(None),
         }
     }
@@ -111,8 +128,8 @@ impl ProxyClient {
     }
 
     /// Borrowed accessor for the configured server name (for diagnostics).
-    pub fn server_name(&self) -> &str {
-        &self.server_name
+    pub fn server_name(&self) -> &'static str {
+        self.server_name
     }
 
     /// Lazily build the (runtime, engine) pair on first call, then run
@@ -137,7 +154,7 @@ impl ProxyClient {
             anyhow::ensure!(
                 !cfg.servers.is_empty(),
                 "no MCP servers configured. Run `cas mcp add {} ...` or check ~/.config/code-mode-mcp/config.toml.",
-                self.server_name,
+                self.server_name
             );
             let engine = rt
                 .block_on(cmcp_core::ProxyEngine::from_configs(cfg.servers))
@@ -157,11 +174,11 @@ impl ProxyClient {
         tool: &str,
         args: Option<serde_json::Map<String, Value>>,
     ) -> anyhow::Result<Value> {
-        let server_name = self.server_name.clone();
+        let server_name = self.server_name; // &'static str — Copy
         self.with_engine(|rt, engine| {
             rt.block_on(async {
                 engine
-                    .call_tool(&server_name, tool, args)
+                    .call_tool(server_name, tool, args)
                     .await
                     .with_context(|| format!("calling {server_name}.{tool}"))
             })
@@ -284,6 +301,59 @@ mod tests {
     fn server_name_is_threaded_into_diagnostics() {
         let client = ProxyClient::new("neon");
         assert_eq!(client.server_name(), "neon");
+        drop(client);
+    }
+
+    #[test]
+    fn first_call_attempts_lazy_init_and_engine_stays_uninstalled_on_empty_config() {
+        // Hermetic env: no proxy.toml anywhere → load_merged returns
+        // an empty servers map → ensure! fires BEFORE the engine is
+        // installed into self.state. engine_constructed must remain
+        // false so a follow-on retry hits the same code path.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let prev_home = std::env::var_os("HOME");
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        // SAFETY: env mutation; this test is single-threaded and restores
+        // on Drop.
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
+        }
+        struct Restore {
+            home: Option<std::ffi::OsString>,
+            xdg: Option<std::ffi::OsString>,
+        }
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                unsafe {
+                    match &self.home {
+                        Some(v) => std::env::set_var("HOME", v),
+                        None => std::env::remove_var("HOME"),
+                    }
+                    match &self.xdg {
+                        Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                        None => std::env::remove_var("XDG_CONFIG_HOME"),
+                    }
+                }
+            }
+        }
+        let _g = Restore {
+            home: prev_home,
+            xdg: prev_xdg,
+        };
+
+        let client = ProxyClient::new("vercel");
+        assert!(!client.engine_constructed());
+        let err = client.call("list_projects", None).unwrap_err();
+        assert!(
+            err.to_string().contains("no MCP servers configured"),
+            "expected empty-config Err; got: {err}"
+        );
+        assert!(
+            !client.engine_constructed(),
+            "ensure! fires before installing the engine; engine_constructed must remain false"
+        );
+        // Drop without engine must not panic.
         drop(client);
     }
 }
