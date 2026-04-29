@@ -33,8 +33,8 @@
 //! # Templates
 //!
 //! Templates live in `templates/vercel/` next to this file and are embedded
-//! at compile time via `include_str!`. The mode hold all project-specific
-//! IDs inside named keep blocks (`<!-- keep vercel-ids -->`,
+//! at compile time via `include_str!`. They hold all project-specific IDs
+//! inside named keep blocks (`<!-- keep vercel-ids -->`,
 //! `<!-- keep vercel-notes -->`) so refresh can either preserve them
 //! (default) or replace them (`--update-ids`).
 
@@ -58,6 +58,18 @@ const REL_CLAUDE_SKILL: &str = ".claude/skills/vercel-deployments/SKILL.md";
 const REL_CLAUDE_REFS: &str =
     ".claude/skills/vercel-deployments/references/common-tasks.md";
 const REL_CURSOR_SKILL: &str = ".cursor/skills/vercel-deployments/SKILL.md";
+
+/// Detection sentinels (mirror this convention in cas-1ece / cas-f425).
+const VERCEL_JSON: &str = "vercel.json";
+const PACKAGE_JSON: &str = "package.json";
+/// Vercel deploy ID prefix.
+const PROJECT_ID_PREFIX: &str = "prj_";
+/// Named keep block holding project-specific IDs.
+const KEEP_IDS_BLOCK: &str = "vercel-ids";
+
+/// Cap on bytes read from user-controlled markdown / JSON files.
+/// Defends against `dd`-style accidents and symlinks to `/dev/zero`.
+const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024; // 4 MiB
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -105,13 +117,13 @@ impl VercelDetection {
 
 /// Detect Vercel usage in `repo_root` by checking for `vercel.json` at the
 /// root and `@vercel/*` dependencies in `package.json`.
+///
+/// Both inputs are accessed via [`is_regular_file`] which rejects symlinks
+/// and missing files; reads are size-capped at [`MAX_FILE_BYTES`].
 pub fn detect_vercel(repo_root: &Path) -> VercelDetection {
-    let has_vercel_json = repo_root.join("vercel.json").is_file();
-    let has_at_vercel_dep = repo_root
-        .join("package.json")
-        .is_file()
-        .then(|| package_json_has_at_vercel_dep(&repo_root.join("package.json")))
-        .unwrap_or(false);
+    let has_vercel_json = is_regular_file(&repo_root.join(VERCEL_JSON));
+    let has_at_vercel_dep =
+        package_json_has_at_vercel_dep(&repo_root.join(PACKAGE_JSON));
     VercelDetection {
         has_vercel_json,
         has_at_vercel_dep,
@@ -119,7 +131,10 @@ pub fn detect_vercel(repo_root: &Path) -> VercelDetection {
 }
 
 fn package_json_has_at_vercel_dep(package_json: &Path) -> bool {
-    let Ok(content) = std::fs::read_to_string(package_json) else {
+    if !is_regular_file(package_json) {
+        return false;
+    }
+    let Ok(content) = read_capped(package_json) else {
         return false;
     };
     let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&content) else {
@@ -159,14 +174,18 @@ pub fn match_project(repo_basename: &str, projects: &[ProjectSummary]) -> MatchO
         return MatchOutcome::None;
     }
 
-    // Score: exact (case-insensitive) > contains > none.
+    // Score: exact (case-insensitive) > project-name contains repo-basename
+    // > none. Note: we deliberately do NOT match when the project name is a
+    // substring of the repo basename — short generic project names like
+    // "app" or "web" would otherwise auto-match every repo. The project
+    // name must contain the basename.
     let mut exact: Vec<&ProjectSummary> = Vec::new();
     let mut contains: Vec<&ProjectSummary> = Vec::new();
     for p in projects {
         let n = p.name.to_ascii_lowercase();
         if n == needle {
             exact.push(p);
-        } else if n.contains(&needle) || needle.contains(&n) {
+        } else if n.contains(&needle) {
             contains.push(p);
         }
     }
@@ -232,12 +251,33 @@ fn render_ids_table(projects: &[ProjectSummary]) -> String {
     for p in projects {
         out.push_str(&format!(
             "| {} | `{}` | `{}` |\n",
-            p.name,
-            p.id,
-            p.team_id.as_deref().unwrap_or("-")
+            escape_md_cell(&p.name),
+            escape_md_cell_code(&p.id),
+            escape_md_cell_code(p.team_id.as_deref().unwrap_or("-")),
         ));
     }
     out
+}
+
+/// Escape a value for safe inclusion in a markdown table cell. Strips:
+/// - `|` (would break the cell layout)
+/// - HTML comment open/close (`<!--`, `-->`) — would corrupt the surrounding
+///   keep-block markers and on subsequent refresh cause `keep_block::extract`
+///   to mis-parse.
+/// - Newlines (would break the row).
+fn escape_md_cell(s: &str) -> String {
+    s.replace('|', "\\|")
+        .replace("<!--", "&lt;!--")
+        .replace("-->", "--&gt;")
+        .replace('\n', " ")
+        .replace('\r', " ")
+}
+
+/// Escape a value rendered inside backticks (`code` cell). Same as
+/// [`escape_md_cell`] but additionally strips backticks so a malicious id
+/// cannot break out of the inline-code span and hijack the table.
+fn escape_md_cell_code(s: &str) -> String {
+    escape_md_cell(s).replace('`', "")
 }
 
 // ---------------------------------------------------------------------------
@@ -297,7 +337,7 @@ pub fn init(
     }
 
     let claude_skill = repo_root.join(REL_CLAUDE_SKILL);
-    if claude_skill.is_file() && !is_empty_or_placeholder(&claude_skill)? {
+    if claude_skill.is_file() && !is_empty(&claude_skill)? {
         outcome.status = IntegrationStatus::AlreadyConfigured;
         outcome.summary.push(format!(
             "{} already populated; use `cas integrate vercel refresh`",
@@ -313,7 +353,13 @@ pub fn init(
     let basename = repo_basename(repo_root);
     let chosen = match match_project(&basename, &projects) {
         MatchOutcome::Strong(p) => vec![p],
-        MatchOutcome::Multiple(candidates) => candidates,
+        MatchOutcome::Multiple(candidates) => {
+            outcome.summary.push(format!(
+                "captured {} ambiguous Vercel matches for '{basename}' (interactive picker pending cas-7417 wire-up)",
+                candidates.len()
+            ));
+            candidates
+        }
         MatchOutcome::None => {
             outcome.summary.push(format!(
                 "no Vercel project matched repo name '{basename}' among {} projects; skipping",
@@ -323,9 +369,10 @@ pub fn init(
         }
     };
 
+    let chosen_len = chosen.len();
     let ctx = RenderContext {
         repo_name: basename,
-        projects: chosen.clone(),
+        projects: chosen,
     };
     let claude_doc = render_skill(&ctx, TemplateTarget::Claude);
     let cursor_doc = render_skill(&ctx, TemplateTarget::Cursor);
@@ -341,8 +388,7 @@ pub fn init(
         PathBuf::from(REL_CURSOR_SKILL),
     ];
     outcome.summary.push(format!(
-        "captured {} Vercel project(s); wrote 3 files",
-        chosen.len()
+        "captured {chosen_len} Vercel project(s); wrote 3 files",
     ));
     Ok(outcome)
 }
@@ -372,36 +418,46 @@ pub fn refresh(
         return Ok(outcome);
     }
 
-    // Determine projects to render: either freshly fetched (--update-ids) or
-    // an empty list (the existing keep-block content survives via merge).
-    let projects = if update_ids {
+    let basename = repo_basename(repo_root);
+
+    // Determine projects to render and merge mode:
+    // - default refresh: empty `projects`; mode = PreserveExisting; existing
+    //   keep-block content survives via merge.
+    // - `--update-ids` with a real upstream match: fetched `projects`;
+    //   mode = PreferTemplate; new IDs overwrite the keep block.
+    // - `--update-ids` with NO upstream match: surface a warning and fall
+    //   back to PreserveExisting so we never silently wipe recorded IDs.
+    let (projects, mode) = if update_ids {
         let all = client
             .list_projects()
             .context("re-fetching Vercel projects via MCP")?;
-        let basename = repo_basename(repo_root);
         match match_project(&basename, &all) {
-            MatchOutcome::Strong(p) => vec![p],
-            MatchOutcome::Multiple(c) => c,
-            MatchOutcome::None => Vec::new(),
+            MatchOutcome::Strong(p) => (vec![p], MergeMode::PreferTemplate),
+            MatchOutcome::Multiple(c) => {
+                outcome.summary.push(format!(
+                    "captured {} ambiguous Vercel matches for '{basename}' (picker pending cas-7417)",
+                    c.len()
+                ));
+                (c, MergeMode::PreferTemplate)
+            }
+            MatchOutcome::None => {
+                outcome.summary.push(format!(
+                    "warning: no Vercel project matched '{basename}' on refresh --update-ids; preserving existing keep-block IDs"
+                ));
+                (Vec::new(), MergeMode::PreserveExisting)
+            }
         }
     } else {
-        Vec::new()
+        (Vec::new(), MergeMode::PreserveExisting)
     };
 
-    let basename = repo_basename(repo_root);
     let ctx = RenderContext {
         repo_name: basename,
         projects,
     };
 
-    let mode = if update_ids {
-        MergeMode::PreferTemplate
-    } else {
-        MergeMode::PreserveExisting
-    };
-
-    let claude_existing = std::fs::read_to_string(&claude_path).ok();
-    let cursor_existing = std::fs::read_to_string(&cursor_path).ok();
+    let claude_existing = read_capped(&claude_path).ok();
+    let cursor_existing = read_capped(&cursor_path).ok();
 
     let new_claude = render_skill(&ctx, TemplateTarget::Claude);
     let new_cursor = render_skill(&ctx, TemplateTarget::Cursor);
@@ -414,6 +470,16 @@ pub fn refresh(
                     let label = o.name.unwrap_or_else(|| "<unnamed>".to_string());
                     outcome.summary.push(format!(
                         "warning: dropped hand-edited keep block '{label}' from {REL_CLAUDE_SKILL} (not present in current template)",
+                    ));
+                }
+            }
+        }
+        if let Some(existing) = cursor_existing.as_deref() {
+            if let Ok(orphans) = keep_block::orphaned_existing(&new_cursor, existing) {
+                for o in orphans {
+                    let label = o.name.unwrap_or_else(|| "<unnamed>".to_string());
+                    outcome.summary.push(format!(
+                        "warning: dropped hand-edited keep block '{label}' from {REL_CURSOR_SKILL} (not present in current template)",
                     ));
                 }
             }
@@ -464,13 +530,13 @@ pub fn verify(
         return Ok(outcome);
     }
 
-    let content = std::fs::read_to_string(&claude_path)
+    let content = read_capped(&claude_path)
         .with_context(|| format!("reading {}", claude_path.display()))?;
     let blocks = keep_block::extract(&content)
         .context("parsing keep blocks in claude SKILL.md")?;
     let ids_block = blocks
         .into_iter()
-        .find(|b| b.name.as_deref() == Some("vercel-ids"));
+        .find(|b| b.name.as_deref() == Some(KEEP_IDS_BLOCK));
     let Some(ids_block) = ids_block else {
         outcome.summary.push(
             "no <!-- keep vercel-ids --> block found; nothing to verify".to_string(),
@@ -531,34 +597,84 @@ fn write_file(path: &Path, content: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn is_empty_or_placeholder(path: &Path) -> anyhow::Result<bool> {
-    let s = std::fs::read_to_string(path)?;
+/// Treat a SKILL.md as "ready to overwrite" if it does not exist or its
+/// trimmed contents are empty. Used by `init` to refuse overwriting populated
+/// SKILL files. We deliberately stay conservative — partial-state recovery is
+/// out of scope for this task and tracked separately.
+fn is_empty(path: &Path) -> anyhow::Result<bool> {
+    let s = read_capped(path)?;
     Ok(s.trim().is_empty())
 }
 
-/// Pull `prj_*` ids out of a recorded keep-block body. Tolerant of formatting
-/// (table, list, prose) — extracts any backtick-fenced token starting with
-/// `prj_`.
+/// Pull `prj_*` ids out of a recorded keep-block body. Tolerant of
+/// formatting (table, list, prose, fenced code) — extracts any token of the
+/// form `prj_<word>` regardless of surrounding markdown punctuation.
 fn parse_recorded_ids(body: &str) -> Vec<String> {
     let mut out = Vec::new();
-    let mut buf = String::new();
-    let mut in_tick = false;
-    for c in body.chars() {
-        if c == '`' {
-            if in_tick && !buf.is_empty() {
-                if buf.starts_with("prj_") && !out.contains(&buf) {
-                    out.push(buf.clone());
+    let mut iter = body.char_indices().peekable();
+    while let Some((i, c)) = iter.next() {
+        if c == 'p' && body[i..].starts_with(PROJECT_ID_PREFIX) {
+            // Capture the longest run of [A-Za-z0-9_] starting at i.
+            let mut end = i + PROJECT_ID_PREFIX.len();
+            for (j, cc) in body[end..].char_indices() {
+                if cc.is_ascii_alphanumeric() || cc == '_' {
+                    end = i + PROJECT_ID_PREFIX.len() + j + cc.len_utf8();
+                } else {
+                    break;
                 }
-                buf.clear();
             }
-            in_tick = !in_tick;
-            continue;
-        }
-        if in_tick {
-            buf.push(c);
+            let token = body[i..end].to_string();
+            if token.len() > PROJECT_ID_PREFIX.len() && !out.contains(&token) {
+                out.push(token);
+            }
+            // Skip iter forward to the end of the captured token.
+            while let Some(&(k, _)) = iter.peek() {
+                if k < end {
+                    iter.next();
+                } else {
+                    break;
+                }
+            }
         }
     }
     out
+}
+
+/// True iff `path` exists, is a regular file, and is NOT a symlink.
+fn is_regular_file(path: &Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(md) => md.file_type().is_file(),
+        Err(_) => false,
+    }
+}
+
+/// Read a file with a [`MAX_FILE_BYTES`] cap. Refuses symlinks and rejects
+/// inputs larger than the cap with a clear error rather than allocating
+/// unbounded memory.
+fn read_capped(path: &Path) -> anyhow::Result<String> {
+    use std::io::Read;
+    let md = std::fs::symlink_metadata(path)
+        .with_context(|| format!("statting {}", path.display()))?;
+    if md.file_type().is_symlink() {
+        anyhow::bail!(
+            "{} is a symlink; refusing to follow",
+            path.display()
+        );
+    }
+    if md.len() > MAX_FILE_BYTES {
+        anyhow::bail!(
+            "{} is {} bytes; exceeds cap of {} bytes",
+            path.display(),
+            md.len(),
+            MAX_FILE_BYTES
+        );
+    }
+    let mut f = std::fs::File::open(path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    let mut s = String::new();
+    f.take(MAX_FILE_BYTES + 1).read_to_string(&mut s)
+        .with_context(|| format!("reading {}", path.display()))?;
+    Ok(s)
 }
 
 // ---------------------------------------------------------------------------
@@ -599,13 +715,20 @@ impl VercelClient for NoMcpVercelClient {
 mod mcp_proxy_client {
     //! Production [`VercelClient`] backed by the on-disk MCP proxy config
     //! (`.cas/proxy.toml` or `~/.config/code-mode-mcp/config.toml`).
+    //!
+    //! Currently a placeholder — the cmcp_core::ProxyEngine wiring (tokio
+    //! runtime, proxy lifecycle, server lookup) is the responsibility of
+    //! cas-7417 (init wire-up), which already has to construct a long-lived
+    //! client. Until then this trait impl returns a clear "not yet wired"
+    //! error so the production path fails loudly rather than silently
+    //! producing empty results.
 
     use super::{ProjectSummary, VercelClient};
 
-    pub struct ProxyVercelClient;
+    pub(super) struct ProxyVercelClient;
 
     impl ProxyVercelClient {
-        pub fn new() -> Self {
+        pub(super) fn new() -> Self {
             Self
         }
     }
@@ -690,17 +813,6 @@ mod tests {
             name: name.to_string(),
             team_id: Some(team.to_string()),
         }
-    }
-
-    fn make_repo(name: &str) -> TempDir {
-        let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().join(name);
-        std::fs::create_dir_all(&dir).unwrap();
-        // Tempdir wrapper that exposes the named subdir? Just hand back tmp
-        // and have callers pass `tmp.path().join(name)` as repo_root. Simpler:
-        // callers use this directly.
-        std::mem::forget(dir);
-        tmp
     }
 
     fn make_repo_with_name(name: &str) -> (TempDir, PathBuf) {
@@ -1059,9 +1171,255 @@ mod tests {
         assert_eq!(parse_recorded_ids(body), vec!["prj_y".to_string()]);
     }
 
-    // Suppress unused warnings on the throwaway helper.
-    #[allow(dead_code)]
-    fn _unused() {
-        let _ = make_repo("x");
+    #[test]
+    fn parse_recorded_ids_extracts_from_unfenced_prose() {
+        // No backticks at all — still extract the prj_ token.
+        let body = "Production project is prj_abc123 on team team_x.";
+        assert_eq!(parse_recorded_ids(body), vec!["prj_abc123".to_string()]);
+    }
+
+    #[test]
+    fn parse_recorded_ids_extracts_from_triple_backtick_fence() {
+        let body = "```\nconst id = \"prj_fenced\";\n```";
+        assert_eq!(parse_recorded_ids(body), vec!["prj_fenced".to_string()]);
+    }
+
+    #[test]
+    fn parse_recorded_ids_returns_empty_for_empty_or_no_match() {
+        assert!(parse_recorded_ids("").is_empty());
+        assert!(parse_recorded_ids("no ids here").is_empty());
+    }
+
+    // --- Detection edge cases ------------------------------------------
+
+    #[test]
+    fn detect_vercel_finds_at_vercel_dep_in_peerDependencies() {
+        let (_tmp, root) = make_repo_with_name("foo");
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"peerDependencies":{"@vercel/og":"*"}}"#,
+        )
+        .unwrap();
+        assert!(detect_vercel(&root).detected());
+    }
+
+    #[test]
+    fn detect_vercel_rejects_symlinked_package_json() {
+        let (_tmp, root) = make_repo_with_name("foo");
+        let real = root.join("real.json");
+        std::fs::write(&real, r#"{"dependencies":{"@vercel/og":"*"}}"#).unwrap();
+        let link = root.join("package.json");
+        // Best-effort symlink; skip on platforms without symlink support.
+        if std::os::unix::fs::symlink(&real, &link).is_err() {
+            return;
+        }
+        let d = detect_vercel(&root);
+        assert!(
+            !d.has_at_vercel_dep,
+            "symlinked package.json must not be followed"
+        );
+    }
+
+    #[test]
+    fn detect_vercel_handles_malformed_package_json() {
+        let (_tmp, root) = make_repo_with_name("foo");
+        std::fs::write(root.join("package.json"), "this is not json").unwrap();
+        // Should not panic and should not crash; just returns false.
+        assert!(!detect_vercel(&root).has_at_vercel_dep);
+    }
+
+    // --- match_project: short generic name guard -----------------------
+
+    #[test]
+    fn match_project_does_not_match_short_generic_project_into_long_basename() {
+        // Pre-fix this would match: "myapp-web".contains("app") was true.
+        let projects = vec![proj("prj_x", "app", "team_a")];
+        assert_eq!(match_project("myapp-web", &projects), MatchOutcome::None);
+    }
+
+    // --- Render escaping ------------------------------------------------
+
+    #[test]
+    fn render_skill_escapes_pipe_and_html_comment_in_project_name() {
+        let ctx = RenderContext {
+            repo_name: "myapp".to_string(),
+            projects: vec![proj(
+                "prj_1",
+                "evil | name <!-- /keep vercel-ids -->",
+                "team_a",
+            )],
+        };
+        let doc = render_skill(&ctx, TemplateTarget::Claude);
+        // Must remain valid keep-block document — no premature close.
+        keep_block::extract(&doc).expect("escaped doc must round-trip");
+        assert!(!doc.contains("<!-- /keep vercel-ids --> bar"));
+    }
+
+    #[test]
+    fn render_skill_with_empty_projects_emits_placeholder() {
+        let ctx = RenderContext {
+            repo_name: "myapp".to_string(),
+            projects: Vec::new(),
+        };
+        let doc = render_skill(&ctx, TemplateTarget::Claude);
+        assert!(doc.contains("No Vercel projects captured"));
+        keep_block::extract(&doc).expect("empty-projects doc must round-trip");
+    }
+
+    // --- Init: multi-match ---------------------------------------------
+
+    #[test]
+    fn init_writes_all_candidates_when_match_is_ambiguous() {
+        let (_tmp, root) = make_repo_with_name("myapp");
+        std::fs::write(root.join("vercel.json"), "{}").unwrap();
+        let client = MockVercelClient::new(vec![
+            proj("prj_fe", "myapp-frontend", "team_a"),
+            proj("prj_be", "myapp-backend", "team_a"),
+        ]);
+        let outcome = init(&root, &client).unwrap();
+        assert_eq!(outcome.status, IntegrationStatus::Configured);
+        let claude = std::fs::read_to_string(root.join(REL_CLAUDE_SKILL)).unwrap();
+        assert!(claude.contains("prj_fe"));
+        assert!(claude.contains("prj_be"));
+        assert!(outcome.summary.iter().any(|s| s.contains("ambiguous")));
+    }
+
+    // --- Init: empty SKILL.md is treated as fresh ----------------------
+
+    #[test]
+    fn init_treats_empty_existing_skill_md_as_fresh() {
+        let (_tmp, root) = make_repo_with_name("myapp");
+        std::fs::write(root.join("vercel.json"), "{}").unwrap();
+        let path = root.join(REL_CLAUDE_SKILL);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "  \n  \n").unwrap();
+        let client = MockVercelClient::new(vec![proj("prj_1", "myapp", "team_a")]);
+
+        let outcome = init(&root, &client).unwrap();
+        assert_eq!(outcome.status, IntegrationStatus::Configured);
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains("prj_1"));
+    }
+
+    // --- Refresh: cursor-side orphan detection -------------------------
+
+    #[test]
+    fn refresh_surfaces_orphaned_keep_blocks_in_cursor_skill_too() {
+        let (_tmp, root) = make_repo_with_name("myapp");
+        std::fs::write(root.join("vercel.json"), "{}").unwrap();
+        let client = MockVercelClient::new(vec![proj("prj_1", "myapp", "team_a")]);
+        init(&root, &client).unwrap();
+
+        let cursor_path = root.join(REL_CURSOR_SKILL);
+        let mut cursor = std::fs::read_to_string(&cursor_path).unwrap();
+        cursor.push_str(
+            "\n<!-- keep vercel-cursor-extra -->\nuser content\n<!-- /keep vercel-cursor-extra -->\n",
+        );
+        std::fs::write(&cursor_path, &cursor).unwrap();
+
+        let outcome = refresh(&root, &client, false).unwrap();
+        assert!(
+            outcome
+                .summary
+                .iter()
+                .any(|s| s.contains("vercel-cursor-extra") && s.contains(REL_CURSOR_SKILL)),
+            "cursor orphan must be surfaced: summary={:?}",
+            outcome.summary
+        );
+    }
+
+    // --- Refresh: --update-ids with no upstream match falls back -------
+
+    #[test]
+    fn refresh_with_update_ids_and_no_match_preserves_existing() {
+        let (_tmp, root) = make_repo_with_name("myapp");
+        std::fs::write(root.join("vercel.json"), "{}").unwrap();
+        let client = MockVercelClient::new(vec![proj("prj_old", "myapp", "team_old")]);
+        init(&root, &client).unwrap();
+
+        // Upstream now has nothing matching the basename.
+        let stranger = MockVercelClient::new(vec![proj(
+            "prj_other",
+            "totally-unrelated",
+            "team_b",
+        )]);
+        let outcome = refresh(&root, &stranger, true).unwrap();
+        assert_eq!(outcome.status, IntegrationStatus::Refreshed);
+        assert!(
+            outcome
+                .summary
+                .iter()
+                .any(|s| s.contains("preserving existing")),
+            "must surface fallback warning: summary={:?}",
+            outcome.summary
+        );
+        // IDs from init survive.
+        let after = std::fs::read_to_string(root.join(REL_CLAUDE_SKILL)).unwrap();
+        assert!(after.contains("prj_old"));
+        assert!(!after.contains("prj_other"));
+    }
+
+    // --- Verify: mixed-staleness + empty ID block ----------------------
+
+    #[test]
+    fn verify_classifies_mixed_ok_and_stale_per_id() {
+        let (_tmp, root) = make_repo_with_name("myapp");
+        std::fs::write(root.join("vercel.json"), "{}").unwrap();
+        let client = MockVercelClient::new(vec![
+            proj("prj_a", "myapp-frontend", "team_a"),
+            proj("prj_b", "myapp-backend", "team_a"),
+        ]);
+        init(&root, &client).unwrap();
+
+        let mut mixed = MockVercelClient::new(vec![
+            proj("prj_a", "myapp-frontend", "team_a"),
+            proj("prj_b", "myapp-backend", "team_a"),
+        ]);
+        mixed.stale_ids.push("prj_a".to_string());
+        let outcome = verify(&root, &mixed).unwrap();
+        assert_eq!(outcome.status, IntegrationStatus::Stale);
+        assert!(outcome.summary.iter().any(|s| s.contains("prj_a") && s.contains("Stale")));
+        assert!(outcome.summary.iter().any(|s| s.contains("prj_b") && s.contains("Ok")));
+    }
+
+    #[test]
+    fn verify_returns_skipped_when_keep_block_has_no_ids() {
+        let (_tmp, root) = make_repo_with_name("myapp");
+        let path = root.join(REL_CLAUDE_SKILL);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "# vercel\n<!-- keep vercel-ids -->\n_no ids yet_\n<!-- /keep vercel-ids -->\n",
+        )
+        .unwrap();
+        let client = MockVercelClient::new(vec![]);
+        let outcome = verify(&root, &client).unwrap();
+        assert_eq!(outcome.status, IntegrationStatus::Skipped);
+        assert!(outcome.summary.iter().any(|s| s.contains("no project IDs recorded")));
+    }
+
+    // --- read_capped: symlink + size guards -----------------------------
+
+    #[test]
+    fn read_capped_rejects_symlinks() {
+        let (_tmp, root) = make_repo_with_name("foo");
+        let real = root.join("real.txt");
+        std::fs::write(&real, "hi").unwrap();
+        let link = root.join("link.txt");
+        if std::os::unix::fs::symlink(&real, &link).is_err() {
+            return;
+        }
+        let err = read_capped(&link).unwrap_err().to_string();
+        assert!(err.contains("symlink"), "got: {err}");
+    }
+
+    #[test]
+    fn read_capped_rejects_oversize_files() {
+        let (_tmp, root) = make_repo_with_name("foo");
+        let path = root.join("big.txt");
+        let big = vec![b'a'; (MAX_FILE_BYTES as usize) + 1];
+        std::fs::write(&path, &big).unwrap();
+        let err = read_capped(&path).unwrap_err().to_string();
+        assert!(err.contains("exceeds cap"), "got: {err}");
     }
 }

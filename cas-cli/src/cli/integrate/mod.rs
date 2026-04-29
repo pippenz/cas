@@ -14,18 +14,23 @@
 //!
 //! ## Template loading convention
 //!
-//! Platform handlers embed their SKILL.md templates with `include_str!` at
-//! compile time:
+//! Platform handlers embed their SKILL.md templates from a sibling
+//! `templates/<platform>/` directory via `include_str!` at compile time
+//! (cas-8e37 established this layout — neon and github mirror it):
 //!
 //! ```ignore
-//! const TEMPLATE_INIT: &str = include_str!(
-//!     "../../../assets/integrate/vercel_init.md.tmpl"
-//! );
+//! const TEMPLATE_CLAUDE_SKILL: &str =
+//!     include_str!("templates/vercel/SKILL.md.tmpl");
+//! const TEMPLATE_CURSOR_SKILL: &str =
+//!     include_str!("templates/vercel/cursor.md.tmpl");
 //! ```
 //!
 //! Templates contain `<!-- keep -->` / `<!-- /keep -->` markers around the
-//! ID payloads they want preserved across regeneration. See [`keep_block::merge`]
-//! for the merge semantics.
+//! ID payloads they want preserved across regeneration. Use **named**
+//! markers (e.g. `<!-- keep vercel-ids -->`) so reordering or adding a new
+//! block in a future template revision does not silently misroute user
+//! content. See [`keep_block::merge`] and [`keep_block::orphaned_existing`]
+//! for the merge semantics and the recommended call shape for handlers.
 
 pub mod github;
 pub mod keep_block;
