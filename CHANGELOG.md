@@ -7,6 +7,21 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [2.10.1] - 2026-04-29
+
+### Changed
+
+- **Shared proxy transport (cas-36fd0):** new `cli/integrate/proxy.rs`
+  module exposes `ProxyClient` with the proxy lifecycle (`proxy_config_path`,
+  `call`, `block_on`, `unwrap_envelope`). Both `ProxyVercelClient` and
+  `LiveNeonClient` are now thin wrappers — ~165 LOC of duplicated boilerplate
+  retired. Future `Live<X>Client` implementations inherit the wiring.
+- Speculative neon parser tolerance shapes (`orgs/data` alias, flat
+  `describe_project`) removed until proven against real envelopes; bail
+  messages cite cas-36fd0 and request bug filing on real upstream drift.
+- `default_database` "neondb" silent fallback → explicit bail with
+  provisioning recovery hint.
+
 ## [2.10.0] - 2026-04-29
 
 ### Added
