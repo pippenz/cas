@@ -1889,6 +1889,47 @@ mod tests {
         assert!(parse_get_project(&empty_envelope).unwrap().is_none());
     }
 
+    // --- ProxyVercelClient lifecycle (no live MCP) -----------------------
+    //
+    // These tests exercise the per-call → lazy-init refactor (cas-2dc9
+    // item 2). Full fixture-spawned end-to-end is bounded to a follow-on
+    // (see task notes); writing a minimal MCP server fixture is a
+    // half-day of rmcp boilerplate that didn't fit the task's scope.
+
+    #[cfg(feature = "mcp-proxy")]
+    #[test]
+    fn proxy_vercel_client_new_does_not_construct_engine() {
+        use super::mcp_proxy_client::ProxyVercelClient;
+        let client = ProxyVercelClient::new();
+        assert!(
+            !client.engine_constructed(),
+            "construction is lazy — engine should remain unbuilt until first call"
+        );
+        // Drop with no engine constructed must not panic.
+        drop(client);
+    }
+
+    #[cfg(feature = "mcp-proxy")]
+    #[test]
+    fn proxy_vercel_client_first_call_attempts_lazy_init() {
+        use super::mcp_proxy_client::ProxyVercelClient;
+        let client = ProxyVercelClient::new();
+        // The first call exercises the load_merged + ensure!(servers
+        // non-empty) path. In the test environment there is no proxy.toml
+        // and no user-level config, so we expect a clear error rather than
+        // a hang or a panic. The exact phrasing depends on whether
+        // load_merged finds an empty user-level config or no config at
+        // all; we assert on the structure (Err) and the lifecycle state.
+        let result = client.list_projects();
+        assert!(result.is_err(), "no servers configured → expected Err");
+        // engine_constructed may be true or false depending on whether
+        // load_merged succeeded with empty servers (anyhow::ensure! fires
+        // before we install the engine into self.state). We only assert
+        // that the call returned cleanly without panic — drop must work
+        // either way.
+        drop(client);
+    }
+
     #[test]
     fn parse_get_project_propagates_is_error_envelope_as_err() {
         // A real MCP transport / auth failure must NOT silently collapse
