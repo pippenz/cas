@@ -36,9 +36,12 @@
 //!
 //! All MCP/Neon access goes through the [`NeonClient`] trait. Tests use
 //! [`FakeNeonClient`] — `cargo test` never depends on a live Neon endpoint.
-//! The production [`LiveNeonClient`] is currently a placeholder that returns
-//! a clear error pointing at the orchestration layer; wiring it to the actual
-//! MCP fan-out lives outside this task's scope.
+//! The production [`LiveNeonClient`] is wired to `cmcp_core::ProxyEngine`
+//! (cas-1549) when the binary is built with `--features mcp-proxy`; off
+//! that feature it bails with a clear rebuild hint. Parser-level fixture
+//! tests live in `super::neon_parsers_test`; live MCP transport is
+//! intentionally not exercised by `cargo test` (verified manually, same
+//! scope cap as cas-7417's vercel wiring).
 
 use std::collections::BTreeMap;
 use std::fs;
