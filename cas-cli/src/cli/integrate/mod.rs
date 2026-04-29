@@ -45,6 +45,8 @@ pub mod md;
 pub mod neon;
 #[cfg(test)]
 mod neon_parsers_test;
+#[cfg(feature = "mcp-proxy")]
+pub mod proxy;
 pub mod types;
 pub mod vercel;
 

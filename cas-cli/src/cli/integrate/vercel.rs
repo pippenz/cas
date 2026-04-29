@@ -799,139 +799,45 @@ mod mcp_proxy_client {
     //! fixture-tested. A separate fixture-spawned end-to-end test for the
     //! ProxyEngine lifecycle lives under `cas-cli/tests/`.
 
-    use std::sync::Mutex;
+    //! Production [`VercelClient`] backed by the shared
+    //! [`super::super::proxy::ProxyClient`] (cas-36fd0). The proxy
+    //! lifecycle (lazy init, engine reuse, Drop with shutdown, poison
+    //! recovery) lives once in `proxy.rs`; this module is just the
+    //! Vercel-specific wrapper.
 
-    use anyhow::Context;
     use serde_json::Value;
-    use tokio::runtime::Runtime;
 
+    use super::super::proxy::ProxyClient;
     use super::{parse_get_project, parse_list_projects, ProjectSummary, VercelClient};
 
-    /// Shared (runtime, engine) state. Wrapped in `Mutex<Option<…>>` so we
-    /// can take it on Drop and run shutdown synchronously inside the
-    /// runtime before dropping it. No Arc — the engine is never cloned out
-    /// of the Mutex.
-    type ProxyState = (Runtime, cmcp_core::ProxyEngine);
-
     pub(super) struct ProxyVercelClient {
-        state: Mutex<Option<ProxyState>>,
+        inner: ProxyClient,
     }
 
     impl ProxyVercelClient {
         pub(super) fn new() -> Self {
             Self {
-                state: Mutex::new(None),
+                inner: ProxyClient::new("vercel"),
             }
         }
 
-        /// Test-visible accessor: true once the engine has been lazily
-        /// constructed. Used to assert engine reuse across multiple calls
-        /// without depending on a live MCP transport.
+        /// Test-visible passthrough to [`ProxyClient::engine_constructed`].
         #[cfg(test)]
         pub(super) fn engine_constructed(&self) -> bool {
-            self.state
-                .lock()
-                .map(|g| g.is_some())
-                .unwrap_or(false)
-        }
-
-        /// Resolve a proxy config path: first `<cas_root>/proxy.toml` if cas
-        /// is initialized, else the user-level fallback the cmcp_core loader
-        /// already handles.
-        fn proxy_config_path() -> Option<std::path::PathBuf> {
-            crate::store::find_cas_root()
-                .ok()
-                .map(|r| r.join("proxy.toml"))
-                .filter(|p| p.exists())
-        }
-
-        /// Lazily build the (runtime, engine) pair, then run `f` on it.
-        /// Subsequent calls reuse the same engine.
-        fn with_engine<F, T>(&self, f: F) -> anyhow::Result<T>
-        where
-            F: FnOnce(&Runtime, &cmcp_core::ProxyEngine) -> anyhow::Result<T>,
-        {
-            let mut guard = self
-                .state
-                .lock()
-                .map_err(|_| anyhow::anyhow!("ProxyVercelClient mutex poisoned"))?;
-            if guard.is_none() {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .context("building tokio runtime")?;
-                let cfg = cmcp_core::config::Config::load_merged(
-                    Self::proxy_config_path().as_deref(),
-                )
-                .context("loading MCP proxy config")?;
-                anyhow::ensure!(
-                    !cfg.servers.is_empty(),
-                    "no MCP servers configured. Run `cas mcp add vercel ...` or check ~/.config/code-mode-mcp/config.toml."
-                );
-                let engine = rt
-                    .block_on(cmcp_core::ProxyEngine::from_configs(cfg.servers))
-                    .context("starting MCP proxy engine")?;
-                *guard = Some((rt, engine));
-            }
-            let (rt, engine) = guard.as_ref().unwrap();
-            f(rt, engine)
-        }
-
-        async fn call_with_engine(
-            engine: &cmcp_core::ProxyEngine,
-            tool: &str,
-            args: Option<serde_json::Map<String, Value>>,
-        ) -> anyhow::Result<Value> {
-            engine
-                .call_tool("vercel", tool, args)
-                .await
-                .with_context(|| format!("calling vercel.{tool}"))
-        }
-    }
-
-    impl Drop for ProxyVercelClient {
-        fn drop(&mut self) {
-            // Shut down the engine inside the runtime that owns it. Errors
-            // here are swallowed — Drop can't return them, and an init flow
-            // that already succeeded shouldn't fail at shutdown.
-            //
-            // Recover from a poisoned Mutex via PoisonError::into_inner: a
-            // panic during a prior `with_engine` would otherwise silently
-            // skip shutdown and leak the upstream MCP child process for
-            // the lifetime of the parent.
-            //
-            // Drop must NOT be invoked from inside an active tokio runtime
-            // — `rt.block_on` panics with "Cannot start a runtime from
-            // within a runtime". The current production caller (`cas
-            // integrate` from sync main) is safe; future async callers
-            // must call an explicit `close()` (TODO: expose) before drop.
-            let mut guard = match self.state.lock() {
-                Ok(g) => g,
-                Err(p) => p.into_inner(),
-            };
-            if let Some((rt, engine)) = guard.take() {
-                rt.block_on(async move {
-                    engine.shutdown().await;
-                });
-                // rt drops here, joining its blocking pool.
-            }
+            self.inner.engine_constructed()
         }
     }
 
     impl VercelClient for ProxyVercelClient {
         fn list_projects(&self) -> anyhow::Result<Vec<ProjectSummary>> {
-            let value = self.with_engine(|rt, engine| {
-                rt.block_on(Self::call_with_engine(engine, "list_projects", None))
-            })?;
+            let value = self.inner.call("list_projects", None)?;
             parse_list_projects(&value)
         }
 
         fn get_project(&self, id: &str) -> anyhow::Result<Option<ProjectSummary>> {
             let mut args = serde_json::Map::new();
             args.insert("projectId".to_string(), Value::String(id.to_string()));
-            let value = self.with_engine(|rt, engine| {
-                rt.block_on(Self::call_with_engine(engine, "get_project", Some(args)))
-            })?;
+            let value = self.inner.call("get_project", Some(args))?;
             parse_get_project(&value)
         }
     }
@@ -993,10 +899,16 @@ pub fn parse_get_project(value: &serde_json::Value) -> anyhow::Result<Option<Pro
     Ok(project_from_value(&inner))
 }
 
-/// MCP tool calls return an envelope of the form
-/// `{ content: [{ type: "text", text: "<json string>" }, ...], isError: bool }`.
-/// Strip that wrapper and parse the inner JSON. If `value` is not the
-/// envelope shape, return it unchanged.
+/// MCP envelope unwrap. Delegates to the shared
+/// [`super::proxy::unwrap_envelope`] when the proxy feature is on; non-
+/// feature builds keep a tiny inline copy so `cargo build` without
+/// `mcp-proxy` (which doesn't pull in proxy.rs) still parses fixtures.
+#[cfg(feature = "mcp-proxy")]
+fn unwrap_mcp_envelope(value: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+    super::proxy::unwrap_envelope(value)
+}
+
+#[cfg(not(feature = "mcp-proxy"))]
 fn unwrap_mcp_envelope(value: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
     use serde_json::Value;
     let Value::Object(map) = value else {
@@ -1008,7 +920,6 @@ fn unwrap_mcp_envelope(value: &serde_json::Value) -> anyhow::Result<serde_json::
     let Some(Value::Array(content)) = map.get("content") else {
         return Ok(value.clone());
     };
-    // Concatenate any "text" parts then parse as JSON.
     let mut buf = String::new();
     for item in content {
         if let Some(t) = item.get("text").and_then(|v| v.as_str()) {

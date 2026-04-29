@@ -52,13 +52,8 @@ fn parse_list_organizations_handles_bare_array() {
     assert_eq!(orgs.len(), 2);
 }
 
-#[test]
-fn parse_list_organizations_handles_orgs_alias() {
-    let v = serde_json::json!({"orgs": [{"id": "org-x", "name": "X"}]});
-    let orgs = parse_list_organizations(&v).unwrap();
-    assert_eq!(orgs.len(), 1);
-    assert_eq!(orgs[0].id, "org-x");
-}
+// (cas-36fd0 dropped the `orgs` alias — it was speculative tolerance
+// added without a real fixture. The corresponding test is removed.)
 
 #[test]
 fn parse_list_organizations_propagates_is_error_envelope() {
@@ -72,12 +67,12 @@ fn parse_list_organizations_propagates_is_error_envelope() {
 
 #[test]
 fn parse_list_organizations_bails_on_unknown_wrapper_key() {
-    // cas-1549 autofix: a future upstream shape drift to {"items": [...]}
-    // must NOT silently masquerade as an empty org list.
+    // A future upstream shape drift to {"items": [...]} must NOT silently
+    // masquerade as an empty org list.
     let v = serde_json::json!({"items": [{"id": "org-1", "name": "X"}]});
     let err = parse_list_organizations(&v).unwrap_err();
     assert!(
-        err.to_string().contains("neither `organizations`"),
+        err.to_string().contains("no `organizations` array"),
         "got: {err}"
     );
 }
@@ -106,13 +101,8 @@ fn parse_list_projects_handles_canonical_envelope() {
     assert_eq!(projects[1].name, "ozer-health");
 }
 
-#[test]
-fn parse_list_projects_handles_data_alias() {
-    let v = serde_json::json!({"data": [{"id": "p1", "name": "n1"}]});
-    let projects = parse_list_projects(&v).unwrap();
-    assert_eq!(projects.len(), 1);
-    assert_eq!(projects[0].id, "p1");
-}
+// (cas-36fd0 dropped the `data` alias — speculative tolerance without a
+// real fixture. The corresponding test is removed.)
 
 #[test]
 fn parse_list_projects_propagates_is_error_envelope() {
@@ -129,7 +119,7 @@ fn parse_list_projects_bails_on_unknown_wrapper_key() {
     let v = serde_json::json!({"items": [{"id": "p1", "name": "x"}]});
     let err = parse_list_projects(&v).unwrap_err();
     assert!(
-        err.to_string().contains("neither `projects`"),
+        err.to_string().contains("no `projects` array"),
         "got: {err}"
     );
 }
@@ -158,19 +148,26 @@ fn parse_describe_project_handles_canonical_envelope() {
     assert!(!staging.is_default);
 }
 
+// (cas-36fd0 dropped the flat-object describe_project tolerance — it was
+// added defensively without a real fixture. Canonical shape now requires
+// the nested `project` object. The corresponding test is removed.)
+
 #[test]
-fn parse_describe_project_handles_flat_object() {
+fn parse_describe_project_bails_when_no_default_database_name_is_resolvable() {
+    // cas-36fd0: the silent "neondb" fallback used to mask upstream-shape
+    // drift. We now require the database name to be discoverable from one
+    // of (project.default_database_name, top-level default_database,
+    // databases[0].name) — anything else is an explicit error so the user
+    // can see they need to investigate.
     let v = serde_json::json!({
-        "id": "p1",
-        "name": "flatproj",
-        "default_database_name": "appdb",
-        "branches": [{"id": "br1", "name": "main", "default": true}]
+        "project": {"id": "p", "name": "n"},
+        "branches": []
     });
-    let detail = parse_describe_project(&v).unwrap();
-    assert_eq!(detail.project.id, "p1");
-    assert_eq!(detail.default_database, "appdb");
-    assert_eq!(detail.branches.len(), 1);
-    assert!(detail.branches[0].is_default);
+    let err = parse_describe_project(&v).unwrap_err();
+    assert!(
+        err.to_string().contains("no default database name"),
+        "got: {err}"
+    );
 }
 
 #[test]
@@ -187,7 +184,7 @@ fn parse_describe_project_falls_back_to_databases_array() {
 #[test]
 fn parse_describe_project_accepts_is_default_alias_on_branch() {
     let v = serde_json::json!({
-        "project": {"id": "p", "name": "n"},
+        "project": {"id": "p", "name": "n", "default_database_name": "appdb"},
         "branches": [{"id": "br1", "name": "main", "is_default": true}]
     });
     let detail = parse_describe_project(&v).unwrap();
@@ -197,7 +194,7 @@ fn parse_describe_project_accepts_is_default_alias_on_branch() {
 #[test]
 fn parse_describe_project_handles_branch_with_neither_default_nor_is_default() {
     let v = serde_json::json!({
-        "project": {"id": "p", "name": "n"},
+        "project": {"id": "p", "name": "n", "default_database_name": "appdb"},
         "branches": [{"id": "br1", "name": "main"}]
     });
     let detail = parse_describe_project(&v).unwrap();

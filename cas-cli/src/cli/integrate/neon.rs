@@ -138,20 +138,62 @@ pub trait NeonClient {
     fn describe_branch(&self, org_id: &str, project_id: &str, branch_id: &str) -> Result<bool>;
 }
 
-/// Production [`NeonClient`] backed by the on-disk MCP proxy config
-/// (`<cas_root>/proxy.toml` or `~/.config/code-mode-mcp/config.toml`).
-///
-/// Mirrors `vercel::mcp_proxy_client::ProxyVercelClient` (cas-7417): per-call
-/// tokio current-thread runtime, `cmcp_core::ProxyEngine::call_tool("neon",
-/// ...)`, engine.shutdown() on both success and error paths to avoid
-/// leaking spawned upstream MCP child processes.
+/// Production [`NeonClient`] backed by the shared
+/// [`super::proxy::ProxyClient`] (cas-36fd0). The proxy lifecycle (lazy
+/// init, engine reuse, Drop with shutdown, poison recovery) lives once
+/// in `proxy.rs`; this struct is just the Neon-specific wrapper that
+/// translates trait calls into `ProxyClient::call(tool, args)` plus the
+/// neon-specific parsers below.
 ///
 /// **Live MCP is not exercised by `cargo test`** — the parsers in
 /// [`parse_list_organizations`] / [`parse_list_projects`] /
 /// [`parse_describe_project`] / [`parse_describe_branch`] are
-/// fixture-tested against canonical Neon MCP response shapes. The transport
-/// itself is verified manually.
+/// fixture-tested against canonical Neon MCP response shapes. End-to-end
+/// transport is verified by the shared fixture in
+/// `cas-cli/tests/integrate_lifecycle_test.rs` (cas-2dc9).
+#[cfg(feature = "mcp-proxy")]
+pub struct LiveNeonClient {
+    inner: super::proxy::ProxyClient,
+}
+
+#[cfg(feature = "mcp-proxy")]
+impl Default for LiveNeonClient {
+    fn default() -> Self {
+        Self {
+            inner: super::proxy::ProxyClient::new("neon"),
+        }
+    }
+}
+
+#[cfg(feature = "mcp-proxy")]
+impl LiveNeonClient {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn arg_str(k: &str, v: &str) -> serde_json::Map<String, serde_json::Value> {
+        let mut m = serde_json::Map::new();
+        m.insert(k.to_string(), serde_json::Value::String(v.to_string()));
+        m
+    }
+}
+
+#[cfg(not(feature = "mcp-proxy"))]
 pub struct LiveNeonClient;
+
+#[cfg(not(feature = "mcp-proxy"))]
+impl Default for LiveNeonClient {
+    fn default() -> Self {
+        Self
+    }
+}
+
+#[cfg(not(feature = "mcp-proxy"))]
+impl LiveNeonClient {
+    pub fn new() -> Self {
+        Self
+    }
+}
 
 #[cfg(not(feature = "mcp-proxy"))]
 const NO_MCP_PROXY: &str =
@@ -175,71 +217,15 @@ impl NeonClient for LiveNeonClient {
 }
 
 #[cfg(feature = "mcp-proxy")]
-impl LiveNeonClient {
-    /// Resolve a proxy config path: first `<cas_root>/proxy.toml` if cas is
-    /// initialized, else fall through to the user-level lookup the
-    /// `cmcp_core` loader already handles.
-    fn proxy_config_path() -> Option<std::path::PathBuf> {
-        crate::store::find_cas_root()
-            .ok()
-            .map(|r| r.join("proxy.toml"))
-            .filter(|p| p.exists())
-    }
-
-    async fn call(
-        tool: &str,
-        args: Option<serde_json::Map<String, serde_json::Value>>,
-    ) -> Result<serde_json::Value> {
-        let cfg = cmcp_core::config::Config::load_merged(
-            Self::proxy_config_path().as_deref(),
-        )
-        .context("loading MCP proxy config")?;
-        anyhow::ensure!(
-            !cfg.servers.is_empty(),
-            "no MCP servers configured. Run `cas mcp add neon ...` or check ~/.config/code-mode-mcp/config.toml."
-        );
-        let engine = cmcp_core::ProxyEngine::from_configs(cfg.servers)
-            .await
-            .context("starting MCP proxy engine")?;
-        // Capture the call result so we can shut the engine down on both the
-        // success and error paths — otherwise a transport failure would leak
-        // spawned upstream MCP child processes for the lifetime of `cas init`.
-        let outcome = engine
-            .call_tool("neon", tool, args)
-            .await
-            .with_context(|| format!("calling neon.{tool}"));
-        engine.shutdown().await;
-        outcome
-    }
-
-    fn block_on<F, T>(fut: F) -> Result<T>
-    where
-        F: std::future::Future<Output = Result<T>>,
-    {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("building tokio runtime")?;
-        rt.block_on(fut)
-    }
-
-    fn arg_str(k: &str, v: &str) -> serde_json::Map<String, serde_json::Value> {
-        let mut m = serde_json::Map::new();
-        m.insert(k.to_string(), serde_json::Value::String(v.to_string()));
-        m
-    }
-}
-
-#[cfg(feature = "mcp-proxy")]
 impl NeonClient for LiveNeonClient {
     fn list_organizations(&self) -> Result<Vec<NeonOrg>> {
-        let value = Self::block_on(Self::call("list_organizations", None))?;
+        let value = self.inner.call("list_organizations", None)?;
         parse_list_organizations(&value)
     }
 
     fn list_projects(&self, org_id: &str) -> Result<Vec<NeonProject>> {
         let args = Self::arg_str("org_id", org_id);
-        let value = Self::block_on(Self::call("list_projects", Some(args)))?;
+        let value = self.inner.call("list_projects", Some(args))?;
         parse_list_projects(&value)
     }
 
@@ -250,7 +236,7 @@ impl NeonClient for LiveNeonClient {
             "project_id".to_string(),
             serde_json::Value::String(project_id.to_string()),
         );
-        let value = Self::block_on(Self::call("describe_project", Some(args)))?;
+        let value = self.inner.call("describe_project", Some(args))?;
         parse_describe_project(&value)
     }
 
@@ -265,7 +251,7 @@ impl NeonClient for LiveNeonClient {
             "branch_id".to_string(),
             serde_json::Value::String(branch_id.to_string()),
         );
-        let value = Self::block_on(Self::call("describe_branch", Some(args)))?;
+        let value = self.inner.call("describe_branch", Some(args))?;
         parse_describe_branch(&value)
     }
 }
@@ -287,23 +273,22 @@ impl NeonClient for LiveNeonClient {
 /// Tolerated shapes:
 /// - `{ "organizations": [...] }` (canonical)
 /// - bare `[...]` array
-/// - `{ "orgs": [...] }` (older alias seen in some envelopes)
+///
+/// (cas-36fd0 dropped the `orgs` alias — it was speculative tolerance
+/// added in cas-1549 with no fixture from a real Neon envelope. Add it
+/// back if a real upstream rolls out the alias.)
 pub fn parse_list_organizations(value: &serde_json::Value) -> Result<Vec<NeonOrg>> {
     let inner = unwrap_mcp_envelope(value)?;
     let array = match &inner {
         serde_json::Value::Array(a) => a.clone(),
         serde_json::Value::Object(m) => m
             .get("organizations")
-            .or_else(|| m.get("orgs"))
             .and_then(|v| v.as_array())
             .cloned()
-            // cas-1549 round 1 autofix: bail if neither recognized wrapper
-            // key is present. Silently returning an empty Vec would let a
-            // future upstream-shape drift mask itself as "no orgs found".
             .ok_or_else(|| {
                 anyhow!(
-                    "list_organizations: response had neither `organizations` \
-                     nor `orgs` array: {inner}"
+                    "list_organizations: response had no `organizations` array: \
+                     {inner}"
                 )
             })?,
         _ => anyhow::bail!("unexpected list_organizations shape: {inner}"),
@@ -319,25 +304,24 @@ pub fn parse_list_organizations(value: &serde_json::Value) -> Result<Vec<NeonOrg
 
 /// Parse `mcp__neon__list_projects` into a vec of [`NeonProject`].
 ///
-/// Tolerated shapes mirror [`parse_list_organizations`]: bare array, or an
-/// object with `projects` (canonical) or `data` (older alias).
+/// Tolerated shapes:
+/// - `{ "projects": [...] }` (canonical)
+/// - bare `[...]` array
+///
+/// (cas-36fd0 dropped the `data` alias — speculative tolerance added in
+/// cas-1549 without a fixture from a real Neon envelope. Re-add if a
+/// real upstream rolls out the alias.)
 pub fn parse_list_projects(value: &serde_json::Value) -> Result<Vec<NeonProject>> {
     let inner = unwrap_mcp_envelope(value)?;
     let array = match &inner {
         serde_json::Value::Array(a) => a.clone(),
         serde_json::Value::Object(m) => m
             .get("projects")
-            .or_else(|| m.get("data"))
             .and_then(|v| v.as_array())
             .cloned()
-            // cas-1549 round 1 autofix: bail rather than silently return
-            // an empty Vec when neither `projects` nor `data` is present.
-            // An empty Vec would mask an upstream-shape drift as
-            // "user has no projects" and the picker would skip cleanly.
             .ok_or_else(|| {
                 anyhow!(
-                    "list_projects: response had neither `projects` nor \
-                     `data` array: {inner}"
+                    "list_projects: response had no `projects` array: {inner}"
                 )
             })?,
         _ => anyhow::bail!("unexpected list_projects shape: {inner}"),
@@ -359,33 +343,32 @@ pub fn parse_list_projects(value: &serde_json::Value) -> Result<Vec<NeonProject>
 ///   "branches": [ { "id": "...", "name": "...", "default": true|false } ] }
 /// ```
 ///
-/// Also tolerates a flatter `{id, name, default_database_name, branches: []}`
-/// shape some older Neon MCP servers returned.
+/// (cas-36fd0 dropped the speculative flat-object tolerance + the
+/// silent `"neondb"` fallback. The flat shape was added defensively
+/// without a real fixture; the silent fallback masked upstream-shape
+/// drift as "user has the default database". Both can be reintroduced
+/// if a real upstream warrants it.)
 pub fn parse_describe_project(value: &serde_json::Value) -> Result<NeonProjectDetail> {
     let inner = unwrap_mcp_envelope(value)?;
     let obj = inner
         .as_object()
         .ok_or_else(|| anyhow!("describe_project: expected object, got {inner}"))?;
 
-    // Canonical: nested `project` + sibling `branches`. Fallback: flat object.
-    let (project_value, branches_value) = if obj.contains_key("project") {
-        (
-            obj.get("project").cloned().unwrap_or(serde_json::Value::Null),
-            obj.get("branches").cloned().unwrap_or(serde_json::Value::Null),
+    let project_value = obj.get("project").ok_or_else(|| {
+        anyhow!(
+            "describe_project: response had no `project` object: {inner}"
         )
-    } else {
-        (
-            serde_json::Value::Object(obj.clone()),
-            obj.get("branches").cloned().unwrap_or(serde_json::Value::Null),
-        )
-    };
-
-    let project = neon_project_from_value(&project_value).ok_or_else(|| {
+    })?;
+    let project = neon_project_from_value(project_value).ok_or_else(|| {
         anyhow!("describe_project: missing or malformed project: {project_value}")
     })?;
 
-    // default_database can come from `project.default_database_name`,
-    // top-level `default_database`, or a `databases` array. Best-effort.
+    // default_database resolution: try `project.default_database_name`,
+    // then top-level `default_database`, then the first entry in
+    // `databases[]`. If none of those land, **bail** rather than silently
+    // defaulting to "neondb" — the user must see that the recorded
+    // database name is not authoritative so they can correct the upstream
+    // (or open a follow-up).
     let default_database = project_value
         .get("default_database_name")
         .and_then(|v| v.as_str())
@@ -397,11 +380,18 @@ pub fn parse_describe_project(value: &serde_json::Value) -> Result<NeonProjectDe
                 .and_then(|d| d.get("name"))
                 .and_then(|v| v.as_str())
         })
-        .unwrap_or("neondb")
+        .ok_or_else(|| {
+            anyhow!(
+                "describe_project: no default database name found. Looked at \
+                 `project.default_database_name`, top-level `default_database`, \
+                 and `databases[0].name`. Response: {inner}"
+            )
+        })?
         .to_string();
 
-    let branches = branches_value
-        .as_array()
+    let branches = obj
+        .get("branches")
+        .and_then(|v| v.as_array())
         .map(|a| a.iter().filter_map(neon_branch_from_value).collect())
         .unwrap_or_default();
 
@@ -516,10 +506,16 @@ fn neon_branch_from_value(v: &serde_json::Value) -> Option<NeonBranch> {
     Some(NeonBranch { id, name, is_default })
 }
 
-/// Strip the `{ content: [{type:"text", text:"<json>"}], isError }` envelope
-/// that `cmcp_core::ProxyEngine::call_tool` returns. If `value` is not the
-/// envelope shape, return it unchanged. Mirrors
-/// `vercel::unwrap_mcp_envelope`.
+/// MCP envelope unwrap. Delegates to the shared
+/// [`super::proxy::unwrap_envelope`] when the proxy feature is on; non-
+/// feature builds keep a tiny inline fallback so parser tests still
+/// build without `--features mcp-proxy`.
+#[cfg(feature = "mcp-proxy")]
+fn unwrap_mcp_envelope(value: &serde_json::Value) -> Result<serde_json::Value> {
+    super::proxy::unwrap_envelope(value)
+}
+
+#[cfg(not(feature = "mcp-proxy"))]
 fn unwrap_mcp_envelope(value: &serde_json::Value) -> Result<serde_json::Value> {
     let serde_json::Value::Object(map) = value else {
         return Ok(value.clone());
@@ -665,7 +661,7 @@ pub struct RefreshOpts {
 /// nested-worktree directory (cas-fc38).
 pub fn execute(action: IntegrationAction) -> Result<IntegrationOutcome> {
     let repo_root = super::fs::locate_repo_root().context("locating repo root")?;
-    let client = LiveNeonClient;
+    let client = LiveNeonClient::new();
     match action {
         IntegrationAction::Init => init(&repo_root, &client, InitChoices::default()),
         IntegrationAction::Refresh => refresh(&repo_root, &client, RefreshOpts::default()),

@@ -262,7 +262,7 @@ fn dispatch(
             }
         },
         Step::Neon { mode, preseed_project } => {
-            let client = LiveNeonClient;
+            let client = LiveNeonClient::new();
             match mode {
                 StepMode::Init => {
                     let choices = neon::InitChoices {
