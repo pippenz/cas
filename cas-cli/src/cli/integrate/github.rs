@@ -379,16 +379,22 @@ fn recorded_full_name(existing: &str) -> anyhow::Result<Option<String>> {
         return Ok(None);
     };
     for line in block.body.lines() {
-        // Match the row "| **Full name** | `OWNER/REPO` |".
-        if let Some(rest) = line.split_once("**Full name**").map(|(_, r)| r) {
-            // rest is "| `OWNER/REPO` |" — pull whatever's between backticks.
-            let start = rest.find('`');
-            let end = rest.rfind('`');
-            if let (Some(s), Some(e)) = (start, end) {
-                if e > s + 1 {
-                    return Ok(Some(rest[s + 1..e].to_string()));
-                }
-            }
+        // Match the row "| **Full name** | `OWNER/REPO` |". We deliberately
+        // pull the value between the *first pair* of backticks (not first and
+        // last) so an injected extra `` ` `` later in the line can't widen the
+        // capture. The extracted token is then trimmed and re-validated as a
+        // well-formed OWNER/REPO before we trust it.
+        let Some(rest) = line.split_once("**Full name**").map(|(_, r)| r) else {
+            continue;
+        };
+        let mut parts = rest.splitn(3, '`');
+        let _before = parts.next();
+        let Some(candidate) = parts.next() else {
+            continue;
+        };
+        let candidate = candidate.trim();
+        if RepoRef::from_owner_slash_repo(candidate).is_some() {
+            return Ok(Some(candidate.to_string()));
         }
     }
     Ok(None)
@@ -449,7 +455,7 @@ fn write_skill_files(
             .push(format!("{} already current — no changes", repo.full_name()));
     } else {
         out.summary
-            .insert(0, format!("recorded {} ", repo.full_name()));
+            .insert(0, format!("recorded {}", repo.full_name()));
     }
 
     Ok(out)
@@ -510,9 +516,49 @@ fn write_one(
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(&path, &merged)?;
+        atomic_write(&path, &merged)?;
     }
     Ok(changed)
+}
+
+/// Write `contents` to `path` via tempfile + rename so concurrent readers
+/// never see a half-written file. Reduces (but does not eliminate) the
+/// blast radius of two `cas integrate` invocations racing on the same SKILL
+/// file — the rename on POSIX is atomic, so the loser of the race overwrites
+/// cleanly rather than leaving a torn file behind.
+///
+/// Implemented with `std::fs` only to avoid adding a runtime crate dep
+/// (`tempfile` is dev-only here); we generate a sibling tempfile name from
+/// the process id + a nanosecond timestamp and clean it up on failure.
+fn atomic_write(path: &Path, contents: &str) -> anyhow::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("refusing to write to a root-less path: {}", path.display()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| anyhow::anyhow!("non-UTF8 target file name: {}", path.display()))?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp_name = format!(".{}.cas-integrate.{}.{nanos}.tmp", file_name, std::process::id());
+    let tmp_path = parent.join(tmp_name);
+
+    // Ensure the temp file is removed on any failure path before rename.
+    let write_result = (|| -> std::io::Result<()> {
+        fs::write(&tmp_path, contents.as_bytes())?;
+        fs::rename(&tmp_path, path)
+    })();
+    if let Err(e) = write_result {
+        // Best-effort cleanup; if rename succeeded, tmp_path is already gone.
+        let _ = fs::remove_file(&tmp_path);
+        return Err(anyhow::anyhow!(
+            "failed to atomically write {}: {e}",
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 // ===========================================================================
@@ -814,6 +860,161 @@ name: github-repo
     }
 
     // --- orphan surfacing --------------------------------------------------
+
+    #[test]
+    fn init_writes_distinct_cursor_template_content() {
+        // Regression guard: SKILL.md.template and cursor.md.template must not
+        // be silently swapped or rendered to the same path. The cursor file
+        // carries a unique 'Refer to ~/.cursor/skills/mcp-github/...' line.
+        let tmp = TempDir::new().unwrap();
+        let _ = init_at(tmp.path(), Some("acme/widget")).unwrap();
+        let claude = read(&tmp.path().join(CLAUDE_SKILL_REL));
+        let cursor = read(&tmp.path().join(CURSOR_SKILL_REL));
+        assert!(
+            cursor.contains("`~/.cursor/skills/mcp-github/SKILL.md`"),
+            "cursor template should reference the user-level cursor skill"
+        );
+        assert!(
+            !claude.contains("`~/.cursor/skills/mcp-github/SKILL.md`"),
+            "claude template must not include the cursor-only reference"
+        );
+    }
+
+    #[test]
+    fn refresh_bails_on_malformed_existing_keep_markers() {
+        // Safety rail: when an existing SKILL.md has malformed keep markers
+        // (e.g. an unmatched open marker from a botched hand-edit), we must
+        // refuse to silently overwrite — the user might have valuable content
+        // in there.
+        let tmp = TempDir::new().unwrap();
+        let claude_path = tmp.path().join(CLAUDE_SKILL_REL);
+        fs::create_dir_all(claude_path.parent().unwrap()).unwrap();
+        // Open marker with no matching close.
+        fs::write(&claude_path, "<!-- keep github-repo -->\nstray content\n").unwrap();
+        let err = refresh_at(tmp.path(), Some("acme/widget")).unwrap_err();
+        assert!(
+            err.to_string().contains("malformed keep markers"),
+            "expected malformed-marker bail; got: {err}"
+        );
+    }
+
+    #[test]
+    fn recorded_full_name_rejects_garbled_value_with_extra_backticks() {
+        // An attacker (or a bad hand-edit) injects a second backtick pair
+        // into the Full-name row. The parser must take only the value
+        // between the *first pair* of backticks and validate it as a
+        // well-formed OWNER/REPO. Anything else returns None.
+        let body = "\
+<!-- keep github-repo -->
+| **Full name** | `acme/widget` (also see `evil/x`) |
+<!-- /keep github-repo -->
+";
+        assert_eq!(
+            recorded_full_name(body).unwrap().as_deref(),
+            Some("acme/widget"),
+            "first-pair extraction should ignore the second backtick pair"
+        );
+
+        // A malformed value (whitespace, no slash, etc.) returns None even
+        // though the surrounding markdown is well-formed.
+        let bad = "\
+<!-- keep github-repo -->
+| **Full name** | `not a repo at all` |
+<!-- /keep github-repo -->
+";
+        assert_eq!(recorded_full_name(bad).unwrap(), None);
+    }
+
+    #[test]
+    fn detect_repo_against_real_git_init_https_remote() {
+        // End-to-end: stand up a real git repo with a GitHub HTTPS remote and
+        // assert detect_repo extracts the OWNER/REPO via the
+        // run_git_remote_v -> parse_remote_v -> parse_origin_url chain.
+        // Skips when `git` isn't on PATH so the test stays portable.
+        if Command::new("git").arg("--version").output().is_err() {
+            eprintln!("skipping: git binary not available");
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        // `git init` + `git remote add origin <url>` — minimal config; no
+        // user.email needed for these.
+        let init = Command::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(["init", "-q"])
+            .status()
+            .unwrap();
+        assert!(init.success(), "git init failed");
+        let add = Command::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/Richards-LLC/gabber-studio.git",
+            ])
+            .status()
+            .unwrap();
+        assert!(add.success(), "git remote add failed");
+        let detected = detect_repo(tmp.path()).unwrap();
+        assert_eq!(
+            detected,
+            Some(RepoRef {
+                owner: "Richards-LLC".to_string(),
+                repo: "gabber-studio".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn detect_repo_against_real_git_init_ssh_remote() {
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(["init", "-q"])
+            .status()
+            .unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:Richards-LLC/gabber-studio.git",
+            ])
+            .status()
+            .unwrap();
+        let detected = detect_repo(tmp.path()).unwrap();
+        assert_eq!(detected.unwrap().full_name(), "Richards-LLC/gabber-studio");
+    }
+
+    #[test]
+    fn detect_repo_against_real_git_init_gitlab_remote_returns_none() {
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(["init", "-q"])
+            .status()
+            .unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(["remote", "add", "origin", "https://gitlab.com/foo/bar.git"])
+            .status()
+            .unwrap();
+        // Detection must reject the non-GitHub remote.
+        assert_eq!(detect_repo(tmp.path()).unwrap(), None);
+    }
 
     #[test]
     fn refresh_surfaces_orphan_keep_blocks_in_summary() {
