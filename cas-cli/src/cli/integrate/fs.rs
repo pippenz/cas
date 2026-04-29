@@ -200,8 +200,15 @@ pub fn locate_repo_root_from(start: &Path) -> anyhow::Result<PathBuf> {
         cur = p.parent();
     }
 
-    // Step 3: fall back to start. Rare — would require no git, no markers.
-    Ok(start.to_path_buf())
+    // Step 3: refuse to silently fall back to a bare CWD — `cas integrate`
+    // from `~/Downloads` would otherwise scribble `.claude/skills/...` next
+    // to whatever happens to live there. Explicit error is the cas-7417
+    // sentinel-check semantic.
+    anyhow::bail!(
+        "{} is not inside a project (no git toplevel, no .git/.cas/Cargo.toml/package.json marker). \
+         Run `cas integrate` from a project root.",
+        start.display()
+    )
 }
 
 /// Production wrapper: resolve from `std::env::current_dir`.
