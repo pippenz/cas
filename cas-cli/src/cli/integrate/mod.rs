@@ -36,6 +36,7 @@
 //! for the merge semantics and the recommended call shape for handlers.
 
 pub mod atomic;
+pub mod doctor;
 pub mod fs;
 pub mod github;
 pub mod integrations;

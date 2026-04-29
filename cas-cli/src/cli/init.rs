@@ -227,6 +227,7 @@ impl WizardConfig {
             telemetry: None,
             logging: None,
             llm: None,
+            integrations: None,
         }
     }
 }

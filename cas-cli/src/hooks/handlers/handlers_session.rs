@@ -248,6 +248,16 @@ pub fn handle_session_start(
         context
     };
 
+    // Phase 3 / cas-3efe: opt-in integrations staleness banner. Default
+    // off — only fires when `[integrations] session_start_warn = true` in
+    // .cas/config.toml *and* at least one platform reports a `Stale` ID.
+    // Appended last so it sits below codemap / project-overview / WIP.
+    let context = match build_integrations_session_start_banner(cas_root) {
+        Some(banner) if context.is_empty() => banner,
+        Some(banner) => format!("{context}\n{banner}"),
+        None => context,
+    };
+
     let output = if context.is_empty() {
         HookOutput::empty()
     } else {
@@ -290,6 +300,37 @@ pub fn handle_session_start(
 /// Estimate token count (rough approximation: ~4 chars per token)
 pub(crate) fn estimate_tokens(s: &str) -> usize {
     s.len() / 4
+}
+
+/// Build the opt-in Phase 3 (cas-3efe) integrations banner.
+///
+/// Returns `None` unless **all three** conditions hold:
+/// 1. `cas_root/config.toml` (or its parent's `.cas/config.toml`) has
+///    `[integrations] session_start_warn = true`.
+/// 2. The repo root resolves (cas_root parent).
+/// 3. At least one platform's [`crate::cli::integrate::types::VerifyReport`]
+///    returns `has_stale() == true`.
+///
+/// `McpUnreachable` and `not_configured` are deliberately silent here: they
+/// aren't actionable enough to displace the codemap freshness banner that
+/// shares this slot. Failures during reading/verifying are swallowed —
+/// SessionStart should never block on a misconfigured integration.
+pub(crate) fn build_integrations_session_start_banner(cas_root: &Path) -> Option<String> {
+    let config = crate::config::Config::load(cas_root).ok()?;
+    let opt_in = config
+        .integrations
+        .as_ref()
+        .map(|i| i.session_start_warn)
+        .unwrap_or(false);
+    if !opt_in {
+        return None;
+    }
+    let repo_root = cas_root.parent()?;
+    let reports = crate::cli::integrate::doctor::collect_reports(repo_root);
+    let body = crate::cli::integrate::doctor::session_start_banner_text(&reports, true)?;
+    Some(format!(
+        "<integrations-staleness severity=\"info\">\n{body}\n</integrations-staleness>"
+    ))
 }
 
 /// Compute session outcome based on metrics and friction events

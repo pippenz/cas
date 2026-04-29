@@ -120,3 +120,106 @@ impl IntegrationOutcome {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Structured verify reports (cas-3efe / Phase 3: cas doctor consumes these)
+// ---------------------------------------------------------------------------
+
+/// State of a single recorded ID after a verify call.
+///
+/// `Stale` is reserved for "the platform answered, and the recorded ID is
+/// not present" — i.e. genuine drift that the user can fix by running
+/// `cas integrate <platform> refresh`. `McpUnreachable` is the transport-
+/// error case (MCP server not configured, network down, auth failed); doctor
+/// treats this as a *skip*, not a stale, so a missing MCP server doesn't
+/// hard-fail `cas doctor` in CI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdState {
+    /// ID exists on the platform.
+    Ok,
+    /// ID is recorded locally but not present on the platform — user should refresh.
+    Stale,
+    /// ID is recorded locally with no corresponding platform query (informational).
+    NotFound,
+    /// MCP/transport call failed; cannot determine state. Carries the error text.
+    McpUnreachable(String),
+}
+
+impl IdState {
+    pub fn as_label(&self) -> &'static str {
+        match self {
+            IdState::Ok => "ok",
+            IdState::Stale => "stale",
+            IdState::NotFound => "not-found",
+            IdState::McpUnreachable(_) => "mcp-unreachable",
+        }
+    }
+}
+
+/// One recorded ID and its verified state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifyItem {
+    /// Display label (e.g. `"production branchId"`, `"OWNER/REPO"`, `"projectId"`).
+    pub label: String,
+    /// Raw recorded value as it appears in the keep block.
+    pub id: String,
+    pub state: IdState,
+}
+
+/// Structured verify report consumed by `cas doctor`.
+///
+/// Distinct from [`IntegrationOutcome`] (which carries the verb-level
+/// printed-output story) so doctor can render uniform per-ID rows without
+/// re-parsing free-form summary strings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifyReport {
+    pub platform: Platform,
+    /// `true` when the platform has no SKILL.md (or the file lacks a usable
+    /// keep block). Doctor renders this as "not configured" rather than a
+    /// warning.
+    pub not_configured: bool,
+    /// Per-ID rows. Empty when `not_configured == true`.
+    pub items: Vec<VerifyItem>,
+    /// Free-form notes (e.g. "no `<!-- keep neon-ids -->` block found",
+    /// "MCP not configured — set NEON_API_KEY"). Doctor surfaces these
+    /// alongside the per-ID rows.
+    pub notes: Vec<String>,
+}
+
+impl VerifyReport {
+    pub fn not_configured(platform: Platform, note: impl Into<String>) -> Self {
+        Self {
+            platform,
+            not_configured: true,
+            items: Vec::new(),
+            notes: vec![note.into()],
+        }
+    }
+
+    pub fn ok(platform: Platform) -> Self {
+        Self {
+            platform,
+            not_configured: false,
+            items: Vec::new(),
+            notes: Vec::new(),
+        }
+    }
+
+    /// At least one item is in [`IdState::Stale`].
+    pub fn has_stale(&self) -> bool {
+        self.items.iter().any(|i| i.state == IdState::Stale)
+    }
+
+    /// At least one item failed with a transport error.
+    pub fn has_mcp_unreachable(&self) -> bool {
+        self.items
+            .iter()
+            .any(|i| matches!(i.state, IdState::McpUnreachable(_)))
+    }
+
+    pub fn all_ok(&self) -> bool {
+        !self.not_configured
+            && !self.items.is_empty()
+            && self.items.iter().all(|i| i.state == IdState::Ok)
+    }
+}

@@ -45,7 +45,8 @@ use anyhow::Context;
 
 use super::keep_block::{self, MergeMode};
 use super::types::{
-    IntegrationAction, IntegrationOutcome, IntegrationStatus, Platform,
+    IdState, IntegrationAction, IntegrationOutcome, IntegrationStatus, Platform, VerifyItem,
+    VerifyReport,
 };
 
 /// Embedded template content.
@@ -606,6 +607,76 @@ pub fn verify(
         IntegrationStatus::Configured
     };
     Ok(outcome)
+}
+
+/// Structured verify, for `cas doctor` consumption.
+///
+/// Unlike [`verify`], this never propagates transport errors as `Err` —
+/// per-ID transport failures are folded into the report as
+/// [`IdState::McpUnreachable`] so doctor can render a "skip" rather than
+/// hard-fail the whole run when the MCP server is down.
+///
+/// Returns a [`VerifyReport`] with:
+/// - `not_configured = true` when the SKILL file is missing or has no
+///   recorded IDs in the keep block.
+/// - one [`VerifyItem`] per recorded project id otherwise.
+pub fn verify_report(repo_root: &Path, client: &dyn VercelClient) -> VerifyReport {
+    let claude_path = repo_root.join(REL_CLAUDE_SKILL);
+    if !claude_path.is_file() {
+        return VerifyReport::not_configured(
+            Platform::Vercel,
+            format!("{REL_CLAUDE_SKILL} not present"),
+        );
+    }
+    let content = match read_capped(&claude_path) {
+        Ok(c) => c,
+        Err(e) => {
+            return VerifyReport::not_configured(
+                Platform::Vercel,
+                format!("could not read {REL_CLAUDE_SKILL}: {e:#}"),
+            );
+        }
+    };
+    let blocks = match keep_block::extract(&content) {
+        Ok(b) => b,
+        Err(e) => {
+            return VerifyReport::not_configured(
+                Platform::Vercel,
+                format!("malformed keep blocks in {REL_CLAUDE_SKILL}: {e}"),
+            );
+        }
+    };
+    let Some(ids_block) = blocks
+        .into_iter()
+        .find(|b| b.name.as_deref() == Some(KEEP_IDS_BLOCK))
+    else {
+        return VerifyReport::not_configured(
+            Platform::Vercel,
+            format!("no <!-- keep {KEEP_IDS_BLOCK} --> block in {REL_CLAUDE_SKILL}"),
+        );
+    };
+    let recorded_ids = parse_recorded_ids(&ids_block.body);
+    if recorded_ids.is_empty() {
+        return VerifyReport::not_configured(
+            Platform::Vercel,
+            "no project IDs recorded in keep block",
+        );
+    }
+
+    let mut report = VerifyReport::ok(Platform::Vercel);
+    for id in &recorded_ids {
+        let state = match client.get_project(id) {
+            Ok(Some(_)) => IdState::Ok,
+            Ok(None) => IdState::Stale,
+            Err(e) => IdState::McpUnreachable(format!("{e:#}")),
+        };
+        report.items.push(VerifyItem {
+            label: "projectId".to_string(),
+            id: id.clone(),
+            state,
+        });
+    }
+    report
 }
 
 // ---------------------------------------------------------------------------

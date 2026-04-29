@@ -43,7 +43,10 @@ use std::process::Command;
 use clap::Subcommand;
 
 use super::keep_block::{self, MergeMode};
-use super::types::{IntegrationAction, IntegrationOutcome, IntegrationStatus, Platform};
+use super::types::{
+    IdState, IntegrationAction, IntegrationOutcome, IntegrationStatus, Platform, VerifyItem,
+    VerifyReport,
+};
 
 const SKILL_TEMPLATE: &str = include_str!("templates/github/SKILL.md.template");
 const CURSOR_TEMPLATE: &str = include_str!("templates/github/cursor.md.template");
@@ -391,6 +394,67 @@ pub fn verify_at(repo_root: &Path) -> anyhow::Result<IntegrationOutcome> {
         }
     }
     Ok(out)
+}
+
+/// Structured verify, for `cas doctor` consumption.
+///
+/// Returns one [`VerifyItem`] for the recorded OWNER/REPO. State maps as:
+/// - `Ok` when the SKILL.md value matches the live `git remote -v`.
+/// - `Stale` when they disagree (drift) or no remote is detected anymore.
+/// - `not_configured = true` when SKILL.md is missing or has no recorded value.
+///
+/// `git remote` is local — there is no MCP call here, so this report never
+/// produces [`IdState::McpUnreachable`].
+pub fn verify_report(repo_root: &Path) -> VerifyReport {
+    let claude_path = repo_root.join(CLAUDE_SKILL_REL);
+    if !claude_path.exists() {
+        return VerifyReport::not_configured(
+            Platform::Github,
+            format!("{CLAUDE_SKILL_REL} not present"),
+        );
+    }
+    let existing = match fs::read_to_string(&claude_path) {
+        Ok(s) => s,
+        Err(e) => {
+            return VerifyReport::not_configured(
+                Platform::Github,
+                format!("could not read {CLAUDE_SKILL_REL}: {e}"),
+            );
+        }
+    };
+    let recorded = match recorded_full_name(&existing) {
+        Ok(Some(name)) => name,
+        Ok(None) => {
+            return VerifyReport::not_configured(
+                Platform::Github,
+                format!("no OWNER/REPO recorded in {CLAUDE_SKILL_REL} keep block"),
+            );
+        }
+        Err(e) => {
+            return VerifyReport::not_configured(
+                Platform::Github,
+                format!("malformed keep block in {CLAUDE_SKILL_REL}: {e}"),
+            );
+        }
+    };
+    let detected = detect_repo(repo_root).ok().flatten();
+    let state = match detected.as_ref() {
+        Some(d) if d.full_name() == recorded => IdState::Ok,
+        Some(_) => IdState::Stale,
+        None => IdState::Stale,
+    };
+    let mut report = VerifyReport::ok(Platform::Github);
+    report.items.push(VerifyItem {
+        label: "OWNER/REPO".to_string(),
+        id: recorded,
+        state,
+    });
+    if let Some(d) = detected {
+        report
+            .notes
+            .push(format!("git remote -v reports {}", d.full_name()));
+    }
+    report
 }
 
 /// Pull the recorded `OWNER/REPO` out of the named keep block.

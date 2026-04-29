@@ -47,7 +47,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context, Result};
 
 use super::keep_block::{self, MergeMode};
-use super::types::{IntegrationAction, IntegrationOutcome, IntegrationStatus, Platform};
+use super::types::{
+    IdState, IntegrationAction, IntegrationOutcome, IntegrationStatus, Platform, VerifyItem,
+    VerifyReport,
+};
 
 // --- Templates -------------------------------------------------------------
 
@@ -629,6 +632,54 @@ pub fn verify<C: NeonClient>(repo_root: &Path, client: &C) -> Result<Integration
     let mut outcome = IntegrationOutcome::new(Platform::Neon, IntegrationAction::Verify, status);
     outcome.summary = summary;
     Ok(outcome)
+}
+
+/// Structured verify, for `cas doctor` consumption.
+///
+/// Returns a [`VerifyReport`] with one [`VerifyItem`] per recorded branch.
+/// Transport errors from `describe_branch` become [`IdState::McpUnreachable`]
+/// (so doctor renders a "skip" rather than hard-failing). A missing SKILL
+/// file or absent keep block returns `not_configured = true`.
+pub fn verify_report<C: NeonClient>(repo_root: &Path, client: &C) -> VerifyReport {
+    let claude_path = repo_root.join(CLAUDE_SKILL);
+    let existing = match fs::read_to_string(&claude_path) {
+        Ok(s) => s,
+        Err(_) => {
+            return VerifyReport::not_configured(
+                Platform::Neon,
+                format!("{CLAUDE_SKILL} not present"),
+            );
+        }
+    };
+    let payload = match parse_keep_payload(&existing) {
+        Ok(p) => p,
+        Err(e) => {
+            return VerifyReport::not_configured(
+                Platform::Neon,
+                format!("could not parse keep block in {CLAUDE_SKILL}: {e:#}"),
+            );
+        }
+    };
+    if payload.branches.is_empty() {
+        return VerifyReport::not_configured(
+            Platform::Neon,
+            "no branches recorded in keep block",
+        );
+    }
+    let mut report = VerifyReport::ok(Platform::Neon);
+    for (label, branch_id) in &payload.branches {
+        let state = match client.describe_branch(&payload.org_id, &payload.project_id, branch_id) {
+            Ok(true) => IdState::Ok,
+            Ok(false) => IdState::Stale,
+            Err(e) => IdState::McpUnreachable(format!("{e:#}")),
+        };
+        report.items.push(VerifyItem {
+            label: format!("{label} branchId"),
+            id: branch_id.clone(),
+            state,
+        });
+    }
+    report
 }
 
 // --- Helpers ---------------------------------------------------------------
