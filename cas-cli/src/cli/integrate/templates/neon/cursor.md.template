@@ -1,0 +1,51 @@
+---
+name: neon-database
+description: |
+  Project-specific Neon database config for {{PROJECT_BASENAME}}. Use for all
+  SQL queries, migrations, and schema work on this project. Refer to user-level
+  mcp-neon skill for tool usage patterns — this skill provides projectId,
+  branchIds, and databaseName.
+  Triggers: query the database, run SQL, add column, migration, check schema,
+  inspect table, neon, branch.
+metadata:
+  category: database
+  server: user-neon
+  managed_by: cas
+---
+
+# Neon Database — {{PROJECT_BASENAME}}
+
+Refer to `~/.cursor/skills/mcp-neon/SKILL.md` for tool usage. This skill
+provides project-specific IDs and branch routing.
+
+## Project Config
+
+<!-- keep neon-ids -->
+{{CAS_FULL_NAME_TAG}}
+| | Value |
+|--|--|
+| **org_id** | `{{ORG_ID}}` |
+| **projectId** | `{{PROJECT_ID}}` |
+| **databaseName** | `{{DATABASE_NAME}}` |
+{{BRANCH_TABLE_ROWS}}
+<!-- /keep neon-ids -->
+
+## Quick Reference
+
+```
+# Default-branch query
+run_sql({ params: { sql: "...", projectId: "{{PROJECT_ID}}" }})
+
+# Non-default branch — pass branchId from the table above
+run_sql({ params: { sql: "...", projectId: "{{PROJECT_ID}}", branchId: "<branchId>" }})
+```
+
+## Safety Rules
+
+```
+NEVER: prisma db push --accept-data-loss
+NEVER: prisma migrate reset
+NEVER: prisma db push --force-reset
+```
+
+Always use the 3-step migration flow: prepare → verify → complete.

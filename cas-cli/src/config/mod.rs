@@ -93,6 +93,11 @@ pub struct Config {
     /// LLM configuration for harness and model selection
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub llm: Option<LlmConfig>,
+
+    /// `[integrations]` — Phase 3 (cas-3efe) doctor + opt-in SessionStart
+    /// banner gates for vercel/neon/github auto-integration. Default off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integrations: Option<IntegrationsConfig>,
 }
 
 impl Config {
@@ -125,6 +130,7 @@ impl Config {
         merge_option!(telemetry);
         merge_option!(logging);
         merge_option!(llm);
+        merge_option!(integrations);
         changed
     }
 }

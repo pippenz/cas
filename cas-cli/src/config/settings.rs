@@ -624,6 +624,19 @@ impl Default for SyncConfig {
     }
 }
 
+/// `[integrations]` — gates Phase-3 doctor-and-banner behavior for the
+/// vercel/neon/github auto-integration family (EPIC cas-b65f). Default-off
+/// across the board so an absent or empty section preserves the prior UX.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct IntegrationsConfig {
+    /// When true, the SessionStart hook surfaces a low-severity banner if
+    /// any platform reports stale IDs. Default `false` — the codemap
+    /// freshness banner already occupies the SessionStart slot, and
+    /// stacking another banner there erodes its signal. Opt-in only.
+    #[serde(default)]
+    pub session_start_warn: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

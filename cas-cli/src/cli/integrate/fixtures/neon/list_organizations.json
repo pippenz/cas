@@ -1,0 +1,9 @@
+{
+  "content": [
+    {
+      "type": "text",
+      "text": "{\"organizations\":[{\"id\":\"org-2k3q\",\"name\":\"Petra Stella\",\"plan_id\":\"scale\"},{\"id\":\"org-9m5p\",\"name\":\"Personal\",\"plan_id\":\"free\"}]}"
+    }
+  ],
+  "isError": false
+}

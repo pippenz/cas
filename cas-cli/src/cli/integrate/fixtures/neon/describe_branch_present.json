@@ -1,0 +1,9 @@
+{
+  "content": [
+    {
+      "type": "text",
+      "text": "{\"branch\":{\"id\":\"br-main-1\",\"name\":\"main\",\"project_id\":\"proj-cool-bird\",\"default\":true,\"current_state\":\"ready\"}}"
+    }
+  ],
+  "isError": false
+}

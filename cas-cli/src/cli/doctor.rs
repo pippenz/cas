@@ -45,9 +45,13 @@ pub fn execute(args: &DoctorArgs, cli: &Cli, cas_root: Option<&Path>) -> anyhow:
 
     if args.fix {
         if resolved_cas_root.is_none() {
+            // doctor --fix runs init non-interactively in the background;
+            // `no_integrations: true` ensures no platform MCP calls or
+            // prompts are issued during a diagnostic run.
             let init_args = crate::cli::init::InitArgs {
                 yes: true,
-                force: false,
+                no_integrations: true,
+                ..Default::default()
             };
             match crate::cli::init::execute(&init_args, cli) {
                 Ok(()) => {
@@ -523,7 +527,134 @@ pub fn execute(args: &DoctorArgs, cli: &Cli, cas_root: Option<&Path>) -> anyhow:
     let mcp_check = check_claude_code_mcp(project_root);
     checks.push(mcp_check);
 
+    // Check 13: Integration ID staleness (vercel/neon/github)
+    // ------------------------------------------------------------------
+    // Phase 3 / cas-3efe: surface stale platform IDs without the user
+    // having to remember `cas integrate <p> verify`. Severity capped at
+    // Warning so an MCP outage doesn't fail `cas doctor` in CI.
+    for row in integration_checks(project_root) {
+        checks.push(Check {
+            name: row.name,
+            status: match row.severity {
+                crate::cli::integrate::doctor::DoctorSeverity::Ok => CheckStatus::Ok,
+                crate::cli::integrate::doctor::DoctorSeverity::Warning => CheckStatus::Warning,
+            },
+            message: row.message,
+        });
+    }
+
     output_checks(&checks, cli)
+}
+
+/// Helper around `cli::integrate::doctor::collect_reports` +
+/// `render_for_doctor`. Lifted out so it can be tested with a synthetic
+/// repo root that doesn't need a `.cas` parent.
+fn integration_checks(project_root: &Path) -> Vec<crate::cli::integrate::doctor::DoctorRow> {
+    let reports = crate::cli::integrate::doctor::collect_reports(project_root);
+    crate::cli::integrate::doctor::render_for_doctor(&reports)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    /// `cas-3efe`: doctor's integrations check on a project with no SKILL.md
+    /// files anywhere collapses to a single Ok row stating "no integrations
+    /// configured". This is the green-field new-repo case — doctor must not
+    /// nag about missing platform configs.
+    #[test]
+    fn integration_checks_no_integrations_configured_emits_single_ok_row() {
+        let repo = TempDir::new().unwrap();
+        let rows = integration_checks(repo.path());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "integrations");
+        assert!(matches!(
+            rows[0].severity,
+            crate::cli::integrate::doctor::DoctorSeverity::Ok
+        ));
+        assert!(rows[0].message.contains("no integrations configured"));
+    }
+
+    /// `cas-3efe`: a github SKILL.md with a recorded OWNER/REPO that doesn't
+    /// match any local `git remote -v` (no remotes at all in the tempdir)
+    /// produces a github "stale" row at Warning severity, with a hint to
+    /// run `cas integrate github refresh`.
+    #[test]
+    fn integration_checks_github_stale_when_recorded_repo_missing_locally() {
+        let repo = TempDir::new().unwrap();
+        let github_skill = repo.path().join(".claude/skills/github-repo/SKILL.md");
+        fs::create_dir_all(github_skill.parent().unwrap()).unwrap();
+        fs::write(
+            &github_skill,
+            "---\nname: github-repo\n---\n\n## Identity\n\
+             <!-- keep github-repo -->\n\
+             | **Full name** | `someone/some-repo` |\n\
+             <!-- /keep github-repo -->\n",
+        )
+        .unwrap();
+
+        let rows = integration_checks(repo.path());
+        // Stale platform's row should be present and at Warning severity.
+        let github_row = rows
+            .iter()
+            .find(|r| r.name.contains("github"))
+            .expect("github row");
+        assert!(matches!(
+            github_row.severity,
+            crate::cli::integrate::doctor::DoctorSeverity::Warning
+        ));
+        assert!(
+            github_row.message.contains("stale"),
+            "got: {}",
+            github_row.message
+        );
+        assert!(
+            github_row.message.contains("cas integrate github refresh"),
+            "got: {}",
+            github_row.message
+        );
+    }
+
+    /// `cas-3efe`: when neon is configured but the live client can't reach
+    /// the platform (LiveNeonClient is a placeholder that always errors),
+    /// every recorded branch becomes McpUnreachable. Doctor reports
+    /// "skipped — MCP not configured" at Warning severity rather than
+    /// hard-failing — so the whole `cas doctor` run still exits cleanly
+    /// in CI environments without an MCP server.
+    #[test]
+    fn integration_checks_neon_mcp_unreachable_is_skipped_not_error() {
+        let repo = TempDir::new().unwrap();
+        let neon_skill = repo.path().join(".claude/skills/neon-database/SKILL.md");
+        fs::create_dir_all(neon_skill.parent().unwrap()).unwrap();
+        fs::write(
+            &neon_skill,
+            "---\nname: neon-database\n---\n\n\
+             <!-- keep neon-ids -->\n\
+             | **org_id** | `org-x` |\n\
+             | **projectId** | `proj-y` |\n\
+             | **databaseName** | `neondb` |\n\
+             | **production branchId** | `br-prod` |\n\
+             <!-- /keep neon-ids -->\n",
+        )
+        .unwrap();
+
+        let rows = integration_checks(repo.path());
+        let neon_row = rows
+            .iter()
+            .find(|r| r.name.contains("neon"))
+            .expect("neon row");
+        assert!(matches!(
+            neon_row.severity,
+            crate::cli::integrate::doctor::DoctorSeverity::Warning
+        ));
+        assert!(
+            neon_row.message.contains("MCP not configured"),
+            "got: {}",
+            neon_row.message
+        );
+    }
 }
 
 /// Check Claude Code MCP configuration

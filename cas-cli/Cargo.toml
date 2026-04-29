@@ -1,6 +1,6 @@
 [package]
 name = "cas"
-version = "2.0.0"
+version = "2.10.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Coding Agent System - unified tasks, memory, rules, and skills for AI agents"
@@ -73,6 +73,11 @@ rayon = "1.10"
 # Terminal UI
 ratatui = "0.30"
 crossterm = "0.29"
+
+# Interactive prompts (one-shot CLI Q&A flows for `cas integrate` — purpose-built
+# for prompts; ratatui is the wrong tool for this surface). Pinned to the 0.7
+# stable line; bump if a platform handler needs a 0.9-only feature.
+inquire = "0.7"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -173,7 +178,11 @@ tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 sentry = { version = "0.35", default-features = false, features = ["backtrace", "contexts", "panic", "reqwest", "rustls"] }
 
 [features]
-default = ["mcp-server"]
+# `mcp-proxy` is in `default` so `cas integrate <platform>` (cas-7417, EPIC
+# cas-b65f) ships out of the box — the integration flow needs the proxy to
+# call upstream platform MCPs (Vercel, Neon). Without it, integrate handlers
+# bail with a clear "rebuild with --features mcp-proxy" message.
+default = ["mcp-server", "mcp-proxy"]
 mcp-server = ["dep:rmcp", "dep:schemars", "dep:cas-mcp"]
 mcp-proxy = ["mcp-server", "dep:cmcp_core"]
 claude_rs_e2e = []

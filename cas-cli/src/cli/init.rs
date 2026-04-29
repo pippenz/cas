@@ -70,7 +70,7 @@ fn spawn_init_watchdog() {
     });
 }
 
-#[derive(Parser)]
+#[derive(Parser, Default)]
 pub struct InitArgs {
     /// Accept all defaults without prompts
     #[arg(long, short = 'y')]
@@ -79,6 +79,24 @@ pub struct InitArgs {
     /// Force reinitialize even if already initialized
     #[arg(long, short = 'f')]
     pub force: bool,
+
+    /// Skip the Vercel/Neon/GitHub auto-integration section entirely.
+    /// Equivalent to the `cas integrate <platform> init` flow not running.
+    #[arg(long)]
+    pub no_integrations: bool,
+
+    /// Pre-seed the Vercel projectId; skips the picker. Still prompts to
+    /// confirm in interactive mode.
+    #[arg(long, value_name = "PROJECT_ID")]
+    pub vercel: Option<String>,
+
+    /// Pre-seed the Neon projectId; skips the picker.
+    #[arg(long, value_name = "PROJECT_ID")]
+    pub neon: Option<String>,
+
+    /// Override the auto-detected GitHub `OWNER/REPO` (from `git remote -v`).
+    #[arg(long, value_name = "OWNER/REPO")]
+    pub github: Option<String>,
 }
 
 // ============================================================================
@@ -209,6 +227,7 @@ impl WizardConfig {
             telemetry: None,
             logging: None,
             llm: None,
+            integrations: None,
         }
     }
 }
@@ -365,11 +384,21 @@ fn execute_defaults(cwd: &Path, args: &InitArgs) -> anyhow::Result<()> {
 
     // Apply with animation
     let config = WizardConfig::with_detected_agents(cwd);
-    apply_configuration(&cas_dir, cwd, &config, false)?;
+    apply_configuration(&cas_dir, cwd, &config, false, &integration_flags_from(args))?;
 
     print_quick_start();
     print_next_steps(cwd);
     Ok(())
+}
+
+/// Translate CLI args into the orchestration layer's [`IntegrationFlags`].
+fn integration_flags_from(args: &InitArgs) -> super::integrate::integrations::IntegrationFlags {
+    super::integrate::integrations::IntegrationFlags {
+        disabled: args.no_integrations,
+        vercel_project: args.vercel.clone(),
+        neon_project: args.neon.clone(),
+        github_repo: args.github.clone(),
+    }
 }
 
 // ============================================================================
@@ -404,7 +433,7 @@ fn run_wizard(cwd: &Path, args: &InitArgs) -> anyhow::Result<()> {
     let wizard_config = WizardConfig::with_detected_agents(cwd);
 
     // Confirmation with file summary
-    if !confirm_and_apply(&cas_dir, cwd, &wizard_config)? {
+    if !confirm_and_apply(&cas_dir, cwd, &wizard_config, &integration_flags_from(args))? {
         println!("\n  Initialization cancelled.");
         return Ok(());
     }
@@ -517,7 +546,12 @@ fn detect_agent_defaults(cwd: &Path) -> AgentSelection {
 // Confirmation and execution
 // ============================================================================
 
-fn confirm_and_apply(cas_dir: &Path, cwd: &Path, config: &WizardConfig) -> anyhow::Result<bool> {
+fn confirm_and_apply(
+    cas_dir: &Path,
+    cwd: &Path,
+    config: &WizardConfig,
+    integration_flags: &super::integrate::integrations::IntegrationFlags,
+) -> anyhow::Result<bool> {
     print_section_header("Confirmation")?;
     println!();
 
@@ -623,7 +657,7 @@ fn confirm_and_apply(cas_dir: &Path, cwd: &Path, config: &WizardConfig) -> anyho
     // Telemetry is opt-in; don't enable by default
 
     // Apply with animation
-    apply_configuration(cas_dir, cwd, config, true)?;
+    apply_configuration(cas_dir, cwd, config, true, integration_flags)?;
 
     Ok(true)
 }
@@ -648,6 +682,7 @@ fn apply_configuration(
     cwd: &Path,
     config: &WizardConfig,
     animate: bool,
+    integration_flags: &super::integrate::integrations::IntegrationFlags,
 ) -> anyhow::Result<()> {
     println!();
 
@@ -714,6 +749,29 @@ fn apply_configuration(
     execute_step("Setting up factory tooling", animate, || {
         factory_tooling::setup_factory_tooling(cwd)
     })?;
+
+    // Step 8 (cas-7417): Vercel/Neon/GitHub auto-integration.
+    // Run after factory tooling so the project is fully bootstrapped before
+    // we touch platform-specific skills. Uses the orchestration layer in
+    // `cli/integrate/integrations.rs` which acquires the integrate lockfile,
+    // detects each platform, and dispatches to the corresponding handler.
+    let ux = if animate {
+        super::integrate::integrations::UxMode::Interactive
+    } else {
+        super::integrate::integrations::UxMode::NonInteractive
+    };
+    match super::integrate::integrations::run(cwd, integration_flags, ux) {
+        Ok(report) => super::integrate::integrations::render(&report),
+        Err(e) => {
+            // Don't fail the entire init if integrations explode — they're
+            // additive. Surface the error and continue.
+            print_colored("  ! ", colors::ORANGE)?;
+            print_colored(
+                &format!("Integrations failed: {e:#}\n"),
+                colors::WHITE,
+            )?;
+        }
+    }
 
     // Final success message
     println!();
@@ -977,3 +1035,35 @@ pub(crate) use crate::cli::init::docs_and_skill::{
     is_skill_managed_by_cas,
 };
 pub use crate::cli::init::docs_and_skill::{generate_cas_skill, update_claude_md};
+
+#[cfg(test)]
+mod integration_flag_tests {
+    use super::*;
+
+    #[test]
+    fn integration_flags_from_threads_each_field() {
+        let args = InitArgs {
+            yes: true,
+            force: false,
+            no_integrations: true,
+            vercel: Some("prj_abc".to_string()),
+            neon: Some("np_xyz".to_string()),
+            github: Some("acme/widgets".to_string()),
+        };
+        let flags = integration_flags_from(&args);
+        assert!(flags.disabled);
+        assert_eq!(flags.vercel_project.as_deref(), Some("prj_abc"));
+        assert_eq!(flags.neon_project.as_deref(), Some("np_xyz"));
+        assert_eq!(flags.github_repo.as_deref(), Some("acme/widgets"));
+    }
+
+    #[test]
+    fn integration_flags_from_defaults_when_unset() {
+        let args = InitArgs::default();
+        let flags = integration_flags_from(&args);
+        assert!(!flags.disabled);
+        assert!(flags.vercel_project.is_none());
+        assert!(flags.neon_project.is_none());
+        assert!(flags.github_repo.is_none());
+    }
+}
