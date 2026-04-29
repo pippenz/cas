@@ -32,8 +32,11 @@
 //! content. See [`keep_block::merge`] and [`keep_block::orphaned_existing`]
 //! for the merge semantics and the recommended call shape for handlers.
 
+pub mod atomic;
 pub mod github;
+pub mod integrations;
 pub mod keep_block;
+pub mod lock;
 pub mod neon;
 pub mod types;
 pub mod vercel;

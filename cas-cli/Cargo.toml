@@ -178,7 +178,11 @@ tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 sentry = { version = "0.35", default-features = false, features = ["backtrace", "contexts", "panic", "reqwest", "rustls"] }
 
 [features]
-default = ["mcp-server"]
+# `mcp-proxy` is in `default` so `cas integrate <platform>` (cas-7417, EPIC
+# cas-b65f) ships out of the box — the integration flow needs the proxy to
+# call upstream platform MCPs (Vercel, Neon). Without it, integrate handlers
+# bail with a clear "rebuild with --features mcp-proxy" message.
+default = ["mcp-server", "mcp-proxy"]
 mcp-server = ["dep:rmcp", "dep:schemars", "dep:cas-mcp"]
 mcp-proxy = ["mcp-server", "dep:cmcp_core"]
 claude_rs_e2e = []

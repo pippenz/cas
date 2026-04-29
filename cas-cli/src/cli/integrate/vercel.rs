@@ -688,6 +688,14 @@ fn read_capped(path: &Path) -> anyhow::Result<String> {
 // Default client factory (mcp-proxy gated)
 // ---------------------------------------------------------------------------
 
+/// Production [`VercelClient`] factory. Exposed for the orchestration layer
+/// (`integrations::run`) so it can construct one client per `cas init`
+/// invocation rather than per-handler-call. Tests should NOT use this —
+/// inject a `MockVercelClient` directly.
+pub fn default_client() -> Box<dyn VercelClient> {
+    make_default_client()
+}
+
 fn make_default_client() -> Box<dyn VercelClient> {
     #[cfg(feature = "mcp-proxy")]
     {
@@ -723,14 +731,20 @@ mod mcp_proxy_client {
     //! Production [`VercelClient`] backed by the on-disk MCP proxy config
     //! (`.cas/proxy.toml` or `~/.config/code-mode-mcp/config.toml`).
     //!
-    //! Currently a placeholder — the cmcp_core::ProxyEngine wiring (tokio
-    //! runtime, proxy lifecycle, server lookup) is the responsibility of
-    //! cas-7417 (init wire-up), which already has to construct a long-lived
-    //! client. Until then this trait impl returns a clear "not yet wired"
-    //! error so the production path fails loudly rather than silently
-    //! producing empty results.
+    //! Wires `mcp__vercel__list_projects` and `mcp__vercel__get_project`
+    //! through `cmcp_core::ProxyEngine`. A tokio current-thread runtime is
+    //! spun up per call (the CLI is otherwise sync) — fine for the
+    //! handful of calls one `cas integrate vercel <action>` makes.
+    //!
+    //! **Live MCP is not exercised by `cargo test`** — the parsers in
+    //! [`super::parse_list_projects`] / [`super::parse_get_project`] are
+    //! fixture-tested against canonical Vercel MCP response shapes. The
+    //! transport itself is verified manually.
 
-    use super::{ProjectSummary, VercelClient};
+    use anyhow::Context;
+    use serde_json::Value;
+
+    use super::{parse_get_project, parse_list_projects, ProjectSummary, VercelClient};
 
     pub(super) struct ProxyVercelClient;
 
@@ -738,30 +752,161 @@ mod mcp_proxy_client {
         pub(super) fn new() -> Self {
             Self
         }
+
+        /// Resolve a proxy config path: first `<cas_root>/proxy.toml` if cas
+        /// is initialized, else the user-level fallback the cmcp_core loader
+        /// already handles.
+        fn proxy_config_path() -> Option<std::path::PathBuf> {
+            crate::store::find_cas_root()
+                .ok()
+                .map(|r| r.join("proxy.toml"))
+                .filter(|p| p.exists())
+        }
+
+        async fn call(
+            tool: &str,
+            args: Option<serde_json::Map<String, Value>>,
+        ) -> anyhow::Result<Value> {
+            let cfg = cmcp_core::config::Config::load_merged(
+                Self::proxy_config_path().as_deref(),
+            )
+            .context("loading MCP proxy config")?;
+            anyhow::ensure!(
+                !cfg.servers.is_empty(),
+                "no MCP servers configured. Run `cas mcp add vercel ...` or check ~/.config/code-mode-mcp/config.toml."
+            );
+            let engine = cmcp_core::ProxyEngine::from_configs(cfg.servers)
+                .await
+                .context("starting MCP proxy engine")?;
+            let result = engine
+                .call_tool("vercel", tool, args)
+                .await
+                .with_context(|| format!("calling vercel.{tool}"))?;
+            // Best-effort shutdown so the spawned upstream child terminates.
+            engine.shutdown().await;
+            Ok(result)
+        }
+
+        fn block_on<F, T>(fut: F) -> anyhow::Result<T>
+        where
+            F: std::future::Future<Output = anyhow::Result<T>>,
+        {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("building tokio runtime")?;
+            rt.block_on(fut)
+        }
     }
 
     impl VercelClient for ProxyVercelClient {
         fn list_projects(&self) -> anyhow::Result<Vec<ProjectSummary>> {
-            // Wiring to cmcp_core::ProxyEngine requires a tokio runtime and
-            // proxy config load; this is straightforward but involves the
-            // proxy lifecycle. The trait separation here lets cas-7417
-            // (init wire-up) supply a long-lived client built once at
-            // startup. For now this returns a clear "not yet wired" error
-            // so unit tests stay deterministic via the mock client and the
-            // feature-gate path is exercised at compile time.
-            anyhow::bail!(
-                "ProxyVercelClient is not yet wired to cmcp_core::ProxyEngine; \
-                 inject a custom VercelClient via init/refresh/verify directly \
-                 (see vercel::init signature). Tracked separately."
-            )
+            let value = Self::block_on(Self::call("list_projects", None))?;
+            parse_list_projects(&value)
         }
 
-        fn get_project(&self, _id: &str) -> anyhow::Result<Option<ProjectSummary>> {
-            anyhow::bail!(
-                "ProxyVercelClient is not yet wired to cmcp_core::ProxyEngine"
-            )
+        fn get_project(&self, id: &str) -> anyhow::Result<Option<ProjectSummary>> {
+            let mut args = serde_json::Map::new();
+            args.insert("projectId".to_string(), Value::String(id.to_string()));
+            let value = Self::block_on(Self::call("get_project", Some(args)))?;
+            parse_get_project(&value)
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// MCP response parsers (fixture-testable, transport-independent).
+// ---------------------------------------------------------------------------
+
+/// Parse the response from `mcp__vercel__list_projects` into a vec of
+/// [`ProjectSummary`]. Tolerant of:
+///
+/// - The raw RPC envelope (`{ content: [{ type: "text", text: "<json>" }] }`)
+///   that `cmcp_core::ProxyEngine::call_tool` returns.
+/// - A bare JSON array of project objects.
+/// - A top-level object with a `projects` field.
+pub fn parse_list_projects(value: &serde_json::Value) -> anyhow::Result<Vec<ProjectSummary>> {
+    use serde_json::Value;
+    let inner = unwrap_mcp_envelope(value)?;
+    let array = match &inner {
+        Value::Array(a) => a.clone(),
+        Value::Object(map) => map
+            .get("projects")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default(),
+        _ => anyhow::bail!("unexpected list_projects shape: {inner}"),
+    };
+    let mut out = Vec::with_capacity(array.len());
+    for v in array {
+        if let Some(p) = project_from_value(&v) {
+            out.push(p);
+        }
+    }
+    Ok(out)
+}
+
+/// Parse the response from `mcp__vercel__get_project` into an
+/// `Option<ProjectSummary>`. Returns `None` if the response signals
+/// not-found (empty content / `null` / `{ error: "not found" }`).
+pub fn parse_get_project(value: &serde_json::Value) -> anyhow::Result<Option<ProjectSummary>> {
+    use serde_json::Value;
+    let inner = match unwrap_mcp_envelope(value) {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    if matches!(&inner, Value::Null) {
+        return Ok(None);
+    }
+    if let Value::Object(map) = &inner {
+        if let Some(err) = map.get("error").and_then(|v| v.as_str()) {
+            if err.to_ascii_lowercase().contains("not found") {
+                return Ok(None);
+            }
+        }
+    }
+    Ok(project_from_value(&inner))
+}
+
+/// MCP tool calls return an envelope of the form
+/// `{ content: [{ type: "text", text: "<json string>" }, ...], isError: bool }`.
+/// Strip that wrapper and parse the inner JSON. If `value` is not the
+/// envelope shape, return it unchanged.
+fn unwrap_mcp_envelope(value: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+    use serde_json::Value;
+    let Value::Object(map) = value else {
+        return Ok(value.clone());
+    };
+    if map.get("isError").and_then(|v| v.as_bool()) == Some(true) {
+        anyhow::bail!("MCP returned isError=true: {value}");
+    }
+    let Some(Value::Array(content)) = map.get("content") else {
+        return Ok(value.clone());
+    };
+    // Concatenate any "text" parts then parse as JSON.
+    let mut buf = String::new();
+    for item in content {
+        if let Some(t) = item.get("text").and_then(|v| v.as_str()) {
+            buf.push_str(t);
+        }
+    }
+    if buf.trim().is_empty() {
+        return Ok(Value::Null);
+    }
+    serde_json::from_str(&buf).with_context(|| format!("parsing MCP text content: {buf}"))
+}
+
+fn project_from_value(v: &serde_json::Value) -> Option<ProjectSummary> {
+    let id = v.get("id")?.as_str()?.to_string();
+    let name = v.get("name")?.as_str()?.to_string();
+    // Vercel returns `accountId` (the team/user owning the project) in the
+    // standard list shape. Some envelopes use `teamId` directly.
+    let team_id = v
+        .get("teamId")
+        .and_then(|s| s.as_str())
+        .or_else(|| v.get("accountId").and_then(|s| s.as_str()))
+        .map(|s| s.to_string());
+    Some(ProjectSummary { id, name, team_id })
 }
 
 // ---------------------------------------------------------------------------
@@ -1418,6 +1563,90 @@ mod tests {
         }
         let err = read_capped(&link).unwrap_err().to_string();
         assert!(err.contains("symlink"), "got: {err}");
+    }
+
+    // --- MCP response parsers ------------------------------------------
+
+    #[test]
+    fn parse_list_projects_handles_mcp_text_envelope() {
+        let v = serde_json::json!({
+            "content": [{
+                "type": "text",
+                "text": "[{\"id\":\"prj_1\",\"name\":\"myapp\",\"accountId\":\"team_a\"}]"
+            }]
+        });
+        let projects = parse_list_projects(&v).unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].id, "prj_1");
+        assert_eq!(projects[0].name, "myapp");
+        assert_eq!(projects[0].team_id.as_deref(), Some("team_a"));
+    }
+
+    #[test]
+    fn parse_list_projects_handles_bare_array() {
+        let v = serde_json::json!([
+            {"id":"prj_1","name":"myapp","teamId":"team_a"},
+            {"id":"prj_2","name":"other","accountId":"team_b"},
+        ]);
+        let projects = parse_list_projects(&v).unwrap();
+        assert_eq!(projects.len(), 2);
+        assert_eq!(projects[1].team_id.as_deref(), Some("team_b"));
+    }
+
+    #[test]
+    fn parse_list_projects_handles_object_with_projects_field() {
+        let v = serde_json::json!({
+            "projects": [
+                {"id":"prj_1","name":"myapp","teamId":"team_a"},
+            ],
+            "pagination": {}
+        });
+        let projects = parse_list_projects(&v).unwrap();
+        assert_eq!(projects.len(), 1);
+    }
+
+    #[test]
+    fn parse_list_projects_skips_malformed_entries_without_panicking() {
+        let v = serde_json::json!([
+            {"id":"prj_1","name":"good","teamId":"team_a"},
+            {"id":"prj_2"},                 // missing name
+            "not an object",
+            {"id":"prj_3","name":"good3","teamId":"team_a"}
+        ]);
+        let projects = parse_list_projects(&v).unwrap();
+        // Only the well-formed entries land.
+        assert_eq!(projects.len(), 2);
+        assert_eq!(projects[0].id, "prj_1");
+        assert_eq!(projects[1].id, "prj_3");
+    }
+
+    #[test]
+    fn parse_list_projects_propagates_mcp_error_envelope() {
+        let v = serde_json::json!({
+            "isError": true,
+            "content": [{"type":"text","text":"boom"}]
+        });
+        assert!(parse_list_projects(&v).is_err());
+    }
+
+    #[test]
+    fn parse_get_project_returns_some_for_valid_envelope() {
+        let v = serde_json::json!({
+            "content": [{"type":"text","text":"{\"id\":\"prj_1\",\"name\":\"myapp\",\"teamId\":\"team_a\"}"}]
+        });
+        let p = parse_get_project(&v).unwrap();
+        assert_eq!(p.unwrap().id, "prj_1");
+    }
+
+    #[test]
+    fn parse_get_project_returns_none_for_null_or_not_found() {
+        let null_v = serde_json::json!(null);
+        assert!(parse_get_project(&null_v).unwrap().is_none());
+        let not_found = serde_json::json!({"error":"project not found"});
+        assert!(parse_get_project(&not_found).unwrap().is_none());
+        let empty_envelope =
+            serde_json::json!({"content":[{"type":"text","text":""}]});
+        assert!(parse_get_project(&empty_envelope).unwrap().is_none());
     }
 
     #[test]
