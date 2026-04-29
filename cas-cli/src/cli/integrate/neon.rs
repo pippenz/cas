@@ -135,27 +135,354 @@ pub trait NeonClient {
     fn describe_branch(&self, org_id: &str, project_id: &str, branch_id: &str) -> Result<bool>;
 }
 
-/// Production placeholder. Wiring to real Neon MCP / HTTP API lives outside
-/// the scope of cas-1ece — see EPIC cas-b65f follow-on. Returns a clear,
-/// actionable error.
+/// Production [`NeonClient`] backed by the on-disk MCP proxy config
+/// (`<cas_root>/proxy.toml` or `~/.config/code-mode-mcp/config.toml`).
+///
+/// Mirrors `vercel::mcp_proxy_client::ProxyVercelClient` (cas-7417): per-call
+/// tokio current-thread runtime, `cmcp_core::ProxyEngine::call_tool("neon",
+/// ...)`, engine.shutdown() on both success and error paths to avoid
+/// leaking spawned upstream MCP child processes.
+///
+/// **Live MCP is not exercised by `cargo test`** — the parsers in
+/// [`parse_list_organizations`] / [`parse_list_projects`] /
+/// [`parse_describe_project`] / [`parse_describe_branch`] are
+/// fixture-tested against canonical Neon MCP response shapes. The transport
+/// itself is verified manually.
 pub struct LiveNeonClient;
 
-const LIVE_NOT_WIRED: &str =
-    "live Neon client not yet wired — invoke `cas integrate neon` through the integration skill that fans out to MCP, or pass a fixture via the test API";
+#[cfg(not(feature = "mcp-proxy"))]
+const NO_MCP_PROXY: &str =
+    "this build of cas does not include the mcp-proxy feature; rebuild with \
+     `cargo install cas --features mcp-proxy` to enable `cas integrate neon`";
 
+#[cfg(not(feature = "mcp-proxy"))]
 impl NeonClient for LiveNeonClient {
     fn list_organizations(&self) -> Result<Vec<NeonOrg>> {
-        Err(anyhow!(LIVE_NOT_WIRED))
+        Err(anyhow!(NO_MCP_PROXY))
     }
     fn list_projects(&self, _org_id: &str) -> Result<Vec<NeonProject>> {
-        Err(anyhow!(LIVE_NOT_WIRED))
+        Err(anyhow!(NO_MCP_PROXY))
     }
     fn describe_project(&self, _org_id: &str, _project_id: &str) -> Result<NeonProjectDetail> {
-        Err(anyhow!(LIVE_NOT_WIRED))
+        Err(anyhow!(NO_MCP_PROXY))
     }
     fn describe_branch(&self, _o: &str, _p: &str, _b: &str) -> Result<bool> {
-        Err(anyhow!(LIVE_NOT_WIRED))
+        Err(anyhow!(NO_MCP_PROXY))
     }
+}
+
+#[cfg(feature = "mcp-proxy")]
+impl LiveNeonClient {
+    /// Resolve a proxy config path: first `<cas_root>/proxy.toml` if cas is
+    /// initialized, else fall through to the user-level lookup the
+    /// `cmcp_core` loader already handles.
+    fn proxy_config_path() -> Option<std::path::PathBuf> {
+        crate::store::find_cas_root()
+            .ok()
+            .map(|r| r.join("proxy.toml"))
+            .filter(|p| p.exists())
+    }
+
+    async fn call(
+        tool: &str,
+        args: Option<serde_json::Map<String, serde_json::Value>>,
+    ) -> Result<serde_json::Value> {
+        let cfg = cmcp_core::config::Config::load_merged(
+            Self::proxy_config_path().as_deref(),
+        )
+        .context("loading MCP proxy config")?;
+        anyhow::ensure!(
+            !cfg.servers.is_empty(),
+            "no MCP servers configured. Run `cas mcp add neon ...` or check ~/.config/code-mode-mcp/config.toml."
+        );
+        let engine = cmcp_core::ProxyEngine::from_configs(cfg.servers)
+            .await
+            .context("starting MCP proxy engine")?;
+        // Capture the call result so we can shut the engine down on both the
+        // success and error paths — otherwise a transport failure would leak
+        // spawned upstream MCP child processes for the lifetime of `cas init`.
+        let outcome = engine
+            .call_tool("neon", tool, args)
+            .await
+            .with_context(|| format!("calling neon.{tool}"));
+        engine.shutdown().await;
+        outcome
+    }
+
+    fn block_on<F, T>(fut: F) -> Result<T>
+    where
+        F: std::future::Future<Output = Result<T>>,
+    {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("building tokio runtime")?;
+        rt.block_on(fut)
+    }
+
+    fn arg_str(k: &str, v: &str) -> serde_json::Map<String, serde_json::Value> {
+        let mut m = serde_json::Map::new();
+        m.insert(k.to_string(), serde_json::Value::String(v.to_string()));
+        m
+    }
+}
+
+#[cfg(feature = "mcp-proxy")]
+impl NeonClient for LiveNeonClient {
+    fn list_organizations(&self) -> Result<Vec<NeonOrg>> {
+        let value = Self::block_on(Self::call("list_organizations", None))?;
+        parse_list_organizations(&value)
+    }
+
+    fn list_projects(&self, org_id: &str) -> Result<Vec<NeonProject>> {
+        let args = Self::arg_str("org_id", org_id);
+        let value = Self::block_on(Self::call("list_projects", Some(args)))?;
+        parse_list_projects(&value)
+    }
+
+    fn describe_project(&self, org_id: &str, project_id: &str) -> Result<NeonProjectDetail> {
+        let mut args = serde_json::Map::new();
+        args.insert("org_id".to_string(), serde_json::Value::String(org_id.to_string()));
+        args.insert(
+            "project_id".to_string(),
+            serde_json::Value::String(project_id.to_string()),
+        );
+        let value = Self::block_on(Self::call("describe_project", Some(args)))?;
+        parse_describe_project(&value)
+    }
+
+    fn describe_branch(&self, org_id: &str, project_id: &str, branch_id: &str) -> Result<bool> {
+        let mut args = serde_json::Map::new();
+        args.insert("org_id".to_string(), serde_json::Value::String(org_id.to_string()));
+        args.insert(
+            "project_id".to_string(),
+            serde_json::Value::String(project_id.to_string()),
+        );
+        args.insert(
+            "branch_id".to_string(),
+            serde_json::Value::String(branch_id.to_string()),
+        );
+        let value = Self::block_on(Self::call("describe_branch", Some(args)))?;
+        parse_describe_branch(&value)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MCP response parsers (fixture-testable, transport-independent).
+//
+// All four `parse_*` functions follow the same shape as
+// vercel::parse_list_projects: peel off the MCP envelope (`{ content: [{
+// type: "text", text: "<json>" }] }`), then accept multiple inner shapes
+// because the upstream Neon MCP server has rolled through several response
+// layouts during its lifetime. The parsers must never silently swallow a
+// transport-level failure — `isError: true` and JSON parse errors propagate
+// as Err so verify can distinguish "transport error" from "drift".
+// ---------------------------------------------------------------------------
+
+/// Parse `mcp__neon__list_organizations` into a vec of [`NeonOrg`].
+///
+/// Tolerated shapes:
+/// - `{ "organizations": [...] }` (canonical)
+/// - bare `[...]` array
+/// - `{ "orgs": [...] }` (older alias seen in some envelopes)
+pub fn parse_list_organizations(value: &serde_json::Value) -> Result<Vec<NeonOrg>> {
+    let inner = unwrap_mcp_envelope(value)?;
+    let array = match &inner {
+        serde_json::Value::Array(a) => a.clone(),
+        serde_json::Value::Object(m) => m
+            .get("organizations")
+            .or_else(|| m.get("orgs"))
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default(),
+        _ => anyhow::bail!("unexpected list_organizations shape: {inner}"),
+    };
+    let mut out = Vec::with_capacity(array.len());
+    for v in array {
+        if let Some(o) = neon_org_from_value(&v) {
+            out.push(o);
+        }
+    }
+    Ok(out)
+}
+
+/// Parse `mcp__neon__list_projects` into a vec of [`NeonProject`].
+///
+/// Tolerated shapes mirror [`parse_list_organizations`]: bare array, or an
+/// object with `projects` (canonical) or `data` (older alias).
+pub fn parse_list_projects(value: &serde_json::Value) -> Result<Vec<NeonProject>> {
+    let inner = unwrap_mcp_envelope(value)?;
+    let array = match &inner {
+        serde_json::Value::Array(a) => a.clone(),
+        serde_json::Value::Object(m) => m
+            .get("projects")
+            .or_else(|| m.get("data"))
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default(),
+        _ => anyhow::bail!("unexpected list_projects shape: {inner}"),
+    };
+    let mut out = Vec::with_capacity(array.len());
+    for v in array {
+        if let Some(p) = neon_project_from_value(&v) {
+            out.push(p);
+        }
+    }
+    Ok(out)
+}
+
+/// Parse `mcp__neon__describe_project` into a [`NeonProjectDetail`].
+///
+/// Canonical shape:
+/// ```ignore
+/// { "project": { "id": "...", "name": "...", "default_database_name": "..." },
+///   "branches": [ { "id": "...", "name": "...", "default": true|false } ] }
+/// ```
+///
+/// Also tolerates a flatter `{id, name, default_database_name, branches: []}`
+/// shape some older Neon MCP servers returned.
+pub fn parse_describe_project(value: &serde_json::Value) -> Result<NeonProjectDetail> {
+    let inner = unwrap_mcp_envelope(value)?;
+    let obj = inner
+        .as_object()
+        .ok_or_else(|| anyhow!("describe_project: expected object, got {inner}"))?;
+
+    // Canonical: nested `project` + sibling `branches`. Fallback: flat object.
+    let (project_value, branches_value) = if obj.contains_key("project") {
+        (
+            obj.get("project").cloned().unwrap_or(serde_json::Value::Null),
+            obj.get("branches").cloned().unwrap_or(serde_json::Value::Null),
+        )
+    } else {
+        (
+            serde_json::Value::Object(obj.clone()),
+            obj.get("branches").cloned().unwrap_or(serde_json::Value::Null),
+        )
+    };
+
+    let project = neon_project_from_value(&project_value).ok_or_else(|| {
+        anyhow!("describe_project: missing or malformed project: {project_value}")
+    })?;
+
+    // default_database can come from `project.default_database_name`,
+    // top-level `default_database`, or a `databases` array. Best-effort.
+    let default_database = project_value
+        .get("default_database_name")
+        .and_then(|v| v.as_str())
+        .or_else(|| obj.get("default_database").and_then(|v| v.as_str()))
+        .or_else(|| {
+            obj.get("databases")
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.first())
+                .and_then(|d| d.get("name"))
+                .and_then(|v| v.as_str())
+        })
+        .unwrap_or("neondb")
+        .to_string();
+
+    let branches = branches_value
+        .as_array()
+        .map(|a| a.iter().filter_map(neon_branch_from_value).collect())
+        .unwrap_or_default();
+
+    Ok(NeonProjectDetail {
+        project,
+        default_database,
+        branches,
+    })
+}
+
+/// Parse `mcp__neon__describe_branch` into a presence bool.
+///
+/// Returns:
+/// - `Ok(true)` when the response contains a recognizable branch object
+///   (canonical `{ "branch": {...} }` or a flat `{id, name, ...}`).
+/// - `Ok(false)` for explicit not-found signals: a Null inner, or an
+///   `{ "error": "...not found..." }` envelope.
+/// - `Err` for transport-level failures (`isError: true` envelopes, JSON
+///   parse errors, malformed shapes) — never silently downgraded to
+///   `Ok(false)` so verify can route these to `IntegrationStatus::TransportError`
+///   instead of `Stale`.
+pub fn parse_describe_branch(value: &serde_json::Value) -> Result<bool> {
+    let inner = unwrap_mcp_envelope(value)?;
+    if matches!(&inner, serde_json::Value::Null) {
+        return Ok(false);
+    }
+    let obj = inner.as_object().ok_or_else(|| {
+        anyhow!("describe_branch: expected object or null, got {inner}")
+    })?;
+    if let Some(err) = obj.get("error").and_then(|v| v.as_str()) {
+        if err.to_ascii_lowercase().contains("not found") {
+            return Ok(false);
+        }
+        anyhow::bail!("describe_branch returned non-not-found error: {err}");
+    }
+    // Canonical shape wraps the branch under `branch`; accept flat too.
+    let branch_obj = obj
+        .get("branch")
+        .and_then(|v| v.as_object())
+        .or_else(|| {
+            // Flat form: the root IS the branch object.
+            if obj.contains_key("id") && obj.contains_key("name") {
+                Some(obj)
+            } else {
+                None
+            }
+        });
+    match branch_obj {
+        Some(b) if b.get("id").and_then(|v| v.as_str()).is_some() => Ok(true),
+        _ => anyhow::bail!("describe_branch: response had neither `branch` nor a flat branch object: {inner}"),
+    }
+}
+
+fn neon_org_from_value(v: &serde_json::Value) -> Option<NeonOrg> {
+    let id = v.get("id")?.as_str()?.to_string();
+    let name = v.get("name")?.as_str()?.to_string();
+    Some(NeonOrg { id, name })
+}
+
+fn neon_project_from_value(v: &serde_json::Value) -> Option<NeonProject> {
+    let id = v.get("id")?.as_str()?.to_string();
+    let name = v.get("name")?.as_str()?.to_string();
+    Some(NeonProject { id, name })
+}
+
+fn neon_branch_from_value(v: &serde_json::Value) -> Option<NeonBranch> {
+    let id = v.get("id")?.as_str()?.to_string();
+    let name = v.get("name")?.as_str()?.to_string();
+    // Neon's API uses both `default` and (older) `is_default`. Accept either.
+    let is_default = v
+        .get("default")
+        .or_else(|| v.get("is_default"))
+        .and_then(|x| x.as_bool())
+        .unwrap_or(false);
+    Some(NeonBranch { id, name, is_default })
+}
+
+/// Strip the `{ content: [{type:"text", text:"<json>"}], isError }` envelope
+/// that `cmcp_core::ProxyEngine::call_tool` returns. If `value` is not the
+/// envelope shape, return it unchanged. Mirrors
+/// `vercel::unwrap_mcp_envelope`.
+fn unwrap_mcp_envelope(value: &serde_json::Value) -> Result<serde_json::Value> {
+    let serde_json::Value::Object(map) = value else {
+        return Ok(value.clone());
+    };
+    if map.get("isError").and_then(|v| v.as_bool()) == Some(true) {
+        anyhow::bail!("MCP returned isError=true: {value}");
+    }
+    let Some(serde_json::Value::Array(content)) = map.get("content") else {
+        return Ok(value.clone());
+    };
+    let mut buf = String::new();
+    for item in content {
+        if let Some(t) = item.get("text").and_then(|v| v.as_str()) {
+            buf.push_str(t);
+        }
+    }
+    if buf.trim().is_empty() {
+        return Ok(serde_json::Value::Null);
+    }
+    serde_json::from_str(&buf).with_context(|| format!("parsing MCP text content: {buf}"))
 }
 
 // --- Detection -------------------------------------------------------------
@@ -956,6 +1283,211 @@ fn pick_project(projects: &[NeonProject], basename: &str) -> Result<String> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    // --- MCP response parser tests (fixture-driven) -----------------------
+    //
+    // Each fixture lives under `cas-cli/src/cli/integrate/fixtures/neon/` and
+    // is embedded via include_str! so the parsers run against canonical Neon
+    // MCP envelopes without any live transport. Mirror of vercel.rs's
+    // parse_*_handles_mcp_text_envelope tests.
+
+    const FIXTURE_LIST_ORGS: &str =
+        include_str!("fixtures/neon/list_organizations.json");
+    const FIXTURE_LIST_PROJECTS: &str =
+        include_str!("fixtures/neon/list_projects.json");
+    const FIXTURE_DESCRIBE_PROJECT: &str =
+        include_str!("fixtures/neon/describe_project.json");
+    const FIXTURE_DESCRIBE_BRANCH_PRESENT: &str =
+        include_str!("fixtures/neon/describe_branch_present.json");
+    const FIXTURE_DESCRIBE_BRANCH_MISSING: &str =
+        include_str!("fixtures/neon/describe_branch_missing.json");
+
+    fn parse_fixture(s: &str) -> serde_json::Value {
+        serde_json::from_str(s).expect("fixture must be valid JSON")
+    }
+
+    #[test]
+    fn parse_list_organizations_handles_canonical_envelope() {
+        let v = parse_fixture(FIXTURE_LIST_ORGS);
+        let orgs = parse_list_organizations(&v).unwrap();
+        assert_eq!(orgs.len(), 2);
+        assert_eq!(orgs[0].id, "org-2k3q");
+        assert_eq!(orgs[0].name, "Petra Stella");
+        assert_eq!(orgs[1].id, "org-9m5p");
+    }
+
+    #[test]
+    fn parse_list_organizations_handles_bare_array() {
+        let v = serde_json::json!([
+            {"id": "org-1", "name": "A"},
+            {"id": "org-2", "name": "B"}
+        ]);
+        let orgs = parse_list_organizations(&v).unwrap();
+        assert_eq!(orgs.len(), 2);
+    }
+
+    #[test]
+    fn parse_list_organizations_handles_orgs_alias() {
+        // Older envelope: `orgs` instead of `organizations`.
+        let v = serde_json::json!({"orgs": [{"id": "org-x", "name": "X"}]});
+        let orgs = parse_list_organizations(&v).unwrap();
+        assert_eq!(orgs.len(), 1);
+        assert_eq!(orgs[0].id, "org-x");
+    }
+
+    #[test]
+    fn parse_list_organizations_propagates_is_error_envelope() {
+        let v = serde_json::json!({
+            "content": [{"type": "text", "text": "{}"}],
+            "isError": true
+        });
+        let err = parse_list_organizations(&v).unwrap_err();
+        assert!(err.to_string().contains("isError=true"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_list_projects_handles_canonical_envelope() {
+        let v = parse_fixture(FIXTURE_LIST_PROJECTS);
+        let projects = parse_list_projects(&v).unwrap();
+        assert_eq!(projects.len(), 2);
+        assert_eq!(projects[0].id, "proj-cool-bird");
+        assert_eq!(projects[0].name, "gabber-studio");
+        assert_eq!(projects[1].name, "ozer-health");
+    }
+
+    #[test]
+    fn parse_list_projects_handles_data_alias() {
+        let v = serde_json::json!({"data": [{"id": "p1", "name": "n1"}]});
+        let projects = parse_list_projects(&v).unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].id, "p1");
+    }
+
+    #[test]
+    fn parse_describe_project_handles_canonical_envelope() {
+        let v = parse_fixture(FIXTURE_DESCRIBE_PROJECT);
+        let detail = parse_describe_project(&v).unwrap();
+        assert_eq!(detail.project.id, "proj-cool-bird");
+        assert_eq!(detail.project.name, "gabber-studio");
+        assert_eq!(detail.default_database, "neondb");
+        assert_eq!(detail.branches.len(), 3);
+        // Default branch flagged correctly.
+        let main = detail.branches.iter().find(|b| b.id == "br-main-1").unwrap();
+        assert!(main.is_default);
+        let staging = detail.branches.iter().find(|b| b.id == "br-staging-7").unwrap();
+        assert!(!staging.is_default);
+    }
+
+    #[test]
+    fn parse_describe_project_handles_flat_object() {
+        // Older / flatter shape some Neon MCP servers returned: project
+        // fields at the root, branches as a sibling field.
+        let v = serde_json::json!({
+            "id": "p1",
+            "name": "flatproj",
+            "default_database_name": "appdb",
+            "branches": [{"id": "br1", "name": "main", "default": true}]
+        });
+        let detail = parse_describe_project(&v).unwrap();
+        assert_eq!(detail.project.id, "p1");
+        assert_eq!(detail.default_database, "appdb");
+        assert_eq!(detail.branches.len(), 1);
+        assert!(detail.branches[0].is_default);
+    }
+
+    #[test]
+    fn parse_describe_project_falls_back_to_databases_array() {
+        // Neither default_database_name nor default_database — pull from a
+        // databases[] array.
+        let v = serde_json::json!({
+            "project": {"id": "p", "name": "n"},
+            "branches": [],
+            "databases": [{"name": "alt-db", "branch_id": "br1"}]
+        });
+        let detail = parse_describe_project(&v).unwrap();
+        assert_eq!(detail.default_database, "alt-db");
+    }
+
+    #[test]
+    fn parse_describe_project_accepts_is_default_alias_on_branch() {
+        let v = serde_json::json!({
+            "project": {"id": "p", "name": "n"},
+            "branches": [{"id": "br1", "name": "main", "is_default": true}]
+        });
+        let detail = parse_describe_project(&v).unwrap();
+        assert!(detail.branches[0].is_default);
+    }
+
+    #[test]
+    fn parse_describe_project_errors_on_missing_project_field() {
+        // Neither nested nor flat — not a project at all.
+        let v = serde_json::json!({"random": 42});
+        let err = parse_describe_project(&v).unwrap_err();
+        assert!(err.to_string().contains("project"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_describe_branch_present_returns_true() {
+        let v = parse_fixture(FIXTURE_DESCRIBE_BRANCH_PRESENT);
+        assert_eq!(parse_describe_branch(&v).unwrap(), true);
+    }
+
+    #[test]
+    fn parse_describe_branch_missing_returns_false() {
+        let v = parse_fixture(FIXTURE_DESCRIBE_BRANCH_MISSING);
+        assert_eq!(parse_describe_branch(&v).unwrap(), false);
+    }
+
+    #[test]
+    fn parse_describe_branch_null_inner_returns_false() {
+        let v = serde_json::json!({"content": [{"type": "text", "text": "null"}]});
+        assert_eq!(parse_describe_branch(&v).unwrap(), false);
+    }
+
+    #[test]
+    fn parse_describe_branch_flat_object_returns_true() {
+        // Flat shape: branch fields at root.
+        let v = serde_json::json!({"id": "br1", "name": "main", "default": true});
+        assert_eq!(parse_describe_branch(&v).unwrap(), true);
+    }
+
+    #[test]
+    fn parse_describe_branch_propagates_non_not_found_error() {
+        // Transport-level error must propagate as Err, never silently become
+        // Ok(false) — verify_at relies on this distinction to route to
+        // IntegrationStatus::TransportError vs Stale.
+        let v = serde_json::json!({
+            "content": [{
+                "type": "text",
+                "text": "{\"error\":\"unauthorized: token expired\"}"
+            }]
+        });
+        let err = parse_describe_branch(&v).unwrap_err();
+        assert!(err.to_string().contains("unauthorized"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_describe_branch_propagates_is_error_envelope() {
+        let v = serde_json::json!({
+            "content": [{"type": "text", "text": "{}"}],
+            "isError": true
+        });
+        let err = parse_describe_branch(&v).unwrap_err();
+        assert!(err.to_string().contains("isError=true"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_describe_branch_malformed_response_errors() {
+        let v = serde_json::json!({"random": 42});
+        let err = parse_describe_branch(&v).unwrap_err();
+        assert!(
+            err.to_string().contains("neither `branch`"),
+            "got: {err}"
+        );
+    }
+
+    // --- end MCP parser tests ---------------------------------------------
+
     use std::cell::RefCell;
     use std::collections::HashMap;
     use tempfile::TempDir;

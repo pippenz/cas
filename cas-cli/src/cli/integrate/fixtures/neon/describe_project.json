@@ -1,0 +1,9 @@
+{
+  "content": [
+    {
+      "type": "text",
+      "text": "{\"project\":{\"id\":\"proj-cool-bird\",\"name\":\"gabber-studio\",\"org_id\":\"org-2k3q\",\"default_database_name\":\"neondb\"},\"branches\":[{\"id\":\"br-main-1\",\"name\":\"main\",\"default\":true},{\"id\":\"br-staging-7\",\"name\":\"staging\",\"default\":false},{\"id\":\"br-dev-13\",\"name\":\"dev\",\"default\":false}],\"databases\":[{\"name\":\"neondb\",\"branch_id\":\"br-main-1\"}]}"
+    }
+  ],
+  "isError": false
+}

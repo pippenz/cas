@@ -1,0 +1,9 @@
+{
+  "content": [
+    {
+      "type": "text",
+      "text": "{\"projects\":[{\"id\":\"proj-cool-bird\",\"name\":\"gabber-studio\",\"org_id\":\"org-2k3q\",\"region_id\":\"aws-us-east-1\"},{\"id\":\"proj-quiet-fish\",\"name\":\"ozer-health\",\"org_id\":\"org-2k3q\",\"region_id\":\"aws-us-east-1\"}]}"
+    }
+  ],
+  "isError": false
+}

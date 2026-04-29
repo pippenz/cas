@@ -1,0 +1,9 @@
+{
+  "content": [
+    {
+      "type": "text",
+      "text": "{\"error\":\"branch br-deleted-99 not found in project proj-cool-bird\"}"
+    }
+  ],
+  "isError": false
+}
