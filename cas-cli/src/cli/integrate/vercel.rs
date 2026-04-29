@@ -300,8 +300,15 @@ pub fn execute(action: IntegrationAction) -> anyhow::Result<IntegrationOutcome> 
     }
 }
 
+/// Sentinels that mark a directory as a real project root for the purposes
+/// of `cas integrate`. If git toplevel resolution fails AND none of these
+/// is present at the cwd, we refuse to write skill files into a bare CWD —
+/// otherwise `cas integrate vercel init` from `~/Downloads` would silently
+/// scribble `.claude/skills/...` into the user's home-adjacent directory.
+const PROJECT_SENTINELS: &[&str] =
+    &[".git", ".cas", "Cargo.toml", "package.json", "pyproject.toml"];
+
 fn locate_repo_root() -> anyhow::Result<PathBuf> {
-    // Prefer git toplevel; fall back to current dir.
     let cwd = std::env::current_dir().context("getting current dir")?;
     if let Ok(out) = std::process::Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
@@ -314,13 +321,39 @@ fn locate_repo_root() -> anyhow::Result<PathBuf> {
             }
         }
     }
-    Ok(cwd)
+    // No git toplevel — only fall back to CWD if it looks like a project.
+    if PROJECT_SENTINELS
+        .iter()
+        .any(|s| cwd.join(s).exists())
+    {
+        return Ok(cwd);
+    }
+    anyhow::bail!(
+        "{} is not inside a project (no git toplevel, no .git/.cas/Cargo.toml/package.json/pyproject.toml). \
+         Run `cas integrate vercel <action>` from a project root.",
+        cwd.display()
+    )
 }
 
 /// `cas integrate vercel init`: detect, fetch, fuzzy-match, write 3 files.
+///
+/// Convenience wrapper for [`init_with_preseed`] — equivalent to passing
+/// `preseed_project_id = None`.
 pub fn init(
     repo_root: &Path,
     client: &dyn VercelClient,
+) -> anyhow::Result<IntegrationOutcome> {
+    init_with_preseed(repo_root, client, None)
+}
+
+/// Same as [`init`] but accepts a pre-seeded `prj_*` id. When supplied, the
+/// list-projects + fuzzy-match step is bypassed and the handler validates
+/// the id via [`VercelClient::get_project`]. If the id is unknown to the
+/// upstream MCP, returns `Skipped` with a warning rather than writing.
+pub fn init_with_preseed(
+    repo_root: &Path,
+    client: &dyn VercelClient,
+    preseed_project_id: Option<&str>,
 ) -> anyhow::Result<IntegrationOutcome> {
     let mut outcome = IntegrationOutcome::new(
         Platform::Vercel,
@@ -343,6 +376,43 @@ pub fn init(
             "{} already populated; use `cas integrate vercel refresh`",
             REL_CLAUDE_SKILL
         ));
+        return Ok(outcome);
+    }
+
+    // Pre-seeded path: bypass list+match entirely, just validate via get.
+    if let Some(preseed_id) = preseed_project_id {
+        let basename = repo_basename(repo_root);
+        let project = match client
+            .get_project(preseed_id)
+            .with_context(|| format!("validating pre-seeded vercel id {preseed_id}"))?
+        {
+            Some(p) => p,
+            None => {
+                outcome.summary.push(format!(
+                    "vercel project '{preseed_id}' not found via MCP; skipping. \
+                     Pass a different --vercel <id> or omit the flag to fall back to the picker."
+                ));
+                return Ok(outcome);
+            }
+        };
+        let ctx = RenderContext {
+            repo_name: basename,
+            projects: vec![project],
+        };
+        let claude_doc = render_skill(&ctx, TemplateTarget::Claude);
+        let cursor_doc = render_skill(&ctx, TemplateTarget::Cursor);
+        write_file(&claude_skill, &claude_doc)?;
+        write_file(&repo_root.join(REL_CLAUDE_REFS), TEMPLATE_COMMON_TASKS)?;
+        write_file(&repo_root.join(REL_CURSOR_SKILL), &cursor_doc)?;
+        outcome.status = IntegrationStatus::Configured;
+        outcome.files = vec![
+            PathBuf::from(REL_CLAUDE_SKILL),
+            PathBuf::from(REL_CLAUDE_REFS),
+            PathBuf::from(REL_CURSOR_SKILL),
+        ];
+        outcome
+            .summary
+            .push(format!("captured pre-seeded Vercel id {preseed_id}; wrote 3 files"));
         return Ok(outcome);
     }
 
@@ -1659,6 +1729,95 @@ mod tests {
             "content": [{"type":"text","text":"auth failure"}]
         });
         assert!(parse_get_project(&v).is_err());
+    }
+
+    // --- locate_repo_root sentinel -------------------------------------
+
+    #[test]
+    fn locate_repo_root_errors_outside_a_project() {
+        // CWD is a fresh tmp dir with no markers. locate_repo_root() must
+        // refuse to fall back to it. We cd via std::env::set_current_dir;
+        // restore in a guard.
+        let tmp = TempDir::new().unwrap();
+        let prev = std::env::current_dir().unwrap();
+        struct Guard(std::path::PathBuf);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                let _ = std::env::set_current_dir(&self.0);
+            }
+        }
+        let _g = Guard(prev);
+        std::env::set_current_dir(tmp.path()).unwrap();
+        // This test is racy across other tests that also set_current_dir;
+        // best-effort. If the helper happens to find a git repo above the
+        // tempdir, skip — only assert that absent any sentinel + no git
+        // repo, the fn errors. We can't easily induce that condition
+        // reliably across CI environments, so the test is best-effort
+        // and only fails if locate_repo_root returns the bare tmp path
+        // (i.e., the silent-fallback bug is present).
+        if let Ok(p) = locate_repo_root() {
+            // Acceptable only if the resolved path is NOT the bare tmp dir.
+            assert_ne!(
+                p.canonicalize().unwrap_or(p.clone()),
+                tmp.path().canonicalize().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn locate_repo_root_accepts_dir_with_cargo_toml_sentinel() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("Cargo.toml"), "[package]\nname=\"x\"\nversion=\"0.1\"\nedition=\"2024\"\n").unwrap();
+        let prev = std::env::current_dir().unwrap();
+        struct Guard(std::path::PathBuf);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                let _ = std::env::set_current_dir(&self.0);
+            }
+        }
+        let _g = Guard(prev);
+        std::env::set_current_dir(tmp.path()).unwrap();
+        // Either git toplevel returns a sane path or sentinel fallback
+        // accepts the cwd. Both are valid; we just require Ok.
+        let _ = locate_repo_root().unwrap();
+    }
+
+    // --- Preseed init path ---------------------------------------------
+
+    #[test]
+    fn init_with_preseed_writes_files_when_id_resolves() {
+        let (_tmp, root) = make_repo_with_name("anything");
+        std::fs::write(root.join("vercel.json"), "{}").unwrap();
+        let client = MockVercelClient::new(vec![proj("prj_seed", "wholly-different-name", "team_a")]);
+
+        let outcome = init_with_preseed(&root, &client, Some("prj_seed")).unwrap();
+        assert_eq!(outcome.status, IntegrationStatus::Configured);
+        let claude = std::fs::read_to_string(root.join(REL_CLAUDE_SKILL)).unwrap();
+        assert!(claude.contains("prj_seed"));
+        // Pre-seed bypasses list_projects entirely.
+        assert_eq!(*client.list_calls.borrow(), 0);
+        // But it does call get_project to validate.
+        assert!(client
+            .get_calls
+            .borrow()
+            .iter()
+            .any(|c| c == "prj_seed"));
+    }
+
+    #[test]
+    fn init_with_preseed_skips_when_id_not_found() {
+        let (_tmp, root) = make_repo_with_name("anything");
+        std::fs::write(root.join("vercel.json"), "{}").unwrap();
+        let mut client = MockVercelClient::new(vec![]);
+        client.stale_ids.push("prj_unknown".to_string());
+
+        let outcome =
+            init_with_preseed(&root, &client, Some("prj_unknown")).unwrap();
+        assert_eq!(outcome.status, IntegrationStatus::Skipped);
+        assert!(outcome
+            .summary
+            .iter()
+            .any(|s| s.contains("not found via MCP")));
     }
 
     #[test]

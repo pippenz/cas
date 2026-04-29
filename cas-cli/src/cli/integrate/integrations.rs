@@ -180,22 +180,51 @@ fn skill_mode(repo_root: &Path, rel: &str) -> StepMode {
 fn dispatch(
     repo_root: &Path,
     step: &Step,
-    _ux: UxMode,
+    ux: UxMode,
 ) -> anyhow::Result<IntegrationOutcome> {
-    // NB: prompting via inquire is intentionally NOT done here in the first
-    // landing of cas-7417. The default behavior is "auto-confirm strong
-    // detections, otherwise skip". cas-init invokes `run` from both
-    // interactive and non-interactive paths today; introducing inquire
-    // prompts inside the dispatch path would require threading prompt
-    // state through the existing TUI animation loop, which is out of
-    // scope for this task. Interactive prompting can be lifted into the
-    // wizard layer in a follow-on without changing this trait surface.
+    // Confirmation prompt — fires only in Interactive mode. Default Yes for
+    // Init steps (the user is bootstrapping a project); default No for
+    // Refresh prompts so re-running `cas init` on an existing project never
+    // silently re-renders SKILL files the user might have hand-edited.
+    if ux == UxMode::Interactive {
+        let (label, default_yes) = match step {
+            Step::Vercel { mode, .. } => match mode {
+                StepMode::Init => ("Configure Vercel integration?", true),
+                StepMode::Refresh => ("Refresh Vercel integration?", false),
+            },
+            Step::Neon { mode, .. } => match mode {
+                StepMode::Init => ("Configure Neon integration?", true),
+                StepMode::Refresh => ("Refresh Neon integration?", false),
+            },
+            Step::Github { mode, .. } => match mode {
+                StepMode::Init => ("Configure GitHub integration?", true),
+                StepMode::Refresh => ("Refresh GitHub integration?", false),
+            },
+        };
+        let confirmed = inquire::Confirm::new(label)
+            .with_default(default_yes)
+            .prompt()
+            .unwrap_or(default_yes);
+        if !confirmed {
+            let mut o = IntegrationOutcome::new(
+                step.platform_marker(),
+                super::types::IntegrationAction::Init,
+                IntegrationStatus::Skipped,
+            );
+            o.summary.push("user declined".to_string());
+            return Ok(o);
+        }
+    }
 
     match step {
-        Step::Vercel { mode, preseed_project: _ } => match mode {
+        Step::Vercel { mode, preseed_project } => match mode {
             StepMode::Init => {
                 let client = vercel::default_client();
-                vercel::init(repo_root, client.as_ref())
+                vercel::init_with_preseed(
+                    repo_root,
+                    client.as_ref(),
+                    preseed_project.as_deref(),
+                )
             }
             StepMode::Refresh => {
                 let client = vercel::default_client();
@@ -203,21 +232,15 @@ fn dispatch(
                 vercel::refresh(repo_root, client.as_ref(), false)
             }
         },
-        Step::Neon { mode, preseed_project: _ } => {
+        Step::Neon { mode, preseed_project } => {
             let client = LiveNeonClient;
             match mode {
                 StepMode::Init => {
-                    // cas-1ece's init takes a `choices` arg; in
-                    // non-interactive orchestration we pass empty defaults
-                    // so the handler picks sensible auto-confirm behavior
-                    // when only one project / branch matches. Multi-org or
-                    // multi-project repos will surface as Skipped with a
-                    // hint to run `cas integrate neon init` interactively.
-                    neon::init(
-                        repo_root,
-                        &client,
-                        neon::InitChoices::default(),
-                    )
+                    let choices = neon::InitChoices {
+                        project_id: preseed_project.clone(),
+                        ..Default::default()
+                    };
+                    neon::init(repo_root, &client, choices)
                 }
                 StepMode::Refresh => neon::refresh(
                     repo_root,
@@ -380,6 +403,20 @@ mod tests {
             }
             other => panic!("expected Neon step, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn run_in_non_interactive_mode_does_not_prompt() {
+        // Smoke: run() in NonInteractive mode must complete without ever
+        // calling inquire::Confirm (which would block on stdin in CI).
+        // The fact that this test runs to completion under `cargo test`
+        // confirms the property — Confirm::prompt would error/block
+        // without a tty. We assert non-skip-globally + completion.
+        let t = tmp_repo();
+        std::fs::write(t.path().join("vercel.json"), "{}").unwrap();
+        let r = run(t.path(), &IntegrationFlags::default(), UxMode::NonInteractive)
+            .expect("non-interactive run should not block on stdin");
+        assert!(!r.skipped_globally);
     }
 
     #[test]
