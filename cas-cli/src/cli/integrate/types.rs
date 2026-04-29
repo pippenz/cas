@@ -9,10 +9,8 @@
 
 use std::path::PathBuf;
 
-use clap::ValueEnum;
-
 /// Which third-party platform an integration targets.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Platform {
     Vercel,
     Neon,
@@ -75,6 +73,18 @@ pub enum IntegrationStatus {
     Stale,
     /// User declined the prompt or platform not detected.
     Skipped,
+}
+
+impl IntegrationStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IntegrationStatus::Configured => "configured",
+            IntegrationStatus::Refreshed => "refreshed",
+            IntegrationStatus::AlreadyConfigured => "already-configured",
+            IntegrationStatus::Stale => "stale",
+            IntegrationStatus::Skipped => "skipped",
+        }
+    }
 }
 
 /// Structured result of an integration action.

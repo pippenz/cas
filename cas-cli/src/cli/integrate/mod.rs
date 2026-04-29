@@ -59,7 +59,7 @@ pub enum IntegrateCommands {
 }
 
 /// `cas integrate <platform> <action>` — pick an action.
-#[derive(Subcommand, Debug)]
+#[derive(Subcommand, Debug, Clone, Copy)]
 pub enum PlatformAction {
     /// First-time setup: detect platform, prompt, write SKILL files.
     Init,
@@ -69,9 +69,9 @@ pub enum PlatformAction {
     Verify,
 }
 
-impl PlatformAction {
-    fn to_action(&self) -> IntegrationAction {
-        match self {
+impl From<PlatformAction> for IntegrationAction {
+    fn from(p: PlatformAction) -> Self {
+        match p {
             PlatformAction::Init => IntegrationAction::Init,
             PlatformAction::Refresh => IntegrationAction::Refresh,
             PlatformAction::Verify => IntegrationAction::Verify,
@@ -83,9 +83,9 @@ impl PlatformAction {
 /// error pointing at its owning task — see module docs.
 pub fn execute(cmd: &IntegrateCommands, _cli: &Cli) -> anyhow::Result<()> {
     let outcome = match cmd {
-        IntegrateCommands::Vercel { action } => vercel::execute(action.to_action())?,
-        IntegrateCommands::Neon { action } => neon::execute(action.to_action())?,
-        IntegrateCommands::Github { action } => github::execute(action.to_action())?,
+        IntegrateCommands::Vercel { action } => vercel::execute((*action).into())?,
+        IntegrateCommands::Neon { action } => neon::execute((*action).into())?,
+        IntegrateCommands::Github { action } => github::execute((*action).into())?,
     };
     render_outcome(&outcome);
     Ok(())
@@ -93,10 +93,10 @@ pub fn execute(cmd: &IntegrateCommands, _cli: &Cli) -> anyhow::Result<()> {
 
 fn render_outcome(outcome: &IntegrationOutcome) {
     println!(
-        "{} {}: {:?}",
+        "{} {}: {}",
         outcome.platform.as_str(),
         outcome.action.as_str(),
-        outcome.status
+        outcome.status.as_str()
     );
     for line in &outcome.summary {
         println!("  {line}");
@@ -127,9 +127,9 @@ mod tests {
 
     fn dispatch(cmd: &IntegrateCommands) -> anyhow::Result<IntegrationOutcome> {
         match cmd {
-            IntegrateCommands::Vercel { action } => vercel::execute(action.to_action()),
-            IntegrateCommands::Neon { action } => neon::execute(action.to_action()),
-            IntegrateCommands::Github { action } => github::execute(action.to_action()),
+            IntegrateCommands::Vercel { action } => vercel::execute((*action).into()),
+            IntegrateCommands::Neon { action } => neon::execute((*action).into()),
+            IntegrateCommands::Github { action } => github::execute((*action).into()),
         }
     }
 

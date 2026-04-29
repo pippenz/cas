@@ -14,10 +14,27 @@
 //! - Markers must be on their own line (leading/trailing whitespace ignored).
 //! - Nested keep blocks are not supported.
 //! - When a block is opened with a name, its close marker must use the same name.
+//! - Input is normalized: a leading UTF-8 BOM is stripped, and trailing `\r`
+//!   on each line is stripped before classification (so CRLF-terminated files
+//!   parse identically to LF). The output of [`merge`] is normalized to LF
+//!   regardless of input EOL convention.
 //!
 //! ## Merge semantics
 //!
 //! See [`MergeMode`] for the two flows (regenerate vs refresh).
+//!
+//! ## Recommendation for downstream consumers
+//!
+//! **Prefer named keep blocks** (`<!-- keep vercel-ids -->`) over unnamed ones
+//! when generating SKILL.md from templates that may be revised over time.
+//! Unnamed blocks match by ordinal position; reordering or adding/removing a
+//! block in a future template revision will silently misroute user content.
+//! Named blocks match by name and survive structural revisions.
+//!
+//! Callers that care about user data integrity on regen should call
+//! [`orphaned_existing`] before [`merge`] to detect keep blocks present in
+//! the existing file but absent from the new template, and surface them via
+//! `IntegrationOutcome.summary` rather than silently dropping content.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -113,11 +130,26 @@ fn parse_close(trim: &str) -> Option<Option<String>> {
     })
 }
 
+/// Strip a leading UTF-8 BOM (U+FEFF) if present.
+fn strip_bom(s: &str) -> &str {
+    s.strip_prefix('\u{FEFF}').unwrap_or(s)
+}
+
+/// Strip a trailing `\r` from a line, so CRLF-terminated input parses
+/// identically to LF.
+fn strip_cr(line: &str) -> &str {
+    line.strip_suffix('\r').unwrap_or(line)
+}
+
 /// Extract every keep block from `source`, preserving order.
 ///
 /// Returns an empty vec if no markers are present.
+///
+/// The input is normalized before parsing: a leading UTF-8 BOM is stripped,
+/// and a trailing `\r` on each line is stripped (CRLF tolerance).
 pub fn extract(source: &str) -> Result<Vec<KeepBlock>, KeepBlockError> {
-    let lines: Vec<&str> = source.split('\n').collect();
+    let source = strip_bom(source);
+    let lines: Vec<&str> = source.split('\n').map(strip_cr).collect();
     let mut out: Vec<KeepBlock> = Vec::new();
     // (1-based open line, name, accumulated body lines)
     let mut state: Option<(usize, Option<String>, Vec<&str>)> = None;
@@ -158,7 +190,7 @@ pub fn extract(source: &str) -> Result<Vec<KeepBlock>, KeepBlockError> {
         }
 
         if let Some((_, _, body)) = state.as_mut() {
-            body.push(line);
+            body.push(*line);
         }
     }
 
@@ -166,6 +198,57 @@ pub fn extract(source: &str) -> Result<Vec<KeepBlock>, KeepBlockError> {
         return Err(KeepBlockError::UnmatchedOpen { line: open_line });
     }
     Ok(out)
+}
+
+/// Identify keep blocks present in `existing` but with no matching slot in
+/// `template`. Callers should surface these (e.g. via
+/// `IntegrationOutcome.summary`) before writing the merged content, since
+/// [`merge`] in [`MergeMode::PreserveExisting`] mode will silently drop them.
+///
+/// Matching follows the same rules as [`merge`]: named-by-name, then
+/// unnamed-by-ordinal among the unnamed blocks.
+///
+/// Returns an empty vec if both inputs are well-formed and `existing` has no
+/// blocks beyond what `template` accommodates. Returns the same errors as
+/// [`extract`] for malformed input.
+pub fn orphaned_existing(
+    template: &str,
+    existing: &str,
+) -> Result<Vec<KeepBlock>, KeepBlockError> {
+    let template_blocks = extract(template)?;
+    let existing_blocks = extract(existing)?;
+
+    let mut template_named: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut template_unnamed_count = 0usize;
+    for b in &template_blocks {
+        match &b.name {
+            Some(n) => {
+                template_named.insert(n.clone());
+            }
+            None => template_unnamed_count += 1,
+        }
+    }
+
+    let mut orphans = Vec::new();
+    let mut unnamed_seen = 0usize;
+    for b in existing_blocks {
+        match &b.name {
+            Some(n) => {
+                if !template_named.contains(n) {
+                    orphans.push(b);
+                }
+            }
+            None => {
+                if unnamed_seen >= template_unnamed_count {
+                    orphans.push(b);
+                } else {
+                    unnamed_seen += 1;
+                }
+            }
+        }
+    }
+    Ok(orphans)
 }
 
 /// Merge `template` with an optional `existing` document under [`MergeMode`].
@@ -190,11 +273,11 @@ pub fn merge(
     let _ = extract(template)?;
 
     if mode == MergeMode::PreferTemplate {
-        return Ok(template.to_string());
+        return Ok(strip_bom(template).to_string());
     }
 
     let Some(existing) = existing else {
-        return Ok(template.to_string());
+        return Ok(strip_bom(template).to_string());
     };
 
     let existing_blocks = extract(existing)?;
@@ -209,7 +292,8 @@ pub fn merge(
         }
     }
 
-    let lines: Vec<&str> = template.split('\n').collect();
+    let template = strip_bom(template);
+    let lines: Vec<&str> = template.split('\n').map(strip_cr).collect();
     let mut out_lines: Vec<String> = Vec::with_capacity(lines.len());
     let mut i = 0;
     while i < lines.len() {
@@ -505,5 +589,108 @@ mod tests {
         let blocks = extract(src).unwrap();
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].body, "  body");
+    }
+
+    // --- input normalization (BOM, CRLF) --------------------------------
+
+    #[test]
+    fn extract_strips_leading_bom() {
+        let src = "\u{FEFF}<!-- keep -->\nbody\n<!-- /keep -->\n";
+        let blocks = extract(src).unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].body, "body");
+    }
+
+    #[test]
+    fn extract_tolerates_crlf_line_endings() {
+        // Note: the source uses \r\n separators; the body should not retain \r.
+        let src = "<!-- keep -->\r\nfoo\r\nbar\r\n<!-- /keep -->\r\n";
+        let blocks = extract(src).unwrap();
+        assert_eq!(
+            blocks,
+            vec![KeepBlock {
+                name: None,
+                body: "foo\nbar".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn merge_normalizes_crlf_input_to_lf_output() {
+        let template = "intro\r\n<!-- keep -->\r\nph\r\n<!-- /keep -->\r\nouter\r\n";
+        let existing = "old\r\n<!-- keep -->\r\nuser-edit\r\n<!-- /keep -->\r\nold\r\n";
+        let merged =
+            merge(template, Some(existing), MergeMode::PreserveExisting).unwrap();
+        assert!(!merged.contains('\r'), "merged output should be LF-only: {merged:?}");
+        assert!(merged.contains("user-edit"));
+    }
+
+    // --- named-block direction symmetry ---------------------------------
+
+    #[test]
+    fn extract_named_open_unnamed_close_errors() {
+        let src = "<!-- keep mine -->\nx\n<!-- /keep -->\n";
+        let err = extract(src).unwrap_err();
+        assert_eq!(
+            err,
+            KeepBlockError::NameMismatch {
+                open: Some("mine".to_string()),
+                close: None,
+                line: 3
+            }
+        );
+    }
+
+    // --- PreferTemplate validates template only -------------------------
+
+    #[test]
+    fn merge_prefer_template_ignores_malformed_existing() {
+        let template = "<!-- keep -->\nfresh\n<!-- /keep -->\n";
+        let existing = "<!-- /keep -->\n"; // malformed but should be ignored
+        let merged = merge(template, Some(existing), MergeMode::PreferTemplate).unwrap();
+        assert_eq!(merged, template);
+    }
+
+    // --- orphaned_existing helper ---------------------------------------
+
+    #[test]
+    fn orphaned_existing_returns_empty_when_template_covers_existing() {
+        let template = "<!-- keep -->\nph\n<!-- /keep -->\n";
+        let existing = "<!-- keep -->\nval\n<!-- /keep -->\n";
+        assert_eq!(orphaned_existing(template, existing).unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn orphaned_existing_returns_extra_unnamed_blocks() {
+        let template = "<!-- keep -->\nph\n<!-- /keep -->\n";
+        let existing = concat!(
+            "<!-- keep -->\nfirst\n<!-- /keep -->\n",
+            "<!-- keep -->\nsecond\n<!-- /keep -->\n",
+        );
+        let orphans = orphaned_existing(template, existing).unwrap();
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0].name, None);
+        assert_eq!(orphans[0].body, "second");
+    }
+
+    #[test]
+    fn orphaned_existing_returns_named_blocks_missing_from_template() {
+        let template = "<!-- keep a -->\nph-a\n<!-- /keep a -->\n";
+        let existing = concat!(
+            "<!-- keep a -->\nA-val\n<!-- /keep a -->\n",
+            "<!-- keep b -->\nB-val\n<!-- /keep b -->\n",
+        );
+        let orphans = orphaned_existing(template, existing).unwrap();
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0].name, Some("b".to_string()));
+        assert_eq!(orphans[0].body, "B-val");
+    }
+
+    #[test]
+    fn orphaned_existing_propagates_extract_errors() {
+        let template = "<!-- keep -->\nph\n<!-- /keep -->\n";
+        let existing = "<!-- /keep -->\n";
+        let err = orphaned_existing(template, existing).unwrap_err();
+        assert!(matches!(err, KeepBlockError::UnmatchedClose { .. }));
     }
 }
