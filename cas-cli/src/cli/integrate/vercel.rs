@@ -575,14 +575,25 @@ pub fn verify(
         return Ok(outcome);
     }
 
+    // cas-fc38: distinguish IntegrationStatus::TransportError ("we couldn't
+    // reach Vercel") from IntegrationStatus::Stale ("Vercel answered, the
+    // recorded id no longer exists"). When both are observed, drift wins —
+    // a confirmed-missing project is more actionable than a transport blip
+    // on another id.
     let mut statuses: BTreeMap<String, IdStatus> = BTreeMap::new();
     let mut any_stale = false;
+    let mut any_transport_error = false;
     for id in &recorded_ids {
-        let status = match client.get_project(id)? {
-            Some(_) => IdStatus::Ok,
-            None => {
+        let status = match client.get_project(id) {
+            Ok(Some(_)) => IdStatus::Ok,
+            Ok(None) => {
                 any_stale = true;
                 IdStatus::Stale
+            }
+            Err(e) => {
+                any_transport_error = true;
+                outcome.summary.push(format!("{id}: transport error: {e:#}"));
+                continue;
             }
         };
         statuses.insert(id.clone(), status);
@@ -593,6 +604,8 @@ pub fn verify(
     }
     outcome.status = if any_stale {
         IntegrationStatus::Stale
+    } else if any_transport_error {
+        IntegrationStatus::TransportError
     } else {
         IntegrationStatus::Configured
     };
@@ -1115,6 +1128,76 @@ mod tests {
         let claude = std::fs::read_to_string(root.join(REL_CLAUDE_SKILL)).unwrap();
         assert!(claude.contains("prj_1"));
         assert!(claude.contains("<!-- keep vercel-ids -->"));
+    }
+
+    #[test]
+    fn verify_routes_get_project_error_to_transport_error_status() {
+        // cas-fc38: Verify must not collapse a transport blip into Stale.
+        // Bespoke client returns Err on get_project; status must be
+        // TransportError, not Stale.
+        struct ErrClient {
+            inner: MockVercelClient,
+        }
+        impl VercelClient for ErrClient {
+            fn list_projects(&self) -> anyhow::Result<Vec<ProjectSummary>> {
+                self.inner.list_projects()
+            }
+            fn get_project(&self, _id: &str) -> anyhow::Result<Option<ProjectSummary>> {
+                anyhow::bail!("network unreachable")
+            }
+        }
+        let (_tmp, root) = make_repo_with_name("acme-app");
+        std::fs::write(root.join("vercel.json"), "{}").unwrap();
+        let inner = MockVercelClient::new(vec![proj("prj_1", "acme-app", "team_a")]);
+        let _ = init(&root, &inner).unwrap();
+        let err_client = ErrClient { inner };
+        let outcome = verify(&root, &err_client).unwrap();
+        assert_eq!(outcome.status, IntegrationStatus::TransportError);
+        let joined = outcome.summary.join("\n");
+        assert!(
+            joined.contains("transport error"),
+            "summary should label transport error: {joined}"
+        );
+    }
+
+    #[test]
+    fn verify_drift_wins_over_transport_error() {
+        // Two recorded ids: one Ok(None) (stale), one Err (transport).
+        // Stale must win (drift is more actionable).
+        struct MixedClient {
+            inner: MockVercelClient,
+        }
+        impl VercelClient for MixedClient {
+            fn list_projects(&self) -> anyhow::Result<Vec<ProjectSummary>> {
+                self.inner.list_projects()
+            }
+            fn get_project(&self, id: &str) -> anyhow::Result<Option<ProjectSummary>> {
+                if id == "prj_2" {
+                    anyhow::bail!("flaky network")
+                } else {
+                    self.inner.get_project(id)
+                }
+            }
+        }
+        let (_tmp, root) = make_repo_with_name("acme-app");
+        std::fs::write(root.join("vercel.json"), "{}").unwrap();
+        let mut inner = MockVercelClient::new(vec![
+            proj("prj_1", "acme-app", "team_a"),
+            proj("prj_2", "acme-app-staging", "team_a"),
+        ]);
+        // Pretend prj_1 was deleted upstream → get_project returns None.
+        inner.stale_ids = vec!["prj_1".into()];
+        // Hand-write a SKILL.md with both ids in the keep block so verify
+        // sees both rather than going through init's match path.
+        let skill_path = root.join(REL_CLAUDE_SKILL);
+        std::fs::create_dir_all(skill_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &skill_path,
+            "<!-- keep vercel-ids -->\n| | | |\n| - | `prj_1` | - |\n| - | `prj_2` | - |\n<!-- /keep vercel-ids -->\n",
+        ).unwrap();
+        let mixed = MixedClient { inner };
+        let outcome = verify(&root, &mixed).unwrap();
+        assert_eq!(outcome.status, IntegrationStatus::Stale);
     }
 
     #[test]
