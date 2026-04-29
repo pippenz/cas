@@ -61,6 +61,33 @@ const CLAUDE_SKILL: &str = ".claude/skills/neon-database/SKILL.md";
 const CLAUDE_QUERIES: &str = ".claude/skills/neon-database/references/queries.md";
 const CURSOR_SKILL: &str = ".cursor/skills/neon-database/SKILL.md";
 
+// --- Detection sentinels ---------------------------------------------------
+//
+// Hoisted to module-top per cas-fc38 / sibling-handler convention (vercel.rs,
+// github.rs). Lets a future reader scan the file and immediately see what
+// project signals this handler probes for, without spelunking through fn
+// bodies.
+const PACKAGE_JSON: &str = "package.json";
+const NEONDATABASE_DEP_PREFIX: &str = "\"@neondatabase/";
+const NEON_PRISMA_ADAPTER_DEP: &str = "\"@prisma/adapter-neon\"";
+const PRISMA_NEON_URL_MARKER: &str = "neon.tech";
+
+/// Well-known prisma schema locations probed during detection. Extending this
+/// list to support a new monorepo layout is the supported customisation point.
+const PRISMA_SCHEMA_PATHS: &[&str] = &[
+    "prisma/schema.prisma",
+    "apps/backend/prisma/schema.prisma",
+    "apps/api/prisma/schema.prisma",
+    "packages/db/prisma/schema.prisma",
+];
+
+// --- Keep-block name -------------------------------------------------------
+
+/// Name of the canonical IDs keep block in the rendered SKILL.md. Centralised
+/// so the template, refresh, verify, and orphan-detection paths can't drift
+/// out of sync on the marker spelling.
+const KEEP_IDS_BLOCK: &str = "neon-ids";
+
 // --- Public types ----------------------------------------------------------
 
 /// A Neon organization, as returned by `list_organizations`.
@@ -151,32 +178,25 @@ impl NeonDetection {
 pub fn detect(repo_root: &Path) -> NeonDetection {
     let mut out = NeonDetection::default();
 
-    // Probe well-known prisma locations. New monorepo layouts can be added
-    // by extending this list.
-    const PRISMA_PATHS: &[&str] = &[
-        "prisma/schema.prisma",
-        "apps/backend/prisma/schema.prisma",
-        "apps/api/prisma/schema.prisma",
-        "packages/db/prisma/schema.prisma",
-    ];
-    for rel in PRISMA_PATHS {
+    // Probe well-known prisma locations from the module-top sentinel list.
+    for rel in PRISMA_SCHEMA_PATHS {
         if out.prisma_neon_url {
             break;
         }
         // Use read_capped (cas-fc38) so an oversized or symlinked
         // schema.prisma can't redirect us into ~/.ssh or balloon memory.
         if let Ok(prisma) = super::fs::read_capped(&repo_root.join(rel)) {
-            if prisma.contains("neon.tech") {
+            if prisma.contains(PRISMA_NEON_URL_MARKER) {
                 out.prisma_neon_url = true;
             }
         }
     }
 
-    if let Ok(pkg) = super::fs::read_capped(&repo_root.join("package.json")) {
+    if let Ok(pkg) = super::fs::read_capped(&repo_root.join(PACKAGE_JSON)) {
         // Cheap structural check: any `"@neondatabase/...": ` or
         // `"@prisma/adapter-neon": ` is enough — we don't care about which
         // dep section.
-        if pkg.contains("\"@neondatabase/") || pkg.contains("\"@prisma/adapter-neon\"") {
+        if pkg.contains(NEONDATABASE_DEP_PREFIX) || pkg.contains(NEON_PRISMA_ADAPTER_DEP) {
             out.package_neon_dep = true;
         }
     }
@@ -507,7 +527,7 @@ pub fn refresh<C: NeonClient>(
                 })?;
                 let has_neon_ids = blocks
                     .iter()
-                    .any(|b| b.name.as_deref() == Some("neon-ids"));
+                    .any(|b| b.name.as_deref() == Some(KEEP_IDS_BLOCK));
                 if !has_neon_ids {
                     return Err(anyhow!(
                         "{label} is missing the `<!-- keep neon-ids -->` block — refusing to write template placeholder values. Run `cas integrate neon init` to regenerate, or restore the keep block manually."
@@ -674,31 +694,46 @@ fn blank_template_context(basename: String) -> TemplateContext {
 }
 
 fn render_template(template: &str, ctx: &TemplateContext) -> String {
+    use super::md::{escape_md_cell, escape_md_cell_code};
+
+    // cas-fc38: every platform-supplied string spliced into a markdown
+    // cell goes through escape_md_cell / escape_md_cell_code so a value
+    // containing `|`, `<!--`, `-->`, CR/LF, or backticks cannot corrupt
+    // the surrounding table or keep markers. Branch names are
+    // user-controlled at the Neon dashboard (and so are project
+    // basenames in monorepos), so this is not theoretical.
     let branch_rows = if ctx.branch_map.is_empty() {
         "| **branches** | _none recorded_ |".to_string()
     } else {
         ctx.branch_map
             .iter()
             .map(|(label, branch)| {
-                format!("| **{} branchId** | `{}` (name: `{}`) |", label, branch.id, branch.name)
+                format!(
+                    "| **{} branchId** | `{}` (name: `{}`) |",
+                    escape_md_cell(label),
+                    escape_md_cell_code(&branch.id),
+                    escape_md_cell_code(&branch.name),
+                )
             })
             .collect::<Vec<_>>()
             .join("\n")
     };
-    // cas-fc38: the cas:full_name tag goes through super::md::emit_cas_full_name_tag
-    // so an org/project id containing literal `-->` (or CR/LF) cannot corrupt
-    // the surrounding `<!-- keep neon-ids -->` markers. Other substitutions
-    // are scoped to markdown table cells.
+
+    // cas-fc38: the cas:full_name tag goes through emit_cas_full_name_tag
+    // so an org/project id containing literal `-->` (or CR/LF) cannot
+    // corrupt the surrounding `<!-- keep neon-ids -->` markers. Other
+    // substitutions are scoped to markdown table cells and routed through
+    // escape_md_cell_code (which strips backticks too).
     let cas_tag = super::md::emit_cas_full_name_tag(&format!(
         "{}/{}",
         ctx.org_id, ctx.project_id
     ));
     template
         .replace("{{CAS_FULL_NAME_TAG}}", &cas_tag)
-        .replace("{{PROJECT_BASENAME}}", &ctx.project_basename)
-        .replace("{{ORG_ID}}", &ctx.org_id)
-        .replace("{{PROJECT_ID}}", &ctx.project_id)
-        .replace("{{DATABASE_NAME}}", &ctx.database_name)
+        .replace("{{PROJECT_BASENAME}}", &escape_md_cell(&ctx.project_basename))
+        .replace("{{ORG_ID}}", &escape_md_cell_code(&ctx.org_id))
+        .replace("{{PROJECT_ID}}", &escape_md_cell_code(&ctx.project_id))
+        .replace("{{DATABASE_NAME}}", &escape_md_cell_code(&ctx.database_name))
         .replace("{{BRANCH_TABLE_ROWS}}", &branch_rows)
 }
 
@@ -717,7 +752,7 @@ fn parse_keep_payload(existing: &str) -> Result<KeepPayload> {
         .with_context(|| "parsing keep blocks in existing skill file")?;
     let block = blocks
         .into_iter()
-        .find(|b| b.name.as_deref() == Some("neon-ids"))
+        .find(|b| b.name.as_deref() == Some(KEEP_IDS_BLOCK))
         .ok_or_else(|| anyhow!("no `<!-- keep neon-ids -->` block found in existing skill file"))?;
 
     let mut org_id = None;
@@ -1094,6 +1129,90 @@ pub(crate) mod tests {
     // --- Init: happy path --------------------------------------------------
 
     #[test]
+    fn render_template_escapes_branch_name_with_pipes_and_keep_markers() {
+        // cas-fc38 verifier feedback: branch names are user-controlled at the
+        // Neon dashboard. A name with `|`, `<!--`, `-->`, or backticks must
+        // not break the rendered table or corrupt the surrounding
+        // <!-- keep neon-ids --> markers.
+        let ctx = TemplateContext {
+            project_basename: "x".to_string(),
+            org_id: "org".to_string(),
+            project_id: "p".to_string(),
+            database_name: "db".to_string(),
+            branch_map: vec![(
+                "production".to_string(),
+                NeonBranch {
+                    id: "br-1".to_string(),
+                    name: "evil|branch <!-- gotcha -->".to_string(),
+                    is_default: true,
+                },
+            )],
+        };
+        let doc = render_template(TEMPLATE_CLAUDE, &ctx);
+
+        // 1. Keep block must still parse cleanly.
+        let blocks = super::super::keep_block::extract(&doc).expect("keep markers intact");
+        let ids = blocks
+            .iter()
+            .find(|b| b.name.as_deref() == Some(KEEP_IDS_BLOCK))
+            .expect("neon-ids block must exist");
+
+        // 2. The `|` was escaped to `\|` (preserves the cell layout).
+        assert!(
+            ids.body.contains("evil\\|branch"),
+            "literal `|` must be escaped: {body}",
+            body = ids.body
+        );
+        // 3. `<!--` and `-->` were neutralized.
+        assert!(!ids.body.contains("<!-- gotcha"));
+        assert!(ids.body.contains("&lt;!-- gotcha"));
+        assert!(!ids.body.contains("gotcha -->"));
+    }
+
+    #[test]
+    fn render_template_escapes_org_and_project_id_with_pipes() {
+        // Neon ids are typically slug-shaped, but we treat them as
+        // user-controlled per the convention.
+        let ctx = TemplateContext {
+            project_basename: "x".to_string(),
+            org_id: "org|with|pipes".to_string(),
+            project_id: "p`with`backticks".to_string(),
+            database_name: "db".to_string(),
+            branch_map: vec![],
+        };
+        let doc = render_template(TEMPLATE_CLAUDE, &ctx);
+        let blocks = super::super::keep_block::extract(&doc).expect("keep markers intact");
+        let ids = blocks
+            .iter()
+            .find(|b| b.name.as_deref() == Some(KEEP_IDS_BLOCK))
+            .unwrap();
+        // Restrict assertions to the table rows (skip the cas:full_name tag,
+        // which legitimately preserves raw bytes — backticks inside an HTML
+        // comment cannot open a code span).
+        let table_only: String = ids
+            .body
+            .lines()
+            .filter(|l| l.trim_start().starts_with('|'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Pipes in ORG_ID escaped in the table cell.
+        assert!(
+            table_only.contains("org\\|with\\|pipes"),
+            "ORG_ID pipes must be escaped in cell: {table_only}"
+        );
+        // Backticks in PROJECT_ID stripped in the table cell (the rendered
+        // row is `pwithbackticks` after escape_md_cell_code).
+        assert!(
+            table_only.contains("`pwithbackticks`"),
+            "PROJECT_ID backticks must be stripped in cell: {table_only}"
+        );
+        assert!(
+            !table_only.contains("p`with`backticks"),
+            "raw backticks must not appear in any cell: {table_only}"
+        );
+    }
+
+    #[test]
     fn render_template_sanitizes_cas_full_name_tag_against_close_marker() {
         // cas-fc38 autofix: an org_id or project_id containing `-->` or a
         // newline must not corrupt the surrounding `<!-- keep neon-ids -->`
@@ -1110,7 +1229,7 @@ pub(crate) mod tests {
         let blocks = super::super::keep_block::extract(&doc).unwrap();
         let ids_block = blocks
             .iter()
-            .find(|b| b.name.as_deref() == Some("neon-ids"))
+            .find(|b| b.name.as_deref() == Some(KEEP_IDS_BLOCK))
             .expect("neon-ids keep block must still parse");
         let recovered =
             super::super::md::parse_cas_full_name_tag(&ids_block.body).unwrap();
@@ -1386,7 +1505,7 @@ pub(crate) mod tests {
                 1,
                 "{label} template should have exactly one keep block"
             );
-            assert_eq!(blocks[0].name.as_deref(), Some("neon-ids"));
+            assert_eq!(blocks[0].name.as_deref(), Some(KEEP_IDS_BLOCK));
         }
     }
 

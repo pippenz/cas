@@ -52,6 +52,20 @@ const CURSOR_TEMPLATE: &str = include_str!("templates/github/cursor.md.template"
 const CLAUDE_SKILL_REL: &str = ".claude/skills/github-repo/SKILL.md";
 const CURSOR_SKILL_REL: &str = ".cursor/skills/github-repo/SKILL.md";
 
+// --- Detection sentinels --------------------------------------------------
+//
+// Hoisted to module-top per cas-fc38 / sibling-handler convention
+// (vercel.rs, neon.rs). A new GitHub URL form (a private GitHub Enterprise
+// host, say) can be supported by adding to GITHUB_HTTPS_PREFIXES; the body
+// of `parse_origin_url` reads top-down and treats unknown forms as
+// non-GitHub.
+const GITHUB_SCP_PREFIX: &str = "git@github.com:";
+const GITHUB_SSH_URL_PREFIX: &str = "ssh://git@github.com/";
+const GITHUB_HTTPS_PREFIXES: &[&str] = &["https://github.com/", "http://github.com/"];
+
+/// Name of the canonical IDs keep block in the rendered SKILL.md.
+const KEEP_GITHUB_BLOCK: &str = "github-repo";
+
 /// `cas integrate github <action>` — github-specific subcommand.
 ///
 /// The `--repo OWNER/REPO` flag overrides auto-detection from `git remote -v`,
@@ -145,18 +159,18 @@ pub fn parse_origin_url(url: &str) -> Option<RepoRef> {
     }
 
     // SCP-like SSH form: git@github.com:owner/repo[.git]
-    if let Some(rest) = url.strip_prefix("git@github.com:") {
+    if let Some(rest) = url.strip_prefix(GITHUB_SCP_PREFIX) {
         return split_owner_repo(rest);
     }
 
     // ssh://git@github.com/owner/repo[.git]
-    if let Some(rest) = url.strip_prefix("ssh://git@github.com/") {
+    if let Some(rest) = url.strip_prefix(GITHUB_SSH_URL_PREFIX) {
         return split_owner_repo(rest);
     }
 
     // https://github.com/... or http://github.com/...
-    for prefix in ["https://github.com/", "http://github.com/"] {
-        if let Some(rest) = url.strip_prefix(prefix) {
+    for prefix in GITHUB_HTTPS_PREFIXES {
+        if let Some(rest) = url.strip_prefix(*prefix) {
             return split_owner_repo(rest);
         }
     }
@@ -385,7 +399,7 @@ fn recorded_full_name(existing: &str) -> anyhow::Result<Option<String>> {
         .map_err(|e| anyhow::anyhow!("malformed SKILL.md keep block: {e}"))?;
     let Some(block) = blocks
         .into_iter()
-        .find(|b| b.name.as_deref() == Some("github-repo"))
+        .find(|b| b.name.as_deref() == Some(KEEP_GITHUB_BLOCK))
     else {
         return Ok(None);
     };
@@ -1011,7 +1025,7 @@ name: github-repo
         let blocks = super::super::keep_block::extract(&rendered).unwrap();
         let github_block = blocks
             .iter()
-            .find(|b| b.name.as_deref() == Some("github-repo"))
+            .find(|b| b.name.as_deref() == Some(KEEP_GITHUB_BLOCK))
             .expect("keep block must still parse");
         // The cas:full_name tag must still parse and round-trip the
         // sanitized value (with `-->` neutralized).
@@ -1067,7 +1081,7 @@ name: github-repo
         let blocks = super::super::keep_block::extract(&claude).unwrap();
         let github_block = blocks
             .iter()
-            .find(|b| b.name.as_deref() == Some("github-repo"))
+            .find(|b| b.name.as_deref() == Some(KEEP_GITHUB_BLOCK))
             .expect("github-repo keep block must exist");
         assert!(
             super::super::md::parse_cas_full_name_tag(&github_block.body).is_some(),
