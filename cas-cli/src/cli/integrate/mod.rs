@@ -164,13 +164,23 @@ mod tests {
 
     #[test]
     fn neon_subcommand_parses_cleanly() {
-        // cas-1ece landed the real handler. The stub assertion is gone;
-        // the dispatch itself may error in a sandbox (no cwd / no detection /
-        // live-client placeholder), but parsing must succeed for all three
-        // verbs.
+        // cas-1ece landed the real handler. The dispatch itself may error in
+        // a sandbox (LiveNeonClient is a placeholder; no detection signals in
+        // the test cwd), but parsing must succeed for all three verbs and the
+        // dispatch arm must exist — assert on the error shape so a regression
+        // that removes the arm or swaps it for a clap-parse error is caught.
         for action in ["init", "refresh", "verify"] {
             let cmd = parse(&["neon", action]);
-            let _ = dispatch(&cmd);
+            match dispatch(&cmd) {
+                Ok(_) => {}
+                Err(e) => {
+                    let msg = format!("{e:#}").to_lowercase();
+                    assert!(
+                        !msg.contains("unrecognized") && !msg.contains("unknown subcommand"),
+                        "{action} dispatch produced a parse-shaped error: {msg}"
+                    );
+                }
+            }
         }
     }
 

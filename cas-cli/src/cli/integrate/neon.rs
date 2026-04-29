@@ -110,20 +110,21 @@ pub trait NeonClient {
 /// actionable error.
 pub struct LiveNeonClient;
 
+const LIVE_NOT_WIRED: &str =
+    "live Neon client not yet wired — invoke `cas integrate neon` through the integration skill that fans out to MCP, or pass a fixture via the test API";
+
 impl NeonClient for LiveNeonClient {
     fn list_organizations(&self) -> Result<Vec<NeonOrg>> {
-        Err(anyhow!(
-            "live Neon client not yet wired — invoke `cas integrate neon` through the integration skill that fans out to MCP, or pass a fixture via the test API"
-        ))
+        Err(anyhow!(LIVE_NOT_WIRED))
     }
     fn list_projects(&self, _org_id: &str) -> Result<Vec<NeonProject>> {
-        Err(anyhow!("live Neon client not yet wired"))
+        Err(anyhow!(LIVE_NOT_WIRED))
     }
     fn describe_project(&self, _org_id: &str, _project_id: &str) -> Result<NeonProjectDetail> {
-        Err(anyhow!("live Neon client not yet wired"))
+        Err(anyhow!(LIVE_NOT_WIRED))
     }
     fn describe_branch(&self, _o: &str, _p: &str, _b: &str) -> Result<bool> {
-        Err(anyhow!("live Neon client not yet wired"))
+        Err(anyhow!(LIVE_NOT_WIRED))
     }
 }
 
@@ -150,15 +151,19 @@ impl NeonDetection {
 pub fn detect(repo_root: &Path) -> NeonDetection {
     let mut out = NeonDetection::default();
 
-    if let Ok(prisma) = fs::read_to_string(repo_root.join("prisma/schema.prisma")) {
-        if prisma.contains("neon.tech") {
-            out.prisma_neon_url = true;
+    // Probe well-known prisma locations. New monorepo layouts can be added
+    // by extending this list.
+    const PRISMA_PATHS: &[&str] = &[
+        "prisma/schema.prisma",
+        "apps/backend/prisma/schema.prisma",
+        "apps/api/prisma/schema.prisma",
+        "packages/db/prisma/schema.prisma",
+    ];
+    for rel in PRISMA_PATHS {
+        if out.prisma_neon_url {
+            break;
         }
-    }
-    // Common monorepo location too.
-    if !out.prisma_neon_url {
-        if let Ok(prisma) = fs::read_to_string(repo_root.join("apps/backend/prisma/schema.prisma"))
-        {
+        if let Ok(prisma) = fs::read_to_string(repo_root.join(rel)) {
             if prisma.contains("neon.tech") {
                 out.prisma_neon_url = true;
             }
@@ -188,9 +193,10 @@ pub fn detect(repo_root: &Path) -> NeonDetection {
 /// Order is preserved from the input. Stable, deterministic output suitable
 /// for templating into the keep block.
 pub fn map_branches(branches: &[NeonBranch]) -> Vec<(String, NeonBranch)> {
-    let mut out = Vec::new();
+    let mut out: Vec<(String, NeonBranch)> = Vec::new();
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for b in branches {
-        let label = if b.is_default {
+        let base = if b.is_default {
             "production".to_string()
         } else if b.name == "staging" {
             "staging".to_string()
@@ -199,6 +205,17 @@ pub fn map_branches(branches: &[NeonBranch]) -> Vec<(String, NeonBranch)> {
         } else {
             b.name.clone()
         };
+        // Disambiguate when two branches collide on the same heuristic label
+        // (e.g. `dev-api` and `dev-web` both → `dev`). The first occurrence
+        // keeps the bare label; subsequent occurrences get a numeric suffix
+        // so each row in the keep block carries a unique key.
+        let count = seen.entry(base.clone()).or_insert(0);
+        let label = if *count == 0 {
+            base.clone()
+        } else {
+            format!("{base}-{}", *count + 1)
+        };
+        *count += 1;
         out.push((label, b.clone()));
     }
     out
@@ -424,6 +441,27 @@ pub fn refresh<C: NeonClient>(
         let claude = render_template(TEMPLATE_CLAUDE, &context);
         let cursor = render_template(TEMPLATE_CURSOR, &context);
 
+        // Surface orphan blocks even on the overwrite path: when the user
+        // hand-added a keep block beyond `neon-ids`, PreferTemplate would
+        // silently drop it. Foundation cas-e6b6 review note: call
+        // orphaned_existing before merge regardless of mode.
+        if let Some(existing) = existing_claude.as_deref() {
+            for orphan in keep_block::orphaned_existing(&claude, existing)? {
+                outcome.summary.push(format!(
+                    "warning: --update-ids dropping orphan keep block in {}: name={:?}",
+                    CLAUDE_SKILL, orphan.name
+                ));
+            }
+        }
+        if let Some(existing) = existing_cursor.as_deref() {
+            for orphan in keep_block::orphaned_existing(&cursor, existing)? {
+                outcome.summary.push(format!(
+                    "warning: --update-ids dropping orphan keep block in {}: name={:?}",
+                    CURSOR_SKILL, orphan.name
+                ));
+            }
+        }
+
         // PreferTemplate: caller has fresh keep-block content.
         write_merged(
             repo_root,
@@ -444,10 +482,32 @@ pub fn refresh<C: NeonClient>(
     } else {
         // Preserve keep block; regenerate prose from a deflated template.
         // We feed the template as-is (placeholder values) and let merge
-        // splice the user's keep block into it.
+        // splice the user's keep block into it. If the existing file is
+        // missing the `neon-ids` keep block (e.g. user renamed/deleted it),
+        // splicing would leave the placeholder strings in the rendered
+        // prose — refuse instead of writing junk.
         let context = blank_template_context(repo_basename(repo_root));
         let claude = render_template(TEMPLATE_CLAUDE, &context);
         let cursor = render_template(TEMPLATE_CURSOR, &context);
+
+        for (label, existing_opt) in [
+            (CLAUDE_SKILL, existing_claude.as_deref()),
+            (CURSOR_SKILL, existing_cursor.as_deref()),
+        ] {
+            if let Some(existing) = existing_opt {
+                let blocks = keep_block::extract(existing).with_context(|| {
+                    format!("parsing keep blocks in existing {label}")
+                })?;
+                let has_neon_ids = blocks
+                    .iter()
+                    .any(|b| b.name.as_deref() == Some("neon-ids"));
+                if !has_neon_ids {
+                    return Err(anyhow!(
+                        "{label} is missing the `<!-- keep neon-ids -->` block — refusing to write template placeholder values. Run `cas integrate neon init` to regenerate, or restore the keep block manually."
+                    ));
+                }
+            }
+        }
 
         if let Some(existing) = existing_claude.as_deref() {
             for orphan in keep_block::orphaned_existing(&claude, existing)? {
@@ -680,13 +740,16 @@ fn parse_kv_row(line: &str) -> Option<(String, String)> {
     }
     let label = cells[0].trim().trim_matches('*').trim().to_string();
     let raw_value = cells[1].trim();
-    // Take whatever is between the first pair of backticks.
-    let value = match (raw_value.find('`'), raw_value.rfind('`')) {
-        (Some(s), Some(e)) if e > s => raw_value[s + 1..e].to_string(),
-        _ => raw_value.to_string(),
+    // Pull the *first* backtick span: opening backtick, then the next backtick
+    // strictly after it. If either is missing we fall through to the raw
+    // trimmed cell so callers still get something to inspect.
+    let value = match raw_value.find('`') {
+        Some(s) => match raw_value[s + 1..].find('`') {
+            Some(rel_end) => raw_value[s + 1..s + 1 + rel_end].to_string(),
+            None => raw_value[s + 1..].to_string(),
+        },
+        None => raw_value.to_string(),
     };
-    // Some rows wrap multiple backtick spans; we only want the first.
-    let value = value.split('`').next().unwrap_or(&value).to_string();
     if label.is_empty() {
         return None;
     }
@@ -708,7 +771,10 @@ fn pick_org_interactively(orgs: &[NeonOrg]) -> Result<String> {
     let chosen = Select::new("Multiple Neon orgs available — pick one:", display.clone())
         .prompt()
         .with_context(|| "Neon org selection prompt failed (run with --org-id to bypass)")?;
-    let idx = display.iter().position(|d| d == &chosen).unwrap_or(0);
+    let idx = display
+        .iter()
+        .position(|d| d == &chosen)
+        .ok_or_else(|| anyhow!("inquire returned a selection not present in display list"))?;
     Ok(orgs[idx].id.clone())
 }
 
@@ -738,7 +804,10 @@ fn pick_project(projects: &[NeonProject], basename: &str) -> Result<String> {
     )
     .prompt()
     .with_context(|| "Neon project selection prompt failed (run with --project-id to bypass)")?;
-    let idx = display.iter().position(|d| d == &chosen).unwrap_or(0);
+    let idx = display
+        .iter()
+        .position(|d| d == &chosen)
+        .ok_or_else(|| anyhow!("inquire returned a selection not present in display list"))?;
     Ok(projects[idx].id.clone())
 }
 
@@ -1237,5 +1306,197 @@ pub(crate) mod tests {
             );
             assert_eq!(blocks[0].name.as_deref(), Some("neon-ids"));
         }
+    }
+
+    // --- Reviewer-driven coverage additions (cas-1ece autofix round) -------
+
+    #[test]
+    fn detect_finds_monorepo_apps_backend_path() {
+        let repo = make_repo();
+        let dir = repo.path().join("apps/backend/prisma");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("schema.prisma"),
+            "// neon.tech\ndatasource db { provider=\"postgresql\" }\n",
+        )
+        .unwrap();
+        assert!(detect(repo.path()).prisma_neon_url);
+    }
+
+    #[test]
+    fn map_branches_disambiguates_colliding_dev_labels() {
+        // Two dev-* branches should not collapse to a single `dev` label.
+        let bs = vec![
+            NeonBranch {
+                id: "1".into(),
+                name: "main".into(),
+                is_default: true,
+            },
+            NeonBranch {
+                id: "2".into(),
+                name: "dev-api".into(),
+                is_default: false,
+            },
+            NeonBranch {
+                id: "3".into(),
+                name: "dev-web".into(),
+                is_default: false,
+            },
+        ];
+        let labels: Vec<String> = map_branches(&bs).into_iter().map(|(l, _)| l).collect();
+        assert_eq!(labels, vec!["production", "dev", "dev-2"]);
+    }
+
+    #[test]
+    fn init_errors_when_no_organizations() {
+        let repo = make_repo();
+        write_prisma_with_neon(repo.path());
+        let client = FakeNeonClient::empty(); // no orgs
+        let err = init(repo.path(), &client, InitChoices::default())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no organizations"), "got: {err}");
+    }
+
+    #[test]
+    fn init_errors_when_no_projects_for_org() {
+        let repo = make_repo();
+        write_prisma_with_neon(repo.path());
+        let mut client = FakeNeonClient::empty();
+        client.orgs = vec![NeonOrg {
+            id: "org-only".into(),
+            name: "Solo".into(),
+        }];
+        // No projects registered for org-only.
+        let err = init(repo.path(), &client, InitChoices::default())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no projects"), "got: {err}");
+    }
+
+    #[test]
+    fn init_auto_picks_single_org_without_prompting() {
+        let repo = make_repo();
+        write_prisma_with_neon(repo.path());
+        let mut client = FakeNeonClient::empty();
+        client.orgs = vec![NeonOrg {
+            id: "org-solo".into(),
+            name: "Solo".into(),
+        }];
+        client.projects_by_org.insert(
+            "org-solo".into(),
+            vec![NeonProject {
+                id: "proj-solo".into(),
+                // Match the tempdir basename so pick_project's substring
+                // heuristic accepts it without prompting.
+                name: repo
+                    .path()
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string(),
+            }],
+        );
+        client.details.insert(
+            ("org-solo".into(), "proj-solo".into()),
+            NeonProjectDetail {
+                project: NeonProject {
+                    id: "proj-solo".into(),
+                    name: "anything".into(),
+                },
+                default_database: "neondb".into(),
+                branches: vec![NeonBranch {
+                    id: "br-main".into(),
+                    name: "main".into(),
+                    is_default: true,
+                }],
+            },
+        );
+        let outcome = init(repo.path(), &client, InitChoices::default()).unwrap();
+        assert_eq!(outcome.status, IntegrationStatus::Configured);
+        let claude = fs::read_to_string(repo.path().join(CLAUDE_SKILL)).unwrap();
+        assert!(claude.contains("org-solo"));
+    }
+
+    #[test]
+    fn refresh_default_refuses_when_keep_block_missing() {
+        let repo = make_repo();
+        write_prisma_with_neon(repo.path());
+        // Write a SKILL.md with NO keep-neon-ids block — placeholder leak guard
+        // must refuse rather than write `<org_id>` etc into the user's file.
+        let p = repo.path().join(CLAUDE_SKILL);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(&p, "# manually edited\nno keep block here.\n").unwrap();
+        let client = FakeNeonClient::empty();
+        let err = refresh(repo.path(), &client, RefreshOpts { update_ids: false })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("neon-ids"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_kv_row_extracts_first_backtick_span() {
+        // Branch rows look like: `| **production branchId** | `br-foo` (name: `main`) |`
+        let row = "| **production branchId** | `br-foo` (name: `main`) |";
+        let (label, value) = parse_kv_row(row).unwrap();
+        assert_eq!(label, "production branchId");
+        assert_eq!(
+            value, "br-foo",
+            "first backtick span only (not first-to-last)"
+        );
+    }
+
+    #[test]
+    fn parse_kv_row_returns_none_for_non_table_lines() {
+        assert!(parse_kv_row("# not a table row").is_none());
+        assert!(parse_kv_row("| only one cell").is_none());
+    }
+
+    #[test]
+    fn verify_treats_describe_branch_err_as_stale_with_error_text() {
+        // Bespoke client: describe_branch returns Err for the dev branch.
+        struct ErrClient {
+            inner: FakeNeonClient,
+        }
+        impl NeonClient for ErrClient {
+            fn list_organizations(&self) -> Result<Vec<NeonOrg>> {
+                self.inner.list_organizations()
+            }
+            fn list_projects(&self, o: &str) -> Result<Vec<NeonProject>> {
+                self.inner.list_projects(o)
+            }
+            fn describe_project(&self, o: &str, p: &str) -> Result<NeonProjectDetail> {
+                self.inner.describe_project(o, p)
+            }
+            fn describe_branch(&self, o: &str, p: &str, b: &str) -> Result<bool> {
+                if b == "br-dev" {
+                    Err(anyhow!("network unreachable"))
+                } else {
+                    self.inner.describe_branch(o, p, b)
+                }
+            }
+        }
+
+        let repo = make_repo();
+        write_prisma_with_neon(repo.path());
+        let inner = fixture_with_two_orgs();
+        let client = ErrClient { inner };
+        init(
+            repo.path(),
+            &client,
+            InitChoices {
+                org_id: Some("org-a".into()),
+                project_id: Some("proj-a".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let outcome = verify(repo.path(), &client).unwrap();
+        assert_eq!(outcome.status, IntegrationStatus::Stale);
+        let joined = outcome.summary.join("\n");
+        assert!(
+            joined.contains("network unreachable"),
+            "transport error text should appear in summary: {joined}"
+        );
     }
 }
