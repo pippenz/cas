@@ -789,25 +789,49 @@ mod mcp_proxy_client {
     //! (`.cas/proxy.toml` or `~/.config/code-mode-mcp/config.toml`).
     //!
     //! Wires `mcp__vercel__list_projects` and `mcp__vercel__get_project`
-    //! through `cmcp_core::ProxyEngine`. A tokio current-thread runtime is
-    //! spun up per call (the CLI is otherwise sync) — fine for the
-    //! handful of calls one `cas integrate vercel <action>` makes.
+    //! through `cmcp_core::ProxyEngine`. The runtime + engine are
+    //! lazily-initialized once on first call and reused for the lifetime of
+    //! the client (cas-2dc9). On `Drop`, the engine is shut down inside the
+    //! same runtime so the spawned upstream child process exits cleanly.
     //!
     //! **Live MCP is not exercised by `cargo test`** — the parsers in
     //! [`super::parse_list_projects`] / [`super::parse_get_project`] are
-    //! fixture-tested against canonical Vercel MCP response shapes. The
-    //! transport itself is verified manually.
+    //! fixture-tested. A separate fixture-spawned end-to-end test for the
+    //! ProxyEngine lifecycle lives under `cas-cli/tests/`.
+
+    use std::sync::{Arc, Mutex};
 
     use anyhow::Context;
     use serde_json::Value;
+    use tokio::runtime::Runtime;
 
     use super::{parse_get_project, parse_list_projects, ProjectSummary, VercelClient};
 
-    pub(super) struct ProxyVercelClient;
+    /// Shared (runtime, engine) state. Wrapped in `Mutex<Option<…>>` so we
+    /// can take it on Drop and run shutdown synchronously inside the
+    /// runtime before dropping it.
+    type ProxyState = (Runtime, Arc<cmcp_core::ProxyEngine>);
+
+    pub(super) struct ProxyVercelClient {
+        state: Mutex<Option<ProxyState>>,
+    }
 
     impl ProxyVercelClient {
         pub(super) fn new() -> Self {
-            Self
+            Self {
+                state: Mutex::new(None),
+            }
+        }
+
+        /// Test-visible accessor: true once the engine has been lazily
+        /// constructed. Used to assert engine reuse across multiple calls
+        /// without depending on a live MCP transport.
+        #[cfg(test)]
+        pub(super) fn engine_constructed(&self) -> bool {
+            self.state
+                .lock()
+                .map(|g| g.is_some())
+                .unwrap_or(false)
         }
 
         /// Resolve a proxy config path: first `<cas_root>/proxy.toml` if cas
@@ -820,59 +844,85 @@ mod mcp_proxy_client {
                 .filter(|p| p.exists())
         }
 
-        async fn call(
+        /// Lazily build the (runtime, engine) pair, then run `f` on it.
+        /// Subsequent calls reuse the same engine.
+        fn with_engine<F, T>(&self, f: F) -> anyhow::Result<T>
+        where
+            F: FnOnce(&Runtime, &Arc<cmcp_core::ProxyEngine>) -> anyhow::Result<T>,
+        {
+            let mut guard = self
+                .state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("ProxyVercelClient mutex poisoned"))?;
+            if guard.is_none() {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .context("building tokio runtime")?;
+                let cfg = cmcp_core::config::Config::load_merged(
+                    Self::proxy_config_path().as_deref(),
+                )
+                .context("loading MCP proxy config")?;
+                anyhow::ensure!(
+                    !cfg.servers.is_empty(),
+                    "no MCP servers configured. Run `cas mcp add vercel ...` or check ~/.config/code-mode-mcp/config.toml."
+                );
+                let engine = rt
+                    .block_on(cmcp_core::ProxyEngine::from_configs(cfg.servers))
+                    .context("starting MCP proxy engine")?;
+                *guard = Some((rt, Arc::new(engine)));
+            }
+            let (rt, engine) = guard.as_ref().unwrap();
+            f(rt, engine)
+        }
+
+        async fn call_with_engine(
+            engine: &cmcp_core::ProxyEngine,
             tool: &str,
             args: Option<serde_json::Map<String, Value>>,
         ) -> anyhow::Result<Value> {
-            let cfg = cmcp_core::config::Config::load_merged(
-                Self::proxy_config_path().as_deref(),
-            )
-            .context("loading MCP proxy config")?;
-            anyhow::ensure!(
-                !cfg.servers.is_empty(),
-                "no MCP servers configured. Run `cas mcp add vercel ...` or check ~/.config/code-mode-mcp/config.toml."
-            );
-            let engine = cmcp_core::ProxyEngine::from_configs(cfg.servers)
-                .await
-                .context("starting MCP proxy engine")?;
-            // Run the call; capture Result so we can shut down the engine on
-            // both the success and error paths. Otherwise a transport
-            // failure would leak the spawned upstream MCP child process for
-            // the lifetime of `cas init`.
-            let outcome = engine
+            engine
                 .call_tool("vercel", tool, args)
                 .await
-                .with_context(|| format!("calling vercel.{tool}"));
-            engine.shutdown().await;
-            outcome
+                .with_context(|| format!("calling vercel.{tool}"))
         }
+    }
 
-        fn block_on<F, T>(fut: F) -> anyhow::Result<T>
-        where
-            F: std::future::Future<Output = anyhow::Result<T>>,
-        {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .context("building tokio runtime")?;
-            rt.block_on(fut)
+    impl Drop for ProxyVercelClient {
+        fn drop(&mut self) {
+            // Shut down the engine inside the runtime that owns it. Errors
+            // here are swallowed — Drop can't return them, and an init flow
+            // that already succeeded shouldn't fail at shutdown.
+            if let Ok(mut guard) = self.state.lock() {
+                if let Some((rt, engine)) = guard.take() {
+                    rt.block_on(async move {
+                        engine.shutdown().await;
+                    });
+                    // rt drops here, joining its blocking pool.
+                }
+            }
         }
     }
 
     impl VercelClient for ProxyVercelClient {
         fn list_projects(&self) -> anyhow::Result<Vec<ProjectSummary>> {
-            let value = Self::block_on(Self::call("list_projects", None))?;
+            let value = self.with_engine(|rt, engine| {
+                rt.block_on(Self::call_with_engine(engine, "list_projects", None))
+            })?;
             parse_list_projects(&value)
         }
 
         fn get_project(&self, id: &str) -> anyhow::Result<Option<ProjectSummary>> {
             let mut args = serde_json::Map::new();
             args.insert("projectId".to_string(), Value::String(id.to_string()));
-            let value = Self::block_on(Self::call("get_project", Some(args)))?;
+            let value = self.with_engine(|rt, engine| {
+                rt.block_on(Self::call_with_engine(engine, "get_project", Some(args)))
+            })?;
             parse_get_project(&value)
         }
     }
 }
+
 
 // ---------------------------------------------------------------------------
 // MCP response parsers (fixture-testable, transport-independent).

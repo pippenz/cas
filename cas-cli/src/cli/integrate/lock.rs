@@ -12,16 +12,28 @@
 //! until available, or [`IntegrateLock::try_acquire`] for a fail-fast
 //! variant.
 //!
-//! Owner: task **cas-7417**. Convention: handlers themselves do NOT take the
-//! lock — the orchestration layer (`integrations::run` or a manual
-//! `cas integrate` invocation) wraps the call. This keeps platform handlers
-//! testable in isolation without requiring filesystem state.
+//! Owner: task **cas-7417**, refined by **cas-2dc9** (RO-FS handling).
+//! Convention: handlers themselves do NOT take the lock — the orchestration
+//! layer (`integrations::run` or a manual `cas integrate` invocation) wraps
+//! the call. This keeps platform handlers testable in isolation without
+//! requiring filesystem state.
+//!
+//! ## Read-only operations
+//!
+//! Use [`IntegrateLock::for_action`] in preference to [`IntegrateLock::acquire`].
+//! `Verify` is a read-only action — it never mutates SKILL.md — so on a
+//! read-only filesystem (CI sandboxes, container rootfs layers, some
+//! mounted volumes) we must NOT fail the verify just because we couldn't
+//! create the lockfile. `for_action(repo_root, IntegrationAction::Verify)`
+//! returns `Ok(None)` instead, letting verify succeed.
 
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use fs2::FileExt;
+
+use super::types::IntegrationAction;
 
 const LOCKFILE_NAME: &str = "integrate.lock";
 
@@ -60,6 +72,35 @@ impl IntegrateLock {
     /// Path to the lockfile (mostly for diagnostics).
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Acquire a lock if the action requires one.
+    ///
+    /// `Init` and `Refresh` mutate SKILL.md and need an exclusive lock to
+    /// serialize concurrent invocations — returns `Some(lock)`.
+    ///
+    /// `Verify` is read-only (extracts keep-block IDs, calls MCP, classifies
+    /// status). Acquiring a write-mode lockfile would fail fatally on a
+    /// read-only filesystem (CI sandbox, ROFS layer) for no benefit. This
+    /// path returns `Ok(None)`; the caller proceeds without a lock.
+    pub fn for_action(
+        repo_root: &Path,
+        action: IntegrationAction,
+    ) -> anyhow::Result<Option<Self>> {
+        if action_requires_lock(action) {
+            Ok(Some(Self::acquire(repo_root)?))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+/// True for actions that mutate on-disk state under `<repo>/.claude` /
+/// `<repo>/.cursor`. False for read-only actions.
+pub fn action_requires_lock(action: IntegrationAction) -> bool {
+    match action {
+        IntegrationAction::Init | IntegrationAction::Refresh => true,
+        IntegrationAction::Verify => false,
     }
 }
 
@@ -116,6 +157,48 @@ mod tests {
         }
         let lock = IntegrateLock::try_acquire(tmp.path()).unwrap();
         assert!(lock.is_some(), "lock must be re-acquirable after drop");
+    }
+
+    #[test]
+    fn for_action_init_takes_a_lock() {
+        let tmp = TempDir::new().unwrap();
+        let lock = IntegrateLock::for_action(tmp.path(), IntegrationAction::Init).unwrap();
+        assert!(lock.is_some());
+    }
+
+    #[test]
+    fn for_action_refresh_takes_a_lock() {
+        let tmp = TempDir::new().unwrap();
+        let lock =
+            IntegrateLock::for_action(tmp.path(), IntegrationAction::Refresh).unwrap();
+        assert!(lock.is_some());
+    }
+
+    #[test]
+    fn for_action_verify_is_lock_free() {
+        let tmp = TempDir::new().unwrap();
+        let lock =
+            IntegrateLock::for_action(tmp.path(), IntegrationAction::Verify).unwrap();
+        assert!(lock.is_none(), "verify is read-only — must not require a lock");
+        // No lockfile created on the verify path.
+        assert!(!tmp.path().join(".cas/integrate.lock").exists());
+    }
+
+    #[test]
+    fn for_action_verify_succeeds_in_unwritable_repo_root() {
+        // Simulate a read-only repo by passing a path that doesn't exist
+        // and is not creatable (we don't actually need the FS to be RO —
+        // for_action(Verify) returns None without ever touching the FS).
+        let bogus = std::path::Path::new("/nonexistent-cas-2dc9-test-path");
+        let lock = IntegrateLock::for_action(bogus, IntegrationAction::Verify).unwrap();
+        assert!(lock.is_none());
+    }
+
+    #[test]
+    fn action_requires_lock_matches_expected_actions() {
+        assert!(action_requires_lock(IntegrationAction::Init));
+        assert!(action_requires_lock(IntegrationAction::Refresh));
+        assert!(!action_requires_lock(IntegrationAction::Verify));
     }
 
     #[test]

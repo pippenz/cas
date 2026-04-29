@@ -35,7 +35,6 @@
 //! content. See [`keep_block::merge`] and [`keep_block::orphaned_existing`]
 //! for the merge semantics and the recommended call shape for handlers.
 
-pub mod atomic;
 pub mod doctor;
 pub mod fs;
 pub mod github;

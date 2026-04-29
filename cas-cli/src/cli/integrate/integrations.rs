@@ -69,8 +69,16 @@ pub fn run(
         return Ok(report);
     }
 
-    let _lock = IntegrateLock::acquire(repo_root)
-        .context("acquiring .cas/integrate.lock")?;
+    // Take the lock for the run if any planned step is a write action.
+    // run() today only dispatches Init/Refresh (Verify goes through the
+    // standalone path), so this is always Some — but using `for_action`
+    // keeps the door open for adding Verify dispatch here without
+    // re-introducing the RO-FS regression.
+    let _lock = IntegrateLock::for_action(
+        repo_root,
+        super::types::IntegrationAction::Init,
+    )
+    .context("acquiring .cas/integrate.lock")?;
 
     let plan = build_plan(repo_root, flags);
     if plan.is_empty() {
@@ -156,7 +164,15 @@ fn build_plan(repo_root: &Path, flags: &IntegrationFlags) -> Vec<Step> {
         });
     }
 
-    if repo_root.join(".git").exists() || flags.github_repo.is_some() {
+    // GitHub: only queue the step if `.git` exists AND a github.com remote
+    // is detected, OR the user explicitly passed `--github`. This prevents a
+    // gitlab/bitbucket/codeberg/self-hosted-gitea repo from queueing a
+    // pointless Github step that the handler would only Skip internally.
+    let github_repo_present = match github::detect_repo(repo_root) {
+        Ok(Some(_)) => true,
+        Ok(None) | Err(_) => false,
+    };
+    if github_repo_present || flags.github_repo.is_some() {
         plan.push(Step::Github {
             mode: skill_mode(repo_root, ".claude/skills/github-repo/SKILL.md"),
             repo: flags.github_repo.clone(),
@@ -419,6 +435,67 @@ mod tests {
         let r = run(t.path(), &IntegrationFlags::default(), UxMode::NonInteractive)
             .expect("non-interactive run should not block on stdin");
         assert!(!r.skipped_globally);
+    }
+
+    #[test]
+    fn build_plan_skips_github_when_remote_is_not_github() {
+        // A repo with .git/ but a gitlab origin must NOT queue a Github
+        // step — the handler would only Skip it internally.
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        // Initialize a real git repo with a non-github origin.
+        let git_init = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(repo)
+            .status();
+        if git_init.map(|s| !s.success()).unwrap_or(true) {
+            // git not installed; skip on platforms without it.
+            return;
+        }
+        let _ = std::process::Command::new("git")
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://gitlab.com/owner/repo.git",
+            ])
+            .current_dir(repo)
+            .status();
+
+        let plan = build_plan(repo, &IntegrationFlags::default());
+        let has_github = plan.iter().any(|s| matches!(s, Step::Github { .. }));
+        assert!(
+            !has_github,
+            "gitlab remote must not queue a Github step: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn build_plan_includes_github_when_remote_is_github() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        let git_init = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(repo)
+            .status();
+        if git_init.map(|s| !s.success()).unwrap_or(true) {
+            return;
+        }
+        let _ = std::process::Command::new("git")
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/acme/widgets.git",
+            ])
+            .current_dir(repo)
+            .status();
+
+        let plan = build_plan(repo, &IntegrationFlags::default());
+        assert!(
+            plan.iter().any(|s| matches!(s, Step::Github { .. })),
+            "github.com remote must queue a Github step: {plan:?}"
+        );
     }
 
     #[test]
