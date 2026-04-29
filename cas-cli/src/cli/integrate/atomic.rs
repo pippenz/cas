@@ -72,11 +72,25 @@ pub fn atomic_write_all(items: &[(PathBuf, String)]) -> anyhow::Result<Vec<PathB
         staged.push((final_path.clone(), tmp));
     }
 
-    // Promote each temp to its final path.
-    for (final_path, tmp) in staged {
-        std::fs::rename(&tmp, &final_path)
-            .with_context(|| format!("rename {} -> {}", tmp.display(), final_path.display()))?;
-        written.push(final_path);
+    // Promote each temp to its final path. On rename failure, drain
+    // remaining staged temps so we never leave `<path>.cas-tmp.*` siblings
+    // beside the final files. (Already-renamed final files survive — that's
+    // the documented per-file-atomic guarantee. Orchestration layer
+    // converges via `refresh`.)
+    let mut promote_iter = staged.into_iter();
+    while let Some((final_path, tmp)) = promote_iter.next() {
+        match std::fs::rename(&tmp, &final_path) {
+            Ok(()) => written.push(final_path),
+            Err(e) => {
+                // Clean up the failing temp + everything still staged.
+                let _ = std::fs::remove_file(&tmp);
+                for (_, remaining) in promote_iter {
+                    let _ = std::fs::remove_file(remaining);
+                }
+                return Err(anyhow::Error::from(e))
+                    .with_context(|| format!("rename {} -> {}", tmp.display(), final_path.display()));
+            }
+        }
     }
     Ok(written)
 }
@@ -95,13 +109,15 @@ fn write_then_sync(tmp: &Path, content: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Process-local monotonic counter for staging-path uniqueness. Replaces
+/// the earlier `subsec_nanos` nonce, which collided when two
+/// `staging_path` calls hit the same nanosecond bucket (notably in the
+/// tight loop inside [`atomic_write_all`]).
+static STAGING_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn staging_path(final_path: &Path) -> PathBuf {
-    use std::time::{SystemTime, UNIX_EPOCH};
     let pid = std::process::id();
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
+    let nonce = STAGING_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut s = final_path.as_os_str().to_owned();
     s.push(format!(".cas-tmp.{pid}.{nonce}"));
     PathBuf::from(s)
@@ -161,14 +177,56 @@ mod tests {
         let p = Path::new("/tmp/foo.md");
         let a = staging_path(p);
         let b = staging_path(p);
-        // Different nonces produce different paths most of the time.
-        // (Allow a single-bit collision in the unlikely event two calls
-        // land on the same nanosecond — pid is constant so the nonce alone
-        // bears all variance.)
+        let c = staging_path(p);
+        // Monotonic counter must produce three distinct paths.
+        assert_ne!(a, b);
+        assert_ne!(b, c);
+        assert_ne!(a, c);
+        // All paths share the documented suffix shape.
+        for path in [&a, &b, &c] {
+            assert!(path.to_string_lossy().contains(".cas-tmp."));
+            assert!(path.to_string_lossy().starts_with("/tmp/foo.md.cas-tmp."));
+        }
+    }
+
+    #[test]
+    fn atomic_write_all_cleans_temps_when_rename_fails() {
+        // Force a rename failure by making the second target path a
+        // pre-existing directory: `rename <file> <existing-dir>` errors on
+        // most platforms (ENOTEMPTY / ENOTDIR / EISDIR depending on libc).
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("blocker")).unwrap();
+        // Put a file inside the blocker dir so rename-onto-dir cannot win.
+        std::fs::write(tmp.path().join("blocker/anchor"), "x").unwrap();
+
+        let items = vec![
+            (tmp.path().join("first.md"), "1".to_string()),
+            (tmp.path().join("blocker"), "2".to_string()), // forces rename failure
+            (tmp.path().join("never_reached.md"), "3".to_string()),
+        ];
+        let result = atomic_write_all(&items);
+        assert!(result.is_err(), "rename onto non-empty dir must fail");
+
+        // First file IS visible at its final path (per-file atomic).
+        assert_eq!(std::fs::read_to_string(&items[0].0).unwrap(), "1");
+        // Third item never made it past staging; no final.
+        assert!(!items[2].0.exists());
+
+        // Critically: no stray `.cas-tmp.*` files remain anywhere under tmp.
+        let mut leftover = Vec::new();
+        for entry in walkdir::WalkDir::new(tmp.path()) {
+            let entry = entry.unwrap();
+            if entry
+                .path()
+                .to_string_lossy()
+                .contains(".cas-tmp.")
+            {
+                leftover.push(entry.path().to_path_buf());
+            }
+        }
         assert!(
-            a == b || a != b,
-            "staging path must be deterministic about parent + suffix shape"
+            leftover.is_empty(),
+            "rename-failure path leaked staged temps: {leftover:?}"
         );
-        assert!(a.to_string_lossy().contains(".cas-tmp."));
     }
 }

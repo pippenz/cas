@@ -70,7 +70,7 @@ fn spawn_init_watchdog() {
     });
 }
 
-#[derive(Parser)]
+#[derive(Parser, Default)]
 pub struct InitArgs {
     /// Accept all defaults without prompts
     #[arg(long, short = 'y')]
@@ -1034,3 +1034,35 @@ pub(crate) use crate::cli::init::docs_and_skill::{
     is_skill_managed_by_cas,
 };
 pub use crate::cli::init::docs_and_skill::{generate_cas_skill, update_claude_md};
+
+#[cfg(test)]
+mod integration_flag_tests {
+    use super::*;
+
+    #[test]
+    fn integration_flags_from_threads_each_field() {
+        let args = InitArgs {
+            yes: true,
+            force: false,
+            no_integrations: true,
+            vercel: Some("prj_abc".to_string()),
+            neon: Some("np_xyz".to_string()),
+            github: Some("acme/widgets".to_string()),
+        };
+        let flags = integration_flags_from(&args);
+        assert!(flags.disabled);
+        assert_eq!(flags.vercel_project.as_deref(), Some("prj_abc"));
+        assert_eq!(flags.neon_project.as_deref(), Some("np_xyz"));
+        assert_eq!(flags.github_repo.as_deref(), Some("acme/widgets"));
+    }
+
+    #[test]
+    fn integration_flags_from_defaults_when_unset() {
+        let args = InitArgs::default();
+        let flags = integration_flags_from(&args);
+        assert!(!flags.disabled);
+        assert!(flags.vercel_project.is_none());
+        assert!(flags.neon_project.is_none());
+        assert!(flags.github_repo.is_none());
+    }
+}

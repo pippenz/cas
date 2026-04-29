@@ -45,16 +45,13 @@ pub fn execute(args: &DoctorArgs, cli: &Cli, cas_root: Option<&Path>) -> anyhow:
 
     if args.fix {
         if resolved_cas_root.is_none() {
+            // doctor --fix runs init non-interactively in the background;
+            // `no_integrations: true` ensures no platform MCP calls or
+            // prompts are issued during a diagnostic run.
             let init_args = crate::cli::init::InitArgs {
                 yes: true,
-                force: false,
-                // doctor --fix runs init non-interactively in the background;
-                // skip platform integrations to avoid unexpected MCP calls
-                // and prompts the user did not opt into.
                 no_integrations: true,
-                vercel: None,
-                neon: None,
-                github: None,
+                ..Default::default()
             };
             match crate::cli::init::execute(&init_args, cli) {
                 Ok(()) => {

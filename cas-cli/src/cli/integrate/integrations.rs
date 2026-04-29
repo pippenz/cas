@@ -100,9 +100,23 @@ pub fn run(
 
 #[derive(Debug, Clone)]
 enum Step {
-    Vercel { mode: StepMode },
-    Neon { mode: StepMode },
-    Github { mode: StepMode, repo: Option<String> },
+    Vercel {
+        mode: StepMode,
+        /// Pre-seeded `prj_*` from `--vercel <id>` if any. Currently used
+        /// only to gate plan inclusion; threading into the handler is
+        /// part of the picker work tracked in cas-7417's prompt follow-on.
+        preseed_project: Option<String>,
+    },
+    Neon {
+        mode: StepMode,
+        /// Pre-seeded Neon project ID. Same caveat as `Vercel.preseed_project`.
+        preseed_project: Option<String>,
+    },
+    Github {
+        mode: StepMode,
+        /// `--github OWNER/REPO`. Plumbed through to `GithubAction::{Init,Refresh}.repo`.
+        repo: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,32 +140,27 @@ impl Step {
 fn build_plan(repo_root: &Path, flags: &IntegrationFlags) -> Vec<Step> {
     let mut plan = Vec::new();
 
-    let vercel_det = vercel::detect_vercel(repo_root);
-    let consider_vercel = vercel_det.detected() || flags.vercel_project.is_some();
-    if consider_vercel {
+    if vercel::detect_vercel(repo_root).detected() || flags.vercel_project.is_some() {
         plan.push(Step::Vercel {
             mode: skill_mode(repo_root, ".claude/skills/vercel-deployments/SKILL.md"),
+            preseed_project: flags.vercel_project.clone(),
         });
     }
 
-    let neon_det = neon::detect(repo_root);
-    let consider_neon = neon_det.detected() || flags.neon_project.is_some();
-    if consider_neon {
+    if neon::detect(repo_root).detected() || flags.neon_project.is_some() {
         plan.push(Step::Neon {
             mode: skill_mode(repo_root, ".claude/skills/neon-database/SKILL.md"),
+            preseed_project: flags.neon_project.clone(),
         });
     }
 
-    let github_present = repo_root.join(".git").exists() || flags.github_repo.is_some();
-    if github_present {
+    if repo_root.join(".git").exists() || flags.github_repo.is_some() {
         plan.push(Step::Github {
             mode: skill_mode(repo_root, ".claude/skills/github-repo/SKILL.md"),
             repo: flags.github_repo.clone(),
         });
     }
 
-    let _ = vercel_det;
-    let _ = neon_det;
     plan
 }
 
@@ -183,7 +192,7 @@ fn dispatch(
     // wizard layer in a follow-on without changing this trait surface.
 
     match step {
-        Step::Vercel { mode } => match mode {
+        Step::Vercel { mode, preseed_project: _ } => match mode {
             StepMode::Init => {
                 let client = vercel::default_client();
                 vercel::init(repo_root, client.as_ref())
@@ -194,7 +203,7 @@ fn dispatch(
                 vercel::refresh(repo_root, client.as_ref(), false)
             }
         },
-        Step::Neon { mode } => {
+        Step::Neon { mode, preseed_project: _ } => {
             let client = LiveNeonClient;
             match mode {
                 StepMode::Init => {
@@ -330,6 +339,62 @@ mod tests {
             .iter()
             .find(|s| matches!(s, Step::Vercel { .. }))
             .expect("vercel step should be planned");
-        assert!(matches!(vercel_step, Step::Vercel { mode: StepMode::Refresh }));
+        assert!(matches!(
+            vercel_step,
+            Step::Vercel { mode: StepMode::Refresh, .. }
+        ));
+    }
+
+    #[test]
+    fn build_plan_includes_vercel_step_when_only_flag_set() {
+        let t = tmp_repo();
+        // No vercel.json, no @vercel deps — but flag is set.
+        let flags = IntegrationFlags {
+            vercel_project: Some("prj_x".to_string()),
+            ..Default::default()
+        };
+        let plan = build_plan(t.path(), &flags);
+        let vercel_step = plan
+            .iter()
+            .find(|s| matches!(s, Step::Vercel { .. }))
+            .expect("flag should force the step into the plan");
+        match vercel_step {
+            Step::Vercel { preseed_project, .. } => {
+                assert_eq!(preseed_project.as_deref(), Some("prj_x"));
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn build_plan_includes_neon_step_when_only_flag_set() {
+        let t = tmp_repo();
+        let flags = IntegrationFlags {
+            neon_project: Some("np_x".to_string()),
+            ..Default::default()
+        };
+        let plan = build_plan(t.path(), &flags);
+        match plan.iter().find(|s| matches!(s, Step::Neon { .. })) {
+            Some(Step::Neon { preseed_project, .. }) => {
+                assert_eq!(preseed_project.as_deref(), Some("np_x"));
+            }
+            other => panic!("expected Neon step, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_plan_threads_github_repo_flag_into_step() {
+        let t = tmp_repo();
+        let flags = IntegrationFlags {
+            github_repo: Some("acme/widgets".to_string()),
+            ..Default::default()
+        };
+        let plan = build_plan(t.path(), &flags);
+        match plan.iter().find(|s| matches!(s, Step::Github { .. })) {
+            Some(Step::Github { repo, .. }) => {
+                assert_eq!(repo.as_deref(), Some("acme/widgets"));
+            }
+            other => panic!("expected Github step, got {other:?}"),
+        }
     }
 }

@@ -292,7 +292,7 @@ fn escape_md_cell_code(s: &str) -> String {
 /// directly by `cas init` once cas-7417 wires that path.
 pub fn execute(action: IntegrationAction) -> anyhow::Result<IntegrationOutcome> {
     let repo_root = locate_repo_root()?;
-    let client = make_default_client();
+    let client = default_client();
     match action {
         IntegrationAction::Init => init(&repo_root, client.as_ref()),
         IntegrationAction::Refresh => refresh(&repo_root, client.as_ref(), false),
@@ -689,14 +689,10 @@ fn read_capped(path: &Path) -> anyhow::Result<String> {
 // ---------------------------------------------------------------------------
 
 /// Production [`VercelClient`] factory. Exposed for the orchestration layer
-/// (`integrations::run`) so it can construct one client per `cas init`
-/// invocation rather than per-handler-call. Tests should NOT use this —
-/// inject a `MockVercelClient` directly.
+/// (`integrations::run`) so it can construct a client per `cas init`
+/// invocation. Tests should NOT use this — inject a `MockVercelClient`
+/// directly.
 pub fn default_client() -> Box<dyn VercelClient> {
-    make_default_client()
-}
-
-fn make_default_client() -> Box<dyn VercelClient> {
     #[cfg(feature = "mcp-proxy")]
     {
         Box::new(mcp_proxy_client::ProxyVercelClient::new())
@@ -778,13 +774,16 @@ mod mcp_proxy_client {
             let engine = cmcp_core::ProxyEngine::from_configs(cfg.servers)
                 .await
                 .context("starting MCP proxy engine")?;
-            let result = engine
+            // Run the call; capture Result so we can shut down the engine on
+            // both the success and error paths. Otherwise a transport
+            // failure would leak the spawned upstream MCP child process for
+            // the lifetime of `cas init`.
+            let outcome = engine
                 .call_tool("vercel", tool, args)
                 .await
-                .with_context(|| format!("calling vercel.{tool}"))?;
-            // Best-effort shutdown so the spawned upstream child terminates.
+                .with_context(|| format!("calling vercel.{tool}"));
             engine.shutdown().await;
-            Ok(result)
+            outcome
         }
 
         fn block_on<F, T>(fut: F) -> anyhow::Result<T>
@@ -847,14 +846,15 @@ pub fn parse_list_projects(value: &serde_json::Value) -> anyhow::Result<Vec<Proj
 }
 
 /// Parse the response from `mcp__vercel__get_project` into an
-/// `Option<ProjectSummary>`. Returns `None` if the response signals
-/// not-found (empty content / `null` / `{ error: "not found" }`).
+/// `Option<ProjectSummary>`. Returns `None` only for explicit not-found
+/// signals (`null`, empty content, `{ error: "<text containing 'not found'>" }`).
+/// Real transport / MCP failures (`isError: true` envelopes, JSON parse
+/// errors) are propagated as `Err`, NOT silently swallowed into None — a
+/// stale-id verifier must never confuse "MCP unreachable" with "project
+/// genuinely missing".
 pub fn parse_get_project(value: &serde_json::Value) -> anyhow::Result<Option<ProjectSummary>> {
     use serde_json::Value;
-    let inner = match unwrap_mcp_envelope(value) {
-        Ok(v) => v,
-        Err(_) => return Ok(None),
-    };
+    let inner = unwrap_mcp_envelope(value)?;
     if matches!(&inner, Value::Null) {
         return Ok(None);
     }
@@ -1647,6 +1647,18 @@ mod tests {
         let empty_envelope =
             serde_json::json!({"content":[{"type":"text","text":""}]});
         assert!(parse_get_project(&empty_envelope).unwrap().is_none());
+    }
+
+    #[test]
+    fn parse_get_project_propagates_is_error_envelope_as_err() {
+        // A real MCP transport / auth failure must NOT silently collapse
+        // into Ok(None) — that would let verify report "stale" for projects
+        // the caller can't actually reach.
+        let v = serde_json::json!({
+            "isError": true,
+            "content": [{"type":"text","text":"auth failure"}]
+        });
+        assert!(parse_get_project(&v).is_err());
     }
 
     #[test]
