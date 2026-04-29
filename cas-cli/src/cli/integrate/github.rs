@@ -272,7 +272,15 @@ pub fn detect_repo(repo_root: &Path) -> anyhow::Result<Option<RepoRef>> {
 // ---------------------------------------------------------------------------
 
 fn render_template(template: &str, repo: &RepoRef) -> String {
+    // The cas:full_name tag goes through `super::md::emit_cas_full_name_tag`
+    // so a value containing literal `-->` / CR / LF is sanitized before it
+    // can corrupt the surrounding `<!-- keep github-repo -->` markers.
+    // Plain string substitutions (OWNER / REPO / FULL_NAME) appear inside
+    // markdown table cells where backtick-quoting is sufficient; if the
+    // future RepoRef::from_owner_slash_repo loosens, revisit.
+    let cas_tag = super::md::emit_cas_full_name_tag(&repo.full_name());
     template
+        .replace("{{CAS_FULL_NAME_TAG}}", &cas_tag)
         .replace("{{OWNER}}", &repo.owner)
         .replace("{{REPO}}", &repo.repo)
         .replace("{{FULL_NAME}}", &repo.full_name())
@@ -332,7 +340,10 @@ pub fn verify_at(repo_root: &Path) -> anyhow::Result<IntegrationOutcome> {
             .push(format!("{CLAUDE_SKILL_REL} not found — run `cas integrate github init` first"));
         return Ok(out);
     }
-    let existing = fs::read_to_string(&claude_path)?;
+    // cas-fc38: read user-controlled SKILL.md via read_capped so a symlink
+    // at the path is rejected and we don't allocate unbounded memory on a
+    // pathological file.
+    let existing = super::fs::read_capped(&claude_path)?;
     let recorded = recorded_full_name(&existing)?;
     let detected = detect_repo(repo_root)?;
     let mut out = IntegrationOutcome::new(
@@ -482,8 +493,9 @@ fn write_one(
     summary: &mut Vec<String>,
 ) -> anyhow::Result<bool> {
     let path = repo_root.join(rel);
+    // cas-fc38: symlink-rejecting + size-capped read.
     let existing_str = if path.exists() {
-        Some(fs::read_to_string(&path)?)
+        Some(super::fs::read_capped(&path)?)
     } else {
         None
     };
@@ -982,6 +994,57 @@ name: github-repo
             .unwrap();
         // Detection must reject the non-GitHub remote.
         assert_eq!(detect_repo(tmp.path()).unwrap(), None);
+    }
+
+    #[test]
+    fn render_template_sanitizes_close_marker_in_cas_full_name_tag() {
+        // cas-fc38 autofix round 1: an OWNER/REPO containing literal `-->` or
+        // a newline must not corrupt the surrounding keep markers. The render
+        // path now routes the value through emit_cas_full_name_tag so the
+        // close-marker rewrite (`-->` → `--&gt;`) actually fires.
+        let evil = RepoRef {
+            owner: "evil-->payload".to_string(),
+            repo: "x".to_string(),
+        };
+        let rendered = render_template(SKILL_TEMPLATE, &evil);
+        // Keep-block extraction must still succeed.
+        let blocks = super::super::keep_block::extract(&rendered).unwrap();
+        let github_block = blocks
+            .iter()
+            .find(|b| b.name.as_deref() == Some("github-repo"))
+            .expect("keep block must still parse");
+        // The cas:full_name tag must still parse and round-trip the
+        // sanitized value (with `-->` neutralized).
+        let recovered =
+            super::super::md::parse_cas_full_name_tag(&github_block.body).unwrap();
+        assert!(
+            !recovered.contains("-->"),
+            "tag value should have neutralized literal `-->`; got {recovered}"
+        );
+    }
+
+    #[test]
+    fn refresh_rejects_symlinked_skill_md() {
+        // cas-fc38: github verify/refresh now read SKILL.md via read_capped
+        // which refuses symlinks. Plant a symlink at the SKILL path and
+        // confirm refresh bails rather than silently following.
+        #[cfg(not(unix))]
+        return;
+        let tmp = TempDir::new().unwrap();
+        let claude_path = tmp.path().join(CLAUDE_SKILL_REL);
+        fs::create_dir_all(claude_path.parent().unwrap()).unwrap();
+        let real = tmp.path().join("decoy.md");
+        fs::write(&real, "decoy contents").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &claude_path).unwrap();
+        let err = refresh_at(tmp.path(), Some("acme/widget")).unwrap_err();
+        let s = err.to_string();
+        assert!(
+            s.contains("symlink"),
+            "expected symlink rejection from read_capped; got {s}"
+        );
+        // Decoy must be untouched.
+        assert_eq!(fs::read_to_string(&real).unwrap(), "decoy contents");
     }
 
     #[test]

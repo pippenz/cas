@@ -21,7 +21,7 @@ provides project-specific IDs and branch routing.
 ## Project Config
 
 <!-- keep neon-ids -->
-<!-- cas:full_name={{ORG_ID}}/{{PROJECT_ID}} -->
+{{CAS_FULL_NAME_TAG}}
 | | Value |
 |--|--|
 | **org_id** | `{{ORG_ID}}` |

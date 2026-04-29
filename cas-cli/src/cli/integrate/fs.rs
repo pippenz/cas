@@ -17,7 +17,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::Context;
+use anyhow::{anyhow, Context};
 
 /// Cap on user-controlled file reads (SKILL.md, package.json, schema.prisma,
 /// vercel.json, etc.). Anything above this is almost certainly not a doc
@@ -86,12 +86,12 @@ pub fn read_capped(path: &Path) -> anyhow::Result<String> {
 /// pick distinct names.
 pub fn atomic_write(path: &Path, contents: &str) -> anyhow::Result<()> {
     let parent = path.parent().ok_or_else(|| {
-        anyhow::anyhow!("refusing to write to a root-less path: {}", path.display())
+        anyhow!("refusing to write to a root-less path: {}", path.display())
     })?;
     let file_name = path
         .file_name()
         .and_then(|s| s.to_str())
-        .ok_or_else(|| anyhow::anyhow!("non-UTF8 target file name: {}", path.display()))?;
+        .ok_or_else(|| anyhow!("non-UTF8 target file name: {}", path.display()))?;
 
     // Symlink defense: if the target exists as a symlink, refuse. We do not
     // need to chase parent traversal here — the worker's repo_root is already
@@ -133,7 +133,7 @@ pub fn atomic_write(path: &Path, contents: &str) -> anyhow::Result<()> {
     })();
     if let Err(e) = result {
         let _ = fs::remove_file(&tmp_path);
-        return Err(anyhow::anyhow!(
+        return Err(anyhow!(
             "failed to atomically write {}: {e}",
             path.display()
         ));

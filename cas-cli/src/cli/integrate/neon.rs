@@ -685,7 +685,16 @@ fn render_template(template: &str, ctx: &TemplateContext) -> String {
             .collect::<Vec<_>>()
             .join("\n")
     };
+    // cas-fc38: the cas:full_name tag goes through super::md::emit_cas_full_name_tag
+    // so an org/project id containing literal `-->` (or CR/LF) cannot corrupt
+    // the surrounding `<!-- keep neon-ids -->` markers. Other substitutions
+    // are scoped to markdown table cells.
+    let cas_tag = super::md::emit_cas_full_name_tag(&format!(
+        "{}/{}",
+        ctx.org_id, ctx.project_id
+    ));
     template
+        .replace("{{CAS_FULL_NAME_TAG}}", &cas_tag)
         .replace("{{PROJECT_BASENAME}}", &ctx.project_basename)
         .replace("{{ORG_ID}}", &ctx.org_id)
         .replace("{{PROJECT_ID}}", &ctx.project_id)
@@ -793,32 +802,37 @@ fn pick_org_interactively(orgs: &[NeonOrg]) -> Result<String> {
     Ok(orgs[idx].id.clone())
 }
 
+/// Candidate projects whose name is bidirectionally a substring of `basename`
+/// (or vice versa), with a 3-char minimum-length guard on BOTH operands
+/// (cas-fc38). Generic 1–2 char project names like "ui"/"db" or 1–2 char repo
+/// basenames otherwise auto-match every project.
+///
+/// Pulled out of [`pick_project`] so tests can exercise the actual filter
+/// instead of re-implementing it.
+pub(crate) fn fuzzy_substring_candidates<'a>(
+    projects: &'a [NeonProject],
+    basename: &str,
+) -> Vec<&'a NeonProject> {
+    const MIN_FUZZY_LEN: usize = 3;
+    if basename.chars().count() < MIN_FUZZY_LEN {
+        return Vec::new();
+    }
+    projects
+        .iter()
+        .filter(|p| {
+            p.name.chars().count() >= MIN_FUZZY_LEN
+                && (p.name.contains(basename) || basename.contains(&p.name))
+        })
+        .collect()
+}
+
 fn pick_project(projects: &[NeonProject], basename: &str) -> Result<String> {
     // Strong match: exact name == basename, or single substring hit.
     if let Some(exact) = projects.iter().find(|p| p.name == basename) {
         return Ok(exact.id.clone());
     }
 
-    // cas-fc38: require BOTH operands of the bidirectional substring check to
-    // be at least 3 chars. Without this, generic 1–2 char project names like
-    // "ui", "db", "x" auto-match every repo whose name happens to contain
-    // those letters; conversely a 1–2 char repo basename auto-matches every
-    // project. 3 is the empirical floor for "the user probably meant this
-    // pair to relate".
-    const MIN_FUZZY_LEN: usize = 3;
-    let basename_long_enough = basename.chars().count() >= MIN_FUZZY_LEN;
-    let substring: Vec<&NeonProject> = if !basename_long_enough {
-        Vec::new()
-    } else {
-        projects
-            .iter()
-            .filter(|p| {
-                let name_long_enough = p.name.chars().count() >= MIN_FUZZY_LEN;
-                name_long_enough
-                    && (p.name.contains(basename) || basename.contains(&p.name))
-            })
-            .collect()
-    };
+    let substring = fuzzy_substring_candidates(projects, basename);
     if substring.len() == 1 {
         return Ok(substring[0].id.clone());
     }
@@ -1078,6 +1092,37 @@ pub(crate) mod tests {
     }
 
     // --- Init: happy path --------------------------------------------------
+
+    #[test]
+    fn render_template_sanitizes_cas_full_name_tag_against_close_marker() {
+        // cas-fc38 autofix: an org_id or project_id containing `-->` or a
+        // newline must not corrupt the surrounding `<!-- keep neon-ids -->`
+        // markers. The render path routes the {ORG}/{PROJECT} pair through
+        // emit_cas_full_name_tag.
+        let ctx = TemplateContext {
+            project_basename: "x".to_string(),
+            org_id: "org-->bad".to_string(),
+            project_id: "p\n2".to_string(),
+            database_name: "db".to_string(),
+            branch_map: vec![],
+        };
+        let doc = render_template(TEMPLATE_CLAUDE, &ctx);
+        let blocks = super::super::keep_block::extract(&doc).unwrap();
+        let ids_block = blocks
+            .iter()
+            .find(|b| b.name.as_deref() == Some("neon-ids"))
+            .expect("neon-ids keep block must still parse");
+        let recovered =
+            super::super::md::parse_cas_full_name_tag(&ids_block.body).unwrap();
+        assert!(
+            !recovered.contains("-->"),
+            "literal `-->` must be neutralized: {recovered}"
+        );
+        assert!(
+            !recovered.contains('\n'),
+            "tag value must be single-line: {recovered}"
+        );
+    }
 
     #[test]
     fn init_writes_three_files_with_keep_block_payload() {
@@ -1592,47 +1637,41 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn pick_project_3char_min_blocks_short_substring_match() {
-        // basename "x" + project name "xenon" used to fuzzy-match (because
-        // "xenon" contains "x"). With the cas-fc38 3-char floor, both
-        // operands must be ≥ 3 chars, so this no longer auto-matches.
-        // Without the picker (which we can't drive in unit tests), we should
-        // see the function fall through to the inquire prompt — so we just
-        // assert that the substring filter returned 0 candidates by exercising
-        // it indirectly via a fixture with a single short project: if the
-        // fuzzy match still fired, pick_project would return that single id;
-        // with the guard it falls through and we observe via the inquire path
-        // by giving exactly one project (that picker auto-selects).
-        // To stay deterministic in unit tests, we use a 2-char basename and
-        // assert that no substring match would happen by directly checking
-        // against MIN_FUZZY_LEN semantics: 2-char basename → empty filter.
-        // (The higher-level dispatch goes through inquire which we can't
-        // drive headless; this test pins the contract at the source.)
+    fn fuzzy_substring_candidates_3char_guard_blocks_short_basename() {
+        // Direct test against the production helper (cas-fc38 autofix).
         let projects = vec![
-            NeonProject {
-                id: "p1".into(),
-                name: "xenon".into(),
-            },
-            NeonProject {
-                id: "p2".into(),
-                name: "xerus".into(),
-            },
+            NeonProject { id: "p1".into(), name: "xenon".into() },
+            NeonProject { id: "p2".into(), name: "xerus".into() },
         ];
-        // basename "x" → ZERO substring candidates after the 3-char guard.
-        // Without the guard, both would have matched (both contain "x") and
-        // we'd hit the Multiple branch via inquire; with the guard, the
-        // fuzzy filter is empty and falls through to inquire's full list.
-        // We can't easily reach the inquire boundary headless, so we assert
-        // the guard semantics via a direct probe of the filter expression.
-        let basename = "x";
-        let candidates: Vec<&NeonProject> = if basename.chars().count() < 3 {
-            Vec::new()
-        } else {
-            projects.iter().filter(|p| p.name.contains(basename)).collect()
-        };
+        // 1-char basename → 0 candidates regardless of project name length.
+        assert!(fuzzy_substring_candidates(&projects, "x").is_empty());
+        // 2-char basename → still 0.
+        assert!(fuzzy_substring_candidates(&projects, "xe").is_empty());
+        // 3-char basename → matches both via .contains().
+        let hits = fuzzy_substring_candidates(&projects, "xen");
+        assert_eq!(hits.len(), 1, "only 'xenon' contains 'xen'");
+        assert_eq!(hits[0].id, "p1");
+    }
+
+    #[test]
+    fn fuzzy_substring_candidates_3char_guard_blocks_short_project_name() {
+        // Even with a long basename, projects with 1- or 2-char names must
+        // not bidirectionally-fuzzy-match.
+        let projects = vec![
+            NeonProject { id: "p1".into(), name: "ui".into() }, // 2 chars
+            NeonProject { id: "p2".into(), name: "x".into() },  // 1 char
+            NeonProject { id: "p3".into(), name: "ui-stack".into() },
+        ];
+        let hits = fuzzy_substring_candidates(&projects, "my-ui-app");
+        // Only "ui-stack" survives; the bare "ui" / "x" projects are blocked
+        // by the per-project name_long_enough check, and "my-ui-app" doesn't
+        // contain "ui-stack" so the bidirectional miss is also fine.
+        // Intersection: "ui-stack" length 8 ≥ 3, basename contains "ui-stack"?
+        // No — "my-ui-app" doesn't contain "ui-stack". Vice versa? "ui-stack"
+        // doesn't contain "my-ui-app". So 0 hits — exactly what we want.
         assert!(
-            candidates.is_empty(),
-            "3-char min-length guard must reject 1-char basenames"
+            hits.is_empty(),
+            "no candidate is bidirectional substring with 'my-ui-app': {hits:?}"
         );
     }
 }

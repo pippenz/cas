@@ -69,7 +69,6 @@ const KEEP_IDS_BLOCK: &str = "vercel-ids";
 
 /// Cap on bytes read from user-controlled markdown / JSON files.
 /// Defends against `dd`-style accidents and symlinks to `/dev/zero`.
-// File-size cap (4 MiB) lives in `super::fs::MAX_FILE_BYTES` post-cas-fc38.
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -236,7 +235,9 @@ pub fn render_skill(ctx: &RenderContext, target: TemplateTarget) -> String {
             "- Add project-specific Vercel notes here (preserved across refresh)."
         }
     };
-    raw.replace("{{REPO_NAME}}", &ctx.repo_name)
+    let cas_tag = super::md::emit_cas_full_name_tag(&ctx.repo_name);
+    raw.replace("{{CAS_FULL_NAME_TAG}}", &cas_tag)
+        .replace("{{REPO_NAME}}", &ctx.repo_name)
         .replace("{{IDS_TABLE}}", ids_table.trim_end())
         .replace("{{NOTES_PLACEHOLDER}}", notes_placeholder)
 }
@@ -259,8 +260,6 @@ fn render_ids_table(projects: &[ProjectSummary]) -> String {
     out
 }
 
-// Markdown cell escaping moved to `super::md` (cas-fc38). Re-exported as
-// thin local aliases so existing call sites stay readable.
 use super::md::{escape_md_cell, escape_md_cell_code};
 
 // ---------------------------------------------------------------------------
@@ -283,9 +282,6 @@ pub fn execute(action: IntegrationAction) -> anyhow::Result<IntegrationOutcome> 
     }
 }
 
-// `locate_repo_root` moved to `super::fs` (cas-fc38) — uniform across all
-// platform handlers. The shared version uses `git -C <cwd>` so submodule and
-// nested-worktree invocations resolve to the inner repo, not the parent.
 use super::fs::locate_repo_root;
 
 /// `cas integrate vercel init`: detect, fetch, fuzzy-match, write 3 files.
@@ -676,8 +672,6 @@ fn parse_recorded_ids(body: &str) -> Vec<String> {
     out
 }
 
-// `is_regular_file` and `read_capped` moved to `super::fs` (cas-fc38) and
-// are re-exported here so existing call sites keep their unqualified names.
 use super::fs::{is_regular_file, read_capped};
 
 // ---------------------------------------------------------------------------
@@ -1128,6 +1122,36 @@ mod tests {
         let claude = std::fs::read_to_string(root.join(REL_CLAUDE_SKILL)).unwrap();
         assert!(claude.contains("prj_1"));
         assert!(claude.contains("<!-- keep vercel-ids -->"));
+    }
+
+    #[test]
+    fn render_skill_sanitizes_close_marker_in_cas_full_name_tag() {
+        // cas-fc38 autofix: a repo_name containing `-->` or a newline must
+        // not corrupt the surrounding `<!-- keep vercel-ids -->` markers.
+        // render_skill routes the value through emit_cas_full_name_tag.
+        let ctx = RenderContext {
+            repo_name: "evil-->\nname".to_string(),
+            projects: vec![proj("prj_1", "x", "team_a")],
+        };
+        let doc = render_skill(&ctx, TemplateTarget::Claude);
+        // Keep-block must still parse cleanly.
+        let blocks = super::super::keep_block::extract(&doc).unwrap();
+        let ids_block = blocks
+            .iter()
+            .find(|b| b.name.as_deref() == Some("vercel-ids"))
+            .expect("vercel-ids block must still parse");
+        // Tag must parse and the recovered value must NOT contain literal
+        // `-->` (sanitized to `--&gt;`).
+        let recovered =
+            super::super::md::parse_cas_full_name_tag(&ids_block.body).unwrap();
+        assert!(
+            !recovered.contains("-->"),
+            "tag value should have neutralized `-->`: {recovered}"
+        );
+        assert!(
+            !recovered.contains('\n'),
+            "tag value should be on a single line: {recovered}"
+        );
     }
 
     #[test]
