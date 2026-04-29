@@ -294,7 +294,15 @@ pub fn parse_list_organizations(value: &serde_json::Value) -> Result<Vec<NeonOrg
             .or_else(|| m.get("orgs"))
             .and_then(|v| v.as_array())
             .cloned()
-            .unwrap_or_default(),
+            // cas-1549 round 1 autofix: bail if neither recognized wrapper
+            // key is present. Silently returning an empty Vec would let a
+            // future upstream-shape drift mask itself as "no orgs found".
+            .ok_or_else(|| {
+                anyhow!(
+                    "list_organizations: response had neither `organizations` \
+                     nor `orgs` array: {inner}"
+                )
+            })?,
         _ => anyhow::bail!("unexpected list_organizations shape: {inner}"),
     };
     let mut out = Vec::with_capacity(array.len());
@@ -319,7 +327,16 @@ pub fn parse_list_projects(value: &serde_json::Value) -> Result<Vec<NeonProject>
             .or_else(|| m.get("data"))
             .and_then(|v| v.as_array())
             .cloned()
-            .unwrap_or_default(),
+            // cas-1549 round 1 autofix: bail rather than silently return
+            // an empty Vec when neither `projects` nor `data` is present.
+            // An empty Vec would mask an upstream-shape drift as
+            // "user has no projects" and the picker would skip cleanly.
+            .ok_or_else(|| {
+                anyhow!(
+                    "list_projects: response had neither `projects` nor \
+                     `data` array: {inner}"
+                )
+            })?,
         _ => anyhow::bail!("unexpected list_projects shape: {inner}"),
     };
     let mut out = Vec::with_capacity(array.len());
@@ -394,35 +411,64 @@ pub fn parse_describe_project(value: &serde_json::Value) -> Result<NeonProjectDe
 
 /// Parse `mcp__neon__describe_branch` into a presence bool.
 ///
-/// Returns:
-/// - `Ok(true)` when the response contains a recognizable branch object
-///   (canonical `{ "branch": {...} }` or a flat `{id, name, ...}`).
-/// - `Ok(false)` for explicit not-found signals: a Null inner, or an
-///   `{ "error": "...not found..." }` envelope.
-/// - `Err` for transport-level failures (`isError: true` envelopes, JSON
-///   parse errors, malformed shapes) — never silently downgraded to
-///   `Ok(false)` so verify can route these to `IntegrationStatus::TransportError`
-///   instead of `Stale`.
+/// Authoritative absence vs transport blip is load-bearing here: verify
+/// routes the two to `IntegrationStatus::Stale` (drift) and
+/// `IntegrationStatus::TransportError` respectively, and `cas init` reacts
+/// differently to each. The function therefore admits **only** explicit
+/// not-found signals as `Ok(false)` and bubbles everything else as `Err`:
+///
+/// - `Ok(true)` — response contains a recognizable branch object
+///   (canonical `{ "branch": { id, name, ... } }` or a flat
+///   `{ id, name, ... }`).
+/// - `Ok(false)` — only when the inner JSON is **explicitly** an
+///   `{ "branch": null }` object **or** an `{ "error": "branch ... not found ..." }`
+///   string whose substring identifies the *branch* as the missing
+///   resource. A bare `null` inner, an `error` string mentioning a
+///   different resource ("project not found", "org not found", "rate
+///   limited"), or any other ambiguous shape returns `Err`.
+/// - `Err` — `isError: true` envelopes, JSON parse errors, empty-content
+///   envelopes (which `unwrap_mcp_envelope` reports as `Null` and we
+///   refuse to interpret), and any unrecognized shape. cas-fc38 contract:
+///   never silently downgraded to `Ok(false)`.
 pub fn parse_describe_branch(value: &serde_json::Value) -> Result<bool> {
     let inner = unwrap_mcp_envelope(value)?;
+    // A bare `Null` inner is ambiguous (could be empty content from a
+    // transport hiccup, could be the upstream returning null for a
+    // genuinely-missing branch). cas-fc38 contract is to bubble — verify
+    // routes this to TransportError, the safer default.
     if matches!(&inner, serde_json::Value::Null) {
-        return Ok(false);
+        anyhow::bail!(
+            "describe_branch returned an empty/null payload — refusing to \
+             interpret as authoritative not-found; treating as transport error"
+        );
     }
     let obj = inner.as_object().ok_or_else(|| {
-        anyhow!("describe_branch: expected object or null, got {inner}")
+        anyhow!("describe_branch: expected object, got {inner}")
     })?;
+
+    // Explicit `{ "branch": null }` is an authoritative not-found.
+    if matches!(obj.get("branch"), Some(serde_json::Value::Null)) {
+        return Ok(false);
+    }
+
     if let Some(err) = obj.get("error").and_then(|v| v.as_str()) {
-        if err.to_ascii_lowercase().contains("not found") {
+        let lc = err.to_ascii_lowercase();
+        // Tighten the not-found sniff: the error must mention "branch" so
+        // an upstream "project not found" / "org not found" / "rate
+        // limited" doesn't get misclassified as branch-missing.
+        if lc.contains("not found") && lc.contains("branch") {
             return Ok(false);
         }
-        anyhow::bail!("describe_branch returned non-not-found error: {err}");
+        anyhow::bail!("describe_branch returned non-branch-not-found error: {err}");
     }
+
     // Canonical shape wraps the branch under `branch`; accept flat too.
+    // Both id and name are required so a malformed `{branch:{id:"x"}}` is
+    // rejected (per testing finding #2 from cas-code-review).
     let branch_obj = obj
         .get("branch")
         .and_then(|v| v.as_object())
         .or_else(|| {
-            // Flat form: the root IS the branch object.
             if obj.contains_key("id") && obj.contains_key("name") {
                 Some(obj)
             } else {
@@ -430,8 +476,16 @@ pub fn parse_describe_branch(value: &serde_json::Value) -> Result<bool> {
             }
         });
     match branch_obj {
-        Some(b) if b.get("id").and_then(|v| v.as_str()).is_some() => Ok(true),
-        _ => anyhow::bail!("describe_branch: response had neither `branch` nor a flat branch object: {inner}"),
+        Some(b)
+            if b.get("id").and_then(|v| v.as_str()).is_some()
+                && b.get("name").and_then(|v| v.as_str()).is_some() =>
+        {
+            Ok(true)
+        }
+        _ => anyhow::bail!(
+            "describe_branch: response had neither `branch` nor a flat branch \
+             object with id+name: {inner}"
+        ),
     }
 }
 
@@ -1356,6 +1410,78 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn parse_list_projects_propagates_is_error_envelope() {
+        let v = serde_json::json!({
+            "content": [{"type": "text", "text": "{}"}],
+            "isError": true
+        });
+        let err = parse_list_projects(&v).unwrap_err();
+        assert!(err.to_string().contains("isError=true"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_describe_project_propagates_is_error_envelope() {
+        let v = serde_json::json!({
+            "content": [{"type": "text", "text": "{}"}],
+            "isError": true
+        });
+        let err = parse_describe_project(&v).unwrap_err();
+        assert!(err.to_string().contains("isError=true"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_list_organizations_bails_on_unknown_wrapper_key() {
+        // cas-1549 round 1 autofix: a future upstream drift to a new
+        // wrapper (e.g. {"items": [...]}) must NOT silently masquerade as
+        // an empty org list. Bail loudly so verify routes to TransportError.
+        let v = serde_json::json!({"items": [{"id": "org-1", "name": "X"}]});
+        let err = parse_list_organizations(&v).unwrap_err();
+        assert!(
+            err.to_string().contains("neither `organizations`"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_list_projects_bails_on_unknown_wrapper_key() {
+        let v = serde_json::json!({"items": [{"id": "p1", "name": "x"}]});
+        let err = parse_list_projects(&v).unwrap_err();
+        assert!(
+            err.to_string().contains("neither `projects`"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_list_organizations_errors_on_malformed_text_envelope() {
+        // unwrap_mcp_envelope's serde_json::from_str(&buf) error path:
+        // a regression that swallowed this would mis-route corrupt
+        // responses. Pin it.
+        let v = serde_json::json!({
+            "content": [{"type": "text", "text": "definitely not json {{}"}]
+        });
+        let err = parse_list_organizations(&v).unwrap_err();
+        assert!(
+            err.to_string().contains("parsing MCP text content"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_describe_project_handles_branch_with_neither_default_nor_is_default() {
+        // neon_branch_from_value defaults is_default=false when both keys
+        // are absent. Pin so a future change to bail isn't silently
+        // backwards-incompatible with old fixtures.
+        let v = serde_json::json!({
+            "project": {"id": "p", "name": "n"},
+            "branches": [{"id": "br1", "name": "main"}]
+        });
+        let detail = parse_describe_project(&v).unwrap();
+        assert_eq!(detail.branches.len(), 1);
+        assert!(!detail.branches[0].is_default);
+    }
+
+    #[test]
     fn parse_list_projects_handles_data_alias() {
         let v = serde_json::json!({"data": [{"id": "p1", "name": "n1"}]});
         let projects = parse_list_projects(&v).unwrap();
@@ -1439,9 +1565,67 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn parse_describe_branch_null_inner_returns_false() {
+    fn parse_describe_branch_null_inner_bubbles_as_transport_error() {
+        // cas-1549 round 1 autofix: a bare `null` inner is ambiguous —
+        // could be a transport blip's empty content. Verify wants to
+        // route those to TransportError, not Stale. Only an EXPLICIT
+        // `{branch: null}` is treated as authoritative not-found.
         let v = serde_json::json!({"content": [{"type": "text", "text": "null"}]});
+        let err = parse_describe_branch(&v).unwrap_err();
+        assert!(
+            err.to_string().contains("empty/null payload"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_describe_branch_explicit_branch_null_returns_false() {
+        // The post-tightening "authoritative not-found" canonical shape.
+        let v = serde_json::json!({
+            "content": [{"type": "text", "text": "{\"branch\": null}"}]
+        });
         assert_eq!(parse_describe_branch(&v).unwrap(), false);
+    }
+
+    #[test]
+    fn parse_describe_branch_empty_content_array_bubbles() {
+        // cas-1549 round 1 autofix: empty content array → unwrap_mcp_envelope
+        // returns Null → caller MUST bubble (verify routes to TransportError).
+        let v = serde_json::json!({"content": [], "isError": false});
+        let err = parse_describe_branch(&v).unwrap_err();
+        assert!(
+            err.to_string().contains("empty/null payload"),
+            "expected transport-error bubble; got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_describe_branch_project_not_found_does_not_misclassify_as_branch_missing() {
+        // cas-1549 round 1 autofix: tightened error sniff. An "org not found"
+        // / "project not found" reply must NOT collapse to Ok(false) — that
+        // would make verify report the BRANCH as drifted when the real
+        // problem is org/project access.
+        let v = serde_json::json!({
+            "content": [{
+                "type": "text",
+                "text": "{\"error\":\"project proj-cool-bird not found\"}"
+            }]
+        });
+        let err = parse_describe_branch(&v).unwrap_err();
+        assert!(
+            err.to_string().contains("non-branch-not-found"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_describe_branch_flat_form_requires_id_and_name() {
+        // Tightened: `{id: "x"}` alone (without name) is rejected.
+        let only_id = serde_json::json!({"id": "br1"});
+        assert!(parse_describe_branch(&only_id).is_err());
+        // Wrapped form with id but no name also rejected.
+        let wrapped_no_name = serde_json::json!({"branch": {"id": "br1"}});
+        assert!(parse_describe_branch(&wrapped_no_name).is_err());
     }
 
     #[test]
