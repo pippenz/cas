@@ -587,6 +587,13 @@ fn repo_basename(repo_root: &Path) -> String {
         .unwrap_or_else(|| "project".to_string())
 }
 
+/// Write `content` to `path`, creating parent directories as needed.
+///
+/// **Not atomic.** A process kill between the parent-dir create and the file
+/// write, or mid-write, can leave a partial file on disk. Init's three-file
+/// write sequence inherits this — partial-state recovery is tracked in
+/// **cas-7417** (init wire-up) which already needs to thread a long-lived
+/// client + tokio runtime and is the natural place for tempfile-and-rename.
 fn write_file(path: &Path, content: &str) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -849,7 +856,7 @@ mod tests {
     }
 
     #[test]
-    fn detect_vercel_finds_at_vercel_dep_in_devDependencies() {
+    fn detect_vercel_finds_at_vercel_dep_in_dev_dependencies() {
         let (_tmp, root) = make_repo_with_name("foo");
         std::fs::write(
             root.join("package.json"),
@@ -1193,7 +1200,7 @@ mod tests {
     // --- Detection edge cases ------------------------------------------
 
     #[test]
-    fn detect_vercel_finds_at_vercel_dep_in_peerDependencies() {
+    fn detect_vercel_finds_at_vercel_dep_in_peer_dependencies() {
         let (_tmp, root) = make_repo_with_name("foo");
         std::fs::write(
             root.join("package.json"),
