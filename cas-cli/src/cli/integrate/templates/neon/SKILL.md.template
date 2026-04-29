@@ -1,0 +1,56 @@
+---
+name: neon-database
+description: |
+  Project-specific Neon database config. Use for SQL queries, migrations, schema
+  inspection, and branch routing on this project. Refer to user-level mcp-neon
+  guidance for tool usage patterns; this skill provides the IDs and branch map.
+  Triggers: query the database, run SQL, add column, migration, check schema,
+  inspect table, neon, branch, prisma migrate.
+metadata:
+  category: database
+  managed_by: cas
+---
+
+# Neon Database — {{PROJECT_BASENAME}}
+
+The IDs and branch routing for this project's Neon database. Pass `projectId`
+and `databaseName` explicitly on every MCP call; pass `branchId` whenever you
+target a non-default branch.
+
+## Project Config
+
+<!-- keep neon-ids -->
+| | Value |
+|--|--|
+| **org_id** | `{{ORG_ID}}` |
+| **projectId** | `{{PROJECT_ID}}` |
+| **databaseName** | `{{DATABASE_NAME}}` |
+{{BRANCH_TABLE_ROWS}}
+<!-- /keep neon-ids -->
+
+## Quick Reference
+
+```
+# Default-branch query
+mcp__neon__run_sql({
+  projectId: "{{PROJECT_ID}}",
+  databaseName: "{{DATABASE_NAME}}",
+  sql: "SELECT 1 AS neon_mcp_ok;"
+})
+```
+
+For staging or other non-default branches, add `branchId:` from the table above.
+
+## Migration Workflow
+
+Always use the 3-step flow: `prepare_database_migration` →
+`describe_branch` (verify on the temp branch) → `complete_database_migration`.
+Never run migrations directly on a production branch.
+
+## Safety Rules
+
+- Never run destructive SQL on production branches without explicit confirmation.
+- Never `prisma migrate reset` or `prisma db push --accept-data-loss` on shared branches.
+- Confirm the active env's `DATABASE_URL` points at the branch you intend to touch.
+
+See `references/queries.md` for common SQL workflows and per-branch routing recipes.

@@ -1,12 +1,1241 @@
-//! Stub for `cas integrate neon <action>`. Full implementation lives in
-//! task **cas-1ece**.
+//! `cas integrate neon <action>` — full implementation (task **cas-1ece**,
+//! EPIC cas-b65f).
+//!
+//! ## Stub-handler convention (mirrors cas-8e37 vercel handler)
+//!
+//! Following the convention codified in cas-e6b6 / cas-8e37 for the integrate
+//! family:
+//!
+//! - **`Ok(IntegrationOutcome { status: Skipped, .. })`** when Neon is
+//!   genuinely not present in the repo (no detection signals). Init exits
+//!   cleanly without error so `cas init` orchestration can move on to the
+//!   next platform.
+//! - **`Err(...)`** for unrecoverable conditions: malformed `package.json`,
+//!   filesystem errors, MCP/Neon client failures, or required prompts the
+//!   caller cannot answer.
+//!
+//! ## Keep-block convention
+//!
+//! All MCP-fetched IDs live inside a single named keep block,
+//! `<!-- keep neon-ids -->` … `<!-- /keep neon-ids -->`. Named (not unnamed)
+//! per cas-e6b6 design note: a future template revision that adds another
+//! preserved block should not silently misroute user content into the wrong
+//! slot.
+//!
+//! Refresh calls [`super::keep_block::orphaned_existing`] before
+//! [`super::keep_block::merge`] and surfaces dropped blocks via
+//! `IntegrationOutcome.summary` rather than letting them disappear.
+//!
+//! ## Multi-org wrinkle
+//!
+//! The user has multiple Neon orgs (memory `reference_neon_cas_cloud.md`),
+//! so `mcp__neon__list_projects` *requires* `org_id`. Org selection is
+//! interactive when more than one org is returned; otherwise auto-picked.
+//!
+//! ## Testability
+//!
+//! All MCP/Neon access goes through the [`NeonClient`] trait. Tests use
+//! [`FakeNeonClient`] — `cargo test` never depends on a live Neon endpoint.
+//! The production [`LiveNeonClient`] is currently a placeholder that returns
+//! a clear error pointing at the orchestration layer; wiring it to the actual
+//! MCP fan-out lives outside this task's scope.
 
-use super::types::{IntegrationAction, IntegrationOutcome, Platform};
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
 
-pub fn execute(action: IntegrationAction) -> anyhow::Result<IntegrationOutcome> {
-    anyhow::bail!(
-        "neon {} handler not yet implemented — see task {}",
-        action.as_str(),
-        Platform::Neon.handler_task()
+use anyhow::{anyhow, Context, Result};
+
+use super::keep_block::{self, MergeMode};
+use super::types::{IntegrationAction, IntegrationOutcome, IntegrationStatus, Platform};
+
+// --- Templates -------------------------------------------------------------
+
+const TEMPLATE_CLAUDE: &str = include_str!("templates/neon/SKILL.md.template");
+const TEMPLATE_CURSOR: &str = include_str!("templates/neon/cursor.md.template");
+const TEMPLATE_QUERIES: &str = include_str!("templates/neon/references/queries.md");
+
+// --- Output paths ----------------------------------------------------------
+
+const CLAUDE_SKILL: &str = ".claude/skills/neon-database/SKILL.md";
+const CLAUDE_QUERIES: &str = ".claude/skills/neon-database/references/queries.md";
+const CURSOR_SKILL: &str = ".cursor/skills/neon-database/SKILL.md";
+
+// --- Public types ----------------------------------------------------------
+
+/// A Neon organization, as returned by `list_organizations`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NeonOrg {
+    pub id: String,
+    pub name: String,
+}
+
+/// A Neon project, as returned by `list_projects(org_id)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NeonProject {
+    pub id: String,
+    pub name: String,
+}
+
+/// A Neon branch, as returned within `describe_project`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NeonBranch {
+    pub id: String,
+    pub name: String,
+    /// True for the project's default branch (typically `main`).
+    pub is_default: bool,
+}
+
+/// Project detail with branches and a database name. Returned by
+/// `describe_project`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NeonProjectDetail {
+    pub project: NeonProject,
+    pub default_database: String,
+    pub branches: Vec<NeonBranch>,
+}
+
+/// Provider trait for Neon read operations — mocked in tests.
+pub trait NeonClient {
+    fn list_organizations(&self) -> Result<Vec<NeonOrg>>;
+    fn list_projects(&self, org_id: &str) -> Result<Vec<NeonProject>>;
+    fn describe_project(&self, org_id: &str, project_id: &str) -> Result<NeonProjectDetail>;
+    /// Returns Ok(true) if the branch still exists, Ok(false) if missing,
+    /// Err for transport-level failures.
+    fn describe_branch(&self, org_id: &str, project_id: &str, branch_id: &str) -> Result<bool>;
+}
+
+/// Production placeholder. Wiring to real Neon MCP / HTTP API lives outside
+/// the scope of cas-1ece — see EPIC cas-b65f follow-on. Returns a clear,
+/// actionable error.
+pub struct LiveNeonClient;
+
+impl NeonClient for LiveNeonClient {
+    fn list_organizations(&self) -> Result<Vec<NeonOrg>> {
+        Err(anyhow!(
+            "live Neon client not yet wired — invoke `cas integrate neon` through the integration skill that fans out to MCP, or pass a fixture via the test API"
+        ))
+    }
+    fn list_projects(&self, _org_id: &str) -> Result<Vec<NeonProject>> {
+        Err(anyhow!("live Neon client not yet wired"))
+    }
+    fn describe_project(&self, _org_id: &str, _project_id: &str) -> Result<NeonProjectDetail> {
+        Err(anyhow!("live Neon client not yet wired"))
+    }
+    fn describe_branch(&self, _o: &str, _p: &str, _b: &str) -> Result<bool> {
+        Err(anyhow!("live Neon client not yet wired"))
+    }
+}
+
+// --- Detection -------------------------------------------------------------
+
+/// Detection signals for Neon usage in a repo.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NeonDetection {
+    /// `prisma/schema.prisma` mentions a `neon.tech` URL.
+    pub prisma_neon_url: bool,
+    /// `package.json` declares a `@neondatabase/*` or `@prisma/adapter-neon` dep.
+    pub package_neon_dep: bool,
+}
+
+impl NeonDetection {
+    pub fn detected(&self) -> bool {
+        self.prisma_neon_url || self.package_neon_dep
+    }
+}
+
+/// Scan `repo_root` for Neon usage signals.
+///
+/// Pure I/O over the filesystem; never panics on missing files.
+pub fn detect(repo_root: &Path) -> NeonDetection {
+    let mut out = NeonDetection::default();
+
+    if let Ok(prisma) = fs::read_to_string(repo_root.join("prisma/schema.prisma")) {
+        if prisma.contains("neon.tech") {
+            out.prisma_neon_url = true;
+        }
+    }
+    // Common monorepo location too.
+    if !out.prisma_neon_url {
+        if let Ok(prisma) = fs::read_to_string(repo_root.join("apps/backend/prisma/schema.prisma"))
+        {
+            if prisma.contains("neon.tech") {
+                out.prisma_neon_url = true;
+            }
+        }
+    }
+
+    if let Ok(pkg) = fs::read_to_string(repo_root.join("package.json")) {
+        // Cheap structural check: any `"@neondatabase/...": ` or
+        // `"@prisma/adapter-neon": ` is enough — we don't care about which
+        // dep section.
+        if pkg.contains("\"@neondatabase/") || pkg.contains("\"@prisma/adapter-neon\"") {
+            out.package_neon_dep = true;
+        }
+    }
+
+    out
+}
+
+// --- Branch heuristic ------------------------------------------------------
+
+/// Map a list of branches to logical environments using simple heuristics:
+/// - the branch flagged `is_default` → `production`
+/// - branch named exactly `staging` → `staging`
+/// - branch name starting with `dev` (e.g. `dev`, `dev-foo`) → `dev`
+/// - other branches keep their raw name as the env label
+///
+/// Order is preserved from the input. Stable, deterministic output suitable
+/// for templating into the keep block.
+pub fn map_branches(branches: &[NeonBranch]) -> Vec<(String, NeonBranch)> {
+    let mut out = Vec::new();
+    for b in branches {
+        let label = if b.is_default {
+            "production".to_string()
+        } else if b.name == "staging" {
+            "staging".to_string()
+        } else if b.name == "dev" || b.name.starts_with("dev-") || b.name.starts_with("dev_") {
+            "dev".to_string()
+        } else {
+            b.name.clone()
+        };
+        out.push((label, b.clone()));
+    }
+    out
+}
+
+// --- Init / Refresh / Verify options --------------------------------------
+
+/// Inputs that init has resolved interactively (org pick, project confirm,
+/// branch label overrides). Tests bypass the prompts and pass this directly.
+#[derive(Debug, Clone, Default)]
+pub struct InitChoices {
+    /// If `Some`, use this org without prompting (single-org auto-pick or test injection).
+    pub org_id: Option<String>,
+    /// If `Some`, force this project id without prompting.
+    pub project_id: Option<String>,
+    /// Optional override for the default-database name (defaults to value
+    /// returned by the client).
+    pub database_name: Option<String>,
+    /// Optional override of the (env_label -> branch_id) mapping; replaces
+    /// the heuristic output entirely if non-empty.
+    pub branch_label_overrides: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RefreshOpts {
+    /// Re-fetch IDs from Neon and overwrite the keep block. When false
+    /// (default), the keep block is preserved verbatim and only the
+    /// surrounding prose is regenerated.
+    pub update_ids: bool,
+}
+
+// --- Public CLI dispatch ---------------------------------------------------
+
+/// CLI entrypoint. Constructs a [`LiveNeonClient`] and dispatches.
+pub fn execute(action: IntegrationAction) -> Result<IntegrationOutcome> {
+    let cwd = std::env::current_dir().context("failed to read current_dir")?;
+    let client = LiveNeonClient;
+    match action {
+        IntegrationAction::Init => init(&cwd, &client, InitChoices::default()),
+        IntegrationAction::Refresh => refresh(&cwd, &client, RefreshOpts::default()),
+        IntegrationAction::Verify => verify(&cwd, &client),
+    }
+}
+
+// --- Init ------------------------------------------------------------------
+
+/// Init flow — pure-fn / dependency-injected for testability.
+pub fn init<C: NeonClient>(
+    repo_root: &Path,
+    client: &C,
+    choices: InitChoices,
+) -> Result<IntegrationOutcome> {
+    let detection = detect(repo_root);
+    if !detection.detected() && choices.org_id.is_none() {
+        let mut outcome = IntegrationOutcome::new(
+            Platform::Neon,
+            IntegrationAction::Init,
+            IntegrationStatus::Skipped,
+        );
+        outcome
+            .summary
+            .push("no Neon detection signals (prisma/schema.prisma neon.tech URL or @neondatabase deps)".into());
+        return Ok(outcome);
+    }
+
+    // 1. Pick org
+    let org_id = match choices.org_id.clone() {
+        Some(id) => id,
+        None => {
+            let orgs = client
+                .list_organizations()
+                .context("listing Neon organizations")?;
+            if orgs.is_empty() {
+                return Err(anyhow!("Neon returned no organizations for this user"));
+            }
+            if orgs.len() == 1 {
+                orgs[0].id.clone()
+            } else {
+                // Multi-org case: prompt for selection.
+                pick_org_interactively(&orgs)?
+            }
+        }
+    };
+
+    // 2. Pick project (fuzzy-match by repo basename, prompt on ambiguity).
+    let project_id = match choices.project_id.clone() {
+        Some(id) => id,
+        None => {
+            let projects = client
+                .list_projects(&org_id)
+                .with_context(|| format!("listing Neon projects for org {org_id}"))?;
+            if projects.is_empty() {
+                return Err(anyhow!("Neon returned no projects for org {org_id}"));
+            }
+            let basename = repo_basename(repo_root);
+            pick_project(&projects, &basename)?
+        }
+    };
+
+    // 3. Describe project, capture branches.
+    let detail = client
+        .describe_project(&org_id, &project_id)
+        .with_context(|| format!("describing project {project_id} in org {org_id}"))?;
+
+    let database_name = choices
+        .database_name
+        .clone()
+        .unwrap_or_else(|| detail.default_database.clone());
+
+    let mut branch_map: Vec<(String, NeonBranch)> = if !choices.branch_label_overrides.is_empty() {
+        // Caller injected explicit labels — apply them by branch id.
+        let by_id: std::collections::HashMap<&str, &NeonBranch> = detail
+            .branches
+            .iter()
+            .map(|b| (b.id.as_str(), b))
+            .collect();
+        choices
+            .branch_label_overrides
+            .iter()
+            .filter_map(|(label, id)| by_id.get(id.as_str()).map(|b| (label.clone(), (*b).clone())))
+            .collect()
+    } else {
+        map_branches(&detail.branches)
+    };
+    // Stable order: production first, staging, dev, then others alphabetically.
+    branch_map.sort_by_key(|(label, _)| label_sort_key(label));
+
+    let context = TemplateContext {
+        project_basename: repo_basename(repo_root),
+        org_id: org_id.clone(),
+        project_id: project_id.clone(),
+        database_name: database_name.clone(),
+        branch_map: branch_map.clone(),
+    };
+
+    let claude = render_template(TEMPLATE_CLAUDE, &context);
+    let cursor = render_template(TEMPLATE_CURSOR, &context);
+
+    let mut outcome = IntegrationOutcome::new(
+        Platform::Neon,
+        IntegrationAction::Init,
+        IntegrationStatus::Configured,
+    );
+    write_with_dirs(repo_root, CLAUDE_SKILL, &claude)?;
+    outcome.files.push(PathBuf::from(CLAUDE_SKILL));
+    write_with_dirs(repo_root, CURSOR_SKILL, &cursor)?;
+    outcome.files.push(PathBuf::from(CURSOR_SKILL));
+    write_with_dirs(repo_root, CLAUDE_QUERIES, TEMPLATE_QUERIES)?;
+    outcome.files.push(PathBuf::from(CLAUDE_QUERIES));
+
+    outcome.summary.push(format!(
+        "neon org {} / project {} / db {} ({} branch(es))",
+        org_id,
+        project_id,
+        database_name,
+        branch_map.len()
+    ));
+    Ok(outcome)
+}
+
+// --- Refresh --------------------------------------------------------------
+
+/// Refresh flow.
+///
+/// - Default (`update_ids = false`): regenerate prose around an unchanged keep
+///   block. The previous keep-block content (org_id, projectId, branches) is
+///   preserved verbatim. Used when the user has hand-edited the IDs or the
+///   branch labels and only wants the surrounding template prose refreshed.
+/// - `update_ids = true`: re-fetch via the client and overwrite the keep block.
+pub fn refresh<C: NeonClient>(
+    repo_root: &Path,
+    client: &C,
+    opts: RefreshOpts,
+) -> Result<IntegrationOutcome> {
+    let claude_path = repo_root.join(CLAUDE_SKILL);
+    let cursor_path = repo_root.join(CURSOR_SKILL);
+    let existing_claude = fs::read_to_string(&claude_path).ok();
+    let existing_cursor = fs::read_to_string(&cursor_path).ok();
+
+    if existing_claude.is_none() && existing_cursor.is_none() {
+        let mut outcome = IntegrationOutcome::new(
+            Platform::Neon,
+            IntegrationAction::Refresh,
+            IntegrationStatus::Skipped,
+        );
+        outcome.summary.push(
+            "no existing neon SKILL.md found — run `cas integrate neon init` first".into(),
+        );
+        return Ok(outcome);
+    }
+
+    let mut outcome = IntegrationOutcome::new(
+        Platform::Neon,
+        IntegrationAction::Refresh,
+        IntegrationStatus::Refreshed,
+    );
+
+    if opts.update_ids {
+        // Re-fetch via the client. We need the org_id and project_id from the
+        // existing keep block to know where to look.
+        let existing = existing_claude
+            .as_deref()
+            .or(existing_cursor.as_deref())
+            .ok_or_else(|| anyhow!("no existing skill file to derive ids from"))?;
+        let prev = parse_keep_payload(existing)?;
+        let detail = client
+            .describe_project(&prev.org_id, &prev.project_id)
+            .with_context(|| {
+                format!(
+                    "re-describing project {} in org {}",
+                    prev.project_id, prev.org_id
+                )
+            })?;
+        let mut branch_map = map_branches(&detail.branches);
+        branch_map.sort_by_key(|(label, _)| label_sort_key(label));
+        let context = TemplateContext {
+            project_basename: repo_basename(repo_root),
+            org_id: prev.org_id.clone(),
+            project_id: prev.project_id.clone(),
+            database_name: detail.default_database.clone(),
+            branch_map,
+        };
+        let claude = render_template(TEMPLATE_CLAUDE, &context);
+        let cursor = render_template(TEMPLATE_CURSOR, &context);
+
+        // PreferTemplate: caller has fresh keep-block content.
+        write_merged(
+            repo_root,
+            CLAUDE_SKILL,
+            &claude,
+            existing_claude.as_deref(),
+            MergeMode::PreferTemplate,
+            &mut outcome,
+        )?;
+        write_merged(
+            repo_root,
+            CURSOR_SKILL,
+            &cursor,
+            existing_cursor.as_deref(),
+            MergeMode::PreferTemplate,
+            &mut outcome,
+        )?;
+    } else {
+        // Preserve keep block; regenerate prose from a deflated template.
+        // We feed the template as-is (placeholder values) and let merge
+        // splice the user's keep block into it.
+        let context = blank_template_context(repo_basename(repo_root));
+        let claude = render_template(TEMPLATE_CLAUDE, &context);
+        let cursor = render_template(TEMPLATE_CURSOR, &context);
+
+        if let Some(existing) = existing_claude.as_deref() {
+            for orphan in keep_block::orphaned_existing(&claude, existing)? {
+                outcome.summary.push(format!(
+                    "warning: dropping orphan keep block in {}: name={:?}",
+                    CLAUDE_SKILL, orphan.name
+                ));
+            }
+        }
+        if let Some(existing) = existing_cursor.as_deref() {
+            for orphan in keep_block::orphaned_existing(&cursor, existing)? {
+                outcome.summary.push(format!(
+                    "warning: dropping orphan keep block in {}: name={:?}",
+                    CURSOR_SKILL, orphan.name
+                ));
+            }
+        }
+
+        write_merged(
+            repo_root,
+            CLAUDE_SKILL,
+            &claude,
+            existing_claude.as_deref(),
+            MergeMode::PreserveExisting,
+            &mut outcome,
+        )?;
+        write_merged(
+            repo_root,
+            CURSOR_SKILL,
+            &cursor,
+            existing_cursor.as_deref(),
+            MergeMode::PreserveExisting,
+            &mut outcome,
+        )?;
+    }
+
+    // Always re-stamp queries.md (no keep blocks to preserve there).
+    write_with_dirs(repo_root, CLAUDE_QUERIES, TEMPLATE_QUERIES)?;
+    outcome.files.push(PathBuf::from(CLAUDE_QUERIES));
+
+    Ok(outcome)
+}
+
+// --- Verify ---------------------------------------------------------------
+
+pub fn verify<C: NeonClient>(repo_root: &Path, client: &C) -> Result<IntegrationOutcome> {
+    let claude_path = repo_root.join(CLAUDE_SKILL);
+    let existing = fs::read_to_string(&claude_path).with_context(|| {
+        format!(
+            "{} missing — run `cas integrate neon init` first",
+            CLAUDE_SKILL
+        )
+    })?;
+    let payload = parse_keep_payload(&existing)?;
+
+    let mut any_stale = false;
+    let mut summary = Vec::new();
+    summary.push(format!(
+        "checking {} branch(es) in project {}",
+        payload.branches.len(),
+        payload.project_id
+    ));
+    for (label, branch_id) in &payload.branches {
+        match client.describe_branch(&payload.org_id, &payload.project_id, branch_id) {
+            Ok(true) => summary.push(format!("  {label} ({branch_id}): ok")),
+            Ok(false) => {
+                any_stale = true;
+                summary.push(format!("  {label} ({branch_id}): STALE"));
+            }
+            Err(e) => {
+                any_stale = true;
+                summary.push(format!("  {label} ({branch_id}): error: {e:#}"));
+            }
+        }
+    }
+
+    let status = if any_stale {
+        IntegrationStatus::Stale
+    } else {
+        IntegrationStatus::AlreadyConfigured
+    };
+    let mut outcome = IntegrationOutcome::new(Platform::Neon, IntegrationAction::Verify, status);
+    outcome.summary = summary;
+    Ok(outcome)
+}
+
+// --- Helpers ---------------------------------------------------------------
+
+fn label_sort_key(label: &str) -> (u8, String) {
+    match label {
+        "production" => (0, label.to_string()),
+        "staging" => (1, label.to_string()),
+        "dev" => (2, label.to_string()),
+        _ => (3, label.to_string()),
+    }
+}
+
+fn repo_basename(repo_root: &Path) -> String {
+    repo_root
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("project")
+        .to_string()
+}
+
+fn write_with_dirs(repo_root: &Path, rel: &str, content: &str) -> Result<()> {
+    let path = repo_root.join(rel);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    fs::write(&path, content).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
+fn write_merged(
+    repo_root: &Path,
+    rel: &str,
+    template: &str,
+    existing: Option<&str>,
+    mode: MergeMode,
+    outcome: &mut IntegrationOutcome,
+) -> Result<()> {
+    let merged = keep_block::merge(template, existing, mode)
+        .with_context(|| format!("merging keep blocks for {rel}"))?;
+    write_with_dirs(repo_root, rel, &merged)?;
+    outcome.files.push(PathBuf::from(rel));
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct TemplateContext {
+    project_basename: String,
+    org_id: String,
+    project_id: String,
+    database_name: String,
+    /// (env_label, branch) in display order.
+    branch_map: Vec<(String, NeonBranch)>,
+}
+
+fn blank_template_context(basename: String) -> TemplateContext {
+    TemplateContext {
+        project_basename: basename,
+        org_id: "<org_id>".into(),
+        project_id: "<project_id>".into(),
+        database_name: "<databaseName>".into(),
+        branch_map: Vec::new(),
+    }
+}
+
+fn render_template(template: &str, ctx: &TemplateContext) -> String {
+    let branch_rows = if ctx.branch_map.is_empty() {
+        "| **branches** | _none recorded_ |".to_string()
+    } else {
+        ctx.branch_map
+            .iter()
+            .map(|(label, branch)| {
+                format!("| **{} branchId** | `{}` (name: `{}`) |", label, branch.id, branch.name)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    template
+        .replace("{{PROJECT_BASENAME}}", &ctx.project_basename)
+        .replace("{{ORG_ID}}", &ctx.org_id)
+        .replace("{{PROJECT_ID}}", &ctx.project_id)
+        .replace("{{DATABASE_NAME}}", &ctx.database_name)
+        .replace("{{BRANCH_TABLE_ROWS}}", &branch_rows)
+}
+
+/// Decoded contents of the `<!-- keep neon-ids -->` block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KeepPayload {
+    org_id: String,
+    project_id: String,
+    database_name: String,
+    /// (label, branchId) pairs.
+    branches: Vec<(String, String)>,
+}
+
+fn parse_keep_payload(existing: &str) -> Result<KeepPayload> {
+    let blocks = keep_block::extract(existing)
+        .with_context(|| "parsing keep blocks in existing skill file")?;
+    let block = blocks
+        .into_iter()
+        .find(|b| b.name.as_deref() == Some("neon-ids"))
+        .ok_or_else(|| anyhow!("no `<!-- keep neon-ids -->` block found in existing skill file"))?;
+
+    let mut org_id = None;
+    let mut project_id = None;
+    let mut database_name = None;
+    let mut branches: Vec<(String, String)> = Vec::new();
+
+    for line in block.body.lines() {
+        // Markdown table rows look like `| **org_id** | \`value\` |` or
+        // `| **production branchId** | \`br-foo\` (name: \`main\`) |`.
+        if let Some((label, value)) = parse_kv_row(line) {
+            let lower = label.to_lowercase();
+            if lower == "org_id" {
+                org_id = Some(value);
+            } else if lower == "projectid" {
+                project_id = Some(value);
+            } else if lower == "databasename" {
+                database_name = Some(value);
+            } else if let Some(env) = lower.strip_suffix(" branchid") {
+                branches.push((env.to_string(), value));
+            }
+        }
+    }
+
+    Ok(KeepPayload {
+        org_id: org_id.ok_or_else(|| anyhow!("keep block missing org_id"))?,
+        project_id: project_id.ok_or_else(|| anyhow!("keep block missing projectId"))?,
+        database_name: database_name
+            .ok_or_else(|| anyhow!("keep block missing databaseName"))?,
+        branches,
+    })
+}
+
+/// Parse one `| **<label>** | \`<value>\` ... |` row. Returns
+/// (label_without_bold, value_without_backticks). Tolerates trailing parenthetical.
+fn parse_kv_row(line: &str) -> Option<(String, String)> {
+    let trim = line.trim();
+    if !trim.starts_with('|') || !trim.ends_with('|') {
+        return None;
+    }
+    let cells: Vec<&str> = trim.trim_matches('|').split('|').collect();
+    if cells.len() < 2 {
+        return None;
+    }
+    let label = cells[0].trim().trim_matches('*').trim().to_string();
+    let raw_value = cells[1].trim();
+    // Take whatever is between the first pair of backticks.
+    let value = match (raw_value.find('`'), raw_value.rfind('`')) {
+        (Some(s), Some(e)) if e > s => raw_value[s + 1..e].to_string(),
+        _ => raw_value.to_string(),
+    };
+    // Some rows wrap multiple backtick spans; we only want the first.
+    let value = value.split('`').next().unwrap_or(&value).to_string();
+    if label.is_empty() {
+        return None;
+    }
+    Some((label, value))
+}
+
+// --- Interactive prompt seams ---------------------------------------------
+//
+// These are split out so unit tests can exercise the non-interactive paths
+// (auto-pick / strong-match / fixture-driven choices) without spinning up a
+// terminal.
+
+fn pick_org_interactively(orgs: &[NeonOrg]) -> Result<String> {
+    use inquire::Select;
+    let display: Vec<String> = orgs
+        .iter()
+        .map(|o| format!("{} — {}", o.name, o.id))
+        .collect();
+    let chosen = Select::new("Multiple Neon orgs available — pick one:", display.clone())
+        .prompt()
+        .with_context(|| "Neon org selection prompt failed (run with --org-id to bypass)")?;
+    let idx = display.iter().position(|d| d == &chosen).unwrap_or(0);
+    Ok(orgs[idx].id.clone())
+}
+
+fn pick_project(projects: &[NeonProject], basename: &str) -> Result<String> {
+    // Strong match: exact name == basename, or single substring hit.
+    if let Some(exact) = projects.iter().find(|p| p.name == basename) {
+        return Ok(exact.id.clone());
+    }
+    let substring: Vec<&NeonProject> = projects
+        .iter()
+        .filter(|p| p.name.contains(basename) || basename.contains(&p.name))
+        .collect();
+    if substring.len() == 1 {
+        return Ok(substring[0].id.clone());
+    }
+
+    use inquire::Select;
+    let display: Vec<String> = projects
+        .iter()
+        .map(|p| format!("{} — {}", p.name, p.id))
+        .collect();
+    let chosen = Select::new(
+        &format!(
+            "No strong match for repo basename {basename:?} — pick a Neon project:"
+        ),
+        display.clone(),
     )
+    .prompt()
+    .with_context(|| "Neon project selection prompt failed (run with --project-id to bypass)")?;
+    let idx = display.iter().position(|d| d == &chosen).unwrap_or(0);
+    Ok(projects[idx].id.clone())
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use tempfile::TempDir;
+
+    /// In-memory fake satisfying [`NeonClient`].
+    pub struct FakeNeonClient {
+        pub orgs: Vec<NeonOrg>,
+        pub projects_by_org: HashMap<String, Vec<NeonProject>>,
+        pub details: HashMap<(String, String), NeonProjectDetail>,
+        pub live_branches: RefCell<HashMap<(String, String, String), bool>>,
+    }
+
+    impl FakeNeonClient {
+        pub fn empty() -> Self {
+            Self {
+                orgs: Vec::new(),
+                projects_by_org: HashMap::new(),
+                details: HashMap::new(),
+                live_branches: RefCell::new(HashMap::new()),
+            }
+        }
+    }
+
+    impl NeonClient for FakeNeonClient {
+        fn list_organizations(&self) -> Result<Vec<NeonOrg>> {
+            Ok(self.orgs.clone())
+        }
+        fn list_projects(&self, org_id: &str) -> Result<Vec<NeonProject>> {
+            Ok(self
+                .projects_by_org
+                .get(org_id)
+                .cloned()
+                .unwrap_or_default())
+        }
+        fn describe_project(&self, org_id: &str, project_id: &str) -> Result<NeonProjectDetail> {
+            self.details
+                .get(&(org_id.to_string(), project_id.to_string()))
+                .cloned()
+                .ok_or_else(|| anyhow!("fake: no detail for {org_id}/{project_id}"))
+        }
+        fn describe_branch(
+            &self,
+            org_id: &str,
+            project_id: &str,
+            branch_id: &str,
+        ) -> Result<bool> {
+            Ok(self
+                .live_branches
+                .borrow()
+                .get(&(
+                    org_id.to_string(),
+                    project_id.to_string(),
+                    branch_id.to_string(),
+                ))
+                .copied()
+                .unwrap_or(false))
+        }
+    }
+
+    fn make_repo() -> TempDir {
+        TempDir::new().expect("tempdir")
+    }
+
+    fn write_prisma_with_neon(repo: &Path) {
+        let prisma_dir = repo.join("prisma");
+        fs::create_dir_all(&prisma_dir).unwrap();
+        fs::write(
+            prisma_dir.join("schema.prisma"),
+            "datasource db {\n  provider = \"postgresql\"\n  url = env(\"DATABASE_URL\")\n}\n// neon.tech\n",
+        )
+        .unwrap();
+    }
+
+    fn write_pkg_with_neon_dep(repo: &Path) {
+        fs::write(
+            repo.join("package.json"),
+            r#"{ "dependencies": { "@neondatabase/serverless": "^0.9.0" } }"#,
+        )
+        .unwrap();
+    }
+
+    fn fixture_with_two_orgs() -> FakeNeonClient {
+        let mut client = FakeNeonClient::empty();
+        client.orgs = vec![
+            NeonOrg {
+                id: "org-a".into(),
+                name: "Org A".into(),
+            },
+            NeonOrg {
+                id: "org-b".into(),
+                name: "Org B".into(),
+            },
+        ];
+        client.projects_by_org.insert(
+            "org-a".into(),
+            vec![NeonProject {
+                id: "proj-a".into(),
+                name: "demo".into(),
+            }],
+        );
+        client.details.insert(
+            ("org-a".into(), "proj-a".into()),
+            NeonProjectDetail {
+                project: NeonProject {
+                    id: "proj-a".into(),
+                    name: "demo".into(),
+                },
+                default_database: "neondb".into(),
+                branches: vec![
+                    NeonBranch {
+                        id: "br-main".into(),
+                        name: "main".into(),
+                        is_default: true,
+                    },
+                    NeonBranch {
+                        id: "br-staging".into(),
+                        name: "staging".into(),
+                        is_default: false,
+                    },
+                    NeonBranch {
+                        id: "br-dev".into(),
+                        name: "dev-feature".into(),
+                        is_default: false,
+                    },
+                ],
+            },
+        );
+        client
+            .live_branches
+            .borrow_mut()
+            .insert(("org-a".into(), "proj-a".into(), "br-main".into()), true);
+        client.live_branches.borrow_mut().insert(
+            ("org-a".into(), "proj-a".into(), "br-staging".into()),
+            true,
+        );
+        client
+            .live_branches
+            .borrow_mut()
+            .insert(("org-a".into(), "proj-a".into(), "br-dev".into()), true);
+        client
+    }
+
+    // --- Detection ---------------------------------------------------------
+
+    #[test]
+    fn detect_finds_prisma_neon_url() {
+        let repo = make_repo();
+        write_prisma_with_neon(repo.path());
+        let d = detect(repo.path());
+        assert!(d.prisma_neon_url);
+        assert!(!d.package_neon_dep);
+        assert!(d.detected());
+    }
+
+    #[test]
+    fn detect_finds_neondatabase_dep() {
+        let repo = make_repo();
+        write_pkg_with_neon_dep(repo.path());
+        let d = detect(repo.path());
+        assert!(!d.prisma_neon_url);
+        assert!(d.package_neon_dep);
+        assert!(d.detected());
+    }
+
+    #[test]
+    fn detect_finds_prisma_adapter_neon() {
+        let repo = make_repo();
+        fs::write(
+            repo.path().join("package.json"),
+            r#"{ "dependencies": { "@prisma/adapter-neon": "^1.0.0" } }"#,
+        )
+        .unwrap();
+        assert!(detect(repo.path()).detected());
+    }
+
+    #[test]
+    fn detect_returns_false_when_no_signals() {
+        let repo = make_repo();
+        let d = detect(repo.path());
+        assert!(!d.detected());
+    }
+
+    // --- Branch heuristic --------------------------------------------------
+
+    #[test]
+    fn map_branches_labels_default_as_production() {
+        let bs = vec![
+            NeonBranch {
+                id: "1".into(),
+                name: "main".into(),
+                is_default: true,
+            },
+            NeonBranch {
+                id: "2".into(),
+                name: "staging".into(),
+                is_default: false,
+            },
+            NeonBranch {
+                id: "3".into(),
+                name: "dev-foo".into(),
+                is_default: false,
+            },
+            NeonBranch {
+                id: "4".into(),
+                name: "feature-x".into(),
+                is_default: false,
+            },
+        ];
+        let mapped = map_branches(&bs);
+        assert_eq!(mapped[0].0, "production");
+        assert_eq!(mapped[1].0, "staging");
+        assert_eq!(mapped[2].0, "dev");
+        assert_eq!(mapped[3].0, "feature-x");
+    }
+
+    // --- Init: skip when not detected -------------------------------------
+
+    #[test]
+    fn init_skips_cleanly_when_no_neon_signals() {
+        let repo = make_repo();
+        let client = FakeNeonClient::empty();
+        let outcome = init(repo.path(), &client, InitChoices::default()).unwrap();
+        assert_eq!(outcome.status, IntegrationStatus::Skipped);
+        assert!(outcome.files.is_empty());
+        assert!(!repo.path().join(CLAUDE_SKILL).exists());
+    }
+
+    // --- Init: happy path --------------------------------------------------
+
+    #[test]
+    fn init_writes_three_files_with_keep_block_payload() {
+        let repo = make_repo();
+        write_prisma_with_neon(repo.path());
+        let client = fixture_with_two_orgs();
+        let choices = InitChoices {
+            org_id: Some("org-a".into()),
+            project_id: Some("proj-a".into()),
+            ..Default::default()
+        };
+        let outcome = init(repo.path(), &client, choices).unwrap();
+        assert_eq!(outcome.status, IntegrationStatus::Configured);
+        assert_eq!(outcome.files.len(), 3);
+
+        let claude = fs::read_to_string(repo.path().join(CLAUDE_SKILL)).unwrap();
+        assert!(claude.contains("<!-- keep neon-ids -->"));
+        assert!(claude.contains("<!-- /keep neon-ids -->"));
+        assert!(claude.contains("org-a"));
+        assert!(claude.contains("proj-a"));
+        assert!(claude.contains("neondb"));
+        assert!(claude.contains("br-main"));
+        assert!(claude.contains("br-staging"));
+        // Ordering: production before staging before dev.
+        let prod = claude.find("production branchId").unwrap();
+        let stag = claude.find("staging branchId").unwrap();
+        assert!(prod < stag);
+
+        let cursor = fs::read_to_string(repo.path().join(CURSOR_SKILL)).unwrap();
+        assert!(cursor.contains("br-main"));
+        assert!(cursor.contains("server: user-neon"));
+
+        let queries = fs::read_to_string(repo.path().join(CLAUDE_QUERIES)).unwrap();
+        assert!(queries.contains("3-step flow"));
+    }
+
+    // --- Init: multi-org auto-pick path -----------------------------------
+
+    #[test]
+    fn init_uses_injected_org_id_in_multi_org_environment() {
+        // Even though there are 2 orgs available, providing org_id via choices
+        // bypasses the prompt — exactly the path tests need.
+        let repo = make_repo();
+        write_prisma_with_neon(repo.path());
+        let client = fixture_with_two_orgs();
+        let choices = InitChoices {
+            org_id: Some("org-a".into()),
+            project_id: Some("proj-a".into()),
+            ..Default::default()
+        };
+        let outcome = init(repo.path(), &client, choices).unwrap();
+        let claude = fs::read_to_string(repo.path().join(CLAUDE_SKILL)).unwrap();
+        assert!(claude.contains("org-a"));
+        // The other org's id should not leak in.
+        assert!(!claude.contains("org-b"));
+        assert_eq!(outcome.status, IntegrationStatus::Configured);
+    }
+
+    // --- Refresh: preserves keep block by default -------------------------
+
+    #[test]
+    fn refresh_default_preserves_user_edited_keep_block() {
+        let repo = make_repo();
+        write_prisma_with_neon(repo.path());
+        let client = fixture_with_two_orgs();
+        let choices = InitChoices {
+            org_id: Some("org-a".into()),
+            project_id: Some("proj-a".into()),
+            ..Default::default()
+        };
+        init(repo.path(), &client, choices).unwrap();
+
+        // Hand-edit the keep block — pretend the user added a hand-curated row.
+        let path = repo.path().join(CLAUDE_SKILL);
+        let mut content = fs::read_to_string(&path).unwrap();
+        content = content.replace(
+            "| **org_id** | `org-a` |",
+            "| **org_id** | `org-a` |\n| **note** | `manual edit retained` |",
+        );
+        fs::write(&path, &content).unwrap();
+
+        let outcome =
+            refresh(repo.path(), &client, RefreshOpts { update_ids: false }).unwrap();
+        assert_eq!(outcome.status, IntegrationStatus::Refreshed);
+
+        let after = fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains("manual edit retained"),
+            "user-added keep-block content should survive refresh:\n{after}"
+        );
+    }
+
+    // --- Refresh: --update-ids re-fetches ----------------------------------
+
+    #[test]
+    fn refresh_with_update_ids_overwrites_keep_block_with_fresh_data() {
+        let repo = make_repo();
+        write_prisma_with_neon(repo.path());
+        let client = fixture_with_two_orgs();
+        init(
+            repo.path(),
+            &client,
+            InitChoices {
+                org_id: Some("org-a".into()),
+                project_id: Some("proj-a".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // Sanity: hand-edit a stale value to prove update-ids overwrites it.
+        let path = repo.path().join(CLAUDE_SKILL);
+        let original = fs::read_to_string(&path).unwrap();
+        fs::write(
+            &path,
+            original.replace("`neondb`", "`old-stale-name-from-user-edit`"),
+        )
+        .unwrap();
+
+        let outcome =
+            refresh(repo.path(), &client, RefreshOpts { update_ids: true }).unwrap();
+        assert_eq!(outcome.status, IntegrationStatus::Refreshed);
+
+        let after = fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains("`neondb`"),
+            "update_ids should restore freshly-fetched databaseName:\n{after}"
+        );
+        assert!(
+            !after.contains("old-stale-name-from-user-edit"),
+            "stale user-edit should be overwritten by update_ids:\n{after}"
+        );
+    }
+
+    // --- Refresh: skip when nothing to refresh -----------------------------
+
+    #[test]
+    fn refresh_skips_when_no_existing_skill_files() {
+        let repo = make_repo();
+        let client = FakeNeonClient::empty();
+        let outcome = refresh(repo.path(), &client, RefreshOpts::default()).unwrap();
+        assert_eq!(outcome.status, IntegrationStatus::Skipped);
+    }
+
+    // --- Verify: ok and stale ---------------------------------------------
+
+    #[test]
+    fn verify_reports_ok_when_all_branches_live() {
+        let repo = make_repo();
+        write_prisma_with_neon(repo.path());
+        let client = fixture_with_two_orgs();
+        init(
+            repo.path(),
+            &client,
+            InitChoices {
+                org_id: Some("org-a".into()),
+                project_id: Some("proj-a".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let outcome = verify(repo.path(), &client).unwrap();
+        assert_eq!(outcome.status, IntegrationStatus::AlreadyConfigured);
+        let joined = outcome.summary.join("\n");
+        assert!(joined.contains("ok"));
+        assert!(!joined.contains("STALE"));
+    }
+
+    #[test]
+    fn verify_reports_stale_only_for_deleted_branch() {
+        let repo = make_repo();
+        write_prisma_with_neon(repo.path());
+        let client = fixture_with_two_orgs();
+        init(
+            repo.path(),
+            &client,
+            InitChoices {
+                org_id: Some("org-a".into()),
+                project_id: Some("proj-a".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // Mark dev branch as deleted.
+        client
+            .live_branches
+            .borrow_mut()
+            .insert(("org-a".into(), "proj-a".into(), "br-dev".into()), false);
+        let outcome = verify(repo.path(), &client).unwrap();
+        assert_eq!(outcome.status, IntegrationStatus::Stale);
+        let joined = outcome.summary.join("\n");
+        assert!(joined.contains("br-dev"));
+        assert!(joined.contains("STALE"));
+        // Other branches should still be ok.
+        assert!(joined.contains("br-main"));
+        assert!(joined.contains("br-staging"));
+    }
+
+    #[test]
+    fn verify_errors_when_skill_file_missing() {
+        let repo = make_repo();
+        let client = FakeNeonClient::empty();
+        let err = verify(repo.path(), &client).unwrap_err().to_string();
+        assert!(
+            err.contains("cas integrate neon init"),
+            "expected hint to run init: {err}"
+        );
+    }
+
+    // --- Keep-payload parser ----------------------------------------------
+
+    #[test]
+    fn parse_keep_payload_round_trips_init_output() {
+        let repo = make_repo();
+        write_prisma_with_neon(repo.path());
+        let client = fixture_with_two_orgs();
+        init(
+            repo.path(),
+            &client,
+            InitChoices {
+                org_id: Some("org-a".into()),
+                project_id: Some("proj-a".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let content = fs::read_to_string(repo.path().join(CLAUDE_SKILL)).unwrap();
+        let payload = parse_keep_payload(&content).unwrap();
+        assert_eq!(payload.org_id, "org-a");
+        assert_eq!(payload.project_id, "proj-a");
+        assert_eq!(payload.database_name, "neondb");
+        let labels: Vec<&str> = payload.branches.iter().map(|(l, _)| l.as_str()).collect();
+        assert!(labels.contains(&"production"));
+        assert!(labels.contains(&"staging"));
+        assert!(labels.contains(&"dev"));
+    }
+
+    #[test]
+    fn parse_keep_payload_errors_when_block_missing() {
+        let err = parse_keep_payload("# Hi\nNo keep block.\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("neon-ids"));
+    }
+
+    // --- Templates well-formed (extract round-trip) ------------------------
+
+    #[test]
+    fn templates_have_well_formed_keep_blocks() {
+        // The keep-block helper must accept our templates verbatim.
+        for (label, tmpl) in [("claude", TEMPLATE_CLAUDE), ("cursor", TEMPLATE_CURSOR)] {
+            let blocks = keep_block::extract(tmpl)
+                .unwrap_or_else(|e| panic!("{label} template parse error: {e}"));
+            assert_eq!(
+                blocks.len(),
+                1,
+                "{label} template should have exactly one keep block"
+            );
+            assert_eq!(blocks[0].name.as_deref(), Some("neon-ids"));
+        }
+    }
 }

@@ -163,15 +163,14 @@ mod tests {
     }
 
     #[test]
-    fn neon_all_actions_point_at_task_cas_1ece() {
+    fn neon_subcommand_parses_cleanly() {
+        // cas-1ece landed the real handler. The stub assertion is gone;
+        // the dispatch itself may error in a sandbox (no cwd / no detection /
+        // live-client placeholder), but parsing must succeed for all three
+        // verbs.
         for action in ["init", "refresh", "verify"] {
             let cmd = parse(&["neon", action]);
-            let err = dispatch(&cmd).unwrap_err().to_string();
-            assert!(
-                err.contains(&format!("neon {action}")),
-                "{action}: {err}"
-            );
-            assert!(err.contains("cas-1ece"), "{action}: {err}");
+            let _ = dispatch(&cmd);
         }
     }
 
