@@ -69,16 +69,13 @@ pub fn run(
         return Ok(report);
     }
 
-    // Take the lock for the run if any planned step is a write action.
-    // run() today only dispatches Init/Refresh (Verify goes through the
-    // standalone path), so this is always Some — but using `for_action`
-    // keeps the door open for adding Verify dispatch here without
-    // re-introducing the RO-FS regression.
-    let _lock = IntegrateLock::for_action(
-        repo_root,
-        super::types::IntegrationAction::Init,
-    )
-    .context("acquiring .cas/integrate.lock")?;
+    // run() always writes (it only dispatches Init/Refresh), so take an
+    // exclusive lock unconditionally. If a future change adds Verify
+    // dispatch here, switch to `IntegrateLock::for_action` driven by the
+    // strictest action across the plan — the RO-FS-aware helper exists
+    // for that day.
+    let _lock = IntegrateLock::acquire(repo_root)
+        .context("acquiring .cas/integrate.lock")?;
 
     let plan = build_plan(repo_root, flags);
     if plan.is_empty() {
@@ -164,15 +161,29 @@ fn build_plan(repo_root: &Path, flags: &IntegrationFlags) -> Vec<Step> {
         });
     }
 
-    // GitHub: only queue the step if `.git` exists AND a github.com remote
-    // is detected, OR the user explicitly passed `--github`. This prevents a
-    // gitlab/bitbucket/codeberg/self-hosted-gitea repo from queueing a
-    // pointless Github step that the handler would only Skip internally.
-    let github_repo_present = match github::detect_repo(repo_root) {
-        Ok(Some(_)) => true,
-        Ok(None) | Err(_) => false,
+    // GitHub: queue the step when the user explicitly passed `--github`,
+    // OR `.git` exists AND a github.com remote is detected. We
+    // short-circuit on `--github` so the user's explicit override never
+    // pays for a `git remote -v` subprocess. For non-github remotes
+    // (gitlab/bitbucket/codeberg/self-hosted-gitea) we skip the step
+    // entirely instead of dispatching a Skipped roundtrip through the
+    // handler. detect_repo errors are surfaced via stderr (rather than
+    // silently dropped) so a misconfigured git is visible.
+    let queue_github = if flags.github_repo.is_some() {
+        true
+    } else {
+        match github::detect_repo(repo_root) {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(e) => {
+                eprintln!(
+                    "  Integrations: skipping GitHub plan check (`git remote -v` failed: {e:#})"
+                );
+                false
+            }
+        }
     };
-    if github_repo_present || flags.github_repo.is_some() {
+    if queue_github {
         plan.push(Step::Github {
             mode: skill_mode(repo_root, ".claude/skills/github-repo/SKILL.md"),
             repo: flags.github_repo.clone(),

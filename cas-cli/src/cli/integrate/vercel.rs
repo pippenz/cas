@@ -799,7 +799,7 @@ mod mcp_proxy_client {
     //! fixture-tested. A separate fixture-spawned end-to-end test for the
     //! ProxyEngine lifecycle lives under `cas-cli/tests/`.
 
-    use std::sync::{Arc, Mutex};
+    use std::sync::Mutex;
 
     use anyhow::Context;
     use serde_json::Value;
@@ -809,8 +809,9 @@ mod mcp_proxy_client {
 
     /// Shared (runtime, engine) state. Wrapped in `Mutex<Option<…>>` so we
     /// can take it on Drop and run shutdown synchronously inside the
-    /// runtime before dropping it.
-    type ProxyState = (Runtime, Arc<cmcp_core::ProxyEngine>);
+    /// runtime before dropping it. No Arc — the engine is never cloned out
+    /// of the Mutex.
+    type ProxyState = (Runtime, cmcp_core::ProxyEngine);
 
     pub(super) struct ProxyVercelClient {
         state: Mutex<Option<ProxyState>>,
@@ -848,7 +849,7 @@ mod mcp_proxy_client {
         /// Subsequent calls reuse the same engine.
         fn with_engine<F, T>(&self, f: F) -> anyhow::Result<T>
         where
-            F: FnOnce(&Runtime, &Arc<cmcp_core::ProxyEngine>) -> anyhow::Result<T>,
+            F: FnOnce(&Runtime, &cmcp_core::ProxyEngine) -> anyhow::Result<T>,
         {
             let mut guard = self
                 .state
@@ -870,7 +871,7 @@ mod mcp_proxy_client {
                 let engine = rt
                     .block_on(cmcp_core::ProxyEngine::from_configs(cfg.servers))
                     .context("starting MCP proxy engine")?;
-                *guard = Some((rt, Arc::new(engine)));
+                *guard = Some((rt, engine));
             }
             let (rt, engine) = guard.as_ref().unwrap();
             f(rt, engine)
@@ -893,13 +894,26 @@ mod mcp_proxy_client {
             // Shut down the engine inside the runtime that owns it. Errors
             // here are swallowed — Drop can't return them, and an init flow
             // that already succeeded shouldn't fail at shutdown.
-            if let Ok(mut guard) = self.state.lock() {
-                if let Some((rt, engine)) = guard.take() {
-                    rt.block_on(async move {
-                        engine.shutdown().await;
-                    });
-                    // rt drops here, joining its blocking pool.
-                }
+            //
+            // Recover from a poisoned Mutex via PoisonError::into_inner: a
+            // panic during a prior `with_engine` would otherwise silently
+            // skip shutdown and leak the upstream MCP child process for
+            // the lifetime of the parent.
+            //
+            // Drop must NOT be invoked from inside an active tokio runtime
+            // — `rt.block_on` panics with "Cannot start a runtime from
+            // within a runtime". The current production caller (`cas
+            // integrate` from sync main) is safe; future async callers
+            // must call an explicit `close()` (TODO: expose) before drop.
+            let mut guard = match self.state.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            if let Some((rt, engine)) = guard.take() {
+                rt.block_on(async move {
+                    engine.shutdown().await;
+                });
+                // rt drops here, joining its blocking pool.
             }
         }
     }
@@ -1896,6 +1910,51 @@ mod tests {
     // (see task notes); writing a minimal MCP server fixture is a
     // half-day of rmcp boilerplate that didn't fit the task's scope.
 
+    /// Run `f` with `HOME` and `XDG_CONFIG_HOME` redirected to a fresh
+    /// tempdir so cmcp_core::config::Config::load_merged cannot pick up
+    /// the developer's real `~/.config/code-mode-mcp/config.toml`. This
+    /// is a same-process env mutation and is not thread-safe across
+    /// parallel tests — but cargo test serializes per-binary by default
+    /// for tests that touch the same env var, and these are the only two
+    /// tests that flip HOME.
+    #[cfg(feature = "mcp-proxy")]
+    fn with_hermetic_home<F, T>(f: F) -> T
+    where
+        F: FnOnce() -> T,
+    {
+        let tmp = TempDir::new().unwrap();
+        let prev_home = std::env::var_os("HOME");
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        // SAFETY: env mutation. See note above on parallelism.
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
+        }
+        struct Restore {
+            home: Option<std::ffi::OsString>,
+            xdg: Option<std::ffi::OsString>,
+        }
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                unsafe {
+                    match &self.home {
+                        Some(v) => std::env::set_var("HOME", v),
+                        None => std::env::remove_var("HOME"),
+                    }
+                    match &self.xdg {
+                        Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                        None => std::env::remove_var("XDG_CONFIG_HOME"),
+                    }
+                }
+            }
+        }
+        let _g = Restore {
+            home: prev_home,
+            xdg: prev_xdg,
+        };
+        f()
+    }
+
     #[cfg(feature = "mcp-proxy")]
     #[test]
     fn proxy_vercel_client_new_does_not_construct_engine() {
@@ -1913,21 +1972,29 @@ mod tests {
     #[test]
     fn proxy_vercel_client_first_call_attempts_lazy_init() {
         use super::mcp_proxy_client::ProxyVercelClient;
-        let client = ProxyVercelClient::new();
-        // The first call exercises the load_merged + ensure!(servers
-        // non-empty) path. In the test environment there is no proxy.toml
-        // and no user-level config, so we expect a clear error rather than
-        // a hang or a panic. The exact phrasing depends on whether
-        // load_merged finds an empty user-level config or no config at
-        // all; we assert on the structure (Err) and the lifecycle state.
-        let result = client.list_projects();
-        assert!(result.is_err(), "no servers configured → expected Err");
-        // engine_constructed may be true or false depending on whether
-        // load_merged succeeded with empty servers (anyhow::ensure! fires
-        // before we install the engine into self.state). We only assert
-        // that the call returned cleanly without panic — drop must work
-        // either way.
-        drop(client);
+        with_hermetic_home(|| {
+            let client = ProxyVercelClient::new();
+            assert!(!client.engine_constructed());
+
+            // First call: hermetic env → empty config → ensure!(servers
+            // non-empty) fires BEFORE the engine is installed into
+            // self.state. Therefore engine_constructed must remain false
+            // after this Err.
+            let result = client.list_projects();
+            assert!(result.is_err(), "empty config → expected Err");
+            assert!(
+                !client.engine_constructed(),
+                "ensure!(servers non-empty) fires before installing the engine; engine_constructed must remain false"
+            );
+
+            // Second call mirrors first — same Err shape; lazy-init never advances.
+            let result2 = client.list_projects();
+            assert!(result2.is_err());
+            assert!(!client.engine_constructed());
+
+            // Drop without an engine must not panic.
+            drop(client);
+        });
     }
 
     #[test]
