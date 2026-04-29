@@ -52,9 +52,13 @@ pub enum IntegrateCommands {
         action: PlatformAction,
     },
     /// Integrate the project with GitHub (repo path from `git remote -v`).
+    ///
+    /// Uses a github-specific action enum so `init` and `refresh` can accept
+    /// `--repo OWNER/REPO` to override auto-detection. See
+    /// [`github::GithubAction`].
     Github {
         #[command(subcommand)]
-        action: PlatformAction,
+        action: github::GithubAction,
     },
 }
 
@@ -85,7 +89,7 @@ pub fn execute(cmd: &IntegrateCommands, _cli: &Cli) -> anyhow::Result<()> {
     let outcome = match cmd {
         IntegrateCommands::Vercel { action } => vercel::execute((*action).into())?,
         IntegrateCommands::Neon { action } => neon::execute((*action).into())?,
-        IntegrateCommands::Github { action } => github::execute((*action).into())?,
+        IntegrateCommands::Github { action } => github::execute(action.clone())?,
     };
     render_outcome(&outcome);
     Ok(())
@@ -129,7 +133,7 @@ mod tests {
         match cmd {
             IntegrateCommands::Vercel { action } => vercel::execute((*action).into()),
             IntegrateCommands::Neon { action } => neon::execute((*action).into()),
-            IntegrateCommands::Github { action } => github::execute((*action).into()),
+            IntegrateCommands::Github { action } => github::execute(action.clone()),
         }
     }
 
@@ -171,16 +175,36 @@ mod tests {
         }
     }
 
+    // GitHub handler is no longer a stub (cas-f425). Its full test coverage
+    // lives in `super::github::tests`. We just sanity-check that the clap
+    // surface still parses all three actions and that the `--repo` override
+    // round-trips into the action enum.
     #[test]
-    fn github_all_actions_point_at_task_cas_f425() {
+    fn github_clap_surface_parses_all_actions() {
         for action in ["init", "refresh", "verify"] {
-            let cmd = parse(&["github", action]);
-            let err = dispatch(&cmd).unwrap_err().to_string();
-            assert!(
-                err.contains(&format!("github {action}")),
-                "{action}: {err}"
-            );
-            assert!(err.contains("cas-f425"), "{action}: {err}");
+            let _ = parse(&["github", action]);
+        }
+    }
+
+    #[test]
+    fn github_init_accepts_repo_override_flag() {
+        let cmd = parse(&["github", "init", "--repo", "Richards-LLC/gabber-studio"]);
+        match cmd {
+            IntegrateCommands::Github {
+                action: github::GithubAction::Init { repo },
+            } => assert_eq!(repo.as_deref(), Some("Richards-LLC/gabber-studio")),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn github_refresh_accepts_repo_override_flag() {
+        let cmd = parse(&["github", "refresh", "--repo", "acme/widget"]);
+        match cmd {
+            IntegrateCommands::Github {
+                action: github::GithubAction::Refresh { repo },
+            } => assert_eq!(repo.as_deref(), Some("acme/widget")),
+            other => panic!("unexpected variant: {other:?}"),
         }
     }
 }

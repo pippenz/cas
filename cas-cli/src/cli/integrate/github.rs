@@ -1,12 +1,846 @@
-//! Stub for `cas integrate github <action>`. Full implementation lives in
-//! task **cas-f425**.
+//! `cas integrate github <action>` — auto-integration handler for the GitHub
+//! `owner/repo` pair backing the current repo.
+//!
+//! Owner: task **cas-f425** (EPIC cas-b65f).
+//!
+//! Unlike the Vercel and Neon handlers, this branch needs no MCP call: the
+//! authoritative source is the local clone's `git remote -v`. Detection is
+//! cheap, deterministic, and can be tested by feeding a fake `git remote -v`
+//! string into [`parse_remote_v`].
+//!
+//! ## Stub-handler / status convention
+//!
+//! Per cas-e6b6 design note 4 ("Stub-handler convention for 'platform not
+//! detected'"), the cases below split as follows:
+//!
+//! - GitHub remote not present (no remote, or remote points at gitlab/bitbucket
+//!   etc.) → returns `Ok(IntegrationOutcome { status: Skipped, .. })`. This is
+//!   the "platform genuinely not present in repo" branch — `cas init` should
+//!   keep going past it without erroring.
+//! - `git remote -v` failed to execute, or the remote URL is GitHub-shaped but
+//!   unparseable → returns `Err(...)`. These are "unrecoverable error" — the
+//!   user needs to look.
+//!
+//! Sibling handlers (cas-8e37 vercel, cas-1ece neon) follow the same split.
+//!
+//! ## Keep-block strategy
+//!
+//! The generated SKILL.md files use a **named** keep block,
+//! `<!-- keep github-repo -->`, around the owner/repo identity. Per cas-e6b6
+//! design note 1, named blocks survive future template revisions that reorder
+//! sections; unnamed blocks would silently misroute on reorder.
+//!
+//! Refresh writes via [`MergeMode::PreferTemplate`]: the canonical owner/repo
+//! comes from `git remote -v`, so the freshly rendered template wins. Before
+//! writing, [`keep_block::orphaned_existing`] is consulted and any orphans are
+//! surfaced in `IntegrationOutcome.summary` so hand-edited blocks the user
+//! added (and a future template revision dropped) aren't silently lost.
 
-use super::types::{IntegrationAction, IntegrationOutcome, Platform};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
-pub fn execute(action: IntegrationAction) -> anyhow::Result<IntegrationOutcome> {
-    anyhow::bail!(
-        "github {} handler not yet implemented — see task {}",
-        action.as_str(),
-        Platform::Github.handler_task()
+use clap::Subcommand;
+
+use super::keep_block::{self, MergeMode};
+use super::types::{IntegrationAction, IntegrationOutcome, IntegrationStatus, Platform};
+
+const SKILL_TEMPLATE: &str = include_str!("templates/github/SKILL.md.template");
+const CURSOR_TEMPLATE: &str = include_str!("templates/github/cursor.md.template");
+
+/// Relative paths (from repo root) of the SKILL files this handler manages.
+const CLAUDE_SKILL_REL: &str = ".claude/skills/github-repo/SKILL.md";
+const CURSOR_SKILL_REL: &str = ".cursor/skills/github-repo/SKILL.md";
+
+/// `cas integrate github <action>` — github-specific subcommand.
+///
+/// The `--repo OWNER/REPO` flag overrides auto-detection from `git remote -v`,
+/// which is useful when the local clone's remote differs from where the
+/// project really lives (forks, mirrors, ssh-vs-https discrepancies).
+#[derive(Subcommand, Debug, Clone)]
+pub enum GithubAction {
+    /// First-time setup: detect, prompt, write SKILL files.
+    Init {
+        /// Override the auto-detected `OWNER/REPO`. When supplied, the
+        /// `git remote -v` lookup is skipped entirely.
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+    },
+    /// Re-run detection. If the remote changed (rename / transfer), update
+    /// the keep block; otherwise no-op.
+    Refresh {
+        /// Override the auto-detected `OWNER/REPO`.
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+    },
+    /// Read recorded `OWNER/REPO`, compare to current `git remote -v`, return
+    /// a staleness report.
+    Verify,
+}
+
+impl From<GithubAction> for IntegrationAction {
+    fn from(a: GithubAction) -> Self {
+        match a {
+            GithubAction::Init { .. } => IntegrationAction::Init,
+            GithubAction::Refresh { .. } => IntegrationAction::Refresh,
+            GithubAction::Verify => IntegrationAction::Verify,
+        }
+    }
+}
+
+/// `OWNER/REPO` pair — the only data the GitHub integration cares about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoRef {
+    pub owner: String,
+    pub repo: String,
+}
+
+impl RepoRef {
+    pub fn full_name(&self) -> String {
+        format!("{}/{}", self.owner, self.repo)
+    }
+
+    /// Parse from an `OWNER/REPO` string (used by the `--repo` flag).
+    pub fn from_owner_slash_repo(s: &str) -> Option<Self> {
+        let s = s.trim();
+        let (owner, repo) = s.split_once('/')?;
+        if owner.is_empty() || repo.is_empty() || repo.contains('/') {
+            return None;
+        }
+        Some(RepoRef {
+            owner: owner.to_string(),
+            repo: repo.trim_end_matches(".git").to_string(),
+        })
+    }
+}
+
+/// CLI dispatch entry point. Called from [`super::execute`].
+pub fn execute(action: GithubAction) -> anyhow::Result<IntegrationOutcome> {
+    let cwd = std::env::current_dir()?;
+    match action {
+        GithubAction::Init { repo } => init_at(&cwd, repo.as_deref()),
+        GithubAction::Refresh { repo } => refresh_at(&cwd, repo.as_deref()),
+        GithubAction::Verify => verify_at(&cwd),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// URL parsing helpers (pure — easy to unit-test).
+// ---------------------------------------------------------------------------
+
+/// Parse a single remote URL into a `RepoRef` if it points at GitHub.
+///
+/// Accepts:
+/// - `https://github.com/<owner>/<repo>` (with or without trailing `.git`)
+/// - `http://github.com/<owner>/<repo>` (rare but tolerated)
+/// - `git@github.com:<owner>/<repo>` (with or without trailing `.git`)
+/// - `ssh://git@github.com/<owner>/<repo>` (uncommon but valid)
+///
+/// Returns `None` for non-GitHub hosts (gitlab.com, bitbucket.org, self-hosted
+/// gitea, ...) and for malformed URLs.
+pub fn parse_origin_url(url: &str) -> Option<RepoRef> {
+    let url = url.trim();
+    if url.is_empty() {
+        return None;
+    }
+
+    // SCP-like SSH form: git@github.com:owner/repo[.git]
+    if let Some(rest) = url.strip_prefix("git@github.com:") {
+        return split_owner_repo(rest);
+    }
+
+    // ssh://git@github.com/owner/repo[.git]
+    if let Some(rest) = url.strip_prefix("ssh://git@github.com/") {
+        return split_owner_repo(rest);
+    }
+
+    // https://github.com/... or http://github.com/...
+    for prefix in ["https://github.com/", "http://github.com/"] {
+        if let Some(rest) = url.strip_prefix(prefix) {
+            return split_owner_repo(rest);
+        }
+    }
+
+    None
+}
+
+fn split_owner_repo(rest: &str) -> Option<RepoRef> {
+    // Strip any query/fragment first ("?...", "#...").
+    let rest = rest
+        .split_once(['?', '#'])
+        .map(|(p, _)| p)
+        .unwrap_or(rest);
+    // Trim trailing slash to tolerate `.../owner/repo/`.
+    let rest = rest.trim_end_matches('/');
+    let mut parts = rest.splitn(3, '/');
+    let owner = parts.next()?;
+    let repo = parts.next()?;
+    // Anything after the second segment is unexpected — only allow it if it's
+    // empty (e.g. trailing slash already stripped above).
+    if let Some(extra) = parts.next() {
+        if !extra.is_empty() {
+            return None;
+        }
+    }
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    let repo = repo.trim_end_matches(".git");
+    if repo.is_empty() {
+        return None;
+    }
+    Some(RepoRef {
+        owner: owner.to_string(),
+        repo: repo.to_string(),
+    })
+}
+
+/// Parse the output of `git remote -v` and return the `origin` fetch URL, if
+/// any. Falls back to the first remote's fetch URL if `origin` is absent.
+pub fn parse_remote_v(stdout: &str) -> Option<String> {
+    let mut first_fetch: Option<String> = None;
+    for line in stdout.lines() {
+        // Format: "<name>\t<url> (<verb>)"
+        let line = line.trim_end();
+        if line.is_empty() {
+            continue;
+        }
+        let mut tab_split = line.splitn(2, '\t');
+        let name = tab_split.next()?.trim();
+        let rest = tab_split.next()?.trim();
+        let url = match rest.rsplit_once(' ') {
+            Some((u, verb)) => {
+                if !verb.contains("fetch") {
+                    continue;
+                }
+                u.trim()
+            }
+            None => rest,
+        };
+        if url.is_empty() {
+            continue;
+        }
+        if name == "origin" {
+            return Some(url.to_string());
+        }
+        if first_fetch.is_none() {
+            first_fetch = Some(url.to_string());
+        }
+    }
+    first_fetch
+}
+
+/// Run `git remote -v` in `repo_root` and return its stdout. Returns
+/// `Ok(None)` when git exits non-zero (e.g. not a repo) so callers can map
+/// that to `Skipped` rather than a hard error. Other errors (git missing
+/// from PATH) propagate.
+fn run_git_remote_v(repo_root: &Path) -> anyhow::Result<Option<String>> {
+    let output = match Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["remote", "-v"])
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => {
+            // ENOENT / permission issues should bubble up — the user almost
+            // certainly wants to know git isn't on PATH.
+            anyhow::bail!("failed to invoke `git remote -v`: {e}");
+        }
+    };
+    if !output.status.success() {
+        return Ok(None);
+    }
+    Ok(Some(String::from_utf8_lossy(&output.stdout).into_owned()))
+}
+
+/// Detect the `RepoRef` from `git remote -v` in `repo_root`. Returns `None`
+/// when the project isn't a git repo, has no remotes, or the remote points
+/// at a non-GitHub host.
+pub fn detect_repo(repo_root: &Path) -> anyhow::Result<Option<RepoRef>> {
+    let Some(stdout) = run_git_remote_v(repo_root)? else {
+        return Ok(None);
+    };
+    let Some(url) = parse_remote_v(&stdout) else {
+        return Ok(None);
+    };
+    Ok(parse_origin_url(&url))
+}
+
+// ---------------------------------------------------------------------------
+// Template rendering & file IO.
+// ---------------------------------------------------------------------------
+
+fn render_template(template: &str, repo: &RepoRef) -> String {
+    template
+        .replace("{{OWNER}}", &repo.owner)
+        .replace("{{REPO}}", &repo.repo)
+        .replace("{{FULL_NAME}}", &repo.full_name())
+}
+
+/// Resolve a `RepoRef` from either an explicit override or `git remote -v`.
+/// `Ok(None)` means "no GitHub remote and no override" — caller maps to
+/// `Skipped`. `Err` means the override string is malformed.
+fn resolve_repo(
+    repo_root: &Path,
+    flag_override: Option<&str>,
+) -> anyhow::Result<Option<RepoRef>> {
+    if let Some(s) = flag_override {
+        let parsed = RepoRef::from_owner_slash_repo(s).ok_or_else(|| {
+            anyhow::anyhow!(
+                "--repo expects OWNER/REPO (e.g. Richards-LLC/gabber-studio), got: {s:?}"
+            )
+        })?;
+        return Ok(Some(parsed));
+    }
+    detect_repo(repo_root)
+}
+
+/// `init` action implementation, parameterised on `repo_root` for tests.
+pub fn init_at(repo_root: &Path, flag_override: Option<&str>) -> anyhow::Result<IntegrationOutcome> {
+    let Some(repo) = resolve_repo(repo_root, flag_override)? else {
+        return Ok(skipped_outcome(IntegrationAction::Init));
+    };
+    write_skill_files(repo_root, &repo, IntegrationAction::Init)
+}
+
+/// `refresh` action implementation. Same write semantics as init — both use
+/// `MergeMode::PreferTemplate` because the canonical owner/repo comes from a
+/// fresh `git remote -v` lookup. The status differs: a refresh of unchanged
+/// content reports `AlreadyConfigured`; init reports `Configured`.
+pub fn refresh_at(
+    repo_root: &Path,
+    flag_override: Option<&str>,
+) -> anyhow::Result<IntegrationOutcome> {
+    let Some(repo) = resolve_repo(repo_root, flag_override)? else {
+        return Ok(skipped_outcome(IntegrationAction::Refresh));
+    };
+    write_skill_files(repo_root, &repo, IntegrationAction::Refresh)
+}
+
+/// `verify` action implementation. Reads the keep block in the .claude SKILL
+/// file and compares the recorded full_name to the current `git remote -v`.
+pub fn verify_at(repo_root: &Path) -> anyhow::Result<IntegrationOutcome> {
+    let claude_path = repo_root.join(CLAUDE_SKILL_REL);
+    if !claude_path.exists() {
+        let mut out = IntegrationOutcome::new(
+            Platform::Github,
+            IntegrationAction::Verify,
+            IntegrationStatus::Skipped,
+        );
+        out.summary
+            .push(format!("{CLAUDE_SKILL_REL} not found — run `cas integrate github init` first"));
+        return Ok(out);
+    }
+    let existing = fs::read_to_string(&claude_path)?;
+    let recorded = recorded_full_name(&existing)?;
+    let detected = detect_repo(repo_root)?;
+    let mut out = IntegrationOutcome::new(
+        Platform::Github,
+        IntegrationAction::Verify,
+        IntegrationStatus::AlreadyConfigured,
+    );
+    match (recorded.as_deref(), detected.as_ref()) {
+        (Some(rec), Some(det)) if rec == det.full_name() => {
+            out.summary
+                .push(format!("recorded {rec} matches `git remote -v`"));
+        }
+        (Some(rec), Some(det)) => {
+            out.status = IntegrationStatus::Stale;
+            out.summary.push(format!(
+                "drift: SKILL.md records {rec} but `git remote -v` says {}",
+                det.full_name()
+            ));
+        }
+        (Some(rec), None) => {
+            out.status = IntegrationStatus::Stale;
+            out.summary.push(format!(
+                "drift: SKILL.md records {rec} but no GitHub remote was detected — \
+                 was the repo deleted or transferred to a non-GitHub host?"
+            ));
+        }
+        (None, _) => {
+            out.status = IntegrationStatus::Stale;
+            out.summary
+                .push("could not read OWNER/REPO from SKILL.md keep block".to_string());
+        }
+    }
+    Ok(out)
+}
+
+/// Pull the recorded `OWNER/REPO` out of the named keep block.
+fn recorded_full_name(existing: &str) -> anyhow::Result<Option<String>> {
+    let blocks = keep_block::extract(existing)
+        .map_err(|e| anyhow::anyhow!("malformed SKILL.md keep block: {e}"))?;
+    let Some(block) = blocks
+        .into_iter()
+        .find(|b| b.name.as_deref() == Some("github-repo"))
+    else {
+        return Ok(None);
+    };
+    for line in block.body.lines() {
+        // Match the row "| **Full name** | `OWNER/REPO` |".
+        if let Some(rest) = line.split_once("**Full name**").map(|(_, r)| r) {
+            // rest is "| `OWNER/REPO` |" — pull whatever's between backticks.
+            let start = rest.find('`');
+            let end = rest.rfind('`');
+            if let (Some(s), Some(e)) = (start, end) {
+                if e > s + 1 {
+                    return Ok(Some(rest[s + 1..e].to_string()));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn skipped_outcome(action: IntegrationAction) -> IntegrationOutcome {
+    let mut out = IntegrationOutcome::new(Platform::Github, action, IntegrationStatus::Skipped);
+    out.summary
+        .push("no GitHub remote detected (no `origin`, or origin points at a non-GitHub host)".to_string());
+    out
+}
+
+/// Write both SKILL files, merging via `PreferTemplate` if they already exist.
+/// Returns `AlreadyConfigured` when both target files are byte-identical to
+/// the freshly rendered template.
+fn write_skill_files(
+    repo_root: &Path,
+    repo: &RepoRef,
+    action: IntegrationAction,
+) -> anyhow::Result<IntegrationOutcome> {
+    let claude_rendered = render_template(SKILL_TEMPLATE, repo);
+    let cursor_rendered = render_template(CURSOR_TEMPLATE, repo);
+
+    let mut out = IntegrationOutcome::new(
+        Platform::Github,
+        action,
+        match action {
+            IntegrationAction::Init => IntegrationStatus::Configured,
+            IntegrationAction::Refresh => IntegrationStatus::Refreshed,
+            // Caller never invokes us with Verify; keep the match exhaustive.
+            IntegrationAction::Verify => IntegrationStatus::AlreadyConfigured,
+        },
+    );
+
+    let claude_changed = write_one(
+        repo_root,
+        CLAUDE_SKILL_REL,
+        &claude_rendered,
+        &mut out.summary,
+    )?;
+    let cursor_changed = write_one(
+        repo_root,
+        CURSOR_SKILL_REL,
+        &cursor_rendered,
+        &mut out.summary,
+    )?;
+
+    if claude_changed {
+        out.files.push(PathBuf::from(CLAUDE_SKILL_REL));
+    }
+    if cursor_changed {
+        out.files.push(PathBuf::from(CURSOR_SKILL_REL));
+    }
+
+    if !claude_changed && !cursor_changed {
+        out.status = IntegrationStatus::AlreadyConfigured;
+        out.summary
+            .push(format!("{} already current — no changes", repo.full_name()));
+    } else {
+        out.summary
+            .insert(0, format!("recorded {} ", repo.full_name()));
+    }
+
+    Ok(out)
+}
+
+/// Write a single file. Computes `merge(template, existing, PreferTemplate)`,
+/// surfaces orphaned existing keep blocks in `summary`, and returns true iff
+/// the file's bytes changed.
+fn write_one(
+    repo_root: &Path,
+    rel: &str,
+    rendered_template: &str,
+    summary: &mut Vec<String>,
+) -> anyhow::Result<bool> {
+    let path = repo_root.join(rel);
+    let existing_str = if path.exists() {
+        Some(fs::read_to_string(&path)?)
+    } else {
+        None
+    };
+
+    if let Some(ref existing) = existing_str {
+        match keep_block::orphaned_existing(rendered_template, existing) {
+            Ok(orphans) => {
+                for orphan in orphans {
+                    let label = match &orphan.name {
+                        Some(n) => format!("named '{n}'"),
+                        None => "unnamed".to_string(),
+                    };
+                    summary.push(format!(
+                        "warning: dropping orphan keep block ({label}) from {rel} — \
+                         it has no slot in the current template"
+                    ));
+                }
+            }
+            Err(e) => {
+                // Malformed existing file: refuse to silently overwrite.
+                anyhow::bail!(
+                    "existing {rel} has malformed keep markers: {e} — fix or delete the file before re-running"
+                );
+            }
+        }
+    }
+
+    let merged = keep_block::merge(
+        rendered_template,
+        existing_str.as_deref(),
+        MergeMode::PreferTemplate,
     )
+    .map_err(|e| anyhow::anyhow!("keep-block merge failed for {rel}: {e}"))?;
+
+    let changed = match &existing_str {
+        Some(prev) => prev != &merged,
+        None => true,
+    };
+
+    if changed {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&path, &merged)?;
+    }
+    Ok(changed)
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    // --- URL parsing -------------------------------------------------------
+
+    #[test]
+    fn parse_https_with_dot_git() {
+        let r = parse_origin_url("https://github.com/Richards-LLC/gabber-studio.git").unwrap();
+        assert_eq!(r.owner, "Richards-LLC");
+        assert_eq!(r.repo, "gabber-studio");
+        assert_eq!(r.full_name(), "Richards-LLC/gabber-studio");
+    }
+
+    #[test]
+    fn parse_https_without_dot_git() {
+        let r = parse_origin_url("https://github.com/Richards-LLC/gabber-studio").unwrap();
+        assert_eq!(r.full_name(), "Richards-LLC/gabber-studio");
+    }
+
+    #[test]
+    fn parse_https_trailing_slash() {
+        let r = parse_origin_url("https://github.com/Richards-LLC/gabber-studio/").unwrap();
+        assert_eq!(r.full_name(), "Richards-LLC/gabber-studio");
+    }
+
+    #[test]
+    fn parse_ssh_scp_form() {
+        let r = parse_origin_url("git@github.com:Richards-LLC/gabber-studio.git").unwrap();
+        assert_eq!(r.full_name(), "Richards-LLC/gabber-studio");
+    }
+
+    #[test]
+    fn parse_ssh_scp_form_no_dot_git() {
+        let r = parse_origin_url("git@github.com:Richards-LLC/gabber-studio").unwrap();
+        assert_eq!(r.full_name(), "Richards-LLC/gabber-studio");
+    }
+
+    #[test]
+    fn parse_ssh_url_form() {
+        let r = parse_origin_url("ssh://git@github.com/Richards-LLC/gabber-studio.git").unwrap();
+        assert_eq!(r.full_name(), "Richards-LLC/gabber-studio");
+    }
+
+    #[test]
+    fn parse_rejects_gitlab() {
+        assert!(parse_origin_url("https://gitlab.com/foo/bar.git").is_none());
+    }
+
+    #[test]
+    fn parse_rejects_bitbucket() {
+        assert!(parse_origin_url("git@bitbucket.org:foo/bar.git").is_none());
+    }
+
+    #[test]
+    fn parse_rejects_self_hosted_gitea() {
+        assert!(parse_origin_url("https://git.example.com/foo/bar.git").is_none());
+    }
+
+    #[test]
+    fn parse_rejects_empty() {
+        assert!(parse_origin_url("").is_none());
+        assert!(parse_origin_url("   ").is_none());
+    }
+
+    #[test]
+    fn parse_rejects_missing_repo() {
+        assert!(parse_origin_url("https://github.com/Richards-LLC").is_none());
+        assert!(parse_origin_url("https://github.com/Richards-LLC/").is_none());
+        assert!(parse_origin_url("git@github.com:Richards-LLC").is_none());
+    }
+
+    #[test]
+    fn parse_rejects_extra_path_segments() {
+        // GitHub URLs with /tree/main, /pull/1, etc. shouldn't be accepted as
+        // "OWNER/REPO" — they're not clone URLs.
+        assert!(
+            parse_origin_url("https://github.com/Richards-LLC/gabber-studio/tree/main").is_none()
+        );
+    }
+
+    // --- git remote -v parsing --------------------------------------------
+
+    #[test]
+    fn parse_remote_v_picks_origin() {
+        let stdout = "\
+upstream\thttps://github.com/upstream/foo.git (fetch)
+upstream\thttps://github.com/upstream/foo.git (push)
+origin\thttps://github.com/me/foo.git (fetch)
+origin\thttps://github.com/me/foo.git (push)
+";
+        assert_eq!(
+            parse_remote_v(stdout).as_deref(),
+            Some("https://github.com/me/foo.git")
+        );
+    }
+
+    #[test]
+    fn parse_remote_v_falls_back_to_first_when_no_origin() {
+        let stdout = "fork\thttps://github.com/fork/foo.git (fetch)\nfork\thttps://github.com/fork/foo.git (push)\n";
+        assert_eq!(
+            parse_remote_v(stdout).as_deref(),
+            Some("https://github.com/fork/foo.git")
+        );
+    }
+
+    #[test]
+    fn parse_remote_v_empty_returns_none() {
+        assert!(parse_remote_v("").is_none());
+    }
+
+    #[test]
+    fn parse_remote_v_skips_push_lines() {
+        // First line is push-only; we should pick origin's fetch URL, not the
+        // push URL on the line above.
+        let stdout = "origin\thttps://example.com/push (push)\norigin\thttps://github.com/me/foo.git (fetch)\n";
+        assert_eq!(
+            parse_remote_v(stdout).as_deref(),
+            Some("https://github.com/me/foo.git")
+        );
+    }
+
+    // --- RepoRef::from_owner_slash_repo ------------------------------------
+
+    #[test]
+    fn from_flag_simple() {
+        let r = RepoRef::from_owner_slash_repo("foo/bar").unwrap();
+        assert_eq!(r.owner, "foo");
+        assert_eq!(r.repo, "bar");
+    }
+
+    #[test]
+    fn from_flag_strips_dot_git() {
+        let r = RepoRef::from_owner_slash_repo("foo/bar.git").unwrap();
+        assert_eq!(r.repo, "bar");
+    }
+
+    #[test]
+    fn from_flag_rejects_bare_name() {
+        assert!(RepoRef::from_owner_slash_repo("just-a-name").is_none());
+    }
+
+    #[test]
+    fn from_flag_rejects_three_segments() {
+        assert!(RepoRef::from_owner_slash_repo("a/b/c").is_none());
+    }
+
+    #[test]
+    fn from_flag_rejects_empty_halves() {
+        assert!(RepoRef::from_owner_slash_repo("/bar").is_none());
+        assert!(RepoRef::from_owner_slash_repo("foo/").is_none());
+    }
+
+    // --- File-level init / refresh ----------------------------------------
+
+    fn read(p: &Path) -> String {
+        fs::read_to_string(p).unwrap()
+    }
+
+    #[test]
+    fn init_with_flag_override_writes_both_files() {
+        let tmp = TempDir::new().unwrap();
+        let outcome = init_at(tmp.path(), Some("Richards-LLC/gabber-studio")).unwrap();
+        assert_eq!(outcome.status, IntegrationStatus::Configured);
+        assert_eq!(outcome.files.len(), 2);
+        let claude = read(&tmp.path().join(CLAUDE_SKILL_REL));
+        let cursor = read(&tmp.path().join(CURSOR_SKILL_REL));
+        for s in [&claude, &cursor] {
+            assert!(s.contains("Richards-LLC/gabber-studio"));
+            assert!(s.contains("CRITICAL: Always pass --repo"));
+            assert!(s.contains("--repo Richards-LLC/gabber-studio"));
+            assert!(s.contains("<!-- keep github-repo -->"));
+            assert!(s.contains("<!-- /keep github-repo -->"));
+        }
+    }
+
+    #[test]
+    fn init_with_no_remote_returns_skipped() {
+        let tmp = TempDir::new().unwrap();
+        // No flag, no git repo → Skipped. (The `git remote -v` invocation in
+        // a non-repo directory exits non-zero, which we map to None.)
+        let outcome = init_at(tmp.path(), None).unwrap();
+        assert_eq!(outcome.status, IntegrationStatus::Skipped);
+        assert!(!tmp.path().join(CLAUDE_SKILL_REL).exists());
+        assert!(!tmp.path().join(CURSOR_SKILL_REL).exists());
+    }
+
+    #[test]
+    fn init_rejects_malformed_flag() {
+        let tmp = TempDir::new().unwrap();
+        let err = init_at(tmp.path(), Some("not-a-slash-pair")).unwrap_err();
+        assert!(err.to_string().contains("--repo expects OWNER/REPO"));
+    }
+
+    #[test]
+    fn init_idempotent_second_call_is_already_configured() {
+        let tmp = TempDir::new().unwrap();
+        let _ = init_at(tmp.path(), Some("Richards-LLC/gabber-studio")).unwrap();
+        let second = init_at(tmp.path(), Some("Richards-LLC/gabber-studio")).unwrap();
+        assert_eq!(second.status, IntegrationStatus::AlreadyConfigured);
+        assert!(second.files.is_empty());
+    }
+
+    #[test]
+    fn refresh_after_rename_updates_keep_block() {
+        let tmp = TempDir::new().unwrap();
+        let _ = init_at(tmp.path(), Some("OldOwner/old-name")).unwrap();
+        let before = read(&tmp.path().join(CLAUDE_SKILL_REL));
+        assert!(before.contains("OldOwner/old-name"));
+
+        let outcome = refresh_at(tmp.path(), Some("NewOwner/new-name")).unwrap();
+        assert_eq!(outcome.status, IntegrationStatus::Refreshed);
+        let after = read(&tmp.path().join(CLAUDE_SKILL_REL));
+        assert!(!after.contains("OldOwner/old-name"));
+        assert!(after.contains("NewOwner/new-name"));
+        assert!(after.contains("--repo NewOwner/new-name"));
+    }
+
+    #[test]
+    fn refresh_no_change_reports_already_configured() {
+        let tmp = TempDir::new().unwrap();
+        let _ = init_at(tmp.path(), Some("Richards-LLC/gabber-studio")).unwrap();
+        let outcome = refresh_at(tmp.path(), Some("Richards-LLC/gabber-studio")).unwrap();
+        assert_eq!(outcome.status, IntegrationStatus::AlreadyConfigured);
+    }
+
+    #[test]
+    fn refresh_with_no_remote_and_no_flag_is_skipped() {
+        let tmp = TempDir::new().unwrap();
+        let outcome = refresh_at(tmp.path(), None).unwrap();
+        assert_eq!(outcome.status, IntegrationStatus::Skipped);
+    }
+
+    // --- verify ------------------------------------------------------------
+
+    #[test]
+    fn verify_missing_skill_is_skipped() {
+        let tmp = TempDir::new().unwrap();
+        let outcome = verify_at(tmp.path()).unwrap();
+        assert_eq!(outcome.status, IntegrationStatus::Skipped);
+        assert!(outcome
+            .summary
+            .iter()
+            .any(|s| s.contains("not found")));
+    }
+
+    #[test]
+    fn verify_with_matching_flag_path_uses_recorded_value() {
+        // We can't exercise the real `git remote -v` portion in a unit test
+        // without standing up a fake git, but we *can* assert the recorded
+        // value extraction works.
+        let tmp = TempDir::new().unwrap();
+        let _ = init_at(tmp.path(), Some("Richards-LLC/gabber-studio")).unwrap();
+        let body = read(&tmp.path().join(CLAUDE_SKILL_REL));
+        let recorded = recorded_full_name(&body).unwrap();
+        assert_eq!(recorded.as_deref(), Some("Richards-LLC/gabber-studio"));
+    }
+
+    #[test]
+    fn verify_handles_keep_block_with_drift_marker() {
+        // Construct a SKILL file by hand with a known recorded value, then
+        // confirm `recorded_full_name` plucks it out cleanly.
+        let body = "\
+---
+name: github-repo
+---
+
+<!-- keep github-repo -->
+| | Value |
+|--|--|
+| **Owner** | `acme` |
+| **Repo** | `widget` |
+| **Full name** | `acme/widget` |
+<!-- /keep github-repo -->
+";
+        assert_eq!(
+            recorded_full_name(body).unwrap().as_deref(),
+            Some("acme/widget")
+        );
+    }
+
+    #[test]
+    fn verify_unparseable_keep_block_returns_none() {
+        // Keep block exists but has no Full name row.
+        let body = "<!-- keep github-repo -->\nrandom\n<!-- /keep github-repo -->\n";
+        assert_eq!(recorded_full_name(body).unwrap(), None);
+    }
+
+    #[test]
+    fn verify_no_keep_block_returns_none() {
+        assert_eq!(recorded_full_name("# no keep block here\n").unwrap(), None);
+    }
+
+    // --- orphan surfacing --------------------------------------------------
+
+    #[test]
+    fn refresh_surfaces_orphan_keep_blocks_in_summary() {
+        let tmp = TempDir::new().unwrap();
+        // Hand-write an existing SKILL.md with the canonical block PLUS a
+        // user-added unnamed block the template doesn't accommodate.
+        let claude_path = tmp.path().join(CLAUDE_SKILL_REL);
+        fs::create_dir_all(claude_path.parent().unwrap()).unwrap();
+        let with_orphan = "\
+# Hand-written
+<!-- keep github-repo -->
+| **Full name** | `Richards-LLC/gabber-studio` |
+<!-- /keep github-repo -->
+<!-- keep my-notes -->
+hand-edited notes
+<!-- /keep my-notes -->
+";
+        fs::write(&claude_path, with_orphan).unwrap();
+
+        let outcome = refresh_at(tmp.path(), Some("Richards-LLC/gabber-studio")).unwrap();
+        assert!(
+            outcome
+                .summary
+                .iter()
+                .any(|s| s.contains("orphan keep block") && s.contains("my-notes")),
+            "summary should warn about orphan; got: {:?}",
+            outcome.summary
+        );
+    }
 }
