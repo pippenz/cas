@@ -15,6 +15,7 @@ metadata:
 ## Repository
 
 <!-- keep github-repo -->
+<!-- cas:full_name={{FULL_NAME}} -->
 | | Value |
 |--|--|
 | **Owner** | `{{OWNER}}` |

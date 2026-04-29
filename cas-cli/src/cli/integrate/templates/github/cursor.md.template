@@ -17,6 +17,7 @@ Refer to `~/.cursor/skills/mcp-github/SKILL.md` for tool usage. This skill provi
 ## Repository
 
 <!-- keep github-repo -->
+<!-- cas:full_name={{FULL_NAME}} -->
 | | Value |
 |--|--|
 | **Owner** | `{{OWNER}}` |

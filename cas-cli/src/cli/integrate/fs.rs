@@ -14,7 +14,8 @@
 
 use std::fs;
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use anyhow::Context;
 
@@ -147,6 +148,66 @@ pub fn atomic_write_create_dirs(path: &Path, contents: &str) -> anyhow::Result<(
             .with_context(|| format!("creating {}", parent.display()))?;
     }
     atomic_write(path, contents)
+}
+
+// ---------------------------------------------------------------------------
+// Repo-root resolution with git -C discipline
+// ---------------------------------------------------------------------------
+
+/// Resolve the repo root for a `cas integrate` invocation, starting from
+/// `start`. Tries, in order:
+///
+/// 1. `git -C <start> rev-parse --show-toplevel` — if `start` lives inside
+///    a git repo (or a submodule), this returns the inner repo's toplevel
+///    (the one a user would expect `cas integrate` to operate on, not the
+///    parent of a containing superproject).
+/// 2. The first ancestor of `start` containing a `.git`, `.cas`,
+///    `Cargo.toml`, or `package.json` marker — handles cases where `git`
+///    isn't on PATH but the directory clearly is a project root.
+/// 3. `start` itself, as a last resort.
+///
+/// Tests pass an explicit start path; production callers use
+/// [`locate_repo_root`] which uses `std::env::current_dir`.
+pub fn locate_repo_root_from(start: &Path) -> anyhow::Result<PathBuf> {
+    // Step 1: `git -C <start> rev-parse --show-toplevel`. Using `-C` keeps
+    // git's repo-discovery anchored at `start` rather than wherever the
+    // process happened to be invoked from — and on a submodule checkout it
+    // returns the *inner* repo's toplevel, which is what users want for
+    // `cas integrate`.
+    if let Ok(out) = Command::new("git")
+        .arg("-C")
+        .arg(start)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+    {
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !s.is_empty() {
+                return Ok(PathBuf::from(s));
+            }
+        }
+    }
+
+    // Step 2: walk upward looking for a project marker.
+    const MARKERS: &[&str] = &[".git", ".cas", "Cargo.toml", "package.json"];
+    let mut cur: Option<&Path> = Some(start);
+    while let Some(p) = cur {
+        for m in MARKERS {
+            if p.join(m).exists() {
+                return Ok(p.to_path_buf());
+            }
+        }
+        cur = p.parent();
+    }
+
+    // Step 3: fall back to start. Rare — would require no git, no markers.
+    Ok(start.to_path_buf())
+}
+
+/// Production wrapper: resolve from `std::env::current_dir`.
+pub fn locate_repo_root() -> anyhow::Result<PathBuf> {
+    let cwd = std::env::current_dir().context("getting current dir")?;
+    locate_repo_root_from(&cwd)
 }
 
 #[cfg(test)]
@@ -360,5 +421,68 @@ mod tests {
     fn is_regular_file_false_for_missing() {
         let tmp = TempDir::new().unwrap();
         assert!(!is_regular_file(&tmp.path().join("nope.txt")));
+    }
+
+    // --- locate_repo_root_from -----------------------------------------------
+
+    #[test]
+    fn locate_repo_root_from_returns_inner_git_toplevel_in_real_repo() {
+        // `git init` a tempdir, then descend into a subdir and confirm
+        // locate_repo_root_from resolves back to the toplevel — i.e. the
+        // git -C discipline works.
+        if Command::new("git").arg("--version").output().is_err() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(["init", "-q"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let inner = tmp.path().join("a/b/c");
+        fs::create_dir_all(&inner).unwrap();
+        // Resolve canonical paths because git typically returns the
+        // canonicalized toplevel and tempdir paths often go through
+        // /private on macOS / a symlinked /tmp.
+        let resolved = locate_repo_root_from(&inner).unwrap();
+        assert_eq!(
+            fs::canonicalize(&resolved).unwrap(),
+            fs::canonicalize(tmp.path()).unwrap()
+        );
+    }
+
+    #[test]
+    fn locate_repo_root_from_walks_up_to_marker_when_no_git() {
+        // No git in this temp tree (ensure no .git dir exists). Drop a
+        // Cargo.toml at the top, descend into a subdir, confirm we walk up
+        // to it. Even if git is on PATH, `rev-parse` will fail outside a
+        // repo; the function falls through to the marker walk.
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("Cargo.toml"), "[package]\nname=\"x\"").unwrap();
+        let inner = tmp.path().join("a/b");
+        fs::create_dir_all(&inner).unwrap();
+        // Skip if git accidentally finds an outer parent repo (e.g. running
+        // inside a CAS worktree). We can detect that by checking whether
+        // git's --show-toplevel would succeed — if it does, this test isn't
+        // exercising the marker-walk path.
+        let git_finds_outer = Command::new("git")
+            .arg("-C")
+            .arg(&inner)
+            .args(["rev-parse", "--show-toplevel"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if git_finds_outer {
+            eprintln!("skipping: git rev-parse found an outer repo, marker-walk not exercised");
+            return;
+        }
+        let resolved = locate_repo_root_from(&inner).unwrap();
+        assert_eq!(
+            fs::canonicalize(&resolved).unwrap(),
+            fs::canonicalize(tmp.path()).unwrap()
+        );
     }
 }

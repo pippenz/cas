@@ -378,12 +378,23 @@ fn recorded_full_name(existing: &str) -> anyhow::Result<Option<String>> {
     else {
         return Ok(None);
     };
+
+    // Primary path (cas-fc38): look for the machine-readable
+    // `<!-- cas:full_name=OWNER/REPO -->` tag emitted by current templates.
+    // This is the canonical convention shared with vercel/neon and is
+    // resilient to future template revisions that rename row labels.
+    if let Some(tagged) = super::md::parse_cas_full_name_tag(&block.body) {
+        if RepoRef::from_owner_slash_repo(&tagged).is_some() {
+            return Ok(Some(tagged));
+        }
+    }
+
+    // Backwards-compat path: pre-cas-fc38 templates encoded the value in a
+    // `| **Full name** | `OWNER/REPO` |` table row. We deliberately pull the
+    // value between the *first pair* of backticks (not first and last) so an
+    // injected extra `` ` `` can't widen the capture, then re-validate the
+    // token as a well-formed OWNER/REPO.
     for line in block.body.lines() {
-        // Match the row "| **Full name** | `OWNER/REPO` |". We deliberately
-        // pull the value between the *first pair* of backticks (not first and
-        // last) so an injected extra `` ` `` later in the line can't widen the
-        // capture. The extracted token is then trimmed and re-validated as a
-        // well-formed OWNER/REPO before we trust it.
         let Some(rest) = line.split_once("**Full name**").map(|(_, r)| r) else {
             continue;
         };
@@ -513,52 +524,9 @@ fn write_one(
     };
 
     if changed {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        atomic_write(&path, &merged)?;
+        super::fs::atomic_write_create_dirs(&path, &merged)?;
     }
     Ok(changed)
-}
-
-/// Write `contents` to `path` via tempfile + rename so concurrent readers
-/// never see a half-written file. Reduces (but does not eliminate) the
-/// blast radius of two `cas integrate` invocations racing on the same SKILL
-/// file — the rename on POSIX is atomic, so the loser of the race overwrites
-/// cleanly rather than leaving a torn file behind.
-///
-/// Implemented with `std::fs` only to avoid adding a runtime crate dep
-/// (`tempfile` is dev-only here); we generate a sibling tempfile name from
-/// the process id + a nanosecond timestamp and clean it up on failure.
-fn atomic_write(path: &Path, contents: &str) -> anyhow::Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("refusing to write to a root-less path: {}", path.display()))?;
-    let file_name = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .ok_or_else(|| anyhow::anyhow!("non-UTF8 target file name: {}", path.display()))?;
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let tmp_name = format!(".{}.cas-integrate.{}.{nanos}.tmp", file_name, std::process::id());
-    let tmp_path = parent.join(tmp_name);
-
-    // Ensure the temp file is removed on any failure path before rename.
-    let write_result = (|| -> std::io::Result<()> {
-        fs::write(&tmp_path, contents.as_bytes())?;
-        fs::rename(&tmp_path, path)
-    })();
-    if let Err(e) = write_result {
-        // Best-effort cleanup; if rename succeeded, tmp_path is already gone.
-        let _ = fs::remove_file(&tmp_path);
-        return Err(anyhow::anyhow!(
-            "failed to atomically write {}: {e}",
-            path.display()
-        ));
-    }
-    Ok(())
 }
 
 // ===========================================================================
@@ -1014,6 +982,69 @@ name: github-repo
             .unwrap();
         // Detection must reject the non-GitHub remote.
         assert_eq!(detect_repo(tmp.path()).unwrap(), None);
+    }
+
+    #[test]
+    fn init_emits_cas_full_name_tag_in_keep_block() {
+        // cas-fc38: every handler emits the `<!-- cas:full_name=... -->`
+        // identity tag so downstream tooling can recover the canonical
+        // identity without parsing template-internal markdown layout.
+        let tmp = TempDir::new().unwrap();
+        let _ = init_at(tmp.path(), Some("Richards-LLC/gabber-studio")).unwrap();
+        let claude = read(&tmp.path().join(CLAUDE_SKILL_REL));
+        let cursor = read(&tmp.path().join(CURSOR_SKILL_REL));
+        for s in [&claude, &cursor] {
+            assert!(
+                s.contains("<!-- cas:full_name=Richards-LLC/gabber-studio -->"),
+                "expected canonical cas:full_name tag in:\n{s}"
+            );
+        }
+        // The tag must be inside the named keep block so refresh preserves
+        // it via PreferTemplate semantics.
+        let blocks = super::super::keep_block::extract(&claude).unwrap();
+        let github_block = blocks
+            .iter()
+            .find(|b| b.name.as_deref() == Some("github-repo"))
+            .expect("github-repo keep block must exist");
+        assert!(
+            super::super::md::parse_cas_full_name_tag(&github_block.body).is_some(),
+            "tag must live inside the keep block, not adjacent prose"
+        );
+    }
+
+    #[test]
+    fn recorded_full_name_prefers_cas_full_name_tag_over_table_row() {
+        // Provided both, the tag is canonical (cas-fc38). This guards
+        // against templates that legitimately reorder the row in a future
+        // revision.
+        let body = "\
+<!-- keep github-repo -->
+<!-- cas:full_name=acme/widget -->
+| | Value |
+| **Full name** | `something/else` |
+<!-- /keep github-repo -->
+";
+        assert_eq!(
+            recorded_full_name(body).unwrap().as_deref(),
+            Some("acme/widget"),
+            "tag must beat the table-row fallback"
+        );
+    }
+
+    #[test]
+    fn recorded_full_name_falls_back_to_table_row_when_tag_absent() {
+        // Backwards compat: a SKILL.md from a pre-fc38 install has no tag,
+        // only the **Full name** row. We must still recover.
+        let body = "\
+<!-- keep github-repo -->
+| | Value |
+| **Full name** | `acme/widget` |
+<!-- /keep github-repo -->
+";
+        assert_eq!(
+            recorded_full_name(body).unwrap().as_deref(),
+            Some("acme/widget")
+        );
     }
 
     #[test]

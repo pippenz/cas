@@ -20,6 +20,7 @@ target a non-default branch.
 ## Project Config
 
 <!-- keep neon-ids -->
+<!-- cas:full_name={{ORG_ID}}/{{PROJECT_ID}} -->
 | | Value |
 |--|--|
 | **org_id** | `{{ORG_ID}}` |

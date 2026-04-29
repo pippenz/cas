@@ -69,7 +69,7 @@ const KEEP_IDS_BLOCK: &str = "vercel-ids";
 
 /// Cap on bytes read from user-controlled markdown / JSON files.
 /// Defends against `dd`-style accidents and symlinks to `/dev/zero`.
-const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024; // 4 MiB
+// File-size cap (4 MiB) lives in `super::fs::MAX_FILE_BYTES` post-cas-fc38.
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -259,26 +259,9 @@ fn render_ids_table(projects: &[ProjectSummary]) -> String {
     out
 }
 
-/// Escape a value for safe inclusion in a markdown table cell. Strips:
-/// - `|` (would break the cell layout)
-/// - HTML comment open/close (`<!--`, `-->`) — would corrupt the surrounding
-///   keep-block markers and on subsequent refresh cause `keep_block::extract`
-///   to mis-parse.
-/// - Newlines (would break the row).
-fn escape_md_cell(s: &str) -> String {
-    s.replace('|', "\\|")
-        .replace("<!--", "&lt;!--")
-        .replace("-->", "--&gt;")
-        .replace('\n', " ")
-        .replace('\r', " ")
-}
-
-/// Escape a value rendered inside backticks (`code` cell). Same as
-/// [`escape_md_cell`] but additionally strips backticks so a malicious id
-/// cannot break out of the inline-code span and hijack the table.
-fn escape_md_cell_code(s: &str) -> String {
-    escape_md_cell(s).replace('`', "")
-}
+// Markdown cell escaping moved to `super::md` (cas-fc38). Re-exported as
+// thin local aliases so existing call sites stay readable.
+use super::md::{escape_md_cell, escape_md_cell_code};
 
 // ---------------------------------------------------------------------------
 // Init / Refresh / Verify
@@ -300,40 +283,10 @@ pub fn execute(action: IntegrationAction) -> anyhow::Result<IntegrationOutcome> 
     }
 }
 
-/// Sentinels that mark a directory as a real project root for the purposes
-/// of `cas integrate`. If git toplevel resolution fails AND none of these
-/// is present at the cwd, we refuse to write skill files into a bare CWD —
-/// otherwise `cas integrate vercel init` from `~/Downloads` would silently
-/// scribble `.claude/skills/...` into the user's home-adjacent directory.
-const PROJECT_SENTINELS: &[&str] =
-    &[".git", ".cas", "Cargo.toml", "package.json", "pyproject.toml"];
-
-fn locate_repo_root() -> anyhow::Result<PathBuf> {
-    let cwd = std::env::current_dir().context("getting current dir")?;
-    if let Ok(out) = std::process::Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .output()
-    {
-        if out.status.success() {
-            let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !path.is_empty() {
-                return Ok(PathBuf::from(path));
-            }
-        }
-    }
-    // No git toplevel — only fall back to CWD if it looks like a project.
-    if PROJECT_SENTINELS
-        .iter()
-        .any(|s| cwd.join(s).exists())
-    {
-        return Ok(cwd);
-    }
-    anyhow::bail!(
-        "{} is not inside a project (no git toplevel, no .git/.cas/Cargo.toml/package.json/pyproject.toml). \
-         Run `cas integrate vercel <action>` from a project root.",
-        cwd.display()
-    )
-}
+// `locate_repo_root` moved to `super::fs` (cas-fc38) — uniform across all
+// platform handlers. The shared version uses `git -C <cwd>` so submodule and
+// nested-worktree invocations resolve to the inner repo, not the parent.
+use super::fs::locate_repo_root;
 
 /// `cas integrate vercel init`: detect, fetch, fuzzy-match, write 3 files.
 ///
@@ -659,19 +612,12 @@ fn repo_basename(repo_root: &Path) -> String {
 
 /// Write `content` to `path`, creating parent directories as needed.
 ///
-/// **Not atomic.** A process kill between the parent-dir create and the file
-/// write, or mid-write, can leave a partial file on disk. Init's three-file
-/// write sequence inherits this — partial-state recovery is tracked in
-/// **cas-7417** (init wire-up) which already needs to thread a long-lived
-/// client + tokio runtime and is the natural place for tempfile-and-rename.
+/// Write a single file via the shared `super::fs::atomic_write_create_dirs`
+/// helper (cas-fc38). Atomic at the rename: a process crash mid-write either
+/// leaves the old contents intact or the new contents intact, never a torn
+/// intermediate. Refuses to write through a symlink at the target.
 fn write_file(path: &Path, content: &str) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
-    std::fs::write(path, content)
-        .with_context(|| format!("writing {}", path.display()))?;
-    Ok(())
+    super::fs::atomic_write_create_dirs(path, content)
 }
 
 /// Treat a SKILL.md as "ready to overwrite" if it does not exist or its
@@ -717,42 +663,9 @@ fn parse_recorded_ids(body: &str) -> Vec<String> {
     out
 }
 
-/// True iff `path` exists, is a regular file, and is NOT a symlink.
-fn is_regular_file(path: &Path) -> bool {
-    match std::fs::symlink_metadata(path) {
-        Ok(md) => md.file_type().is_file(),
-        Err(_) => false,
-    }
-}
-
-/// Read a file with a [`MAX_FILE_BYTES`] cap. Refuses symlinks and rejects
-/// inputs larger than the cap with a clear error rather than allocating
-/// unbounded memory.
-fn read_capped(path: &Path) -> anyhow::Result<String> {
-    use std::io::Read;
-    let md = std::fs::symlink_metadata(path)
-        .with_context(|| format!("statting {}", path.display()))?;
-    if md.file_type().is_symlink() {
-        anyhow::bail!(
-            "{} is a symlink; refusing to follow",
-            path.display()
-        );
-    }
-    if md.len() > MAX_FILE_BYTES {
-        anyhow::bail!(
-            "{} is {} bytes; exceeds cap of {} bytes",
-            path.display(),
-            md.len(),
-            MAX_FILE_BYTES
-        );
-    }
-    let mut f = std::fs::File::open(path)
-        .with_context(|| format!("opening {}", path.display()))?;
-    let mut s = String::new();
-    f.take(MAX_FILE_BYTES + 1).read_to_string(&mut s)
-        .with_context(|| format!("reading {}", path.display()))?;
-    Ok(s)
-}
+// `is_regular_file` and `read_capped` moved to `super::fs` (cas-fc38) and
+// are re-exported here so existing call sites keep their unqualified names.
+use super::fs::{is_regular_file, read_capped};
 
 // ---------------------------------------------------------------------------
 // Default client factory (mcp-proxy gated)
@@ -1202,6 +1115,35 @@ mod tests {
         let claude = std::fs::read_to_string(root.join(REL_CLAUDE_SKILL)).unwrap();
         assert!(claude.contains("prj_1"));
         assert!(claude.contains("<!-- keep vercel-ids -->"));
+    }
+
+    #[test]
+    fn init_emits_cas_full_name_tag_in_keep_block() {
+        // cas-fc38: every handler emits the canonical cas:full_name tag
+        // inside its IDs keep block. For vercel the value is the repo
+        // basename (matched against project names).
+        let (_tmp, root) = make_repo_with_name("acme-app");
+        std::fs::write(root.join("vercel.json"), "{}").unwrap();
+        let client = MockVercelClient::new(vec![proj("prj_1", "acme-app", "team_a")]);
+        let _ = init(&root, &client).unwrap();
+        let claude = std::fs::read_to_string(root.join(REL_CLAUDE_SKILL)).unwrap();
+        let cursor = std::fs::read_to_string(root.join(REL_CURSOR_SKILL)).unwrap();
+        for s in [&claude, &cursor] {
+            assert!(
+                s.contains("<!-- cas:full_name=acme-app -->"),
+                "expected cas:full_name tag in:\n{s}"
+            );
+            // Tag must live inside the keep block.
+            let blocks = super::super::keep_block::extract(s).unwrap();
+            let ids_block = blocks
+                .iter()
+                .find(|b| b.name.as_deref() == Some("vercel-ids"))
+                .expect("vercel-ids keep block must exist");
+            assert!(
+                super::super::md::parse_cas_full_name_tag(&ids_block.body).is_some(),
+                "tag must live inside vercel-ids keep block, not adjacent prose"
+            );
+        }
     }
 
     #[test]
@@ -1824,7 +1766,7 @@ mod tests {
     fn read_capped_rejects_oversize_files() {
         let (_tmp, root) = make_repo_with_name("foo");
         let path = root.join("big.txt");
-        let big = vec![b'a'; (MAX_FILE_BYTES as usize) + 1];
+        let big = vec![b'a'; (super::super::fs::MAX_FILE_BYTES as usize) + 1];
         std::fs::write(&path, &big).unwrap();
         let err = read_capped(&path).unwrap_err().to_string();
         assert!(err.contains("exceeds cap"), "got: {err}");
