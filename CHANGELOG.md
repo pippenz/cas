@@ -7,9 +7,100 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [2.10.0] - 2026-04-29
+
 ### Added
 
+#### Vercel/Neon/GitHub Auto-Integration (EPIC cas-b65f)
+- `cas integrate <vercel|neon|github> [init|refresh|verify]` standalone subcommands.
+  - **Vercel**: detects `vercel.json` / `@vercel/*` deps, fuzzy-matches via
+    `mcp__vercel__list_projects`, captures team + project + env→branch mapping.
+  - **Neon**: detects Prisma + `@neondatabase/*` / `@prisma/adapter-neon`, prompts
+    for org when multiple exist, captures `org_id` + `projectId` + `databaseName` +
+    branches via `mcp__neon__{list_organizations,list_projects,describe_project,describe_branch}`.
+  - **GitHub**: parses `git remote -v` (https + ssh forms), records `owner/repo`.
+- `cas init` runs platform detection and prompts Y/N per detected platform,
+  delegating to the corresponding `cas integrate <platform> init` in-process.
+  Idempotent on re-run: existing populated SKILL.md flips the prompt to
+  "Refresh? [y/N]" with default N.
+- `--no-integrations`, `--vercel <id>`, `--neon <id>`, `--github <repo>` flags
+  for non-interactive `cas init` use.
+- Generated SKILL files land in **both** `.claude/skills/<name>/` and
+  `.cursor/skills/<name>/` so both harnesses pick them up.
+- `<!-- keep <name> -->` … `<!-- /keep <name> -->` named keep blocks preserve
+  user-owned IDs across `refresh` regenerations. `--update-ids` opts into
+  re-fetching IDs from the platform MCP.
+- `<!-- cas:full_name=... -->` identity tag convention for canonical project
+  identity inside keep blocks; sanitized to neutralize markdown injection.
+- `cas doctor` audits integration freshness via per-platform `verify_report`
+  and surfaces stale IDs as warnings (not errors); MCP-down reports as
+  `skipped — MCP not configured` rather than failing the doctor run.
+- Optional opt-in `[integrations] session_start_warn = true` in
+  `.cas/config.toml` emits a low-severity SessionStart banner when integrations
+  go stale. Default off — preserves the codemap banner's signal.
+
+#### Codemap Skill (cas-4d84)
+- `/codemap` skill ships in `.claude/skills/codemap/`, builtins, and codex
+  variant. Generates `.claude/CODEMAP.md` and resets the freshness counter
+  via `cas codemap clear` after writing. Closes the long-standing gap where
+  hooks referenced a `/codemap` slash command that did not exist.
+
+### Changed
+
+#### Factory Skill Bundles (cas-61af)
+- `cas-supervisor.md` split from 44 KB into a 6.8 KB SKILL.md + six
+  references (`preflight`, `intake`, `planning`, `workflow`,
+  `worker-recovery`, `reference`).
+- `cas-worker.md` split from 22 KB into a 5.7 KB SKILL.md + three
+  references (`close-gate`, `recovery`, `details`).
+- `supervisor_guidance()` and `worker_guidance()` no longer bundle
+  `cas-task-tracking`, `cas-memory-management`, or `cas-search` — those are
+  autonomous skills the agent invokes via the Skill tool. Bundled payload
+  dropped from ~61 KB / ~35 KB to ~10 KB / ~5.5 KB respectively.
+- Test ceiling at 12 KB enforces the bundle stays small enough that the
+  Claude Code harness does not truncate the SessionStart additionalContext
+  to a 2 KB preview.
+
+#### Cross-cutting Hardening (cas-fc38)
+- New `cli/integrate/fs.rs` shared module: `atomic_write`,
+  `atomic_write_create_dirs`, `read_capped` (4 MiB cap with symlink
+  rejection), `is_regular_file`, `locate_repo_root[_from]` (with `git -C`
+  discipline that resolves the inner repo on submodule / nested-worktree
+  invocations).
+- New `cli/integrate/md.rs` shared module: `escape_md_cell`,
+  `escape_md_cell_code`, `emit_cas_full_name_tag`, `parse_cas_full_name_tag`.
+- `IntegrationStatus` split: `TransportError` distinct from `Stale` so a
+  failed MCP call is no longer misreported as a stale ID.
+- All three platform handlers consume the shared helpers — atomic-write
+  semantics, symlink defense, file-size cap, markdown escaping, and
+  identity tag behave uniformly.
+
 #### Team Memories
+- `cas cloud team set|show|clear` subcommands to configure the active team
+  (UUID input; slug resolution deferred pending cloud-side endpoint).
+- `cas memory share <id>|--since <duration>|--all [--dry-run]` for retroactive
+  backfill of pre-existing personal memories to the team push queue.
+- `cas memory unshare <id>` to mark a memory `share=Private` (blocks future
+  team dual-enqueue; does not retract cloud-side copies).
+- `share: Option<ShareScope>` (`Private`/`Team`) persisted on Entry, Rule,
+  Skill, and Task via SQLite migrations `m037`/`m060`/`m082`/`m121`.
+- Automatic dual-enqueue: when a team is configured via
+  `cas cloud team set`, `cas memory remember` in any Project-scoped
+  non-Preference context queues the entry to both personal and team
+  push queues. `cas cloud sync` drains both.
+- Coarse kill-switch: `cloud.json.team_auto_promote: false` disables the
+  automatic promotion without requiring the team to be cleared.
+- Integration test suite: `team_sync_test.rs`, `memory_share_test.rs`,
+  `team_memories_e2e_test.rs` cover the full push → pull pipeline.
+
+### Changed
+
+- `mcp-proxy` is now a default Cargo feature so `cas integrate vercel|neon`
+  ships out of the box — the wired `ProxyVercelClient` / `LiveNeonClient`
+  require it.
+- `cas cloud team-memories`'s "no team configured" error now correctly
+  directs users to `cas cloud team set <uuid>` (previously referenced a
+  non-existent subcommand with `<slug>` argument).
 - `cas cloud team set|show|clear` subcommands to configure the active team
   (UUID input; slug resolution deferred pending cloud-side endpoint).
 - `cas memory share <id>|--since <duration>|--all [--dry-run]` for retroactive
