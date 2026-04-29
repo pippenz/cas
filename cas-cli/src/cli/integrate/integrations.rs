@@ -102,14 +102,16 @@ pub fn run(
 enum Step {
     Vercel {
         mode: StepMode,
-        /// Pre-seeded `prj_*` from `--vercel <id>` if any. Currently used
-        /// only to gate plan inclusion; threading into the handler is
-        /// part of the picker work tracked in cas-7417's prompt follow-on.
+        /// Pre-seeded `prj_*` from `--vercel <id>` if any. Threaded into
+        /// `vercel::init_with_preseed`, which bypasses list_projects +
+        /// fuzzy-match and validates the id via `client.get_project`.
         preseed_project: Option<String>,
     },
     Neon {
         mode: StepMode,
-        /// Pre-seeded Neon project ID. Same caveat as `Vercel.preseed_project`.
+        /// Pre-seeded Neon project ID from `--neon <id>` if any. Threaded
+        /// into `neon::InitChoices.project_id`, which forces the handler to
+        /// use this project without prompting.
         preseed_project: Option<String>,
     },
     Github {
