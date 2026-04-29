@@ -44,6 +44,8 @@ pub mod keep_block;
 pub mod lock;
 pub mod md;
 pub mod neon;
+#[cfg(test)]
+mod neon_parsers_test;
 pub mod types;
 pub mod vercel;
 
