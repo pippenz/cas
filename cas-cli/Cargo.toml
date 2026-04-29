@@ -74,6 +74,11 @@ rayon = "1.10"
 ratatui = "0.30"
 crossterm = "0.29"
 
+# Interactive prompts (one-shot CLI Q&A flows for `cas integrate` — purpose-built
+# for prompts; ratatui is the wrong tool for this surface). Pinned to the 0.7
+# stable line; bump if a platform handler needs a 0.9-only feature.
+inquire = "0.7"
+
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

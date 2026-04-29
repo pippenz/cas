@@ -22,6 +22,7 @@ mod factory;
 mod factory_tooling;
 mod hook;
 mod init;
+pub mod integrate;
 pub mod interactive;
 mod list;
 mod mcp_cmd;
@@ -189,6 +190,10 @@ pub enum Commands {
     #[command(subcommand, name = "project-overview")]
     ProjectOverview(project_overview_cmd::ProjectOverviewCommands),
 
+    /// Auto-integrate the project with Vercel/Neon/GitHub (writes SKILL files)
+    #[command(subcommand)]
+    Integrate(integrate::IntegrateCommands),
+
     /// Share or unshare personal memories with your team (retroactive)
     #[command(subcommand)]
     Memory(memory::MemoryCommands),
@@ -247,6 +252,7 @@ fn auth_requirement(command: &Option<Commands>) -> AuthRequirement {
         | Commands::ClaudeMd(_)
         | Commands::Codemap(_)
         | Commands::ProjectOverview(_)
+        | Commands::Integrate(_)
         | Commands::Memory(_)
         | Commands::KnownRepos(_)
         | Commands::Worktree(_)
@@ -407,6 +413,7 @@ fn get_command_name(cmd: &Option<Commands>) -> String {
         Commands::ClaudeMd(_) => "claude-md".to_string(),
         Commands::Codemap(_) => "codemap".to_string(),
         Commands::ProjectOverview(_) => "project-overview".to_string(),
+        Commands::Integrate(_) => "integrate".to_string(),
         Commands::Memory(_) => "memory".to_string(),
         Commands::KnownRepos(_) => "known-repos".to_string(),
         Commands::Worktree(_) => "worktree".to_string(),
@@ -462,6 +469,7 @@ fn run_command(cli: &Cli, cas_root: Option<&Path>) -> anyhow::Result<()> {
         Commands::ProjectOverview(cmd) => {
             project_overview_cmd::execute(cmd, cli, require_cas_root(cas_root)?)
         }
+        Commands::Integrate(cmd) => integrate::execute(cmd, cli),
         Commands::Memory(cmd) => memory::execute(cmd, cli, require_cas_root(cas_root)?),
         Commands::KnownRepos(cmd) => known_repos::execute(cmd),
         Commands::Worktree(cmd) => worktree::execute(cmd),
