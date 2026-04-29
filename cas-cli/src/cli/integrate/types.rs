@@ -133,14 +133,19 @@ impl IntegrationOutcome {
 /// error case (MCP server not configured, network down, auth failed); doctor
 /// treats this as a *skip*, not a stale, so a missing MCP server doesn't
 /// hard-fail `cas doctor` in CI.
+///
+/// The two-variant split (Stale vs McpUnreachable) is intentionally minimal
+/// for cas-3efe; if a future platform needs additional states (e.g.
+/// `NotFound` for "ID recorded but never queryable"), add them here at the
+/// same time as a `render_one` arm in `cli/integrate/doctor.rs` — adding a
+/// variant without wiring the renderer makes the new state silently
+/// indistinguishable from `Ok`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IdState {
     /// ID exists on the platform.
     Ok,
     /// ID is recorded locally but not present on the platform — user should refresh.
     Stale,
-    /// ID is recorded locally with no corresponding platform query (informational).
-    NotFound,
     /// MCP/transport call failed; cannot determine state. Carries the error text.
     McpUnreachable(String),
 }
@@ -150,7 +155,6 @@ impl IdState {
         match self {
             IdState::Ok => "ok",
             IdState::Stale => "stale",
-            IdState::NotFound => "not-found",
             IdState::McpUnreachable(_) => "mcp-unreachable",
         }
     }
@@ -205,21 +209,9 @@ impl VerifyReport {
         }
     }
 
-    /// At least one item is in [`IdState::Stale`].
+    /// At least one item is in [`IdState::Stale`]. Used by the SessionStart
+    /// banner gate in `cli/integrate/doctor::session_start_banner_text`.
     pub fn has_stale(&self) -> bool {
         self.items.iter().any(|i| i.state == IdState::Stale)
-    }
-
-    /// At least one item failed with a transport error.
-    pub fn has_mcp_unreachable(&self) -> bool {
-        self.items
-            .iter()
-            .any(|i| matches!(i.state, IdState::McpUnreachable(_)))
-    }
-
-    pub fn all_ok(&self) -> bool {
-        !self.not_configured
-            && !self.items.is_empty()
-            && self.items.iter().all(|i| i.state == IdState::Ok)
     }
 }

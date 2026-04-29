@@ -644,10 +644,16 @@ pub fn verify_report<C: NeonClient>(repo_root: &Path, client: &C) -> VerifyRepor
     let claude_path = repo_root.join(CLAUDE_SKILL);
     let existing = match fs::read_to_string(&claude_path) {
         Ok(s) => s,
-        Err(_) => {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return VerifyReport::not_configured(
                 Platform::Neon,
                 format!("{CLAUDE_SKILL} not present"),
+            );
+        }
+        Err(e) => {
+            return VerifyReport::not_configured(
+                Platform::Neon,
+                format!("could not read {CLAUDE_SKILL}: {e}"),
             );
         }
     };

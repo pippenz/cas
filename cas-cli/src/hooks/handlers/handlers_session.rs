@@ -252,7 +252,8 @@ pub fn handle_session_start(
     // off — only fires when `[integrations] session_start_warn = true` in
     // .cas/config.toml *and* at least one platform reports a `Stale` ID.
     // Appended last so it sits below codemap / project-overview / WIP.
-    let context = match build_integrations_session_start_banner(cas_root) {
+    // Reuses the already-loaded `config` from earlier in this handler.
+    let context = match build_integrations_session_start_banner(cas_root, &config) {
         Some(banner) if context.is_empty() => banner,
         Some(banner) => format!("{context}\n{banner}"),
         None => context,
@@ -305,8 +306,8 @@ pub(crate) fn estimate_tokens(s: &str) -> usize {
 /// Build the opt-in Phase 3 (cas-3efe) integrations banner.
 ///
 /// Returns `None` unless **all three** conditions hold:
-/// 1. `cas_root/config.toml` (or its parent's `.cas/config.toml`) has
-///    `[integrations] session_start_warn = true`.
+/// 1. `config.integrations.session_start_warn == true` (project-level
+///    `.cas/config.toml`; the spec scopes the flag to project config).
 /// 2. The repo root resolves (cas_root parent).
 /// 3. At least one platform's [`crate::cli::integrate::types::VerifyReport`]
 ///    returns `has_stale() == true`.
@@ -315,8 +316,14 @@ pub(crate) fn estimate_tokens(s: &str) -> usize {
 /// aren't actionable enough to displace the codemap freshness banner that
 /// shares this slot. Failures during reading/verifying are swallowed —
 /// SessionStart should never block on a misconfigured integration.
-pub(crate) fn build_integrations_session_start_banner(cas_root: &Path) -> Option<String> {
-    let config = crate::config::Config::load(cas_root).ok()?;
+///
+/// Takes the already-loaded [`Config`](crate::config::Config) by reference
+/// rather than reloading from disk, so the SessionStart hook only parses
+/// `config.toml` once per fire.
+pub(crate) fn build_integrations_session_start_banner(
+    cas_root: &Path,
+    config: &crate::config::Config,
+) -> Option<String> {
     let opt_in = config
         .integrations
         .as_ref()
@@ -328,9 +335,29 @@ pub(crate) fn build_integrations_session_start_banner(cas_root: &Path) -> Option
     let repo_root = cas_root.parent()?;
     let reports = crate::cli::integrate::doctor::collect_reports(repo_root);
     let body = crate::cli::integrate::doctor::session_start_banner_text(&reports, true)?;
+    let safe_body = escape_xml_text(&body);
     Some(format!(
-        "<integrations-staleness severity=\"info\">\n{body}\n</integrations-staleness>"
+        "<integrations-freshness severity=\"info\">\n{safe_body}\n</integrations-freshness>"
     ))
+}
+
+/// Minimal XML-text escape so a recorded platform ID containing `<`, `>`,
+/// `&`, `"`, or `'` cannot mis-close the wrapper tag (or inject an
+/// attribute into the opening tag). Used only for SessionStart banner
+/// bodies whose content is platform-supplied via SKILL.md keep blocks.
+fn escape_xml_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '&' => out.push_str("&amp;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 /// Compute session outcome based on metrics and friction events

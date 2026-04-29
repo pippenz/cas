@@ -75,8 +75,27 @@ pub enum DoctorSeverity {
 }
 
 /// Flatten a vec of [`VerifyReport`] into doctor rows.
+///
+/// When *every* platform's report has `not_configured = true` AND every
+/// note describes an absent file (rather than a parse error), this
+/// collapses to a single "no integrations configured" Ok row — the
+/// green-field new-repo case.
+///
+/// A report whose note signals a *parse error* on a present-but-broken
+/// SKILL.md (i.e. note text containing `"malformed"` or `"could not"`)
+/// blocks the collapse, so the user sees a per-platform row pointing at
+/// the broken file instead of a misleading "all clean" row.
 pub fn render_for_doctor(reports: &[VerifyReport]) -> Vec<DoctorRow> {
-    if reports.iter().all(|r| r.not_configured) {
+    fn note_is_absence_only(notes: &[String]) -> bool {
+        notes.iter().all(|n| {
+            let l = n.to_lowercase();
+            !l.contains("malformed") && !l.contains("could not")
+        })
+    }
+    if reports
+        .iter()
+        .all(|r| r.not_configured && note_is_absence_only(&r.notes))
+    {
         // No platform has an active integration — emit a single Ok row.
         return vec![DoctorRow {
             name: "integrations".to_string(),
@@ -90,14 +109,23 @@ pub fn render_for_doctor(reports: &[VerifyReport]) -> Vec<DoctorRow> {
 fn render_one(report: &VerifyReport) -> DoctorRow {
     let name = format!("{} integration", report.platform.as_str());
     if report.not_configured {
+        let note = report
+            .notes
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "not configured".to_string());
+        let lower = note.to_lowercase();
+        // Parse error / read failure on a present SKILL.md — surface as a
+        // Warning so a corrupted file isn't silently ignored.
+        let severity = if lower.contains("malformed") || lower.contains("could not") {
+            DoctorSeverity::Warning
+        } else {
+            DoctorSeverity::Ok
+        };
         return DoctorRow {
             name,
-            severity: DoctorSeverity::Ok,
-            message: report
-                .notes
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "not configured".to_string()),
+            severity,
+            message: note,
         };
     }
 
@@ -115,11 +143,21 @@ fn render_one(report: &VerifyReport) -> DoctorRow {
         .collect();
 
     if !stale.is_empty() {
+        // Mention any co-occurring unreachable IDs so a partial transport
+        // outage isn't hidden by the (more actionable) stale signal.
+        let unreachable_suffix = if unreachable.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "; also {} unreachable (MCP not configured)",
+                unreachable.len()
+            )
+        };
         return DoctorRow {
             name,
             severity: DoctorSeverity::Warning,
             message: format!(
-                "stale: {} — run `cas integrate {} refresh`",
+                "stale: {} — run `cas integrate {} refresh`{unreachable_suffix}",
                 stale.join(", "),
                 report.platform.as_str()
             ),

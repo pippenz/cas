@@ -1940,6 +1940,74 @@ mod tests {
             .any(|s| s.contains("not found via MCP")));
     }
 
+    // --- verify_report (cas-3efe) ----------------------------------------
+
+    #[test]
+    fn verify_report_not_configured_when_skill_absent() {
+        let (_tmp, root) = make_repo_with_name("nope");
+        let client = MockVercelClient::new(vec![]);
+        let report = super::verify_report(&root, &client);
+        assert!(report.not_configured);
+        assert!(report.items.is_empty());
+        assert!(report.notes.first().unwrap().contains("not present"));
+    }
+
+    #[test]
+    fn verify_report_emits_ok_item_per_recorded_id_when_present_on_platform() {
+        let (_tmp, root) = make_repo_with_name("myapp");
+        std::fs::write(root.join("vercel.json"), "{}").unwrap();
+        let client = MockVercelClient::new(vec![proj("prj_1", "myapp", "team_a")]);
+        init(&root, &client).unwrap();
+
+        let report = super::verify_report(&root, &client);
+        assert!(!report.not_configured);
+        assert!(!report.items.is_empty());
+        assert!(report.items.iter().all(|i| i.state == IdState::Ok));
+        assert!(report.items.iter().all(|i| i.label == "projectId"));
+    }
+
+    #[test]
+    fn verify_report_marks_id_stale_when_client_returns_none() {
+        let (_tmp, root) = make_repo_with_name("myapp");
+        std::fs::write(root.join("vercel.json"), "{}").unwrap();
+        let client = MockVercelClient::new(vec![proj("prj_1", "myapp", "team_a")]);
+        init(&root, &client).unwrap();
+
+        let mut stale_client = MockVercelClient::new(vec![]);
+        stale_client.stale_ids.push("prj_1".to_string());
+        let report = super::verify_report(&root, &stale_client);
+        assert!(!report.not_configured);
+        assert!(report.items.iter().any(|i| i.state == IdState::Stale));
+    }
+
+    #[test]
+    fn verify_report_marks_id_unreachable_on_transport_error() {
+        // A client that always errors on get_project should produce
+        // McpUnreachable rather than Stale or propagating Err.
+        struct ErrClient;
+        impl VercelClient for ErrClient {
+            fn list_projects(&self) -> anyhow::Result<Vec<ProjectSummary>> {
+                Err(anyhow::anyhow!("network unreachable"))
+            }
+            fn get_project(&self, _id: &str) -> anyhow::Result<Option<ProjectSummary>> {
+                Err(anyhow::anyhow!("auth expired"))
+            }
+        }
+        let (_tmp, root) = make_repo_with_name("myapp");
+        std::fs::write(root.join("vercel.json"), "{}").unwrap();
+        let init_client = MockVercelClient::new(vec![proj("prj_1", "myapp", "team_a")]);
+        init(&root, &init_client).unwrap();
+        let report = super::verify_report(&root, &ErrClient);
+        assert!(!report.not_configured);
+        assert!(matches!(
+            report.items[0].state,
+            IdState::McpUnreachable(_)
+        ));
+        if let IdState::McpUnreachable(msg) = &report.items[0].state {
+            assert!(msg.contains("auth expired"));
+        }
+    }
+
     #[test]
     fn read_capped_rejects_oversize_files() {
         let (_tmp, root) = make_repo_with_name("foo");

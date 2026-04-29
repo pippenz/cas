@@ -437,11 +437,24 @@ pub fn verify_report(repo_root: &Path) -> VerifyReport {
             );
         }
     };
-    let detected = detect_repo(repo_root).ok().flatten();
-    let state = match detected.as_ref() {
-        Some(d) if d.full_name() == recorded => IdState::Ok,
-        Some(_) => IdState::Stale,
-        None => IdState::Stale,
+    // Distinguish "git invocation failed" (transport-shaped — should
+    // render as `skipped`) from "git ran but reports no GitHub remote"
+    // (genuine drift — `Stale`). A missing `git` binary or a non-git repo
+    // root would otherwise produce a misleading false-positive Stale.
+    let (state, note) = match detect_repo(repo_root) {
+        Ok(Some(d)) if d.full_name() == recorded => (
+            IdState::Ok,
+            Some(format!("git remote -v reports {}", d.full_name())),
+        ),
+        Ok(Some(d)) => (
+            IdState::Stale,
+            Some(format!("git remote -v reports {}", d.full_name())),
+        ),
+        Ok(None) => (IdState::Stale, None),
+        Err(e) => (
+            IdState::McpUnreachable(format!("git remote -v failed: {e:#}")),
+            None,
+        ),
     };
     let mut report = VerifyReport::ok(Platform::Github);
     report.items.push(VerifyItem {
@@ -449,10 +462,8 @@ pub fn verify_report(repo_root: &Path) -> VerifyReport {
         id: recorded,
         state,
     });
-    if let Some(d) = detected {
-        report
-            .notes
-            .push(format!("git remote -v reports {}", d.full_name()));
+    if let Some(n) = note {
+        report.notes.push(n);
     }
     report
 }
@@ -1215,5 +1226,33 @@ hand-edited notes
             "summary should warn about orphan; got: {:?}",
             outcome.summary
         );
+    }
+
+    // --- verify_report (cas-3efe) ----------------------------------------
+
+    #[test]
+    fn verify_report_not_configured_when_skill_absent() {
+        let tmp = TempDir::new().unwrap();
+        let report = super::verify_report(tmp.path());
+        assert!(report.not_configured);
+        assert!(report
+            .notes
+            .first()
+            .unwrap()
+            .contains(CLAUDE_SKILL_REL));
+    }
+
+    #[test]
+    fn verify_report_marks_stale_when_no_local_remote_matches_recorded() {
+        let tmp = TempDir::new().unwrap();
+        // init_at without a flag would skip; use the flag path so SKILL.md
+        // gets written deterministically. Then verify_report's
+        // detect_repo will find no git repo and return Ok(None) → Stale.
+        let _ = init_at(tmp.path(), Some("alice/repo")).unwrap();
+        let report = super::verify_report(tmp.path());
+        assert!(!report.not_configured);
+        assert_eq!(report.items.len(), 1);
+        assert_eq!(report.items[0].id, "alice/repo");
+        assert_eq!(report.items[0].state, IdState::Stale);
     }
 }
