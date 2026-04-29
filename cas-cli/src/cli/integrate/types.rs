@@ -69,8 +69,17 @@ pub enum IntegrationStatus {
     Refreshed,
     /// Init found existing populated SKILL files; no changes written.
     AlreadyConfigured,
-    /// Verify found drift between recorded IDs and platform state.
+    /// Verify confirmed the recorded IDs no longer match the platform's
+    /// reality (project deleted, branch removed, repo renamed/transferred,
+    /// etc.). Distinct from [`IntegrationStatus::TransportError`] — the
+    /// platform answered, the answer disagrees.
     Stale,
+    /// Verify could not reach the platform's source-of-truth (MCP call
+    /// failed, network unavailable, `git` binary missing, auth expired).
+    /// Distinct from [`IntegrationStatus::Stale`] — we don't know whether
+    /// the recorded IDs are accurate; we couldn't ask. Callers should
+    /// surface as a soft warning, not data drift.
+    TransportError,
     /// User declined the prompt or platform not detected.
     Skipped,
 }
@@ -82,6 +91,7 @@ impl IntegrationStatus {
             IntegrationStatus::Refreshed => "refreshed",
             IntegrationStatus::AlreadyConfigured => "already-configured",
             IntegrationStatus::Stale => "stale",
+            IntegrationStatus::TransportError => "transport-error",
             IntegrationStatus::Skipped => "skipped",
         }
     }

@@ -8,9 +8,12 @@
 //! 3. The keep-block helper in [`keep_block`] for `<!-- keep -->` … `<!-- /keep -->`
 //!    block round-tripping. All three platform handlers reuse this.
 //!
-//! Platform handlers ([`vercel`], [`neon`], [`github`]) are intentional stubs;
-//! the full implementations land in cas-8e37, cas-1ece, and cas-f425. Each
-//! stub returns an error pointing at its owning task.
+//! Platform handlers ([`vercel`], [`neon`], [`github`]) are full
+//! implementations (cas-8e37, cas-1ece, cas-f425 — all closed). They share
+//! the helpers in [`fs`], [`md`], and [`keep_block`] so atomic-write
+//! semantics, symlink defense, file-size cap, markdown cell escaping, and
+//! the `<!-- cas:full_name=... -->` identity tag all behave uniformly
+//! across platforms (cas-fc38).
 //!
 //! ## Template loading convention
 //!
@@ -33,10 +36,12 @@
 //! for the merge semantics and the recommended call shape for handlers.
 
 pub mod atomic;
+pub mod fs;
 pub mod github;
 pub mod integrations;
 pub mod keep_block;
 pub mod lock;
+pub mod md;
 pub mod neon;
 pub mod types;
 pub mod vercel;
