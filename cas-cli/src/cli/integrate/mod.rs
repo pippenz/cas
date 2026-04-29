@@ -113,6 +113,7 @@ fn render_outcome(outcome: &IntegrationOutcome) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::integrate::types::IntegrationStatus;
     use clap::Parser;
 
     /// Minimal clap harness so we can drive the subcommand parser without
@@ -137,29 +138,55 @@ mod tests {
         }
     }
 
+    // The three vercel_*_stub_points_at_task_cas_8e37 tests from foundation
+    // (cas-e6b6) are obsolete now that cas-8e37 has implemented the vercel
+    // handler. Vercel-specific behaviour lives in `vercel::tests` and exercises
+    // the real init/refresh/verify paths against MockVercelClient. The neon
+    // and github stub tests below are unchanged — those handlers remain stubs
+    // until cas-1ece and cas-f425 land.
+
     #[test]
-    fn vercel_init_stub_points_at_task_cas_8e37() {
+    fn vercel_subcommand_dispatches_into_handler() {
+        // Without vercel.json or a configured client, init takes the
+        // `not detected` Skipped path and returns Ok — i.e. the subcommand
+        // is wired through to the real handler, not the old stub.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd_guard = scoped_chdir(tmp.path());
         let cmd = parse(&["vercel", "init"]);
-        let err = dispatch(&cmd).unwrap_err().to_string();
-        assert!(err.contains("vercel init"), "msg was: {err}");
-        assert!(err.contains("cas-8e37"), "msg was: {err}");
-        assert!(err.contains("not yet implemented"), "msg was: {err}");
+        let result = dispatch(&cmd);
+        // Either Ok(Skipped) (no vercel.json + default no-mcp-proxy client
+        // never reached) or an Err pointing at the mcp-proxy not built — but
+        // never the old stub error.
+        match result {
+            Ok(o) => {
+                assert!(matches!(
+                    o.status,
+                    IntegrationStatus::Skipped | IntegrationStatus::AlreadyConfigured
+                ));
+            }
+            Err(e) => {
+                let s = e.to_string();
+                assert!(
+                    !s.contains("not yet implemented"),
+                    "should no longer return the foundation stub error: {s}"
+                );
+            }
+        }
+        drop(cwd_guard);
     }
 
-    #[test]
-    fn vercel_refresh_stub_points_at_task_cas_8e37() {
-        let cmd = parse(&["vercel", "refresh"]);
-        let err = dispatch(&cmd).unwrap_err().to_string();
-        assert!(err.contains("vercel refresh"));
-        assert!(err.contains("cas-8e37"));
+    /// Best-effort cwd guard for tests that exercise the vercel handler's
+    /// `locate_repo_root`. Only used here; not exposed.
+    struct CwdGuard(std::path::PathBuf);
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
     }
-
-    #[test]
-    fn vercel_verify_stub_points_at_task_cas_8e37() {
-        let cmd = parse(&["vercel", "verify"]);
-        let err = dispatch(&cmd).unwrap_err().to_string();
-        assert!(err.contains("vercel verify"));
-        assert!(err.contains("cas-8e37"));
+    fn scoped_chdir(p: &std::path::Path) -> CwdGuard {
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(p).unwrap();
+        CwdGuard(prev)
     }
 
     #[test]

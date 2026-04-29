@@ -1,0 +1,28 @@
+---
+name: vercel-deployments
+description: |
+  Project-specific Vercel deployment IDs for {{REPO_NAME}}. Use when checking deployments, reading logs, or debugging build failures. Provides projectId(s) and teamId — refer to your installed Vercel MCP skill for tool-usage patterns.
+  Triggers: check logs, deployment failed, build error, production error, runtime error, check Vercel, pull logs, what's deployed, is it live
+metadata:
+  category: deployment
+  server: vercel
+managed_by: cas-integrate
+---
+
+# Vercel Deployments — {{REPO_NAME}}
+
+Refer to your installed Vercel MCP skill (typically `~/.claude/skills/mcp-vercel/SKILL.md` or `~/.cursor/skills/mcp-vercel/SKILL.md`) for tool usage. This skill records project-specific IDs only.
+
+## Project IDs
+<!-- keep vercel-ids -->
+{{IDS_TABLE}}
+<!-- /keep vercel-ids -->
+
+## Common Workflows
+
+See [references/common-tasks.md](references/common-tasks.md) for the typical request shapes (pull logs, list deployments, debug builds).
+
+## Notes
+<!-- keep vercel-notes -->
+{{NOTES_PLACEHOLDER}}
+<!-- /keep vercel-notes -->
