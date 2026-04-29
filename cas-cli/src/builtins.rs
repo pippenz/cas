@@ -146,12 +146,48 @@ pub const BUILTIN_SKILLS: &[BuiltinFile] = &[
         content: include_str!("builtins/skills/cas-supervisor.md"),
     },
     BuiltinFile {
+        path: "skills/cas-supervisor/references/preflight.md",
+        content: include_str!("builtins/skills/cas-supervisor/references/preflight.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-supervisor/references/intake.md",
+        content: include_str!("builtins/skills/cas-supervisor/references/intake.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-supervisor/references/planning.md",
+        content: include_str!("builtins/skills/cas-supervisor/references/planning.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-supervisor/references/workflow.md",
+        content: include_str!("builtins/skills/cas-supervisor/references/workflow.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-supervisor/references/worker-recovery.md",
+        content: include_str!("builtins/skills/cas-supervisor/references/worker-recovery.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-supervisor/references/reference.md",
+        content: include_str!("builtins/skills/cas-supervisor/references/reference.md"),
+    },
+    BuiltinFile {
         path: "skills/cas-supervisor-checklist/SKILL.md",
         content: include_str!("builtins/skills/cas-supervisor-checklist.md"),
     },
     BuiltinFile {
         path: "skills/cas-worker/SKILL.md",
         content: include_str!("builtins/skills/cas-worker.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-worker/references/close-gate.md",
+        content: include_str!("builtins/skills/cas-worker/references/close-gate.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-worker/references/recovery.md",
+        content: include_str!("builtins/skills/cas-worker/references/recovery.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-worker/references/details.md",
+        content: include_str!("builtins/skills/cas-worker/references/details.md"),
     },
     BuiltinFile {
         path: "skills/cas-brainstorm/SKILL.md",
@@ -228,6 +264,13 @@ pub const BUILTIN_SKILLS: &[BuiltinFile] = &[
         path: "skills/project-overview/SKILL.md",
         content: include_str!("builtins/skills/project-overview/SKILL.md"),
     },
+    // codemap skill (cas-4d84): remediation skill for the codemap
+    // freshness gate. Generates .claude/CODEMAP.md so SessionStart and
+    // PreToolUse stop nagging.
+    BuiltinFile {
+        path: "skills/codemap/SKILL.md",
+        content: include_str!("builtins/skills/codemap/SKILL.md"),
+    },
 ];
 
 /// All built-in skills managed by CAS for Codex
@@ -261,12 +304,48 @@ pub const CODEX_BUILTIN_SKILLS: &[BuiltinFile] = &[
         content: include_str!("builtins/codex/skills/cas-supervisor.md"),
     },
     BuiltinFile {
+        path: "skills/cas-supervisor/references/preflight.md",
+        content: include_str!("builtins/codex/skills/cas-supervisor/references/preflight.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-supervisor/references/intake.md",
+        content: include_str!("builtins/codex/skills/cas-supervisor/references/intake.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-supervisor/references/planning.md",
+        content: include_str!("builtins/codex/skills/cas-supervisor/references/planning.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-supervisor/references/workflow.md",
+        content: include_str!("builtins/codex/skills/cas-supervisor/references/workflow.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-supervisor/references/worker-recovery.md",
+        content: include_str!("builtins/codex/skills/cas-supervisor/references/worker-recovery.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-supervisor/references/reference.md",
+        content: include_str!("builtins/codex/skills/cas-supervisor/references/reference.md"),
+    },
+    BuiltinFile {
         path: "skills/cas-codex-supervisor-checklist/SKILL.md",
         content: include_str!("builtins/codex/skills/cas-codex-supervisor-checklist.md"),
     },
     BuiltinFile {
         path: "skills/cas-worker/SKILL.md",
         content: include_str!("builtins/codex/skills/cas-worker.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-worker/references/close-gate.md",
+        content: include_str!("builtins/codex/skills/cas-worker/references/close-gate.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-worker/references/recovery.md",
+        content: include_str!("builtins/codex/skills/cas-worker/references/recovery.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-worker/references/details.md",
+        content: include_str!("builtins/codex/skills/cas-worker/references/details.md"),
     },
     BuiltinFile {
         path: "skills/cas-brainstorm/SKILL.md",
@@ -345,6 +424,11 @@ pub const CODEX_BUILTIN_SKILLS: &[BuiltinFile] = &[
     BuiltinFile {
         path: "skills/project-overview/SKILL.md",
         content: include_str!("builtins/codex/skills/project-overview/SKILL.md"),
+    },
+    // codemap skill (cas-4d84) — codex mirror.
+    BuiltinFile {
+        path: "skills/codemap/SKILL.md",
+        content: include_str!("builtins/codex/skills/codemap/SKILL.md"),
     },
 ];
 
@@ -579,33 +663,27 @@ pub fn extract_body(content: &str) -> &str {
     content[body_start..].trim_start()
 }
 
-/// Get the supervisor guidance with all preloaded skills.
+/// Get the supervisor guidance injected at factory SessionStart.
 ///
-/// Bundles the supervisor guide, checklist, task-tracking, memory, and search
-/// skills into a single block injected into supervisor context at factory start.
+/// Returns the trimmed supervisor SKILL.md plus the supervisor checklist.
+/// task-tracking, memory, and search are autonomous skills the agent invokes
+/// on demand via the Skill tool — bundling them inflated SessionStart context
+/// past the harness "Output too large" threshold (the additionalContext got
+/// truncated to a 2KB preview), which silently disabled the supervisor guide.
 pub fn supervisor_guidance() -> String {
     [
         extract_body(SUPERVISOR_GUIDE),
         extract_body(CHECKLIST_GUIDE),
-        extract_body(TASK_TRACKING_GUIDE),
-        extract_body(MEMORY_GUIDE),
-        extract_body(SEARCH_GUIDE),
     ]
     .join("\n\n---\n\n")
 }
 
-/// Get the worker guidance with all preloaded skills.
+/// Get the worker guidance injected at factory SessionStart.
 ///
-/// Bundles the worker guide, task-tracking, memory, and search skills
-/// into a single block injected into worker context at factory start.
+/// Returns only the worker SKILL.md. task-tracking/memory/search load on
+/// demand — same rationale as `supervisor_guidance`.
 pub fn worker_guidance() -> String {
-    [
-        extract_body(WORKER_GUIDE),
-        extract_body(TASK_TRACKING_GUIDE),
-        extract_body(MEMORY_GUIDE),
-        extract_body(SEARCH_GUIDE),
-    ]
-    .join("\n\n---\n\n")
+    extract_body(WORKER_GUIDE).to_string()
 }
 
 #[cfg(test)]
@@ -639,21 +717,38 @@ This is the body content."#;
     #[test]
     fn test_supervisor_guidance_loads() {
         let guide = supervisor_guidance();
-        assert!(guide.contains("Supervisor"));
+        assert!(guide.contains("Factory Supervisor"));
         assert!(!guide.contains("managed_by:"));
-        // Verify preloaded skills are included
-        assert!(
-            guide.contains("CAS Task Tracking"),
-            "should include task-tracking skill"
-        );
-        assert!(
-            guide.contains("CAS Memory Management"),
-            "should include memory skill"
-        );
-        assert!(guide.contains("CAS Search"), "should include search skill");
         assert!(
             guide.contains("Supervisor Checklist"),
-            "should include checklist skill"
+            "should include checklist"
+        );
+        // task-tracking/memory/search are autonomous skills, not bundled.
+        assert!(
+            !guide.contains("CAS Task Tracking"),
+            "should NOT bundle task-tracking — loads on demand"
+        );
+        assert!(
+            !guide.contains("CAS Memory Management"),
+            "should NOT bundle memory — loads on demand"
+        );
+    }
+
+    /// SessionStart additionalContext gets truncated to a small preview by
+    /// the Claude Code harness once the payload exceeds its threshold (the
+    /// pre-trim bundle was ~61KB and got cut to 2KB). The exact threshold
+    /// isn't documented; 12KB is a conservative ceiling that leaves room for
+    /// the rest of the SessionStart context (codemap banner, agent identity,
+    /// coordination block) to fit alongside without tripping truncation.
+    #[test]
+    fn test_supervisor_guidance_under_12kb() {
+        let guide = supervisor_guidance();
+        assert!(
+            guide.len() < 12_288,
+            "supervisor_guidance is {} bytes — over the 12KB ceiling. \
+             Move content into cas-supervisor/references/ instead of \
+             inlining it in cas-supervisor.md.",
+            guide.len()
         );
     }
 
@@ -662,20 +757,31 @@ This is the body content."#;
         let guide = worker_guidance();
         assert!(guide.contains("Worker"));
         assert!(!guide.contains("managed_by:"));
-        // Verify preloaded skills are included
-        assert!(
-            guide.contains("CAS Task Tracking"),
-            "should include task-tracking skill"
-        );
-        assert!(
-            guide.contains("CAS Memory Management"),
-            "should include memory skill"
-        );
-        assert!(guide.contains("CAS Search"), "should include search skill");
         // Worker should NOT have supervisor checklist
         assert!(
             !guide.contains("Supervisor Checklist"),
             "should not include supervisor checklist"
+        );
+        // task-tracking/memory/search are autonomous skills, not bundled.
+        assert!(
+            !guide.contains("CAS Task Tracking"),
+            "should NOT bundle task-tracking — loads on demand"
+        );
+    }
+
+    /// Same rationale as `test_supervisor_guidance_under_12kb` — the worker
+    /// SessionStart bundle must stay small enough that the harness doesn't
+    /// truncate it to a preview. Move content into cas-worker/references/
+    /// instead of inlining.
+    #[test]
+    fn test_worker_guidance_under_12kb() {
+        let guide = worker_guidance();
+        assert!(
+            guide.len() < 12_288,
+            "worker_guidance is {} bytes — over the 12KB ceiling. \
+             Move content into cas-worker/references/ instead of \
+             inlining it in cas-worker.md.",
+            guide.len()
         );
     }
 
@@ -764,30 +870,41 @@ This is the body content."#;
         // skill must document the new close-time code-review gate so
         // workers know how to read the block message, what happens to
         // residual findings, and which tools they must NOT fall back
-        // to. Pin the required markers structurally so drift through
-        // cas sync cannot silently delete them.
-        for (label, path, content) in [
+        // to. After the cas-61af split, SKILL.md keeps the high-signal
+        // references (cas-code-review and the close-gate pointer) and
+        // the detailed P0/bypass/legacy-tool guidance lives in
+        // references/close-gate.md. Pin both layers structurally so
+        // drift through cas sync cannot silently delete them.
+        for (label, skill_content, ref_content) in [
             (
                 "claude",
-                "skills/cas-worker/SKILL.md",
                 include_str!("builtins/skills/cas-worker.md"),
+                include_str!("builtins/skills/cas-worker/references/close-gate.md"),
             ),
             (
                 "codex",
-                "skills/cas-worker/SKILL.md",
                 include_str!("builtins/codex/skills/cas-worker.md"),
+                include_str!("builtins/codex/skills/cas-worker/references/close-gate.md"),
             ),
         ] {
+            // SKILL.md points workers at the gate.
+            for required in ["cas-code-review", "close-gate.md"] {
+                assert!(
+                    skill_content.contains(required),
+                    "{label} cas-worker SKILL.md missing required marker: {required:?}"
+                );
+            }
+            // close-gate.md carries the detailed gate content.
             for required in [
-                "## Close-time code review gate",
-                "### If close is blocked on P0",
+                "Close-time Code Review Gate",
+                "If close is blocked on P0",
                 "cas-code-review",
                 "bypass_code_review",
                 "code-reviewer",
             ] {
                 assert!(
-                    content.contains(required),
-                    "{label} cas-worker skill ({path}) missing required marker: {required:?}"
+                    ref_content.contains(required),
+                    "{label} cas-worker close-gate.md missing required marker: {required:?}"
                 );
             }
         }
