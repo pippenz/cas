@@ -46,13 +46,17 @@ Binary entrypoint and the only crate users interact with directly. Contains ever
   - `codemap_cmd.rs` — `cas codemap status|pending|clear`
   - `project_overview_cmd.rs` — `cas project-overview clear`
   - `factory/` — factory subcommands (`is-wedged`, `kill`, `debug`)
+  - `factory_tooling.rs` — `cas init` worktree helper templates (`.env.worktree.template`, `worktree-boot.sh`, gitignore entries)
   - `hook.rs`, `hook/` — `cas hook` dispatcher (called from settings.json)
   - `hook_tests/` — golden-JSON hook tests
   - `init/`, `init.rs` — `cas init` (writes CLAUDE.md, .claude/, .cas/)
-  - `update/`, `update.rs` — `cas update` (rewrites managed_by:cas files)
+  - `integrate/` — `cas integrate <platform> <action>` for Vercel/Neon/GitHub auto-integration; `vercel.rs`, `neon.rs`, `github.rs`, `proxy.rs`, `integrations.rs`, `keep_block.rs`, `templates/`, `fixtures/`
+  - `known_repos.rs` — `cas known-repos list|seed` over `~/.cas/cas.db::known_repos`
+  - `open.rs` — `cas open` interactive TUI project picker (scans `~/projects/`)
+  - `update/`, `update.rs`, `update_transaction.rs`, `update_tests/` — `cas update` rewrites managed_by:cas files atomically with rollback
   - `mcp_cmd.rs`, `memory.rs`, `queue.rs`, `worktree.rs`, `doctor.rs`, `status.rs`, `list.rs`, `sweep.rs`, `bridge.rs`, `changelog.rs`, `claude_md.rs`, `interactive.rs`
-  - `config/`, `config_tui/` — config read/write + the config TUI
-  - `statusline/` — `cas statusline` for shell prompts
+  - `config/`, `config_tui/`, `config_tui.rs` — config read/write + the config TUI
+  - `statusline/`, `statusline.rs` — `cas statusline` for shell prompts
 - `hooks/` — hook input handling
   - `mod.rs`, `handlers.rs`, `handlers/` — `SessionStart`, `PreToolUse`, `PostToolUse`, `Stop`, `Notification` handlers
   - `handlers/handlers_events/` — codemap freshness, project-overview drift, notifications, pre-tool gates
@@ -82,9 +86,9 @@ Binary entrypoint and the only crate users interact with directly. Contains ever
   - `factory/` — multi-pane factory TUI (the `cas` binary launches into this)
   - `components/`, `widgets/`, `markdown/`, `theme/`
 - `builtins.rs` + `builtins/` — embedded skills, agents, and content
-  - `builtins/skills/` — claude-variant SKILL.md files
+  - `builtins/skills/` — claude-variant SKILL.md files (cas-* skills, codemap, project-overview, fallow)
   - `builtins/codex/skills/` — codex-variant mirror
-  - `builtins/agents/` — task-verifier, learning-reviewer, etc.
+  - `builtins/agents/` — task-verifier, learning-reviewer, rule-reviewer, duplicate-detector, etc.
   - `BUILTIN_SKILLS` / `CODEX_BUILTIN_SKILLS` arrays drive `cas sync`
   - `supervisor_guidance()` / `worker_guidance()` — SessionStart bundles
 - `bridge/` — codex/cli bridges
@@ -107,15 +111,15 @@ Planning artifacts only — product/domain content goes in `docs/PRODUCT_OVERVIE
 - `ideation/` — survivor lists from the `cas-ideate` skill
 - `requests/` — cross-team BUG/FEATURE inboxes; `requests/completed/` is closed work
 - `spikes/` — investigation outputs
-- `onboarding/` — onboarding notes
+- `onboarding/` — onboarding notes (`macbook-from-zero.md`, etc.)
 - `compound-engineering-roadmap.md`, `verifier-dispatch-trace.md`, `FEATURE-REQUEST-*`, `SCOPE-*` — standalone planning docs
 
 ## Cross-cutting
 
-- **Tests:** Rust convention — inline `#[cfg(test)] mod tests` in each file, plus `cas-cli/tests/` integration tests. PTY-based TUI tests use `crates/cas-tui-test`.
+- **Tests:** Rust convention — inline `#[cfg(test)] mod tests` in each file, plus `cas-cli/tests/` integration tests (e.g., `integrate_lifecycle_test.rs`, `mcp_proxy_test.rs`, `code_review_e2e_test.rs`). PTY-based TUI tests use `crates/cas-tui-test`.
 - **Docs:** `README.md`, `CONTRIBUTING.md`, `CHANGELOG.md`, `CAS-DEEP-DIVE.md` at repo root; CLAUDE.md cascades from `~/CLAUDE.md` → `Petrastella/CLAUDE.md` → `cas-src/CLAUDE.md`.
 - **Tooling / scripts:** `scripts/worktree-boot.sh`; release/install/bootstrap scripts live in `~/.local/bin/`. `homebrew/cas.rb` is the formula.
-- **Config:** `.claude/settings.json` (harness hooks + permissions), `.mcp.json` (MCP servers), `.cas/config.toml` (factory knobs), `Cargo.toml` (workspace + profiles), `.cargo/config.toml` (cargo profile overrides).
+- **Config:** `.claude/settings.json` (harness hooks + permissions), `.mcp.json` (MCP servers), `.cas/config.toml` (factory knobs), `Cargo.toml` (workspace + profiles).
 - **Migration:** one-shot scripts in `migration/` (Phase 2/3/7/8 logs from the cloud move). Not active build infra.
 
 ## Entrypoints
