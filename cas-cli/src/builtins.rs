@@ -271,6 +271,27 @@ pub const BUILTIN_SKILLS: &[BuiltinFile] = &[
         path: "skills/codemap/SKILL.md",
         content: include_str!("builtins/skills/codemap/SKILL.md"),
     },
+    // fallow skill: vendored from https://github.com/fallow-rs/fallow-skills
+    // (MIT, Bart Waardenburg). Codebase intelligence for JS/TS — dead code,
+    // duplication, complexity, boundaries, feature flags. SKILL.md +
+    // 3 references match the upstream layout; only `managed_by: cas` is
+    // injected so `cas sync` keeps user copies fresh.
+    BuiltinFile {
+        path: "skills/fallow/SKILL.md",
+        content: include_str!("builtins/skills/fallow/SKILL.md"),
+    },
+    BuiltinFile {
+        path: "skills/fallow/references/cli-reference.md",
+        content: include_str!("builtins/skills/fallow/references/cli-reference.md"),
+    },
+    BuiltinFile {
+        path: "skills/fallow/references/gotchas.md",
+        content: include_str!("builtins/skills/fallow/references/gotchas.md"),
+    },
+    BuiltinFile {
+        path: "skills/fallow/references/patterns.md",
+        content: include_str!("builtins/skills/fallow/references/patterns.md"),
+    },
 ];
 
 /// All built-in skills managed by CAS for Codex
@@ -429,6 +450,24 @@ pub const CODEX_BUILTIN_SKILLS: &[BuiltinFile] = &[
     BuiltinFile {
         path: "skills/codemap/SKILL.md",
         content: include_str!("builtins/codex/skills/codemap/SKILL.md"),
+    },
+    // fallow skill — codex mirror. See the claude-side entry above for the
+    // upstream attribution (fallow-rs/fallow-skills, MIT).
+    BuiltinFile {
+        path: "skills/fallow/SKILL.md",
+        content: include_str!("builtins/codex/skills/fallow/SKILL.md"),
+    },
+    BuiltinFile {
+        path: "skills/fallow/references/cli-reference.md",
+        content: include_str!("builtins/codex/skills/fallow/references/cli-reference.md"),
+    },
+    BuiltinFile {
+        path: "skills/fallow/references/gotchas.md",
+        content: include_str!("builtins/codex/skills/fallow/references/gotchas.md"),
+    },
+    BuiltinFile {
+        path: "skills/fallow/references/patterns.md",
+        content: include_str!("builtins/codex/skills/fallow/references/patterns.md"),
     },
 ];
 
@@ -944,6 +983,49 @@ This is the body content."#;
             assert!(
                 entry.content.contains(required),
                 "project-overview SKILL.md missing required marker: {required:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_builtin_skills_contains_fallow() {
+        // Vendored from fallow-rs/fallow-skills (MIT). SKILL.md plus three
+        // references must be registered in both Claude and Codex mirrors so
+        // `cas sync` installs the full skill.
+        let expected = [
+            "skills/fallow/SKILL.md",
+            "skills/fallow/references/cli-reference.md",
+            "skills/fallow/references/gotchas.md",
+            "skills/fallow/references/patterns.md",
+        ];
+        for p in expected {
+            assert!(
+                BUILTIN_SKILLS.iter().any(|b| b.path == p),
+                "{p} missing from BUILTIN_SKILLS"
+            );
+            assert!(
+                CODEX_BUILTIN_SKILLS.iter().any(|b| b.path == p),
+                "{p} missing from CODEX_BUILTIN_SKILLS"
+            );
+        }
+
+        // Frontmatter sanity: `managed_by: cas` is the marker that lets
+        // `cas sync` overwrite stale downstream copies, and the upstream
+        // attribution must survive any drift from the vendor's repo.
+        let entry = BUILTIN_SKILLS
+            .iter()
+            .find(|b| b.path == "skills/fallow/SKILL.md")
+            .unwrap();
+        for required in [
+            "name: fallow",
+            "managed_by: cas",
+            "license: MIT",
+            "author: Bart Waardenburg",
+            "upstream: https://github.com/fallow-rs/fallow-skills",
+        ] {
+            assert!(
+                entry.content.contains(required),
+                "fallow SKILL.md missing required marker: {required:?}"
             );
         }
     }

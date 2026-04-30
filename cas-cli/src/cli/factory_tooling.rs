@@ -110,6 +110,8 @@ pub fn update_gitignore(cwd: &Path) -> Result<bool> {
     let entries = vec![
         "# Worktree-specific files (generated per worktree)",
         ".env.worktree",
+        "# fallow incremental analysis cache (used by the fallow skill)",
+        ".fallow/",
     ];
 
     let mut content = if gitignore_path.exists() {

@@ -46,6 +46,13 @@ class Cas < Formula
         ~/.config/cas/    (global data)
         .cas/             (project data)
 
+      Optional companion tools (used by built-in skills):
+        fallow            # JS/TS codebase intelligence — used by the
+                          #   `fallow` skill for dead code, duplication,
+                          #   complexity, and PR audit gates.
+                          #   Install with: npm install -g fallow
+                          #   Or run on demand: npx fallow
+
       To update CAS:
         cas update        (self-update)
         brew upgrade cas  (via Homebrew)
