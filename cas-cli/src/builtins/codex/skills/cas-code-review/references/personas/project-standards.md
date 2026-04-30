@@ -25,11 +25,24 @@ This persona absorbs the rule-compliance responsibility previously handled by th
 - **Forbidden dependencies, imports, or API calls** listed in rules (e.g., "do not use `println!` in library code", "no `TodoWrite`").
 - **Naming conventions** when codified in a rule. (Uncodified naming drift is `maintainability`.)
 
+## Defer to the `fallow` persona
+
+The `fallow` persona enforces JS/TS architecture boundaries deterministically via `fallow audit` and the project's `boundaries` configuration. Where the project codifies architecture rules through fallow boundary zones (`layered`, `hexagonal`, `feature-sliced`, `bulletproof`, or a custom zone definition), **defer the import-direction enforcement to fallow** — its graph-based detection is exhaustive and you would only re-derive the same finding by hand.
+
+You still own:
+
+- Architecture rules that are documented in `mcp__cas__rule`, `CLAUDE.md`, or `AGENTS.md` but **not** modeled in fallow's `boundaries` config (e.g., "no `cas-cli` may depend on `cas-factory` internals" when the project is Rust and fallow does not run).
+- Boundary violations in non-JS/TS code (Rust crate dependency rules, Python module layering, etc.).
+- Every other rule type (managed-file headers, forbidden APIs, license headers, naming conventions, commit-message hygiene, etc.) — fallow does not touch any of these.
+
+If a rule says "no `console.log` in production code" and a fallow plugin would catch it, defer to fallow only when you can verify fallow actually flags it. Otherwise, enforce it yourself.
+
 ## Out of scope
 
 - **Logic bugs** → `correctness` persona, even if the bug also happens to violate a rule — emit in whichever is more actionable and let the dedup handle overlap.
 - **Test coverage requirements** → `testing` persona, unless the project has an explicit "every public fn must have a test" rule, in which case enforce it here.
 - **Subjective readability / layering without a stated rule** → `maintainability` persona.
+- **JS/TS architecture boundary violations modeled in fallow's `boundaries` config** → `fallow` persona.
 - **Security / performance-specific rules** → still enforce here when they are registered rules; let the dedup stage collapse overlap with `security` / `performance` personas.
 - Rules marked inactive, draft, or archived in the rule store.
 

@@ -257,6 +257,15 @@ pub const BUILTIN_SKILLS: &[BuiltinFile] = &[
             "builtins/skills/cas-code-review/references/personas/adversarial.md"
         ),
     },
+    // fallow persona — 5th always-on reviewer. Thin Sonnet wrapper around
+    // `fallow audit` that translates deterministic findings into the
+    // ReviewerOutput envelope and self-skips on non-JS/TS repos / diffs.
+    BuiltinFile {
+        path: "skills/cas-code-review/references/personas/fallow.md",
+        content: include_str!(
+            "builtins/skills/cas-code-review/references/personas/fallow.md"
+        ),
+    },
     // project-overview skill (EPIC cas-19a2b): generates
     // docs/PRODUCT_OVERVIEW.md for any project and writes a thin memory
     // pointer so CAS search surfaces the doc.
@@ -439,6 +448,13 @@ pub const CODEX_BUILTIN_SKILLS: &[BuiltinFile] = &[
         path: "skills/cas-code-review/references/personas/adversarial.md",
         content: include_str!(
             "builtins/codex/skills/cas-code-review/references/personas/adversarial.md"
+        ),
+    },
+    // fallow persona — codex mirror. See claude-side entry above.
+    BuiltinFile {
+        path: "skills/cas-code-review/references/personas/fallow.md",
+        content: include_str!(
+            "builtins/codex/skills/cas-code-review/references/personas/fallow.md"
         ),
     },
     // project-overview skill (EPIC cas-19a2b) — codex mirror.
@@ -1032,7 +1048,8 @@ This is the body content."#;
 
     #[test]
     fn test_builtin_skills_contains_cas_code_review() {
-        // Phase 1 subsystem A (EPIC cas-0750): 9 files per mirror.
+        // Phase 1 subsystem A (EPIC cas-0750): 9 files per mirror; the
+        // `fallow` persona added later brings the count to 10.
         let expected = [
             "skills/cas-code-review/SKILL.md",
             "skills/cas-code-review/references/findings-schema.md",
@@ -1040,6 +1057,7 @@ This is the body content."#;
             "skills/cas-code-review/references/personas/testing.md",
             "skills/cas-code-review/references/personas/maintainability.md",
             "skills/cas-code-review/references/personas/project-standards.md",
+            "skills/cas-code-review/references/personas/fallow.md",
             "skills/cas-code-review/references/personas/security.md",
             "skills/cas-code-review/references/personas/performance.md",
             "skills/cas-code-review/references/personas/adversarial.md",

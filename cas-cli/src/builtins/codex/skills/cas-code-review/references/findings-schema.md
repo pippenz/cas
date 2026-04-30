@@ -1,10 +1,10 @@
 # Findings Schema — cas-code-review
 
-All seven reviewer personas (correctness, testing, maintainability,
-project-standards, security, performance, adversarial) **must** emit a single
-JSON object matching this schema. The orchestrator parses, validates, merges,
-and routes these outputs. Any persona output that fails validation is treated
-as a reviewer error, not a finding.
+All eight reviewer personas (correctness, testing, maintainability,
+project-standards, fallow, security, performance, adversarial) **must** emit a
+single JSON object matching this schema. The orchestrator parses, validates,
+merges, and routes these outputs. Any persona output that fails validation is
+treated as a reviewer error, not a finding.
 
 The canonical Rust types live in
 [`crates/cas-types/src/code_review.rs`](../../../../../../crates/cas-types/src/code_review.rs)

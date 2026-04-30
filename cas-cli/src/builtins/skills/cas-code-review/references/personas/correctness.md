@@ -37,6 +37,7 @@ When a structural pattern above is present, you may use `ast-grep` to confirm ex
 
 - **Test coverage and test quality** → `testing` persona.
 - **Naming, duplication, layering, readability** → `maintainability` persona.
+- **JS/TS circular dependencies and unresolved imports** → `fallow` persona (its `circular-deps` and `unresolved-imports` detectors are deterministic and exhaustive; do not re-derive). You retain ownership of *consequence-of-the-cycle* analysis when the cycle creates a real correctness bug fallow's structural finding alone does not surface.
 - **Rule-compliance against `mcp__cas__rule`** → `project-standards` persona.
 - **Auth / input validation / permission-surface defects** → `security` persona (but report the *logic* bug here if it is purely a correctness failure independent of threat model).
 - **DB / async / caching hot-path defects** → `performance` persona.

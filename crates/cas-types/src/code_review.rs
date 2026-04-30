@@ -1,9 +1,9 @@
 //! Multi-persona code review findings schema.
 //!
-//! This module defines the structured contract that all seven reviewer
+//! This module defines the structured contract that all eight reviewer
 //! personas (correctness, testing, maintainability, project-standards,
-//! security, performance, adversarial) emit, and that the orchestrator
-//! merges, dedupes, and routes.
+//! fallow, security, performance, adversarial) emit, and that the
+//! orchestrator merges, dedupes, and routes.
 //!
 //! The shape is fixed by the Phase 1 subsystem A brainstorm
 //! (`docs/brainstorms/2026-04-09-multi-persona-code-review-requirements.md`,

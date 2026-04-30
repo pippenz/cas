@@ -144,6 +144,7 @@ const PERSONA_FILES: &[&str] = &[
     "testing.md",
     "maintainability.md",
     "project-standards.md",
+    "fallow.md",
     "security.md",
     "performance.md",
     "adversarial.md",

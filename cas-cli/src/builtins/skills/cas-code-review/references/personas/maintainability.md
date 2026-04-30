@@ -20,11 +20,24 @@ Hunt for changes that make the codebase harder to read, reason about, extend, or
 - Backwards-compatibility cruft without justification: `// legacy`, `// removed in v2`, `_unused: bool`, re-exports of deleted types — flag when introduced in a new diff with no stated reason.
 - Feature flags or configurability for hypothetical future cases that the current PR does not actually use.
 
+## Defer to the `fallow` persona
+
+The `fallow` persona runs `fallow audit` on JS/TS diffs and emits deterministic findings. Where its lane covers your lane, **do not re-emit** — let it own those findings:
+
+- **Code duplication in JS/TS** → fallow's `dupes` (suffix-array detection across the repo). You only flag duplication that fallow cannot see (Rust/Python/Go diffs, or duplication of *intent* across heterogeneous expressions that fallow's AST normalization misses).
+- **Dead exports / unused files / unused class or enum members in JS/TS** → fallow's `dead-code`. You still flag *internal* deadness that fallow does not chase: dead local branches, always-false conditions, unused parameters, `_unused: bool` fields, dead imports introduced in the diff but never referenced inside the same file.
+- **Oversized / overly complex functions in JS/TS** → fallow's `health` (cyclomatic + cognitive). You still flag oversized functions in non-JS/TS files, and judgment calls fallow cannot make ("this 80-line function is fine because it's a state machine; this 80-line function is bad because it has three unrelated responsibilities").
+
+Fingerprint dedup will collapse honest overlap, but fallow's machine-generated `title`s rarely match an LLM's prose title — manual deferral is safer than relying on dedup.
+
+You remain the **owner** of all judgment-driven maintainability concerns: naming drift, premature abstraction, comment rot, layering, the "why is this even here" smells. Fallow has no opinion on those.
+
 ## Out of scope
 
 - **Logic and execution-path bugs** → `correctness` persona.
 - **Test quality** → `testing` persona. Test duplication in particular is often intentional — do not flag.
 - **Rule violations** → `project-standards` persona. If the repo has a rule about naming, maintainability defers to the rule check.
+- **Deterministic structural findings in JS/TS** → `fallow` persona (see "Defer to the `fallow` persona" above).
 - **Security smells** → `security` persona.
 - **Performance smells** → `performance` persona.
 - Subjective style preferences (bracket placement, import grouping, one-liner vs. multi-line) unless they materially affect readability.
