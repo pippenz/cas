@@ -180,13 +180,13 @@ impl PtyConfig {
             args.push(m.to_string());
         }
         // Supervisors need deeper reasoning for planning/coordination;
-        // workers execute well-defined tasks where medium effort suffices.
+        // workers execute well-defined tasks where high effort suffices.
         args.push("--effort".to_string());
         args.push(
             if role == "supervisor" {
-                "high"
+                "xhigh"
             } else {
-                "medium"
+                "high"
             }
             .to_string(),
         );

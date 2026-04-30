@@ -399,7 +399,7 @@ impl TeamsManager {
 
         let project_cwd_str = project_cwd.to_string_lossy().to_string();
 
-        let model = Some("claude-opus-4-6".to_string());
+        let model = Some("claude-opus-4-7".to_string());
 
         // Supervisor is the team lead but also a teammate so it polls its inbox.
         // Always registered as "supervisor" regardless of the generated pane name.
@@ -523,7 +523,7 @@ impl TeamsManager {
             agent_id: self.agent_id_for(name),
             name: name.to_string(),
             agent_type: "general-purpose".to_string(),
-            model: Some("claude-opus-4-6".to_string()),
+            model: Some("claude-opus-4-7".to_string()),
             prompt: None,
             color: Some(Self::color_for_index(color_index).to_string()),
             plan_mode_required: Some(false),
