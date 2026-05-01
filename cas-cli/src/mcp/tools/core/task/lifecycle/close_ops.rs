@@ -189,7 +189,23 @@ impl CasCore {
             // epic branch. Bypass-immune (data-state guard, not a
             // review gate). Diagnostic surface for in-flight queries
             // is `mcp__cas__coordination action=epic_status id=<epic>`.
-            let subtasks = task_store.get_subtasks(&req.id).unwrap_or_default();
+            //
+            // Errors from `get_subtasks` MUST surface as a hard error,
+            // never a silent empty-list pass. Round-1 cas-code-review
+            // (correctness P1) caught the `unwrap_or_default()` failure
+            // mode: a transient SQLite error would map to "no children"
+            // and the gate would Proceed — defeating the entire
+            // enforcement that this task adds. Mirror the conservative
+            // pattern at line ~869 (`epic_subtask_receipts_cover`)
+            // where a store error is treated as gate-blocking.
+            let subtasks = task_store.get_subtasks(&req.id).map_err(|e| McpError {
+                code: ErrorCode::INTERNAL_ERROR,
+                message: Cow::from(format!(
+                    "epic-close merge gate: failed to read subtasks of {epic_id}: {e}",
+                    epic_id = req.id
+                )),
+                data: None,
+            })?;
             let close_project_root = self.cas_root.parent().unwrap_or(&self.cas_root);
             match run_epic_close_merge_gate(
                 &task,
@@ -1703,7 +1719,11 @@ pub(crate) fn render_epic_status_report(
     out.push_str("| Task | Status | Assignee | Factory branch | Unmerged | Last commit |\n");
     out.push_str("|------|--------|----------|----------------|----------|-------------|\n");
     for s in statuses {
-        let status_str = format!("{:?}", s.task_status);
+        // Use Display (snake_case: in_progress, closed) rather than
+        // Debug (PascalCase: InProgress, Closed) so the supervisor-
+        // facing column matches the rest of the CLI's status rendering
+        // (e.g., `task list`). Round-1 cas-code-review fix.
+        let status_str = s.task_status.to_string();
         let assignee = s.assignee.as_deref().unwrap_or("—");
         let branch = s.factory_branch.as_deref().unwrap_or("—");
         let unmerged = if s.factory_branch.is_some() {
@@ -1739,10 +1759,11 @@ pub(crate) fn render_epic_status_report(
     out
 }
 
-/// Format a Unix epoch second as ISO-8601 UTC. Pure helper kept here
-/// for test coverage; the production caller is
-/// [`render_epic_status_report`].
-pub(crate) fn format_unix_timestamp(ts: i64) -> String {
+/// Format a Unix epoch second as ISO-8601 UTC. Pure helper used only
+/// by [`render_epic_status_report`] in this module; tests in the
+/// same file can call private helpers directly. (Round-1 cas-code-review
+/// fix: was previously `pub(crate)` for no good reason.)
+fn format_unix_timestamp(ts: i64) -> String {
     chrono::DateTime::<chrono::Utc>::from_timestamp(ts, 0)
         .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
         .unwrap_or_else(|| format!("ts={ts}"))
@@ -1808,15 +1829,18 @@ pub(crate) fn run_epic_close_merge_gate(
     }
     let mut detail = String::new();
     for s in &stranded {
-        let _ = std::fmt::Write::write_fmt(
-            &mut detail,
-            format_args!(
-                "  - {task} ({branch}): {n} commit(s) not on {parent}\n",
-                task = s.task_id,
-                branch = s.factory_branch.as_deref().unwrap_or("—"),
-                n = s.unmerged_count,
-                parent = parent_branch,
-            ),
+        // Round-1 cas-code-review autofix: use idiomatic `writeln!`
+        // rather than the explicit `Write::write_fmt(format_args!(...))`
+        // desugaring. `writeln!` returns Result; the surrounding
+        // String backing cannot fail, so the discard is intentional.
+        use std::fmt::Write as _;
+        let _ = writeln!(
+            detail,
+            "  - {task} ({branch}): {n} commit(s) not on {parent}",
+            task = s.task_id,
+            branch = s.factory_branch.as_deref().unwrap_or("—"),
+            n = s.unmerged_count,
+            parent = parent_branch,
         );
     }
     EpicCloseGateOutcome::Reject(format!(
@@ -3583,15 +3607,18 @@ mod epic_status_gate_tests {
         ];
         let report = render_epic_status_report("cas-754b", "epic/foo", &statuses);
 
+        // Status column uses TaskStatus's Display impl (snake_case:
+        // closed, in_progress) per round-1 cas-code-review fix —
+        // matches the rest of the CLI's status rendering.
         let expected = "\
 Epic cas-754b — factory branch status\n\
 Parent branch: epic/foo\n\
 \n\
 | Task | Status | Assignee | Factory branch | Unmerged | Last commit |\n\
 |------|--------|----------|----------------|----------|-------------|\n\
-| cas-aaaa | Closed | alpha | factory/alpha | 0 | 2025-01-01 00:00 UTC |\n\
-| cas-bbbb | InProgress | bravo | factory/bravo | 2 | 2025-01-02 00:00 UTC |\n\
-| cas-cccc | InProgress | — | — | — | — |\n\
+| cas-aaaa | closed | alpha | factory/alpha | 0 | 2025-01-01 00:00 UTC |\n\
+| cas-bbbb | in_progress | bravo | factory/bravo | 2 | 2025-01-02 00:00 UTC |\n\
+| cas-cccc | in_progress | — | — | — | — |\n\
 \n\
 ⚠️  1 child task(s) carry stranded factory commits. \
 Epic close will be hard-blocked until they are merged.\n";
