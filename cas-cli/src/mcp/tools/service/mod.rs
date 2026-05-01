@@ -488,7 +488,8 @@ impl CasService {
                 // ---- Factory domain ----
                 "spawn_workers" | "shutdown_workers" | "worker_status" | "worker_activity"
                 | "clear_context" | "my_context" | "sync_all_workers" | "gc_report"
-                | "gc_cleanup" | "remind" | "remind_list" | "remind_cancel" => {
+                | "gc_cleanup" | "epic_status" | "remind" | "remind_list"
+                | "remind_cancel" => {
                     let factory_req = req.to_factory_request();
                     match action.as_str() {
                         "spawn_workers" => this.factory_spawn_workers(factory_req).await,
@@ -500,6 +501,10 @@ impl CasService {
                         "sync_all_workers" => this.factory_sync_all_workers(factory_req).await,
                         "gc_report" => this.factory_gc_report(factory_req).await,
                         "gc_cleanup" => this.factory_gc_cleanup(factory_req).await,
+                        // cas-8f8f: per-child branch merge-state diagnostic.
+                        // Same data source as the epic-close gate so report
+                        // and gate cannot disagree.
+                        "epic_status" => this.factory_epic_status(factory_req).await,
                         "remind" => this.factory_remind(factory_req).await,
                         "remind_list" => this.factory_remind_list(factory_req).await,
                         "remind_cancel" => this.factory_remind_cancel(factory_req).await,

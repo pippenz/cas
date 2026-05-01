@@ -180,6 +180,29 @@ impl CasCore {
                     req.id
                 )));
             }
+
+            // cas-8f8f: per-child factory-branch merge-state guard for
+            // epic close. The check above (`check_unmerged_epic_branches`)
+            // operates on the epic's own branch namespace; this gate
+            // walks every child task's `factory/<assignee>` branch and
+            // rejects when any has stranded commits relative to the
+            // epic branch. Bypass-immune (data-state guard, not a
+            // review gate). Diagnostic surface for in-flight queries
+            // is `mcp__cas__coordination action=epic_status id=<epic>`.
+            let subtasks = task_store.get_subtasks(&req.id).unwrap_or_default();
+            let close_project_root = self.cas_root.parent().unwrap_or(&self.cas_root);
+            match run_epic_close_merge_gate(
+                &task,
+                &req,
+                target_branch,
+                close_project_root,
+                &subtasks,
+            ) {
+                EpicCloseGateOutcome::Proceed => {}
+                EpicCloseGateOutcome::Reject(msg) => {
+                    return Ok(Self::tool_error(msg));
+                }
+            }
         }
 
         // cas-95ce: per-task close-time merge-state guard. Mirrors the
@@ -1633,24 +1656,87 @@ pub(crate) struct EpicChildBranchStatus {
 /// so the report is complete; the gate filters them out by checking
 /// `factory_branch.is_some() && unmerged_count > 0`.
 pub(crate) fn collect_epic_branch_statuses(
-    _subtasks: &[Task],
-    _parent_branch: &str,
-    _repo_path: &std::path::Path,
+    subtasks: &[Task],
+    parent_branch: &str,
+    repo_path: &std::path::Path,
 ) -> Vec<EpicChildBranchStatus> {
-    // cas-8f8f step 1 (test-first): stub returning empty.
-    Vec::new()
+    subtasks
+        .iter()
+        .map(|t| {
+            let factory_branch = t.assignee.as_ref().map(|a| format!("factory/{a}"));
+            let (unmerged_count, last_commit_unix) = match factory_branch.as_deref() {
+                Some(branch) => (
+                    count_unmerged_factory_commits(repo_path, branch, parent_branch),
+                    last_commit_unix(repo_path, branch),
+                ),
+                None => (0, None),
+            };
+            EpicChildBranchStatus {
+                task_id: t.id.clone(),
+                task_status: t.status,
+                assignee: t.assignee.clone(),
+                factory_branch,
+                unmerged_count,
+                last_commit_unix,
+            }
+        })
+        .collect()
 }
 
 /// Render the per-child branch statuses as a Markdown report for the
 /// supervisor-facing `factory_epic_status` action. Stable shape; the
 /// snapshot test in `epic_status_gate_tests` pins the exact layout.
 pub(crate) fn render_epic_status_report(
-    _epic_id: &str,
-    _parent_branch: &str,
-    _statuses: &[EpicChildBranchStatus],
+    epic_id: &str,
+    parent_branch: &str,
+    statuses: &[EpicChildBranchStatus],
 ) -> String {
-    // cas-8f8f step 1 (test-first): stub.
-    String::new()
+    let mut out = String::new();
+    out.push_str(&format!(
+        "Epic {epic_id} — factory branch status\n\
+         Parent branch: {parent_branch}\n\n",
+    ));
+    if statuses.is_empty() {
+        out.push_str("(no child tasks)\n");
+        return out;
+    }
+    out.push_str("| Task | Status | Assignee | Factory branch | Unmerged | Last commit |\n");
+    out.push_str("|------|--------|----------|----------------|----------|-------------|\n");
+    for s in statuses {
+        let status_str = format!("{:?}", s.task_status);
+        let assignee = s.assignee.as_deref().unwrap_or("—");
+        let branch = s.factory_branch.as_deref().unwrap_or("—");
+        let unmerged = if s.factory_branch.is_some() {
+            s.unmerged_count.to_string()
+        } else {
+            "—".to_string()
+        };
+        let last_commit = match s.last_commit_unix {
+            Some(ts) => format_unix_timestamp(ts),
+            None => "—".to_string(),
+        };
+        out.push_str(&format!(
+            "| {task} | {status} | {assignee} | {branch} | {unmerged} | {last} |\n",
+            task = s.task_id,
+            status = status_str,
+            assignee = assignee,
+            branch = branch,
+            unmerged = unmerged,
+            last = last_commit,
+        ));
+    }
+    let stranded = statuses.iter().filter(|s| s.unmerged_count > 0).count();
+    if stranded > 0 {
+        out.push_str(&format!(
+            "\n⚠️  {stranded} child task(s) carry stranded factory commits. \
+             Epic close will be hard-blocked until they are merged.\n",
+        ));
+    } else {
+        out.push_str(
+            "\n✓ All child factory branches are merged into the parent epic branch.\n",
+        );
+    }
+    out
 }
 
 /// Format a Unix epoch second as ISO-8601 UTC. Pure helper kept here
@@ -1703,14 +1789,51 @@ pub(crate) enum EpicCloseGateOutcome {
 /// [`run_factory_branch_merge_gate`]: this is a data-state guard,
 /// not a review gate. `_req` is intentionally unused.
 pub(crate) fn run_epic_close_merge_gate(
-    _task: &Task,
+    task: &Task,
     _req: &TaskCloseRequest,
-    _parent_branch: &str,
-    _repo_path: &std::path::Path,
-    _subtasks: &[Task],
+    parent_branch: &str,
+    repo_path: &std::path::Path,
+    subtasks: &[Task],
 ) -> EpicCloseGateOutcome {
-    // cas-8f8f step 1 (test-first): stub.
-    EpicCloseGateOutcome::Proceed
+    if task.task_type != TaskType::Epic {
+        return EpicCloseGateOutcome::Proceed;
+    }
+    let statuses = collect_epic_branch_statuses(subtasks, parent_branch, repo_path);
+    let stranded: Vec<&EpicChildBranchStatus> = statuses
+        .iter()
+        .filter(|s| s.factory_branch.is_some() && s.unmerged_count > 0)
+        .collect();
+    if stranded.is_empty() {
+        return EpicCloseGateOutcome::Proceed;
+    }
+    let mut detail = String::new();
+    for s in &stranded {
+        let _ = std::fmt::Write::write_fmt(
+            &mut detail,
+            format_args!(
+                "  - {task} ({branch}): {n} commit(s) not on {parent}\n",
+                task = s.task_id,
+                branch = s.factory_branch.as_deref().unwrap_or("—"),
+                n = s.unmerged_count,
+                parent = parent_branch,
+            ),
+        );
+    }
+    EpicCloseGateOutcome::Reject(format!(
+        "⚠️ MERGE REQUIRED\n\n\
+         Epic {epic_id} cannot close — {n} child task(s) have stranded factory \
+         branches:\n{detail}\n\
+         Each child's factory branch must be merged into {parent} before the \
+         epic can close. This guard cannot be bypassed (use of \
+         bypass_code_review=true does not skip merge-state checks — it is a \
+         data-state guard, not a review gate).\n\n\
+         Diagnostic: run `mcp__cas__coordination action=epic_status id={epic_id}` \
+         for a per-child report.",
+        epic_id = task.id,
+        n = stranded.len(),
+        detail = detail,
+        parent = parent_branch,
+    ))
 }
 
 // ---------------------------------------------------------------------------
