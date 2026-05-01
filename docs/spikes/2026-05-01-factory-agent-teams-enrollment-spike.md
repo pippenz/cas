@@ -11,7 +11,7 @@
 
 Agent-teams enrollment provides exactly one load-bearing capability today: **the harness polls `~/.claude/teams/<team>/inboxes/<agent>.json` and surfaces inbox messages into the active conversation**. Every other claimed capability is either (a) implemented natively by CAS, (b) cargo-cult metadata that no caller reads, or (c) actively harmful (the SendMessage interceptor hook, the team-mode UG9 deadlock, and the per-role settings hack that only exists to work around UG9).
 
-The one load-bearing capability is itself flaky per multiple open Anthropic issues (`#23415`, `#34668`, `#51959`) and we already have a working substitute on the codex code path (PTY-stdin injection gated on pane-readiness, see `cas-cli/src/ui/factory/daemon/runtime/queue_and_events.rs:241–252`). Folding Claude workers onto the same path costs us one harness-side push channel but buys us: deletion of the SendMessage hook, deletion of the per-role settings allowlist hack (because the deadlock only exists in team-mode), exit from an experimental Anthropic surface that is being actively re-shaped, and ~700 lines of `teams.rs` reduced to a thin worktree-boundary write.
+The one load-bearing capability is itself flaky per multiple Anthropic issues — `#23415` (closed `NOT_PLANNED` 2026-03-20, i.e. won't-fix; bug still real), `#34668` (open), `#51959` (open) — and we already have a working substitute on the codex code path (PTY-stdin injection gated on pane-readiness, see `cas-cli/src/ui/factory/daemon/runtime/queue_and_events.rs:241–252`). Folding Claude workers onto the same path costs us one harness-side push channel but buys us: deletion of the SendMessage hook, deletion of the per-role settings allowlist hack (because the deadlock only exists in team-mode), exit from an experimental Anthropic surface that is being actively re-shaped, and ~700 lines of `teams.rs` reduced to a thin worktree-boundary write.
 
 Recommend a follow-on EPIC to execute the drop. Sketch in §7.
 
@@ -20,7 +20,7 @@ Recommend a follow-on EPIC to execute the drop. Sketch in §7.
 ## 1. Sources
 
 ### Local code (read 2026-05-01)
-- `cas-cli/src/ui/factory/daemon/runtime/teams.rs` — `TeamsManager` (765 lines + 591 lines of tests)
+- `cas-cli/src/ui/factory/daemon/runtime/teams.rs` — `TeamsManager` (1358 lines total: ~800 production + ~558 tests; `#[cfg(test)]` starts at line 801)
 - `crates/cas-pty/src/pty.rs` lines 41–354 — `TeamsSpawnConfig`, `PtyConfig::claude` argv assembly, `PtyConfig::codex` (no teams flags)
 - `cas-cli/src/ui/factory/daemon/runtime/queue_and_events.rs` lines 220–500 — daemon delivery loop with `if let Some(ref teams) … else mux.inject` branching
 - `cas-cli/src/ui/factory/daemon/runtime/lifecycle.rs` lines 96–124 — `TeamsManager` is created **unconditionally** even though the comment claims "Claude CLI only" (latent bug on codex)
@@ -41,20 +41,26 @@ Recommend a follow-on EPIC to execute the drop. Sketch in §7.
 - https://code.claude.com/docs/en/agent-teams — agent-teams architecture, enumerated hooks (`TeammateIdle`, `TaskCreated`, `TaskCompleted`), explicit statement that *"the lead's conversation history does not carry over"*, explicit statement that team config *"is overwritten on the next state update — don't edit it by hand or pre-author it"*
 - https://code.claude.com/docs/en/hooks — `PreToolUse` hook schema, `permissionDecision` shape
 
-### GitHub issues (queried directly via `gh issue list -R anthropics/claude-code` 2026-05-01)
-| # | Date | Title | Why it matters |
-|---|------|-------|----|
-| [#23415](https://github.com/anthropics/claude-code/issues/23415) | 2026-02-05 | Teammates don't poll inbox — messages never delivered (tmux backend, macOS) | Disproves the only load-bearing capability on the only platform where we ship cas factory in tmux mode. Open. |
-| [#51959](https://github.com/anthropics/claude-code/issues/51959) | 2026-04-22 | Lead agent requires manual stdin input to process teammate notifications — breaks unattended orchestration | The exact failure mode `bba7685` commit body called out 7 months ago. Still open. |
-| [#34668](https://github.com/anthropics/claude-code/issues/34668) | recent | Teammates intermittently stop receiving SendMessage after extended polling | Inbox polling unreliable even on default in-process backend. |
-| [#44080](https://github.com/anthropics/claude-code/issues/44080) | 2026-04-06 | [BUG] SendMessage no longer available | Tool surface drift. |
-| [#47021](https://github.com/anthropics/claude-code/issues/47021) | recent | SendMessage tool referenced but not available at runtime | Tool surface drift. |
-| [#42999](https://github.com/anthropics/claude-code/issues/42999) | 2026-04-03 | SendMessage silently fails when using agent name — only agent ID works | Silent-fail mode hidden behind our hook interceptor. |
-| [#48160](https://github.com/anthropics/claude-code/issues/48160) | 2026-04-14 | Spawned subagents cannot originate SendMessage | Asymmetry; means our agent-teams plumbing is doubly bridged. |
-| [#27555](https://github.com/anthropics/claude-code/issues/27555) | 2026-03 | Teammate messages render with `⏺ Human:` prefix | UX bug; teammates can't tell teammate messages from user input. |
-| [#51431](https://github.com/anthropics/claude-code/issues/51431) | 2026-04-21 | [Hooks] Missing hook events for inter-teammate notifications | Hook surface incomplete. |
-| [#52251](https://github.com/anthropics/claude-code/issues/52251) | 2026-04-23 | Agent-Teams sub-agents with model:opus cannot call SendMessage / TaskCreate / TaskUpdate (tmux backend) | Tool gating regressions on the exact backend we use. |
-| [#53896](https://github.com/anthropics/claude-code/issues/53896) | 2026-04-27 | SendMessage concurrent writes lose messages via array rewrite | Same bug class as our cas-7f57 inbox-replay fix — i.e. we are forking + carrying CC's inbox bugs. |
+### GitHub issues (queried directly via `gh issue view -R anthropics/claude-code <num> --json number,title,state,closedAt,stateReason` 2026-05-01)
+
+State legend: `OPEN` = currently open; `NOT_PLANNED` = closed without fix (Anthropic acknowledged but won't address; the underlying bug is still real); `DUPLICATE` = closed in favour of another tracking issue.
+
+| # | State | Date | Title | Why it matters |
+|---|----|------|-------|----|
+| [#23415](https://github.com/anthropics/claude-code/issues/23415) | CLOSED `NOT_PLANNED` 2026-03-20 | 2026-02-05 | Teammates don't poll inbox — messages never delivered (tmux backend, macOS) | Closed won't-fix — Anthropic confirmed the bug but does not plan to fix the tmux-backend inbox-polling failure. Disproves the only load-bearing capability on the platform where we ship cas factory. |
+| [#51959](https://github.com/anthropics/claude-code/issues/51959) | OPEN | 2026-04-22 | Lead agent requires manual stdin input to process teammate notifications — breaks unattended orchestration | The exact failure mode `bba7685` commit body called out 7 months ago. |
+| [#34668](https://github.com/anthropics/claude-code/issues/34668) | OPEN | recent | Teammates intermittently stop receiving SendMessage after extended polling (default in-process mode) | Inbox polling unreliable even on default backend. |
+| [#44080](https://github.com/anthropics/claude-code/issues/44080) | OPEN | 2026-04-06 | [BUG] SendMessage no longer available | Tool surface drift. |
+| [#47021](https://github.com/anthropics/claude-code/issues/47021) | CLOSED `DUPLICATE` 2026-04-16 | 2026-03 | SendMessage tool referenced but not available at runtime | Closed as duplicate of an upstream tracker; bug class still active per the duplicates' chain. |
+| [#42999](https://github.com/anthropics/claude-code/issues/42999) | OPEN | 2026-04-03 | SendMessage silently fails when using agent name — only agent ID works | Silent-fail mode hidden behind our hook interceptor. |
+| [#48160](https://github.com/anthropics/claude-code/issues/48160) | CLOSED `DUPLICATE` 2026-04-18 | 2026-04-14 | Spawned subagents cannot originate SendMessage | Closed as duplicate; asymmetry in agent-teams comms still unaddressed in the parent issue. |
+| [#27555](https://github.com/anthropics/claude-code/issues/27555) | CLOSED `NOT_PLANNED` 2026-03-22 | 2026-03 | Teammate messages render with `⏺ Human:` prefix | Closed won't-fix; cosmetic UX bug. |
+| [#25135](https://github.com/anthropics/claude-code/issues/25135) | CLOSED `NOT_PLANNED` 2026-03-23 | 2026-03 | SendMessage silently succeeds when recipient name doesn't match team-lead's inbox polling target | Closed won't-fix; the silent-success delivery hazard is acknowledged but unfixed. |
+| [#51431](https://github.com/anthropics/claude-code/issues/51431) | OPEN | 2026-04-21 | [Hooks] Missing hook events for inter-teammate notifications | Hook surface incomplete. |
+| [#52251](https://github.com/anthropics/claude-code/issues/52251) | OPEN | 2026-04-23 | Agent-Teams sub-agents with model:opus cannot call SendMessage / TaskCreate / TaskUpdate (tmux backend) | Tool gating regressions on the exact backend we use. |
+| [#53896](https://github.com/anthropics/claude-code/issues/53896) | OPEN | 2026-04-27 | SendMessage concurrent writes lose messages via array rewrite | Same bug class as our cas-7f57 inbox-replay fix — i.e. we are forking + carrying CC's inbox bugs. |
+
+**Reading note on the four `NOT_PLANNED`/`DUPLICATE` closures:** none of these were closed because the bug was *fixed* — `NOT_PLANNED` is GitHub's "won't-fix" reason and `DUPLICATE` rolls the report into another (still-open or also-closed) tracker. The closure pattern itself reinforces the verdict: agent-teams bugs are getting acknowledged-and-shelved rather than addressed.
 
 ### context7
 Not used — agent-teams is Claude Code-internal, not a third-party library.
@@ -72,7 +78,7 @@ These are the observable effects of writing `~/.claude/teams/<session>/config.js
 |---|----|----|----|
 | **A** | **Daemon→Worker push: harness ingests inbox JSON file and surfaces messages as conversation turns** | `--teammate-mode tmux` activates inbox polling; daemon writes via `TeamsManager::write_to_inbox` | `crates/cas-pty/src/pty.rs:195–209`; `cas-cli/src/ui/factory/daemon/runtime/queue_and_events.rs:326–338`; observed in `~/.claude/teams/cas-src-fast-hawk-50/inboxes/mighty-stork-36.json` (this very session) |
 | **B** | **`SendMessage` tool auto-surfaced to the agent** | Anthropic docs: *"Team coordination tools such as `SendMessage` and the task management tools are always available to a teammate"* | https://code.claude.com/docs/en/agent-teams (fetched 2026-05-01) |
-| **C** | **Per-role settings file path (`--settings <path>`) load-bearing for filesystem auto-approve** | `--settings` is itself NOT agent-teams-specific — but the file lives under the team dir today and its `permissions.allow` exists *solely* to work around the team-mode "UG9" leader-escalation deadlock | `cas-cli/src/ui/factory/daemon/runtime/teams.rs:271–374`; `pre_tool.rs:40–58` (`is_supervisor` carve-out reflects same deadlock); observed at `~/.claude/teams/cas-src-fast-hawk-50/{supervisor,mighty-stork-36}-settings.json` |
+| **C** | **Per-role settings file path (`--settings <path>`) load-bearing for filesystem auto-approve** | `--settings` is itself NOT agent-teams-specific — but the file lives under the team dir today and its `permissions.allow` exists *solely* to work around the team-mode "UG9" leader-escalation deadlock | `cas-cli/src/ui/factory/daemon/runtime/teams.rs:271–374`; `pre_tool.rs:81–92` (the `is_factory_agent` auto-approve hoist that exists to bypass the same deadlock when `cas_root=None`); observed at `~/.claude/teams/cas-src-fast-hawk-50/{supervisor,mighty-stork-36}-settings.json` |
 | **D** | **TUI tmux pane layout with teammate panes side-by-side** | tmux is set up by `cas factory` itself, not by the harness — `--teammate-mode tmux` is what the *harness* expects to find, not what creates the panes | `crates/cas-pty/src/pty.rs:208`; cas-mux owns pane layout entirely (`crates/cas-mux/src/pane/`) |
 | **E** | **Agent visibility / status-line entries** | Inherited from per-pane Claude Code session display; not gated on agent-teams | https://code.claude.com/docs/en/agent-teams §UI |
 | **F** | **`TeammateIdle` / `TaskCreated` / `TaskCompleted` hooks** | Anthropic-only, agent-teams-exclusive | https://code.claude.com/docs/en/agent-teams §Hooks |
@@ -127,7 +133,7 @@ These are concrete tax items that disappear if we drop enrollment:
 1. **SendMessage interceptor hook** (`cas-cli/src/hooks/handlers/handlers_events/pre_tool.rs:137–143, 857–983`, ~127 lines) — exists only because the harness surfaces `SendMessage`.
 2. **SendMessage autoroute test suite** (`cas-cli/src/hooks/handlers/handlers_tests/send_message_autoroute.rs`) — ~lines of test code testing the bridge.
 3. **Per-role settings file generator + 9 unit tests** (`cas-cli/src/ui/factory/daemon/runtime/teams.rs:271–374` + 200 lines of tests) — entire UG9 workaround.
-4. **`teams.rs` itself** (1359 lines including tests) — `init_team_config`, `add_member`, `remove_member`, `cleanup_orphans`, `write_to_inbox` (with dedup + retention), `spawn_config_for`, `build_configs_for_mux`, the supervisor/worker settings synchronization.
+4. **`teams.rs` itself** (1358 lines including tests) — `init_team_config`, `add_member`, `remove_member`, `cleanup_orphans`, `write_to_inbox` (with dedup + retention), `spawn_config_for`, `build_configs_for_mux`, the supervisor/worker settings synchronization.
 5. **`TeamsSpawnConfig` + claude-side argv assembly** (`crates/cas-pty/src/pty.rs:41–225`) — flag construction that has no codex equivalent.
 6. **Inbox replay/dedup machinery** (cas-7f57: `INBOX_DEDUP_WINDOW`, `INBOX_RETENTION`, ~120 lines including tests) — fixes a bug class that exists only on the inbox-file delivery path.
 7. **Per-message phantom "tool error"** in every agent that defaults to SendMessage — ~200-500 tokens of context per agent per session. Multiplied across the 4-pane factory, this is one of the largest avoidable token costs we ship.
