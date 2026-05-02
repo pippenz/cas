@@ -34,3 +34,4 @@ node_modules/
 # Process sockets
 .overmind.sock
 # Worktree-specific files (generated per worktree)
+# fallow incremental analysis cache (used by the fallow skill)
