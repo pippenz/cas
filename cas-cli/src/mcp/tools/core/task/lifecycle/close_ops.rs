@@ -2237,6 +2237,56 @@ pub(crate) fn run_code_review_gate(
     }
 
     use cas_store::code_review::close_gate::{GateDecision, evaluate_gate, format_block_message};
+    use cas_types::FindingSeverity;
+
+    // cas-4c64: apply the full forgery defence — symmetric with
+    // worker_review_envelope_is_clean — so the gate is equally strict
+    // whether the envelope came from `req.code_review_findings` or was
+    // read back from the persisted `task.deliverables.review_envelope`
+    // (the cas-3086 retry-after-jail path). Before this fix, only
+    // `evaluate_gate` was called here; that function filters on
+    // `!f.pre_existing && f.severity == P0`, so a forged envelope with a
+    // P0 carrying `pre_existing: true` in `residual[]` would pass the
+    // gate even though `worker_review_envelope_is_clean` had rejected it
+    // on the original close attempt and the envelope was persisted by the
+    // jail-arming branch.
+
+    // Check A: no P0 in residual[], regardless of per-finding pre_existing
+    // flag. This catches the forgery vector where a P0 is marked
+    // pre_existing=true to evade evaluate_gate's filter. Genuine
+    // pre-existing P0s belong in `outcome.pre_existing[]`, not residual[].
+    let residual_p0s: Vec<_> = envelope
+        .residual
+        .iter()
+        .filter(|f| f.severity == FindingSeverity::P0)
+        .cloned()
+        .collect();
+    if !residual_p0s.is_empty() {
+        return CodeReviewGateOutcome::Reject(format_block_message(&task.id, &residual_p0s));
+    }
+
+    // Check B: no P0 in pre_existing[] bucket (cas-fef4 forgery defence).
+    // Workers cannot reclassify a P0 as pre-existing to bypass the gate.
+    if envelope
+        .pre_existing
+        .iter()
+        .any(|f| f.severity == FindingSeverity::P0)
+    {
+        return CodeReviewGateOutcome::Reject(
+            "⚠️ BLOCKED: P0 in pre_existing[]\n\n\
+             task close rejected: code_review_findings pre_existing[] contains \
+             a P0-severity finding. Pre-existing P0s are not a downgrade slot — \
+             they block the close gate regardless of classification. \
+             Fix the P0, re-run cas-code-review, and retry close. \
+             (cas-fef4 + cas-4c64 forgery defence)"
+                .to_string(),
+        );
+    }
+
+    // Final check: evaluate_gate for PR-introduced P0s (pre_existing=false).
+    // After Checks A and B above, this is redundant for P0 detection, but
+    // retained for the format_block_message formatting it provides and as a
+    // safety net in case evaluate_gate's semantics are extended in future.
     match evaluate_gate(&envelope.residual) {
         GateDecision::Allow => CodeReviewGateOutcome::Proceed,
         GateDecision::BlockOnP0(blocking) => {
@@ -3175,6 +3225,139 @@ mod code_review_gate_tests {
             !epic_subtask_receipts_are_clean(&subtasks),
             "malformed envelope on any subtask must disqualify the bypass"
         );
+    }
+
+    // --- cas-4c64: run_code_review_gate forgery defence (persisted path) ------
+    //
+    // These tests cover the two-step attack surface fixed in cas-4c64:
+    //
+    //   Step 1: Worker submits a forged envelope (P0 marked pre_existing=true in
+    //           residual[], or P0 in pre_existing[]). `worker_review_envelope_is_clean`
+    //           rejects it, so the short-circuit does NOT fire. The jail-arming
+    //           `else` branch persists the envelope unconditionally to
+    //           `task.deliverables.review_envelope`.
+    //
+    //   Step 2: Supervisor's task-verifier clears the jail.
+    //
+    //   Step 3: Worker retries close WITHOUT code_review_findings. The gate reads
+    //           the persisted forged envelope. Before cas-4c64, `evaluate_gate`
+    //           filtered `!f.pre_existing`, so the P0 was silently skipped →
+    //           Allow → bypass. After cas-4c64, Check A/B fire unconditionally →
+    //           Reject.
+    //
+    // Step 1 integration is covered by `test_worker_close_with_p0_residual_pre_existing_true_still_blocked`
+    // in verification_flow.rs. Step 3 (the close-gate layer) is here.
+
+    /// P0 finding with `pre_existing: true` — the per-finding flag that
+    /// `evaluate_gate` filters on (`!f.pre_existing && f.severity == P0`),
+    /// making it the attack vector before cas-4c64 Check A.
+    fn p0_finding_pre_existing_true() -> Finding {
+        Finding {
+            pre_existing: true,
+            ..p0_finding()
+        }
+    }
+
+    #[test]
+    fn persisted_envelope_with_p0_pre_existing_true_in_residual_is_blocked() {
+        // Regression for cas-4c64 Check A: a persisted envelope whose
+        // residual[] contains a P0 marked `pre_existing:true` must be
+        // rejected even though `evaluate_gate` would have allowed it
+        // (it filters `!f.pre_existing`). Check A catches all P0s in
+        // residual[], regardless of the per-finding flag.
+        let _g = env_lock();
+        let dir = repo_with_staged(&[("src/foo.rs", "fn new() {}\n")]);
+        let mut t = base_task();
+        // Forged envelope: P0 in residual[] with pre_existing=true.
+        let forged =
+            envelope_with_pre_existing(vec![p0_finding_pre_existing_true()], Vec::new());
+        t.deliverables.review_envelope = Some(forged);
+        let req = base_req(&t.id); // no findings in request — reads persisted
+        let out = run_code_review_gate(&t, &req, dir.path());
+        match out {
+            CodeReviewGateOutcome::Reject(msg) => {
+                assert!(
+                    msg.contains("P0 BLOCK"),
+                    "must block on P0 even with pre_existing=true in residual[]: {msg}"
+                );
+            }
+            other => panic!(
+                "expected Reject for persisted forged P0-in-residual envelope, got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn persisted_envelope_with_p0_in_pre_existing_array_is_blocked() {
+        // Regression for cas-4c64 Check B: a persisted envelope whose
+        // pre_existing[] bucket contains a P0 must be rejected. Before
+        // cas-4c64, `evaluate_gate` did not inspect this bucket at all —
+        // only `residual[]` was checked. Check B closes that gap.
+        let _g = env_lock();
+        let dir = repo_with_staged(&[("src/foo.rs", "fn new() {}\n")]);
+        let mut t = base_task();
+        // Envelope with P0 reclassified as pre-existing (the fef4 forgery).
+        let forged = envelope_with_pre_existing(Vec::new(), vec![p0_finding()]);
+        t.deliverables.review_envelope = Some(forged);
+        let req = base_req(&t.id);
+        let out = run_code_review_gate(&t, &req, dir.path());
+        match out {
+            CodeReviewGateOutcome::Reject(msg) => {
+                assert!(
+                    msg.contains("P0 in pre_existing"),
+                    "must block on P0 in pre_existing[]: {msg}"
+                );
+            }
+            other => panic!(
+                "expected Reject for persisted P0-in-pre_existing[] envelope, got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn two_step_forged_envelope_rejected_on_retry() {
+        // Full two-step attack regression (cas-4c64 supervisor spec):
+        //
+        //   (1) Worker sends {residual:[{P0, pre_existing:true}]}.
+        //       worker_review_envelope_is_clean → false (no short-circuit).
+        //       Jail-arming branch persists the envelope unconditionally.
+        //   (2) Supervisor verifies + clears jail (simulated here by
+        //       setting t.deliverables.review_envelope directly).
+        //   (3) Worker retries close without code_review_findings.
+        //       Before cas-4c64: evaluate_gate skips pre_existing=true → Allow
+        //       (bypass succeeds — the bug).
+        //       After cas-4c64: Check A blocks on any P0 in residual[] → Reject
+        //       (the fix).
+        //
+        // This test exercises step 3 only (the close-gate function boundary).
+        // Step 1 integration is in verification_flow.rs
+        // `test_worker_close_with_p0_residual_pre_existing_true_still_blocked`.
+        let _g = env_lock();
+        let dir = repo_with_staged(&[("src/auth.rs", "fn login() {}\n")]);
+        let mut t = base_task();
+        // Simulate the persisted forged envelope from step 1.
+        let forged = serde_json::to_string(&ReviewOutcome {
+            residual: vec![p0_finding_pre_existing_true()],
+            pre_existing: Vec::new(),
+            mode: "autofix".to_string(),
+        })
+        .expect("serialize forged envelope");
+        t.deliverables.review_envelope = Some(forged);
+        // Step 3: worker retries without providing code_review_findings.
+        let req = base_req(&t.id);
+        let out = run_code_review_gate(&t, &req, dir.path());
+        match out {
+            CodeReviewGateOutcome::Reject(msg) => {
+                // Must block with P0 — not CODE_REVIEW_REQUIRED (which would
+                // mislead the worker into thinking they just forgot to attach
+                // findings).
+                assert!(
+                    msg.contains("P0 BLOCK"),
+                    "two-step forged close must produce P0 BLOCK, not CODE_REVIEW_REQUIRED: {msg}"
+                );
+            }
+            other => panic!("two-step forged close must be rejected, got {other:?}"),
+        }
     }
 }
 
