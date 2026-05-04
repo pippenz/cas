@@ -2942,10 +2942,12 @@ pub(crate) fn run_lightweight_structural_lint(
 ) -> LightweightLintOutcome {
     use std::process::Command;
 
-    // Collect the diff text. Prefer the committed diff over the HEAD diff;
-    // either is acceptable. We use `--unified=0` to get minimal context so
-    // the consecutive-blank-lines heuristic below is not confused by context
-    // lines from the surrounding diff.
+    // Collect the diff text. Try `HEAD` (committed + staged vs last commit)
+    // first; fall back to `--cached` (staged only) when HEAD fails (e.g.
+    // fresh repo with no commits). We use `--unified=0` to get minimal
+    // context so the consecutive-comment heuristic below is not confused by
+    // context lines from the surrounding diff. Only one diff source is used
+    // to avoid duplicating added-lines counts.
     let diff_text = {
         let mut text = String::new();
         for args in [
@@ -2957,8 +2959,9 @@ pub(crate) fn run_lightweight_structural_lint(
                 .current_dir(project_root)
                 .output()
             {
-                if output.status.success() {
-                    text.push_str(&String::from_utf8_lossy(&output.stdout));
+                if output.status.success() && !output.stdout.is_empty() {
+                    text = String::from_utf8_lossy(&output.stdout).into_owned();
+                    break; // use the first non-empty diff; don't append both
                 }
             }
         }
@@ -2978,16 +2981,18 @@ pub(crate) fn run_lightweight_structural_lint(
         .map(|l| &l[1..]) // strip the leading '+'
         .collect();
 
-    // Check 1: unimplemented!() or todo!() macro calls
+    // Check 1: unimplemented!() or todo!() macro calls anywhere on the line.
+    // Use `contains("macro!(")` to catch both `macro!()` (no args) and
+    // `macro!("msg")` forms, regardless of where they appear on the line.
     for (i, line) in added_lines.iter().enumerate() {
         let trimmed = line.trim();
-        if trimmed.contains("unimplemented!()") || trimmed.starts_with("unimplemented!(") {
+        if trimmed.contains("unimplemented!(") {
             violations.push(format!(
                 "Line +{}: `unimplemented!()` — replace with a real implementation",
                 i + 1
             ));
         }
-        if trimmed.contains("todo!()") || trimmed.starts_with("todo!(") {
+        if trimmed.contains("todo!(") {
             violations.push(format!(
                 "Line +{}: `todo!()` — replace with a real implementation",
                 i + 1

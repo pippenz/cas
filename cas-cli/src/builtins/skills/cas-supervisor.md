@@ -49,28 +49,6 @@ New session? Run these 5 steps in order. Open the linked reference for detail.
 4. **Create EPIC** — `mcp__cas__task action=create task_type=epic title="..." description="..."`. Spec shape and templates in [references/planning.md](cas-supervisor/references/planning.md).
 5. **Spawn, assign, end turn** — `mcp__cas__coordination action=spawn_workers count=N isolate=true`, then assign with `update` (not `transfer`), send context, stop. Phases and merge flow in [references/workflow.md](cas-supervisor/references/workflow.md).
 
-## Supervisor-Owned Code Review (cas-b51a)
-
-When the project config has `[code_review] owner = "supervisor"`, workers skip the full multi-persona review at close and instead transition their tasks to `pending_supervisor_review`. This eliminates the ~14-minute per-close blocking cost on the worker side.
-
-**Your responsibilities in this mode:**
-
-1. **Monitor the review queue** — Tasks in `pending_supervisor_review` are waiting for you. List them:
-   ```
-   mcp__cas__task action=list status=pending_supervisor_review
-   ```
-2. **Run the full review** — For each queued task, invoke `/cas-code-review mode=interactive task_id=<id>` or batch-review all pending tasks.
-3. **Deliver the verdict** — After review, send the worker a coordination message with the findings summary and any P0/P1 issues to address. If clean, confirm they can consider the task complete.
-4. **Record the verification** (optional) — `mcp__cas__verification action=add task_id=<id> status=approved summary="..."` to create an audit trail.
-
-**Config to enable (add to `.cas/config.toml`):**
-```toml
-[code_review]
-owner = "supervisor"
-```
-
-Default (`owner = "worker"`) preserves the existing behavior where each worker runs the full review inline.
-
 ## Heterogeneous Teams (Claude supervisor + Codex workers)
 
 To spawn workers on a different CLI backend than the supervisor, pass `cli=` to `spawn_workers`:
@@ -98,6 +76,7 @@ Each file below is a focused chunk of the operational guide. Open the one you ne
 - **[workflow.md](cas-supervisor/references/workflow.md)** — Worker modes, count strategy, Phase 1–4, merge/sync, blocker handling.
 - **[worker-recovery.md](cas-supervisor/references/worker-recovery.md)** — `is-wedged` triage, dead/silent worker, garbage output, verification jail, resource-contention crashes.
 - **[reference.md](cas-supervisor/references/reference.md)** — Exact valid actions and field names, dispatch two-step pattern, `update` vs `transfer`, message field requirements.
+- **[code-review-queue.md](cas-supervisor/references/code-review-queue.md)** — Supervisor-owned code review mode: queue monitoring, running full review, delivering verdict (cas-b51a).
 
 ## When to open which reference
 
@@ -109,3 +88,4 @@ Each file below is a focused chunk of the operational guide. Open the one you ne
 | Workers running, coordinating their work | workflow |
 | A worker pane looks broken or stuck | worker-recovery |
 | Hit "No active lease" / "missing field" / dispatch confusion | reference |
+| Tasks in `pending_supervisor_review`; running code review queue | code-review-queue |
