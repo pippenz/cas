@@ -403,7 +403,11 @@ After upgrading, the new gates fire on `task.close` calls. If a worker hits the 
 ### Added
 - Initial stable release with core functionality.
 
-[Unreleased]: https://github.com/pippenz/cas/compare/v2.0.0...HEAD
+[Unreleased]: https://github.com/pippenz/cas/compare/v2.12.0...HEAD
+[2.12.0]: https://github.com/pippenz/cas/compare/v2.11.0...v2.12.0
+[2.11.0]: https://github.com/pippenz/cas/compare/v2.10.1...v2.11.0
+[2.10.1]: https://github.com/pippenz/cas/compare/v2.10.0...v2.10.1
+[2.10.0]: https://github.com/pippenz/cas/compare/v2.0.0...v2.10.0
 [2.0.0]: https://github.com/pippenz/cas/compare/v1.0...v2.0.0
 [1.0.0]: https://github.com/pippenz/cas/compare/v0.6.2...v1.0
 [0.6.2]: https://github.com/pippenz/cas/compare/v0.5.7...v0.6.2
