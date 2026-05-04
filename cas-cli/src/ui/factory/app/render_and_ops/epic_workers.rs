@@ -283,6 +283,7 @@ impl FactoryApp {
             cas_root.as_ref(),
             &self.supervisor_name,
             teams.as_ref(),
+            None, // spec: use Mux default (T3 will supply per-spawn overrides)
         ) {
             crate::telemetry::track(
                 "factory_worker_spawn_result",
@@ -549,6 +550,7 @@ impl FactoryApp {
             cas_root.as_ref(),
             &self.supervisor_name,
             teams.as_ref(),
+            None, // spec: use Mux default (T3 will supply per-spawn overrides)
         ) {
             crate::telemetry::track(
                 "factory_worker_respawn_result",
