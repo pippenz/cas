@@ -1,6 +1,6 @@
 //! Cascade resolver for [`WorkerSpec`].
 //!
-//! Resolves per-worker configuration by merging five layers in order (last
+//! Resolves per-worker configuration by merging six layers in order (last
 //! wins):
 //!
 //! 1. **Built-in defaults** — Claude / no model / High effort.
@@ -11,6 +11,7 @@
 //! 6. **Per-worker JSON** — `--worker-spec '{"name":"alice","cli":"codex"}'`
 //!    (repeatable; matched by name then sequential position).
 
+use std::io;
 use std::path::PathBuf;
 
 use serde::Deserialize;
@@ -173,8 +174,7 @@ pub fn resolve_specs(
         .or_else(|| dirs::home_dir().map(|h| h.join(".cas").join("config.toml")));
 
     if let Some(ref path) = user_path {
-        if path.exists() {
-            let (defaults, _per_worker) = load_config_file(path)?;
+        if let Some((defaults, _per_worker)) = load_config_file(path)? {
             if let Some(d) = defaults {
                 apply_defaults_to_all(&mut specs, &d)?;
             }
@@ -183,8 +183,7 @@ pub fn resolve_specs(
 
     // ── Layer 3 + 4: project config (.cas/config.toml) ───────────────────
     if let Some(ref path) = sources.project_config {
-        if path.exists() {
-            let (defaults, per_worker) = load_config_file(path)?;
+        if let Some((defaults, per_worker)) = load_config_file(path)? {
             // 3. [factory.defaults]
             if let Some(d) = defaults {
                 apply_defaults_to_all(&mut specs, &d)?;
@@ -256,21 +255,31 @@ pub fn resolve_specs(
 
 /// Read and parse a TOML config file.
 ///
-/// Returns `(defaults_section, per_worker_entries)`.
+/// Returns `Some((defaults_section, per_worker_entries))` when the file exists
+/// and parses successfully, or `None` when the file does not exist.
+///
+/// Avoids the TOCTOU race of `path.exists()` + `read_to_string` by attempting
+/// the read directly and treating `NotFound` as an absent file.
 fn load_config_file(
-    path: &PathBuf,
-) -> Result<(Option<FactoryDefaultsToml>, Vec<FactoryWorkerToml>), SpecResolverError> {
-    let text = std::fs::read_to_string(path).map_err(|e| SpecResolverError::ReadConfig {
-        path: path.clone(),
-        source: e,
-    })?;
+    path: &std::path::Path,
+) -> Result<Option<(Option<FactoryDefaultsToml>, Vec<FactoryWorkerToml>)>, SpecResolverError> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(SpecResolverError::ReadConfig {
+                path: path.to_path_buf(),
+                source: e,
+            })
+        }
+    };
     let config: ConfigFileToml =
         toml::from_str(&text).map_err(|e| SpecResolverError::ParseConfig {
-            path: path.clone(),
+            path: path.to_path_buf(),
             source: e,
         })?;
     let factory = config.factory.unwrap_or_default();
-    Ok((factory.defaults, factory.workers))
+    Ok(Some((factory.defaults, factory.workers)))
 }
 
 /// Apply a `[factory.defaults]` section to every spec in the vec.
