@@ -802,4 +802,64 @@ mod tests {
             "unknown role with no top-level must return None"
         );
     }
+
+    /// A per-role block may exist (e.g. to override harness or model) without
+    /// setting `reasoning_effort`. In that case the top-level value must still
+    /// be returned — the `and_then` short-circuit must not swallow the fallback.
+    #[test]
+    fn reasoning_effort_for_role_partial_override_falls_back_to_top_level() {
+        let llm = LlmConfig {
+            reasoning_effort: Some("high".to_string()),
+            supervisor: Some(LlmRoleConfig {
+                harness: Some("codex".to_string()),
+                reasoning_effort: None, // effort NOT set in the role block
+                ..LlmRoleConfig::default()
+            }),
+            ..LlmConfig::default()
+        };
+        assert_eq!(
+            llm.reasoning_effort_for_role("supervisor"),
+            Some("high"),
+            "partial role override (harness set, effort absent) must fall back to top-level"
+        );
+    }
+
+    /// Round-trip via TOML deserialization: verifies that the serde attributes
+    /// on `LlmRoleConfig::reasoning_effort` are correct and that the field is
+    /// not silently dropped during deserialization.
+    #[test]
+    fn reasoning_effort_for_role_toml_roundtrip() {
+        let toml_str = r#"
+[llm]
+reasoning_effort = "medium"
+
+[llm.supervisor]
+reasoning_effort = "low"
+
+[llm.worker]
+reasoning_effort = "high"
+"#;
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            llm: LlmConfig,
+        }
+        let parsed: Wrapper = toml::from_str(toml_str).expect("valid toml");
+        let llm = parsed.llm;
+        assert_eq!(
+            llm.reasoning_effort_for_role("supervisor"),
+            Some("low"),
+            "supervisor reasoning_effort must survive TOML deserialization"
+        );
+        assert_eq!(
+            llm.reasoning_effort_for_role("worker"),
+            Some("high"),
+            "worker reasoning_effort must survive TOML deserialization"
+        );
+        // Top-level fallback still works after round-trip
+        assert_eq!(
+            llm.reasoning_effort_for_role("orchestrator"),
+            Some("medium"),
+            "top-level reasoning_effort must survive TOML deserialization"
+        );
+    }
 }
