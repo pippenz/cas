@@ -181,7 +181,7 @@ impl SqliteSpawnQueueStore {
         let force: i32 = row.get(4).unwrap_or(0);
         let isolate: i32 = row.get(5).unwrap_or(0);
         // Column 6 = worker_spec (added by migration m201; NULL for pre-migration rows)
-        let worker_spec: Option<String> = row.get(6).unwrap_or(None);
+        let worker_spec: Option<String> = row.get(6).unwrap_or_default();
         let processed_at_str: Option<String> = row.get(8)?;
 
         Ok(SpawnRequest {
