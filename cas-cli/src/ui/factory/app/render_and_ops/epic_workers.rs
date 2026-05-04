@@ -185,7 +185,7 @@ impl FactoryApp {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!(
-                    "cas-9bc6: failed to re-read live config before spawn; \
+                    "failed to re-read live config before spawn; \
                      cached worker harness retained: {}",
                     e
                 );
