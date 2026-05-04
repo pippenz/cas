@@ -269,14 +269,14 @@ impl FactoryDaemon {
                 if names.is_empty() {
                     self.app.spawning_count += count;
                     for i in 0..count {
-                        let spec = specs.get(i).and_then(|s| s.clone());
+                        let spec = specs.get(i).cloned().flatten();
                         self.pending_spawns
                             .push_back(PendingSpawn::Anonymous { isolate: false, spec });
                     }
                 } else {
                     self.app.spawning_count += names.len();
                     for (i, name) in names.into_iter().enumerate() {
-                        let spec = specs.get(i).and_then(|s| s.clone());
+                        let spec = specs.get(i).cloned().flatten();
                         self.pending_spawns.push_back(PendingSpawn::Named {
                             name,
                             isolate: false,

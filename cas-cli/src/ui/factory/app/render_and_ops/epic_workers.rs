@@ -352,6 +352,10 @@ impl FactoryApp {
 
         tracing::info!("Adding worker pane: {} in {:?}", worker_name, cwd);
 
+        // Capture effective CLI before spec is moved into add_worker.
+        // Explicit spec overrides session default so the intro prompt matches the actual harness.
+        let effective_cli = spec.as_ref().map(|s| s.cli).unwrap_or(self.worker_cli);
+
         if let Err(e) = self.mux.add_worker(
             &worker_name,
             cwd,
@@ -372,7 +376,7 @@ impl FactoryApp {
         crate::ui::factory::app::queue_codex_worker_intro_prompt(
             self.cas_dir(),
             &worker_name,
-            self.worker_cli,
+            effective_cli,
         );
 
         // Update event detector so it recognizes this worker's events

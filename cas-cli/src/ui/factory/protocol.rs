@@ -421,6 +421,7 @@ mod tests {
                 assert_eq!(names, vec!["alice"]);
                 assert_eq!(specs.len(), 1);
                 let s = specs[0].as_ref().unwrap();
+                assert_eq!(s.name.as_deref(), Some("alice"), "WorkerSpec.name must survive wire round-trip");
                 assert_eq!(s.cli, SupervisorCli::Codex);
                 assert_eq!(s.model.as_deref(), Some("gpt-5.5"));
                 assert_eq!(s.effort, Some(cas_mux::Effort::Medium));
