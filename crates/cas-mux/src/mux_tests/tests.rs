@@ -138,6 +138,20 @@ fn factory_pane_configs_none_effort_uses_role_defaults() {
 // Tests the MuxConfig.resolved_worker_specs → factory_pane_configs per-worker
 // CLI selection path, and the Mux::add_worker explicit spec override path.
 
+/// Return the effective binary name from a PtyConfig, stripping any `nice`
+/// wrapper that `CAS_FACTORY_NICE_WORKER=1` injects in the test environment.
+fn effective_command(pty: &crate::pty::PtyConfig) -> &str {
+    if pty.command == "nice" {
+        // nice -n <level> <binary> [args...] → binary is at index 2
+        pty.args
+            .get(2)
+            .map(String::as_str)
+            .unwrap_or("nice")
+    } else {
+        &pty.command
+    }
+}
+
 #[test]
 fn factory_pane_configs_uses_per_worker_specs() {
     // worker-1 → Codex, worker-2 → Claude, but MuxConfig.worker_cli is Claude.
@@ -177,11 +191,13 @@ fn factory_pane_configs_uses_per_worker_specs() {
         .expect("worker-2 must be present");
 
     assert_eq!(
-        w1.command, "codex",
+        effective_command(w1),
+        "codex",
         "worker-1 with Codex spec must use codex binary"
     );
     assert_eq!(
-        w2.command, "claude",
+        effective_command(w2),
+        "claude",
         "worker-2 with Claude spec must use claude binary"
     );
 }
@@ -203,13 +219,21 @@ fn factory_pane_configs_falls_back_to_singular_when_specs_empty() {
     for (name, pty_config) in &configs {
         if name == &config.supervisor_name {
             assert_eq!(
-                pty_config.command, "claude",
+                effective_command(pty_config),
+                "claude",
                 "supervisor must use claude binary"
             );
         } else {
             assert_eq!(
-                pty_config.command, "codex",
+                effective_command(pty_config),
+                "codex",
                 "worker {name} with empty resolved_worker_specs must fall back to worker_cli=Codex"
+            );
+            // PtyConfig::codex ignores the effort argument (_effort) intentionally;
+            // verify --effort does NOT appear in the codex worker args (cas-206d coverage).
+            assert!(
+                !pty_config.args.iter().any(|a| a == "--effort"),
+                "codex worker must NOT have --effort in args (codex ignores effort)"
             );
         }
     }
@@ -238,7 +262,8 @@ fn add_worker_uses_explicit_spec() {
     );
 
     assert_eq!(
-        pty_config.command, "codex",
+        effective_command(&pty_config),
+        "codex",
         "explicit Codex spec must override Claude default in dynamic add_worker path"
     );
 
@@ -252,7 +277,8 @@ fn add_worker_uses_explicit_spec() {
         None,
     );
     assert_eq!(
-        claude_config.command, "claude",
+        effective_command(&claude_config),
+        "claude",
         "no explicit spec must fall back to Mux default (Claude)"
     );
 }

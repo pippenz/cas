@@ -253,6 +253,7 @@ impl FactoryCore {
                 self.cas_root.as_ref(),
                 supervisor_name,
                 None, // teams: cas-factory doesn't use native Agent Teams yet
+                None, // spec: use Mux default
             )
             .map_err(|e| FactoryError::Mux(e.to_string()))?;
 
