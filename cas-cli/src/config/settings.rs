@@ -631,24 +631,25 @@ impl Default for SyncConfig {
 ///
 /// ```toml
 /// [code_review]
-/// owner = "supervisor"  # or "worker" (default)
+/// owner = "worker"  # opt-out: legacy inline dispatch
 /// ```
 ///
-/// - `"worker"` (default): existing behaviour — worker dispatches
-///   `cas-code-review` before close; ~14 min per close.
-/// - `"supervisor"`: worker runs a lightweight structural lint and
-///   transitions the task to `PendingSupervisorReview`; supervisor
+/// - `"supervisor"` (default, cas-865b): worker runs a lightweight structural
+///   lint and transitions the task to `PendingSupervisorReview`; supervisor
 ///   invokes `cas-code-review` on their own schedule.
+/// - `"worker"`: legacy behaviour — worker dispatches `cas-code-review` before
+///   close (~14 min per close). Use this to opt back in to the old inline flow.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodeReviewConfig {
-    /// Who owns the full cas-code-review dispatch: `"worker"` or `"supervisor"`.
-    /// Default is `"worker"` (backward-compat). Stage 2 will flip to `"supervisor"`.
+    /// Who owns the full cas-code-review dispatch: `"supervisor"` (default) or `"worker"`.
+    /// Default is `"supervisor"` (cas-865b). Set to `"worker"` to opt out to
+    /// the legacy inline dispatch.
     #[serde(default = "default_code_review_owner")]
     pub owner: String,
 }
 
 fn default_code_review_owner() -> String {
-    "worker".to_string()
+    "supervisor".to_string()
 }
 
 impl Default for CodeReviewConfig {
