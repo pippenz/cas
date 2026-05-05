@@ -1,9 +1,9 @@
 /// Integration tests for the cas-b51a supervisor-owned review pipeline.
 ///
-/// These tests verify Stage 1 of the supervisor-owned review pipeline:
-/// - AC1: CodeReviewConfig reads from cas config, defaults to "worker"
+/// These tests verify the supervisor-owned review pipeline (Stage 2, cas-865b):
+/// - AC1: CodeReviewConfig reads from cas config, defaults to "supervisor"
 /// - AC2: owner=supervisor mode → PendingSupervisorReview transition
-/// - AC3: owner=worker mode → existing behavior unchanged
+/// - AC3: owner=worker mode (explicit opt-out) → existing behavior unchanged
 /// - AC4: supervisor verify path works on PendingSupervisorReview tasks
 /// - AC5: all 5 named test functions listed in spec
 use crate::support::*;
@@ -54,11 +54,15 @@ owner = "supervisor"
     std::fs::write(cas_dir.join("config.toml"), toml).expect("config.toml should be writable");
 }
 
-/// Write a config.toml with verification disabled and default (worker) code review.
+/// Write a config.toml with verification disabled and explicit worker code review
+/// (the legacy opt-out path — `owner = "worker"` overrides the supervisor default).
 fn write_worker_review_config(cas_dir: &std::path::Path) {
     let toml = r#"
 [verification]
 enabled = false
+
+[code_review]
+owner = "worker"
 "#;
     std::fs::write(cas_dir.join("config.toml"), toml).expect("config.toml should be writable");
 }
@@ -196,15 +200,16 @@ async fn test_worker_close_in_supervisor_mode_skips_cas_code_review() {
     );
 }
 
-/// AC5 test 2: in worker-owned review mode (default), the existing behavior
-/// is unchanged — a close without a review envelope returns CODE_REVIEW_REQUIRED.
+/// AC5 test 2: with explicit `owner = "worker"` (the legacy opt-out), the
+/// existing behavior is unchanged — a close without a review envelope returns
+/// CODE_REVIEW_REQUIRED.
 #[tokio::test]
 async fn test_worker_close_in_worker_mode_runs_cas_code_review_unchanged() {
     let (temp, _core) = setup_cas();
     let _env_lock = env_test_lock();
 
     let cas_dir = temp.path().join(".cas");
-    // Use worker-mode config (verification disabled so we hit the code review gate).
+    // Use explicit worker opt-out config (verification disabled so we hit the code review gate).
     write_worker_review_config(&cas_dir);
 
     // Init git repo so has_reviewable_changes() = true.
@@ -344,20 +349,19 @@ async fn test_supervisor_verify_on_pending_review_task_works() {
     );
 }
 
-/// AC5 test 5: the `CodeReviewConfig` default owner is "worker" in factory
-/// mode — Stage 1 backwards compat. Stage 2 (flip to "supervisor") is a
-/// follow-on task and must not be activated by this code.
+/// AC5 test 5: the `CodeReviewConfig` default owner is "supervisor" (cas-865b).
+/// `"worker"` is now the explicit opt-out for the legacy inline dispatch.
 #[tokio::test]
-async fn test_owner_config_default_is_worker_in_factory_mode() {
+async fn test_owner_config_default_is_supervisor() {
     // Test CodeReviewConfig direct default.
     let default_cfg = CodeReviewConfig::default();
     assert_eq!(
-        default_cfg.owner, "worker",
-        "CodeReviewConfig::default() owner must be 'worker' for Stage 1 backwards compat"
+        default_cfg.owner, "supervisor",
+        "CodeReviewConfig::default() owner must be 'supervisor' after cas-865b flip"
     );
     assert!(
-        !default_cfg.supervisor_owned(),
-        "supervisor_owned() must return false for default config"
+        default_cfg.supervisor_owned(),
+        "supervisor_owned() must return true for default config"
     );
 
     // Test Config deserialization from empty TOML (no [code_review] section).
@@ -367,11 +371,16 @@ async fn test_owner_config_default_is_worker_in_factory_mode() {
         cfg.code_review.is_none(),
         "Absent [code_review] section must deserialize to None"
     );
-    // When code_review is None, supervisor_owned() defaults to false (worker mode).
-    let supervisor_owned = cfg.code_review.as_ref().map(|c| c.supervisor_owned()).unwrap_or(false);
+    // When code_review is None, unwrap_or_default() resolves to CodeReviewConfig::default()
+    // which is now supervisor-owned.
+    let supervisor_owned = cfg
+        .code_review
+        .clone()
+        .unwrap_or_default()
+        .supervisor_owned();
     assert!(
-        !supervisor_owned,
-        "Missing [code_review] section must default to worker mode (not supervisor)"
+        supervisor_owned,
+        "Missing [code_review] section must default to supervisor mode via CodeReviewConfig::default()"
     );
 
     // Test explicit owner = "supervisor" round-trip.
@@ -381,7 +390,7 @@ async fn test_owner_config_default_is_worker_in_factory_mode() {
     assert_eq!(cr2.owner, "supervisor", "TOML owner = 'supervisor' must round-trip");
     assert!(cr2.supervisor_owned(), "supervisor_owned() must be true for owner = 'supervisor'");
 
-    // Test explicit owner = "worker" round-trip.
+    // Test explicit owner = "worker" round-trip (legacy opt-out).
     let toml_worker = "[code_review]\nowner = \"worker\"\n";
     let cfg3: Config = toml::from_str(toml_worker).expect("worker TOML should parse");
     let cr3 = cfg3.code_review.as_ref().expect("code_review section should be present");
