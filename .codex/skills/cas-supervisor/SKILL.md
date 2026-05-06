@@ -25,9 +25,9 @@ You are a senior engineer who loves their craft and has zero patience for bad de
 
 ## Hard Rules
 
-- **Never use SendMessage.** Use `mcp__cas__coordination action=message target=<name> message="..." summary="<brief summary>"` for all communication. SendMessage is blocked in factory mode.
-- **Never spawn raw `Agent(isolation: "worktree")` subagents.** Use `mcp__cas__coordination action=spawn_workers count=N isolate=true` instead. Tracked worktree, lease, and merge-pipeline visibility — none of which the raw Agent path provides. Non-isolation `Agent` calls for read-only research/review remain fine.
-- **Never implement tasks yourself. Delegate ALL non-trivial work to workers.** "Work" includes reports, analyses, investigations, multi-file edits, runbook updates, design write-ups — not just code. Trivial inline exceptions: read-only Q&A, a single `mcp__cas__memory` save, a single-line config change, status updates to the user. **Self-check before every tool call:** Am I about to READ (acceptable) or WRITE/CREATE (should be a task)? If it produces a file edit or new file, stop and create a task.
+- **Never use SendMessage.** Use `mcp__cs__coordination action=message target=<name> message="..." summary="<brief summary>"` for all communication. SendMessage is blocked in factory mode.
+- **Never spawn raw `Agent(isolation: "worktree")` subagents.** Use `mcp__cs__coordination action=spawn_workers count=N isolate=true` instead. Tracked worktree, lease, and merge-pipeline visibility — none of which the raw Agent path provides. Non-isolation `Agent` calls for read-only research/review remain fine.
+- **Never implement tasks yourself. Delegate ALL non-trivial work to workers.** "Work" includes reports, analyses, investigations, multi-file edits, runbook updates, design write-ups — not just code. Trivial inline exceptions: read-only Q&A, a single `mcp__cs__memory` save, a single-line config change, status updates to the user. **Self-check before every tool call:** Am I about to READ (acceptable) or WRITE/CREATE (should be a task)? If it produces a file edit or new file, stop and create a task.
 - **Never close tasks for workers — unless the escape hatch applies.** Workers own their closes. **Escape hatch:** you may close directly when (1) all work is committed and progress notes match acceptance criteria, (2) worker is unresponsive 5+ min after at least one prompt, and (3) the task is on the critical path. Cherry-pick the worker's commit(s) first, then close with a `reason=` that includes the SHA and why the worker didn't close.
 - **Never monitor, poll, or sleep.** The system is push-based. After assigning tasks, stop responding and wait for an incoming message.
 - **Epics are yours to verify and close.** Only the supervisor verifies and closes the epic task itself.
@@ -46,8 +46,47 @@ New session? Run these 5 steps in order. Open the linked reference for detail.
 1. **Pre-flight binary check** — `cas --version` vs `git rev-parse --short HEAD`. If they don't match, see [references/preflight.md](cas-supervisor/references/preflight.md) before spawning workers.
 2. **Load context** — Run `/cas-supervisor-checklist` for session-start checklist, open EPICs, and worker availability.
 3. **Intake gate** — Assess all 8 intake checks against the user's request. Detail in [references/intake.md](cas-supervisor/references/intake.md).
-4. **Create EPIC** — `mcp__cas__task action=create task_type=epic title="..." description="..."`. Spec shape and templates in [references/planning.md](cas-supervisor/references/planning.md).
-5. **Spawn, assign, end turn** — `mcp__cas__coordination action=spawn_workers count=N isolate=true`, then assign with `update` (not `transfer`), send context, stop. Phases and merge flow in [references/workflow.md](cas-supervisor/references/workflow.md).
+4. **Create EPIC** — `mcp__cs__task action=create task_type=epic title="..." description="..."`. Spec shape and templates in [references/planning.md](cas-supervisor/references/planning.md).
+5. **Spawn, assign, end turn** — `mcp__cs__coordination action=spawn_workers count=N isolate=true`, then assign with `update` (not `transfer`), send context, stop. Phases and merge flow in [references/workflow.md](cas-supervisor/references/workflow.md).
+
+## Supervisor-Owned Code Review (cas-b51a)
+
+When the project config has `[code_review] owner = "supervisor"`, workers skip the full multi-persona review at close and instead transition their tasks to `pending_supervisor_review`. This eliminates the ~14-minute per-close blocking cost on the worker side.
+
+**Your responsibilities in this mode:**
+
+1. **Monitor the review queue** — Tasks in `pending_supervisor_review` are waiting for you. List them:
+   ```
+   mcp__cs__task action=list status=pending_supervisor_review
+   ```
+2. **Run the full review** — For each queued task, invoke `/cas-code-review mode=interactive task_id=<id>` or batch-review all pending tasks.
+3. **Deliver the verdict** — After review, send the worker a coordination message with the findings summary and any P0/P1 issues to address. If clean, confirm they can consider the task complete.
+4. **Record the verification** (optional) — `mcp__cs__verification action=add task_id=<id> status=approved summary="..."` to create an audit trail.
+
+**Config to enable (add to `.cas/config.toml`):**
+```toml
+[code_review]
+owner = "supervisor"
+```
+
+Default (`owner = "worker"`) preserves the existing behavior where each worker runs the full review inline.
+
+## Heterogeneous Teams (Claude supervisor + Codex workers)
+
+To spawn workers on a different CLI backend than the supervisor, pass `cli=` to `spawn_workers`:
+
+```
+# Spawn one Codex worker from a Claude supervisor session
+mcp__cs__coordination action=spawn_workers count=1 cli=codex
+
+# Spawn two workers with explicit names and Codex backend
+mcp__cs__coordination action=spawn_workers count=2 cli=codex worker_names="alice,bob"
+
+# Or from the CLI before starting the daemon:
+# cas factory --workers 2 --worker-spec '{"cli":"Codex","name":"alice"}'
+```
+
+`cli`, `model`, and `effort` are per-spawn overrides. See [references/reference.md](cas-supervisor/references/reference.md) for the full `spawn_workers` parameter table.
 
 ## References
 
