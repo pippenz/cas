@@ -416,4 +416,137 @@ impl FactoryApp {
 
         Ok(app)
     }
+
+    /// Construct a minimal `FactoryApp` for unit testing.
+    ///
+    /// This does **not** spawn any PTYs, open any stores, or read any files.
+    /// It is only compiled under `#[cfg(test)]` and must not be used in
+    /// production paths.
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        use cas_factory::EpicState;
+        use cas_mux::SupervisorCli;
+
+        let supervisor = "test-supervisor".to_string();
+        let worker_names: Vec<String> = vec![];
+        let mux = Mux::new(24, 80);
+        let mut event_detector =
+            DirectorEventDetector::new(worker_names.clone(), supervisor.clone());
+        let director_data = DirectorData {
+            ready_tasks: Vec::new(),
+            in_progress_tasks: Vec::new(),
+            epic_tasks: Vec::new(),
+            agents: Vec::new(),
+            activity: Vec::new(),
+            agent_id_to_name: HashMap::new(),
+            changes: Vec::new(),
+            git_loaded: false,
+            reminders: Vec::new(),
+            epic_closed_counts: HashMap::new(),
+        };
+        event_detector.initialize(&director_data);
+        let notifier = Notifier::new(cas_factory::NotifyConfig::default());
+        let pane_grid = PaneGrid::new(&worker_names, &supervisor, false);
+
+        Self {
+            mux,
+            cas_dir: PathBuf::from("/tmp/cas-test"),
+            director_stores: None,
+            director_data,
+            input_mode: InputMode::Normal,
+            inject_buffer: String::new(),
+            inject_target: None,
+            show_help: false,
+            show_changes_dialog: false,
+            changes_dialog_file: None,
+            changes_dialog_scroll: 0,
+            changes_dialog_diff: Vec::new(),
+            show_task_dialog: false,
+            task_dialog_id: None,
+            task_dialog_scroll: 0,
+            task_dialog_max_scroll: 0,
+            show_reminder_dialog: false,
+            reminder_dialog_idx: None,
+            reminder_dialog_scroll: 0,
+            show_terminal_dialog: false,
+            terminal_pane_name: None,
+            show_feedback_dialog: false,
+            feedback_category: FeedbackCategory::default(),
+            feedback_buffer: String::new(),
+            last_refresh: std::time::Instant::now(),
+            refresh_interval: std::time::Duration::from_secs(2),
+            last_db_fingerprint: None,
+            last_git_refresh: std::time::Instant::now(),
+            git_refresh_interval: std::time::Duration::from_secs(10),
+            theme: ActiveTheme::default(),
+            worker_names,
+            supervisor_name: supervisor,
+            factory_session: None,
+            supervisor_cli: SupervisorCli::Claude,
+            worker_cli: SupervisorCli::Claude,
+            error_message: None,
+            spawning_count: 0,
+            select_mode: false,
+            pending_workers: Vec::new(),
+            error_set_at: None,
+            sidecar_collapsed: false,
+            worktree_manager: None,
+            selected_worker_tab: 0,
+            tabbed_workers: false,
+            is_tabbed: false,
+            layout_sizes: None,
+            pane_grid,
+            selected_pane: None,
+            event_detector,
+            notifier,
+            current_epic_id: None,
+            epic_state: EpicState::Idle,
+            sidecar_focus: SidecarFocus::None,
+            panels: Default::default(),
+            panel_areas: PanelAreas::default(),
+            view_mode: ViewMode::default(),
+            detail_scroll: 0,
+            agent_filter: None,
+            diff_cache: Vec::new(),
+            diff_scroll: 0,
+            diff_metadata: None,
+            syntax_highlighter: cas_diffs::highlight::SyntaxHighlighter::new(),
+            diff_view_state: cas_diffs::widget::DiffViewState::default(),
+            diff_display_style: cas_diffs::iter::DiffStyle::Unified,
+            diff_inline_mode: cas_diffs::LineDiffType::WordAlt,
+            diff_show_line_numbers: true,
+            diff_expanded_hunks: std::collections::HashMap::new(),
+            diff_expand_all: false,
+            diff_search_mode: false,
+            diff_search_query: String::new(),
+            diff_search_matches: Vec::new(),
+            diff_search_current: 0,
+            collapsed_epics: std::collections::HashSet::new(),
+            collapsed_dirs: std::collections::HashSet::new(),
+            changes_item_types: Vec::new(),
+            worker_tab_bar_area: None,
+            worker_content_area: None,
+            worker_areas: vec![],
+            supervisor_area: None,
+            sidecar_area: None,
+            terminal_cols: 80,
+            terminal_rows: 24,
+            auto_prompt: AutoPromptConfig::default(),
+            epic_branch: None,
+            record_enabled: false,
+            recording_session_id: None,
+            recording_start: None,
+            recorded_events: Vec::new(),
+            lead_session_id: None,
+            project_dir: PathBuf::from("/tmp/cas-test"),
+            session_to_pane: HashMap::new(),
+            last_interrupt_time: None,
+            factory_view_mode: crate::ui::factory::renderer::FactoryViewMode::default(),
+            mc_focus: crate::ui::factory::renderer::MissionControlFocus::default(),
+            mc_workers_area: Rect::default(),
+            mc_tasks_area: Rect::default(),
+            mc_changes_area: Rect::default(),
+            mc_activity_area: Rect::default(),
+        }
+    }
 }

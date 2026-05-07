@@ -614,6 +614,41 @@ impl FactoryDaemon {
                 continue;
             }
 
+            // PgUp (ESC [ 5 ~) / PgDn (ESC [ 6 ~) — must be checked before the
+            // generic ESC-sequence handler that only reads 3 bytes.
+            if byte == 0x1b
+                && i + 3 < input.len()
+                && input[i + 1] == b'['
+                && matches!(input[i + 2], b'5' | b'6')
+                && input[i + 3] == b'~'
+            {
+                let is_pgup = input[i + 2] == b'5';
+                if self.app.show_changes_dialog {
+                    if is_pgup {
+                        self.app.diff_scroll_up();
+                    } else {
+                        self.app.diff_scroll_down();
+                    }
+                } else if self.app.alt_screen_scroll_input(is_pgup).is_some() {
+                    // Focused pane is in alt-screen — send the native page-scroll
+                    // sequence so the inner TUI can handle it (PgUp/PgDn is more
+                    // than 3 lines; let the app decide).
+                    let seq: &[u8] = if is_pgup { b"\x1b[5~" } else { b"\x1b[6~" };
+                    tracing::debug!(
+                        "alt-screen pg{}: forwarding {:?} to PTY",
+                        if is_pgup { "up" } else { "dn" },
+                        seq,
+                    );
+                    let _ = self.app.mux.send_input(seq).await;
+                } else if is_pgup {
+                    self.app.handle_scroll_up();
+                } else {
+                    self.app.handle_scroll_down();
+                }
+                i += 4;
+                continue;
+            }
+
             // Check for escape sequence (arrow keys: ESC [ A/B/C/D)
             if byte == 0x1b && i + 2 < input.len() && input[i + 1] == b'[' {
                 let arrow = input[i + 2];
