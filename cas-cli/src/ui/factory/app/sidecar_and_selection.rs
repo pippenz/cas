@@ -363,6 +363,47 @@ impl FactoryApp {
         }
     }
 
+    /// Return the bytes to forward to the focused PTY when a mouse-wheel scroll
+    /// event arrives while the inner process is in alt-screen mode.
+    ///
+    /// Returns `Some(bytes)` only when **all** of the following are true:
+    /// 1. No dialog (task / reminder / changes) is open — those handle scroll
+    ///    themselves via `handle_scroll_up/down`.
+    /// 2. The sidecar is not focused.
+    /// 3. Mission Control is not active with a focused panel.
+    /// 4. The focused pane's inner process is in alt-screen mode.
+    ///
+    /// When `Some` is returned the caller should forward the bytes to the
+    /// focused PTY (e.g., `mux.send_input(bytes).await`) instead of calling
+    /// `handle_scroll_up/down`. The payload is 3× arrow-up or arrow-down
+    /// (matching the `scroll_focused_pane(±3)` line granularity).
+    ///
+    /// Returns `None` in all other cases — the normal `handle_scroll_up/down`
+    /// path should be used.
+    pub fn alt_screen_scroll_input(&self, scroll_up: bool) -> Option<&'static [u8]> {
+        // Conditions that would prevent reaching scroll_focused_pane normally
+        if self.show_task_dialog
+            || self.show_reminder_dialog
+            || self.show_changes_dialog
+            || self.sidecar_focus != SidecarFocus::None
+            || (self.is_mission_control()
+                && self.mc_focus
+                    != crate::ui::factory::renderer::MissionControlFocus::None)
+        {
+            return None;
+        }
+        if self.mux.focused_is_in_alt_screen() {
+            // 3 arrows = same line granularity as scroll_focused_pane(±3)
+            if scroll_up {
+                Some(b"\x1b[A\x1b[A\x1b[A")
+            } else {
+                Some(b"\x1b[B\x1b[B\x1b[B")
+            }
+        } else {
+            None
+        }
+    }
+
     /// Scroll the supervisor pane to bottom (most recent content)
     pub fn scroll_supervisor_to_bottom(&mut self) {
         if let Err(e) = self.mux.scroll_pane_to_bottom(&self.supervisor_name) {

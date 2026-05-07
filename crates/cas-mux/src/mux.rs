@@ -970,6 +970,17 @@ impl Mux {
         pane.interrupt().await
     }
 
+    /// Whether the focused pane's inner process is in alt-screen mode.
+    ///
+    /// Alt-screen means the ghostty_vt scrollback is empty — `scroll_focused`
+    /// will be a no-op. Use this to decide whether to forward wheel events to
+    /// the PTY instead.
+    pub fn focused_is_in_alt_screen(&self) -> bool {
+        self.focused()
+            .map(|p| p.is_in_alt_screen())
+            .unwrap_or(false)
+    }
+
     /// Scroll the focused pane by delta lines
     ///
     /// Positive delta scrolls down (towards newer content), negative scrolls up (towards older content).

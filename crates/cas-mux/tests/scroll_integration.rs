@@ -541,3 +541,131 @@ fn test_repeated_feed_while_scrolled_no_drift() {
     );
     assert_eq!(pane.new_lines_below(), total_new_lines);
 }
+
+// =============================================================================
+// Alt-screen Tracking Tests (cas-d5fa)
+// =============================================================================
+
+/// Entering alt-screen via ESC [ ? 1049 h must be detected.
+#[test]
+fn test_alt_screen_entry_1049() {
+    let mut pane = Pane::director("test", 24, 80).unwrap();
+    assert!(!pane.is_in_alt_screen(), "should start in normal screen");
+
+    pane.feed(b"\x1b[?1049h").unwrap();
+    assert!(pane.is_in_alt_screen(), "1049h should enter alt-screen");
+}
+
+/// Exiting alt-screen via ESC [ ? 1049 l must be detected.
+#[test]
+fn test_alt_screen_exit_1049() {
+    let mut pane = Pane::director("test", 24, 80).unwrap();
+    pane.feed(b"\x1b[?1049h").unwrap();
+    assert!(pane.is_in_alt_screen());
+
+    pane.feed(b"\x1b[?1049l").unwrap();
+    assert!(!pane.is_in_alt_screen(), "1049l should leave alt-screen");
+}
+
+/// Variant mode 47 (older xterm): enter and exit.
+#[test]
+fn test_alt_screen_mode_47() {
+    let mut pane = Pane::director("test", 24, 80).unwrap();
+    pane.feed(b"\x1b[?47h").unwrap();
+    assert!(pane.is_in_alt_screen(), "?47h should enter alt-screen");
+
+    pane.feed(b"\x1b[?47l").unwrap();
+    assert!(!pane.is_in_alt_screen(), "?47l should leave alt-screen");
+}
+
+/// Variant mode 1047: enter and exit.
+#[test]
+fn test_alt_screen_mode_1047() {
+    let mut pane = Pane::director("test", 24, 80).unwrap();
+    pane.feed(b"\x1b[?1047h").unwrap();
+    assert!(pane.is_in_alt_screen(), "?1047h should enter alt-screen");
+
+    pane.feed(b"\x1b[?1047l").unwrap();
+    assert!(!pane.is_in_alt_screen(), "?1047l should leave alt-screen");
+}
+
+/// Sequences embedded in normal output are still detected.
+#[test]
+fn test_alt_screen_detected_in_mixed_output() {
+    let mut pane = Pane::director("test", 24, 80).unwrap();
+    // Some terminal output followed by the alt-screen sequence
+    pane.feed(b"Hello, world!\r\n\x1b[?1049hmore output").unwrap();
+    assert!(
+        pane.is_in_alt_screen(),
+        "should detect alt-screen inside mixed output"
+    );
+}
+
+/// If alt-screen is entered and exited in the same feed chunk, the final
+/// state (exited) must win.
+#[test]
+fn test_alt_screen_enter_then_exit_same_chunk() {
+    let mut pane = Pane::director("test", 24, 80).unwrap();
+    // Enter then immediately exit in one chunk — final state is exited
+    pane.feed(b"\x1b[?1049h\x1b[?1049l").unwrap();
+    assert!(
+        !pane.is_in_alt_screen(),
+        "last sequence wins: should be out of alt-screen"
+    );
+}
+
+/// Scroll on an alt-screen pane returns an error (no scrollback), confirming
+/// why we must forward to the PTY instead.
+#[test]
+fn test_alt_screen_scroll_is_noop() {
+    let mut pane = Pane::director("test", 24, 80).unwrap();
+
+    // Fill some scrollback in normal-screen mode first
+    for i in 0..50 {
+        pane.feed(format!("Line {i}\r\n").as_bytes()).unwrap();
+    }
+
+    // Enter alt-screen
+    pane.feed(b"\x1b[?1049h").unwrap();
+    assert!(pane.is_in_alt_screen());
+
+    // scrollback_info should report no viewport offset (cannot scroll back)
+    let info_before = pane.scrollback_info();
+    // Attempt to scroll — should return an error (ghostty no-ops on alt-screen)
+    let result = pane.scroll(-5);
+    let info_after = pane.scrollback_info();
+
+    // Whether it errors or silently no-ops, the viewport offset must not move
+    // The key assertion: scroll_focused_pane would produce no visible change.
+    assert_eq!(
+        info_before.viewport_offset, info_after.viewport_offset,
+        "viewport must not change when scrolling in alt-screen"
+    );
+    // Log the result so CI output is informative
+    if result.is_err() {
+        // Expected: ghostty returns error code for alt-screen scroll
+    }
+}
+
+/// Mux::focused_is_in_alt_screen reflects the focused pane's alt-screen state.
+#[test]
+fn test_mux_focused_is_in_alt_screen() {
+    use cas_mux::Mux;
+
+    let mut mux = Mux::new(24, 80);
+    let pane = Pane::director("test-pane", 24, 80).unwrap();
+    mux.add_pane(pane);
+    mux.focus("test-pane");
+
+    assert!(!mux.focused_is_in_alt_screen());
+
+    if let Some(p) = mux.get_mut("test-pane") {
+        p.feed(b"\x1b[?1049h").unwrap();
+    }
+    assert!(mux.focused_is_in_alt_screen());
+
+    if let Some(p) = mux.get_mut("test-pane") {
+        p.feed(b"\x1b[?1049l").unwrap();
+    }
+    assert!(!mux.focused_is_in_alt_screen());
+}

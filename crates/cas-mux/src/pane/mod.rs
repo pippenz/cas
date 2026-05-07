@@ -100,6 +100,16 @@ pub struct Pane {
     total_bytes_received: u64,
     /// When this pane was created (for startup grace period)
     created_at: std::time::Instant,
+    /// Whether the inner process is currently in alt-screen mode.
+    ///
+    /// Tracked by watching for DEC private mode set/reset sequences in `feed()`:
+    /// - Enter: ESC [ ? 1049 h  /  ESC [ ? 1047 h  /  ESC [ ? 47 h
+    /// - Exit:  ESC [ ? 1049 l  /  ESC [ ? 1047 l  /  ESC [ ? 47 l
+    ///
+    /// Used by the factory UI to decide whether wheel events should be
+    /// forwarded to the inner process (alt-screen, no scrollback) or handled
+    /// by `Pane::scroll` (normal screen, scrollback available).
+    in_alt_screen: bool,
 }
 
 impl Pane {
@@ -137,6 +147,7 @@ impl Pane {
             drain_buf: Vec::with_capacity(65536),
             total_bytes_received: 0,
             created_at: std::time::Instant::now(),
+            in_alt_screen: false,
         })
     }
 
@@ -426,7 +437,69 @@ impl Pane {
         Ok(())
     }
 
+    /// Scan `data` for DEC private mode sequences that toggle the alternate
+    /// screen buffer and return the updated `in_alt_screen` state.
+    ///
+    /// Handles:
+    /// - ESC [ ? 1049 h/l  (save-cursor + enter/leave alt-screen — most common)
+    /// - ESC [ ? 1047 h/l  (use alternate screen buffer)
+    /// - ESC [ ? 47 h/l    (older xterm alternate screen)
+    ///
+    /// This is a fast forward scan; only the *last* matching sequence in the
+    /// data wins, which is correct: if a pane enters and exits alt-screen in
+    /// the same chunk, the final state is what matters.
+    fn update_alt_screen(data: &[u8], current: bool) -> bool {
+        let mut state = current;
+        let mut i = 0;
+        while i + 4 < data.len() {
+            // Fast pre-check: must start with ESC [ ?
+            if data[i] != 0x1b || data[i + 1] != b'[' || data[i + 2] != b'?' {
+                i += 1;
+                continue;
+            }
+            // Scan past digits for the parameter value
+            let param_start = i + 3;
+            let mut j = param_start;
+            while j < data.len() && data[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j >= data.len() || j == param_start {
+                i += 1;
+                continue;
+            }
+            let final_byte = data[j];
+            // Only care about h (set) or l (reset)
+            if final_byte != b'h' && final_byte != b'l' {
+                i += 1;
+                continue;
+            }
+            // Parse the parameter (ASCII digits only, bounded length — safe)
+            let param: u32 = data[param_start..j]
+                .iter()
+                .fold(0u32, |acc, &b| acc.wrapping_mul(10).wrapping_add((b - b'0') as u32));
+            match (param, final_byte) {
+                (47 | 1047 | 1049, b'h') => state = true,
+                (47 | 1047 | 1049, b'l') => state = false,
+                _ => {}
+            }
+            i = j + 1;
+        }
+        state
+    }
+
+    /// Whether the inner process is currently in alt-screen (alternate buffer) mode.
+    ///
+    /// When `true`, the pane's ghostty_vt scrollback is empty — scrolling the
+    /// viewport is a no-op. Wheel events should be forwarded to the inner process
+    /// as arrow-key input so it can scroll its own transcript.
+    pub fn is_in_alt_screen(&self) -> bool {
+        self.in_alt_screen
+    }
+
     pub fn feed(&mut self, data: &[u8]) -> Result<()> {
+        // Track alt-screen mode transitions before handing data to the terminal.
+        self.in_alt_screen = Self::update_alt_screen(data, self.in_alt_screen);
+
         if self.user_scrolled {
             // Save scroll position before feeding new data
             let before = self.terminal.scrollback_info();

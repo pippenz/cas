@@ -157,6 +157,16 @@ impl FactoryDaemon {
                                 ControlEvent::MouseScrollUp => {
                                     if self.app.show_changes_dialog {
                                         self.app.diff_scroll_up();
+                                    } else if let Some(bytes) =
+                                        self.app.alt_screen_scroll_input(true)
+                                    {
+                                        // Focused pane is in alt-screen — forward as
+                                        // arrow-up keys so the inner TUI can scroll.
+                                        tracing::debug!(
+                                            "alt-screen scroll up: forwarding {} arrow-up bytes to PTY",
+                                            bytes.len() / 3
+                                        );
+                                        let _ = self.app.mux.send_input(bytes).await;
                                     } else {
                                         self.app.handle_scroll_up();
                                     }
@@ -164,6 +174,16 @@ impl FactoryDaemon {
                                 ControlEvent::MouseScrollDown => {
                                     if self.app.show_changes_dialog {
                                         self.app.diff_scroll_down();
+                                    } else if let Some(bytes) =
+                                        self.app.alt_screen_scroll_input(false)
+                                    {
+                                        // Focused pane is in alt-screen — forward as
+                                        // arrow-down keys so the inner TUI can scroll.
+                                        tracing::debug!(
+                                            "alt-screen scroll down: forwarding {} arrow-down bytes to PTY",
+                                            bytes.len() / 3
+                                        );
+                                        let _ = self.app.mux.send_input(bytes).await;
                                     } else {
                                         self.app.handle_scroll_down();
                                     }
