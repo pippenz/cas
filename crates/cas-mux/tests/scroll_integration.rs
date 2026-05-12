@@ -647,6 +647,40 @@ fn test_alt_screen_scroll_is_noop() {
     }
 }
 
+// =============================================================================
+// cas-e0b9 characterization: in_alt_screen leaks across pane exit
+// =============================================================================
+//
+// When the inner process exits while still in alt-screen mode (e.g., a
+// `kill -9` on a TUI that never had a chance to emit `\x1b[?1049l`), the
+// pane's `in_alt_screen` flag stays `true` forever. Subsequent normal-screen
+// output (next process, redraw) is then mishandled — wheel events get
+// forwarded to the PTY as arrow keys instead of driving host scrollback.
+//
+// This test asserts the CURRENT (buggy) behavior. The cas-e0b9 fix commit
+// will reset `in_alt_screen` inside `mark_exited` and flip the assertion.
+
+#[test]
+fn test_pane_exit_currently_leaks_alt_screen_bug_cas_e0b9() {
+    let mut pane = Pane::director("test", 24, 80).unwrap();
+
+    // Enter alt-screen.
+    pane.feed(b"\x1b[?1049h").unwrap();
+    assert!(pane.is_in_alt_screen(), "precondition: pane is in alt-screen");
+
+    // Simulate the inner process exiting without sending `\x1b[?1049l`.
+    pane.mark_exited(Some(137)); // SIGKILL exit code
+
+    assert!(pane.has_exited(), "precondition: mark_exited took effect");
+
+    // BUG: should be `false` after the fix; today this is still `true` and
+    // we lock that in so the fix commit explicitly flips it.
+    assert!(
+        pane.is_in_alt_screen(),
+        "characterization: in_alt_screen leaks across pane exit today"
+    );
+}
+
 /// Mux::focused_is_in_alt_screen reflects the focused pane's alt-screen state.
 #[test]
 fn test_mux_focused_is_in_alt_screen() {

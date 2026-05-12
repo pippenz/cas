@@ -202,6 +202,34 @@ mod cases {
         assert!(!Pane::update_alt_screen(&data, true));
     }
 
+    // ---- cas-e0b9 characterization tests (BUGGY current behavior) -----------
+    //
+    // These tests assert what the scanner *currently* does on inputs it
+    // should handle but doesn't. They will be flipped to the correct
+    // assertions in the cas-e0b9 fix commit. Until then they prove the bug
+    // is reachable from a unit test.
+
+    #[test]
+    fn update_alt_screen_sub_param_currently_misses_bug_cas_e0b9() {
+        // ECMA-48 §5.4.2 allows sub-parameters after a parameter using `;` /
+        // `:` separators. xterm-style emitters can produce e.g.
+        // `\x1b[?1049;1h` (enter alt-screen with extra sub-arg). The current
+        // parser stops at `;`, sees a non-`h`/`l` final byte, and abandons
+        // the sequence — missing a real alt-screen entry.
+        let data = b"\x1b[?1049;1h";
+        // BUG: should be `true`. We assert the broken value to lock it in.
+        assert!(
+            !Pane::update_alt_screen(data, false),
+            "characterization: sub-param `1049;1h` is silently dropped today"
+        );
+        // Same shape with `:` per ECMA-48 sub-parameter separator.
+        let data = b"\x1b[?1049:1h";
+        assert!(
+            !Pane::update_alt_screen(data, false),
+            "characterization: sub-param `1049:1h` is silently dropped today"
+        );
+    }
+
     #[test]
     fn update_alt_screen_sparse_non_dec_esc_ignored() {
         // ESC bytes followed by non-'[' must not be treated as DEC sequences.

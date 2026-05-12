@@ -744,6 +744,21 @@ impl Pane {
         Ok(lines)
     }
 
+    /// Record that the inner process has exited.
+    ///
+    /// Called internally from `poll()` and `drain_output()` when the PTY emits
+    /// `PtyEvent::Exited` (or `PtyEvent::Error`, treated as an abnormal exit).
+    /// Exposed publicly so external tests can simulate process termination on
+    /// a non-PTY backend (e.g., `Pane::director`).
+    ///
+    /// NOTE: this method intentionally does *not* reset `in_alt_screen` —
+    /// see cas-e0b9 characterization tests pinning the current behavior. The
+    /// fix commit on that task will change this.
+    pub fn mark_exited(&mut self, code: Option<i32>) {
+        self.exited = true;
+        self.exit_code = code;
+    }
+
     pub fn poll(&mut self) -> Option<PtyEvent> {
         let event = match &mut self.backend {
             PaneBackend::Pty(pty) => pty.try_recv(),
@@ -758,10 +773,11 @@ impl Pane {
                 }
             }
             PtyEvent::Exited(code) => {
-                self.exited = true;
-                self.exit_code = *code;
+                self.mark_exited(*code);
             }
             PtyEvent::Error(_) => {
+                // Abnormal exit: mark exited but preserve any previously
+                // recorded exit_code (matches pre-cas-e0b9 behavior).
                 self.exited = true;
             }
         }
@@ -785,11 +801,12 @@ impl Pane {
                     self.drain_buf.extend_from_slice(&data);
                 }
                 PtyEvent::Exited(code) => {
-                    self.exited = true;
-                    self.exit_code = code;
+                    self.mark_exited(code);
                     other_events.push(PtyEvent::Exited(code));
                 }
                 PtyEvent::Error(e) => {
+                    // Abnormal exit: mark exited but preserve any previously
+                    // recorded exit_code (matches pre-cas-e0b9 behavior).
                     self.exited = true;
                     other_events.push(PtyEvent::Error(e));
                 }
