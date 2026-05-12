@@ -146,6 +146,22 @@ brew tap codingagentsystem/cas
 brew install cas
 ```
 
+> **Homebrew users — auto-upgrade Claude Code in the background:**
+> If you installed Claude Code via Homebrew, set this env var to let it
+> self-upgrade automatically (added in Claude Code 2.1.129):
+>
+> ```bash
+> export CLAUDE_CODE_PACKAGE_MANAGER_AUTO_UPDATE=1
+> ```
+>
+> Add it to your shell profile (`~/.zprofile`, `~/.bashrc`, etc.) to make it
+> permanent. Claude Code will run `brew upgrade claude` in the background and
+> prompt you to restart.
+>
+> **This is for Claude Code only — not CAS.** CAS updates via `cas update`.
+>
+> Reference: [Claude Code 2.1.129 changelog](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md)
+
 ### Build from source
 
 ```bash
