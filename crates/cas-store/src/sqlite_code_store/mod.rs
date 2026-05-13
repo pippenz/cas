@@ -17,8 +17,22 @@ use cas_code::{
 /// SQLite DDL for the code-store tables (`code_files`, `code_symbols`,
 /// `code_relationships`, `code_memory_links`).
 ///
-/// Re-exported via `cas_store::CODE_SCHEMA` so the migration runner in
-/// `cas-cli` can bootstrap the base tables before applying ALTER migrations.
+/// **IMPORTANT:** This constant is used ONLY by `SqliteCodeStore::open()` —
+/// it is DELIBERATELY EXCLUDED from the migration-runner bootstrap
+/// (`Subsystem::Code::ensure_base_schema` returns `(None, None)`).
+///
+/// Rationale: the code-store tables are owned by the migration ledger
+/// (`m131_code_files_create_table` … `m134_code_memory_links_create_table`
+/// plus several follow-on ALTERs). This constant represents the modern
+/// post-migration shape, NOT the m131-m134 baseline. Installing this DDL
+/// before the migration chain runs would race the create-table migrations
+/// and potentially shadow later ALTERs against historical column layouts.
+///
+/// If you ever want to add `Code` to the migration-runner bootstrap path,
+/// you must FIRST either: (a) shape this constant to match the m131-m134
+/// baselines, or (b) rewrite the migration chain to stop depending on
+/// intermediate shapes.
+///
 /// See cas-bdb9 / EPIC cas-9fdb.
 pub const CODE_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS code_files (

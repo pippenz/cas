@@ -148,6 +148,17 @@ CREATE TABLE IF NOT EXISTS sessions (
 
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sessions_team ON sessions(team_id);
+
+-- Expression index for helpful-score sort (requires SQLite 3.31+). Previously
+-- created via a best-effort inline `let _ = conn.execute(...)` in
+-- `store_init`; lifted here so the migration-runner bootstrap installs it
+-- alongside the rest of the entries schema. SQLite 3.31 has been minimum-
+-- supported across the supported platform matrix for years, so the
+-- silent-skip fallback is no longer required.
+CREATE INDEX IF NOT EXISTS idx_entries_helpful_score ON entries(
+    (helpful_count - harmful_count) DESC,
+    last_accessed DESC
+) WHERE archived = 0 AND (helpful_count - harmful_count) > 0;
 "#;
 
 /// SQLite-based entry store

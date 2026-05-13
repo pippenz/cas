@@ -676,10 +676,11 @@ mod tests {
             "entries",
             "rules",
             "metadata",
+            "sessions", // shipped as part of ENTRIES_RULES_SCHEMA — target of m028/m031/m032/m042/m043/m044
             "tasks",
             "skills",
             "agents",
-            "task_leases",
+            "task_leases", // lives in AGENT_SCHEMA (FK to agents + NOT-NULL renewed_at)
             "entities",
             "relationships",
             "entity_mentions",
@@ -698,6 +699,82 @@ mod tests {
                 .unwrap();
             assert_eq!(exists, 1, "expected table `{table}` to exist after bootstrap");
         }
+
+        // Negative invariant: migration-driven subsystems (Worktrees, Code,
+        // Events, Recording, Recordings) must NOT be pre-created by the
+        // bootstrap. Their CREATE TABLE shape is owned by the migration
+        // ledger and pre-installing the modern post-ALTER shape would break
+        // later ALTERs (e.g. m112 indexes `worktrees.task_id`).
+        let must_not_exist = [
+            "worktrees",
+            "code_files",
+            "code_symbols",
+            "code_relationships",
+            "code_memory_links",
+            "events",
+            "recordings",
+            "recording_text",
+        ];
+        for table in must_not_exist {
+            let exists: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                exists, 0,
+                "table `{table}` must NOT be pre-created by ensure_base_schemas; \
+                 its CREATE TABLE lives in a numbered migration"
+            );
+        }
+    }
+
+    /// cas-bdb9: confirm `task_leases` lands via Agents (FK + NOT-NULL
+    /// constraints intact), not via Tasks. Regression guard for fix-round-1
+    /// P1 — the old `TASK_SCHEMA` duplicated `task_leases` with a slimmer
+    /// shape that silently shadowed `AGENT_SCHEMA`'s definition when
+    /// `Subsystem::ALL` iterated `Tasks` (index 1) before `Agents` (index 4),
+    /// losing the FK to `agents(id)` and the `renewed_at NOT NULL` constraint.
+    #[test]
+    fn test_task_leases_lands_with_fk_and_not_null_via_agents() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Foreign keys are OFF by default on a new connection; turn them on
+        // so the FK is actually recorded by sqlite_master inspection.
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+
+        ensure_base_schemas(&conn).unwrap();
+
+        // FK presence: pragma_foreign_key_list returns one row per FK column.
+        let fk_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_foreign_key_list('task_leases') \
+                 WHERE \"table\"='agents' AND \"from\"='agent_id' AND \"to\"='id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            fk_count, 1,
+            "task_leases must keep its FK to agents(id) ON DELETE CASCADE — \
+             AGENT_SCHEMA is the single source of truth"
+        );
+
+        // renewed_at must be NOT NULL (AGENT_SCHEMA shape, not the legacy
+        // slim TASK_SCHEMA shape).
+        let renewed_at_notnull: i64 = conn
+            .query_row(
+                "SELECT \"notnull\" FROM pragma_table_info('task_leases') WHERE name='renewed_at'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            renewed_at_notnull, 1,
+            "task_leases.renewed_at must be NOT NULL — regression on the \
+             dual-definition / IF-NOT-EXISTS no-op bug"
+        );
     }
 
     /// cas-bdb9: `ensure_base_schemas` is idempotent — running it twice on
@@ -795,6 +872,13 @@ mod tests {
 
         assert!(first.errors.is_empty());
         assert!(second.errors.is_empty());
+        // Without this assertion `bootstrap_migrations` auto-detecting every
+        // migration as already applied would let the test silently pass.
+        assert!(
+            first.applied_count > 0,
+            "first run should apply at least one migration after base-schema bootstrap; \
+             a 0-count would mean bootstrap_migrations falsely flagged every migration as applied"
+        );
         assert_eq!(
             second.applied_count, 0,
             "second migration run should apply nothing"
