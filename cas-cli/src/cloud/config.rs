@@ -725,6 +725,99 @@ mod tests {
         assert_eq!(config.active_team_id(), None);
     }
 
+    // ── cas-ea2f5: resolution-chain unit tests (test-first, added before impl) ──
+
+    #[test]
+    fn test_active_team_id_user_default_team_fallback() {
+        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // No project-level team_id, user config has default_team_id set → return it.
+        let project_cfg = CloudConfig::default(); // no team_id
+        let mut user_cfg = CloudConfig::default();
+        user_cfg.default_team_id = Some("user-default-team".to_string());
+
+        assert_eq!(
+            project_cfg.active_team_id_with_user_config(Some(&user_cfg)).as_deref(),
+            Some("user-default-team"),
+        );
+    }
+
+    #[test]
+    fn test_active_team_id_single_team_auto_pick() {
+        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // No project-level team_id, user config has exactly 1 team, no default_team_id
+        // → return the sole team's id.
+        let project_cfg = CloudConfig::default();
+        let mut user_cfg = CloudConfig::default();
+        user_cfg.teams = vec![TeamInfo {
+            id: "solo-team-id".to_string(),
+            slug: "solo".to_string(),
+            name: "Solo".to_string(),
+            role: "member".to_string(),
+        }];
+
+        assert_eq!(
+            project_cfg.active_team_id_with_user_config(Some(&user_cfg)).as_deref(),
+            Some("solo-team-id"),
+        );
+    }
+
+    #[test]
+    fn test_active_team_id_multi_team_ambiguous_returns_none() {
+        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // No project-level team_id, user config has 2 teams but no default_team_id
+        // → None (ambiguous).
+        let project_cfg = CloudConfig::default();
+        let mut user_cfg = CloudConfig::default();
+        user_cfg.teams = vec![
+            TeamInfo { id: "t1".to_string(), slug: "a".to_string(), name: "A".to_string(), role: "member".to_string() },
+            TeamInfo { id: "t2".to_string(), slug: "b".to_string(), name: "B".to_string(), role: "member".to_string() },
+        ];
+
+        assert_eq!(
+            project_cfg.active_team_id_with_user_config(Some(&user_cfg)),
+            None,
+        );
+    }
+
+    #[test]
+    fn test_active_team_id_project_override_beats_user_default() {
+        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // Project-level team_id wins over user-level default_team_id.
+        let mut project_cfg = CloudConfig::default();
+        project_cfg.set_team("project-team", "proj");
+        let mut user_cfg = CloudConfig::default();
+        user_cfg.default_team_id = Some("user-default-team".to_string());
+
+        assert_eq!(
+            project_cfg.active_team_id_with_user_config(Some(&user_cfg)).as_deref(),
+            Some("project-team"),
+        );
+    }
+
+    #[test]
+    fn test_active_team_id_kill_switch_beats_user_config() {
+        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // team_auto_promote=Some(false) short-circuits to None even when user
+        // config would otherwise supply a team.
+        let mut project_cfg = CloudConfig::default();
+        project_cfg.team_auto_promote = Some(false);
+        let mut user_cfg = CloudConfig::default();
+        user_cfg.default_team_id = Some("user-default-team".to_string());
+
+        assert_eq!(
+            project_cfg.active_team_id_with_user_config(Some(&user_cfg)),
+            None,
+        );
+    }
+
+    #[test]
+    fn test_active_team_id_no_user_config_no_project_team() {
+        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // Neither project nor user config has team info → None.
+        let project_cfg = CloudConfig::default();
+        assert_eq!(project_cfg.active_team_id_with_user_config(None), None);
+    }
+
     #[test]
     fn test_team_sync_timestamps() {
         let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
