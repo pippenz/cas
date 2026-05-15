@@ -1,49 +1,39 @@
 # Contributing to CAS
 
-Thank you for your interest in CAS! This document explains how you can participate in the project.
+Thank you for your interest in CAS.
 
 ## Contribution Model
 
-CAS is **source-available** under the MIT license. The code is public for transparency, learning, and self-hosting — but we do not accept pull requests at this time.
+This is the `pippenz/cas` development fork. The upstream `codingagentsystem/cas` is source-available and does not accept PRs — this fork does, on a **case-by-case** basis.
 
-This is similar to projects like SQLite and Litestream, where a small team maintains the codebase to ensure quality and coherence.
+- **Small, high-signal fixes** (bug fixes with clean diffs, warning hygiene, regression repros) are welcome. Send a PR.
+- **Larger changes** (new features, refactors, public API changes) — please open an issue first so we can talk about scope before you spend time on a diff.
+- **No process** beyond that. We trust contributors to be honest about what they're sending.
 
 ## How to Participate
 
 ### Report Bugs
 
-Found a bug? Please [open an issue](https://github.com/codingagentsystem/cas/issues/new) with:
+Open an [issue](https://github.com/pippenz/cas/issues/new) with:
 
 - A clear description of what happened vs. what you expected
-- Steps to reproduce the issue
+- Steps to reproduce
 - Your OS, CAS version (`cas --version`), and relevant configuration
 
 ### Suggest Features
 
-Have an idea? Start a conversation in [Discussions](https://github.com/codingagentsystem/cas/discussions):
-
-- **Ideas** — Feature requests and suggestions
-- **Q&A** — Questions about usage or architecture
-- **Show and Tell** — Share what you've built with CAS
+Open a [discussion](https://github.com/pippenz/cas/discussions) before writing code, especially for anything that touches the public CLI / MCP surface or the daemon protocol.
 
 ### Build from Source
 
-You're welcome to build, modify, and run CAS locally:
-
 ```bash
-git clone https://github.com/codingagentsystem/cas.git
+git clone https://github.com/pippenz/cas.git
 cd cas
 cargo build --release
 ```
 
 See the [README](README.md) for full build instructions.
 
-## Why No PRs?
-
-CAS is built by a small team with a strong opinion on architecture and code quality. Accepting external PRs introduces coordination overhead that slows us down at this stage. We revisit this policy periodically.
-
-Your bug reports and feature ideas still directly shape the project — many features started as community suggestions.
-
 ## Code of Conduct
 
-Be respectful and constructive in all interactions. We're here to build great tools for AI-assisted development.
+Be respectful and constructive in all interactions.
