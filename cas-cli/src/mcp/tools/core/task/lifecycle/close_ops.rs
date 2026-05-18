@@ -979,6 +979,52 @@ impl CasCore {
             }
         }
 
+        // cas-490f: commit-claim integrity gate.
+        //
+        // The cas-ba91 incident: a factory worker fabricated a commit SHA
+        // and code_review_findings against a branch with 0 actual commits.
+        // The supervisor lost ~10 min before detecting the fabrication.
+        //
+        // Gate logic: when a worker provides non-empty `code_review_findings`
+        // they are asserting "I wrote code and had it reviewed." This gate
+        // verifies that assertion by counting commits on the worker branch
+        // beyond its parent. 0 commits + findings = fabrication → hard reject.
+        //
+        // Firing conditions (all required):
+        //   1. Task has a resolved worker worktree (non-isolated tasks skip).
+        //   2. `code_review_findings` is non-empty (fabrication claim present).
+        //   3. commit count on HEAD vs parent_branch == 0.
+        //
+        // Supervisors can bypass with `bypass_code_review=true` (same pattern
+        // as other gates — logged, escape-hatched for genuine edge cases).
+        if !bypass_close_gates {
+            if let Some(worker_wt) = worker_worktree_path.as_ref() {
+                let has_findings = req
+                    .code_review_findings
+                    .as_deref()
+                    .map(|s| !s.trim().is_empty())
+                    .unwrap_or(false);
+                if has_findings {
+                    let parent_branch = task
+                        .worktree_id
+                        .as_deref()
+                        .and_then(|wt_id| {
+                            self.open_worktree_store()
+                                .ok()
+                                .and_then(|store| store.get(wt_id).ok())
+                                .map(|wt| wt.parent_branch.clone())
+                        })
+                        .unwrap_or_else(|| "main".to_string());
+                    match check_commit_claim_integrity(worker_wt, &parent_branch, true) {
+                        CommitClaimGateOutcome::Reject(msg) => {
+                            return Ok(Self::tool_error(msg));
+                        }
+                        CommitClaimGateOutcome::Proceed => {}
+                    }
+                }
+            }
+        }
+
         // cas-e235 + cas-bc1b: additive-only execution_note backstop.
         //
         // If the worker declared `execution_note=additive-only`, reject
@@ -1500,13 +1546,41 @@ impl CasCore {
             )
         };
 
+        // cas-490f: surface the actual `git diff --stat` for the worker's
+        // committed branch so supervisors see real deltas at close time,
+        // without having to inspect the worktree manually. This is included
+        // unconditionally when a resolved worker worktree is available —
+        // the stat is an objective record of what was committed, independent
+        // of whatever the worker's close reason claims.
+        let diff_stat_msg = if let Some(worker_wt) = worker_worktree_path.as_ref() {
+            let parent_branch = task
+                .worktree_id
+                .as_deref()
+                .and_then(|wt_id| {
+                    self.open_worktree_store()
+                        .ok()
+                        .and_then(|store| store.get(wt_id).ok())
+                        .map(|wt| wt.parent_branch.clone())
+                })
+                .unwrap_or_else(|| "main".to_string());
+            let stat = get_worker_diff_stat(worker_wt, &parent_branch);
+            if stat.is_empty() {
+                String::new()
+            } else {
+                format!("\n\n📊 Committed diff stat (vs {parent_branch}):\n{stat}")
+            }
+        } else {
+            String::new()
+        };
+
         Ok(Self::success(format!(
-            "Closed task: {} - {}{}{}{}{}{}{}",
+            "Closed task: {} - {}{}{}{}{}{}{}{}",
             req.id,
             task.title,
             verification_note,
             lease_msg,
             worktree_msg,
+            diff_stat_msg,
             epic_close_msg,
             commit_nudge_msg,
             auto_unblock_msg
@@ -1993,6 +2067,149 @@ pub(crate) fn count_unmerged_factory_commits(
             // direction for an unparseable count.
             .unwrap_or(u32::MAX),
         _ => 0,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// cas-490f: commit-claim integrity helpers
+// ---------------------------------------------------------------------------
+
+/// Count commits reachable from `HEAD` but not from `parent_branch`,
+/// running `git` inside `worker_worktree_path`.
+///
+/// Used by [`check_commit_claim_integrity`] to detect workers that submit
+/// `code_review_findings` (claiming code was written) when their branch
+/// carries no commits beyond the parent. The key difference from
+/// [`count_unmerged_factory_commits`] is that this function operates on
+/// `HEAD` — it is meant to be called from inside the worker's own
+/// worktree, where `HEAD` IS the worker branch.
+///
+/// Returns 0 on any git failure (graceful degradation — an unknowable
+/// history is not treated as fabrication evidence).
+pub(crate) fn count_worker_branch_commits(
+    worker_worktree_path: &std::path::Path,
+    parent_branch: &str,
+) -> u32 {
+    use std::process::Command;
+
+    let merge_base_out = Command::new("git")
+        .args(["merge-base", "HEAD", parent_branch])
+        .current_dir(worker_worktree_path)
+        .output();
+    let merge_base = match merge_base_out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        _ => return 0,
+    };
+    if merge_base.is_empty() {
+        return 0;
+    }
+
+    let count_out = Command::new("git")
+        .args(["rev-list", "--count", &format!("{merge_base}..HEAD")])
+        .current_dir(worker_worktree_path)
+        .output();
+    match count_out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .trim()
+            .parse::<u32>()
+            .unwrap_or(u32::MAX),
+        _ => 0,
+    }
+}
+
+/// Return a `git diff --stat` summary for commits on `HEAD` beyond
+/// `parent_branch`, running inside `worker_worktree_path`.
+///
+/// Included verbatim in the `task.close` success message so supervisors
+/// see the actual code delta without inspecting the worktree manually.
+///
+/// Returns an empty string on any git failure or when there are no commits
+/// beyond the parent (an empty stat is the correct representation there).
+pub(crate) fn get_worker_diff_stat(
+    worker_worktree_path: &std::path::Path,
+    parent_branch: &str,
+) -> String {
+    use std::process::Command;
+
+    let merge_base_out = Command::new("git")
+        .args(["merge-base", "HEAD", parent_branch])
+        .current_dir(worker_worktree_path)
+        .output();
+    let merge_base = match merge_base_out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        _ => return String::new(),
+    };
+    if merge_base.is_empty() {
+        return String::new();
+    }
+
+    let stat_out = Command::new("git")
+        .args(["diff", "--stat", &format!("{merge_base}..HEAD")])
+        .current_dir(worker_worktree_path)
+        .output();
+    match stat_out {
+        Ok(o) if o.status.success() => {
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        }
+        _ => String::new(),
+    }
+}
+
+/// Outcome of the cas-490f commit-claim integrity gate.
+#[derive(Debug)]
+pub(crate) enum CommitClaimGateOutcome {
+    /// Close may proceed — either no `code_review_findings` was provided,
+    /// or the worker branch has at least one commit to back up the claim.
+    Proceed,
+    /// Close must be rejected — worker provided `code_review_findings`
+    /// (claiming code was written and reviewed) but the branch has 0
+    /// commits beyond the parent (fabrication signal).
+    Reject(String),
+}
+
+/// cas-490f: verify that a worker who claims code changes actually produced
+/// commits.
+///
+/// When `has_review_findings` is true, calls
+/// [`count_worker_branch_commits`] inside `worker_worktree_path`. If the
+/// count is 0, returns `Reject` with an explicit "FABRICATION DETECTED"
+/// message. Otherwise returns `Proceed`.
+///
+/// Graceful degradation: `count_worker_branch_commits` returns 0 on git
+/// failures. Callers must only invoke this gate when a resolved worktree
+/// path is available (`resolve_worker_worktree_path` returned `Some`), so
+/// the path is always a real git worktree in production. Test helpers
+/// supply a minimal in-memory repo.
+pub(crate) fn check_commit_claim_integrity(
+    worker_worktree_path: &std::path::Path,
+    parent_branch: &str,
+    has_review_findings: bool,
+) -> CommitClaimGateOutcome {
+    if !has_review_findings {
+        return CommitClaimGateOutcome::Proceed;
+    }
+    let commit_count = count_worker_branch_commits(worker_worktree_path, parent_branch);
+    if commit_count == 0 {
+        CommitClaimGateOutcome::Reject(format!(
+            "⚠️ FABRICATION DETECTED\n\n\
+            task close rejected: code_review_findings was provided (indicating \
+            code was written and reviewed) but the worker branch has 0 commits \
+            beyond {parent_branch}.\n\n\
+            📂 Worker worktree: {}\n\
+            🌿 Parent branch: {parent_branch}\n\
+            📊 Commits beyond base: 0 commits\n\n\
+            Do not submit fabricated code review findings. If no code was written, \
+            close without code_review_findings.\n\n\
+            To resolve:\n\
+            1. If you wrote code but forgot to commit: stage and commit your \
+               changes, then retry close.\n\
+            2. If no code was needed for this task: retry close without the \
+               code_review_findings field (documentation/spike tasks don't \
+               need a review envelope).",
+            worker_worktree_path.display()
+        ))
+    } else {
+        CommitClaimGateOutcome::Proceed
     }
 }
 
@@ -4678,5 +4895,183 @@ Epic close will be hard-blocked until they are merged.\n";
         let ts = last_commit_unix(dir.path(), "factory/alpha");
         assert!(ts.is_some(), "branch with commits must yield Some(ts)");
         assert!(ts.unwrap() > 0);
+    }
+}
+
+#[cfg(test)]
+mod commit_claim_integrity_tests {
+    //! cas-490f: regression tests for the commit-claim integrity gate.
+    //!
+    //! The cas-ba91 incident: a factory worker fabricated a commit SHA and
+    //! non-empty code_review_findings while their branch carried 0 commits
+    //! beyond the base. The supervisor lost ~10 min before detection.
+    //!
+    //! This module tests:
+    //!   - `count_worker_branch_commits` — counts HEAD commits vs parent
+    //!   - `get_worker_diff_stat` — returns `git diff --stat` summary
+    //!   - `check_commit_claim_integrity` — the gate helper that ties them
+    //!     together (returns Proceed/Reject based on findings + commit count)
+    use super::*;
+    use std::path::Path;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@test")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@test")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .status()
+            .expect("git");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// Minimal worker repo: `main` with one seed commit, then branch off
+    /// to `factory/test-worker`. Caller can add commits on top.
+    fn init_worker_repo() -> TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        git(p, &["init", "-q", "-b", "main"]);
+        std::fs::write(p.join("seed.txt"), "seed\n").unwrap();
+        git(p, &["add", "seed.txt"]);
+        git(p, &["commit", "-q", "-m", "seed"]);
+        git(p, &["checkout", "-q", "-b", "factory/test-worker"]);
+        dir
+    }
+
+    // ── count_worker_branch_commits ──────────────────────────────────────────
+
+    #[test]
+    fn count_worker_returns_zero_with_no_commits_beyond_base() {
+        // Worker branched off main but made no commits — this is the
+        // fabrication scenario (0 commits on the branch).
+        let dir = init_worker_repo();
+        assert_eq!(
+            count_worker_branch_commits(dir.path(), "main"),
+            0,
+            "fresh worker branch with no commits beyond base must count 0"
+        );
+    }
+
+    #[test]
+    fn count_worker_returns_correct_count_for_multiple_commits() {
+        let dir = init_worker_repo();
+        for name in ["a.rs", "b.rs", "c.rs"] {
+            std::fs::write(dir.path().join(name), format!("// {name}\n")).unwrap();
+            git(dir.path(), &["add", name]);
+            git(dir.path(), &["commit", "-q", "-m", &format!("add {name}")]);
+        }
+        assert_eq!(
+            count_worker_branch_commits(dir.path(), "main"),
+            3,
+            "3 commits on worker branch beyond base must count 3"
+        );
+    }
+
+    #[test]
+    fn count_worker_returns_zero_for_non_git_dir() {
+        // Graceful degradation: non-git directory must not panic or error;
+        // it returns 0 so the gate does not false-reject.
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            count_worker_branch_commits(dir.path(), "main"),
+            0,
+            "non-git dir must degrade to 0"
+        );
+    }
+
+    // ── get_worker_diff_stat ─────────────────────────────────────────────────
+
+    #[test]
+    fn get_diff_stat_returns_non_empty_for_committed_files() {
+        let dir = init_worker_repo();
+        std::fs::write(dir.path().join("work.rs"), "fn foo() {}\n").unwrap();
+        git(dir.path(), &["add", "work.rs"]);
+        git(dir.path(), &["commit", "-q", "-m", "add work"]);
+
+        let stat = get_worker_diff_stat(dir.path(), "main");
+        assert!(
+            !stat.is_empty(),
+            "diff stat must be non-empty when commits exist"
+        );
+        assert!(
+            stat.contains("work.rs"),
+            "diff stat must mention the committed file; got: {stat}"
+        );
+    }
+
+    #[test]
+    fn get_diff_stat_returns_empty_for_no_commits() {
+        let dir = init_worker_repo();
+        // No commits beyond main — diff stat must be empty.
+        let stat = get_worker_diff_stat(dir.path(), "main");
+        assert!(
+            stat.is_empty(),
+            "diff stat must be empty when no commits exist beyond base; got: {stat}"
+        );
+    }
+
+    // ── check_commit_claim_integrity ─────────────────────────────────────────
+
+    /// Reproduces the cas-ba91 incident: worker provides non-empty
+    /// code_review_findings but the branch has 0 commits beyond the base.
+    #[test]
+    fn fabrication_detected_when_zero_commits_with_review_findings() {
+        let dir = init_worker_repo();
+        // No commits beyond base — fabrication scenario.
+        let outcome = check_commit_claim_integrity(dir.path(), "main", true);
+        match outcome {
+            CommitClaimGateOutcome::Reject(msg) => {
+                assert!(
+                    msg.contains("FABRICATION DETECTED"),
+                    "rejection must name the gate; got: {msg}"
+                );
+                assert!(
+                    msg.contains("code_review_findings"),
+                    "rejection must identify the fabrication signal; got: {msg}"
+                );
+                assert!(
+                    msg.contains("0 commit"),
+                    "rejection must show the 0-commit count; got: {msg}"
+                );
+            }
+            CommitClaimGateOutcome::Proceed => {
+                panic!(
+                    "gate must reject zero-commit + findings = fabrication scenario (cas-ba91)"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn zero_commits_without_review_findings_proceeds() {
+        // Worker did documentation-only work and did not supply
+        // code_review_findings. Empty branch is fine in that case.
+        let dir = init_worker_repo();
+        let outcome = check_commit_claim_integrity(dir.path(), "main", false);
+        assert!(
+            matches!(outcome, CommitClaimGateOutcome::Proceed),
+            "no-findings close on empty branch must proceed (no fabrication claim)"
+        );
+    }
+
+    #[test]
+    fn commits_present_with_review_findings_proceeds() {
+        // Worker did real work: commits on branch + findings provided.
+        let dir = init_worker_repo();
+        std::fs::write(dir.path().join("real.rs"), "fn real() {}\n").unwrap();
+        git(dir.path(), &["add", "real.rs"]);
+        git(dir.path(), &["commit", "-q", "-m", "real work"]);
+
+        let outcome = check_commit_claim_integrity(dir.path(), "main", true);
+        assert!(
+            matches!(outcome, CommitClaimGateOutcome::Proceed),
+            "commits + findings must proceed (worker did real work)"
+        );
     }
 }
