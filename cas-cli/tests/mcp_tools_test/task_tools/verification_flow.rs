@@ -250,6 +250,14 @@ enabled = false
     std::fs::write(worktree_path.join("seed.txt"), "seed\n").unwrap();
     git(&["add", "seed.txt"]);
     git(&["commit", "-q", "-m", "seed"]);
+    // cas-d987: fork a worker branch off main so that commits in Scenario C
+    // land beyond `parent_branch` ("main"). Before this fix the test committed
+    // directly on main, so `count_worker_branch_commits(path, "main")` returned
+    // 0 (HEAD == main, rev-list HEAD..HEAD = 0) and the cas-ee2b zero-commit
+    // gate rejected the close in Scenario C. Compare with
+    // `test_additive_only_uses_worker_branch_not_main_worktree` which correctly
+    // checks out a worker branch before making commits.
+    git(&["checkout", "-q", "-b", "factory/895d-worker"]);
 
     // Register the worktree in cas and attach it to a task.
     let worktree_store = open_worktree_store(&cas_dir).expect("open worktree store");
@@ -257,7 +265,7 @@ enabled = false
     let worktree_id = Worktree::generate_id();
     let worktree = Worktree::new(
         worktree_id.clone(),
-        "cas/895d-worker".to_string(),
+        "factory/895d-worker".to_string(),
         "main".to_string(),
         worktree_path.clone(),
     );
