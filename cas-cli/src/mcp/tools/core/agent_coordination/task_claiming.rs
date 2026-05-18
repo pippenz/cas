@@ -577,6 +577,12 @@ impl CasCore {
             }
             Some(l) if l.agent_id != agent_id => {
                 // Lease is held by a different agent.
+                // Resolve UUID → friendly name so the supervisor can identify
+                // the holding worker without cross-referencing worker_status.
+                let holder_display = agent_store
+                    .get(&l.agent_id)
+                    .map(|a| format!("{} ({})", a.name, l.agent_id))
+                    .unwrap_or_else(|_| l.agent_id.clone());
                 if supervisor_override_requested {
                     if !is_supervisor_from_env() {
                         return Err(McpError {
@@ -608,7 +614,7 @@ impl CasCore {
                             "Task {} is owned by {}, not {}. \
                              Supervisors can force-transfer with supervisor_override=true \
                              (bypasses the lease check and logs an audit entry).",
-                            req.task_id, l.agent_id, agent_id
+                            req.task_id, holder_display, agent_id
                         )),
                         data: None,
                     });

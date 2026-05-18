@@ -231,11 +231,15 @@ fn supervisor_role_case_insensitive() {
 // guards the legacy path.
 // ============================================================================
 
-/// Delegate to the crate-wide env lock so this module coordinates with all
-/// other lib test modules that mutate `CAS_AGENT_ROLE`.  A local lock is NOT
-/// sufficient — each module gets its own `static`, so separate locals race.
+/// Serialize this one env-touching test against itself. The rest of the suite
+/// is pure and does not mutate env, so a single local lock is enough — we no
+/// longer need to coordinate with other test modules.
 fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-    crate::harness_policy::env_test_lock()
+    use std::sync::{Mutex, OnceLock};
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
 }
 
 struct RoleGuard(Option<String>);
