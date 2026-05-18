@@ -1123,6 +1123,36 @@ impl CasCore {
         //     harness.
         let close_project_root = self.cas_root.parent().unwrap_or(&self.cas_root);
 
+        // cas-ee2b: resolve the effective "has reviewable changes" signal.
+        //
+        // For isolated worker worktrees, checking the main repo's working-tree
+        // state (`has_reviewable_changes(close_project_root)`) gives the wrong
+        // answer: the main repo may have dirty files unrelated to the worker's
+        // task (supervisor edits, other in-flight work). This caused false
+        // CODE_REVIEW_REQUIRED on research/spike tasks with zero code commits
+        // (the cas-cabc incident).
+        //
+        // Fix (cas-ee2b): for tasks with a resolved isolated worker worktree,
+        // use `has_worker_committed_reviewable_changes` which inspects only
+        // what the worker committed on their branch (merge-base..HEAD). For
+        // non-isolated tasks, fall through to the existing main-repo check —
+        // those workers share the main worktree so its state IS the task diff.
+        let effective_has_reviewable = if let Some(worker_wt) = worker_worktree_path.as_ref() {
+            let parent_branch = task
+                .worktree_id
+                .as_deref()
+                .and_then(|wt_id| {
+                    self.open_worktree_store()
+                        .ok()
+                        .and_then(|store| store.get(wt_id).ok())
+                        .map(|wt| wt.parent_branch.clone())
+                })
+                .unwrap_or_else(|| "main".to_string());
+            has_worker_committed_reviewable_changes(worker_wt, &parent_branch)
+        } else {
+            has_reviewable_changes(close_project_root)
+        };
+
         // cas-b51a: supervisor-owned review mode.
         //
         // When `[code_review] owner = "supervisor"` AND the caller is a
@@ -1161,7 +1191,7 @@ impl CasCore {
             && task.task_type != TaskType::Epic
             && task.execution_note.as_deref() != Some("additive-only")
             && !bypass_close_gates
-            && has_reviewable_changes(close_project_root)
+            && effective_has_reviewable
         {
             // Run the lightweight structural lint.
             match run_lightweight_structural_lint(close_project_root) {
@@ -1250,6 +1280,16 @@ impl CasCore {
         };
 
         let gate_outcome = if epic_subtask_receipts_cover {
+            CodeReviewGateOutcome::Proceed
+        } else if !effective_has_reviewable {
+            // cas-ee2b: no reviewable changes on the worker's committed branch
+            // (or non-isolated task with a clean main-repo diff). Skip the
+            // review gate — this is the isolated-worker-aware equivalent of
+            // Skip 3 inside `run_code_review_gate`.
+            //
+            // This fixes the cas-cabc false-positive: researcher closes spike
+            // with zero code commits; main repo has unrelated dirty files;
+            // old code fired CODE_REVIEW_REQUIRED. Now the gate skips.
             CodeReviewGateOutcome::Proceed
         } else {
             run_code_review_gate(&task, &req, close_project_root)
@@ -2841,6 +2881,60 @@ pub(crate) fn is_reviewable_path(path: &str) -> bool {
     }
 
     true
+}
+
+/// cas-ee2b: return `true` if the worker's committed history
+/// (`merge-base..HEAD` inside `worker_worktree_path`) contains any files
+/// that qualify as reviewable by [`is_reviewable_path`].
+///
+/// This is the isolated-worker-aware replacement for the
+/// `has_reviewable_changes(close_project_root)` call that was checking
+/// the **main repo's working tree** state. For a worker with an isolated
+/// worktree, the main repo's dirty files are irrelevant — what matters is
+/// what the worker actually committed on their branch.
+///
+/// Examples of cases where the old check gave a wrong answer:
+/// - Researcher closes a spike task (zero code commits). Main repo has
+///   a dirty `Cargo.lock` or in-flight edit. Old: true (wrong) → CODE_REVIEW_REQUIRED.
+///   New: false (correct) → gate skipped.
+/// - Worker committed only `*.md` docs. Old: depends on main repo state.
+///   New: false (correct) → gate skipped.
+///
+/// Returns `false` on any git failure (graceful degradation — avoids
+/// false-requiring review when history is unknowable, consistent with
+/// `has_reviewable_changes` returning false for non-git dirs).
+pub(crate) fn has_worker_committed_reviewable_changes(
+    worker_worktree_path: &std::path::Path,
+    parent_branch: &str,
+) -> bool {
+    use std::process::Command;
+
+    let merge_base_out = Command::new("git")
+        .args(["merge-base", "HEAD", parent_branch])
+        .current_dir(worker_worktree_path)
+        .output();
+    let merge_base = match merge_base_out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        _ => return false,
+    };
+    if merge_base.is_empty() {
+        return false;
+    }
+
+    let diff_out = Command::new("git")
+        .args(["diff", "--name-only", &format!("{merge_base}..HEAD")])
+        .current_dir(worker_worktree_path)
+        .output();
+    match diff_out {
+        Ok(o) if o.status.success() => {
+            let output = String::from_utf8_lossy(&o.stdout);
+            output.lines().any(|line| {
+                let trimmed = line.trim();
+                !trimmed.is_empty() && is_reviewable_path(trimmed)
+            })
+        }
+        _ => false,
+    }
 }
 
 /// Parse the output of `git diff --name-status` into violations. Only rows
@@ -5072,6 +5166,121 @@ mod commit_claim_integrity_tests {
         assert!(
             matches!(outcome, CommitClaimGateOutcome::Proceed),
             "commits + findings must proceed (worker did real work)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod zero_change_close_tests {
+    //! cas-ee2b: regression tests for the "no-diff close" fix.
+    //!
+    //! The cas-cabc incident: a researcher closed a spike task with zero code
+    //! commits. The main repo had unrelated dirty files (normal during an active
+    //! session). `has_reviewable_changes(close_project_root)` returned true
+    //! (main repo dirty), triggering CODE_REVIEW_REQUIRED on a task that never
+    //! touched code.
+    //!
+    //! Fix: `has_worker_committed_reviewable_changes(worker_wt, parent_branch)`
+    //! checks the worker's committed diff instead of the main repo working tree.
+    //!
+    //! Tests cover:
+    //! - Zero commits → false (the cas-cabc scenario)
+    //! - Docs-only commits → false (*.md, docs/)
+    //! - Code commits → true (Rust source, TypeScript, etc.)
+    //! - Non-git dir → false (graceful degradation)
+    use super::*;
+    use std::path::Path;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@test")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@test")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .status()
+            .expect("git");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    fn init_worker_repo() -> TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        git(p, &["init", "-q", "-b", "main"]);
+        std::fs::write(p.join("seed.txt"), "seed\n").unwrap();
+        git(p, &["add", "seed.txt"]);
+        git(p, &["commit", "-q", "-m", "seed"]);
+        git(p, &["checkout", "-q", "-b", "factory/test-worker"]);
+        dir
+    }
+
+    // ── has_worker_committed_reviewable_changes ──────────────────────────────
+
+    /// Reproduces the cas-cabc scenario: researcher closes spike with zero
+    /// code commits. Must return false so the review gate is skipped.
+    #[test]
+    fn zero_commits_returns_false() {
+        let dir = init_worker_repo();
+        // No commits beyond base.
+        assert!(
+            !has_worker_committed_reviewable_changes(dir.path(), "main"),
+            "zero commits beyond base must not be reviewable (cas-cabc scenario)"
+        );
+    }
+
+    #[test]
+    fn docs_only_commits_return_false() {
+        let dir = init_worker_repo();
+        // Only markdown and docs/ files committed — not reviewable.
+        std::fs::write(dir.path().join("NOTES.md"), "# notes\n").unwrap();
+        git(dir.path(), &["add", "NOTES.md"]);
+        git(dir.path(), &["commit", "-q", "-m", "docs: add notes"]);
+
+        assert!(
+            !has_worker_committed_reviewable_changes(dir.path(), "main"),
+            "docs-only commits must not trigger the review gate"
+        );
+    }
+
+    #[test]
+    fn code_commits_return_true() {
+        let dir = init_worker_repo();
+        std::fs::write(dir.path().join("lib.rs"), "pub fn foo() {}\n").unwrap();
+        git(dir.path(), &["add", "lib.rs"]);
+        git(dir.path(), &["commit", "-q", "-m", "feat: add lib"]);
+
+        assert!(
+            has_worker_committed_reviewable_changes(dir.path(), "main"),
+            "code file commits must be reviewable"
+        );
+    }
+
+    #[test]
+    fn mixed_docs_and_code_commits_return_true() {
+        let dir = init_worker_repo();
+        std::fs::write(dir.path().join("README.md"), "# readme\n").unwrap();
+        std::fs::write(dir.path().join("main.ts"), "export function x() {}\n").unwrap();
+        git(dir.path(), &["add", "README.md", "main.ts"]);
+        git(dir.path(), &["commit", "-q", "-m", "feat: mixed commit"]);
+
+        assert!(
+            has_worker_committed_reviewable_changes(dir.path(), "main"),
+            "commit containing both docs and code must be reviewable"
+        );
+    }
+
+    #[test]
+    fn non_git_dir_returns_false() {
+        // Graceful degradation: non-git directory must not panic or error.
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            !has_worker_committed_reviewable_changes(dir.path(), "main"),
+            "non-git dir must degrade to false (no false-require-review)"
         );
     }
 }
