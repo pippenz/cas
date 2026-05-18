@@ -142,6 +142,25 @@ pub fn is_worker_without_subagents_from_env() -> bool {
     is_worker_from_env() && !worker_harness_from_env().capabilities().supports_subagents
 }
 
+/// Process-wide mutex for tests that mutate `CAS_AGENT_ROLE` (or any other
+/// env var that `harness_policy` functions read).
+///
+/// **All** lib-test modules that call `std::env::set_var("CAS_AGENT_ROLE", …)`
+/// or `std::env::remove_var("CAS_AGENT_ROLE")` must hold this guard for the
+/// duration of the mutation.  Using separate module-local locks is not
+/// sufficient because each module gets its own `static`, which means the locks
+/// don't coordinate and the tests race on the process-global env.
+///
+/// Callers in other modules: `crate::harness_policy::env_test_lock()`.
+#[cfg(test)]
+pub(crate) fn env_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    use std::sync::{Mutex, OnceLock};
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,8 +170,9 @@ mod tests {
     // ----------------------------------------------------------------------
     //
     // Most cases don't touch the env at all — they drive agent_role on
-    // HookInput. The env-fallback tests serialize through a local mutex to
-    // avoid racing with each other within this module.
+    // HookInput. The env-fallback tests serialize through the process-wide
+    // `env_test_lock()` (defined at module level above) to avoid racing with
+    // other modules that also mutate CAS_AGENT_ROLE.
 
     fn input_with_role(role: Option<&str>) -> HookInput {
         HookInput {
@@ -161,12 +181,10 @@ mod tests {
         }
     }
 
+    /// Shim: delegate to the single crate-level env lock so all modules that
+    /// touch `CAS_AGENT_ROLE` share the same mutex.
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        use std::sync::{Mutex, OnceLock};
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        super::env_test_lock()
     }
 
     struct EnvRoleGuard(Option<String>);

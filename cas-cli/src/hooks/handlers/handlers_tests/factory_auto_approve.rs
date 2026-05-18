@@ -256,17 +256,14 @@ fn factory_agent_unknown_tool_without_cas_root_is_not_auto_approved() {
 // never overrides them either.
 
 // ----------------------------------------------------------------------------
-// Env helpers — mirror the pattern in agent_worktree_block.rs. Required
-// because main's gate reads role from `CAS_AGENT_ROLE`, so every test
-// that exercises the gate mutates process env and must serialize.
+// Env helpers. Required because main's gate reads role from `CAS_AGENT_ROLE`,
+// so every test that exercises the gate mutates process env and must
+// serialize.  Delegate to the crate-wide lock so all env-touching modules
+// coordinate on the same mutex.
 // ----------------------------------------------------------------------------
 
 fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-    use std::sync::{Mutex, OnceLock};
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    crate::harness_policy::env_test_lock()
 }
 
 struct RoleGuard(Option<String>);

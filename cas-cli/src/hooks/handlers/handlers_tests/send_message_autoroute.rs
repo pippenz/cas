@@ -15,12 +15,10 @@
 use crate::hooks::handlers::handle_pre_tool_use;
 use cas_core::hooks::types::HookInput;
 
+/// Delegate to the crate-wide env lock so this module coordinates with all
+/// other lib test modules that mutate `CAS_AGENT_ROLE`.
 fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-    use std::sync::{Mutex, OnceLock};
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    crate::harness_policy::env_test_lock()
 }
 
 struct EnvGuard {
