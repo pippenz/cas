@@ -4947,3 +4947,118 @@ mod commit_claim_integrity_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod zero_change_close_tests {
+    //! cas-ee2b: regression tests for the "no-diff close" fix.
+    //!
+    //! The cas-cabc incident: a researcher closed a spike task with zero code
+    //! commits. The main repo had unrelated dirty files (normal during an active
+    //! session). `has_reviewable_changes(close_project_root)` returned true
+    //! (main repo dirty), triggering CODE_REVIEW_REQUIRED on a task that never
+    //! touched code.
+    //!
+    //! Fix: `has_worker_committed_reviewable_changes(worker_wt, parent_branch)`
+    //! checks the worker's committed diff instead of the main repo working tree.
+    //!
+    //! Tests cover:
+    //! - Zero commits → false (the cas-cabc scenario)
+    //! - Docs-only commits → false (*.md, docs/)
+    //! - Code commits → true (Rust source, TypeScript, etc.)
+    //! - Non-git dir → false (graceful degradation)
+    use super::*;
+    use std::path::Path;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@test")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@test")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .status()
+            .expect("git");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    fn init_worker_repo() -> TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        git(p, &["init", "-q", "-b", "main"]);
+        std::fs::write(p.join("seed.txt"), "seed\n").unwrap();
+        git(p, &["add", "seed.txt"]);
+        git(p, &["commit", "-q", "-m", "seed"]);
+        git(p, &["checkout", "-q", "-b", "factory/test-worker"]);
+        dir
+    }
+
+    // ── has_worker_committed_reviewable_changes ──────────────────────────────
+
+    /// Reproduces the cas-cabc scenario: researcher closes spike with zero
+    /// code commits. Must return false so the review gate is skipped.
+    #[test]
+    fn zero_commits_returns_false() {
+        let dir = init_worker_repo();
+        // No commits beyond base.
+        assert!(
+            !has_worker_committed_reviewable_changes(dir.path(), "main"),
+            "zero commits beyond base must not be reviewable (cas-cabc scenario)"
+        );
+    }
+
+    #[test]
+    fn docs_only_commits_return_false() {
+        let dir = init_worker_repo();
+        // Only markdown and docs/ files committed — not reviewable.
+        std::fs::write(dir.path().join("NOTES.md"), "# notes\n").unwrap();
+        git(dir.path(), &["add", "NOTES.md"]);
+        git(dir.path(), &["commit", "-q", "-m", "docs: add notes"]);
+
+        assert!(
+            !has_worker_committed_reviewable_changes(dir.path(), "main"),
+            "docs-only commits must not trigger the review gate"
+        );
+    }
+
+    #[test]
+    fn code_commits_return_true() {
+        let dir = init_worker_repo();
+        std::fs::write(dir.path().join("lib.rs"), "pub fn foo() {}\n").unwrap();
+        git(dir.path(), &["add", "lib.rs"]);
+        git(dir.path(), &["commit", "-q", "-m", "feat: add lib"]);
+
+        assert!(
+            has_worker_committed_reviewable_changes(dir.path(), "main"),
+            "code file commits must be reviewable"
+        );
+    }
+
+    #[test]
+    fn mixed_docs_and_code_commits_return_true() {
+        let dir = init_worker_repo();
+        std::fs::write(dir.path().join("README.md"), "# readme\n").unwrap();
+        std::fs::write(dir.path().join("main.ts"), "export function x() {}\n").unwrap();
+        git(dir.path(), &["add", "README.md", "main.ts"]);
+        git(dir.path(), &["commit", "-q", "-m", "feat: mixed commit"]);
+
+        assert!(
+            has_worker_committed_reviewable_changes(dir.path(), "main"),
+            "commit containing both docs and code must be reviewable"
+        );
+    }
+
+    #[test]
+    fn non_git_dir_returns_false() {
+        // Graceful degradation: non-git directory must not panic or error.
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            !has_worker_committed_reviewable_changes(dir.path(), "main"),
+            "non-git dir must degrade to false (no false-require-review)"
+        );
+    }
+}
