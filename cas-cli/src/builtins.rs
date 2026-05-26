@@ -305,6 +305,20 @@ pub const BUILTIN_SKILLS: &[BuiltinFile] = &[
         path: "skills/codemap/SKILL.md",
         content: include_str!("builtins/skills/codemap/SKILL.md"),
     },
+    // cas-nuxt-playwright skill: unified Nuxt 3 + Playwright E2E testing
+    // guide. Replaces the legacy user-level cas-playwright-debug skill with
+    // a single builtin that covers both writing and debugging tests. Modeled
+    // after the gabber-studio production test suite; Firebase-focused.
+    BuiltinFile {
+        path: "skills/cas-nuxt-playwright/SKILL.md",
+        content: include_str!("builtins/skills/cas-nuxt-playwright/SKILL.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-nuxt-playwright/references/auth-fixture-template.md",
+        content: include_str!(
+            "builtins/skills/cas-nuxt-playwright/references/auth-fixture-template.md"
+        ),
+    },
     // fallow skill: vendored from https://github.com/fallow-rs/fallow-skills
     // (MIT, Bart Waardenburg). Codebase intelligence for JS/TS — dead code,
     // duplication, complexity, boundaries, feature flags. SKILL.md +
@@ -504,6 +518,17 @@ pub const CODEX_BUILTIN_SKILLS: &[BuiltinFile] = &[
     BuiltinFile {
         path: "skills/codemap/SKILL.md",
         content: include_str!("builtins/codex/skills/codemap/SKILL.md"),
+    },
+    // cas-nuxt-playwright skill — codex mirror.
+    BuiltinFile {
+        path: "skills/cas-nuxt-playwright/SKILL.md",
+        content: include_str!("builtins/codex/skills/cas-nuxt-playwright/SKILL.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-nuxt-playwright/references/auth-fixture-template.md",
+        content: include_str!(
+            "builtins/codex/skills/cas-nuxt-playwright/references/auth-fixture-template.md"
+        ),
     },
     // fallow skill — codex mirror. See the claude-side entry above for the
     // upstream attribution (fallow-rs/fallow-skills, MIT).
@@ -1795,6 +1820,73 @@ This is the body content."#;
         assert!(
             task_verifier_path.exists(),
             "task-verifier.md should be created by sync_all_builtins"
+        );
+    }
+
+    #[test]
+    fn test_builtin_skills_contains_cas_nuxt_playwright() {
+        let expected = [
+            "skills/cas-nuxt-playwright/SKILL.md",
+            "skills/cas-nuxt-playwright/references/auth-fixture-template.md",
+        ];
+        for p in expected {
+            assert!(
+                BUILTIN_SKILLS.iter().any(|b| b.path == p),
+                "{p} missing from BUILTIN_SKILLS"
+            );
+            assert!(
+                CODEX_BUILTIN_SKILLS.iter().any(|b| b.path == p),
+                "{p} missing from CODEX_BUILTIN_SKILLS"
+            );
+        }
+
+        let entry = BUILTIN_SKILLS
+            .iter()
+            .find(|b| b.path == "skills/cas-nuxt-playwright/SKILL.md")
+            .unwrap();
+        for required in [
+            "name: cas-nuxt-playwright",
+            "managed_by: cas",
+            "navigateTo",
+            "window.__nuxt",
+            "IndexedDB",
+            "ssr: false",
+            "routeRules",
+            "q-btn",
+        ] {
+            assert!(
+                entry.content.contains(required),
+                "cas-nuxt-playwright SKILL.md missing required marker: {required:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_cas_nuxt_playwright_mirrors_are_identical() {
+        let claude = BUILTIN_SKILLS
+            .iter()
+            .find(|b| b.path == "skills/cas-nuxt-playwright/SKILL.md")
+            .expect("BUILTIN_SKILLS missing cas-nuxt-playwright SKILL.md");
+        let codex = CODEX_BUILTIN_SKILLS
+            .iter()
+            .find(|b| b.path == "skills/cas-nuxt-playwright/SKILL.md")
+            .expect("CODEX_BUILTIN_SKILLS missing cas-nuxt-playwright SKILL.md");
+        assert_eq!(
+            claude.content, codex.content,
+            "cas-nuxt-playwright SKILL.md .claude and .codex copies must be byte-identical",
+        );
+
+        let claude_ref = BUILTIN_SKILLS
+            .iter()
+            .find(|b| b.path == "skills/cas-nuxt-playwright/references/auth-fixture-template.md")
+            .expect("BUILTIN_SKILLS missing auth-fixture-template.md");
+        let codex_ref = CODEX_BUILTIN_SKILLS
+            .iter()
+            .find(|b| b.path == "skills/cas-nuxt-playwright/references/auth-fixture-template.md")
+            .expect("CODEX_BUILTIN_SKILLS missing auth-fixture-template.md");
+        assert_eq!(
+            claude_ref.content, codex_ref.content,
+            "auth-fixture-template.md .claude and .codex copies must be byte-identical",
         );
     }
 
