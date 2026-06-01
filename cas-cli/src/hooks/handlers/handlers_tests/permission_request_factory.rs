@@ -57,7 +57,7 @@ fn allow_reason(out: &cas_core::hooks::types::HookOutput) -> Option<String> {
 
 #[test]
 fn supervisor_write_permission_request_is_auto_approved_without_cas_root() {
-    let _g = env_lock();
+    let _g = super::env_lock();
     let _role = set_role_env(Some("supervisor"));
     let input = input_for("Write", Some("/tmp/foo.txt"));
     let out = handle_permission_request(&input, None).expect("handler ok");
@@ -70,7 +70,7 @@ fn supervisor_write_permission_request_is_auto_approved_without_cas_root() {
 
 #[test]
 fn worker_edit_permission_request_is_auto_approved_without_cas_root() {
-    let _g = env_lock();
+    let _g = super::env_lock();
     let _role = set_role_env(Some("worker"));
     let input = input_for("Edit", Some("/tmp/foo.txt"));
     let out = handle_permission_request(&input, None).expect("handler ok");
@@ -82,7 +82,7 @@ fn worker_edit_permission_request_is_auto_approved_without_cas_root() {
 
 #[test]
 fn supervisor_bash_permission_request_is_auto_approved_without_cas_root() {
-    let _g = env_lock();
+    let _g = super::env_lock();
     let _role = set_role_env(Some("supervisor"));
     let input = input_for("Bash", None);
     let out = handle_permission_request(&input, None).expect("handler ok");
@@ -97,7 +97,7 @@ fn supervisor_write_permission_request_is_auto_approved_with_cas_root() {
     // Asymmetric-by-design with the PreToolUse hoist: belt #3 fires even
     // when cas_root=Some, because PermissionRequest has no protection
     // gate invariant to preserve. See comment in notifications.rs.
-    let _g = env_lock();
+    let _g = super::env_lock();
     let _role = set_role_env(Some("supervisor"));
     let input = input_for("Write", Some("/tmp/foo.txt"));
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -118,7 +118,7 @@ fn solo_user_permission_request_is_not_auto_approved() {
     // CAS_AGENT_ROLE unset — the handler must fall through. With no
     // agent store present, the cas_root=None early return (or the
     // agent-lookup failure) yields an empty output.
-    let _g = env_lock();
+    let _g = super::env_lock();
     let _role = set_role_env(None);
     let input = input_for("Write", Some("/tmp/foo.txt"));
     let out = handle_permission_request(&input, None).expect("handler ok");
@@ -132,7 +132,7 @@ fn solo_user_permission_request_is_not_auto_approved() {
 fn factory_agent_unknown_tool_permission_request_is_not_auto_approved() {
     // Tools outside FACTORY_AUTO_APPROVE_TOOLS must not get the bypass —
     // regression guard against widening the belt.
-    let _g = env_lock();
+    let _g = super::env_lock();
     let _role = set_role_env(Some("worker"));
     let input = input_for("WebFetch", None);
     let out = handle_permission_request(&input, None).expect("handler ok");
@@ -143,18 +143,9 @@ fn factory_agent_unknown_tool_permission_request_is_not_auto_approved() {
 }
 
 // ----------------------------------------------------------------------------
-// Env helpers — duplicate the pattern from factory_auto_approve.rs. They
-// are file-private there; copying the ~15 lines here is cheaper than
-// re-plumbing a shared test helper for two call sites.
+// Env helpers — use the shared process-wide mutex from mod.rs so that
+// concurrent tests across sibling modules don't race on CAS_AGENT_ROLE.
 // ----------------------------------------------------------------------------
-
-fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-    use std::sync::{Mutex, OnceLock};
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-}
 
 struct RoleGuard(Option<String>);
 
