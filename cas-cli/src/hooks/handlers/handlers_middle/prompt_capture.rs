@@ -1,5 +1,27 @@
 use crate::hooks::handlers::*;
 
+/// Build the per-turn supervisor reminder (≤512 bytes).
+///
+/// Emitted by `handle_user_prompt_submit` when `is_factory_agent && role==supervisor`.
+/// Refreshes Hard Rules every turn to prevent mid-session drift where supervisors
+/// forget their role and start using incorrect tools (e.g. `AskUserQuestion` for workers,
+/// or `SendMessage` instead of `mcp__cas__coordination`).
+///
+/// Identity is resolved at call time from process env vars set by the factory daemon:
+/// - `CAS_AGENT_NAME` → supervisor name (e.g. "loyal-bear-96")
+/// - `CAS_FACTORY_SESSION` → team/session name (e.g. "cas-src-wild-dragon-82")
+pub(crate) fn build_supervisor_reminder() -> String {
+    let name = std::env::var("CAS_AGENT_NAME").unwrap_or_else(|_| "supervisor".to_string());
+    let team = std::env::var("CAS_FACTORY_SESSION").unwrap_or_else(|_| "team".to_string());
+    format!(
+        "[supervisor reminder]\n\
+         You are {name}, supervisor of team {team}. Hard rules:\n\
+         \u{2022} AskUserQuestion \u{2192} human user ONLY. Workers/teammates \u{2192} mcp__cas__coordination action=message.\n\
+         \u{2022} Never SendMessage. Never close worker tasks. Never implement non-trivial work yourself.\n\
+         \u{2022} Never poll/monitor/sleep. End your turn after assigning. Wait for messages."
+    )
+}
+
 pub fn handle_user_prompt_submit(
     input: &HookInput,
     cas_root: Option<&Path>,
@@ -9,6 +31,17 @@ pub fn handle_user_prompt_submit(
         Some(p) if !p.trim().is_empty() => p.trim(),
         _ => return Ok(HookOutput::empty()),
     };
+
+    // === SUPERVISOR REMINDER (cas-55ac) ===
+    // Emit a per-turn Hard Rules reminder for factory supervisors.
+    // Runs BEFORE the cas_root check (no store needed) and returns early,
+    // skipping attribution capture (supervisors don't write code).
+    if crate::harness_policy::is_factory_agent(input)
+        && crate::harness_policy::is_supervisor(input)
+    {
+        let reminder = build_supervisor_reminder();
+        return Ok(HookOutput::with_user_prompt_context(reminder));
+    }
 
     // Check if CAS is initialized (needed for all operations)
     let cas_root = match cas_root {
