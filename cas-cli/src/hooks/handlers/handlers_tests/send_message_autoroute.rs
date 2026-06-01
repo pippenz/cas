@@ -15,14 +15,6 @@
 use crate::hooks::handlers::handle_pre_tool_use;
 use cas_core::hooks::types::HookInput;
 
-fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-    use std::sync::{Mutex, OnceLock};
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-}
-
 struct EnvGuard {
     vars: Vec<(&'static str, Option<String>)>,
 }
@@ -85,7 +77,7 @@ fn deny_reason(out: &cas_core::hooks::types::HookOutput) -> Option<String> {
 
 #[test]
 fn send_message_auto_routes_onto_prompt_queue() {
-    let _g = env_lock();
+    let _g = super::env_lock();
     let _env = set_env(&[
         ("CAS_AGENT_ROLE", Some("worker")),
         ("CAS_AGENT_NAME", Some("test-worker-99")),
@@ -135,7 +127,7 @@ fn send_message_auto_routes_onto_prompt_queue() {
 
 #[test]
 fn send_message_serializes_structured_payload() {
-    let _g = env_lock();
+    let _g = super::env_lock();
     let _env = set_env(&[
         ("CAS_AGENT_ROLE", Some("worker")),
         ("CAS_AGENT_NAME", Some("test-worker-22")),
@@ -177,7 +169,7 @@ fn send_message_serializes_structured_payload() {
 
 #[test]
 fn send_message_missing_target_falls_back_to_guidance() {
-    let _g = env_lock();
+    let _g = super::env_lock();
     let _env = set_env(&[
         ("CAS_AGENT_ROLE", Some("worker")),
         ("CAS_AGENT_NAME", Some("test-worker-3")),
@@ -202,7 +194,7 @@ fn send_message_missing_target_falls_back_to_guidance() {
 
 #[test]
 fn send_message_missing_body_falls_back_to_guidance() {
-    let _g = env_lock();
+    let _g = super::env_lock();
     let _env = set_env(&[
         ("CAS_AGENT_ROLE", Some("worker")),
         ("CAS_AGENT_NAME", Some("test-worker-4")),
@@ -223,7 +215,7 @@ fn send_message_missing_body_falls_back_to_guidance() {
 
 #[test]
 fn send_message_no_tool_input_falls_back_to_guidance() {
-    let _g = env_lock();
+    let _g = super::env_lock();
     let _env = set_env(&[
         ("CAS_AGENT_ROLE", Some("supervisor")),
         ("CAS_AGENT_NAME", Some("test-super-1")),
@@ -244,7 +236,7 @@ fn send_message_no_tool_input_falls_back_to_guidance() {
 
 #[test]
 fn send_message_outside_factory_falls_through() {
-    let _g = env_lock();
+    let _g = super::env_lock();
     let _env = set_env(&[("CAS_AGENT_ROLE", None), ("CAS_AGENT_NAME", None)]);
 
     let tmp = tempfile::tempdir().expect("tempdir");

@@ -159,6 +159,27 @@ pub fn handle_pre_tool_use(
     let worker_supports_subagents = worker_harness_from_env().capabilities().supports_subagents;
 
     // ========================================================================
+    // FACTORY SUPERVISOR: Remind about AskUserQuestion routing (cas-e603)
+    //
+    // AskUserQuestion routes to the human user ONLY. Factory supervisors
+    // sometimes invoke it intending to reach a worker/teammate — the correct
+    // path is mcp__cas__coordination action=message. This intercept fires a
+    // permissionDecisionReason reminder at the exact moment of misuse without
+    // blocking the call (decision=allow), since the supervisor may genuinely
+    // need the human's input in some cases (e.g. this very session).
+    //
+    // Never deny: the hint is advisory only. Never parse question content to
+    // guess intent — always remind regardless.
+    // ========================================================================
+    if is_factory_agent && is_supervisor && tool_name == "AskUserQuestion" {
+        const REMINDER: &str = "[role-routing reminder] AskUserQuestion routes to the human user ONLY.\n\
+            If you meant to ask a worker/teammate, cancel this call and use:\n  \
+            mcp__cas__coordination action=message target=<worker-name> message=\"...\"\n\
+            If you genuinely need the human's input, proceed.";
+        return Ok(HookOutput::with_pre_tool_permission("allow", REMINDER));
+    }
+
+    // ========================================================================
     // CODEMAP FRESHNESS GATE: Block supervisor from creating tasks / spawning
     // workers while CODEMAP.md is significantly out of date.
     //

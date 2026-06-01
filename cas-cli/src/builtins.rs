@@ -878,17 +878,15 @@ pub fn extract_body(content: &str) -> &str {
 
 /// Get the supervisor guidance injected at factory SessionStart.
 ///
-/// Returns the trimmed supervisor SKILL.md plus the supervisor checklist.
+/// Returns only the trimmed supervisor SKILL.md body. The checklist
+/// (`cas-supervisor-checklist`) is a separate skill invocable via
+/// `/cas-supervisor-checklist` — bundling it pushed the SessionStart payload
+/// over the ~10KB Claude Code harness cap (measured by cas-ecd5, 2026-06-01),
+/// causing the full briefing to be silently replaced with a 2KB preview.
 /// task-tracking, memory, and search are autonomous skills the agent invokes
-/// on demand via the Skill tool — bundling them inflated SessionStart context
-/// past the harness "Output too large" threshold (the additionalContext got
-/// truncated to a 2KB preview), which silently disabled the supervisor guide.
+/// on demand via the Skill tool — same rationale.
 pub fn supervisor_guidance() -> String {
-    [
-        extract_body(SUPERVISOR_GUIDE),
-        extract_body(CHECKLIST_GUIDE),
-    ]
-    .join("\n\n---\n\n")
+    extract_body(SUPERVISOR_GUIDE).to_string()
 }
 
 /// Get the worker guidance injected at factory SessionStart.
@@ -932,9 +930,10 @@ This is the body content."#;
         let guide = supervisor_guidance();
         assert!(guide.contains("Factory Supervisor"));
         assert!(!guide.contains("managed_by:"));
+        // Checklist must NOT be bundled — it loads separately via /cas-supervisor-checklist.
         assert!(
-            guide.contains("Supervisor Checklist"),
-            "should include checklist"
+            !guide.contains("Supervisor Checklist"),
+            "should NOT bundle checklist — invocable separately via /cas-supervisor-checklist"
         );
         // task-tracking/memory/search are autonomous skills, not bundled.
         assert!(
@@ -947,18 +946,58 @@ This is the body content."#;
         );
     }
 
-    /// SessionStart additionalContext gets truncated to a small preview by
-    /// the Claude Code harness once the payload exceeds its threshold (the
-    /// pre-trim bundle was ~61KB and got cut to 2KB). The exact threshold
-    /// isn't documented; 12KB is a conservative ceiling that leaves room for
-    /// the rest of the SessionStart context (codemap banner, agent identity,
-    /// coordination block) to fit alongside without tripping truncation.
+    /// All 6 Hard Rules must appear verbatim in the supervisor briefing.
+    /// These keywords are the ones confirmed present in the model-visible
+    /// hook_additional_context bytes after the harness cap trim (cas-5e4b).
     #[test]
-    fn test_supervisor_guidance_under_12kb() {
+    fn test_supervisor_guidance_hard_rules() {
+        let guide = supervisor_guidance();
+        for keyword in [
+            "AskUserQuestion",
+            "SendMessage",
+            "coordination",
+            "Never close",
+            "Never implement",
+            "Never monitor",
+            "End your turn",
+        ] {
+            assert!(
+                guide.contains(keyword),
+                "supervisor_guidance() missing Hard Rule keyword: {keyword:?}"
+            );
+        }
+    }
+
+    /// The checklist is a separate skill invocable via /cas-supervisor-checklist.
+    /// Bundling it into supervisor_guidance() would push the SessionStart
+    /// payload over the ~10KB harness cap (cas-ecd5, 2026-06-01).
+    #[test]
+    fn test_supervisor_guidance_no_checklist() {
         let guide = supervisor_guidance();
         assert!(
-            guide.len() < 12_288,
-            "supervisor_guidance is {} bytes — over the 12KB ceiling. \
+            !guide.contains("# Supervisor Checklist"),
+            "supervisor_guidance() must not inline the checklist — \
+             it is invocable separately via /cas-supervisor-checklist"
+        );
+        // Cross-check: the checklist skill itself must still exist.
+        let checklist = extract_body(CHECKLIST_GUIDE);
+        assert!(
+            checklist.contains("# Supervisor Checklist"),
+            "CHECKLIST_GUIDE must still contain its content (invocable on demand)"
+        );
+    }
+
+    /// SessionStart additionalContext gets truncated by the Claude Code harness
+    /// once the payload exceeds its ~10KB threshold (measured empirically by
+    /// cas-ecd5, 2026-06-01). 8KB leaves ~2KB headroom for SessionStart banners
+    /// (codemap freshness, agent identity, WIP banner) to fit alongside without
+    /// tripping truncation. See memory `project_session_start_truncation.md`.
+    #[test]
+    fn test_supervisor_guidance_under_8kb() {
+        let guide = supervisor_guidance();
+        assert!(
+            guide.len() < 8_192,
+            "supervisor_guidance is {} bytes — over the 8KB ceiling. \
              Move content into cas-supervisor/references/ instead of \
              inlining it in cas-supervisor.md.",
             guide.len()
@@ -1008,27 +1047,40 @@ This is the body content."#;
     /// mirrors are checked so neither surface silently drifts.
     #[test]
     fn test_skills_document_context_budgeting_cas_5787() {
-        for (label, content) in [
+        // Common markers required in all four skill files.
+        let common = [
+            "## Context budgeting",
+            "Immutable Core",
+            "Task Context",
+            "Ephemeral",
+            "project_session_start_truncation.md",
+            "references/",
+        ];
+        // Supervisor cap was lowered to 8KB (cas-5e4b); worker cap remains 12KB.
+        let supervisor_files = [
             ("claude cas-supervisor.md", SUPERVISOR_GUIDE),
-            ("claude cas-worker.md", WORKER_GUIDE),
             (
                 "codex cas-supervisor.md",
                 include_str!("builtins/codex/skills/cas-supervisor.md"),
             ),
+        ];
+        let worker_files = [
+            ("claude cas-worker.md", WORKER_GUIDE),
             (
                 "codex cas-worker.md",
                 include_str!("builtins/codex/skills/cas-worker.md"),
             ),
-        ] {
-            for required in [
-                "## Context budgeting",
-                "Immutable Core",
-                "Task Context",
-                "Ephemeral",
-                "project_session_start_truncation.md",
-                "12 KB",
-                "references/",
-            ] {
+        ];
+        for (label, content) in supervisor_files {
+            for required in common.iter().chain(["8 KB"].iter()) {
+                assert!(
+                    content.contains(required),
+                    "{label} missing required Context-budgeting marker: {required:?}"
+                );
+            }
+        }
+        for (label, content) in worker_files {
+            for required in common.iter().chain(["12 KB"].iter()) {
                 assert!(
                     content.contains(required),
                     "{label} missing required Context-budgeting marker: {required:?}"
