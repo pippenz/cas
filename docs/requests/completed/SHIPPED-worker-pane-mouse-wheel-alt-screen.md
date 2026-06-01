@@ -1,13 +1,24 @@
 ---
 from: pippenz (Penguinz)
 date: 2026-05-07
+resolved: 2026-06-01
 priority: P1
-cas_task: cas-d5fa
+cas_task: cas-d5fa, cas-f93a
+status: SHIPPED
 ---
 
 # Worker pane: mouse wheel / touch scroll does nothing while inner TUI is in alt-screen
 
-Filed previously without a fix landing — re-filing with deeper instrumentation so the next attempt has a target.
+Filed previously without a fix landing — re-filed with deeper instrumentation, then resolved in two passes.
+
+## Resolution
+
+Shipped in two commits:
+
+1. **`53a7bf4` (cas-d5fa, 2026-05-07)** — added alt-screen detection on `Pane::feed` and a wheel-event PTY-forwarding path in `cas-cli/src/ui/factory/app/sidecar_and_selection.rs::alt_screen_scroll_input`. Initially forwarded `ESC[A` × 3 (arrow keys), which did NOT fix the user-visible symptom — arrow keys land in Claude Code's prompt-input box and cycle previous-prompt history, not the transcript.
+2. **`678f75b` (cas-f93a, 2026-06-01)** — swapped the wheel payload to `ESC[5~` / `ESC[6~` (PgUp / PgDn). Empirical A/B by the user confirmed PgUp/PgDn correctly scrolls Claude Code's transcript. Wheel now rides the same byte payload as the existing PgUp/PgDn forwarding path.
+
+Effective from cas builds containing `678f75b` (post-v2.17.3 dev / next tagged release). Penguinz-side note: previously-referenced phantom task `cas-c08d` did not exist in the cas-src CAS instance and has been removed from frontmatter.
 
 ## Affected version
 
@@ -69,6 +80,34 @@ This is the well-known alt-screen scroll trap. Tmux faced the same call ([tmux#3
 **Right behavior for CAS:** when the focused worker pane's inner process is in alt-screen mode, **forward wheel events to the inner process as `MouseEvent::ScrollUp/ScrollDown`** (Claude Code consumes these and scrolls its own transcript), instead of consuming them for `Pane::scroll`.
 
 CAS already has a forwarding path for keyboard input (`ClientMessage::Input`); this is plumbing the existing path for mouse-wheel events when the inner TTY has alt-screen active.
+
+### Concrete fix prescription
+
+Two changes, in order:
+
+1. **`cas_mux::pane::Pane` — expose alt-screen state per pane.** `ghostty_vt` already knows which screen is active (primary vs alternate). Surface that as a `Pane::is_alt_screen() -> bool` (or similar) so the client can gate its scroll-routing decision on the current pane mode rather than guessing from the pane class.
+
+2. **`cas::ui::factory::app::FactoryApp::scroll_focused_pane` — branch on that flag.** Pseudo-shape:
+
+   ```text
+   fn scroll_focused_pane(&mut self, direction: ScrollDir) {
+       let pane = self.focused_pane();
+       if pane.is_alt_screen() {
+           // Forward as input: serialize crossterm MouseEvent::ScrollUp/ScrollDown
+           // to the SGR mouse-wheel sequence (CSI < 64 ; Cx ; Cy M for up,
+           // 65 for down) and emit ClientMessage::Input. Inner TUI (Claude Code)
+           // consumes it and paginates its own transcript.
+           self.send_input(serialize_wheel(direction, pane.cursor_pos()));
+       } else {
+           // Primary screen — existing path: ask cas_mux to move the viewport.
+           self.pane_scroll(pane.id(), direction);
+       }
+   }
+   ```
+
+   The `send_input` path already exists for keyboard events; this just funnels wheel events through it when alt-screen is active. The else branch is the current (broken-on-alt-screen, fine-on-primary) `Pane::scroll` path unchanged.
+
+3. **Apply the same branch to PgUp/PgDn handlers** — same root cause when the focused pane is in alt-screen.
 
 ### Secondary issue (don't lose track)
 
