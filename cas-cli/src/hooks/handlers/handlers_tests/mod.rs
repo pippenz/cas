@@ -6,3 +6,4 @@ mod preferences_context;
 mod reviews;
 mod ripple_path_scope;
 mod send_message_autoroute;
+mod supervisor_reminder;
