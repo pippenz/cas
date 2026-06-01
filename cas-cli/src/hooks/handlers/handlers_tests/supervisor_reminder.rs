@@ -9,6 +9,36 @@ use cas_core::hooks::types::{HookInput, HookSpecificOutput};
 
 use crate::hooks::handlers::handle_user_prompt_submit;
 
+// Env helpers — `resolve_role` falls back to `CAS_AGENT_ROLE` when
+// `HookInput::agent_role` is None/blank, so tests running inside a real
+// factory supervisor process inherit a "supervisor" role from the parent
+// env. Serialize through the shared `super::env_lock()` and reset the env
+// per test to prevent that leak.
+
+struct RoleGuard(Option<String>);
+
+impl Drop for RoleGuard {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.0 {
+                Some(v) => std::env::set_var("CAS_AGENT_ROLE", v),
+                None => std::env::remove_var("CAS_AGENT_ROLE"),
+            }
+        }
+    }
+}
+
+fn set_role_env(role: Option<&str>) -> RoleGuard {
+    let prev = std::env::var("CAS_AGENT_ROLE").ok();
+    unsafe {
+        match role {
+            Some(v) => std::env::set_var("CAS_AGENT_ROLE", v),
+            None => std::env::remove_var("CAS_AGENT_ROLE"),
+        }
+    }
+    RoleGuard(prev)
+}
+
 fn supervisor_input() -> HookInput {
     HookInput {
         session_id: "test-supervisor-session".to_string(),
@@ -47,6 +77,8 @@ fn non_factory_input() -> HookInput {
 /// Both checked together since they require the same setup.
 #[test]
 fn supervisor_gets_reminder_within_512_bytes() {
+    let _g = super::env_lock();
+    let _role = set_role_env(Some("supervisor"));
     let input = supervisor_input();
     let output = handle_user_prompt_submit(&input, None).unwrap();
 
@@ -67,6 +99,8 @@ fn supervisor_gets_reminder_within_512_bytes() {
 /// AC1: The reminder contains all 6 Hard Rule keywords.
 #[test]
 fn supervisor_reminder_contains_all_6_hard_rule_keywords() {
+    let _g = super::env_lock();
+    let _role = set_role_env(Some("supervisor"));
     let input = supervisor_input();
     let output = handle_user_prompt_submit(&input, None).unwrap();
 
@@ -97,6 +131,8 @@ fn supervisor_reminder_contains_all_6_hard_rule_keywords() {
 /// AC2: Worker sessions return empty (no reminder injected).
 #[test]
 fn worker_does_not_get_supervisor_reminder() {
+    let _g = super::env_lock();
+    let _role = set_role_env(Some("worker"));
     let input = worker_input();
     let output = handle_user_prompt_submit(&input, None).unwrap();
 
@@ -110,6 +146,8 @@ fn worker_does_not_get_supervisor_reminder() {
 /// AC2: Non-factory (generic Claude) sessions return empty.
 #[test]
 fn non_factory_does_not_get_supervisor_reminder() {
+    let _g = super::env_lock();
+    let _role = set_role_env(None);
     let input = non_factory_input();
     let output = handle_user_prompt_submit(&input, None).unwrap();
 
@@ -125,6 +163,8 @@ fn non_factory_does_not_get_supervisor_reminder() {
 /// knows which role it's been assigned.
 #[test]
 fn supervisor_reminder_contains_identity_context() {
+    let _g = super::env_lock();
+    let _role = set_role_env(Some("supervisor"));
     let input = supervisor_input();
     let output = handle_user_prompt_submit(&input, None).unwrap();
 
