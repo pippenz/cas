@@ -55,7 +55,7 @@ fn allow_reason(out: &cas_core::hooks::types::HookOutput) -> Option<String> {
 
 #[test]
 fn supervisor_write_is_auto_approved() {
-    let _g = env_lock();
+    let _g = super::env_lock();
     let _role = set_role_env(Some("supervisor"));
     let input = input_for("Write", Some("/tmp/foo.txt"));
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -69,7 +69,7 @@ fn supervisor_write_is_auto_approved() {
 
 #[test]
 fn worker_write_is_auto_approved() {
-    let _g = env_lock();
+    let _g = super::env_lock();
     let _role = set_role_env(Some("worker"));
     let input = input_for("Write", Some("/tmp/foo.txt"));
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -79,7 +79,7 @@ fn worker_write_is_auto_approved() {
 
 #[test]
 fn worker_edit_is_auto_approved() {
-    let _g = env_lock();
+    let _g = super::env_lock();
     let _role = set_role_env(Some("worker"));
     let input = input_for("Edit", Some("/tmp/foo.txt"));
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -89,7 +89,7 @@ fn worker_edit_is_auto_approved() {
 
 #[test]
 fn supervisor_bash_is_auto_approved() {
-    let _g = env_lock();
+    let _g = super::env_lock();
     let _role = set_role_env(Some("supervisor"));
     let input = input_for("Bash", None);
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -102,7 +102,7 @@ fn supervisor_bash_is_auto_approved() {
 
 #[test]
 fn supervisor_read_is_auto_approved() {
-    let _g = env_lock();
+    let _g = super::env_lock();
     let _role = set_role_env(Some("supervisor"));
     let input = input_for("Read", Some("/tmp/foo.txt"));
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -112,7 +112,7 @@ fn supervisor_read_is_auto_approved() {
 
 #[test]
 fn supervisor_notebook_edit_is_auto_approved() {
-    let _g = env_lock();
+    let _g = super::env_lock();
     let _role = set_role_env(Some("supervisor"));
     let input = input_for("NotebookEdit", Some("/tmp/n.ipynb"));
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -132,7 +132,7 @@ fn supervisor_notebook_edit_is_auto_approved() {
 
 #[test]
 fn supervisor_write_is_auto_approved_without_cas_root() {
-    let _g = env_lock();
+    let _g = super::env_lock();
     let _role = set_role_env(Some("supervisor"));
     let input = input_for("Write", Some("/tmp/foo.txt"));
     let out = handle_pre_tool_use(&input, None).expect("handler ok");
@@ -147,7 +147,7 @@ fn supervisor_write_is_auto_approved_without_cas_root() {
 
 #[test]
 fn worker_edit_is_auto_approved_without_cas_root() {
-    let _g = env_lock();
+    let _g = super::env_lock();
     let _role = set_role_env(Some("worker"));
     let input = input_for("Edit", Some("/tmp/foo.txt"));
     let out = handle_pre_tool_use(&input, None).expect("handler ok");
@@ -162,7 +162,7 @@ fn solo_user_write_without_cas_root_is_not_auto_approved() {
     // When CAS_AGENT_ROLE is unset AND cas_root is None, we must still
     // fall through to Claude Code's normal flow — the bypass is strictly
     // scoped to factory agents.
-    let _g = env_lock();
+    let _g = super::env_lock();
     let _role = set_role_env(None);
     let input = input_for("Write", Some("/tmp/foo.txt"));
     let out = handle_pre_tool_use(&input, None).expect("handler ok");
@@ -180,7 +180,7 @@ fn solo_user_write_without_cas_root_is_not_auto_approved() {
 fn solo_user_write_is_not_auto_approved() {
     // CAS_AGENT_ROLE unset — the handler must leave the permission decision
     // to Claude Code's normal flow so user-facing approvals keep working.
-    let _g = env_lock();
+    let _g = super::env_lock();
     let _role = set_role_env(None);
     let input = input_for("Write", Some("/tmp/foo.txt"));
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -195,7 +195,7 @@ fn solo_user_write_is_not_auto_approved() {
 fn factory_agent_unknown_tool_is_not_auto_approved() {
     // Tools outside the filesystem allowlist (e.g., Agent, Task, MCP) must
     // fall through so their specialized handling still runs.
-    let _g = env_lock();
+    let _g = super::env_lock();
     let _role = set_role_env(Some("worker"));
     let input = input_for("WebFetch", None);
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -212,7 +212,7 @@ fn factory_agent_unknown_tool_without_cas_root_is_not_auto_approved() {
     // hoisted `cas_root=None` path. Locks in the allowlist guard on the
     // rescue branch so a future refactor that drops the `contains()`
     // check fails the suite instead of silently broadening the bypass.
-    let _g = env_lock();
+    let _g = super::env_lock();
     let _role = set_role_env(Some("worker"));
     let input = input_for("WebFetch", None);
     let out = handle_pre_tool_use(&input, None).expect("handler ok");
@@ -256,18 +256,9 @@ fn factory_agent_unknown_tool_without_cas_root_is_not_auto_approved() {
 // never overrides them either.
 
 // ----------------------------------------------------------------------------
-// Env helpers — mirror the pattern in agent_worktree_block.rs. Required
-// because main's gate reads role from `CAS_AGENT_ROLE`, so every test
-// that exercises the gate mutates process env and must serialize.
+// Env helpers — use the shared process-wide mutex from mod.rs so that
+// concurrent tests across sibling modules don't race on CAS_AGENT_ROLE.
 // ----------------------------------------------------------------------------
-
-fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-    use std::sync::{Mutex, OnceLock};
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-}
 
 struct RoleGuard(Option<String>);
 
