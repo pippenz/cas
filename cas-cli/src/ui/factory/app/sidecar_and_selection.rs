@@ -17,25 +17,23 @@ pub enum ScrollAction {
     Done,
     /// The focused pane is in alt-screen mode and no overlay is suppressing
     /// forwarding.  The caller must send the appropriate PTY escape sequence:
-    /// [`SCROLL_UP_ARROWS`] / [`SCROLL_DOWN_ARROWS`] for wheel events, or
-    /// `\x1b[5~` / `\x1b[6~` for PgUp / PgDn.
+    /// [`SCROLL_UP_ARROWS`] / [`SCROLL_DOWN_ARROWS`] (PgUp / PgDn) to the PTY.
     AltScreen,
 }
 
-/// Number of lines scrolled per wheel tick (host scrollback) *and* the number
-/// of arrow-key repeats forwarded to an alt-screen PTY.
+/// Number of lines scrolled per wheel tick (host scrollback).
 pub const SCROLL_LINES: usize = 3;
 
-/// Arrow-up bytes forwarded to an alt-screen PTY on scroll-up (ESC\[A × [`SCROLL_LINES`]).
-pub const SCROLL_UP_ARROWS: &[u8] = b"\x1b[A\x1b[A\x1b[A";
-/// Arrow-down bytes forwarded to an alt-screen PTY on scroll-down (ESC\[B × [`SCROLL_LINES`]).
-pub const SCROLL_DOWN_ARROWS: &[u8] = b"\x1b[B\x1b[B\x1b[B";
+/// PgUp bytes forwarded to an alt-screen PTY on scroll-up (`\x1b[5~`).
+pub const SCROLL_UP_ARROWS: &[u8] = b"\x1b[5~";
+/// PgDn bytes forwarded to an alt-screen PTY on scroll-down (`\x1b[6~`).
+pub const SCROLL_DOWN_ARROWS: &[u8] = b"\x1b[6~";
 
-// Compile-time assertion: byte count must stay in sync with SCROLL_LINES.
-// Each arrow sequence is 3 bytes (ESC [ A/B).
+// Compile-time assertion: byte count must stay in sync with the sequences above.
+// PgUp (ESC [ 5 ~) and PgDn (ESC [ 6 ~) are each 4 bytes.
 const _: () = {
-    assert!(SCROLL_UP_ARROWS.len() == SCROLL_LINES * 3);
-    assert!(SCROLL_DOWN_ARROWS.len() == SCROLL_LINES * 3);
+    assert!(SCROLL_UP_ARROWS.len() == 4);
+    assert!(SCROLL_DOWN_ARROWS.len() == 4);
 };
 
 impl FactoryApp {
@@ -320,7 +318,7 @@ impl FactoryApp {
     ///
     /// Returns [`ScrollAction::AltScreen`] when the focused pane is in
     /// alt-screen mode and no overlay suppresses forwarding — the caller must
-    /// send [`SCROLL_UP_ARROWS`] (wheel) or `\x1b[5~` (PgUp) to the PTY.
+    /// send [`SCROLL_UP_ARROWS`] (`\x1b[5~`, PgUp) to the PTY.
     /// Returns [`ScrollAction::Done`] in all other cases (the scroll was
     /// handled internally by a dialog, sidecar, MC panel, or host scrollback).
     ///
@@ -359,8 +357,8 @@ impl FactoryApp {
     ///
     /// Mirror of [`handle_scroll_up`].  Returns [`ScrollAction::AltScreen`]
     /// when the focused pane is in alt-screen mode and no overlay suppresses
-    /// forwarding — the caller must send [`SCROLL_DOWN_ARROWS`] (wheel) or
-    /// `\x1b[6~` (PgDn) to the PTY.
+    /// forwarding — the caller must send [`SCROLL_DOWN_ARROWS`] (`\x1b[6~`,
+    /// PgDn) to the PTY.
     pub fn handle_scroll_down(&mut self) -> ScrollAction {
         if self.show_task_dialog {
             self.task_dialog_scroll =
@@ -1098,8 +1096,8 @@ mod tests {
     // pre- and post-conditions the daemon relies on:
     //
     //   1. `SCROLL_UP_ARROWS` / `SCROLL_DOWN_ARROWS` have the exact byte
-    //      shape (`ESC [ A` × `SCROLL_LINES`) the daemon documents and
-    //      sends. A typo in either constant would silently break the wheel
+    //      shape (`\x1b[5~` / `\x1b[6~`) the daemon documents and sends.
+    //      A typo in either constant would silently break the wheel
     //      forwarding without any production assertion firing.
     //   2. `show_changes_dialog` shortcuts the daemon's outer `if` — it
     //      consumes the wheel event even when the focused pane is in
@@ -1114,27 +1112,22 @@ mod tests {
     //      contract without updating this mirror, the table test fails.
     // =========================================================================
 
-    /// AC #3 (cas-72c3, point 1): the wheel-arrow byte constants must match
-    /// the documented shape — `ESC [ A` repeated `SCROLL_LINES` times for up,
-    /// `ESC [ B` repeated `SCROLL_LINES` times for down. The daemon forwards
-    /// these literals verbatim via `mux.send_input`, so a silent typo here
-    /// would translate to a broken wheel-to-PTY forward with no compile-time
-    /// or runtime guard.
+    /// AC #3 (cas-72c3, point 1): the wheel byte constants must match the
+    /// documented shape — PgUp (`\x1b[5~`) for up, PgDn (`\x1b[6~`) for
+    /// down.  The daemon forwards these literals verbatim via `mux.send_input`,
+    /// so a silent typo here would translate to a broken wheel-to-PTY forward
+    /// with no compile-time or runtime guard.
     #[test]
     fn scroll_arrow_consts_have_exact_byte_shape_cas_72c3() {
-        let expected_up: Vec<u8> = (0..SCROLL_LINES).flat_map(|_| b"\x1b[A".iter().copied()).collect();
         assert_eq!(
             SCROLL_UP_ARROWS,
-            expected_up.as_slice(),
-            "SCROLL_UP_ARROWS must be ESC[A repeated SCROLL_LINES times"
+            b"\x1b[5~",
+            "SCROLL_UP_ARROWS must be the PgUp sequence (ESC [ 5 ~)"
         );
-        let expected_down: Vec<u8> = (0..SCROLL_LINES)
-            .flat_map(|_| b"\x1b[B".iter().copied())
-            .collect();
         assert_eq!(
             SCROLL_DOWN_ARROWS,
-            expected_down.as_slice(),
-            "SCROLL_DOWN_ARROWS must be ESC[B repeated SCROLL_LINES times"
+            b"\x1b[6~",
+            "SCROLL_DOWN_ARROWS must be the PgDn sequence (ESC [ 6 ~)"
         );
     }
 
