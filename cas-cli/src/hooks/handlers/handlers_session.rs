@@ -265,6 +265,15 @@ pub fn handle_session_start(
         HookOutput::with_session_start_context(context.clone())
     };
 
+    // Emit reloadSkills when skill files have changed since this session last
+    // loaded them (cas-f9ad). Best-effort: failure to read/write sentinel/marker
+    // files is silently ignored so SessionStart never blocks on I/O errors.
+    let output = if detect_and_mark_skill_drift(cas_root, &input.session_id) {
+        output.with_reload_skills(true)
+    } else {
+        output
+    };
+
     // Record trace if dev mode is enabled
     if let Some(tracer) = DevTracer::get() {
         if tracer.should_trace_hooks() {
@@ -301,6 +310,56 @@ pub fn handle_session_start(
 /// Estimate token count (rough approximation: ~4 chars per token)
 pub(crate) fn estimate_tokens(s: &str) -> usize {
     s.len() / 4
+}
+
+// ─── Skill drift detection (cas-f9ad) ─────────────────────────────────────
+
+/// Check whether synced skill files have changed since *this* session last
+/// loaded them, and if so update the per-session marker so subsequent calls
+/// within the same session return `false`.
+///
+/// ## Mechanism
+///
+/// `cas update --sync` writes a **sentinel** file at
+/// `<cas_root>/skill_sync_sentinel` containing an opaque timestamp token
+/// that changes on every sync run.
+///
+/// Each session tracks the last sentinel token it acknowledged in a
+/// **per-session marker** file `<cas_root>/session_skills_seen_<session_id>`.
+///
+/// On every `SessionStart`:
+/// - No sentinel → no sync has ever run → `false`.
+/// - No marker   → session hasn't loaded skills yet → `true`, write marker.
+/// - Marker content matches sentinel → `false`.
+/// - Marker content differs          → `true`, update marker.
+///
+/// The comparison is content-based (not mtime-based) to be resilient to
+/// filesystem clock skew and backup/restore workflows.  The token written by
+/// the sync step is a nanosecond-resolution UNIX timestamp, so collisions are
+/// negligible in practice.
+///
+/// Failures (unreadable sentinel, unwritable marker, etc.) are silently
+/// treated as "no drift" so `SessionStart` never blocks on I/O errors.
+pub(crate) fn detect_and_mark_skill_drift(cas_root: &Path, session_id: &str) -> bool {
+    let sentinel_path = cas_root.join("skill_sync_sentinel");
+    let marker_path = cas_root.join(format!("session_skills_seen_{session_id}"));
+
+    // Read sentinel — absent means sync has never run, no drift.
+    let sentinel = match std::fs::read_to_string(&sentinel_path) {
+        Ok(s) if !s.is_empty() => s,
+        _ => return false,
+    };
+
+    // Read per-session marker — absent means session hasn't acked any sync.
+    let marker = std::fs::read_to_string(&marker_path).unwrap_or_default();
+
+    if sentinel == marker {
+        return false;
+    }
+
+    // Drift detected: update marker and report.
+    let _ = std::fs::write(&marker_path, sentinel.as_bytes());
+    true
 }
 
 /// Build the opt-in Phase 3 (cas-3efe) integrations banner.

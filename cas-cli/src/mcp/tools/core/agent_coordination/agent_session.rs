@@ -132,7 +132,7 @@ impl CasCore {
         // eliminate.
         use crate::hooks::HookSpecificOutput;
         let context = match output.hook_specific_output {
-            Some(HookSpecificOutput::SessionStart { additional_context }) => Some(additional_context),
+            Some(HookSpecificOutput::SessionStart { additional_context, .. }) => Some(additional_context),
             // None variants below are unreachable in practice (handle_session_start
             // never emits these shapes), but pattern-matching them explicitly
             // makes the invariant load-bearing on the type system rather than on

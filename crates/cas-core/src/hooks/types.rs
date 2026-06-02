@@ -172,6 +172,16 @@ pub enum HookSpecificOutput {
     SessionStart {
         #[serde(rename = "additionalContext")]
         additional_context: String,
+        /// Ask the session to re-scan skill dirs and reload skill markdown without
+        /// a daemon restart. Emitted when `cas update --sync` has written new skill
+        /// content since this session last loaded skills.
+        ///
+        /// Absent (None) when no drift is detected — `skip_serializing_if` keeps
+        /// the field out of the JSON payload entirely in that case, matching
+        /// Claude Code's expectation that unknown `false`-ish booleans may be
+        /// omitted.
+        #[serde(rename = "reloadSkills", skip_serializing_if = "Option::is_none")]
+        reload_skills: Option<bool>,
     },
     PermissionRequest {
         #[serde(rename = "permissionDecision")]
@@ -225,9 +235,37 @@ impl HookOutput {
         Self {
             hook_specific_output: Some(HookSpecificOutput::SessionStart {
                 additional_context: context,
+                reload_skills: None,
             }),
             ..Default::default()
         }
+    }
+
+    /// Set `reloadSkills: true` on an existing `SessionStart` output, or create
+    /// a minimal `SessionStart` output when the current output is empty.
+    ///
+    /// Has no effect when `reload` is `false` and there is no existing
+    /// `SessionStart` output — this avoids accidentally emitting an empty
+    /// `hookSpecificOutput` payload for non-SessionStart events.
+    pub fn with_reload_skills(mut self, reload: bool) -> Self {
+        match self.hook_specific_output {
+            Some(HookSpecificOutput::SessionStart {
+                ref mut reload_skills,
+                ..
+            }) => {
+                *reload_skills = Some(reload);
+            }
+            None if reload => {
+                // No existing output yet — emit a minimal SessionStart so
+                // `reloadSkills` has a valid hookEventName wrapper.
+                self.hook_specific_output = Some(HookSpecificOutput::SessionStart {
+                    additional_context: String::new(),
+                    reload_skills: Some(true),
+                });
+            }
+            _ => {}
+        }
+        self
     }
 
     /// PreToolUse permission decision. `decision` must be `"allow"`, `"deny"`,

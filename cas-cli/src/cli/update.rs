@@ -274,6 +274,12 @@ fn sync_claude_files(cli: &Cli, cas_root_param: Option<&Path>) -> anyhow::Result
     let builtin_result =
         sync_all_builtins_for_harness(cas_mux::SupervisorCli::Claude, &claude_dir)?;
 
+    // After all skill writes complete, refresh the skill-sync sentinel so that
+    // live sessions can detect the new content and emit `reloadSkills: true`
+    // on their next SessionStart (cas-f9ad). Best-effort: failure to write the
+    // sentinel is non-fatal; the hot-reload feature simply won't fire.
+    write_skill_sync_sentinel(&cas_root);
+
     // Sync factory tooling helper templates.
     let factory_tooling_result = match factory_tooling::setup_factory_tooling(project_root) {
         Ok(summary) => {
@@ -1072,6 +1078,26 @@ fn format_elapsed(duration: Duration) -> String {
     } else {
         format!("{}ms", duration.as_millis())
     }
+}
+
+/// Write (or refresh) the skill-sync sentinel file in `<cas_root>`.
+///
+/// The sentinel stores a nanosecond-resolution UNIX timestamp token that
+/// changes on every successful `cas update --sync` run. `handle_session_start`
+/// compares this token against a per-session marker file to decide whether to
+/// emit `reloadSkills: true` (cas-f9ad).
+///
+/// Failures are silently ignored — the hot-reload feature simply won't fire
+/// when the sentinel is unwritable.
+fn write_skill_sync_sentinel(cas_root: &std::path::Path) {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let token = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos().to_string())
+        .unwrap_or_else(|_| "0".to_string());
+
+    let _ = std::fs::write(cas_root.join("skill_sync_sentinel"), token.as_bytes());
 }
 
 #[cfg(test)]

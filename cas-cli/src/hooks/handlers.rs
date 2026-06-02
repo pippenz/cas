@@ -273,6 +273,8 @@ mod handlers_state;
 pub(crate) mod session_hygiene;
 
 #[cfg(test)]
+pub(crate) use handlers_session::detect_and_mark_skill_drift;
+#[cfg(test)]
 pub(crate) use handlers_session::estimate_tokens;
 pub(crate) use handlers_session::{
     extract_learnings_sync, generate_session_summary_sync, session_learn_sync,
