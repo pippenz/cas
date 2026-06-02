@@ -499,4 +499,42 @@ mod tests {
         let retrieved = store.get(&id).unwrap();
         assert_eq!(retrieved.argument_hint, "[title] [priority?]");
     }
+
+    // cas-5be8: disallowed_tools round-trip
+    #[test]
+    fn test_skill_disallowed_tools_roundtrip() {
+        let (_temp, store) = create_test_store();
+
+        let id = store.generate_id().unwrap();
+        let mut skill = Skill::new(id.clone(), "Restricted Skill".to_string());
+        skill.disallowed_tools = vec![
+            "Write".to_string(),
+            "Edit".to_string(),
+            "NotebookEdit".to_string(),
+        ];
+        store.add(&skill).unwrap();
+
+        let retrieved = store.get(&id).unwrap();
+        assert_eq!(
+            retrieved.disallowed_tools,
+            vec!["Write", "Edit", "NotebookEdit"],
+            "disallowed_tools must survive a DB round-trip"
+        );
+    }
+
+    #[test]
+    fn test_skill_disallowed_tools_empty_roundtrip() {
+        let (_temp, store) = create_test_store();
+
+        let id = store.generate_id().unwrap();
+        let skill = Skill::new(id.clone(), "Open Skill".to_string());
+        // disallowed_tools defaults to empty Vec
+        store.add(&skill).unwrap();
+
+        let retrieved = store.get(&id).unwrap();
+        assert!(
+            retrieved.disallowed_tools.is_empty(),
+            "empty disallowed_tools must round-trip as empty"
+        );
+    }
 }
