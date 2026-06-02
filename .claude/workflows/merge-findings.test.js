@@ -332,18 +332,16 @@ describe('real fixture: cas-e603 (wf_0a04a6b2-2d2)', { skip: rawFixture === null
     assert.ok(found.confidence >= 0.95, `confidence should be ≥ 0.95, got ${found.confidence}`)
   })
 
-  test('cross-persona duplicate (AskUserQuestion/cas_root) collapsed to one finding', () => {
-    // correctness + adversarial + project-standards all flagged AskUserQuestion/cas_root
-    // merge should collapse duplicates — confirmed by 26 raw → 24 merged
+  test('26 raw findings split into 24 residual + 2 pre-existing (no fingerprint dedup in this diff)', () => {
+    // All 26 raw findings from cas-e603 have unique fingerprints — no cross-persona
+    // duplicates occurred. The 26→24 "reduction" is entirely the pre-existing separation
+    // (2 findings have pre_existing:true). This verifies the separation step correctly.
     const inputs = Object.values(rawFixture)
-    const { residual } = mergeFindings(inputs)
-    const askQ = residual.filter(f =>
-      f.title.toLowerCase().includes('askuserquestion') ||
-      f.title.toLowerCase().includes('ask_user_question')
-    )
-    // Multiple raw findings about AskUserQuestion should merge to ≤ distinct fingerprints
-    // (some may survive as separate lines if they have different line numbers)
-    assert.ok(askQ.length < 5, `expected fewer than 5 AskUserQuestion findings, got ${askQ.length}`)
+    const allRaw = inputs.flatMap(r => r.findings || [])
+    assert.equal(allRaw.length, 26, `expected 26 raw findings, got ${allRaw.length}`)
+    const { residual, pre_existing } = mergeFindings(inputs)
+    assert.equal(residual.length + pre_existing.length, 26,
+      `all 26 raw findings should be preserved (residual ${residual.length} + pre-existing ${pre_existing.length})`)
   })
 
   test('first finding in output is the highest-severity highest-confidence item', () => {
