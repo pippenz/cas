@@ -34,20 +34,32 @@ fn test_configure_creates_settings() {
     assert!(settings.pointer("/hooks/PostToolUse").is_some());
     assert!(settings.pointer("/hooks/UserPromptSubmit").is_some());
 
-    // Exec-form fixture: hook entries must carry "args" array, not a "command" string.
-    // cas-9a60 re-adopts exec-form now that anthropics/claude-code#58441 is
-    // fixed in CC ≥ 2.1.142 (verified on CC 2.1.143).
-    let session_start_args = first_hook_args(&settings, "SessionStart");
+    // Shell-form fixture: hook entries must carry a "command" string and NO
+    // "args" array. /doctor on CC 2.1.159 rejects type:"command" hooks that
+    // lack a string `command`, so the malformed cas-9a60 exec-form
+    // (`args` only, no `command`) silently disabled every hook. cas-c17b
+    // convergence: this matches teams.rs::factory_hooks_block.
+    let session_start_cmd = first_hook_command(&settings, "SessionStart");
     assert_eq!(
-        session_start_args,
-        Some(vec!["cas", "hook", "SessionStart"]),
-        "cas init should emit exec-form args for SessionStart hook"
+        session_start_cmd,
+        Some("cas hook SessionStart"),
+        "cas init should emit shell-form command for SessionStart hook"
     );
-    let stop_args = first_hook_args(&settings, "Stop");
     assert_eq!(
-        stop_args,
-        Some(vec!["cas", "hook", "Stop"]),
-        "cas init should emit exec-form args for Stop hook"
+        first_hook_args(&settings, "SessionStart"),
+        None,
+        "cas init SessionStart hook must not carry an args array"
+    );
+    let stop_cmd = first_hook_command(&settings, "Stop");
+    assert_eq!(
+        stop_cmd,
+        Some("cas hook Stop"),
+        "cas init should emit shell-form command for Stop hook"
+    );
+    assert_eq!(
+        first_hook_args(&settings, "Stop"),
+        None,
+        "cas init Stop hook must not carry an args array"
     );
 
     // Permissions should always be written
@@ -306,16 +318,23 @@ env = { CAS_LOG = "debug" }
 // which isn't available in test environments. The function now uses `claude mcp add`.
 
 // =============================================================================
-// Characterization tests for hook emission format (cas-9a60)
+// Characterization tests for hook emission format (shell-form)
 //
-// cas-7ecd migrated emitters to exec-form "args" arrays.  cas-c17b reverted
-// them back to shell-form "command" strings because Claude Code 2.1.139's
-// /doctor validator rejected exec-form before the agent loaded, blocking every
-// factory worker spawn (anthropics/claude-code#58441).
+// get_cas_hooks_config emits shell-form `"command": "cas hook <Event>"`
+// (and `"command": "cas factory check-staleness"`), converging on the same
+// shape as ui/factory/daemon/runtime/teams.rs::factory_hooks_block (cas-c17b).
 //
-// cas-9a60 re-adopts exec-form now that #58441 is fixed in CC ≥ 2.1.142.
-// exec-form remains recognised in has_cas_hook_entries / strip_cas_hooks for
-// backward-compat with existing pre-revert settings.json files on disk.
+// The cas-9a60 exec-form attempt emitted `{"type":"command","args":[...]}`
+// with NO top-level `command` string. That is malformed: CC's /doctor requires
+// a string `command` for every type:"command" hook, so it rejected all 12
+// entries and the harness silently disabled every CAS hook (see
+// docs/requests/BUG-hooks-exec-form-missing-command.md). #58441 closing was a
+// red herring — valid exec-form is `{"command":"cas","args":[...]}` and
+// `command` is required regardless.
+//
+// Both legacy on-disk forms (malformed exec-form `args[0]=="cas"` and
+// shell-form) remain recognised by has_cas_hook_entries / strip_cas_hooks so
+// users upgrade cleanly on the next `cas init`.
 // =============================================================================
 
 /// Extract the first hook entry's "command" value for a given event name.
@@ -393,40 +412,39 @@ fn nth_hook_args<'a>(
         })
 }
 
-/// Confirm: hooks emitted by get_cas_hooks_config use exec-form
-/// `"args": ["cas", "hook", "<Event>"]`.  cas-9a60 re-adopts exec-form now
-/// that anthropics/claude-code#58441 is fixed in CC ≥ 2.1.142.
+/// AC#2 — every event hook emitted by get_cas_hooks_config carries the
+/// shell-form `"command": "cas hook <Event>"` string. /doctor on CC 2.1.159
+/// requires this string; the malformed cas-9a60 exec-form lacked it.
 #[test]
-fn hook_entries_emit_exec_form_args() {
+fn hook_entries_emit_shell_form_command() {
     let config = get_cas_hooks_config(&HookConfig::default());
 
-    for (event, expected_args) in &[
-        ("SessionStart", vec!["cas", "hook", "SessionStart"]),
-        ("SessionEnd", vec!["cas", "hook", "SessionEnd"]),
-        ("Stop", vec!["cas", "hook", "Stop"]),
-        ("SubagentStart", vec!["cas", "hook", "SubagentStart"]),
-        ("SubagentStop", vec!["cas", "hook", "SubagentStop"]),
-        ("PostToolUse", vec!["cas", "hook", "PostToolUse"]),
-        ("PreToolUse", vec!["cas", "hook", "PreToolUse"]),
-        ("UserPromptSubmit", vec!["cas", "hook", "UserPromptSubmit"]),
-        ("PermissionRequest", vec!["cas", "hook", "PermissionRequest"]),
-        ("Notification", vec!["cas", "hook", "Notification"]),
-        ("PreCompact", vec!["cas", "hook", "PreCompact"]),
+    for (event, expected_command) in &[
+        ("SessionStart", "cas hook SessionStart"),
+        ("SessionEnd", "cas hook SessionEnd"),
+        ("Stop", "cas hook Stop"),
+        ("SubagentStart", "cas hook SubagentStart"),
+        ("SubagentStop", "cas hook SubagentStop"),
+        ("PostToolUse", "cas hook PostToolUse"),
+        ("PreToolUse", "cas hook PreToolUse"),
+        ("UserPromptSubmit", "cas hook UserPromptSubmit"),
+        ("PermissionRequest", "cas hook PermissionRequest"),
+        ("Notification", "cas hook Notification"),
+        ("PreCompact", "cas hook PreCompact"),
     ] {
         assert_eq!(
-            first_hook_args(&config, event),
-            Some(expected_args.clone()),
-            "{event} hook must carry exec-form args array (cas-9a60)"
+            first_hook_command(&config, event),
+            Some(*expected_command),
+            "{event} hook must carry shell-form command string"
         );
     }
 }
 
-/// Confirm: hooks emitted by get_cas_hooks_config do NOT use shell-form
-/// `"command": "..."` — only exec-form `"args": [...]` is emitted (cas-9a60).
-/// Shell-form hooks in existing user settings files are still recognised by
-/// has_cas_hook_entries — see test_exec_form_still_detected_by_has_cas_hook_entries.
+/// AC#2 — no event hook leaks an `"args"` array. The malformed cas-9a60
+/// exec-form put the executable in args[0] with no top-level command; this
+/// guards against any regression back to that shape.
 #[test]
-fn hook_entries_do_not_emit_shell_form_command() {
+fn hook_entries_do_not_emit_args_array() {
     let config = get_cas_hooks_config(&HookConfig::default());
 
     for event in &[
@@ -443,21 +461,116 @@ fn hook_entries_do_not_emit_shell_form_command() {
         "PreCompact",
     ] {
         assert_eq!(
-            first_hook_command(&config, event),
+            first_hook_args(&config, event),
             None,
-            "{event} hook must not carry shell-form command string after cas-9a60 exec-form re-adoption"
+            "{event} hook must not carry an exec-form args array"
         );
     }
 }
 
-/// AC#4 — has_cas_hook_entries still detects exec-form settings generated by
-/// pre-cas-c17b CAS versions.  Users who ran `cas hook install` on older CAS
-/// will have exec-form entries; detection must not regress.
+/// AC#2 — exhaustive shape check: walk EVERY hook object under
+/// `hooks.*[].hooks[]` and assert each has a string `command` and NO `args`
+/// key. This catches any future entry that forgets `command` or reintroduces
+/// `args`, including ones the per-event helpers above don't cover.
 #[test]
-fn test_exec_form_still_detected_by_has_cas_hook_entries() {
-    // Exec-form: realistic shape generated by CAS before cas-c17b (cas-7ecd era),
-    // including matcher, timeout, and async fields as pre-cas-c17b CAS actually wrote.
-    let exec_form = serde_json::json!({
+fn every_emitted_hook_object_has_command_and_no_args() {
+    let config = get_cas_hooks_config(&HookConfig::default());
+    let hooks = config
+        .get("hooks")
+        .and_then(|h| h.as_object())
+        .expect("hooks object missing");
+
+    let mut hook_objects = 0usize;
+    for (event, entries) in hooks {
+        let entries = entries
+            .as_array()
+            .unwrap_or_else(|| panic!("{event} entries is not an array"));
+        for entry in entries {
+            let hook_list = entry
+                .get("hooks")
+                .and_then(|h| h.as_array())
+                .unwrap_or_else(|| panic!("{event} entry missing hooks array"));
+            for hook in hook_list {
+                hook_objects += 1;
+                let cmd = hook.get("command").and_then(|c| c.as_str());
+                assert!(
+                    cmd.is_some(),
+                    "{event} hook object lacks string command: {hook}"
+                );
+                assert!(
+                    hook.get("args").is_none(),
+                    "{event} hook object must not carry args key: {hook}"
+                );
+                assert_eq!(hook.get("type").and_then(|t| t.as_str()), Some("command"));
+            }
+        }
+    }
+
+    // 12 events x 1 hook object (cc160 added MessageDisplay), plus the extra
+    // SessionStart staleness entry = 13.
+    assert_eq!(
+        hook_objects, 13,
+        "expected exactly 13 hook objects (12 events + factory check-staleness)"
+    );
+}
+
+/// AC#2 — the second SessionStart entry is the factory staleness check, and it
+/// emits exactly `cas factory check-staleness` in shell-form with no args.
+#[test]
+fn session_start_check_staleness_emits_shell_form() {
+    let config = get_cas_hooks_config(&HookConfig::default());
+    let staleness_cmd = nth_hook_command(&config, "SessionStart", 1);
+    assert_eq!(
+        staleness_cmd,
+        Some("cas factory check-staleness"),
+        "check-staleness entry under SessionStart must be shell-form command"
+    );
+    // And no exec-form args leak on the staleness entry.
+    let staleness_args = nth_hook_args(&config, "SessionStart", 1);
+    assert!(
+        staleness_args.is_none(),
+        "check-staleness entry must not carry an exec-form args array"
+    );
+}
+
+/// AC#4 — round-trip: the freshly-emitted shell-form config is detected by
+/// has_cas_hook_entries, fully stripped by strip_cas_hooks (hooks key gone),
+/// and a second strip is a no-op (idempotent re-`cas init`).
+#[test]
+fn emitted_config_round_trips_through_detect_and_strip() {
+    let mut config = get_cas_hooks_config(&HookConfig::default());
+
+    assert!(
+        has_cas_hook_entries(&config),
+        "freshly-emitted shell-form config must be detected as CAS hooks"
+    );
+
+    let stripped = strip_cas_hooks(&mut config);
+    assert!(stripped, "strip_cas_hooks must report removal of CAS hooks");
+    assert!(
+        config.get("hooks").is_none(),
+        "hooks key must be gone after stripping an all-CAS config"
+    );
+
+    // Idempotent: detection now false, second strip is a no-op.
+    assert!(
+        !has_cas_hook_entries(&config),
+        "no CAS hooks should remain after stripping"
+    );
+    assert!(
+        !strip_cas_hooks(&mut config),
+        "a second strip must be a no-op (idempotent re-init)"
+    );
+}
+
+/// AC#6 — regression: both legacy on-disk forms must still be detected and
+/// removed on the next `cas init`. Covers the malformed cas-9a60 exec-form
+/// (`args[0]=="cas"`, no command) and the cas-c17b shell-form.
+#[test]
+fn legacy_forms_still_detected_and_stripped() {
+    // Malformed exec-form: shape CAS actually wrote on cas-9a60 / cas-7ecd era,
+    // including matcher, timeout, and async fields. No top-level command.
+    let mut exec_form = serde_json::json!({
         "hooks": {
             "PreToolUse": [{
                 "matcher": "Read|Write|Edit|Glob|Grep|Bash|NotebookEdit",
@@ -466,44 +579,45 @@ fn test_exec_form_still_detected_by_has_cas_hook_entries() {
                     "args": ["cas", "hook", "PreToolUse"],
                     "timeout": 2000
                 }]
+            }],
+            "SessionStart": [{
+                "hooks": [{
+                    "type": "command",
+                    "args": ["cas", "factory", "check-staleness"],
+                    "timeout": 5000
+                }]
             }]
         }
     });
     assert!(
         has_cas_hook_entries(&exec_form),
-        "exec-form settings from pre-cas-c17b CAS must still be detected as CAS hooks"
+        "malformed exec-form settings from pre-cas-c17b CAS must still be detected"
+    );
+    assert!(
+        strip_cas_hooks(&mut exec_form),
+        "malformed exec-form CAS hooks must be stripped on re-init"
+    );
+    assert!(
+        exec_form.get("hooks").is_none(),
+        "all exec-form CAS hooks should be removed, leaving no hooks key"
     );
 
-    // Shell-form: shape generated by CAS after cas-c17b
-    let shell_form = serde_json::json!({
+    // Shell-form: shape generated by CAS after cas-c17b.
+    let mut shell_form = serde_json::json!({
         "hooks": {
             "PreToolUse": [{"hooks": [{"type": "command", "command": "cas hook PreToolUse"}]}]
         }
     });
     assert!(
         has_cas_hook_entries(&shell_form),
-        "shell-form settings from post-cas-c17b CAS must also be detected as CAS hooks"
+        "shell-form settings must also be detected as CAS hooks"
     );
-}
-
-/// Confirm: the second SessionStart hook entry emits `cas factory check-staleness`
-/// in exec-form.  `first_hook_args` only returns the first entry; this test
-/// uses `nth_hook_args(..., 1)` to reach the staleness-check entry explicitly.
-/// cas-9a60 re-adopts exec-form for all emitters; this guards the
-/// check-staleness emitter specifically (config_gen.rs).
-#[test]
-fn session_start_check_staleness_emits_exec_form() {
-    let config = get_cas_hooks_config(&HookConfig::default());
-    let staleness_args = nth_hook_args(&config, "SessionStart", 1);
-    assert_eq!(
-        staleness_args,
-        Some(vec!["cas", "factory", "check-staleness"]),
-        "check-staleness entry under SessionStart must use exec-form args (cas-9a60)"
-    );
-    // Also confirm the second entry has no shell-form command leak.
-    let staleness_cmd = nth_hook_command(&config, "SessionStart", 1);
     assert!(
-        staleness_cmd.is_none(),
-        "check-staleness entry must not carry shell-form command string"
+        strip_cas_hooks(&mut shell_form),
+        "shell-form CAS hooks must be stripped on re-init"
+    );
+    assert!(
+        shell_form.get("hooks").is_none(),
+        "all shell-form CAS hooks should be removed, leaving no hooks key"
     );
 }
