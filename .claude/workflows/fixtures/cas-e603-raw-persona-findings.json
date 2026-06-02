@@ -1,0 +1,556 @@
+{
+  "adversarial": {
+    "findings": [
+      {
+        "title": "AskUserQuestion reminder never fires when cas_root=None",
+        "severity": "P2",
+        "file": "cas-cli/src/hooks/handlers/handlers_events/pre_tool.rs",
+        "line": 174,
+        "why_it_matters": "The AskUserQuestion intercept at line 174 is placed after the `cas_root=None` early-return at line 95\u201398. When a factory supervisor runs in a session where CAS is not initialized in the CWD (cas_root=None), the intercept is never reached and no routing reminder fires. This is exactly the early-session confusion scenario the feature targets. AskUserQuestion is not in FACTORY_AUTO_APPROVE_TOOLS so it also doesn't get the hoisted allow-pass-through \u2014 the hook returns empty. The UserPromptSubmit reminder compensates for most turns, but the in-the-moment PreToolUse signal is silently absent in this case.",
+        "autofix_class": "manual",
+        "owner": "review-fixer",
+        "confidence": 0.92,
+        "pre_existing": false,
+        "suggested_fix": "Hoist the AskUserQuestion guard above the `cas_root=None` early-return, alongside the Agent/worktree-isolation block (which is already hoisted for the same reason). The reminder needs no store access \u2014 it is pure env-var logic. Add a test mirroring `supervisor_write_is_auto_approved_without_cas_root` for the AskUserQuestion case.",
+        "evidence": [
+          "pre_tool.rs line 82\u201398: cas_root=None early-return fires before line 174",
+          "pre_tool.rs line 174: `if is_factory_agent && is_supervisor && tool_name == \"AskUserQuestion\"` \u2014 unreachable when cas_root is None",
+          "FACTORY_AUTO_APPROVE_TOOLS (line 868) does not include AskUserQuestion",
+          "Agent/worktree-isolation block at line 40 is explicitly hoisted before the cas_root check with the comment 'Placed before the cas_root check so the gate fires even if CAS isn't initialized'",
+          "No test in ask_user_question_remind.rs covers the `cas_root=None` path \u2014 tests always pass `Some(tmp.path())`"
+        ],
+        "requires_verification": false
+      },
+      {
+        "title": "Codex supervisor loses AskUserQuestion hard rule with no hook compensation",
+        "severity": "P2",
+        "file": "cas-cli/src/builtins/codex/skills/cas-supervisor.md",
+        "line": 26,
+        "why_it_matters": "The diff removes the AskUserQuestion hard rule from both Claude and Codex supervisor skill files. For Claude supervisors, the PreToolUse hook provides a compensating in-the-moment reminder. For Codex supervisors, there is no hook plumbing at all (acknowledged as out of scope). The net result: Codex supervisors running after this diff have zero guidance \u2014 no skill-level hard rule and no hook-level reminder \u2014 about AskUserQuestion routing. Any heterogeneous team using `cli=codex` for the supervisor will silently lose the behavior. This regression is undetected by the test suite.",
+        "autofix_class": "manual",
+        "owner": "human",
+        "confidence": 0.88,
+        "pre_existing": false,
+        "suggested_fix": "Either (a) keep the AskUserQuestion hard rule in the Codex supervisor skill since there is no hook to compensate, or (b) add a test that explicitly asserts the Codex skill still contains the AskUserQuestion routing guidance, making the gap visible and intentional.",
+        "evidence": [
+          "cas-supervisor.md (Claude) diff: removes line '- **Never use AskUserQuestion for agent communication.**'",
+          "cas-supervisor.md (Codex) diff: removes same line",
+          "pre_tool.rs intercept guards on harness_policy::is_supervisor_from_env() \u2014 Codex has no PreToolUse hook plumbing",
+          "Intent doc states 'Codex parity is out of scope (no hook plumbing exists there \u2014 gap documented)' but the ONLY fallback (the skill-level hard rule) is also removed",
+          "No test asserts the Codex supervisor skill still mentions AskUserQuestion after this diff"
+        ]
+      },
+      {
+        "title": "Separate static mutexes for CAS_AGENT_ROLE in harness_policy vs handlers_tests",
+        "severity": "P2",
+        "file": "cas-cli/src/hooks/handlers/handlers_tests/mod.rs",
+        "line": 22,
+        "why_it_matters": "The diff correctly consolidates all handlers_tests submodules onto a single shared static lock in mod.rs. However, harness_policy.rs::tests (line 164) and close_ops.rs (line 3950) each still have their own independent static locks. All three locks protect mutations of the same process-wide environment variable CAS_AGENT_ROLE. When `cargo test` runs with the default thread pool (all tests in the same binary share a process), harness_policy env-fallback tests can race with the new ask_user_question_remind and supervisor_reminder tests, producing flaky failures. The diff adds new env-mutating tests but does not address the cross-module race.",
+        "autofix_class": "gated_auto",
+        "owner": "review-fixer",
+        "confidence": 0.85,
+        "pre_existing": true,
+        "suggested_fix": "Promote the env_lock to a crate-level static (e.g., in a test_utils module or as `pub(crate) fn env_lock()` in the crate root's `#[cfg(test)]` block) and have all three sites \u2014 handlers_tests/mod.rs, harness_policy.rs, close_ops.rs \u2014 reference the same static Mutex. Alternatively, add `-- --test-threads=1` to CI for this crate to serialize all tests.",
+        "evidence": [
+          "handlers_tests/mod.rs line 22: `static LOCK: OnceLock<Mutex<()>>`",
+          "harness_policy.rs line 166: separate `static LOCK: OnceLock<Mutex<()>>`",
+          "close_ops.rs line 3950: third separate `static LOCK: OnceLock<Mutex<()>>`",
+          "All three read/write CAS_AGENT_ROLE in the same process when `cargo test` is run without --test-threads=1"
+        ]
+      },
+      {
+        "title": "build_supervisor_reminder() has no truncation guard; can silently exceed 512 bytes",
+        "severity": "P3",
+        "file": "cas-cli/src/hooks/handlers/handlers_middle/prompt_capture.rs",
+        "line": 13,
+        "why_it_matters": "The 512-byte AC is enforced by a test, but the test uses default env-var fallbacks ('supervisor' and 'team'). The function interpolates CAS_AGENT_NAME and CAS_FACTORY_SESSION verbatim without truncation. If a factory daemon sets either to a long value (e.g., 400-char team/session name in a path-based session ID), the reminder will exceed 512 bytes at runtime without any test failure \u2014 the test never sees the long env var. Exceeding the hook output size may cause the harness to truncate or discard the reminder, defeating the feature.",
+        "autofix_class": "safe_auto",
+        "owner": "review-fixer",
+        "confidence": 0.82,
+        "pre_existing": false,
+        "suggested_fix": "Add a truncation guard: `let name = name.chars().take(40).collect::<String>(); let team = team.chars().take(60).collect::<String>();` before the format!(), and add a test that passes a 200-char CAS_AGENT_NAME and asserts the output stays \u2264512 bytes.",
+        "evidence": [
+          "prompt_capture.rs line 14: `let name = std::env::var(\"CAS_AGENT_NAME\").unwrap_or_else(|_| \"supervisor\".to_string());`",
+          "prompt_capture.rs line 15: `let team = std::env::var(\"CAS_FACTORY_SESSION\").unwrap_or_else(|_| \"team\".to_string());`",
+          "No truncation before format!() at line 16",
+          "supervisor_reminder.rs test `supervisor_gets_reminder_within_512_bytes` uses supervisor_input() which sets agent_role but NOT CAS_AGENT_NAME/CAS_FACTORY_SESSION env vars \u2014 test gets fallback values 'supervisor' and 'team' (combined payload 352 bytes), not the long values the daemon would actually inject"
+        ]
+      },
+      {
+        "title": "test_supervisor_guidance_hard_rules guard removed; End-your-turn keyword no longer enforced",
+        "severity": "P3",
+        "file": "cas-cli/src/builtins.rs",
+        "line": 932,
+        "why_it_matters": "The diff removes test_supervisor_guidance_hard_rules, which verified six Hard Rule keywords including 'End your turn', 'Never monitor', 'AskUserQuestion', etc. appear verbatim in supervisor_guidance(). The section heading is simultaneously renamed from '### End your turn' to '### What \"end your turn\" means', so the 'End your turn' keyword no longer appears as a heading. The heading change alone is harmless, but eliminating the keyword-coverage test means any future edit that removes or rewrites these Hard Rules will not be caught by the CI suite \u2014 a silent regression hazard on a critical behavioral constraint.",
+        "autofix_class": "safe_auto",
+        "owner": "review-fixer",
+        "confidence": 0.8,
+        "pre_existing": false,
+        "suggested_fix": "Restore the Hard Rules keyword test (or a variant of it). Update the 'End your turn' keyword to match the new heading text ('end your turn'). Since the AskUserQuestion rule is now in the hook (not the skill body), the test for that keyword can be removed, but the remaining 5 keywords should still be regression-guarded.",
+        "evidence": [
+          "builtins.rs diff removes test_supervisor_guidance_hard_rules (lines ~953-969 in base)",
+          "The diff renames '### End your turn' to '### What \"end your turn\" means' in both supervisor.md files",
+          "No replacement test checks for Hard Rule keyword presence in supervisor_guidance() output",
+          "supervisor_reminder.rs tests check the per-turn UserPromptSubmit reminder body, not the persistent SessionStart skill body"
+        ]
+      }
+    ],
+    "residual_risks": [
+      "The 'mcp__cs__coordination' tool name in the Codex supervisor.md (uses `__cs__`) differs from the Claude version (`mcp__cas__coordination`). This pre-existing discrepancy is visible in the REMINDER const in pre_tool.rs which uses `mcp__cas__coordination` \u2014 if a Codex supervisor agent ever does get hook plumbing, the MCP tool name mismatch would surface as a silent incorrect routing instruction.",
+      "The supervisor reminder returns early from handle_user_prompt_submit (line 43), permanently skipping prompt attribution (capture_prompt_for_attribution) and preference extraction for all factory supervisors. This behavioral change is undocumented and untested \u2014 a future call path that needs supervisor attribution data will silently get an empty result.",
+      "The combined supervisor_guidance() + checklist body size (estimated ~14KB post-diff) would exceed the new 12KB test cap if the diff is applied as written. The test test_supervisor_guidance_under_12kb would catch this at CI time, but it represents a design instability: re-bundling checklist reverses cas-5e4b and the sizing math may require additional content trimming in the supervisor skill files to pass."
+    ],
+    "testing_gaps": [
+      "No test covers the cas_root=None path for the AskUserQuestion intercept in pre_tool.rs",
+      "No test verifies that the Codex supervisor skill still contains AskUserQuestion routing guidance after the hard rule removal",
+      "The 512-byte test for build_supervisor_reminder() uses env-var fallback values, never testing with realistic long CAS_AGENT_NAME or CAS_FACTORY_SESSION values that the factory daemon would inject",
+      "No test documents or prevents the behavioral change that factory supervisor prompts skip attribution (capture_prompt_for_attribution) after the early-return addition",
+      "Cross-crate env lock isolation: no test harness enforces serialization between harness_policy::tests and handlers_tests when run in the same binary"
+    ],
+    "reviewer": "adversarial"
+  },
+  "testing": {
+    "findings": [
+      {
+        "title": "ask_user_question_remind: no test for cas_root=None + supervisor path",
+        "severity": "P2",
+        "file": "cas-cli/src/hooks/handlers/handlers_tests/ask_user_question_remind.rs",
+        "line": 92,
+        "why_it_matters": "The AskUserQuestion intercept fires AFTER the cas_root=None early return in pre_tool.rs (lines 94-98). A supervisor session with no CAS root silently returns empty instead of the reminder. No test documents this contract. A future refactor moving the intercept above the guard would cause solo users to see spurious reminders, and no test would catch it.",
+        "autofix_class": "manual",
+        "owner": "review-fixer",
+        "confidence": 0.88,
+        "evidence": [
+          "pre_tool.rs line 174: intercept fires AFTER the `cas_root` unwrap at lines 94-98, so cas_root=None exits before reaching it",
+          "ask_user_question_remind.rs line 97: all three tests pass `Some(tmp.path())`, covering only cas_root=Some path",
+          "No test calls `handle_pre_tool_use(&hook_input(\"AskUserQuestion\"), None)` with supervisor env set"
+        ],
+        "suggested_fix": "Add `supervisor_ask_user_question_no_reminder_without_cas_root` calling `handle_pre_tool_use(&hook_input(\"AskUserQuestion\"), None)` with role=supervisor, asserting `reminder_reason(&out).is_none()`.",
+        "pre_existing": false,
+        "requires_verification": false
+      },
+      {
+        "title": "ask_user_question_remind: no test for non-factory (solo) user calling AskUserQuestion",
+        "severity": "P2",
+        "file": "cas-cli/src/hooks/handlers/handlers_tests/ask_user_question_remind.rs",
+        "line": 132,
+        "why_it_matters": "Tests cover role=supervisor and role=worker but not CAS_AGENT_ROLE unset (solo user). If the `is_factory_agent` guard were accidentally removed, solo users would receive spurious role-routing reminders and no test would catch the regression. The analogous send_message_autoroute tests explicitly cover this path (`send_message_outside_factory_falls_through`).",
+        "autofix_class": "manual",
+        "owner": "review-fixer",
+        "confidence": 0.85,
+        "evidence": [
+          "ask_user_question_remind.rs covers role=supervisor (line 93) and role=worker (line 132) but not role=None",
+          "pre_tool.rs line 174 guard: `is_factory_agent && is_supervisor` \u2014 the factory check is the first gate",
+          "send_message_autoroute.rs line 236 has `fn send_message_outside_factory_falls_through` as the pattern to follow"
+        ],
+        "suggested_fix": "Add `non_factory_ask_user_question_no_reminder` that unsets CAS_AGENT_ROLE and asserts `reminder_reason(&out).is_none()`.",
+        "pre_existing": false,
+        "requires_verification": false
+      },
+      {
+        "title": "supervisor_reminder: no lower-bound assertion in size test",
+        "severity": "P3",
+        "file": "cas-cli/src/hooks/handlers/handlers_tests/supervisor_reminder.rs",
+        "line": 92,
+        "why_it_matters": "The test asserts `byte_len <= 512` but not `byte_len > 0`. An implementation returning `with_user_prompt_context(\"\")` would satisfy this test. The non-empty property is covered implicitly by the keyword test in a separate test function, making the sizing test incomplete on its own.",
+        "autofix_class": "safe_auto",
+        "owner": "review-fixer",
+        "confidence": 0.82,
+        "evidence": [
+          "supervisor_reminder.rs lines 92-96: checks `byte_len <= 512` with no lower bound assertion",
+          "build_supervisor_reminder() is non-empty today, but the test contract does not enforce it",
+          "`supervisor_reminder_contains_all_6_hard_rule_keywords` is a separate test providing implicit coverage"
+        ],
+        "suggested_fix": "Add `assert!(byte_len > 0, \"Supervisor reminder must not be empty\");` before the upper-bound check in `supervisor_gets_reminder_within_512_bytes`.",
+        "pre_existing": false,
+        "requires_verification": false
+      },
+      {
+        "title": "Deleted test_supervisor_guidance_hard_rules leaves AskUserQuestion skill coverage gap",
+        "severity": "P2",
+        "file": "cas-cli/src/builtins.rs",
+        "line": 953,
+        "why_it_matters": "The diff removes `test_supervisor_guidance_hard_rules` which asserted 7 keyword presence in the supervisor skill body, including 'AskUserQuestion'. It also removes the 'Never use AskUserQuestion' hard rule line from the skill. The hook tests cover the runtime reminder, but no static test validates the skill document teaches the routing constraint. If the hook were disabled, there would be no skill-body fallback and no test catching the drift.",
+        "autofix_class": "manual",
+        "owner": "review-fixer",
+        "confidence": 0.83,
+        "evidence": [
+          "Diff removes test_supervisor_guidance_hard_rules which checked 'AskUserQuestion' in supervisor_guidance()",
+          "Diff removes 'Never use AskUserQuestion for agent communication' from cas-supervisor.md Hard Rules",
+          "No new test in builtins.rs validates that at least the 6 remaining hard-rule keywords still appear in supervisor_guidance()"
+        ],
+        "suggested_fix": "Retain a partial `test_supervisor_guidance_hard_rules` covering the 6 remaining keywords (excluding AskUserQuestion which moved to hooks), to prevent silent drift of the skill body.",
+        "pre_existing": false,
+        "requires_verification": false
+      },
+      {
+        "title": "builtins.rs checklist-bundling tests contradict on-disk implementation",
+        "severity": "P1",
+        "file": "cas-cli/src/builtins.rs",
+        "line": 934,
+        "why_it_matters": "The diff changes supervisor_guidance() to bundle the checklist and inverts test_supervisor_guidance_loads. But builtins.rs on disk still has the OLD assertion (checklist must NOT be present) while the hook changes are already landed. If the builtins.rs changes land separately, the current disk state would fail cargo test. Requires atomic landing.",
+        "autofix_class": "manual",
+        "owner": "human",
+        "confidence": 0.8,
+        "evidence": [
+          "builtins.rs line 934-937 on disk: `assert!(!guide.contains(\"Supervisor Checklist\"))` \u2014 old assertion expecting checklist absent",
+          "Diff shows this flipped to `assert!(guide.contains(\"Supervisor Checklist\"))`",
+          "git diff shows builtins.rs NOT in the changed files for this branch \u2014 the diff is from a broader EPIC scope not yet merged"
+        ],
+        "pre_existing": false,
+        "requires_verification": true
+      },
+      {
+        "title": "supervisor_reminder env guard pattern: dual-source role state is fragile",
+        "severity": "P3",
+        "file": "cas-cli/src/hooks/handlers/handlers_tests/supervisor_reminder.rs",
+        "line": 79,
+        "why_it_matters": "Tests both set input.agent_role AND call set_role_env. Since resolve_role() prefers the input field, the env guard is load-bearing only for cross-test pollution prevention, not for behavior. A future test author copying this pattern that forgets to set input.agent_role will silently change from input-driven to env-driven resolution, potentially hiding bugs.",
+        "autofix_class": "advisory",
+        "owner": "human",
+        "confidence": 0.72,
+        "evidence": [
+          "supervisor_reminder.rs: supervisor_input() sets agent_role=Some('supervisor') on the HookInput struct",
+          "harness_policy.rs resolve_role() prefers agent_role field over env var",
+          "The env guard in supervisor_reminder tests is defensive, not behavioral, creating an implicit assumption that is not documented in the test"
+        ],
+        "pre_existing": false,
+        "requires_verification": false
+      }
+    ],
+    "residual_risks": [
+      "The hook-based AskUserQuestion reminder fires advisory-only (decision=allow, never deny). No test validates the downstream consequence \u2014 that the human receives the question instead of a worker. End-to-end coverage of the message routing outcome is absent.",
+      "build_supervisor_reminder() reads CAS_AGENT_NAME and CAS_FACTORY_SESSION from env with unwrap_or_else fallbacks. No test exercises the fallback values ('supervisor' and 'team') to confirm they are human-readable when env vars are absent in production.",
+      "The shared env_lock() consolidates CAS_AGENT_ROLE serialization, but send_message_autoroute tests also set CAS_AGENT_NAME and CAS_FACTORY_SESSION. The shared lock guards CAS_AGENT_ROLE only; the additional vars are not covered, creating a theoretical race window if ask_user_question_remind tests run concurrently with send_message_autoroute tests that depend on those vars."
+    ],
+    "testing_gaps": [
+      "No test for the PreToolUse AskUserQuestion path when cas_root=None with supervisor role \u2014 the reminder is unreachable in this scenario but no test documents this contract.",
+      "No test for the PreToolUse AskUserQuestion path when CAS_AGENT_ROLE is completely unset (solo user).",
+      "supervisor_gets_reminder_within_512_bytes does not assert byte_len > 0 \u2014 size contract is one-sided.",
+      "The deleted test_supervisor_guidance_hard_rules had 7 keyword assertions; no equivalent test verifies the 6 remaining Hard Rule keywords still appear in supervisor_guidance() after the AskUserQuestion line moves to hooks."
+    ],
+    "reviewer": "testing"
+  },
+  "project-standards": {
+    "reviewer": "project-standards",
+    "findings": [
+      {
+        "title": "CODEMAP.md not updated for two new test files",
+        "severity": "P3",
+        "file": ".claude/CODEMAP.md",
+        "line": 70,
+        "why_it_matters": "The project convention is to call out notable test files in CODEMAP.md \u2014 ripple_path_scope.rs has its own entry specifically because it covers a cross-cutting concern. ask_user_question_remind.rs (cas-e603) and supervisor_reminder.rs (cas-55ac) both cover new hook behaviours visible to every factory session. Omitting them means (a) the CODEMAP freshness gate will fire on the next supervisor session because new .rs files count as structural changes, blocking worker dispatch until someone runs /codemap, and (b) future workers navigating handlers_tests won't know these interceptors are tested.",
+        "autofix_class": "manual",
+        "owner": "review-fixer",
+        "confidence": 0.9,
+        "evidence": [
+          "handlers/handlers_tests/ripple_path_scope.rs has its own CODEMAP.md entry at line 70, showing the convention for notable test files",
+          "Two new test files added: handlers_tests/ask_user_question_remind.rs and handlers_tests/supervisor_reminder.rs \u2014 neither appears in CODEMAP.md",
+          "CODEMAP freshness gate in codemap.rs counts added files (type 'A') as structural changes; these two additions will trigger the gate"
+        ],
+        "pre_existing": false,
+        "suggested_fix": "Add to the handlers_tests bullet under `hooks/` in .claude/CODEMAP.md: `- handlers/handlers_tests/ask_user_question_remind.rs` \u2014 PreToolUse AskUserQuestion role-routing reminder (cas-e603); `- handlers/handlers_tests/supervisor_reminder.rs` \u2014 per-turn UserPromptSubmit Hard Rules reminder (cas-55ac)",
+        "requires_verification": false
+      },
+      {
+        "title": "CODEMAP handlers_middle description stale after prompt_capture.rs change",
+        "severity": "P3",
+        "file": ".claude/CODEMAP.md",
+        "line": 69,
+        "why_it_matters": "The CODEMAP entry for handlers_middle reads 'post-tool, session-stop, session-hygiene' but prompt_capture.rs \u2014 which lives there \u2014 now handles UserPromptSubmit (a pre-turn event) in addition to attribution capture. Workers consulting CODEMAP to find the UserPromptSubmit handler will not look in handlers_middle, increasing navigation time and encouraging incorrect grep-based search over the breadcrumb index.",
+        "autofix_class": "manual",
+        "owner": "review-fixer",
+        "confidence": 0.85,
+        "evidence": [
+          "CODEMAP line 69: `handlers/handlers_middle/ \u2014 post-tool, session-stop, session-hygiene; post_tool.rs carries is_file_within_project`",
+          "prompt_capture.rs is in handlers_middle/ and now exports handle_user_prompt_submit which fires on UserPromptSubmit (a pre-turn hook)",
+          "build_supervisor_reminder() added to prompt_capture.rs \u2014 a new public function not reflected in the module description"
+        ],
+        "pre_existing": false,
+        "suggested_fix": "Update the CODEMAP handlers_middle line to: `handlers/handlers_middle/ \u2014 post-tool, session-stop, session-hygiene, UserPromptSubmit supervisor reminder (prompt_capture.rs, cas-55ac); post_tool.rs carries is_file_within_project`",
+        "requires_verification": false
+      },
+      {
+        "title": "AskUserQuestion reminder silently drops when cas_root is None",
+        "severity": "P3",
+        "file": "cas-cli/src/hooks/handlers/handlers_events/pre_tool.rs",
+        "line": 174,
+        "why_it_matters": "The AskUserQuestion intercept (cas-e603) is placed after the `cas_root=None` early return (line 95-98). If a supervisor session runs without a resolved CAS root \u2014 the exact scenario the SendMessage hoisted block was added to handle (cas-7f33) \u2014 the advisory reminder never fires. The SendMessage advisory has a mirrored limitation, but unlike SendMessage (which has a deny fallback even without CAS root when cas_root=Some), this intercept has no hoist. The reminder is advisory-only so correctness is unaffected, but the hook misses every on-boarding session where CAS isn't yet initialized.",
+        "autofix_class": "advisory",
+        "owner": "review-fixer",
+        "confidence": 0.82,
+        "evidence": [
+          "pre_tool.rs line 95-98: `let cas_root = match cas_root { None => return Ok(HookOutput::empty()), Some(r) => r };`",
+          "pre_tool.rs line 174: `if is_factory_agent && is_supervisor && tool_name == \"AskUserQuestion\"` \u2014 placed AFTER the early return, not hoisted like the factory auto-approve block at line 82",
+          "All three tests in ask_user_question_remind.rs pass `Some(tmp.path())` as cas_root; no test covers the `None` path where the reminder would silently not fire"
+        ],
+        "pre_existing": false,
+        "suggested_fix": "Hoist the AskUserQuestion intercept above the `cas_root` early return, mirroring the pattern used for the factory auto-approve at line 82. Since the reminder string is a `const` and requires no store access, it can run without cas_root. Add a test passing `None` for cas_root that asserts the reminder still fires.",
+        "requires_verification": false
+      },
+      {
+        "title": "RoleGuard / set_role_env duplicated across 5 test modules after env_lock consolidation",
+        "severity": "P3",
+        "file": "cas-cli/src/hooks/handlers/handlers_tests/mod.rs",
+        "line": 7,
+        "why_it_matters": "The diff consolidated env_lock() into mod.rs (correctly) but left RoleGuard and set_role_env() duplicated verbatim in five modules: agent_worktree_block.rs, ask_user_question_remind.rs, factory_auto_approve.rs, permission_request_factory.rs, and supervisor_reminder.rs. Any future change to the restore-on-drop semantics (e.g. the unsafe annotation) must be applied in five places instead of one, which is the same defect env_lock consolidation was explicitly fixing per the diff comments.",
+        "autofix_class": "manual",
+        "owner": "review-fixer",
+        "confidence": 0.88,
+        "evidence": [
+          "mod.rs comment: 'Use per-module mutexes silently fails: they don't coordinate with each other' \u2014 same reasoning applies to RoleGuard and set_role_env",
+          "grep shows RoleGuard struct defined in: agent_worktree_block.rs:240, ask_user_question_remind.rs:23, factory_auto_approve.rs:263, permission_request_factory.rs:150, supervisor_reminder.rs:18",
+          "The diff explicitly says about factory_auto_approve.rs: 'use the shared process-wide mutex from mod.rs' \u2014 completing the consolidation should include RoleGuard"
+        ],
+        "pre_existing": true,
+        "suggested_fix": "Move RoleGuard and set_role_env() into handlers_tests/mod.rs with pub(super) visibility, then import them in each submodule the same way env_lock() is imported. The two new test modules (ask_user_question_remind.rs, supervisor_reminder.rs) introduced their own copies in this diff \u2014 the fix should be applied at consolidation time."
+      }
+    ],
+    "residual_risks": [
+      "The diff's composite nature (combining pre-base-SHA epic changes with post-base commits) means the presented diff for builtins.rs and cas-supervisor.md files includes changes already settled in 9b81e68; the project-standards review was scoped to the actual delta (handlers_tests/ and pre_tool.rs/prompt_capture.rs changes). If the full diff is re-reviewed against an earlier base, the 8KB vs 12KB cap reversal and AskUserQuestion Hard Rule removal/re-addition sequence should be examined for doc consistency.",
+      "The codex skill file continues to use mcp__cs__ (abbreviated Codex namespace) for coordination references while the hook reminder injects mcp__cas__ \u2014 if a Codex supervisor encounters the AskUserQuestion intercept, the reminder correctly says mcp__cas__coordination but the Codex skill body says mcp__cs__coordination. This mismatch is pre-existing and not introduced by this diff but is surfaced by the new intercept."
+    ],
+    "testing_gaps": [
+      "No test covers AskUserQuestion + cas_root=None path; the reminder silently drops in that scenario",
+      "No test covers supervisor path with a very short prompt (e.g. 'ok', 2 chars) \u2014 the reminder does fire in this case (prompt_capture empty check is non-empty only, not length-gated for supervisors) but this behavior is not asserted",
+      "The supervisor_reminder tests do not verify that CAS_AGENT_NAME / CAS_FACTORY_SESSION env vars are reflected in the reminder output \u2014 the identity line is checked only for the string 'supervisor', not for the actual dynamic name"
+    ]
+  },
+  "maintainability": {
+    "findings": [
+      {
+        "title": "RoleGuard/set_role_env duplicated in two new test modules instead of hoisting to mod.rs",
+        "severity": "P2",
+        "file": "cas-cli/src/hooks/handlers/handlers_tests/ask_user_question_remind.rs",
+        "line": 23,
+        "why_it_matters": "The diff centralized env_lock() into mod.rs to prevent cross-module races, but left RoleGuard and set_role_env as separate local copies in every new module. The two new test files (ask_user_question_remind.rs and supervisor_reminder.rs) each redefine the identical 20-line struct+impl+fn, and three pre-existing modules retain their own copies too. Any future bug in the drop-guard logic (e.g. unsafe set_var missing a case) must be fixed in five places. The centralization of env_lock was the right instinct; stopping halfway leaves the same technical-debt pattern the PR comment acknowledges ('cheaper than re-plumbing') still active for new code.",
+        "autofix_class": "gated_auto",
+        "owner": "review-fixer",
+        "confidence": 0.95,
+        "evidence": [
+          "ask_user_question_remind.rs lines 23-45: defines struct RoleGuard(Option<String>) and fn set_role_env identical to other modules",
+          "supervisor_reminder.rs lines 18-40: defines an identical struct RoleGuard and fn set_role_env",
+          "factory_auto_approve.rs lines 263-284: retains its own copy (not removed by diff, only env_lock removed)",
+          "permission_request_factory.rs lines 150-171: retains its own copy",
+          "agent_worktree_block.rs lines 240-261: retains its own copy",
+          "mod.rs comment at line 12: 'Usage in a submodule: let _g = super::env_lock()' \u2014 same pattern would work for RoleGuard"
+        ],
+        "pre_existing": false,
+        "suggested_fix": "Add pub(super) struct RoleGuard(Option<String>) and pub(super) fn set_role_env(role: Option<&str>) -> RoleGuard to handlers_tests/mod.rs alongside env_lock, then remove the five per-module copies. The visibility matches env_lock's pub(super) since all consumers are siblings.",
+        "requires_verification": false
+      },
+      {
+        "title": "build_supervisor_reminder is pub(crate) but used only within the same file",
+        "severity": "P3",
+        "file": "cas-cli/src/hooks/handlers/handlers_middle/prompt_capture.rs",
+        "line": 13,
+        "why_it_matters": "pub(crate) signals that a function is part of the crate's internal API and may be called from any module. build_supervisor_reminder is only ever called on line 42 within the same file. The over-broad visibility makes it harder to reason about where the function is consumed and invites callers in other modules that would depend on its env-var side-channel reading. Private fn would be correct.",
+        "autofix_class": "safe_auto",
+        "owner": "review-fixer",
+        "confidence": 0.97,
+        "evidence": [
+          "prompt_capture.rs line 13: pub(crate) fn build_supervisor_reminder() -> String",
+          "prompt_capture.rs line 42: only call site \u2014 let reminder = build_supervisor_reminder();",
+          "grep across entire cas-cli/src confirms no other caller outside the file"
+        ],
+        "pre_existing": false,
+        "suggested_fix": "Change pub(crate) fn build_supervisor_reminder() to fn build_supervisor_reminder()",
+        "requires_verification": false
+      },
+      {
+        "title": "AskUserQuestion guard uses is_supervisor_from_env() inconsistently with surrounding blocks",
+        "severity": "P2",
+        "file": "cas-cli/src/hooks/handlers/handlers_events/pre_tool.rs",
+        "line": 174,
+        "why_it_matters": "Within handle_pre_tool_use, the existing blocks at line 40 and via the harness_policy module use is_supervisor(input) which prefers HookInput.agent_role (populated by the harness at dispatch time) and falls back to env. The new AskUserQuestion check at line 174 uses the is_supervisor local variable which is assigned via is_supervisor_from_env() (env-only, line 158). If the harness injects agent_role into the input but CAS_AGENT_ROLE is not set (or mismatches), the new guard will produce a different result than is_supervisor(input). This was not a problem for the pre-existing blocks using is_supervisor_from_env() (they were placed before input-field reading was available), but adding new code using the older API extends the inconsistency. The doc for is_supervisor states 'Prefer the role snapshotted into HookInput by the harness'.",
+        "autofix_class": "gated_auto",
+        "owner": "review-fixer",
+        "confidence": 0.85,
+        "evidence": [
+          "pre_tool.rs line 40: crate::harness_policy::is_supervisor(input) \u2014 prefers HookInput field",
+          "pre_tool.rs line 158: let is_supervisor = crate::harness_policy::is_supervisor_from_env(); \u2014 env-only",
+          "pre_tool.rs line 174: if is_factory_agent && is_supervisor \u2014 uses env-only result",
+          "harness_policy.rs lines 85-88: is_supervisor docs say 'Prefer the role snapshotted into the HookInput by the harness'",
+          "Both is_factory_agent check (line 174) and SendMessage check (line 137) already use is_factory_agent which IS the input-aware variant via the std::env::var fallback \u2014 but is_supervisor here doesn't follow that pattern"
+        ],
+        "pre_existing": false,
+        "suggested_fix": "Replace the local is_supervisor variable usage with crate::harness_policy::is_supervisor(input) in the AskUserQuestion guard: if is_factory_agent && crate::harness_policy::is_supervisor(input) && tool_name == \"AskUserQuestion\"",
+        "requires_verification": false
+      },
+      {
+        "title": "Vercel-specific operational detail baked into the universal cas-supervisor.md skill",
+        "severity": "P3",
+        "file": "cas-cli/src/builtins/skills/cas-supervisor.md",
+        "line": 66,
+        "why_it_matters": "The diff adds a 'Running Scripts Against Prod' section with vercel env pull instructions to both Claude and Codex supervisor skill mirrors. This skill ships to all CAS users regardless of their stack (the project memory confirms 'CAS users are mostly JS/TS, not Rust' but the deployed base spans many project types). Baking Vercel-specific workflow content into the universal Immutable Core increases the SessionStart context budget for every supervisor session, including those with no Vercel involvement. It also violates the separation between a framework-level skill (cas-supervisor) and project-specific operational runbooks (which belong in a project's own references/ directory or CLAUDE.md).",
+        "autofix_class": "manual",
+        "owner": "human",
+        "confidence": 0.82,
+        "evidence": [
+          "diff adds lines in skills/cas-supervisor.md: '## Running Scripts Against Prod' with vercel env pull .env.<env> instructions",
+          "diff adds same section to codex/skills/cas-supervisor.md",
+          "Context budgeting test (test_supervisor_guidance_under_12kb) raises ceiling to 12KB precisely because bundling is growing \u2014 this addition makes headroom tighter",
+          "MEMORY.md note: 'CAS users are mostly JS/TS, not Rust' \u2014 stack diversity means Vercel content is irrelevant for non-Vercel users"
+        ],
+        "pre_existing": false,
+        "suggested_fix": "Move the 'Running Scripts Against Prod' section to the Petrastella project's own CLAUDE.md or a local cas-supervisor/references/ extension rather than shipping it in the built-in skill body.",
+        "requires_verification": false
+      },
+      {
+        "title": "Structural asymmetry between Claude and Codex supervisor skill mirrors for code-review guidance",
+        "severity": "P3",
+        "file": "cas-cli/src/builtins/codex/skills/cas-supervisor.md",
+        "line": 49,
+        "why_it_matters": "After the diff: the Claude mirror (skills/cas-supervisor.md) keeps the code-review-queue reference file link in its References section and adds a lookup-table row for it, while the Codex mirror (codex/skills/cas-supervisor.md) inlines a full 'Supervisor-Owned Code Review' section and drops the code-review-queue reference link entirely. This creates two divergent information architectures for the same concept across mirrors that the codebase explicitly tests must stay in sync (test_skills_document_context_budgeting_cas_5787 verifies key markers in all four files). Future maintainers editing one mirror may not realize the other uses a completely different structural approach for the same section.",
+        "autofix_class": "manual",
+        "owner": "human",
+        "confidence": 0.8,
+        "evidence": [
+          "diff for codex/skills/cas-supervisor.md: adds inline '## Supervisor-Owned Code Review' section, removes 'code-review-queue.md' reference link",
+          "diff for skills/cas-supervisor.md: keeps 'code-review-queue.md' reference link, adds lookup table entry for it, no new inline section",
+          "test_skills_document_context_budgeting_cas_5787 in builtins.rs tests both files for the same markers \u2014 but this structural difference is not covered by the marker set"
+        ],
+        "pre_existing": false,
+        "suggested_fix": "Align both mirrors to either (a) use the same inline section approach with no reference link, or (b) use the reference link approach with no inlined section. The lookup-table row in the Claude mirror should reference the same structural pattern as the Codex mirror.",
+        "requires_verification": false
+      },
+      {
+        "title": "Redundant decision-allow re-check inside supervisor_ask_user_question_gets_reminder test",
+        "severity": "P3",
+        "file": "cas-cli/src/hooks/handlers/handlers_tests/ask_user_question_remind.rs",
+        "line": 101,
+        "why_it_matters": "reminder_reason() at line 70-86 already returns None if decision != 'allow', so the .expect() at line 101-103 already proves decision is 'allow'. Lines 106-112 then re-extract and re-assert the same decision value. This is dead verification logic that adds noise without adding safety \u2014 if reminder_reason ever changed its contract, the duplicate assertion would hide that the first check already covers it.",
+        "autofix_class": "safe_auto",
+        "owner": "review-fixer",
+        "confidence": 0.9,
+        "evidence": [
+          "ask_user_question_remind.rs lines 70-86: reminder_reason() returns None if decision != 'allow'",
+          "ask_user_question_remind.rs line 101-103: .expect() would panic if decision were not 'allow'",
+          "ask_user_question_remind.rs lines 106-112: re-extracts hook_specific_output and re-asserts permissionDecision == Some('allow')"
+        ],
+        "pre_existing": false,
+        "suggested_fix": "Remove lines 105-112 (the second decision re-check). The .expect() on line 101 is sufficient proof that decision was 'allow' since reminder_reason() filters on that condition.",
+        "requires_verification": false
+      }
+    ],
+    "reviewer": "maintainability",
+    "residual_risks": [
+      "The doc comment on supervisor_guidance() in builtins.rs (lines 881-887) still says 'Returns only the trimmed supervisor SKILL.md body' with the rationale for NOT bundling the checklist \u2014 this will directly contradict the new implementation after the diff is applied. However, confirming whether the diff's new comment replaces it completely requires verifying the diff context more carefully; the diff's new doc says the opposite. If the old comment is retained by mistake, it will actively mislead future maintainers about whether bundling is intended.",
+      "The hardcoded unicode bullet characters (\\u{2022}) in build_supervisor_reminder's format string (prompt_capture.rs line 19-21) will render as literal bullet points in any downstream consumer that doesn't handle UTF-8. In contrast the other reminder strings in pre_tool.rs use ASCII. Minor visual consistency gap.",
+      "The test test_supervisor_guidance_hard_rules (removed by the diff) checked for 'Never monitor' and 'AskUserQuestion' as keywords in supervisor_guidance(). After the AskUserQuestion Hard Rule line is removed from the skill file and the test is deleted, there is no test ensuring the hook reminder adequately compensates for the missing static skill text. The hook reminder covers runtime (per-turn) but the static guidance no longer documents AskUserQuestion restrictions for readers of the skill file itself."
+    ],
+    "testing_gaps": [
+      "No test verifies that the 'Running Scripts Against Prod' section addition stays within the 12KB SessionStart ceiling \u2014 it's covered by the aggregate test_supervisor_guidance_under_12kb, but there's no test that would catch this specific section bloating the budget.",
+      "The AskUserQuestion PreToolUse reminder in pre_tool.rs uses is_supervisor_from_env() while the UserPromptSubmit reminder in prompt_capture.rs uses is_supervisor(input). There is no test that exercises a scenario where HookInput.agent_role and CAS_AGENT_ROLE disagree, which is the only way to detect the inconsistency at runtime.",
+      "No test covers the 'user genuinely needs human input' path where the supervisor legitimately uses AskUserQuestion \u2014 the test suite only verifies the reminder is injected, not that the call is actually allowed through to Claude Code's decision layer."
+    ]
+  },
+  "correctness": {
+    "reviewer": "correctness",
+    "findings": [
+      {
+        "title": "supervisor_guidance bundled size 12,322 bytes exceeds its own 12,288-byte test guard",
+        "severity": "P1",
+        "file": "cas-cli/src/builtins.rs",
+        "line": 964,
+        "why_it_matters": "The diff bundles SUPERVISOR_GUIDE (7,887 B) + separator (9 B) + CHECKLIST_GUIDE (4,428 B) = 12,322 bytes, but the replacement test asserts `guide.len() < 12_288`. The test fails immediately. The 8KB limit existed to leave headroom for SessionStart banners; raising the limit to 12KB while bundling a 4.4KB checklist makes the ceiling tighter than the combined payload.",
+        "autofix_class": "manual",
+        "owner": "review-fixer",
+        "confidence": 0.98,
+        "evidence": [
+          "extract_body(SUPERVISOR_GUIDE) = 7,887 bytes (measured from skill file)",
+          "extract_body(CHECKLIST_GUIDE) = 4,428 bytes (measured from checklist file)",
+          "separator '\\n\\n---\\n\\n' = 9 bytes; total = 12,322 bytes",
+          "New guard: `assert!(guide.len() < 12_288)` \u2014 12,322 > 12,288, fails by 34 bytes"
+        ],
+        "pre_existing": false,
+        "suggested_fix": "Trim the checklist body by at least 35 bytes, or keep the pre-diff design (unbundled, 8KB guard) which fits at 7,887 bytes.",
+        "requires_verification": false
+      },
+      {
+        "title": "AskUserQuestion reminder silently skipped when cas_root=None",
+        "severity": "P2",
+        "file": "cas-cli/src/hooks/handlers/handlers_events/pre_tool.rs",
+        "line": 174,
+        "why_it_matters": "The AskUserQuestion intercept is placed after the early-return at line 97 (`None => return Ok(HookOutput::empty())`). AskUserQuestion is not in FACTORY_AUTO_APPROVE_TOOLS, so the hoisted cas_root=None rescue block does not fire. Any supervisor calling AskUserQuestion in a session where CAS is not initialized gets no routing reminder, silently defeating cas-e603.",
+        "autofix_class": "safe_auto",
+        "owner": "review-fixer",
+        "confidence": 0.92,
+        "evidence": [
+          "Lines 82-98: hoisted auto-approve fires only for FACTORY_AUTO_APPROVE_TOOLS; line 97 early-returns empty for everything else when cas_root=None",
+          "AskUserQuestion is not in FACTORY_AUTO_APPROVE_TOOLS (const at line 868)",
+          "Line 174 intercept is unreachable when cas_root=None; no store access needed so there is no reason it must be post-cas_root"
+        ],
+        "pre_existing": false,
+        "suggested_fix": "Hoist the AskUserQuestion check above line 95 (the cas_root shadow binding), alongside the Agent worktree-block check at line 40. The reminder requires only is_factory_agent and is_supervisor, both available from env/HookInput before any store open.",
+        "requires_verification": false
+      },
+      {
+        "title": "supervisor_reminder tests missing env_lock and env reset; flaky in factory process",
+        "severity": "P2",
+        "file": "cas-cli/src/hooks/handlers/handlers_tests/supervisor_reminder.rs",
+        "line": 147,
+        "why_it_matters": "non_factory_does_not_get_supervisor_reminder uses agent_role: None. When the test binary runs inside a factory supervisor process (CAS_AGENT_ROLE=supervisor in env), resolve_role() falls back to env, is_factory_agent/is_supervisor return true, the reminder fires, and the assertion fails. The follow-on hotfix 0da05ac confirms this was a real observed failure.",
+        "autofix_class": "safe_auto",
+        "owner": "review-fixer",
+        "confidence": 0.98,
+        "evidence": [
+          "supervisor_reminder.rs at commit 3626f9e: no env_lock(), no set_role_env(), no RoleGuard in any of the 4 tests",
+          "non_factory_input() sets agent_role: None; resolve_role() falls through to CAS_AGENT_ROLE env var",
+          "Hotfix 0da05ac: 'CAS_AGENT_ROLE=supervisor leaked through resolve_role env fallback and reminder fired in non-factory assertion'",
+          "0da05ac added RoleGuard + set_role_env + super::env_lock() to all 4 tests"
+        ],
+        "pre_existing": false,
+        "suggested_fix": "Add `let _g = super::env_lock(); let _role = set_role_env(Some/None(...));` to all four tests, mirroring ask_user_question_remind.rs.",
+        "requires_verification": false
+      },
+      {
+        "title": "AskUserQuestion intercept reuses env-only is_supervisor_from_env(), not field-first",
+        "severity": "P3",
+        "file": "cas-cli/src/hooks/handlers/handlers_events/pre_tool.rs",
+        "line": 174,
+        "why_it_matters": "The Agent worktree-block at line 40 uses is_supervisor(input) (field-first per resolve_role). The AskUserQuestion check reuses `is_supervisor` bound at line 158 via is_supervisor_from_env() (env-only). If the harness sets agent_role on HookInput but CAS_AGENT_ROLE is absent from the env, the reminder never fires for a genuine supervisor. Tests only drive the env path so this gap is uncaught.",
+        "autofix_class": "safe_auto",
+        "owner": "review-fixer",
+        "confidence": 0.82,
+        "evidence": [
+          "Line 40: `crate::harness_policy::is_supervisor(input)` (field-first)",
+          "Line 158: `let is_supervisor = crate::harness_policy::is_supervisor_from_env();` (env-only)",
+          "Line 174: condition uses the env-only `is_supervisor` variable",
+          "ask_user_question_remind.rs hook_input() does not set agent_role; tests never exercise the field path"
+        ],
+        "pre_existing": false,
+        "suggested_fix": "At line 174, replace `is_supervisor` with `crate::harness_policy::is_supervisor(input)` directly, consistent with the Agent block at line 40.",
+        "requires_verification": false
+      },
+      {
+        "title": "Deleted test_supervisor_guidance_hard_rules leaves no keyword coverage after bundling",
+        "severity": "P3",
+        "file": "cas-cli/src/builtins.rs",
+        "line": 949,
+        "why_it_matters": "The diff removes test_supervisor_guidance_hard_rules, which verified 7 hard-rule keywords appear in supervisor_guidance(). No replacement test checks that the combined bundled output still contains these keywords. A future edit could silently drop them.",
+        "autofix_class": "advisory",
+        "owner": "review-fixer",
+        "confidence": 0.81,
+        "evidence": [
+          "Diff deletes test_supervisor_guidance_hard_rules with 7 keyword assertions and no replacement",
+          "Diff removes 'Never use AskUserQuestion for agent communication' from both cas-supervisor.md files",
+          "test_supervisor_guidance_loads replacement only checks 'Factory Supervisor' and 'Supervisor Checklist', not hard-rule keywords"
+        ],
+        "pre_existing": false,
+        "suggested_fix": "Add a test asserting the combined supervisor_guidance() contains 'coordination', 'Never close', 'Never implement', and 'AskUserQuestion'.",
+        "requires_verification": false
+      }
+    ],
+    "residual_risks": [
+      "The env-only is_factory_agent check (std::env::var('CAS_AGENT_ROLE').is_ok()) at pre_tool.rs line 81 accepts empty-string env values while harness_policy::is_factory_agent(input) rejects them via filter(!s.is_empty()) \u2014 pre-existing inconsistency, not introduced by this diff",
+      "build_supervisor_reminder() includes supervisor name and team from env vars without sanitization; low risk since these are daemon-set values, not user input",
+      "Supervisor reminder fires on every non-empty UserPromptSubmit turn including short one-word prompts; minor noise but not a correctness defect"
+    ],
+    "testing_gaps": [
+      "No test covers the cas_root=None path for the AskUserQuestion intercept; all existing tests pass Some(tmp.path())",
+      "No test drives HookInput.agent_role field (without CAS_AGENT_ROLE env) for the AskUserQuestion intercept, leaving the is_supervisor_from_env vs is_supervisor(input) inconsistency uncaught",
+      "No test verifies combined supervisor_guidance() output still contains the Hard Rule keywords previously asserted in test_supervisor_guidance_hard_rules"
+    ]
+  }
+}
