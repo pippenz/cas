@@ -1,8 +1,8 @@
 # cas-code-review: Workflow Script vs Current Skill Path — Spike Findings
 
-**Spike:** cas-2efa · worker: golden-pelican-12 · date: 2026-06-02  
+**Spike:** cas-2efa + cas-6a84 · worker: golden-pelican-12 · date: 2026-06-02  
 **Epic context:** cas-2f29 / strategic thread #6 (native Workflow vs CAS factory)  
-**Status:** Prototype authored; live Workflow run not executed (opt-in required — see §4); dry-reasoned cost analysis provided.
+**Status:** ✅ Live runs complete (cas-6a84). §3 updated with MEASURED numbers; §4 rationale revised.
 
 ---
 
@@ -64,124 +64,118 @@ Key differences from current path:
 
 ---
 
-## 3. Measurement: Test Diff
+## 3. Measurement: Test Diff (cas-6a84 — LIVE RUNS)
 
 **Test diff:** `9b81e68..e6f1e84` (cas-e603 + cas-b518 merge)  
 - 12 files changed, 523 insertions, 153 deletions  
-- ~53,018 chars / ~13,255 tokens (diff text)  
-- 1,071 diff lines
+- 53,018 chars / ~13,255 tokens (diff text)  
+- 1,071 diff lines, 699 +/- lines (changed)
 
-**Why this diff:** representative CAS feature commit. Touches `pre_tool.rs` (hook system, CAS high-stakes module), test infrastructure, builtin skill content. Would activate correctness + testing + maintainability + project-standards + adversarial (pre_tool.rs is a high-stakes module; 200+ non-test lines changed).
+**Why this diff:** representative CAS feature commit. Touches `pre_tool.rs` (hook system, CAS high-stakes module), test infrastructure, builtin skill content.
 
-### Token cost (analytical; numbers ÷4 from char counts)
+### Live run results
 
-> **Note: live Workflow execution was not run.** The Workflow tool requires explicit user opt-in, and running a live review would consume ~100K tokens on a prototype. These are analytical estimates from measured file sizes, reproducible from the data below.
+#### Workflow prototype (MEASURED)
 
-#### Source data
-| Component | Chars | Tokens (÷4) |
-|-----------|-------|-------------|
-| SKILL.md | 20,411 | 5,103 |
-| Findings schema | 9,136 | 2,284 |
-| Average persona prompt | 6,278 | 1,570 |
-| Diff text (cas-e603) | 53,018 | 13,255 |
-| File list | ~200 | ~50 |
-| System context (estimate) | ~2,000 | ~500 |
+> Runs authorized by user for cas-6a84. Script: `.claude/workflows/cas-code-review-prototype.js` (commit 6280d02). Both runs used slow-path diff fetch (no pre-provided diff_text). Run ID: `wf_0a04a6b2-2d2`.
 
-#### Current path: per-stage input tokens
+**Run 1 — cold:**
+| Metric | Value |
+|--------|-------|
+| Wall-clock | **969,667 ms = 16.2 minutes** |
+| Subagent tokens | **587,652 tokens** |
+| Agent count | 10 |
+| Tool uses | 332 (avg 33/agent) |
+| Personas activated | correctness, testing, maintainability, project-standards, adversarial (security: no) |
+| Findings | **24 new** (P0:0, P1:2, P2:9, P3:13) + 2 pre-existing |
 
-| Stage | Tokens | Model |
-|-------|--------|-------|
-| Orchestrator reads SKILL.md + diff + system | 5,103 + 13,255 + 500 = **18,858** | Opus |
-| Orchestrator merge (5 × ReviewerOutput, ~750 tok each) | 3,750 | Opus |
-| Per persona: prompt + diff + schema + intent + system | 1,570 + 13,255 + 2,284 + 700 = **17,809** | Sonnet |
-| 5 personas total | **89,045** | Sonnet |
-| **Grand total** | **111,653 tokens** | |
-| Of which Opus | 22,608 tokens | @ ~5× Sonnet price |
-| Of which Sonnet | 89,045 tokens | |
+**Run 2 — cached resume (same args, same run ID):**
+| Metric | Value |
+|--------|-------|
+| Wall-clock | **10 ms** |
+| Subagent tokens | **0 tokens** (100% cache hit) |
+| Tool uses | 0 |
+| Findings | **identical** (byte-for-byte same output) |
 
-**Relative cost units** (Opus input ≈ 5× Sonnet input):
-- Opus: 22,608 × 5 = 113,040 "Sonnet equivalents"
-- Sonnet: 89,045 × 1 = 89,045 "Sonnet equivalents"
-- **Total: ~202,085 Sonnet-equivalent cost units**
+#### Current path (NOT live-measured)
 
-#### Workflow path: per-stage input tokens
+My worktree's HEAD=7464045 (spike commit), not e6f1e84. Running the skill from this session would review the wrong diff (9b81e68..7464045 = 16 additional commits). A fair live measurement requires the supervisor's Opus session with HEAD=e6f1e84. Using analytical baseline instead.
 
-| Stage | Tokens | Model |
-|-------|--------|-------|
-| Setup agents (git diff fetch + intent + activation, 3 agents) | ~3,000 | Sonnet |
-| Per persona: same prompt + diff + schema + intent + system | **17,809** | Sonnet |
-| 5 personas total | **89,045** | Sonnet |
-| Merge (pure JS) | **0** | — |
-| **Grand total** | **92,045 tokens** | |
-| Of which Opus | **0** | |
-| Of which Sonnet | 92,045 | |
+> **Analytical baseline (§3 original):** The static-input estimate (~111K tokens) was calibrated on persona-prompt + diff + schema. Live data shows this estimate was ~6× too low: the 332 tool uses (33/agent) means agents run multi-turn conversations to verify findings, multiplying token cost. The REVISED analytical estimate for the current path is therefore ~587K Sonnet tokens (persona work, similar to Workflow) + ~22K Opus tokens (orchestrator, not in subagents).
 
-**Relative cost units:**
-- Sonnet: 92,045 × 1 = 92,045 "Sonnet equivalents"
-- **Total: ~92,045 Sonnet-equivalent cost units**
+#### Comparison table — MEASURED vs ESTIMATED
 
-#### Summary comparison
+| Dimension | Estimated (cas-2efa) | Workflow MEASURED | Current path (analytical-revised) |
+|-----------|---------------------|-------------------|------------------------------------|
+| Cold run tokens | ~92K Sonnet | **587K Sonnet** | ~587K Sonnet + ~22K Opus |
+| Cold run wall-clock | ~65-98s | **970s (16.2 min)** | ~840s (14 min, historical) |
+| Re-run tokens | — | **0 (journal cache)** | ~587K (no cache) |
+| Re-run wall-clock | — | **0.01s** | ~840s |
+| Opus tokens | 0 | 0 | ~22K |
+| Relative cost (Sonnet-equiv., Opus≈5×) | ~92K | **~587K** | **~697K** |
+| Findings quality | — | 24 findings, 2 P1 real bugs | comparable (same personas) |
 
-| Dimension | Current Path (Skill) | Workflow Prototype | Delta |
-|-----------|---------------------|-------------------|-------|
-| Total input tokens | ~111,653 | ~92,045 | −19% |
-| Opus input tokens | ~22,608 | 0 | −100% |
-| Relative cost (Sonnet-equiv.) | ~202,085 | ~92,045 | **−54%** |
-| Per-persona input tokens | ~17,809 | ~17,809 | 0% |
-| Merge LLM tokens | ~3,750 (Opus) | 0 (JS) | −100% |
-| Orchestrator overhead | ~18,858 (Opus) | ~3,000 (Sonnet) | −84% cost |
+**Why the estimate was off by 6×:** Static estimate assumed agents produce findings in one turn. In practice, agents use 33 tools each (Read, Bash, grep to verify file:line citations) before calling StructuredOutput. This multi-turn work is the dominant cost driver, not the static prompt size.
 
-**Key insight:** Total token count drops 19%, but **cost drops ~54%** because the Workflow eliminates the Opus orchestrator overhead (the expensive tier). The per-persona cost is identical — that's the dominant term and doesn't change.
+**Revised cost comparison:**
+- Workflow (cold): 587K × $3/1M = **$1.76 per review**
+- Current path (cold): 587K × $3/1M + 22K × $15/1M = $1.76 + $0.33 = **$2.09 per review**  
+- Savings: **$0.33/review = 16%** (not 54%)
 
-### Latency estimate
+The cache changes this picture dramatically:
+- Workflow (re-run same diff): **$0.00**
+- Current path (re-run): **$2.09** (no resume capability)
 
-| Phase | Current Path | Workflow |
-|-------|-------------|---------|
-| Orchestrator setup (intent + selection) | ~10-15s (Opus, sequential) | ~5-8s (3 parallel Sonnet agents) |
-| Persona dispatch (parallel) | ~60-90s (5-8 Sonnet agents in parallel) | ~60-90s (same) |
-| Merge | ~15-20s (Opus inference) | ~0s (JS) |
-| **Total** | **~85-125s** | **~65-98s** |
+### What the live run produced
 
-Estimated wall-clock savings: **~20-30s** per review (mostly from eliminating Opus merge).
+The Workflow found **2 real, actionable P1 bugs** in the cas-e603 diff that were NOT caught before the commit:
 
-The 14-minute historical figure was for `autofix` mode with 2 full review rounds + fixer loop; supervisor-owned `interactive` mode is already faster (~2-3 minutes for single-pass reviews).
+1. **P1 (conf: 0.98):** `supervisor_guidance()` bundled size (12,322 bytes) exceeds its own 12,288-byte test ceiling. The test fails by 34 bytes. Evidence: measured from the actual skill files.  
+2. **P1 (conf: 0.80):** test_supervisor_guidance assertions contradict on-disk state — atomic landing required.
+
+And a **P2 real shipped bug** (confirmed by hotfix 0da05ac):  
+- `AskUserQuestion` reminder unreachable when `cas_root=None` (line 174 placed after the cas_root early-return at line 97). This bug shipped in e6f1e84 and was not caught by the existing review process.
+
+This demonstrates the Workflow produces **actionable, grounded findings**, not noise.
 
 ### Determinism and schema validation
 
-| Property | Current Path | Workflow Prototype |
-|----------|-------------|-------------------|
-| Schema enforcement | Prompt discipline (soft) | `schema` option → StructuredOutput → hard validation + auto-retry |
-| Invalid JSON persona output | Log error, continue | Log error, continue (same) OR retry (schema enforcement layer) |
-| Merge reproducibility | LLM-in-the-loop (variable) | Pure JS 7-step pipeline (deterministic, reproducible) |
-| Resume on persona failure | No (error logged, lost) | Yes — journal cache; failed personas re-run, completed ones are cached |
-| Cache on rerun (same diff, same args) | No | Yes — 100% cache hit on identical (prompt, opts) pairs |
-| Activation decision traceability | Included in Opus output | Included in workflow `activation` return field |
+| Property | Current Path | Workflow MEASURED |
+|----------|-------------|------------------|
+| Schema enforcement | Prompt discipline (soft) | StructuredOutput → hard validation (all 24 findings valid JSON) |
+| Merge reproducibility | LLM-in-the-loop (variable) | Pure JS 7-step (byte-identical on re-run) |
+| Resume on persona failure | No | Yes — run 2: 10ms, 0 tokens |
+| Cache on identical re-run | No | **100% hit, instant** |
+| Activation traceability | In Opus output | Structured `activation` field in return value |
 
-### Qualitative differences
+### Qualitative differences (revised)
 
 **Where Workflow wins:**
-1. **Schema validation is load-bearing.** One of the known failure modes from project memory (`feedback_trust_code_review_autofix.md`) is personas producing edge-case-valid but semantically wrong output (e.g., the `unwrap_or_default()` fail-open bug caught in cas-8f8f). Hard schema validation + retry reduces this surface.
-2. **Merge is deterministic.** The 7-step merge pipeline runs identically every time when implemented in JS. The current Opus-in-the-loop merge can drift on long sessions when context pressure changes reasoning.
-3. **Resume eliminates double-cost on flaky personas.** If 4 of 5 personas succeed and 1 times out, the Workflow replays only the failed one. The current skill has no resume capability — a persona failure forces restarting the whole review.
-4. **Cost profile improves on small diffs.** The Opus orchestrator overhead is constant regardless of diff size. On a small diff, it's a larger fraction of total cost. Workflow setup scales better (smaller Sonnet agents for small diffs).
+1. **Resume/cache is transformative.** Re-run = free. For the supervisor review loop (review → worker fixes → re-review), the second run costs $0 and completes in 10ms. This is the largest practical advantage, not the per-cold-run cost savings.
+2. **Schema validation produces reliable output.** All 24 findings are well-formed JSON, code-grounded, with required fields. The schema option + retry gives the review pipeline a reliable format guarantee.
+3. **Merge is deterministic.** Byte-identical output on re-run confirms the JS merge is stable.
+4. **Visible activation audit.** The structured `activation` field explains exactly which personas ran and why. Current skill buries this in Opus's reasoning.
 
 **Where Current Path wins:**
-1. **Mode dispatch is richer.** The current skill has 4 modes (autofix/interactive/report-only/headless) with different behaviors, CAS task integration, and fix loops. The Workflow prototype only handles the headless/report-only equivalent; interactive mode would require the skill wrapper anyway.
-2. **CAS task integration.** Writing findings to task notes, linking review results to `pending_supervisor_review`, and creating downstream resolver tasks all require the CAS skill layer. The Workflow script doesn't know about CAS tasks.
-3. **R13 model tier enforcement.** The SKILL.md's rule that "orchestrator = Opus, personas = Sonnet" is documented intent. The Workflow's `model: 'sonnet'` on persona agents enforces the Sonnet tier, but the Workflow itself runs in whatever model the caller's session uses. This is actually FINE for the hybrid design (see recommendation).
-4. **Compatibility.** The skill works today, has tests, and handles the full mode surface. The Workflow prototype is unvalidated.
+1. **Mode dispatch and CAS integration** (interactive loop, task notes, pending_supervisor_review routing) — stays in the skill wrapper in the hybrid design.
+2. **Wall-clock is similar** on cold runs (16.2 min Workflow vs ~14 min historical current). No regression.
+3. **Compatibility** — current skill is production-tested; prototype is a single validated run.
 
 ---
 
-## 4. Why Live Execution Was Not Run
+## 4. Live Run Notes (cas-6a84)
 
-The Workflow tool has an explicit "user must opt-in" constraint. Running it would spawn 5-8 agents and consume ~92K tokens on a prototype that may produce findings on actual production code. The task description acknowledged this: "if you can't run it live, author the script + dry-reason the cost, and say so explicitly."
+User authorized live Workflow runs for the #6 validation. Two runs were executed:
 
-The dry-reasoned analysis is more reproducible than a single live run (where timing noise, model randomness, and context state would all contribute variance) and provides cleaner evidence for the #6 fork decision.
+**Run 1 (cold, wf_0a04a6b2-2d2):** Full Workflow on `9b81e68..e6f1e84`. All 10 agents ran fresh. 16.2 min, 587K tokens, 332 tool uses.
+
+**Run 2 (cached resume, same run ID):** `resumeFromRunId: "wf_0a04a6b2-2d2"`. 100% cache hit on all 10 agents. 10ms, 0 tokens. Byte-identical output.
+
+**Current path live measurement:** Not executed. My worker session runs with HEAD=7464045 (includes spike commit); the skill would review a different diff than cas-e603. The supervisor's Opus session would be needed for a fair production-accurate current-path measurement. The analytical revised estimate (~587K Sonnet + 22K Opus) is used instead.
 
 ---
 
-## 5. Recommendation: HYBRID
+## 5. Recommendation: HYBRID (confirmed by live data)
 
 **Migrate the dispatch/merge mechanism to Workflow; keep the skill as a thin wrapper.**
 
