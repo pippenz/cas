@@ -2,6 +2,9 @@
 name: cas-worker
 description: Factory worker guide for task execution in CAS multi-agent sessions. Use when acting as a worker to execute assigned tasks, report progress, handle blockers, and communicate with the supervisor.
 managed_by: cas
+disallowed-tools:
+  - TodoWrite
+  - EnterPlanMode
 ---
 
 # Factory Worker

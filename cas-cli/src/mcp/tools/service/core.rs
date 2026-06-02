@@ -711,6 +711,7 @@ impl CasService {
             context_mode: req.context_mode,
             agent_type: req.agent_type,
             allowed_tools: req.allowed_tools,
+            disallowed_tools: req.disallowed_tools,
             draft: req.draft.unwrap_or(false),
             disable_model_invocation: req.disable_model_invocation.unwrap_or(false),
         };

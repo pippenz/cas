@@ -27,6 +27,7 @@ fn create_test_skill(name: &str, enabled: bool) -> Skill {
         context_mode: None,
         agent_type: None,
         allowed_tools: Vec::new(),
+        disallowed_tools: Vec::new(),
         hooks: None,
         disable_model_invocation: false,
         usage_count: 0,
@@ -338,4 +339,38 @@ fn test_sync_skill_with_hooks() {
         content.contains("command: cas hook Stop"),
         "Missing Stop command"
     );
+}
+
+// cas-5be8: disallowed-tools frontmatter support
+#[test]
+fn test_sync_skill_with_disallowed_tools() {
+    let temp = TempDir::new().unwrap();
+    let target = temp.path().join(".claude/skills");
+    let syncer = SkillSyncer::new(target.clone());
+
+    let mut skill = create_test_skill("blocked-skill", true);
+    skill.disallowed_tools = vec!["Write".to_string(), "Edit".to_string(), "NotebookEdit".to_string()];
+
+    syncer.sync_skill(&skill).unwrap();
+
+    let content = fs::read_to_string(target.join("cas-blocked-skill/SKILL.md")).unwrap();
+    assert!(content.contains("disallowed-tools:"), "disallowed-tools block must be emitted");
+    assert!(content.contains("  - Write"), "Write must be listed");
+    assert!(content.contains("  - Edit"), "Edit must be listed");
+    assert!(content.contains("  - NotebookEdit"), "NotebookEdit must be listed");
+}
+
+#[test]
+fn test_sync_skill_disallowed_tools_omitted_when_empty() {
+    let temp = TempDir::new().unwrap();
+    let target = temp.path().join(".claude/skills");
+    let syncer = SkillSyncer::new(target.clone());
+
+    let skill = create_test_skill("open-skill", true);
+    // disallowed_tools defaults to empty
+
+    syncer.sync_skill(&skill).unwrap();
+
+    let content = fs::read_to_string(target.join("cas-open-skill/SKILL.md")).unwrap();
+    assert!(!content.contains("disallowed-tools:"), "disallowed-tools must NOT be emitted when empty");
 }

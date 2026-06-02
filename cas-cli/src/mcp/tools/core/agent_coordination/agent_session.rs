@@ -115,6 +115,7 @@ impl CasCore {
             agent_role: requested_role
                 .map(|r| r.to_string())
                 .or_else(|| std::env::var("CAS_AGENT_ROLE").ok()),
+            message: None,
         };
 
         // Use hook handler for session start side effects
@@ -132,7 +133,7 @@ impl CasCore {
         // eliminate.
         use crate::hooks::HookSpecificOutput;
         let context = match output.hook_specific_output {
-            Some(HookSpecificOutput::SessionStart { additional_context }) => Some(additional_context),
+            Some(HookSpecificOutput::SessionStart { additional_context, .. }) => Some(additional_context),
             // None variants below are unreachable in practice (handle_session_start
             // never emits these shapes), but pattern-matching them explicitly
             // makes the invariant load-bearing on the type system rather than on
@@ -141,6 +142,7 @@ impl CasCore {
             | Some(HookSpecificOutput::UserPromptSubmit { .. })
             | Some(HookSpecificOutput::PostToolUse { .. })
             | Some(HookSpecificOutput::PermissionRequest { .. })
+            | Some(HookSpecificOutput::MessageDisplay { .. })
             | None => None,
         }
         .filter(|c| !c.is_empty())
@@ -223,6 +225,7 @@ impl CasCore {
             subagent_type: None,
             subagent_prompt: None,
             agent_role: std::env::var("CAS_AGENT_ROLE").ok(),
+            message: None,
         };
 
         handle_session_end(&input, Some(&self.cas_root)).map_err(|e| McpError {

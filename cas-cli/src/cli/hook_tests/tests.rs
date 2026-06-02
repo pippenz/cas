@@ -1,13 +1,24 @@
 use crate::cli::hook::*;
 use crate::cli::hook::config_gen::{get_cas_hooks_config, has_cas_hook_entries};
+use crate::cli::hook::configure_claude_hooks_with_home;
 use crate::config::HookConfig;
 use tempfile::TempDir;
 use toml::map::Map;
 
+/// Create a TempDir that acts as an isolated $HOME with no global settings.
+/// Pass this to `configure_claude_hooks_with_home` / `global_has_cas_hooks_in`
+/// so tests never read the real `~/.claude/settings.json` (cas-1888).
+fn isolated_home() -> TempDir {
+    TempDir::new().unwrap()
+}
+
 #[test]
 fn test_configure_creates_settings() {
+    // Use an isolated fake home so global_has_cas_hooks_in always returns false
+    // regardless of the developer's real ~/.claude/settings.json (cas-1888).
+    let fake_home = isolated_home();
     let temp = TempDir::new().unwrap();
-    let result = configure_claude_hooks(temp.path(), false).unwrap();
+    let result = configure_claude_hooks_with_home(temp.path(), false, Some(fake_home.path())).unwrap();
 
     assert!(result); // Created new file
     assert!(temp.path().join(".claude/settings.json").exists());
@@ -15,37 +26,29 @@ fn test_configure_creates_settings() {
     let content = std::fs::read_to_string(temp.path().join(".claude/settings.json")).unwrap();
     let settings: serde_json::Value = serde_json::from_str(&content).unwrap();
 
-    if global_has_cas_hooks() {
-        // Global hooks exist — project should NOT have hooks
-        assert!(
-            settings.get("hooks").is_none(),
-            "Hooks should be omitted when global hooks exist"
-        );
-    } else {
-        // No global hooks — project should have hooks in shell-form (/doctor compat, cas-c17b)
-        assert!(settings.pointer("/hooks/SessionStart").is_some());
-        assert!(settings.pointer("/hooks/SessionEnd").is_some());
-        assert!(settings.pointer("/hooks/Stop").is_some());
-        assert!(settings.pointer("/hooks/SubagentStop").is_some());
-        assert!(settings.pointer("/hooks/PostToolUse").is_some());
-        assert!(settings.pointer("/hooks/UserPromptSubmit").is_some());
+    // With isolated home (no global settings), hooks must always be written.
+    assert!(settings.pointer("/hooks/SessionStart").is_some());
+    assert!(settings.pointer("/hooks/SessionEnd").is_some());
+    assert!(settings.pointer("/hooks/Stop").is_some());
+    assert!(settings.pointer("/hooks/SubagentStop").is_some());
+    assert!(settings.pointer("/hooks/PostToolUse").is_some());
+    assert!(settings.pointer("/hooks/UserPromptSubmit").is_some());
 
-        // Exec-form fixture: hook entries must carry "args" array, not a "command" string.
-        // cas-9a60 re-adopts exec-form now that anthropics/claude-code#58441 is
-        // fixed in CC ≥ 2.1.142 (verified on CC 2.1.143).
-        let session_start_args = first_hook_args(&settings, "SessionStart");
-        assert_eq!(
-            session_start_args,
-            Some(vec!["cas", "hook", "SessionStart"]),
-            "cas init should emit exec-form args for SessionStart hook"
-        );
-        let stop_args = first_hook_args(&settings, "Stop");
-        assert_eq!(
-            stop_args,
-            Some(vec!["cas", "hook", "Stop"]),
-            "cas init should emit exec-form args for Stop hook"
-        );
-    }
+    // Exec-form fixture: hook entries must carry "args" array, not a "command" string.
+    // cas-9a60 re-adopts exec-form now that anthropics/claude-code#58441 is
+    // fixed in CC ≥ 2.1.142 (verified on CC 2.1.143).
+    let session_start_args = first_hook_args(&settings, "SessionStart");
+    assert_eq!(
+        session_start_args,
+        Some(vec!["cas", "hook", "SessionStart"]),
+        "cas init should emit exec-form args for SessionStart hook"
+    );
+    let stop_args = first_hook_args(&settings, "Stop");
+    assert_eq!(
+        stop_args,
+        Some(vec!["cas", "hook", "Stop"]),
+        "cas init should emit exec-form args for Stop hook"
+    );
 
     // Permissions should always be written
     let allow = settings
@@ -84,6 +87,8 @@ fn test_configure_creates_settings() {
 
 #[test]
 fn test_configure_merges_existing() {
+    // Isolated home → global_has_cas_hooks_in always returns false (cas-1888).
+    let fake_home = isolated_home();
     let temp = TempDir::new().unwrap();
     let claude_dir = temp.path().join(".claude");
     std::fs::create_dir_all(&claude_dir).unwrap();
@@ -103,30 +108,17 @@ fn test_configure_merges_existing() {
     )
     .unwrap();
 
-    // Configure CAS hooks
-    let result = configure_claude_hooks(temp.path(), false).unwrap();
+    // Configure CAS hooks using isolated home so the check is deterministic.
+    let result = configure_claude_hooks_with_home(temp.path(), false, Some(fake_home.path())).unwrap();
     assert!(!result); // Updated, not created
 
     let content = std::fs::read_to_string(claude_dir.join("settings.json")).unwrap();
     let settings: serde_json::Value = serde_json::from_str(&content).unwrap();
 
-    if global_has_cas_hooks() {
-        // Global hooks exist — CAS hooks should NOT be added to project
-        assert!(
-            settings.pointer("/hooks/SessionStart").is_none(),
-            "CAS hooks should not be added when global hooks exist"
-        );
-        // Non-CAS custom hook should be preserved
-        assert!(
-            settings.pointer("/hooks/CustomHook").is_some(),
-            "Non-CAS custom hooks should be preserved"
-        );
-    } else {
-        // No global hooks — CAS hooks should be added
-        assert!(settings.pointer("/hooks/SessionStart").is_some());
-        assert!(settings.pointer("/hooks/Stop").is_some());
-        assert!(settings.pointer("/hooks/PostToolUse").is_some());
-    }
+    // Isolated home → no global hooks → CAS hooks must be added.
+    assert!(settings.pointer("/hooks/SessionStart").is_some());
+    assert!(settings.pointer("/hooks/Stop").is_some());
+    assert!(settings.pointer("/hooks/PostToolUse").is_some());
 
     // Existing permissions should always be preserved and CAS permissions added
     let allow = settings

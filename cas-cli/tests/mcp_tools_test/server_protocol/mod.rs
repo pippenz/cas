@@ -170,6 +170,7 @@ async fn test_all_store_types_accessible() {
         context_mode: None,
         agent_type: None,
         allowed_tools: None,
+        disallowed_tools: None,
         draft: false,
         disable_model_invocation: false,
     };

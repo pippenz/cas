@@ -6,6 +6,10 @@ pub fn handle_session_start(
 ) -> Result<HookOutput, MemError> {
     let timer = TraceTimer::new();
 
+    // Computed inside the inner `cas_root` block and applied to the output
+    // after context building (cas-ae09). None for non-factory sessions.
+    let mut factory_session_title: Option<String> = None;
+
     // Record session start for analytics and register agent
     if let Some(cas_root) = cas_root {
         let mut stores = HookStores::new(cas_root);
@@ -110,13 +114,17 @@ pub fn handle_session_start(
         let project_path = cas_root.parent().map(|p| p.to_string_lossy().to_string());
 
         // Check for active task (reuses cached task store)
-        let active_task_id = stores
+        // Fetch the full list so downstream consumers (OTEL, sessionTitle) share
+        // the same query without redundant store access.
+        let active_tasks: Vec<Task> = stores
             .tasks()
-            .and_then(|ts| {
-                ts.list(Some(TaskStatus::InProgress))
-                    .ok()
-                    .and_then(|tasks| tasks.first().map(|t| t.id.clone()))
-            });
+            .and_then(|ts| ts.list(Some(TaskStatus::InProgress)).ok())
+            .unwrap_or_default();
+        let active_task_id = active_tasks.first().map(|t| t.id.clone());
+
+        // Compute factory session title now while active_tasks is in scope (cas-ae09).
+        let role = std::env::var("CAS_AGENT_ROLE").unwrap_or_default();
+        factory_session_title = compute_session_title(&role, &active_tasks);
 
         let otel_ctx = OtelContext::new(input.session_id.clone())
             .with_project_id(project_id)
@@ -265,6 +273,23 @@ pub fn handle_session_start(
         HookOutput::with_session_start_context(context.clone())
     };
 
+    // Emit reloadSkills when skill files have changed since this session last
+    // loaded them (cas-f9ad). Best-effort: failure to read/write sentinel/marker
+    // files is silently ignored so SessionStart never blocks on I/O errors.
+    let output = if detect_and_mark_skill_drift(cas_root, &input.session_id) {
+        output.with_reload_skills(true)
+    } else {
+        output
+    };
+
+    // Emit sessionTitle for factory sessions so agent dashboard / tmux panes
+    // show which worker owns which task at a glance (cas-ae09).
+    // Non-factory sessions produce None → field absent → unchanged wire shape.
+    let output = match factory_session_title {
+        Some(title) => output.with_session_title(title),
+        None => output,
+    };
+
     // Record trace if dev mode is enabled
     if let Some(tracer) = DevTracer::get() {
         if tracer.should_trace_hooks() {
@@ -301,6 +326,94 @@ pub fn handle_session_start(
 /// Estimate token count (rough approximation: ~4 chars per token)
 pub(crate) fn estimate_tokens(s: &str) -> usize {
     s.len() / 4
+}
+
+// ─── Session title computation (cas-ae09) ─────────────────────────────────
+
+/// Compute the `sessionTitle` string for a factory session.
+///
+/// Returns `None` for non-factory sessions (empty or unknown role) so the
+/// `sessionTitle` field is absent from the SessionStart JSON output, preserving
+/// the unchanged wire shape for regular interactive sessions.
+///
+/// ## Title formats
+///
+/// | Role       | Condition              | Title                                  |
+/// |------------|------------------------|----------------------------------------|
+/// | worker     | active in-progress task | `[worker] <task-id> · <title ≤40ch>` |
+/// | worker     | no active task          | `[worker] idle`                        |
+/// | supervisor | in-progress epic exists | `[supervisor] <epic-id>`              |
+/// | supervisor | no in-progress epic     | `[supervisor] factory`                 |
+/// | other / "" | —                       | `None`                                 |
+pub(crate) fn compute_session_title(agent_role: &str, active_tasks: &[Task]) -> Option<String> {
+    match agent_role {
+        "worker" => {
+            let title = active_tasks.first().map(|t| {
+                let preview = truncate_display(&t.title, 40);
+                format!("[worker] {} · {}", t.id, preview)
+            });
+            Some(title.unwrap_or_else(|| "[worker] idle".to_string()))
+        }
+        "supervisor" => {
+            let epic_context = active_tasks
+                .iter()
+                .find(|t| t.task_type == TaskType::Epic)
+                .map(|t| t.id.clone())
+                .unwrap_or_else(|| "factory".to_string());
+            Some(format!("[supervisor] {epic_context}"))
+        }
+        _ => None,
+    }
+}
+
+// ─── Skill drift detection (cas-f9ad) ─────────────────────────────────────
+
+/// Check whether synced skill files have changed since *this* session last
+/// loaded them, and if so update the per-session marker so subsequent calls
+/// within the same session return `false`.
+///
+/// ## Mechanism
+///
+/// `cas update --sync` writes a **sentinel** file at
+/// `<cas_root>/skill_sync_sentinel` containing an opaque timestamp token
+/// that changes on every sync run.
+///
+/// Each session tracks the last sentinel token it acknowledged in a
+/// **per-session marker** file `<cas_root>/session_skills_seen_<session_id>`.
+///
+/// On every `SessionStart`:
+/// - No sentinel → no sync has ever run → `false`.
+/// - No marker   → session hasn't loaded skills yet → `true`, write marker.
+/// - Marker content matches sentinel → `false`.
+/// - Marker content differs          → `true`, update marker.
+///
+/// The comparison is content-based (not mtime-based) to be resilient to
+/// filesystem clock skew and backup/restore workflows.  The token written by
+/// the sync step is a nanosecond-resolution UNIX timestamp, so collisions are
+/// negligible in practice.
+///
+/// Failures (unreadable sentinel, unwritable marker, etc.) are silently
+/// treated as "no drift" so `SessionStart` never blocks on I/O errors.
+pub(crate) fn detect_and_mark_skill_drift(cas_root: &Path, session_id: &str) -> bool {
+    let sentinel_path = cas_root.join("skill_sync_sentinel");
+    let marker_path = cas_root.join(format!("session_skills_seen_{session_id}"));
+
+    // Read sentinel — absent means sync has never run, no drift.
+    let sentinel = match std::fs::read_to_string(&sentinel_path) {
+        Ok(s) if !s.is_empty() => s,
+        _ => return false,
+    };
+
+    // Read per-session marker — absent means session hasn't acked any sync.
+    let marker = std::fs::read_to_string(&marker_path).unwrap_or_default();
+
+    if sentinel == marker {
+        return false;
+    }
+
+    // Drift detected: update marker and report.
+    let _ = std::fs::write(&marker_path, sentinel.as_bytes());
+    true
 }
 
 /// Build the opt-in Phase 3 (cas-3efe) integrations banner.

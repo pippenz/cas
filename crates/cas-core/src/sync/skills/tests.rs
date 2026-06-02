@@ -27,6 +27,7 @@ fn create_test_skill(name: &str, enabled: bool) -> Skill {
         context_mode: None,
         agent_type: None,
         allowed_tools: Vec::new(),
+        disallowed_tools: Vec::new(),
         hooks: None,
         disable_model_invocation: false,
         usage_count: 0,

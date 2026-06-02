@@ -75,6 +75,17 @@ pub struct HookInput {
     /// deserialization of existing payloads unchanged.
     #[serde(default)]
     pub agent_role: Option<String>,
+
+    /// Message text for the MessageDisplay hook event (CC 2.1.152+).
+    ///
+    /// Claude Code sends the assistant message text here when the
+    /// MessageDisplay hook fires, giving the handler a chance to transform
+    /// or redact the content before it reaches the terminal renderer.
+    ///
+    /// Never sent for other events — `#[serde(default)]` keeps existing
+    /// payloads unchanged.
+    #[serde(default)]
+    pub message: Option<String>,
 }
 
 /// Output sent back to Claude Code via stdout (JSON)
@@ -172,6 +183,27 @@ pub enum HookSpecificOutput {
     SessionStart {
         #[serde(rename = "additionalContext")]
         additional_context: String,
+        /// Ask the session to re-scan skill dirs and reload skill markdown without
+        /// a daemon restart. Emitted when `cas update --sync` has written new skill
+        /// content since this session last loaded skills.
+        ///
+        /// Absent (None) when no drift is detected — `skip_serializing_if` keeps
+        /// the field out of the JSON payload entirely in that case, matching
+        /// Claude Code's expectation that unknown `false`-ish booleans may be
+        /// omitted.
+        #[serde(rename = "reloadSkills", skip_serializing_if = "Option::is_none")]
+        reload_skills: Option<bool>,
+        /// Human-readable session title surfaced in the Claude Code agent dashboard
+        /// and factory tmux panes so each pane shows which worker owns which task.
+        ///
+        /// Workers: `[worker] <task-id> · <title preview>` or `[worker] idle`.
+        /// Supervisors: `[supervisor] <epic-id>` or `[supervisor] factory`.
+        /// Non-factory sessions: absent.
+        ///
+        /// Added by cas-ae09; absent when None to preserve unchanged wire shape
+        /// for sessions that don't participate in factory mode.
+        #[serde(rename = "sessionTitle", skip_serializing_if = "Option::is_none")]
+        session_title: Option<String>,
     },
     PermissionRequest {
         #[serde(rename = "permissionDecision")]
@@ -181,6 +213,19 @@ pub enum HookSpecificOutput {
             skip_serializing_if = "Option::is_none"
         )]
         permission_decision_reason: Option<String>,
+    },
+
+    /// MessageDisplay hook (CC 2.1.152+) — replaces the assistant message text
+    /// before it is rendered to the terminal. When `updated_message` is None
+    /// the variant is serialized but carries no transform (prefer returning
+    /// `HookOutput::empty()` for pure passthrough instead).
+    ///
+    /// Only emitted when the guard is opt-in (`[hooks] message_display_guard =
+    /// true`) AND a transform is actually needed; benign content returns
+    /// `HookOutput::empty()` so Claude Code does a zero-copy passthrough.
+    MessageDisplay {
+        #[serde(rename = "updatedMessage", skip_serializing_if = "Option::is_none")]
+        updated_message: Option<String>,
     },
 }
 
@@ -225,9 +270,63 @@ impl HookOutput {
         Self {
             hook_specific_output: Some(HookSpecificOutput::SessionStart {
                 additional_context: context,
+                reload_skills: None,
+                session_title: None,
             }),
             ..Default::default()
         }
+    }
+
+    /// Set `reloadSkills: true` on an existing `SessionStart` output, or create
+    /// a minimal `SessionStart` output when the current output is empty.
+    ///
+    /// Has no effect when `reload` is `false` and there is no existing
+    /// `SessionStart` output — this avoids accidentally emitting an empty
+    /// `hookSpecificOutput` payload for non-SessionStart events.
+    pub fn with_reload_skills(mut self, reload: bool) -> Self {
+        match self.hook_specific_output {
+            Some(HookSpecificOutput::SessionStart {
+                ref mut reload_skills,
+                ..
+            }) => {
+                *reload_skills = Some(reload);
+            }
+            None if reload => {
+                // No existing output yet — emit a minimal SessionStart so
+                // `reloadSkills` has a valid hookEventName wrapper.
+                self.hook_specific_output = Some(HookSpecificOutput::SessionStart {
+                    additional_context: String::new(),
+                    reload_skills: Some(true),
+                    session_title: None,
+                });
+            }
+            _ => {}
+        }
+        self
+    }
+
+    /// Set `sessionTitle` on an existing `SessionStart` output, or create a
+    /// minimal `SessionStart` output when the current output is empty (cas-ae09).
+    ///
+    /// Has no effect on non-SessionStart outputs.
+    pub fn with_session_title(mut self, title: String) -> Self {
+        match self.hook_specific_output {
+            Some(HookSpecificOutput::SessionStart {
+                ref mut session_title,
+                ..
+            }) => {
+                *session_title = Some(title);
+            }
+            None => {
+                self.hook_specific_output = Some(HookSpecificOutput::SessionStart {
+                    additional_context: String::new(),
+                    reload_skills: None,
+                    session_title: Some(title),
+                });
+            }
+            _ => {}
+        }
+        self
     }
 
     /// PreToolUse permission decision. `decision` must be `"allow"`, `"deny"`,
@@ -274,6 +373,18 @@ impl HookOutput {
             hook_specific_output: Some(HookSpecificOutput::PermissionRequest {
                 permission_decision: decision.to_string(),
                 permission_decision_reason: Some(reason.to_string()),
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// MessageDisplay transform — replaces the assistant message text before it
+    /// reaches the terminal renderer. Only call this when a transform is actually
+    /// needed; return `HookOutput::empty()` for passthrough (no allocation).
+    pub fn with_message_display_transform(updated: String) -> Self {
+        Self {
+            hook_specific_output: Some(HookSpecificOutput::MessageDisplay {
+                updated_message: Some(updated),
             }),
             ..Default::default()
         }

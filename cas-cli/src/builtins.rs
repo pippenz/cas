@@ -1089,6 +1089,64 @@ This is the body content."#;
         }
     }
 
+    // cas-5be8: disallowed-tools frontmatter in builtin skills
+    #[test]
+    fn test_builtin_cas_worker_disallowed_tools() {
+        for (label, skills) in [
+            ("BUILTIN_SKILLS", BUILTIN_SKILLS),
+            ("CODEX_BUILTIN_SKILLS", CODEX_BUILTIN_SKILLS),
+        ] {
+            let entry = skills
+                .iter()
+                .find(|b| b.path == "skills/cas-worker/SKILL.md")
+                .unwrap_or_else(|| panic!("{label}: cas-worker SKILL.md missing"));
+            for required in ["disallowed-tools:", "- TodoWrite", "- EnterPlanMode"] {
+                assert!(
+                    entry.content.contains(required),
+                    "{label}: cas-worker SKILL.md missing disallowed-tools entry: {required:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_builtin_cas_brainstorm_disallowed_tools() {
+        for (label, skills) in [
+            ("BUILTIN_SKILLS", BUILTIN_SKILLS),
+            ("CODEX_BUILTIN_SKILLS", CODEX_BUILTIN_SKILLS),
+        ] {
+            let entry = skills
+                .iter()
+                .find(|b| b.path == "skills/cas-brainstorm/SKILL.md")
+                .unwrap_or_else(|| panic!("{label}: cas-brainstorm SKILL.md missing"));
+            for required in ["disallowed-tools:", "- Write", "- Edit", "- NotebookEdit"] {
+                assert!(
+                    entry.content.contains(required),
+                    "{label}: cas-brainstorm SKILL.md missing disallowed-tools entry: {required:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_builtin_cas_ideate_disallowed_tools() {
+        for (label, skills) in [
+            ("BUILTIN_SKILLS", BUILTIN_SKILLS),
+            ("CODEX_BUILTIN_SKILLS", CODEX_BUILTIN_SKILLS),
+        ] {
+            let entry = skills
+                .iter()
+                .find(|b| b.path == "skills/cas-ideate/SKILL.md")
+                .unwrap_or_else(|| panic!("{label}: cas-ideate SKILL.md missing"));
+            for required in ["disallowed-tools:", "- Write", "- Edit", "- NotebookEdit"] {
+                assert!(
+                    entry.content.contains(required),
+                    "{label}: cas-ideate SKILL.md missing disallowed-tools entry: {required:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_is_managed_by_cas() {
         let managed = "---\nname: test\nmanaged_by: cas\n---\nContent";

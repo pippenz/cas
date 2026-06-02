@@ -2,16 +2,14 @@ use std::path::Path;
 
 use toml::map::Map;
 
-/// Check if the global ~/.claude/settings.json already has CAS hooks configured.
+/// Check if a specific home directory's ~/.claude/settings.json has CAS hooks
+/// configured.
 ///
-/// Returns true if the global settings contain at least one hook entry whose
-/// command starts with "cas hook". When this is true, project-level settings
-/// should NOT add hooks (only permissions/statusLine) to avoid duplication.
-pub fn global_has_cas_hooks() -> bool {
-    let Some(home) = dirs::home_dir() else {
-        return false;
-    };
-    let global_settings_path = home.join(".claude").join("settings.json");
+/// Extracted for test-isolation: callers can pass a fake home TempDir to avoid
+/// reading the real `~/.claude/settings.json` and eliminate the parallel-test
+/// race documented in cas-1888.
+pub(crate) fn global_has_cas_hooks_in(home_dir: &std::path::Path) -> bool {
+    let global_settings_path = home_dir.join(".claude").join("settings.json");
     let Ok(content) = std::fs::read_to_string(&global_settings_path) else {
         return false;
     };
@@ -19,6 +17,22 @@ pub fn global_has_cas_hooks() -> bool {
         return false;
     };
     has_cas_hook_entries(&settings)
+}
+
+/// Check if the global ~/.claude/settings.json already has CAS hooks configured.
+///
+/// Returns true if the global settings contain at least one hook entry whose
+/// command starts with "cas hook". When this is true, project-level settings
+/// should NOT add hooks (only permissions/statusLine) to avoid duplication.
+///
+/// Wraps [`global_has_cas_hooks_in`] with `dirs::home_dir()`. Tests should use
+/// `global_has_cas_hooks_in` with a controlled TempDir to avoid reading real
+/// user state (cas-1888).
+pub fn global_has_cas_hooks() -> bool {
+    let Some(home) = dirs::home_dir() else {
+        return false;
+    };
+    global_has_cas_hooks_in(&home)
 }
 
 /// Check if a settings JSON value contains any CAS hook entries.
@@ -377,6 +391,30 @@ pub(crate) fn get_cas_hooks_config(config: &crate::config::HookConfig) -> serde_
             ]),
         );
     }
+
+    // MessageDisplay hook (CC 2.1.152+) — Ink-crash guard + assistant-text
+    // redaction. Registered unconditionally (guard is opt-in via config flag
+    // `[hooks] message_display_guard = true`; the handler itself is a
+    // zero-cost passthrough when the flag is absent or false).
+    //
+    // Uses a short timeout (1 s) since the handler does no I/O when the
+    // guard is off and only regex + string operations when it's on.
+    // Not async: MessageDisplay may block rendering until we respond, so we
+    // must not defer into the background.
+    hooks.insert(
+        "MessageDisplay".to_string(),
+        serde_json::json!([
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "args": ["cas", "hook", "MessageDisplay"],
+                        "timeout": 1000
+                    }
+                ]
+            }
+        ]),
+    );
 
     let mut allow_permissions = get_cas_bash_permissions();
     allow_permissions.extend(get_cas_mcp_permissions());

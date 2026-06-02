@@ -2,6 +2,10 @@
 name: cas-brainstorm
 description: Explore requirements and approaches through structured Q&A before any planning or coding. Use when the user describes a vague feature, asks "what should we build", "help me think through X", presents a problem with multiple valid solutions, says "let's brainstorm", or seems unsure about scope or direction. Trigger PROACTIVELY when a request is ambiguous, when assumptions would have to be invented to proceed, or when you catch yourself about to execute on an under-specified ask. The whole point of this skill is to force ASKING instead of ASSUMING.
 managed_by: cas
+disallowed-tools:
+  - Write
+  - Edit
+  - NotebookEdit
 ---
 
 # Brainstorm Before You Build
