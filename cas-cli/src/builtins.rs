@@ -342,6 +342,25 @@ pub const BUILTIN_SKILLS: &[BuiltinFile] = &[
     },
 ];
 
+/// Built-in Workflow scripts shipped to `.claude/workflows/` on `cas update --sync`.
+///
+/// Workflow scripts are machine-generated JS files with no user-customizable
+/// frontmatter. Unlike skills/agents (which use the `managed_by: cas` gate),
+/// workflows are always force-written on sync — they are pure CAS-managed
+/// artifacts and should never be hand-edited by users. The `sync_workflows`
+/// function handles this unconditional write.
+///
+/// Only Claude-harness workflows are shipped here. Codex does not use the
+/// Claude Code Workflow tool.
+pub const BUILTIN_WORKFLOWS: &[BuiltinFile] = &[
+    // cas-code-review Steps 3-4: parallel persona dispatch + deterministic merge
+    // (Phase B of EPIC cas-b667). Invoked by the cas-code-review skill wrapper.
+    BuiltinFile {
+        path: "workflows/cas-code-review.js",
+        content: include_str!("builtins/workflows/cas-code-review.js"),
+    },
+];
+
 /// All built-in skills managed by CAS for Codex
 pub const CODEX_BUILTIN_SKILLS: &[BuiltinFile] = &[
     BuiltinFile {
@@ -730,9 +749,39 @@ fn sync_all_builtins_inner(
     Ok(result)
 }
 
+/// Sync built-in Workflow scripts to the target directory.
+///
+/// Unlike skills and agents (which use the `managed_by: cas` gate), workflow
+/// scripts are always force-written — they are machine-generated JS files that
+/// users should not hand-edit. A workflow that diverges from the builtin is
+/// always replaced on sync.
+///
+/// Counts are returned on `result.skills_updated` (workflow scripts don't have
+/// their own counter; they are a minor surface relative to skills).
+fn sync_workflows(target_dir: &Path, workflows: &[BuiltinFile], result: &mut SyncResult) -> std::io::Result<()> {
+    for wf in workflows {
+        let target = target_dir.join(wf.path);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let needs_write = match std::fs::read_to_string(&target) {
+            Ok(existing) => existing != wf.content,
+            Err(_) => true,  // file absent or unreadable → create
+        };
+        if needs_write {
+            std::fs::write(&target, wf.content)?;
+            result.skills_updated += 1;
+            result.updated_files.push(wf.path.to_string());
+        }
+    }
+    Ok(())
+}
+
 /// Sync all built-in files to .claude/ directory
 pub fn sync_all_builtins(claude_dir: &Path) -> std::io::Result<SyncResult> {
-    sync_all_builtins_inner(claude_dir, BUILTIN_AGENTS, BUILTIN_SKILLS)
+    let mut result = sync_all_builtins_inner(claude_dir, BUILTIN_AGENTS, BUILTIN_SKILLS)?;
+    sync_workflows(claude_dir, BUILTIN_WORKFLOWS, &mut result)?;
+    Ok(result)
 }
 
 /// Sync all built-in files to .codex/ directory
@@ -1660,10 +1709,29 @@ This is the body content."#;
             "skills/cas-code-review/references/personas/security.md",
             "skills/cas-code-review/references/personas/performance.md",
             "skills/cas-code-review/references/personas/adversarial.md",
+            // Phase B (cas-b667): production Workflow shipped via BUILTIN_WORKFLOWS
+            "workflows/cas-code-review.js",
         ] {
             let f = claude_dir.join(p);
             assert!(f.exists(), "{p} not synced");
         }
+
+        // Phase B: verify the workflow content is the production script
+        let workflow_content = std::fs::read_to_string(
+            claude_dir.join("workflows/cas-code-review.js")
+        ).expect("workflow script must be synced");
+        assert!(
+            workflow_content.contains("cas-code-review"),
+            "workflow script must reference cas-code-review"
+        );
+        assert!(
+            workflow_content.contains("mergeFindings"),
+            "workflow script must contain the mergeFindings() pipeline"
+        );
+        assert!(
+            workflow_content.contains("REVIEWER_OUTPUT_SCHEMA"),
+            "workflow script must define the reviewer output schema"
+        );
 
         let overwritten = std::fs::read_to_string(&stale_agent).unwrap();
         assert!(
