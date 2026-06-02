@@ -258,8 +258,9 @@ ${fileList}
 ${diffText}
 \`\`\`
 
-**Schema reminder** — output MUST be a single JSON object:
+**Findings contract** — output MUST be a single JSON object:
 {"reviewer":"${name}","findings":[...],"residual_risks":[...],"testing_gaps":[...]}
+The canonical schema for Finding and ReviewerOutput is in references/findings-schema.md.
 Each finding needs: title (≤100 chars), severity (P0-P3), file (relative path),
 line (1-based int), why_it_matters, autofix_class (safe_auto|gated_auto|manual|advisory),
 owner (review-fixer|downstream-resolver|human), confidence (0.0-1.0),
@@ -341,7 +342,8 @@ ${fileList ?? '(not provided)'}
 ## Diff header (first 1500 chars)
 ${diffText.slice(0, 1500)}
 
-## Activation rules (apply LLM judgment, not path matching)
+## Activation rules — LLM-judged, not path pattern matching
+Do NOT grep for /auth/ in paths and call it security activation. Read the diff, understand what it does, decide whether the heuristic fires. This is an LLM-judged decision, not path pattern matching.
 - activate_security: diff touches auth/session/token boundaries, user input parsing/deserialization, or permission surfaces (MCP tool dispatch, jail/sandbox logic, factory-mode tool restriction)
 - activate_adversarial: diff has 50+ non-test changed lines (you have ${changeLines}) AND touches CAS high-stakes modules (close_ops, verify_ops, factory coordination, SQLite stores, hook system, MCP dispatch). Always false if fewer than 20 non-test lines.
 - activate_performance: diff touches DB queries, data transforms on large inputs, caching, or async hot paths
