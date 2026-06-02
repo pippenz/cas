@@ -158,6 +158,16 @@ impl CasCore {
             })
             .unwrap_or_default();
 
+        let disallowed_tools: Vec<String> = req
+            .disallowed_tools
+            .map(|t| {
+                t.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+
         let status = if req.draft {
             SkillStatus::Draft
         } else {
@@ -184,6 +194,7 @@ impl CasCore {
             context_mode: req.context_mode,
             agent_type: req.agent_type,
             allowed_tools,
+            disallowed_tools,
             hooks: None,
             disable_model_invocation: req.disable_model_invocation,
             usage_count: 0,

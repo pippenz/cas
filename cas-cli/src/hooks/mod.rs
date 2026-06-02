@@ -74,9 +74,10 @@ pub use context::{build_context, build_context_ai, build_plan_context};
 
 // Re-export handlers
 pub use handlers::{
-    get_session_files, handle_notification, handle_permission_request, handle_post_tool_use,
-    handle_pre_compact, handle_pre_tool_use, handle_session_end, handle_session_start, handle_stop,
-    handle_subagent_start, handle_subagent_stop, handle_user_prompt_submit,
+    get_session_files, handle_message_display, handle_notification, handle_permission_request,
+    handle_post_tool_use, handle_pre_compact, handle_pre_tool_use, handle_session_end,
+    handle_session_start, handle_stop, handle_subagent_start, handle_subagent_stop,
+    handle_user_prompt_submit,
 };
 
 use std::path::PathBuf;
@@ -110,6 +111,7 @@ pub fn handle_hook(event_name: &str, input: HookInput) -> Result<HookOutput, Mem
         "PermissionRequest" => handle_permission_request(&input, cas_root.as_deref()),
         "Notification" => handle_notification(&input, cas_root.as_deref()),
         "PreCompact" => handle_pre_compact(&input, cas_root.as_deref()),
+        "MessageDisplay" => handle_message_display(&input, cas_root.as_deref()),
         _ => {
             // Unknown hook, just pass through
             Ok(HookOutput::empty())

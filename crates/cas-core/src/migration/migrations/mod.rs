@@ -69,6 +69,7 @@ mod m079_skills_add_allowed_tools;
 mod m080_skills_add_hooks;
 mod m081_skills_add_disable_model_invocation;
 mod m082_skills_add_share;
+mod m083_skills_add_disallowed_tools;
 
 // Agents subsystem (91-110)
 mod m091_task_leases_add_epoch;
@@ -152,6 +153,7 @@ pub const MIGRATIONS: &[Migration] = &[
     m080_skills_add_hooks::MIGRATION,
     m081_skills_add_disable_model_invocation::MIGRATION,
     m082_skills_add_share::MIGRATION,
+    m083_skills_add_disallowed_tools::MIGRATION,
     // Agents
     m091_task_leases_add_epoch::MIGRATION,
     m092_agents_add_worktree_id::MIGRATION,

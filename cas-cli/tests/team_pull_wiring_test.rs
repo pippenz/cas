@@ -44,7 +44,7 @@ mod common;
 use common::{TEST_TEAM, make_cli_json, make_cloud_config};
 
 use cas::cli::cloud::{CloudSyncArgs, execute_sync, execute_team_pull};
-use cas::cloud::{CloudConfig, SyncQueue};
+use cas::cloud::{CloudConfig, SyncQueue, get_project_canonical_id};
 use cas::store::{
     open_commit_link_store, open_event_store, open_file_change_store, open_prompt_store,
     open_rule_store, open_skill_store, open_spec_store, open_store, open_task_store,
@@ -95,6 +95,38 @@ impl Drop for CasRootGuard {
     }
 }
 
+/// RAII guard for scoping an arbitrary env-var mutation to the duration of
+/// one test. Used to isolate `active_team_id()` from `~/.cas/cloud.json`
+/// (which may have a `default_team_id` on the developer's machine) by
+/// pointing `CAS_USER_CLOUD_JSON` at a non-existent path.
+struct ScopedEnvVar {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    key: &'static str,
+    prev: Option<std::ffi::OsString>,
+}
+
+impl ScopedEnvVar {
+    fn set(key: &'static str, value: &str) -> Self {
+        let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var_os(key);
+        // SAFETY: env mutation guarded by ENV_LOCK; no other test can race.
+        unsafe { std::env::set_var(key, value) };
+        Self { _lock: lock, key, prev }
+    }
+}
+
+impl Drop for ScopedEnvVar {
+    fn drop(&mut self) {
+        // SAFETY: ENV_LOCK held for entire guard lifetime.
+        unsafe {
+            match &self.prev {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+}
+
 /// Initialize a fresh `.cas`-style tempdir with empty SQLite stores + queue.
 fn make_cas_root() -> TempDir {
     let tmp = TempDir::new().unwrap();
@@ -113,6 +145,14 @@ fn make_cas_root() -> TempDir {
 /// serialized via `serde_json::to_value(&Entry{...})` to lock in the actual
 /// wire shape (matches the precedent in `team_memories_e2e_test.rs:331`).
 async fn mount_team_pull_with_one_entry(server: &MockServer, entry_id: &str) {
+    // Inject the same project_id that execute_team_pull resolves via
+    // get_project_canonical_id() so entity_matches_project() (cas-6479) accepts
+    // the row. Using the same runtime resolver ensures the mock and the
+    // production path agree even when the process canonical-id is cached from
+    // a prior test or set via CAS_ROOT (cas-6ddc).
+    let project_id = get_project_canonical_id()
+        .unwrap_or_else(|| "cas-src".to_string());
+
     let alice_entry = Entry {
         id: entry_id.to_string(),
         scope: Scope::Project,
@@ -120,7 +160,8 @@ async fn mount_team_pull_with_one_entry(server: &MockServer, entry_id: &str) {
         content: "alice's shared learning".to_string(),
         ..Default::default()
     };
-    let shared_entry = serde_json::to_value(&alice_entry).unwrap();
+    let mut shared_entry = serde_json::to_value(&alice_entry).unwrap();
+    shared_entry["project_id"] = serde_json::json!(project_id);
 
     Mock::given(method("GET"))
         .and(path(format!("/api/teams/{TEST_TEAM}/sync/pull")))
@@ -208,6 +249,18 @@ async fn team_pull_no_op_when_no_team_configured() {
 
     let tmp = make_cas_root();
     let cas_root = tmp.path().to_path_buf();
+
+    // Isolate from ~/.cas/cloud.json: on machines where the developer has a
+    // default_team_id set (e.g. via `cas cloud team set`), active_team_id()
+    // falls through to user-level config and returns that team even when the
+    // project config has no team — causing a spurious team pull (cas-6ddc).
+    // Pointing CAS_USER_CLOUD_JSON at a nonexistent path makes CloudConfig::
+    // load_from() fail and return None, so active_team_id() gets no user
+    // config and correctly resolves to None for this no-team project config.
+    let _user_cloud_guard = ScopedEnvVar::set(
+        "CAS_USER_CLOUD_JSON",
+        "/nonexistent/cas-test-isolation/cloud.json",
+    );
 
     // Cloud config WITHOUT an active team — `active_team_id()` returns None.
     let mut cfg = CloudConfig::default();
@@ -329,6 +382,9 @@ async fn mount_full_sync_mocks(server: &MockServer, team_entry_id: &str) {
     // assertion — it fails the test if execute_sync hits this endpoint
     // zero times (the original bug) OR more than once (regression guard
     // for the previously-rejected double-call fix).
+    // project_id injected so entity_matches_project (cas-6479) accepts the row.
+    let project_id = get_project_canonical_id()
+        .unwrap_or_else(|| "cas-src".to_string());
     let alice_entry = Entry {
         id: team_entry_id.to_string(),
         scope: Scope::Project,
@@ -336,7 +392,8 @@ async fn mount_full_sync_mocks(server: &MockServer, team_entry_id: &str) {
         content: "alice's shared learning".to_string(),
         ..Default::default()
     };
-    let shared_entry = serde_json::to_value(&alice_entry).unwrap();
+    let mut shared_entry = serde_json::to_value(&alice_entry).unwrap();
+    shared_entry["project_id"] = serde_json::json!(project_id);
     Mock::given(method("GET"))
         .and(path(format!("/api/teams/{TEST_TEAM}/sync/pull")))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({

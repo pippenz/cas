@@ -273,6 +273,10 @@ mod handlers_state;
 pub(crate) mod session_hygiene;
 
 #[cfg(test)]
+pub(crate) use handlers_session::compute_session_title;
+#[cfg(test)]
+pub(crate) use handlers_session::detect_and_mark_skill_drift;
+#[cfg(test)]
 pub(crate) use handlers_session::estimate_tokens;
 pub(crate) use handlers_session::{
     extract_learnings_sync, generate_session_summary_sync, session_learn_sync,
@@ -291,7 +295,8 @@ pub(crate) use handlers_middle::is_file_within_project;
 
 pub(crate) mod handlers_events;
 pub use handlers_events::{
-    handle_notification, handle_permission_request, handle_pre_compact, handle_pre_tool_use,
+    handle_message_display, handle_notification, handle_permission_request, handle_pre_compact,
+    handle_pre_tool_use,
 };
 
 #[cfg(test)]

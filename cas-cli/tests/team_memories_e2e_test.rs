@@ -335,7 +335,11 @@ async fn fresh_teammate_pull_applies_team_memories_to_local_store() {
         content: "alice's shared learning".to_string(),
         ..Default::default()
     };
-    let shared_entry = serde_json::to_value(&alice_entry).unwrap();
+    let mut shared_entry = serde_json::to_value(&alice_entry).unwrap();
+    // The real cloud echoes `project_id` on every pull-response row (cas-6479), so the
+    // mock must too — otherwise the hardened `entity_matches_project` correctly skips this
+    // Project-scoped entry for lacking a project_id. Mirrors the project the teammate pulls.
+    shared_entry["project_id"] = serde_json::json!("fresh-teammate-test-project");
 
     Mock::given(method("GET"))
         .and(path(format!("/api/teams/{TEST_TEAM}/sync/pull")))
