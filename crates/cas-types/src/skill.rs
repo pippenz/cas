@@ -254,6 +254,12 @@ pub struct Skill {
     #[serde(default)]
     pub allowed_tools: Vec<String>,
 
+    /// List of tools this skill is not allowed to use
+    /// Maps to `disallowed-tools` frontmatter in SKILL.md (YAML list format)
+    /// Used to enforce bans at the harness level (Claude Code 2.1.152+)
+    #[serde(default)]
+    pub disallowed_tools: Vec<String>,
+
     /// Skill-scoped hooks (PreToolUse, PostToolUse, Stop)
     /// Maps to `hooks` frontmatter in SKILL.md (Claude Code 2.1.0+)
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -319,6 +325,7 @@ impl Skill {
             context_mode: None,
             agent_type: None,
             allowed_tools: Vec::new(),
+            disallowed_tools: Vec::new(),
             hooks: None,
             disable_model_invocation: false,
             usage_count: 0,

@@ -128,6 +128,11 @@ pub struct SkillCreateRequest {
     #[serde(default)]
     pub allowed_tools: Option<String>,
 
+    /// Disallowed tools (comma-separated) — harness-enforced bans (Claude Code 2.1.152+)
+    #[schemars(description = "Disallowed tools (harness-enforced, Claude Code 2.1.152+)")]
+    #[serde(default)]
+    pub disallowed_tools: Option<String>,
+
     /// Start as draft
     #[schemars(description = "Create as draft (not enabled)")]
     #[serde(default)]
