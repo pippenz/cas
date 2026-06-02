@@ -6,6 +6,10 @@ pub fn handle_session_start(
 ) -> Result<HookOutput, MemError> {
     let timer = TraceTimer::new();
 
+    // Computed inside the inner `cas_root` block and applied to the output
+    // after context building (cas-ae09). None for non-factory sessions.
+    let mut factory_session_title: Option<String> = None;
+
     // Record session start for analytics and register agent
     if let Some(cas_root) = cas_root {
         let mut stores = HookStores::new(cas_root);
@@ -110,13 +114,17 @@ pub fn handle_session_start(
         let project_path = cas_root.parent().map(|p| p.to_string_lossy().to_string());
 
         // Check for active task (reuses cached task store)
-        let active_task_id = stores
+        // Fetch the full list so downstream consumers (OTEL, sessionTitle) share
+        // the same query without redundant store access.
+        let active_tasks: Vec<Task> = stores
             .tasks()
-            .and_then(|ts| {
-                ts.list(Some(TaskStatus::InProgress))
-                    .ok()
-                    .and_then(|tasks| tasks.first().map(|t| t.id.clone()))
-            });
+            .and_then(|ts| ts.list(Some(TaskStatus::InProgress)).ok())
+            .unwrap_or_default();
+        let active_task_id = active_tasks.first().map(|t| t.id.clone());
+
+        // Compute factory session title now while active_tasks is in scope (cas-ae09).
+        let role = std::env::var("CAS_AGENT_ROLE").unwrap_or_default();
+        factory_session_title = compute_session_title(&role, &active_tasks);
 
         let otel_ctx = OtelContext::new(input.session_id.clone())
             .with_project_id(project_id)
@@ -274,6 +282,14 @@ pub fn handle_session_start(
         output
     };
 
+    // Emit sessionTitle for factory sessions so agent dashboard / tmux panes
+    // show which worker owns which task at a glance (cas-ae09).
+    // Non-factory sessions produce None → field absent → unchanged wire shape.
+    let output = match factory_session_title {
+        Some(title) => output.with_session_title(title),
+        None => output,
+    };
+
     // Record trace if dev mode is enabled
     if let Some(tracer) = DevTracer::get() {
         if tracer.should_trace_hooks() {
@@ -310,6 +326,44 @@ pub fn handle_session_start(
 /// Estimate token count (rough approximation: ~4 chars per token)
 pub(crate) fn estimate_tokens(s: &str) -> usize {
     s.len() / 4
+}
+
+// ─── Session title computation (cas-ae09) ─────────────────────────────────
+
+/// Compute the `sessionTitle` string for a factory session.
+///
+/// Returns `None` for non-factory sessions (empty or unknown role) so the
+/// `sessionTitle` field is absent from the SessionStart JSON output, preserving
+/// the unchanged wire shape for regular interactive sessions.
+///
+/// ## Title formats
+///
+/// | Role       | Condition              | Title                                  |
+/// |------------|------------------------|----------------------------------------|
+/// | worker     | active in-progress task | `[worker] <task-id> · <title ≤40ch>` |
+/// | worker     | no active task          | `[worker] idle`                        |
+/// | supervisor | in-progress epic exists | `[supervisor] <epic-id>`              |
+/// | supervisor | no in-progress epic     | `[supervisor] factory`                 |
+/// | other / "" | —                       | `None`                                 |
+pub(crate) fn compute_session_title(agent_role: &str, active_tasks: &[Task]) -> Option<String> {
+    match agent_role {
+        "worker" => {
+            let title = active_tasks.first().map(|t| {
+                let preview = truncate_display(&t.title, 40);
+                format!("[worker] {} · {}", t.id, preview)
+            });
+            Some(title.unwrap_or_else(|| "[worker] idle".to_string()))
+        }
+        "supervisor" => {
+            let epic_context = active_tasks
+                .iter()
+                .find(|t| t.task_type == TaskType::Epic)
+                .map(|t| t.id.clone())
+                .unwrap_or_else(|| "factory".to_string());
+            Some(format!("[supervisor] {epic_context}"))
+        }
+        _ => None,
+    }
 }
 
 // ─── Skill drift detection (cas-f9ad) ─────────────────────────────────────

@@ -273,6 +273,8 @@ mod handlers_state;
 pub(crate) mod session_hygiene;
 
 #[cfg(test)]
+pub(crate) use handlers_session::compute_session_title;
+#[cfg(test)]
 pub(crate) use handlers_session::detect_and_mark_skill_drift;
 #[cfg(test)]
 pub(crate) use handlers_session::estimate_tokens;

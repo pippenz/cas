@@ -182,6 +182,17 @@ pub enum HookSpecificOutput {
         /// omitted.
         #[serde(rename = "reloadSkills", skip_serializing_if = "Option::is_none")]
         reload_skills: Option<bool>,
+        /// Human-readable session title surfaced in the Claude Code agent dashboard
+        /// and factory tmux panes so each pane shows which worker owns which task.
+        ///
+        /// Workers: `[worker] <task-id> · <title preview>` or `[worker] idle`.
+        /// Supervisors: `[supervisor] <epic-id>` or `[supervisor] factory`.
+        /// Non-factory sessions: absent.
+        ///
+        /// Added by cas-ae09; absent when None to preserve unchanged wire shape
+        /// for sessions that don't participate in factory mode.
+        #[serde(rename = "sessionTitle", skip_serializing_if = "Option::is_none")]
+        session_title: Option<String>,
     },
     PermissionRequest {
         #[serde(rename = "permissionDecision")]
@@ -236,6 +247,7 @@ impl HookOutput {
             hook_specific_output: Some(HookSpecificOutput::SessionStart {
                 additional_context: context,
                 reload_skills: None,
+                session_title: None,
             }),
             ..Default::default()
         }
@@ -261,6 +273,31 @@ impl HookOutput {
                 self.hook_specific_output = Some(HookSpecificOutput::SessionStart {
                     additional_context: String::new(),
                     reload_skills: Some(true),
+                    session_title: None,
+                });
+            }
+            _ => {}
+        }
+        self
+    }
+
+    /// Set `sessionTitle` on an existing `SessionStart` output, or create a
+    /// minimal `SessionStart` output when the current output is empty (cas-ae09).
+    ///
+    /// Has no effect on non-SessionStart outputs.
+    pub fn with_session_title(mut self, title: String) -> Self {
+        match self.hook_specific_output {
+            Some(HookSpecificOutput::SessionStart {
+                ref mut session_title,
+                ..
+            }) => {
+                *session_title = Some(title);
+            }
+            None => {
+                self.hook_specific_output = Some(HookSpecificOutput::SessionStart {
+                    additional_context: String::new(),
+                    reload_skills: None,
+                    session_title: Some(title),
                 });
             }
             _ => {}

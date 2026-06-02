@@ -6,6 +6,7 @@ mod permission_request_factory;
 mod preferences_context;
 mod reload_skills;
 mod reviews;
+mod session_title;
 mod ripple_path_scope;
 mod send_message_autoroute;
 mod supervisor_reminder;
