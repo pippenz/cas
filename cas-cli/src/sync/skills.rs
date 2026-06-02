@@ -102,6 +102,14 @@ impl SkillSyncer {
             }
         }
 
+        // Add disallowed-tools as YAML list if set (Claude Code 2.1.152+, cas-5be8)
+        if !skill.disallowed_tools.is_empty() {
+            content.push_str("disallowed-tools:\n");
+            for tool in &skill.disallowed_tools {
+                content.push_str(&format!("  - {}\n", escape_yaml(tool)));
+            }
+        }
+
         // Add disable-model-invocation if set (Claude Code 2.1.3+)
         if skill.disable_model_invocation {
             content.push_str("disable-model-invocation: true\n");
@@ -495,6 +503,7 @@ fn parse_skill_file(path: &Path) -> Result<Skill, CasError> {
     let agent_type = extract_yaml_value(&frontmatter, "agent");
 
     let allowed_tools = extract_yaml_list(&frontmatter, "allowed-tools");
+    let disallowed_tools = extract_yaml_list(&frontmatter, "disallowed-tools");
 
     let disable_model_invocation = extract_yaml_value(&frontmatter, "disable-model-invocation")
         .map(|v| v == "true")
@@ -519,6 +528,7 @@ fn parse_skill_file(path: &Path) -> Result<Skill, CasError> {
     skill.context_mode = context_mode;
     skill.agent_type = agent_type;
     skill.allowed_tools = allowed_tools;
+    skill.disallowed_tools = disallowed_tools;
     skill.disable_model_invocation = disable_model_invocation;
     skill.status = SkillStatus::Enabled;
     skill.skill_type = if managed_by_cas {

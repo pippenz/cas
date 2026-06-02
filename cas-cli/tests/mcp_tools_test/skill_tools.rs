@@ -23,6 +23,7 @@ async fn test_skill_create() {
         context_mode: None,
         agent_type: None,
         allowed_tools: None,
+        disallowed_tools: None,
         draft: false,
         disable_model_invocation: false,
     };
@@ -58,6 +59,7 @@ async fn test_skill_show() {
         context_mode: None,
         agent_type: None,
         allowed_tools: None,
+        disallowed_tools: None,
         draft: false,
         disable_model_invocation: false,
     };
@@ -104,6 +106,7 @@ async fn test_skill_list() {
             context_mode: None,
             agent_type: None,
             allowed_tools: None,
+            disallowed_tools: None,
             draft: false,
             disable_model_invocation: false,
         };
@@ -152,6 +155,7 @@ async fn test_skill_update() {
         context_mode: None,
         agent_type: None,
         allowed_tools: None,
+        disallowed_tools: None,
         draft: false,
         disable_model_invocation: false,
     };
@@ -206,6 +210,7 @@ async fn test_skill_enable_disable() {
         context_mode: None,
         agent_type: None,
         allowed_tools: None,
+        disallowed_tools: None,
         draft: false,
         disable_model_invocation: false,
     };
@@ -261,6 +266,7 @@ async fn test_skill_delete() {
         context_mode: None,
         agent_type: None,
         allowed_tools: None,
+        disallowed_tools: None,
         draft: false,
         disable_model_invocation: false,
     };
@@ -306,6 +312,7 @@ async fn test_skill_use() {
         context_mode: None,
         agent_type: None,
         allowed_tools: None,
+        disallowed_tools: None,
         draft: false,
         disable_model_invocation: false,
     };
