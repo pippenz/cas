@@ -177,38 +177,64 @@ function mergeFindings(reviewerOutputs) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PHASE 1: RESOLVE
+//
+// Production shape: skill wrapper pre-fetches diff + file list and passes them
+// via args to avoid paying output tokens for the agent to "echo" a large diff.
+// args.diff_text / args.file_list / args.intent_summary short-circuit the
+// fetch agents when provided. Useful for live-run validation (cas-6a84) and
+// for the production supervisor-owned path.
 // ─────────────────────────────────────────────────────────────────────────────
 phase('Resolve')
 
-// args: { base_sha, task_id, mode } — or infer from git
+// args: { base_sha, end_sha, diff_text, file_list, intent_summary, task_id, mode }
 const baseSha = args?.base_sha || (await agent(
   `Run: git log --oneline -5 && git rev-parse HEAD~1 2>/dev/null || git rev-list --max-parents=0 HEAD
   Return ONLY the SHA that should be used as the review base (the commit immediately before the tip, or origin/HEAD if on a feature branch). No prose, just the SHA.`,
   { label: 'resolve-base-sha' }
 )).trim()
 
-const [diffText, fileList, intentRaw] = await parallel([
-  () => agent(
-    `Run: git diff ${baseSha}..HEAD
-     Return the full diff text verbatim. No truncation. If diff is empty say EMPTY_DIFF.`,
-    { label: 'fetch-diff' }
-  ),
-  () => agent(
-    `Run: git diff --name-only ${baseSha}..HEAD
-     Return the newline-separated file list verbatim.`,
-    { label: 'fetch-file-list' }
-  ),
-  () => agent(
+const endRef = args?.end_sha || 'HEAD'
+
+let diffText, fileList, intentRaw
+if (args?.diff_text && args?.file_list) {
+  // Fast path: diff + file list pre-provided by caller (production shape)
+  diffText = args.diff_text
+  fileList = args.file_list
+  intentRaw = args?.intent_summary || (await agent(
     args?.task_id
       ? `Fetch CAS task ${args.task_id} via mcp__cas__task action=show id=${args.task_id}.
-         Synthesize a 2-3 line intent summary: Goal (one line), Scope marker (new feature/refactor/bug fix/etc.), Non-goals if stated.
+         Synthesize a 2-3 line intent summary: Goal (one line), Scope marker, Non-goals if stated.
          Return ONLY the intent summary, no extra prose.`
-      : `Run: git log --format=%B ${baseSha}..HEAD
+      : `Run: git log --format=%B ${baseSha}..${endRef}
          Synthesize a 2-3 line intent summary from the commit messages: Goal (one line), Scope marker, Non-goals if any.
          Return ONLY the intent summary, no extra prose.`,
     { label: 'extract-intent' }
-  ),
-])
+  ))
+} else {
+  // Slow path: fetch all three via agents (used when diff not pre-provided)
+  ;[diffText, fileList, intentRaw] = await parallel([
+    () => agent(
+      `Run: git diff ${baseSha}..${endRef}
+       Return the full diff text verbatim. No truncation. If diff is empty say EMPTY_DIFF.`,
+      { label: 'fetch-diff' }
+    ),
+    () => agent(
+      `Run: git diff --name-only ${baseSha}..${endRef}
+       Return the newline-separated file list verbatim.`,
+      { label: 'fetch-file-list' }
+    ),
+    () => agent(
+      args?.task_id
+        ? `Fetch CAS task ${args.task_id} via mcp__cas__task action=show id=${args.task_id}.
+           Synthesize a 2-3 line intent summary: Goal (one line), Scope marker (new feature/refactor/bug fix/etc.), Non-goals if stated.
+           Return ONLY the intent summary, no extra prose.`
+        : `Run: git log --format=%B ${baseSha}..${endRef}
+           Synthesize a 2-3 line intent summary from the commit messages: Goal (one line), Scope marker, Non-goals if any.
+           Return ONLY the intent summary, no extra prose.`,
+      { label: 'extract-intent' }
+    ),
+  ])
+}
 
 if (diffText.trim() === 'EMPTY_DIFF' || !diffText.trim()) {
   log('Diff is empty — returning clean envelope')
