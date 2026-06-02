@@ -2,6 +2,7 @@ mod agent_worktree_block;
 mod ask_user_question_remind;
 mod basic;
 mod factory_auto_approve;
+mod message_display;
 mod permission_request_factory;
 mod preferences_context;
 mod reload_skills;

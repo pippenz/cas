@@ -295,7 +295,8 @@ pub(crate) use handlers_middle::is_file_within_project;
 
 pub(crate) mod handlers_events;
 pub use handlers_events::{
-    handle_notification, handle_permission_request, handle_pre_compact, handle_pre_tool_use,
+    handle_message_display, handle_notification, handle_permission_request, handle_pre_compact,
+    handle_pre_tool_use,
 };
 
 #[cfg(test)]

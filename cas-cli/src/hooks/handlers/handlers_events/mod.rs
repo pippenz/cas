@@ -1,5 +1,6 @@
 mod attribution;
 pub(crate) mod codemap;
+pub(crate) mod message_display;
 mod notifications;
 mod pre_tool;
 pub(crate) mod project_overview;
@@ -14,5 +15,6 @@ pub use codemap::{
     CodemapStaleness, check_codemap_freshness, codemap_stop_reminder,
     detect_codemap_structural_changes,
 };
+pub use message_display::handle_message_display;
 pub use notifications::{handle_notification, handle_permission_request, handle_pre_compact};
 pub use pre_tool::handle_pre_tool_use;

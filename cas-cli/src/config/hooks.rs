@@ -466,6 +466,15 @@ impl Default for NotificationHookConfig {
 /// Hook configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HookConfig {
+    /// MessageDisplay guard — sanitize Ink-crash trigger shapes and redact
+    /// secrets from assistant text before it reaches the terminal renderer
+    /// (CC 2.1.152+ MessageDisplay hook, cas-b39a).
+    ///
+    /// **Default: false** — the handler is a pure passthrough when this flag
+    /// is absent or false, preserving existing behavior byte-for-byte.
+    /// Set to `true` in `[hooks]` of `.cas/config.toml` to opt in.
+    #[serde(default)]
+    pub message_display_guard: bool,
     /// Whether capture is enabled (legacy, use post_tool_use.enabled)
     #[serde(default = "default_true")]
     pub capture_enabled: bool,
@@ -637,6 +646,8 @@ impl Default for HookConfig {
             permission_request: PermissionRequestHookConfig::default(),
             pre_compact: PreCompactHookConfig::default(),
             notification: NotificationHookConfig::default(),
+            // MessageDisplay guard — off by default (opt-in)
+            message_display_guard: false,
         }
     }
 }

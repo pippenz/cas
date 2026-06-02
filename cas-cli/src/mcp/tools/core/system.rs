@@ -34,6 +34,7 @@ impl CasCore {
             subagent_type: None,
             subagent_prompt: None,
             agent_role: std::env::var("CAS_AGENT_ROLE").ok(),
+            message: None,
         };
 
         let context = build_context(&hook_input, limit, &self.cas_root).map_err(|e| McpError {
