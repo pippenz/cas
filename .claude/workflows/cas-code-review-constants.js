@@ -71,6 +71,50 @@ export const REVIEWER_OUTPUT_SCHEMA = Object.freeze({
 })
 
 // ─────────────────────────────────────────────────────────────────────────────
+// SETUP_SCHEMA — Phase C (cas-7c64)
+// Combined Steps 1-2 agent output: intent extraction + persona selection in one call.
+// Using boolean flags per conditional persona (not a string array) gives the
+// schema layer hard-type enforcement on the activation decision.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export const SETUP_SCHEMA = Object.freeze({
+  type: 'object',
+  required: [
+    'intent_summary',
+    'activate_security',
+    'activate_adversarial',
+    'activate_performance',
+    'fallow_skip_reason',
+  ],
+  additionalProperties: false,
+  properties: {
+    // Step 1: Intent — 2-3 line synthesis of what the author was trying to do
+    intent_summary: {
+      type: 'string',
+      description: 'Goal (1 line) + Scope marker (new feature/refactor/fix/etc.) + Non-goals (optional)',
+    },
+    // Step 2: Conditional persona activation flags (LLM judgment, not path pattern matching)
+    activate_security: {
+      type: 'boolean',
+      description: 'true if diff touches auth boundaries, user input parsing, or permission surfaces',
+    },
+    activate_adversarial: {
+      type: 'boolean',
+      description: 'true if diff is 50+ non-test lines AND touches CAS high-stakes modules',
+    },
+    activate_performance: {
+      type: 'boolean',
+      description: 'true if diff touches DB queries, data transforms, caching, or async hot paths',
+    },
+    // Fallow detection
+    fallow_skip_reason: {
+      type: ['string', 'null'],
+      description: 'null if fallow should run; string reason if it should skip (non-JS/TS repo, etc.)',
+    },
+  },
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
 // PERSONA PROMPTS — verbatim from references/personas/ (embedded for self-containment)
 // ─────────────────────────────────────────────────────────────────────────────
 

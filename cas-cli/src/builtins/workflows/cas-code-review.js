@@ -268,7 +268,29 @@ Do NOT emit any prose outside the JSON envelope.`
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// WORKFLOW BODY — Steps 3-4
+// SETUP_SCHEMA — Phase C (inlined; Workflow scripts cannot import from ES modules)
+// Combined Steps 1-2 agent output: intent extraction + persona selection in one call.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const SETUP_SCHEMA = {
+  type: 'object',
+  required: ['intent_summary', 'activate_security', 'activate_adversarial', 'activate_performance', 'fallow_skip_reason'],
+  additionalProperties: false,
+  properties: {
+    intent_summary:       { type: 'string' },
+    activate_security:    { type: 'boolean' },
+    activate_adversarial: { type: 'boolean' },
+    activate_performance: { type: 'boolean' },
+    fallow_skip_reason:   { type: ['string', 'null'] },
+  },
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WORKFLOW BODY — Steps 1-4 (Phase C: Steps 1-2 now inside Workflow)
+//
+// Skill wrapper passes: diff_text, file_list, base_sha, commit_log,
+//   task_context (optional), mode, task_id (optional)
+// Workflow handles: intent extraction, persona selection, dispatch, merge
 // ─────────────────────────────────────────────────────────────────────────────
 
 phase('Resolve')
@@ -277,9 +299,8 @@ const {
   diff_text: diffText,
   file_list: fileList,
   base_sha: baseSha,
-  intent_summary: intentSummary,
-  activated_personas: callerActivatedPersonas,
-  fallow_skip_reason: fallowSkipReason,
+  commit_log: commitLog,
+  task_context: taskContext,
   mode = 'headless',
   task_id: taskId,
 } = args ?? {}
@@ -290,22 +311,67 @@ if (!diffText || !diffText.trim() || diffText.trim() === 'EMPTY_DIFF') {
 }
 
 if (!baseSha) {
-  log('ERROR: base_sha required — pass from skill Step 1')
+  log('ERROR: base_sha required — pass from skill')
   return { residual: [], pre_existing: [], mode, error: 'missing base_sha', stats: { personas_run: 0 } }
 }
 
-const toRun = callerActivatedPersonas
-  ? callerActivatedPersonas.filter(name => name in PERSONA_PROMPTS)
-  : [...ALWAYS_ON_PERSONAS]
+const changeLines = diffText.split('\n').filter(l => l.startsWith('+') || l.startsWith('-')).length
+const fileCount = fileList ? fileList.split('\n').filter(Boolean).length : '?'
+log(`Diff: ${changeLines} changed lines, ${fileCount} files`)
 
-const isFallowSkipped = !!fallowSkipReason || !toRun.includes('fallow')
+// ── COMBINED SETUP AGENT (Steps 1 + 2 in one call) ───────────────────────
+// Intent extraction + persona activation. One round-trip instead of 2-3.
+// Schema-validated → activation flags are hard booleans, not freeform text.
+
+const intentContext = taskContext
+  ? `CAS task context:\n${taskContext}`
+  : `Commit messages:\n${commitLog ?? '(no commit log provided)'}`
+
+const setup = await agent(`You are the cas-code-review setup agent. Analyze the diff and decide:
+1. A 2-3 line intent summary (Goal + Scope marker + Non-goals if any)
+2. Which conditional personas to activate (LLM judgment — read the diff, do not pattern-match paths)
+3. Whether the fallow persona should run (JS/TS detection)
+
+## Source of truth for intent
+${intentContext}
+
+## File list
+${fileList ?? '(not provided)'}
+
+## Diff header (first 1500 chars)
+${diffText.slice(0, 1500)}
+
+## Activation rules (apply LLM judgment, not path matching)
+- activate_security: diff touches auth/session/token boundaries, user input parsing/deserialization, or permission surfaces (MCP tool dispatch, jail/sandbox logic, factory-mode tool restriction)
+- activate_adversarial: diff has 50+ non-test changed lines (you have ${changeLines}) AND touches CAS high-stakes modules (close_ops, verify_ops, factory coordination, SQLite stores, hook system, MCP dispatch). Always false if fewer than 20 non-test lines.
+- activate_performance: diff touches DB queries, data transforms on large inputs, caching, or async hot paths
+- fallow_skip_reason: null if this is a JS/TS repo with JS/TS files in the diff; a short string reason if fallow should skip (e.g. "non-JS/TS repo: no package.json and no JS/TS files in diff")
+
+Return a single JSON object matching this schema exactly. No prose outside the JSON.`,
+  {
+    label: 'setup',
+    phase: 'Resolve',
+    schema: SETUP_SCHEMA,
+    model: 'sonnet',
+  }
+)
+
+const intentSummary = setup?.intent_summary ?? '(intent extraction failed)'
+const isFallowSkipped = !!setup?.fallow_skip_reason
 const fallowRuns = !isFallowSkipped
+
+// Build the active persona list from setup flags + always-on
+const toRun = [...ALWAYS_ON_PERSONAS]
+if (setup?.activate_security) toRun.push('security')
+if (setup?.activate_performance) toRun.push('performance')
+if (setup?.activate_adversarial) toRun.push('adversarial')
+if (fallowRuns) toRun.push('fallow')
+
 const personasToDispatch = toRun.filter(name => name !== 'fallow')
 
-const effectiveIntent = intentSummary || '(intent not provided — review the diff on its own merits)'
-
-log(`Dispatching ${personasToDispatch.length} LLM personas${fallowRuns ? ' + fallow' : ''}: ${personasToDispatch.join(', ')}`)
-log(`Diff: ${diffText.split('\n').filter(l => l.startsWith('+') || l.startsWith('-')).length} changed lines, ${fileList ? fileList.split('\n').filter(Boolean).length : '?'} files`)
+log(`Intent: ${intentSummary.split('\n')[0]}`)
+log(`Active personas: ${toRun.join(', ')}`)
+log(`Conditional: security=${setup?.activate_security}, performance=${setup?.activate_performance}, adversarial=${setup?.activate_adversarial}, fallow=${fallowRuns}`)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PHASE 2: PARALLEL PERSONA DISPATCH (Step 3)
@@ -316,7 +382,7 @@ phase('Review')
 const personaResults = await pipeline(
   personasToDispatch,
   (name) => agent(
-    buildPersonaPrompt(name, diffText, fileList ?? '', effectiveIntent, baseSha),
+    buildPersonaPrompt(name, diffText, fileList ?? '', intentSummary, baseSha),
     { label: `review:${name}`, phase: 'Review', schema: REVIEWER_OUTPUT_SCHEMA, model: 'sonnet' }
   )
 )
@@ -324,7 +390,7 @@ const personaResults = await pipeline(
 let fallowResult = null
 if (fallowRuns) {
   fallowResult = await agent(
-    buildPersonaPrompt('fallow', diffText, fileList ?? '', effectiveIntent, baseSha),
+    buildPersonaPrompt('fallow', diffText, fileList ?? '', intentSummary, baseSha),
     { label: 'review:fallow', phase: 'Review', schema: REVIEWER_OUTPUT_SCHEMA, model: 'sonnet' }
   )
 }
@@ -350,10 +416,11 @@ return {
   residual,
   pre_existing,
   mode,
+  intent_summary: intentSummary,
   activation: {
     activated: toRun,
     fallow_skipped: isFallowSkipped,
-    fallow_skip_reason: fallowSkipReason ?? null,
+    fallow_skip_reason: setup?.fallow_skip_reason ?? null,
     personas_run: personasToDispatch.length + (fallowRuns ? 1 : 0),
   },
   stats: {
