@@ -89,39 +89,40 @@ Why the stridency: past iterations of automated review have drifted into "activa
 
 Record your activation decision explicitly in the output envelope so a reader can see *which* personas ran and *why* the conditional ones were included. Example: `"activated": ["security", "adversarial"], "activation_reason": {"security": "diff adds a new MCP tool handler that parses untrusted input", "adversarial": "diff is 83 non-test lines and touches close_ops.rs"}`.
 
-## Step 3: Parallel dispatch
+## Step 3 + Step 4: Workflow dispatch + deterministic merge (Phase B — cas-b667)
 
-Spawn all activated personas in parallel via the Task tool. This is a single message with one Task tool call per persona — **not** a sequential loop. Opus can issue all 4–8 Task calls in a single response; do so.
+**Steps 3 and 4 now run inside the `cas-code-review` Workflow** (`.claude/workflows/cas-code-review.js`). You no longer spawn Task tools manually for personas. Instead:
 
-For each persona, the Task tool call passes:
+1. Pre-fetch the diff and file list:
+   ```bash
+   git diff <base_sha>..HEAD          # → diff_text
+   git diff --name-only <base_sha>..HEAD  # → file_list
+   ```
 
-- `subagent_type` — a Sonnet-tier generic subagent (the persona's prompt file *is* the prompt; persona files are not registered as first-class agents).
-- **Persona prompt body** — loaded verbatim from `references/personas/<persona>.md`.
-- **Intent summary** — the 2–3 line output of Step 1.
-- **Full diff text** — `git diff <base_sha>..HEAD`, not just a file list. Personas need the actual hunks to ground findings.
-- **Changed files list** — `git diff --name-only <base_sha>..HEAD` as a convenience index.
-- **`base_sha`** — so the persona can spot-check history or ancestry if needed.
-- **Findings schema reference** — point each persona at `references/findings-schema.md` and remind them that output must be a single `ReviewerOutput` JSON envelope conforming to that schema (and to `crates/cas-types/src/code_review.rs` at runtime).
-- **Reviewer name** — so the persona knows which `reviewer` field to set in the envelope.
-- **Model tier** — Sonnet, per R13.
+2. Determine whether fallow should run (JS/TS repo check — no package.json AND no .ts/.js in diff → skip, record reason).
 
-Each persona returns exactly one `ReviewerOutput` JSON object. Collect all of them in a vector. Any persona that fails to produce valid JSON (parse error, schema violation, unknown field, invalid enum) is a **reviewer error**, not a finding — log the error to the output envelope's per-persona status field and continue with the rest. Do not retry a failed persona within a single review pass; the merge pipeline will surface the error.
+3. Call the Workflow:
+   ```
+   Workflow({
+     name: 'cas-code-review',
+     args: {
+       diff_text, file_list, base_sha,
+       intent_summary,        // from Step 1
+       activated_personas,    // from Step 2 selection
+       fallow_skip_reason,    // string or null
+       mode, task_id,
+     }
+   })
+   ```
 
-**Parallelism is not optional.** Serializing personas burns latency budget for no benefit — they do not share state and Opus is already the orchestrator; running one at a time would just double or quadruple the review wall-clock. One message, N Task calls.
+4. The Workflow returns `{ residual, pre_existing, activation, stats }`. Use this as the merged findings envelope for Step 5.
 
-## Step 4: Hand off to the merge pipeline (Unit 5)
+**What the Workflow does internally:**
+- Fans out all activated personas in parallel (`pipeline()`) with schema-validated `ReviewerOutput` output (hard enforcement + auto-retry on mismatch). All personas on Sonnet per R13.
+- Merges with Phase-A-validated `mergeFindings()` (7-step deterministic JS pipeline, 30 unit tests, byte-identical on re-run).
+- Re-run on same diff = 100% cache hit, 0 tokens (~10ms).
 
-Once every persona has returned (or errored), pass the full vector of `ReviewerOutput` envelopes to the merge pipeline. Unit 5 implements this and defines the deterministic merge ordering from R4:
-
-1. Schema validation — drop unparseable envelopes as reviewer errors.
-2. Confidence gate — suppress findings with `confidence < 0.60`, except P0 findings which pass at `confidence >= 0.50`.
-3. Fingerprint deduplication — collapse findings with the same normalized (`file`, `line bucket ±3`, normalized `title`).
-4. Cross-reviewer agreement boost — when two or more reviewers agree on a fingerprint, add `+0.10` to the merged confidence (cap at `1.0`).
-5. Pre-existing separation — split findings with `pre_existing: true` into a separate bucket so they can be reported without gating the close.
-6. Conservative route resolution — when reviewers disagree on `owner`, keep the more restrictive owner (`human` > `downstream-resolver` > `review-fixer`).
-7. Partition + severity-sorted presentation — group by severity descending.
-
-**Unit 4 does not re-implement any of this.** Call Unit 5. Unit 5 is the source of truth for merge semantics, and any drift in that ordering belongs in Unit 5's module, not here.
+**What stays in this skill:** Steps 1-2 (intent + activation), Step 5 (mode routing), all CAS integration.
 
 ## Step 5: Mode-specific output
 

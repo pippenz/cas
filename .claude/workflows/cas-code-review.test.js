@@ -19,15 +19,19 @@ import assert from 'node:assert/strict'
 // The script itself is NOT a standard module (it's a Workflow script).
 // We test the exported constants via a thin barrel-export pattern:
 // the production script exports its testable parts at the bottom.
+// Import testable constants from the constants module.
+// (The production Workflow script cas-code-review.js cannot be imported as a
+// standard ES module because Workflow scripts use top-level `return` — a
+// non-standard extension of the Workflow runtime. Constants are in a
+// separate importable module.)
 import {
   PERSONA_PROMPTS,
   ALWAYS_ON_PERSONAS,
   CONDITIONAL_PERSONAS,
   REVIEWER_OUTPUT_SCHEMA,
   WORKFLOW_META,
-} from './cas-code-review.js'
+} from './cas-code-review-constants.js'
 
-// Also verify the mergeFindings import works through the production script.
 import { mergeFindings } from './merge-findings.js'
 
 const CANONICAL_ALWAYS_ON = ['correctness', 'testing', 'maintainability', 'project-standards']
