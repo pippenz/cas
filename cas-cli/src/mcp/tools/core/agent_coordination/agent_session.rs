@@ -115,6 +115,7 @@ impl CasCore {
             agent_role: requested_role
                 .map(|r| r.to_string())
                 .or_else(|| std::env::var("CAS_AGENT_ROLE").ok()),
+            message: None,
         };
 
         // Use hook handler for session start side effects
@@ -141,6 +142,7 @@ impl CasCore {
             | Some(HookSpecificOutput::UserPromptSubmit { .. })
             | Some(HookSpecificOutput::PostToolUse { .. })
             | Some(HookSpecificOutput::PermissionRequest { .. })
+            | Some(HookSpecificOutput::MessageDisplay { .. })
             | None => None,
         }
         .filter(|c| !c.is_empty())
@@ -223,6 +225,7 @@ impl CasCore {
             subagent_type: None,
             subagent_prompt: None,
             agent_role: std::env::var("CAS_AGENT_ROLE").ok(),
+            message: None,
         };
 
         handle_session_end(&input, Some(&self.cas_root)).map_err(|e| McpError {

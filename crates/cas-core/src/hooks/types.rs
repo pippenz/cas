@@ -75,6 +75,17 @@ pub struct HookInput {
     /// deserialization of existing payloads unchanged.
     #[serde(default)]
     pub agent_role: Option<String>,
+
+    /// Message text for the MessageDisplay hook event (CC 2.1.152+).
+    ///
+    /// Claude Code sends the assistant message text here when the
+    /// MessageDisplay hook fires, giving the handler a chance to transform
+    /// or redact the content before it reaches the terminal renderer.
+    ///
+    /// Never sent for other events — `#[serde(default)]` keeps existing
+    /// payloads unchanged.
+    #[serde(default)]
+    pub message: Option<String>,
 }
 
 /// Output sent back to Claude Code via stdout (JSON)
@@ -182,6 +193,19 @@ pub enum HookSpecificOutput {
         )]
         permission_decision_reason: Option<String>,
     },
+
+    /// MessageDisplay hook (CC 2.1.152+) — replaces the assistant message text
+    /// before it is rendered to the terminal. When `updated_message` is None
+    /// the variant is serialized but carries no transform (prefer returning
+    /// `HookOutput::empty()` for pure passthrough instead).
+    ///
+    /// Only emitted when the guard is opt-in (`[hooks] message_display_guard =
+    /// true`) AND a transform is actually needed; benign content returns
+    /// `HookOutput::empty()` so Claude Code does a zero-copy passthrough.
+    MessageDisplay {
+        #[serde(rename = "updatedMessage", skip_serializing_if = "Option::is_none")]
+        updated_message: Option<String>,
+    },
 }
 
 impl HookOutput {
@@ -274,6 +298,18 @@ impl HookOutput {
             hook_specific_output: Some(HookSpecificOutput::PermissionRequest {
                 permission_decision: decision.to_string(),
                 permission_decision_reason: Some(reason.to_string()),
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// MessageDisplay transform — replaces the assistant message text before it
+    /// reaches the terminal renderer. Only call this when a transform is actually
+    /// needed; return `HookOutput::empty()` for passthrough (no allocation).
+    pub fn with_message_display_transform(updated: String) -> Self {
+        Self {
+            hook_specific_output: Some(HookSpecificOutput::MessageDisplay {
+                updated_message: Some(updated),
             }),
             ..Default::default()
         }

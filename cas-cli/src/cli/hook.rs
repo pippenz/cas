@@ -63,6 +63,8 @@ pub enum HookCommand {
     Notification,
     /// Handle PreCompact hook event (context preservation)
     PreCompact,
+    /// Handle MessageDisplay hook event (Ink-crash guard + assistant-text redaction, opt-in)
+    MessageDisplay,
     /// Remove duplicate CAS hooks from project-level .claude/settings.json files
     ///
     /// When CAS hooks are configured globally in ~/.claude/settings.json,
@@ -94,6 +96,7 @@ pub fn execute(args: &HookArgs, cli: &Cli) -> anyhow::Result<()> {
         HookCommand::PermissionRequest => execute_event("PermissionRequest", cli),
         HookCommand::Notification => execute_event("Notification", cli),
         HookCommand::PreCompact => execute_event("PreCompact", cli),
+        HookCommand::MessageDisplay => execute_event("MessageDisplay", cli),
     }
 }
 

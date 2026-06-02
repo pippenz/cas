@@ -378,6 +378,30 @@ pub(crate) fn get_cas_hooks_config(config: &crate::config::HookConfig) -> serde_
         );
     }
 
+    // MessageDisplay hook (CC 2.1.152+) — Ink-crash guard + assistant-text
+    // redaction. Registered unconditionally (guard is opt-in via config flag
+    // `[hooks] message_display_guard = true`; the handler itself is a
+    // zero-cost passthrough when the flag is absent or false).
+    //
+    // Uses a short timeout (1 s) since the handler does no I/O when the
+    // guard is off and only regex + string operations when it's on.
+    // Not async: MessageDisplay may block rendering until we respond, so we
+    // must not defer into the background.
+    hooks.insert(
+        "MessageDisplay".to_string(),
+        serde_json::json!([
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "args": ["cas", "hook", "MessageDisplay"],
+                        "timeout": 1000
+                    }
+                ]
+            }
+        ]),
+    );
+
     let mut allow_permissions = get_cas_bash_permissions();
     allow_permissions.extend(get_cas_mcp_permissions());
 
