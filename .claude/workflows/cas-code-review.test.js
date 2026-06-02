@@ -1,7 +1,7 @@
 // cas-code-review.test.js — structural validation for the production Workflow script
 // Run with: node --test cas-code-review.test.js
 //
-// Written test-first (cas-0f13, test-first posture).
+// Written test-first (cas-0f13 + cas-7c64, test-first posture).
 // The production script under test: .claude/workflows/cas-code-review.js
 //
 // Tests validate:
@@ -11,6 +11,9 @@
 //   4. mergeFindings is imported from merge-findings.js (Phase A module)
 //   5. ALWAYS_ON_PERSONAS contains exactly the 4 required personas
 //   6. CONDITIONAL_PERSONAS contains exactly the 3 conditional personas
+//   7. [Phase C] SETUP_SCHEMA exists and validates the combined setup agent output
+//   8. [Phase C] Skill-facing args no longer require intent_summary or activated_personas
+//      (the Workflow now handles Steps 1-2 internally)
 
 import { test, describe } from 'node:test'
 import assert from 'node:assert/strict'
@@ -189,5 +192,75 @@ describe('mergeFindings integration (Phase A)', () => {
     const { residual, pre_existing } = mergeFindings([])
     assert.deepEqual(residual, [])
     assert.deepEqual(pre_existing, [])
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PHASE C: SETUP_SCHEMA (combined Steps 1-2 agent output)
+// The single setup agent returns intent + activation decisions in one call,
+// halving the Phase 1 round-trips vs the Phase B design.
+// ─────────────────────────────────────────────────────────────────────────────
+
+import {
+  SETUP_SCHEMA,
+} from './cas-code-review-constants.js'
+
+describe('SETUP_SCHEMA (Phase C — combined setup agent)', () => {
+  test('is a JSON Schema object', () => {
+    assert.equal(SETUP_SCHEMA.type, 'object')
+  })
+
+  test('requires intent_summary field', () => {
+    assert.ok(SETUP_SCHEMA.required.includes('intent_summary'),
+      'SETUP_SCHEMA must require intent_summary')
+  })
+
+  test('requires activate_security field', () => {
+    assert.ok(SETUP_SCHEMA.required.includes('activate_security'),
+      'SETUP_SCHEMA must require activate_security')
+  })
+
+  test('requires activate_adversarial field', () => {
+    assert.ok(SETUP_SCHEMA.required.includes('activate_adversarial'),
+      'SETUP_SCHEMA must require activate_adversarial')
+  })
+
+  test('requires fallow_skip_reason field', () => {
+    assert.ok(SETUP_SCHEMA.required.includes('fallow_skip_reason'),
+      'SETUP_SCHEMA must require fallow_skip_reason')
+  })
+
+  test('activate_security is boolean', () => {
+    const prop = SETUP_SCHEMA.properties.activate_security
+    assert.equal(prop.type, 'boolean',
+      'activate_security must be boolean for deterministic activation')
+  })
+
+  test('activate_adversarial is boolean', () => {
+    const prop = SETUP_SCHEMA.properties.activate_adversarial
+    assert.equal(prop.type, 'boolean',
+      'activate_adversarial must be boolean for deterministic activation')
+  })
+
+  test('activate_performance is boolean (optional conditional)', () => {
+    const prop = SETUP_SCHEMA.properties.activate_performance
+    assert.ok(prop, 'activate_performance property must exist')
+    assert.equal(prop.type, 'boolean')
+  })
+
+  test('fallow_skip_reason allows null (fallow should run)', () => {
+    const prop = SETUP_SCHEMA.properties.fallow_skip_reason
+    const types = Array.isArray(prop.type) ? prop.type : [prop.type]
+    assert.ok(types.includes('null') || prop.nullable === true,
+      'fallow_skip_reason must allow null to signal fallow should run')
+  })
+
+  test('intent_summary is a string', () => {
+    const prop = SETUP_SCHEMA.properties.intent_summary
+    assert.equal(prop.type, 'string')
+  })
+
+  test('has additionalProperties: false for strict validation', () => {
+    assert.equal(SETUP_SCHEMA.additionalProperties, false)
   })
 })
