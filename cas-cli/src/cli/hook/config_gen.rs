@@ -2,16 +2,14 @@ use std::path::Path;
 
 use toml::map::Map;
 
-/// Check if the global ~/.claude/settings.json already has CAS hooks configured.
+/// Check if a specific home directory's ~/.claude/settings.json has CAS hooks
+/// configured.
 ///
-/// Returns true if the global settings contain at least one hook entry whose
-/// command starts with "cas hook". When this is true, project-level settings
-/// should NOT add hooks (only permissions/statusLine) to avoid duplication.
-pub fn global_has_cas_hooks() -> bool {
-    let Some(home) = dirs::home_dir() else {
-        return false;
-    };
-    let global_settings_path = home.join(".claude").join("settings.json");
+/// Extracted for test-isolation: callers can pass a fake home TempDir to avoid
+/// reading the real `~/.claude/settings.json` and eliminate the parallel-test
+/// race documented in cas-1888.
+pub(crate) fn global_has_cas_hooks_in(home_dir: &std::path::Path) -> bool {
+    let global_settings_path = home_dir.join(".claude").join("settings.json");
     let Ok(content) = std::fs::read_to_string(&global_settings_path) else {
         return false;
     };
@@ -19,6 +17,22 @@ pub fn global_has_cas_hooks() -> bool {
         return false;
     };
     has_cas_hook_entries(&settings)
+}
+
+/// Check if the global ~/.claude/settings.json already has CAS hooks configured.
+///
+/// Returns true if the global settings contain at least one hook entry whose
+/// command starts with "cas hook". When this is true, project-level settings
+/// should NOT add hooks (only permissions/statusLine) to avoid duplication.
+///
+/// Wraps [`global_has_cas_hooks_in`] with `dirs::home_dir()`. Tests should use
+/// `global_has_cas_hooks_in` with a controlled TempDir to avoid reading real
+/// user state (cas-1888).
+pub fn global_has_cas_hooks() -> bool {
+    let Some(home) = dirs::home_dir() else {
+        return false;
+    };
+    global_has_cas_hooks_in(&home)
 }
 
 /// Check if a settings JSON value contains any CAS hook entries.

@@ -517,7 +517,16 @@ fn execute_status(cli: &Cli) -> anyhow::Result<()> {
 /// settings — no hooks — to avoid duplicate hook execution.
 ///
 /// Returns Ok(true) if file was created, Ok(false) if updated.
-pub fn configure_claude_hooks(project_root: &Path, force: bool) -> anyhow::Result<bool> {
+/// Configure CAS hooks, injecting an explicit home directory for the global-settings
+/// check. Pass `None` for production (uses `dirs::home_dir()`); pass `Some(path)` in
+/// tests to avoid reading the real `~/.claude/settings.json` (cas-1888).
+pub(crate) fn configure_claude_hooks_with_home(
+    project_root: &Path,
+    force: bool,
+    home_dir: Option<&Path>,
+) -> anyhow::Result<bool> {
+    use config_gen::global_has_cas_hooks_in;
+
     let claude_dir = project_root.join(".claude");
     let settings_path = claude_dir.join("settings.json");
     let cas_dir = project_root.join(".cas");
@@ -540,7 +549,10 @@ pub fn configure_claude_hooks(project_root: &Path, force: bool) -> anyhow::Resul
 
     // Check if global settings already have CAS hooks — if so, skip project-level
     // hooks to avoid duplicate execution. Only write permissions and statusLine.
-    let skip_hooks = global_has_cas_hooks();
+    let skip_hooks = match home_dir {
+        Some(h) => global_has_cas_hooks_in(h),
+        None => global_has_cas_hooks(),
+    };
 
     let created = if settings_path.exists() && !force {
         // Merge with existing settings
@@ -635,6 +647,17 @@ pub fn configure_claude_hooks(project_root: &Path, force: bool) -> anyhow::Resul
     };
 
     Ok(created)
+}
+
+/// Public API: configure CAS Claude hooks for a project.
+///
+/// Delegates to [`configure_claude_hooks_with_home`] with `home_dir = None`
+/// (uses `dirs::home_dir()` to locate global settings). Call sites in
+/// production (`init`, `update`, `hook configure`) use this wrapper.
+/// Tests use `configure_claude_hooks_with_home` directly to inject an isolated
+/// home directory (cas-1888).
+pub fn configure_claude_hooks(project_root: &Path, force: bool) -> anyhow::Result<bool> {
+    configure_claude_hooks_with_home(project_root, force, None)
 }
 
 /// Merge worktree additionalDirectories into settings permissions if enabled.
