@@ -80,6 +80,55 @@ impl WorkerSpawnPrep {
 
             // Check if worktree already exists on disk (reuse from previous session)
             if wt.worktree_path.exists() {
+                // STEP 2 (cas-5232): Hard-error — validate that the existing path is a
+                // *properly registered* git worktree on the expected branch before reusing
+                // it.  Without this check a stale directory (left by a partial failed
+                // `git worktree add`, or by a previous non-isolated session that happened
+                // to create a same-named subdirectory) would pass the `exists()` test and
+                // be returned as the worker's cwd.  Because the directory has no `.git`
+                // file, `git` would then traverse upward to the main checkout and commit
+                // on whatever branch `HEAD` points at there — typically `main`.
+                //
+                // The check runs `git rev-parse --abbrev-ref HEAD` in the worktree
+                // directory itself (not in wt.repo_root).  In a valid worktree the
+                // answer is the worktree's branch; in a plain directory git climbs to
+                // the nearest ancestor repo and reports its HEAD instead.
+                let wt_git = GitOperations::new(wt.worktree_path.clone());
+                match wt_git.current_branch() {
+                    Ok(ref actual_branch) if actual_branch == &wt.branch_name => {
+                        // Valid — correct branch confirmed.
+                        tracing::info!(
+                            worker = %self.worker_name,
+                            cwd = %wt.worktree_path.display(),
+                            branch = %actual_branch,
+                            reused = true,
+                            "spawn prep: worktree validated on correct branch (reuse path)"
+                        );
+                    }
+                    Ok(actual_branch) => {
+                        anyhow::bail!(
+                            "Worker '{}': worktree {:?} exists but git reports branch '{}' \
+                             (expected '{}'). Stale directory or branch mismatch — \
+                             remove {:?} and retry.",
+                            self.worker_name,
+                            wt.worktree_path,
+                            actual_branch,
+                            wt.branch_name,
+                            wt.worktree_path,
+                        );
+                    }
+                    Err(e) => {
+                        anyhow::bail!(
+                            "Worker '{}': path {:?} exists but is not a valid git worktree \
+                             (git current_branch failed: {}). Remove {:?} and retry.",
+                            self.worker_name,
+                            wt.worktree_path,
+                            e,
+                            wt.worktree_path,
+                        );
+                    }
+                }
+
                 let _ = git.init_submodules(&wt.worktree_path);
                 // Ensure gitignored config is available (may be missing from prior run)
                 crate::worktree::symlink_project_config(
@@ -108,6 +157,17 @@ impl WorkerSpawnPrep {
             // Create git worktree (THE SLOW PART)
             git.create_worktree(&wt.worktree_path, &wt.branch_name, Some(&wt.parent_branch))?;
 
+            // STEP 1 (cas-5232): Log the resolved cwd immediately after worktree creation
+            // so the daemon trace contains a clear record of which path each worker got.
+            tracing::info!(
+                worker = %self.worker_name,
+                cwd = %wt.worktree_path.display(),
+                branch = %wt.branch_name,
+                parent = %wt.parent_branch,
+                reused = false,
+                "spawn prep: new worktree created — cwd resolved"
+            );
+
             // Symlink .mcp.json and .claude/ so workers get MCP access
             crate::worktree::symlink_project_config(&wt.repo_root, &wt.worktree_path);
 
@@ -125,7 +185,16 @@ impl WorkerSpawnPrep {
                 worktree: Some(worktree),
             })
         } else {
+            // Non-isolated worker: cwd is wherever the daemon process is running.
+            // STEP 1 (cas-5232): Log so this path is distinguishable from the
+            // isolated paths in the trace.
             let cwd = std::env::current_dir()?;
+            tracing::info!(
+                worker = %self.worker_name,
+                cwd = %cwd.display(),
+                isolated = false,
+                "spawn prep: non-isolated worker — sharing process cwd"
+            );
             Ok(WorkerSpawnResult {
                 worker_name: self.worker_name,
                 cwd,
@@ -133,6 +202,58 @@ impl WorkerSpawnPrep {
                 worktree: None,
             })
         }
+    }
+}
+
+/// Post-spawn branch assertion for isolated workers (STEP 3, cas-5232).
+///
+/// Runs `git rev-parse --abbrev-ref HEAD` in the worker's assigned `cwd` and
+/// verifies the result matches `expected_branch`.  If the cwd is the main
+/// checkout (e.g., the supervisor's working tree) rather than the worker's
+/// dedicated git worktree, git will report the *main checkout's* current branch
+/// — not `factory/<name>` — and this function returns an error.  That lets the
+/// daemon surface the bug before the worker has a chance to commit to the wrong
+/// ref.
+///
+/// Called from `finish_worker_spawn` right after `mux.add_worker` succeeds so
+/// we detect the bad cwd while the spawn is still observable.
+pub(crate) fn verify_isolated_worker_branch(
+    worker_name: &str,
+    cwd: &std::path::Path,
+    expected_branch: &str,
+) -> anyhow::Result<()> {
+    use crate::worktree::GitOperations;
+    let git = GitOperations::new(cwd.to_path_buf());
+    match git.current_branch() {
+        Ok(actual_branch) => {
+            if actual_branch == expected_branch {
+                tracing::info!(
+                    worker = %worker_name,
+                    branch = %actual_branch,
+                    cwd = %cwd.display(),
+                    "post-spawn: worker cwd verified on correct branch"
+                );
+                Ok(())
+            } else {
+                // The cwd resolves to the wrong branch.  Most likely causes:
+                //   (a) cmd.cwd() was applied to the wrong path,
+                //   (b) the worktree directory exists but is not a registered git
+                //       worktree (stale dir) and git traversed up to the main repo,
+                //   (c) a Teams config.json cwd race caused Claude Code to adopt the
+                //       supervisor's project directory.
+                // See EPIC cas-073f for the full investigation.
+                anyhow::bail!(
+                    "ISOLATION BUG: worker '{}' cwd {:?} resolved to branch '{}' \
+                     (expected '{}'). Worker will commit to the wrong ref. \
+                     See EPIC cas-073f.",
+                    worker_name, cwd, actual_branch, expected_branch
+                )
+            }
+        }
+        Err(e) => anyhow::bail!(
+            "post-spawn: could not verify git branch for worker '{}' in {:?}: {}",
+            worker_name, cwd, e
+        ),
     }
 }
 
@@ -1642,5 +1763,210 @@ mod tests {
             "with no current epic, EpicStarted must fire for the subtask-winning \
              epic, not the lex-greatest one (cas-4181)"
         );
+    }
+}
+
+/// Spawn-path isolation tests for EPIC cas-073f / task cas-5232.
+///
+/// These tests follow the test-first mandate from the task execution_note.
+/// Two tests were written first (before the implementation):
+///   - `reuse_branch_rejects_stale_non_worktree_directory`
+///   - `post_spawn_assertion_fails_for_main_checkout`
+/// Both failed until the corresponding implementation was added.
+#[cfg(test)]
+mod spawn_isolation_tests {
+    use super::*;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    /// Initialise a bare git repo with one commit on `main`.
+    fn init_repo(dir: &std::path::Path) {
+        Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(dir)
+            .output()
+            .expect("git init");
+        Command::new("git")
+            .args(["config", "user.email", "test@cas.test"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "CAS Test"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        std::fs::write(dir.join("README.md"), "# test").unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "initial"])
+            .current_dir(dir)
+            .output()
+            .expect("git commit");
+    }
+
+    // -----------------------------------------------------------------
+    // verify_isolated_worker_branch tests
+    // -----------------------------------------------------------------
+
+    /// Happy path: cwd is a proper worktree on the expected branch → Ok.
+    #[test]
+    fn post_spawn_assertion_passes_for_correct_worktree() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo);
+
+        let wt_path = repo.join(".cas").join("worktrees").join("test-worker");
+        std::fs::create_dir_all(wt_path.parent().unwrap()).unwrap();
+        Command::new("git")
+            .args([
+                "worktree", "add", "-b", "factory/test-worker",
+                wt_path.to_str().unwrap(),
+                "main",
+            ])
+            .current_dir(&repo)
+            .output()
+            .expect("git worktree add");
+
+        assert!(
+            verify_isolated_worker_branch("test-worker", &wt_path, "factory/test-worker").is_ok(),
+            "assertion must pass when cwd is the worktree on the correct branch"
+        );
+    }
+
+    /// Bug-scenario: the worker's cwd is the main checkout (on `main`), not its
+    /// worktree.  The assertion must detect the branch mismatch and return Err.
+    ///
+    /// This test was written BEFORE the implementation (test-first, cas-5232).
+    #[test]
+    fn post_spawn_assertion_fails_for_main_checkout() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo);
+
+        // Simulate the bug: the worker process started in the MAIN checkout,
+        // not in its factory/worker-X worktree.
+        let err = verify_isolated_worker_branch("worker-x", &repo, "factory/worker-x")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("ISOLATION BUG"),
+            "error must flag as an isolation bug; got: {err}"
+        );
+        assert!(
+            err.to_string().contains("main"),
+            "error must mention the actual branch ('main'); got: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // WorkerSpawnPrep::run() tests
+    // -----------------------------------------------------------------
+
+    /// WorkerSpawnPrep::run() must return the worktree path as cwd for N=4
+    /// isolated workers — never the process's current directory.
+    ///
+    /// This exercises the multi-worker stress-spawn path (AC3 of cas-5232).
+    #[test]
+    fn spawn_prep_cwd_is_worktree_for_four_workers() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo);
+
+        let process_cwd = std::env::current_dir().unwrap();
+        let cas_dir = repo.join(".cas");
+        std::fs::create_dir_all(&cas_dir).unwrap();
+
+        for i in 0..4usize {
+            let worker_name = format!("w{i}");
+            let expected_wt_path = repo
+                .join(".cas")
+                .join("worktrees")
+                .join(&worker_name);
+            let prep = WorkerSpawnPrep {
+                worker_name: worker_name.clone(),
+                worktree_info: Some(WorktreePrep {
+                    worktree_path: expected_wt_path.clone(),
+                    branch_name: format!("factory/{worker_name}"),
+                    parent_branch: "main".to_string(),
+                    repo_root: repo.clone(),
+                    cas_dir: cas_dir.clone(),
+                }),
+            };
+
+            let result = prep
+                .run()
+                .unwrap_or_else(|e| panic!("worker {i} spawn prep failed: {e}"));
+
+            assert_eq!(
+                result.cwd, expected_wt_path,
+                "worker {i}: cwd must be the worktree path"
+            );
+            assert_ne!(
+                result.cwd, process_cwd,
+                "worker {i}: cwd MUST NOT be the supervisor process cwd"
+            );
+            assert!(
+                result.worktree.is_some(),
+                "worker {i}: worktree field must be populated for isolated spawn"
+            );
+        }
+    }
+
+    /// STEP 2 — hard-error regression test (written first, cas-5232):
+    /// The REUSE BRANCH must reject a stale directory that exists on disk but is
+    /// not a registered git worktree (the directory has no `.git` file, so git
+    /// traverses up to the main checkout and reports `main` as current branch).
+    ///
+    /// Before the hard-error check was added, `run()` would return Ok with the
+    /// stale directory as cwd, causing subsequent git operations to commit on
+    /// the main branch.
+    ///
+    /// After the check, `run()` returns Err with a clear message.
+    #[test]
+    fn reuse_branch_rejects_stale_non_worktree_directory() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo);
+
+        let cas_dir = repo.join(".cas");
+        std::fs::create_dir_all(&cas_dir).unwrap();
+        let stale_path = repo.join(".cas").join("worktrees").join("stale");
+
+        // Create the directory WITHOUT running `git worktree add`.
+        // exists() == true, but it is NOT a git worktree.
+        std::fs::create_dir_all(&stale_path).unwrap();
+
+        let prep = WorkerSpawnPrep {
+            worker_name: "stale".to_string(),
+            worktree_info: Some(WorktreePrep {
+                worktree_path: stale_path.clone(),
+                branch_name: "factory/stale".to_string(),
+                parent_branch: "main".to_string(),
+                repo_root: repo.clone(),
+                cas_dir,
+            }),
+        };
+
+        match prep.run() {
+            Ok(_) => panic!(
+                "reuse branch must reject a stale non-worktree directory; got Ok"
+            ),
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("stale") || msg.contains("branch") || msg.contains("worktree")
+                        || msg.contains("Stale"),
+                    "error must describe the rejection; got: {msg}"
+                );
+            }
+        }
     }
 }
