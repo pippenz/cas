@@ -352,6 +352,11 @@ pub fn handle_pre_compact(
         context.len()
     );
 
+    // B4 FLUSH: write worker in-flight findings to the active task note BEFORE
+    // compaction erases them from context. Best-effort: all errors are swallowed
+    // inside flush_worker_findings_to_task; compaction is never blocked.
+    flush_worker_findings_to_task(input, cas_root);
+
     // PreCompact doesn't support hookSpecificOutput in Claude Code's schema
     // (only PreToolUse, UserPromptSubmit, PostToolUse do)
     // Use systemMessage instead to inject context
@@ -359,4 +364,301 @@ pub fn handle_pre_compact(
         system_message: Some(context),
         ..Default::default()
     })
+}
+
+// =============================================================================
+// B4 PreCompact FLUSH (cas-c299)
+// =============================================================================
+
+/// Best-effort flush of in-flight worker findings to the active task note.
+///
+/// Called from `handle_pre_compact` immediately before returning. All errors
+/// are swallowed so compaction is never blocked. Also exported for B3 (session-
+/// stop handler) to call the same logic at stop time.
+pub(crate) fn flush_worker_findings_to_task(input: &HookInput, cas_root: &Path) {
+    if let Err(e) = do_flush(input, cas_root) {
+        eprintln!("cas: PreCompact flush: {e} (ignored, compaction proceeds)");
+    }
+}
+
+fn do_flush(input: &HookInput, cas_root: &Path) -> Result<(), MemError> {
+    // Guard: run only inside a factory worker process
+    let is_factory_worker = std::env::var("CAS_AGENT_ROLE")
+        .map(|r| r.eq_ignore_ascii_case("worker"))
+        .unwrap_or(false)
+        && std::env::var("CAS_FACTORY_MODE").is_ok();
+    if !is_factory_worker {
+        return Ok(());
+    }
+
+    let transcript_path = match input.transcript_path.as_deref() {
+        Some(p) => p,
+        None => return Ok(()),
+    };
+
+    let task_id = match resolve_worker_active_task(&input.session_id, cas_root)? {
+        Some(id) => id,
+        None => {
+            eprintln!("cas: PreCompact flush: no active task for session {}", input.session_id);
+            return Ok(());
+        }
+    };
+
+    let findings = extract_compact_findings(transcript_path)?;
+    if findings.is_empty() {
+        return Ok(());
+    }
+
+    write_findings_note(cas_root, &task_id, &findings)
+}
+
+/// Resolve the InProgress task claimed by the worker session.
+///
+/// Walks: session_id → Agent record → active TaskLease → Task with InProgress status.
+/// Returns `Ok(None)` if no active task is found (not an error — worker may not
+/// have claimed anything yet, or the task was already closed).
+pub(crate) fn resolve_worker_active_task(
+    session_id: &str,
+    cas_root: &Path,
+) -> Result<Option<String>, MemError> {
+    let agent_store = open_agent_store(cas_root)?;
+    let agent = match agent_store.get(session_id) {
+        Ok(a) => a,
+        Err(_) => return Ok(None),
+    };
+    let leases = agent_store.list_agent_leases(&agent.id).unwrap_or_default();
+    let task_store = open_task_store(cas_root)?;
+    let active_task_id = leases
+        .iter()
+        .filter_map(|lease| task_store.get(&lease.task_id).ok())
+        .find(|t| t.status == TaskStatus::InProgress)
+        .map(|t| t.id.clone());
+    Ok(active_task_id)
+}
+
+/// Maximum findings written per flush (bounds note size).
+const MAX_FLUSH_FINDINGS: usize = 8;
+/// Maximum characters per individual finding body.
+const MAX_FLUSH_FINDING_LEN: usize = 200;
+/// Maximum total characters for the flush note body.
+const MAX_FLUSH_NOTE_CHARS: usize = 2000;
+
+/// Extract high-confidence findings from the transcript via session-learn.
+///
+/// Returns an empty Vec on any session-learn error (best-effort).
+fn extract_compact_findings(transcript_path: &str) -> Result<Vec<String>, MemError> {
+    let drafts = match session_learn_sync(transcript_path, &[]) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("cas: PreCompact flush: session-learn failed: {e} (no findings written)");
+            return Ok(vec![]);
+        }
+    };
+    let findings: Vec<String> = drafts
+        .into_iter()
+        .filter(|d| {
+            d.confidence >= 0.5
+                && matches!(
+                    d.signal.as_str(),
+                    "decision" | "correction" | "concept" | "pattern"
+                )
+                && d.dedup_hits.is_empty()
+        })
+        .take(MAX_FLUSH_FINDINGS)
+        .map(|d| truncate_display(&d.content, MAX_FLUSH_FINDING_LEN))
+        .collect();
+    Ok(findings)
+}
+
+/// Write the findings as a decision note on the task.
+///
+/// Deduplicates by checking if the first finding's 60-char fingerprint already
+/// appears in `task.notes`. Bounds the note body to `MAX_FLUSH_NOTE_CHARS`.
+pub(crate) fn write_findings_note(
+    cas_root: &Path,
+    task_id: &str,
+    findings: &[String],
+) -> Result<(), MemError> {
+    let task_store = open_task_store(cas_root)?;
+    let mut task = task_store.get(task_id)?;
+
+    // Dedup: fingerprint = first 60 bytes of the first finding (raw slice, no "...")
+    if let Some(first) = findings.first() {
+        let mut fp_end = 60.min(first.len());
+        while fp_end > 0 && !first.is_char_boundary(fp_end) {
+            fp_end -= 1;
+        }
+        let fingerprint = &first[..fp_end];
+        if !fingerprint.is_empty() && task.notes.contains(fingerprint) {
+            eprintln!("cas: PreCompact flush: deduped (fingerprint already in notes)");
+            return Ok(());
+        }
+    }
+
+    let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M");
+    let mut body = findings
+        .iter()
+        .map(|f| format!("- {f}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // Bound to MAX_FLUSH_NOTE_CHARS
+    if body.len() > MAX_FLUSH_NOTE_CHARS {
+        let mut end = MAX_FLUSH_NOTE_CHARS;
+        while end > 0 && !body.is_char_boundary(end) {
+            end -= 1;
+        }
+        body = body[..end].to_string();
+    }
+
+    let formatted_note = format!("[{timestamp}] ✅ DECISION Pre-compact flush\n{body}");
+    if task.notes.is_empty() {
+        task.notes = formatted_note;
+    } else {
+        task.notes = format!("{}\n\n{}", task.notes, formatted_note);
+    }
+    task.updated_at = chrono::Utc::now();
+    task_store.update(&task)?;
+    eprintln!(
+        "cas: PreCompact flush: wrote {} finding(s) to task {task_id}",
+        findings.len()
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod pre_compact_flush_tests {
+    use super::*;
+    use crate::store::{init_cas_dir, open_task_store};
+    use crate::types::{Task, TaskStatus};
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    // -------------------------------------------------------------------------
+    // Test helpers
+    // -------------------------------------------------------------------------
+
+    struct CasDir {
+        _tmp: TempDir,
+        pub root: PathBuf,
+    }
+
+    fn setup_cas() -> CasDir {
+        let tmp = tempfile::tempdir().expect("TempDir");
+        let root = init_cas_dir(tmp.path()).expect("init_cas_dir");
+        CasDir { _tmp: tmp, root }
+    }
+
+    fn add_inprogress_task(cas_root: &std::path::Path, task_id: &str) {
+        let store = open_task_store(cas_root).expect("open_task_store");
+        let mut task = Task::new(task_id.to_string(), "B4 test task".to_string());
+        task.status = TaskStatus::InProgress;
+        store.add(&task).expect("task.add");
+    }
+
+    // -------------------------------------------------------------------------
+    // AC: transcript-with-findings → note written with correct format
+    // -------------------------------------------------------------------------
+    #[test]
+    fn test_write_findings_note_creates_formatted_decision_note() {
+        let cas = setup_cas();
+        add_inprogress_task(&cas.root, "cas-b4t1");
+
+        let findings = vec![
+            "Found two spawn paths: queue path and fork_first.rs daemon path".to_string(),
+            "create_worktree silently falls back to main cwd on failure".to_string(),
+        ];
+
+        write_findings_note(&cas.root, "cas-b4t1", &findings)
+            .expect("write_findings_note should succeed");
+
+        let store = open_task_store(&cas.root).expect("open_task_store");
+        let task = store.get("cas-b4t1").expect("task.get");
+
+        assert!(
+            task.notes.contains("DECISION") || task.notes.contains("Pre-compact flush"),
+            "note must contain flush marker; got:\n{}",
+            task.notes
+        );
+        assert!(
+            task.notes.contains("Found two spawn paths"),
+            "note must contain first finding; got:\n{}",
+            task.notes
+        );
+        assert!(
+            task.notes.contains("create_worktree"),
+            "note must contain second finding; got:\n{}",
+            task.notes
+        );
+        assert!(
+            task.notes.contains("- "),
+            "findings must be bullet-formatted; got:\n{}",
+            task.notes
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // AC: dedup — repeated compaction with same findings fingerprint → no dup
+    // -------------------------------------------------------------------------
+    #[test]
+    fn test_write_findings_note_deduplicates_repeated_flush() {
+        let cas = setup_cas();
+        add_inprogress_task(&cas.root, "cas-b4t2");
+
+        let findings = vec![
+            "Root cause: worktree isolation flag not propagated to daemon spawn".to_string(),
+        ];
+
+        // First flush
+        write_findings_note(&cas.root, "cas-b4t2", &findings)
+            .expect("first write should succeed");
+
+        // Second flush — same fingerprint → must be deduped
+        write_findings_note(&cas.root, "cas-b4t2", &findings)
+            .expect("second write (dedup path) should succeed");
+
+        let store = open_task_store(&cas.root).expect("open_task_store");
+        let task = store.get("cas-b4t2").expect("task.get");
+
+        let occurrences = task.notes.matches("Root cause:").count();
+        assert_eq!(
+            occurrences, 1,
+            "same finding must appear exactly once after dedup; notes:\n{}",
+            task.notes
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // AC: no active task → graceful (resolve returns None, no panic)
+    // -------------------------------------------------------------------------
+    #[test]
+    fn test_resolve_worker_active_task_returns_none_for_unknown_session() {
+        let cas = setup_cas();
+
+        let result = resolve_worker_active_task("nonexistent-session-xyz", &cas.root);
+        assert!(result.is_ok(), "must not error for unknown session");
+        assert_eq!(
+            result.unwrap(),
+            None,
+            "must return None for session with no agent record"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // AC: failure path → compaction unaffected (no panic, flush is silent)
+    // -------------------------------------------------------------------------
+    #[test]
+    fn test_flush_worker_findings_no_transcript_is_graceful() {
+        let cas = setup_cas();
+
+        let input = HookInput {
+            session_id: "test-session-b4".to_string(),
+            transcript_path: None, // no transcript → early return
+            hook_event_name: "PreCompact".to_string(),
+            ..Default::default()
+        };
+
+        // Must not panic; errors must be swallowed
+        flush_worker_findings_to_task(&input, &cas.root);
+    }
 }
