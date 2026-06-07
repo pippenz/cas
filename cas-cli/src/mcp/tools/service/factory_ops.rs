@@ -1564,6 +1564,73 @@ pub(crate) fn read_context_usage_from_tail(path: &std::path::Path) -> Option<u64
     None
 }
 
+// =============================================================================
+// B1 (cas-844bf): worker_status git introspection
+// =============================================================================
+
+/// Git state snapshot for a factory worker.
+///
+/// All fields are best-effort: a failed git sub-command yields a sentinel
+/// value ("?" or "none" or 0) rather than aborting the status render.
+/// See [`collect_worker_git_status`] for field semantics.
+#[derive(Debug)]
+pub(super) struct WorkerGitStatus {
+    /// Current branch name (or "HEAD" if detached, "?" on error)
+    pub branch: String,
+    /// Short HEAD SHA (7 hex chars, or "?" on error)
+    pub head_sha: String,
+    /// Commits ahead of `base_branch` (0 when the count can't be determined)
+    pub ahead: usize,
+    /// Commits behind `base_branch` (0 when the count can't be determined)
+    pub behind: usize,
+    /// Branch used as the ahead/behind baseline (e.g. "origin/main")
+    pub base_branch: String,
+    /// `true` if the working tree has staged or unstaged changes
+    pub dirty: bool,
+    /// `"origin/<branch>"` when the branch has been pushed, otherwise `"none"`
+    pub pushed_ref: String,
+    /// Open pull-request URL, or `"none"` when not found / gh unavailable
+    pub pr_url: String,
+}
+
+/// Collect git introspection data for a worker's worktree path.
+///
+/// Every git sub-command degrades gracefully on failure — a non-git dir or
+/// missing network produces sentinel values, never a panic.
+///
+/// NOTE: This is a synchronous, blocking function that shells out to `git`
+/// and, optionally, `gh`.  It is intended to be called from within
+/// `factory_worker_status` (which is `async` but performs several other
+/// blocking operations already).  Callers in a strict async context should
+/// wrap in `tokio::task::spawn_blocking` if needed.
+pub(super) fn collect_worker_git_status(worktree_path: &std::path::Path) -> WorkerGitStatus {
+    // STUB (cas-844bf test-first): All fields return sentinel values.
+    // Real implementation follows in the next commit once tests are green.
+    let _ = worktree_path;
+    WorkerGitStatus {
+        branch: "?".to_string(),
+        head_sha: "?".to_string(),
+        ahead: 0,
+        behind: 0,
+        base_branch: "?".to_string(),
+        dirty: false,
+        pushed_ref: "none".to_string(),
+        pr_url: "none".to_string(),
+    }
+}
+
+/// Render a `WorkerGitStatus` as a multi-line block for injection into the
+/// `worker_status` output.  Returns an empty string when the status is
+/// entirely unknown (all fields are sentinels).
+pub(super) fn format_worker_git_status(gs: &WorkerGitStatus) -> String {
+    // STUB (cas-844bf test-first): returns empty string.
+    // Real format follows in the implementation commit.
+    let _ = gs;
+    String::new()
+}
+
+// =============================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2156,5 +2223,134 @@ mod tests {
     fn read_context_usage_from_tail_missing_file_returns_none() {
         let path = std::path::Path::new("/tmp/cas_573c_nonexistent_fixture.jsonl");
         assert!(read_context_usage_from_tail(path).is_none());
+    }
+
+    // ---- cas-844bf: worker_status git introspection -------------------------
+
+    /// Helper: create a minimal git repo in a temp dir and return the TempDir.
+    /// Initialises `main`, adds an initial commit, then creates and checks out
+    /// `factory/<worker>` with one additional commit.
+    fn setup_git_repo_with_factory_branch(worker: &str) -> (tempfile::TempDir, String) {
+        use std::process::Command;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let dir = tmp.path();
+
+        // Init
+        Command::new("git").args(["init", "-b", "main"]).current_dir(dir).output().unwrap();
+        Command::new("git").args(["config", "user.email", "test@cas"]).current_dir(dir).output().unwrap();
+        Command::new("git").args(["config", "user.name", "CAS Test"]).current_dir(dir).output().unwrap();
+
+        // Initial commit on main
+        std::fs::write(dir.join("README"), "init").unwrap();
+        Command::new("git").args(["add", "README"]).current_dir(dir).output().unwrap();
+        Command::new("git").args(["commit", "-m", "init"]).current_dir(dir).output().unwrap();
+
+        // Create factory branch and make one commit
+        let branch = format!("factory/{worker}");
+        Command::new("git").args(["checkout", "-b", &branch]).current_dir(dir).output().unwrap();
+        std::fs::write(dir.join("work.rs"), "// task").unwrap();
+        Command::new("git").args(["add", "work.rs"]).current_dir(dir).output().unwrap();
+        Command::new("git").args(["commit", "-m", "feat: worker work"]).current_dir(dir).output().unwrap();
+
+        // Get the short SHA for assertions
+        let sha_out = Command::new("git")
+            .args(["rev-parse", "--short", "HEAD"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        let sha = String::from_utf8_lossy(&sha_out.stdout).trim().to_string();
+
+        (tmp, sha)
+    }
+
+    /// AC3 (cas-844bf): collect_worker_git_status returns the correct branch
+    /// and HEAD SHA for a worktree that is on a real factory/<name> branch with
+    /// at least one commit.
+    ///
+    /// FAILS with the stub (branch == "?", head_sha == "?").
+    /// PASSES once the real implementation runs git commands.
+    #[test]
+    fn collect_git_status_returns_correct_branch_and_sha() {
+        let (tmp, expected_sha) = setup_git_repo_with_factory_branch("test-worker");
+        let status = collect_worker_git_status(tmp.path());
+        assert_eq!(
+            status.branch, "factory/test-worker",
+            "branch must be 'factory/test-worker', got '{}'",
+            status.branch
+        );
+        assert_eq!(
+            status.head_sha, expected_sha,
+            "head_sha must match git rev-parse --short HEAD"
+        );
+    }
+
+    /// AC1 (cas-844bf): format_worker_git_status output must contain the
+    /// structured fields the supervisor needs — branch, HEAD, ahead/behind,
+    /// dirty state, pushed ref, and PR URL.
+    ///
+    /// FAILS with the stub (returns empty string).
+    /// PASSES once the real formatter produces the labelled output.
+    #[test]
+    fn format_git_status_contains_required_fields() {
+        let gs = WorkerGitStatus {
+            branch: "factory/myworker".to_string(),
+            head_sha: "abc1234".to_string(),
+            ahead: 3,
+            behind: 0,
+            base_branch: "origin/main".to_string(),
+            dirty: false,
+            pushed_ref: "origin/factory/myworker".to_string(),
+            pr_url: "https://github.com/org/repo/pull/42".to_string(),
+        };
+        let out = format_worker_git_status(&gs);
+        assert!(!out.is_empty(), "format_worker_git_status must not return empty string");
+        assert!(out.contains("factory/myworker"), "must contain branch name: {out}");
+        assert!(out.contains("abc1234"), "must contain HEAD sha: {out}");
+        assert!(out.contains("ahead"), "must contain 'ahead' label: {out}");
+        assert!(out.contains("behind"), "must contain 'behind' label: {out}");
+        assert!(out.contains("PR"), "must contain 'PR' label: {out}");
+        assert!(out.contains("origin/factory/myworker"), "must contain pushed_ref: {out}");
+        assert!(out.contains("https://github.com"), "must contain PR URL: {out}");
+    }
+
+    /// AC2 (cas-844bf): when gh is unavailable / not pushed, pr_url and
+    /// pushed_ref degrade gracefully to "none" without panicking.
+    #[test]
+    fn collect_git_status_degrades_on_non_git_dir() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        // Plain dir with no git repo — all fields must be sentinels, no panic.
+        let status = collect_worker_git_status(tmp.path());
+        // branch and head_sha degrade to "?" (not empty, not a real branch name)
+        assert!(
+            status.branch == "?" || !status.branch.contains("fatal"),
+            "non-git dir must not propagate git error messages: '{}'",
+            status.branch
+        );
+        // No panics is the primary assertion — the above implicitly proves it.
+    }
+
+    /// AC1 (format): dirty/not-pushed state is conveyed clearly.
+    #[test]
+    fn format_git_status_dirty_not_pushed() {
+        let gs = WorkerGitStatus {
+            branch: "factory/dirty".to_string(),
+            head_sha: "deadbee".to_string(),
+            ahead: 0,
+            behind: 2,
+            base_branch: "origin/main".to_string(),
+            dirty: true,
+            pushed_ref: "none".to_string(),
+            pr_url: "none".to_string(),
+        };
+        let out = format_worker_git_status(&gs);
+        assert!(!out.is_empty(), "format must not return empty for dirty worker: {out}");
+        assert!(
+            out.contains("dirty") || out.contains("[dirty]"),
+            "dirty state must be visible in output: {out}"
+        );
+        assert!(
+            out.contains("not pushed") || out.contains("none"),
+            "unpushed state must be visible in output: {out}"
+        );
     }
 }
