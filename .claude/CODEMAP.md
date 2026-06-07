@@ -12,7 +12,7 @@
 - `site/` — static landing page (`index.html`, PDF)
 - `vendor/` — vendored upstream sources (`ghostty/`)
 - `target/` — cargo build output (skip)
-- `.claude/` — harness config (`settings.json`, `CODEMAP.md` — gitignored, regen per-developer); `.claude/agents/` + `.claude/skills/` are sync output of `cas integrate`
+- `.claude/` — harness config (`settings.json`, `CODEMAP.md` — gitignored, regen per-developer); `.claude/agents/` + `.claude/skills/` are sync output of `cas integrate`; `.claude/workflows/` holds the cas-code-review Workflow scripts (synced from `cas-cli/src/builtins/workflows/`)
 - `.codex/` — Codex CLI mirror: `agents/`, `skills/`, `config.toml`; auto-built from `.claude/` for `--supervisor-cli codex` / `--worker-cli codex`
 - `.cas/` — agent state, factory config, codemap-pending tracker; `.cas/worktrees/` houses isolated factory worker checkouts
 - `.context/` — gitignored vendored toolchains (currently `zig/`); export `ZIG=$PWD/.context/zig/zig` before any cargo build that pulls ghostty-vt
@@ -103,6 +103,7 @@ Binary entrypoint and the only crate users interact with directly. Contains ever
   - `builtins/codex/skills/` — Codex-variant mirror (full parity)
   - `builtins/agents/` — task-verifier, learning-reviewer, rule-reviewer, duplicate-detector, factory-supervisor, etc.
   - `builtins/codex/agents/` — Codex-variant mirror of agents
+  - `builtins/workflows/` — embedded Workflow scripts (`cas-code-review.js`); synced out to `.claude/workflows/` where the dev copies + tests + `merge-findings.js` + `fixtures/` live (cas-b667 Workflow migration)
   - `BUILTIN_SKILLS` / `CODEX_BUILTIN_SKILLS` arrays drive `cas sync`
   - `supervisor_guidance()` / `worker_guidance()` — SessionStart bundles
 - `extraction/` — memory/learning extraction from transcripts; `extract_learnings_async/sync` are the existing path session-learn auto-trigger will parallel
@@ -147,7 +148,8 @@ Planning artifacts only — product/domain content lives in `docs/PRODUCT_OVERVI
 
 - `brainstorms/` — `YYYY-MM-DD-<topic>-requirements.md` from the `cas-brainstorm` skill
 - `ideation/` — survivor lists from the `cas-ideate` skill
-- `requests/` — cross-team BUG/FEATURE inboxes; active: `BUG-worker-pane-mouse-wheel-alt-screen.md`, `FEATURE-nuxt-playwright-skill.md`, `team-memories-filter-policy.md`, `RESOLVED-api-me-deploy-failed-type-check.md`, `SHIPPED-user-team-membership-endpoint.md`, `RESPONSE-user-team-membership-endpoint.md`
+- `requests/` — cross-team BUG/FEATURE inboxes; active: `BUG-isolated-worker-commits-to-supervisor-main.md` (P1 — isolation leak + supervisor blindness), `BUG-team-push-not-chunked.md`, `FEATURE-nuxt-playwright-skill.md`, `team-memories-filter-policy.md`, `RESOLVED-api-me-deploy-failed-type-check.md`, `SHIPPED-user-team-membership-endpoint.md`, `RESPONSE-user-team-membership-endpoint.md`
+- `notes/` — dated working notes (e.g. `2026-06-02-cc160-hook-surface.md`)
 - `requests/completed/` — archived closed work (bulk move 2026-05-18): cloud-client-404, cloud-push-skipped, factory-session-observations, factory-write-permission-deadlock, remember-defaults-to-personal, EPIC-mcp-server-robustness, FEATURE-global-team-config, FEATURE-cloud-sync-pull-team-memories, FEATURE-cloud-sync-pull-return-specs, BUG-session-observations-2026-05-18
 - `spikes/` — investigation outputs (e.g., `2026-05-01-factory-agent-teams-enrollment-spike.md`)
 - `onboarding/` — onboarding notes (`macbook-from-zero.md`, etc.)
