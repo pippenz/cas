@@ -152,11 +152,7 @@ pub fn handle_hook(event_name: &str, input: HookInput) -> Result<HookOutput, Mem
 //
 // Or via a module-local wrapper (preferred for readability):
 //   fn env_lock() -> std::sync::MutexGuard<'static, ()> { crate::hooks::test_env_lock() }
-#[cfg(test)]
-pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
-    use std::sync::{Mutex, OnceLock};
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-}
+//
+// NOTE: the canonical `test_env_lock` is defined once above (before `handle_hook`).
+// A duplicate copy landed here via the cross-branch epic merge (guards A2 + surface R2
+// both added it independently); the redundant definition was removed during assembly.
