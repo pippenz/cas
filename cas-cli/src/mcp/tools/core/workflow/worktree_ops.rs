@@ -146,17 +146,29 @@ impl CasCore {
         let tracked_branches: HashSet<String> =
             worktrees.iter().map(|wt| wt.branch.clone()).collect();
 
-        // Also include factory worktrees from git (not stored in SQLite)
-        // The repo root is the parent of cas_root (.cas directory)
+        // Also include factory (System B) worktrees from git that are not yet
+        // tracked in the SQLite store.
+        //
+        // We scope the scan to paths under `<cas_root>/worktrees/` so that
+        // the main checkout (and any unrelated user worktrees) are excluded.
+        // Factory workers are always placed at `.cas/worktrees/<name>` by
+        // `spawn_workers isolate=true`, so this filter is both safe and precise.
+        let factory_worktrees_base = cas_root.join("worktrees");
         if let Some(repo_root) = cas_root.parent() {
             if let Ok(git_ops) = GitOperations::detect_repo_root(repo_root).map(GitOperations::new)
             {
                 if let Ok(git_worktrees) = git_ops.list_worktrees() {
                     for git_wt in git_worktrees {
-                        // Include factory worktrees not already tracked
+                        // Only include worktrees that live under .cas/worktrees/
+                        // (factory / System B) and are not already in the store.
+                        if !git_wt.path.starts_with(&factory_worktrees_base) {
+                            continue;
+                        }
                         let branch = git_wt.branch.clone().unwrap_or_default();
                         if !branch.is_empty() && !tracked_branches.contains(&branch) {
-                            // Create a transient Worktree entry for display
+                            // Create a transient Worktree entry for display.
+                            // The `git:` id prefix is used downstream to identify
+                            // factory worktrees and render the `[factory]` label.
                             worktrees.push(Worktree::new(
                                 format!("git:{branch}"),
                                 branch,
@@ -518,21 +530,24 @@ impl CasCore {
         let git_context = GitOperations::get_context(&cwd).ok();
 
         let mut output = String::from("WORKTREE STATUS\n\n");
-        output.push_str(&format!("Enabled: {}\n", wt_config.enabled));
-        output.push_str(&format!("Base path: {}\n", wt_config.base_path));
-        output.push_str(&format!("Branch prefix: {}\n", wt_config.branch_prefix));
-        output.push_str(&format!("Auto-merge: {}\n", wt_config.auto_merge));
-        output.push_str(&format!(
-            "Cleanup on close: {}\n",
-            wt_config.cleanup_on_close
-        ));
 
+        // Current git context (caller's working directory)
         if let Some(ctx) = git_context {
-            output.push_str(&format!("\nIn worktree: {}\n", ctx.is_worktree));
+            output.push_str(&format!("In worktree: {}\n", ctx.is_worktree));
             if let Some(branch) = ctx.branch {
                 output.push_str(&format!("Current branch: {branch}\n"));
             }
+            output.push('\n');
         }
+
+        // System A — CAS experimental worktrees (config-gated).
+        // Explicitly labeled to avoid confusion with System B (factory isolation).
+        output.push_str("System A (CAS experimental worktrees):\n");
+        output.push_str(&format!("  Enabled:        {}\n", wt_config.enabled));
+        output.push_str(&format!("  Base path:      {}\n", wt_config.base_path));
+        output.push_str(&format!("  Branch prefix:  {}\n", wt_config.branch_prefix));
+        output.push_str(&format!("  Auto-merge:     {}\n", wt_config.auto_merge));
+        output.push_str(&format!("  Cleanup:        {}\n", wt_config.cleanup_on_close));
 
         // Query worktree store for active worktrees
         let mut stored_branches: HashSet<String> = HashSet::new();
@@ -549,44 +564,47 @@ impl CasCore {
             }
         }
 
-        // Also check git for factory worktrees not tracked in the store
-        let mut factory_branches: Vec<String> = Vec::new();
+        // System B — factory (isolate=true) worktrees.
+        // Scoped to `<cas_root>/worktrees/` so the main checkout is excluded.
+        let factory_worktrees_base = cas_root.join("worktrees");
+        let mut factory_entries: Vec<(String, std::path::PathBuf)> = Vec::new();
         if let Some(repo_root) = cas_root.parent() {
             if let Ok(git_ops) = GitOperations::detect_repo_root(repo_root).map(GitOperations::new)
             {
                 if let Ok(git_worktrees) = git_ops.list_worktrees() {
                     for git_wt in git_worktrees {
+                        if !git_wt.path.starts_with(&factory_worktrees_base) {
+                            continue;
+                        }
                         let branch = git_wt.branch.clone().unwrap_or_default();
                         if !branch.is_empty() && !stored_branches.contains(&branch) {
-                            factory_branches.push(branch);
+                            factory_entries.push((branch, git_wt.path.clone()));
                         }
                     }
                 }
             }
         }
 
-        let total = active_count + factory_branches.len();
-        output.push_str(&format!("\nActive worktrees: {total}\n"));
+        // System B summary — always shown so callers can see isolation state
+        // regardless of the System A flag.
+        output.push_str("\nSystem B (factory isolation worktrees):\n");
+        let b_active = factory_entries.len();
+        if b_active == 0 {
+            output.push_str("  Active: none\n");
+        } else {
+            output.push_str(&format!("  Active: {b_active}\n"));
+            for (branch, path) in &factory_entries {
+                output.push_str(&format!("    {} ({})\n", branch, path.display()));
+            }
+        }
 
-        if !branch_names.is_empty() {
+        // System A active worktrees (if any)
+        if active_count > 0 {
             output.push_str(&format!(
-                "  Tracked: {} ({})\n",
-                branch_names.len(),
+                "\nSystem A tracked worktrees: {} ({})\n",
+                active_count,
                 branch_names.join(", ")
             ));
-        }
-        if !factory_branches.is_empty() {
-            output.push_str(&format!(
-                "  Factory (untracked): {} ({})\n",
-                factory_branches.len(),
-                factory_branches.join(", ")
-            ));
-        }
-
-        if total > 0 && !wt_config.enabled {
-            output.push_str(
-                "\nNote: Factory worktrees detected (managed by factory spawner, not worktree config)\n",
-            );
         }
 
         Ok(Self::success(output))

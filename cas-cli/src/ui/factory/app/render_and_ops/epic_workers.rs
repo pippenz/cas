@@ -350,6 +350,12 @@ impl FactoryApp {
         let cwd = result.cwd;
         let cas_root = result.cas_root;
 
+        // STEP 3 (cas-5232): Capture expected branch before worktree is consumed.
+        // `verify_isolated_worker_branch` runs AFTER the PTY is up, so we log errors
+        // rather than returning them (the worker process is already running at that
+        // point and terminating finish_worker_spawn would orphan it).
+        let expected_branch: Option<String> = result.worktree.as_ref().map(|wt| wt.branch.clone());
+
         // Register the worktree with the manager if applicable
         if let (Some(manager), Some(wt)) = (&mut self.worktree_manager, result.worktree) {
             manager.register_worktree(&worker_name, wt);
@@ -363,7 +369,7 @@ impl FactoryApp {
 
         if let Err(e) = self.mux.add_worker(
             &worker_name,
-            cwd,
+            cwd.clone(),
             cas_root.as_ref(),
             &self.supervisor_name,
             teams.as_ref(),
@@ -374,6 +380,31 @@ impl FactoryApp {
                 vec![("success", "false"), ("reason", "mux_add_worker_failed")],
             );
             return Err(e.into());
+        }
+
+        // STEP 3 (cas-5232): Post-spawn branch assertion.
+        // PTY is now running. Verify the worker's cwd resolves to the expected
+        // branch. STEP 2 makes this nearly impossible to trigger for the stale-
+        // directory case, but this catch covers any gap (e.g. concurrent FS changes,
+        // git state drift between prep and finish, or non-isolated workers that
+        // somehow inherit the wrong cwd).
+        if let Some(ref expected) = expected_branch {
+            if let Err(e) = crate::ui::factory::app::verify_isolated_worker_branch(
+                &worker_name,
+                &cwd,
+                expected,
+            ) {
+                tracing::error!(
+                    worker = %worker_name,
+                    cwd = %cwd.display(),
+                    expected_branch = %expected,
+                    error = %e,
+                    "ISOLATION BUG post-spawn: worker cwd not on expected branch — \
+                     see EPIC cas-073f. Worker is running but may commit to wrong ref."
+                );
+                // Do NOT return Err here — the PTY process is already running and
+                // returning would leave the worker pane without being tracked.
+            }
         }
 
         // Track the worker name

@@ -517,8 +517,19 @@ impl CasService {
                 | "worktree_merge" | "worktree_status" => {
                     let wt_action = action.strip_prefix("worktree_").unwrap();
 
-                    // Check if worktrees are enabled (status action always allowed)
-                    if wt_action != "status" {
+                    // Gate: require System A (`worktrees.enabled`) for mutating or
+                    // detail operations, but let `status` and `list` through always.
+                    //
+                    // `status` reports configuration — must work regardless.
+                    // `list` must reflect reality: factory (System B) worktrees are
+                    // created by `spawn_workers isolate=true` independently of the
+                    // System A flag, and the handler distinguishes both systems in
+                    // its output (cas-af86). Blocking `list` here was the bug:
+                    // it returned a misleading "disabled" message even when workers
+                    // were actively running in real git worktrees.
+                    //
+                    // create / show / cleanup / merge genuinely require System A.
+                    if wt_action != "status" && wt_action != "list" {
                         let config = crate::config::Config::load(&this.inner.cas_root)
                             .map_err(|e| {
                                 Self::error(

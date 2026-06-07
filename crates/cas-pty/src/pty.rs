@@ -502,6 +502,15 @@ impl Pty {
 
         if let Some(cwd) = &config.cwd {
             cmd.cwd(cwd);
+            // STEP 1 (cas-5232): Log the actual cwd being set on the PTY command so
+            // the daemon trace carries an auditable record of where each worker process
+            // will land.  This runs on the main thread immediately before spawn, so the
+            // log timestamp is tightly coupled to the PTY launch.
+            tracing::info!(
+                command = %config.command,
+                cwd = %cwd.display(),
+                "pty: spawning process with explicit cwd"
+            );
         }
 
         for (key, value) in &config.env {

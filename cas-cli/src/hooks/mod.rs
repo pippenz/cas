@@ -85,6 +85,28 @@ use std::path::PathBuf;
 use crate::error::MemError;
 use crate::store::find_cas_root;
 
+/// Process-wide mutex for tests that mutate `CAS_AGENT_ROLE` or any other env
+/// var read by CAS hook handlers.
+///
+/// All test modules that call `std::env::set_var("CAS_AGENT_ROLE", …)` (or any
+/// `CAS_*` var) must hold this guard for the duration of the test.  Per-module
+/// static mutexes silently fail to coordinate with each other, so two tests in
+/// different modules (e.g. `close_ops`, `pre_tool`, `handlers_tests`) can race
+/// on the same env var.  A single shared lock eliminates the race.
+///
+/// Poison-tolerant: if a test panics while holding the lock, the next test
+/// recovers the guard via `into_inner()` instead of propagating the poison.
+///
+/// Usage: `let _g = crate::hooks::test_env_lock();`
+#[cfg(test)]
+pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    use std::sync::{Mutex, OnceLock};
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 /// Route a hook event to its handler
 ///
 /// This is the single entry point that resolves cas_root once and passes it
@@ -118,3 +140,19 @@ pub fn handle_hook(event_name: &str, input: HookInput) -> Result<HookOutput, Mem
         }
     }
 }
+
+// ── Shared test helpers ────────────────────────────────────────────────────
+//
+// A single process-wide mutex for tests that mutate env vars (`CAS_AGENT_ROLE`,
+// `CAS_FACTORY_MODE`, `CAS_CLONE_PATH`, etc.).  All test modules that touch
+// these vars must acquire this lock so they don't race with each other.
+//
+// Usage:
+//   let _g = crate::hooks::test_env_lock();
+//
+// Or via a module-local wrapper (preferred for readability):
+//   fn env_lock() -> std::sync::MutexGuard<'static, ()> { crate::hooks::test_env_lock() }
+//
+// NOTE: the canonical `test_env_lock` is defined once above (before `handle_hook`).
+// A duplicate copy landed here via the cross-branch epic merge (guards A2 + surface R2
+// both added it independently); the redundant definition was removed during assembly.

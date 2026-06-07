@@ -20,11 +20,11 @@ mod supervisor_reminder;
 /// silently fails: they don't coordinate with each other, so two tests in
 /// different modules can race on the same env var.
 ///
+/// This delegates to `crate::hooks::test_env_lock()` so that test modules
+/// outside `handlers_tests` (e.g. `pre_tool::worker_commit_guard_tests`)
+/// that also mutate CAS env vars use the same underlying mutex.
+///
 /// Usage in a submodule: `let _g = super::env_lock();`
 pub(super) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-    use std::sync::{Mutex, OnceLock};
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    crate::hooks::test_env_lock()
 }

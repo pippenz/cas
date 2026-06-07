@@ -162,11 +162,9 @@ mod tests {
     }
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        use std::sync::{Mutex, OnceLock};
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        // Use the shared crate-level env lock so we don't race with sibling
+        // test modules that also mutate CAS_AGENT_ROLE / CAS_FACTORY_MODE.
+        crate::hooks::test_env_lock()
     }
 
     struct EnvRoleGuard(Option<String>);

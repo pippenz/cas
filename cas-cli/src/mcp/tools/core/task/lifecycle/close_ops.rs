@@ -1160,6 +1160,43 @@ impl CasCore {
                 (has_reviewable_changes(close_project_root), None)
             };
 
+        // cas-762e (B2): factory branch merge-reality gate.
+        //
+        // The cas-95ce gate (earlier in this function) already blocks when
+        // factory/<assignee> has >0 stranded commits. But 0 unmerged commits
+        // is ambiguous: either (a) the work was merged via PR — correct — or
+        // (b) the worker never committed to their factory branch and the
+        // commits landed elsewhere (the cas-073f bug). B2 distinguishes the
+        // two cases: if the factory branch exists locally, has 0 commits
+        // beyond the parent branch, AND was never pushed to origin (no remote
+        // tracking ref), the close is refused.
+        //
+        // Bypass conditions mirror the supervisor-review block below:
+        //   * Epic tasks — not a per-worker task.
+        //   * `execution_note = "additive-only"` — no commit expected by spec.
+        //   * `bypass_close_gates` — supervisor emergency bypass.
+        //   * `!effective_has_reviewable` — zero diff; no commits needed.
+        //   * `task.assignee.is_none()` — orphaned task; nothing to check.
+        //   * Non-factory caller (`!is_factory_worker`) — supervisors are
+        //     exempt because they may close on behalf of a worker.
+        if is_factory_worker
+            && task.task_type != TaskType::Epic
+            && task.execution_note.as_deref() != Some("additive-only")
+            && !bypass_close_gates
+            && effective_has_reviewable
+        {
+            if let Some(assignee) = task.assignee.as_deref() {
+                let parent = worker_review_parent_branch.as_deref().unwrap_or("main");
+                let close_root = self.cas_root.parent().unwrap_or(&self.cas_root);
+                match check_factory_branch_merge_reality(close_root, assignee, parent) {
+                    MergeRealityOutcome::Proceed => {}
+                    MergeRealityOutcome::Refuse(msg) => {
+                        return Ok(Self::tool_error(msg));
+                    }
+                }
+            }
+        }
+
         // cas-b51a: supervisor-owned review mode.
         //
         // When `[code_review] owner = "supervisor"` AND the caller is a
@@ -2143,6 +2180,130 @@ pub(crate) fn count_unmerged_factory_commits(
             .unwrap_or(u32::MAX),
         _ => 0,
     }
+}
+
+// ---------------------------------------------------------------------------
+// cas-762e (B2): factory branch merge-reality gate
+// ---------------------------------------------------------------------------
+
+/// Outcome of the B2 factory-branch merge-reality close gate.
+///
+/// Mirrors [`MergeStateGateOutcome`] in shape. The gate refuses close when
+/// a factory branch exists locally with 0 commits beyond the parent branch
+/// AND the branch was never pushed to `origin` — the combination that
+/// distinguishes "committed to wrong place" from "merged and pruned".
+#[derive(Debug)]
+pub(crate) enum MergeRealityOutcome {
+    /// Close may proceed — the factory branch is absent, has commits, or
+    /// shows evidence of a prior push (remote tracking ref exists).
+    Proceed,
+    /// Close must be refused with this user-facing error message.
+    Refuse(String),
+}
+
+/// B2 gate: refuse close when the worker's factory branch exists locally,
+/// has **zero** commits beyond `parent_branch`, and was **never pushed** to
+/// `origin`.
+///
+/// ## Why this gate is needed
+///
+/// `run_factory_branch_merge_gate` (cas-95ce) returns `Proceed` when
+/// `count_unmerged_factory_commits == 0`.  Zero is correct for the normal
+/// merged path (all commits landed on parent), but also true when the worker
+/// never committed to `factory/<name>` — e.g., the commits leaked into the
+/// supervisor's main checkout instead of the isolated worktree (cas-073f).
+///
+/// B2 distinguishes the two cases by checking the remote tracking ref:
+/// - `origin/factory/<name>` present → branch was pushed → PR likely
+///   opened/merged → 0 commits = correct post-merge state → **Proceed**
+/// - `origin/factory/<name>` absent AND 0 commits AND branch exists →
+///   work was never delivered through the normal push/review path →
+///   **Refuse**
+///
+/// ## Safe-fail behaviour
+///
+/// - If `factory/<name>` does not exist locally (push+merge+prune),
+///   returns `Proceed` — matching the graceful-pass documented in
+///   [`count_unmerged_factory_commits`].
+/// - If `count_unmerged_factory_commits > 0`, returns `Proceed` so the
+///   existing cas-95ce gate (which runs earlier) handles that rejection;
+///   B2 must not double-reject.
+/// - Any git failure inside the helpers returns the safe-default
+///   `Proceed` (never a false `Refuse`).
+///
+/// ## Call-site bypass conditions
+///
+/// The caller in `cas_task_close` gates this function behind:
+/// - `is_factory_worker` — supervisor closes are not affected
+/// - `task.task_type != Epic` — epic close is handled elsewhere
+/// - `execution_note != "additive-only"` — no commit expected
+/// - `!bypass_close_gates` — supervisor emergency bypass
+/// - `effective_has_reviewable` — zero-diff tasks don't need commits
+pub(crate) fn check_factory_branch_merge_reality(
+    repo_path: &std::path::Path,
+    assignee: &str,
+    parent_branch: &str,
+) -> MergeRealityOutcome {
+    let factory_branch = format!("factory/{assignee}");
+
+    // Branch absent locally → push+merge+prune path; treat as merged.
+    if !git_ref_exists(repo_path, &factory_branch) {
+        return MergeRealityOutcome::Proceed;
+    }
+
+    // ≥1 unmerged commits: cas-95ce (run earlier in the pipeline) already
+    // blocks this case. Return Proceed so B2 doesn't double-reject.
+    if count_unmerged_factory_commits(repo_path, &factory_branch, parent_branch) > 0 {
+        return MergeRealityOutcome::Proceed;
+    }
+
+    // 0 unmerged commits. Check whether the branch was ever pushed: if
+    // `origin/<factory_branch>` exists, the work went through the normal
+    // push/PR path and 0 commits = post-merge clean state.
+    let remote_ref = format!("origin/{factory_branch}");
+    if git_ref_exists(repo_path, &remote_ref) {
+        return MergeRealityOutcome::Proceed;
+    }
+
+    // Branch exists + 0 commits beyond parent + no remote push evidence.
+    // The worker's commits almost certainly landed on the wrong branch.
+    MergeRealityOutcome::Refuse(format!(
+        "⚠️ MERGE REALITY CHECK FAILED\n\n\
+         task close rejected: {factory_branch} has no commits beyond \
+         {parent_branch} and has never been pushed to origin.\n\n\
+         This typically means commits landed on the wrong branch (e.g., the \
+         supervisor's main checkout instead of the factory worktree), or the \
+         branch was never committed to at all.\n\n\
+         Remediation:\n\
+         1. Check where your commits actually landed:\n\
+            `git log --oneline {parent_branch} -5` and \
+            `git log --oneline {factory_branch} -5`\n\
+         2. If commits are on the wrong branch, move them onto \
+         {factory_branch}:\n\
+            `git cherry-pick <sha>` or `git rebase --onto {factory_branch}`\n\
+         3. Push {factory_branch} to origin:\n\
+            `git push origin {factory_branch}`\n\
+         4. Open a PR targeting {parent_branch} and merge it.\n\
+         5. Retry: `mcp__cas__task action=close`\n\n\
+         If this task intentionally has no code commits, the Supervisor can \
+         bypass with `bypass_code_review=true`.",
+    ))
+}
+
+/// Return `true` if `refname` can be resolved in the git repository at
+/// `repo_path` (equivalent to `git rev-parse --verify <refname>` exiting 0).
+///
+/// Used by [`check_factory_branch_merge_reality`] to test both local branch
+/// existence (`factory/<name>`) and remote tracking ref existence
+/// (`origin/factory/<name>`).
+fn git_ref_exists(repo_path: &std::path::Path, refname: &str) -> bool {
+    use std::process::Command;
+    Command::new("git")
+        .args(["rev-parse", "--verify", refname])
+        .current_dir(repo_path)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -3944,11 +4105,10 @@ mod code_review_gate_tests {
     }
 
     /// Serialize env-mutating tests so `CAS_AGENT_ROLE` changes don't
-    /// leak between them.
+    /// leak between them — delegated to the process-wide poison-tolerant lock
+    /// in `crate::hooks` so all CAS_*-mutating test modules share ONE lock.
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        use std::sync::{Mutex, OnceLock};
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+        crate::hooks::test_env_lock()
     }
 
     // --- Path classification ------------------------------------------------
@@ -5526,6 +5686,198 @@ mod zero_change_close_tests {
         assert!(
             matches!(outcome, ZeroCommitCloseOutcome::Proceed),
             "when review findings are present, the cas-490f gate owns the rejection"
+        );
+    }
+}
+
+#[cfg(test)]
+mod merge_reality_tests {
+    //! cas-762e / B2: regression tests for the factory branch merge reality gate.
+    //!
+    //! Root cause: `run_factory_branch_merge_gate` (cas-95ce) returns PROCEED
+    //! whenever `count_unmerged_factory_commits == 0`. Zero commits is
+    //! ambiguous: it can mean "merged via PR" (correct) or "the worker never
+    //! committed to factory/<name> at all and put their work somewhere else"
+    //! (the bug cas-073f tracks).
+    //!
+    //! `check_factory_branch_merge_reality` disambiguates the 0-commit case:
+    //! if the factory branch exists locally, carries 0 commits beyond the
+    //! parent branch, AND was never pushed to origin (no remote tracking ref),
+    //! the close is refused.
+    //!
+    //! Tests cover:
+    //! - AC1: branch exists, 0 commits, no remote → REFUSE
+    //! - AC3a: branch has ≥1 unmerged commit → PROCEED (cas-95ce already
+    //!         handles the stranded case; B2 must not double-reject)
+    //! - AC3b: branch exists, 0 commits, remote tracking ref present → PROCEED
+    //! - AC4: factory branch absent locally (push+merge+prune) → PROCEED
+    use super::*;
+    use std::path::Path;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@test")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@test")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .status()
+            .expect("git");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    fn git_output(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .expect("git");
+        assert!(out.status.success(), "git {args:?} failed");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Create a minimal git repo on `main` with a seed commit.
+    /// Returns a repo where `factory/test-worker` was created but has
+    /// **0 commits** beyond `main` (the branch was just checked out;
+    /// no work committed to it).
+    fn init_repo_worker_branch_empty() -> TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        git(p, &["init", "-q", "-b", "main"]);
+        std::fs::write(p.join("seed.txt"), "seed\n").unwrap();
+        git(p, &["add", "seed.txt"]);
+        git(p, &["commit", "-q", "-m", "seed"]);
+        git(p, &["checkout", "-q", "-b", "factory/test-worker"]);
+        // switch back to main so factory/test-worker has 0 commits beyond main
+        git(p, &["checkout", "-q", "main"]);
+        dir
+    }
+
+    /// Same as above but also adds one commit ON `factory/test-worker`.
+    fn init_repo_worker_branch_with_commit() -> TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        git(p, &["init", "-q", "-b", "main"]);
+        std::fs::write(p.join("seed.txt"), "seed\n").unwrap();
+        git(p, &["add", "seed.txt"]);
+        git(p, &["commit", "-q", "-m", "seed"]);
+        git(p, &["checkout", "-q", "-b", "factory/test-worker"]);
+        std::fs::write(p.join("work.rs"), "fn work() {}\n").unwrap();
+        git(p, &["add", "work.rs"]);
+        git(p, &["commit", "-q", "-m", "cas-762e work"]);
+        dir
+    }
+
+    // -------------------------------------------------------------------------
+    // AC1: branch exists, 0 commits beyond parent, no remote → REFUSE
+    // -------------------------------------------------------------------------
+
+    /// The core bug scenario: worker ran in an isolated worktree but
+    /// committed to the wrong place. `factory/test-worker` exists with
+    /// 0 commits beyond `main` and was never pushed. Close must be refused.
+    #[test]
+    fn ac1_empty_branch_no_remote_is_refused() {
+        let dir = init_repo_worker_branch_empty();
+        let outcome =
+            check_factory_branch_merge_reality(dir.path(), "test-worker", "main");
+        assert!(
+            matches!(outcome, MergeRealityOutcome::Refuse(_)),
+            "factory branch exists with 0 commits and no remote push — must REFUSE"
+        );
+    }
+
+    /// Verify the refusal message names the factory branch and parent branch.
+    #[test]
+    fn ac1_refusal_message_names_branches() {
+        let dir = init_repo_worker_branch_empty();
+        let outcome =
+            check_factory_branch_merge_reality(dir.path(), "test-worker", "main");
+        if let MergeRealityOutcome::Refuse(msg) = outcome {
+            assert!(
+                msg.contains("factory/test-worker"),
+                "refusal message must name the factory branch; got: {msg}"
+            );
+            assert!(
+                msg.contains("main"),
+                "refusal message must name the parent branch; got: {msg}"
+            );
+        } else {
+            panic!("expected Refuse, got Proceed");
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // AC3a: branch has ≥1 unmerged commit → PROCEED
+    // (cas-95ce already guards this; B2 must not double-reject)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn ac3a_branch_with_unmerged_commit_proceeds() {
+        let dir = init_repo_worker_branch_with_commit();
+        let outcome =
+            check_factory_branch_merge_reality(dir.path(), "test-worker", "main");
+        assert!(
+            matches!(outcome, MergeRealityOutcome::Proceed),
+            "factory branch with ≥1 unmerged commit must PROCEED from B2 \
+             (cas-95ce owns the stranded-commit rejection)"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // AC3b: branch exists, 0 commits, remote tracking ref present → PROCEED
+    // (push+merge path; origin/factory/<name> proves a PR existed)
+    // -------------------------------------------------------------------------
+
+    /// Simulate "was pushed to origin" by creating the remote tracking ref
+    /// directly via `git update-ref`. This avoids needing a real remote.
+    #[test]
+    fn ac3b_remote_ref_present_proceeds() {
+        let dir = init_repo_worker_branch_empty();
+        // Manually create origin/factory/test-worker pointing to HEAD of main
+        let head_sha = git_output(dir.path(), &["rev-parse", "main"]);
+        git(
+            dir.path(),
+            &[
+                "update-ref",
+                "refs/remotes/origin/factory/test-worker",
+                &head_sha,
+            ],
+        );
+        let outcome =
+            check_factory_branch_merge_reality(dir.path(), "test-worker", "main");
+        assert!(
+            matches!(outcome, MergeRealityOutcome::Proceed),
+            "when remote tracking ref exists, branch was pushed — must PROCEED"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // AC4: factory branch absent locally → PROCEED (push+merge+prune path)
+    // -------------------------------------------------------------------------
+
+    /// Worker pushed, PR was merged, and both local + remote refs were pruned.
+    /// `factory/test-worker` does not exist. The gate must not reject the close.
+    #[test]
+    fn ac4_branch_absent_locally_proceeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        git(p, &["init", "-q", "-b", "main"]);
+        std::fs::write(p.join("seed.txt"), "seed\n").unwrap();
+        git(p, &["add", "seed.txt"]);
+        git(p, &["commit", "-q", "-m", "seed"]);
+        // No factory/test-worker branch at all
+        let outcome =
+            check_factory_branch_merge_reality(p, "test-worker", "main");
+        assert!(
+            matches!(outcome, MergeRealityOutcome::Proceed),
+            "absent factory branch (push+merge+prune) must PROCEED"
         );
     }
 }
