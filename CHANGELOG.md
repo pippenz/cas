@@ -23,6 +23,20 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 - **`active_team_id()` resolution chain extended to read user-level config (cas-ea2f5).** Priority order: (0) kill-switch `team_auto_promote = false` → always `None`; (1) project-level `team_id` if set; (2) user `default_team_id`; (3) sole team auto-pick when `teams.len() == 1`; (4) `None` (ambiguous or no membership). The `active_team_id_with_user_config(user_cfg)` testable inner keeps the chain exercisable without disk I/O.
 
+## [2.20.0] - 2026-06-07
+
+### Fixed
+
+- **Isolated factory workers no longer leak commits onto the supervisor's branch (EPIC cas-073f).** Workers spawned with `isolate=true` could commit to the supervisor's shared checkout (`main`/`epic`) instead of their own worktree. Root cause: the worktree-reuse path in `WorkerSpawnPrep::run` checked `path.exists()` but not that the directory was a real git worktree on the expected branch — a stale dir made git walk up to the main checkout's `.git`, so `HEAD` resolved to the supervisor's branch and every commit landed there (deterministic, not the race the report hypothesized). The reuse path now validates the branch and hard-errors on mismatch; `isolate=true` fails loudly instead of silently degrading to the shared checkout, and a post-spawn assertion verifies each worker sits on `factory/<name>`.
+
+### Added
+
+- **Defense-in-depth worker commit guards.** Three layers, all on a `factory/<name>` *allowlist* — a worker may only commit on its own branch; `main`/`master`/`staging`/`epic/*`/any other branch and detached HEAD are denied: a PreToolUse intercept on `git commit`/`merge`, an installed git pre-commit hook (the bulletproof floor for non-tool commits), and a SessionStart cwd/branch assertion.
+- **`coordination action=worker_status` git introspection.** Reports per worker: branch, worktree path, HEAD sha, ahead/behind vs base, dirty/clean, last pushed ref, and open PR URL — worker "done" is verifiable without git forensics.
+- **`task close` gated on merge reality.** Refuses (or routes to pending-merge) when no commit is reachable from the worker's `factory/<name>` branch and no PR exists, without blocking additive-only / zero-commit closes.
+- **Worker-stop git-state event + PreCompact findings flush.** On worker stop the final git state is emitted to the supervisor feed; on context compaction, in-flight findings are extracted from the transcript and written to the worker's active task so they survive the compaction.
+- **Truthful worktree status.** `worktree_list` / `worktree_status` report live factory (isolation) worktrees instead of the misleading "experimental and disabled" message.
+
 ## [2.16.1] - 2026-05-14
 
 ### Fixed
