@@ -626,6 +626,24 @@ pub fn handle_stop(input: &HookInput, cas_root: Option<&Path>) -> Result<HookOut
         eprintln!("cas: {reminder}");
     }
 
+    // cas-5c0a (B3): Emit final git-state event for factory workers so the
+    // supervisor can see branch/HEAD/pushed-ref/PR without manual forensics.
+    // Fires on the normal-stop path (i.e. not on blocked loop-iteration returns).
+    if is_factory_worker {
+        let worker_name = std::env::var("CAS_AGENT_NAME").unwrap_or_else(|_| "unknown".to_string());
+        let cwd_path = if input.cwd.is_empty() {
+            std::path::Path::new(".")
+        } else {
+            std::path::Path::new(&input.cwd)
+        };
+        crate::hooks::handlers::handlers_middle::session_stop::emit_worker_final_git_state(
+            cas_root,
+            &worker_name,
+            cwd_path,
+            &input.session_id,
+        );
+    }
+
     // Clean up session files
     // NOTE: Agent cleanup (graceful_shutdown) happens in SessionEnd, NOT here.
     // Stop hook can be blocked and the agent continues working, so we can't

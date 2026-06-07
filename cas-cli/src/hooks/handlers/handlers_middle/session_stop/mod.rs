@@ -529,9 +529,61 @@ pub(crate) fn emit_worker_final_git_state(
     cwd: &std::path::Path,
     session_id: &str,
 ) {
-    // STUB (cas-5c0a test-first): does nothing.
-    // Real implementation follows in the next commit once tests are green.
-    let (_, _, _, _) = (cas_root, worker_name, cwd, session_id);
+    use crate::mcp::tools::service::factory_ops::collect_worker_git_status;
+    use cas_store::{EventStore, SqliteEventStore};
+    use cas_types::{Event, EventEntityType, EventType};
+
+    let gs = collect_worker_git_status(cwd);
+
+    // Build a compact one-line summary for the activity feed.
+    let dirty_tag = if gs.dirty { "dirty" } else { "clean" };
+    let pushed_tag = if gs.pushed_ref == "none" {
+        "not-pushed"
+    } else {
+        &gs.pushed_ref
+    };
+    let summary = format!(
+        "session-stop git-state: {} @ {} [{}] [{}] ahead:{} behind:{} PR:{}",
+        gs.branch,
+        gs.head_sha,
+        dirty_tag,
+        pushed_tag,
+        gs.ahead,
+        gs.behind,
+        gs.pr_url,
+    );
+
+    // Shell-form emission: echo to stderr so it appears in the session JSONL
+    // (Claude Code captures stderr in the hook output stream, cas-5c0a AC3).
+    eprintln!("cas: worker {} stop: {summary}", worker_name);
+
+    // Structured metadata for machine-readable consumption.
+    let metadata = serde_json::json!({
+        "branch": gs.branch,
+        "head_sha": gs.head_sha,
+        "ahead": gs.ahead,
+        "behind": gs.behind,
+        "base_branch": gs.base_branch,
+        "dirty": gs.dirty,
+        "pushed_ref": gs.pushed_ref,
+        "pr_url": gs.pr_url,
+    });
+
+    let event = Event::new(
+        EventType::WorkerGitCommit,
+        EventEntityType::Agent,
+        worker_name,
+        &summary,
+    )
+    .with_session(session_id)
+    .with_metadata(metadata);
+
+    // Best-effort write: if the store is unreachable, log and continue.
+    if let Ok(store) = SqliteEventStore::open(cas_root) {
+        if let Err(e) = store.record(&event) {
+            eprintln!("cas: worker {worker_name} stop: failed to record git-state event: {e}");
+        }
+    }
 }
 
 // =============================================================================
