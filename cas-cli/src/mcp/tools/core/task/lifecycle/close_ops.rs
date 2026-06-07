@@ -3946,9 +3946,9 @@ mod code_review_gate_tests {
     /// Serialize env-mutating tests so `CAS_AGENT_ROLE` changes don't
     /// leak between them.
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        // Use the shared crate-level env lock so we don't race with sibling
-        // test modules that also mutate CAS_AGENT_ROLE.
-        crate::hooks::test_env_lock()
+        use std::sync::{Mutex, OnceLock};
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
     }
 
     // --- Path classification ------------------------------------------------
