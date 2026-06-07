@@ -426,6 +426,14 @@ impl CasService {
                     .as_ref()
                     .map(|p| format!("\n    Clone: {p}"))
                     .unwrap_or_default();
+                // cas-844bf: git introspection — branch/HEAD/ahead-behind/dirty/PR
+                let git_info = clone_path
+                    .as_ref()
+                    .map(|p| {
+                        let gs = collect_worker_git_status(std::path::Path::new(p.as_str()));
+                        format_worker_git_status(&gs)
+                    })
+                    .unwrap_or_default();
                 // Surface transcript path only for hard-dead workers so the
                 // supervisor can salvage whatever was in-flight when the CC
                 // client died (cas-2749 AC: transcript-path-surfacing on
@@ -477,11 +485,12 @@ impl CasService {
                     }
                 };
                 output.push_str(&format!(
-                    "  • {} (heartbeat: {}){}{}{}{}\n    session: {}\n",
+                    "  • {} (heartbeat: {}){}{}{}{}{}\n    session: {}\n",
                     &agent.name,
                     since,
                     liveness_label,
                     clone_info,
+                    git_info,
                     transcript_info,
                     context_info,
                     session_uuid
@@ -1604,29 +1613,148 @@ pub(super) struct WorkerGitStatus {
 /// blocking operations already).  Callers in a strict async context should
 /// wrap in `tokio::task::spawn_blocking` if needed.
 pub(super) fn collect_worker_git_status(worktree_path: &std::path::Path) -> WorkerGitStatus {
-    // STUB (cas-844bf test-first): All fields return sentinel values.
-    // Real implementation follows in the next commit once tests are green.
-    let _ = worktree_path;
+    // --- current branch -------------------------------------------------------
+    let branch = run_git(worktree_path, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .unwrap_or_else(|_| "?".to_string());
+
+    // --- HEAD short SHA -------------------------------------------------------
+    let head_sha = run_git(worktree_path, &["rev-parse", "--short", "HEAD"])
+        .unwrap_or_else(|_| "?".to_string());
+
+    // --- base branch for ahead/behind ----------------------------------------
+    // Prefer origin/HEAD (most authoritative), then fall back to "main".
+    // `--short` strips the "refs/remotes/" prefix → "origin/main".
+    let base_branch = run_git(
+        worktree_path,
+        &["symbolic-ref", "refs/remotes/origin/HEAD", "--short"],
+    )
+    .unwrap_or_else(|_| {
+        // No remote HEAD symref; try origin/main, then plain "main".
+        let probe = run_git(
+            worktree_path,
+            &["rev-parse", "--verify", "refs/remotes/origin/main"],
+        );
+        if probe.is_ok() {
+            "origin/main".to_string()
+        } else {
+            "main".to_string()
+        }
+    });
+
+    // --- ahead / behind -------------------------------------------------------
+    // `git rev-list --left-right --count <base>...HEAD`
+    // Output: "<behind>\t<ahead>" (the left side is commits in base not in HEAD).
+    let (ahead, behind) = run_git(
+        worktree_path,
+        &[
+            "rev-list",
+            "--left-right",
+            "--count",
+            &format!("{base_branch}...HEAD"),
+        ],
+    )
+    .map(|s| {
+        let parts: Vec<&str> = s.split_whitespace().collect();
+        let behind = parts.first().and_then(|v| v.parse().ok()).unwrap_or(0usize);
+        let ahead = parts.get(1).and_then(|v| v.parse().ok()).unwrap_or(0usize);
+        (ahead, behind)
+    })
+    .unwrap_or((0, 0));
+
+    // --- dirty? ---------------------------------------------------------------
+    let dirty = run_git(worktree_path, &["status", "--porcelain"])
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+
+    // --- pushed ref -----------------------------------------------------------
+    // Check whether `refs/remotes/origin/<branch>` exists locally (i.e. has the
+    // branch been pushed and fetched at least once).
+    let pushed_ref = if branch == "?" {
+        "none".to_string()
+    } else {
+        let origin_ref = format!("origin/{branch}");
+        let exists = run_git(
+            worktree_path,
+            &["rev-parse", "--verify", &format!("refs/remotes/{origin_ref}")],
+        )
+        .is_ok();
+        if exists {
+            origin_ref
+        } else {
+            "none".to_string()
+        }
+    };
+
+    // --- open PR URL (gh, graceful degrade) -----------------------------------
+    // Only attempt the `gh` query when we know the branch has been pushed —
+    // otherwise it will always return nothing and adds ~200ms latency.
+    let pr_url = if pushed_ref == "none" || branch == "?" {
+        "none".to_string()
+    } else {
+        std::process::Command::new("gh")
+            .args([
+                "pr",
+                "list",
+                "--head",
+                &branch,
+                "--json",
+                "url",
+                "--jq",
+                ".[0].url",
+            ])
+            .current_dir(worktree_path)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "none".to_string())
+    };
+
     WorkerGitStatus {
-        branch: "?".to_string(),
-        head_sha: "?".to_string(),
-        ahead: 0,
-        behind: 0,
-        base_branch: "?".to_string(),
-        dirty: false,
-        pushed_ref: "none".to_string(),
-        pr_url: "none".to_string(),
+        branch,
+        head_sha,
+        ahead,
+        behind,
+        base_branch,
+        dirty,
+        pushed_ref,
+        pr_url,
     }
 }
 
 /// Render a `WorkerGitStatus` as a multi-line block for injection into the
 /// `worker_status` output.  Returns an empty string when the status is
-/// entirely unknown (all fields are sentinels).
+/// entirely unknown (all sentinel values).
 pub(super) fn format_worker_git_status(gs: &WorkerGitStatus) -> String {
-    // STUB (cas-844bf test-first): returns empty string.
-    // Real format follows in the implementation commit.
-    let _ = gs;
-    String::new()
+    // Skip entirely if everything is unknown — this keeps the output clean for
+    // non-isolated (non-worktree) workers where the clone_path may not be set.
+    if gs.branch == "?" && gs.head_sha == "?" {
+        return String::new();
+    }
+
+    let dirty_label = if gs.dirty { "[dirty]" } else { "[clean]" };
+    let pushed_label = if gs.pushed_ref == "none" {
+        "[not pushed]".to_string()
+    } else {
+        format!("[pushed: {}]", gs.pushed_ref)
+    };
+    let pr_label = gs.pr_url.clone(); // "none" or a URL
+
+    format!(
+        "\n    git: {} @ {} {} {}\
+         \n    ahead: {} behind: {} (vs {})\
+         \n    PR: {}",
+        gs.branch,
+        gs.head_sha,
+        dirty_label,
+        pushed_label,
+        gs.ahead,
+        gs.behind,
+        gs.base_branch,
+        pr_label,
+    )
 }
 
 // =============================================================================
@@ -2006,10 +2134,11 @@ mod tests {
         const UUID: &str = "0a7f2802-e977-493b-965b-c620e99f04ef";
 
         // Reproduce the format! call from factory_worker_status (cas-85bf +
-        // cas-573c): context_info is the 6th positional arg.
+        // cas-573c + cas-844bf): git_info is the 4th positional arg,
+        // context_info is the 6th, transcript_info is the 5th.
         let output = format!(
-            "  • {} (heartbeat: {}){}{}{}{}\n    session: {}\n",
-            NAME, "5s ago", "", "", "", "", UUID
+            "  • {} (heartbeat: {}){}{}{}{}{}\n    session: {}\n",
+            NAME, "5s ago", "", "", "", "", "", UUID
         );
 
         assert!(
