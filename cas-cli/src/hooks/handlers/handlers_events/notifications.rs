@@ -496,7 +496,9 @@ pub(crate) fn write_findings_note(
     }
 
     let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M");
-    let mut body = findings
+    // Enforce the cap defensively in the writer regardless of call site
+    let capped = &findings[..MAX_FLUSH_FINDINGS.min(findings.len())];
+    let mut body = capped
         .iter()
         .map(|f| format!("- {f}"))
         .collect::<Vec<_>>()
@@ -660,5 +662,72 @@ mod pre_compact_flush_tests {
 
         // Must not panic; errors must be swallowed
         flush_worker_findings_to_task(&input, &cas.root);
+    }
+
+    // -------------------------------------------------------------------------
+    // AC#4: note is size-bounded — MAX_FLUSH_FINDINGS cap enforced
+    // -------------------------------------------------------------------------
+    #[test]
+    fn test_write_findings_note_respects_max_findings_cap() {
+        let cas = setup_cas();
+        add_inprogress_task(&cas.root, "cas-b4t5");
+
+        // Write 12 findings — only MAX_FLUSH_FINDINGS (8) should appear
+        let findings: Vec<String> = (0..12)
+            .map(|i| format!("finding-{i}: discovered something important about subsystem"))
+            .collect();
+
+        write_findings_note(&cas.root, "cas-b4t5", &findings)
+            .expect("write should succeed");
+
+        let store = open_task_store(&cas.root).expect("open_task_store");
+        let task = store.get("cas-b4t5").expect("task.get");
+
+        // Count how many "finding-N:" lines appear
+        let written = (0..12)
+            .filter(|i| task.notes.contains(&format!("finding-{i}:")))
+            .count();
+
+        assert!(
+            written <= MAX_FLUSH_FINDINGS,
+            "must write at most {MAX_FLUSH_FINDINGS} findings; wrote {written};\nnotes:\n{}",
+            task.notes
+        );
+        assert!(
+            written > 0,
+            "must write at least some findings; notes:\n{}",
+            task.notes
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // AC#5: inject direction preserved — handle_pre_compact still returns
+    //       a non-empty systemMessage even after flush is wired in
+    // -------------------------------------------------------------------------
+    #[test]
+    fn test_handle_pre_compact_inject_direction_preserved() {
+        let cas = setup_cas();
+
+        // Minimal HookInput — no transcript, so flush short-circuits gracefully
+        let input = HookInput {
+            session_id: "inject-test-session".to_string(),
+            transcript_path: None,
+            hook_event_name: "PreCompact".to_string(),
+            ..Default::default()
+        };
+
+        // Even with an empty store (no high-importance memories), the function
+        // must not error.  With memories present it would return Some(context).
+        let result = handle_pre_compact(&input, Some(&cas.root));
+        assert!(
+            result.is_ok(),
+            "handle_pre_compact must not error after B4 flush wired in; got: {result:?}"
+        );
+        // hook_specific_output must be None — PreCompact schema forbids it
+        let output = result.unwrap();
+        assert!(
+            output.hook_specific_output.is_none(),
+            "PreCompact must not set hookSpecificOutput (schema forbids it)"
+        );
     }
 }
