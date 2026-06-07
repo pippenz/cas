@@ -84,3 +84,30 @@ Spawn 4 isolated workers and assign each a task that makes a commit. After all f
 - Prior incidence: gabber-studio memory `feedback_workers_commit_direct_to_main`.
 - Recovery performed by supervisor: cherry-pick `4c6add3c 7659a0e5` onto the epic branch (→ `2c32f9df`, `39c6ac8a`), then `git reset --hard origin/main` to defuse the unpushed-main risk.
 - Deploy trigger context: gabber-studio backend deploys on push to `main`/`staging` (`main-build.yml`); Vercel does **not** run `prisma migrate`, so schema-dependent code on `main` is doubly dangerous.
+
+---
+
+## Update — second incident same day, and the bigger problem: the supervisor is blind to worker state (2026-06-07)
+
+The leak recurred a third+ time in the same session with a different (frontend) worker — but the more important finding is the **compounding failure it exposed: the supervisor has no reliable view of what a worker is actually doing or where its commits land.** The human watching the worker's terminal could see the truth; the supervisor could not, and burned ~8 tool calls on git forensics to reconstruct it.
+
+### What happened
+
+1. Frontend worker was assigned two tasks. It did the work but committed it onto the **supervisor's shared checkout** (`epic` branch in the primary working dir), not its `factory/frontend` worktree — the same leak as above. (The worker itself later narrated: *"my earlier commits went to the main repo on the epic branch (wrong place)."*)
+2. The worker then **closed the CAS task** (status → `Closed` via the dual-gate workaround). So from the task DB, the supervisor saw "done."
+3. But: there was **no PR**, the commits were **not on `origin/epic`**, and the supervisor's own `git status` / `git log` were now polluted with commits it never made (`7adca583` etc. sitting on the supervisor's local `epic`, unpushed).
+4. The worker eventually self-corrected (cherry-picked the stray commits into its `factory/frontend` worktree, force-pushed, opened a PR) — but the supervisor only learned this by reading the worker's terminal scrollback, which was surfaced **by the human**, not by any tool.
+5. Separately, the worker discovered the filed task pointed at the wrong file (`p/[slug]/settings.vue` had no overlap; the real bug was `brands/[id].vue`) — a correct call the supervisor had no way to see being made.
+
+### Why this is worse than the base leak
+
+- **Task status lies.** `Closed` (+ dual-gate workaround) masks "committed to the wrong ref, never merged, no PR." A supervisor that trusts task status ships nothing or ships stale.
+- **No worker-state introspection.** There is no `coordination` action that answers "what has worker X committed, to which branch, is it pushed, is there a PR?" The supervisor resorts to `git cat-file` / `git log <ref>..<ref>` / `ls` archaeology — on a working tree the worker may be concurrently mutating (I hit `git checkout` aborts because the worker had uncommitted changes in *my* tree).
+- **Shared checkout corrupts the supervisor's own git.** Recovery required `git reset --hard origin/epic` on the supervisor's checkout to discard the worker's stray commits — i.e., the bug doesn't just leak worker work, it makes the *supervisor's* repo state untrustworthy.
+
+### Suggested additions to the fix
+
+- **Supervisor-facing worker git introspection:** a `coordination action=worker_status` that reports per worker — current branch, worktree path, HEAD sha, ahead/behind vs base, dirty/clean, **last pushed ref + open PR URL**. "Done" must be verifiable without git forensics.
+- **Gate `task close` on merge reality:** refuse close (or mark `pending-merge`) when no commit is reachable from the worker's `factory/<name>` branch / no PR exists for the change. Kill the dual-gate "Closed but unmerged" path.
+- **Hard-isolate the worker's git from the supervisor's checkout** (the core fix) so neither can commit into or corrupt the other's working tree / branch refs. The supervisor should never see worker commits appear on its own `HEAD`.
+- **Surface worker reasoning to the supervisor, not just the human.** The worker made several correct decisions (wrong-file detection, self-correcting the branch) that were invisible to the orchestrator — the orchestrator needs a feed of worker progress/decisions to coordinate, instead of relying on the human to relay the terminal.
