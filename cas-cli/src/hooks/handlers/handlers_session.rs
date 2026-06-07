@@ -267,6 +267,18 @@ pub fn handle_session_start(
         None => context,
     };
 
+    // ========================================================================
+    // WORKER WORKTREE ASSERTION (cas-bea2 LAYER 3)
+    //
+    // For isolated factory workers: verify the session cwd matches the
+    // assigned worktree (CAS_CLONE_PATH) and HEAD is not on a protected
+    // branch. Mismatches are prepended as a loud warning so the worker
+    // sees them before any other context. Non-isolated workers and non-
+    // factory sessions fall through silently. Best-effort — git failures
+    // or absent env vars are treated as "no mismatch".
+    // ========================================================================
+    let context = build_worker_worktree_assertion(&input.cwd, context);
+
     let output = if context.is_empty() {
         HookOutput::empty()
     } else {
@@ -471,6 +483,75 @@ fn escape_xml_text(s: &str) -> String {
         }
     }
     out
+}
+
+// ── Worker worktree assertion (cas-bea2, LAYER 3) ─────────────────────────
+
+/// Prepend a critical warning to `context` if the session cwd of an isolated
+/// factory worker is:
+/// - outside the assigned worktree (`CAS_CLONE_PATH`), OR
+/// - on a protected branch (main/master/staging).
+///
+/// Only fires when `CAS_AGENT_ROLE=worker` AND `CAS_CLONE_PATH` is set.
+/// Non-factory sessions and non-isolated workers are silent pass-through.
+/// Best-effort: git failures and absent env vars are treated as "no mismatch".
+pub(crate) fn build_worker_worktree_assertion(cwd: &str, context: String) -> String {
+    let role = std::env::var("CAS_AGENT_ROLE").unwrap_or_default();
+    if !role.eq_ignore_ascii_case("worker") {
+        return context;
+    }
+    let clone_path = match std::env::var("CAS_CLONE_PATH") {
+        Ok(p) if !p.is_empty() => p,
+        _ => return context,
+    };
+
+    let mut warnings: Vec<String> = Vec::new();
+
+    // Check 1: session cwd is inside the assigned worktree
+    let cwd_path = std::path::Path::new(cwd);
+    let worktree_path = std::path::Path::new(&clone_path);
+    if !cwd_path.starts_with(worktree_path) {
+        warnings.push(format!(
+            "⚠️  CWD MISMATCH: Session cwd ({cwd}) is outside your assigned worktree \
+            ({clone_path}).\n   Run: cd {clone_path}"
+        ));
+    }
+
+    // Check 2: HEAD is not on a protected branch
+    const PROTECTED: &[&str] = &["main", "master", "staging"];
+    let branch_output = std::process::Command::new("git")
+        .args(["-C", cwd, "symbolic-ref", "--short", "HEAD"])
+        .output()
+        .ok();
+    if let Some(out) = branch_output {
+        if out.status.success() {
+            let branch = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if PROTECTED.contains(&branch.as_str()) {
+                let worker_name = std::env::var("CAS_AGENT_NAME")
+                    .unwrap_or_else(|_| "<worker-name>".to_string());
+                warnings.push(format!(
+                    "⚠️  PROTECTED BRANCH: HEAD is on '{branch}' — DO NOT commit here!\n   \
+                    Switch first: git switch factory/{worker_name}"
+                ));
+            }
+        }
+    }
+
+    if warnings.is_empty() {
+        return context;
+    }
+
+    let banner = format!(
+        "<worker-worktree-alert severity=\"critical\">\n{}\n</worker-worktree-alert>",
+        warnings.join("\n\n")
+    );
+
+    // Prepend: critical alerts must appear before other context
+    if context.is_empty() {
+        banner
+    } else {
+        format!("{banner}\n{context}")
+    }
 }
 
 /// Compute session outcome based on metrics and friction events
@@ -1184,6 +1265,210 @@ mod session_learn_tests {
         assert!(
             result.unwrap().is_empty(),
             "trivial transcript must return empty draft list"
+        );
+    }
+}
+
+// ── Worker worktree assertion tests (cas-bea2, LAYER 3) ───────────────────
+#[cfg(test)]
+mod worker_worktree_assertion_tests {
+    use super::*;
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::{Mutex, OnceLock};
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    struct EnvGuard(Vec<(String, Option<String>)>);
+    impl EnvGuard {
+        fn set(vars: &[(&str, Option<&str>)]) -> Self {
+            let saved = vars
+                .iter()
+                .map(|(k, v)| {
+                    let prev = std::env::var(k).ok();
+                    unsafe {
+                        match v {
+                            Some(val) => std::env::set_var(k, val),
+                            None => std::env::remove_var(k),
+                        }
+                    }
+                    (k.to_string(), prev)
+                })
+                .collect();
+            EnvGuard(saved)
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in &self.0 {
+                unsafe {
+                    match v {
+                        Some(val) => std::env::set_var(k, val),
+                        None => std::env::remove_var(k),
+                    }
+                }
+            }
+        }
+    }
+
+    fn make_git_repo() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let p = tmp.path();
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["config", "user.email", "t@t.com"],
+            vec!["config", "user.name", "T"],
+        ] {
+            std::process::Command::new("git")
+                .args(&args)
+                .current_dir(p)
+                .output()
+                .unwrap();
+        }
+        std::fs::write(p.join("r.txt"), "r").unwrap();
+        for args in [vec!["add", "."], vec!["commit", "-m", "init"]] {
+            std::process::Command::new("git")
+                .args(&args)
+                .current_dir(p)
+                .output()
+                .unwrap();
+        }
+        tmp
+    }
+
+    /// Non-worker role → pass-through (no banner)
+    #[test]
+    fn non_worker_passes_through() {
+        let _lock = env_lock();
+        let _env = EnvGuard::set(&[
+            ("CAS_AGENT_ROLE", Some("supervisor")),
+            ("CAS_CLONE_PATH", Some("/tmp/some-worktree")),
+        ]);
+        let ctx = "some context".to_string();
+        let result = build_worker_worktree_assertion("/tmp/other", ctx.clone());
+        assert_eq!(result, ctx, "supervisor must not be warned");
+    }
+
+    /// Worker with no CAS_CLONE_PATH → pass-through (not isolated)
+    #[test]
+    fn no_clone_path_passes_through() {
+        let _lock = env_lock();
+        let _env = EnvGuard::set(&[
+            ("CAS_AGENT_ROLE", Some("worker")),
+            ("CAS_CLONE_PATH", None),
+        ]);
+        let ctx = "some context".to_string();
+        let result = build_worker_worktree_assertion("/tmp/foo", ctx.clone());
+        assert_eq!(result, ctx);
+    }
+
+    /// CWD outside worktree → warning prepended
+    #[test]
+    fn cwd_outside_worktree_prepends_warning() {
+        let _lock = env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let worktree = tmp.path().join("wt").to_string_lossy().to_string();
+        let other = tmp.path().join("other").to_string_lossy().to_string();
+        let _env = EnvGuard::set(&[
+            ("CAS_AGENT_ROLE", Some("worker")),
+            ("CAS_CLONE_PATH", Some(&worktree)),
+        ]);
+
+        let result = build_worker_worktree_assertion(&other, String::new());
+        assert!(
+            result.contains("CWD MISMATCH"),
+            "expected CWD MISMATCH warning: {result}"
+        );
+        assert!(
+            result.contains("worker-worktree-alert"),
+            "expected XML wrapper: {result}"
+        );
+    }
+
+    /// CWD inside worktree on protected branch → branch warning prepended
+    #[test]
+    fn protected_branch_prepends_warning() {
+        let _lock = env_lock();
+        let tmp = make_git_repo(); // on main
+        let p = tmp.path().to_string_lossy().to_string();
+        let _env = EnvGuard::set(&[
+            ("CAS_AGENT_ROLE", Some("worker")),
+            ("CAS_CLONE_PATH", Some(&p)),
+        ]);
+
+        let result = build_worker_worktree_assertion(&p, String::new());
+        assert!(
+            result.contains("PROTECTED BRANCH"),
+            "expected PROTECTED BRANCH warning for 'main': {result}"
+        );
+    }
+
+    /// CWD inside worktree on factory branch → no warning
+    #[test]
+    fn factory_branch_is_clean() {
+        let _lock = env_lock();
+        let tmp = make_git_repo();
+        let p = tmp.path();
+
+        std::process::Command::new("git")
+            .args(["checkout", "-b", "factory/test-w"])
+            .current_dir(p)
+            .output()
+            .unwrap();
+
+        let ps = p.to_string_lossy().to_string();
+        let _env = EnvGuard::set(&[
+            ("CAS_AGENT_ROLE", Some("worker")),
+            ("CAS_CLONE_PATH", Some(&ps)),
+        ]);
+
+        let original_ctx = "existing context".to_string();
+        let result = build_worker_worktree_assertion(&ps, original_ctx.clone());
+        assert_eq!(result, original_ctx, "no warning on factory branch, got: {result}");
+    }
+
+    /// Existing context is preserved (warning is prepended, not replacing)
+    #[test]
+    fn warning_prepends_not_replaces_context() {
+        let _lock = env_lock();
+        let tmp = make_git_repo(); // on main
+        let p = tmp.path().to_string_lossy().to_string();
+        let _env = EnvGuard::set(&[
+            ("CAS_AGENT_ROLE", Some("worker")),
+            ("CAS_CLONE_PATH", Some(&p)),
+        ]);
+
+        let original = "## Important context\nDo this first.".to_string();
+        let result = build_worker_worktree_assertion(&p, original.clone());
+        assert!(result.contains("## Important context"), "original context must be preserved");
+        assert!(result.starts_with("<worker-worktree-alert"), "alert must be prepended");
+    }
+
+    /// SessionStart bundle size must stay under 12KB after adding the assertion
+    #[test]
+    fn worker_session_start_with_assertion_stays_under_12kb() {
+        let _lock = env_lock();
+        // Simulate the largest plausible warning: both cwd mismatch + protected branch
+        let tmp = make_git_repo();
+        let p = tmp.path();
+        let wt = "/some/very/long/absolute/path/to/worktrees/worker-name";
+        let ps = p.to_string_lossy().to_string();
+        let _env = EnvGuard::set(&[
+            ("CAS_AGENT_ROLE", Some("worker")),
+            ("CAS_CLONE_PATH", Some(wt)),
+            ("CAS_AGENT_NAME", Some("some-worker")),
+        ]);
+
+        // Simulate a near-12KB context (just below 12KB)
+        let large_ctx = "x".repeat(11_000);
+        let result = build_worker_worktree_assertion(&ps, large_ctx);
+        assert!(
+            result.len() < 12_288,
+            "bundle with assertion must stay under 12KB, got {} bytes",
+            result.len()
         );
     }
 }

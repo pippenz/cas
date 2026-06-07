@@ -118,3 +118,23 @@ pub fn handle_hook(event_name: &str, input: HookInput) -> Result<HookOutput, Mem
         }
     }
 }
+
+// ── Shared test helpers ────────────────────────────────────────────────────
+//
+// A single process-wide mutex for tests that mutate env vars (`CAS_AGENT_ROLE`,
+// `CAS_FACTORY_MODE`, `CAS_CLONE_PATH`, etc.).  All test modules that touch
+// these vars must acquire this lock so they don't race with each other.
+//
+// Usage:
+//   let _g = crate::hooks::test_env_lock();
+//
+// Or via a module-local wrapper (preferred for readability):
+//   fn env_lock() -> std::sync::MutexGuard<'static, ()> { crate::hooks::test_env_lock() }
+#[cfg(test)]
+pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    use std::sync::{Mutex, OnceLock};
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}

@@ -801,6 +801,123 @@ impl TeamsManager {
             settings_path: Some(worker_settings_path.to_string_lossy().to_string()),
         }
     }
+
+    // ── Worker pre-commit guard (cas-bea2, LAYER 2) ───────────────────────
+
+    /// Shell-form pre-commit hook content that hard-refuses commits on protected
+    /// branches (main/master/staging). Installed into each isolated worker's
+    /// git repo by [`Self::install_worker_pre_commit_hook`].
+    ///
+    /// Shell-form (`#!/bin/sh`) per the cas-7ecd scar — exec-form hooks trip
+    /// Claude Code's /doctor validator regardless of Anthropic #58441 state.
+    pub const WORKER_PRE_COMMIT_HOOK: &'static str = "#!/bin/sh
+# CAS factory worker guard — installed by `cas factory` when spawning isolated workers.
+# Refuses commits on protected branches (main/master/staging) to prevent accidental
+# direct-to-protected-branch commits from workers that lost their worktree branch context.
+branch=$(git symbolic-ref --short HEAD 2>/dev/null)
+case \"$branch\" in
+  main|master|staging)
+    echo \"CAS COMMIT GUARD: Cannot commit on protected branch '$branch'.\" >&2
+    echo \"Switch to your worker branch first: git switch factory/<worker-name>\" >&2
+    exit 1
+    ;;
+esac
+exit 0
+";
+
+    /// Install the CAS worker pre-commit guard into `worktree_path`'s git hooks
+    /// directory. Uses `git rev-parse --git-path hooks` so it resolves correctly
+    /// for both main checkouts and linked worktrees (which share the common gitdir).
+    ///
+    /// Idempotent: if the guard marker is already present in the existing hook,
+    /// no-ops. If another pre-commit exists, writes a separate `pre-commit-cas-guard`
+    /// file and appends a sourcing line to the existing hook so both fire.
+    ///
+    /// Non-fatal failures are logged as warnings — LAYER 1 (PreToolUse) and
+    /// LAYER 3 (SessionStart) are the primary guards.
+    pub fn install_worker_pre_commit_hook(
+        worktree_path: &std::path::Path,
+    ) -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let hooks_output = std::process::Command::new("git")
+            .args([
+                "-C",
+                &worktree_path.to_string_lossy(),
+                "rev-parse",
+                "--git-path",
+                "hooks",
+            ])
+            .output()?;
+        if !hooks_output.status.success() {
+            anyhow::bail!(
+                "git rev-parse --git-path hooks failed in {:?}: {}",
+                worktree_path,
+                String::from_utf8_lossy(&hooks_output.stderr)
+            );
+        }
+        // `git rev-parse --git-path hooks` returns an absolute path for linked
+        // worktrees but a relative path (`.git/hooks`) for plain repos. Resolve
+        // relative results against `worktree_path` so we always have an absolute
+        // path and don't accidentally write into the test process's CWD.
+        let hooks_raw = String::from_utf8_lossy(&hooks_output.stdout)
+            .trim()
+            .to_string();
+        let hooks_dir = {
+            let p = std::path::Path::new(&hooks_raw);
+            if p.is_absolute() {
+                std::path::PathBuf::from(p)
+            } else {
+                worktree_path.join(p)
+            }
+        };
+        std::fs::create_dir_all(&hooks_dir)?;
+
+        const GUARD_MARKER: &str = "CAS factory worker guard";
+        let hook_path = hooks_dir.join("pre-commit");
+
+        if hook_path.exists() {
+            let existing = std::fs::read_to_string(&hook_path).unwrap_or_default();
+            if existing.contains(GUARD_MARKER) {
+                tracing::debug!(
+                    "CAS pre-commit guard already installed at {:?}",
+                    hook_path
+                );
+                return Ok(());
+            }
+            // Existing hook present — write guard as separate file, append sourcing line.
+            let guard_path = hooks_dir.join("pre-commit-cas-guard");
+            std::fs::write(&guard_path, Self::WORKER_PRE_COMMIT_HOOK)?;
+            std::fs::set_permissions(
+                &guard_path,
+                std::fs::Permissions::from_mode(0o755),
+            )?;
+            let sourcing_line = format!(
+                "\n# {GUARD_MARKER} (sourced by cas factory — do not remove)\n\
+                 _cas_guard=\"$(git rev-parse --git-path hooks 2>/dev/null)/pre-commit-cas-guard\"\n\
+                 [ -f \"$_cas_guard\" ] && . \"$_cas_guard\"\n"
+            );
+            let mut updated = existing;
+            updated.push_str(&sourcing_line);
+            std::fs::write(&hook_path, updated)?;
+            tracing::info!(
+                "Appended CAS guard sourcing line to existing pre-commit hook at {:?}",
+                hook_path
+            );
+        } else {
+            std::fs::write(&hook_path, Self::WORKER_PRE_COMMIT_HOOK)?;
+            std::fs::set_permissions(
+                &hook_path,
+                std::fs::Permissions::from_mode(0o755),
+            )?;
+            tracing::info!(
+                "Installed CAS worker pre-commit guard at {:?}",
+                hook_path
+            );
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1366,5 +1483,216 @@ mod tests {
         .unwrap();
         assert_eq!(inbox.len(), 1);
         assert_eq!(inbox[0].text, "fresh");
+    }
+
+    // ── Worker pre-commit hook tests (cas-bea2, LAYER 2) ─────────────────
+
+    fn make_git_repo_for_hook_test() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let p = tmp.path();
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["config", "user.email", "t@t.com"],
+            vec!["config", "user.name", "T"],
+        ] {
+            std::process::Command::new("git")
+                .args(&args)
+                .current_dir(p)
+                .output()
+                .unwrap();
+        }
+        std::fs::write(p.join("f.txt"), "x").unwrap();
+        for args in [vec!["add", "."], vec!["commit", "-m", "init"]] {
+            std::process::Command::new("git")
+                .args(&args)
+                .current_dir(p)
+                .output()
+                .unwrap();
+        }
+        tmp
+    }
+
+    /// `WORKER_PRE_COMMIT_HOOK` must contain the guard marker so the idempotent
+    /// install check recognises an already-installed hook.
+    #[test]
+    fn worker_pre_commit_hook_content_has_marker() {
+        assert!(
+            TeamsManager::WORKER_PRE_COMMIT_HOOK.contains("CAS factory worker guard"),
+            "hook content must contain the guard marker for idempotent install"
+        );
+    }
+
+    /// `WORKER_PRE_COMMIT_HOOK` must start with `#!/bin/sh` (shell-form).
+    /// Exec-form hooks (`#!/usr/bin/env cas`) trip /doctor on every CC version.
+    #[test]
+    fn worker_pre_commit_hook_is_shell_form() {
+        assert!(
+            TeamsManager::WORKER_PRE_COMMIT_HOOK.starts_with("#!/bin/sh"),
+            "pre-commit hook must use shell-form (#!/bin/sh)"
+        );
+    }
+
+    /// After installation, the pre-commit hook file must exist and be executable.
+    #[test]
+    fn install_worker_pre_commit_hook_creates_executable_hook() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = make_git_repo_for_hook_test();
+        let p = tmp.path();
+
+        TeamsManager::install_worker_pre_commit_hook(p)
+            .expect("install should succeed");
+
+        // git rev-parse --git-path hooks may return a relative path (.git/hooks)
+        // for plain repos; resolve against p to get the absolute location.
+        let output = std::process::Command::new("git")
+            .args(["-C", &p.to_string_lossy(), "rev-parse", "--git-path", "hooks"])
+            .output()
+            .unwrap();
+        let hooks_raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let hooks_dir = {
+            let rp = std::path::Path::new(&hooks_raw);
+            if rp.is_absolute() { rp.to_path_buf() } else { p.join(rp) }
+        };
+        let hook_path = hooks_dir.join("pre-commit");
+
+        assert!(hook_path.exists(), "pre-commit hook must be created at {hook_path:?}");
+        let perms = std::fs::metadata(&hook_path).unwrap().permissions();
+        assert!(
+            perms.mode() & 0o111 != 0,
+            "pre-commit hook must be executable"
+        );
+    }
+
+    /// Running `git commit` on `main` with the hook installed must exit non-zero.
+    #[test]
+    fn installed_hook_blocks_commit_on_protected_branch() {
+        let tmp = make_git_repo_for_hook_test();
+        let p = tmp.path();
+
+        TeamsManager::install_worker_pre_commit_hook(p)
+            .expect("install should succeed");
+
+        // Try to commit something on main
+        std::fs::write(p.join("new.txt"), "change").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(p)
+            .output()
+            .unwrap();
+
+        let result = std::process::Command::new("git")
+            .args(["commit", "-m", "should be blocked"])
+            .current_dir(p)
+            .output()
+            .unwrap();
+
+        assert!(
+            !result.status.success(),
+            "git commit on main should be blocked by the pre-commit hook; exit code: {:?}",
+            result.status.code()
+        );
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            stderr.contains("CAS COMMIT GUARD") || stderr.contains("protected branch"),
+            "hook stderr should mention the guard: {stderr}"
+        );
+    }
+
+    /// Running `git commit` on a factory branch must succeed (hook allows it).
+    #[test]
+    fn installed_hook_allows_commit_on_worker_branch() {
+        let tmp = make_git_repo_for_hook_test();
+        let p = tmp.path();
+
+        // Create and switch to factory/test-worker
+        std::process::Command::new("git")
+            .args(["checkout", "-b", "factory/test-worker"])
+            .current_dir(p)
+            .output()
+            .unwrap();
+
+        TeamsManager::install_worker_pre_commit_hook(p)
+            .expect("install should succeed");
+
+        std::fs::write(p.join("wip.txt"), "work").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(p)
+            .output()
+            .unwrap();
+
+        let result = std::process::Command::new("git")
+            .args(["commit", "-m", "wip on worker branch"])
+            .current_dir(p)
+            .output()
+            .unwrap();
+
+        assert!(
+            result.status.success(),
+            "git commit on factory/test-worker should be allowed; stderr: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+
+    /// Installing the hook twice must be idempotent (second install is a no-op).
+    #[test]
+    fn install_worker_pre_commit_hook_is_idempotent() {
+        let tmp = make_git_repo_for_hook_test();
+        let p = tmp.path();
+
+        TeamsManager::install_worker_pre_commit_hook(p).expect("first install");
+        TeamsManager::install_worker_pre_commit_hook(p).expect("second install must not fail");
+
+        // Should still have exactly one copy of the guard marker
+        let output = std::process::Command::new("git")
+            .args(["-C", &p.to_string_lossy(), "rev-parse", "--git-path", "hooks"])
+            .output()
+            .unwrap();
+        let hooks_raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let hooks_dir = {
+            let rp = std::path::Path::new(&hooks_raw);
+            if rp.is_absolute() { rp.to_path_buf() } else { p.join(rp) }
+        };
+        let content = std::fs::read_to_string(hooks_dir.join("pre-commit")).unwrap();
+        let count = content.matches("CAS factory worker guard").count();
+        assert_eq!(
+            count, 1,
+            "guard marker must appear exactly once after two installs; found {count} occurrences"
+        );
+    }
+
+    /// When an existing pre-commit hook is present, our guard must be appended
+    /// without clobbering the original.
+    #[test]
+    fn install_worker_pre_commit_hook_appends_to_existing_hook() {
+        let tmp = make_git_repo_for_hook_test();
+        let p = tmp.path();
+
+        // Pre-install a custom hook
+        let output = std::process::Command::new("git")
+            .args(["-C", &p.to_string_lossy(), "rev-parse", "--git-path", "hooks"])
+            .output()
+            .unwrap();
+        let hooks_raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let hooks_dir = {
+            let rp = std::path::Path::new(&hooks_raw);
+            if rp.is_absolute() { rp.to_path_buf() } else { p.join(rp) }
+        };
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        let existing_content = "#!/bin/sh\n# My existing hook\nexit 0\n";
+        let hook_path = hooks_dir.join("pre-commit");
+        std::fs::write(&hook_path, existing_content).unwrap();
+
+        TeamsManager::install_worker_pre_commit_hook(p).expect("install with existing hook");
+
+        let final_content = std::fs::read_to_string(&hook_path).unwrap();
+        assert!(
+            final_content.contains("My existing hook"),
+            "existing hook content must be preserved"
+        );
+        assert!(
+            final_content.contains("CAS factory worker guard"),
+            "guard marker must be appended"
+        );
     }
 }

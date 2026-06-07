@@ -58,6 +58,38 @@ pub fn handle_pre_tool_use(
     }
 
     // ========================================================================
+    // WORKER COMMIT GUARD — HOISTED ABOVE cas_root check (cas-bea2, LAYER 1)
+    //
+    // Must run before the hoisted FACTORY_AUTO_APPROVE block below. That
+    // block returns "allow" for all Bash tool calls when cas_root=None,
+    // which would bypass this guard. Placing it here ensures it fires on
+    // both the cas_root=None and cas_root=Some paths.
+    //
+    // Only intercepts `git commit` / `git merge` from isolated factory
+    // workers (CAS_CLONE_PATH set). All other tool names and non-worker
+    // roles fall through silently.
+    // ========================================================================
+    {
+        let is_factory_worker_guard = std::env::var("CAS_AGENT_ROLE")
+            .map(|r| r.eq_ignore_ascii_case("worker"))
+            .unwrap_or(false)
+            && std::env::var("CAS_FACTORY_MODE").is_ok();
+        if is_factory_worker_guard && tool_name == "Bash" {
+            let command = input
+                .tool_input
+                .as_ref()
+                .and_then(|ti| ti.get("command").and_then(|v| v.as_str()));
+            if let Some(cmd) = command {
+                if looks_like_git_write_op(cmd) {
+                    if let Some(deny_msg) = check_worker_git_commit_scope(&input.cwd) {
+                        return Ok(HookOutput::with_pre_tool_permission("deny", &deny_msg));
+                    }
+                }
+            }
+        }
+    }
+
+    // ========================================================================
     // FACTORY AUTO-APPROVE — HOISTED ABOVE cas_root check (cas-7f33)
     //
     // The factory filesystem auto-approve also runs below, AFTER all
@@ -852,6 +884,122 @@ pub fn handle_pre_tool_use(
     Ok(HookOutput::empty())
 }
 
+// ── Worker commit guard helpers (cas-bea2, LAYER 1) ───────────────────────
+//
+// Detects `git commit` / `git merge` Bash commands from isolated factory
+// workers and denies them when HEAD is on a protected branch OR the cwd
+// is outside the worker's assigned worktree (CAS_CLONE_PATH).
+//
+// Only fires when CAS_CLONE_PATH is set (meaning the worker was spawned
+// with isolate=true) AND the tool is Bash with a git write command.
+// Non-isolated workers (no CAS_CLONE_PATH) and non-factory sessions are
+// silent pass-through.
+
+/// Protected branches that isolated workers must never commit to directly.
+pub(crate) const PROTECTED_BRANCHES: &[&str] = &["main", "master", "staging"];
+
+/// Return true if `cmd` looks like a `git commit` or `git merge` invocation.
+///
+/// Matches common forms:
+/// - `git commit -m "msg"`
+/// - `git -C /some/path commit`
+/// - `git merge main`
+/// - Commands with env-var prefixes like `GIT_AUTHOR_NAME=... git commit`
+///
+/// Intentionally conservative: false-negatives (missed commands) are safe
+/// because LAYER 2 (pre-commit hook) is the hard floor.
+pub(crate) fn looks_like_git_write_op(cmd: &str) -> bool {
+    // Find the first occurrence of "git" as a word boundary
+    let mut rest = cmd;
+    loop {
+        let pos = match rest.find("git") {
+            Some(p) => p,
+            None => return false,
+        };
+        // Ensure "git" is not a substring of another word (e.g. "config")
+        let before_ok = pos == 0 || !rest.as_bytes()[pos - 1].is_ascii_alphanumeric();
+        let after_idx = pos + 3;
+        let after_ok = after_idx >= rest.len()
+            || !rest.as_bytes()[after_idx].is_ascii_alphanumeric();
+        if before_ok && after_ok {
+            let after_git = &rest[after_idx..];
+            // After "git" there may be flags like -C /path before the subcommand
+            // We look for "commit" or "merge" as a word anywhere after "git"
+            return after_git.split_whitespace().any(|tok| {
+                tok == "commit" || tok == "merge"
+            });
+        }
+        // Not a word boundary — advance past this occurrence
+        rest = &rest[pos + 1..];
+    }
+}
+
+/// Return true if `branch` is a protected branch name workers must not commit to.
+pub(crate) fn is_protected_branch(branch: &str) -> bool {
+    PROTECTED_BRANCHES.contains(&branch.trim())
+}
+
+/// Run `git symbolic-ref --short HEAD` in `cwd` and return the branch name.
+/// Returns `None` on detached HEAD, git unavailable, or any error.
+pub(crate) fn get_branch_at_cwd(cwd: &str) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["-C", cwd, "symbolic-ref", "--short", "HEAD"])
+        .output()
+        .ok()?;
+    if output.status.success() {
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        None
+    }
+}
+
+/// Check whether a factory worker's `git commit` / `git merge` should be denied.
+///
+/// Returns `Some(denial_message)` when:
+/// - `CAS_CLONE_PATH` is set (isolated worker) AND either:
+///   - `cwd` is outside the assigned worktree path, OR
+///   - HEAD at `cwd` is a protected branch.
+///
+/// Returns `None` to allow (not isolated, or everything is correct).
+pub(crate) fn check_worker_git_commit_scope(cwd: &str) -> Option<String> {
+    let clone_path = std::env::var("CAS_CLONE_PATH").ok()?;
+    if clone_path.is_empty() {
+        return None;
+    }
+
+    let cwd_path = std::path::Path::new(cwd);
+    let worktree_path = std::path::Path::new(&clone_path);
+
+    // DENY: cwd is outside the assigned worktree
+    if !cwd_path.starts_with(worktree_path) {
+        let worker_name = std::env::var("CAS_AGENT_NAME")
+            .unwrap_or_else(|_| "<worker-name>".to_string());
+        return Some(format!(
+            "🚫 WORKER COMMIT GUARD: Your current directory ({cwd}) is outside \
+            your assigned worktree ({clone_path}).\n\n\
+            Workers MUST commit inside their worktree. Switch first:\n  \
+            cd {clone_path}\n  git switch factory/{worker_name}\n\n\
+            Then retry your commit from there."
+        ));
+    }
+
+    // DENY: HEAD at cwd is a protected branch
+    if let Some(branch) = get_branch_at_cwd(cwd) {
+        if is_protected_branch(&branch) {
+            let worker_name = std::env::var("CAS_AGENT_NAME")
+                .unwrap_or_else(|_| "<worker-name>".to_string());
+            return Some(format!(
+                "🚫 WORKER COMMIT GUARD: You are on protected branch '{branch}'.\n\n\
+                Factory workers MUST NOT commit directly to {branch}. Switch to \
+                your worker branch first:\n  git switch factory/{worker_name}\n\n\
+                Then retry your commit."
+            ));
+        }
+    }
+
+    None
+}
+
 /// Filesystem tool families auto-approved for factory agents (supervisor and
 /// workers). Matches the `permissions.allow` list written by
 /// `cas-cli/src/ui/factory/daemon/runtime/teams.rs::worker_settings_contents`
@@ -1001,4 +1149,296 @@ fn auto_route_send_message(
              For future messages, call `mcp__cas__coordination action=message target=<name> message=\"...\" summary=\"...\"` directly — skip SendMessage."
         ),
     )
+}
+
+#[cfg(test)]
+mod worker_commit_guard_tests {
+    use super::*;
+
+    // ── Env-var locking for tests that set CAS_* vars ─────────────────────
+    // Delegates to the shared hooks-level lock so this module's env mutations
+    // don't race with tests in sibling modules (e.g. handlers_tests).
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::hooks::test_env_lock()
+    }
+
+    struct EnvGuard {
+        vars: Vec<(String, Option<String>)>,
+    }
+    impl EnvGuard {
+        fn set(vars: &[(&str, Option<&str>)]) -> Self {
+            let saved: Vec<_> = vars
+                .iter()
+                .map(|(k, v)| {
+                    let prev = std::env::var(k).ok();
+                    unsafe {
+                        match v {
+                            Some(val) => std::env::set_var(k, val),
+                            None => std::env::remove_var(k),
+                        }
+                    }
+                    (k.to_string(), prev)
+                })
+                .collect();
+            EnvGuard { vars: saved }
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in &self.vars {
+                unsafe {
+                    match v {
+                        Some(val) => std::env::set_var(k, val),
+                        None => std::env::remove_var(k),
+                    }
+                }
+            }
+        }
+    }
+
+    // Helper: create a temp git repo with an initial commit on `main`.
+    fn make_git_repo() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let p = tmp.path();
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["config", "user.email", "test@test.com"],
+            vec!["config", "user.name", "Test"],
+        ] {
+            std::process::Command::new("git")
+                .args(&args)
+                .current_dir(p)
+                .output()
+                .unwrap();
+        }
+        std::fs::write(p.join("f.txt"), "hi").unwrap();
+        for args in [vec!["add", "."], vec!["commit", "-m", "init"]] {
+            std::process::Command::new("git")
+                .args(&args)
+                .current_dir(p)
+                .output()
+                .unwrap();
+        }
+        tmp
+    }
+
+    // ── looks_like_git_write_op tests ─────────────────────────────────────
+
+    #[test]
+    fn git_commit_detected() {
+        assert!(looks_like_git_write_op("git commit -m 'foo'"));
+    }
+
+    #[test]
+    fn git_commit_with_path_flag_detected() {
+        assert!(looks_like_git_write_op("git -C /some/path commit -m msg"));
+    }
+
+    #[test]
+    fn git_merge_detected() {
+        assert!(looks_like_git_write_op("git merge main"));
+    }
+
+    #[test]
+    fn git_merge_with_flags_detected() {
+        assert!(looks_like_git_write_op("git merge --no-ff factory/worker1"));
+    }
+
+    #[test]
+    fn git_status_not_detected() {
+        assert!(!looks_like_git_write_op("git status"));
+    }
+
+    #[test]
+    fn git_add_not_detected() {
+        assert!(!looks_like_git_write_op("git add ."));
+    }
+
+    #[test]
+    fn non_git_command_not_detected() {
+        assert!(!looks_like_git_write_op("ls -la"));
+        assert!(!looks_like_git_write_op("cargo test"));
+        assert!(!looks_like_git_write_op("echo commit this"));
+    }
+
+    #[test]
+    fn git_substring_in_other_word_not_detected() {
+        // "config" contains "git" — must not false-positive
+        assert!(!looks_like_git_write_op("digitalocean config commit"));
+    }
+
+    // ── is_protected_branch tests ─────────────────────────────────────────
+
+    #[test]
+    fn protected_branches_are_blocked() {
+        assert!(is_protected_branch("main"));
+        assert!(is_protected_branch("master"));
+        assert!(is_protected_branch("staging"));
+    }
+
+    #[test]
+    fn worker_branch_is_not_protected() {
+        assert!(!is_protected_branch("factory/worker1"));
+        assert!(!is_protected_branch("feature/foo"));
+    }
+
+    // ── get_branch_at_cwd tests ───────────────────────────────────────────
+
+    #[test]
+    fn get_branch_returns_branch_name() {
+        let tmp = make_git_repo();
+        let branch = get_branch_at_cwd(&tmp.path().to_string_lossy());
+        assert_eq!(branch.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn get_branch_returns_none_for_nonexistent_dir() {
+        let branch = get_branch_at_cwd("/nonexistent/path/12345");
+        assert!(branch.is_none());
+    }
+
+    // ── check_worker_git_commit_scope tests ──────────────────────────────
+
+    #[test]
+    fn no_clone_path_allows() {
+        let _lock = env_lock();
+        let _env = EnvGuard::set(&[("CAS_CLONE_PATH", None)]);
+        assert!(check_worker_git_commit_scope("/tmp").is_none());
+    }
+
+    #[test]
+    fn cwd_outside_worktree_denied() {
+        let _lock = env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let clone_path = tmp.path().join("worktree").to_string_lossy().to_string();
+        let other_dir = tmp.path().join("other").to_string_lossy().to_string();
+        let _env = EnvGuard::set(&[("CAS_CLONE_PATH", Some(&clone_path))]);
+
+        let result = check_worker_git_commit_scope(&other_dir);
+        assert!(result.is_some(), "expected deny when cwd outside worktree");
+        let msg = result.unwrap();
+        assert!(msg.contains("WORKER COMMIT GUARD"));
+        assert!(msg.contains("outside your assigned worktree"));
+    }
+
+    #[test]
+    fn cwd_inside_worktree_on_protected_branch_denied() {
+        let _lock = env_lock();
+        let tmp = make_git_repo(); // on main
+        let p = tmp.path().to_string_lossy().to_string();
+        let _env = EnvGuard::set(&[("CAS_CLONE_PATH", Some(&p))]);
+
+        let result = check_worker_git_commit_scope(&p);
+        assert!(result.is_some(), "expected deny on protected branch 'main'");
+        let msg = result.unwrap();
+        assert!(msg.contains("WORKER COMMIT GUARD"));
+        assert!(msg.contains("protected branch"));
+        assert!(msg.contains("main"));
+    }
+
+    #[test]
+    fn cwd_inside_worktree_on_worker_branch_allowed() {
+        let _lock = env_lock();
+        let tmp = make_git_repo();
+        let p = tmp.path();
+
+        // Create and switch to factory/worker1 branch
+        std::process::Command::new("git")
+            .args(["checkout", "-b", "factory/worker1"])
+            .current_dir(p)
+            .output()
+            .unwrap();
+
+        let ps = p.to_string_lossy().to_string();
+        let _env = EnvGuard::set(&[("CAS_CLONE_PATH", Some(&ps))]);
+
+        let result = check_worker_git_commit_scope(&ps);
+        assert!(result.is_none(), "expected allow on factory/worker1 branch, got: {result:?}");
+    }
+
+    // ── Integration: handle_pre_tool_use for Bash git commit ─────────────
+
+    #[test]
+    fn pre_tool_denies_git_commit_on_protected_branch() {
+        let _lock = env_lock();
+        let tmp = make_git_repo(); // on main
+        let p = tmp.path().to_string_lossy().to_string();
+        let _env = EnvGuard::set(&[
+            ("CAS_AGENT_ROLE", Some("worker")),
+            ("CAS_FACTORY_MODE", Some("1")),
+            ("CAS_CLONE_PATH", Some(&p)),
+        ]);
+
+        let mut input = crate::hooks::handlers::HookInput::default();
+        input.hook_event_name = "PreToolUse".to_string();
+        input.tool_name = Some("Bash".to_string());
+        input.cwd = p.clone();
+        input.tool_input = Some(serde_json::json!({"command": "git commit -m 'oops'"}));
+
+        let out = handle_pre_tool_use(&input, None).expect("handler ok");
+        let val = serde_json::to_value(&out).unwrap();
+        let decision = val.get("hookSpecificOutput")
+            .and_then(|h| h.get("permissionDecision"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert_eq!(decision, "deny", "expected deny, got: {val}");
+    }
+
+    #[test]
+    fn pre_tool_allows_git_commit_on_worker_branch() {
+        let _lock = env_lock();
+        let tmp = make_git_repo();
+        let p = tmp.path();
+
+        std::process::Command::new("git")
+            .args(["checkout", "-b", "factory/guards"])
+            .current_dir(p)
+            .output()
+            .unwrap();
+
+        let ps = p.to_string_lossy().to_string();
+        let _env = EnvGuard::set(&[
+            ("CAS_AGENT_ROLE", Some("worker")),
+            ("CAS_FACTORY_MODE", Some("1")),
+            ("CAS_CLONE_PATH", Some(&ps)),
+        ]);
+
+        let mut input = crate::hooks::handlers::HookInput::default();
+        input.hook_event_name = "PreToolUse".to_string();
+        input.tool_name = Some("Bash".to_string());
+        input.cwd = ps.clone();
+        input.tool_input = Some(serde_json::json!({"command": "git commit -m 'wip'"}));
+
+        let out = handle_pre_tool_use(&input, None).expect("handler ok");
+        let val = serde_json::to_value(&out).unwrap();
+        // On a factory branch with correct cwd, guard must not deny
+        let decision = val.get("hookSpecificOutput")
+            .and_then(|h| h.get("permissionDecision"))
+            .and_then(|v| v.as_str());
+        assert_ne!(decision, Some("deny"), "expected allow/empty, got: {val}");
+    }
+
+    #[test]
+    fn pre_tool_passes_through_for_non_worker() {
+        // No CAS_AGENT_ROLE set → guard must not fire
+        let _lock = env_lock();
+        let _env = EnvGuard::set(&[
+            ("CAS_AGENT_ROLE", None),
+            ("CAS_FACTORY_MODE", None),
+            ("CAS_CLONE_PATH", Some("/tmp/some-worktree")),
+        ]);
+
+        let mut input = crate::hooks::handlers::HookInput::default();
+        input.hook_event_name = "PreToolUse".to_string();
+        input.tool_name = Some("Bash".to_string());
+        input.cwd = "/tmp/other".to_string();
+        input.tool_input = Some(serde_json::json!({"command": "git commit -m 'foo'"}));
+
+        let out = handle_pre_tool_use(&input, None).expect("handler ok");
+        let val = serde_json::to_value(&out).unwrap();
+        let decision = val.get("hookSpecificOutput")
+            .and_then(|h| h.get("permissionDecision"))
+            .and_then(|v| v.as_str());
+        assert_ne!(decision, Some("deny"), "non-worker must not be denied");
+    }
 }
