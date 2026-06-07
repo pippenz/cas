@@ -1582,8 +1582,11 @@ pub(crate) fn read_context_usage_from_tail(path: &std::path::Path) -> Option<u64
 /// All fields are best-effort: a failed git sub-command yields a sentinel
 /// value ("?" or "none" or 0) rather than aborting the status render.
 /// See [`collect_worker_git_status`] for field semantics.
+///
+/// `pub(crate)` so the Stop hook (cas-5c0a) can reuse this struct without
+/// creating a divergent duplicate.
 #[derive(Debug)]
-pub(super) struct WorkerGitStatus {
+pub(crate) struct WorkerGitStatus {
     /// Current branch name (or "HEAD" if detached, "?" on error)
     pub branch: String,
     /// Short HEAD SHA (7 hex chars, or "?" on error)
@@ -1607,12 +1610,15 @@ pub(super) struct WorkerGitStatus {
 /// Every git sub-command degrades gracefully on failure — a non-git dir or
 /// missing network produces sentinel values, never a panic.
 ///
+/// `pub(crate)` so the Stop hook (cas-5c0a / B3) can call this without
+/// duplicating the collector.
+///
 /// NOTE: This is a synchronous, blocking function that shells out to `git`
 /// and, optionally, `gh`.  It is intended to be called from within
 /// `factory_worker_status` (which is `async` but performs several other
 /// blocking operations already).  Callers in a strict async context should
 /// wrap in `tokio::task::spawn_blocking` if needed.
-pub(super) fn collect_worker_git_status(worktree_path: &std::path::Path) -> WorkerGitStatus {
+pub(crate) fn collect_worker_git_status(worktree_path: &std::path::Path) -> WorkerGitStatus {
     // --- current branch -------------------------------------------------------
     let branch = run_git(worktree_path, &["rev-parse", "--abbrev-ref", "HEAD"])
         .unwrap_or_else(|_| "?".to_string());
@@ -1727,7 +1733,7 @@ pub(super) fn collect_worker_git_status(worktree_path: &std::path::Path) -> Work
 /// Render a `WorkerGitStatus` as a multi-line block for injection into the
 /// `worker_status` output.  Returns an empty string when the status is
 /// entirely unknown (all sentinel values).
-pub(super) fn format_worker_git_status(gs: &WorkerGitStatus) -> String {
+pub(crate) fn format_worker_git_status(gs: &WorkerGitStatus) -> String {
     // Skip entirely if everything is unknown — this keeps the output clean for
     // non-isolated (non-worktree) workers where the clone_path may not be set.
     if gs.branch == "?" && gs.head_sha == "?" {

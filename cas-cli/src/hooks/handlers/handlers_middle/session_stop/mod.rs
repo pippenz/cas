@@ -509,6 +509,33 @@ pub fn build_session_summary_context(
     Some(context)
 }
 
+// =============================================================================
+// B3 (cas-5c0a): Worker-stop hook — emit final git-state event
+// =============================================================================
+
+/// Emit a `WorkerGitCommit` daemon event carrying the worker's final git state
+/// when a factory worker session ends.
+///
+/// Reuses `collect_worker_git_status` from B1 (`factory_ops`) so there is no
+/// divergent duplicate collector.  The event appears in `coordination
+/// action=worker_activity` and lets the supervisor see branch/HEAD/ahead-behind/
+/// pushed-ref/PR without any manual `git log` forensics.
+///
+/// Failure is best-effort: if the event store is unreachable or the git
+/// commands fail, the function logs to stderr and returns without panicking.
+pub(crate) fn emit_worker_final_git_state(
+    cas_root: &std::path::Path,
+    worker_name: &str,
+    cwd: &std::path::Path,
+    session_id: &str,
+) {
+    // STUB (cas-5c0a test-first): does nothing.
+    // Real implementation follows in the next commit once tests are green.
+    let (_, _, _, _) = (cas_root, worker_name, cwd, session_id);
+}
+
+// =============================================================================
+
 /// Handle Stop hook - generate session summary when agent finishes
 ///
 /// This is triggered when the agent explicitly finishes its task,
@@ -523,3 +550,106 @@ mod synthesis;
 
 pub use stop_flow::handle_stop;
 pub use synthesis::synthesize_buffered_observations;
+
+// =============================================================================
+// B3 tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests_b3 {
+    use super::emit_worker_final_git_state;
+    use cas_store::{EventStore, SqliteEventStore};
+    use cas_types::EventType;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    fn setup_git_repo_with_factory_branch(tmp: &std::path::Path) {
+        Command::new("git").args(["init", "-b", "main"]).current_dir(tmp).output().unwrap();
+        Command::new("git").args(["config", "user.email", "test@cas"]).current_dir(tmp).output().unwrap();
+        Command::new("git").args(["config", "user.name", "CAS Test"]).current_dir(tmp).output().unwrap();
+        std::fs::write(tmp.join("README"), "init").unwrap();
+        Command::new("git").args(["add", "README"]).current_dir(tmp).output().unwrap();
+        Command::new("git").args(["commit", "-m", "init"]).current_dir(tmp).output().unwrap();
+        Command::new("git")
+            .args(["checkout", "-b", "factory/stop-worker"])
+            .current_dir(tmp)
+            .output()
+            .unwrap();
+        std::fs::write(tmp.join("work.rs"), "// task").unwrap();
+        Command::new("git").args(["add", "work.rs"]).current_dir(tmp).output().unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "feat: worker task done"])
+            .current_dir(tmp)
+            .output()
+            .unwrap();
+    }
+
+    /// AC1 + AC4 (cas-5c0a): emit_worker_final_git_state writes a WorkerGitCommit
+    /// event to the event store carrying the worker's branch and session ID.
+    ///
+    /// FAILS with the stub (stub does nothing; store has 0 events).
+    /// PASSES once the real implementation calls the event store.
+    #[test]
+    fn emit_final_git_state_writes_worker_git_commit_event() {
+        let git_dir = TempDir::new().expect("git tempdir");
+        setup_git_repo_with_factory_branch(git_dir.path());
+
+        let cas_dir = TempDir::new().expect("cas tempdir");
+
+        emit_worker_final_git_state(
+            cas_dir.path(),
+            "stop-worker",
+            git_dir.path(),
+            "ses-b3-test-001",
+        );
+
+        let store = SqliteEventStore::open(cas_dir.path())
+            .expect("event store must open");
+        let events = store.list_recent(10).expect("list_recent must succeed");
+
+        assert!(
+            !events.is_empty(),
+            "emit must write at least one event; got 0 — stub was not replaced"
+        );
+
+        let evt = &events[0];
+        assert_eq!(
+            evt.event_type,
+            EventType::WorkerGitCommit,
+            "event_type must be WorkerGitCommit; got {:?}",
+            evt.event_type
+        );
+        assert_eq!(
+            evt.entity_id, "stop-worker",
+            "entity_id must be the worker name"
+        );
+        assert!(
+            evt.summary.contains("factory/stop-worker"),
+            "summary must include branch name: {}",
+            evt.summary
+        );
+        assert_eq!(
+            evt.session_id.as_deref(),
+            Some("ses-b3-test-001"),
+            "session_id must be set on the event"
+        );
+    }
+
+    /// AC2 (cas-5c0a): WorkerGitStatus is pub(crate) from factory_ops — reuse contract.
+    /// This is a compile-time assertion; if it compiles, the contract holds.
+    #[test]
+    fn worker_git_status_struct_is_pub_crate_from_factory_ops() {
+        use crate::mcp::tools::service::factory_ops::WorkerGitStatus;
+        // Constructing it proves visibility — no runtime behavior needed.
+        let _ = WorkerGitStatus {
+            branch: "factory/x".to_string(),
+            head_sha: "abc1234".to_string(),
+            ahead: 1,
+            behind: 0,
+            base_branch: "main".to_string(),
+            dirty: false,
+            pushed_ref: "none".to_string(),
+            pr_url: "none".to_string(),
+        };
+    }
+}
