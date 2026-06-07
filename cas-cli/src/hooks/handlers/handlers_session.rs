@@ -1275,11 +1275,9 @@ mod worker_worktree_assertion_tests {
     use super::*;
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        use std::sync::{Mutex, OnceLock};
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        // Use the shared crate-level env lock so we don't race with sibling
+        // test modules that also mutate CAS_AGENT_ROLE / CAS_CLONE_PATH.
+        crate::hooks::test_env_lock()
     }
 
     struct EnvGuard(Vec<(String, Option<String>)>);
