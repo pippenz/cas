@@ -558,12 +558,22 @@ pub fn init_cas_dir(path: &Path) -> Result<PathBuf> {
     // (MCP serve, factory daemon boot) only upsert without touching DDL.
     // Non-fatal: init must still succeed if the host registry cannot be
     // written (unusual permissions, readonly HOME).
+    //
+    // Skipped in test builds: tests call `init_cas_dir` extensively with
+    // per-test TempDir paths. Without this guard, tests running concurrently
+    // with HOME-mutex-holding tests (which set `$HOME` to an isolated
+    // TempDir) would open the mutex-holder's `$HOME/.cas/cas.db` and insert
+    // spurious registry rows — causing non-deterministic failures in
+    // `list_tracked_flags_healthy_correctly` and
+    // `cross_repo_iteration_continues_on_failure` (cas-ca76).
+    #[cfg(not(test))]
     if let Err(e) = crate::store::known_repos::ensure_host_schema() {
         tracing::warn!(
             error = %e,
             "failed to install host known_repos schema (non-fatal)",
         );
     }
+    #[cfg(not(test))]
     crate::store::known_repos::register_repo(path);
 
     Ok(cas_dir)

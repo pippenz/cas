@@ -66,27 +66,40 @@ pub(crate) mod test_support {
 
     /// Run `f` with `HOME` pointed at a fresh `TempDir`, serialized against
     /// every other HOME-mutating test in the crate. Restores the previous
-    /// `HOME` value on return. Shared by tests in multiple modules so a
-    /// future change to the HOME-isolation protocol lives in one place.
+    /// `HOME` value on return, **including when `f` panics**. Shared by
+    /// tests in multiple modules so a future change to the HOME-isolation
+    /// protocol lives in one place.
     pub fn with_temp_home<F: FnOnce(&Path)>(f: F) {
         let _guard = HOME_MUTEX
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let temp = TempDir::new().unwrap();
         let prev = std::env::var_os("HOME");
-        // SAFETY: mutex above serializes concurrent writers within this
-        // test binary. `f` reads HOME at most once per call; we restore
-        // the prior value after `f` returns.
+
+        // RAII guard: restores HOME on drop so panics inside `f` cannot
+        // leave the process env in a broken state and poison later tests.
+        struct HomeGuard(Option<std::ffi::OsString>);
+        impl Drop for HomeGuard {
+            fn drop(&mut self) {
+                // SAFETY: HOME_MUTEX is held by the enclosing scope (not
+                // dropped until after this guard); no concurrent writer can
+                // race with this restoration.
+                unsafe {
+                    match &self.0 {
+                        Some(v) => std::env::set_var("HOME", v),
+                        None => std::env::remove_var("HOME"),
+                    }
+                }
+            }
+        }
+        let _home_guard = HomeGuard(prev);
+
+        // SAFETY: HOME_MUTEX serializes concurrent writers within this
+        // test binary; the HomeGuard above guarantees restoration on drop.
         unsafe {
             std::env::set_var("HOME", temp.path());
         }
         f(temp.path());
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
-        }
     }
 }
 
