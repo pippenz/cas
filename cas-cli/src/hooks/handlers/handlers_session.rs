@@ -271,11 +271,12 @@ pub fn handle_session_start(
     // WORKER WORKTREE ASSERTION (cas-bea2 LAYER 3)
     //
     // For isolated factory workers: verify the session cwd matches the
-    // assigned worktree (CAS_CLONE_PATH) and HEAD is not on a protected
-    // branch. Mismatches are prepended as a loud warning so the worker
-    // sees them before any other context. Non-isolated workers and non-
-    // factory sessions fall through silently. Best-effort — git failures
-    // or absent env vars are treated as "no mismatch".
+    // assigned worktree (CAS_CLONE_PATH) and HEAD is on a factory/<name>
+    // branch (allowlist — detached HEAD and non-factory branches all warn).
+    // Mismatches are prepended as a loud warning so the worker sees them
+    // before any other context. Non-isolated workers and non-factory sessions
+    // fall through silently. Best-effort — git failures or absent env vars
+    // are treated as "no mismatch".
     // ========================================================================
     let context = build_worker_worktree_assertion(&input.cwd, context);
 
@@ -490,7 +491,9 @@ fn escape_xml_text(s: &str) -> String {
 /// Prepend a critical warning to `context` if the session cwd of an isolated
 /// factory worker is:
 /// - outside the assigned worktree (`CAS_CLONE_PATH`), OR
-/// - on a protected branch (main/master/staging).
+/// - NOT on a `factory/<name>` branch (allowlist semantics: main, master,
+///   staging, epic/*, arbitrary branches, and detached HEAD are all denied —
+///   fail-closed).
 ///
 /// Only fires when `CAS_AGENT_ROLE=worker` AND `CAS_CLONE_PATH` is set.
 /// Non-factory sessions and non-isolated workers are silent pass-through.
@@ -517,24 +520,31 @@ pub(crate) fn build_worker_worktree_assertion(cwd: &str, context: String) -> Str
         ));
     }
 
-    // Check 2: HEAD is not on a protected branch
-    const PROTECTED: &[&str] = &["main", "master", "staging"];
-    let branch_output = std::process::Command::new("git")
+    // Check 2: HEAD must be on a factory/<name> branch (allowlist).
+    // Detached HEAD is also warned — fail-closed.
+    let worker_name = std::env::var("CAS_AGENT_NAME")
+        .unwrap_or_else(|_| "<worker-name>".to_string());
+    let branch_result = std::process::Command::new("git")
         .args(["-C", cwd, "symbolic-ref", "--short", "HEAD"])
         .output()
-        .ok();
-    if let Some(out) = branch_output {
-        if out.status.success() {
-            let branch = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if PROTECTED.contains(&branch.as_str()) {
-                let worker_name = std::env::var("CAS_AGENT_NAME")
-                    .unwrap_or_else(|_| "<worker-name>".to_string());
-                warnings.push(format!(
-                    "⚠️  PROTECTED BRANCH: HEAD is on '{branch}' — DO NOT commit here!\n   \
-                    Switch first: git switch factory/{worker_name}"
-                ));
-            }
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string());
+    match branch_result {
+        None => {
+            warnings.push(format!(
+                "⚠️  DETACHED HEAD: Cannot determine current branch — DO NOT commit here!\n   \
+                Switch first: git switch factory/{worker_name}"
+            ));
         }
+        Some(ref branch) if !branch.starts_with("factory/") => {
+            warnings.push(format!(
+                "⚠️  WRONG BRANCH: HEAD is on '{branch}' — DO NOT commit here!\n   \
+                Workers may only commit on factory/<name>. Switch first:\n   \
+                git switch factory/{worker_name}"
+            ));
+        }
+        Some(_) => {} // factory/* — allowed
     }
 
     if warnings.is_empty() {
@@ -1386,9 +1396,9 @@ mod worker_worktree_assertion_tests {
         );
     }
 
-    /// CWD inside worktree on protected branch → branch warning prepended
+    /// CWD inside worktree on a non-factory branch (e.g. main) → branch warning prepended
     #[test]
-    fn protected_branch_prepends_warning() {
+    fn non_factory_branch_prepends_warning() {
         let _lock = env_lock();
         let tmp = make_git_repo(); // on main
         let p = tmp.path().to_string_lossy().to_string();
@@ -1399,8 +1409,76 @@ mod worker_worktree_assertion_tests {
 
         let result = build_worker_worktree_assertion(&p, String::new());
         assert!(
-            result.contains("PROTECTED BRANCH"),
-            "expected PROTECTED BRANCH warning for 'main': {result}"
+            result.contains("WRONG BRANCH"),
+            "expected WRONG BRANCH warning for 'main': {result}"
+        );
+        assert!(
+            result.contains("main"),
+            "expected branch name 'main' in warning: {result}"
+        );
+    }
+
+    /// CWD inside worktree on an epic branch → branch warning prepended
+    /// (Regression guard: epic/* used to bypass the denylist.)
+    #[test]
+    fn epic_branch_prepends_warning() {
+        let _lock = env_lock();
+        let tmp = make_git_repo();
+        let p = tmp.path();
+
+        std::process::Command::new("git")
+            .args(["checkout", "-b", "epic/cas-073f"])
+            .current_dir(p)
+            .output()
+            .unwrap();
+
+        let ps = p.to_string_lossy().to_string();
+        let _env = EnvGuard::set(&[
+            ("CAS_AGENT_ROLE", Some("worker")),
+            ("CAS_CLONE_PATH", Some(&ps)),
+        ]);
+
+        let result = build_worker_worktree_assertion(&ps, String::new());
+        assert!(
+            result.contains("WRONG BRANCH"),
+            "expected WRONG BRANCH warning for epic branch: {result}"
+        );
+        assert!(
+            result.contains("epic/cas-073f"),
+            "expected branch name in warning: {result}"
+        );
+    }
+
+    /// CWD inside worktree on detached HEAD → branch warning prepended (fail-closed)
+    #[test]
+    fn detached_head_prepends_warning() {
+        let _lock = env_lock();
+        let tmp = make_git_repo();
+        let p = tmp.path();
+
+        // Detach HEAD by checking out the commit SHA directly
+        let head_out = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(p)
+            .output()
+            .unwrap();
+        let sha = String::from_utf8_lossy(&head_out.stdout).trim().to_string();
+        std::process::Command::new("git")
+            .args(["checkout", "--detach", &sha])
+            .current_dir(p)
+            .output()
+            .unwrap();
+
+        let ps = p.to_string_lossy().to_string();
+        let _env = EnvGuard::set(&[
+            ("CAS_AGENT_ROLE", Some("worker")),
+            ("CAS_CLONE_PATH", Some(&ps)),
+        ]);
+
+        let result = build_worker_worktree_assertion(&ps, String::new());
+        assert!(
+            result.contains("DETACHED HEAD"),
+            "expected DETACHED HEAD warning: {result}"
         );
     }
 
@@ -1449,7 +1527,7 @@ mod worker_worktree_assertion_tests {
     #[test]
     fn worker_session_start_with_assertion_stays_under_12kb() {
         let _lock = env_lock();
-        // Simulate the largest plausible warning: both cwd mismatch + protected branch
+        // Simulate the largest plausible warning: both cwd mismatch + wrong branch (non-factory)
         let tmp = make_git_repo();
         let p = tmp.path();
         let wt = "/some/very/long/absolute/path/to/worktrees/worker-name";

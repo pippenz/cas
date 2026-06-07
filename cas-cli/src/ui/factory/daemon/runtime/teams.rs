@@ -812,17 +812,23 @@ impl TeamsManager {
     /// Claude Code's /doctor validator regardless of Anthropic #58441 state.
     pub const WORKER_PRE_COMMIT_HOOK: &'static str = "#!/bin/sh
 # CAS factory worker guard — installed by `cas factory` when spawning isolated workers.
-# Refuses commits on protected branches (main/master/staging) to prevent accidental
-# direct-to-protected-branch commits from workers that lost their worktree branch context.
+# Workers may ONLY commit on their own factory/<name> branch. All other branches
+# (main, master, staging, epic/*, arbitrary branches, and detached HEAD) are denied.
 branch=$(git symbolic-ref --short HEAD 2>/dev/null)
 case \"$branch\" in
-  main|master|staging)
-    echo \"CAS COMMIT GUARD: Cannot commit on protected branch '$branch'.\" >&2
-    echo \"Switch to your worker branch first: git switch factory/<worker-name>\" >&2
+  factory/*)
+    exit 0
+    ;;
+  *)
+    if [ -z \"$branch\" ]; then
+      echo \"CAS COMMIT GUARD: HEAD is detached — cannot determine branch.\" >&2
+    else
+      echo \"CAS COMMIT GUARD: Cannot commit on '$branch'.\" >&2
+    fi
+    echo \"Workers may only commit on their factory/<name> branch.\" >&2
     exit 1
     ;;
 esac
-exit 0
 ";
 
     /// Install the CAS worker pre-commit guard into `worktree_path`'s git hooks
@@ -1563,9 +1569,9 @@ mod tests {
         );
     }
 
-    /// Running `git commit` on `main` with the hook installed must exit non-zero.
+    /// Running `git commit` on `main` (non-factory branch) with the hook installed must exit non-zero.
     #[test]
-    fn installed_hook_blocks_commit_on_protected_branch() {
+    fn installed_hook_blocks_commit_on_non_factory_branch() {
         let tmp = make_git_repo_for_hook_test();
         let p = tmp.path();
 
@@ -1631,6 +1637,48 @@ mod tests {
             result.status.success(),
             "git commit on factory/test-worker should be allowed; stderr: {}",
             String::from_utf8_lossy(&result.stderr)
+        );
+    }
+
+    /// Running `git commit` on an epic branch must exit non-zero (regression guard:
+    /// epic/* used to bypass the denylist; the allowlist must close that gap).
+    #[test]
+    fn installed_hook_blocks_commit_on_epic_branch() {
+        let tmp = make_git_repo_for_hook_test();
+        let p = tmp.path();
+
+        // Switch to an epic branch before installing hook
+        std::process::Command::new("git")
+            .args(["checkout", "-b", "epic/cas-073f"])
+            .current_dir(p)
+            .output()
+            .unwrap();
+
+        TeamsManager::install_worker_pre_commit_hook(p)
+            .expect("install should succeed");
+
+        std::fs::write(p.join("epic.txt"), "leak").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(p)
+            .output()
+            .unwrap();
+
+        let result = std::process::Command::new("git")
+            .args(["commit", "-m", "should be blocked on epic branch"])
+            .current_dir(p)
+            .output()
+            .unwrap();
+
+        assert!(
+            !result.status.success(),
+            "git commit on epic/cas-073f should be blocked; exit code: {:?}",
+            result.status.code()
+        );
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            stderr.contains("CAS COMMIT GUARD"),
+            "hook stderr should mention the guard: {stderr}"
         );
     }
 

@@ -895,8 +895,14 @@ pub fn handle_pre_tool_use(
 // Non-isolated workers (no CAS_CLONE_PATH) and non-factory sessions are
 // silent pass-through.
 
-/// Protected branches that isolated workers must never commit to directly.
-pub(crate) const PROTECTED_BRANCHES: &[&str] = &["main", "master", "staging"];
+/// Return true if `branch` is a valid factory worker branch.
+///
+/// Workers may ONLY commit on branches matching `factory/<name>`.
+/// Every other branch — main, master, staging, epic/*, arbitrary feature
+/// branches, and detached HEAD — is denied (allowlist semantics, not denylist).
+pub(crate) fn is_factory_worker_branch(branch: &str) -> bool {
+    branch.trim().starts_with("factory/")
+}
 
 /// Return true if `cmd` looks like a `git commit` or `git merge` invocation.
 ///
@@ -934,11 +940,6 @@ pub(crate) fn looks_like_git_write_op(cmd: &str) -> bool {
     }
 }
 
-/// Return true if `branch` is a protected branch name workers must not commit to.
-pub(crate) fn is_protected_branch(branch: &str) -> bool {
-    PROTECTED_BRANCHES.contains(&branch.trim())
-}
-
 /// Run `git symbolic-ref --short HEAD` in `cwd` and return the branch name.
 /// Returns `None` on detached HEAD, git unavailable, or any error.
 pub(crate) fn get_branch_at_cwd(cwd: &str) -> Option<String> {
@@ -958,7 +959,9 @@ pub(crate) fn get_branch_at_cwd(cwd: &str) -> Option<String> {
 /// Returns `Some(denial_message)` when:
 /// - `CAS_CLONE_PATH` is set (isolated worker) AND either:
 ///   - `cwd` is outside the assigned worktree path, OR
-///   - HEAD at `cwd` is a protected branch.
+///   - HEAD at `cwd` is NOT a `factory/<name>` branch (allowlist semantics:
+///     main, master, staging, epic/*, arbitrary branches, and detached HEAD
+///     are all denied — fail-closed).
 ///
 /// Returns `None` to allow (not isolated, or everything is correct).
 pub(crate) fn check_worker_git_commit_scope(cwd: &str) -> Option<String> {
@@ -983,18 +986,26 @@ pub(crate) fn check_worker_git_commit_scope(cwd: &str) -> Option<String> {
         ));
     }
 
-    // DENY: HEAD at cwd is a protected branch
-    if let Some(branch) = get_branch_at_cwd(cwd) {
-        if is_protected_branch(&branch) {
-            let worker_name = std::env::var("CAS_AGENT_NAME")
-                .unwrap_or_else(|_| "<worker-name>".to_string());
+    // DENY: HEAD at cwd is not on a factory/<name> branch (allowlist semantics).
+    // Detached HEAD (None from get_branch_at_cwd) is also denied — fail-closed.
+    let worker_name = std::env::var("CAS_AGENT_NAME")
+        .unwrap_or_else(|_| "<worker-name>".to_string());
+    match get_branch_at_cwd(cwd) {
+        None => {
             return Some(format!(
-                "🚫 WORKER COMMIT GUARD: You are on protected branch '{branch}'.\n\n\
-                Factory workers MUST NOT commit directly to {branch}. Switch to \
-                your worker branch first:\n  git switch factory/{worker_name}\n\n\
-                Then retry your commit."
+                "🚫 WORKER COMMIT GUARD: HEAD is detached — cannot determine branch.\n\n\
+                Factory workers MUST commit on their worker branch:\n  \
+                git switch factory/{worker_name}\n\nThen retry."
             ));
         }
+        Some(branch) if !is_factory_worker_branch(&branch) => {
+            return Some(format!(
+                "🚫 WORKER COMMIT GUARD: You are on branch '{branch}'.\n\n\
+                Factory workers MUST commit ONLY on their factory/<name> branch. \
+                Switch first:\n  git switch factory/{worker_name}\n\nThen retry."
+            ));
+        }
+        Some(_) => {} // factory/* — allowed
     }
 
     None
@@ -1267,19 +1278,31 @@ mod worker_commit_guard_tests {
         assert!(!looks_like_git_write_op("digitalocean config commit"));
     }
 
-    // ── is_protected_branch tests ─────────────────────────────────────────
+    // ── is_factory_worker_branch tests ───────────────────────────────────
 
     #[test]
-    fn protected_branches_are_blocked() {
-        assert!(is_protected_branch("main"));
-        assert!(is_protected_branch("master"));
-        assert!(is_protected_branch("staging"));
+    fn factory_branches_are_allowed() {
+        assert!(is_factory_worker_branch("factory/worker1"));
+        assert!(is_factory_worker_branch("factory/guards"));
+        assert!(is_factory_worker_branch("factory/surface"));
+        // Leading/trailing whitespace (from git output) is tolerated
+        assert!(is_factory_worker_branch("  factory/guards  "));
     }
 
     #[test]
-    fn worker_branch_is_not_protected() {
-        assert!(!is_protected_branch("factory/worker1"));
-        assert!(!is_protected_branch("feature/foo"));
+    fn non_factory_branches_are_denied() {
+        // Old denylist entries are still denied
+        assert!(!is_factory_worker_branch("main"));
+        assert!(!is_factory_worker_branch("master"));
+        assert!(!is_factory_worker_branch("staging"));
+        // Epic branches — the original bug: previously bypassed denylist
+        assert!(!is_factory_worker_branch("epic/big-feature"));
+        assert!(!is_factory_worker_branch("epic/cas-073f"));
+        // Arbitrary feature / fix branches
+        assert!(!is_factory_worker_branch("feature/foo"));
+        assert!(!is_factory_worker_branch("fix/my-bug"));
+        // Empty string (detached HEAD)
+        assert!(!is_factory_worker_branch(""));
     }
 
     // ── get_branch_at_cwd tests ───────────────────────────────────────────
@@ -1322,18 +1345,69 @@ mod worker_commit_guard_tests {
     }
 
     #[test]
-    fn cwd_inside_worktree_on_protected_branch_denied() {
+    fn cwd_inside_worktree_on_non_factory_branch_denied() {
         let _lock = env_lock();
         let tmp = make_git_repo(); // on main
         let p = tmp.path().to_string_lossy().to_string();
         let _env = EnvGuard::set(&[("CAS_CLONE_PATH", Some(&p))]);
 
         let result = check_worker_git_commit_scope(&p);
-        assert!(result.is_some(), "expected deny on protected branch 'main'");
+        assert!(result.is_some(), "expected deny on non-factory branch 'main'");
         let msg = result.unwrap();
         assert!(msg.contains("WORKER COMMIT GUARD"));
-        assert!(msg.contains("protected branch"));
         assert!(msg.contains("main"));
+    }
+
+    #[test]
+    fn cwd_inside_worktree_on_epic_branch_denied() {
+        let _lock = env_lock();
+        let tmp = make_git_repo();
+        let p = tmp.path();
+
+        // Switch to an epic branch — previously bypassed the denylist
+        std::process::Command::new("git")
+            .args(["checkout", "-b", "epic/cas-073f"])
+            .current_dir(p)
+            .output()
+            .unwrap();
+
+        let ps = p.to_string_lossy().to_string();
+        let _env = EnvGuard::set(&[("CAS_CLONE_PATH", Some(&ps))]);
+
+        let result = check_worker_git_commit_scope(&ps);
+        assert!(result.is_some(), "epic branch must be denied, got: {result:?}");
+        let msg = result.unwrap();
+        assert!(msg.contains("WORKER COMMIT GUARD"));
+        assert!(msg.contains("epic/cas-073f"));
+    }
+
+    #[test]
+    fn cwd_inside_worktree_detached_head_denied() {
+        let _lock = env_lock();
+        let tmp = make_git_repo();
+        let p = tmp.path();
+
+        // Detach HEAD by checking out the commit SHA directly
+        let head_out = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(p)
+            .output()
+            .unwrap();
+        let sha = String::from_utf8_lossy(&head_out.stdout).trim().to_string();
+        std::process::Command::new("git")
+            .args(["checkout", "--detach", &sha])
+            .current_dir(p)
+            .output()
+            .unwrap();
+
+        let ps = p.to_string_lossy().to_string();
+        let _env = EnvGuard::set(&[("CAS_CLONE_PATH", Some(&ps))]);
+
+        let result = check_worker_git_commit_scope(&ps);
+        assert!(result.is_some(), "detached HEAD must be denied, got: {result:?}");
+        let msg = result.unwrap();
+        assert!(msg.contains("WORKER COMMIT GUARD"));
+        assert!(msg.contains("detached"));
     }
 
     #[test]
@@ -1382,6 +1456,41 @@ mod worker_commit_guard_tests {
             .and_then(|v| v.as_str())
             .unwrap_or("");
         assert_eq!(decision, "deny", "expected deny, got: {val}");
+    }
+
+    #[test]
+    fn pre_tool_denies_git_commit_on_epic_branch() {
+        // Regression guard for the P1: epic/* previously bypassed the denylist.
+        let _lock = env_lock();
+        let tmp = make_git_repo();
+        let p = tmp.path();
+
+        std::process::Command::new("git")
+            .args(["checkout", "-b", "epic/big-feature"])
+            .current_dir(p)
+            .output()
+            .unwrap();
+
+        let ps = p.to_string_lossy().to_string();
+        let _env = EnvGuard::set(&[
+            ("CAS_AGENT_ROLE", Some("worker")),
+            ("CAS_FACTORY_MODE", Some("1")),
+            ("CAS_CLONE_PATH", Some(&ps)),
+        ]);
+
+        let mut input = crate::hooks::handlers::HookInput::default();
+        input.hook_event_name = "PreToolUse".to_string();
+        input.tool_name = Some("Bash".to_string());
+        input.cwd = ps.clone();
+        input.tool_input = Some(serde_json::json!({"command": "git commit -m 'leaking to epic'"}));
+
+        let out = handle_pre_tool_use(&input, None).expect("handler ok");
+        let val = serde_json::to_value(&out).unwrap();
+        let decision = val.get("hookSpecificOutput")
+            .and_then(|h| h.get("permissionDecision"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert_eq!(decision, "deny", "epic/* branch must be denied, got: {val}");
     }
 
     #[test]
