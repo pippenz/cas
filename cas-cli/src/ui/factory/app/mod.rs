@@ -80,6 +80,55 @@ impl WorkerSpawnPrep {
 
             // Check if worktree already exists on disk (reuse from previous session)
             if wt.worktree_path.exists() {
+                // STEP 2 (cas-5232): Hard-error — validate that the existing path is a
+                // *properly registered* git worktree on the expected branch before reusing
+                // it.  Without this check a stale directory (left by a partial failed
+                // `git worktree add`, or by a previous non-isolated session that happened
+                // to create a same-named subdirectory) would pass the `exists()` test and
+                // be returned as the worker's cwd.  Because the directory has no `.git`
+                // file, `git` would then traverse upward to the main checkout and commit
+                // on whatever branch `HEAD` points at there — typically `main`.
+                //
+                // The check runs `git rev-parse --abbrev-ref HEAD` in the worktree
+                // directory itself (not in wt.repo_root).  In a valid worktree the
+                // answer is the worktree's branch; in a plain directory git climbs to
+                // the nearest ancestor repo and reports its HEAD instead.
+                let wt_git = GitOperations::new(wt.worktree_path.clone());
+                match wt_git.current_branch() {
+                    Ok(ref actual_branch) if actual_branch == &wt.branch_name => {
+                        // Valid — correct branch confirmed.
+                        tracing::info!(
+                            worker = %self.worker_name,
+                            cwd = %wt.worktree_path.display(),
+                            branch = %actual_branch,
+                            reused = true,
+                            "spawn prep: worktree validated on correct branch (reuse path)"
+                        );
+                    }
+                    Ok(actual_branch) => {
+                        anyhow::bail!(
+                            "Worker '{}': worktree {:?} exists but git reports branch '{}' \
+                             (expected '{}'). Stale directory or branch mismatch — \
+                             remove {:?} and retry.",
+                            self.worker_name,
+                            wt.worktree_path,
+                            actual_branch,
+                            wt.branch_name,
+                            wt.worktree_path,
+                        );
+                    }
+                    Err(e) => {
+                        anyhow::bail!(
+                            "Worker '{}': path {:?} exists but is not a valid git worktree \
+                             (git current_branch failed: {}). Remove {:?} and retry.",
+                            self.worker_name,
+                            wt.worktree_path,
+                            e,
+                            wt.worktree_path,
+                        );
+                    }
+                }
+
                 let _ = git.init_submodules(&wt.worktree_path);
                 // Ensure gitignored config is available (may be missing from prior run)
                 crate::worktree::symlink_project_config(
@@ -108,6 +157,17 @@ impl WorkerSpawnPrep {
             // Create git worktree (THE SLOW PART)
             git.create_worktree(&wt.worktree_path, &wt.branch_name, Some(&wt.parent_branch))?;
 
+            // STEP 1 (cas-5232): Log the resolved cwd immediately after worktree creation
+            // so the daemon trace contains a clear record of which path each worker got.
+            tracing::info!(
+                worker = %self.worker_name,
+                cwd = %wt.worktree_path.display(),
+                branch = %wt.branch_name,
+                parent = %wt.parent_branch,
+                reused = false,
+                "spawn prep: new worktree created — cwd resolved"
+            );
+
             // Symlink .mcp.json and .claude/ so workers get MCP access
             crate::worktree::symlink_project_config(&wt.repo_root, &wt.worktree_path);
 
@@ -125,7 +185,16 @@ impl WorkerSpawnPrep {
                 worktree: Some(worktree),
             })
         } else {
+            // Non-isolated worker: cwd is wherever the daemon process is running.
+            // STEP 1 (cas-5232): Log so this path is distinguishable from the
+            // isolated paths in the trace.
             let cwd = std::env::current_dir()?;
+            tracing::info!(
+                worker = %self.worker_name,
+                cwd = %cwd.display(),
+                isolated = false,
+                "spawn prep: non-isolated worker — sharing process cwd"
+            );
             Ok(WorkerSpawnResult {
                 worker_name: self.worker_name,
                 cwd,

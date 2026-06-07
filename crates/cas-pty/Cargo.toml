@@ -18,6 +18,9 @@ serde = { version = "1", features = ["derive"] }
 # Error handling
 thiserror = "2"
 
+# Structured logging (cas-5232: cwd audit trail)
+tracing = "0.1"
+
 # Home directory detection
 dirs = "6"
 
