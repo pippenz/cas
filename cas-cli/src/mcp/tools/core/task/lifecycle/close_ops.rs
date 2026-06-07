@@ -4105,11 +4105,10 @@ mod code_review_gate_tests {
     }
 
     /// Serialize env-mutating tests so `CAS_AGENT_ROLE` changes don't
-    /// leak between them.
+    /// leak between them — delegated to the process-wide poison-tolerant lock
+    /// in `crate::hooks` so all CAS_*-mutating test modules share ONE lock.
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        use std::sync::{Mutex, OnceLock};
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+        crate::hooks::test_env_lock()
     }
 
     // --- Path classification ------------------------------------------------

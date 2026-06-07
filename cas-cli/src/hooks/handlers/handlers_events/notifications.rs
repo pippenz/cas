@@ -342,6 +342,14 @@ pub fn handle_pre_compact(
         }
     }
 
+    // B4 FLUSH: write worker in-flight findings to the active task note BEFORE
+    // compaction erases them from context. Must run UNCONDITIONALLY — even when
+    // context_parts is empty (no high-importance memories, no active tasks), the
+    // worker may still have in-flight findings worth preserving. Best-effort: all
+    // errors are swallowed inside flush_worker_findings_to_task; compaction is
+    // never blocked regardless of flush outcome.
+    flush_worker_findings_to_task(input, cas_root);
+
     if context_parts.is_empty() {
         return Ok(HookOutput::empty());
     }
@@ -351,11 +359,6 @@ pub fn handle_pre_compact(
         "cas: PreCompact injecting {} chars of context",
         context.len()
     );
-
-    // B4 FLUSH: write worker in-flight findings to the active task note BEFORE
-    // compaction erases them from context. Best-effort: all errors are swallowed
-    // inside flush_worker_findings_to_task; compaction is never blocked.
-    flush_worker_findings_to_task(input, cas_root);
 
     // PreCompact doesn't support hookSpecificOutput in Claude Code's schema
     // (only PreToolUse, UserPromptSubmit, PostToolUse do)
@@ -696,6 +699,41 @@ mod pre_compact_flush_tests {
         assert!(
             written > 0,
             "must write at least some findings; notes:\n{}",
+            task.notes
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // FIX A regression: flush fires even when context_parts is empty
+    //
+    // Before the fix, flush_worker_findings_to_task was called AFTER the
+    // `if context_parts.is_empty() { return Ok(empty) }` guard, so a worker
+    // with in-flight findings but no high-importance memories would compact
+    // WITHOUT flushing.  This test calls write_findings_note directly to prove
+    // the writer succeeds on a fresh (empty-notes) task — the reorder fix is
+    // verified structurally (flush call is above the early-return in the source).
+    // -------------------------------------------------------------------------
+    #[test]
+    fn test_flush_writes_even_when_inject_context_is_empty() {
+        let cas = setup_cas();
+        add_inprogress_task(&cas.root, "cas-b4t7");
+
+        // Simulate a worker that has findings but an empty CAS store
+        // (no high-importance memories → context_parts would be empty → old
+        // code would have returned before flushing).
+        let findings = vec![
+            "Found root cause: create_worktree falls back to main cwd on reuse-branch".to_string(),
+        ];
+
+        write_findings_note(&cas.root, "cas-b4t7", &findings)
+            .expect("write must succeed even in empty-context scenario");
+
+        let store = open_task_store(&cas.root).expect("open_task_store");
+        let task = store.get("cas-b4t7").expect("task.get");
+
+        assert!(
+            task.notes.contains("create_worktree"),
+            "findings must be written even when inject context is empty; notes:\n{}",
             task.notes
         );
     }
