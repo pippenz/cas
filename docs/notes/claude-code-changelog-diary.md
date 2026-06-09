@@ -7,6 +7,8 @@ require a CAS change, and if so, where's the proof?"*
 This is the index layer. Deep per-EPIC working notes live in their own dated files
 (e.g. `2026-06-02-cc160-hook-surface.md`); this diary links out to them.
 
+Sibling ledger for the other supported harness: `codex-changelog-diary.md`.
+
 ## How to update
 
 When a new Claude Code version ships:
