@@ -90,9 +90,12 @@ model, not a refutation — discounted.) **Conclusion: real model, genuinely lau
   If "inherited Claude Code env vars" was the trigger, factory worker sessions on ≤2.1.169 may have
   silently failed to save transcripts — which would undercut session-log mining + blame attribution
   (the per-session JSONL we rely on; see `reference_claude_session_log_paths`,
-  `feedback_cross_project_log_mining`). **Check:** do worker session JSONLs exist for recent ≤.169
-  factory runs? If there are gaps that correlate with env-inherited spawns, 2.1.170 is the fix and
-  the action is just the version bump. Candidate verify task.
+  `feedback_cross_project_log_mining`). **Checked 2026-06-10:** local CC is **2.1.168** (pre-fix),
+  yet **161 worker session JSONLs exist** across `*cas-worktrees-*` dirs incl. recent runs — so
+  factory workers ARE saving transcripts. The trigger is therefore narrower than generic CC-env
+  inheritance (likely VS Code-terminal-specific, or a path var CAS doesn't set). **Downgraded to low
+  risk** — no evidence of categorical transcript loss; just pick up the fix on the normal 2.1.170
+  bump. No standalone verify task needed.
 
 ### 2.1.169 — `--safe-mode` · `disableBundledSkills` · `/cd` · `agents --json` state/id
 
