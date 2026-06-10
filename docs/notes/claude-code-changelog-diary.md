@@ -39,6 +39,7 @@ When a new Claude Code version ships:
 
 | CC version | Headline | CAS verdict | Pointer |
 |------------|----------|-------------|---------|
+| 2.1.170 | **Claude Fable 5** (Mythos-class model) GA + VS Code / inherited-env transcript-save fix | 👀 evaluate | this doc |
 | 2.1.169 | **`--safe-mode`**, `/cd`, **`disableBundledSkills`**, `agents --json` state/id, managed-MCP enforcement fixes | ✅ no action / 👀 noted | this doc |
 | 2.1.168 | Bug-fix rollup | ⏭ n/a | — |
 | 2.1.167 | Bug-fix rollup | ⏭ n/a | — |
@@ -54,6 +55,44 @@ When a new Claude Code version ships:
 ---
 
 ## Entries
+
+### 2.1.170 — Claude Fable 5 (Mythos-class model) GA · VS Code transcript-save fix
+
+Reviewed 2026-06-10 (calm-crane-32 / supervisor).
+
+**Verification note:** the "Claude Fable 5 / Mythos-class" headline tripped every skepticism wire
+(naming doesn't match Opus/Sonnet/Haiku; hype phrasing; post-dates the Jan-2026 assistant cutoff),
+so it was verified before recording. Multiple independent reputable sources — Anthropic news, CNBC,
+NBC, TechCrunch, MacRumors, AWS/Amazon — corroborate a real launch on **2026-06-09**. (A WebFetch
+summary labeled the page "fictional," but that is an April-2024-cutoff artifact of the summarizer
+model, not a refutation — discounted.) **Conclusion: real model, genuinely launched.**
+
+- **Claude Fable 5 — new top-tier model, GA 2026-06-09.** Public, safety-gated member of the
+  "Mythos" class; positioned ABOVE Opus 4.8 (its safeguards fall back to Opus 4.8 on ~5% of sessions
+  and block cyber/bio/chem topics). Pricing ~$10/Mtok in, ~$50/Mtok out. Heavy SWE claims
+  (codebase-wide migrations in a day). → 👀 **opportunity, not yet actionable.** Relevant to CAS
+  worker/supervisor model selection (`STOCK_WORKER_MODEL` in `cas-cli/src/config/settings.rs`;
+  `--model` passthrough for both claude + codex paths). Blockers before wiring anything:
+  1. **Need the exact API model ID** — the announcement doesn't publish it; can't set a config
+     default without the literal id string.
+  2. **Cost** — ~5–10× current default; at most a supervisor / hard-task option, never a stock
+     worker default.
+  3. **Safeguard fallback** — CAS is sometimes used for *authorized* security testing; Fable 5
+     silently downgrades cyber/bio/chem prompts to Opus 4.8, so a security-focused worker may not
+     actually run on Fable 5. Must be called out in any model-selection guidance.
+  4. **Subscription window** — included in Pro/Max/Team/Enterprise only until **2026-06-22**, then
+     usage-credits. Affects cost planning if adopted.
+- **"Fixed sessions not saving transcripts (and not appearing in `--resume`) when launched from the
+  VS Code integrated terminal or any shell that inherited Claude Code environment variables."** →
+  👀 **watch — potential factory impact, highest-priority item in this release for us.** CAS spawns
+  workers via PTY with INHERITED + augmented Claude Code env (`CAS_*`,
+  `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`, etc. — `crates/cas-pty/src/pty.rs::PtyConfig::claude`).
+  If "inherited Claude Code env vars" was the trigger, factory worker sessions on ≤2.1.169 may have
+  silently failed to save transcripts — which would undercut session-log mining + blame attribution
+  (the per-session JSONL we rely on; see `reference_claude_session_log_paths`,
+  `feedback_cross_project_log_mining`). **Check:** do worker session JSONLs exist for recent ≤.169
+  factory runs? If there are gaps that correlate with env-inherited spawns, 2.1.170 is the fix and
+  the action is just the version bump. Candidate verify task.
 
 ### 2.1.169 — `--safe-mode` · `disableBundledSkills` · `/cd` · `agents --json` state/id
 
