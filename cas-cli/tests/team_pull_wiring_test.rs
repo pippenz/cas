@@ -441,7 +441,7 @@ async fn execute_sync_hits_each_pull_endpoint_exactly_once_when_team_configured(
     // runs. ENV_LOCK held inside the guard serializes parallel tests.
     let _env = CasRootGuard::set(&cas_root);
 
-    let args = CloudSyncArgs { dry_run: false };
+    let args = CloudSyncArgs { dry_run: false, rehome: false };
     let cli = make_cli_json();
     let cas_root_owned = cas_root.clone();
     let result =
@@ -520,7 +520,7 @@ async fn execute_sync_does_not_hit_team_pull_when_no_team_configured() {
 
     let _env = CasRootGuard::set(&cas_root);
 
-    let args = CloudSyncArgs { dry_run: false };
+    let args = CloudSyncArgs { dry_run: false, rehome: false };
     let cli = make_cli_json();
     let cas_root_owned = cas_root.clone();
     let result =

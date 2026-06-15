@@ -14,8 +14,13 @@ impl CloudSyncer {
             return Ok(result);
         }
 
-        // Drain queue items with matching team_id
-        let queued = self.queue.drain_by_team(team_id, self.config.max_retries)?;
+        // Fetch (but do NOT delete) pending team items so we can
+        // mark_failed / mark_synced per item after the HTTP call completes.
+        // Using drain_by_team here would delete items up-front and then
+        // re-enqueue them via enqueue_for_team on failure, which resets
+        // retry_count to 0 (ON CONFLICT DO UPDATE) — preventing items from
+        // ever reaching the `failed` bucket (defect B / cas-8dd8).
+        let queued = self.queue.pending_for_team(team_id, usize::MAX, self.config.max_retries)?;
 
         if queued.is_empty() {
             result.duration_ms = start.elapsed().as_millis() as u64;
@@ -226,19 +231,31 @@ impl CloudSyncer {
             }
         }
 
-        if let Some(err) = last_error {
-            // Re-enqueue items on failure
+        if let Some(ref err) = last_error {
+            // Mark every queued item as failed (increments retry_count).
+            // Previously this re-enqueued via enqueue_for_team which reset
+            // retry_count to 0 on conflict, preventing items from ever
+            // reaching the `failed` bucket (defect B / cas-8dd8).
+            // `ref err` borrows (not moves) so `last_error.is_none()` below
+            // can still read the option for the deletes gate.
             for item in &queued {
-                let _ = self.queue.enqueue_for_team(
-                    item.entity_type,
-                    &item.entity_id,
-                    item.operation,
-                    item.payload.as_deref(),
-                    team_id,
-                );
+                let _ = self.queue.mark_failed(item.id, &err.to_string());
             }
             result.errors.push(err.to_string());
-        } else if has_deletes {
+        } else {
+            // Success: mark every queued item synced (delete from queue).
+            // Items that were dropped by group_queued_items (null payload for
+            // upsert) are also deleted — they were silently un-pushable; the
+            // server accepted the rest, so we remove them to prevent permanent
+            // residue.  Unpushable items will be re-enqueued by a future
+            // write; the personal-push path handles the poison-head case by
+            // calling mark_failed instead (cas-8dd8).
+            for item in &queued {
+                let _ = self.queue.mark_synced(item.id);
+            }
+        }
+
+        if last_error.is_none() && has_deletes {
             // Process deletes (after successful upserts or if no upserts)
             let (deleted_count, delete_errors) = self.send_team_deletes(team_id, &grouped, token);
             // Track successful deletes (deleted_count is total across all types)

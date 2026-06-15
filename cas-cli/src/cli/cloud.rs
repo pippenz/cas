@@ -8,9 +8,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::cli::Cli;
-use crate::cloud::{BackfillOutcome, CloudConfig, FetchTeamsOutcome, fetch_and_cache_teams,
-    get_project_canonical_id, maybe_apply_team_backfill, teams_cache_stale,
-    user_level_cloud_json_path};
+use crate::cloud::{BackfillOutcome, CloudConfig, FetchTeamsOutcome, SyncQueue,
+    fetch_and_cache_teams, get_project_canonical_id, maybe_apply_team_backfill,
+    teams_cache_stale, user_level_cloud_json_path};
 use crate::ui::components::Formatter;
 use crate::ui::theme::ActiveTheme;
 
@@ -123,6 +123,17 @@ pub struct CloudPushArgs {
     /// Dry run (don't actually push)
     #[arg(long)]
     pub dry_run: bool,
+
+    /// Allow re-homing existing cloud entities to the current project slug.
+    ///
+    /// By default, `cas cloud push` refuses when the `project_canonical_id` has
+    /// changed since the last push — a changed slug would silently move all
+    /// existing cloud entities into the new bucket (defect D from the ozer
+    /// cloud-sync bug report). Pass `--rehome` to explicitly confirm the
+    /// operation. Only needed when you intentionally changed the project slug
+    /// via `cas cloud project set`.
+    #[arg(long)]
+    pub rehome: bool,
 }
 
 #[derive(Parser)]
@@ -145,6 +156,12 @@ pub struct CloudSyncArgs {
     /// Dry run (don't actually sync)
     #[arg(long)]
     pub dry_run: bool,
+
+    /// Allow re-homing existing cloud entities (passed through to push).
+    ///
+    /// See `cas cloud push --rehome` for details.
+    #[arg(long)]
+    pub rehome: bool,
 }
 
 #[derive(Parser)]
@@ -1026,6 +1043,59 @@ fn execute_queue(args: &CloudQueueArgs, cli: &Cli, cas_root: &Path) -> anyhow::R
 // PUSH
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/// Rehome guard for `cas cloud push` (AC6 — defect D).
+///
+/// Verifies that the `project_canonical_id` used for the next push matches the
+/// one recorded from the last successful push. A changed slug would cause the
+/// cloud server to re-home ALL existing entities into the new project bucket —
+/// a surprising and difficult-to-reverse side effect of a normal push.
+///
+/// Returns `Ok(())` when the push is safe to proceed:
+/// - No prior push recorded (first push for this project).
+/// - The slug is unchanged since the last push.
+/// - `rehome` is `true` (user explicitly confirmed the re-home with `--rehome`).
+///
+/// Returns `Err(message)` with a user-facing explanation when a slug change is
+/// detected and `rehome` is `false`.
+///
+/// `pub` + `#[doc(hidden)]` so integration tests in `cas-cli/tests/` can
+/// exercise the guard without a live HTTP server — same convention as
+/// `execute_team_push` / `execute_team_pull`.
+#[doc(hidden)]
+pub fn check_canonical_id_rehome(
+    queue: &SyncQueue,
+    project_id: &str,
+    rehome: bool,
+) -> Result<(), String> {
+    // Fail-open: if the metadata read errors (malformed DB, etc.) we let the
+    // push proceed. The guard will re-run on the next invocation once the DB
+    // is healthy. The metadata is only authoritative when it exists.
+    let stored = queue
+        .get_metadata("last_push_canonical_id")
+        .unwrap_or(None);
+    match stored {
+        None => Ok(()), // First push — no prior slug on record
+        Some(ref stored_id) if stored_id == project_id => Ok(()), // Unchanged, safe
+        Some(stored_id) => {
+            if rehome {
+                Ok(()) // User explicitly confirmed the re-home with --rehome
+            } else {
+                Err(format!(
+                    "push refused: project slug changed from `{stored_id}` to `{project_id}`.\n\
+                     Pushing with a different slug would re-home all existing cloud entities\n\
+                     into the new project bucket — a potentially large, hard-to-reverse operation.\n\
+                     \n\
+                     To confirm the re-home, pass --rehome:\n\
+                       cas cloud push --rehome\n\
+                     \n\
+                     To restore the previous slug (no re-home):\n\
+                       cas cloud project set {stored_id}"
+                ))
+            }
+        }
+    }
+}
+
 fn execute_push(args: &CloudPushArgs, cli: &Cli, cas_root: &Path) -> anyhow::Result<()> {
     let config = CloudConfig::load()?;
     let token = config
@@ -1218,6 +1288,41 @@ fn execute_push(args: &CloudPushArgs, cli: &Cli, cas_root: &Path) -> anyhow::Res
             ("worktrees", &worktrees_json),
         ];
 
+        // AC5: Track which resource types have actual items to push.
+        // Only entity types with a non-empty payload appear in the summary,
+        // preventing "fixed boilerplate" counts for types not touched this run
+        // and ensuring the Tasks line is never silently omitted when tasks moved.
+        let sent_types: std::collections::HashSet<&str> = resource_types
+            .iter()
+            .filter(|(_, items)| !items.is_empty())
+            .map(|(name, _)| *name)
+            .collect();
+
+        let project_id = get_project_canonical_id()
+            .ok_or_else(|| anyhow::anyhow!("Cannot sync: not inside a CAS project directory"))?;
+
+        // AC6: Rehome guard — refuse if the pinned project slug changed since
+        // the last successful push. A slug change silently re-homes ALL existing
+        // cloud entities into the new bucket (defect D, ozer bug report).
+        // The guard is best-effort: if the queue can't be opened we fail-open
+        // (push proceeds) and try again next run.
+        if let Ok(guard_queue) = SyncQueue::open(cas_root) {
+            let _ = guard_queue.init();
+            if let Err(msg) = check_canonical_id_rehome(&guard_queue, &project_id, args.rehome) {
+                if cli.json {
+                    println!("{}", serde_json::json!({"status": "error", "message": msg}));
+                } else {
+                    let mut err = io::stderr();
+                    let mut fmt = Formatter::stdout(&mut err, ActiveTheme::default());
+                    let error_color = fmt.theme().palette.status_error;
+                    fmt.write_colored("  \u{2717} ", error_color)?;
+                    fmt.write_raw(&msg)?;
+                    fmt.newline()?;
+                }
+                return Ok(());
+            }
+        }
+
         // Build list of batches: each batch is a JSON payload with chunked data
         let mut batches: Vec<serde_json::Value> = Vec::new();
 
@@ -1228,9 +1333,6 @@ fn execute_push(args: &CloudPushArgs, cli: &Cli, cas_root: &Path) -> anyhow::Res
             .max()
             .unwrap_or(1)
             .max(1);
-
-        let project_id = get_project_canonical_id()
-            .ok_or_else(|| anyhow::anyhow!("Cannot sync: not inside a CAS project directory"))?;
 
         for chunk_idx in 0..max_chunks {
             let start = chunk_idx * BATCH_SIZE;
@@ -1413,9 +1515,27 @@ fn execute_push(args: &CloudPushArgs, cli: &Cli, cas_root: &Path) -> anyhow::Res
             clear_inline(prev_lines)?;
         }
 
+        // AC6: Push succeeded — record the canonical_id so the next push can
+        // detect a slug change. Best-effort: a metadata write failure is logged
+        // but does not fail the command (the push itself already succeeded).
+        if let Ok(state_queue) = SyncQueue::open(cas_root) {
+            let _ = state_queue.init();
+            if let Err(e) = state_queue.set_metadata("last_push_canonical_id", &project_id) {
+                tracing::warn!(
+                    error = %e,
+                    project_id = %project_id,
+                    "failed to record last_push_canonical_id in sync queue (non-fatal)"
+                );
+            }
+        }
+
         if cli.json {
+            // AC5: only emit entries for entity types that were in the push
+            // payload (sent_types), preventing boilerplate counts for types
+            // not touched in this run.
             let json_totals: serde_json::Map<String, serde_json::Value> = totals
                 .iter()
+                .filter(|(k, _)| sent_types.contains(k.as_str()))
                 .map(|(k, (ins, upd))| {
                     (
                         k.clone(),
@@ -1444,12 +1564,16 @@ fn execute_push(args: &CloudPushArgs, cli: &Cli, cas_root: &Path) -> anyhow::Res
                 ("commit_links", "Commit links"),
                 ("worktrees", "Worktrees"),
             ];
+            // AC5: only show lines for entity types that were in the push
+            // payload. This prevents "fixed boilerplate" counts from types
+            // the user didn't intend to touch AND ensures the Tasks line is
+            // always shown when tasks were part of the push (even if the
+            // server reports 0 inserted, 0 updated — e.g., all already synced).
             for (key, label) in &display_order {
-                if let Some(&(ins, upd)) = totals.get(*key) {
-                    if ins > 0 || upd > 0 {
-                        fmt.write_raw(&format!("    {label}: {ins} inserted, {upd} updated"))?;
-                        fmt.newline()?;
-                    }
+                if sent_types.contains(key) {
+                    let (ins, upd) = totals.get(*key).copied().unwrap_or((0, 0));
+                    fmt.write_raw(&format!("    {label}: {ins} inserted, {upd} updated"))?;
+                    fmt.newline()?;
                 }
             }
         }
@@ -1746,6 +1870,7 @@ pub fn execute_sync(args: &CloudSyncArgs, cli: &Cli, cas_root: &Path) -> anyhow:
             entries_only: false,
             tasks_only: false,
             dry_run: args.dry_run,
+            rehome: args.rehome,
         },
         cli,
         cas_root,
