@@ -551,6 +551,32 @@ fn execute_team_set(
             // that's the exact bug this task fixes).
             let slug = resolve_project_slug_for_team_set(cas_root);
 
+            // cas-f07a (AC1): warn when the resolved slug is an under-populated
+            // bucket while another team project holds significantly more data.
+            // Best-effort — a network failure silently skips the check; the
+            // team_id is already persisted so the overall command still succeeds.
+            let resolved_id_opt = match &slug {
+                SlugResolution::FromConfig(s) | SlugResolution::FromGitRemote(s) => {
+                    Some(s.as_str())
+                }
+                SlugResolution::NotResolved => None,
+            };
+            if let Some(resolved_id) = resolved_id_opt {
+                if let Some(projects) = fetch_team_projects(&config.endpoint, &token, &uuid) {
+                    if let Some((richer_id, resolved_count, richer_count)) =
+                        check_bucket_ambiguity(resolved_id, &projects)
+                    {
+                        eprintln!(
+                            "\nWarning: project bucket '{resolved_id}' has only \
+                             {resolved_count} items. Team project '{richer_id}' has \
+                             {richer_count} — you may be connected to the wrong \
+                             bucket. Run `cas cloud project set {richer_id}` to \
+                             pin the correct slug.\n"
+                        );
+                    }
+                }
+            }
+
             if cli.json {
                 let (resolved, source) = match &slug {
                     SlugResolution::FromConfig(s) => (Some(s.as_str()), "config_toml"),
@@ -651,13 +677,79 @@ fn resolve_project_slug_for_team_set(cas_root: &Path) -> SlugResolution {
     SlugResolution::NotResolved
 }
 
+/// Fetch the team's project list from `/api/teams/{uuid}/projects`. Best-effort:
+/// returns `None` on any network or parse failure so the caller can skip the
+/// ambiguity check without failing the overall operation.
+///
+/// Note: `probe_team_membership` already hits this endpoint to validate
+/// membership — this is a second call that reads the body. The endpoint is
+/// cheap (read-only, small payload) and `cas cloud team set` is a rare
+/// interactive command, so two round-trips are acceptable.
+fn fetch_team_projects(
+    endpoint: &str,
+    token: &str,
+    team_uuid: &str,
+) -> Option<Vec<crate::cloud::TeamProject>> {
+    let url = format!("{endpoint}/api/teams/{team_uuid}/projects");
+    ureq::get(&url)
+        .timeout(TEAM_PROBE_TIMEOUT)
+        .set("Authorization", &format!("Bearer {token}"))
+        .call()
+        .ok()?
+        .into_json::<crate::cloud::TeamProjectsResponse>()
+        .ok()
+        .map(|r| r.projects)
+}
+
+/// Check whether the resolved `canonical_id` is an under-populated bucket
+/// compared to the richest other project in the team. Returns
+/// `Some((richer_id, resolved_count, richer_count))` when:
+///   - `resolved_id` appears in `projects`, AND
+///   - there is at least one OTHER project with ≥ 50 memories, AND
+///   - the resolved project holds < 10 % of the richest other project's count.
+///
+/// The 10 % / 50-memory thresholds are conservative so the warning only fires
+/// when the evidence strongly suggests the wrong bucket was chosen (e.g. 666
+/// memories vs 19 285). New projects (0 memories) that genuinely haven't
+/// synced yet will trigger the warning when another bucket is large — callers
+/// should frame the warning as advisory, not conclusive.
+///
+/// Pure function (no IO) — tested independently in the unit-test module.
+pub(crate) fn check_bucket_ambiguity(
+    resolved_id: &str,
+    projects: &[crate::cloud::TeamProject],
+) -> Option<(String, u32, u32)> {
+    let resolved = projects.iter().find(|p| p.canonical_id == resolved_id)?;
+
+    let richest = projects
+        .iter()
+        .filter(|p| p.canonical_id != resolved_id)
+        .max_by_key(|p| p.memory_count)?;
+
+    if richest.memory_count >= 50
+        && (resolved.memory_count as u64) * 10 < richest.memory_count as u64
+    {
+        Some((
+            richest.canonical_id.clone(),
+            resolved.memory_count,
+            richest.memory_count,
+        ))
+    } else {
+        None
+    }
+}
+
 /// Pure-data variant of `execute_team_show` — builds the JSON payload
 /// without doing IO. Used by `execute_team_show` and exposed (via the
 /// `_for_test` wrapper) so integration tests can assert on the shape
 /// without capturing stdout. cas-1ced.
+///
+/// cas-f07a (AC2): uses `resolve_canonical_id` (full 3-step chain) so the
+/// output is never `null` for an active project — the folder name is the
+/// minimum returned when no explicit pin exists.
 fn team_show_json(cas_root: &Path) -> anyhow::Result<serde_json::Value> {
     let config = CloudConfig::load_from_cas_dir(cas_root)?;
-    let canonical_id = crate::cloud::canonical_id_from_config_toml(cas_root);
+    let canonical_id = crate::cloud::resolve_canonical_id(cas_root);
     Ok(serde_json::json!({
         "team_id": config.team_id,
         "team_slug": config.team_slug,
@@ -680,8 +772,13 @@ fn execute_team_show(cli: &Cli, cas_root: &Path) -> anyhow::Result<()> {
 
     match (&config.team_id, &config.team_slug) {
         (Some(id), slug) => {
-            // cas-1ced: also surface the resolved project slug.
-            let canonical_id = crate::cloud::canonical_id_from_config_toml(cas_root);
+            // cas-f07a (AC2): use the full resolution chain so the slug is
+            // never shown as "<not resolved>" for an active project.  The
+            // 3-step chain is: config.toml → folder name → path hash.  Only
+            // the config-toml step was called before this fix; the folder-name
+            // fallback makes the output actionable even without an explicit
+            // pin.
+            let canonical_id = crate::cloud::resolve_canonical_id(cas_root);
             if cli.json {
                 let out = serde_json::json!({
                     "team_id": id,
@@ -3194,6 +3291,107 @@ mod team_cmd_tests {
             }
             other => panic!("expected Error, got {other:?}"),
         }
+    }
+
+    // ── check_bucket_ambiguity unit tests (cas-f07a AC1) ──────────────────
+    //
+    // Pure-function tests — no live cloud, no wiremock. Each creates an
+    // in-memory projects slice and asserts the ambiguity detector's output.
+
+    fn make_project(
+        canonical_id: &str,
+        memory_count: u32,
+    ) -> crate::cloud::TeamProject {
+        crate::cloud::TeamProject {
+            id: format!("id-{canonical_id}"),
+            canonical_id: canonical_id.to_string(),
+            name: canonical_id.to_string(),
+            contributor_count: 1,
+            memory_count,
+        }
+    }
+
+    #[test]
+    fn bucket_ambiguity_warns_when_resolved_is_underpopulated() {
+        // Scenario from the ozer bug: git-remote slug has 666 memories while
+        // the short-name bucket has 19 285. 666 / 19285 ≈ 3.4 % → warn.
+        let projects = vec![
+            make_project("github.com/Richards-LLC/ozer-health", 666),
+            make_project("ozer", 19_285),
+        ];
+        let result = check_bucket_ambiguity("github.com/Richards-LLC/ozer-health", &projects);
+        let (richer_id, resolved_count, richer_count) =
+            result.expect("should warn when resolved bucket is < 10% of richest");
+        assert_eq!(richer_id, "ozer");
+        assert_eq!(resolved_count, 666);
+        assert_eq!(richer_count, 19_285);
+    }
+
+    #[test]
+    fn bucket_ambiguity_no_warn_when_resolved_is_richest() {
+        // The resolved bucket IS the richest — no warning.
+        let projects = vec![
+            make_project("cas-src", 5_000),
+            make_project("github.com/foo/cas-src", 10),
+        ];
+        assert!(
+            check_bucket_ambiguity("cas-src", &projects).is_none(),
+            "should not warn when resolved bucket is richest"
+        );
+    }
+
+    #[test]
+    fn bucket_ambiguity_no_warn_when_resolved_not_in_list() {
+        // If the resolved canonical_id isn't in the team projects list yet
+        // (brand-new project that hasn't synced), skip the warning.
+        let projects = vec![
+            make_project("other-project", 10_000),
+        ];
+        assert!(
+            check_bucket_ambiguity("new-project", &projects).is_none(),
+            "should not warn when resolved id is absent from project list"
+        );
+    }
+
+    #[test]
+    fn bucket_ambiguity_no_warn_when_richest_below_threshold() {
+        // All projects are small; the 50-memory guard suppresses the warning
+        // so new teams don't see noise on early setup.
+        let projects = vec![
+            make_project("slug-a", 5),
+            make_project("slug-b", 40),
+        ];
+        assert!(
+            check_bucket_ambiguity("slug-a", &projects).is_none(),
+            "should not warn when richest other project is < 50 memories"
+        );
+    }
+
+    #[test]
+    fn bucket_ambiguity_no_warn_at_10_pct_boundary() {
+        // resolved = 10, richest = 100. 10/100 = 10%. The check is
+        // `resolved * 10 < richest`, i.e. `100 < 100` = false → no warn.
+        let projects = vec![
+            make_project("slug-small", 10),
+            make_project("slug-big", 100),
+        ];
+        assert!(
+            check_bucket_ambiguity("slug-small", &projects).is_none(),
+            "should not warn at exactly the 10% boundary"
+        );
+    }
+
+    #[test]
+    fn bucket_ambiguity_warns_just_below_10_pct_boundary() {
+        // resolved = 9, richest = 100. 9 * 10 = 90 < 100 → warn.
+        let projects = vec![
+            make_project("slug-small", 9),
+            make_project("slug-big", 100),
+        ];
+        assert!(
+            check_bucket_ambiguity("slug-small", &projects).is_some(),
+            "should warn when resolved count * 10 < richest count"
+        );
     }
 }
 

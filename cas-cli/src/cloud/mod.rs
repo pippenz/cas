@@ -28,7 +28,7 @@ mod syncer;
 pub use backfill::{BackfillOutcome, maybe_apply_team_backfill, maybe_apply_team_backfill_inner};
 pub use config::{
     CloudConfig, TeamInfo, canonical_id_from_config_toml, derive_canonical_id_from_git_remote,
-    get_project_canonical_id, set_canonical_id_in_config_toml,
+    get_project_canonical_id, resolve_canonical_id, set_canonical_id_in_config_toml,
 };
 pub(crate) use config::{default_endpoint, is_acceptable_endpoint, user_level_cloud_json_path};
 // T2: /api/me fetch helpers — `pub` so integration tests can call them directly.
