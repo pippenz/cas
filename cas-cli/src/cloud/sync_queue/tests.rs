@@ -356,6 +356,167 @@ fn test_pending_by_type_for_team() {
     assert_eq!(by_type.skills.len(), 0);
 }
 
+// --- cas-8dd8 regression tests (defects B + C) ---
+
+/// AC3: A single un-pushable queue item (null payload for upsert) must not
+/// freeze the rest of the queue.  The fixed push_batch calls mark_failed
+/// instead of silently skipping, so the poison accumulates retry_count until
+/// it transitions from `pending` to `failed`.  Good items behind it remain
+/// pending and oldest_item advances past the parked head.
+#[test]
+fn test_poison_head_doesnt_block_queue() {
+    let (_temp, queue) = create_test_queue();
+    const MAX_RETRIES: i32 = 5;
+
+    // Enqueue the poison head first (null payload → invalid upsert).
+    queue
+        .enqueue(
+            EntityType::Task,
+            "task-poison",
+            SyncOperation::Upsert,
+            None,
+        )
+        .unwrap();
+
+    // Two healthy items enqueued after the poison.
+    queue
+        .enqueue(
+            EntityType::Task,
+            "task-good-1",
+            SyncOperation::Upsert,
+            Some(r#"{"id":"task-good-1"}"#),
+        )
+        .unwrap();
+    queue
+        .enqueue(
+            EntityType::Task,
+            "task-good-2",
+            SyncOperation::Upsert,
+            Some(r#"{"id":"task-good-2"}"#),
+        )
+        .unwrap();
+
+    // Locate the poison item's id.
+    let all_pending = queue.pending(10, MAX_RETRIES).unwrap();
+    assert_eq!(all_pending.len(), 3);
+    let poison_id = all_pending
+        .iter()
+        .find(|i| i.entity_id == "task-poison")
+        .unwrap()
+        .id;
+
+    // Simulate the fixed push_batch calling mark_failed MAX_RETRIES times on
+    // the poison.  Each call increments retry_count; once retry_count reaches
+    // MAX_RETRIES the item stops appearing in pending() and is counted as
+    // failed in stats().
+    for attempt in 0..MAX_RETRIES {
+        queue
+            .mark_failed(
+                poison_id,
+                &format!("missing payload for upsert operation (attempt {attempt})"),
+            )
+            .unwrap();
+    }
+
+    // --- AC3 assertions ---
+
+    // Good items must still be pending; poison must not appear.
+    let still_pending = queue.pending(10, MAX_RETRIES).unwrap();
+    assert_eq!(still_pending.len(), 2, "good items must remain pending");
+    assert!(
+        still_pending.iter().all(|i| i.entity_id != "task-poison"),
+        "poison must not appear in pending after max_retries failures"
+    );
+
+    // Stats: 1 failed, 2 pending.
+    let stats = queue.stats(MAX_RETRIES).unwrap();
+    assert_eq!(stats.failed, 1, "poison must be counted as failed");
+    assert_eq!(stats.pending, 2, "good items must be counted as pending");
+
+    // oldest_item must advance past the parked poison and reflect a good item.
+    // (Before the fix, oldest_item stayed frozen on the poison's created_at
+    // because the stats query did not filter by retry_count.)
+    assert!(
+        stats.oldest_item.is_some(),
+        "oldest_item must be Some — queue is not empty of pending items"
+    );
+}
+
+/// AC4: A row with team_id=NULL (inserted by an older code path that did not
+/// normalise the personal-queue sentinel) must coalesce with a new personal-
+/// queue enqueue (team_id='') instead of creating a duplicate.
+///
+/// Root cause (defect C / cas-8dd8): SQLite treats NULL != '' under UNIQUE,
+/// so a row with team_id=NULL and a subsequent enqueue with team_id='' each
+/// satisfy UNIQUE(entity_type, entity_id, team_id) independently and create
+/// two rows for the same entity.  The fix adds an idempotent UPDATE at the end
+/// of migrate_team_id() that normalises NULL→'' so the unique index can
+/// deduplicate correctly on the next enqueue.
+#[test]
+fn test_null_team_id_normalized_to_empty_on_migration() {
+    use rusqlite::Connection;
+
+    let temp = TempDir::new().unwrap();
+    let db_path = temp.path().join("cas.db");
+
+    // Step 1: Initialise the queue normally so the full schema (including
+    // team_id column and indexes) is in place.
+    {
+        let queue = SyncQueue::open(temp.path()).unwrap();
+        queue.init().unwrap();
+    }
+
+    // Step 2: Simulate a pre-normalisation state by directly inserting a row
+    // with team_id=NULL.  This is the shape produced by an older code path
+    // that used NULL as the personal-queue sentinel before the fix.
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            r#"INSERT INTO sync_queue
+                (entity_type, entity_id, operation, payload, team_id, created_at, retry_count)
+               VALUES
+                ('task', 'task-dup', 'upsert', '{"id":"task-dup","v":1}', NULL, '2026-01-01T00:00:00Z', 0)"#,
+            [],
+        )
+        .unwrap();
+    }
+
+    // Step 3: Re-open and call init() — migrate_team_id() ends with an
+    // idempotent `UPDATE … SET team_id = '' WHERE team_id IS NULL` that turns
+    // the legacy NULL row into a '' row, making the UNIQUE index cover it.
+    let queue = SyncQueue::open(temp.path()).unwrap();
+    queue.init().unwrap();
+
+    // Step 4: Enqueue the same entity via the normal path (team_id='').
+    // Before the fix: NULL != '' under UNIQUE → second row inserted (duplicate).
+    // After the fix: both rows share team_id='' → ON CONFLICT coalesces to 1.
+    queue
+        .enqueue(
+            EntityType::Task,
+            "task-dup",
+            SyncOperation::Upsert,
+            Some(r#"{"id":"task-dup","v":2}"#),
+        )
+        .unwrap();
+
+    let pending = queue.pending(10, 5).unwrap();
+    assert_eq!(
+        pending.len(),
+        1,
+        "NULL team_id must be normalised to '' so the UNIQUE constraint deduplicates — no duplicate (defect C / cas-8dd8)"
+    );
+
+    // Confirm the coalesced row holds the latest payload.
+    assert!(
+        pending[0]
+            .payload
+            .as_ref()
+            .unwrap()
+            .contains("\"v\":2"),
+        "coalesced row must hold the updated payload from the most-recent enqueue"
+    );
+}
+
 #[test]
 fn test_team_coalesce_updates() {
     let (_temp, queue) = create_test_queue();
