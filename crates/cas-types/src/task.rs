@@ -122,6 +122,45 @@ impl FromStr for TaskType {
     }
 }
 
+/// Execution depth of a task (EPIC cas-1255 — per-task speed mode).
+///
+/// Controls the speed-vs-rigor tradeoff for feel-driven iteration. `Deep`
+/// is the default and preserves full execution rigor; `Light` signals a
+/// fast, feel-driven pass. Rows created before this field existed read back
+/// as `Deep` (NULL maps to the default).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum TaskDepth {
+    /// Full execution rigor (default)
+    #[default]
+    Deep,
+    /// Fast, feel-driven pass
+    Light,
+}
+
+impl fmt::Display for TaskDepth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TaskDepth::Deep => write!(f, "deep"),
+            TaskDepth::Light => write!(f, "light"),
+        }
+    }
+}
+
+impl FromStr for TaskDepth {
+    type Err = TypeError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.eq_ignore_ascii_case("deep") {
+            Ok(TaskDepth::Deep)
+        } else if s.eq_ignore_ascii_case("light") {
+            Ok(TaskDepth::Light)
+        } else {
+            Err(TypeError::Parse(format!("invalid task depth: {s}")))
+        }
+    }
+}
+
 /// Priority level (0 = highest, 4 = lowest)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
 pub struct Priority(pub i32);
@@ -304,6 +343,12 @@ pub struct Task {
     /// See cas-7fc1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_note: Option<String>,
+
+    /// Execution depth (EPIC cas-1255). `Deep` (default) preserves full
+    /// rigor; `Light` signals a fast, feel-driven pass. Defaults to `Deep`
+    /// when absent so existing tasks read as deep.
+    #[serde(default)]
+    pub depth: TaskDepth,
 }
 
 impl Task {
@@ -339,6 +384,7 @@ impl Task {
             share: None,
             demo_statement: String::new(),
             execution_note: None,
+            depth: TaskDepth::Deep,
         }
     }
 
@@ -406,6 +452,7 @@ impl Default for Task {
             share: None,
             demo_statement: String::new(),
             execution_note: None,
+            depth: TaskDepth::Deep,
         }
     }
 }
@@ -499,5 +546,31 @@ mod tests {
         assert_eq!(task.priority, Priority::MEDIUM);
         assert!(task.is_open());
         assert!(task.is_ready());
+    }
+
+    #[test]
+    fn test_task_depth_default_is_deep() {
+        assert_eq!(TaskDepth::default(), TaskDepth::Deep);
+        let task = Task::new("cas-d3p1".to_string(), "Test".to_string());
+        assert_eq!(task.depth, TaskDepth::Deep);
+        assert_eq!(Task::default().depth, TaskDepth::Deep);
+    }
+
+    #[test]
+    fn test_task_depth_from_str() {
+        assert_eq!(TaskDepth::from_str("deep").unwrap(), TaskDepth::Deep);
+        assert_eq!(TaskDepth::from_str("light").unwrap(), TaskDepth::Light);
+        assert_eq!(TaskDepth::from_str("LIGHT").unwrap(), TaskDepth::Light);
+        assert!(TaskDepth::from_str("medium").is_err());
+        assert!(TaskDepth::from_str("").is_err());
+    }
+
+    #[test]
+    fn test_task_depth_display_roundtrip() {
+        for d in [TaskDepth::Deep, TaskDepth::Light] {
+            assert_eq!(TaskDepth::from_str(&d.to_string()).unwrap(), d);
+        }
+        assert_eq!(TaskDepth::Light.to_string(), "light");
+        assert_eq!(TaskDepth::Deep.to_string(), "deep");
     }
 }

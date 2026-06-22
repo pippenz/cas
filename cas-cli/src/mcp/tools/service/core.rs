@@ -245,6 +245,7 @@ impl CasService {
             external_ref: req.external_ref,
             assignee: req.assignee,
             epic: req.epic,
+            depth: req.depth,
         };
         self.inner.cas_task_create(Parameters(inner_req)).await
     }
@@ -280,6 +281,7 @@ impl CasService {
             status: req.status,
             epic: req.epic,
             epic_verification_owner: req.epic_verification_owner,
+            depth: req.depth,
         };
         self.inner.cas_task_update(Parameters(inner_req)).await
     }

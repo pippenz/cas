@@ -14,13 +14,14 @@ impl CasCore {
         })?;
 
         let mut output = format!(
-            "Task: {}\n{}\n\nTitle: {}\nStatus: {:?}\nPriority: P{}\nType: {}\n",
+            "Task: {}\n{}\n\nTitle: {}\nStatus: {:?}\nPriority: P{}\nType: {}\nDepth: {}\n",
             task.id,
             "=".repeat(task.id.len() + 6),
             task.title,
             task.status,
             task.priority.0,
-            task.task_type
+            task.task_type,
+            task.depth
         );
 
         if !task.description.is_empty() {

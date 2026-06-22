@@ -8,6 +8,7 @@ async fn test_task_create_basic() {
     let (_temp, service) = setup_cas();
 
     let req = TaskCreateRequest {
+        depth: None,
         title: "Test task".to_string(),
         description: Some("Task description".to_string()),
         priority: 2,
@@ -40,6 +41,7 @@ async fn test_task_create_and_start() {
 
     // Create task
     let req = TaskCreateRequest {
+        depth: None,
         title: "Auto-start task".to_string(),
         description: None,
         priority: 1,
@@ -135,6 +137,7 @@ async fn test_epic_creates_branch_not_worktree() {
 
     // Create epic task
     let req = TaskCreateRequest {
+        depth: None,
         title: "Add User Authentication".to_string(),
         description: Some("Epic for auth feature".to_string()),
         priority: 1,
@@ -218,6 +221,7 @@ async fn test_task_create_invalid_epic_does_not_persist_task() {
     let (_temp, service) = setup_cas();
 
     let req = TaskCreateRequest {
+        depth: None,
         title: "Should fail atomic create".to_string(),
         description: Some("invalid epic should not leave orphan task".to_string()),
         priority: 2,
@@ -265,6 +269,7 @@ async fn test_task_create_surfaces_dependency_write_failure() {
 
     let blocker = service
         .cas_task_create(Parameters(TaskCreateRequest {
+        depth: None,
             title: "Blocking task".to_string(),
             description: None,
             priority: 2,
@@ -300,6 +305,7 @@ async fn test_task_create_surfaces_dependency_write_failure() {
 
     let create_result = service
         .cas_task_create(Parameters(TaskCreateRequest {
+        depth: None,
             title: "Should fail dependency write".to_string(),
             description: None,
             priority: 2,
@@ -341,4 +347,141 @@ async fn test_task_create_surfaces_dependency_write_failure() {
         !list_text.contains("Should fail dependency write"),
         "create_atomic should roll back task on dependency insert error: {list_text}"
     );
+}
+
+// =============================================================================
+// cas-0344: per-task depth flag end-to-end coverage (EPIC cas-1255)
+// =============================================================================
+
+fn depth_create_req(title: &str, depth: Option<&str>) -> TaskCreateRequest {
+    TaskCreateRequest {
+        depth: depth.map(|s| s.to_string()),
+        title: title.to_string(),
+        description: None,
+        priority: 2,
+        task_type: "task".to_string(),
+        labels: None,
+        notes: None,
+        blocked_by: None,
+        design: None,
+        acceptance_criteria: None,
+        external_ref: None,
+        assignee: None,
+        demo_statement: None,
+        execution_note: None,
+        epic: None,
+    }
+}
+
+#[tokio::test]
+async fn test_task_create_with_light_depth_shows_light() {
+    let (_temp, service) = setup_cas();
+
+    let text = extract_text(
+        service
+            .cas_task_create(Parameters(depth_create_req("light task", Some("light"))))
+            .await
+            .expect("create should succeed"),
+    );
+    let id = extract_task_id(&text).expect("task id").to_string();
+
+    let show = extract_text(
+        service
+            .cas_task_show(Parameters(TaskShowRequest {
+                id,
+                with_deps: false,
+            }))
+            .await
+            .expect("show should succeed"),
+    );
+    assert!(show.contains("Depth: light"), "expected light depth: {show}");
+}
+
+#[tokio::test]
+async fn test_task_create_without_depth_defaults_to_deep() {
+    let (_temp, service) = setup_cas();
+
+    let text = extract_text(
+        service
+            .cas_task_create(Parameters(depth_create_req("default task", None)))
+            .await
+            .expect("create should succeed"),
+    );
+    let id = extract_task_id(&text).expect("task id").to_string();
+
+    let show = extract_text(
+        service
+            .cas_task_show(Parameters(TaskShowRequest {
+                id,
+                with_deps: false,
+            }))
+            .await
+            .expect("show should succeed"),
+    );
+    assert!(show.contains("Depth: deep"), "expected deep default: {show}");
+}
+
+#[tokio::test]
+async fn test_task_create_invalid_depth_is_rejected() {
+    let (_temp, service) = setup_cas();
+
+    let result = service
+        .cas_task_create(Parameters(depth_create_req("bad depth", Some("medium"))))
+        .await;
+    assert!(result.is_err(), "invalid depth must be rejected");
+    let msg = result.err().unwrap().message.to_string();
+    assert!(
+        msg.contains("Invalid depth"),
+        "error should explain invalid depth: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn test_task_update_depth_to_light() {
+    let (_temp, service) = setup_cas();
+
+    let text = extract_text(
+        service
+            .cas_task_create(Parameters(depth_create_req("upgrade me", None)))
+            .await
+            .expect("create should succeed"),
+    );
+    let id = extract_task_id(&text).expect("task id").to_string();
+
+    // Update depth -> light
+    let update_text = extract_text(
+        service
+            .cas_task_update(Parameters(TaskUpdateRequest {
+                id: id.clone(),
+                title: None,
+                notes: None,
+                priority: None,
+                labels: None,
+                description: None,
+                design: None,
+                acceptance_criteria: None,
+                demo_statement: None,
+                execution_note: None,
+                external_ref: None,
+                assignee: None,
+                status: None,
+                epic: None,
+                epic_verification_owner: None,
+                depth: Some("light".to_string()),
+            }))
+            .await
+            .expect("update should succeed"),
+    );
+    assert!(update_text.contains("depth"), "update should report depth change: {update_text}");
+
+    let show = extract_text(
+        service
+            .cas_task_show(Parameters(TaskShowRequest {
+                id,
+                with_deps: false,
+            }))
+            .await
+            .expect("show should succeed"),
+    );
+    assert!(show.contains("Depth: light"), "expected light after update: {show}");
 }
