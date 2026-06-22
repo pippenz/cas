@@ -138,8 +138,12 @@ impl FactoryDaemon {
     /// future cross-tick state machine can refine this into a true quiescence
     /// gate; for now it is observational only.
     ///
-    /// Codex panes need a longer settle than Claude (matching the inject
-    /// carriage-return settle in `Pane::inject_prompt`).
+    /// 1200ms is a single starting value for CC's turn-cancel latency. We do
+    /// NOT yet vary it per CLI: `Pane::inject_prompt`'s Codex-vs-Claude split is
+    /// an *input-buffer* settle, a different quantity from *turn-cancel* latency,
+    /// so inferring a Codex delta here would be unvalidated. Tuning this value
+    /// (and whether Codex needs its own) is part of the deferred live-factory
+    /// e2e for cas-c931.
     pub(super) fn urgent_settle_duration(&self, pane_target: &str) -> std::time::Duration {
         let bytes_before = self.app.mux.pane_bytes_received(pane_target).unwrap_or(0);
         tracing::debug!(
