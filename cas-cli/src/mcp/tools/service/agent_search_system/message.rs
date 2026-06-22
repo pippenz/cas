@@ -252,11 +252,20 @@ impl CasService {
         };
 
         let factory_session = std::env::var("CAS_FACTORY_SESSION").ok();
+        let urgent = req.urgent.unwrap_or(false);
+        // Urgent messages break the target's in-flight turn, so they must jump
+        // the queue ahead of any backlog: force Critical priority when urgent
+        // and no explicit priority was given.
         let priority = req.priority.as_deref().map(|p| match p {
             "critical" | "0" => cas_store::NotificationPriority::Critical,
             "high" | "1" => cas_store::NotificationPriority::High,
             _ => cas_store::NotificationPriority::Normal,
         });
+        let priority = if urgent && priority.is_none() {
+            Some(cas_store::NotificationPriority::Critical)
+        } else {
+            priority
+        };
         // cas-f9e8 telemetry: measure the wall-clock spent inside the DB
         // insert and log it alongside the caller-visible message id, so a
         // future investigator can bisect whether stalls live in send-side
@@ -265,13 +274,14 @@ impl CasService {
         // `RUST_LOG=cas::coordination=debug`.
         let enqueue_started = std::time::Instant::now();
         let message_id = queue
-            .enqueue_full(
+            .enqueue_urgent(
                 &display_name,
                 &resolved_target,
                 &message,
                 factory_session.as_deref(),
                 Some(summary.as_str()),
                 priority,
+                urgent,
             )
             .map_err(|error| {
                 Self::error(
@@ -323,11 +333,17 @@ impl CasService {
         }
 
         Ok(Self::success(format!(
-            "Message queued\n\nID: {}\nFrom: {} ({})\nTo: {}\nMessage: {}",
+            "{} queued\n\nID: {}\nFrom: {} ({})\nTo: {}\n{}Message: {}",
+            if urgent { "URGENT message" } else { "Message" },
             message_id,
             display_name,
             role,
             resolved_target,
+            if urgent {
+                "Delivery: interrupt-and-redirect (breaks the target's in-flight turn, then injects)\n"
+            } else {
+                ""
+            },
             truncate_str(&message, 100)
         )))
     }

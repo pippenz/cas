@@ -740,6 +740,13 @@ pub struct AgentRequest {
     )]
     #[serde(default)]
     pub summary: Option<String>,
+
+    /// Urgent (interrupt-and-redirect) delivery for the message action.
+    #[schemars(
+        description = "When true, deliver the message URGENTLY: interrupt the target worker's in-flight turn (Esc) and inject the correction as its next prompt, bypassing the Claude Code inbox. Discards the worker's in-flight reasoning/partial work — use only when the worker is demonstrably off the rails. Default false = normal inbox/queue delivery."
+    )]
+    #[serde(default)]
+    pub urgent: Option<bool>,
 }
 
 /// Unified personal pattern operations request

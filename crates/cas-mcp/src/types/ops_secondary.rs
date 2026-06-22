@@ -492,7 +492,7 @@ pub struct FactoryRequest {
 pub struct CoordinationRequest {
     /// Action to perform
     #[schemars(
-        description = "Action: agent ops (register, unregister, whoami, heartbeat, agent_list, agent_cleanup, session_start, session_end, loop_start, loop_cancel, loop_status, lease_history, queue_notify, queue_poll, queue_peek, queue_ack, message, message_ack, message_status), factory ops (spawn_workers, shutdown_workers, worker_status, worker_activity, clear_context, my_context, sync_all_workers, gc_report, gc_cleanup, remind, remind_list, remind_cancel), worktree ops (worktree_create, worktree_list, worktree_show, worktree_cleanup, worktree_merge, worktree_status). Only available in factory mode. For shutdown_workers, supervisor should verify worktree cleanliness/policy before issuing shutdown."
+        description = "Action: agent ops (register, unregister, whoami, heartbeat, agent_list, agent_cleanup, session_start, session_end, loop_start, loop_cancel, loop_status, lease_history, queue_notify, queue_poll, queue_peek, queue_ack, message, interrupt, message_ack, message_status), factory ops (spawn_workers, shutdown_workers, worker_status, worker_activity, clear_context, my_context, sync_all_workers, gc_report, gc_cleanup, remind, remind_list, remind_cancel), worktree ops (worktree_create, worktree_list, worktree_show, worktree_cleanup, worktree_merge, worktree_status). Only available in factory mode. 'interrupt' is shorthand for 'message' with urgent=true (breaks the target's in-flight turn, then injects). For shutdown_workers, supervisor should verify worktree cleanliness/policy before issuing shutdown."
     )]
     pub action: String,
 
@@ -527,6 +527,13 @@ pub struct CoordinationRequest {
     )]
     #[serde(default)]
     pub summary: Option<String>,
+
+    /// Urgent (interrupt-and-redirect) delivery for message/interrupt actions.
+    #[schemars(
+        description = "When true (or with action=interrupt), deliver the message URGENTLY: break the target worker's in-flight turn (Esc) and inject the correction as its next prompt, bypassing the Claude Code inbox even in agent-teams mode. This DISCARDS the worker's in-flight reasoning/partial work — use only when the worker is demonstrably off the rails. Default false = normal, non-disruptive inbox/queue delivery."
+    )]
+    #[serde(default)]
+    pub urgent: Option<bool>,
 
     /// Force operation (shutdown, worktree cleanup/merge, gc_cleanup)
     #[schemars(description = "Force operation even with uncommitted changes")]
@@ -777,6 +784,7 @@ impl CoordinationRequest {
             target: self.target.clone(),
             message: self.message.clone(),
             summary: self.summary.clone(),
+            urgent: self.urgent,
         }
     }
 

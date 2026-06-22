@@ -895,6 +895,17 @@ impl Pane {
         }
     }
 
+    /// Total bytes of PTY output observed for this pane since creation.
+    ///
+    /// Monotonically increasing; only advances when [`Pane::drain_output`]
+    /// runs (i.e. when the daemon polls the mux). Used by the urgent
+    /// interrupt-and-redirect path to detect output quiescence — a pane that
+    /// has stopped emitting bytes after an interrupt has (best-effort) returned
+    /// to its prompt and is safe to inject into.
+    pub fn bytes_received(&self) -> u64 {
+        self.total_bytes_received
+    }
+
     /// Whether this pane is ready to accept prompt injection.
     /// Claude Code flushes the PTY input buffer during startup, so text
     /// written before readline initialization is silently lost. We require
@@ -919,6 +930,24 @@ impl Pane {
                     let _ = guard.write_all(b"\r");
                     let _ = guard.flush();
                 });
+                Ok(())
+            }
+            PaneBackend::None => Err(Error::pty("Pane has no backend")),
+        }
+    }
+
+    /// Break the current turn by sending a single Esc (0x1b).
+    ///
+    /// This is distinct from [`Pane::interrupt`], which sends Ctrl+C (0x03).
+    /// For Claude Code, Esc is the canonical "stop the current turn / cancel"
+    /// key, whereas Ctrl+C is the (double-press) quit signal. The urgent
+    /// interrupt-and-redirect path uses Esc so it breaks the worker's in-flight
+    /// turn without risking a process exit — matching exactly what a human
+    /// presses (`KeyCode::Esc => vec![0x1b]` in the factory TUI client).
+    pub async fn break_turn(&self) -> Result<()> {
+        match &self.backend {
+            PaneBackend::Pty(pty) => {
+                pty.write(&[0x1b]).await?;
                 Ok(())
             }
             PaneBackend::None => Err(Error::pty("Pane has no backend")),

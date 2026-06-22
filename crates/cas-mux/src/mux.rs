@@ -756,6 +756,54 @@ impl Mux {
         pane.inject_prompt(prompt).await
     }
 
+    /// Total bytes of PTY output observed for a pane by name.
+    ///
+    /// Returns `None` if the pane does not exist. Used by the urgent
+    /// interrupt-and-redirect path to detect output quiescence after a
+    /// turn-break before injecting the correction.
+    pub fn pane_bytes_received(&self, pane_id: &str) -> Option<u64> {
+        self.panes.get(pane_id).map(|p| p.bytes_received())
+    }
+
+    /// Break a specific worker's current turn by name by sending a single
+    /// Esc (0x1b) — the canonical Claude Code "stop this turn" key.
+    ///
+    /// Distinct from [`Mux::interrupt`], which sends Ctrl+C (0x03). Targets a
+    /// pane by name independent of TUI focus.
+    pub async fn break_turn(&self, pane_id: &str) -> Result<()> {
+        let pane = self
+            .panes
+            .get(pane_id)
+            .ok_or_else(|| Error::pane_not_found(pane_id))?;
+        pane.break_turn().await
+    }
+
+    /// Urgent interrupt-and-redirect: break the target worker's in-flight turn
+    /// (Esc), wait a bounded settle window for the turn to actually break, then
+    /// inject the correction as the worker's next prompt — by name, independent
+    /// of TUI focus.
+    ///
+    /// `settle` is the bounded fallback delay between the turn-break and the
+    /// inject. It exists because Claude Code (like the 2.1.183 tmux fix) drops
+    /// or misroutes keystrokes typed before the PTY has finished cancelling the
+    /// turn; injecting immediately races that window. The caller may have
+    /// already confirmed output quiescence via [`Mux::pane_bytes_received`];
+    /// `settle` is the unconditional floor / timeout fallback.
+    pub async fn interrupt_and_inject(
+        &self,
+        pane_id: &str,
+        prompt: &str,
+        settle: std::time::Duration,
+    ) -> Result<()> {
+        let pane = self
+            .panes
+            .get(pane_id)
+            .ok_or_else(|| Error::pane_not_found(pane_id))?;
+        pane.break_turn().await?;
+        tokio::time::sleep(settle).await;
+        pane.inject_prompt(prompt).await
+    }
+
     /// Inject a prompt into the focused pane
     pub async fn inject_focused(&self, prompt: &str) -> Result<()> {
         let pane = self

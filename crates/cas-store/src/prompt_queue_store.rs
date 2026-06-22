@@ -34,6 +34,11 @@ pub struct QueuedPrompt {
     pub priority: NotificationPriority,
     /// When the target agent acknowledged receipt (None if not yet acked)
     pub acked_at: Option<DateTime<Utc>>,
+    /// Urgent delivery flag (cas-c931): when true, the daemon breaks the
+    /// target's in-flight turn (Esc) and injects via the PTY, bypassing the
+    /// Claude Code inbox even in agent-teams mode. Default false = normal
+    /// inbox/queue delivery (non-disruptive).
+    pub urgent: bool,
 }
 
 /// Schema for prompt queue table
@@ -69,6 +74,13 @@ ALTER TABLE prompt_queue ADD COLUMN priority INTEGER NOT NULL DEFAULT 2;
 /// Add acked_at column for delivery confirmation.
 const PROMPT_QUEUE_ACKED_AT_MIGRATION: &str = r#"
 ALTER TABLE prompt_queue ADD COLUMN acked_at TEXT;
+"#;
+
+/// Add urgent column (cas-c931) for interrupt-and-redirect delivery.
+/// 0 = normal inbox/queue delivery (default), 1 = break the target's turn
+/// (Esc) then inject via PTY, bypassing the Claude Code inbox.
+const PROMPT_QUEUE_URGENT_MIGRATION: &str = r#"
+ALTER TABLE prompt_queue ADD COLUMN urgent INTEGER NOT NULL DEFAULT 0;
 "#;
 
 /// Delivery status of a prompt queue message
@@ -121,7 +133,9 @@ pub trait PromptQueueStore: Send + Sync {
         self.enqueue_full(source, target, prompt, factory_session, summary, None)
     }
 
-    /// Queue a prompt with all options including priority
+    /// Queue a prompt with all options including priority.
+    ///
+    /// Equivalent to [`PromptQueueStore::enqueue_urgent`] with `urgent = false`.
     fn enqueue_full(
         &self,
         source: &str,
@@ -130,6 +144,25 @@ pub trait PromptQueueStore: Send + Sync {
         factory_session: Option<&str>,
         summary: Option<&str>,
         priority: Option<NotificationPriority>,
+    ) -> Result<i64> {
+        self.enqueue_urgent(source, target, prompt, factory_session, summary, priority, false)
+    }
+
+    /// Queue a prompt with all options, including the cas-c931 `urgent` flag.
+    ///
+    /// When `urgent` is true, the daemon delivers via interrupt-and-redirect:
+    /// it breaks the target worker's in-flight turn (Esc) and injects the
+    /// message via the PTY, bypassing the Claude Code inbox even in agent-teams
+    /// mode. When false, delivery is unchanged (inbox/queue, non-disruptive).
+    fn enqueue_urgent(
+        &self,
+        source: &str,
+        target: &str,
+        prompt: &str,
+        factory_session: Option<&str>,
+        summary: Option<&str>,
+        priority: Option<NotificationPriority>,
+        urgent: bool,
     ) -> Result<i64>;
 
     /// Poll for pending prompts for a specific target (marks as processed)
@@ -211,6 +244,8 @@ impl SqlitePromptQueueStore {
         let priority: u8 = row.get(7).unwrap_or(2);
         let acked_at_str: Option<String> = row.get(8).unwrap_or(None);
         let acked_at = acked_at_str.and_then(|s| Self::parse_datetime(&s));
+        // Column 9 = urgent (cas-c931). Tolerate absence on legacy rows/tables.
+        let urgent: bool = row.get::<_, i64>(9).map(|v| v != 0).unwrap_or(false);
 
         Ok(QueuedPrompt {
             id: row.get(0)?,
@@ -222,6 +257,7 @@ impl SqlitePromptQueueStore {
             summary,
             priority: NotificationPriority::from(priority),
             acked_at,
+            urgent,
         })
     }
 }
@@ -263,6 +299,14 @@ impl PromptQueueStore for SqlitePromptQueueStore {
             conn.execute_batch(PROMPT_QUEUE_ACKED_AT_MIGRATION)?;
         }
 
+        // Add urgent column if missing (cas-c931 interrupt-and-redirect)
+        let has_urgent_col = conn
+            .prepare_cached("SELECT urgent FROM prompt_queue LIMIT 0")
+            .is_ok();
+        if !has_urgent_col {
+            conn.execute_batch(PROMPT_QUEUE_URGENT_MIGRATION)?;
+        }
+
         Ok(())
     }
 
@@ -280,7 +324,7 @@ impl PromptQueueStore for SqlitePromptQueueStore {
         self.enqueue_full(source, target, prompt, Some(factory_session), None, None)
     }
 
-    fn enqueue_full(
+    fn enqueue_urgent(
         &self,
         source: &str,
         target: &str,
@@ -288,15 +332,17 @@ impl PromptQueueStore for SqlitePromptQueueStore {
         factory_session: Option<&str>,
         summary: Option<&str>,
         priority: Option<NotificationPriority>,
+        urgent: bool,
     ) -> Result<i64> {
         crate::shared_db::with_write_retry(|| {
         let conn = self.conn.lock().unwrap();
         let now = Utc::now().to_rfc3339();
         let prio: i32 = priority.unwrap_or(NotificationPriority::Normal).into();
+        let urgent_flag: i64 = if urgent { 1 } else { 0 };
 
         conn.execute(
-            "INSERT INTO prompt_queue (source, target, prompt, created_at, factory_session, summary, priority) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            params![source, target, prompt, now, factory_session, summary, prio],
+            "INSERT INTO prompt_queue (source, target, prompt, created_at, factory_session, summary, priority, urgent) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            params![source, target, prompt, now, factory_session, summary, prio, urgent_flag],
         )?;
 
         let id = conn.last_insert_rowid();
@@ -312,7 +358,7 @@ impl PromptQueueStore for SqlitePromptQueueStore {
 
         // Get pending prompts for this target or "all_workers"
         let mut stmt = conn.prepare_cached(
-            "SELECT id, source, target, prompt, created_at, processed_at, summary, priority, acked_at
+            "SELECT id, source, target, prompt, created_at, processed_at, summary, priority, acked_at, urgent
              FROM prompt_queue
              WHERE (target = ? OR target = 'all_workers') AND processed_at IS NULL
              ORDER BY priority ASC, id ASC
@@ -353,7 +399,7 @@ impl PromptQueueStore for SqlitePromptQueueStore {
         let now = Utc::now().to_rfc3339();
 
         let mut stmt = conn.prepare_cached(
-            "SELECT id, source, target, prompt, created_at, processed_at, summary, priority, acked_at
+            "SELECT id, source, target, prompt, created_at, processed_at, summary, priority, acked_at, urgent
              FROM prompt_queue
              WHERE processed_at IS NULL
              ORDER BY priority ASC, id ASC
@@ -392,7 +438,7 @@ impl PromptQueueStore for SqlitePromptQueueStore {
         let conn = self.conn.lock().unwrap();
 
         let mut stmt = conn.prepare_cached(
-            "SELECT id, source, target, prompt, created_at, processed_at, summary, priority, acked_at
+            "SELECT id, source, target, prompt, created_at, processed_at, summary, priority, acked_at, urgent
              FROM prompt_queue
              WHERE processed_at IS NULL
              ORDER BY priority ASC, id ASC
@@ -439,7 +485,7 @@ impl PromptQueueStore for SqlitePromptQueueStore {
 
         let where_clause = conditions.join(" OR ");
         let sql = format!(
-            "SELECT id, source, target, prompt, created_at, processed_at, summary, priority, acked_at
+            "SELECT id, source, target, prompt, created_at, processed_at, summary, priority, acked_at, urgent
              FROM prompt_queue
              WHERE processed_at IS NULL
                AND ({where_clause})
@@ -494,7 +540,7 @@ impl PromptQueueStore for SqlitePromptQueueStore {
         let cutoff = (Utc::now() - chrono::Duration::seconds(timeout_secs)).to_rfc3339();
 
         let mut stmt = conn.prepare_cached(
-            "SELECT id, source, target, prompt, created_at, processed_at, summary, priority, acked_at
+            "SELECT id, source, target, prompt, created_at, processed_at, summary, priority, acked_at, urgent
              FROM prompt_queue
              WHERE processed_at IS NOT NULL
                AND processed_at < ?
@@ -905,5 +951,124 @@ mod tests {
         // With a large timeout, the recently processed message should NOT appear
         let unacked = store.unacked(3600, 10).unwrap();
         assert!(unacked.is_empty());
+    }
+
+    // ---- cas-c931: urgent (interrupt-and-redirect) flag ----
+
+    #[test]
+    fn test_enqueue_full_defaults_urgent_false() {
+        let (_temp, store) = create_test_store();
+        store
+            .enqueue_full("supervisor", "worker", "Normal note", None, None, None)
+            .unwrap();
+        let prompts = store.peek_all(10).unwrap();
+        assert_eq!(prompts.len(), 1);
+        assert!(
+            !prompts[0].urgent,
+            "non-urgent enqueue_full must default urgent=false"
+        );
+    }
+
+    #[test]
+    fn test_enqueue_urgent_roundtrips() {
+        let (_temp, store) = create_test_store();
+        let id = store
+            .enqueue_urgent(
+                "supervisor",
+                "worker",
+                "STOP — you are editing the wrong file",
+                Some("sess-1"),
+                Some("redirect"),
+                Some(NotificationPriority::Critical),
+                true,
+            )
+            .unwrap();
+        assert!(id > 0);
+
+        let prompts = store.peek_all(10).unwrap();
+        assert_eq!(prompts.len(), 1);
+        assert!(prompts[0].urgent, "urgent flag must round-trip as true");
+        assert_eq!(prompts[0].priority, NotificationPriority::Critical);
+
+        // Also visible via the session/target peek used by the daemon.
+        let by_target = store
+            .peek_for_targets(&["worker"], Some("sess-1"), 10)
+            .unwrap();
+        assert_eq!(by_target.len(), 1);
+        assert!(by_target[0].urgent);
+    }
+
+    #[test]
+    fn test_urgent_and_normal_coexist() {
+        let (_temp, store) = create_test_store();
+        store
+            .enqueue_full("supervisor", "worker", "fyi", None, None, None)
+            .unwrap();
+        store
+            .enqueue_urgent(
+                "supervisor",
+                "worker",
+                "abort now",
+                None,
+                None,
+                Some(NotificationPriority::Critical),
+                true,
+            )
+            .unwrap();
+
+        let prompts = store.poll_for_target("worker", 10).unwrap();
+        assert_eq!(prompts.len(), 2);
+        // Critical/urgent should sort ahead of the normal note.
+        assert_eq!(prompts[0].prompt, "abort now");
+        assert!(prompts[0].urgent);
+        assert_eq!(prompts[1].prompt, "fyi");
+        assert!(!prompts[1].urgent);
+    }
+
+    #[test]
+    fn test_urgent_column_migration_on_legacy_table() {
+        // Simulate a pre-cas-c931 prompt_queue table (no urgent column) and
+        // confirm init() adds the column non-destructively and old rows read
+        // back as urgent=false.
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("cas.db");
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE prompt_queue (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source TEXT NOT NULL,
+                    target TEXT NOT NULL,
+                    prompt TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    processed_at TEXT,
+                    factory_session TEXT,
+                    summary TEXT,
+                    priority INTEGER NOT NULL DEFAULT 2,
+                    acked_at TEXT
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO prompt_queue (source, target, prompt, created_at) VALUES ('s','w','legacy', datetime('now'))",
+                [],
+            )
+            .unwrap();
+        }
+
+        let store = SqlitePromptQueueStore::open(temp.path()).unwrap();
+        store.init().unwrap(); // must add the urgent column without dropping the legacy row
+
+        let prompts = store.peek_all(10).unwrap();
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].prompt, "legacy");
+        assert!(!prompts[0].urgent, "legacy rows must read back urgent=false");
+
+        // New urgent inserts work after migration.
+        store
+            .enqueue_urgent("s", "w", "new urgent", None, None, None, true)
+            .unwrap();
+        let prompts = store.poll_for_target("w", 10).unwrap();
+        assert!(prompts.iter().any(|p| p.prompt == "new urgent" && p.urgent));
     }
 }

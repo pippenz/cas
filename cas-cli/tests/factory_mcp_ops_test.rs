@@ -21,7 +21,7 @@ use cas::store::{
     open_prompt_queue_store, open_spawn_queue_store, open_task_store,
 };
 use cas::types::{Agent, Task, TaskStatus, TaskType};
-use cas_mcp::types::FactoryRequest;
+use cas_mcp::types::{CoordinationRequest, FactoryRequest};
 use cas_types::AgentRole;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::RawContent;
@@ -790,5 +790,118 @@ async fn test_unknown_action() {
         err.message.contains("Unknown factory action"),
         "Should report unknown action: {}",
         err.message
+    );
+}
+
+// =============================================================================
+// cas-c931: urgent (interrupt-and-redirect) message routing
+// =============================================================================
+
+/// Minimal CoordinationRequest for the `message`/`interrupt` actions.
+fn coord_msg(action: &str, target: &str, message: &str, urgent: Option<bool>) -> CoordinationRequest {
+    CoordinationRequest {
+        action: action.to_string(),
+        id: None,
+        task_id: None,
+        target: Some(target.to_string()),
+        message: Some(message.to_string()),
+        summary: Some("test".to_string()),
+        urgent,
+        force: None,
+        limit: None,
+        name: None,
+        agent_type: None,
+        parent_id: None,
+        session_id: None,
+        prompt: None,
+        max_iterations: None,
+        completion_promise: None,
+        reason: None,
+        stale_threshold_secs: None,
+        supervisor_id: None,
+        event_type: None,
+        payload: None,
+        priority: None,
+        notification_id: None,
+        count: None,
+        worker_names: None,
+        branch: None,
+        older_than_secs: None,
+        isolate: None,
+        cli: None,
+        model: None,
+        effort: None,
+        remind_message: None,
+        remind_delay_secs: None,
+        remind_event: None,
+        remind_filter: None,
+        remind_id: None,
+        remind_ttl_secs: None,
+        all: None,
+        status: None,
+        orphans: None,
+        dry_run: None,
+    }
+}
+
+/// Default (non-urgent) coordination message must enqueue with urgent=false —
+/// the unchanged inbox/queue delivery path. Regression guard.
+#[tokio::test]
+async fn test_coordination_message_default_is_not_urgent() {
+    let _guard = EnvGuard::set(&[("CAS_AGENT_ROLE", "supervisor"), ("CAS_AGENT_NAME", "supervisor")]);
+    let env = FactoryTestEnv::new();
+    env.register_worker("swift-fox");
+
+    let req = coord_msg("message", "swift-fox", "FYI: status update", None);
+    let result = env.service.coordination(Parameters(req)).await;
+    assert!(result.is_ok(), "message should succeed: {result:?}");
+
+    let prompts = env.prompt_queue().peek_all(10).expect("peek");
+    assert_eq!(prompts.len(), 1);
+    assert_eq!(prompts[0].target, "swift-fox");
+    assert!(!prompts[0].urgent, "default message must not be urgent");
+}
+
+/// `urgent=true` on the message action enqueues urgent + Critical priority and
+/// the response advertises interrupt-and-redirect delivery.
+#[tokio::test]
+async fn test_coordination_message_urgent_flag_enqueues_urgent() {
+    let _guard = EnvGuard::set(&[("CAS_AGENT_ROLE", "supervisor"), ("CAS_AGENT_NAME", "supervisor")]);
+    let env = FactoryTestEnv::new();
+    env.register_worker("swift-fox");
+
+    let req = coord_msg("message", "swift-fox", "STOP — wrong file", Some(true));
+    let result = env.service.coordination(Parameters(req)).await;
+    assert!(result.is_ok(), "urgent message should succeed: {result:?}");
+    let text = get_text(&result.unwrap());
+    assert!(text.contains("URGENT"), "response should mark URGENT: {text}");
+
+    let prompts = env.prompt_queue().peek_all(10).expect("peek");
+    assert_eq!(prompts.len(), 1);
+    assert!(prompts[0].urgent, "urgent=true must persist on the queue row");
+    assert_eq!(
+        prompts[0].priority,
+        cas_store::NotificationPriority::Critical,
+        "urgent with no explicit priority defaults to Critical so it jumps the queue"
+    );
+}
+
+/// `action=interrupt` is sugar for `message` with urgent=true.
+#[tokio::test]
+async fn test_coordination_interrupt_action_is_urgent() {
+    let _guard = EnvGuard::set(&[("CAS_AGENT_ROLE", "supervisor"), ("CAS_AGENT_NAME", "supervisor")]);
+    let env = FactoryTestEnv::new();
+    env.register_worker("swift-fox");
+
+    // urgent intentionally None — the action alone must force urgent.
+    let req = coord_msg("interrupt", "swift-fox", "abort and re-read the ticket", None);
+    let result = env.service.coordination(Parameters(req)).await;
+    assert!(result.is_ok(), "interrupt action should succeed: {result:?}");
+
+    let prompts = env.prompt_queue().peek_all(10).expect("peek");
+    assert_eq!(prompts.len(), 1);
+    assert!(
+        prompts[0].urgent,
+        "action=interrupt must enqueue urgent even when the urgent flag is omitted"
     );
 }

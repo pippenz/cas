@@ -292,13 +292,28 @@ impl FactoryDaemon {
                     force: false,
                 });
             }
-            ClientMessage::Inject { pane_id, prompt } => {
+            ClientMessage::Inject {
+                pane_id,
+                prompt,
+                urgent,
+            } => {
                 let actual = self.resolve_pane_name(&pane_id);
-                // Recipient-aware routing (cas-b68a): inject reaches a Codex pane
-                // via PTY even when the supervisor runs Claude teams.
-                let _ = self
-                    .deliver_to_worker(&actual, super::teams::DIRECTOR_AGENT_NAME, &prompt, None)
-                    .await;
+                if urgent {
+                    // Urgent: interrupt-and-redirect by name via the PTY,
+                    // bypassing the inbox even in teams mode (cas-c931).
+                    let settle = self.urgent_settle_duration(&actual);
+                    let _ = self
+                        .app
+                        .mux
+                        .interrupt_and_inject(&actual, &prompt, settle)
+                        .await;
+                } else {
+                    // Recipient-aware routing (cas-b68a): inject reaches a Codex pane
+                    // via PTY even when the supervisor runs Claude teams.
+                    let _ = self
+                        .deliver_to_worker(&actual, super::teams::DIRECTOR_AGENT_NAME, &prompt, None)
+                        .await;
+                }
             }
             ClientMessage::GetState => {
                 let state = self.build_session_state();

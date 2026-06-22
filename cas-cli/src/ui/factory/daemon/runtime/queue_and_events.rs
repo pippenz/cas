@@ -120,6 +120,40 @@ impl FactoryDaemon {
         IDLE_PREFIXES.iter().any(|prefix| lower.starts_with(prefix))
     }
 
+    /// Bounded settle window between an urgent turn-break (Esc) and the
+    /// follow-up inject (cas-c931).
+    ///
+    /// This is the **timeout fallback** of the confirm-then-inject design:
+    /// injecting before Claude Code has finished cancelling the turn races the
+    /// same window the 2.1.183 tmux fix addressed (keystrokes typed during the
+    /// transition get eaten or leak into the wrong buffer). We pause for a
+    /// fixed window so the PTY child can process the Esc and return to its
+    /// readline prompt before we type.
+    ///
+    /// True per-tick output-quiescence polling is not possible here: the daemon
+    /// main loop drains PTY output (`mux.poll_batch`) and runs
+    /// `process_prompt_queue` sequentially on the same task, so byte counts do
+    /// not advance while this function awaits. We therefore use a bounded fixed
+    /// settle as the safe fallback. The `bytes_received` snapshot is logged so a
+    /// future cross-tick state machine can refine this into a true quiescence
+    /// gate; for now it is observational only.
+    ///
+    /// Codex panes need a longer settle than Claude (matching the inject
+    /// carriage-return settle in `Pane::inject_prompt`).
+    pub(super) fn urgent_settle_duration(&self, pane_target: &str) -> std::time::Duration {
+        let bytes_before = self.app.mux.pane_bytes_received(pane_target).unwrap_or(0);
+        tracing::debug!(
+            target: "cas::coordination",
+            stage = "urgent_settle",
+            target_agent = %pane_target,
+            bytes_before,
+            "urgent interrupt settle snapshot"
+        );
+        // 1200ms: comfortably above CC's turn-cancel latency while staying well
+        // under the daemon's prompt poll interval so delivery stays prompt.
+        std::time::Duration::from_millis(1200)
+    }
+
     /// Process prompt queue
     pub(super) async fn process_prompt_queue(&mut self) -> anyhow::Result<()> {
         use cas_store::{EventStore, SqliteEventStore};
@@ -211,7 +245,9 @@ impl FactoryDaemon {
             // Dedup idle-like messages from the same worker (max 1 per 5 minutes).
             // Workers often send repeated "standing by", "ready", "idle" messages
             // that flood the supervisor context without adding information.
-            if Self::is_idle_message(&queued.prompt) {
+            // Urgent (interrupt-and-redirect) messages are never deduped — the
+            // supervisor sent them precisely to break the recipient's turn.
+            if !queued.urgent && Self::is_idle_message(&queued.prompt) {
                 let now = std::time::Instant::now();
                 let dominated = self
                     .last_idle_message_times
@@ -245,10 +281,12 @@ impl FactoryDaemon {
             // even under a Claude teams supervisor, and its *first* message was being
             // dropped because the gate was skipped whenever `teams.is_some()`.
             //
-            // `all_workers` is not a single pane, so harness/readiness can't be resolved
-            // for it — it keeps the original `teams.is_none()` semantics exactly (the
-            // per-worker loop below resolves each worker individually). Claude inbox
-            // writes need no gate (plain file write, no readline race).
+            // cas-c931: an urgent message always takes the PTY interrupt-and-redirect
+            // path (even for a Claude recipient under teams), so it needs a ready pane
+            // too. `all_workers` is not a single pane, so harness/readiness can't be
+            // resolved for it — it keeps the original `teams.is_none()` semantics
+            // exactly (the per-worker loop below resolves each worker, urgent included,
+            // individually). Claude inbox writes need no gate (plain file write).
             {
                 let pane_target = if target == "supervisor" {
                     self.app.supervisor_name()
@@ -257,10 +295,11 @@ impl FactoryDaemon {
                 };
                 let pty_delivered = self.teams.is_none()
                     || (target != "all_workers"
-                        && super::delivery::requires_pty_readiness_gate(
-                            self.app.harness_for(pane_target),
-                            true,
-                        ));
+                        && (queued.urgent
+                            || super::delivery::requires_pty_readiness_gate(
+                                self.app.harness_for(pane_target),
+                                true,
+                            )));
                 if pty_delivered && !self.app.mux.pane_ready_for_injection(pane_target) {
                     // Don't ack — the prompt stays in the queue for the next tick.
                     continue;
@@ -339,16 +378,29 @@ impl FactoryDaemon {
                 }
                 let mut any_success = false;
                 for name in workers {
-                    // Recipient-aware routing (cas-b68a): each worker may run a
-                    // different harness, so resolve per-worker inside the loop.
-                    let inject_result = self
-                        .deliver_to_worker(
+                    // For urgent broadcasts, skip workers whose pane isn't ready
+                    // yet (don't ack the row — it stays queued for retry).
+                    if queued.urgent && !self.app.mux.pane_ready_for_injection(&name) {
+                        continue;
+                    }
+                    let inject_result: anyhow::Result<()> = if queued.urgent {
+                        let settle = self.urgent_settle_duration(&name);
+                        self.app
+                            .mux
+                            .interrupt_and_inject(&name, &prompt_with_instructions, settle)
+                            .await
+                            .map_err(Into::into)
+                    } else {
+                        // Recipient-aware routing (cas-b68a): each worker may run a
+                        // different harness, so resolve per-worker inside the loop.
+                        self.deliver_to_worker(
                             &name,
                             &inbox_source,
                             &prompt_with_instructions,
                             queued.summary.as_deref(),
                         )
-                        .await;
+                        .await
+                    };
                     match inject_result {
                         Ok(_) => {
                             any_success = true;
@@ -391,14 +443,36 @@ impl FactoryDaemon {
                 } else {
                     target.as_str()
                 };
-                let inject_result = self
-                    .deliver_to_worker(
+                let inject_result: anyhow::Result<()> = if queued.urgent {
+                    // Urgent: interrupt-and-redirect by name via the PTY,
+                    // bypassing the inbox even in teams mode. Break the turn
+                    // (Esc), wait the bounded settle window for the turn to
+                    // actually break, then inject.
+                    let settle = self.urgent_settle_duration(pane_target);
+                    tracing::info!(
+                        target: "cas::coordination",
+                        stage = "urgent_interrupt",
+                        message_id = queued.id,
+                        target_agent = %pane_target,
+                        settle_ms = settle.as_millis() as u64,
+                        "urgent message: breaking turn then injecting"
+                    );
+                    self.app
+                        .mux
+                        .interrupt_and_inject(pane_target, &prompt_with_instructions, settle)
+                        .await
+                        .map_err(Into::into)
+                } else {
+                    // Recipient-aware routing (cas-b68a): delivery channel +
+                    // name normalisation handled inside the helper.
+                    self.deliver_to_worker(
                         target,
                         &inbox_source,
                         &prompt_with_instructions,
                         queued.summary.as_deref(),
                     )
-                    .await;
+                    .await
+                };
                 match inject_result {
                     Ok(_) => {
                         success = true;

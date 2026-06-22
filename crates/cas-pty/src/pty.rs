@@ -2116,4 +2116,119 @@ mod tests {
             );
         }
     }
+
+    // ---- cas-c931: turn-break keystroke characterization ----
+    //
+    // The urgent interrupt-and-redirect path breaks a worker's turn with Esc
+    // (0x1b), NOT Ctrl+C (0x03). `Pty::interrupt` sends 0x03; the Esc payload
+    // is sent at the Pane/Mux layer (`Pane::break_turn`). These tests lock the
+    // byte values against a real PTY so we never regress the payload.
+
+    /// Esc (0x1b) is NOT a signal-generating control char (unlike 0x03 = INTR),
+    /// so it traverses the PTY rather than killing the child. We send Esc then a
+    /// newline through `cat`: canonical-mode `cat` flushes the line and the
+    /// content echoes back. The Esc surfaces either verbatim (0x1b) or as the
+    /// line-discipline control rendering `^[` (0x5e 0x5b) depending on ECHOCTL.
+    /// Either proves the exact `Pane::break_turn` payload reaches the child
+    /// intact — and, crucially, that it does NOT terminate the process the way
+    /// Ctrl+C does (the contrast locked by `interrupt_sends_ctrl_c...`).
+    #[tokio::test]
+    async fn esc_byte_reaches_pty_child_verbatim() {
+        let config = PtyConfig {
+            command: "cat".to_string(),
+            args: vec![],
+            cwd: None,
+            env: vec![],
+            rows: 24,
+            cols: 80,
+        };
+        let mut pty = match Pty::spawn("esc-probe", config) {
+            Ok(p) => p,
+            Err(_) => return, // `cat` unavailable in this environment — skip.
+        };
+
+        // Esc (the exact payload of Pane::break_turn) followed by newline so
+        // canonical-mode cat flushes the line back to us.
+        pty.write(&[0x1b]).await.expect("write esc");
+        pty.write(b"\r").await.expect("write newline");
+
+        // Drain echoed output for up to ~2s. Accept raw 0x1b OR the ECHOCTL
+        // rendering "^[". Also assert the child stays ALIVE (no Exited event) —
+        // Esc must not behave like Ctrl+C.
+        let mut saw_esc = false;
+        let mut exited = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline && !saw_esc {
+            match tokio::time::timeout(std::time::Duration::from_millis(250), pty.recv()).await {
+                Ok(Some(PtyEvent::Output(data))) => {
+                    let rendered_caret = data
+                        .windows(2)
+                        .any(|w| w == [0x5e, 0x5b]); // "^["
+                    if data.contains(&0x1b) || rendered_caret {
+                        saw_esc = true;
+                    }
+                }
+                Ok(Some(PtyEvent::Exited(_))) | Ok(Some(PtyEvent::Error(_))) => {
+                    exited = true;
+                    break;
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => {} // timeout tick — keep waiting until deadline
+            }
+        }
+        pty.kill();
+        assert!(
+            !exited,
+            "Esc (0x1b) must NOT terminate the child the way Ctrl+C does"
+        );
+        assert!(
+            saw_esc,
+            "Esc (0x1b) must reach the PTY child and echo back (verbatim or as ^[)"
+        );
+    }
+
+    /// Lock the `Pty::interrupt` payload: it sends Ctrl+C (0x03), the quit
+    /// signal — distinct from the Esc turn-break. We assert by behavior: 0x03
+    /// is INTR in the default line discipline, so it terminates `cat`.
+    #[tokio::test]
+    async fn interrupt_sends_ctrl_c_and_terminates_cat() {
+        let config = PtyConfig {
+            command: "cat".to_string(),
+            args: vec![],
+            cwd: None,
+            env: vec![],
+            rows: 24,
+            cols: 80,
+        };
+        let mut pty = match Pty::spawn("intr-probe", config) {
+            Ok(p) => p,
+            Err(_) => return, // `cat` unavailable — skip.
+        };
+
+        pty.interrupt().await.expect("interrupt"); // writes 0x03
+
+        // 0x03 = INTR → SIGINT → cat exits. Expect an Exited/Error event.
+        let mut exited = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(250), pty.recv()).await {
+                Ok(Some(PtyEvent::Exited(_))) | Ok(Some(PtyEvent::Error(_))) => {
+                    exited = true;
+                    break;
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    exited = true; // channel closed = process gone
+                    break;
+                }
+                Err(_) => {}
+            }
+        }
+        pty.kill();
+        assert!(
+            exited,
+            "Ctrl+C (0x03) from interrupt() must terminate cat (INTR signal)"
+        );
+    }
 }

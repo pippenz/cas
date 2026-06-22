@@ -515,3 +515,66 @@ fn test_remove_pane_focus_transfer() {
     assert_eq!(mux.pane_count(), 1);
 }
 
+// ── cas-c931: urgent interrupt-and-redirect by-name primitives ──────────────
+
+#[test]
+fn pane_bytes_received_present_for_known_pane_none_for_missing() {
+    let mut mux = Mux::new(24, 80);
+    mux.add_pane(Pane::director("w1", 24, 80).unwrap());
+
+    // Known pane: returns Some (0 until output is drained).
+    assert_eq!(mux.pane_bytes_received("w1"), Some(0));
+    // Unknown pane: None.
+    assert_eq!(mux.pane_bytes_received("ghost"), None);
+}
+
+/// Helper: a real PTY-backed pane (running `cat`) so write paths exercise an
+/// actual backend. `Pane::director` uses `PaneBackend::None`, which rejects
+/// writes — useless for the urgent-redirect write tests. Returns None if a PTY
+/// can't be spawned in this environment so the test skips rather than flakes.
+fn cat_pane(name: &str) -> Option<Pane> {
+    Pane::shell(name, PathBuf::from("/tmp"), Some("cat"), 24, 80).ok()
+}
+
+#[tokio::test]
+async fn break_turn_targets_pane_by_name_independent_of_focus() {
+    let mut mux = Mux::new(24, 80);
+    let (Some(w1), Some(w2)) = (cat_pane("w1"), cat_pane("w2")) else {
+        return; // no PTY available — skip
+    };
+    mux.add_pane(w1);
+    mux.add_pane(w2);
+
+    // Focus is on w1, but we break w2 by name — must succeed regardless of focus.
+    assert_eq!(mux.focused_id(), Some("w1"));
+    assert!(mux.break_turn("w2").await.is_ok());
+
+    // Unknown target is a pane-not-found error, not a panic.
+    assert!(mux.break_turn("ghost").await.is_err());
+}
+
+#[tokio::test]
+async fn interrupt_and_inject_errors_on_missing_pane() {
+    let mux = Mux::new(24, 80);
+    let res = mux
+        .interrupt_and_inject("nope", "hi", std::time::Duration::from_millis(0))
+        .await;
+    assert!(res.is_err(), "missing pane must surface an error, not panic");
+}
+
+#[tokio::test]
+async fn interrupt_and_inject_breaks_then_injects_by_name() {
+    let mut mux = Mux::new(24, 80);
+    let Some(w1) = cat_pane("w1") else {
+        return; // no PTY available — skip
+    };
+    mux.add_pane(w1);
+
+    // Zero settle keeps the test fast; the ordering (Esc then inject) is
+    // enforced by interrupt_and_inject internally. Just assert the by-name
+    // delivery completes Ok against a live PTY-backed pane.
+    let res = mux
+        .interrupt_and_inject("w1", "STOP and switch tasks", std::time::Duration::from_millis(0))
+        .await;
+    assert!(res.is_ok(), "urgent redirect to a live pane must succeed");
+}

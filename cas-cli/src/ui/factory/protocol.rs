@@ -90,6 +90,13 @@ pub enum ClientMessage {
         pane_id: String,
         /// Prompt text to inject
         prompt: String,
+        /// Urgent (interrupt-and-redirect) delivery (cas-c931): when true,
+        /// break the target's in-flight turn (Esc) and inject via the PTY,
+        /// bypassing the Claude Code inbox even in agent-teams mode. Defaults
+        /// to false (normal inbox/queue delivery) for older clients that omit
+        /// the field.
+        #[serde(default)]
+        urgent: bool,
     },
 
     /// Request current state snapshot

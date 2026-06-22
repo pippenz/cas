@@ -452,8 +452,16 @@ impl CasService {
                 "register" | "unregister" | "whoami" | "heartbeat" | "session_start"
                 | "session_end" | "loop_start" | "loop_cancel" | "loop_status"
                 | "lease_history" | "queue_notify" | "queue_poll" | "queue_peek"
-                | "queue_ack" | "message" | "message_ack" | "message_status" => {
-                    let agent_req = req.to_agent_request(&action);
+                | "queue_ack" | "message" | "interrupt" | "message_ack"
+                | "message_status" => {
+                    // `interrupt` is sugar for `message` with urgent=true.
+                    let agent_req = if action == "interrupt" {
+                        let mut r = req.to_agent_request("message");
+                        r.urgent = Some(true);
+                        r
+                    } else {
+                        req.to_agent_request(&action)
+                    };
                     match action.as_str() {
                         "register" => this.agent_register(agent_req).await,
                         "unregister" => this.agent_unregister(agent_req).await,
@@ -469,7 +477,7 @@ impl CasService {
                         "queue_poll" => this.queue_poll(agent_req).await,
                         "queue_peek" => this.queue_peek(agent_req).await,
                         "queue_ack" => this.queue_ack(agent_req).await,
-                        "message" => this.message_send(agent_req).await,
+                        "message" | "interrupt" => this.message_send(agent_req).await,
                         "message_ack" => this.message_ack(agent_req).await,
                         "message_status" => this.message_status_query(agent_req).await,
                         _ => unreachable!(),
