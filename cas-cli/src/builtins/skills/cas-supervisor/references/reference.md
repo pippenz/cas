@@ -95,6 +95,24 @@ mcp__cas__coordination action=message target=worker-1 \
 
 Missing either field is a rejection. `summary` is the one-line UI preview; `message` is the full body.
 
+**Urgent / interrupt delivery — course-correct a worker mid-turn (cas-c931):**
+
+Normal messages land only *between* turns: a worker that is mid-turn going down the wrong path finishes the wrong turn before it ever reads "stop, do X instead." For those cases, send an **urgent** message — it breaks the worker's in-flight turn and injects your correction as its next prompt:
+
+```
+# Urgent flag on the normal message action
+mcp__cas__coordination action=message target=<worker> urgent=true \
+  summary="..." message="Stop — you're editing the wrong file. Switch to ..."
+
+# Shorthand — forces urgent even without the flag
+mcp__cas__coordination action=interrupt target=<worker> \
+  summary="..." message="Stop — wrong approach. Do ... instead."
+```
+
+When urgent, the message: breaks the target's in-flight turn (Esc), waits a bounded settle window, then injects the correction as its next prompt; bypasses the Claude Code inbox even in agent-teams mode; forces Critical priority (queue jump) when none is given; skips idle-message dedup; targets the worker **by name**, independent of TUI focus.
+
+**Caveat — urgent DISCARDS the worker's in-flight reasoning / partial work.** Use it ONLY when the worker is demonstrably off the rails (wrong file, wrong approach, ignoring the ticket). For routine nudges or FYIs, use a normal `action=message` (non-disruptive, lands between turns).
+
 **Task notes** parameter is `notes` (plural), not `note`:
 
 ```
