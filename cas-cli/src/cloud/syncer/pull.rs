@@ -11,7 +11,7 @@ use crate::store::{
     Store, TaskStore,
 };
 use crate::types::{
-    CommitLink, Entry, Event, FileChange, Prompt, Rule, Session, Skill, Spec, Task,
+    CommitLink, Entry, Event, FileChange, Prompt, Rule, Session, Skill, Spec, Task, TaskStatus,
 };
 
 /// Check whether a raw JSON entity belongs to the current project.
@@ -74,6 +74,57 @@ fn entity_matches_project(
             );
             false
         }
+    }
+}
+
+/// cas-fc52: detect a teammate's web-initiated close (cloud contract §4).
+///
+/// The cloud server records a web close as a soft tombstone merged into the
+/// task's `data`: `closed_via == "web"` (plus `status="closed"`,
+/// `close_reason`, `closed_at`) with a bumped `updated_at`. The marker arrives
+/// at the top level of the pulled task JSON (the same level the strongly-typed
+/// `Task` deserializes from). `closed_via == "web"` is the discriminator: the
+/// client's OWN pushed closes never carry it, so this never reconciles a
+/// self-close as web-initiated (no loop, no double-close).
+fn is_web_close_tombstone(raw: &serde_json::Value) -> bool {
+    raw.get("closed_via").and_then(|v| v.as_str()) == Some("web")
+}
+
+/// cas-fc52: apply a teammate's web-initiated close as the authoritative local
+/// close (cloud contract §4). Unlike the timestamp-gated [`upsert_task`], this
+/// forces the closed status even when the local row looks newer — a web close
+/// is an explicit instruction, not a data-merge race.
+///
+/// Side effects mirror a real close at the task-store level: status becomes
+/// `Closed` (carried on the tombstone `Task`, along with `close_reason` /
+/// `closed_at`), and the task's `assignee` is cleared so no stale ownership
+/// lingers on the closed task. The separate agent-lease row (if any) is left to
+/// the existing lease GC — a closed task is not claimable, so a lingering lease
+/// is inert.
+///
+/// Idempotent: a task already locally `Closed` is a no-op.
+fn reconcile_web_close(store: &dyn TaskStore, mut task: Task) -> Result<UpsertResult, CasError> {
+    match store.get(&task.id) {
+        Ok(local) => {
+            if local.status == TaskStatus::Closed {
+                // Already closed locally — nothing to do.
+                return Ok(UpsertResult::Skipped);
+            }
+            task.assignee = None;
+            store.update(&task)?;
+            tracing::info!(
+                task_id = %task.id,
+                "cas-fc52: reconciled web-initiated close from cloud pull"
+            );
+            Ok(UpsertResult::Updated)
+        }
+        Err(cas_store::StoreError::TaskNotFound(_)) => {
+            // Never had this task locally — record the closed tombstone.
+            task.assignee = None;
+            store.add(&task)?;
+            Ok(UpsertResult::Created)
+        }
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -172,6 +223,11 @@ impl CloudSyncer {
             if !entity_matches_project(&raw_task, &current_project_id, "task") {
                 continue;
             }
+            // cas-fc52: a teammate's web-initiated close arrives as a soft
+            // tombstone (closed_via == "web"). The CLI owns the real local
+            // close — apply it authoritatively rather than via the
+            // timestamp-gated upsert.
+            let web_close = is_web_close_tombstone(&raw_task);
             let remote_task: Task = match serde_json::from_value(raw_task) {
                 Ok(t) => t,
                 Err(e) => {
@@ -179,7 +235,12 @@ impl CloudSyncer {
                     continue;
                 }
             };
-            match self.upsert_task(task_store, remote_task) {
+            let task_outcome = if web_close {
+                reconcile_web_close(task_store, remote_task)
+            } else {
+                self.upsert_task(task_store, remote_task)
+            };
+            match task_outcome {
                 Ok(UpsertResult::Created) | Ok(UpsertResult::Updated) => {
                     result.pulled_tasks += 1;
                 }
@@ -976,5 +1037,100 @@ mod tests {
         let entity = json!({ "id": "p-001", "project_canonical_id": "local:abcd1234ef567890" });
         assert!(entity_matches_project(&entity, "local:abcd1234ef567890", "entry"));
         assert!(!entity_matches_project(&entity, "local:0000000000000000", "entry"));
+    }
+}
+
+// cas-fc52: web-initiated close reconcile (cloud contract §4)
+#[cfg(test)]
+mod web_close_tests {
+    use super::{is_web_close_tombstone, reconcile_web_close};
+    use crate::cloud::syncer::UpsertResult;
+    use crate::store::{init_cas_dir, open_task_store};
+    use crate::types::{Task, TaskStatus};
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    fn closed_tombstone(id: &str) -> Task {
+        let mut t = Task::new(id.to_string(), format!("title {id}"));
+        t.status = TaskStatus::Closed;
+        t.close_reason = Some("closed from web by teammate".to_string());
+        t.closed_at = Some(chrono::Utc::now());
+        t
+    }
+
+    #[test]
+    fn detects_web_close_marker() {
+        assert!(is_web_close_tombstone(
+            &json!({ "id": "t1", "closed_via": "web" })
+        ));
+        // Our own pushed closes never carry closed_via == "web".
+        assert!(!is_web_close_tombstone(
+            &json!({ "id": "t1", "status": "closed" })
+        ));
+        assert!(!is_web_close_tombstone(
+            &json!({ "id": "t1", "closed_via": "cli" })
+        ));
+        assert!(!is_web_close_tombstone(
+            &json!({ "id": "t1", "closed_via": null })
+        ));
+    }
+
+    #[test]
+    fn reconcile_forces_close_on_open_task_even_if_local_is_newer() {
+        let temp = TempDir::new().unwrap();
+        let cas_dir = init_cas_dir(temp.path()).unwrap();
+        let store = open_task_store(&cas_dir).unwrap();
+
+        // Local in-progress task, assigned, with a NEWER updated_at than the
+        // tombstone — a timestamp-gated upsert would skip it; the web close
+        // must apply regardless.
+        let mut local = Task::new("t-web".to_string(), "title".to_string());
+        local.assignee = Some("agent-x".to_string());
+        local.status = TaskStatus::InProgress;
+        local.updated_at = chrono::Utc::now() + chrono::Duration::hours(1);
+        store.add(&local).unwrap();
+
+        let outcome = reconcile_web_close(&*store, closed_tombstone("t-web")).unwrap();
+        assert!(matches!(outcome, UpsertResult::Updated));
+
+        let got = store.get("t-web").unwrap();
+        assert_eq!(got.status, TaskStatus::Closed);
+        assert_eq!(
+            got.close_reason.as_deref(),
+            Some("closed from web by teammate")
+        );
+        assert!(
+            got.assignee.is_none(),
+            "assignee must be cleared on web close"
+        );
+    }
+
+    #[test]
+    fn reconcile_is_idempotent_on_already_closed() {
+        let temp = TempDir::new().unwrap();
+        let cas_dir = init_cas_dir(temp.path()).unwrap();
+        let store = open_task_store(&cas_dir).unwrap();
+
+        let mut local = Task::new("t-done".to_string(), "title".to_string());
+        local.status = TaskStatus::Closed;
+        local.close_reason = Some("already closed locally".to_string());
+        store.add(&local).unwrap();
+
+        let outcome = reconcile_web_close(&*store, closed_tombstone("t-done")).unwrap();
+        assert!(matches!(outcome, UpsertResult::Skipped));
+        // The no-op must not clobber the pre-existing local close_reason.
+        let got = store.get("t-done").unwrap();
+        assert_eq!(got.close_reason.as_deref(), Some("already closed locally"));
+    }
+
+    #[test]
+    fn reconcile_adds_unknown_closed_task() {
+        let temp = TempDir::new().unwrap();
+        let cas_dir = init_cas_dir(temp.path()).unwrap();
+        let store = open_task_store(&cas_dir).unwrap();
+
+        let outcome = reconcile_web_close(&*store, closed_tombstone("t-new")).unwrap();
+        assert!(matches!(outcome, UpsertResult::Created));
+        assert_eq!(store.get("t-new").unwrap().status, TaskStatus::Closed);
     }
 }
