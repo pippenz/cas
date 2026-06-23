@@ -58,10 +58,13 @@ impl SyncQueue {
             by_type.insert(entity_type, count);
         }
 
+        // oldest_item reports the head of the *pending* queue (retry_count <
+        // max_retries) so that parked/failed items don't hold oldest_item
+        // frozen after the poison-head fix (defect B / cas-8dd8).
         let oldest_item: Option<String> = conn
             .query_row(
-                "SELECT created_at FROM sync_queue ORDER BY created_at ASC LIMIT 1",
-                [],
+                "SELECT created_at FROM sync_queue WHERE retry_count < ?1 ORDER BY created_at ASC LIMIT 1",
+                params![max_retries],
                 |row| row.get(0),
             )
             .optional()?;

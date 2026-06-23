@@ -61,7 +61,7 @@ impl SyncQueue {
                     UNIQUE(entity_type, entity_id, team_id)
                 );
                 INSERT INTO sync_queue_new (id, entity_type, entity_id, operation, payload, team_id, created_at, retry_count, last_error)
-                    SELECT id, entity_type, entity_id, operation, payload, team_id, created_at, retry_count, last_error FROM sync_queue;
+                    SELECT id, entity_type, entity_id, operation, payload, COALESCE(team_id, ''), created_at, retry_count, last_error FROM sync_queue;
                 DROP TABLE sync_queue;
                 ALTER TABLE sync_queue_new RENAME TO sync_queue;
                 CREATE INDEX IF NOT EXISTS idx_sync_queue_created ON sync_queue(created_at);
@@ -70,6 +70,16 @@ impl SyncQueue {
                 "#,
             )?;
         }
+
+        // Normalize any pre-migration NULL team_ids to '' so the UNIQUE
+        // constraint (entity_type, entity_id, team_id) properly deduplicates
+        // personal-queue items. In SQLite, NULL != NULL and NULL != '' under
+        // UNIQUE, so a row with team_id=NULL and a subsequent enqueue with
+        // team_id='' would create duplicates (defect C / cas-8dd8).
+        // This UPDATE is idempotent — a no-op when no NULLs remain.
+        conn.execute_batch(
+            "UPDATE sync_queue SET team_id = '' WHERE team_id IS NULL;",
+        )?;
 
         Ok(())
     }

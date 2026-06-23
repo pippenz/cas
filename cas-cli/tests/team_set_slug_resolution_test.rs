@@ -370,3 +370,61 @@ async fn team_show_displays_resolved_project_slug() {
         "team show output must include team UUID, got:\n{output}"
     );
 }
+
+/// cas-f07a AC2: `cas cloud team show` must never print `<not resolved>` for
+/// an active project when config.toml is absent. The full resolution chain
+/// falls through to the folder name (parent-dir basename), so the output
+/// must contain a non-null `canonical_id`.
+///
+/// Before the fix, `team_show_json` called `canonical_id_from_config_toml`
+/// which returns `None` when config.toml is absent, causing the CLI to
+/// display `<not resolved>`. After the fix it calls `resolve_canonical_id`
+/// which falls through to the folder-name step and returns the tempdir name.
+#[tokio::test]
+async fn team_show_never_shows_not_resolved_for_active_project() {
+    let server = MockServer::start().await;
+    let tmp = seed_cas_root(&server.uri());
+    let cas_root = tmp.path().to_path_buf();
+
+    // Derive the expected canonical_id.  `canonical_id_from_cas_root` treats
+    // `cas_root` as the `.cas/` directory, so it returns the *parent*'s
+    // file_name (the project root).  In tests, `cas_root` is the TempDir
+    // root itself (`/tmp/.tmpXXXX`), so the resolved id is
+    // `cas_root.parent().file_name()` — typically `tmp` on Linux.  The
+    // exact value doesn't matter; what matters is that it is non-null and is
+    // NOT the sentinel `<not resolved>`.
+    let expected_id = cas_root
+        .parent()
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| cas_root.to_string_lossy().to_string());
+
+    // Seed cloud.json with a team_id but DO NOT write config.toml —
+    // that is the condition under which the old code showed <not resolved>.
+    let mut cfg = cas::cloud::CloudConfig::load_from_cas_dir(&cas_root).unwrap();
+    cfg.team_id = Some(TEST_TEAM.to_string());
+    cfg.save_to_cas_dir(&cas_root).unwrap();
+
+    let _env = CasRootGuard::set(&cas_root);
+
+    let cli = make_cli_json();
+    let cas_root_owned = cas_root.clone();
+    let output = tokio::task::spawn_blocking(move || {
+        execute_team_show_for_test(&cli, &cas_root_owned).expect("team show must succeed")
+    })
+    .await
+    .unwrap();
+
+    // The output must carry the resolved canonical_id (the tempdir name).
+    assert!(
+        output.contains(&expected_id),
+        "team show must show resolved canonical_id (folder name) when config.toml absent, \
+         expected '{}', got:\n{output}",
+        expected_id
+    );
+    // Negative invariant: the sentinel string must NOT appear.
+    assert!(
+        !output.contains("not resolved"),
+        "team show must NOT show 'not resolved' for an active project, got:\n{output}"
+    );
+}

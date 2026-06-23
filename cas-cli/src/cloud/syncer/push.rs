@@ -267,16 +267,31 @@ impl CloudSyncer {
             .map(|i| i.entity_id.as_str())
             .collect();
 
-        // Parse payloads to (item, json_value, estimated_size) tuples
-        let upsert_entries: Vec<(&QueuedSync, serde_json::Value)> = upsert_items
-            .iter()
-            .filter_map(|item| {
-                item.payload
-                    .as_deref()
-                    .and_then(|p| serde_json::from_str(p).ok())
-                    .map(|v| (*item, v))
-            })
-            .collect();
+        // Parse payloads to (item, json_value) tuples.
+        // Items with a missing or unparseable payload cannot be pushed; park
+        // them as failed immediately (mark_failed increments retry_count) so
+        // they surface under `failed` in queue stats and don't consume a batch
+        // slot on every push cycle.  After max_retries calls they leave
+        // `pending` entirely, advancing `oldest_item` past them (defect B /
+        // cas-8dd8 poison-head fix).
+        let mut upsert_entries: Vec<(&QueuedSync, serde_json::Value)> = Vec::new();
+        for item in &upsert_items {
+            match item.payload.as_deref() {
+                Some(payload) => match serde_json::from_str::<serde_json::Value>(payload) {
+                    Ok(v) => upsert_entries.push((*item, v)),
+                    Err(_) => {
+                        let _ = self
+                            .queue
+                            .mark_failed(item.id, "invalid JSON payload for upsert");
+                    }
+                },
+                None => {
+                    let _ = self
+                        .queue
+                        .mark_failed(item.id, "missing payload for upsert operation");
+                }
+            }
+        }
 
         let mut synced_count = 0;
 
