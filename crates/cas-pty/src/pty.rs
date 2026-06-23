@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 const CODEX_SUPERVISOR_INSTRUCTIONS: &str = "You are the CAS Factory Supervisor. Coordinate only: plan epics, assign tasks, monitor progress, review/merge. Never implement tasks. Use skills cas-supervisor and cas-codex-supervisor-checklist. Use MCP tools explicitly; no /cas-start, /cas-context, or /cas-end.";
 
 /// Instructions injected into Codex worker agents via `--config developer_instructions`.
-const CODEX_WORKER_INSTRUCTIONS: &str = "You are a CAS Factory Worker. Always use CAS MCP tools for task lifecycle and coordination. On startup run `mcp__cs__coordination action=session_start name=<worker-name> agent_type=worker` then `mcp__cs__coordination action=whoami`, then run `mcp__cs__task action=mine`. For assigned tasks run `mcp__cs__task action=show id=<task-id>` then `mcp__cs__task action=start id=<task-id>` before coding. Add progress notes frequently using `mcp__cs__task action=notes id=<task-id> note_type=progress notes=\"...\"`. For blockers, add blocker note, set `status=blocked`, and message supervisor via `mcp__cs__coordination action=message target=supervisor message=\"...\"`. When implementation is complete, close with `mcp__cs__task action=close id=<task-id> reason=\"...\"`. If close returns verification-required guidance, immediately ask supervisor to verify/close on your behalf. Do not use /cas-start, /cas-context, or /cas-end. Stay within assigned task scope.";
+const CODEX_WORKER_INSTRUCTIONS: &str = "You are a CAS Factory Worker. Always use CAS MCP tools for task lifecycle and coordination. On startup run `mcp__cs__coordination action=session_start name=<worker-name> agent_type=worker` then `mcp__cs__coordination action=whoami`, then run `mcp__cs__task action=mine`. Work exactly ONE task at a time: choose a single assigned task, run `mcp__cs__task action=show id=<task-id>` then `mcp__cs__task action=start id=<task-id>` before coding, implement it, commit and push your changes, then close it with `mcp__cs__task action=close id=<task-id> reason=\"...\"` (or hand it to the supervisor if close returns verification-required guidance) BEFORE starting any other task. Never start a second task while one is still in progress — the verification jail allows only one unverified in-progress task at a time, so batch-starting tasks will block you. Add progress notes frequently using `mcp__cs__task action=notes id=<task-id> note_type=progress notes=\"...\"`. For blockers, add a blocker note, set `status=blocked`, and message supervisor via `mcp__cs__coordination action=message target=supervisor message=\"...\"`. If close returns verification-required guidance, immediately ask the supervisor to verify/close on your behalf. Do not use /cas-start, /cas-context, or /cas-end. Stay within assigned task scope.";
 
 /// Prefix for the Codex worker startup prompt. The worker name is appended at runtime.
 const CODEX_WORKER_STARTUP_PREFIX: &str = "I'm initiating CAS worker startup now: register this worker session, confirm identity, check assigned tasks, then start any assigned task with a progress note.\n1) Run mcp__cs__coordination action=session_start name=";
@@ -310,6 +310,14 @@ impl PtyConfig {
         push_worker_cargo_env(&mut env, role);
 
         let mut args = vec!["--yolo".to_string(), "--no-alt-screen".to_string()];
+
+        // cas-bbc2: spawn-inject the CAS MCP server so every Codex agent (worker
+        // and supervisor) has mcp__cs__* tools even when the project was never
+        // integrated for the Codex harness (no .codex/config.toml). Must precede
+        // the developer_instructions block but order among `-c` flags is
+        // irrelevant to Codex.
+        push_codex_mcp_server_args(&mut args);
+
         if let Some(m) = model {
             args.push("--model".to_string());
             args.push(m.to_string());
@@ -340,7 +348,7 @@ impl PtyConfig {
                 "{CODEX_WORKER_STARTUP_PREFIX}{name} agent_type=worker\n\
                  2) Run mcp__cs__coordination action=whoami\n\
                  3) Run mcp__cs__task action=mine\n\
-                 4) If tasks are assigned: show/start each task and add a progress note\n\
+                 4) If a task is assigned: choose exactly ONE task, run mcp__cs__task action=show then action=start, add a progress note, implement it, commit and push, then close it (or hand to supervisor) BEFORE starting any other task. Never start more than one task at a time — batch-starting collides with the one-unverified-in-progress verification jail.\n\
                  5) If no tasks are assigned: send mcp__cs__coordination action=message target=supervisor confirming ready state\n\
                  6) Do NOT message target=cas. Use target=supervisor."
             );
@@ -399,6 +407,52 @@ fn cargo_build_jobs_for_worker() -> Option<String> {
     let cores = std::thread::available_parallelism().ok()?.get();
     let capped = std::cmp::max(2, cores / DEFAULT_WORKER_CONCURRENCY_ASSUMPTION);
     Some(capped.to_string())
+}
+
+/// Spawn-inject the CAS MCP server into a Codex command via `-c` overrides
+/// (cas-bbc2). Codex does NOT read Claude's `.mcp.json`; it only discovers the
+/// CAS server from a project `.codex/config.toml` written by `cas init`/`cas
+/// update` (`configure_codex_mcp_server`). Projects integrated for Claude but
+/// never for Codex (e.g. gabber-studio: has `.mcp.json`, no `.codex/`) therefore
+/// spawned Codex agents with **zero** `mcp__cs__*` tools, which burned the whole
+/// session reverse-engineering the wire protocol and produced no code.
+///
+/// Injecting the server at spawn time makes every Codex agent (worker and
+/// supervisor) self-contained regardless of downstream integration. We mirror
+/// `configure_codex_mcp_server` exactly — `command="cas"`, `args=["serve"]`,
+/// `env.CAS_CODEX_FALLBACK_SESSION="1"` — and register under the `cs` key so the
+/// resulting tool prefix is `mcp__cs__` (the Codex alias used throughout the
+/// factory prompts and skills; intentionally distinct from Claude's `mcp__cas__`).
+///
+/// Each value is valid TOML so Codex's `-c key=value` parser (value parsed as
+/// TOML, raw-string fallback) yields the intended types: quoted strings stay
+/// strings, `["serve"]` becomes a string array. If a project DOES ship a
+/// `.codex/config.toml`, these `-c` overrides simply add the `cs` server on top
+/// — they never remove the project's own entries.
+fn push_codex_mcp_server_args(args: &mut Vec<String>) {
+    args.push("-c".to_string());
+    args.push("mcp_servers.cs.command=\"cas\"".to_string());
+    args.push("-c".to_string());
+    args.push("mcp_servers.cs.args=[\"serve\"]".to_string());
+    args.push("-c".to_string());
+    args.push("mcp_servers.cs.env.CAS_CODEX_FALLBACK_SESSION=\"1\"".to_string());
+}
+
+/// Returns `true` when an executable named `cas` is resolvable on `PATH`.
+///
+/// Used by the Codex spawn preflight (cas-bbc2). The CAS MCP server is now
+/// spawn-injected as `mcp_servers.cs.command=cas`, but Codex still needs the
+/// `cas` binary on `PATH` to actually launch it. If `PATH` is unset we return
+/// `true` (skip the check) rather than risk a false refusal — the spawn will
+/// surface its own error in that pathological case.
+fn cas_binary_on_path() -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return true;
+    };
+    std::env::split_paths(&path).any(|dir| {
+        let candidate = dir.join("cas");
+        candidate.is_file()
+    })
 }
 
 /// Push the `CARGO_BUILD_JOBS` env entry into `env` when `role == "worker"`.
@@ -484,6 +538,24 @@ impl Pty {
     pub fn spawn(id: impl Into<String>, config: PtyConfig) -> Result<Self> {
         let id = id.into();
         let is_codex = config.command == "codex";
+
+        // cas-bbc2 preflight: a Codex agent's CAS MCP server is spawn-injected as
+        // `mcp_servers.cs.command=cas`, but Codex can only launch it if the `cas`
+        // binary is resolvable on PATH. Detect Codex by the direct command or the
+        // niced wrapper form (cas-0bf4) so the preflight covers both. Refuse loudly
+        // with remediation rather than spawning a worker that comes up with zero
+        // CAS tools and flails.
+        let codex_spawn = is_codex
+            || (config.command == "nice" && config.args.iter().any(|a| a == "codex"));
+        if codex_spawn && !cas_binary_on_path() {
+            return Err(Error::pty(
+                "Codex agent cannot start: the `cas` MCP server binary is not on PATH. \
+                 CAS is spawn-injected as mcp_servers.cs (command=cas), but Codex needs \
+                 `cas` resolvable to launch it. Install CAS / add it to PATH, or run \
+                 `cas init` / `cas update` in this project to enable the Codex harness."
+                    .to_string(),
+            ));
+        }
 
         // Create PTY system and open a PTY pair
         let pty_system = native_pty_system();
@@ -982,6 +1054,143 @@ mod tests {
         );
     }
 
+    /// cas-bbc2 AC#2: a Codex worker spawn must inject the CAS MCP server via
+    /// `-c` overrides so it has `mcp__cs__*` tools without a project
+    /// `.codex/config.toml`. Mirrors `configure_codex_mcp_server`.
+    #[tokio::test]
+    async fn test_pty_config_codex_worker_injects_cas_mcp_server() {
+        let _e = ScopedEnv::new();
+        let config = PtyConfig::codex(
+            "test-worker",
+            "worker",
+            PathBuf::from("/tmp"),
+            None,
+            None,
+            None,
+            None, // model
+            None, // effort
+            None, // teams
+        );
+        let all_args = config.args.join(" ");
+        assert!(
+            all_args.contains("mcp_servers.cs.command=\"cas\""),
+            "codex worker must inject mcp_servers.cs.command=cas; got: {all_args}"
+        );
+        assert!(
+            all_args.contains("mcp_servers.cs.args=[\"serve\"]"),
+            "codex worker must inject mcp_servers.cs.args=[\"serve\"]; got: {all_args}"
+        );
+        assert!(
+            all_args.contains("mcp_servers.cs.env.CAS_CODEX_FALLBACK_SESSION=\"1\""),
+            "codex worker must inject CAS_CODEX_FALLBACK_SESSION env; got: {all_args}"
+        );
+    }
+
+    /// cas-bbc2: the supervisor is equally self-contained — a Codex supervisor
+    /// must also get the spawn-injected CAS MCP server.
+    #[tokio::test]
+    async fn test_pty_config_codex_supervisor_injects_cas_mcp_server() {
+        let config = PtyConfig::codex(
+            "test-supervisor",
+            "supervisor",
+            PathBuf::from("/tmp"),
+            None,
+            None,
+            None,
+            None, // model
+            None, // effort
+            None, // teams
+        );
+        let all_args = config.args.join(" ");
+        assert!(
+            all_args.contains("mcp_servers.cs.command=\"cas\"")
+                && all_args.contains("mcp_servers.cs.args=[\"serve\"]")
+                && all_args.contains("mcp_servers.cs.env.CAS_CODEX_FALLBACK_SESSION=\"1\""),
+            "codex supervisor must inject the cas MCP server; got: {all_args}"
+        );
+    }
+
+    /// cas-bbc2 AC#3: the Codex worker startup prompt must drive a single-task
+    /// loop (start exactly one task at a time), not the old batch-start wording
+    /// that collides with the one-unverified-in-progress verification jail.
+    #[tokio::test]
+    async fn test_pty_config_codex_worker_single_task_loop() {
+        let _e = ScopedEnv::new();
+        let config = PtyConfig::codex(
+            "test-worker",
+            "worker",
+            PathBuf::from("/tmp"),
+            None,
+            None,
+            None,
+            None, // model
+            None, // effort
+            None, // teams
+        );
+        let all_args = config.args.join(" ");
+        assert!(
+            all_args.contains("exactly ONE task"),
+            "startup prompt must instruct starting exactly one task at a time; got: {all_args}"
+        );
+        assert!(
+            !all_args.contains("show/start each task"),
+            "old batch-start wording must be gone; got: {all_args}"
+        );
+        // The developer_instructions must carry the same discipline.
+        assert!(
+            all_args.contains("Work exactly ONE task at a time"),
+            "worker developer_instructions must enforce one-task-at-a-time; got: {all_args}"
+        );
+    }
+
+    /// cas-bbc2: `cas_binary_on_path()` returns true when an executable named
+    /// `cas` lives in a PATH entry. Builds a temp dir with a fake `cas` file and
+    /// points PATH at it, under ENV_LOCK to avoid racing other env-mutating tests.
+    #[tokio::test]
+    async fn test_cas_binary_on_path_detects_binary() {
+        let _e = ScopedEnv::new();
+        let dir = std::env::temp_dir().join("cas-bbc2-preflight-present");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("cas"), b"#!/bin/sh\n").unwrap();
+        let saved = std::env::var_os("PATH");
+        // SAFETY: ENV_LOCK held via ScopedEnv serializes PATH mutation.
+        unsafe {
+            std::env::set_var("PATH", &dir);
+        }
+        let found = cas_binary_on_path();
+        unsafe {
+            match &saved {
+                Some(p) => std::env::set_var("PATH", p),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(found, "cas_binary_on_path must find a `cas` file on PATH");
+    }
+
+    /// cas-bbc2: when no `cas` exists on PATH, the preflight helper reports false
+    /// so `Pty::spawn` can refuse a Codex spawn loudly.
+    #[tokio::test]
+    async fn test_cas_binary_on_path_absent_when_missing() {
+        let _e = ScopedEnv::new();
+        let dir = std::env::temp_dir().join("cas-bbc2-preflight-absent");
+        std::fs::create_dir_all(&dir).unwrap();
+        let saved = std::env::var_os("PATH");
+        // SAFETY: ENV_LOCK held via ScopedEnv serializes PATH mutation.
+        unsafe {
+            std::env::set_var("PATH", &dir);
+        }
+        let found = cas_binary_on_path();
+        unsafe {
+            match &saved {
+                Some(p) => std::env::set_var("PATH", p),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!found, "cas_binary_on_path must be false when no `cas` is on PATH");
+    }
+
     #[tokio::test]
     async fn test_pty_config_codex_supervisor_instructions() {
         let config = PtyConfig::codex(
@@ -1129,14 +1338,18 @@ mod tests {
             Some("medium"),  // effort
             None,  // teams
         );
-        let c_idx = config
+        // Multiple `-c` flags exist now that the CAS MCP server is spawn-injected
+        // (cas-bbc2), so locate the effort override by its value rather than
+        // assuming it is the first `-c`. It must be emitted as a `-c` pair.
+        let effort_idx = config
             .args
             .iter()
-            .position(|a| a == "-c")
-            .expect("-c flag must be present when effort is Some");
+            .position(|a| a == "model_reasoning_effort=medium")
+            .expect("effort override must emit model_reasoning_effort TOML key");
         assert_eq!(
-            config.args[c_idx + 1], "model_reasoning_effort=medium",
-            "effort override must emit model_reasoning_effort TOML key"
+            config.args[effort_idx - 1],
+            "-c",
+            "model_reasoning_effort override must be preceded by a -c flag"
         );
     }
 
@@ -1159,9 +1372,19 @@ mod tests {
             !config.args.iter().any(|a| a.starts_with("model_reasoning_effort")),
             "no model_reasoning_effort arg should be emitted when effort is None"
         );
+        // The CAS MCP server injection (cas-bbc2) always emits `-c` flags, so we
+        // can no longer assert the total absence of `-c`. Instead assert that the
+        // only `-c` overrides present are the MCP server ones — none configure
+        // reasoning effort.
+        let c_values: Vec<&String> = config
+            .args
+            .windows(2)
+            .filter(|w| w[0] == "-c")
+            .map(|w| &w[1])
+            .collect();
         assert!(
-            !config.args.iter().any(|a| a == "-c"),
-            "no -c flag should be emitted when effort is None"
+            c_values.iter().all(|v| v.starts_with("mcp_servers.cs.")),
+            "with effort=None the only -c overrides should be the cas MCP server injection; got: {c_values:?}"
         );
     }
 
