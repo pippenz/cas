@@ -103,15 +103,33 @@ fn is_web_close_tombstone(raw: &serde_json::Value) -> bool {
 /// is inert.
 ///
 /// Idempotent: a task already locally `Closed` is a no-op.
-fn reconcile_web_close(store: &dyn TaskStore, mut task: Task) -> Result<UpsertResult, CasError> {
+fn reconcile_web_close(store: &dyn TaskStore, task: Task) -> Result<UpsertResult, CasError> {
     match store.get(&task.id) {
         Ok(local) => {
             if local.status == TaskStatus::Closed {
                 // Already closed locally — nothing to do.
                 return Ok(UpsertResult::Skipped);
             }
-            task.assignee = None;
-            store.update(&task)?;
+            if local.status == TaskStatus::PendingSupervisorReview {
+                // An explicit teammate web close overrides the pending-review
+                // gate. Surface it so the bypassed supervisor review is auditable.
+                tracing::warn!(
+                    task_id = %task.id,
+                    "cas-fc52: web close applied to a PendingSupervisorReview task — \
+                     supervisor review gate bypassed by explicit teammate close"
+                );
+            }
+            // Merge ONLY the close signal onto the local row. A full overwrite
+            // with the remote tombstone would clobber locally-authored,
+            // not-yet-pushed content (notes / description / acceptance_criteria):
+            // the web close is authoritative about the CLOSE, not the body.
+            let mut merged = local;
+            merged.status = TaskStatus::Closed;
+            merged.close_reason = task.close_reason;
+            merged.closed_at = task.closed_at.or(merged.closed_at);
+            merged.updated_at = task.updated_at;
+            merged.assignee = None;
+            store.update(&merged)?;
             tracing::info!(
                 task_id = %task.id,
                 "cas-fc52: reconciled web-initiated close from cloud pull"
@@ -119,9 +137,11 @@ fn reconcile_web_close(store: &dyn TaskStore, mut task: Task) -> Result<UpsertRe
             Ok(UpsertResult::Updated)
         }
         Err(cas_store::StoreError::TaskNotFound(_)) => {
-            // Never had this task locally — record the closed tombstone.
-            task.assignee = None;
-            store.add(&task)?;
+            // Never had this task locally — record the closed tombstone as-is
+            // (no local content to preserve).
+            let mut tombstone = task;
+            tombstone.assignee = None;
+            store.add(&tombstone)?;
             Ok(UpsertResult::Created)
         }
         Err(e) => Err(e.into()),
@@ -1103,6 +1123,37 @@ mod web_close_tests {
             got.assignee.is_none(),
             "assignee must be cleared on web close"
         );
+    }
+
+    #[test]
+    fn reconcile_preserves_locally_authored_content() {
+        // P1 (cas-71f7 review): a web close must NOT clobber local-only,
+        // not-yet-pushed body content. Only the close signal is applied.
+        let temp = TempDir::new().unwrap();
+        let cas_dir = init_cas_dir(temp.path()).unwrap();
+        let store = open_task_store(&cas_dir).unwrap();
+
+        let mut local = Task::new("t-content".to_string(), "title".to_string());
+        local.status = TaskStatus::InProgress;
+        local.description = "local description not yet pushed".to_string();
+        local.notes = "local working notes".to_string();
+        local.updated_at = chrono::Utc::now() + chrono::Duration::hours(1);
+        store.add(&local).unwrap();
+
+        // Tombstone carries empty body fields (server snapshot) + the close.
+        let outcome = reconcile_web_close(&*store, closed_tombstone("t-content")).unwrap();
+        assert!(matches!(outcome, UpsertResult::Updated));
+
+        let got = store.get("t-content").unwrap();
+        assert_eq!(got.status, TaskStatus::Closed);
+        assert_eq!(
+            got.close_reason.as_deref(),
+            Some("closed from web by teammate")
+        );
+        // Local-authored content survives the close.
+        assert_eq!(got.description, "local description not yet pushed");
+        assert_eq!(got.notes, "local working notes");
+        assert!(got.assignee.is_none());
     }
 
     #[test]

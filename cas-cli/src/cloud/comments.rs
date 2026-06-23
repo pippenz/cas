@@ -24,8 +24,29 @@ pub struct CommentAttachment {
     pub url: String,
     #[serde(default)]
     pub mime: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_lenient_u64")]
     pub size: u64,
+}
+
+/// Tolerant `u64` deserializer: accepts a JSON number (int OR float), a numeric
+/// string, null, or an absent field, all mapped to a best-effort `u64`
+/// (defaulting to 0). A Next.js / Postgres JSONB stack can emit an integer as a
+/// float (`1234.0`); without this, one oddly-encoded attachment `size` would
+/// fail the whole `attachments` array → the whole comment → the whole response,
+/// silently dropping every comment on the task.
+fn de_lenient_u64<'de, D>(d: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    Ok(match serde_json::Value::deserialize(d)? {
+        serde_json::Value::Number(n) => n
+            .as_u64()
+            .or_else(|| n.as_f64().map(|f| if f < 0.0 { 0 } else { f as u64 }))
+            .unwrap_or(0),
+        serde_json::Value::String(s) => s.trim().parse::<u64>().unwrap_or(0),
+        _ => 0,
+    })
 }
 
 /// A single task comment from
@@ -85,7 +106,11 @@ pub fn fetch_task_comments(task_id: &str) -> Vec<TaskComment> {
     );
     match ureq::get(&url)
         .set("Authorization", &format!("Bearer {token}"))
-        .timeout(std::time::Duration::from_secs(4))
+        // Short timeout: `task show` is interactive and may be called often, so
+        // bound the worst case when the cloud is slow/unreachable. (A logged-in
+        // + offline session still pays this once per show; a config-cached
+        // enablement check to skip entirely is a follow-up.)
+        .timeout(std::time::Duration::from_secs(3))
         .call()
     {
         Ok(r) => match r.into_string() {
@@ -166,6 +191,27 @@ mod tests {
         assert_eq!(atts[2].kind, "link");
         assert_eq!(atts[0].url, "https://blob.vercel/abc.png");
         assert_eq!(atts[2].size, 0);
+    }
+
+    #[test]
+    fn lenient_size_tolerates_float_and_string() {
+        // P1 (cas-71f7 review): a float (1234.0) or numeric-string size must not
+        // fail the whole comments array. Without de_lenient_u64 this returns [].
+        let raw = r#"{"comments":[{
+            "id":"c","author_email":"a@b.c","body":"x","created_at":"t",
+            "attachments":[
+                {"kind":"image","url":"u1","mime":"image/png","size":1234.0},
+                {"kind":"link","url":"u2","mime":"text/html","size":"5678"},
+                {"kind":"video","url":"u3","mime":"video/mp4","size":-5}
+            ]
+        }]}"#;
+        let comments = parse_comments(raw);
+        assert_eq!(comments.len(), 1, "odd size encodings must not drop the comment");
+        let atts = &comments[0].attachments;
+        assert_eq!(atts.len(), 3);
+        assert_eq!(atts[0].size, 1234); // float -> truncated
+        assert_eq!(atts[1].size, 5678); // numeric string
+        assert_eq!(atts[2].size, 0); // negative clamped to 0
     }
 
     #[test]
