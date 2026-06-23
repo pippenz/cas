@@ -23,6 +23,23 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 - **`active_team_id()` resolution chain extended to read user-level config (cas-ea2f5).** Priority order: (0) kill-switch `team_auto_promote = false` → always `None`; (1) project-level `team_id` if set; (2) user `default_team_id`; (3) sole team auto-pick when `teams.len() == 1`; (4) `None` (ambiguous or no membership). The `active_team_id_with_user_config(user_cfg)` testable inner keeps the chain exercisable without disk I/O.
 
+## [2.21.0] - 2026-06-23
+
+Coordinated release: cloud-sync reliability (EPIC cas-f75f) + the team ticket
+explorer **client half** (EPIC cas-71f7). The cloud half shipped separately
+(petra-stella-cloud EPIC cas-9133).
+
+### Fixed
+
+- **Cloud-sync reliability — slug fragmentation, queue poison-head stall, duplicate-enqueue, silent re-homing (EPIC cas-f75f).** (A) `cas cloud team show` reports the concrete resolved slug and warns on bucket ambiguity instead of silently syncing an empty bucket. (B) A single un-pushable queue item is parked as `failed` with a reason instead of head-of-line-blocking the whole queue. (C) Legacy `NULL` `team_id` queue rows are normalized so one task mutation enqueues one item (no permanent residue). (D) `cas cloud push` no longer re-homes existing cloud entities to a changed slug without the explicit `--rehome` flag, and prints truthful per-type insert/update counts.
+
+### Added
+
+- **Team ticket explorer — CLI client half (EPIC cas-71f7).** Three behaviors that keep the CLI in sync with the web ticket explorer (petra-stella-cloud). See `docs/team-ticket-explorer-client.md`.
+  - **Canonical project-id adoption on push (cas-8ca5).** `cas cloud push` (team scope) sends your normalized git remote; when the server's returned `git_remote` matches your local `origin`, the returned `canonical_id` is adopted into `.cas/config.toml`. Stops an unpinned machine from syncing a fragmented per-remote bucket. Equality-gated so a shared machine with a different remote is never silently re-homed.
+  - **Web-initiated close reconcile on pull (cas-fc52).** A teammate's close from the web UI (`closed_via = "web"` tombstone) is reconciled as an authoritative local close — applied even if the local copy is newer, with `close_reason` preserved and `assignee` cleared. Merges only the close signal so locally-authored unpushed content is not clobbered. Idempotent; never reconciles the client's own pushed closes.
+  - **Read-only mirror of web-authored comments (cas-7d54).** `task show` surfaces comments authored in the web explorer (author, timestamp, body, image/video/link attachments), fetched per task. Best-effort: degrades to nothing when not logged in / offline; never blocks or fails `task show`.
+
 ## [2.20.0] - 2026-06-07
 
 ### Fixed
