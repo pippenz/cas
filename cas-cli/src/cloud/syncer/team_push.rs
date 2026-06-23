@@ -113,6 +113,19 @@ impl CloudSyncer {
             serde_json::json!(project_id),
         );
 
+        // cas-8ca5 / contract §5: include the normalized git remote so the
+        // server's project resolver can map an unpinned machine onto the team's
+        // canonical bucket instead of fragmenting onto github.com/<org>/<repo>.
+        // Lowercased to match the server's `normalizeGitRemote` rule.
+        if let Ok(cas_root) = crate::store::find_cas_root() {
+            if let Some(remote) = crate::cloud::derive_canonical_id_from_git_remote(&cas_root) {
+                payload.insert(
+                    "git_remote".to_string(),
+                    serde_json::json!(remote.to_lowercase()),
+                );
+            }
+        }
+
         // Include client version info for server-side compatibility checks
         Self::insert_client_version(&mut payload);
 
@@ -186,6 +199,46 @@ impl CloudSyncer {
                                 result.pushed_commit_links = body.synced.commit_links;
                                 result.pushed_agents = body.synced.agents;
                                 result.pushed_worktrees = body.synced.worktrees;
+
+                                // cas-8ca5 / contract §5: adopt the server's
+                                // canonical id when our git remote matches the
+                                // returned git_remote. Stops an unpinned machine
+                                // from continuing to sync the fragmented
+                                // per-remote bucket instead of the team's slug.
+                                if let Ok(cas_root) = crate::store::find_cas_root() {
+                                    let local_remote =
+                                        crate::cloud::derive_canonical_id_from_git_remote(&cas_root);
+                                    let current_pin =
+                                        crate::cloud::canonical_id_from_config_toml(&cas_root);
+                                    if let Some(adopted) = crate::cloud::should_adopt_canonical_id(
+                                        local_remote.as_deref(),
+                                        body.git_remote.as_deref(),
+                                        body.canonical_id.as_deref(),
+                                        current_pin.as_deref(),
+                                    ) {
+                                        match crate::cloud::set_canonical_id_in_config_toml(
+                                            &cas_root, &adopted,
+                                        ) {
+                                            Ok(()) => {
+                                                crate::cloud::invalidate_cached_project_id();
+                                                tracing::info!(
+                                                    canonical_id = %adopted,
+                                                    "cas-8ca5: adopted server canonical project id"
+                                                );
+                                                eprintln!(
+                                                    "[CAS sync] adopted team canonical project id \
+                                                     '{adopted}' (matched git remote)"
+                                                );
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    error = %e,
+                                                    "cas-8ca5: failed to persist adopted canonical_id"
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
                             } else {
                                 // If parsing fails, count what we sent
                                 result.pushed_entries = grouped.upsert_entries.len();

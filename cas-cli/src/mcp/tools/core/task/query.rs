@@ -31,6 +31,20 @@ impl CasCore {
             output.push_str(&format!("\nNotes:\n{}\n", task.notes));
         }
 
+        // cas-7d54: surface web-authored comments (read-only mirror, contract
+        // §2). Best-effort fetch off the async runtime via spawn_blocking;
+        // degrades to nothing when not logged in / no team / offline so it
+        // never blocks or fails `task show`.
+        {
+            let comment_task_id = req.id.clone();
+            let comments = tokio::task::spawn_blocking(move || {
+                crate::cloud::comments::fetch_task_comments(&comment_task_id)
+            })
+            .await
+            .unwrap_or_default();
+            output.push_str(&crate::cloud::comments::render_comments_section(&comments));
+        }
+
         if !task.design.is_empty() {
             output.push_str(&format!("\nDesign:\n{}\n", task.design));
         }

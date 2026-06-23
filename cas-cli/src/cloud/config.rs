@@ -60,6 +60,18 @@ pub fn get_project_canonical_id() -> Option<String> {
     result
 }
 
+/// Clear the process-lifetime canonical-id cache so the next
+/// `get_project_canonical_id` re-resolves from disk.
+///
+/// Call after writing a new `[project] canonical_id` mid-process (e.g. the
+/// cas-8ca5 adoption that fires on a successful team push) so a subsequent
+/// pull in the same `cas cloud sync` run uses the freshly-adopted id rather
+/// than the stale value cached at process start.
+pub fn invalidate_cached_project_id() {
+    let mut cached = CACHED_PROJECT_ID.lock().unwrap_or_else(|e| e.into_inner());
+    *cached = None;
+}
+
 /// Pure composition of the canonical-id resolution chain.
 /// Extracted from `get_project_canonical_id` so the chain is testable
 /// without the `OnceLock` static — callers should prefer the cached public API.
@@ -214,6 +226,42 @@ pub fn normalize_git_remote_url(url: &str) -> Option<String> {
     } else {
         Some(clean.to_string())
     }
+}
+
+/// Decide whether to adopt the server-returned canonical id after a team push
+/// (cas-8ca5 / cloud contract §5). Returns `Some(new_id)` to adopt and persist,
+/// `None` to leave the local pin untouched.
+///
+/// Adopt only when ALL of these hold:
+///  - the server returned a non-empty `canonical_id` and `git_remote`,
+///  - we have a local git remote,
+///  - the local remote equals the returned `git_remote` (case-insensitive —
+///    the server lowercases per its `normalizeGitRemote` rule, while our
+///    [`normalize_git_remote_url`] preserves the original case),
+///  - the returned id differs from the current pin (otherwise it is a no-op).
+///
+/// The git-remote equality gate is the safety property: it prevents a shared
+/// machine whose `origin` differs from the returned project from being silently
+/// re-homed onto someone else's canonical id.
+pub fn should_adopt_canonical_id(
+    local_remote: Option<&str>,
+    resp_git_remote: Option<&str>,
+    resp_canonical_id: Option<&str>,
+    current_pin: Option<&str>,
+) -> Option<String> {
+    let local = local_remote?.trim();
+    let resp_remote = resp_git_remote?.trim();
+    let canonical = resp_canonical_id?.trim();
+    if local.is_empty() || resp_remote.is_empty() || canonical.is_empty() {
+        return None;
+    }
+    if !local.eq_ignore_ascii_case(resp_remote) {
+        return None;
+    }
+    if current_pin.is_some_and(|p| p == canonical) {
+        return None; // already pinned correctly — no-op
+    }
+    Some(canonical.to_string())
 }
 
 /// Derive the canonical project ID from a `.cas` directory path.
@@ -1551,6 +1599,103 @@ mod tests {
             resolve_canonical_id(&cas_root).as_deref(),
             Some("github.com/owner/explicit"),
             "config.toml [project] canonical_id must win over folder-name fallback",
+        );
+    }
+
+    // ── cas-8ca5: canonical-id adoption decision (contract §5) ─────────────
+
+    #[test]
+    fn adopt_when_remote_matches_and_id_differs() {
+        // Unpinned machine: local remote == returned git_remote, server maps us
+        // to the short canonical "ozer" → adopt it.
+        assert_eq!(
+            should_adopt_canonical_id(
+                Some("github.com/richards-llc/ozer-health"),
+                Some("github.com/richards-llc/ozer-health"),
+                Some("ozer"),
+                None,
+            )
+            .as_deref(),
+            Some("ozer"),
+        );
+    }
+
+    #[test]
+    fn adopt_is_case_insensitive_on_remote() {
+        // Our normalize preserves case (Richards-LLC); the server lowercases.
+        // Equality must still hold so mixed-case orgs adopt correctly.
+        assert_eq!(
+            should_adopt_canonical_id(
+                Some("github.com/Richards-LLC/ozer-health"),
+                Some("github.com/richards-llc/ozer-health"),
+                Some("ozer"),
+                Some("github.com/Richards-LLC/ozer-health"),
+            )
+            .as_deref(),
+            Some("ozer"),
+        );
+    }
+
+    #[test]
+    fn no_adopt_when_already_pinned_correctly() {
+        // Already on the canonical id → no-op (avoid a redundant config write).
+        assert_eq!(
+            should_adopt_canonical_id(
+                Some("github.com/richards-llc/ozer-health"),
+                Some("github.com/richards-llc/ozer-health"),
+                Some("ozer"),
+                Some("ozer"),
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn no_adopt_when_remotes_differ() {
+        // Safety gate: a shared machine whose remote differs from the returned
+        // project must NOT be re-homed onto someone else's canonical id.
+        assert_eq!(
+            should_adopt_canonical_id(
+                Some("github.com/someone-else/other-repo"),
+                Some("github.com/richards-llc/ozer-health"),
+                Some("ozer"),
+                None,
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn no_adopt_when_server_omits_fields() {
+        // Older cloud build that doesn't return canonical_id / git_remote → skip.
+        assert_eq!(
+            should_adopt_canonical_id(Some("github.com/r/x"), None, None, None),
+            None,
+        );
+        assert_eq!(
+            should_adopt_canonical_id(Some("github.com/r/x"), Some("github.com/r/x"), None, None),
+            None,
+        );
+    }
+
+    #[test]
+    fn no_adopt_when_no_local_remote() {
+        // Non-git project (no origin) → nothing to match against → skip.
+        assert_eq!(
+            should_adopt_canonical_id(None, Some("github.com/r/x"), Some("x"), None),
+            None,
+        );
+    }
+
+    #[test]
+    fn no_adopt_when_fields_empty_or_whitespace() {
+        assert_eq!(
+            should_adopt_canonical_id(Some("  "), Some("github.com/r/x"), Some("x"), None),
+            None,
+        );
+        assert_eq!(
+            should_adopt_canonical_id(Some("github.com/r/x"), Some("github.com/r/x"), Some("   "), None),
+            None,
         );
     }
 }

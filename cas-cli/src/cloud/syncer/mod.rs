@@ -355,6 +355,16 @@ pub struct TeamProject {
 #[derive(Debug, Deserialize)]
 struct TeamPushResponse {
     synced: SyncedCounts,
+    /// cas-8ca5 / contract §5: the canonical project id the server's resolver
+    /// mapped this push to. `None` on older cloud builds that predate the
+    /// resolver echo — the client then leaves its local pin untouched.
+    #[serde(default)]
+    canonical_id: Option<String>,
+    /// cas-8ca5 / contract §5: the normalized git remote the server matched us
+    /// to. Compared (case-insensitively) against our local remote before we
+    /// adopt `canonical_id`, so a shared machine is never silently re-homed.
+    #[serde(default)]
+    git_remote: Option<String>,
 }
 
 /// Response shape from the personal push endpoint (`POST /api/sync/push`).
