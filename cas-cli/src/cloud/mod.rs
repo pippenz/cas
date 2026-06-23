@@ -17,6 +17,7 @@
 //! 3. Pulling latest changes on MCP server startup
 
 mod backfill;
+pub mod comments;
 mod config;
 mod coordinator;
 pub mod device;
