@@ -62,6 +62,12 @@ pub enum McpCommands {
         /// Only show server names (don't connect to fetch tools)
         #[arg(short, long)]
         short: bool,
+
+        /// Show secret values (stdio env, http/sse auth + headers) in plaintext.
+        /// Off by default — `cas mcp list --json` redacts secrets unless this is
+        /// set (cas-9f07: a tool-less Codex worker leaked live tokens via --json).
+        #[arg(long)]
+        show_secrets: bool,
     },
 
     /// Import MCP servers from Claude or Codex config.
@@ -92,7 +98,9 @@ pub fn execute(cmd: &McpCommands, cli: &super::Cli, cas_root: &Path) -> Result<(
     match cmd {
         McpCommands::Add { raw } => execute_add(raw, cli, cas_root),
         McpCommands::Remove { name, scope } => execute_remove(name, scope, cli, cas_root),
-        McpCommands::List { short } => execute_list(*short, cli, cas_root),
+        McpCommands::List { short, show_secrets } => {
+            execute_list(*short, *show_secrets, cli, cas_root)
+        }
         McpCommands::Import {
             from,
             dry_run,
@@ -374,8 +382,42 @@ fn execute_remove(name: &str, scope: &str, cli: &super::Cli, cas_root: &Path) ->
 
 // ── List ─────────────────────────────────────────────────────────────
 
+/// Marker substituted for secret values in `cas mcp list` output unless
+/// `--show-secrets` is passed (cas-9f07).
 #[cfg(feature = "mcp-proxy")]
-fn execute_list(short: bool, cli: &super::Cli, cas_root: &Path) -> Result<()> {
+const SECRET_REDACTION: &str = "***REDACTED***";
+
+/// Redact the secret-bearing fields of a serialized `ServerConfig` JSON value
+/// in place (cas-9f07). `ServerConfig` carries stdio `env`, http/sse `auth`,
+/// and `headers` — all of which `serde_json::to_value` emits verbatim. A
+/// tool-less Codex worker that improvised `cas mcp list --json` leaked a live
+/// GitHub PAT, Neon API key, and Vercel token into its rollout log because of
+/// this. We replace each secret *value* with [`SECRET_REDACTION`] while leaving
+/// keys, server names, commands, args, URLs, and `oauth` visible so the listing
+/// still tells you which server holds which credential.
+#[cfg(feature = "mcp-proxy")]
+fn redact_server_secrets(value: &mut serde_json::Value) {
+    let serde_json::Value::Object(map) = value else {
+        return;
+    };
+    // http/sse `auth: Option<String>` — redact when present and non-null.
+    if let Some(auth) = map.get_mut("auth") {
+        if auth.is_string() {
+            *auth = serde_json::Value::String(SECRET_REDACTION.to_string());
+        }
+    }
+    // stdio `env` and http/sse `headers` — redact every value, keep the keys.
+    for field in ["env", "headers"] {
+        if let Some(serde_json::Value::Object(inner)) = map.get_mut(field) {
+            for v in inner.values_mut() {
+                *v = serde_json::Value::String(SECRET_REDACTION.to_string());
+            }
+        }
+    }
+}
+
+#[cfg(feature = "mcp-proxy")]
+fn execute_list(short: bool, show_secrets: bool, cli: &super::Cli, cas_root: &Path) -> Result<()> {
     use crate::ui::components::Table;
 
     // Merge project config (.cas/proxy.toml) with user config (~/.config/code-mode-mcp/config.toml)
@@ -405,6 +447,9 @@ fn execute_list(short: bool, cli: &super::Cli, cas_root: &Path) -> Result<()> {
             .iter()
             .map(|(name, cfg)| {
                 let mut obj = serde_json::to_value(cfg).unwrap_or_default();
+                if !show_secrets {
+                    redact_server_secrets(&mut obj);
+                }
                 if let serde_json::Value::Object(ref mut m) = obj {
                     m.insert("name".to_string(), serde_json::json!(name));
                 }
@@ -947,4 +992,62 @@ fn extract_auth_header(
             }
         });
     (auth, headers)
+}
+
+// ── Tests ────────────────────────────────────────────────────────────
+
+#[cfg(all(test, feature = "mcp-proxy"))]
+mod tests {
+    use super::*;
+    use cmcp_core::config::ServerConfig;
+    use std::collections::HashMap;
+
+    /// cas-9f07: stdio `env` values are redacted by default; keys + command stay.
+    #[test]
+    fn redacts_stdio_env_values_by_default() {
+        let cfg = ServerConfig::Stdio {
+            command: "cas".into(),
+            args: vec!["serve".into()],
+            env: HashMap::from([("GITHUB_PAT".to_string(), "ghp_SECRET123".to_string())]),
+        };
+        let mut v = serde_json::to_value(&cfg).unwrap();
+        redact_server_secrets(&mut v);
+        let s = serde_json::to_string(&v).unwrap();
+        assert!(!s.contains("ghp_SECRET123"), "env secret must be redacted: {s}");
+        assert!(s.contains(SECRET_REDACTION), "redaction marker expected: {s}");
+        assert!(s.contains("GITHUB_PAT"), "env key should stay visible: {s}");
+        assert!(s.contains("\"cas\""), "command should stay visible: {s}");
+    }
+
+    /// cas-9f07: http `auth` and `headers` values are redacted; url stays.
+    #[test]
+    fn redacts_http_auth_and_headers() {
+        let cfg = ServerConfig::Http {
+            url: "https://mcp.example.com".into(),
+            auth: Some("bearer_SECRET456".into()),
+            headers: HashMap::from([("X-Api-Key".to_string(), "key_SECRET789".to_string())]),
+            oauth: false,
+        };
+        let mut v = serde_json::to_value(&cfg).unwrap();
+        redact_server_secrets(&mut v);
+        let s = serde_json::to_string(&v).unwrap();
+        assert!(!s.contains("bearer_SECRET456"), "auth must be redacted: {s}");
+        assert!(!s.contains("key_SECRET789"), "header value must be redacted: {s}");
+        assert!(s.contains("https://mcp.example.com"), "url should stay visible: {s}");
+        assert!(s.contains("X-Api-Key"), "header key should stay visible: {s}");
+    }
+
+    /// cas-9f07: with `--show-secrets`, `redact_server_secrets` is not called, so
+    /// the serialized value retains the plaintext secret.
+    #[test]
+    fn show_secrets_path_keeps_plaintext() {
+        let cfg = ServerConfig::Stdio {
+            command: "cas".into(),
+            args: vec![],
+            env: HashMap::from([("TOKEN".to_string(), "plain_SECRET".to_string())]),
+        };
+        let v = serde_json::to_value(&cfg).unwrap();
+        let s = serde_json::to_string(&v).unwrap();
+        assert!(s.contains("plain_SECRET"), "un-redacted value retains secret: {s}");
+    }
 }
