@@ -784,6 +784,17 @@ impl CasCore {
                 continue;
             }
 
+            // cas-33eb: a depth=light task never jails the agent — skipping the
+            // verification machinery is the whole point of "speed mode" (mirrors
+            // the close_ops.rs `depth_light` short-circuit from cas-6538).
+            // Without this, a SOLO (non-factory) user who starts then closes a
+            // light task still hits VERIFICATION_JAIL_BLOCKED at this dispatch
+            // layer, because the factory-worker / supervisor exemptions in
+            // `authorize_agent_action` do not apply to them.
+            if task.depth == crate::types::TaskDepth::Light {
+                continue;
+            }
+
             // Skip task types where current harness policy bypasses verification.
             if !verification_required_for_task_type(task.task_type) {
                 continue;
