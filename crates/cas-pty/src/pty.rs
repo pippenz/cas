@@ -14,10 +14,10 @@ use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 
 /// Instructions injected into Codex supervisor agents via `--config developer_instructions`.
-const CODEX_SUPERVISOR_INSTRUCTIONS: &str = "You are the CAS Factory Supervisor. Coordinate only: plan epics, assign tasks, monitor progress, review/merge. Never implement tasks. Use skills cas-supervisor and cas-codex-supervisor-checklist. Use MCP tools explicitly; no /cas-start, /cas-context, or /cas-end.";
+const CODEX_SUPERVISOR_INSTRUCTIONS: &str = "You are the CAS Factory Supervisor. Coordinate only: plan epics, assign tasks, monitor progress, review/merge. Never implement tasks. Use skills cas-supervisor and cas-codex-supervisor-checklist. Use MCP tools explicitly; no /cas-start, /cas-context, or /cas-end. Worker messages (status/blocker/ready) arrive asynchronously as new injected turns framed 'Message from <sender>: …'. Each is a triage trigger, not a fresh startup: read it, then assign/answer/redirect/merge as appropriate and reply via `mcp__cs__coordination action=message target=<worker>`. Finishing one round does not mean you are done — remain available to coordinate the next message.";
 
 /// Instructions injected into Codex worker agents via `--config developer_instructions`.
-const CODEX_WORKER_INSTRUCTIONS: &str = "You are a CAS Factory Worker. Always use CAS MCP tools for task lifecycle and coordination. On startup run `mcp__cs__coordination action=session_start name=<worker-name> agent_type=worker` then `mcp__cs__coordination action=whoami`, then run `mcp__cs__task action=mine`. Work exactly ONE task at a time: choose a single assigned task, run `mcp__cs__task action=show id=<task-id>` then `mcp__cs__task action=start id=<task-id>` before coding, implement it, commit and push your changes, then close it with `mcp__cs__task action=close id=<task-id> reason=\"...\"` (or hand it to the supervisor if close returns verification-required guidance) BEFORE starting any other task. Never start a second task while one is still in progress — the verification jail allows only one unverified in-progress task at a time, so batch-starting tasks will block you. Add progress notes frequently using `mcp__cs__task action=notes id=<task-id> note_type=progress notes=\"...\"`. For blockers, add a blocker note, set `status=blocked`, and message supervisor via `mcp__cs__coordination action=message target=supervisor message=\"...\"`. If close returns verification-required guidance, immediately ask the supervisor to verify/close on your behalf. Do not use /cas-start, /cas-context, or /cas-end. Stay within assigned task scope.";
+const CODEX_WORKER_INSTRUCTIONS: &str = "You are a CAS Factory Worker. Always use CAS MCP tools for task lifecycle and coordination. On startup run `mcp__cs__coordination action=session_start name=<worker-name> agent_type=worker` then `mcp__cs__coordination action=whoami`, then run `mcp__cs__task action=mine`. Work exactly ONE task at a time: choose a single assigned task, run `mcp__cs__task action=show id=<task-id>` then `mcp__cs__task action=start id=<task-id>` before coding, implement it, commit and push your changes, then close it with `mcp__cs__task action=close id=<task-id> reason=\"...\"` (or hand it to the supervisor if close returns verification-required guidance) BEFORE starting any other task. Never start a second task while one is still in progress — the verification jail allows only one unverified in-progress task at a time, so batch-starting tasks will block you. Add progress notes frequently using `mcp__cs__task action=notes id=<task-id> note_type=progress notes=\"...\"`. For blockers, add a blocker note, set `status=blocked`, and message supervisor via `mcp__cs__coordination action=message target=supervisor message=\"...\"`. If close returns verification-required guidance, immediately ask the supervisor to verify/close on your behalf. After closing or handing off a task, stay available — you are not permanently done. The supervisor will send you more work or redirection as new messages. Treat any injected turn framed 'Message from <sender>: …' as an instruction to act on, not noise: read it and follow it. Keep honoring one-task-at-a-time — finish or hand off your current task before starting the next one a message assigns. Do not use /cas-start, /cas-context, or /cas-end. Stay within assigned task scope.";
 
 /// Prefix for the Codex worker startup prompt. The worker name is appended at runtime.
 const CODEX_WORKER_STARTUP_PREFIX: &str = "I'm initiating CAS worker startup now: register this worker session, confirm identity, check assigned tasks, then start any assigned task with a progress note.\n1) Run mcp__cs__coordination action=session_start name=";
@@ -1208,6 +1208,80 @@ mod tests {
         assert!(
             all_args.contains("CAS Factory Supervisor"),
             "Codex supervisor should have supervisor instructions"
+        );
+    }
+
+    /// cas-83c8: the Codex supervisor prompt must explain that worker messages
+    /// arrive asynchronously as injected turns and must be triaged + replied to
+    /// via mcp__cs__coordination, not treated as a fresh startup.
+    #[tokio::test]
+    async fn test_pty_config_codex_supervisor_handles_injected_worker_messages() {
+        let config = PtyConfig::codex(
+            "test-supervisor",
+            "supervisor",
+            PathBuf::from("/tmp"),
+            None,
+            None,
+            None,
+            None, // model
+            None, // effort
+            None, // teams
+        );
+        let all_args = config.args.join(" ");
+        assert!(
+            all_args.contains("Message from <sender>"),
+            "supervisor prompt must reference the injected message framing; got: {all_args}"
+        );
+        assert!(
+            all_args.contains("triage trigger"),
+            "supervisor prompt must frame incoming worker messages as a triage trigger; got: {all_args}"
+        );
+        assert!(
+            all_args.contains("mcp__cs__coordination action=message target=<worker>"),
+            "supervisor prompt must tell it to reply/redirect via mcp__cs__coordination; got: {all_args}"
+        );
+        // Must keep the mcp__cs__ alias (not the claude mcp__cas__ alias).
+        assert!(
+            !all_args.contains("mcp__cas__"),
+            "Codex supervisor prompt must use the mcp__cs__ alias, never mcp__cas__; got: {all_args}"
+        );
+    }
+
+    /// cas-83c8: the Codex worker prompt must instruct continued availability
+    /// after a task closes (you are not permanently done) and acting on injected
+    /// supervisor messages, without breaking the one-task-at-a-time rule.
+    #[tokio::test]
+    async fn test_pty_config_codex_worker_stays_available_for_injected_messages() {
+        let _e = ScopedEnv::new();
+        let config = PtyConfig::codex(
+            "test-worker",
+            "worker",
+            PathBuf::from("/tmp"),
+            None,
+            None,
+            None,
+            None, // model
+            None, // effort
+            None, // teams
+        );
+        let all_args = config.args.join(" ");
+        assert!(
+            all_args.contains("not permanently done"),
+            "worker prompt must say it is not permanently done after closing a task; got: {all_args}"
+        );
+        assert!(
+            all_args.contains("Message from <sender>"),
+            "worker prompt must instruct acting on injected 'Message from <sender>' turns; got: {all_args}"
+        );
+        // The one-task-at-a-time discipline must still be present alongside the
+        // new continued-availability clause.
+        assert!(
+            all_args.contains("Work exactly ONE task at a time"),
+            "worker prompt must retain one-task-at-a-time discipline; got: {all_args}"
+        );
+        assert!(
+            all_args.contains("finish or hand off your current task before starting the next"),
+            "worker prompt must reconcile continued availability with the one-task rule; got: {all_args}"
         );
     }
 
