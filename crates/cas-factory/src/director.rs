@@ -64,6 +64,11 @@ pub struct TaskSummary {
     pub epic: Option<String>,
     /// Branch name (for epics)
     pub branch: Option<String>,
+    /// Last-updated timestamp from the task store. Drives recency ordering in
+    /// the TASKS panel so the supervisor's current focus surfaces above a
+    /// stale, high-subtask-count epic (cas-2fb6). `None` when the source is a
+    /// hand-built summary that does not carry timing (e.g. some tests).
+    pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// A summary of an agent for display
@@ -221,6 +226,7 @@ impl DirectorData {
                 task_type: t.task_type,
                 epic: child_to_epic.get(&t.id).cloned(),
                 branch: t.branch.clone(),
+                updated_at: Some(t.updated_at),
             }
         };
 
@@ -432,11 +438,48 @@ impl DirectorData {
             })
             .collect();
 
-        // Sort groups: active first, then by epic priority
-        groups.sort_by_key(|g| (!g.has_active, g.epic.priority.0));
+        // Sort groups by recency of activity so the supervisor's CURRENT focus
+        // surfaces at the top of the panel, rather than a stale epic that merely
+        // happens to carry more subtasks or a higher static priority (cas-2fb6).
+        //
+        // Recency = newest `updated_at` across the epic row and its subtasks.
+        // This naturally follows focus: starting/closing/noting a subtask bumps
+        // its `updated_at`, so the panel re-sorts within one refresh. Ties fall
+        // back to the historical ordering (active-first, then epic priority,
+        // then id) so single-epic and timing-less (test) data are unaffected.
+        groups.sort_by(|a, b| {
+            group_recency(b)
+                .cmp(&group_recency(a))
+                .then_with(|| a.has_active.cmp(&b.has_active).reverse())
+                .then_with(|| a.epic.priority.0.cmp(&b.epic.priority.0))
+                .then_with(|| a.epic.id.cmp(&b.epic.id))
+        });
+
+        // Standalone tasks: most-recently-updated first, then by priority, then
+        // id, so a freshly-touched standalone task is not buried under older
+        // ones either.
+        standalone.sort_by(|a, b| {
+            a.updated_at
+                .cmp(&b.updated_at)
+                .reverse()
+                .then_with(|| a.priority.0.cmp(&b.priority.0))
+                .then_with(|| a.id.cmp(&b.id))
+        });
 
         (groups, standalone)
     }
+}
+
+/// Newest `updated_at` across an epic group (the epic row and all of its
+/// subtasks). Used to order the TASKS panel by recency of activity so the
+/// supervisor's current focus stays on top (cas-2fb6). Returns `None` only when
+/// neither the epic nor any subtask carries timing information, in which case
+/// the caller falls back to the historical active-first/priority ordering.
+fn group_recency(group: &EpicGroup) -> Option<chrono::DateTime<chrono::Utc>> {
+    std::iter::once(group.epic.updated_at)
+        .chain(group.subtasks.iter().map(|t| t.updated_at))
+        .flatten()
+        .max()
 }
 
 /// Load pending + recently fired reminders from a reminder store.

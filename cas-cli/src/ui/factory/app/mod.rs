@@ -1152,6 +1152,7 @@ mod tests {
                 task_type: TaskType::Task,
                 epic: Some(new_epic_id.to_string()),
                 branch: None,
+                updated_at: None,
             }],
             in_progress_tasks: vec![TaskSummary {
                 id: "task-2".to_string(),
@@ -1162,6 +1163,7 @@ mod tests {
                 task_type: TaskType::Task,
                 epic: Some(new_epic_id.to_string()),
                 branch: None,
+                updated_at: None,
             }],
             epic_tasks: vec![TaskSummary {
                 id: new_epic_id.to_string(),
@@ -1172,6 +1174,7 @@ mod tests {
                 task_type: TaskType::Epic,
                 epic: None,
                 branch: Some("epic/new-feature".to_string()),
+                updated_at: None,
             }],
             agents: Vec::new(),
             activity: Vec::new(),
@@ -1319,6 +1322,7 @@ mod tests {
                 task_type: TaskType::Task,
                 epic: Some(active_epic_id.to_string()),
                 branch: None,
+                updated_at: None,
             }],
             in_progress_tasks: vec![TaskSummary {
                 id: "task-ip".to_string(),
@@ -1329,6 +1333,7 @@ mod tests {
                 task_type: TaskType::Task,
                 epic: Some(active_epic_id.to_string()),
                 branch: None,
+                updated_at: None,
             }],
             epic_tasks: vec![
                 TaskSummary {
@@ -1340,6 +1345,7 @@ mod tests {
                     task_type: TaskType::Epic,
                     epic: None,
                     branch: Some("epic/stale".to_string()),
+                    updated_at: None,
                 },
                 TaskSummary {
                     id: active_epic_id.to_string(),
@@ -1350,6 +1356,7 @@ mod tests {
                     task_type: TaskType::Epic,
                     epic: None,
                     branch: Some("epic/active".to_string()),
+                    updated_at: None,
                 },
             ],
             agents: Vec::new(),
@@ -1389,6 +1396,7 @@ mod tests {
                 task_type: TaskType::Task,
                 epic: Some(active_epic_id.to_string()),
                 branch: None,
+                updated_at: None,
             }],
             in_progress_tasks: Vec::new(),
             epic_tasks: vec![
@@ -1401,6 +1409,7 @@ mod tests {
                     task_type: TaskType::Epic,
                     epic: None,
                     branch: Some("epic/stale".to_string()),
+                    updated_at: None,
                 },
                 TaskSummary {
                     id: active_epic_id.to_string(),
@@ -1411,6 +1420,7 @@ mod tests {
                     task_type: TaskType::Epic,
                     epic: None,
                     branch: Some("epic/active".to_string()),
+                    updated_at: None,
                 },
             ],
             agents: Vec::new(),
@@ -1451,6 +1461,7 @@ mod tests {
                 task_type: TaskType::Task,
                 epic: Some(active_id.to_string()),
                 branch: None,
+                updated_at: None,
             }],
             epic_tasks: vec![
                 TaskSummary {
@@ -1462,6 +1473,7 @@ mod tests {
                     task_type: TaskType::Epic,
                     epic: None,
                     branch: Some("epic/preferred".to_string()),
+                    updated_at: None,
                 },
                 TaskSummary {
                     id: active_id.to_string(),
@@ -1472,6 +1484,7 @@ mod tests {
                     task_type: TaskType::Epic,
                     epic: None,
                     branch: Some("epic/active".to_string()),
+                    updated_at: None,
                 },
             ],
             agents: Vec::new(),
@@ -1527,6 +1540,7 @@ mod tests {
                 task_type: TaskType::Task,
                 epic: Some(active_id.to_string()),
                 branch: None,
+                updated_at: None,
             }],
             in_progress_tasks: vec![TaskSummary {
                 id: "task-ip".to_string(),
@@ -1537,6 +1551,7 @@ mod tests {
                 task_type: TaskType::Task,
                 epic: Some(active_id.to_string()),
                 branch: None,
+                updated_at: None,
             }],
             epic_tasks: vec![
                 TaskSummary {
@@ -1548,6 +1563,7 @@ mod tests {
                     task_type: TaskType::Epic,
                     epic: None,
                     branch: Some("epic/active".to_string()),
+                    updated_at: None,
                 },
                 TaskSummary {
                     id: hijacker_id.to_string(),
@@ -1558,6 +1574,7 @@ mod tests {
                     task_type: TaskType::Epic,
                     epic: None,
                     branch: Some("epic/hijacker".to_string()),
+                    updated_at: None,
                 },
             ],
             agents: Vec::new(),
@@ -1654,6 +1671,7 @@ mod tests {
                 task_type: TaskType::Task,
                 epic: Some(new_id.to_string()),
                 branch: None,
+                updated_at: None,
             }],
             in_progress_tasks: Vec::new(),
             epic_tasks: vec![TaskSummary {
@@ -1665,6 +1683,7 @@ mod tests {
                 task_type: TaskType::Epic,
                 epic: None,
                 branch: Some("epic/new".to_string()),
+                updated_at: None,
             }],
             agents: Vec::new(),
             activity: Vec::new(),
@@ -1731,6 +1750,7 @@ mod tests {
                 task_type: TaskType::Task,
                 epic: Some(active_id.to_string()),
                 branch: None,
+                updated_at: None,
             }],
             in_progress_tasks: Vec::new(),
             epic_tasks: vec![
@@ -1743,6 +1763,7 @@ mod tests {
                     task_type: TaskType::Epic,
                     epic: None,
                     branch: Some("epic/active".to_string()),
+                    updated_at: None,
                 },
                 TaskSummary {
                     id: hijacker_id.to_string(),
@@ -1753,6 +1774,7 @@ mod tests {
                     task_type: TaskType::Epic,
                     epic: None,
                     branch: Some("epic/hijacker".to_string()),
+                    updated_at: None,
                 },
             ],
             agents: Vec::new(),
