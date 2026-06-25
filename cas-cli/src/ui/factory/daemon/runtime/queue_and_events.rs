@@ -235,17 +235,33 @@ impl FactoryDaemon {
                 continue;
             }
 
-            // Gate PTY injection on pane readiness: Claude Code flushes the PTY
-            // input buffer during startup, so text written before readline
-            // initialization is silently lost. Wait for output + a 5s grace
-            // period before injecting. Teams-mode uses inbox files, not PTY.
-            if self.teams.is_none() {
+            // Gate PTY injection on pane readiness: harnesses flush the PTY input
+            // buffer during startup, so text written before readline initialization
+            // is silently lost. Wait for output + a grace period before injecting.
+            //
+            // The gate applies to any PTY-delivered recipient. Originally this was
+            // `self.teams.is_none()` (everyone PTY-delivered in a non-teams factory).
+            // cas-b68a note b adds the missing case: a Codex recipient is PTY-delivered
+            // even under a Claude teams supervisor, and its *first* message was being
+            // dropped because the gate was skipped whenever `teams.is_some()`.
+            //
+            // `all_workers` is not a single pane, so harness/readiness can't be resolved
+            // for it — it keeps the original `teams.is_none()` semantics exactly (the
+            // per-worker loop below resolves each worker individually). Claude inbox
+            // writes need no gate (plain file write, no readline race).
+            {
                 let pane_target = if target == "supervisor" {
                     self.app.supervisor_name()
                 } else {
                     target.as_str()
                 };
-                if !self.app.mux.pane_ready_for_injection(pane_target) {
+                let pty_delivered = self.teams.is_none()
+                    || (target != "all_workers"
+                        && super::delivery::requires_pty_readiness_gate(
+                            self.app.harness_for(pane_target),
+                            true,
+                        ));
+                if pty_delivered && !self.app.mux.pane_ready_for_injection(pane_target) {
                     // Don't ack — the prompt stays in the queue for the next tick.
                     continue;
                 }
@@ -323,21 +339,16 @@ impl FactoryDaemon {
                 }
                 let mut any_success = false;
                 for name in workers {
-                    let inject_result: anyhow::Result<()> = if let Some(ref teams) = self.teams {
-                        teams.write_to_inbox(
+                    // Recipient-aware routing (cas-b68a): each worker may run a
+                    // different harness, so resolve per-worker inside the loop.
+                    let inject_result = self
+                        .deliver_to_worker(
                             &name,
                             &inbox_source,
                             &prompt_with_instructions,
                             queued.summary.as_deref(),
-                            None,
                         )
-                    } else {
-                        self.app
-                            .mux
-                            .inject(&name, &prompt_with_instructions)
-                            .await
-                            .map_err(Into::into)
-                    };
+                        .await;
                     match inject_result {
                         Ok(_) => {
                             any_success = true;
@@ -372,34 +383,22 @@ impl FactoryDaemon {
                 }
                 success = any_success;
             } else {
-                // Resolve target for delivery. For teams, the supervisor's team
-                // name is "supervisor". For mux.inject, use the generated pane name.
+                // Resolve the pane name for diagnostics / event records. Delivery
+                // itself (channel selection + name normalisation) is handled by the
+                // recipient-aware helper (cas-b68a).
                 let pane_target = if target == "supervisor" {
                     self.app.supervisor_name()
                 } else {
                     target.as_str()
                 };
-                // For teams inbox, map generated pane name back to "supervisor"
-                let inbox_target = if pane_target == self.app.supervisor_name() {
-                    "supervisor"
-                } else {
-                    pane_target
-                };
-                let inject_result: anyhow::Result<()> = if let Some(ref teams) = self.teams {
-                    teams.write_to_inbox(
-                        inbox_target,
+                let inject_result = self
+                    .deliver_to_worker(
+                        target,
                         &inbox_source,
                         &prompt_with_instructions,
                         queued.summary.as_deref(),
-                        None,
                     )
-                } else {
-                    self.app
-                        .mux
-                        .inject(pane_target, &prompt_with_instructions)
-                        .await
-                        .map_err(Into::into)
-                };
+                    .await;
                 match inject_result {
                     Ok(_) => {
                         success = true;

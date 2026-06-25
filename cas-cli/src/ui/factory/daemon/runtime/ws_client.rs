@@ -294,17 +294,11 @@ impl FactoryDaemon {
             }
             ClientMessage::Inject { pane_id, prompt } => {
                 let actual = self.resolve_pane_name(&pane_id);
-                if let Some(ref teams) = self.teams {
-                    let _ = teams.write_to_inbox(
-                        &actual,
-                        super::teams::DIRECTOR_AGENT_NAME,
-                        &prompt,
-                        None,
-                        None,
-                    );
-                } else {
-                    let _ = self.app.mux.inject(&actual, &prompt).await;
-                }
+                // Recipient-aware routing (cas-b68a): inject reaches a Codex pane
+                // via PTY even when the supervisor runs Claude teams.
+                let _ = self
+                    .deliver_to_worker(&actual, super::teams::DIRECTOR_AGENT_NAME, &prompt, None)
+                    .await;
             }
             ClientMessage::GetState => {
                 let state = self.build_session_state();

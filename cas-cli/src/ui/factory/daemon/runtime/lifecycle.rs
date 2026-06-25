@@ -369,23 +369,16 @@ impl FactoryDaemon {
                         // number that tells us whether refresh_interval
                         // needs to be lowered for the P99 SLO.
                         let inject_started = std::time::Instant::now();
-                        let inject_result: anyhow::Result<()> = if let Some(ref teams) = self.teams {
-                            teams
-                                .write_to_inbox(
-                                    &prompt.target,
-                                    super::teams::DIRECTOR_AGENT_NAME,
-                                    &prompt.text,
-                                    None,
-                                    None,
-                                )
-                                .map_err(Into::into)
-                        } else {
-                            self.app
-                                .mux
-                                .inject(&prompt.target, &prompt.text)
-                                .await
-                                .map_err(Into::into)
-                        };
+                        // Recipient-aware routing (cas-b68a): a director event aimed
+                        // at a Codex agent must reach its PTY, not a Claude inbox.
+                        let inject_result = self
+                            .deliver_to_worker(
+                                &prompt.target,
+                                super::teams::DIRECTOR_AGENT_NAME,
+                                &prompt.text,
+                                None,
+                            )
+                            .await;
                         let inject_ms =
                             inject_started.elapsed().as_secs_f64() * 1000.0;
                         let total_ms =

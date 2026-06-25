@@ -1,5 +1,6 @@
 mod client_input;
 mod cloud;
+mod delivery;
 mod gui_client;
 mod lifecycle;
 mod output;
