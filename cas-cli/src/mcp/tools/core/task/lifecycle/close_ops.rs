@@ -156,6 +156,29 @@ impl CasCore {
             data: None,
         })?;
 
+        // cas-6538 (EPIC cas-1255 — per-task depth speed mode): a `depth=light`
+        // task is the feel-driven, fast-iteration path. The close gate skips
+        // the two *rigor* gates — the verification jail (no `task-verifier`
+        // dispatch / `pending_verification` arming) and the P0 code-review gate
+        // (treated as satisfied, including the supervisor-review queue hop that
+        // *is* the P0 gate under `owner = "supervisor"`). The skip is recorded
+        // as a decision note on the task (see `light_skip_decision_note`) so
+        // the bypass is auditable.
+        //
+        // REGRESSION GUARD: this flag is the *only* condition that diverges
+        // light from today's behavior. `Deep`/unset rows read back as `Deep`
+        // (NULL→Deep, see cas-0344), so every existing close path is byte-for-
+        // byte unchanged unless the task was explicitly created `depth=light`.
+        //
+        // SCOPE: the light skip deliberately does NOT touch the data-state
+        // guards (merge-state cas-95ce/cas-762e, uncommitted-work cas-895d,
+        // additive-only cas-bc1b, commit-claim). Those verify the work
+        // physically exists / is merged — orthogonal to review rigor — and a
+        // light task must still satisfy them. It also does not interact with
+        // the supervisor `bypass_code_review` override, which stays exactly as
+        // before for `Deep` and is simply redundant for `Light`.
+        let depth_light = task.depth == crate::types::TaskDepth::Light;
+
         // For Epics: Check that all worker branches are merged before verification
         // This ensures epic-level verification runs on the complete merged code
         if task.task_type == TaskType::Epic {
@@ -334,7 +357,16 @@ impl CasCore {
                 .map(|aid| task.assignee.as_deref() == Some(aid.as_str()))
                 .unwrap_or(false);
 
-        if verification_enabled && !skip_verification && !worker_under_supervisor_review {
+        // cas-6538: `depth_light` short-circuits the verification jail. The
+        // jail arms `pending_verification=true` and demands a `task-verifier`
+        // verdict before close; light tasks skip it entirely. For `Deep`/unset
+        // (`!depth_light`) the condition is unchanged, so the jail arms exactly
+        // as today.
+        if verification_enabled
+            && !skip_verification
+            && !worker_under_supervisor_review
+            && !depth_light
+        {
             let is_worker_without_subagents = is_worker_without_subagents_from_env();
 
             // Check for approved verification
@@ -1230,12 +1262,20 @@ impl CasCore {
             .map(|cr| cr.supervisor_owned())
             .unwrap_or_else(|| crate::config::CodeReviewConfig::default().supervisor_owned());
 
+        // cas-6538: under `owner = "supervisor"` the worker close normally
+        // transitions to `PendingSupervisorReview` — that queue hop IS the P0
+        // code-review gate for this mode (the supervisor runs cas-code-review
+        // off the queue). For `depth_light` we treat the P0 gate as satisfied,
+        // so skip the pend-transition and let the close complete immediately
+        // (AC: "close succeeds", demo: "closes immediately"). `Deep`/unset is
+        // unaffected — `!depth_light` keeps the transition firing as today.
         if supervisor_review_mode
             && is_factory_worker
             && task.task_type != TaskType::Epic
             && task.execution_note.as_deref() != Some("additive-only")
             && !bypass_close_gates
             && effective_has_reviewable
+            && !depth_light
         {
             // Run the lightweight structural lint.
             match run_lightweight_structural_lint(close_project_root) {
@@ -1331,7 +1371,15 @@ impl CasCore {
         //
         // Cases 1/3/4 are handled here: docs-only, ambiguous zero-commit,
         // and deliberate no-code respectively.
-        let gate_outcome = if epic_subtask_receipts_cover {
+        let gate_outcome = if depth_light {
+            // cas-6538: light tasks treat the P0 code-review gate as satisfied.
+            // This is the non-factory / solo close path (the factory worker
+            // supervisor-review hop is already skipped above for light); a
+            // direct close that reaches the gate must not be blocked by a
+            // missing review envelope. `Deep`/unset falls through to the
+            // existing routing, so the gate enforces exactly as today.
+            CodeReviewGateOutcome::Proceed
+        } else if epic_subtask_receipts_cover {
             CodeReviewGateOutcome::Proceed
         } else if !effective_has_reviewable {
             let has_review_findings = req
@@ -1464,6 +1512,21 @@ impl CasCore {
                         }
                     }
                 }
+            }
+        }
+
+        // cas-6538: record an auditable decision note for the light-depth skip
+        // BEFORE the close-reason note, so the bypass is permanently visible in
+        // the task timeline. Persisted via the single `task_store.update(&task)`
+        // below (the final write), which guarantees it survives — unlike the
+        // earlier gate clone-persist paths that the final write overwrites.
+        if depth_light {
+            let timestamp = now.format("%Y-%m-%d %H:%M");
+            let decision_note = format!("[{timestamp}] {}", light_skip_decision_note());
+            if task.notes.is_empty() {
+                task.notes = decision_note;
+            } else {
+                task.notes = format!("{}\n\n{}", task.notes, decision_note);
             }
         }
 
@@ -1913,6 +1976,20 @@ impl CasCore {
             );
         }
     }
+}
+
+/// cas-6538: audit text recorded on a `depth=light` task at close time,
+/// stating exactly which rigor gates were skipped and why. Kept as a
+/// self-contained `pub(crate)` fn (not an inline literal) so the wording
+/// is unit-testable and stays in one place. The caller prepends a
+/// `[timestamp]` and appends it to the task notes timeline.
+pub(crate) fn light_skip_decision_note() -> String {
+    "decision: depth=light close (EPIC cas-1255 speed mode) — skipped the \
+     verification jail (no task-verifier dispatch; pending_verification left \
+     false) and the P0 code-review gate (treated as satisfied; supervisor \
+     review queue hop bypassed). Reason: task depth=light. Data-state guards \
+     (merge-state, uncommitted-work, additive-only, commit-claim) still ran."
+        .to_string()
 }
 
 /// A single additive-only violation: a file whose git status indicates it
@@ -4003,6 +4080,27 @@ mod code_review_gate_tests {
     //! close-side glue — env role check, envelope plumbing, override
     //! path, docs-only skip, CODE_REVIEW_REQUIRED rejection.
     use super::*;
+
+    /// cas-6538: the light-skip decision note must name both rigor gates it
+    /// bypasses and the reason, so the bypass is auditable. The integration
+    /// tests assert on substrings of this text; lock the wording here.
+    #[test]
+    fn light_skip_decision_note_names_both_gates_and_reason() {
+        let note = light_skip_decision_note();
+        assert!(note.contains("depth=light"), "must cite the reason: {note}");
+        assert!(
+            note.to_lowercase().contains("decision"),
+            "must be a decision note: {note}"
+        );
+        assert!(
+            note.contains("verification jail"),
+            "must name the verification jail skip: {note}"
+        );
+        assert!(
+            note.contains("code-review gate"),
+            "must name the P0 code-review gate skip: {note}"
+        );
+    }
     use cas_types::{AutofixClass, Finding, FindingSeverity, Owner, ReviewOutcome};
     use tempfile::TempDir;
 
