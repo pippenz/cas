@@ -71,10 +71,20 @@ struct McpTestClient {
 impl McpTestClient {
     /// Spawn MCP server (7 meta-tools)
     fn spawn(cas_dir: &std::path::Path) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_cas"))
-            .arg("serve")
-            .env("CAS_DIR", cas_dir)
-            .current_dir(cas_dir)
+        // `cas serve` resolves its store via `find_cas_root()`, which honors an
+        // inherited `CAS_ROOT` BEFORE any cwd-based detection — `CAS_DIR` is not
+        // consulted by serve at all. When the test runner itself was launched
+        // inside a CAS factory worker session, `CAS_ROOT`/`CAS_SESSION_ID` are
+        // inherited and would redirect serve to the live worker DB instead of
+        // this test's freshly-`init`ed temp dir. That live DB may legitimately
+        // lack newer columns (e.g. `depth`), so task-create INSERTs fail with
+        // "table tasks has no column named depth" — a false red unrelated to the
+        // code under test. Scrub all CAS_* vars (matching `init_cas_dir`) so
+        // serve falls back to cwd-based detection and finds `<cas_dir>/.cas`.
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_cas"));
+        cmd.arg("serve").current_dir(cas_dir);
+        scrub_cas_env(&mut cmd);
+        let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
