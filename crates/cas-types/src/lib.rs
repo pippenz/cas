@@ -84,7 +84,7 @@ pub use sort::{
     TaskSortOptions,
 };
 pub use spec::{Spec, SpecStatus, SpecType};
-pub use task::{Priority, Task, TaskDeliverables, TaskStatus, TaskType};
+pub use task::{Priority, Task, TaskDeliverables, TaskDepth, TaskStatus, TaskType};
 pub use verification::{
     IssueSeverity, Verification, VerificationIssue, VerificationStatus, VerificationType,
 };

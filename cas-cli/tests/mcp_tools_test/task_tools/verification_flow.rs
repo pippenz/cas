@@ -25,6 +25,7 @@ async fn test_task_close_blocked_without_verification() {
 
     // Create task
     let req = TaskCreateRequest {
+        depth: None,
         title: "Task requiring verification".to_string(),
         description: None,
         priority: 2,
@@ -116,6 +117,7 @@ require_merge_on_epic_close = true
     .expect("should write config");
 
     let req = TaskCreateRequest {
+        depth: None,
         title: "Task with worktree".to_string(),
         description: None,
         priority: 2,
@@ -272,6 +274,7 @@ enabled = false
     worktree_store.add(&worktree).expect("add worktree");
 
     let create_req = TaskCreateRequest {
+        depth: None,
         title: "cas-895d regression: committed-state close gate".to_string(),
         description: None,
         priority: 2,
@@ -478,6 +481,7 @@ enabled = false
     let task_store = open_task_store(&cas_dir).expect("open task store");
 
     let additive_req = |title: &str| TaskCreateRequest {
+        depth: None,
         title: title.to_string(),
         description: None,
         priority: 2,
@@ -681,6 +685,7 @@ enabled = false
     let task_store = open_task_store(&cas_dir).expect("open task store");
 
     let create_req = TaskCreateRequest {
+        depth: None,
         title: "Non-isolated task over dirty main (cas-895d skip)".to_string(),
         description: None,
         priority: 2,
@@ -744,6 +749,7 @@ enabled = false
     git(&["commit", "-q", "-m", "main: extend shared.md"]);
 
     let create_additive_req = TaskCreateRequest {
+        depth: None,
         title: "Non-isolated additive-only task (cas-bc1b skip)".to_string(),
         description: None,
         priority: 2,
@@ -819,6 +825,7 @@ enabled = false
     .expect("write config");
 
     let create_req = TaskCreateRequest {
+        depth: None,
         title: "Notes-only task".to_string(),
         description: None,
         priority: 2,
@@ -878,6 +885,7 @@ async fn test_epic_close_requires_epic_verification_type() {
 
     // Create epic
     let req = TaskCreateRequest {
+        depth: None,
         title: "Epic requiring epic verification".to_string(),
         description: None,
         priority: 2,
@@ -987,6 +995,7 @@ async fn test_task_lifecycle_with_verification() {
 
     // Create task
     let req = TaskCreateRequest {
+        depth: None,
         title: "Lifecycle task".to_string(),
         description: None,
         priority: 2,
@@ -1065,6 +1074,7 @@ async fn test_task_close_blocked_with_rejected_verification() {
 
     // Create task
     let req = TaskCreateRequest {
+        depth: None,
         title: "Task with rejected verification".to_string(),
         description: None,
         priority: 2,
@@ -1147,6 +1157,7 @@ async fn test_task_close_runs_verifier_or_skips_cleanly() {
 
     // Create + start a task.
     let req = TaskCreateRequest {
+        depth: None,
         title: "Dispatch-on-close regression task".to_string(),
         description: None,
         priority: 2,
@@ -1284,6 +1295,7 @@ async fn test_close_supervisor_bypass_orphaned_task() {
     // Create + start a task, then strip its assignee to simulate the
     // orphaned-worker state the hatch is designed to recover from.
     let req = TaskCreateRequest {
+        depth: None,
         title: "Orphaned worker task for escape-hatch test".to_string(),
         description: None,
         priority: 2,
@@ -1396,6 +1408,7 @@ async fn test_close_supervisor_bypass_ghost_assignee() {
     let verification_store = open_verification_store(&cas_dir).unwrap();
 
     let req = TaskCreateRequest {
+        depth: None,
         title: "Task assigned to a ghost agent".to_string(),
         description: None,
         priority: 2,
@@ -1497,6 +1510,7 @@ async fn test_close_supervisor_active_worker_assignee_by_name() {
     agent_store.register(&worker).expect("register worker");
 
     let create_req = TaskCreateRequest {
+        depth: None,
         title: "Task held by a by-name assignee".to_string(),
         description: None,
         priority: 2,
@@ -1650,6 +1664,7 @@ async fn test_close_supervisor_no_bypass_when_assignee_alive() {
         .expect("setup_cas should register a test agent");
 
     let req = TaskCreateRequest {
+        depth: None,
         title: "Task with an alive assignee".to_string(),
         description: None,
         priority: 2,
@@ -2296,6 +2311,7 @@ async fn test_close_auto_escalates_stale_verification_dispatch() {
 
     // Create + start task.
     let req = TaskCreateRequest {
+        depth: None,
         title: "Stuck in verification jail".to_string(),
         description: None,
         priority: 2,
@@ -2444,6 +2460,7 @@ async fn test_close_forwards_persisted_review_envelope_after_jail() {
     git(&["add", "src/lib.rs"]);
 
     let req = TaskCreateRequest {
+        depth: None,
         title: "cas-3086: persisted-envelope forwarding".to_string(),
         description: None,
         priority: 2,
@@ -2649,6 +2666,7 @@ async fn test_verification_add_supervisor_active_assignee_error_message() {
 
     // Create a regular (non-Epic) task and assign the live worker to it.
     let create_req = TaskCreateRequest {
+        depth: None,
         title: "Live worker task — supervisor must not verify behind their back".to_string(),
         description: None,
         priority: 2,
@@ -2850,6 +2868,7 @@ owner = "worker"
 
     // Create a task.
     let req = TaskCreateRequest {
+        depth: None,
         title: "cas-778a: worker-owned verification happy path".to_string(),
         description: None,
         priority: 2,
@@ -2966,6 +2985,7 @@ owner = "worker"
     let _env = FactoryWorkerEnv::enter();
 
     let req = TaskCreateRequest {
+        depth: None,
         title: "cas-778a: P0-in-residual with pre_existing=true must block".to_string(),
         description: None,
         priority: 2,
@@ -3052,6 +3072,7 @@ owner = "worker"
     let _env = FactoryWorkerEnv::enter();
 
     let req = TaskCreateRequest {
+        depth: None,
         title: "cas-778a: worker P0 residual must still block".to_string(),
         description: None,
         priority: 2,
@@ -3137,6 +3158,7 @@ owner = "worker"
     let _env = FactoryWorkerEnv::enter();
 
     let req = TaskCreateRequest {
+        depth: None,
         title: "cas-778a: worker malformed envelope must still block".to_string(),
         description: None,
         priority: 2,
@@ -3233,6 +3255,7 @@ owner = "worker"
 
     // Create + start task.
     let req = TaskCreateRequest {
+        depth: None,
         title: "cas-164c: self-cert blocked by fresh dispatch row".to_string(),
         description: None,
         priority: 2,
@@ -3400,6 +3423,7 @@ async fn test_worker_close_succeeds_when_skipped_row_write_fails_option_b() {
 
     // Create + start task.
     let req = TaskCreateRequest {
+        depth: None,
         title: "cas-c97e: close succeeds when Skipped row write fails".to_string(),
         description: None,
         priority: 2,

@@ -11,6 +11,7 @@ async fn test_task_show() {
 
     // Create task
     let req = TaskCreateRequest {
+        depth: None,
         title: "Show task".to_string(),
         description: Some("Detailed description".to_string()),
         priority: 1,
@@ -56,6 +57,7 @@ async fn test_task_show() {
 
 fn basic_create(title: &str, execution_note: Option<String>) -> TaskCreateRequest {
     TaskCreateRequest {
+        depth: None,
         title: title.to_string(),
         description: None,
         priority: 2,
@@ -173,6 +175,7 @@ async fn test_execution_note_update_sets_value() {
 
     let updated = service
         .cas_task_update(Parameters(TaskUpdateRequest {
+        depth: None,
             id: id.clone(),
             title: None,
             notes: None,
@@ -224,6 +227,7 @@ async fn test_execution_note_update_empty_string_clears() {
 
     service
         .cas_task_update(Parameters(TaskUpdateRequest {
+        depth: None,
             id: id.clone(),
             title: None,
             notes: None,
@@ -262,6 +266,7 @@ async fn test_task_update() {
 
     // Create task
     let req = TaskCreateRequest {
+        depth: None,
         title: "Update task".to_string(),
         description: None,
         priority: 2,
@@ -288,6 +293,7 @@ async fn test_task_update() {
 
     // Update task
     let update_req = TaskUpdateRequest {
+        depth: None,
         id: id.to_string(),
         title: Some("Updated title".to_string()),
         notes: Some("Added note".to_string()),
@@ -320,6 +326,7 @@ async fn test_task_update_design_and_acceptance_criteria() {
 
     // Create task
     let req = TaskCreateRequest {
+        depth: None,
         title: "Spec task".to_string(),
         description: None,
         priority: 2,
@@ -346,6 +353,7 @@ async fn test_task_update_design_and_acceptance_criteria() {
 
     // Update design and acceptance_criteria
     let update_req = TaskUpdateRequest {
+        depth: None,
         id: id.to_string(),
         title: None,
         notes: None,
@@ -402,6 +410,7 @@ async fn test_task_notes() {
 
     // Create task
     let req = TaskCreateRequest {
+        depth: None,
         title: "Notes task".to_string(),
         description: None,
         priority: 2,
@@ -449,6 +458,7 @@ async fn test_task_list() {
     // Create tasks
     for i in 0..3 {
         let req = TaskCreateRequest {
+        depth: None,
             title: format!("List task {i}"),
             description: None,
             priority: 2,
@@ -498,6 +508,7 @@ async fn test_task_ready() {
     // Create ready tasks
     for i in 0..3 {
         let req = TaskCreateRequest {
+        depth: None,
             title: format!("Ready task {i}"),
             description: None,
             priority: 2,
@@ -545,6 +556,7 @@ async fn test_task_ready_epic_filter() {
     // Create an epic.
     let epic_result = service
         .cas_task_create(Parameters(TaskCreateRequest {
+        depth: None,
             title: "Test Epic".to_string(),
             description: None,
             priority: 1,
@@ -570,6 +582,7 @@ async fn test_task_ready_epic_filter() {
     for i in 0..2 {
         service
             .cas_task_create(Parameters(TaskCreateRequest {
+        depth: None,
                 title: format!("Epic subtask {i}"),
                 description: None,
                 priority: 2,
@@ -592,6 +605,7 @@ async fn test_task_ready_epic_filter() {
     // Create 1 task NOT under the epic.
     service
         .cas_task_create(Parameters(TaskCreateRequest {
+        depth: None,
             title: "Unrelated task".to_string(),
             description: None,
             priority: 2,
@@ -655,6 +669,7 @@ async fn test_task_delete() {
 
     // Create task
     let req = TaskCreateRequest {
+        depth: None,
         title: "Delete task".to_string(),
         description: None,
         priority: 2,
@@ -696,6 +711,7 @@ async fn test_task_dependencies() {
 
     // Create two tasks
     let req1 = TaskCreateRequest {
+        depth: None,
         title: "Blocker task".to_string(),
         description: None,
         priority: 1,
@@ -721,6 +737,7 @@ async fn test_task_dependencies() {
     let blocker_id = extract_task_id(&text1).expect("should have task ID");
 
     let req2 = TaskCreateRequest {
+        depth: None,
         title: "Blocked task".to_string(),
         description: None,
         priority: 2,
@@ -779,6 +796,7 @@ async fn test_task_show_dependency_direction_labels() {
 
     let blocker = service
         .cas_task_create(Parameters(TaskCreateRequest {
+        depth: None,
             title: "Direction blocker".to_string(),
             description: None,
             priority: 1,
@@ -802,6 +820,7 @@ async fn test_task_show_dependency_direction_labels() {
 
     let blocked = service
         .cas_task_create(Parameters(TaskCreateRequest {
+        depth: None,
             title: "Direction blocked".to_string(),
             description: None,
             priority: 2,
@@ -856,6 +875,7 @@ async fn test_close_auto_unblocks_blocked_dependents() {
 
     let blocker = service
         .cas_task_create(Parameters(TaskCreateRequest {
+        depth: None,
             title: "Auto unblock blocker".to_string(),
             description: None,
             priority: 1,
@@ -879,6 +899,7 @@ async fn test_close_auto_unblocks_blocked_dependents() {
 
     let blocked = service
         .cas_task_create(Parameters(TaskCreateRequest {
+        depth: None,
             title: "Auto unblock dependent".to_string(),
             description: None,
             priority: 2,
@@ -902,6 +923,7 @@ async fn test_close_auto_unblocks_blocked_dependents() {
 
     let _ = service
         .cas_task_update(Parameters(TaskUpdateRequest {
+        depth: None,
             id: blocked_id.clone(),
             title: None,
             notes: None,
@@ -970,6 +992,7 @@ async fn test_task_update_invalid_epic_keeps_original_parent_dependency() {
 
     let epic_1 = service
         .cas_task_create(Parameters(TaskCreateRequest {
+        depth: None,
             title: "Epic 1".to_string(),
             description: None,
             priority: 1,
@@ -993,6 +1016,7 @@ async fn test_task_update_invalid_epic_keeps_original_parent_dependency() {
 
     let subtask = service
         .cas_task_create(Parameters(TaskCreateRequest {
+        depth: None,
             title: "Child task".to_string(),
             description: None,
             priority: 2,
@@ -1016,6 +1040,7 @@ async fn test_task_update_invalid_epic_keeps_original_parent_dependency() {
 
     let update_result = service
         .cas_task_update(Parameters(TaskUpdateRequest {
+        depth: None,
             id: subtask_id.clone(),
             title: None,
             notes: None,
@@ -1065,6 +1090,7 @@ async fn test_task_update_surfaces_epic_dependency_delete_failure() {
 
     let epic = service
         .cas_task_create(Parameters(TaskCreateRequest {
+        depth: None,
             title: "Epic".to_string(),
             description: None,
             priority: 1,
@@ -1088,6 +1114,7 @@ async fn test_task_update_surfaces_epic_dependency_delete_failure() {
 
     let subtask = service
         .cas_task_create(Parameters(TaskCreateRequest {
+        depth: None,
             title: "Subtask".to_string(),
             description: None,
             priority: 2,
@@ -1123,6 +1150,7 @@ async fn test_task_update_surfaces_epic_dependency_delete_failure() {
 
     let update_result = service
         .cas_task_update(Parameters(TaskUpdateRequest {
+        depth: None,
             id: subtask_id,
             title: None,
             notes: None,
@@ -1152,6 +1180,7 @@ async fn test_subtask_start_auto_starts_epic() {
 
     // Create an epic
     let epic_req = TaskCreateRequest {
+        depth: None,
         title: "Test Epic".to_string(),
         description: Some("An epic with subtasks".to_string()),
         priority: 1,
@@ -1193,6 +1222,7 @@ async fn test_subtask_start_auto_starts_epic() {
 
     // Create a subtask linked to the epic
     let subtask_req = TaskCreateRequest {
+        depth: None,
         title: "Subtask 1".to_string(),
         description: None,
         priority: 2,
@@ -1303,6 +1333,7 @@ async fn test_task_mine_matches_env_worker_name_during_spawn_race() {
     // Create a task, then update its assignee to the worker's friendly name —
     // exactly what a supervisor does via `task update assignee=<worker-name>`.
     let create_req = TaskCreateRequest {
+        depth: None,
         title: "Spawn-race assignment".to_string(),
         description: None,
         priority: 1,
@@ -1327,6 +1358,7 @@ async fn test_task_mine_matches_env_worker_name_during_spawn_race() {
         .to_string();
 
     let update_req = TaskUpdateRequest {
+        depth: None,
         id: id.clone(),
         title: None,
         notes: None,
@@ -1406,6 +1438,7 @@ async fn test_release_autorecovers_lease_less_in_progress_task() {
     // (simulating a dead-session orphan where status diverged from lease).
     let created = service
         .cas_task_create(Parameters(TaskCreateRequest {
+        depth: None,
             title: "Orphaned in-progress".to_string(),
             description: None,
             priority: 2,
@@ -1429,6 +1462,7 @@ async fn test_release_autorecovers_lease_less_in_progress_task() {
 
     service
         .cas_task_update(Parameters(TaskUpdateRequest {
+        depth: None,
             id: id.clone(),
             title: None,
             notes: None,
@@ -1490,6 +1524,7 @@ async fn test_release_still_errors_when_no_lease_and_task_already_open() {
     // there's nothing to recover, surface the underlying error.
     let created = service
         .cas_task_create(Parameters(TaskCreateRequest {
+        depth: None,
             title: "Plain open task".to_string(),
             description: None,
             priority: 2,
@@ -1528,6 +1563,7 @@ async fn test_reset_clears_lease_assignee_and_forces_open() {
 
     let created = service
         .cas_task_create(Parameters(TaskCreateRequest {
+        depth: None,
             title: "Needs reset".to_string(),
             description: None,
             priority: 1,
@@ -1551,6 +1587,7 @@ async fn test_reset_clears_lease_assignee_and_forces_open() {
 
     service
         .cas_task_update(Parameters(TaskUpdateRequest {
+        depth: None,
             id: id.clone(),
             title: None,
             notes: None,
@@ -1607,6 +1644,7 @@ async fn test_reset_refuses_closed_task() {
 
     let created = service
         .cas_task_create(Parameters(TaskCreateRequest {
+        depth: None,
             title: "Already closed".to_string(),
             description: None,
             priority: 2,
@@ -1630,6 +1668,7 @@ async fn test_reset_refuses_closed_task() {
 
     service
         .cas_task_update(Parameters(TaskUpdateRequest {
+        depth: None,
             id: id.clone(),
             title: None,
             notes: None,
@@ -1669,6 +1708,7 @@ async fn test_show_after_update_reflects_new_status_without_lag() {
 
     let created = service
         .cas_task_create(Parameters(TaskCreateRequest {
+        depth: None,
             title: "Status readback".to_string(),
             description: None,
             priority: 2,
@@ -1693,6 +1733,7 @@ async fn test_show_after_update_reflects_new_status_without_lag() {
     // Move to InProgress.
     service
         .cas_task_update(Parameters(TaskUpdateRequest {
+        depth: None,
             id: id.clone(),
             title: None,
             notes: None,
@@ -1730,6 +1771,7 @@ async fn test_show_after_update_reflects_new_status_without_lag() {
     // Now flip back to Open. Show must reflect Open, not a cached InProgress.
     service
         .cas_task_update(Parameters(TaskUpdateRequest {
+        depth: None,
             id: id.clone(),
             title: None,
             notes: None,
@@ -1774,6 +1816,7 @@ async fn test_task_mine_matches_case_insensitive_and_trimmed() {
     // Exercise the defensive matching path: assignee spelled with differing
     // case and surrounding whitespace still matches the current agent.
     let create_req = TaskCreateRequest {
+        depth: None,
         title: "Case-trim mine match".to_string(),
         description: None,
         priority: 2,
@@ -1798,6 +1841,7 @@ async fn test_task_mine_matches_case_insensitive_and_trimmed() {
         .to_string();
 
     let update_req = TaskUpdateRequest {
+        depth: None,
         id: id.clone(),
         title: None,
         notes: None,
@@ -1862,6 +1906,7 @@ impl Drop for ScopedSupervisorRole {
 
 fn make_task_create_req(title: &str) -> TaskCreateRequest {
     TaskCreateRequest {
+        depth: None,
         title: title.to_string(),
         description: None,
         priority: 2,
@@ -2256,6 +2301,7 @@ async fn test_create_rejects_blocked_by_same_as_epic() {
 
     // Create an epic first
     let epic_create = TaskCreateRequest {
+        depth: None,
         title: "Epic for mixed-dep rejection test".to_string(),
         description: None,
         priority: 2,
@@ -2281,6 +2327,7 @@ async fn test_create_rejects_blocked_by_same_as_epic() {
 
     // Attempt to create a child task that is ALSO blocked by the same epic
     let bad_create = TaskCreateRequest {
+        depth: None,
         title: "Child blocked by its own epic".to_string(),
         description: None,
         priority: 2,
@@ -2348,6 +2395,7 @@ async fn test_task_start_locked_error_includes_worker_name() {
     // Create a task.
     let created = service
         .cas_task_create(Parameters(TaskCreateRequest {
+        depth: None,
             title: "Locked task for name-in-error test".to_string(),
             description: None,
             priority: 2,

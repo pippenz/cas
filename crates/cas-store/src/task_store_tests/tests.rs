@@ -48,6 +48,31 @@ fn test_task_crud() {
 }
 
 #[test]
+fn test_task_depth_roundtrip() {
+    use cas_types::TaskDepth;
+    let (_temp, store) = create_test_store();
+
+    // Default (no depth specified) reads back as Deep.
+    let id = store.generate_id().unwrap();
+    let task = Task::new(id.clone(), "deep by default".to_string());
+    store.add(&task).unwrap();
+    assert_eq!(store.get(&id).unwrap().depth, TaskDepth::Deep);
+
+    // Create with Light, read back Light.
+    let light_id = store.generate_id().unwrap();
+    let mut light = Task::new(light_id.clone(), "light task".to_string());
+    light.depth = TaskDepth::Light;
+    store.add(&light).unwrap();
+    assert_eq!(store.get(&light_id).unwrap().depth, TaskDepth::Light);
+
+    // Update Light -> Deep; round-trips through the store.
+    let mut fetched = store.get(&light_id).unwrap();
+    fetched.depth = TaskDepth::Deep;
+    store.update(&fetched).unwrap();
+    assert_eq!(store.get(&light_id).unwrap().depth, TaskDepth::Deep);
+}
+
+#[test]
 fn test_dependencies() {
     let (_temp, store) = create_test_store();
 

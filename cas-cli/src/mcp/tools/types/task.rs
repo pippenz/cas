@@ -1,5 +1,9 @@
+use std::str::FromStr;
+
 use rmcp::schemars::JsonSchema;
 use serde::Deserialize;
+
+use cas_types::TaskDepth;
 
 use crate::mcp::tools::types::defaults::{
     default_dep_type, default_note_type, default_priority, default_subagent_tokens,
@@ -27,6 +31,20 @@ pub fn validate_execution_note(value: Option<&str>) -> Result<Option<String>, St
             s,
             EXECUTION_NOTE_VALUES.join(", ")
         )),
+    }
+}
+
+/// Validate and parse an incoming `depth` parameter (EPIC cas-1255). Returns
+/// - `Ok(None)` if the input is absent or an empty string (no-op / default)
+/// - `Ok(Some(depth))` for an accepted value (`light` / `deep`)
+/// - `Err(message)` otherwise, with a human-readable hint
+pub fn validate_depth(value: Option<&str>) -> Result<Option<TaskDepth>, String> {
+    match value.map(str::trim) {
+        None => Ok(None),
+        Some(s) if s.is_empty() => Ok(None),
+        Some(s) => TaskDepth::from_str(s).map(Some).map_err(|_| {
+            format!("Invalid depth: '{s}'. Must be one of: light, deep (or empty/absent)")
+        }),
     }
 }
 
@@ -106,6 +124,13 @@ pub struct TaskCreateRequest {
     )]
     #[serde(default)]
     pub epic: Option<String>,
+
+    /// Execution depth (EPIC cas-1255 speed mode)
+    #[schemars(
+        description = "Execution depth: 'deep' (default, full rigor) or 'light' (fast, feel-driven pass). Omit to default to deep."
+    )]
+    #[serde(default)]
+    pub depth: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -245,6 +270,13 @@ pub struct TaskUpdateRequest {
     )]
     #[serde(default)]
     pub epic_verification_owner: Option<String>,
+
+    /// Update execution depth (EPIC cas-1255 speed mode)
+    #[schemars(
+        description = "Execution depth: 'deep' (full rigor) or 'light' (fast, feel-driven pass). Omit to leave unchanged."
+    )]
+    #[serde(default)]
+    pub depth: Option<String>,
 }
 
 // ============================================================================

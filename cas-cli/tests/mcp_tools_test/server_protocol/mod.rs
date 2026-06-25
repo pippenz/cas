@@ -118,6 +118,7 @@ async fn test_all_store_types_accessible() {
 
     // Test task store
     let req = TaskCreateRequest {
+        depth: None,
         title: "Task store test".to_string(),
         description: None,
         priority: 2,
@@ -190,6 +191,7 @@ async fn test_start_blocked_with_pending_verification() {
 
     // Create and start first task
     let req = TaskCreateRequest {
+        depth: None,
         title: "First task".to_string(),
         description: None,
         priority: 2,
@@ -243,6 +245,7 @@ code_review_findings: None,
 
     // Create second task
     let req2 = TaskCreateRequest {
+        depth: None,
         title: "Second task".to_string(),
         description: None,
         priority: 2,
@@ -294,6 +297,7 @@ async fn test_claim_blocked_with_pending_verification() {
 
     // Create and start first task
     let req = TaskCreateRequest {
+        depth: None,
         title: "First task for claim test".to_string(),
         description: None,
         priority: 2,
@@ -347,6 +351,7 @@ code_review_findings: None,
 
     // Create second task
     let req2 = TaskCreateRequest {
+        depth: None,
         title: "Second task for claim test".to_string(),
         description: None,
         priority: 2,
@@ -409,6 +414,7 @@ async fn test_start_allowed_after_verification_approved() {
 
     // Create and start first task
     let req = TaskCreateRequest {
+        depth: None,
         title: "First task".to_string(),
         description: None,
         priority: 2,
@@ -452,6 +458,7 @@ async fn test_start_allowed_after_verification_approved() {
 
     // Create second task
     let req2 = TaskCreateRequest {
+        depth: None,
         title: "Second task".to_string(),
         description: None,
         priority: 2,
@@ -502,6 +509,7 @@ async fn test_start_same_task_allowed_when_pending() {
 
     // Create and start task
     let req = TaskCreateRequest {
+        depth: None,
         title: "Task to resume".to_string(),
         description: None,
         priority: 2,
@@ -576,6 +584,7 @@ async fn test_task_list_type_filter() {
 
     // Create an epic
     let epic_req = TaskCreateRequest {
+        depth: None,
         title: "Test Epic for filtering".to_string(),
         description: None,
         notes: None,
@@ -598,6 +607,7 @@ async fn test_task_list_type_filter() {
 
     // Create a regular task
     let task_req = TaskCreateRequest {
+        depth: None,
         title: "Test Task for filtering".to_string(),
         description: None,
         notes: None,
@@ -650,6 +660,7 @@ async fn test_task_list_epic_filter() {
 
     // Create an epic
     let epic_req = TaskCreateRequest {
+        depth: None,
         title: "My Test Epic".to_string(),
         description: Some("An epic to test filtering".to_string()),
         notes: None,
@@ -679,6 +690,7 @@ async fn test_task_list_epic_filter() {
 
     // Create a subtask linked to the epic
     let subtask_req = TaskCreateRequest {
+        depth: None,
         title: "Subtask of Epic".to_string(),
         description: None,
         notes: None,
@@ -701,6 +713,7 @@ async fn test_task_list_epic_filter() {
 
     // Create an unrelated task (NOT linked to the epic)
     let unrelated_req = TaskCreateRequest {
+        depth: None,
         title: "Unrelated Task".to_string(),
         description: None,
         notes: None,

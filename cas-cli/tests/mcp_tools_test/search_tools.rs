@@ -94,6 +94,7 @@ async fn test_search_filter_by_type() {
         .expect("remember should succeed");
 
     let task_req = TaskCreateRequest {
+        depth: None,
         title: "Filter test task".to_string(),
         description: None,
         priority: 2,
