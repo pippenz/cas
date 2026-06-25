@@ -38,3 +38,13 @@ node_modules/
 .overmind.sock
 # Worktree-specific files (generated per worktree)
 # fallow incremental analysis cache (used by the fallow skill)
+
+# Synced skill copies — rendered from cas-cli/src/builtins/{skills,codex/skills}
+# by `cas update --sync`. The builtins are the source of truth; tracking the
+# rendered output dirties the tree on every upstream skill change. Skills with
+# NO builtin source (local-only) are kept tracked via the negations below.
+/.claude/skills/*
+!/.claude/skills/cas/
+!/.claude/skills/cas-seo-expert/
+!/.claude/skills/cas-servers/
+/.codex/skills/
