@@ -265,6 +265,7 @@ mod tests {
                 task_type: TaskType::Task,
                 epic: None,
                 branch: None,
+                updated_at: None,
             })
             .collect();
 
