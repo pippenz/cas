@@ -490,6 +490,195 @@ fn test_tasks_by_epic_with_parent_child_dependency() {
 }
 
 // =============================================================================
+// Recency ordering tests (cas-2fb6)
+// =============================================================================
+
+/// Build a `TaskSummary` with an explicit `updated_at` for deterministic
+/// recency-ordering assertions.
+fn summary_at(
+    id: &str,
+    status: TaskStatus,
+    task_type: TaskType,
+    priority: Priority,
+    epic: Option<&str>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+) -> TaskSummary {
+    TaskSummary {
+        id: id.to_string(),
+        title: format!("title {id}"),
+        status,
+        priority,
+        assignee: None,
+        task_type,
+        epic: epic.map(|s| s.to_string()),
+        branch: if task_type == TaskType::Epic {
+            Some(format!("epic/{id}"))
+        } else {
+            None
+        },
+        updated_at: Some(updated_at),
+    }
+}
+
+/// Assemble a minimal `DirectorData` from explicit task summaries. Tasks are
+/// partitioned into ready/in_progress/epic buckets the same way `load_with_stores`
+/// does, so `tasks_by_epic` sees the same shape it would in production.
+fn data_from_tasks(tasks: Vec<TaskSummary>) -> DirectorData {
+    let mut ready_tasks = Vec::new();
+    let mut in_progress_tasks = Vec::new();
+    let mut epic_tasks = Vec::new();
+    for t in tasks {
+        match (t.task_type, t.status) {
+            (TaskType::Epic, _) => epic_tasks.push(t),
+            (_, TaskStatus::InProgress | TaskStatus::PendingSupervisorReview) => {
+                in_progress_tasks.push(t)
+            }
+            _ => ready_tasks.push(t),
+        }
+    }
+    DirectorData {
+        ready_tasks,
+        in_progress_tasks,
+        epic_tasks,
+        agents: Vec::new(),
+        activity: Vec::new(),
+        agent_id_to_name: std::collections::HashMap::new(),
+        changes: Vec::new(),
+        git_loaded: false,
+        reminders: Vec::new(),
+        epic_closed_counts: std::collections::HashMap::new(),
+    }
+}
+
+/// A stale epic with MANY low-priority subtasks must NOT pin to the top of the
+/// TASKS panel over a smaller, recently-active epic. The panel orders epic
+/// groups by recency of activity, not subtask count or static priority.
+#[test]
+fn test_tasks_by_epic_recent_epic_outranks_stale_high_count_epic() {
+    let old = chrono::Utc::now() - chrono::Duration::days(5);
+    let recent = chrono::Utc::now();
+
+    let mut tasks = Vec::new();
+
+    // Stale follow-up epic: 14 untouched P4 subtasks (the reported symptom).
+    tasks.push(summary_at(
+        "cas-stale",
+        TaskStatus::Open,
+        TaskType::Epic,
+        Priority::HIGH,
+        None,
+        old,
+    ));
+    for i in 0..14 {
+        tasks.push(summary_at(
+            &format!("cas-stale-{i}"),
+            TaskStatus::Open,
+            TaskType::Task,
+            Priority::BACKLOG,
+            Some("cas-stale"),
+            old,
+        ));
+    }
+
+    // The supervisor's CURRENT focus: a small, recently-touched epic with a
+    // single subtask, at a numerically lower (= less urgent) static priority.
+    tasks.push(summary_at(
+        "cas-current",
+        TaskStatus::Open,
+        TaskType::Epic,
+        Priority::MEDIUM,
+        None,
+        recent,
+    ));
+    tasks.push(summary_at(
+        "cas-current-0",
+        TaskStatus::Open,
+        TaskType::Task,
+        Priority::MEDIUM,
+        Some("cas-current"),
+        recent,
+    ));
+
+    let data = data_from_tasks(tasks);
+    let (groups, _standalone) = data.tasks_by_epic();
+
+    assert_eq!(groups.len(), 2, "both epics should be present");
+    assert_eq!(
+        groups[0].epic.id, "cas-current",
+        "the recently-active epic must sort first, not the stale 14-subtask epic"
+    );
+    assert_eq!(groups[1].epic.id, "cas-stale");
+}
+
+/// Switching focus (touching a different epic's subtask) makes the panel follow
+/// within a refresh: the newly-touched epic moves to the top.
+#[test]
+fn test_tasks_by_epic_follows_focus_switch() {
+    let t0 = chrono::Utc::now() - chrono::Duration::hours(2);
+    let t1 = chrono::Utc::now() - chrono::Duration::hours(1);
+    let t2 = chrono::Utc::now();
+
+    // Epic A touched at t1, epic B touched more recently at t2 -> B first.
+    let tasks = vec![
+        summary_at("cas-a", TaskStatus::Open, TaskType::Epic, Priority::HIGH, None, t0),
+        summary_at(
+            "cas-a-0",
+            TaskStatus::Open,
+            TaskType::Task,
+            Priority::HIGH,
+            Some("cas-a"),
+            t1,
+        ),
+        summary_at("cas-b", TaskStatus::Open, TaskType::Epic, Priority::HIGH, None, t0),
+        summary_at(
+            "cas-b-0",
+            TaskStatus::Open,
+            TaskType::Task,
+            Priority::HIGH,
+            Some("cas-b"),
+            t2,
+        ),
+    ];
+
+    let (groups, _) = data_from_tasks(tasks).tasks_by_epic();
+    assert_eq!(groups[0].epic.id, "cas-b", "most-recently-touched epic leads");
+    assert_eq!(groups[1].epic.id, "cas-a");
+}
+
+/// No regression for a single-epic session: ordering is trivially stable and the
+/// epic + its subtasks are returned intact.
+#[test]
+fn test_tasks_by_epic_single_epic_unchanged() {
+    let now = chrono::Utc::now();
+    let tasks = vec![
+        summary_at("cas-only", TaskStatus::InProgress, TaskType::Epic, Priority::HIGH, None, now),
+        summary_at(
+            "cas-only-0",
+            TaskStatus::InProgress,
+            TaskType::Task,
+            Priority::HIGH,
+            Some("cas-only"),
+            now,
+        ),
+        summary_at(
+            "cas-only-1",
+            TaskStatus::Open,
+            TaskType::Task,
+            Priority::MEDIUM,
+            Some("cas-only"),
+            now,
+        ),
+    ];
+
+    let (groups, standalone) = data_from_tasks(tasks).tasks_by_epic();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].epic.id, "cas-only");
+    assert_eq!(groups[0].subtasks.len(), 2);
+    assert!(groups[0].has_active);
+    assert!(standalone.is_empty());
+}
+
+// =============================================================================
 // TaskSummary Tests
 // =============================================================================
 
@@ -504,6 +693,7 @@ fn test_task_summary_fields() {
         task_type: TaskType::Feature,
         epic: Some("cas-epic".to_string()),
         branch: Some("feature/test".to_string()),
+        updated_at: None,
     };
 
     assert_eq!(summary.id, "cas-1234");
@@ -556,6 +746,7 @@ fn test_epic_group_fields() {
         task_type: TaskType::Epic,
         epic: None,
         branch: Some("epic/test".to_string()),
+        updated_at: None,
     };
 
     let subtask = TaskSummary {
@@ -567,6 +758,7 @@ fn test_epic_group_fields() {
         task_type: TaskType::Task,
         epic: Some("cas-epic".to_string()),
         branch: None,
+        updated_at: None,
     };
 
     let group = EpicGroup {

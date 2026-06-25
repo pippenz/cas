@@ -88,6 +88,7 @@ mod m118_tasks_idx_branch;
 mod m119_tasks_idx_worktree;
 mod m120_tasks_add_deliverables;
 mod m121_tasks_add_share;
+mod m122_tasks_add_depth;
 
 /// All migrations in order. IDs must be sequential and never reused.
 pub const MIGRATIONS: &[Migration] = &[
@@ -170,6 +171,7 @@ pub const MIGRATIONS: &[Migration] = &[
     m119_tasks_idx_worktree::MIGRATION,
     m120_tasks_add_deliverables::MIGRATION,
     m121_tasks_add_share::MIGRATION,
+    m122_tasks_add_depth::MIGRATION,
 ];
 
 #[cfg(test)]

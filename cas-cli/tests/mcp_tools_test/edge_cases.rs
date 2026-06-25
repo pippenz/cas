@@ -158,6 +158,7 @@ async fn test_negative_priority() {
 
     // Negative priority should be handled
     let req = TaskCreateRequest {
+        depth: None,
         title: "Negative priority task".to_string(),
         description: None,
         priority: 255, // Max u8, should be clamped or handled
@@ -185,6 +186,7 @@ async fn test_duplicate_dependency() {
 
     // Create tasks
     let req1 = TaskCreateRequest {
+        depth: None,
         title: "Task A".to_string(),
         description: None,
         priority: 2,
@@ -210,6 +212,7 @@ async fn test_duplicate_dependency() {
     let id_a = extract_task_id(&text1).expect("should have task ID");
 
     let req2 = TaskCreateRequest {
+        depth: None,
         title: "Task B".to_string(),
         description: None,
         priority: 2,
@@ -262,6 +265,7 @@ async fn test_self_dependency() {
     let (_temp, service) = setup_cas();
 
     let req = TaskCreateRequest {
+        depth: None,
         title: "Self dep task".to_string(),
         description: None,
         priority: 2,

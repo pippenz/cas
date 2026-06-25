@@ -85,6 +85,18 @@ impl CasCore {
             changes.push("external_ref");
         }
 
+        // Empty/absent depth is a no-op; an invalid value is rejected.
+        if let Some(depth) = crate::mcp::tools::types::validate_depth(req.depth.as_deref())
+            .map_err(|msg| McpError {
+                code: ErrorCode::INVALID_PARAMS,
+                message: Cow::from(msg),
+                data: None,
+            })?
+        {
+            task.depth = depth;
+            changes.push("depth");
+        }
+
         // Track warnings to include in response
         let mut warnings: Vec<String> = Vec::new();
 

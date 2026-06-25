@@ -140,8 +140,13 @@ fn codex_worker_runtime_instruction_allows_close_then_escalate() {
     let pty_rs = root.join("crates/cas-pty/src/pty.rs");
     let content = load(&pty_rs);
 
+    // cas-47b7: the worker instruction phrasing is "close it with
+    // `mcp__cs__task action=close ...`" (cas-bbc2 single-task rewrite). Assert on
+    // the close-command form itself rather than a fragile leading verb so prose
+    // tweaks don't re-break this guardrail; the intent is only "workers ARE told
+    // to close their task".
     assert!(
-        content.contains("close with `mcp__cs__task action=close"),
+        content.contains("`mcp__cs__task action=close"),
         "runtime worker instruction should instruct workers to close tasks"
     );
     assert!(

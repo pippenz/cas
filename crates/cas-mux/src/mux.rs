@@ -662,6 +662,13 @@ impl Mux {
             teams,
         )?;
         let id = pane.id().to_string();
+        // Persist the resolved spec so `effective_worker_spec(name, None)` is
+        // authoritative for this worker's lifetime. Without this, a worker spawned
+        // with an explicit per-spawn `spec` override (e.g. a Codex worker added to a
+        // Claude-default factory via SpawnWorkers) would not be in `worker_specs`,
+        // and a later harness lookup would silently fall back to the Mux-wide default
+        // — mis-routing message delivery for that worker (cas-b68a).
+        self.worker_specs.insert(name.to_string(), effective);
         self.add_pane(pane);
         Ok(id)
     }

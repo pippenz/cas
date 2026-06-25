@@ -8,6 +8,10 @@ managed_by: cas
 
 Run all 6 self-verification checks before `mcp__cas__task action=close`. The gate is the same regardless of task type. Skip and you eat a verifier rejection round-trip.
 
+## Depth: `light` tasks skip this gate
+
+If the task you're closing is `depth=light` (check the `Depth:` line in `task show`), **skip the 6 pre-close self-checks below** and close once it runs on localhost. Light is speed mode: minimal diff, no gold-plating, the human is the evaluator — there is no DoD to chase. You must still not claim a proof you didn't run. For `depth=deep` or unset, run the full gate below.
+
 **Code review is not your job at close** under the v2.13.0+ default `[code_review] owner = "supervisor"`. The supervisor runs `/cas-code-review` at cherry-pick + EPIC merge time. Do not invoke the multi-persona review yourself unless your supervisor explicitly tells you to, or your project has opted in to legacy `owner = "worker"` in `.cas/config.toml` — the worker-inline path adds ~14 min and ~100K tokens per close, which is exactly what the v2.13.0 flip was designed to eliminate.
 
 ## Pre-Close Self-Verification

@@ -72,6 +72,16 @@ impl CasCore {
             data: None,
         })?;
 
+        // Absent/empty depth defaults to Deep (full rigor); an invalid value
+        // is rejected with a clear error.
+        let depth = crate::mcp::tools::types::validate_depth(req.depth.as_deref())
+            .map_err(|msg| McpError {
+                code: ErrorCode::INVALID_PARAMS,
+                message: Cow::from(msg),
+                data: None,
+            })?
+            .unwrap_or_default();
+
         let now = chrono::Utc::now();
         let task = Task {
             id: id.clone(),
@@ -102,6 +112,7 @@ impl CasCore {
             pending_worktree_merge: false,
             epic_verification_owner: None,
             share: None,
+            depth,
         };
 
         task_store

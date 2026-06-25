@@ -1,5 +1,8 @@
 mod client_input;
 mod cloud;
+mod delivery;
+#[cfg(test)]
+mod delivery_matrix_tests;
 mod gui_client;
 mod lifecycle;
 mod output;

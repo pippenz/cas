@@ -847,11 +847,12 @@ impl CasCore {
                 })
                 .unwrap_or_else(|| "\n  Lease: not claimed yet".to_string());
             output.push_str(&format!(
-                "- [{}] {:?} P{} {} - {}{}{}\n",
+                "- [{}] {:?} P{} {} ({}) - {}{}{}\n",
                 task.id,
                 task.status,
                 task.priority.0,
                 task.task_type,
+                task.depth,
                 task.title,
                 lease_info,
                 if task.assignee.as_deref() == Some(agent_id.as_str()) {

@@ -323,6 +323,13 @@ pub struct TaskRequest {
     )]
     #[serde(default)]
     pub epic_verification_owner: Option<String>,
+
+    /// Execution depth (for create, update). EPIC cas-1255 speed mode.
+    #[schemars(
+        description = "Execution depth: 'deep' (default, full rigor) or 'light' (fast, feel-driven pass). Omit to leave unchanged (update) or default to deep (create)."
+    )]
+    #[serde(default)]
+    pub depth: Option<String>,
 }
 
 /// Unified rule operations request

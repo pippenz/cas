@@ -320,6 +320,54 @@ fn effective_worker_spec_uses_worker_specs_map() {
 
 // ── end priority-2 coverage ───────────────────────────────────────────────────
 
+// ── cas-b68a: add_worker persists the resolved spec ──────────────────────────
+
+/// Regression for cas-b68a: a dynamically-spawned Codex worker in a Claude-DEFAULT
+/// factory must resolve as Codex via `effective_worker_spec(name, None)` AFTER the
+/// spawn.
+///
+/// This is the load-bearing proof for AC2's live path. The daemon's harness-aware
+/// message router (`FactoryApp::harness_for`) resolves a worker's harness through
+/// `effective_worker_spec(name, None)`. Before the fix, `add_worker` *used* an
+/// explicit per-spawn spec but never persisted it into `worker_specs`, so a Codex
+/// worker added to a Claude-default factory (the exact bug scenario) resolved back
+/// to the Claude default — and the entire routing fix would be inert, silently
+/// inboxing messages the codex process can never read.
+#[test]
+fn add_worker_persists_explicit_spec_so_effective_resolves_codex() {
+    let mut mux = Mux::new(24, 80);
+    // Session default is Claude — the explicit per-spawn spec must persist and win.
+    mux.set_default_worker_spec(WorkerSpec {
+        name: None,
+        cli: crate::harness::SupervisorCli::Claude,
+        model: None,
+        effort: None,
+    });
+
+    // Pre-condition: with nothing registered, an unknown worker resolves to the
+    // Claude default — i.e. without persistence the post-spawn lookup is wrong.
+    assert_eq!(
+        mux.effective_worker_spec("alice", None).cli,
+        crate::harness::SupervisorCli::Claude,
+        "precondition: unregistered worker resolves to the Claude session default"
+    );
+
+    // Dynamically spawn "alice" with an explicit Codex spec (the SpawnWorkers path).
+    let dir = std::env::temp_dir();
+    let spec = WorkerSpec::codex_default("alice");
+    mux.add_worker("alice", dir, None, "supervisor", None, Some(spec))
+        .expect("add_worker should spawn the worker pane");
+
+    // Post-spawn: harness resolution (what FactoryApp::harness_for does) must now
+    // report Codex, with NO explicit spec passed — proving the spec was persisted.
+    assert_eq!(
+        mux.effective_worker_spec("alice", None).cli,
+        crate::harness::SupervisorCli::Codex,
+        "after add_worker, a later harness lookup must resolve the persisted Codex \
+         spec — not fall back to the Claude default (cas-b68a)"
+    );
+}
+
 // ── cas-35fe: custom worker_names branch ─────────────────────────────────────
 
 #[test]
@@ -466,3 +514,4 @@ fn test_remove_pane_focus_transfer() {
     assert_eq!(mux.focused_id(), Some("pane2"));
     assert_eq!(mux.pane_count(), 1);
 }
+

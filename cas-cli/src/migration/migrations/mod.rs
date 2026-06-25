@@ -177,6 +177,7 @@ mod m198_tasks_add_share;
 pub mod m199_known_repos;
 mod m200_agents_add_pid_starttime;
 mod m201_spawn_queue_add_worker_spec;
+mod m202_tasks_add_depth;
 
 /// All migrations in order. IDs must be sequential and never reused.
 pub const MIGRATIONS: &[Migration] = &[
@@ -354,6 +355,8 @@ pub const MIGRATIONS: &[Migration] = &[
     m200_agents_add_pid_starttime::MIGRATION,
     // Add worker_spec column to spawn_queue for per-worker CLI/model/effort overrides (cas-2992)
     m201_spawn_queue_add_worker_spec::MIGRATION,
+    // Add depth column to tasks for per-task speed mode (EPIC cas-1255 / cas-0344)
+    m202_tasks_add_depth::MIGRATION,
 ];
 
 #[cfg(test)]

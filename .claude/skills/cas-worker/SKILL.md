@@ -27,6 +27,15 @@ You execute tasks assigned by the Supervisor. You may be working in an isolated 
 - **Spike** (`task_type=spike`) — produces understanding, not code. Deliverable is a decision/comparison/recommendation captured via `note_type=decision`. Spike acceptance criteria are question-based.
 - **Demo statements** — if a task has a `demo_statement`, the work must produce that observable outcome.
 
+## Task Depth
+
+Tasks carry a `depth` field, shown as `Depth:` in `task show` and `task mine`. Read it when you **start** — it sets your working style. Depth comes from the **task record**, never an env var.
+
+- **`light`** — Speed mode for feel-driven iteration. Ship the **minimal diff** that satisfies the ask, then stop. NO gold-plating: no unasked tests, docs, edge-case handling, or refactors. **Skip the 6 pre-close self-checks** in [close-gate.md](cas-worker/references/close-gate.md). The Definition of Done is "it runs on localhost" — the human is the evaluator, so stop there instead of chasing a DoD that doesn't exist.
+- **`deep` or unset** — Default. Full discipline: the close-gate and everything below apply unchanged.
+
+`light` relaxes thoroughness, not integrity: stay in your layer, respect non-goals, and never claim a proof you didn't run.
+
 ## Execution Posture
 
 Tasks may carry an `execution_note` field declaring the posture. Three values, or null:
