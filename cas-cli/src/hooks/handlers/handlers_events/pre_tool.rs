@@ -894,14 +894,31 @@ pub fn handle_pre_tool_use(
 // with isolate=true) AND the tool is Bash with a git write command.
 // Non-isolated workers (no CAS_CLONE_PATH) and non-factory sessions are
 // silent pass-through.
+//
+// cas-7e7b: branch policy changed from allowlist (only factory/*) to
+// denylist (block main/master/staging + detached HEAD; everything else is
+// allowed). Workers on feature/, fix/, epic/, or arbitrary branches can now
+// commit without supervisor intervention.
+//
+// Escape-hatch note: `--no-verify` does NOT bypass this guard. That flag
+// only skips git's own commit-msg/pre-commit hooks, not the Claude Code
+// PreToolUse harness. The only way to commit is to be on a non-protected
+// branch.
 
-/// Return true if `branch` is a valid factory worker branch.
+/// Return true if `branch` is a branch a factory worker is allowed to commit on.
 ///
-/// Workers may ONLY commit on branches matching `factory/<name>`.
-/// Every other branch — main, master, staging, epic/*, arbitrary feature
-/// branches, and detached HEAD — is denied (allowlist semantics, not denylist).
-pub(crate) fn is_factory_worker_branch(branch: &str) -> bool {
-    branch.trim().starts_with("factory/")
+/// Policy (cas-7e7b, denylist semantics — previously allowlist):
+/// - DENIED: `main`, `master`, `staging`, or empty string (detached HEAD).
+/// - ALLOWED: everything else — `factory/<name>`, `feature/*`, `fix/*`,
+///   `epic/*`, arbitrary named branches.
+///
+/// This was changed from allowlist (only `factory/*`) because workers
+/// legitimately work on feature branches (e.g. spawned outside the
+/// isolated-worktree flow, or on a project-level branch), and blocking them
+/// causes hard stalls that require supervisor intervention.
+pub(crate) fn is_worker_commit_allowed_branch(branch: &str) -> bool {
+    let b = branch.trim();
+    !matches!(b, "main" | "master" | "staging" | "")
 }
 
 /// Return true if `cmd` looks like a `git commit` or `git merge` invocation.
@@ -959,11 +976,13 @@ pub(crate) fn get_branch_at_cwd(cwd: &str) -> Option<String> {
 /// Returns `Some(denial_message)` when:
 /// - `CAS_CLONE_PATH` is set (isolated worker) AND either:
 ///   - `cwd` is outside the assigned worktree path, OR
-///   - HEAD at `cwd` is NOT a `factory/<name>` branch (allowlist semantics:
-///     main, master, staging, epic/*, arbitrary branches, and detached HEAD
-///     are all denied — fail-closed).
+///   - HEAD at `cwd` is a protected branch (`main`, `master`, `staging`) or detached.
 ///
-/// Returns `None` to allow (not isolated, or everything is correct).
+/// Returns `None` to allow (not isolated, or branch is safe to commit on).
+///
+/// Note: `--no-verify` does NOT bypass this guard — it only skips git's own
+/// commit-msg/pre-commit hooks, not the Claude Code PreToolUse harness.
+/// Switching to a non-protected branch is the only way to unblock.
 pub(crate) fn check_worker_git_commit_scope(cwd: &str) -> Option<String> {
     let clone_path = std::env::var("CAS_CLONE_PATH").ok()?;
     if clone_path.is_empty() {
@@ -982,30 +1001,41 @@ pub(crate) fn check_worker_git_commit_scope(cwd: &str) -> Option<String> {
             your assigned worktree ({clone_path}).\n\n\
             Workers MUST commit inside their worktree. Switch first:\n  \
             cd {clone_path}\n  git switch factory/{worker_name}\n\n\
-            Then retry your commit from there."
+            Then retry your commit from there.\n\n\
+            Note: --no-verify does NOT bypass this guard (it only skips git hooks,\n\
+            not the Claude Code PreToolUse harness)."
         ));
     }
 
-    // DENY: HEAD at cwd is not on a factory/<name> branch (allowlist semantics).
-    // Detached HEAD (None from get_branch_at_cwd) is also denied — fail-closed.
+    // DENY: HEAD is on a protected branch (main/master/staging) or detached.
+    // Any other named branch — factory/*, feature/*, fix/*, epic/*, etc. — is allowed.
     let worker_name = std::env::var("CAS_AGENT_NAME")
         .unwrap_or_else(|_| "<worker-name>".to_string());
     match get_branch_at_cwd(cwd) {
         None => {
             return Some(format!(
                 "🚫 WORKER COMMIT GUARD: HEAD is detached — cannot determine branch.\n\n\
-                Factory workers MUST commit on their worker branch:\n  \
-                git switch factory/{worker_name}\n\nThen retry."
+                Commits require a named branch. Switch to your work branch first:\n  \
+                git switch factory/{worker_name}   # or your feature/fix branch\n\n\
+                Your staged changes are preserved — only the branch matters.\n\n\
+                Note: --no-verify does NOT bypass this guard (it only skips git hooks,\n\
+                not the Claude Code PreToolUse harness)."
             ));
         }
-        Some(branch) if !is_factory_worker_branch(&branch) => {
+        Some(branch) if !is_worker_commit_allowed_branch(&branch) => {
             return Some(format!(
-                "🚫 WORKER COMMIT GUARD: You are on branch '{branch}'.\n\n\
-                Factory workers MUST commit ONLY on their factory/<name> branch. \
-                Switch first:\n  git switch factory/{worker_name}\n\nThen retry."
+                "🚫 WORKER COMMIT GUARD: Direct commits to '{branch}' are blocked.\n\n\
+                Workers must NOT commit directly to protected branches \
+                (main, master, staging).\n\
+                Switch to your work branch and commit there:\n  \
+                git switch factory/{worker_name}   # or: git switch <your-feature-branch>\n  \
+                git commit ...\n\n\
+                Your staged changes are preserved — only the branch matters.\n\n\
+                Note: --no-verify does NOT bypass this guard (it only skips git hooks,\n\
+                not the Claude Code PreToolUse harness). Switching branches is the only option."
             ));
         }
-        Some(_) => {} // factory/* — allowed
+        Some(_) => {} // any non-protected named branch — allowed
     }
 
     None
@@ -1278,31 +1308,37 @@ mod worker_commit_guard_tests {
         assert!(!looks_like_git_write_op("digitalocean config commit"));
     }
 
-    // ── is_factory_worker_branch tests ───────────────────────────────────
+    // ── is_worker_commit_allowed_branch tests (cas-7e7b denylist) ──────────
 
     #[test]
     fn factory_branches_are_allowed() {
-        assert!(is_factory_worker_branch("factory/worker1"));
-        assert!(is_factory_worker_branch("factory/guards"));
-        assert!(is_factory_worker_branch("factory/surface"));
+        // factory/* branches are still allowed
+        assert!(is_worker_commit_allowed_branch("factory/worker1"));
+        assert!(is_worker_commit_allowed_branch("factory/guards"));
+        assert!(is_worker_commit_allowed_branch("factory/surface"));
         // Leading/trailing whitespace (from git output) is tolerated
-        assert!(is_factory_worker_branch("  factory/guards  "));
+        assert!(is_worker_commit_allowed_branch("  factory/guards  "));
     }
 
     #[test]
-    fn non_factory_branches_are_denied() {
-        // Old denylist entries are still denied
-        assert!(!is_factory_worker_branch("main"));
-        assert!(!is_factory_worker_branch("master"));
-        assert!(!is_factory_worker_branch("staging"));
-        // Epic branches — the original bug: previously bypassed denylist
-        assert!(!is_factory_worker_branch("epic/big-feature"));
-        assert!(!is_factory_worker_branch("epic/cas-073f"));
-        // Arbitrary feature / fix branches
-        assert!(!is_factory_worker_branch("feature/foo"));
-        assert!(!is_factory_worker_branch("fix/my-bug"));
-        // Empty string (detached HEAD)
-        assert!(!is_factory_worker_branch(""));
+    fn protected_trunk_branches_are_denied() {
+        // Only the trunk protection branches are denied (denylist semantics)
+        assert!(!is_worker_commit_allowed_branch("main"));
+        assert!(!is_worker_commit_allowed_branch("master"));
+        assert!(!is_worker_commit_allowed_branch("staging"));
+        // Empty string (detached HEAD sentinel)
+        assert!(!is_worker_commit_allowed_branch(""));
+    }
+
+    #[test]
+    fn non_trunk_branches_are_allowed() {
+        // cas-7e7b: feature/fix/epic branches are now allowed (denylist, not allowlist)
+        assert!(is_worker_commit_allowed_branch("epic/big-feature"));
+        assert!(is_worker_commit_allowed_branch("epic/cas-073f"));
+        assert!(is_worker_commit_allowed_branch("feature/foo"));
+        assert!(is_worker_commit_allowed_branch("fix/my-bug"));
+        assert!(is_worker_commit_allowed_branch("chore/update-deps"));
+        assert!(is_worker_commit_allowed_branch("my-arbitrary-branch"));
     }
 
     // ── get_branch_at_cwd tests ───────────────────────────────────────────
@@ -1345,26 +1381,29 @@ mod worker_commit_guard_tests {
     }
 
     #[test]
-    fn cwd_inside_worktree_on_non_factory_branch_denied() {
+    fn cwd_inside_worktree_on_main_branch_denied() {
+        // main is a protected branch — must still be blocked after cas-7e7b.
         let _lock = env_lock();
         let tmp = make_git_repo(); // on main
         let p = tmp.path().to_string_lossy().to_string();
         let _env = EnvGuard::set(&[("CAS_CLONE_PATH", Some(&p))]);
 
         let result = check_worker_git_commit_scope(&p);
-        assert!(result.is_some(), "expected deny on non-factory branch 'main'");
+        assert!(result.is_some(), "expected deny on protected branch 'main'");
         let msg = result.unwrap();
         assert!(msg.contains("WORKER COMMIT GUARD"));
         assert!(msg.contains("main"));
+        // Message must include the --no-verify note (cas-7e7b AC)
+        assert!(msg.contains("--no-verify"), "message must explain --no-verify limitation: {msg}");
     }
 
     #[test]
-    fn cwd_inside_worktree_on_epic_branch_denied() {
+    fn cwd_inside_worktree_on_epic_branch_allowed() {
+        // cas-7e7b: epic/* branches are no longer blocked (denylist semantics)
         let _lock = env_lock();
         let tmp = make_git_repo();
         let p = tmp.path();
 
-        // Switch to an epic branch — previously bypassed the denylist
         std::process::Command::new("git")
             .args(["checkout", "-b", "epic/cas-073f"])
             .current_dir(p)
@@ -1375,10 +1414,27 @@ mod worker_commit_guard_tests {
         let _env = EnvGuard::set(&[("CAS_CLONE_PATH", Some(&ps))]);
 
         let result = check_worker_git_commit_scope(&ps);
-        assert!(result.is_some(), "epic branch must be denied, got: {result:?}");
-        let msg = result.unwrap();
-        assert!(msg.contains("WORKER COMMIT GUARD"));
-        assert!(msg.contains("epic/cas-073f"));
+        assert!(result.is_none(), "epic/* branch must be allowed now, got: {result:?}");
+    }
+
+    #[test]
+    fn cwd_inside_worktree_on_feature_branch_allowed() {
+        // cas-7e7b: feature/* branches are allowed (denylist semantics)
+        let _lock = env_lock();
+        let tmp = make_git_repo();
+        let p = tmp.path();
+
+        std::process::Command::new("git")
+            .args(["checkout", "-b", "feature/my-widget"])
+            .current_dir(p)
+            .output()
+            .unwrap();
+
+        let ps = p.to_string_lossy().to_string();
+        let _env = EnvGuard::set(&[("CAS_CLONE_PATH", Some(&ps))]);
+
+        let result = check_worker_git_commit_scope(&ps);
+        assert!(result.is_none(), "feature/* branch must be allowed, got: {result:?}");
     }
 
     #[test]
@@ -1459,8 +1515,10 @@ mod worker_commit_guard_tests {
     }
 
     #[test]
-    fn pre_tool_denies_git_commit_on_epic_branch() {
-        // Regression guard for the P1: epic/* previously bypassed the denylist.
+    fn pre_tool_allows_git_commit_on_epic_branch() {
+        // cas-7e7b: epic/* branches are now allowed (denylist semantics).
+        // Previously these were denied; the over-broad allowlist caused worker
+        // stalls in gabber-studio (true-wolf-20, 2026-06-26).
         let _lock = env_lock();
         let tmp = make_git_repo();
         let p = tmp.path();
@@ -1482,15 +1540,48 @@ mod worker_commit_guard_tests {
         input.hook_event_name = "PreToolUse".to_string();
         input.tool_name = Some("Bash".to_string());
         input.cwd = ps.clone();
-        input.tool_input = Some(serde_json::json!({"command": "git commit -m 'leaking to epic'"}));
+        input.tool_input = Some(serde_json::json!({"command": "git commit -m 'work on epic branch'"}));
 
         let out = handle_pre_tool_use(&input, None).expect("handler ok");
         let val = serde_json::to_value(&out).unwrap();
         let decision = val.get("hookSpecificOutput")
             .and_then(|h| h.get("permissionDecision"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        assert_eq!(decision, "deny", "epic/* branch must be denied, got: {val}");
+            .and_then(|v| v.as_str());
+        assert_ne!(decision, Some("deny"), "epic/* branch must be allowed now, got: {val}");
+    }
+
+    #[test]
+    fn pre_tool_allows_git_commit_on_feature_branch() {
+        // cas-7e7b: feature/* branches are allowed (denylist semantics).
+        let _lock = env_lock();
+        let tmp = make_git_repo();
+        let p = tmp.path();
+
+        std::process::Command::new("git")
+            .args(["checkout", "-b", "feature/my-widget"])
+            .current_dir(p)
+            .output()
+            .unwrap();
+
+        let ps = p.to_string_lossy().to_string();
+        let _env = EnvGuard::set(&[
+            ("CAS_AGENT_ROLE", Some("worker")),
+            ("CAS_FACTORY_MODE", Some("1")),
+            ("CAS_CLONE_PATH", Some(&ps)),
+        ]);
+
+        let mut input = crate::hooks::handlers::HookInput::default();
+        input.hook_event_name = "PreToolUse".to_string();
+        input.tool_name = Some("Bash".to_string());
+        input.cwd = ps.clone();
+        input.tool_input = Some(serde_json::json!({"command": "git commit -m 'add widget'"}));
+
+        let out = handle_pre_tool_use(&input, None).expect("handler ok");
+        let val = serde_json::to_value(&out).unwrap();
+        let decision = val.get("hookSpecificOutput")
+            .and_then(|h| h.get("permissionDecision"))
+            .and_then(|v| v.as_str());
+        assert_ne!(decision, Some("deny"), "feature/* branch must be allowed, got: {val}");
     }
 
     #[test]
