@@ -195,6 +195,103 @@ code_review_findings: None,
     );
 }
 
+// cas-6a99 helper: minimal task-create request.
+fn simple_task_req(title: &str) -> TaskCreateRequest {
+    TaskCreateRequest {
+        depth: None,
+        title: title.to_string(),
+        description: None,
+        priority: 2,
+        task_type: "task".to_string(),
+        labels: None,
+        notes: None,
+        blocked_by: None,
+        design: None,
+        acceptance_criteria: None,
+        external_ref: None,
+        assignee: None,
+        demo_statement: None,
+        execution_note: None,
+        epic: None,
+    }
+}
+
+/// cas-6a99: a sibling task that is merge-gated (`pending_worktree_merge=true`,
+/// i.e. "work complete, awaiting supervisor merge") must NOT jail the worker
+/// from starting an unrelated task. The worker cannot resolve a merge gate (the
+/// supervisor owns the merge), so coupling `start` of B to A's awaiting-merge
+/// state is wrong. This is distinct from the verification jail
+/// (`pending_verification` / no approved verification), which still blocks —
+/// the negative control at the end proves the jail is otherwise intact.
+#[tokio::test]
+async fn test_task_start_not_blocked_by_merge_gated_sibling_cas_6a99() {
+    let (temp, service) = setup_cas();
+    let _env_lock = env_test_lock();
+    let cas_dir = temp.path().join(".cas");
+
+    // Verification ENABLED so check_pending_verification actually runs.
+    std::fs::write(
+        cas_dir.join("config.toml"),
+        "[verification]\nenabled = true\n",
+    )
+    .expect("should write config");
+
+    // Task A — start it (claims a lease + sets InProgress + registers the agent).
+    let res = service
+        .cas_task_create(Parameters(simple_task_req("Task A")))
+        .await
+        .expect("create A");
+    let id_a = extract_task_id(&extract_text(res)).expect("id A").to_string();
+    service
+        .cas_task_start(Parameters(IdRequest { id: id_a.clone() }))
+        .await
+        .expect("start A");
+
+    // Simulate a merge-gated close: A is work-complete, awaiting supervisor merge.
+    let task_store = open_task_store(&cas_dir).expect("open task store");
+    let mut a = task_store.get(&id_a).expect("A exists");
+    a.pending_worktree_merge = true;
+    task_store.update(&a).expect("flag A merge-gated");
+
+    // Task B — unrelated, no dependency edge on A. Starting it must NOT be blocked.
+    let res = service
+        .cas_task_create(Parameters(simple_task_req("Task B")))
+        .await
+        .expect("create B");
+    let id_b = extract_task_id(&extract_text(res)).expect("id B").to_string();
+    let text = extract_text(
+        service
+            .cas_task_start(Parameters(IdRequest { id: id_b }))
+            .await
+            .expect("start B should return"),
+    );
+    assert!(
+        !text.contains("VERIFICATION PENDING"),
+        "merge-gated sibling A must not block starting B, got: {text}"
+    );
+
+    // Negative control: clear the merge gate → A is now just an unverified
+    // InProgress task → starting another task IS still blocked (jail intact).
+    let mut a = task_store.get(&id_a).expect("A exists");
+    a.pending_worktree_merge = false;
+    task_store.update(&a).expect("clear A merge gate");
+    let res = service
+        .cas_task_create(Parameters(simple_task_req("Task C")))
+        .await
+        .expect("create C");
+    let id_c = extract_task_id(&extract_text(res)).expect("id C").to_string();
+    let text = extract_text(
+        service
+            .cas_task_start(Parameters(IdRequest { id: id_c }))
+            .await
+            .expect("start C should return"),
+    );
+    assert!(
+        text.contains("VERIFICATION PENDING"),
+        "an unverified, non-merge-gated sibling should still jail, got: {text}"
+    );
+}
+
 /// cas-895d: a worker completes their work, writes tests, runs build, and
 /// calls `task.close` — all while leaving the actual edits uncommitted in
 /// their worktree. The pre-fix close path accepted this because

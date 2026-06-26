@@ -784,6 +784,16 @@ impl CasCore {
                 continue;
             }
 
+            // cas-6a99: a task awaiting WORKTREE MERGE (its close was merge-gated
+            // because the branch isn't merged yet) is "work complete, awaiting
+            // supervisor merge" — NOT actively-verifying. The worker cannot resolve
+            // it (the merge is the supervisor's job), so it must not jail them from
+            // starting unrelated/bundled work. This is distinct from the verification
+            // jail (`pending_verification`), which still blocks correctly below.
+            if task.pending_worktree_merge {
+                continue;
+            }
+
             // cas-33eb: a depth=light task never jails the agent — skipping the
             // verification machinery is the whole point of "speed mode" (mirrors
             // the close_ops.rs `depth_light` short-circuit from cas-6538).
