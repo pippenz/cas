@@ -230,6 +230,25 @@ pub struct FactoryArgs {
     #[arg(long, default_value = "claude")]
     pub worker_cli: String,
 
+    /// Persist this supervisor provider as the default for future sessions.
+    ///
+    /// When set, writes `[llm.supervisor] harness = "<provider>"` to
+    /// `~/.cas/config.toml` before launching, and prints a confirmation line.
+    /// Use with `cas claude --default` or `cas codex --default`.
+    #[arg(long = "default")]
+    pub set_default: bool,
+
+    /// Internal: whether `supervisor_cli` was explicitly specified by the
+    /// caller (shortcut command or programmatic use) rather than left at the
+    /// clap default.  Set to `true` by `cas claude` / `cas codex` so that the
+    /// config-harness override in `execute` does NOT clobber the explicit
+    /// provider choice with the persisted default.
+    ///
+    /// NOT exposed as a CLI flag — callers that need to signal "explicit" set
+    /// this field directly on the `FactoryArgs` value before calling execute.
+    #[arg(skip)]
+    pub supervisor_cli_explicit: bool,
+
     /// Disable cloud phone-home (push factory state to CAS Cloud)
     #[arg(long, global = true)]
     pub no_phone_home: bool,
@@ -267,6 +286,8 @@ impl Default for FactoryArgs {
             worker_cli: "claude".to_string(),
             no_phone_home: false,
             worker_spec: vec![],
+            set_default: false,
+            supervisor_cli_explicit: false,
         }
     }
 }
@@ -737,6 +758,14 @@ pub fn execute(args: &FactoryArgs, cli: &Cli, cas_root: Option<&std::path::Path>
 
     // Apply [llm] config harness defaults when CLI args are at their defaults.
     // CLI args explicitly set by the user take precedence over config values.
+    //
+    // cas-7f2c: use `supervisor_cli_explicit` (not string-equals-"claude") to
+    // distinguish "user explicitly chose claude" from "default 'claude' that
+    // should be overridden by the persisted config value".  The old check
+    // (`== "claude"`) silently ignored an explicit `--supervisor-cli=claude`
+    // or `cas claude` invocation when `[llm.supervisor] harness = "codex"` was
+    // persisted — the config value always won, even though the user asked for
+    // Claude.
     let mut effective_args = args.clone();
     let cas_dir_buf = cwd.join(".cas");
     let effective_cas_dir = cas_root.or_else(|| {
@@ -749,11 +778,34 @@ pub fn execute(args: &FactoryArgs, cli: &Cli, cas_root: Option<&std::path::Path>
     if let Some(cas_dir) = effective_cas_dir {
         if let Ok(cfg) = Config::load(cas_dir) {
             let llm = cfg.llm();
-            if effective_args.supervisor_cli == "claude" {
+            if !effective_args.supervisor_cli_explicit {
                 effective_args.supervisor_cli = llm.harness_for_role("supervisor").to_string();
             }
             if effective_args.worker_cli == "claude" {
                 effective_args.worker_cli = llm.harness_for_role("worker").to_string();
+            }
+        }
+    }
+
+    // cas-7f2c: persist the chosen provider to ~/.cas/config.toml when
+    // --default (or `cas claude --default` / `cas codex --default`) is set.
+    if effective_args.set_default {
+        use crate::cli::provider_default::set_supervisor_harness;
+        use crate::store::known_repos::host_cas_dir;
+
+        let host_dir = host_cas_dir();
+        if let Err(e) = std::fs::create_dir_all(&host_dir) {
+            eprintln!("Warning: could not create ~/.cas/: {e}");
+        } else {
+            let mut global_cfg = Config::load(&host_dir).unwrap_or_default();
+            set_supervisor_harness(&mut global_cfg, &effective_args.supervisor_cli);
+            if let Err(e) = global_cfg.save(&host_dir) {
+                eprintln!("Warning: could not persist supervisor default: {e}");
+            } else {
+                println!(
+                    "supervisor default set to {}",
+                    effective_args.supervisor_cli
+                );
             }
         }
     }
@@ -1179,10 +1231,17 @@ fn preflight_factory_launch(
     let claude_installed = is_claude_installed();
     let codex_installed = is_codex_installed();
 
+    // cas-7f2c: `allow_default_fallback` controls whether an absent CLI binary
+    // is silently swapped for the other one (e.g. claude→codex).  We allow
+    // fallback only when the provider was NOT explicitly chosen by the user
+    // (`supervisor_cli_explicit = false`).  Using the old string-equals-"claude"
+    // heuristic here was fine while the bug in execute was latent, but now that
+    // we trust `supervisor_cli_explicit` as the authoritative signal we should
+    // be consistent.
     let supervisor_cli = match resolve_cli_choice(
         "Supervisor CLI",
         &args.supervisor_cli,
-        args.supervisor_cli == "claude",
+        !args.supervisor_cli_explicit,
         claude_installed,
         codex_installed,
         &mut notices,

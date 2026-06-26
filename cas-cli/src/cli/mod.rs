@@ -9,6 +9,7 @@ mod claude_md;
 mod codemap_cmd;
 mod known_repos;
 mod project_overview_cmd;
+mod provider_default;
 mod sweep;
 mod worktree;
 // `pub` so integration tests in `cas-cli/tests/` can reach
@@ -51,6 +52,7 @@ pub use hook::HookArgs;
 pub use init::InitArgs;
 pub use list::ListArgs;
 pub use mcp_cmd::McpCommands;
+pub use provider_default::DefaultArgs;
 pub use status::StatusArgs;
 pub use statusline::StatusLineArgs;
 pub use open::OpenArgs;
@@ -118,6 +120,27 @@ pub enum Commands {
 
     /// Launch factory session (bare `cas` runs factory with defaults)
     Factory(FactoryArgs),
+
+    /// Launch factory with Claude as the supervisor (shortcut for `cas factory --supervisor-cli=claude`)
+    ///
+    /// All `cas factory` flags pass through. Use `--default` to also persist
+    /// Claude as the default supervisor for future sessions.
+    Claude(FactoryArgs),
+
+    /// Launch factory with Codex as the supervisor (shortcut for `cas factory --supervisor-cli=codex`)
+    ///
+    /// All `cas factory` flags pass through. Use `--default` to also persist
+    /// Codex as the default supervisor for future sessions.
+    Codex(FactoryArgs),
+
+    /// Set the default supervisor provider without launching (persist only)
+    ///
+    /// `cas default codex` — persists `[llm.supervisor] harness = "codex"` to
+    /// `~/.cas/config.toml` and exits.  `cas default claude` is symmetric.
+    /// To launch immediately AND persist, use `cas codex --default` or
+    /// `cas claude --default`.
+    #[command(name = "default")]
+    Default(DefaultArgs),
 
     /// Local helper server for external orchestration tools
     Bridge(BridgeArgs),
@@ -239,6 +262,9 @@ fn auth_requirement(command: &Option<Commands>) -> AuthRequirement {
         | Commands::Changelog(_)
         | Commands::Hook(_)
         | Commands::Factory(_)
+        | Commands::Claude(_)
+        | Commands::Codex(_)
+        | Commands::Default(_)
         | Commands::Attach(_)
         | Commands::List(_)
         | Commands::Kill(_)
@@ -288,7 +314,10 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
     // `initialize_telemetry` spawns its background thread. Any
     // `std::env::set_var` after that spawn is UB in a multi-threaded
     // process. Only mutates env for the factory command path.
-    if matches!(cli.command, Some(Commands::Factory(_)) | None) {
+    if matches!(
+        cli.command,
+        Some(Commands::Factory(_)) | Some(Commands::Claude(_)) | Some(Commands::Codex(_)) | None
+    ) {
         let early_cas_root = find_cas_root().ok();
         factory::apply_resource_contention_env(early_cas_root.as_deref());
     }
@@ -392,6 +421,9 @@ fn get_command_name(cmd: &Option<Commands>) -> String {
         Commands::Kill(_) => "kill".to_string(),
         Commands::KillAll(_) => "kill-all".to_string(),
         Commands::Factory(_) => "factory".to_string(),
+        Commands::Claude(_) => "claude".to_string(),
+        Commands::Codex(_) => "codex".to_string(),
+        Commands::Default(_) => "default".to_string(),
         Commands::Bridge(_) => "bridge".to_string(),
         #[cfg(feature = "mcp-server")]
         Commands::Serve => "serve".to_string(),
@@ -446,6 +478,21 @@ fn run_command(cli: &Cli, cas_root: Option<&Path>) -> anyhow::Result<()> {
         Commands::Kill(args) => factory::execute_kill(args.name.as_deref(), args.force),
         Commands::KillAll(args) => factory::execute_kill_all(args.force),
         Commands::Factory(args) => factory::execute(args, cli, cas_root),
+        // cas-7f2c: provider shortcuts — preset supervisor_cli + explicit flag,
+        // then delegate to the same factory::execute path.
+        Commands::Claude(args) => {
+            let mut a = args.clone();
+            a.supervisor_cli = "claude".to_string();
+            a.supervisor_cli_explicit = true;
+            factory::execute(&a, cli, cas_root)
+        }
+        Commands::Codex(args) => {
+            let mut a = args.clone();
+            a.supervisor_cli = "codex".to_string();
+            a.supervisor_cli_explicit = true;
+            factory::execute(&a, cli, cas_root)
+        }
+        Commands::Default(args) => provider_default::execute(args),
         Commands::Bridge(args) => bridge::execute(args, cli),
         #[cfg(feature = "mcp-server")]
         Commands::Serve => serve_execute(),
