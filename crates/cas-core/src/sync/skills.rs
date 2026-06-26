@@ -101,6 +101,14 @@ impl SkillSyncer {
             }
         }
 
+        // Add disallowed-tools as YAML list if set (Claude Code 2.1.152+, cas-5be8)
+        if !skill.disallowed_tools.is_empty() {
+            content.push_str("disallowed-tools:\n");
+            for tool in &skill.disallowed_tools {
+                content.push_str(&format!("  - {}\n", escape_yaml(tool)));
+            }
+        }
+
         // Add disable-model-invocation if set (Claude Code 2.1.3+)
         if skill.disable_model_invocation {
             content.push_str("disable-model-invocation: true\n");
