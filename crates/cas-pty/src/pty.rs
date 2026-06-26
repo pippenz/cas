@@ -325,7 +325,7 @@ impl PtyConfig {
         // integrated for the Codex harness (no .codex/config.toml). Must precede
         // the developer_instructions block but order among `-c` flags is
         // irrelevant to Codex.
-        push_codex_mcp_server_args(&mut args, &session_id);
+        push_codex_mcp_server_args(&mut args, &session_id, name, role);
 
         if let Some(m) = model {
             args.push("--model".to_string());
@@ -437,7 +437,7 @@ fn cargo_build_jobs_for_worker() -> Option<String> {
 /// strings, `["serve"]` becomes a string array. If a project DOES ship a
 /// `.codex/config.toml`, these `-c` overrides simply add the `cs` server on top
 /// — they never remove the project's own entries.
-fn push_codex_mcp_server_args(args: &mut Vec<String>, session_id: &str) {
+fn push_codex_mcp_server_args(args: &mut Vec<String>, session_id: &str, name: &str, role: &str) {
     args.push("-c".to_string());
     args.push("mcp_servers.cs.command=\"cas\"".to_string());
     args.push("-c".to_string());
@@ -452,6 +452,24 @@ fn push_codex_mcp_server_args(args: &mut Vec<String>, session_id: &str) {
     // "Agent not registered" until the worker brute-forces a manual `register`.
     args.push("-c".to_string());
     args.push(format!("mcp_servers.cs.env.CAS_SESSION_ID=\"{session_id}\""));
+    // cas-7592: also inject CAS_AGENT_NAME and CAS_AGENT_ROLE into the `cs` MCP
+    // env. Codex does NOT forward the codex process env into MCP servers, so
+    // without these the eager auto-registration (mcp/server/runtime.rs) falls
+    // back to the literal name "worker" and Agent::new's default role=Standard.
+    // The result is a three-way NAME-SPLIT: the mux registers the pane under
+    // `name` (e.g. strong-gazelle-97) and keys delivery/interrupt on it, but the
+    // CAS agent registers as name="worker"/role=Standard — invisible to
+    // worker_status, agent_list, and shutdown_workers (all filter role==Worker)
+    // and unaddressable (the supervisor can only send to a name == pane id).
+    // Injecting `name` makes the registered agent name == pane id, and `role`
+    // makes it surface as a Worker, unifying identity across registration,
+    // worker_status, delivery, AND shutdown in one move. We pass `name` directly
+    // (no `codex-<name>-<uuid>` suffix stripping) so names containing hyphens
+    // (every adjective-animal-NN id) round-trip exactly.
+    args.push("-c".to_string());
+    args.push(format!("mcp_servers.cs.env.CAS_AGENT_NAME=\"{name}\""));
+    args.push("-c".to_string());
+    args.push(format!("mcp_servers.cs.env.CAS_AGENT_ROLE=\"{role}\""));
 }
 
 /// Returns `true` when an executable named `cas` is resolvable on `PATH`.
@@ -1218,6 +1236,64 @@ mod tests {
                 .any(|(k, v)| k == "CAS_SESSION_ID" && v.starts_with("codex-test-worker-")),
             "codex worker process env must carry the matching CAS_SESSION_ID; got: {:?}",
             config.env
+        );
+    }
+
+    /// cas-7592: the Codex `cs` MCP server must also receive CAS_AGENT_NAME (==
+    /// the mux pane id) and CAS_AGENT_ROLE so eager auto-registration names the
+    /// agent after its pane (not the literal "worker") and marks it role=Worker.
+    /// Without this the codex worker is unaddressable (delivery keys on a name ==
+    /// pane id) and invisible to worker_status/shutdown_workers (both filter
+    /// role==Worker).
+    #[tokio::test]
+    async fn test_pty_config_codex_worker_injects_agent_name_and_role() {
+        let _e = ScopedEnv::new();
+        let config = PtyConfig::codex(
+            "strong-gazelle-97",
+            "worker",
+            PathBuf::from("/tmp"),
+            None,
+            None,
+            None,
+            None, // model
+            None, // effort
+            None, // teams
+        );
+        let all_args = config.args.join(" ");
+        assert!(
+            all_args.contains("mcp_servers.cs.env.CAS_AGENT_NAME=\"strong-gazelle-97\""),
+            "codex worker must inject CAS_AGENT_NAME (== pane id) into the cs MCP env; got: {all_args}"
+        );
+        assert!(
+            all_args.contains("mcp_servers.cs.env.CAS_AGENT_ROLE=\"worker\""),
+            "codex worker must inject CAS_AGENT_ROLE=worker into the cs MCP env; got: {all_args}"
+        );
+    }
+
+    /// cas-7592: the Codex supervisor's `cs` MCP server likewise receives its
+    /// pane name and role so it registers under its real identity.
+    #[tokio::test]
+    async fn test_pty_config_codex_supervisor_injects_agent_name_and_role() {
+        let _e = ScopedEnv::new();
+        let config = PtyConfig::codex(
+            "brave-panther-92",
+            "supervisor",
+            PathBuf::from("/tmp"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let all_args = config.args.join(" ");
+        assert!(
+            all_args.contains("mcp_servers.cs.env.CAS_AGENT_NAME=\"brave-panther-92\""),
+            "codex supervisor must inject CAS_AGENT_NAME (== pane id) into the cs MCP env; got: {all_args}"
+        );
+        assert!(
+            all_args.contains("mcp_servers.cs.env.CAS_AGENT_ROLE=\"supervisor\""),
+            "codex supervisor must inject CAS_AGENT_ROLE=supervisor into the cs MCP env; got: {all_args}"
         );
     }
 
