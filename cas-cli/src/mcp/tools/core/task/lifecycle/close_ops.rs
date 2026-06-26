@@ -1333,6 +1333,14 @@ impl CasCore {
                         let _ = crate::mcp::socket::send_event(&self.cas_root, &event);
                     }
 
+                    // cas-7fe9: release the worker's lease so the supervisor
+                    // can claim the task immediately for review. Without this,
+                    // the worker holds a phantom lease for ~10 min and
+                    // `task action=claim` by the supervisor is blocked.
+                    if let Ok(agent_store) = self.open_agent_store() {
+                        let _ = agent_store.release_lease_for_task(&req.id);
+                    }
+
                     return Ok(Self::success(format!(
                         "Task {} queued for supervisor review\n\n\
                         Lightweight structural lint passed (<1s). The full \
