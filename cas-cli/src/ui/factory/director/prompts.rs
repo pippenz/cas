@@ -161,9 +161,19 @@ pub fn generate_prompt(
             let ready_count = dispatchable_ready_count(data);
 
             let text = if ready_count > 0 {
+                // D-3 (cas-405f): do NOT embed the snapshot count here.
+                //
+                // `ready_count` comes from the director's epic-filtered snapshot
+                // (app::filter_director_agents_to_current_session), which tracks
+                // only tasks visible to the current epic scope. The live global
+                // `task action=ready` often shows more — confirmed mismatches of
+                // "said 1, actual 10" and "said 14, actual 25" were traced to this
+                // gap. Advertising a stale number causes the supervisor to
+                // under-assign or over-assign, so we remove the specific count and
+                // direct them to the live command instead.
                 format!(
                     "Worker {worker} is idle with no assigned tasks.\n\
-                     There are {ready_count} ready tasks available.\n\
+                     Ready tasks exist — check live: `{supervisor_prefix}task action=ready`\n\
                      Assign work: {supervisor_prefix}task action=update id=<task-id> assignee={worker}"
                 )
             } else {
@@ -354,7 +364,7 @@ mod tests {
         let event = DirectorEvent::WorkerIdle {
             worker: "swift-fox".to_string(),
         };
-        let data = make_data(3); // 3 ready tasks
+        let data = make_data(3); // 3 ready tasks in snapshot
         let config = default_config();
 
         let prompt =
@@ -363,7 +373,20 @@ mod tests {
         assert_eq!(prompt.target, "supervisor");
         assert!(prompt.text.contains("swift-fox"));
         assert!(prompt.text.contains("idle"));
-        assert!(prompt.text.contains("3 ready tasks"));
+        // D-3 (cas-405f): the specific count is intentionally NOT included — the
+        // snapshot count diverges from the live global `task action=ready` result
+        // because the director filters tasks to the current epic scope. We verify
+        // that the prompt directs the supervisor to the live command instead.
+        assert!(
+            !prompt.text.contains("3 ready tasks"),
+            "Prompt must not embed stale snapshot count (D-3): {}",
+            prompt.text
+        );
+        assert!(
+            prompt.text.contains("task action=ready"),
+            "Prompt must direct supervisor to live task action=ready (D-3): {}",
+            prompt.text
+        );
     }
 
     #[test]

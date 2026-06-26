@@ -93,6 +93,12 @@ impl FactoryDaemon {
     /// name; `summary` is the optional one-line preview carried to Claude inboxes
     /// and used for PTY attribution.
     ///
+    /// `color` overrides the message bubble color when writing to a Claude
+    /// Agent-Teams inbox. Pass `Some(DIRECTOR_AGENT_COLOR)` for director
+    /// messages so the advertised color matches the config.json record (cas-405f
+    /// D-4). Pass `None` for peer/supervisor messages — the team manager resolves
+    /// each sender's configured color from the team record.
+    ///
     /// Returns `Ok(())` on a successful write to the chosen channel.
     pub(crate) async fn deliver_to_worker(
         &self,
@@ -100,6 +106,7 @@ impl FactoryDaemon {
         source: &str,
         text: &str,
         summary: Option<&str>,
+        color: Option<&str>,
     ) -> anyhow::Result<()> {
         // Normalise the target into the two name forms the two channels expect:
         //   - `pane_target`  : the real pane id `Mux::inject` routes on
@@ -125,7 +132,7 @@ impl FactoryDaemon {
                     .teams
                     .as_ref()
                     .expect("TeamsInbox channel requires active teams");
-                teams.write_to_inbox(inbox_target, source, text, summary, None)
+                teams.write_to_inbox(inbox_target, source, text, summary, color)
             }
             DeliveryChannel::Pty => {
                 // Frame based on the RECIPIENT's harness, not teams mode: a Codex
