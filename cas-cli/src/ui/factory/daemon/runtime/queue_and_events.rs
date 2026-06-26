@@ -397,11 +397,14 @@ impl FactoryDaemon {
                     } else {
                         // Recipient-aware routing (cas-b68a): each worker may run a
                         // different harness, so resolve per-worker inside the loop.
+                        // color=None: peer/supervisor senders; team manager resolves
+                        // configured color from the sender's team record.
                         self.deliver_to_worker(
                             &name,
                             &inbox_source,
                             &prompt_with_instructions,
                             queued.summary.as_deref(),
+                            None,
                         )
                         .await
                     };
@@ -469,11 +472,14 @@ impl FactoryDaemon {
                 } else {
                     // Recipient-aware routing (cas-b68a): delivery channel +
                     // name normalisation handled inside the helper.
+                    // color=None: peer/supervisor senders; team manager resolves
+                    // configured color from the sender's team record.
                     self.deliver_to_worker(
                         target,
                         &inbox_source,
                         &prompt_with_instructions,
                         queued.summary.as_deref(),
+                        None,
                     )
                     .await
                 };

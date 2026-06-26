@@ -19,6 +19,16 @@ const AGENT_COLORS: &[&str] = &["green", "blue", "yellow", "cyan", "magenta", "r
 /// team member.
 pub const DIRECTOR_AGENT_NAME: &str = "director";
 
+/// The inbox color used for director (automated coordinator) messages.
+///
+/// Must match the `color` field written to config.json for the director
+/// `TeamMember` entry in [`TeamsManager::init_team_config`]. When
+/// [`super::delivery::FactoryDaemon::deliver_to_worker`] calls
+/// [`TeamsManager::write_to_inbox`] on behalf of the director it passes
+/// this constant explicitly so the advertised color matches the config
+/// record (cas-405f D-4).
+pub const DIRECTOR_AGENT_COLOR: &str = "white";
+
 /// Dedup window for identical (from, text) inbox writes (task cas-7f57).
 ///
 /// The daemon can re-fire the same auto-prompt (e.g. "You have been assigned
@@ -425,19 +435,29 @@ impl TeamsManager {
 
         // Director is the daemon's identity for system/auto-prompt messages.
         // Registered as a team member so Claude Code accepts messages from it.
+        //
+        // `backend_type` is `None` (not "tmux") because the director has no real
+        // process or PTY — it is an automated coordinator, not a live peer. Setting
+        // "tmux" here (cas-405f D-2) caused CC to render director messages as coming
+        // from a live teammate rather than an automated system source. A missing/None
+        // backend_type signals to CC that this is a non-interactive sender.
+        //
+        // `color` must stay "white" and must match `DIRECTOR_AGENT_COLOR` — the two
+        // constants are intentionally kept in sync so inbox writes and the config
+        // entry advertise the same color (cas-405f D-4).
         members.push(TeamMember {
             agent_id: self.agent_id_for(DIRECTOR_AGENT_NAME),
             name: DIRECTOR_AGENT_NAME.to_string(),
             agent_type: "director".to_string(),
             model: model.clone(),
             prompt: None,
-            color: Some("white".to_string()),
+            color: Some(DIRECTOR_AGENT_COLOR.to_string()),
             plan_mode_required: None,
             joined_at: now,
             tmux_pane_id: "tmux".to_string(),
             cwd: project_cwd_str.clone(),
             subscriptions: Vec::new(),
-            backend_type: Some("tmux".to_string()),
+            backend_type: None,
         });
 
         // Add workers (each may have its own worktree path)

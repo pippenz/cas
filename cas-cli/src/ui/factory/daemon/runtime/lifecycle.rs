@@ -377,6 +377,9 @@ impl FactoryDaemon {
                                 super::teams::DIRECTOR_AGENT_NAME,
                                 &prompt.text,
                                 None,
+                                // D-4 (cas-405f): pass the director's config.json color so
+                                // the inbox bubble matches the registered team entry.
+                                Some(super::teams::DIRECTOR_AGENT_COLOR),
                             )
                             .await;
                         let inject_ms =

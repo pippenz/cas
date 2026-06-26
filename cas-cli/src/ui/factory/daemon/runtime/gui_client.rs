@@ -384,8 +384,10 @@ impl FactoryDaemon {
                 } else {
                     // Recipient-aware routing (cas-b68a): inject reaches a Codex pane
                     // via PTY even when the supervisor runs Claude teams.
+                    // color=Some(DIRECTOR_AGENT_COLOR): D-4 (cas-405f) — match the
+                    // director's config.json color so the inbox bubble isn't misattributed.
                     let _ = self
-                        .deliver_to_worker(&actual, super::teams::DIRECTOR_AGENT_NAME, &prompt, None)
+                        .deliver_to_worker(&actual, super::teams::DIRECTOR_AGENT_NAME, &prompt, None, Some(super::teams::DIRECTOR_AGENT_COLOR))
                         .await;
                 }
             }
