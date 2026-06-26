@@ -3,7 +3,14 @@
 use chrono::{DateTime, TimeZone, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+/// Per-process counter mixed into `generate_hash_id` so that two back-to-back
+/// calls within the same nanosecond (same `timestamp_nanos + pid`) always
+/// produce different hashes and therefore different candidate IDs. Fixes the
+/// UNIQUE-constraint flake in `test_skill_search` (cas-6c0a).
+static SKILL_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 use crate::error::StoreError;
 use crate::{Result, SkillStore};
@@ -106,9 +113,15 @@ impl SqliteSkillStore {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
+        // Mix a monotonically-increasing counter so that two back-to-back calls
+        // within the same nanosecond (same timestamp + same pid) produce a
+        // different hash and therefore a different candidate ID (cas-6c0a).
+        let seq = SKILL_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+
         let mut hasher = DefaultHasher::new();
         Utc::now().timestamp_nanos_opt().hash(&mut hasher);
         std::process::id().hash(&mut hasher);
+        seq.hash(&mut hasher);
 
         let hash = hasher.finish();
         let chars: Vec<char> = format!("{hash:016x}").chars().collect();
