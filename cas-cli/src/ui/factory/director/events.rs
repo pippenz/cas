@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use crate::ui::factory::director::data::{DirectorData, TaskSummary};
 use cas_types::TaskStatus;
+use chrono::DateTime;
 
 /// Debounce duration for events (don't emit same event within this window)
 const DEBOUNCE_DURATION: Duration = Duration::from_secs(30);
@@ -16,6 +17,19 @@ const DEBOUNCE_DURATION: Duration = Duration::from_secs(30);
 /// Idle notifications are low-priority and flood the supervisor when multiple
 /// workers idle simultaneously.
 const IDLE_RATE_LIMIT: Duration = Duration::from_secs(300);
+
+/// A worker whose `last_heartbeat` is within this many seconds of `now_utc` is
+/// considered "recently alive" for the purposes of the idle gate (cas-4038).
+/// CC agents heartbeat on every tool call, so a 60s window covers one full
+/// turn without generating a false-idle notification.
+const FRESH_HEARTBEAT_SECS: i64 = 60;
+
+/// A worker whose `latest_activity` timestamp is within this many seconds of
+/// `now_utc` is considered "recently active" (cas-4038). Combined with the
+/// fresh-heartbeat gate: BOTH must be true to suppress a WorkerIdle tick.
+/// 120s gives one comfortable "between tasks" turn window at the 2s refresh
+/// rate without masking a genuinely stalled worker.
+const RECENT_ACTIVITY_SECS: i64 = 120;
 
 /// Number of consecutive refresh ticks an agent must appear idle before
 /// WorkerIdle is emitted.
@@ -389,26 +403,30 @@ impl DirectorEventDetector {
 
     /// Detect changes between the last state and new data.
     ///
-    /// Thin shim: captures `Instant::now()` and delegates to
+    /// Thin shim: captures `Instant::now()` and `Utc::now()` and delegates to
     /// [`detect_changes_at`]. Production callers use this; tests that need to
-    /// isolate the state-guard from the 30s debounce window call
-    /// `detect_changes_at` directly with a synthetic clock value.
+    /// isolate the state-guard from the 30s debounce window or the heartbeat
+    /// freshness gate call `detect_changes_at` directly with synthetic clocks.
     pub fn detect_changes(
         &mut self,
         data: &DirectorData,
         current_epic_id: Option<&str>,
     ) -> Vec<DirectorEvent> {
-        self.detect_changes_at(data, current_epic_id, Instant::now())
+        self.detect_changes_at(data, current_epic_id, Instant::now(), chrono::Utc::now())
     }
 
-    /// Core implementation of change detection with an injectable clock.
+    /// Core implementation of change detection with injectable clocks.
     ///
     /// Returns a list of detected events. Call after each refresh.
     ///
-    /// `now` is the logical "current time" used for debounce bookkeeping.
-    /// Pass `Instant::now()` in production; pass a synthetic value in tests so
-    /// the state-guard (HashSet checks) can be validated independently of the
-    /// 30s `DEBOUNCE_DURATION` window.
+    /// `now` — `Instant` used for debounce bookkeeping (`last_prompt_times`).
+    /// Pass `Instant::now()` in production; inject a synthetic value in tests
+    /// to isolate state-guards from the 30s `DEBOUNCE_DURATION` window.
+    ///
+    /// `now_utc` — `DateTime<Utc>` used for heartbeat / activity freshness
+    /// comparisons. Pass `Utc::now()` in production; inject a synthetic value
+    /// in tests to exercise the `FRESH_HEARTBEAT_SECS` / `RECENT_ACTIVITY_SECS`
+    /// gates without actually sleeping.
     ///
     /// `current_epic_id` is the factory app's currently-tracked epic (pass
     /// `None` at init time before any epic has been resolved). When `Some`,
@@ -423,6 +441,7 @@ impl DirectorEventDetector {
         data: &DirectorData,
         current_epic_id: Option<&str>,
         now: Instant,
+        now_utc: DateTime<chrono::Utc>,
     ) -> Vec<DirectorEvent> {
         let new_state = DirectorState::from_data(data);
         let mut events = Vec::new();
@@ -606,6 +625,46 @@ impl DirectorEventDetector {
                 // counter only starts accumulating after the queue is drained.
                 self.consecutive_idle_ticks.remove(&agent.id);
                 self.idle_already_emitted.remove(&agent.id);
+                continue;
+            }
+
+            // Fresh-heartbeat + recent-activity gate (cas-4038).
+            //
+            // A CC agent sends heartbeats on every tool call. Between turns the
+            // agent has `current_task = None` (no active lease) but is still
+            // alive and may have uncommitted work. If the worker's heartbeat is
+            // fresh AND it had recent activity, the current task-less state is
+            // almost certainly a between-turns gap, not a genuine idle. Reset the
+            // idle streak so WorkerIdle only fires after a truly sustained window
+            // where BOTH signals are cold.
+            //
+            // The gate requires BOTH conditions (AND logic):
+            //  - fresh heartbeat: a live worker always heartbeats; stale = dead/stalled
+            //  - recent activity: guards against a worker that heartbeats as a
+            //    daemon alive-check but hasn't actually done any work lately
+            //
+            // When either signal is absent (no heartbeat data, no activity) the
+            // gate is inactive and normal consecutive-tick debounce governs.
+            let has_fresh_heartbeat = agent
+                .last_heartbeat
+                .map(|hb| {
+                    let age_secs = (now_utc - hb).num_seconds();
+                    age_secs >= 0 && age_secs < FRESH_HEARTBEAT_SECS
+                })
+                .unwrap_or(false);
+            let has_recent_activity = agent
+                .latest_activity
+                .as_ref()
+                .map(|(_, ts)| {
+                    let age_secs = (now_utc - *ts).num_seconds();
+                    age_secs >= 0 && age_secs < RECENT_ACTIVITY_SECS
+                })
+                .unwrap_or(false);
+            if has_fresh_heartbeat && has_recent_activity {
+                // Worker is alive and recently active between turns — do not count
+                // this tick and reset any partial idle streak so a genuine idle
+                // that follows has to accumulate from zero.
+                self.consecutive_idle_ticks.remove(&agent.id);
                 continue;
             }
 

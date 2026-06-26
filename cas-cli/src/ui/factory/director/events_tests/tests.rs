@@ -1279,12 +1279,14 @@ fn test_task_completed_state_guard_independent_of_debounce() {
     detector.initialize(&working_data_for("agent-1", "swift-fox", "task-1", "Work Item"));
 
     let t0 = Instant::now();
+    let t0_utc = chrono::Utc::now();
 
     // t=0: task disappears → first TaskCompleted.
     let events1 = detector.detect_changes_at(
         &idle_data_for("agent-1", "swift-fox"),
         None,
         t0,
+        t0_utc,
     );
     assert!(
         events1.iter().any(|e| matches!(
@@ -1299,6 +1301,7 @@ fn test_task_completed_state_guard_independent_of_debounce() {
         &working_data_for("agent-1", "swift-fox", "task-1", "Work Item"),
         None,
         t0 + Duration::from_secs(1),
+        t0_utc + chrono::Duration::seconds(1),
     );
 
     // t+31s: task disappears again. Debounce would allow re-emission (31s > 30s
@@ -1307,6 +1310,7 @@ fn test_task_completed_state_guard_independent_of_debounce() {
         &idle_data_for("agent-1", "swift-fox"),
         None,
         t0 + Duration::from_secs(31),
+        t0_utc + chrono::Duration::seconds(31),
     );
     assert!(
         !events3.iter().any(|e| matches!(
@@ -1366,5 +1370,116 @@ fn test_task_assigned_no_refire_on_oscillation() {
                 if task_id == "task-1" && worker == "swift-fox"
         )),
         "TaskAssigned must not re-fire when same assignment reappears after oscillation: {events3:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// cas-4038: WorkerIdle must not fire for a live, recently-active worker
+// ---------------------------------------------------------------------------
+
+/// Build an agent snapshot with `latest_activity` set to `activity_ago_secs` seconds
+/// before `base_utc`, and heartbeat `heartbeat_ago_secs` seconds before `base_utc`.
+fn make_agent_active(
+    id: &str,
+    name: &str,
+    heartbeat_ago_secs: i64,
+    activity_ago_secs: i64,
+    base_utc: chrono::DateTime<chrono::Utc>,
+) -> AgentSummary {
+    use chrono::Duration as CDuration;
+    AgentSummary {
+        id: id.to_string(),
+        name: name.to_string(),
+        status: AgentStatus::Active,
+        current_task: None, // task-less between turns
+        latest_activity: Some((
+            "tool_call".to_string(),
+            base_utc - CDuration::seconds(activity_ago_secs),
+        )),
+        last_heartbeat: Some(base_utc - CDuration::seconds(heartbeat_ago_secs)),
+        pending_messages: 0,
+    }
+}
+
+fn active_agent_data(agent: AgentSummary) -> DirectorData {
+    let id = agent.id.clone();
+    let name = agent.name.clone();
+    DirectorData {
+        ready_tasks: vec![],
+        in_progress_tasks: vec![],
+        epic_tasks: vec![],
+        agents: vec![agent],
+        activity: vec![],
+        agent_id_to_name: [(id, name)].into_iter().collect(),
+        changes: vec![],
+        git_loaded: true,
+        reminders: vec![],
+        epic_closed_counts: HashMap::new(),
+    }
+}
+
+/// A worker with current_task=None but a fresh heartbeat and recent activity
+/// must NOT trigger WorkerIdle, even after the consecutive-tick threshold.
+/// This is the "between turns / mid-work" scenario from the cas-4038 description
+/// (e.g. agile-cobra-92 flagged idle while it had uncommitted work).
+#[test]
+fn test_no_worker_idle_for_recently_active_worker() {
+    let base_utc = chrono::Utc::now();
+    let t0 = std::time::Instant::now();
+
+    let mut detector =
+        DirectorEventDetector::new(vec!["swift-fox".to_string()], "supervisor".to_string());
+
+    // Worker has fresh heartbeat (5s old) and recent activity (30s old). No current_task.
+    let agent = make_agent_active("agent-1", "swift-fox", 5, 30, base_utc);
+    let data = active_agent_data(agent);
+
+    detector.initialize(&data);
+
+    // Run enough ticks to exceed IDLE_CONSECUTIVE_TICKS with a frozen now_utc
+    // (heartbeat and activity still appear fresh from the detector's perspective).
+    for _ in 0..5 {
+        let events = detector.detect_changes_at(&data, None, t0, base_utc);
+        assert!(
+            !events.iter().any(|e| matches!(e, DirectorEvent::WorkerIdle { .. })),
+            "WorkerIdle must NOT fire for a worker with fresh heartbeat + recent activity: {events:?}"
+        );
+    }
+}
+
+/// Once the worker's heartbeat goes stale (no heartbeat for > threshold), the
+/// fresh-heartbeat gate is inactive and normal idle detection fires after the
+/// consecutive-tick threshold.
+#[test]
+fn test_worker_idle_fires_when_heartbeat_stale() {
+    let base_utc = chrono::Utc::now();
+    let t0 = std::time::Instant::now();
+
+    let mut detector =
+        DirectorEventDetector::new(vec!["swift-fox".to_string()], "supervisor".to_string());
+
+    // Worker initially had a task (to establish the streak-reset baseline).
+    detector.initialize(&working_data_for("agent-1", "swift-fox", "task-1", "Work"));
+
+    // Worker now has stale heartbeat (120s old) — beyond the fresh-heartbeat window.
+    let agent = make_agent_active("agent-1", "swift-fox", 120, 300, base_utc);
+    let data = active_agent_data(agent);
+
+    // now_utc == base_utc, so heartbeat appears 120s old.
+    // Tick 1: not yet at threshold.
+    let ev1 = detector.detect_changes_at(&data, None, t0, base_utc);
+    assert!(
+        !ev1.iter().any(|e| matches!(e, DirectorEvent::WorkerIdle { .. })),
+        "Tick 1 with stale heartbeat must not fire (still below consecutive threshold): {ev1:?}"
+    );
+
+    // Tick 2: crosses IDLE_CONSECUTIVE_TICKS — WorkerIdle must fire.
+    let ev2 = detector.detect_changes_at(&data, None, t0, base_utc);
+    assert!(
+        ev2.iter().any(|e| matches!(
+            e,
+            DirectorEvent::WorkerIdle { worker } if worker == "swift-fox"
+        )),
+        "WorkerIdle must fire for genuinely-idle worker (stale heartbeat) after threshold: {ev2:?}"
     );
 }
