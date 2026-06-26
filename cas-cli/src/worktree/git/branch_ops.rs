@@ -26,6 +26,50 @@ impl GitOperations {
         Ok(true)
     }
 
+    /// Create a branch from a specific base ref if it doesn't exist.
+    ///
+    /// Unlike `create_branch_if_not_exists`, this uses an explicit start point
+    /// rather than the current HEAD. Pass the configured trunk (e.g. "main") so
+    /// epic and worker branches are always anchored to the correct base.
+    ///
+    /// Returns true if the branch was created, false if it already existed.
+    pub fn create_branch_from(&self, branch: &str, base: &str) -> Result<bool> {
+        if self.branch_exists(branch)? {
+            return Ok(false);
+        }
+
+        let output = Command::new("git")
+            .args(["branch", branch, base])
+            .current_dir(&self.repo_root)
+            .output()?;
+
+        if !output.status.success() {
+            return Err(GitError::CommandFailed(
+                String::from_utf8_lossy(&output.stderr).to_string(),
+            ));
+        }
+
+        Ok(true)
+    }
+
+    /// Resolve the full SHA of a ref (branch name, "HEAD", etc.).
+    ///
+    /// Returns a 40-character hex SHA, or a GitError if the ref doesn't exist.
+    pub fn ref_sha(&self, ref_name: &str) -> Result<String> {
+        let output = Command::new("git")
+            .args(["rev-parse", ref_name])
+            .current_dir(&self.repo_root)
+            .output()?;
+
+        if !output.status.success() {
+            return Err(GitError::CommandFailed(
+                String::from_utf8_lossy(&output.stderr).to_string(),
+            ));
+        }
+
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
     /// Push a branch to origin
     ///
     /// Pushes the specified branch to the 'origin' remote. If the branch doesn't exist

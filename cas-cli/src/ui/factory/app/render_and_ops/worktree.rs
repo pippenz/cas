@@ -6,15 +6,20 @@ impl FactoryApp {
         &self.project_dir
     }
 
-    /// Create an epic branch from the current branch
+    /// Create an epic branch based on the configured trunk (not supervisor HEAD)
     pub fn create_epic_branch(&self, epic_title: &str) -> anyhow::Result<String> {
         use crate::worktree::GitOperations;
 
         let branch_name = epic_branch_name(epic_title);
         let git_ops = GitOperations::new(self.project_dir.clone());
+        let trunk = git_ops.detect_default_branch();
 
-        if git_ops.create_branch_if_not_exists(&branch_name)? {
-            tracing::info!("Created epic branch: {}", branch_name);
+        if git_ops.create_branch_from(&branch_name, &trunk)? {
+            tracing::info!(
+                "Created epic branch {} from trunk '{}'",
+                branch_name,
+                trunk
+            );
         } else {
             tracing::info!("Epic branch already exists: {}", branch_name);
         }

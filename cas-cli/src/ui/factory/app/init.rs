@@ -55,11 +55,36 @@ impl FactoryApp {
         let director_data = DirectorData::load_fast(&cas_dir)?;
         let epic_state = detect_epic_state(&director_data, None);
 
+        // Detect the configured trunk once — used both for epic branch creation
+        // and as the base for worker worktrees when no epic is active.
+        let git_ops = GitOperations::new(config.cwd.clone());
+        let trunk = git_ops.detect_default_branch();
+
         let epic_branch = if let EpicState::Active { epic_title, .. } = &epic_state {
             let branch_name = epic_branch_name(epic_title);
-            let git_ops = GitOperations::new(config.cwd.clone());
-            if git_ops.create_branch_if_not_exists(&branch_name)? {
-                tracing::info!("Created epic branch: {}", branch_name);
+            // Warn when supervisor HEAD has drifted from trunk so operators know
+            // the chosen base for the epic branch (AC: warn + surface base SHA).
+            if let (Ok(head_sha), Ok(trunk_sha)) =
+                (git_ops.ref_sha("HEAD"), git_ops.ref_sha(&trunk))
+            {
+                if head_sha != trunk_sha {
+                    eprintln!(
+                        "[CAS] ⚠  supervisor HEAD ({}) differs from trunk '{}' ({}). \
+                         Epic branch will be based on trunk.",
+                        &head_sha[..head_sha.len().min(8)],
+                        trunk,
+                        &trunk_sha[..trunk_sha.len().min(8)],
+                    );
+                } else {
+                    tracing::debug!(
+                        "Epic base: trunk '{}' @ {}",
+                        trunk,
+                        &trunk_sha[..trunk_sha.len().min(8)]
+                    );
+                }
+            }
+            if git_ops.create_branch_from(&branch_name, &trunk)? {
+                tracing::info!("Created epic branch {} from trunk '{}'", branch_name, trunk);
             } else {
                 tracing::info!("Using existing epic branch: {}", branch_name);
             }
@@ -91,10 +116,14 @@ impl FactoryApp {
                 promote_entries_on_merge: false,
             };
 
+            // Worker worktrees base off the epic branch when one is active,
+            // otherwise off the configured trunk — never off supervisor HEAD.
+            let worker_base = epic_branch.as_deref().unwrap_or(trunk.as_str());
+
             let mut manager = WorktreeManager::new(&config.cwd, wt_config)?;
             let mut cwds = HashMap::new();
             for name in &worker_names {
-                let worktree = manager.ensure_worker_worktree(name)?;
+                let worktree = manager.ensure_worker_worktree_from(name, worker_base)?;
                 cwds.insert(name.clone(), worktree.path.clone());
             }
 
