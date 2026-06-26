@@ -185,14 +185,23 @@ impl PtyConfig {
             args.push("--model".to_string());
             args.push(m.to_string());
         }
-        // Supervisors need deeper reasoning for planning/coordination;
-        // workers execute well-defined tasks where high effort suffices.
-        // Config-provided effort takes precedence; role-based defaults preserve
-        // backward compatibility when no config value is set.
-        let resolved_effort =
-            effort.unwrap_or(if role == "supervisor" { "xhigh" } else { "high" });
-        args.push("--effort".to_string());
-        args.push(resolved_effort.to_string());
+        // Add --effort flag only when the installed claude CLI supports it (cas-6ee8).
+        // Older CLI versions crash silently (non-zero exit, no useful error) when they
+        // encounter an unrecognised flag. The probe runs once and caches the result.
+        // Supervisors need deeper reasoning; workers execute well-defined tasks.
+        // Config-provided effort takes precedence over role-based defaults.
+        if claude_supports_effort_flag() {
+            let resolved_effort =
+                effort.unwrap_or(if role == "supervisor" { "xhigh" } else { "high" });
+            args.push("--effort".to_string());
+            args.push(resolved_effort.to_string());
+        } else {
+            tracing::warn!(
+                "Skipping --effort flag: installed claude CLI does not support it \
+                 (upgrade claude to enable effort/reasoning-depth control). \
+                 Agents will run at the CLI's default effort level."
+            );
+        }
 
         // Add native Agent Teams CLI flags.
         // All agents (including the supervisor) get --teammate-mode tmux
@@ -470,6 +479,44 @@ fn push_codex_mcp_server_args(args: &mut Vec<String>, session_id: &str, name: &s
     args.push(format!("mcp_servers.cs.env.CAS_AGENT_NAME=\"{name}\""));
     args.push("-c".to_string());
     args.push(format!("mcp_servers.cs.env.CAS_AGENT_ROLE=\"{role}\""));
+}
+
+/// Returns `true` when the installed `claude` CLI supports the `--effort` flag.
+///
+/// Probes by spawning `claude --help` once and scanning its output for
+/// `--effort`. The result is cached in a `OnceLock` for the lifetime of the
+/// process — subsequent calls return the cached value immediately.
+///
+/// **Conservative failure mode**: if `claude` is not on PATH, or the probe
+/// subprocess fails for any reason, returns `false`. The caller should then
+/// skip injecting `--effort` rather than risk a silent crash on unsupported
+/// CLI versions (cas-6ee8).
+///
+/// **Test/CI override**: set the `CAS_FACTORY_EFFORT_SUPPORTED` env var to
+/// `"1"` (force supported) or `"0"` (force unsupported) to bypass the probe
+/// entirely. This prevents `OnceLock` state from leaking across tests.
+pub(crate) fn claude_supports_effort_flag() -> bool {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<bool> = OnceLock::new();
+
+    // Allow test / CI environments to bypass the probe via env var override.
+    match std::env::var("CAS_FACTORY_EFFORT_SUPPORTED").as_deref() {
+        Ok("1") => return true,
+        Ok("0") => return false,
+        _ => {}
+    }
+
+    *CACHE.get_or_init(|| {
+        let Ok(output) = std::process::Command::new("claude")
+            .arg("--help")
+            .output()
+        else {
+            return false;
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        stdout.contains("--effort") || stderr.contains("--effort")
+    })
 }
 
 /// Returns `true` when an executable named `cas` is resolvable on `PATH`.
@@ -951,6 +998,8 @@ mod tests {
                 std::env::remove_var("CAS_FACTORY_CARGO_BUILD_JOBS");
                 std::env::remove_var("CAS_FACTORY_NICE_WORKER");
                 std::env::remove_var("CAS_FACTORY_NICE_LEVEL");
+                // cas-6ee8: clear effort-support override so tests don't bleed state.
+                std::env::remove_var("CAS_FACTORY_EFFORT_SUPPORTED");
             }
             Self { _guard: guard }
         }
@@ -963,6 +1012,8 @@ mod tests {
                 std::env::remove_var("CAS_FACTORY_CARGO_BUILD_JOBS");
                 std::env::remove_var("CAS_FACTORY_NICE_WORKER");
                 std::env::remove_var("CAS_FACTORY_NICE_LEVEL");
+                // cas-6ee8: clear effort-support override on exit.
+                std::env::remove_var("CAS_FACTORY_EFFORT_SUPPORTED");
             }
         }
     }
@@ -1669,6 +1720,114 @@ mod tests {
             .position(|a| a == "--effort")
             .expect("--effort must be present");
         assert_eq!(config.args[effort_idx + 1], "high");
+    }
+
+    // ── cas-6ee8: --effort version guard tests ────────────────────────────
+
+    #[tokio::test]
+    async fn test_effort_flag_included_when_supported() {
+        // Verify that PtyConfig::claude includes --effort when the installed
+        // claude CLI reports support (forced via env var to avoid a live probe).
+        let _e = ScopedEnv::new();
+        // SAFETY: ENV_LOCK held by ScopedEnv.
+        unsafe { std::env::set_var("CAS_FACTORY_EFFORT_SUPPORTED", "1"); }
+
+        let config = PtyConfig::claude(
+            "test-agent",
+            "worker",
+            PathBuf::from("/tmp"),
+            None,
+            None,
+            None,
+            None,
+            Some("low"),
+            None,
+        );
+        let effort_idx = config
+            .args
+            .iter()
+            .position(|a| a == "--effort")
+            .expect("--effort must be present when effort is supported (cas-6ee8)");
+        assert_eq!(config.args[effort_idx + 1], "low");
+    }
+
+    #[tokio::test]
+    async fn test_effort_flag_omitted_when_unsupported() {
+        // Regression test for cas-6ee8: when the installed claude CLI does not
+        // support --effort, the flag must be silently omitted (not injected)
+        // so the subprocess does not crash with an unrecognised-flag error.
+        let _e = ScopedEnv::new();
+        // SAFETY: ENV_LOCK held by ScopedEnv.
+        unsafe { std::env::set_var("CAS_FACTORY_EFFORT_SUPPORTED", "0"); }
+
+        let config = PtyConfig::claude(
+            "test-agent",
+            "worker",
+            PathBuf::from("/tmp"),
+            None,
+            None,
+            None,
+            None,
+            Some("low"),
+            None,
+        );
+        assert!(
+            !config.args.contains(&"--effort".to_string()),
+            "--effort must be absent when CLI does not support it (cas-6ee8), got: {:?}",
+            config.args
+        );
+        assert!(
+            !config.args.contains(&"low".to_string()),
+            "effort value must also be absent when --effort is skipped, got: {:?}",
+            config.args
+        );
+    }
+
+    #[tokio::test]
+    async fn test_effort_flag_omitted_unsupported_default_effort() {
+        // When effort=None (default) and CLI is unsupported, neither the flag
+        // nor a role-default value should appear.
+        let _e = ScopedEnv::new();
+        // SAFETY: ENV_LOCK held by ScopedEnv.
+        unsafe { std::env::set_var("CAS_FACTORY_EFFORT_SUPPORTED", "0"); }
+
+        let config = PtyConfig::claude(
+            "sup",
+            "supervisor",
+            PathBuf::from("/tmp"),
+            None,
+            None,
+            None,
+            None,
+            None, // no explicit effort — would default to "xhigh" if supported
+            None,
+        );
+        assert!(
+            !config.args.contains(&"--effort".to_string()),
+            "--effort must be absent for supervisor when unsupported (cas-6ee8), got: {:?}",
+            config.args
+        );
+        assert!(
+            !config.args.contains(&"xhigh".to_string()),
+            "role-default effort value must also be absent, got: {:?}",
+            config.args
+        );
+    }
+
+    #[tokio::test]
+    async fn test_claude_supports_effort_flag_env_override() {
+        // Verify the env var bypass works for both true and false.
+        let _e = ScopedEnv::new();
+        unsafe { std::env::set_var("CAS_FACTORY_EFFORT_SUPPORTED", "1"); }
+        assert!(
+            claude_supports_effort_flag(),
+            "env override '1' must return true"
+        );
+        unsafe { std::env::set_var("CAS_FACTORY_EFFORT_SUPPORTED", "0"); }
+        assert!(
+            !claude_supports_effort_flag(),
+            "env override '0' must return false"
+        );
     }
 
     #[tokio::test]
