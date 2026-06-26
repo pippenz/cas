@@ -86,9 +86,11 @@ fn project_cfg_no_team(endpoint: &str) -> CloudConfig {
 // ── Test 1: single-team — implicit auto-pick ─────────────────────────────────
 
 /// AC: After `/api/me` returns exactly one team, `store.add()` dual-enqueues
-/// to that team without any explicit `cas cloud team set`.
+/// to that team without any explicit `cas cloud team set`, provided the project
+/// has `team_auto_promote = Some(true)` (cas-f8e3 opt-in).
 ///
 /// Resolution chain step: `user_cfg.teams.len() == 1` → auto-pick.
+/// Guard (Step 1.5): fires only when `team_auto_promote = Some(true)`.
 #[tokio::test]
 async fn e2e_single_team_auto_picks_without_team_set() {
     const TEAM_ID: &str = "e2e-single-0000-0000-000000000001";
@@ -121,11 +123,13 @@ async fn e2e_single_team_auto_picks_without_team_set() {
     let user_cloud_json = user_tmp.path().join("cloud.json");
     let _guard = UserCloudGuard::set(&user_cloud_json);
 
-    // — Create project config (no team_id) ————————————————————————————————————
+    // — Create project config (no team_id, but with opt-in for user-level fallback) ——
+    // After cas-f8e3, team_auto_promote=Some(true) is required for Steps 2-3
+    // of the resolution chain to fire. Without it, the project is personal.
     let project_tmp = TempDir::new().unwrap();
-    project_cfg_no_team(&server.uri())
-        .save_to_cas_dir(project_tmp.path())
-        .unwrap();
+    let mut pcfg = project_cfg_no_team(&server.uri());
+    pcfg.team_auto_promote = Some(true);
+    pcfg.save_to_cas_dir(project_tmp.path()).unwrap();
 
     // — Remember an entry ———————————————————————————————————————————————————
     let store = open_store(project_tmp.path()).expect("open_store must succeed");
@@ -151,7 +155,8 @@ async fn e2e_single_team_auto_picks_without_team_set() {
 // ── Test 2: multi-team + server default_team_id ──────────────────────────────
 
 /// AC: When `/api/me` returns 2 teams and a `default_team_id`, the resolution
-/// chain uses `default_team_id` (not the first team).
+/// chain uses `default_team_id` (not the first team), provided the project has
+/// `team_auto_promote = Some(true)` (cas-f8e3 opt-in).
 #[tokio::test]
 async fn e2e_multi_team_uses_server_default_team_id() {
     const DEFAULT_TEAM: &str = "e2e-multi-default-0000-000000000002";
@@ -179,10 +184,11 @@ async fn e2e_multi_team_uses_server_default_team_id() {
     let user_cloud_json = user_tmp.path().join("cloud.json");
     let _guard = UserCloudGuard::set(&user_cloud_json);
 
+    // Add opt-in so user-level fallback fires (cas-f8e3 guard).
     let project_tmp = TempDir::new().unwrap();
-    project_cfg_no_team(&server.uri())
-        .save_to_cas_dir(project_tmp.path())
-        .unwrap();
+    let mut pcfg = project_cfg_no_team(&server.uri());
+    pcfg.team_auto_promote = Some(true);
+    pcfg.save_to_cas_dir(project_tmp.path()).unwrap();
 
     let store = open_store(project_tmp.path()).expect("open_store must succeed");
     let entry = Entry {
