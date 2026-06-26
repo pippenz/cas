@@ -1656,6 +1656,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_pty_config_claude_custom_effort() {
+        // Hold ENV_LOCK and force effort-supported=1 so the version guard
+        // does not race with other tests that set CAS_FACTORY_EFFORT_SUPPORTED=0.
+        let _e = ScopedEnv::new();
+        // SAFETY: ENV_LOCK held by ScopedEnv.
+        unsafe { std::env::set_var("CAS_FACTORY_EFFORT_SUPPORTED", "1"); }
         let config = PtyConfig::claude(
             "test-agent",
             "worker",
@@ -1680,7 +1685,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_pty_config_claude_supervisor_default_effort() {
-        // When effort is None and role is supervisor, must default to "xhigh"
+        // When effort is None and role is supervisor, must default to "xhigh".
+        // Hold ENV_LOCK and force effort-supported=1 (cas-6ee8 guard).
+        let _e = ScopedEnv::new();
+        // SAFETY: ENV_LOCK held by ScopedEnv.
+        unsafe { std::env::set_var("CAS_FACTORY_EFFORT_SUPPORTED", "1"); }
         let config = PtyConfig::claude(
             "sup",
             "supervisor",
@@ -1702,7 +1711,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_pty_config_claude_worker_default_effort() {
-        // When effort is None and role is worker, must default to "high"
+        // When effort is None and role is worker, must default to "high".
+        // Hold ENV_LOCK and force effort-supported=1 (cas-6ee8 guard).
+        let _e = ScopedEnv::new();
+        // SAFETY: ENV_LOCK held by ScopedEnv.
+        unsafe { std::env::set_var("CAS_FACTORY_EFFORT_SUPPORTED", "1"); }
         let config = PtyConfig::claude(
             "wrk",
             "worker",
