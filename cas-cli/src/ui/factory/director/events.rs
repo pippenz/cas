@@ -390,6 +390,13 @@ impl DirectorEventDetector {
 
     /// Add a worker to the tracked list (call when spawning workers dynamically)
     pub fn add_worker(&mut self, name: String) {
+        // cas-c790: guard against the supervisor's name being silently added to
+        // the worker list on resume/reconnect paths, which would cause
+        // is_worker_agent_name to return true for the lead — leaking WorkerIdle
+        // events for the supervisor (recurrence of cas-b67d).
+        if name == self.supervisor_name {
+            return;
+        }
         if !self.worker_names.contains(&name) {
             self.worker_names.push(name);
         }
@@ -931,9 +938,14 @@ impl DirectorEventDetector {
     /// Unlike `is_factory_agent_name`, this explicitly excludes the supervisor /
     /// primary agent. Use this wherever the intent is "this is one of MY workers"
     /// and the supervisor receiving the event would be wrong — e.g. the WorkerIdle
-    /// path (cas-b67d).
+    /// path (cas-b67d / cas-c790).
+    ///
+    /// The explicit `!= supervisor_name` guard is defense-in-depth: even if the
+    /// supervisor's name ends up in `worker_names` via a resume/reconnect path that
+    /// doesn't go through `add_worker`, this check prevents a spurious WorkerIdle
+    /// from propagating to the prompt layer.
     fn is_worker_agent_name(&self, name: &str) -> bool {
-        self.worker_names.contains(&name.to_string())
+        self.worker_names.contains(&name.to_string()) && name != self.supervisor_name
     }
 
     /// Resolve agent ID to display name

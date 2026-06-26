@@ -156,6 +156,15 @@ pub fn generate_prompt(
                 return None;
             }
 
+            // Guard (cas-c790): supervisor / team-lead is never an idle worker.
+            // The event detector filters this at the source (is_worker_agent_name),
+            // but defense-in-depth here catches any path that bypasses the upstream
+            // gate (e.g. supervisor name in worker_names on resume/reconnect — the
+            // recurrence described in cas-c790 / cas-b67d).
+            if worker == supervisor_name {
+                return None;
+            }
+
             // Guard (cas-889d): suppress idle nudge if the worker already has an
             // active in_progress task in the current snapshot. This defends against
             // the window where the event slips through the event-level gate (e.g.
@@ -776,6 +785,55 @@ mod tests {
             prompt.is_none(),
             "cas-889d: AgentRegistered must be suppressed when worker already has active task, got: {:?}",
             prompt.map(|p| p.text)
+        );
+    }
+
+    // ── cas-c790 regression tests ─────────────────────────────────────────────
+
+    /// cas-c790: WorkerIdle must return None when the "worker" is actually the
+    /// supervisor / team-lead. This is defense-in-depth at the prompt layer — the
+    /// event detector already filters via is_worker_agent_name, but that gate can
+    /// be bypassed when the supervisor's name ends up in worker_names on
+    /// resume/reconnect paths (the recurrence pattern described in cas-c790).
+    #[test]
+    fn test_c790_worker_idle_never_fires_for_supervisor() {
+        // The worker name in the event is the supervisor's name.
+        let event = DirectorEvent::WorkerIdle {
+            worker: "supervisor".to_string(),
+        };
+        let data = make_data(5); // 5 ready tasks — the worst-case scenario
+        let config = default_config();
+
+        // Pass "supervisor" as supervisor_name — the prompt must return None.
+        let prompt = generate_prompt(&event, &data, "supervisor", &config, codex(), codex());
+
+        assert!(
+            prompt.is_none(),
+            "cas-c790: WorkerIdle for the supervisor must return None regardless of ready count. \
+             Got: {:?}",
+            prompt.map(|p| p.text)
+        );
+    }
+
+    /// cas-c790: WorkerIdle for a legitimate worker must still fire (not
+    /// accidentally suppressed by the supervisor-name guard).
+    #[test]
+    fn test_c790_worker_idle_still_fires_for_real_workers() {
+        let event = DirectorEvent::WorkerIdle {
+            worker: "swift-fox".to_string(),
+        };
+        // No in_progress tasks (so the busy guard doesn't suppress).
+        let data = make_data(1);
+        let config = default_config();
+
+        // "supervisor" is distinct from "swift-fox" — nudge must fire.
+        let prompt =
+            generate_prompt(&event, &data, "supervisor", &config, codex(), codex());
+
+        assert!(
+            prompt.is_some(),
+            "cas-c790: WorkerIdle for a legitimate worker must still produce a prompt. \
+             Got: None"
         );
     }
 }
