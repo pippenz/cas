@@ -7,6 +7,11 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [2.24.1] - 2026-06-26
+
+### Fixed
+- **`task start` no longer jails on a merge-gated sibling task (cas-6a99).** In a supervisor-deferred-merge workflow, a worker who finished task A and hit the worktree-merge gate on close (work done, awaiting the supervisor's merge) was blocked from `task start`-ing an unrelated/bundled task B — the verification-pending guard treated *awaiting-merge* the same as *actively-verifying*. `check_pending_verification` now skips tasks flagged `pending_worktree_merge` (the worker can't resolve a merge gate); the verification jail (no approved verification) still blocks, covered by a negative control in the new regression test.
+
 ## [2.24.0] - 2026-06-26
 
 Factory-reliability sprint (multi-worker EPIC). Director coordinator hardening,
