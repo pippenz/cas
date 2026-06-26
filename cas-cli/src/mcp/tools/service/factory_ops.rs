@@ -334,6 +334,20 @@ impl CasService {
                 .unwrap_or_default()
         };
 
+        // cas-86c5: wider activity window (10 min) for the per-worker "last
+        // activity" line in worker_status. A worker in the investigation phase
+        // emits checkpoint events but no edits; showing "last activity: 45s ago
+        // (checkpoint)" is the signal that tells the supervisor NOT to reset.
+        const ACTIVITY_WINDOW_SECS: i64 = 600;
+        let activity_cutoff =
+            chrono::Utc::now() - chrono::Duration::seconds(ACTIVITY_WINDOW_SECS);
+        let activity_events: Vec<cas_types::Event> = {
+            use cas_store::{EventStore, SqliteEventStore};
+            SqliteEventStore::open(&self.inner.cas_root)
+                .and_then(|es| es.list_since(activity_cutoff, 200))
+                .unwrap_or_default()
+        };
+
         // Agents suppressed from pruning due to recent I/O activity. Used in
         // the render loop to show the dual-signal annotation.
         let mut active_io_suppressed: std::collections::HashSet<String> =
@@ -484,8 +498,19 @@ impl CasService {
                         None => String::new(),
                     }
                 };
+                // cas-86c5: surface per-worker "last activity" age so the
+                // supervisor can distinguish an actively-investigating worker
+                // (no edits yet, but recent checkpoint events) from one that
+                // is truly stalled. A clean diff + fresh checkpoint is normal
+                // during the analysis phase; no events for >5 min is a stall.
+                let activity_info = match last_worker_activity_secs(&activity_events, &agent.id) {
+                    Some((secs, phase)) => {
+                        format!("\n    last activity: {secs}s ago ({phase})")
+                    }
+                    None => "\n    last activity: none in last 10m (may be investigating or idle)".to_string(),
+                };
                 output.push_str(&format!(
-                    "  • {} (heartbeat: {}){}{}{}{}{}\n    session: {}\n",
+                    "  • {} (heartbeat: {}){}{}{}{}{}{}\n    session: {}\n",
                     &agent.name,
                     since,
                     liveness_label,
@@ -493,6 +518,7 @@ impl CasService {
                     git_info,
                     transcript_info,
                     context_info,
+                    activity_info,
                     session_uuid
                 ));
             }
@@ -1254,6 +1280,53 @@ pub(crate) fn has_recent_worker_io_activity(
     })
 }
 
+/// Return the age (seconds) and a short phase label of the worker's most recent
+/// observable activity event (cas-86c5).
+///
+/// Scans `events` for any event whose `session_id == agent_id` and returns
+/// `Some((elapsed_secs, phase))` for the freshest match, where `phase` is a
+/// short human-readable label:
+///
+/// | EventType           | phase label |
+/// |---------------------|-------------|
+/// | WorkerFileEdited    | "editing"   |
+/// | WorkerGitCommit     | "checkpoint"|
+/// | WorkerSubagentSpawned / Completed | "spawning subagent" |
+/// | anything else       | "activity"  |
+///
+/// Returns `None` when no matching event exists in the provided slice (which
+/// the caller is expected to pre-filter to a reasonable recency window).
+///
+/// This is used in `factory_worker_status` to surface "last activity: Xs ago
+/// (phase)" so a supervisor can distinguish a worker that is actively
+/// investigating (no edits yet, but fresh checkpoint events) from one that is
+/// truly stalled (no events of any kind for minutes).
+pub(crate) fn last_worker_activity_secs(
+    events: &[cas_types::Event],
+    agent_id: &str,
+) -> Option<(i64, &'static str)> {
+    use cas_types::EventType;
+    events
+        .iter()
+        .filter(|e| {
+            e.session_id.as_deref() == Some(agent_id)
+                || e.entity_id == agent_id
+        })
+        .map(|e| {
+            let elapsed = (chrono::Utc::now() - e.created_at).num_seconds().max(0);
+            let phase: &'static str = match e.event_type {
+                EventType::WorkerFileEdited => "editing",
+                EventType::WorkerGitCommit => "checkpoint",
+                EventType::WorkerSubagentSpawned | EventType::WorkerSubagentCompleted => {
+                    "spawning subagent"
+                }
+                _ => "activity",
+            };
+            (elapsed, phase)
+        })
+        .min_by_key(|(elapsed, _)| *elapsed)
+}
+
 /// cas-8240 two-band liveness label for `factory_worker_status`:
 ///
 /// * `elapsed >= WORKER_DEAD_SECS` → `" [DEAD]"` (hard escalation —
@@ -1877,6 +1950,81 @@ mod tests {
         assert_ne!(stale, dead, "stale and DEAD bands must render distinct labels");
         assert!(stale.contains("stale"));
         assert!(dead.contains("DEAD"));
+    }
+
+    // --- cas-86c5: last_worker_activity_secs helper -------------------------
+
+    fn make_event(
+        event_type: cas_types::EventType,
+        session_id: &str,
+        age_secs: i64,
+    ) -> cas_types::Event {
+        let mut e = cas_types::Event::new(
+            event_type,
+            cas_types::EventEntityType::Agent,
+            session_id,
+            "test summary",
+        )
+        .with_session(session_id);
+        // Back-date `created_at` by `age_secs` seconds to simulate historical events.
+        e.created_at = chrono::Utc::now() - chrono::Duration::seconds(age_secs);
+        e
+    }
+
+    /// No events → None.
+    #[test]
+    fn last_worker_activity_returns_none_for_empty_events() {
+        let got = last_worker_activity_secs(&[], "agent-abc");
+        assert!(got.is_none(), "empty slice must return None");
+    }
+
+    /// No events for THIS agent (events exist for another) → None.
+    #[test]
+    fn last_worker_activity_returns_none_when_no_events_for_agent() {
+        let events = vec![
+            make_event(cas_types::EventType::WorkerFileEdited, "other-agent", 10),
+        ];
+        let got = last_worker_activity_secs(&events, "my-agent");
+        assert!(
+            got.is_none(),
+            "events for other agents must not match; got {got:?}"
+        );
+    }
+
+    /// WorkerFileEdited → "editing" phase label.
+    #[test]
+    fn last_worker_activity_phase_file_edited_is_editing() {
+        let events = vec![
+            make_event(cas_types::EventType::WorkerFileEdited, "agent-x", 5),
+        ];
+        let (elapsed, phase) = last_worker_activity_secs(&events, "agent-x")
+            .expect("must find the event");
+        assert_eq!(phase, "editing");
+        assert!(elapsed >= 4 && elapsed <= 7, "elapsed should be ~5s: {elapsed}");
+    }
+
+    /// WorkerGitCommit → "checkpoint" phase label (cas-86c5: renamed from session-stop).
+    #[test]
+    fn last_worker_activity_phase_git_commit_is_checkpoint() {
+        let events = vec![
+            make_event(cas_types::EventType::WorkerGitCommit, "agent-y", 20),
+        ];
+        let (_, phase) = last_worker_activity_secs(&events, "agent-y")
+            .expect("must find the event");
+        assert_eq!(phase, "checkpoint");
+    }
+
+    /// With multiple events, the FRESHEST one wins.
+    #[test]
+    fn last_worker_activity_returns_freshest_event() {
+        let events = vec![
+            make_event(cas_types::EventType::WorkerGitCommit, "agent-z", 120),  // 2m old
+            make_event(cas_types::EventType::WorkerFileEdited, "agent-z", 15),  // 15s old
+        ];
+        let (elapsed, phase) = last_worker_activity_secs(&events, "agent-z")
+            .expect("must find an event");
+        assert_eq!(phase, "editing", "freshest event should be the FileEdited at 15s");
+        assert!(elapsed >= 14 && elapsed <= 17, "elapsed should be ~15s: {elapsed}");
     }
 
     // --- cas-900b: glob-first transcript resolution -------------------------

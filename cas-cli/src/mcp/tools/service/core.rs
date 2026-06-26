@@ -448,6 +448,7 @@ impl CasService {
             task_id: req
                 .id
                 .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required — pass as `id` (not `task_id`, `taskId`, or `_id`). Example: mcp__cas__task action=<verb> id=cas-abc1"))?,
+            force: None,
         };
         self.inner.cas_task_release(Parameters(inner_req)).await
     }
@@ -458,6 +459,7 @@ impl CasService {
             task_id: req
                 .id
                 .ok_or_else(|| Self::error(ErrorCode::INVALID_PARAMS, "id required — pass as `id` (not `task_id`, `taskId`, or `_id`). Example: mcp__cas__task action=reset id=cas-abc1"))?,
+            force: req.force,
         };
         self.inner.cas_task_reset(Parameters(inner_req)).await
     }

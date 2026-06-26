@@ -1488,6 +1488,7 @@ async fn test_release_autorecovers_lease_less_in_progress_task() {
     let released = service
         .cas_task_release(Parameters(cas::mcp::tools::TaskReleaseRequest {
             task_id: id.clone(),
+            force: None,
         }))
         .await
         .expect("release auto-recovery must succeed for lease-less InProgress");
@@ -1549,6 +1550,7 @@ async fn test_release_still_errors_when_no_lease_and_task_already_open() {
     let res = service
         .cas_task_release(Parameters(cas::mcp::tools::TaskReleaseRequest {
             task_id: id.clone(),
+            force: None,
         }))
         .await;
     assert!(
@@ -1610,6 +1612,7 @@ async fn test_reset_clears_lease_assignee_and_forces_open() {
     let res = service
         .cas_task_reset(Parameters(cas::mcp::tools::TaskReleaseRequest {
             task_id: id.clone(),
+            force: None,
         }))
         .await
         .expect("reset must succeed");
@@ -1691,6 +1694,7 @@ async fn test_reset_refuses_closed_task() {
     let err = service
         .cas_task_reset(Parameters(cas::mcp::tools::TaskReleaseRequest {
             task_id: id.clone(),
+            force: None,
         }))
         .await;
     assert!(
@@ -2450,3 +2454,211 @@ async fn test_task_start_locked_error_includes_worker_name() {
 // factory_ops.rs emits "    session: {uuid}" for every active worker entry.
 // The format is tested indirectly via the lib unit test
 // `test_worker_status_format_includes_session_uuid` in factory_ops.rs.
+
+// =============================================================================
+// cas-86c5: alive-worker safety guard on task reset
+// =============================================================================
+
+/// Orphaned task (assignee has stale heartbeat) resets without a guard warning.
+///
+/// AC: `action=reset` on a task whose assignee's heartbeat is older than
+/// WORKER_STALE_SECS (30 s) must succeed unconditionally — this is the
+/// intended dead-session recovery path.
+#[tokio::test]
+async fn test_reset_orphaned_task_stale_assignee_succeeds() {
+    let (temp, service) = setup_cas();
+    let cas_dir = temp.path().join(".cas");
+    let agent_store = open_agent_store(&cas_dir).expect("open agent store");
+    let task_store = cas::store::open_task_store(&cas_dir).expect("open task store");
+
+    // Register a worker with a STALE heartbeat (60 s ago; threshold is 30 s).
+    let mut stale_worker =
+        cas::types::Agent::new("stale-worker-8c5a".to_string(), "stale-worker".to_string());
+    stale_worker.role = cas::types::AgentRole::Worker;
+    stale_worker.last_heartbeat =
+        chrono::Utc::now() - chrono::Duration::seconds(60);
+    agent_store
+        .register(&stale_worker)
+        .expect("register stale worker");
+
+    // Create a task and assign it to the stale worker.
+    let created = service
+        .cas_task_create(Parameters(make_task_create_req(
+            "Orphaned task — stale assignee reset guard test (cas-86c5)",
+        )))
+        .await
+        .expect("create task");
+    let task_id = extract_task_id(&extract_text(created))
+        .expect("task id")
+        .to_string();
+
+    let mut task = task_store.get(&task_id).expect("get task");
+    task.assignee = Some("stale-worker-8c5a".to_string());
+    task.status = cas::types::TaskStatus::InProgress;
+    task_store.update(&task).expect("set stale assignee");
+
+    // Reset without force — must succeed because heartbeat is stale.
+    let res = service
+        .cas_task_reset(Parameters(cas::mcp::tools::TaskReleaseRequest {
+            task_id: task_id.clone(),
+            force: None,
+        }))
+        .await
+        .expect("reset must succeed for stale-assignee task");
+    let text = extract_text(res);
+    assert!(
+        text.contains("Reset task"),
+        "orphaned-task reset must confirm success; got: {text}"
+    );
+    assert!(
+        !text.contains("SAFETY GUARD"),
+        "stale-assignee reset must NOT trigger safety guard; got: {text}"
+    );
+}
+
+/// Live task with fresh-heartbeat assignee — reset without `force` must warn
+/// and leave the task untouched.
+///
+/// AC: `action=reset` on a task whose assignee's heartbeat is within
+/// WORKER_STALE_SECS (30 s) must return an Ok result containing "SAFETY GUARD"
+/// and must NOT change the task's status or assignee.
+#[tokio::test]
+async fn test_reset_alive_worker_task_without_force_returns_safety_guard() {
+    let (temp, service) = setup_cas();
+    let cas_dir = temp.path().join(".cas");
+    let agent_store = open_agent_store(&cas_dir).expect("open agent store");
+    let task_store = cas::store::open_task_store(&cas_dir).expect("open task store");
+
+    // Register a worker with a FRESH heartbeat (just now).
+    let mut alive_worker =
+        cas::types::Agent::new("alive-worker-86c5".to_string(), "alive-worker".to_string());
+    alive_worker.role = cas::types::AgentRole::Worker;
+    alive_worker.heartbeat(); // freshest possible
+    agent_store
+        .register(&alive_worker)
+        .expect("register alive worker");
+
+    // Create a task and assign it to the alive worker.
+    let created = service
+        .cas_task_create(Parameters(make_task_create_req(
+            "Live task — alive assignee reset guard test (cas-86c5)",
+        )))
+        .await
+        .expect("create task");
+    let task_id = extract_task_id(&extract_text(created))
+        .expect("task id")
+        .to_string();
+
+    let mut task = task_store.get(&task_id).expect("get task");
+    task.assignee = Some("alive-worker-86c5".to_string());
+    task.status = cas::types::TaskStatus::InProgress;
+    task_store.update(&task).expect("set alive assignee");
+
+    // Reset without force — must return Ok with SAFETY GUARD text, not an error.
+    let res = service
+        .cas_task_reset(Parameters(cas::mcp::tools::TaskReleaseRequest {
+            task_id: task_id.clone(),
+            force: None,
+        }))
+        .await
+        .expect("reset must return Ok (not McpError) with SAFETY GUARD text");
+    let text = extract_text(res);
+    assert!(
+        text.contains("SAFETY GUARD"),
+        "reset of alive-worker task must surface SAFETY GUARD warning; got: {text}"
+    );
+    assert!(
+        text.contains("force=true"),
+        "SAFETY GUARD message must hint at force=true; got: {text}"
+    );
+
+    // Task must NOT have been mutated — still InProgress with the original assignee.
+    let task_after = task_store.get(&task_id).expect("get task after blocked reset");
+    assert_eq!(
+        task_after.status,
+        cas::types::TaskStatus::InProgress,
+        "task status must remain InProgress after blocked reset"
+    );
+    assert_eq!(
+        task_after.assignee.as_deref(),
+        Some("alive-worker-86c5"),
+        "assignee must be unchanged after blocked reset"
+    );
+}
+
+/// Live task with fresh-heartbeat assignee + `force=true` — reset must succeed
+/// and record a "bypassed" audit note.
+///
+/// AC: `action=reset force=true` on a live-worker task bypasses the guard,
+/// transitions to Open, clears the assignee, and appends an audit note that
+/// mentions the bypass.
+#[tokio::test]
+async fn test_reset_alive_worker_task_with_force_succeeds_and_logs_audit() {
+    let (temp, service) = setup_cas();
+    let cas_dir = temp.path().join(".cas");
+    let agent_store = open_agent_store(&cas_dir).expect("open agent store");
+    let task_store = cas::store::open_task_store(&cas_dir).expect("open task store");
+
+    // Register a worker with a FRESH heartbeat.
+    let mut alive_worker = cas::types::Agent::new(
+        "alive-force-worker-86c5".to_string(),
+        "alive-force-worker".to_string(),
+    );
+    alive_worker.role = cas::types::AgentRole::Worker;
+    alive_worker.heartbeat();
+    agent_store
+        .register(&alive_worker)
+        .expect("register alive worker");
+
+    // Create a task and assign it to the alive worker.
+    let created = service
+        .cas_task_create(Parameters(make_task_create_req(
+            "Force-reset live task test (cas-86c5)",
+        )))
+        .await
+        .expect("create task");
+    let task_id = extract_task_id(&extract_text(created))
+        .expect("task id")
+        .to_string();
+
+    let mut task = task_store.get(&task_id).expect("get task");
+    task.assignee = Some("alive-force-worker-86c5".to_string());
+    task.status = cas::types::TaskStatus::InProgress;
+    task_store.update(&task).expect("set alive assignee");
+
+    // Reset WITH force=true — must bypass the guard and succeed.
+    let res = service
+        .cas_task_reset(Parameters(cas::mcp::tools::TaskReleaseRequest {
+            task_id: task_id.clone(),
+            force: Some(true),
+        }))
+        .await
+        .expect("force reset must succeed");
+    let text = extract_text(res);
+    assert!(
+        text.contains("Reset task"),
+        "force reset must confirm success; got: {text}"
+    );
+    assert!(
+        !text.contains("SAFETY GUARD"),
+        "force reset must NOT emit safety guard; got: {text}"
+    );
+
+    // Task must be Open with assignee cleared.
+    let task_after = task_store.get(&task_id).expect("get task after force reset");
+    assert_eq!(
+        task_after.status,
+        cas::types::TaskStatus::Open,
+        "task must be Open after force reset"
+    );
+    assert!(
+        task_after.assignee.is_none(),
+        "assignee must be cleared after force reset"
+    );
+    // Audit note must mention bypass.
+    let notes = &task_after.notes;
+    assert!(
+        notes.contains("force") || notes.contains("bypassed"),
+        "audit note must mention force/bypassed; notes: {notes}"
+    );
+}

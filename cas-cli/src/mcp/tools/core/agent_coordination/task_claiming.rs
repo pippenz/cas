@@ -447,6 +447,49 @@ impl CasCore {
             });
         }
 
+        // cas-86c5: Alive-worker safety guard.
+        //
+        // If the task has an assignee whose heartbeat is within WORKER_STALE_SECS
+        // (30s), the worker is likely active mid-turn — resetting would orphan
+        // their in-flight work (observed incident: cas-2fb6/happy-fox-41 reset
+        // during an xhigh investigation phase). Warn and abort unless the caller
+        // explicitly passes `force=true`.
+        //
+        // An orphaned task (no assignee, or assignee with a stale/dead heartbeat)
+        // is unaffected — this is the intended dead-session recovery path.
+        if !req.force.unwrap_or(false) {
+            if let Some(ref assignee) = task.assignee {
+                // Look up the agent by name/id.  `list(None)` includes all statuses
+                // so we can check the raw heartbeat even for agents marked stale.
+                let all_agents = agent_store.list(None).unwrap_or_default();
+                let live_agent = all_agents.iter().find(|a| {
+                    a.name == *assignee || a.id == *assignee
+                });
+                if let Some(agent) = live_agent {
+                    use crate::mcp::tools::service::factory_ops::WORKER_STALE_SECS;
+                    let elapsed = (chrono::Utc::now() - agent.last_heartbeat).num_seconds();
+                    if elapsed <= WORKER_STALE_SECS {
+                        return Ok(Self::success(format!(
+                            "SAFETY GUARD: task {} is assigned to '{}' whose heartbeat is {}s ago \
+                             (threshold: {}s) — the worker appears to be ALIVE and may be actively \
+                             working this task. Resetting now would orphan their in-flight work.\n\n\
+                             • To confirm the worker is safe to reset, check `worker_status` for \
+                               '{}' (look for fresh heartbeat + recent activity events).\n\
+                             • To reset anyway (e.g. the worker is stuck in a loop), pass \
+                               `force=true`:\n\
+                               mcp__cas__task action=reset id={} force=true",
+                            req.task_id,
+                            assignee,
+                            elapsed,
+                            WORKER_STALE_SECS,
+                            assignee,
+                            req.task_id,
+                        )));
+                    }
+                }
+            }
+        }
+
         // Force-release any active lease on the task (no ownership check).
         // `release_lease_for_task` returns Ok(true) if a lease was released,
         // Ok(false) if none existed — either is fine here.
@@ -459,8 +502,14 @@ impl CasCore {
         task.status = TaskStatus::Open;
         task.assignee = None;
         let ts = chrono::Utc::now().format("%Y-%m-%d %H:%M");
+        // cas-86c5: note whether the reset was forced (live worker override).
+        let recovery_kind = if req.force.unwrap_or(false) {
+            "forced reset (alive-worker guard bypassed)"
+        } else {
+            "dead-session recovery"
+        };
         let audit = format!(
-            "[{ts}] reset: force-transitioned {prior_status:?}→Open (prior assignee: {}, lease released: {lease_released}) — dead-session recovery",
+            "[{ts}] reset: force-transitioned {prior_status:?}→Open (prior assignee: {}, lease released: {lease_released}) — {recovery_kind}",
             prior_assignee.as_deref().unwrap_or("<none>")
         );
         task.notes = if task.notes.is_empty() {
