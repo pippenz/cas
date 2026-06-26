@@ -702,4 +702,72 @@ mod tests {
             },
         );
     }
+
+    /// When CLAUDE_PROJECT_DIR is set to the path of a CAS factory worktree
+    /// (.cas/worktrees/<name>/), resolve_mcp_serve_root must return the PARENT
+    /// repo's .cas/ directory — not a nested .cas/ inside the worktree.
+    ///
+    /// This is the regression guard for the core bug (cas-9db0): before the fix,
+    /// `find_cas_root()` would walk up from the worktree path and find the main
+    /// repo's .cas/ by luck, but if a nested .cas/ were present it would stop
+    /// there. The `find_cas_root_from_cas_worktree()` fast-path now handles this
+    /// reliably by detecting `.cas/worktrees/` in the path string.
+    ///
+    /// Claude Code 2.1.139+ sets CLAUDE_PROJECT_DIR to the project root where
+    /// `cas serve` is launched, which for factory workers is the worktree root.
+    #[test]
+    fn resolves_to_parent_cas_when_claude_project_dir_is_worktree() {
+        let tmp = TempDir::new().unwrap();
+        let tmp_path = tmp.path().canonicalize().unwrap();
+
+        // Initialize CAS in the project root
+        init_cas_dir(&tmp_path).unwrap();
+
+        // Create the CAS factory worktree directory (.cas/worktrees/<name>/)
+        let worktree_path = tmp_path.join(".cas/worktrees/fox");
+        std::fs::create_dir_all(&worktree_path).unwrap();
+
+        with_env(
+            Some(worktree_path.to_str().unwrap()), // CLAUDE_PROJECT_DIR = worktree root
+            None, // clear CAS_ROOT so only path-based detection is in play
+            || {
+                let result = resolve_mcp_serve_root()
+                    .expect("should succeed when CLAUDE_PROJECT_DIR is a CAS worktree path");
+                assert_eq!(
+                    result,
+                    tmp_path.join(".cas"),
+                    "worktree path must resolve to PARENT .cas/, not a nested .cas/ inside the worktree"
+                );
+            },
+        );
+    }
+
+    /// Same as above but verifies that a SUBDIRECTORY of the worktree also
+    /// resolves correctly. Workers' cwd may be a deeply nested path inside the
+    /// worktree when CLAUDE_PROJECT_DIR is inherited from the outer shell.
+    #[test]
+    fn resolves_to_parent_cas_when_claude_project_dir_is_worktree_subdir() {
+        let tmp = TempDir::new().unwrap();
+        let tmp_path = tmp.path().canonicalize().unwrap();
+
+        init_cas_dir(&tmp_path).unwrap();
+
+        // Simulate a deeply nested cwd inside the worktree
+        let nested_path = tmp_path.join(".cas/worktrees/fox/src/deep/nested");
+        std::fs::create_dir_all(&nested_path).unwrap();
+
+        with_env(
+            Some(nested_path.to_str().unwrap()),
+            None,
+            || {
+                let result = resolve_mcp_serve_root()
+                    .expect("should succeed from a nested path inside a CAS worktree");
+                assert_eq!(
+                    result,
+                    tmp_path.join(".cas"),
+                    "nested worktree path must resolve to parent .cas/"
+                );
+            },
+        );
+    }
 }
