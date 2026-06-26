@@ -65,9 +65,12 @@ pub fn handle_pre_tool_use(
     // which would bypass this guard. Placing it here ensures it fires on
     // both the cas_root=None and cas_root=Some paths.
     //
-    // Only intercepts `git commit` / `git merge` from isolated factory
-    // workers (CAS_CLONE_PATH set). All other tool names and non-worker
-    // roles fall through silently.
+    // Intercepts `git commit` / `git merge` from ALL factory workers
+    // (CAS_AGENT_ROLE=worker && CAS_FACTORY_MODE set), whether or not
+    // they have an isolated worktree (CAS_CLONE_PATH). Non-factory roles
+    // fall through silently. This prevents standalone-task workers that
+    // lack a CAS_CLONE_PATH from committing directly to main/master/staging
+    // in the shared primary checkout (cas-ba04).
     // ========================================================================
     {
         let is_factory_worker_guard = std::env::var("CAS_AGENT_ROLE")
@@ -886,14 +889,15 @@ pub fn handle_pre_tool_use(
 
 // ── Worker commit guard helpers (cas-bea2, LAYER 1) ───────────────────────
 //
-// Detects `git commit` / `git merge` Bash commands from isolated factory
-// workers and denies them when HEAD is on a protected branch OR the cwd
-// is outside the worker's assigned worktree (CAS_CLONE_PATH).
+// Detects `git commit` / `git merge` Bash commands from factory workers
+// and denies them when HEAD is on a protected branch OR (for isolated
+// workers) the cwd is outside the assigned worktree (CAS_CLONE_PATH).
 //
-// Only fires when CAS_CLONE_PATH is set (meaning the worker was spawned
-// with isolate=true) AND the tool is Bash with a git write command.
-// Non-isolated workers (no CAS_CLONE_PATH) and non-factory sessions are
-// silent pass-through.
+// Fires for ALL factory workers (CAS_AGENT_ROLE=worker && CAS_FACTORY_MODE),
+// whether or not they have an isolated worktree (CAS_CLONE_PATH). This
+// prevents standalone-task workers without a CAS_CLONE_PATH from committing
+// to protected branches (main/master/staging) in the shared primary checkout
+// (cas-ba04 regression fix).
 //
 // cas-7e7b: branch policy changed from allowlist (only factory/*) to
 // denylist (block main/master/staging + detached HEAD; everything else is
@@ -974,41 +978,49 @@ pub(crate) fn get_branch_at_cwd(cwd: &str) -> Option<String> {
 /// Check whether a factory worker's `git commit` / `git merge` should be denied.
 ///
 /// Returns `Some(denial_message)` when:
-/// - `CAS_CLONE_PATH` is set (isolated worker) AND either:
-///   - `cwd` is outside the assigned worktree path, OR
-///   - HEAD at `cwd` is a protected branch (`main`, `master`, `staging`) or detached.
+/// - HEAD at `cwd` is a protected branch (`main`, `master`, `staging`) or detached.
+/// - `CAS_CLONE_PATH` is set (isolated worker) AND `cwd` is outside the worktree.
 ///
-/// Returns `None` to allow (not isolated, or branch is safe to commit on).
+/// Returns `None` to allow when HEAD is on a non-protected named branch.
+///
+/// This guard fires for BOTH isolated workers (CAS_CLONE_PATH set) and
+/// non-isolated workers (no CAS_CLONE_PATH). Non-isolated (standalone-task)
+/// workers that run in the shared primary checkout must not commit to
+/// main/master/staging either (cas-ba04).
 ///
 /// Note: `--no-verify` does NOT bypass this guard — it only skips git's own
 /// commit-msg/pre-commit hooks, not the Claude Code PreToolUse harness.
 /// Switching to a non-protected branch is the only way to unblock.
 pub(crate) fn check_worker_git_commit_scope(cwd: &str) -> Option<String> {
-    let clone_path = std::env::var("CAS_CLONE_PATH").ok()?;
-    if clone_path.is_empty() {
-        return None;
-    }
+    let clone_path = std::env::var("CAS_CLONE_PATH").ok();
+    let is_isolated = clone_path.as_deref().map(|s| !s.is_empty()).unwrap_or(false);
 
-    let cwd_path = std::path::Path::new(cwd);
-    let worktree_path = std::path::Path::new(&clone_path);
+    // DENY: isolated worker's cwd is outside the assigned worktree.
+    // Only applicable when CAS_CLONE_PATH is set.
+    if is_isolated {
+        let clone_path = clone_path.as_deref().unwrap();
+        let cwd_path = std::path::Path::new(cwd);
+        let worktree_path = std::path::Path::new(clone_path);
 
-    // DENY: cwd is outside the assigned worktree
-    if !cwd_path.starts_with(worktree_path) {
-        let worker_name = std::env::var("CAS_AGENT_NAME")
-            .unwrap_or_else(|_| "<worker-name>".to_string());
-        return Some(format!(
-            "🚫 WORKER COMMIT GUARD: Your current directory ({cwd}) is outside \
-            your assigned worktree ({clone_path}).\n\n\
-            Workers MUST commit inside their worktree. Switch first:\n  \
-            cd {clone_path}\n  git switch factory/{worker_name}\n\n\
-            Then retry your commit from there.\n\n\
-            Note: --no-verify does NOT bypass this guard (it only skips git hooks,\n\
-            not the Claude Code PreToolUse harness)."
-        ));
+        if !cwd_path.starts_with(worktree_path) {
+            let worker_name = std::env::var("CAS_AGENT_NAME")
+                .unwrap_or_else(|_| "<worker-name>".to_string());
+            return Some(format!(
+                "🚫 WORKER COMMIT GUARD: Your current directory ({cwd}) is outside \
+                your assigned worktree ({clone_path}).\n\n\
+                Workers MUST commit inside their worktree. Switch first:\n  \
+                cd {clone_path}\n  git switch factory/{worker_name}\n\n\
+                Then retry your commit from there.\n\n\
+                Note: --no-verify does NOT bypass this guard (it only skips git hooks,\n\
+                not the Claude Code PreToolUse harness)."
+            ));
+        }
     }
 
     // DENY: HEAD is on a protected branch (main/master/staging) or detached.
     // Any other named branch — factory/*, feature/*, fix/*, epic/*, etc. — is allowed.
+    // Applies to BOTH isolated and non-isolated factory workers (cas-ba04): a worker
+    // without CAS_CLONE_PATH running in the shared checkout must not commit to main.
     let worker_name = std::env::var("CAS_AGENT_NAME")
         .unwrap_or_else(|_| "<worker-name>".to_string());
     match get_branch_at_cwd(cwd) {
@@ -1023,10 +1035,19 @@ pub(crate) fn check_worker_git_commit_scope(cwd: &str) -> Option<String> {
             ));
         }
         Some(branch) if !is_worker_commit_allowed_branch(&branch) => {
+            let non_isolated_hint = if !is_isolated {
+                format!(
+                    "\n\nYou are running without an isolated worktree (CAS_CLONE_PATH not set).\n\
+                    Create a feature branch before committing:\n  \
+                    git switch -c factory/{worker_name}"
+                )
+            } else {
+                String::new()
+            };
             return Some(format!(
                 "🚫 WORKER COMMIT GUARD: Direct commits to '{branch}' are blocked.\n\n\
                 Workers must NOT commit directly to protected branches \
-                (main, master, staging).\n\
+                (main, master, staging).{non_isolated_hint}\n\
                 Switch to your work branch and commit there:\n  \
                 git switch factory/{worker_name}   # or: git switch <your-feature-branch>\n  \
                 git commit ...\n\n\
@@ -1358,11 +1379,49 @@ mod worker_commit_guard_tests {
 
     // ── check_worker_git_commit_scope tests ──────────────────────────────
 
+    // ── cas-ba04 regression: non-isolated worker protection ──────────────
+
     #[test]
-    fn no_clone_path_allows() {
+    fn non_isolated_worker_on_main_is_denied() {
+        // Regression test for cas-ba04: a factory worker with no CAS_CLONE_PATH
+        // (standalone task, no isolated worktree) must be blocked from committing
+        // to protected branches just as isolated workers are.
         let _lock = env_lock();
+        let tmp = make_git_repo(); // creates a repo on `main`
+        let p = tmp.path().to_string_lossy().to_string();
         let _env = EnvGuard::set(&[("CAS_CLONE_PATH", None)]);
-        assert!(check_worker_git_commit_scope("/tmp").is_none());
+
+        let result = check_worker_git_commit_scope(&p);
+        assert!(result.is_some(), "non-isolated worker on main must be denied (cas-ba04)");
+        let msg = result.unwrap();
+        assert!(msg.contains("WORKER COMMIT GUARD"), "expected guard msg, got: {msg}");
+        assert!(msg.contains("main"), "expected 'main' in msg, got: {msg}");
+        assert!(
+            msg.contains("CAS_CLONE_PATH not set"),
+            "message should mention lack of isolation for actionable guidance: {msg}"
+        );
+    }
+
+    #[test]
+    fn non_isolated_worker_on_safe_branch_is_allowed() {
+        // Non-isolated worker on a non-protected branch (e.g. their own feature
+        // branch) must still be allowed to commit.
+        let _lock = env_lock();
+        let tmp = make_git_repo();
+        let p = tmp.path();
+        std::process::Command::new("git")
+            .args(["checkout", "-b", "factory/test-worker"])
+            .current_dir(p)
+            .output()
+            .unwrap();
+        let ps = p.to_string_lossy().to_string();
+        let _env = EnvGuard::set(&[("CAS_CLONE_PATH", None)]);
+
+        let result = check_worker_git_commit_scope(&ps);
+        assert!(
+            result.is_none(),
+            "non-isolated worker on safe branch must be allowed, got: {result:?}"
+        );
     }
 
     #[test]
@@ -1640,5 +1699,38 @@ mod worker_commit_guard_tests {
             .and_then(|h| h.get("permissionDecision"))
             .and_then(|v| v.as_str());
         assert_ne!(decision, Some("deny"), "non-worker must not be denied");
+    }
+
+    #[test]
+    fn pre_tool_denies_git_commit_on_main_without_clone_path() {
+        // Regression test for cas-ba04: a factory worker with no CAS_CLONE_PATH
+        // (standalone task, no isolated worktree) must still be blocked from
+        // committing to main via handle_pre_tool_use, not just check_worker_git_commit_scope.
+        let _lock = env_lock();
+        let tmp = make_git_repo(); // starts on `main`
+        let p = tmp.path().to_string_lossy().to_string();
+        let _env = EnvGuard::set(&[
+            ("CAS_AGENT_ROLE", Some("worker")),
+            ("CAS_FACTORY_MODE", Some("1")),
+            ("CAS_CLONE_PATH", None), // no isolated worktree
+        ]);
+
+        let mut input = crate::hooks::handlers::HookInput::default();
+        input.hook_event_name = "PreToolUse".to_string();
+        input.tool_name = Some("Bash".to_string());
+        input.cwd = p.clone();
+        input.tool_input = Some(serde_json::json!({"command": "git commit -m 'oops on main'"}));
+
+        let out = handle_pre_tool_use(&input, None).expect("handler ok");
+        let val = serde_json::to_value(&out).unwrap();
+        let decision = val
+            .get("hookSpecificOutput")
+            .and_then(|h| h.get("permissionDecision"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert_eq!(
+            decision, "deny",
+            "non-isolated factory worker on main must be denied (cas-ba04), got: {val}"
+        );
     }
 }
