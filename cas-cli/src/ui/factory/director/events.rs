@@ -604,6 +604,18 @@ impl DirectorEventDetector {
             if !self.is_factory_agent(&agent.id, data) {
                 continue;
             }
+
+            // WorkerIdle must never fire for the supervisor / team-lead / primary
+            // agent (cas-b67d). `is_factory_agent` deliberately includes the
+            // supervisor so that task-assignment and completion events can
+            // reference work done by the lead; but for idle tracking we only want
+            // to surface genuine workers. A supervisor with current_task=None is
+            // just waiting between decisions — not idle in the worker sense.
+            let resolved_name = self.resolve_agent_name(&agent.id, data);
+            if !self.is_worker_agent_name(&resolved_name) {
+                continue;
+            }
+
             seen_factory_agents.insert(agent.id.clone());
 
             if agent.current_task.is_some() {
@@ -677,13 +689,12 @@ impl DirectorEventDetector {
             if *count >= IDLE_CONSECUTIVE_TICKS
                 && !self.idle_already_emitted.contains(&agent.id)
             {
-                let agent_name = self.resolve_agent_name(&agent.id, data);
-                if self.is_factory_agent_name(&agent_name) {
-                    events.push(DirectorEvent::WorkerIdle {
-                        worker: agent_name,
-                    });
-                    self.idle_already_emitted.insert(agent.id.clone());
-                }
+                // `resolved_name` is guaranteed to be a worker (supervisor
+                // was excluded above). Re-use it directly — no re-resolve.
+                events.push(DirectorEvent::WorkerIdle {
+                    worker: resolved_name.clone(),
+                });
+                self.idle_already_emitted.insert(agent.id.clone());
             }
         }
 
@@ -913,6 +924,16 @@ impl DirectorEventDetector {
     /// Check if an agent name belongs to this factory session
     fn is_factory_agent_name(&self, name: &str) -> bool {
         self.worker_names.contains(&name.to_string()) || name == self.supervisor_name
+    }
+
+    /// Check if an agent name is a **worker** in this factory session.
+    ///
+    /// Unlike `is_factory_agent_name`, this explicitly excludes the supervisor /
+    /// primary agent. Use this wherever the intent is "this is one of MY workers"
+    /// and the supervisor receiving the event would be wrong — e.g. the WorkerIdle
+    /// path (cas-b67d).
+    fn is_worker_agent_name(&self, name: &str) -> bool {
+        self.worker_names.contains(&name.to_string())
     }
 
     /// Resolve agent ID to display name

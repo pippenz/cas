@@ -1447,6 +1447,56 @@ fn test_no_worker_idle_for_recently_active_worker() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// cas-b67d: never nudge supervisor/lead as an idle worker
+// ---------------------------------------------------------------------------
+
+/// The supervisor must NEVER appear as the `worker` field in a WorkerIdle
+/// event. In cas-fb94 the director sent "Worker fierce-puma-23 is idle…"
+/// to the primary agent because is_factory_agent includes the supervisor.
+/// After the fix, supervisor agents are silently skipped in idle detection.
+#[test]
+fn test_supervisor_never_emits_worker_idle() {
+    let mut detector =
+        DirectorEventDetector::new(vec!["swift-fox".to_string()], "supervisor".to_string());
+
+    // Both a worker and the supervisor appear in data.agents with no task.
+    let data_both_idle = DirectorData {
+        ready_tasks: vec![],
+        in_progress_tasks: vec![],
+        epic_tasks: vec![],
+        agents: vec![
+            make_agent("agent-w", "swift-fox", None),
+            make_agent("agent-s", "supervisor", None),
+        ],
+        activity: vec![],
+        agent_id_to_name: [
+            ("agent-w".to_string(), "swift-fox".to_string()),
+            ("agent-s".to_string(), "supervisor".to_string()),
+        ]
+        .into_iter()
+        .collect(),
+        changes: vec![],
+        git_loaded: true,
+        reminders: vec![],
+        epic_closed_counts: HashMap::new(),
+    };
+    detector.initialize(&data_both_idle);
+
+    // Run enough ticks to cross IDLE_CONSECUTIVE_TICKS for both agents.
+    let _ = detector.detect_changes(&data_both_idle, None);
+    let events = detector.detect_changes(&data_both_idle, None);
+
+    // Worker may emit WorkerIdle — supervisor must NOT.
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            DirectorEvent::WorkerIdle { worker } if worker == "supervisor"
+        )),
+        "Supervisor must never appear as an idle WORKER in WorkerIdle events: {events:?}"
+    );
+}
+
 /// Once the worker's heartbeat goes stale (no heartbeat for > threshold), the
 /// fresh-heartbeat gate is inactive and normal idle detection fires after the
 /// consecutive-tick threshold.

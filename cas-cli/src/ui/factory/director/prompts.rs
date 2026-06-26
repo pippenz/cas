@@ -167,9 +167,16 @@ pub fn generate_prompt(
                      Assign work: {supervisor_prefix}task action=update id=<task-id> assignee={worker}"
                 )
             } else {
+                // Do NOT suggest "closing the epic" here — the task snapshot may
+                // be stale (cas-b67d D-3): the director refresh window is 2s, and
+                // recently-created tasks may not yet be visible. Obeying "close the
+                // epic" advice from a stale snapshot would orphan live open work.
+                // Direct the supervisor to verify with a live query instead.
                 format!(
                     "Worker {worker} is idle with no assigned tasks.\n\
-                     No ready tasks are available. Consider creating new tasks or closing the epic."
+                     No dispatchable tasks in current snapshot — verify with \
+                     `{supervisor_prefix}task action=ready` before acting.\n\
+                     If genuinely idle, assign new work or stand down this worker."
                 )
             };
 
@@ -371,7 +378,37 @@ mod tests {
             generate_prompt(&event, &data, "supervisor", &config, codex(), codex()).unwrap();
 
         assert_eq!(prompt.target, "supervisor");
-        assert!(prompt.text.contains("No ready tasks"));
+        let lower = prompt.text.to_lowercase();
+        assert!(
+            lower.contains("no ready tasks") || lower.contains("no dispatchable"),
+            "Expected 'no ready tasks' or 'no dispatchable' in: {}",
+            prompt.text
+        );
+    }
+
+    /// Regression for cas-b67d D-3: the zero-ready-task nudge must NOT instruct
+    /// the supervisor to close the epic. The director snapshot may be stale; the
+    /// epic may have open children that just aren't visible in this refresh cycle.
+    /// Obeying "close the epic" advice would orphan live work.
+    #[test]
+    fn test_worker_idle_no_close_epic_advice() {
+        let event = DirectorEvent::WorkerIdle {
+            worker: "swift-fox".to_string(),
+        };
+        let data = make_data(0); // No ready tasks in snapshot
+        let config = default_config();
+
+        let prompt =
+            generate_prompt(&event, &data, "supervisor", &config, codex(), codex()).unwrap();
+
+        // Must never suggest closing the epic — the snapshot may be stale and
+        // the epic might have live open children not visible in this refresh.
+        assert!(
+            !prompt.text.to_lowercase().contains("closing the epic")
+                && !prompt.text.to_lowercase().contains("close the epic"),
+            "WorkerIdle nudge must not advise closing the epic (stale-snapshot risk): {:?}",
+            prompt.text
+        );
     }
 
     #[test]
