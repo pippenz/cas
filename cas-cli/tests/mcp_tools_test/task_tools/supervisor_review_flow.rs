@@ -572,6 +572,118 @@ async fn test_worker_close_absent_code_review_section_defaults_to_supervisor_mod
 }
 
 // ---------------------------------------------------------------------------
+// cas-9684: action=start must reject (not silently clobber) PSR status
+// ---------------------------------------------------------------------------
+
+/// cas-9684: `action=start` on a PendingSupervisorReview task must return an
+/// error rather than silently resetting the status to InProgress.
+///
+/// Before this fix, line 572 of lifecycle.rs unconditionally set
+/// `task.status = TaskStatus::InProgress`, dropping the task from
+/// `list status=pending_supervisor_review` without any warning.
+#[tokio::test]
+async fn test_start_on_pending_supervisor_review_task_is_rejected() {
+    let (temp, _core) = setup_cas();
+    let _env_lock = env_test_lock();
+
+    let cas_dir = temp.path().join(".cas");
+    let task_store = open_task_store(&cas_dir).unwrap();
+
+    // Create a task directly in PendingSupervisorReview state (simulates a
+    // worker that already closed → PSR transition).
+    let mut task = cas::types::Task::new("cas-9684-start-psr".to_string(), "PSR start guard test".to_string());
+    task.status = TaskStatus::PendingSupervisorReview;
+    task_store.add(&task).expect("task.add should succeed");
+
+    let core = CasCore::with_daemon(cas_dir.clone(), None, None);
+    let service = CasService::new(core, None);
+
+    // Attempt to start the PSR task — must be rejected.
+    let start_result = service
+        .task(Parameters(task_req(serde_json::json!({
+            "action": "start",
+            "id": "cas-9684-start-psr",
+        }))))
+        .await;
+
+    // The call must either return an Err or an Ok with is_error=true.
+    let was_rejected = match &start_result {
+        Err(_) => true,
+        Ok(result) => result.is_error == Some(true),
+    };
+    assert!(
+        was_rejected,
+        "action=start on a PSR task must be rejected; got: {:?}",
+        start_result.ok().map(|r| extract_text(r))
+    );
+
+    // Status must remain PendingSupervisorReview — must NOT have been reset.
+    let task_after = task_store.get("cas-9684-start-psr").expect("task should exist");
+    assert_eq!(
+        task_after.status,
+        TaskStatus::PendingSupervisorReview,
+        "PSR status must survive an action=start attempt; got: {:?}",
+        task_after.status
+    );
+}
+
+// ---------------------------------------------------------------------------
+// cas-6e4c: orphan-recovery (release) must not reset PSR to Open
+// ---------------------------------------------------------------------------
+
+/// cas-6e4c: When a worker's lease expires and `action=release` fires the
+/// orphan-recovery path, a PendingSupervisorReview task must NOT be reset
+/// to Open. The work is complete; only supervisor review is pending.
+///
+/// Before this fix, task_claiming.rs excluded only Closed and Open from the
+/// auto-recovery reset — PSR tasks were silently reverted to Open, making
+/// the worker's completed work disappear.
+#[tokio::test]
+async fn test_release_orphan_recovery_does_not_reset_psr_to_open() {
+    let (temp, _core) = setup_cas();
+    let _env_lock = env_test_lock();
+
+    let cas_dir = temp.path().join(".cas");
+    let task_store = open_task_store(&cas_dir).unwrap();
+
+    // Create a task in PendingSupervisorReview — simulates a worker that
+    // finished close → PSR transition but whose lease was never released.
+    let mut task = cas::types::Task::new("cas-6e4c-release-psr".to_string(), "PSR release guard test".to_string());
+    task.status = TaskStatus::PendingSupervisorReview;
+    task_store.add(&task).expect("task.add should succeed");
+
+    let core = CasCore::with_daemon(cas_dir.clone(), None, None);
+    let service = CasService::new(core, None);
+
+    // Call action=release with no active lease — triggers the orphan-recovery
+    // path that previously reset status to Open.
+    let release_result = service
+        .task(Parameters(task_req(serde_json::json!({
+            "action": "release",
+            "id": "cas-6e4c-release-psr",
+        }))))
+        .await;
+
+    // The release call may succeed or return an error, but must NOT have
+    // reset the task to Open.
+    let _ = release_result; // result shape is unimportant for this assertion
+
+    let task_after = task_store.get("cas-6e4c-release-psr").expect("task should exist");
+    assert_ne!(
+        task_after.status,
+        TaskStatus::Open,
+        "PSR task must NOT be reset to Open by orphan-recovery release; got: {:?}",
+        task_after.status
+    );
+    assert_eq!(
+        task_after.status,
+        TaskStatus::PendingSupervisorReview,
+        "PSR task must retain PendingSupervisorReview after release; got: {:?}",
+        task_after.status
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Helpers (local copies of patterns from verification_flow.rs)
 // ---------------------------------------------------------------------------
 
