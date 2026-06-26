@@ -1031,6 +1031,18 @@ impl Pane {
         }
     }
 
+    /// Kill the pane's process tree (cas-8c5a).
+    ///
+    /// Delegates to `Pty::kill_tree(force)` which sends SIGKILL (`force=true`)
+    /// or SIGTERM (`force=false`) to the entire process group, then kills the
+    /// direct child handle as a belt-and-suspenders fallback.
+    pub fn kill_tree(&mut self, force: bool) {
+        match &mut self.backend {
+            PaneBackend::Pty(pty) => pty.kill_tree(force),
+            PaneBackend::None => {}
+        }
+    }
+
     pub async fn start_recording(
         &mut self,
         session_id: impl Into<String>,
