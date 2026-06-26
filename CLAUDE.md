@@ -4,6 +4,7 @@
 **DO NOT USE BUILT-IN TOOLS (TodoWrite, EnterPlanMode) FOR TASK TRACKING.**
 
 Use CAS MCP tools instead:
+First use each session — load MCP schemas: ToolSearch(query="select:mcp__cas__task,mcp__cas__memory,mcp__cas__search")
 - `mcp__cas__task` with action: create - Create tasks (NOT TodoWrite)
 - `mcp__cas__task` with action: start/close - Manage task status
 - `mcp__cas__task` with action: ready - See ready tasks
@@ -60,3 +61,8 @@ Writing to disk is always safe; the risk is only when the content streams back t
 ## CAS system bugs are in-repo fixes
 
 This repo **is** the CAS source. When a bug is reported in the verifier, hooks, factory orchestration, MCP dispatch, the task-verifier agent, worker prompts, or built-in skills — regardless of which downstream project (gabber-studio, OpenClaw, etc.) surfaced it — the fix lands here as a Rust or markdown change via a task assigned to a worker. Do not file the bug with team-lead, do not "report upstream", do not treat cas-src IS CAS as an external dependency. Other projects consume CAS; they do not modify it. If you catch yourself wanting to escalate a CAS bug, stop and create the fix task in this repo instead.
+
+## Releases → Slack (mandatory on every merge to main)
+
+Every PR/merge to `main` REQUIRES **two distinct #cas-internal posts** — one user-perspective, one dev-perspective. Each opens with a punchy plain-language **how-it-was → how-it-is-now** hook, then perspective-specific details. Both posts: **no ticket numbers, no internal agent/factory narration**; the user post is always plain language, the dev post may be technical.
+-> See [docs/RELEASE_SLACK_RUBRIC.md](docs/RELEASE_SLACK_RUBRIC.md)
