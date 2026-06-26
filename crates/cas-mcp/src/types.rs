@@ -330,6 +330,19 @@ pub struct TaskRequest {
     )]
     #[serde(default)]
     pub depth: Option<String>,
+
+    /// Override the alive-worker safety guard on `action=reset` (cas-86c5).
+    ///
+    /// By default, `reset` refuses to drop the lease of a task whose
+    /// assignee has a fresh heartbeat — the worker is alive and actively
+    /// working the task. Pass `force=true` to override this guard and
+    /// reset anyway. The audit note will record that the reset was forced.
+    #[schemars(
+        description = "Force reset even when the task's assignee has a fresh heartbeat (alive worker). \
+                       Omit or false → warn and abort; true → reset immediately and log a forced-reset audit note."
+    )]
+    #[serde(default, deserialize_with = "deser::option_bool")]
+    pub force: Option<bool>,
 }
 
 /// Unified rule operations request

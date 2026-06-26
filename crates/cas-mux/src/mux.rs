@@ -729,6 +729,42 @@ impl Mux {
         Ok(())
     }
 
+    /// Kill a worker's PTY process tree, then remove it from the registry (cas-8c5a).
+    ///
+    /// Unlike `remove_worker` (which drops the PTY and relies on SIGHUP), this
+    /// method explicitly signals the **entire process group** before releasing
+    /// the registry entry.  This is required for multi-process workers such as
+    /// Codex, where a node → codex child tree survives a bare SIGHUP.
+    ///
+    /// * `force = true`  → SIGKILL to the process group (cannot be ignored)
+    /// * `force = false` → SIGTERM to the process group (graceful shutdown)
+    ///
+    /// After the signal, `remove_pane` still drops the PTY master, which sends
+    /// a redundant SIGHUP as belt-and-suspenders.
+    pub fn kill_worker(&mut self, name: &str, force: bool) -> Result<()> {
+        // Verify it's a worker pane
+        if let Some(pane) = self.panes.get(name) {
+            if *pane.kind() != PaneKind::Worker {
+                return Err(Error::pty(format!(
+                    "Pane '{}' is not a worker (is {:?})",
+                    name,
+                    pane.kind()
+                )));
+            }
+        } else {
+            return Err(Error::pane_not_found(name));
+        }
+
+        // Kill the process group before removing the pane
+        if let Some(pane) = self.panes.get_mut(name) {
+            pane.kill_tree(force);
+        }
+
+        // Remove the pane (drops the PTY master, sends residual SIGHUP)
+        self.remove_pane(name);
+        Ok(())
+    }
+
     /// Get the supervisor pane
     pub fn supervisor(&self) -> Option<&Pane> {
         self.panes_by_kind(PaneKind::Supervisor).next()

@@ -536,6 +536,10 @@ pub(crate) fn emit_worker_final_git_state(
     let gs = collect_worker_git_status(cwd);
 
     // Build a compact one-line summary for the activity feed.
+    // cas-86c5: use "checkpoint" not "session-stop" — these are routine
+    // per-turn Stop-hook snapshots, not terminal events. "session-stop"
+    // implied the worker died; supervisors were incorrectly using it as a
+    // liveness signal and resetting tasks on active workers.
     let dirty_tag = if gs.dirty { "dirty" } else { "clean" };
     let pushed_tag = if gs.pushed_ref == "none" {
         "not-pushed"
@@ -543,7 +547,7 @@ pub(crate) fn emit_worker_final_git_state(
         &gs.pushed_ref
     };
     let summary = format!(
-        "session-stop git-state: {} @ {} [{}] [{}] ahead:{} behind:{} PR:{}",
+        "checkpoint git-state: {} @ {} [{}] [{}] ahead:{} behind:{} PR:{}",
         gs.branch,
         gs.head_sha,
         dirty_tag,
@@ -555,7 +559,7 @@ pub(crate) fn emit_worker_final_git_state(
 
     // Shell-form emission: echo to stderr so it appears in the session JSONL
     // (Claude Code captures stderr in the hook output stream, cas-5c0a AC3).
-    eprintln!("cas: worker {} stop: {summary}", worker_name);
+    eprintln!("cas: worker {} turn-checkpoint: {summary}", worker_name);
 
     // Structured metadata for machine-readable consumption.
     let metadata = serde_json::json!({
@@ -684,6 +688,43 @@ mod tests_b3 {
             evt.session_id.as_deref(),
             Some("ses-b3-test-001"),
             "session_id must be set on the event"
+        );
+    }
+
+    /// cas-86c5: per-turn git-state snapshots must use "checkpoint" not
+    /// "session-stop" in their activity-feed summary. "session-stop" implied
+    /// the worker died; supervisors were resetting tasks on alive workers as a
+    /// result. This test is a mutation guard — if the format! call reverts to
+    /// "session-stop", it fails here before any supervisor sees the misleading text.
+    #[test]
+    fn git_state_summary_uses_checkpoint_not_session_stop() {
+        let git_dir = TempDir::new().expect("git tempdir");
+        setup_git_repo_with_factory_branch(git_dir.path());
+
+        let cas_dir = TempDir::new().expect("cas tempdir");
+
+        emit_worker_final_git_state(
+            cas_dir.path(),
+            "guard-worker",
+            git_dir.path(),
+            "ses-86c5-label-guard",
+        );
+
+        let store = SqliteEventStore::open(cas_dir.path()).expect("event store must open");
+        let events = store.list_recent(5).expect("list_recent must succeed");
+
+        assert!(!events.is_empty(), "must write at least one event");
+        let summary = &events[0].summary;
+
+        assert!(
+            !summary.starts_with("session-stop"),
+            "summary must NOT start with 'session-stop' — use 'checkpoint' instead \
+             (cas-86c5: misleading label causes supervisors to reset alive workers). \
+             Got: {summary}"
+        );
+        assert!(
+            summary.starts_with("checkpoint"),
+            "summary must start with 'checkpoint'. Got: {summary}"
         );
     }
 

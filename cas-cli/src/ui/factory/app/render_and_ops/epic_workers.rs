@@ -436,12 +436,13 @@ impl FactoryApp {
 
     /// Shutdown a worker by name
     ///
-    /// Removes the worker pane and cleans up its clone (if any).
+    /// Kills the worker's PTY process tree and cleans up its clone (if any).
     ///
     /// # Arguments
-    /// * `name` - Worker name to shutdown
-    /// * `_force` - Reserved for compatibility; supervisor should decide shutdown safety
-    pub fn shutdown_worker(&mut self, name: &str, _force: bool) -> anyhow::Result<()> {
+    /// * `name`  - Worker name to shutdown
+    /// * `force` - `true` → SIGKILL the process group immediately;
+    ///             `false` → SIGTERM (graceful) then drop the PTY
+    pub fn shutdown_worker(&mut self, name: &str, force: bool) -> anyhow::Result<()> {
         // Check if worker exists
         if !self.worker_names.contains(&name.to_string()) {
             anyhow::bail!("Worker '{name}' not found");
@@ -489,8 +490,11 @@ impl FactoryApp {
             );
         }
 
-        // Remove from mux (this kills the Claude process)
-        self.mux.remove_worker(name)?;
+        // Kill the worker's PTY process tree and remove from mux (cas-8c5a).
+        // kill_worker signals the entire process group (SIGKILL when force=true,
+        // SIGTERM when false), ensuring the full node→codex tree is terminated,
+        // not just the direct PTY child that SIGHUP-on-drop would reach.
+        self.mux.kill_worker(name, force)?;
 
         // Remove from tracking
         self.worker_names.retain(|n| n != name);

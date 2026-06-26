@@ -827,6 +827,35 @@ impl Pty {
     pub fn kill(&mut self) {
         let _ = self.child.kill();
     }
+
+    /// Kill the child and its entire process group (cas-8c5a).
+    ///
+    /// `portable_pty` calls `setsid()` in the child before exec, making the
+    /// spawned process a new session leader whose PGID equals its own PID.
+    /// Every descendant (e.g. the node → codex tree inside a Codex worker)
+    /// inherits that PGID, so `killpg(pgid, sig)` terminates the whole tree.
+    ///
+    /// * `force = true`  → SIGKILL  (immediate, cannot be caught)
+    /// * `force = false` → SIGTERM  (polite; give the process a chance to clean up)
+    ///
+    /// Falls back to `child.kill()` (SIGKILL on the direct child) when no PID
+    /// is available (non-unix builds, already-reaped process, etc.).
+    pub fn kill_tree(&mut self, force: bool) {
+        #[cfg(unix)]
+        {
+            if let Some(pid) = self.child.process_id() {
+                let sig = if force { libc::SIGKILL } else { libc::SIGTERM };
+                // SAFETY: standard POSIX call; pid is a valid u32 just returned
+                // by portable_pty — casting to pid_t is always safe on all
+                // Unix targets where pid_t is i32/i64.
+                unsafe {
+                    libc::killpg(pid as libc::pid_t, sig);
+                }
+            }
+        }
+        // Belt-and-suspenders: also kill the direct child handle.
+        let _ = self.child.kill();
+    }
 }
 
 fn filter_cursor_position_requests(carry: &[u8], chunk: &[u8]) -> (Vec<u8>, Vec<u8>, bool) {

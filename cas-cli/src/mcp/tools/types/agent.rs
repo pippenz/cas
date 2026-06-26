@@ -100,6 +100,15 @@ pub struct TaskReleaseRequest {
     /// Task ID to release
     #[schemars(description = "ID of the task to release")]
     pub task_id: String,
+
+    /// Force reset even when the task's assignee has a fresh heartbeat (cas-86c5).
+    /// `None` / `false` → safety guard active; `true` → bypass and log audit note.
+    #[schemars(
+        description = "Bypass alive-worker guard for reset. true = force reset even if the \
+                       assignee's heartbeat is fresh."
+    )]
+    #[serde(default)]
+    pub force: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
