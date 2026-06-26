@@ -48,3 +48,7 @@ node_modules/
 !/.claude/skills/cas-seo-expert/
 !/.claude/skills/cas-servers/
 /.codex/skills/
+
+# Codex/agent rollout session logs — debugging artifacts, not source
+docs/requests/**/*.codex-rollout*.jsonl
+docs/requests/artifacts/
