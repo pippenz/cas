@@ -332,6 +332,25 @@ pub struct DirectorEventDetector {
     /// idle streak can trigger another emission (subject to `IDLE_RATE_LIMIT`
     /// in `debounce_events`). Keyed by agent id.
     idle_already_emitted: HashSet<String>,
+    /// Tasks for which `TaskCompleted` has already been announced this session.
+    ///
+    /// **Never cleared on active-set reappearance.** When a task oscillates
+    /// (lease expires → temporarily disappears → lease re-acquired → reappears)
+    /// the reappearance is NOT a new assignment; it is the same task continuing.
+    /// Clearing the guard on reappearance would cause a re-emission on every
+    /// subsequent oscillation cycle — exactly the ~30s re-fire bug (cas-55dc).
+    ///
+    /// Keyed by task_id.
+    task_completed_announced: HashSet<String>,
+    /// Assignment pairs for which `TaskAssigned` has already been announced.
+    ///
+    /// Same never-clear-on-reappearance policy as `task_completed_announced`:
+    /// if a task oscillates out and back in with the same assignee the
+    /// assignment was already dispatched and must not re-fire.
+    ///
+    /// Key is `"{task_id}:{assignee_id}"`. A genuine reassignment to a
+    /// *different* worker produces a new key and is therefore not suppressed.
+    task_assigned_announced: HashSet<String>,
 }
 
 impl DirectorEventDetector {
@@ -345,6 +364,8 @@ impl DirectorEventDetector {
             removed_workers: HashSet::new(),
             consecutive_idle_ticks: HashMap::new(),
             idle_already_emitted: HashSet::new(),
+            task_completed_announced: HashSet::new(),
+            task_assigned_announced: HashSet::new(),
         }
     }
 
@@ -368,7 +389,26 @@ impl DirectorEventDetector {
 
     /// Detect changes between the last state and new data.
     ///
+    /// Thin shim: captures `Instant::now()` and delegates to
+    /// [`detect_changes_at`]. Production callers use this; tests that need to
+    /// isolate the state-guard from the 30s debounce window call
+    /// `detect_changes_at` directly with a synthetic clock value.
+    pub fn detect_changes(
+        &mut self,
+        data: &DirectorData,
+        current_epic_id: Option<&str>,
+    ) -> Vec<DirectorEvent> {
+        self.detect_changes_at(data, current_epic_id, Instant::now())
+    }
+
+    /// Core implementation of change detection with an injectable clock.
+    ///
     /// Returns a list of detected events. Call after each refresh.
+    ///
+    /// `now` is the logical "current time" used for debounce bookkeeping.
+    /// Pass `Instant::now()` in production; pass a synthetic value in tests so
+    /// the state-guard (HashSet checks) can be validated independently of the
+    /// 30s `DEBOUNCE_DURATION` window.
     ///
     /// `current_epic_id` is the factory app's currently-tracked epic (pass
     /// `None` at init time before any epic has been resolved). When `Some`,
@@ -378,12 +418,12 @@ impl DirectorEventDetector {
     /// prevents a fresh zero-subtask Open-with-branch epic from overwriting
     /// the active `epic_state` mid-session (see task cas-4181).
     /// `InProgress` epic transitions still emit unconditionally.
-    pub fn detect_changes(
+    pub fn detect_changes_at(
         &mut self,
         data: &DirectorData,
         current_epic_id: Option<&str>,
+        now: Instant,
     ) -> Vec<DirectorEvent> {
-        let now = Instant::now();
         let new_state = DirectorState::from_data(data);
         let mut events = Vec::new();
 
@@ -420,16 +460,27 @@ impl DirectorEventDetector {
                     .unwrap_or(false);
 
                 if dispatchable && !was_assigned && self.is_factory_agent(assignee, data) {
-                    let task_title = task_info
-                        .get(task_id.as_str())
-                        .map(|t| t.title.clone())
-                        .unwrap_or_default();
+                    // State-guard (cas-55dc): suppress re-emission if this
+                    // (task, assignee) pair was already announced. Oscillation
+                    // (lease churn causes the task to temporarily leave and
+                    // re-enter active sets with the same assignee) must not
+                    // re-fire TaskAssigned. A genuine reassignment to a
+                    // *different* worker produces a different key and is not
+                    // suppressed.
+                    let announced_key = format!("{task_id}:{assignee}");
+                    if !self.task_assigned_announced.contains(&announced_key) {
+                        self.task_assigned_announced.insert(announced_key);
+                        let task_title = task_info
+                            .get(task_id.as_str())
+                            .map(|t| t.title.clone())
+                            .unwrap_or_default();
 
-                    events.push(DirectorEvent::TaskAssigned {
-                        task_id: task_id.clone(),
-                        task_title,
-                        worker: self.resolve_agent_name(assignee, data),
-                    });
+                        events.push(DirectorEvent::TaskAssigned {
+                            task_id: task_id.clone(),
+                            task_title,
+                            worker: self.resolve_agent_name(assignee, data),
+                        });
+                    }
                 }
             }
 
@@ -461,28 +512,56 @@ impl DirectorEventDetector {
             }
         }
 
-        // Detect task completions (task disappeared from active sets)
-        for (task_id, (old_status, old_assignee)) in &self.last_state.tasks {
-            let removed_from_active_sets = !new_state.tasks.contains_key(task_id);
-            if removed_from_active_sets {
-                // Only emit TaskCompleted for tasks that were actively being worked on
-                if *old_status == TaskStatus::InProgress {
+        // Detect task completions (task disappeared from active sets).
+        //
+        // State-guard (cas-55dc): `task_completed_announced` is a per-session
+        // HashSet that records every task_id for which TaskCompleted has been
+        // emitted. The guard is NEVER cleared on active-set reappearance because
+        // reappearance is the oscillation we are defending against: a task whose
+        // lease expires and then is re-acquired temporarily disappears from and
+        // reappears in the active sets, and without this guard every subsequent
+        // disappearance would re-fire TaskCompleted (observed at ~30-second
+        // intervals, the DEBOUNCE_DURATION). By recording the announcement at the
+        // HashSet level (not the debounce map), the guard remains in force across
+        // the debounce window and indefinitely thereafter.
+        //
+        // Genuine completions are not suppressed: the first time a task_id
+        // disappears while InProgress the announcement fires; subsequent
+        // disappearances for the same ID are no-ops.
+        let completed_task_ids: Vec<(String, String, String)> = self
+            .last_state
+            .tasks
+            .iter()
+            .filter_map(|(task_id, (old_status, old_assignee))| {
+                let removed_from_active_sets = !new_state.tasks.contains_key(task_id);
+                if removed_from_active_sets
+                    && *old_status == TaskStatus::InProgress
+                    && !self.task_completed_announced.contains(task_id)
+                {
                     if let Some(assignee) = old_assignee {
                         if self.is_factory_agent(assignee, data) {
-                            events.push(DirectorEvent::TaskCompleted {
-                                task_id: task_id.clone(),
-                                task_title: self
-                                    .last_state
-                                    .task_titles
-                                    .get(task_id)
-                                    .cloned()
-                                    .unwrap_or_default(),
-                                worker: self.resolve_agent_name(assignee, data),
-                            });
+                            let title = self
+                                .last_state
+                                .task_titles
+                                .get(task_id)
+                                .cloned()
+                                .unwrap_or_default();
+                            let worker = self.resolve_agent_name(assignee, data);
+                            return Some((task_id.clone(), title, worker));
                         }
                     }
                 }
-            }
+                None
+            })
+            .collect();
+        for (task_id, task_title, worker) in completed_task_ids {
+            // Mark before pushing so the borrow on self.last_state is released.
+            self.task_completed_announced.insert(task_id.clone());
+            events.push(DirectorEvent::TaskCompleted {
+                task_id,
+                task_title,
+                worker,
+            });
         }
 
         // Detect idle workers using consecutive-tick debouncing.

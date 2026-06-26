@@ -1214,3 +1214,157 @@ fn test_closed_task_with_stale_assignee_not_redispatched() {
         "Closed task with stale assignee must not produce TaskAssigned: {events:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// cas-55dc: TaskCompleted edge-trigger + state-guard
+// ---------------------------------------------------------------------------
+
+/// Regression for cas-55dc facet A: TaskCompleted must fire at most ONCE per
+/// genuine completion, never re-fire on active-set churn/oscillation.
+///
+/// Scenario:
+///   1. Task is InProgress → disappears → TaskCompleted emitted.
+///   2. Task reappears (lease oscillation / active-set churn).
+///   3. Task disappears again → TaskCompleted must NOT re-fire.
+#[test]
+fn test_task_completed_no_refire_on_oscillation() {
+    let mut detector =
+        DirectorEventDetector::new(vec!["swift-fox".to_string()], "supervisor".to_string());
+
+    // Initial: task is in-progress.
+    detector.initialize(&working_data_for("agent-1", "swift-fox", "task-1", "Work Item"));
+
+    // Tick: task disappears (closed / completed). Should emit TaskCompleted once.
+    let events1 = detector.detect_changes(&idle_data_for("agent-1", "swift-fox"), None);
+    assert!(
+        events1.iter().any(|e| matches!(
+            e,
+            DirectorEvent::TaskCompleted { task_id, .. } if task_id == "task-1"
+        )),
+        "TaskCompleted must fire when InProgress task leaves active sets: {events1:?}"
+    );
+
+    // Tick: task reappears (oscillation — lease re-acquired, task back in InProgress).
+    detector.detect_changes(
+        &working_data_for("agent-1", "swift-fox", "task-1", "Work Item"),
+        None,
+    );
+
+    // Tick: task disappears again. Must NOT re-emit TaskCompleted.
+    let events3 = detector.detect_changes(&idle_data_for("agent-1", "swift-fox"), None);
+    assert!(
+        !events3.iter().any(|e| matches!(
+            e,
+            DirectorEvent::TaskCompleted { task_id, .. } if task_id == "task-1"
+        )),
+        "TaskCompleted must not re-fire on active-set churn/oscillation: {events3:?}"
+    );
+}
+
+/// Regression for cas-55dc facet B: the state-guard must block re-emission even
+/// after the 30s debounce window expires. Uses an injectable clock so the test
+/// does NOT rely on the debounce timer — it isolates the HashSet guard.
+///
+/// Calls `detect_changes_at` with a synthetic `now` that is 31 s ahead of the
+/// first emission, bypassing the debounce window. Without the state-guard the
+/// second emission would sneak through; with the guard it must not.
+#[test]
+fn test_task_completed_state_guard_independent_of_debounce() {
+    use std::time::{Duration, Instant};
+
+    let mut detector =
+        DirectorEventDetector::new(vec!["swift-fox".to_string()], "supervisor".to_string());
+
+    // t=0: task InProgress.
+    detector.initialize(&working_data_for("agent-1", "swift-fox", "task-1", "Work Item"));
+
+    let t0 = Instant::now();
+
+    // t=0: task disappears → first TaskCompleted.
+    let events1 = detector.detect_changes_at(
+        &idle_data_for("agent-1", "swift-fox"),
+        None,
+        t0,
+    );
+    assert!(
+        events1.iter().any(|e| matches!(
+            e,
+            DirectorEvent::TaskCompleted { task_id, .. } if task_id == "task-1"
+        )),
+        "TaskCompleted must fire on first disappearance: {events1:?}"
+    );
+
+    // Oscillation: task reappears.
+    detector.detect_changes_at(
+        &working_data_for("agent-1", "swift-fox", "task-1", "Work Item"),
+        None,
+        t0 + Duration::from_secs(1),
+    );
+
+    // t+31s: task disappears again. Debounce would allow re-emission (31s > 30s
+    // DEBOUNCE_DURATION) but the state-guard must block it.
+    let events3 = detector.detect_changes_at(
+        &idle_data_for("agent-1", "swift-fox"),
+        None,
+        t0 + Duration::from_secs(31),
+    );
+    assert!(
+        !events3.iter().any(|e| matches!(
+            e,
+            DirectorEvent::TaskCompleted { task_id, .. } if task_id == "task-1"
+        )),
+        "State-guard must block TaskCompleted re-emission even past debounce window: {events3:?}"
+    );
+}
+
+/// Regression for cas-55dc: TaskAssigned must also carry an oscillation guard —
+/// once announced for (task_id, worker), do not re-announce when the same
+/// assignment reappears after transient active-set churn.
+#[test]
+fn test_task_assigned_no_refire_on_oscillation() {
+    let mut detector =
+        DirectorEventDetector::new(vec!["swift-fox".to_string()], "supervisor".to_string());
+
+    // Initial: task unassigned.
+    let unassigned = DirectorData {
+        ready_tasks: vec![make_task("task-1", "Work Item", TaskStatus::Open, None)],
+        in_progress_tasks: vec![],
+        epic_tasks: vec![],
+        agents: vec![make_agent("agent-1", "swift-fox", None)],
+        activity: vec![],
+        agent_id_to_name: [("agent-1".to_string(), "swift-fox".to_string())]
+            .into_iter()
+            .collect(),
+        changes: vec![],
+        git_loaded: true,
+        reminders: vec![],
+        epic_closed_counts: HashMap::new(),
+    };
+    detector.initialize(&unassigned);
+
+    // Tick: task assigned to swift-fox → must emit TaskAssigned once.
+    let assigned = working_data_for("agent-1", "swift-fox", "task-1", "Work Item");
+    let events1 = detector.detect_changes(&assigned, None);
+    assert!(
+        events1.iter().any(|e| matches!(
+            e,
+            DirectorEvent::TaskAssigned { task_id, worker, .. }
+                if task_id == "task-1" && worker == "swift-fox"
+        )),
+        "TaskAssigned must fire on first assignment: {events1:?}"
+    );
+
+    // Tick: task temporarily disappears from active sets (lease oscillation).
+    detector.detect_changes(&idle_data_for("agent-1", "swift-fox"), None);
+
+    // Tick: task reappears with the SAME assignee.
+    let events3 = detector.detect_changes(&assigned, None);
+    assert!(
+        !events3.iter().any(|e| matches!(
+            e,
+            DirectorEvent::TaskAssigned { task_id, worker, .. }
+                if task_id == "task-1" && worker == "swift-fox"
+        )),
+        "TaskAssigned must not re-fire when same assignment reappears after oscillation: {events3:?}"
+    );
+}
