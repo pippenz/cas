@@ -1,11 +1,15 @@
 //! Integration tests for the active_team_id() user-level resolution chain
 //! (cas-ea2f5, T3 of EPIC cas-ab88).
 //!
-//! Verifies that when a project-level cloud.json has no `team_id` but a
-//! user-level cloud.json (simulated via the `CAS_USER_CLOUD_JSON` env-var
-//! override) has `default_team_id` set, `open_store` dual-enqueues writes to
-//! the team queue — i.e. `active_team_id()` surfaces the user default and the
-//! syncing store picks it up at open time.
+//! Verifies that when a project-level cloud.json has no `team_id` but has
+//! `team_auto_promote = true` (explicit opt-in) and a user-level cloud.json
+//! (simulated via the `CAS_USER_CLOUD_JSON` env-var override) has
+//! `default_team_id` set, `open_store` dual-enqueues writes to the team queue.
+//!
+//! After cas-f8e3, user-level fallback (Steps 2-3 of the resolution chain)
+//! requires `team_auto_promote = Some(true)` in the project config. Projects
+//! that never explicitly opted in remain personal even if the user has a team
+//! configured globally.
 
 use std::sync::Mutex;
 
@@ -49,9 +53,12 @@ fn queue_len_for_team(cas_dir: &std::path::Path, team_id: &str) -> usize {
         .unwrap_or(0)
 }
 
-/// When the project-level cloud.json has no team_id but the user-level
-/// cloud.json sets default_team_id, `store.add()` (the `cas remember` path)
+/// When the project-level cloud.json has no team_id BUT has
+/// `team_auto_promote = true` (explicit opt-in, cas-f8e3), and the user-level
+/// cloud.json sets `default_team_id`, `store.add()` (the `cas remember` path)
 /// dual-enqueues to the team queue.
+///
+/// This verifies the OPT-IN path still works end-to-end after cas-f8e3.
 #[test]
 fn remember_dual_enqueues_via_user_level_default_team_id() {
     let _guard = USER_CLOUD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -67,15 +74,17 @@ fn remember_dual_enqueues_via_user_level_default_team_id() {
     // SAFETY: serialised by USER_CLOUD_LOCK; no concurrent env mutation.
     unsafe { std::env::set_var("CAS_USER_CLOUD_JSON", &user_cloud_json); }
 
-    // Create a project cas_dir with a token but no team_id.
+    // Create a project cas_dir with a token, no team_id, but explicit opt-in
+    // so the user-level fallback (Steps 2-3) fires.  Without the opt-in, the
+    // project would stay personal (cas-f8e3 guard, Step 1.5).
     let project_temp = TempDir::new().unwrap();
-    make_project_cloud_config_no_team()
-        .save_to_cas_dir(project_temp.path())
-        .unwrap();
+    let mut project_cfg = make_project_cloud_config_no_team();
+    project_cfg.team_auto_promote = Some(true); // explicit opt-in for user-level fallback
+    project_cfg.save_to_cas_dir(project_temp.path()).unwrap();
 
     // open_store calls active_team_id() at construction time.
-    // Because the project config has no team_id, the resolution chain
-    // falls through to the user-level default_team_id set above.
+    // Because team_auto_promote=Some(true), the resolution chain falls through
+    // to the user-level default_team_id set above.
     let store = open_store(project_temp.path()).expect("open_store must succeed");
 
     // Add a project-scoped entry — SyncingEntryStore should dual-enqueue it
@@ -94,6 +103,54 @@ fn remember_dual_enqueues_via_user_level_default_team_id() {
     assert!(
         queue_rows > 0,
         "expected ≥1 row in team queue for {USER_DEFAULT_TEAM}, got {queue_rows}"
+    );
+
+    unsafe { std::env::remove_var("CAS_USER_CLOUD_JSON"); }
+}
+
+/// cas-f8e3 regression: a project with NO team_id and NO
+/// `team_auto_promote = Some(true)` must NOT be dual-enqueued, even when the
+/// user-level cloud.json has `default_team_id` configured.
+///
+/// This is the openclaw/penguinz path: the projects were personal but got
+/// promoted because the user had a team configured globally. The guard at
+/// Step 1.5 of `active_team_id_with_user_config` blocks the fallback for
+/// projects that have not explicitly opted in.
+#[test]
+fn f8e3_personal_project_without_opt_in_stays_personal_despite_user_default() {
+    let _guard = USER_CLOUD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+    let user_home_temp = TempDir::new().unwrap();
+    let user_cloud_json = user_home_temp.path().join("cloud.json");
+    make_user_cloud_config_with_default(USER_DEFAULT_TEAM)
+        .save_to(&user_cloud_json)
+        .unwrap();
+
+    unsafe { std::env::set_var("CAS_USER_CLOUD_JSON", &user_cloud_json); }
+
+    // Personal project: no team_id, no team_auto_promote. Step 1.5 fires →
+    // user-level fallback is skipped → active_team_id() = None.
+    let project_temp = TempDir::new().unwrap();
+    make_project_cloud_config_no_team()
+        .save_to_cas_dir(project_temp.path())
+        .unwrap();
+
+    let store = open_store(project_temp.path()).expect("open_store must succeed");
+
+    let entry = Entry {
+        id: "f8e3-personal-opt-in-guard".to_string(),
+        scope: Scope::Project,
+        entry_type: EntryType::Learning,
+        content: "cas-f8e3 regression: personal stays personal".to_string(),
+        ..Default::default()
+    };
+    store.add(&entry).expect("store.add must succeed");
+
+    let queue_rows = queue_len_for_team(project_temp.path(), USER_DEFAULT_TEAM);
+    assert_eq!(
+        queue_rows, 0,
+        "cas-f8e3: personal project (no team_auto_promote=true) must NOT \
+         land in team queue even when user has default_team_id set"
     );
 
     unsafe { std::env::remove_var("CAS_USER_CLOUD_JSON"); }

@@ -528,14 +528,29 @@ impl FactoryApp {
         // there's a read race between task list and dependency list queries where a newly
         // created task may not yet have its parent-child dependency visible, causing its
         // `epic` field to be `None`. Dropping those tasks causes the panel to flash empty.
+        //
+        // cas-889d: `agent_id_to_name` (already filtered to current-session agents above)
+        // maps session-ID → name. Task `assignee` fields are always session IDs (the
+        // canonical DB key). Checking `allowed.contains(a)` only accepted display-name
+        // assignees (which are never stored in the DB), so tasks with session-ID assignees
+        // were dropped even when the worker was actively working, causing the event
+        // detector to see them "disappear" from the snapshot and fire fabricated
+        // TaskCompleted notices. Collect the current-session session IDs from the already-
+        // filtered map and accept them as well.
         if let Some(epic_id) = self.epic_state.epic_id() {
             let epic_id = epic_id.to_string();
+            // Collect session IDs of current-session agents (agent_id_to_name is already
+            // filtered above to only contain current-session entries).
+            let allowed_session_ids: std::collections::HashSet<String> =
+                self.director_data.agent_id_to_name.keys().cloned().collect();
             let belongs_to_session = |t: &cas_factory::TaskSummary| -> bool {
                 t.epic.as_deref() == Some(&epic_id)
                     || (t.epic.is_none()
-                        && t.assignee
-                            .as_ref()
-                            .is_some_and(|a| allowed.contains(a)))
+                        && t.assignee.as_ref().is_some_and(|a| {
+                            // Accept both display-name keyed (legacy/manual) and
+                            // session-ID keyed (standard DB path) assignees.
+                            allowed.contains(a) || allowed_session_ids.contains(a)
+                        }))
             };
             self.director_data
                 .ready_tasks

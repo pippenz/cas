@@ -1533,3 +1533,77 @@ fn test_worker_idle_fires_when_heartbeat_stale() {
         "WorkerIdle must fire for genuinely-idle worker (stale heartbeat) after threshold: {ev2:?}"
     );
 }
+
+// ── cas-c790 regression tests ─────────────────────────────────────────────────
+
+/// cas-c790: WorkerIdle must NEVER fire for the supervisor, even when the
+/// supervisor's name has been added to worker_names via `add_worker`.
+///
+/// The original recurrence (cas-c790 / cas-b67d) was traced to a path where
+/// the supervisor name could enter worker_names during resume/reconnect, causing
+/// `is_worker_agent_name` to return true for the lead. Two guards now close the
+/// gap: `add_worker` rejects the supervisor's own name, and `is_worker_agent_name`
+/// explicitly excludes the supervisor even if the list is corrupted.
+#[test]
+fn test_c790_worker_idle_never_fires_for_supervisor() {
+    let supervisor = "team-lead-zen";
+    let t0 = std::time::Instant::now();
+    let base_utc = chrono::Utc::now();
+
+    // Detector with no workers — single-session run.
+    let mut detector = DirectorEventDetector::new(vec![], supervisor.to_string());
+
+    // Attempt to add the supervisor to worker_names via the mutator.
+    // add_worker must silently reject this (the guard closes the race window).
+    detector.add_worker(supervisor.to_string());
+
+    // Initialize with the supervisor as the sole agent, no task assigned.
+    let data = idle_data_for("sup-session-id", supervisor);
+    detector.initialize(&data);
+
+    // Run 2 ticks (> IDLE_CONSECUTIVE_TICKS=2 threshold) to give it every
+    // opportunity to fire.
+    let ev1 = detector.detect_changes_at(&data, None, t0, base_utc);
+    let ev2 = detector.detect_changes_at(&data, None, t0, base_utc);
+
+    let fired = ev1
+        .iter()
+        .chain(ev2.iter())
+        .any(|e| matches!(e, DirectorEvent::WorkerIdle { .. }));
+
+    assert!(
+        !fired,
+        "cas-c790: WorkerIdle must never fire for the supervisor, even after add_worker \
+         attempted to add them to the worker list. Events: {ev1:?}, {ev2:?}"
+    );
+}
+
+/// cas-c790: Legitimate workers must still produce WorkerIdle events — the
+/// supervisor guard must not accidentally suppress real workers.
+#[test]
+fn test_c790_worker_idle_still_fires_for_real_workers() {
+    let t0 = std::time::Instant::now();
+    let base_utc = chrono::Utc::now();
+
+    let mut detector =
+        DirectorEventDetector::new(vec!["swift-fox".to_string()], "supervisor".to_string());
+
+    // Initialize with the worker active and then immediately idle.
+    detector.initialize(&working_data_for("agent-1", "swift-fox", "task-1", "Work"));
+    let data = idle_data_for("agent-1", "swift-fox");
+
+    // 2 ticks to cross the threshold.
+    let ev1 = detector.detect_changes_at(&data, None, t0, base_utc);
+    let ev2 = detector.detect_changes_at(&data, None, t0, base_utc);
+
+    let fired = ev1
+        .iter()
+        .chain(ev2.iter())
+        .any(|e| matches!(e, DirectorEvent::WorkerIdle { worker } if worker == "swift-fox"));
+
+    assert!(
+        fired,
+        "cas-c790: WorkerIdle must still fire for a legitimate worker after the supervisor \
+         guard is added. Events: {ev1:?}, {ev2:?}"
+    );
+}

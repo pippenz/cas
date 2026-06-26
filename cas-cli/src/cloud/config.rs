@@ -398,15 +398,30 @@ pub struct CloudConfig {
     #[serde(default)]
     pub factory_cloud_client_enabled: bool,
 
-    /// Whether automatic team auto-promotion is enabled for this folder.
+    /// Per-project team auto-promotion control.
     ///
-    /// When `None` or `Some(true)` (the default), the syncing store
-    /// wrappers dual-enqueue eligible writes to the team queue whenever
-    /// `team_id` is set. `Some(false)` disables the coarse trigger — only
-    /// explicit `cas memory remember --share team` / `cas memory share`
-    /// primitives (T5) push to the team queue after that.
+    /// Three states, each with distinct meaning (cas-f8e3):
     ///
-    /// See `docs/requests/team-memories-filter-policy.md` Decision 3.
+    /// - `None` (default) — **personal project**.  The project has no
+    ///   explicit team link.  User-level `default_team_id` / single-team
+    ///   auto-pick does **not** promote this project to team scope.
+    ///   This is the safe default so that personal side-projects are never
+    ///   silently promoted just because the user has a team configured
+    ///   elsewhere.
+    ///
+    /// - `Some(true)` — **explicit team opt-in**.  The project intentionally
+    ///   inherits the user-level team preference (`default_team_id` →
+    ///   single-team auto-pick).  Set this (together with or instead of
+    ///   `team_id`) when you want every project on this machine to follow
+    ///   the user's default team without running `cas cloud team set` per
+    ///   project.
+    ///
+    /// - `Some(false)` — **hard kill-switch**.  Team auto-promotion is
+    ///   disabled even if `team_id` is set; only explicit `--share team`
+    ///   writes reach the team queue.
+    ///
+    /// See `docs/requests/team-memories-filter-policy.md` Decision 3 and
+    /// the `active_team_id_with_user_config` resolution chain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub team_auto_promote: Option<bool>,
 
@@ -665,21 +680,49 @@ impl CloudConfig {
     /// can inject a controlled user-level config without touching disk.
     ///
     /// Resolution chain (highest priority first):
-    /// 0. Kill-switch: `team_auto_promote = Some(false)` → always `None`.
-    /// 1. `self.team_id` if `Some` → project-level explicit override.
+    ///
+    /// 0. **Kill-switch**: `team_auto_promote = Some(false)` → always `None`,
+    ///    even if `team_id` is set.
+    ///
+    /// 1. **Project-level explicit link**: `self.team_id` if `Some` → use it.
+    ///    The project was explicitly linked to this team via `cas cloud team
+    ///    set`; no further steps needed.
+    ///
+    /// 1.5. **Explicit opt-in guard** (cas-f8e3): if `team_auto_promote` is
+    ///    NOT `Some(true)` at this point, return `None` — the project has no
+    ///    explicit team link and has not opted in to user-level auto-promotion.
+    ///    Personal projects (no `team_id`, no `team_auto_promote = Some(true)`)
+    ///    MUST NOT inherit the user's default team, because that would silently
+    ///    promote every CAS workspace the user touches to team scope, including
+    ///    private personal side-projects.
+    ///
     /// 2. `user_cfg.default_team_id` if `Some` → user's preferred team.
+    ///    Only reached when Step 1.5 passed (i.e. `team_auto_promote = Some(true)`).
+    ///
     /// 3. `user_cfg.teams.len() == 1` → implicit single-team auto-pick.
+    ///    Only reached when Step 1.5 passed.
+    ///
     /// 4. `None` — ambiguous (0 or 2+ teams) or no user config at all.
     pub fn active_team_id_with_user_config(&self, user_cfg: Option<&CloudConfig>) -> Option<String> {
-        // Step 0 — coarse kill-switch.
+        // Step 0 — hard kill-switch.
         if matches!(self.team_auto_promote, Some(false)) {
             return None;
         }
-        // Step 1 — project-level explicit override wins.
+        // Step 1 — project-level explicit link wins.
         if let Some(ref tid) = self.team_id {
             return Some(tid.clone());
         }
-        // Steps 2–4 — fall through to user-level config.
+        // Step 1.5 — explicit opt-in guard (cas-f8e3).
+        //
+        // Without `team_id` (Step 1) or `team_auto_promote = Some(true)`, this
+        // project is personal.  User-level `default_team_id` / single-team
+        // auto-pick must NOT apply, otherwise personal workspaces would be
+        // silently promoted to team scope whenever the user has a team
+        // configured for their main project.
+        if !matches!(self.team_auto_promote, Some(true)) {
+            return None;
+        }
+        // Steps 2–4 — user-level fallback (only reached with opt-in).
         if let Some(user) = user_cfg {
             // Step 2 — user has a default team preference.
             if let Some(ref dtid) = user.default_team_id {
@@ -694,17 +737,22 @@ impl CloudConfig {
         None
     }
 
-    /// Return the team UUID to auto-promote writes to, or `None` if team
-    /// auto-promotion is disabled for this folder.
+    /// Return the team UUID to auto-promote writes to, or `None` if this
+    /// project is personal / not explicitly team-linked.
     ///
-    /// Walks the full resolution chain — project-level `team_id` first, then
-    /// user-level `~/.cas/cloud.json` (`default_team_id` → single-team
-    /// auto-pick → `None`). Distinct from reading `team_id` directly: this
-    /// accessor honours the `team_auto_promote` coarse kill-switch.
-    /// `Some(false)` on `team_auto_promote` returns `None` here even if
-    /// `team_id` is set — the user has opted out of automatic dual-enqueue.
-    /// Callers building the T1 filter predicate should use this accessor,
-    /// not `team_id`.
+    /// A project is team-linked when ANY of the following hold:
+    ///  - `self.team_id` is set (project was explicitly linked via
+    ///    `cas cloud team set`), OR
+    ///  - `team_auto_promote = Some(true)` (project opted in to inheriting
+    ///    the user-level team preference from `~/.cas/cloud.json`).
+    ///
+    /// A project WITHOUT `team_id` AND WITHOUT `team_auto_promote = Some(true)`
+    /// is always personal — the user-level `default_team_id` / single-team
+    /// auto-pick does NOT apply (cas-f8e3 guard).  This prevents personal
+    /// side-projects from being silently promoted to team scope.
+    ///
+    /// The hard kill-switch `team_auto_promote = Some(false)` blocks promotion
+    /// even when `team_id` is set.
     ///
     /// For unit-testable access without disk I/O, use
     /// [`active_team_id_with_user_config`][Self::active_team_id_with_user_config]
@@ -721,10 +769,21 @@ impl CloudConfig {
         self.team_slug = Some(team_slug.to_string());
     }
 
-    /// Clear the current team context
+    /// Clear the current team context, making the project personal.
+    ///
+    /// Clears `team_id`, `team_slug`, and any explicit `team_auto_promote`
+    /// opt-in (`Some(true)`) so that Steps 2/3 of `active_team_id` do not
+    /// fire after the clear.  The hard kill-switch (`Some(false)`) is
+    /// preserved so an intentional "never team-promote" override survives a
+    /// `team clear` command.
     pub fn clear_team(&mut self) {
         self.team_id = None;
         self.team_slug = None;
+        // Reset explicit opt-in so the project defaults to personal under the
+        // cas-f8e3 guard.  The hard kill-switch (Some(false)) is preserved.
+        if matches!(self.team_auto_promote, Some(true)) {
+            self.team_auto_promote = None;
+        }
     }
 
     /// Get the last sync timestamp for a specific team
@@ -838,14 +897,15 @@ mod tests {
     }
 
     #[test]
-    fn test_active_team_id_returns_team_when_auto_promote_is_default() {
+    fn test_active_team_id_returns_team_when_team_id_explicitly_set() {
         let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        // team_auto_promote=None is the default — auto-promote enabled.
+        // team_id is explicitly set via `cas cloud team set` → Step 1 returns it
+        // regardless of team_auto_promote value (Step 1 precedes Step 1.5 guard).
         unsafe { std::env::set_var("CAS_USER_CLOUD_JSON", "/nonexistent/path/cloud.json"); }
         let mut config = CloudConfig::default();
         config.set_team("team-abc", "my-team");
         assert_eq!(config.active_team_id().as_deref(), Some("team-abc"));
-        assert!(config.team_auto_promote.is_none());
+        assert!(config.team_auto_promote.is_none()); // Step 1 fires before Step 1.5
         unsafe { std::env::remove_var("CAS_USER_CLOUD_JSON"); }
     }
 
@@ -876,10 +936,29 @@ mod tests {
     // ── cas-ea2f5: resolution-chain unit tests (test-first, added before impl) ──
 
     #[test]
-    fn test_active_team_id_user_default_team_fallback() {
+    fn test_active_team_id_user_default_team_fallback_requires_opt_in() {
         let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        // No project-level team_id, user config has default_team_id set → return it.
-        let project_cfg = CloudConfig::default(); // no team_id
+        // cas-f8e3: a project WITHOUT team_id AND WITHOUT team_auto_promote=Some(true)
+        // is personal — user-level default_team_id must NOT apply.
+        let project_cfg = CloudConfig::default(); // no team_id, team_auto_promote=None
+        let mut user_cfg = CloudConfig::default();
+        user_cfg.default_team_id = Some("user-default-team".to_string());
+
+        assert_eq!(
+            project_cfg.active_team_id_with_user_config(Some(&user_cfg)),
+            None,
+            "personal project (no team_id, no team_auto_promote=Some(true)) must not \
+             be promoted via user-level default_team_id (cas-f8e3)"
+        );
+    }
+
+    #[test]
+    fn test_active_team_id_user_default_team_fallback_with_explicit_opt_in() {
+        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // team_auto_promote=Some(true) explicitly opts the project in to
+        // inheriting the user-level default_team_id.
+        let mut project_cfg = CloudConfig::default(); // no team_id
+        project_cfg.team_auto_promote = Some(true);
         let mut user_cfg = CloudConfig::default();
         user_cfg.default_team_id = Some("user-default-team".to_string());
 
@@ -890,11 +969,33 @@ mod tests {
     }
 
     #[test]
-    fn test_active_team_id_single_team_auto_pick() {
+    fn test_active_team_id_single_team_auto_pick_requires_opt_in() {
         let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        // No project-level team_id, user config has exactly 1 team, no default_team_id
-        // → return the sole team's id.
+        // cas-f8e3: a project WITHOUT team_id AND WITHOUT team_auto_promote=Some(true)
+        // is personal — single-team auto-pick must NOT apply.
         let project_cfg = CloudConfig::default();
+        let mut user_cfg = CloudConfig::default();
+        user_cfg.teams = vec![TeamInfo {
+            id: "solo-team-id".to_string(),
+            slug: "solo".to_string(),
+            name: "Solo".to_string(),
+            role: "member".to_string(),
+        }];
+
+        assert_eq!(
+            project_cfg.active_team_id_with_user_config(Some(&user_cfg)),
+            None,
+            "personal project must not auto-pick from single-team membership \
+             without explicit opt-in (cas-f8e3)"
+        );
+    }
+
+    #[test]
+    fn test_active_team_id_single_team_auto_pick_with_explicit_opt_in() {
+        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // team_auto_promote=Some(true) opts the project in to single-team auto-pick.
+        let mut project_cfg = CloudConfig::default();
+        project_cfg.team_auto_promote = Some(true);
         let mut user_cfg = CloudConfig::default();
         user_cfg.teams = vec![TeamInfo {
             id: "solo-team-id".to_string(),
@@ -912,9 +1013,10 @@ mod tests {
     #[test]
     fn test_active_team_id_multi_team_ambiguous_returns_none() {
         let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        // No project-level team_id, user config has 2 teams but no default_team_id
-        // → None (ambiguous).
-        let project_cfg = CloudConfig::default();
+        // No project-level team_id → personal regardless of user team count.
+        // Even with team_auto_promote=Some(true), ambiguous (2+ teams) returns None.
+        let mut project_cfg = CloudConfig::default();
+        project_cfg.team_auto_promote = Some(true); // opt in to user-level fallback
         let mut user_cfg = CloudConfig::default();
         user_cfg.teams = vec![
             TeamInfo { id: "t1".to_string(), slug: "a".to_string(), name: "A".to_string(), role: "member".to_string() },
@@ -1696,6 +1798,115 @@ mod tests {
         assert_eq!(
             should_adopt_canonical_id(Some("github.com/r/x"), Some("github.com/r/x"), Some("   "), None),
             None,
+        );
+    }
+
+    // ── cas-f8e3: personal-project promotion guard ────────────────────────────
+    //
+    // Regression coverage: a project without an explicit team link must NOT be
+    // promoted to team scope via the user-level `default_team_id` or
+    // single-team auto-pick, even when the user has a team configured globally.
+
+    #[test]
+    fn f8e3_personal_project_not_promoted_via_user_default_team_id() {
+        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // Simulates: user has `default_team_id` in ~/.cas/cloud.json but the
+        // project's .cas/cloud.json has no team_id and no team_auto_promote.
+        // This was the exact path that caused openclaw/penguinz to be promoted.
+        let project_cfg = CloudConfig::default(); // no team_id, team_auto_promote=None
+        let mut user_cfg = CloudConfig::default();
+        user_cfg.default_team_id = Some("2a57bec9-5dfa-4a8f-b711-31f9aeb8d6cb".to_string());
+
+        assert_eq!(
+            project_cfg.active_team_id_with_user_config(Some(&user_cfg)),
+            None,
+            "cas-f8e3: personal project (no team_id, no team_auto_promote=Some(true)) \
+             must write team_id=NULL even when user has default_team_id set"
+        );
+    }
+
+    #[test]
+    fn f8e3_personal_project_not_promoted_via_single_team_auto_pick() {
+        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // Simulates: user is a member of exactly 1 team (auto-pick previously
+        // fired) but the project is personal.
+        let project_cfg = CloudConfig::default(); // no team_id, team_auto_promote=None
+        let mut user_cfg = CloudConfig::default();
+        user_cfg.teams = vec![TeamInfo {
+            id: "petra-stella-team".to_string(),
+            slug: "petra-stella".to_string(),
+            name: "Petra Stella".to_string(),
+            role: "member".to_string(),
+        }];
+
+        assert_eq!(
+            project_cfg.active_team_id_with_user_config(Some(&user_cfg)),
+            None,
+            "cas-f8e3: personal project must not be auto-picked into the user's \
+             single team membership without team_auto_promote=Some(true)"
+        );
+    }
+
+    #[test]
+    fn f8e3_explicitly_linked_project_still_team_promoted() {
+        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // Sanity: a project with `team_id` set (via `cas cloud team set`) still
+        // works correctly — Step 1 fires before the Step 1.5 guard.
+        unsafe { std::env::set_var("CAS_USER_CLOUD_JSON", "/nonexistent/path/cloud.json"); }
+        let mut project_cfg = CloudConfig::default();
+        project_cfg.set_team("2a57bec9-5dfa-4a8f-b711-31f9aeb8d6cb", "petra-stella");
+        // No user-level config needed — Step 1 is sufficient.
+
+        assert_eq!(
+            project_cfg.active_team_id_with_user_config(None).as_deref(),
+            Some("2a57bec9-5dfa-4a8f-b711-31f9aeb8d6cb"),
+            "cas-f8e3: a project with explicit team_id must still be team-linked (Step 1)"
+        );
+        unsafe { std::env::remove_var("CAS_USER_CLOUD_JSON"); }
+    }
+
+    #[test]
+    fn f8e3_team_auto_promote_true_enables_user_level_fallback() {
+        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // Opt-in path: project sets team_auto_promote=Some(true) to explicitly
+        // inherit the user-level team without running `cas cloud team set`.
+        let mut project_cfg = CloudConfig::default(); // no team_id
+        project_cfg.team_auto_promote = Some(true);
+        let mut user_cfg = CloudConfig::default();
+        user_cfg.default_team_id = Some("2a57bec9-5dfa-4a8f-b711-31f9aeb8d6cb".to_string());
+
+        assert_eq!(
+            project_cfg.active_team_id_with_user_config(Some(&user_cfg)).as_deref(),
+            Some("2a57bec9-5dfa-4a8f-b711-31f9aeb8d6cb"),
+            "cas-f8e3: team_auto_promote=Some(true) is the explicit opt-in for \
+             user-level fallback when team_id is not set"
+        );
+    }
+
+    #[test]
+    fn f8e3_clear_team_resets_opt_in_making_project_personal() {
+        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // `cas cloud team clear` should leave the project in a state where
+        // user-level auto-pick no longer fires.
+        let mut cfg = CloudConfig::default();
+        cfg.set_team("2a57bec9-5dfa-4a8f-b711-31f9aeb8d6cb", "petra-stella");
+        cfg.team_auto_promote = Some(true); // was explicitly opted in
+        cfg.clear_team();
+
+        // After clear: team_id=None, team_auto_promote reset to None.
+        assert!(cfg.team_id.is_none());
+        assert!(
+            !matches!(cfg.team_auto_promote, Some(true)),
+            "clear_team must reset the explicit team opt-in so user-level auto-pick does not re-fire"
+        );
+
+        // With user-level config having default_team_id, project stays personal post-clear.
+        let mut user_cfg = CloudConfig::default();
+        user_cfg.default_team_id = Some("2a57bec9-5dfa-4a8f-b711-31f9aeb8d6cb".to_string());
+        assert_eq!(
+            cfg.active_team_id_with_user_config(Some(&user_cfg)),
+            None,
+            "after clear_team, project must be personal even with user-level default_team_id"
         );
     }
 }
