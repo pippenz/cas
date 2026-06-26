@@ -351,8 +351,14 @@ impl CasCore {
 
                 if is_not_found {
                     if let Ok(mut task) = task_store.get(&req.task_id) {
+                        // cas-6e4c: PSR tasks must be excluded from orphan-recovery.
+                        // The work is already complete — only supervisor review is
+                        // pending. Resetting a PSR task to Open would silently erase
+                        // the worker's completed close and remove it from the
+                        // supervisor review queue.
                         if task.status != TaskStatus::Closed
                             && task.status != TaskStatus::Open
+                            && task.status != TaskStatus::PendingSupervisorReview
                         {
                             let prior_status = task.status;
                             let prior_assignee = task.assignee.clone();

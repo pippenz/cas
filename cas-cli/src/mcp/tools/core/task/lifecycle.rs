@@ -304,6 +304,18 @@ impl CasCore {
             ));
         }
 
+        // cas-9684: PSR tasks are "work complete, awaiting supervisor review".
+        // Allowing `start` would silently clobber the status back to InProgress,
+        // dropping the task from `list status=pending_supervisor_review`.
+        if task.status == TaskStatus::PendingSupervisorReview {
+            return Err(Self::error(
+                ErrorCode::INVALID_PARAMS,
+                "Cannot start a task that is pending supervisor review. \
+                The work is already complete — wait for the supervisor to \
+                review and close it (or reopen it if rework is needed).",
+            ));
+        }
+
         // Auto-claim the task with a lease
         let agent_id = self.get_agent_id()?;
 

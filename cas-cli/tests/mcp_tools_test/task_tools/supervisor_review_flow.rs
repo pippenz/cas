@@ -9,7 +9,7 @@
 use crate::support::*;
 use cas::config::{CodeReviewConfig, Config};
 use cas::mcp::{CasCore, CasService};
-use cas::store::{open_task_store, open_verification_store};
+use cas::store::{open_agent_store, open_task_store, open_verification_store};
 use cas::types::{TaskStatus, Verification, VerificationStatus};
 use rmcp::handler::server::wrapper::Parameters;
 use std::process::Command;
@@ -568,6 +568,203 @@ async fn test_worker_close_absent_code_review_section_defaults_to_supervisor_mod
         TaskStatus::PendingSupervisorReview,
         "Absent [code_review] section must default to PendingSupervisorReview; got: {:?}",
         task.status
+    );
+}
+
+// ---------------------------------------------------------------------------
+// cas-9684: action=start must reject (not silently clobber) PSR status
+// ---------------------------------------------------------------------------
+
+/// cas-9684: `action=start` on a PendingSupervisorReview task must return an
+/// error rather than silently resetting the status to InProgress.
+///
+/// Before this fix, line 572 of lifecycle.rs unconditionally set
+/// `task.status = TaskStatus::InProgress`, dropping the task from
+/// `list status=pending_supervisor_review` without any warning.
+#[tokio::test]
+async fn test_start_on_pending_supervisor_review_task_is_rejected() {
+    let (temp, _core) = setup_cas();
+    let _env_lock = env_test_lock();
+
+    let cas_dir = temp.path().join(".cas");
+    let task_store = open_task_store(&cas_dir).unwrap();
+
+    // Create a task directly in PendingSupervisorReview state (simulates a
+    // worker that already closed → PSR transition).
+    let mut task = cas::types::Task::new("cas-9684-start-psr".to_string(), "PSR start guard test".to_string());
+    task.status = TaskStatus::PendingSupervisorReview;
+    task_store.add(&task).expect("task.add should succeed");
+
+    let core = CasCore::with_daemon(cas_dir.clone(), None, None);
+    let service = CasService::new(core, None);
+
+    // Attempt to start the PSR task — must be rejected.
+    let start_result = service
+        .task(Parameters(task_req(serde_json::json!({
+            "action": "start",
+            "id": "cas-9684-start-psr",
+        }))))
+        .await;
+
+    // The call must either return an Err or an Ok with is_error=true.
+    let was_rejected = match &start_result {
+        Err(_) => true,
+        Ok(result) => result.is_error == Some(true),
+    };
+    assert!(
+        was_rejected,
+        "action=start on a PSR task must be rejected; got: {:?}",
+        start_result.ok().map(|r| extract_text(r))
+    );
+
+    // Status must remain PendingSupervisorReview — must NOT have been reset.
+    let task_after = task_store.get("cas-9684-start-psr").expect("task should exist");
+    assert_eq!(
+        task_after.status,
+        TaskStatus::PendingSupervisorReview,
+        "PSR status must survive an action=start attempt; got: {:?}",
+        task_after.status
+    );
+}
+
+// ---------------------------------------------------------------------------
+// cas-6e4c: orphan-recovery (release) must not reset PSR to Open
+// ---------------------------------------------------------------------------
+
+/// cas-6e4c: When a worker's lease expires and `action=release` fires the
+/// orphan-recovery path, a PendingSupervisorReview task must NOT be reset
+/// to Open. The work is complete; only supervisor review is pending.
+///
+/// Before this fix, task_claiming.rs excluded only Closed and Open from the
+/// auto-recovery reset — PSR tasks were silently reverted to Open, making
+/// the worker's completed work disappear.
+#[tokio::test]
+async fn test_release_orphan_recovery_does_not_reset_psr_to_open() {
+    let (temp, _core) = setup_cas();
+    let _env_lock = env_test_lock();
+
+    let cas_dir = temp.path().join(".cas");
+    let task_store = open_task_store(&cas_dir).unwrap();
+
+    // Create a task in PendingSupervisorReview — simulates a worker that
+    // finished close → PSR transition but whose lease was never released.
+    let mut task = cas::types::Task::new("cas-6e4c-release-psr".to_string(), "PSR release guard test".to_string());
+    task.status = TaskStatus::PendingSupervisorReview;
+    task_store.add(&task).expect("task.add should succeed");
+
+    let core = CasCore::with_daemon(cas_dir.clone(), None, None);
+    let service = CasService::new(core, None);
+
+    // Call action=release with no active lease — triggers the orphan-recovery
+    // path that previously reset status to Open.
+    let release_result = service
+        .task(Parameters(task_req(serde_json::json!({
+            "action": "release",
+            "id": "cas-6e4c-release-psr",
+        }))))
+        .await;
+
+    // The release call may succeed or return an error, but must NOT have
+    // reset the task to Open.
+    let _ = release_result; // result shape is unimportant for this assertion
+
+    let task_after = task_store.get("cas-6e4c-release-psr").expect("task should exist");
+    assert_ne!(
+        task_after.status,
+        TaskStatus::Open,
+        "PSR task must NOT be reset to Open by orphan-recovery release; got: {:?}",
+        task_after.status
+    );
+    assert_eq!(
+        task_after.status,
+        TaskStatus::PendingSupervisorReview,
+        "PSR task must retain PendingSupervisorReview after release; got: {:?}",
+        task_after.status
+    );
+}
+
+// ---------------------------------------------------------------------------
+// cas-7fe9: PSR transition must release the worker's lease
+// ---------------------------------------------------------------------------
+
+/// cas-7fe9: After a worker close transitions a task to PendingSupervisorReview,
+/// the worker's lease must be released so the supervisor can claim it immediately
+/// without hitting a "Task is locked by <worker>" error.
+///
+/// Before this fix, the PSR early-return path in close_ops.rs omitted the
+/// `release_lease_for_task` call that the normal close path performs, leaving
+/// a phantom lease for up to 10 minutes after the worker moved on.
+#[tokio::test]
+async fn test_psr_transition_releases_worker_lease() {
+    let (temp, _core) = setup_cas();
+    let _env_lock = env_test_lock();
+
+    let cas_dir = temp.path().join(".cas");
+    write_supervisor_review_config(&cas_dir);
+    init_git_repo_with_staged_changes(temp.path());
+
+    let core = CasCore::with_daemon(cas_dir.clone(), None, None);
+    let task_store = open_task_store(&cas_dir).unwrap();
+    let service = CasService::new(core, None);
+
+    let _worker_guard = FactoryWorkerGuard::enter();
+
+    // Create and start a task — action=start installs a lease on the task.
+    let create_result = service
+        .task(Parameters(task_req(serde_json::json!({
+            "action": "create",
+            "title": "PSR lease-release test (cas-7fe9)",
+            "priority": 2,
+            "task_type": "task",
+        }))))
+        .await
+        .expect("create should succeed");
+    let id = extract_task_id(&extract_text(create_result))
+        .expect("should have task ID")
+        .to_string();
+
+    service
+        .task(Parameters(task_req(serde_json::json!({ "action": "start", "id": id }))))
+        .await
+        .expect("start should succeed");
+
+    // Close in supervisor-review mode — should transition to PSR and release lease.
+    let close_result = service
+        .task(Parameters(task_req(serde_json::json!({
+            "action": "close",
+            "id": id,
+            "reason": "All acceptance criteria met.",
+        }))))
+        .await
+        .expect("close should return Ok");
+
+    let close_text = extract_text(close_result);
+    assert!(
+        close_text.contains("supervisor review") || close_text.contains("pending_supervisor_review"),
+        "Close must transition to supervisor review mode; got: {close_text}"
+    );
+
+    // Task must be in PendingSupervisorReview state.
+    let task = task_store.get(&id).expect("task should exist");
+    assert_eq!(
+        task.status,
+        TaskStatus::PendingSupervisorReview,
+        "Task must be in PendingSupervisorReview after supervisor-mode close; got: {:?}",
+        task.status
+    );
+
+    // The worker's lease must have been released — no active lease on the task.
+    // Before cas-7fe9, the PSR early-return omitted `release_lease_for_task`,
+    // leaving a phantom lease that blocked supervisor claim for ~10 min.
+    let agent_store = open_agent_store(&cas_dir).unwrap();
+    let lease = agent_store
+        .get_lease(&id)
+        .expect("get_lease must not error");
+    assert!(
+        lease.is_none(),
+        "Worker lease must be released after PSR transition (cas-7fe9 fix); \
+        got active lease: {:?}",
+        lease
     );
 }
 
