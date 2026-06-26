@@ -9,6 +9,34 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Added
 
+- **`cas claude` / `cas codex` provider shortcuts (cas-7f2c).** Launch a
+  factory with a specific supervisor provider without remembering the
+  `--supervisor-cli` flag.  `cas claude` is equivalent to
+  `cas factory --supervisor-cli=claude`; `cas codex` is symmetric.  All
+  existing `cas factory` flags pass through.
+
+- **`cas default <provider>` — persist supervisor harness without launching
+  (cas-7f2c).** `cas default codex` writes `[llm.supervisor] harness =
+  "codex"` to `~/.cas/config.toml` and prints a one-line confirmation.
+  Other config keys are preserved.
+
+- **`--default` flag on shortcut commands (cas-7f2c).** `cas codex --default`
+  both launches the factory with Codex as supervisor AND persists that choice
+  for future sessions.  `cas claude --default` is symmetric.
+
+### Fixed
+
+- **`--supervisor-cli=claude` (or `cas claude`) no longer silently ignored
+  when a codex default is persisted (cas-7f2c).** The old config-override
+  block in `factory::execute` used `supervisor_cli == "claude"` as a proxy
+  for "not explicitly set by the user", so an explicit `--supervisor-cli=claude`
+  was indistinguishable from the default and was overridden by a persisted
+  codex config value.  A new `supervisor_cli_explicit` flag on `FactoryArgs`
+  fixes the precedence: explicit shortcut/flag > persisted config > built-in
+  default.
+
+### Added (continued)
+
 - **Auto-detection of team scope on login — `cas cloud team set` no longer required for most users (EPIC cas-ab88).** CAS now fetches your team membership from `/api/me` (petra-stella-cloud) immediately after `cas login` and caches `teams[]` + `default_team_id` into `~/.cas/cloud.json`. The resolution chain in `active_team_id()` then picks the right team automatically: project-level explicit override → user `default_team_id` → implicit single-team auto-pick → personal scope. Single-team users need only `cas login` + `cas cloud sync`; no manual UUID or slug lookup required.
 
 - **`cas cloud team default <slug-or-uuid>` subcommand (cas-6804).** Sets a user-wide team default in `~/.cas/cloud.json`. Takes a team slug (e.g. `petra-stella`) or UUID; resolves against the cached `teams[]` populated at login. Use `--personal` to revert to personal scope (clears the default). This is the recommended first-time setup step for multi-team users; single-team users typically don't need it.
