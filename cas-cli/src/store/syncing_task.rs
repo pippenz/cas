@@ -384,4 +384,74 @@ mod tests {
         assert_eq!(personal, 1);
         assert_eq!(team, 0, "kill-switch also silences delete fan-out");
     }
+
+    // ── cas-f8e3: personal-project guard ─────────────────────────────────────
+
+    /// Regression: a project with NO project-level `team_id` and NO
+    /// `team_auto_promote = Some(true)` must never enqueue to the team queue,
+    /// even when the user has a team configured at the user level.
+    ///
+    /// This covers the openclaw / penguinz promotion path: the user's
+    /// `~/.cas/cloud.json` had `default_team_id` set, which caused
+    /// `active_team_id()` to return a team UUID for ALL projects via the
+    /// user-level fallback.  After cas-f8e3 the fallback only fires when
+    /// `team_auto_promote = Some(true)` is present in the project config.
+    #[test]
+    fn f8e3_personal_project_no_team_id_never_enqueues_for_team() {
+        let temp = TempDir::new().unwrap();
+        let cas_dir = temp.path();
+        let inner = SqliteTaskStore::open(cas_dir).unwrap();
+        inner.init().unwrap();
+        let queue = SyncQueue::open(cas_dir).unwrap();
+        queue.init().unwrap();
+
+        // Personal project: no team_id, no team_auto_promote=Some(true).
+        // Even if the user-level cloud.json has default_team_id, active_team_id()
+        // returns None for this project (Step 1.5 guard fires).
+        let cfg = CloudConfig::default(); // team_id=None, team_auto_promote=None
+        let store = SyncingTaskStore::new(Arc::new(inner), Arc::new(queue))
+            .with_cloud_config(Arc::new(cfg));
+
+        let task = Task::new("f8e3-personal-001".to_string(), "personal task".to_string());
+        store.add(&task).unwrap();
+
+        let queue = SyncQueue::open(temp.path()).unwrap();
+        let (personal, team) = queue_counts(&queue);
+        assert_eq!(personal, 1, "personal project must enqueue to personal queue");
+        assert_eq!(
+            team, 0,
+            "cas-f8e3: personal project (no team_id) must NOT enqueue to team queue \
+             — was the openclaw/penguinz promotion path"
+        );
+    }
+
+    #[test]
+    fn f8e3_personal_project_delete_never_fans_out_to_team() {
+        let temp = TempDir::new().unwrap();
+        let cas_dir = temp.path();
+        let inner = SqliteTaskStore::open(cas_dir).unwrap();
+        inner.init().unwrap();
+        let queue = SyncQueue::open(cas_dir).unwrap();
+        queue.init().unwrap();
+
+        let cfg = CloudConfig::default(); // personal: no team_id
+        let store = SyncingTaskStore::new(Arc::new(inner), Arc::new(queue))
+            .with_cloud_config(Arc::new(cfg));
+
+        let task = Task::new("f8e3-personal-del".to_string(), "to-delete".to_string());
+        store.add(&task).unwrap();
+
+        // Clear upserts, then delete.
+        let queue = SyncQueue::open(temp.path()).unwrap();
+        queue.clear().unwrap();
+        store.delete(&task.id).unwrap();
+
+        let queue = SyncQueue::open(temp.path()).unwrap();
+        let (personal, team) = queue_counts(&queue);
+        assert_eq!(personal, 1);
+        assert_eq!(
+            team, 0,
+            "cas-f8e3: personal project delete must NOT fan out to team queue"
+        );
+    }
 }
