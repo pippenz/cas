@@ -318,6 +318,19 @@ impl DaemonInitPhase {
 
         let (cols, rows) = (120, 40);
 
+        // If a resolved supervisor spec is present, override scalar supervisor fields (cas-1948).
+        let (supervisor_cli, supervisor_model, supervisor_effort) =
+            if let Some(ref sup_spec) = self.factory_config.resolved_supervisor_spec {
+                let effort_str = sup_spec.effort.map(|e| e.as_claude_arg().to_string());
+                (sup_spec.cli, sup_spec.model.clone(), effort_str)
+            } else {
+                (
+                    self.factory_config.supervisor_cli,
+                    self.factory_config.supervisor_model.clone(),
+                    self.factory_config.supervisor_effort.clone(),
+                )
+            };
+
         // Build mux config
         let mux_config = MuxConfig {
             cwd: self.factory_config.cwd.clone(),
@@ -326,11 +339,11 @@ impl DaemonInitPhase {
             workers: self.worker_names.len(),
             worker_names: self.worker_names.clone(),
             supervisor_name: self.supervisor_name.clone(),
-            supervisor_cli: self.factory_config.supervisor_cli,
+            supervisor_cli,
             worker_cli: self.factory_config.worker_cli,
-            supervisor_model: self.factory_config.supervisor_model.clone(),
+            supervisor_model,
             worker_model: self.factory_config.worker_model.clone(),
-            supervisor_effort: self.factory_config.supervisor_effort.clone(),
+            supervisor_effort,
             worker_effort: self.factory_config.worker_effort.clone(),
             include_director: false,
             rows,

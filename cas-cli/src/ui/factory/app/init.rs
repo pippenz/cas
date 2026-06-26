@@ -113,6 +113,21 @@ impl FactoryApp {
             crate::ui::theme::register_agent_color(name, &tc.agent_color);
         }
 
+        // If a resolved supervisor spec is present (from the cascade resolver),
+        // override the scalar supervisor fields so Mux::factory uses the right
+        // CLI/model/effort for the supervisor pane (cas-1948).
+        let (supervisor_cli, supervisor_model, supervisor_effort) =
+            if let Some(ref sup_spec) = config.resolved_supervisor_spec {
+                let effort_str = sup_spec.effort.map(|e| e.as_claude_arg().to_string());
+                (sup_spec.cli, sup_spec.model.clone(), effort_str)
+            } else {
+                (
+                    config.supervisor_cli,
+                    config.supervisor_model.clone(),
+                    config.supervisor_effort.clone(),
+                )
+            };
+
         let mux_config = MuxConfig {
             cwd: config.cwd.clone(),
             cas_root: cas_root_for_mux,
@@ -120,11 +135,11 @@ impl FactoryApp {
             workers: worker_names.len(),
             worker_names: worker_names.clone(),
             supervisor_name: supervisor_name.clone(),
-            supervisor_cli: config.supervisor_cli,
+            supervisor_cli,
             worker_cli: config.worker_cli,
-            supervisor_model: config.supervisor_model.clone(),
+            supervisor_model,
             worker_model: config.worker_model.clone(),
-            supervisor_effort: config.supervisor_effort.clone(),
+            supervisor_effort,
             worker_effort: config.worker_effort.clone(),
             include_director: false,
             rows,

@@ -22,7 +22,7 @@ use crate::ui::factory::{
 };
 use crate::worktree::GitOperations;
 use anyhow::{Result, bail};
-use cas_factory::spec_resolver::{ConfigSources, resolve_specs};
+use cas_factory::spec_resolver::{ConfigSources, resolve_specs, resolve_supervisor_spec};
 use clap::{Args, Subcommand};
 use std::io::IsTerminal;
 
@@ -243,6 +243,15 @@ pub struct FactoryArgs {
     ///   --worker-spec '{"name":"bob","cli":"claude","effort":"high"}'
     #[arg(long = "worker-spec", value_name = "JSON")]
     pub worker_spec: Vec<String>,
+
+    /// Supervisor spec override as a JSON object (singular).
+    ///
+    /// A JSON object with optional fields `cli`, `model`, `effort`.
+    /// Overrides `--supervisor-cli`/`--supervisor-model`/`--supervisor-effort`
+    /// and `[factory.supervisor]` config.  Example:
+    ///   --supervisor-spec '{"cli":"claude","model":"claude-opus-4-7","effort":"xhigh"}'
+    #[arg(long = "supervisor-spec", value_name = "JSON")]
+    pub supervisor_spec: Option<String>,
 }
 
 impl Default for FactoryArgs {
@@ -267,6 +276,7 @@ impl Default for FactoryArgs {
             worker_cli: "claude".to_string(),
             no_phone_home: false,
             worker_spec: vec![],
+            supervisor_spec: None,
         }
     }
 }
@@ -374,6 +384,10 @@ pub enum FactoryCommands {
         /// Per-worker spec JSON overrides (internal use, repeat per worker)
         #[arg(long = "worker-spec-json", hide = true)]
         worker_spec_jsons: Vec<String>,
+
+        /// Supervisor spec JSON override (internal use, singular)
+        #[arg(long = "supervisor-spec-json", hide = true)]
+        supervisor_spec_json: Option<String>,
     },
 
     /// Check if worktree is behind its sync target (used as SessionStart hook)
@@ -590,6 +604,7 @@ pub fn execute(args: &FactoryArgs, cli: &Cli, cas_root: Option<&std::path::Path>
                 supervisor_name,
                 worker_names,
                 worker_spec_jsons,
+                supervisor_spec_json,
             } => daemon::execute_daemon(
                 session,
                 cwd,
@@ -607,6 +622,7 @@ pub fn execute(args: &FactoryArgs, cli: &Cli, cas_root: Option<&std::path::Path>
                 supervisor_name.clone(),
                 worker_names.clone(),
                 worker_spec_jsons.clone(),
+                supervisor_spec_json.clone(),
             ),
             FactoryCommands::CheckStaleness { branch, fetch } => {
                 worktree_ops::execute_check_staleness(branch.as_deref(), *fetch)
@@ -911,11 +927,35 @@ pub fn execute(args: &FactoryArgs, cli: &Cli, cas_root: Option<&std::path::Path>
                 .reasoning_effort_for_role("worker")
                 .and_then(|s| s.parse().ok()),
             worker_spec_jsons: args.worker_spec.clone(),
+            supervisor_spec_json: None,
             user_config: None, // auto-resolve from home dir
             project_config: Some(cwd.join(".cas").join("config.toml")),
         };
         resolve_specs(args.workers as usize, sources).map_err(|e| {
             anyhow::anyhow!("Failed to resolve worker specs: {e}")
+        })?
+    };
+
+    // Resolve supervisor spec from the cascade (cas-1948): [factory.supervisor] TOML
+    // + --supervisor-cli/model/effort CLI flags + --supervisor-spec JSON override.
+    let resolved_supervisor_spec = {
+        let sources = ConfigSources {
+            cli_flag: if preflight.supervisor_cli != cas_mux::SupervisorCli::Claude {
+                Some(preflight.supervisor_cli)
+            } else {
+                None
+            },
+            model_flag: llm.model_for_role("supervisor").map(String::from),
+            effort_flag: llm
+                .reasoning_effort_for_role("supervisor")
+                .and_then(|s| s.parse().ok()),
+            worker_spec_jsons: vec![],
+            supervisor_spec_json: args.supervisor_spec.clone(),
+            user_config: None, // auto-resolve from home dir
+            project_config: Some(cwd.join(".cas").join("config.toml")),
+        };
+        resolve_supervisor_spec(sources).map_err(|e| {
+            anyhow::anyhow!("Failed to resolve supervisor spec: {e}")
         })?
     };
 
@@ -937,7 +977,7 @@ pub fn execute(args: &FactoryArgs, cli: &Cli, cas_root: Option<&std::path::Path>
         supervisor_effort: llm.reasoning_effort_for_role("supervisor").map(String::from),
         worker_effort: llm.reasoning_effort_for_role("worker").map(String::from),
         resolved_worker_specs,
-        resolved_supervisor_spec: None,
+        resolved_supervisor_spec: Some(resolved_supervisor_spec),
         enable_worktrees: preflight.enable_worktrees,
         worktree_root: args.worktree_root.clone(),
         notify: notify_config,
