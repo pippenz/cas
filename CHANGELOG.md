@@ -7,6 +7,28 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [2.24.0] - 2026-06-26
+
+Factory-reliability sprint (multi-worker EPIC). Director coordinator hardening,
+provider ergonomics, factory spec config, and cross-cutting sync/skill fixes.
+
+### Added (this sprint)
+- **Provider ergonomics — `cas claude` / `cas codex` shortcuts, `cas default <provider>`, and `--default` (cas-7f2c).** Detailed entries below.
+- **`--worker-spec` / `--supervisor-spec` JSON flags + `[[factory.workers]]` / `[factory.supervisor]` TOML cascade (cas-1948).** Per-worker and per-supervisor spec config for factory spawns.
+
+### Fixed (this sprint)
+- **Director coordinator no longer fabricates "completed" notices, mis-keys assignees by name, or idle-spams (cas-889d).** Root cause: the session filter compared display names against session-id-keyed assignees, dropping every in-progress task and firing false completion events each tick. Now gates completion on real task state, resolves session ids for nudges, and suppresses nudges for workers that already hold an active task.
+- **Supervisor/lead can never be nudged as an idle worker (cas-c790).** Two-layer guard in the event detector and the prompt generator.
+- **Epic + worker worktrees base off the configured trunk, not the supervisor's incidental HEAD (cas-dc28).** Warns and surfaces the chosen base SHA when HEAD diverges from trunk.
+- **Personal projects are no longer auto-promoted to team scope on push (cas-f8e3).** User-level team auto-pick now requires explicit opt-in; projects with no team link stay personal.
+- **cas-core sync emits the `disallowed-tools` block in `generate_skill_md` (cas-e2e2).** Skills with a tool blocklist no longer drop it when synced via cas-core.
+- **`filing-cas-bugs` + codex `code-review-queue` registered in BUILTIN_SKILLS (cas-61af).** `cas update` no longer silently skips syncing those referenced skill files.
+- **Role-based effort defaults removed from the spawn layer; Effort threaded through PtyConfig (cas-34f7f).**
+
+### Tests (this sprint)
+- **MCP server worktree → parent-repo `.cas/` resolution coverage (cas-9db0).**
+- **Non-feature-gated verification-jail regression tests — Agent-tool task-verifier bypass + factory-worker exemption (cas-c496).**
+
 ### Added
 
 - **`cas claude` / `cas codex` provider shortcuts (cas-7f2c).** Launch a
