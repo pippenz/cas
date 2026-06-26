@@ -188,13 +188,14 @@ impl PtyConfig {
         // Add --effort flag only when the installed claude CLI supports it (cas-6ee8).
         // Older CLI versions crash silently (non-zero exit, no useful error) when they
         // encounter an unrecognised flag. The probe runs once and caches the result.
-        // Supervisors need deeper reasoning; workers execute well-defined tasks.
-        // Config-provided effort takes precedence over role-based defaults.
+        // When effort is None, omit the flag entirely — defer to the CLI's own default.
+        // Role-based defaults (supervisor→xhigh, worker→high) belong in the cascade
+        // resolver (WorkerSpec / factory config), not here in the spawn layer (cas-34f7f).
         if claude_supports_effort_flag() {
-            let resolved_effort =
-                effort.unwrap_or(if role == "supervisor" { "xhigh" } else { "high" });
-            args.push("--effort".to_string());
-            args.push(resolved_effort.to_string());
+            if let Some(e) = effort {
+                args.push("--effort".to_string());
+                args.push(e.to_string());
+            }
         } else {
             tracing::warn!(
                 "Skipping --effort flag: installed claude CLI does not support it \
@@ -1683,56 +1684,109 @@ mod tests {
         );
     }
 
+    /// cas-34f7f: when effort=None, --effort must be OMITTED (supervisor).
+    /// Role-based defaults belong in the cascade resolver, not pty.rs.
     #[tokio::test]
-    async fn test_pty_config_claude_supervisor_default_effort() {
-        // When effort is None and role is supervisor, must default to "xhigh".
-        // Hold ENV_LOCK and force effort-supported=1 (cas-6ee8 guard).
+    async fn test_pty_config_claude_supervisor_no_effort_omits_flag() {
         let _e = ScopedEnv::new();
-        // SAFETY: ENV_LOCK held by ScopedEnv.
         unsafe { std::env::set_var("CAS_FACTORY_EFFORT_SUPPORTED", "1"); }
         let config = PtyConfig::claude(
             "sup",
             "supervisor",
             PathBuf::from("/tmp"),
-            None,
-            None,
-            None,
+            None, None, None,
             None,  // model
-            None,  // no effort — should fall back to "xhigh"
-            None,  // teams
+            None,  // no effort — must NOT default to "xhigh" anymore
+            None,
         );
-        let effort_idx = config
-            .args
-            .iter()
-            .position(|a| a == "--effort")
-            .expect("--effort must be present");
-        assert_eq!(config.args[effort_idx + 1], "xhigh");
+        assert!(
+            !config.args.contains(&"--effort".to_string()),
+            "None effort must omit --effort entirely (cas-34f7f); got: {:?}",
+            config.args
+        );
     }
 
+    /// cas-34f7f: when effort=None, --effort must be OMITTED (worker).
     #[tokio::test]
-    async fn test_pty_config_claude_worker_default_effort() {
-        // When effort is None and role is worker, must default to "high".
-        // Hold ENV_LOCK and force effort-supported=1 (cas-6ee8 guard).
+    async fn test_pty_config_claude_worker_no_effort_omits_flag() {
         let _e = ScopedEnv::new();
-        // SAFETY: ENV_LOCK held by ScopedEnv.
         unsafe { std::env::set_var("CAS_FACTORY_EFFORT_SUPPORTED", "1"); }
         let config = PtyConfig::claude(
             "wrk",
             "worker",
             PathBuf::from("/tmp"),
-            None,
-            None,
-            None,
+            None, None, None,
             None,  // model
-            None,  // no effort — should fall back to "high"
-            None,  // teams
+            None,  // no effort — must NOT default to "high" anymore
+            None,
         );
-        let effort_idx = config
+        assert!(
+            !config.args.contains(&"--effort".to_string()),
+            "None effort must omit --effort entirely (cas-34f7f); got: {:?}",
+            config.args
+        );
+    }
+
+    /// cas-34f7f: explicit effort is passed through verbatim for Claude.
+    #[tokio::test]
+    async fn test_pty_config_claude_worker_with_explicit_effort() {
+        let _e = ScopedEnv::new();
+        unsafe { std::env::set_var("CAS_FACTORY_EFFORT_SUPPORTED", "1"); }
+        let config = PtyConfig::claude(
+            "wrk",
+            "worker",
+            PathBuf::from("/tmp"),
+            None, None, None,
+            None,
+            Some("medium"),
+            None,
+        );
+        let idx = config
             .args
             .iter()
             .position(|a| a == "--effort")
-            .expect("--effort must be present");
-        assert_eq!(config.args[effort_idx + 1], "high");
+            .expect("--effort must be present when Some(effort) is given");
+        assert_eq!(config.args[idx + 1], "medium");
+    }
+
+    /// cas-34f7f: Codex worker with explicit effort → --config model_reasoning_effort=<v>.
+    #[tokio::test]
+    async fn test_pty_config_codex_worker_with_effort_high() {
+        let _e = ScopedEnv::new();
+        let config = PtyConfig::codex(
+            "wrk",
+            "worker",
+            PathBuf::from("/tmp"),
+            None, None, None,
+            None,
+            Some("high"),
+            None,
+        );
+        let all_args = config.args.join(" ");
+        assert!(
+            all_args.contains("model_reasoning_effort=high"),
+            "Codex worker must emit model_reasoning_effort=high; got: {all_args}"
+        );
+    }
+
+    /// cas-34f7f: Codex worker with None effort → no model_reasoning_effort arg.
+    #[tokio::test]
+    async fn test_pty_config_codex_worker_with_no_effort() {
+        let _e = ScopedEnv::new();
+        let config = PtyConfig::codex(
+            "wrk",
+            "worker",
+            PathBuf::from("/tmp"),
+            None, None, None,
+            None,
+            None,  // no effort
+            None,
+        );
+        let all_args = config.args.join(" ");
+        assert!(
+            !all_args.contains("model_reasoning_effort"),
+            "Codex worker with None effort must omit model_reasoning_effort; got: {all_args}"
+        );
     }
 
     // ── cas-6ee8: --effort version guard tests ────────────────────────────
