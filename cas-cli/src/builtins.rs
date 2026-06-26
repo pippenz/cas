@@ -186,6 +186,12 @@ pub const BUILTIN_SKILLS: &[BuiltinFile] = &[
         ),
     },
     BuiltinFile {
+        path: "skills/cas-supervisor/references/filing-cas-bugs.md",
+        content: include_str!(
+            "builtins/skills/cas-supervisor/references/filing-cas-bugs.md"
+        ),
+    },
+    BuiltinFile {
         path: "skills/cas-supervisor-checklist/SKILL.md",
         content: include_str!("builtins/skills/cas-supervisor-checklist.md"),
     },
@@ -421,6 +427,18 @@ pub const CODEX_BUILTIN_SKILLS: &[BuiltinFile] = &[
     BuiltinFile {
         path: "skills/cas-supervisor/references/reference.md",
         content: include_str!("builtins/codex/skills/cas-supervisor/references/reference.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-supervisor/references/code-review-queue.md",
+        content: include_str!(
+            "builtins/codex/skills/cas-supervisor/references/code-review-queue.md"
+        ),
+    },
+    BuiltinFile {
+        path: "skills/cas-supervisor/references/filing-cas-bugs.md",
+        content: include_str!(
+            "builtins/codex/skills/cas-supervisor/references/filing-cas-bugs.md"
+        ),
     },
     BuiltinFile {
         path: "skills/cas-codex-supervisor-checklist/SKILL.md",

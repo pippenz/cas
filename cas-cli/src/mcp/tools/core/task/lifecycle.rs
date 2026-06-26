@@ -169,7 +169,12 @@ impl CasCore {
                     GitOperations::detect_repo_root(project_root).map(GitOperations::new)
                 {
                     let branch_name = format!("epic/{}-{}", slugify_for_branch(&task.title), id);
-                    match git_ops.create_branch_if_not_exists(&branch_name) {
+                    // Base epic branches on the configured trunk, never on
+                    // the caller's incidental HEAD (cas-dc28).
+                    let trunk = git_ops.detect_default_branch();
+                    let trunk_sha = git_ops.ref_sha(&trunk).unwrap_or_default();
+                    let sha_preview = &trunk_sha[..trunk_sha.len().min(8)];
+                    match git_ops.create_branch_from(&branch_name, &trunk) {
                         Ok(created) => {
                             // Update epic with branch info (no worktree)
                             let task_store = self.open_task_store()?;
@@ -196,7 +201,7 @@ impl CasCore {
                             }
 
                             Some(format!(
-                                "\n\n🌿 Epic branch created: {branch_name}\n   Workers will branch from this when spawned."
+                                "\n\n🌿 Epic branch created: {branch_name}\n   Base: '{trunk}' @ {sha_preview}. Workers will branch from this when spawned."
                             ))
                         }
                         Err(e) => {

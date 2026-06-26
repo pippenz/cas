@@ -2,14 +2,19 @@ use crate::worktree::git::GitError;
 use crate::worktree::manager::{WorktreeError, WorktreeManager, WorktreeResult, slugify_title};
 
 impl WorktreeManager {
-    /// Create an epic branch from current HEAD
+    /// Create an epic branch from the configured trunk (not the current HEAD)
     pub fn create_epic_branch(&self, epic_title: &str) -> WorktreeResult<String> {
         let slug = slugify_title(epic_title);
         let branch_name = format!("epic/{slug}");
+        let trunk = self.git.detect_default_branch();
 
-        let newly_created = match self.git.create_branch_if_not_exists(&branch_name) {
+        let newly_created = match self.git.create_branch_from(&branch_name, &trunk) {
             Ok(true) => {
-                tracing::info!("Created epic branch: {}", branch_name);
+                tracing::info!(
+                    "Created epic branch {} from trunk '{}'",
+                    branch_name,
+                    trunk
+                );
                 true
             }
             Ok(false) => {

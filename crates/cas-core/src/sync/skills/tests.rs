@@ -212,6 +212,32 @@ fn test_sync_skill_with_allowed_tools() {
     assert!(content.contains("  - Glob"));
 }
 
+/// Regression test for cas-e2e2: cas-core sync path was silently dropping
+/// `disallowed_tools` — the field existed in the Skill type and was emitted
+/// by the cas-cli path (cas-5be8) but was never emitted by cas-core's
+/// `generate_skill_md`.  A skill with disallowed_tools synced through
+/// cas-core would produce a SKILL.md without `disallowed-tools:`, causing
+/// the Claude Code harness to ignore the tool restriction entirely.
+#[test]
+fn test_sync_skill_with_disallowed_tools() {
+    let temp = TempDir::new().unwrap();
+    let target = temp.path().join(".claude/skills");
+    let syncer = SkillSyncer::new(target.clone());
+
+    let mut skill = create_test_skill("restricted-skill", true);
+    skill.disallowed_tools = vec!["Write".to_string(), "Edit".to_string()];
+
+    syncer.sync_skill(&skill).unwrap();
+
+    let content = fs::read_to_string(target.join("cas-restricted-skill/SKILL.md")).unwrap();
+    assert!(
+        content.contains("disallowed-tools:"),
+        "SKILL.md must emit disallowed-tools frontmatter — content:\n{content}"
+    );
+    assert!(content.contains("  - Write"), "Must list Write");
+    assert!(content.contains("  - Edit"), "Must list Edit");
+}
+
 #[test]
 fn test_sync_skill_with_all_frontmatter_fields() {
     let temp = TempDir::new().unwrap();

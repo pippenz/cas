@@ -5,7 +5,7 @@ use crate::ui::factory::{
     daemon_log_path, daemonize, fork_first_daemon, run_boot_screen_client,
 };
 use anyhow::{Result, bail};
-use cas_factory::spec_resolver::{ConfigSources, resolve_specs};
+use cas_factory::spec_resolver::{ConfigSources, resolve_specs, resolve_supervisor_spec};
 use std::time::Duration;
 
 #[allow(clippy::too_many_arguments)]
@@ -26,6 +26,7 @@ pub(super) fn execute_daemon(
     supervisor_name: Option<String>,
     worker_names: Vec<String>,
     worker_spec_jsons: Vec<String>,
+    supervisor_spec_json: Option<String>,
 ) -> Result<()> {
     let cas_root = find_cas_root()?;
     let cas_config = Config::load(&cas_root).unwrap_or_default();
@@ -81,11 +82,34 @@ pub(super) fn execute_daemon(
                 .reasoning_effort_for_role("worker")
                 .and_then(|s| s.parse().ok()),
             worker_spec_jsons,
+            supervisor_spec_json: None,
             user_config: None, // auto-resolve from home dir
             project_config: Some(cwd.join(".cas").join("config.toml")),
         };
         resolve_specs(effective_workers, sources).map_err(|e| {
             anyhow::anyhow!("Failed to resolve worker specs: {e}")
+        })?
+    };
+
+    // Resolve supervisor spec from the cascade (cas-1948).
+    let resolved_supervisor_spec = {
+        let sources = ConfigSources {
+            cli_flag: if supervisor_cli != cas_mux::SupervisorCli::Claude {
+                Some(supervisor_cli)
+            } else {
+                None
+            },
+            model_flag: llm.model_for_role("supervisor").map(String::from),
+            effort_flag: llm
+                .reasoning_effort_for_role("supervisor")
+                .and_then(|s| s.parse().ok()),
+            worker_spec_jsons: vec![],
+            supervisor_spec_json,
+            user_config: None, // auto-resolve from home dir
+            project_config: Some(cwd.join(".cas").join("config.toml")),
+        };
+        resolve_supervisor_spec(sources).map_err(|e| {
+            anyhow::anyhow!("Failed to resolve supervisor spec: {e}")
         })?
     };
 
@@ -114,7 +138,7 @@ pub(super) fn execute_daemon(
         supervisor_effort: llm.reasoning_effort_for_role("supervisor").map(String::from),
         worker_effort: llm.reasoning_effort_for_role("worker").map(String::from),
         resolved_worker_specs,
-        resolved_supervisor_spec: None,
+        resolved_supervisor_spec: Some(resolved_supervisor_spec),
         enable_worktrees: !no_worktrees,
         worktree_root,
         notify: NotifyConfig {

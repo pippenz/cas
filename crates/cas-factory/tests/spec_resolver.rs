@@ -5,7 +5,7 @@
 
 use std::io::Write as _;
 
-use cas_factory::{ConfigSources, resolve_specs};
+use cas_factory::{ConfigSources, resolve_specs, resolve_supervisor_spec};
 use cas_mux::{Effort, SupervisorCli, WorkerSpec};
 use tempfile::NamedTempFile;
 
@@ -613,4 +613,152 @@ fn all_effort_variants_roundtrip_through_toml() {
             "effort {toml_val:?} failed to round-trip"
         );
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// resolve_supervisor_spec — cas-1948
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn supervisor_spec_defaults_to_claude_high() {
+    let spec = resolve_supervisor_spec(ConfigSources {
+        user_config: Some(nonexistent_path()),
+        project_config: None,
+        ..Default::default()
+    })
+    .unwrap();
+
+    assert_eq!(spec.cli, SupervisorCli::Claude);
+    assert_eq!(spec.model, None);
+    assert_eq!(spec.effort, Some(Effort::High));
+}
+
+#[test]
+fn supervisor_spec_factory_supervisor_toml_overrides_defaults() {
+    // [factory.defaults] sets codex/low; [factory.supervisor] overrides to claude/xhigh.
+    let project = toml_file(
+        r#"
+[factory.defaults]
+cli = "codex"
+effort = "low"
+
+[factory.supervisor]
+cli = "claude"
+effort = "xhigh"
+"#,
+    );
+
+    let spec = resolve_supervisor_spec(ConfigSources {
+        user_config: Some(nonexistent_path()),
+        project_config: Some(project.path().to_path_buf()),
+        ..Default::default()
+    })
+    .unwrap();
+
+    assert_eq!(spec.cli, SupervisorCli::Claude, "[factory.supervisor] cli should win");
+    assert_eq!(spec.effort, Some(Effort::XHigh), "[factory.supervisor] effort should win");
+}
+
+#[test]
+fn supervisor_spec_factory_supervisor_toml_model_override() {
+    let project = toml_file(
+        r#"
+[factory.supervisor]
+model = "claude-opus-4-7"
+"#,
+    );
+
+    let spec = resolve_supervisor_spec(ConfigSources {
+        user_config: Some(nonexistent_path()),
+        project_config: Some(project.path().to_path_buf()),
+        ..Default::default()
+    })
+    .unwrap();
+
+    assert_eq!(spec.model.as_deref(), Some("claude-opus-4-7"));
+}
+
+#[test]
+fn supervisor_spec_cli_flag_overrides_toml_supervisor() {
+    let project = toml_file(
+        r#"
+[factory.supervisor]
+cli = "codex"
+effort = "minimal"
+"#,
+    );
+
+    let spec = resolve_supervisor_spec(ConfigSources {
+        user_config: Some(nonexistent_path()),
+        project_config: Some(project.path().to_path_buf()),
+        // CLI flag (--supervisor-cli claude) overrides [factory.supervisor]
+        cli_flag: Some(SupervisorCli::Claude),
+        ..Default::default()
+    })
+    .unwrap();
+
+    assert_eq!(spec.cli, SupervisorCli::Claude, "CLI flag must override [factory.supervisor]");
+    // effort from toml is preserved (cli_flag doesn't affect effort)
+    assert_eq!(spec.effort, Some(Effort::Minimal));
+}
+
+#[test]
+fn supervisor_spec_json_override_wins_over_all_layers() {
+    let project = toml_file(
+        r#"
+[factory.supervisor]
+cli = "codex"
+model = "gpt-5.5"
+effort = "minimal"
+"#,
+    );
+
+    let spec = resolve_supervisor_spec(ConfigSources {
+        user_config: Some(nonexistent_path()),
+        project_config: Some(project.path().to_path_buf()),
+        cli_flag: Some(SupervisorCli::Codex),
+        // --supervisor-spec JSON is layer 6 (wins over everything)
+        supervisor_spec_json: Some(r#"{"cli":"claude","effort":"xhigh"}"#.to_string()),
+        ..Default::default()
+    })
+    .unwrap();
+
+    assert_eq!(spec.cli, SupervisorCli::Claude, "--supervisor-spec JSON should win");
+    assert_eq!(spec.effort, Some(Effort::XHigh), "--supervisor-spec JSON should win");
+    // model not in JSON → falls through from [factory.supervisor]
+    assert_eq!(spec.model.as_deref(), Some("gpt-5.5"));
+}
+
+#[test]
+fn supervisor_spec_invalid_json_returns_error() {
+    let result = resolve_supervisor_spec(ConfigSources {
+        user_config: Some(nonexistent_path()),
+        supervisor_spec_json: Some("not-json".to_string()),
+        ..Default::default()
+    });
+
+    assert!(result.is_err(), "invalid JSON should produce an error");
+}
+
+#[test]
+fn supervisor_spec_factory_workers_toml_does_not_affect_supervisor() {
+    // [[factory.workers]] must not bleed into the supervisor spec.
+    let project = toml_file(
+        r#"
+[[factory.workers]]
+cli = "codex"
+effort = "minimal"
+"#,
+    );
+
+    let spec = resolve_supervisor_spec(ConfigSources {
+        user_config: Some(nonexistent_path()),
+        project_config: Some(project.path().to_path_buf()),
+        ..Default::default()
+    })
+    .unwrap();
+
+    // Supervisor should see builtin defaults, NOT the worker TOML.
+    assert_eq!(spec.cli, SupervisorCli::Claude, "[[factory.workers]] must not affect supervisor");
+    assert_eq!(spec.effort, Some(Effort::High), "[[factory.workers]] must not affect supervisor");
 }

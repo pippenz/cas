@@ -79,10 +79,11 @@ fn factory_pane_configs_worker_effort_reaches_pty_args() {
     );
 }
 
+/// cas-34f7f: when MuxConfig effort fields are None, --effort must be OMITTED
+/// from PtyConfig args entirely.  Role-based defaults (xhigh/high) now live in
+/// the cascade resolver layer, not in pty.rs spawn functions.
 #[test]
-fn factory_pane_configs_none_effort_uses_role_defaults() {
-    // When MuxConfig effort fields are None, PtyConfig::claude defaults fire:
-    // supervisor → "xhigh", worker → "high"
+fn factory_pane_configs_none_effort_omits_effort_flag() {
     let config = MuxConfig {
         cwd: PathBuf::from("/tmp/test"),
         workers: 1,
@@ -99,36 +100,20 @@ fn factory_pane_configs_none_effort_uses_role_defaults() {
         .iter()
         .find(|(name, _)| name == &config.supervisor_name)
         .expect("supervisor config must be present");
-    let sup_effort_idx = sup_config
-        .args
-        .iter()
-        .position(|a| a == "--effort")
-        .expect("supervisor PTY args must contain --effort");
-    let sup_effort_val = sup_config
-        .args
-        .get(sup_effort_idx + 1)
-        .expect("--effort must be followed by a value in supervisor PTY args");
-    assert_eq!(
-        sup_effort_val, "xhigh",
-        "supervisor with no effort override must default to xhigh"
+    assert!(
+        !sup_config.args.contains(&"--effort".to_string()),
+        "supervisor with None effort must omit --effort (cas-34f7f); got: {:?}",
+        sup_config.args
     );
 
     let (_, worker_config) = configs
         .iter()
         .find(|(name, _)| name == "worker-1")
         .expect("worker-1 config must be present");
-    let worker_effort_idx = worker_config
-        .args
-        .iter()
-        .position(|a| a == "--effort")
-        .expect("worker PTY args must contain --effort");
-    let worker_effort_val = worker_config
-        .args
-        .get(worker_effort_idx + 1)
-        .expect("--effort must be followed by a value in worker PTY args");
-    assert_eq!(
-        worker_effort_val, "high",
-        "worker with no effort override must default to high"
+    assert!(
+        !worker_config.args.contains(&"--effort".to_string()),
+        "worker with None effort must omit --effort (cas-34f7f); got: {:?}",
+        worker_config.args
     );
 }
 

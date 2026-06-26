@@ -76,12 +76,23 @@ struct FactoryWorkerToml {
     effort: Option<String>,
 }
 
+/// `[factory.supervisor]` table — all fields optional.
+///
+/// Overrides `[factory.defaults]` for the supervisor agent only.
+#[derive(Debug, Default, Deserialize)]
+struct FactorySupervisorToml {
+    cli: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
+}
+
 /// `[factory]` table.
 #[derive(Debug, Default, Deserialize)]
 struct FactoryToml {
     defaults: Option<FactoryDefaultsToml>,
     #[serde(default)]
     workers: Vec<FactoryWorkerToml>,
+    supervisor: Option<FactorySupervisorToml>,
 }
 
 /// Minimal wrapper so we can ignore non-`factory` sections.
@@ -139,6 +150,12 @@ pub struct ConfigSources {
     /// Each string must deserialise as a JSON object with optional fields
     /// `name`, `cli`, `model`, `effort`.
     pub worker_spec_jsons: Vec<String>,
+
+    /// Raw JSON string from a single `--supervisor-spec` flag.
+    ///
+    /// Applied as layer 6 of the supervisor cascade (overrides everything else).
+    /// Ignored by `resolve_specs`; consumed only by `resolve_supervisor_spec`.
+    pub supervisor_spec_json: Option<String>,
 }
 
 /// Resolve `workers` [`WorkerSpec`] slots from the layered config sources.
@@ -174,7 +191,7 @@ pub fn resolve_specs(
         .or_else(|| dirs::home_dir().map(|h| h.join(".cas").join("config.toml")));
 
     if let Some(ref path) = user_path {
-        if let Some((defaults, _per_worker)) = load_config_file(path)? {
+        if let Some((defaults, _per_worker, _supervisor)) = load_config_file(path)? {
             if let Some(d) = defaults {
                 apply_defaults_to_all(&mut specs, &d)?;
             }
@@ -183,7 +200,7 @@ pub fn resolve_specs(
 
     // ── Layer 3 + 4: project config (.cas/config.toml) ───────────────────
     if let Some(ref path) = sources.project_config {
-        if let Some((defaults, per_worker)) = load_config_file(path)? {
+        if let Some((defaults, per_worker, _supervisor)) = load_config_file(path)? {
             // 3. [factory.defaults]
             if let Some(d) = defaults {
                 apply_defaults_to_all(&mut specs, &d)?;
@@ -249,20 +266,92 @@ pub fn resolve_specs(
     Ok(specs)
 }
 
+/// Resolve a single [`WorkerSpec`] for the supervisor agent.
+///
+/// Uses the same 6-layer cascade as [`resolve_specs`], but reads
+/// `[factory.supervisor]` from the project config (layer 4) instead of
+/// `[[factory.workers]]`, and accepts a single `--supervisor-spec` JSON
+/// override (layer 6) via `sources.supervisor_spec_json`.
+///
+/// # Errors
+///
+/// Same error kinds as [`resolve_specs`].
+pub fn resolve_supervisor_spec(sources: ConfigSources) -> Result<WorkerSpec, SpecResolverError> {
+    // ── Layer 1: built-in defaults ────────────────────────────────────────
+    let mut spec = WorkerSpec::builtin_default();
+
+    // ── Layer 2: user config (~/.cas/config.toml [factory.defaults]) ──────
+    let user_path = sources
+        .user_config
+        .clone()
+        .or_else(|| dirs::home_dir().map(|h| h.join(".cas").join("config.toml")));
+
+    if let Some(ref path) = user_path {
+        if let Some((defaults, _per_worker, _supervisor)) = load_config_file(path)? {
+            if let Some(d) = defaults {
+                apply_defaults_to_all(std::slice::from_mut(&mut spec), &d)?;
+            }
+        }
+    }
+
+    // ── Layer 3 + 4: project config (.cas/config.toml) ───────────────────
+    if let Some(ref path) = sources.project_config {
+        if let Some((defaults, _per_worker, supervisor)) = load_config_file(path)? {
+            // 3. [factory.defaults]
+            if let Some(d) = defaults {
+                apply_defaults_to_all(std::slice::from_mut(&mut spec), &d)?;
+            }
+            // 4. [factory.supervisor] — supervisor-specific overrides
+            if let Some(s) = supervisor {
+                apply_supervisor_toml(&mut spec, &s)?;
+            }
+        }
+    }
+
+    // ── Layer 5: CLI flags ────────────────────────────────────────────────
+    if let Some(cli) = sources.cli_flag {
+        spec.cli = cli;
+    }
+    if let Some(ref model) = sources.model_flag {
+        spec.model = Some(model.clone());
+    }
+    if let Some(effort) = sources.effort_flag {
+        spec.effort = Some(effort);
+    }
+
+    // ── Layer 6: --supervisor-spec JSON override ──────────────────────────
+    if let Some(ref json_str) = sources.supervisor_spec_json {
+        let parsed: WorkerSpecJson =
+            serde_json::from_str(json_str).map_err(|e| {
+                SpecResolverError::InvalidWorkerSpec(e.to_string())
+            })?;
+        apply_json_spec(&mut spec, &parsed)?;
+    }
+
+    Ok(spec)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Private helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Read and parse a TOML config file.
 ///
-/// Returns `Some((defaults_section, per_worker_entries))` when the file exists
-/// and parses successfully, or `None` when the file does not exist.
+/// Returns `Some((defaults_section, per_worker_entries, supervisor_section))` when
+/// the file exists and parses successfully, or `None` when the file does not exist.
 ///
 /// Avoids the TOCTOU race of `path.exists()` + `read_to_string` by attempting
 /// the read directly and treating `NotFound` as an absent file.
 fn load_config_file(
     path: &std::path::Path,
-) -> Result<Option<(Option<FactoryDefaultsToml>, Vec<FactoryWorkerToml>)>, SpecResolverError> {
+) -> Result<
+    Option<(
+        Option<FactoryDefaultsToml>,
+        Vec<FactoryWorkerToml>,
+        Option<FactorySupervisorToml>,
+    )>,
+    SpecResolverError,
+> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -279,7 +368,7 @@ fn load_config_file(
             source: e,
         })?;
     let factory = config.factory.unwrap_or_default();
-    Ok(Some((factory.defaults, factory.workers)))
+    Ok(Some((factory.defaults, factory.workers, factory.supervisor)))
 }
 
 /// Apply a `[factory.defaults]` section to every spec in the vec.
@@ -316,6 +405,23 @@ fn apply_worker_toml(
         spec.model = Some(m.clone());
     }
     if let Some(ref s) = wt.effort {
+        spec.effort = Some(parse_effort(s)?);
+    }
+    Ok(())
+}
+
+/// Apply a `[factory.supervisor]` TOML entry to the supervisor spec.
+fn apply_supervisor_toml(
+    spec: &mut WorkerSpec,
+    st: &FactorySupervisorToml,
+) -> Result<(), SpecResolverError> {
+    if let Some(ref s) = st.cli {
+        spec.cli = parse_cli(s)?;
+    }
+    if let Some(ref m) = st.model {
+        spec.model = Some(m.clone());
+    }
+    if let Some(ref s) = st.effort {
         spec.effort = Some(parse_effort(s)?);
     }
     Ok(())
