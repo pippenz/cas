@@ -2,9 +2,9 @@
 
 ## Close hit VERIFICATION_JAIL_BLOCKED
 
-1. **Forward ONCE** to supervisor via `mcp__cas__coordination action=message` — include task ID, brief summary of completion state, and exact error text.
+1. **Forward ONCE** to supervisor via `mcp__cs__coordination action=message` — include task ID, brief summary of completion state, and exact error text. As a Codex worker you use the `mcp__cs__` alias for every CAS tool; the VERIFICATION_JAIL_BLOCKED error text includes a pre-filled suggested message with the correct alias for your harness — copy and send that message directly.
 2. **Do not re-report.** The supervisor will verify and close asynchronously. Re-sending the same message does not speed this up.
-3. **Re-poll the task DB, not your message queue.** Every 60 seconds (or when you otherwise become idle), check `mcp__cas__task action=show id=<your-task-id>`. If `Status: Closed`, treat it as closed regardless of what your message queue shows — **trust the DB over messages** (CAS has known message-queue drift on supervisor → worker channel B; see architecture_coordination_pipeline.md).
+3. **Re-poll the task DB, not your message queue.** Every 60 seconds (or when you otherwise become idle), check `mcp__cs__task action=show id=<your-task-id>`. If `Status: Closed`, treat it as closed regardless of what your message queue shows — **trust the DB over messages** (CAS has known message-queue drift on supervisor → worker channel B; see architecture_coordination_pipeline.md).
 4. **If still InProgress after 5 minutes of idle**, send ONE follow-up to the supervisor with note_type=blocker. Then continue to re-poll DB only.
 5. **Never spam idle notifications as a substitute for work.** If you are idle waiting on verification, stay silent until (a) the DB shows closed and you proceed to the next task, or (b) 5 minutes have elapsed and you send the one follow-up.
 
@@ -13,7 +13,7 @@
 If **every** MCP tool call fails with a jail/blocked error (not just `close`), this is different from VERIFICATION_JAIL_BLOCKED above. This indicates a CAS build issue — the running binary likely predates the factory-mode jail exemption fix.
 
 1. **Do NOT attempt workarounds** — no sqlite edits, no env var hacks, no retries.
-2. **Report to supervisor immediately** via `mcp__cas__coordination action=message` with the exact error message and your agent name.
+2. **Report to supervisor immediately** via `mcp__cs__coordination action=message` with the exact error message and your agent name.
 3. **Supervisor will rebuild CAS and respawn you.** This is not something you can fix from inside your session.
 
 ## Context Exhaustion
@@ -60,7 +60,7 @@ Only report to supervisor after completing at least steps 1–2. Include the err
 
 ## MCP Connectivity Failure
 
-If `mcp__cas__*` tools stop responding or return connection errors:
+If `mcp__cs__*` tools stop responding or return connection errors:
 
 1. **Check the symlink**: Worktrees get MCP config via symlink, not a copy.
    ```bash
@@ -75,24 +75,24 @@ If `mcp__cas__*` tools stop responding or return connection errors:
 
 3. **Do NOT attempt sqlite surgery.** Direct database edits from a worker session risk corrupting shared state.
 
-4. **Report to supervisor** via `mcp__cas__coordination action=message` with the error and diagnostic output. Supervisor will fix the MCP connection or respawn you.
+4. **Report to supervisor** via `mcp__cs__coordination action=message` with the error and diagnostic output. Supervisor will fix the MCP connection or respawn you.
 
 ## Zero CAS Tools Available
 
-(no `mcp__cas__*` tools surfaced at all — not one call errors, they simply do not exist in your tool set)
+(no `mcp__cs__*` tools surfaced at all — not one call errors, they simply do not exist in your tool set)
 
-This is different from connectivity failure above. Here the MCP handshake completed against *something*, but `cas serve` either crashed during startup or silently degraded before registering its tools. Symptom: `ToolSearch select:mcp__cas__task` returns `"No matching deferred tools found"` even though other MCP servers (e.g. Gmail, Calendar) are present.
+This is different from connectivity failure above. Here the MCP handshake completed against *something*, but `cas serve` either crashed during startup or silently degraded before registering its tools. Symptom: `ToolSearch select:mcp__cs__task` returns `"No matching deferred tools found"` even though other MCP servers (e.g. Gmail, Calendar) are present.
 
 **Do not** fall back to running `cas task` as a shell subcommand — it does not exist. **Do not** run `cas init` from inside the worktree (creates a duplicate `.cas/`). **Do not** kill/restart `cas serve` yourself.
 
 Report to supervisor immediately with:
 ```
-mcp__cas__coordination action=message target=supervisor \
+mcp__cs__coordination action=message target=supervisor \
   summary="zero cas tools available" \
-  message="<your-name>: no mcp__cas__* tools in tool set. Need respawn."
+  message="<your-name>: no mcp__cs__* tools in tool set. Need respawn."
 ```
 
-If even `mcp__cas__coordination` is missing (so you cannot send that message), you are fully detached. Output a short plain-text report and stop — the supervisor polls your session and will detect the stall. Do not spin attempting workarounds.
+If even `mcp__cs__coordination` is missing (so you cannot send that message), you are fully detached. Output a short plain-text report and stop — the supervisor polls your session and will detect the stall. Do not spin attempting workarounds.
 
 ## Known-fixed CAS bug reappears
 
@@ -102,7 +102,7 @@ If a bug that was supposedly fixed in the source code still manifests, the runni
 
 If the supervisor hasn't responded after 5 minutes on any blocking question:
 1. Re-read task state with `action=show` — supervisor may have acted without messaging back.
-2. Send ONE follow-up via `mcp__cas__coordination action=message`.
+2. Send ONE follow-up via `mcp__cs__coordination action=message`.
 3. If still no response after another 5 minutes, focus on any non-blocked work or pause. Do not spam.
 
 ## Task Reassigned While Working
@@ -112,11 +112,11 @@ If the supervisor reassigns your current task to another worker:
 1. **Commit or stash WIP immediately** — do not lose work in progress.
 2. **Post progress notes** summarizing what's done and what's left:
    ```
-   mcp__cas__task action=notes id=<task-id> notes="WIP: <what's done>, remaining: <what's left>" note_type=progress
+   mcp__cs__task action=notes id=<task-id> notes="WIP: <what's done>, remaining: <what's left>" note_type=progress
    ```
 3. **Message supervisor** with the commit SHA of your WIP so the new assignee can pick it up.
-4. **Stop work on that task immediately** — do not finish "just one more thing." Move to your next assigned task or check `mcp__cas__task action=mine`.
+4. **Stop work on that task immediately** — do not finish "just one more thing." Move to your next assigned task or check `mcp__cs__task action=mine`.
 
 ## Outbox replay
 
-Your outbox may replay stale messages after task state changes (delivery-layer artifact). Before re-sending a blocker or completion notification, re-check task state with `mcp__cas__task action=show` — the issue may already be resolved.
+Your outbox may replay stale messages after task state changes (delivery-layer artifact). Before re-sending a blocker or completion notification, re-check task state with `mcp__cs__task action=show` — the issue may already be resolved.
