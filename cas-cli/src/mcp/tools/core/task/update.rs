@@ -123,10 +123,13 @@ impl CasCore {
                 if let Ok(agent_store) = self.open_agent_store() {
                     if let Ok(agents) = agent_store.list(None) {
                         // Find by name first (canonical path).
-                        let by_name = agents.iter().find(|a| a.name == *assignee);
+                        // cas-dbbb P2: use case-insensitive compare to match
+                        // `task mine`'s own identity matching logic.
+                        let by_name =
+                            agents.iter().find(|a| a.name.eq_ignore_ascii_case(assignee));
                         // Fall back to ID lookup (supervisor may have copy-pasted session UUID).
                         let by_id = if by_name.is_none() {
-                            agents.iter().find(|a| a.id == *assignee)
+                            agents.iter().find(|a| a.id.eq_ignore_ascii_case(assignee))
                         } else {
                             None
                         };
@@ -180,7 +183,43 @@ impl CasCore {
                                  `task mine` can find this task. \
                                  Use '{worker_name}' directly to avoid this warning."
                             ));
-                            canonical_assignee = worker_name;
+                            canonical_assignee = worker_name.clone();
+                            // cas-dbbb P1: run the same staleness check as the by_name
+                            // branch. The original code skipped this after normalization,
+                            // leaving stale-worktree blocking disabled for UUID assignees.
+                            if factory_config.warn_stale_assignment
+                                || factory_config.block_stale_assignment
+                            {
+                                if let Some(clone_path) = worker.metadata.get("clone_path") {
+                                    if let Some((behind_count, branch)) =
+                                        check_worktree_staleness(clone_path)
+                                    {
+                                        if behind_count > 0 {
+                                            let staleness_msg = format!(
+                                                "⚠️ Worker '{worker_name}' is {behind_count} \
+                                                 commit(s) behind {branch}. Consider syncing first."
+                                            );
+                                            if factory_config.block_stale_assignment
+                                                && behind_count
+                                                    >= factory_config.stale_threshold_commits
+                                            {
+                                                return Err(McpError {
+                                                    code: ErrorCode::INVALID_PARAMS,
+                                                    message: Cow::from(format!(
+                                                        "Cannot assign to worker '{worker_name}': \
+                                                         {behind_count} commits behind {branch} \
+                                                         (threshold: {}). Ask the worker to rebase: \
+                                                         `git rebase {branch}`",
+                                                        factory_config.stale_threshold_commits,
+                                                    )),
+                                                    data: None,
+                                                });
+                                            }
+                                            warnings.push(staleness_msg);
+                                        }
+                                    }
+                                }
+                            }
                         } else {
                             // No agent found by name or ID — warn but allow (agent
                             // may not yet be registered, e.g. spawning in progress).

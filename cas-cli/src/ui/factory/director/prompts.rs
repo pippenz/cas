@@ -210,12 +210,22 @@ pub fn generate_prompt(
             // and the worker calling `task start` (status becomes InProgress) — the
             // director would incorrectly re-fire WorkerIdle during that gap.
             //
+            // Blocked tasks are EXCLUDED: `ready_tasks` contains both Open and Blocked
+            // tasks, but a worker with only a Blocked task is genuinely stalled and may
+            // still need an idle nudge. Including Blocked tasks here would suppress
+            // WorkerIdle indefinitely for stalled workers.
+            //
             // Checking by both display-name assignee (canonical DB path) and session-ID
-            // assignee (legacy assignment path) makes this robust to either convention.
+            // assignee (legacy assignment path via agent_id_to_name) makes this robust
+            // to either convention.
             let worker_is_busy = data
                 .in_progress_tasks
                 .iter()
-                .chain(data.ready_tasks.iter())
+                .chain(
+                    data.ready_tasks
+                        .iter()
+                        .filter(|t| t.status == TaskStatus::Open),
+                )
                 .any(|t| {
                     t.assignee.as_deref() == Some(worker.as_str())
                         || data
@@ -291,10 +301,16 @@ pub fn generate_prompt(
             // assigned-but-not-yet-started Open task (reconnect after session restart,
             // or assignment during the registration window). Check both ID-keyed and
             // name-keyed assignees for the same reason as WorkerIdle above.
+            //
+            // Blocked tasks are EXCLUDED (see WorkerIdle guard comment above).
             let worker_already_busy = data
                 .in_progress_tasks
                 .iter()
-                .chain(data.ready_tasks.iter())
+                .chain(
+                    data.ready_tasks
+                        .iter()
+                        .filter(|t| t.status == TaskStatus::Open),
+                )
                 .any(|t| {
                     t.assignee.as_deref() == Some(agent_id.as_str())
                         || t.assignee.as_deref() == Some(agent_name.as_str())
@@ -1007,6 +1023,140 @@ mod tests {
             "cas-dbbb: AgentRegistered must be suppressed when worker has an assigned Open task: \
              got {:?}",
             prompt2.map(|p| p.text)
+        );
+    }
+
+    /// cas-dbbb P2: WorkerIdle must NOT be suppressed when the worker's only task
+    /// is Blocked. A Blocked task means the worker is genuinely stalled; the
+    /// supervisor still needs an idle nudge so they can resolve the blocker or
+    /// assign new work. Including Blocked tasks in the busy-guard would suppress
+    /// the nudge indefinitely.
+    #[test]
+    fn test_dbbb_idle_not_suppressed_when_worker_only_has_blocked_task() {
+        let blocked_task = TaskSummary {
+            id: "task-blocked".to_string(),
+            title: "Blocked Task".to_string(),
+            status: TaskStatus::Blocked,
+            priority: Priority::MEDIUM,
+            assignee: Some("swift-fox".to_string()),
+            task_type: TaskType::Task,
+            epic: None,
+            branch: None,
+            updated_at: None,
+        };
+        let data = DirectorData {
+            // Blocked task is in ready_tasks (Open|Blocked both land here).
+            ready_tasks: vec![blocked_task],
+            in_progress_tasks: vec![],
+            epic_tasks: vec![],
+            agents: vec![],
+            activity: vec![],
+            agent_id_to_name: HashMap::new(),
+            changes: vec![],
+            git_loaded: true,
+            reminders: vec![],
+            epic_closed_counts: HashMap::new(),
+        };
+
+        let event = DirectorEvent::WorkerIdle {
+            worker: "swift-fox".to_string(),
+        };
+        let config = default_config();
+        let prompt = generate_prompt(&event, &data, "supervisor", &config, codex(), codex());
+        assert!(
+            prompt.is_some(),
+            "cas-dbbb P2: WorkerIdle must NOT be suppressed when worker has only a Blocked task \
+             (blocked ≠ busy). Got: None"
+        );
+    }
+
+    /// cas-dbbb P2: WorkerIdle must be suppressed when the worker has a session-ID
+    /// assignee on an Open task in ready_tasks, with agent_id_to_name mapping the
+    /// session ID to the worker's display name. This covers the chain()
+    /// + session-ID path added in cas-dbbb.
+    #[test]
+    fn test_dbbb_idle_suppressed_via_session_id_in_ready_open_task() {
+        let open_task = TaskSummary {
+            id: "task-open-session-id".to_string(),
+            title: "Session-ID assigned Open task".to_string(),
+            status: TaskStatus::Open,
+            priority: Priority::MEDIUM,
+            assignee: Some("sess-id-abc123".to_string()),
+            task_type: TaskType::Task,
+            epic: None,
+            branch: None,
+            updated_at: None,
+        };
+        let mut data = DirectorData {
+            ready_tasks: vec![open_task],
+            in_progress_tasks: vec![],
+            epic_tasks: vec![],
+            agents: vec![],
+            activity: vec![],
+            agent_id_to_name: HashMap::new(),
+            changes: vec![],
+            git_loaded: true,
+            reminders: vec![],
+            epic_closed_counts: HashMap::new(),
+        };
+        // The reverse-lookup maps session ID → display name.
+        data.agent_id_to_name
+            .insert("sess-id-abc123".to_string(), "swift-fox".to_string());
+
+        let event = DirectorEvent::WorkerIdle {
+            worker: "swift-fox".to_string(),
+        };
+        let config = default_config();
+        let prompt = generate_prompt(&event, &data, "supervisor", &config, codex(), codex());
+        assert!(
+            prompt.is_none(),
+            "cas-dbbb P2: WorkerIdle must be suppressed when worker has a session-ID assigned \
+             Open task in ready_tasks (agent_id_to_name reverse-lookup path). Got: {:?}",
+            prompt.map(|p| p.text)
+        );
+    }
+
+    /// cas-dbbb P2: AgentRegistered must be suppressed when the worker's session ID
+    /// matches an assignee on an Open task in ready_tasks. This verifies the
+    /// chain() + agent_id path added in cas-dbbb.
+    #[test]
+    fn test_dbbb_agent_registered_suppressed_via_session_id_in_ready_open_task() {
+        let open_task = TaskSummary {
+            id: "task-reg-session-id".to_string(),
+            title: "Session-ID assigned for registration test".to_string(),
+            status: TaskStatus::Open,
+            priority: Priority::MEDIUM,
+            // Assignee is the session UUID (agent_id), not the display name.
+            assignee: Some("sess-id-abc123".to_string()),
+            task_type: TaskType::Task,
+            epic: None,
+            branch: None,
+            updated_at: None,
+        };
+        let data = DirectorData {
+            ready_tasks: vec![open_task],
+            in_progress_tasks: vec![],
+            epic_tasks: vec![],
+            agents: vec![],
+            activity: vec![],
+            agent_id_to_name: HashMap::new(),
+            changes: vec![],
+            git_loaded: true,
+            reminders: vec![],
+            epic_closed_counts: HashMap::new(),
+        };
+
+        let event = DirectorEvent::AgentRegistered {
+            agent_id: "sess-id-abc123".to_string(),
+            agent_name: "calm-owl".to_string(),
+        };
+        let config = default_config();
+        let prompt = generate_prompt(&event, &data, "supervisor", &config, codex(), codex());
+        assert!(
+            prompt.is_none(),
+            "cas-dbbb P2: AgentRegistered must be suppressed when session ID (agent_id) is the \
+             assignee of an Open task in ready_tasks. Got: {:?}",
+            prompt.map(|p| p.text)
         );
     }
 
