@@ -360,6 +360,28 @@ mod tests {
         EnvWorkerCliGuard(prev)
     }
 
+    struct EnvSupervisorCliGuard(Option<String>);
+    impl Drop for EnvSupervisorCliGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.0 {
+                    Some(v) => std::env::set_var("CAS_FACTORY_SUPERVISOR_CLI", v),
+                    None => std::env::remove_var("CAS_FACTORY_SUPERVISOR_CLI"),
+                }
+            }
+        }
+    }
+    fn set_supervisor_cli(cli: Option<&str>) -> EnvSupervisorCliGuard {
+        let prev = std::env::var("CAS_FACTORY_SUPERVISOR_CLI").ok();
+        unsafe {
+            match cli {
+                Some(v) => std::env::set_var("CAS_FACTORY_SUPERVISOR_CLI", v),
+                None => std::env::remove_var("CAS_FACTORY_SUPERVISOR_CLI"),
+            }
+        }
+        EnvSupervisorCliGuard(prev)
+    }
+
     #[test]
     fn worker_coordination_tool_defaults_to_cas_when_unset() {
         let _g = env_lock();
@@ -396,11 +418,37 @@ mod tests {
     #[test]
     fn supervisor_verification_tool_returns_cas_when_supervisor_unset() {
         let _g = env_lock();
-        // CAS_FACTORY_SUPERVISOR_CLI unset → defaults to Claude.
+        // Explicitly clear CAS_FACTORY_SUPERVISOR_CLI so the test is isolated
+        // from any harness env the test runner inherits (e.g. a Codex supervisor
+        // factory session sets CAS_FACTORY_SUPERVISOR_CLI=codex which would make
+        // supervisor_harness_from_env() return Codex and flip the assertion).
+        let _s = set_supervisor_cli(None);
         assert_eq!(
             super::supervisor_verification_tool(),
             "mcp__cas__verification",
-            "default supervisor harness (Claude) → mcp__cas__verification"
+            "no CAS_FACTORY_SUPERVISOR_CLI set → default Claude → mcp__cas__verification"
+        );
+    }
+
+    #[test]
+    fn supervisor_verification_tool_returns_cs_for_codex_supervisor() {
+        let _g = env_lock();
+        let _s = set_supervisor_cli(Some("codex"));
+        assert_eq!(
+            super::supervisor_verification_tool(),
+            "mcp__cs__verification",
+            "CAS_FACTORY_SUPERVISOR_CLI=codex → mcp__cs__verification"
+        );
+    }
+
+    #[test]
+    fn supervisor_verification_tool_returns_cas_for_claude_supervisor() {
+        let _g = env_lock();
+        let _s = set_supervisor_cli(Some("claude"));
+        assert_eq!(
+            super::supervisor_verification_tool(),
+            "mcp__cas__verification",
+            "CAS_FACTORY_SUPERVISOR_CLI=claude → mcp__cas__verification"
         );
     }
 }
