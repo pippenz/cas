@@ -4138,3 +4138,125 @@ async fn test_cdee_cas8236_sequence_close_verified_task_while_second_task_in_pro
         "close error must not reference the unrelated task {id_8236}; got: {text}"
     );
 }
+
+// =============================================================================
+// cas-1b80: Codex VERIFICATION_JAIL_BLOCKED guidance must use mcp__cs__coordination
+//
+// Regression guard ensuring that when a Codex factory worker does hit the
+// VERIFICATION_JAIL_BLOCKED path, the emitted guidance uses the Codex MCP
+// alias mcp__cs__coordination — not mcp__cas__coordination (the Claude alias)
+// and not Task(subagent_type=...) (only valid for non-worker callers).
+//
+// The path that fires the jail for a Codex worker:
+//   - Legacy owner=worker config (jail fires at task.close)
+//   - Codex worker (CAS_FACTORY_WORKER_CLI=codex → worker_harness=Codex)
+//   - Claude supervisor (default; CAS_FACTORY_SUPERVISOR_CLI absent)
+//   - Epic task type: verification_policy(Claude, Codex).epic_required() = true
+//     because epic_mode depends on the SUPERVISOR's subagent capability, and
+//     Claude supports subagents. task_required() is false for Codex workers
+//     (non-epic tasks bypass the jail), but epic_required() is true.
+//   - No approved verification → check_pending_verification returns Some
+//     → VERIFICATION_JAIL_BLOCKED fires with worker_coordination_tool()
+//     → CAS_FACTORY_WORKER_CLI=codex → returns mcp__cs__coordination
+//
+// Without the cas-8aaf fix (CAS_FACTORY_WORKER_CLI not injected into the Codex
+// cs MCP server env), worker_harness_from_env() would return Claude, making
+// worker_coordination_tool() return mcp__cas__coordination — an alias that
+// Codex workers cannot execute.
+// =============================================================================
+
+/// cas-1b80: a Codex factory worker closing an Epic task under legacy
+/// owner=worker config must receive VERIFICATION_JAIL_BLOCKED guidance that
+/// uses mcp__cs__coordination (the executable Codex alias).
+///
+/// This is the one task type where a Codex worker can hit the jail:
+/// verification_policy(Claude, Codex).epic_required() returns true because
+/// the epic_mode is determined by the supervisor's subagent capability, not
+/// the worker's. A Claude supervisor (the default) supports subagents so
+/// epics require supervisor verification — and the Codex worker must receive
+/// the correct alias to message the supervisor.
+#[tokio::test]
+async fn test_codex_worker_epic_close_jail_recommends_cs_coordination_cas_1b80() {
+    let (temp, core) = setup_cas();
+    // setup_cas() clears CAS_FACTORY_SUPERVISOR_CLI (among other vars), so
+    // supervisor_harness_from_env() defaults to Claude — the prerequisite for
+    // verification_policy(Claude, Codex).epic_required() returning true.
+    let _env_lock = env_test_lock();
+    let cas_dir = temp.path().join(".cas");
+
+    // Opt into legacy owner=worker so the verification jail fires at task.close.
+    // Under owner=supervisor (default), factory workers are exempt (cas-8edb).
+    std::fs::write(
+        cas_dir.join("config.toml"),
+        "[code_review]\nowner = \"worker\"\n",
+    )
+    .expect("write legacy code_review config");
+
+    let service = CasService::new(core, None);
+    // Codex worker: CAS_FACTORY_WORKER_CLI=codex makes worker_harness_from_env()
+    // return Codex, so worker_coordination_tool() returns mcp__cs__coordination.
+    let _env = CodexWorkerEnv::enter();
+
+    // Create an Epic task. For Codex workers under a Claude supervisor,
+    // verification_policy(Claude, Codex).epic_required() returns true
+    // (epic_mode = Required because the supervisor/Claude supports subagents).
+    // This is the only task type where a Codex worker can hit the jail.
+    let created = service
+        .task(Parameters(task_req(serde_json::json!({
+            "action": "create",
+            "title": "cas-1b80: Codex worker epic close must use cs coordination alias",
+            "priority": 2,
+            "task_type": "epic",
+        }))))
+        .await
+        .expect("create epic");
+    let id = extract_task_id(&extract_text(created))
+        .expect("epic id")
+        .to_string();
+
+    service
+        .task(Parameters(task_req(serde_json::json!({
+            "action": "start",
+            "id": id.clone(),
+        }))))
+        .await
+        .expect("start epic");
+
+    // Attempt to close without verification. Because task_type=Epic and the
+    // supervisor is Claude, verification is required even for Codex workers.
+    // The jail must fire and the guidance must use the Codex MCP alias.
+    let err = service
+        .task(Parameters(task_req(serde_json::json!({
+            "action": "close",
+            "id": id.clone(),
+            "reason": "Done.",
+        }))))
+        .await
+        .expect_err(
+            "Codex worker closing Epic without verification must be blocked by jail",
+        );
+
+    let msg = err.message.to_string();
+
+    // Jail must fire.
+    assert!(
+        msg.contains("VERIFICATION_JAIL_BLOCKED"),
+        "Codex worker closing Epic under owner=worker must hit jail; got: {msg}"
+    );
+    // cas-1b80: Codex factory workers must receive the Codex MCP alias.
+    assert!(
+        msg.contains("mcp__cs__coordination"),
+        "Codex worker jail must recommend mcp__cs__coordination; got: {msg}"
+    );
+    // Must NOT use the Claude alias — that is not executable by a Codex worker.
+    assert!(
+        !msg.contains("mcp__cas__coordination"),
+        "Codex worker jail must not suggest Claude alias mcp__cas__coordination; got: {msg}"
+    );
+    // Must NOT suggest spawning a task-verifier subagent — factory workers
+    // cannot do that; the jail must route to the supervisor instead.
+    assert!(
+        !msg.contains("Task(subagent_type=\"task-verifier\""),
+        "Codex worker jail must not suggest Task() spawn; got: {msg}"
+    );
+}
