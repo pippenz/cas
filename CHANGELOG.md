@@ -7,10 +7,19 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [2.25.0] - 2026-06-30
+
 ### Changed
+- **Heterogeneous Claude + Codex factories now run mixed-harness workers reliably end to end (cas-3cb7).** A factory with one Codex worker and one Claude worker previously drifted in several places — assignment, status surfaces, director messages, and the verification/close path. These are now consistent across both harnesses (details under Fixed).
 - **The Nuxt + Playwright skill no longer auto-pulls workers into browser E2E during normal dev or verification (cas-e0d1).** Its description advertised proactive triggers ("Trigger when editing files under tests/…", "when investigating Playwright test failures…"), so the model invoked it as a matter of course — doubling dev/verification wall-clock. The description is now explicit opt-in: invoke ONLY when the operator explicitly asks for Playwright/E2E help. Playwright stays fully available locally on demand (the MCP server config is unchanged); it's just no longer a default. Both the Claude and Codex skill mirrors are updated byte-identically.
 
 ### Fixed
+- **Director assignment hints now name the worker, so assigning by the suggested target actually moves the task off the ready list (cas-dbbb).** The director surfaced raw session IDs as assignment targets, but assigning by ID left tasks stuck in Ready — only the worker's display name worked. Hints now use display names.
+- **`worker_status` shows worktree, branch, and git detail for Codex workers, matching Claude (cas-4491).** The Clone/git block was printed for Claude workers but silently omitted for Codex workers even when the worktree existed.
+- **The director no longer emits stale idle or close guidance after a task is already assigned or closed (cas-6aaf).** Status messages are now state-aware instead of telling a supervisor to reassign work that's in flight or close a task that's already done.
+- **Codex workers hitting the verification gate get guidance they can actually run (cas-8aaf, cas-1b80).** The jail message handed Codex workers a `Task(subagent_type=…)` subagent flow that doesn't exist for them; it now points at `mcp__cs__coordination`, matching the Codex tool surface.
+- **Codex-supervisor factories resolve the correct verification alias (cas-1544, cas-7998).** `CAS_FACTORY_SUPERVISOR_CLI` is now injected into the Codex supervisor `cs` MCP env, so close/verify guidance suggests `mcp__cs__verification` instead of a `mcp__cas__` alias a Codex supervisor can't call; the remaining hardcoded alias sites in close guidance were swept and free-text close reasons are quote-escaped so they can't break a suggested command.
+- **Codex worker recovery docs use the `mcp__cs__` alias (cas-5b4f).** The built-in Codex recovery guide hardcoded `mcp__cas__` instructions that are unreachable for a Codex worker; a guardrail test now keeps the Claude and Codex copies from drifting.
 - **`cas update --user` now prunes legacy non-managed `cas-*` skill orphans at the user level (cas-e0d1).** The project-level sync already drops stale `cas-*` skill dirs that lack a `managed_by: cas` marker, but the user-level path (`sync_user_builtins`) only wrote builtins and never pruned — so the retired `cas-playwright-debug` skill lingered in `~/.claude/skills` and `~/.codex/skills` on every host. The user-level sync now mirrors the project-level guard (remove only `cas-*` dirs that are neither a known builtin nor `managed_by: cas`), so the orphan is removed on the next `cas update --user`.
 
 ## [2.24.3] - 2026-06-30
