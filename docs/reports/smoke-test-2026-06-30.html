@@ -1,0 +1,582 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CAS Factory Smoke Test — 2026-06-30</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      font-size: 15px;
+      line-height: 1.6;
+      color: #1a1a2e;
+      background: #f5f7fa;
+    }
+
+    header {
+      background: linear-gradient(135deg, #2c3e7a 0%, #4a6fa5 100%);
+      color: #fff;
+      padding: 32px 40px 28px;
+    }
+    header h1 { font-size: 1.75rem; font-weight: 700; letter-spacing: -0.02em; }
+    header .subtitle { margin-top: 6px; opacity: 0.82; font-size: 0.93rem; }
+    header .meta { margin-top: 14px; display: flex; gap: 24px; flex-wrap: wrap; font-size: 0.84rem; opacity: 0.75; }
+    header .meta span::before { margin-right: 4px; }
+
+    main { max-width: 960px; margin: 0 auto; padding: 32px 24px 60px; }
+
+    section { margin-bottom: 36px; }
+    section + section { border-top: 1px solid #e0e4eb; padding-top: 36px; }
+
+    h2 {
+      font-size: 1.15rem; font-weight: 700; color: #2c3e7a;
+      margin-bottom: 16px; display: flex; align-items: center; gap: 8px;
+    }
+    h2 .icon { font-size: 1.1em; }
+    h3 {
+      font-size: 0.98rem; font-weight: 600; color: #374151;
+      margin: 20px 0 10px;
+    }
+
+    /* Summary cards */
+    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 14px; margin-bottom: 8px; }
+    .card {
+      background: #fff; border: 1px solid #dde2ee; border-radius: 10px;
+      padding: 16px 18px; box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+    }
+    .card .label { font-size: 0.76rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; color: #6b7280; margin-bottom: 4px; }
+    .card .value { font-size: 1.05rem; font-weight: 700; color: #1a1a2e; }
+    .card .sub { font-size: 0.8rem; color: #6b7280; margin-top: 2px; }
+
+    /* Timeline */
+    .timeline { list-style: none; position: relative; padding-left: 24px; }
+    .timeline::before { content: ""; position: absolute; left: 7px; top: 4px; bottom: 4px; width: 2px; background: #dde2ee; }
+    .timeline li { position: relative; padding: 4px 0 12px 18px; font-size: 0.88rem; color: #374151; }
+    .timeline li::before {
+      content: ""; position: absolute; left: -4px; top: 8px;
+      width: 10px; height: 10px; border-radius: 50%;
+      background: #4a6fa5; border: 2px solid #fff; box-shadow: 0 0 0 1px #4a6fa5;
+    }
+    .timeline .ts { font-size: 0.78rem; font-weight: 600; color: #4a6fa5; font-variant-numeric: tabular-nums; margin-right: 6px; }
+    .timeline .actor { font-weight: 600; }
+
+    /* Jokes table */
+    .jokes-grid {
+      display: grid; grid-template-columns: 1fr 1fr; gap: 0;
+      border: 1px solid #dde2ee; border-radius: 10px; overflow: hidden;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+    }
+    .jokes-col-header {
+      background: #2c3e7a; color: #fff; font-size: 0.82rem; font-weight: 700;
+      padding: 10px 16px; text-transform: uppercase; letter-spacing: 0.06em;
+    }
+    .jokes-col-header + .jokes-col-header { border-left: 1px solid #4a6fa5; }
+    .joke-row {
+      padding: 10px 16px; background: #fff; font-size: 0.88rem; color: #1a1a2e;
+      border-top: 1px solid #f0f2f5;
+    }
+    .joke-row:nth-child(even) { background: #f8fafc; }
+    .joke-row.left { border-right: 1px solid #e0e4eb; }
+    .joke-num { font-size: 0.75rem; font-weight: 700; color: #4a6fa5; margin-right: 6px; }
+    .joke-q { font-weight: 600; }
+    .joke-a { color: #374151; }
+    .overlap-badge {
+      display: inline-block; font-size: 0.68rem; font-weight: 700;
+      background: #fef3c7; color: #92400e; border: 1px solid #fcd34d;
+      border-radius: 4px; padding: 1px 5px; margin-left: 6px; vertical-align: middle;
+    }
+
+    /* Evaluation table */
+    .eval-table { width: 100%; border-collapse: collapse; font-size: 0.87rem; }
+    .eval-table thead tr { background: #f0f3fa; }
+    .eval-table th { text-align: left; padding: 9px 14px; font-weight: 700; color: #374151; border-bottom: 2px solid #dde2ee; }
+    .eval-table td { padding: 9px 14px; border-bottom: 1px solid #f0f2f5; vertical-align: top; color: #374151; }
+    .eval-table tr:last-child td { border-bottom: none; }
+    .eval-table tr:nth-child(even) td { background: #f8fafc; }
+    .badge { display: inline-block; font-size: 0.75rem; font-weight: 700; border-radius: 5px; padding: 2px 8px; }
+    .badge-pass { background: #d1fae5; color: #065f46; }
+    .badge-warn { background: #fef3c7; color: #92400e; }
+    .badge-fail { background: #fee2e2; color: #991b1b; }
+    .badge-info { background: #e0f2fe; color: #0c4a6e; }
+
+    /* Behaviour section */
+    .behaviour-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+    .behaviour-card {
+      background: #fff; border: 1px solid #dde2ee; border-radius: 10px;
+      padding: 18px 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+    }
+    .behaviour-card h3 { margin-top: 0; margin-bottom: 12px; font-size: 0.93rem; color: #2c3e7a; }
+    .behaviour-card ul { padding-left: 18px; font-size: 0.87rem; color: #374151; }
+    .behaviour-card li { margin-bottom: 6px; }
+    .behaviour-card .notable {
+      margin-top: 12px; padding: 10px 14px; background: #f0f3fa;
+      border-left: 3px solid #4a6fa5; border-radius: 0 6px 6px 0;
+      font-size: 0.84rem; color: #374151;
+    }
+    .behaviour-card .notable strong { color: #2c3e7a; }
+
+    /* Evidence section */
+    .evidence-list { list-style: none; }
+    .evidence-list li {
+      background: #fff; border: 1px solid #dde2ee; border-radius: 8px;
+      padding: 10px 16px; margin-bottom: 8px; font-size: 0.87rem;
+      display: flex; align-items: flex-start; gap: 12px;
+      box-shadow: 0 1px 2px rgba(0,0,0,0.03);
+    }
+    .evidence-list .ev-type {
+      font-size: 0.72rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em;
+      background: #e0f2fe; color: #0c4a6e; border-radius: 4px;
+      padding: 2px 7px; white-space: nowrap; margin-top: 1px;
+    }
+    .evidence-list code {
+      font-family: "SF Mono", "Fira Code", Consolas, monospace;
+      font-size: 0.83rem; background: #f0f3fa; padding: 1px 5px; border-radius: 3px;
+    }
+
+    footer {
+      text-align: center; color: #9ca3af; font-size: 0.8rem; padding: 20px;
+      border-top: 1px solid #e0e4eb; margin-top: 16px;
+    }
+
+    @media (max-width: 640px) {
+      .jokes-grid { grid-template-columns: 1fr; }
+      .behaviour-grid { grid-template-columns: 1fr; }
+      .cards { grid-template-columns: 1fr 1fr; }
+      header { padding: 24px 20px; }
+      main { padding: 24px 16px; }
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>CAS Factory Smoke Test</h1>
+  <div class="subtitle">Two-worker parallel spawn · Computer jokes · Lifecycle verification</div>
+  <div class="meta">
+    <span>📅 2026-06-30</span>
+    <span>🏭 Session cas-src-sharp-viper-85</span>
+    <span>⏱ 15:09–15:17 UTC</span>
+    <span>📋 Tasks cas-73ba &amp; cas-2650</span>
+  </div>
+</header>
+
+<main>
+
+  <!-- SUMMARY -->
+  <section>
+    <h2><span class="icon">📊</span> Executive Summary</h2>
+    <div class="cards">
+      <div class="card">
+        <div class="label">Outcome</div>
+        <div class="value">✅ Pass</div>
+        <div class="sub">Both tasks closed, verified</div>
+      </div>
+      <div class="card">
+        <div class="label">Workers spawned</div>
+        <div class="value">2</div>
+        <div class="sub">claude-jester · codex-jester</div>
+      </div>
+      <div class="card">
+        <div class="label">Jokes delivered</div>
+        <div class="value">14</div>
+        <div class="sub">7 per worker (2 overlap)</div>
+      </div>
+      <div class="card">
+        <div class="label">Repo edits</div>
+        <div class="value">0</div>
+        <div class="sub">Both worktrees clean</div>
+      </div>
+      <div class="card">
+        <div class="label">Spawn-to-first-joke</div>
+        <div class="value">~44 s</div>
+        <div class="sub">claude-jester (fastest)</div>
+      </div>
+      <div class="card">
+        <div class="label">Lifecycle blockers</div>
+        <div class="value">1</div>
+        <div class="sub">VERIFICATION_JAIL on cas-2650</div>
+      </div>
+    </div>
+
+    <h3>Session Timeline</h3>
+    <ul class="timeline">
+      <li><span class="ts">15:09:04</span><span class="actor">daemon</span> — Factory daemon started (session cas-src-sharp-viper-85); bound WS on 127.0.0.1:40879</li>
+      <li><span class="ts">15:09:07</span><span class="actor">wild-gopher-49</span> — Supervisor registered (codex MCP client v0.142.4)</li>
+      <li><span class="ts">15:09:10</span><span class="actor">director</span> — Startup instructions delivered to supervisor (prompt_queue msg 2454)</li>
+      <li><span class="ts">15:12:51</span><span class="actor">daemon</span> — codex-jester spawned in new worktree <code>.cas/worktrees/codex-jester</code> (branch factory/codex-jester)</li>
+      <li><span class="ts">15:12:53</span><span class="actor">codex-jester</span> — Registered (codex MCP client v0.142.4, model gpt-5.4, effort high)</li>
+      <li><span class="ts">15:12:55</span><span class="actor">daemon</span> — claude-jester spawned in new worktree <code>.cas/worktrees/claude-jester</code> (branch factory/claude-jester)</li>
+      <li><span class="ts">15:12:55</span><span class="actor">claude-jester</span> — Registered (claude-code v2.1.196, model claude-sonnet-4-6)</li>
+      <li><span class="ts">15:12:55</span><span class="actor">director</span> — Startup prompt injected to claude-jester (msg 2455)</li>
+      <li><span class="ts">15:13:06</span><span class="actor">director</span> — Task assignment event delivered to claude-jester</li>
+      <li><span class="ts">15:13:26</span><span class="actor">supervisor</span> — Task assignments pushed: cas-73ba → claude-jester (msg 2457); cas-2650 → codex-jester (msg 2456)</li>
+      <li><span class="ts">15:13:39</span><span class="actor">claude-jester</span> — 7 jokes delivered to supervisor (msg 2458); task cas-73ba closed verified</li>
+      <li><span class="ts">15:13:43</span><span class="actor">codex-jester</span> — ACK with execution plan sent (msg 2459)</li>
+      <li><span class="ts">15:14:07</span><span class="actor">codex-jester</span> — 7 jokes delivered to supervisor (msg 2464)</li>
+      <li><span class="ts">15:14:25</span><span class="actor">codex-jester</span> — Close attempt → VERIFICATION_JAIL_BLOCKED</li>
+      <li><span class="ts">15:14:37</span><span class="actor">codex-jester</span> — Correctly reported blocker to supervisor (msg 2466); did not retry or spawn verifier</li>
+      <li><span class="ts">15:15:01</span><span class="actor">supervisor</span> — Called verification tool; issued code ver-d8867b57e6e3 to codex-jester (msg 2467)</li>
+      <li><span class="ts">15:15:13</span><span class="actor">codex-jester</span> — Task cas-2650 closed verified (msg 2468)</li>
+      <li><span class="ts">15:16:34</span><span class="actor">supervisor</span> — Created report task cas-6af0; assigned to claude-jester (msg 2471)</li>
+      <li><span class="ts">15:16:48</span><span class="actor">director</span> — Task assignment event delivered to claude-jester</li>
+      <li><span class="ts">15:16:52</span><span class="actor">supervisor</span> — Report task assignment message delivered (msg 2471/2472)</li>
+    </ul>
+  </section>
+
+  <!-- JOKES -->
+  <section>
+    <h2><span class="icon">😄</span> Worker Joke Output (14 total)</h2>
+    <p style="font-size:0.87rem;color:#6b7280;margin-bottom:16px;">
+      Source: prompt_queue messages 2458 (claude-jester→supervisor) and 2464 (codex-jester→supervisor), retrieved from <code>.cas/cas.db</code>.
+      Two jokes appear in both outputs (marked <span class="overlap-badge">overlap</span>).
+    </p>
+    <div class="jokes-grid">
+      <div class="jokes-col-header">claude-jester (claude-sonnet-4-6) · cas-73ba</div>
+      <div class="jokes-col-header">codex-jester (gpt-5.4 high) · cas-2650</div>
+
+      <div class="joke-row left">
+        <span class="joke-num">1</span>
+        <span class="joke-q">Why do programmers prefer dark mode?</span>
+        <span class="overlap-badge">overlap</span><br>
+        <span class="joke-a">Because light attracts bugs.</span>
+      </div>
+      <div class="joke-row">
+        <span class="joke-num">1</span>
+        <span class="joke-q">Why do programmers prefer dark mode?</span>
+        <span class="overlap-badge">overlap</span><br>
+        <span class="joke-a">Because light attracts bugs.</span>
+      </div>
+
+      <div class="joke-row left">
+        <span class="joke-num">2</span>
+        <span class="joke-q">A SQL query walks into a bar, approaches two tables and asks…</span><br>
+        <span class="joke-a">"Can I join you?"</span>
+      </div>
+      <div class="joke-row">
+        <span class="joke-num">2</span>
+        <span class="joke-q">There are 10 kinds of people in the world:</span>
+        <span class="overlap-badge">overlap</span><br>
+        <span class="joke-a">Those who understand binary and those who don't.</span>
+      </div>
+
+      <div class="joke-row left">
+        <span class="joke-num">3</span>
+        <span class="joke-q">Why don't programmers like nature?</span><br>
+        <span class="joke-a">It has too many bugs and no documentation.</span>
+      </div>
+      <div class="joke-row">
+        <span class="joke-num">3</span>
+        <span class="joke-q">I told my computer I needed a break…</span><br>
+        <span class="joke-a">and now it won't stop sending me beach wallpapers.</span>
+      </div>
+
+      <div class="joke-row left">
+        <span class="joke-num">4</span>
+        <span class="joke-q">How many programmers does it take to change a light bulb?</span><br>
+        <span class="joke-a">None — that's a hardware problem.</span>
+      </div>
+      <div class="joke-row">
+        <span class="joke-num">4</span>
+        <span class="joke-q">Why did the developer go broke?</span><br>
+        <span class="joke-a">Because he used up all his cache.</span>
+      </div>
+
+      <div class="joke-row left">
+        <span class="joke-num">5</span>
+        <span class="joke-q">A programmer's wife says: "Get a gallon of milk, and if they have eggs, get a dozen."</span><br>
+        <span class="joke-a">He comes home with 12 gallons of milk. "They had eggs."</span>
+      </div>
+      <div class="joke-row">
+        <span class="joke-num">5</span>
+        <span class="joke-q">My code doesn't have bugs.</span><br>
+        <span class="joke-a">It just develops random features.</span>
+      </div>
+
+      <div class="joke-row left">
+        <span class="joke-num">6</span>
+        <span class="joke-q">Why was the JavaScript developer sad?</span><br>
+        <span class="joke-a">Because they didn't Node how to Express their feelings.</span>
+      </div>
+      <div class="joke-row">
+        <span class="joke-num">6</span>
+        <span class="joke-q">Why was the computer cold?</span><br>
+        <span class="joke-a">It left its Windows open.</span>
+      </div>
+
+      <div class="joke-row left">
+        <span class="joke-num">7</span>
+        <span class="joke-q">There are 10 types of people in the world:</span>
+        <span class="overlap-badge">overlap</span><br>
+        <span class="joke-a">Those who understand binary, and those who don't.</span>
+      </div>
+      <div class="joke-row">
+        <span class="joke-num">7</span>
+        <span class="joke-q">I asked the keyboard for advice…</span><br>
+        <span class="joke-a">but it just kept giving me mixed signals.</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- WORKER RULE FOLLOWING -->
+  <section>
+    <h2><span class="icon">🔍</span> Worker CAS Rule-Following Evaluation</h2>
+
+    <h3>claude-jester (claude-sonnet-4-6) · Task cas-73ba</h3>
+    <table class="eval-table">
+      <thead>
+        <tr><th style="width:38%">Check</th><th style="width:14%">Result</th><th>Notes</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Loaded MCP schemas first (ToolSearch)</td>
+          <td><span class="badge badge-pass">PASS</span></td>
+          <td>First action was <code>ToolSearch(select:mcp__cas__task,mcp__cas__memory,mcp__cas__search)</code>, per CLAUDE.md instruction.</td>
+        </tr>
+        <tr>
+          <td>Loaded cas-worker skill</td>
+          <td><span class="badge badge-pass">PASS</span></td>
+          <td>Invoked cas-worker skill immediately after schema load.</td>
+        </tr>
+        <tr>
+          <td><code>action=mine</code> to discover assignment</td>
+          <td><span class="badge badge-pass">PASS</span></td>
+          <td>Called <code>mcp__cas__task action=mine</code> correctly; saw cas-73ba.</td>
+        </tr>
+        <tr>
+          <td><code>action=start</code> before working</td>
+          <td><span class="badge badge-pass">PASS</span></td>
+          <td>Started task before any work began.</td>
+        </tr>
+        <tr>
+          <td><code>action=show</code> to read task details</td>
+          <td><span class="badge badge-pass">PASS</span></td>
+          <td>Read full task spec including acceptance criteria.</td>
+        </tr>
+        <tr>
+          <td>ACK sent to supervisor before executing</td>
+          <td><span class="badge badge-warn">MINOR</span></td>
+          <td>For the initial assignment (cas-73ba) no explicit ACK was sent; worker delivered jokes directly. Supervisor had assigned via message but the workflow guidance calls for ACK. For the follow-on task cas-6af0, claude-jester did ACK correctly.</td>
+        </tr>
+        <tr>
+          <td>Delivered ≥5 jokes to supervisor</td>
+          <td><span class="badge badge-pass">PASS</span></td>
+          <td>7 jokes delivered via coordination message (msg 2458) to supervisor wild-gopher-49.</td>
+        </tr>
+        <tr>
+          <td>Zero repository file edits</td>
+          <td><span class="badge badge-pass">PASS</span></td>
+          <td><code>git status --short</code> on worktree <code>.cas/worktrees/claude-jester</code>: empty (exit 0). No M/D/A lines.</td>
+        </tr>
+        <tr>
+          <td>Closed task with reason</td>
+          <td><span class="badge badge-pass">PASS</span></td>
+          <td>CAS returned "Closed task: cas-73ba (verified) (lease released)".</td>
+        </tr>
+        <tr>
+          <td>Messaged supervisor on completion</td>
+          <td><span class="badge badge-pass">PASS</span></td>
+          <td>Sent completion notification in the coordination message that also contained the jokes.</td>
+        </tr>
+        <tr>
+          <td>Did not send peer-to-peer messages</td>
+          <td><span class="badge badge-pass">PASS</span></td>
+          <td>All coordination messages targeted <code>wild-gopher-49</code> (supervisor). No peer messages attempted.</td>
+        </tr>
+        <tr>
+          <td>Used CAS task tools, not built-in TodoWrite</td>
+          <td><span class="badge badge-pass">PASS</span></td>
+          <td>Only <code>mcp__cas__task</code> actions used for task tracking.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3 style="margin-top:28px;">codex-jester (gpt-5.4, effort=high) · Task cas-2650</h3>
+    <table class="eval-table">
+      <thead>
+        <tr><th style="width:38%">Check</th><th style="width:14%">Result</th><th>Notes</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>ACK with execution plan sent before executing</td>
+          <td><span class="badge badge-pass">PASS</span></td>
+          <td>Sent explicit ACK (msg 2459): "1) send jokes; 2) avoid repo edits; 3) verify worktree; 4) close." Contrast with claude-jester which skipped the initial ACK.</td>
+        </tr>
+        <tr>
+          <td><code>mcp__cs__task action=start</code> before working</td>
+          <td><span class="badge badge-pass">PASS</span></td>
+          <td>Task notes confirm start action called. Used correct Codex MCP alias <code>mcp__cs__</code>.</td>
+        </tr>
+        <tr>
+          <td>Delivered ≥5 jokes to supervisor</td>
+          <td><span class="badge badge-pass">PASS</span></td>
+          <td>7 jokes delivered via coordination message (msg 2464) to supervisor.</td>
+        </tr>
+        <tr>
+          <td>Zero repository file edits</td>
+          <td><span class="badge badge-pass">PASS</span></td>
+          <td>Task notes include proof: <code>git status --short</code> exit 0; <code>git diff --stat</code> exit 0; no output. Worktree <code>.cas/worktrees/codex-jester</code> confirmed clean.</td>
+        </tr>
+        <tr>
+          <td>Ran verify-before-claim proof</td>
+          <td><span class="badge badge-pass">PASS</span></td>
+          <td>Explicitly logged proof commands + exit codes in task notes (progress note at 15:14).</td>
+        </tr>
+        <tr>
+          <td>VERIFICATION_JAIL_BLOCKED handling</td>
+          <td><span class="badge badge-pass">PASS</span></td>
+          <td>Did NOT retry close, did NOT spawn a verifier agent. Forwarded exact blocker message to supervisor (msg 2466) and waited. Followed the recovery guide precisely.</td>
+        </tr>
+        <tr>
+          <td>Closed after supervisor verification</td>
+          <td><span class="badge badge-pass">PASS</span></td>
+          <td>Closed with provided code ver-d8867b57e6e3; CAS returned verified+released. Confirmed in msg 2468.</td>
+        </tr>
+        <tr>
+          <td>Used CAS task tools, not built-in TodoWrite</td>
+          <td><span class="badge badge-pass">PASS</span></td>
+          <td>Only <code>mcp__cs__task</code> actions used; no built-in task tools observed.</td>
+        </tr>
+        <tr>
+          <td>Did not send peer-to-peer messages</td>
+          <td><span class="badge badge-pass">PASS</span></td>
+          <td>All messages targeted supervisor only.</td>
+        </tr>
+        <tr>
+          <td>Decision note for close-gate scope waiver</td>
+          <td><span class="badge badge-pass">PASS</span></td>
+          <td>Logged <code>note_type=decision</code> explaining why the 6 pre-close checks (wiring, signatures, etc.) were not applicable for a message-only deliverable.</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- SUPERVISOR AND DIRECTOR -->
+  <section>
+    <h2><span class="icon">🎛️</span> Supervisor &amp; Director Behaviour</h2>
+    <div class="behaviour-grid">
+
+      <div class="behaviour-card">
+        <h3>Supervisor: wild-gopher-49 (codex, gpt-5.4)</h3>
+        <ul>
+          <li>Spawned both workers in rapid succession (4-second gap, codex-jester first).</li>
+          <li>Assigned tasks via coordination messages within ~35 s of spawn — prompt delivery confirmed in prompt_queue (msgs 2456–2457).</li>
+          <li>Did not attempt to start tasks directly. (An earlier session—eager-leopard-33—hit the supervisor-cannot-start-tasks guard at 14:58; this session avoided it.)</li>
+          <li>Acknowledged claude-jester's output immediately (msg 2460, &lt;7 s after delivery).</li>
+          <li>Correctly handled VERIFICATION_JAIL for cas-2650: called the <code>verification</code> MCP tool (id=33, 15:15:01), generated code ver-d8867b57e6e3, and provided the exact close command to codex-jester (msg 2467).</li>
+          <li>Monitored both workers concurrently while each was active.</li>
+          <li>Delegated the report task cas-6af0 to claude-jester once both smoke tests closed.</li>
+        </ul>
+        <div class="notable">
+          <strong>Notable gap:</strong> Attempted to load <code>cas-codex-supervisor-checklist</code> skill (log id=9, 15:09:55) — not found. Recovered promptly; no workflow interruption.
+        </div>
+      </div>
+
+      <div class="behaviour-card">
+        <h3>Director (CAS daemon · factory-session layer)</h3>
+        <ul>
+          <li>Delivered supervisor startup instructions at 15:09:10 via <code>director_events</code> channel (msg 2454).</li>
+          <li>Notified supervisor of both worker spawns via director_events at 15:12:54 and 15:12:56 (&lt;1 s after each spawn).</li>
+          <li>Delivered task assignment events to claude-jester at 15:13:06 and 15:16:48 (for cas-73ba and cas-6af0 respectively).</li>
+          <li>Delivered director event to codex-jester at 15:13:02 for task assignment.</li>
+          <li>Supervisor notifications at 15:13:43, 15:15:13 (task lifecycle events).</li>
+          <li>Cleaned up orphaned teams dir <code>deadlock-test-team</code> on startup.</li>
+          <li>Cleaned up stale agent from previous session on init (Primary, ppid 413633 not running).</li>
+        </ul>
+        <div class="notable">
+          <strong>Observation:</strong> Two MCP transport errors on startup (Vercel auth + context7 content-type) are pre-existing and unrelated to the smoke test. Both recovered automatically; no impact on factory operation.
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- EVIDENCE SOURCES -->
+  <section>
+    <h2><span class="icon">📂</span> Evidence Sources Reviewed</h2>
+    <ul class="evidence-list">
+      <li>
+        <span class="ev-type">log</span>
+        <div>
+          <code>.cas/logs/cas-2026-06-30.log</code> — 295 lines; full daemon lifecycle, agent registrations, MCP tool calls, prompt_queue delivery timestamps, spawn details, and worker registration events for both workers.
+        </div>
+      </li>
+      <li>
+        <span class="ev-type">DB</span>
+        <div>
+          <code>.cas/cas.db → prompt_queue</code> rows 2454–2473 — Full text of all coordination messages between director, supervisor, claude-jester, and codex-jester during the smoke test. Provided exact joke text for both workers.
+        </div>
+      </li>
+      <li>
+        <span class="ev-type">task</span>
+        <div>
+          <code>mcp__cas__task action=show id=cas-73ba</code> — Task record, notes (close reason), acceptance criteria, timestamps. Confirmed closed 15:13, no repo edits.
+        </div>
+      </li>
+      <li>
+        <span class="ev-type">task</span>
+        <div>
+          <code>mcp__cas__task action=show id=cas-2650</code> — Task record with progress notes, decision note, proof commands (git status/diff exit 0), verification jail blocker, close with verification code. Confirmed closed 15:15.
+        </div>
+      </li>
+      <li>
+        <span class="ev-type">git</span>
+        <div>
+          <code>git -C .cas/worktrees/codex-jester status --short</code> and <code>git -C .cas/worktrees/claude-jester status --short</code> — Both returned empty output (exit 0), confirming no repository file modifications by either worker.
+        </div>
+      </li>
+      <li>
+        <span class="ev-type">git</span>
+        <div>
+          Daemon log lines 123 and 145: worktree creation confirmed with <code>reused=false</code> for both workers, on branches <code>factory/codex-jester</code> and <code>factory/claude-jester</code> respectively, parented on <code>main</code>.
+        </div>
+      </li>
+    </ul>
+  </section>
+
+  <!-- VERDICT -->
+  <section>
+    <h2><span class="icon">✅</span> Verdict</h2>
+    <table class="eval-table">
+      <thead>
+        <tr><th>Area</th><th>Result</th><th>Summary</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>claude-jester CAS rule following</td>
+          <td><span class="badge badge-pass">PASS</span></td>
+          <td>All major rules followed. One minor gap: no explicit ACK sent for the initial assignment (corrected on subsequent task cas-6af0).</td>
+        </tr>
+        <tr>
+          <td>codex-jester CAS rule following</td>
+          <td><span class="badge badge-pass">PASS</span></td>
+          <td>Exemplary: ACK sent, proof logged, VERIFICATION_JAIL handled by the book, decision note filed. Zero deviations.</td>
+        </tr>
+        <tr>
+          <td>Supervisor behaviour</td>
+          <td><span class="badge badge-pass">PASS</span></td>
+          <td>Smooth orchestration. Handled the JAIL blocker correctly. One harmless skill-name miss on startup (<code>cas-codex-supervisor-checklist</code> not found) did not impair operations.</td>
+        </tr>
+        <tr>
+          <td>Director behaviour</td>
+          <td><span class="badge badge-pass">PASS</span></td>
+          <td>All lifecycle events delivered correctly and promptly. Session cleanup and orphan removal on startup worked as expected.</td>
+        </tr>
+        <tr>
+          <td>Overall smoke test</td>
+          <td><span class="badge badge-pass">PASS</span></td>
+          <td>Both workers spawned, produced jokes, communicated correctly, and closed without repo modifications. Factory infrastructure functioned end-to-end.</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+</main>
+
+<footer>
+  Generated by claude-jester (claude-sonnet-4-6) · Task cas-6af0 · 2026-06-30
+  &nbsp;|&nbsp; Sources: <code>.cas/logs/cas-2026-06-30.log</code>, <code>.cas/cas.db</code>, task records cas-73ba &amp; cas-2650
+</footer>
+
+</body>
+</html>
