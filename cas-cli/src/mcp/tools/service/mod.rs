@@ -202,7 +202,7 @@ impl CasService {
 
             // Verification jail check
             this.inner
-                .authorize_agent_action("memory", &action, is_mutating)?;
+                .authorize_agent_action("memory", &action, is_mutating, None)?;
 
             let result = match req.action.as_str() {
                 "remember" => this.memory_remember(req).await,
@@ -273,9 +273,17 @@ impl CasService {
                     | "transfer"
             );
 
-            // Verification jail check
+            // Verification jail check.
+            // cas-a3ca: for task.close, scope the jail to only the requested
+            // task so an unrelated in-progress task cannot block closing a
+            // separately verified task.
+            let close_task_id = if action == "close" {
+                req.id.as_deref()
+            } else {
+                None
+            };
             this.inner
-                .authorize_agent_action("task", &action, is_mutating)?;
+                .authorize_agent_action("task", &action, is_mutating, close_task_id)?;
 
             let result = match req.action.as_str() {
                 "create" => this.task_create(req).await,
@@ -341,7 +349,7 @@ impl CasService {
 
             // Verification jail check
             this.inner
-                .authorize_agent_action("rule", &action, is_mutating)?;
+                .authorize_agent_action("rule", &action, is_mutating, None)?;
 
             let result = match req.action.as_str() {
                 "create" => this.rule_create(req).await,
@@ -397,7 +405,7 @@ impl CasService {
 
             // Verification jail check
             this.inner
-                .authorize_agent_action("skill", &action, is_mutating)?;
+                .authorize_agent_action("skill", &action, is_mutating, None)?;
 
             let result = match req.action.as_str() {
                 "create" => this.skill_create(req).await,
@@ -821,7 +829,7 @@ impl CasService {
 
             // Verification jail check
             this.inner
-                .authorize_agent_action("pattern", &action, is_mutating)?;
+                .authorize_agent_action("pattern", &action, is_mutating, None)?;
 
             let result = match req.action.as_str() {
                 "create" => this.pattern_create(req).await,
@@ -887,7 +895,7 @@ impl CasService {
 
             // Verification jail check
             this.inner
-                .authorize_agent_action("spec", &action, is_mutating)?;
+                .authorize_agent_action("spec", &action, is_mutating, None)?;
 
             let result = match req.action.as_str() {
                 "create" => this.spec_create(req).await,

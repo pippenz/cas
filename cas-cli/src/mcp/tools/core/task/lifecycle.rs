@@ -1,4 +1,6 @@
-use crate::harness_policy::is_worker_without_subagents_from_env;
+use crate::harness_policy::{
+    is_worker_without_subagents_from_env, supervisor_verification_tool,
+};
 use crate::mcp::tools::core::imports::*;
 
 pub(crate) mod close_ops;
@@ -324,9 +326,11 @@ impl CasCore {
         // Auto-claim the task with a lease
         let agent_id = self.get_agent_id()?;
 
-        // Check if agent has pending verification (blocks starting new tasks)
+        // Check if agent has pending verification (blocks starting new tasks).
+        // Pass None so all leases are evaluated — start intentionally blocks
+        // across all unverified tasks, not just the one being started.
         if let Some((blocked_task_id, blocked_task_title)) =
-            self.check_pending_verification(&agent_id)?
+            self.check_pending_verification(&agent_id, None)?
         {
             // Allow if starting the same task that's blocking (resuming work)
             if blocked_task_id != req.id {
@@ -341,8 +345,9 @@ impl CasCore {
                     blocked_task_id,
                     blocked_task_title,
                     if is_worker_without_subagents {
+                        let sup_ver = supervisor_verification_tool();
                         format!(
-                            "1. Ask supervisor to verify task {blocked_task_id} (task-verifier or direct mcp__cs__verification)\n\
+                            "1. Ask supervisor to verify task {blocked_task_id} (task-verifier or direct {sup_ver})\n\
                             2. Fix any issues found\n\
                             3. Ask supervisor to close the task once verification is approved"
                         )

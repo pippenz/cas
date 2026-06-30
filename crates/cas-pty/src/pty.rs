@@ -480,6 +480,26 @@ fn push_codex_mcp_server_args(args: &mut Vec<String>, session_id: &str, name: &s
     args.push(format!("mcp_servers.cs.env.CAS_AGENT_NAME=\"{name}\""));
     args.push("-c".to_string());
     args.push(format!("mcp_servers.cs.env.CAS_AGENT_ROLE=\"{role}\""));
+    // cas-8aaf: inject factory context env vars so the `cs` MCP server
+    // knows it is running inside a factory session. Without these, the server
+    // process has CAS_AGENT_ROLE=worker but lacks CAS_FACTORY_MODE, making
+    // `is_factory_worker` false. The result is VERIFICATION_JAIL_BLOCKED with
+    // Task(subagent_type="task-verifier") guidance — an instruction Codex
+    // workers cannot execute. Two downstream fixes are unlocked:
+    //
+    //   1. CAS_FACTORY_MODE=1: enables is_factory_worker in authorize_agent_action
+    //      and close_ops.rs, so supervisor-owned exemptions fire correctly and
+    //      the jail gives "message supervisor" guidance instead of Task().
+    //
+    //   2. CAS_FACTORY_WORKER_CLI=codex: makes worker_harness_from_env() return
+    //      Codex, which (a) causes verification_required_for_task_type() to
+    //      return false for Codex workers under supervisor-owned review (no jail),
+    //      (b) makes is_worker_without_subagents_from_env() true, and (c) selects
+    //      mcp__cs__coordination (not mcp__cas__coordination) in guidance text.
+    args.push("-c".to_string());
+    args.push("mcp_servers.cs.env.CAS_FACTORY_MODE=\"1\"".to_string());
+    args.push("-c".to_string());
+    args.push("mcp_servers.cs.env.CAS_FACTORY_WORKER_CLI=\"codex\"".to_string());
     if role == "supervisor" {
         args.push("-c".to_string());
         args.push("mcp_servers.cs.env.CAS_FACTORY_SUPERVISOR_CLI=\"codex\"".to_string());
@@ -1417,6 +1437,70 @@ mod tests {
         assert!(
             all_args.contains("mcp_servers.cs.env.CAS_SESSION_ID=\"codex-test-supervisor-"),
             "codex supervisor must inject CAS_SESSION_ID into the cs MCP env; got: {all_args}"
+        );
+    }
+
+    /// cas-8aaf: the Codex `cs` MCP server must receive CAS_FACTORY_MODE=1 and
+    /// CAS_FACTORY_WORKER_CLI=codex so the MCP server's is_factory_worker check
+    /// fires and worker_harness_from_env() returns Codex. Without these env vars
+    /// the `cs` server doesn't know it is inside a factory session:
+    ///   - CAS_FACTORY_MODE absent → is_factory_worker=false → VERIFICATION_JAIL_BLOCKED
+    ///     returns Task(subagent_type="task-verifier") guidance Codex cannot execute.
+    ///   - CAS_FACTORY_WORKER_CLI absent → worker_harness_from_env() defaults to
+    ///     Claude → verification_required_for_task_type() returns true → jail fires
+    ///     even under supervisor-owned review (where it must NOT fire for Codex).
+    #[tokio::test]
+    async fn test_pty_config_codex_worker_injects_factory_mode_and_worker_cli_cas_8aaf() {
+        let _e = ScopedEnv::new();
+        let config = PtyConfig::codex(
+            "test-worker",
+            "worker",
+            PathBuf::from("/tmp"),
+            None,
+            None,
+            None,
+            None, // model
+            None, // effort
+            None, // teams
+        );
+        let all_args = config.args.join(" ");
+        assert!(
+            all_args.contains("mcp_servers.cs.env.CAS_FACTORY_MODE=\"1\""),
+            "codex worker cs MCP server must receive CAS_FACTORY_MODE=1 so \
+             is_factory_worker is true; got: {all_args}"
+        );
+        assert!(
+            all_args.contains("mcp_servers.cs.env.CAS_FACTORY_WORKER_CLI=\"codex\""),
+            "codex worker cs MCP server must receive CAS_FACTORY_WORKER_CLI=codex so \
+             worker_harness_from_env() returns Codex; got: {all_args}"
+        );
+    }
+
+    /// cas-8aaf: a Codex supervisor spawn must also receive the factory env vars
+    /// in its `cs` MCP server so supervisor-side harness detection is consistent.
+    #[tokio::test]
+    async fn test_pty_config_codex_supervisor_injects_factory_mode_and_worker_cli_cas_8aaf() {
+        let _e = ScopedEnv::new();
+        let config = PtyConfig::codex(
+            "test-supervisor",
+            "supervisor",
+            PathBuf::from("/tmp"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let all_args = config.args.join(" ");
+        assert!(
+            all_args.contains("mcp_servers.cs.env.CAS_FACTORY_MODE=\"1\""),
+            "codex supervisor cs MCP server must receive CAS_FACTORY_MODE=1; got: {all_args}"
+        );
+        assert!(
+            all_args.contains("mcp_servers.cs.env.CAS_FACTORY_WORKER_CLI=\"codex\""),
+            "codex supervisor cs MCP server must receive CAS_FACTORY_WORKER_CLI=codex; \
+             got: {all_args}"
         );
     }
 

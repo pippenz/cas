@@ -10,7 +10,9 @@ use rmcp::service::Peer;
 use rmcp::service::RoleServer;
 
 use crate::config::Config;
-use crate::harness_policy::verification_required_for_task_type;
+use crate::harness_policy::{
+    supervisor_verification_tool, verification_required_for_task_type, worker_coordination_tool,
+};
 use crate::store::{
     AgentStore, EntityStore, RuleStore, SkillStore, Store, TaskStore, VerificationStore,
     WorktreeStore, open_agent_store, open_entity_store, open_rule_store, open_skill_store,
@@ -619,11 +621,17 @@ impl CasCore {
     /// - All other mutating operations: blocked when jailed
     ///
     /// Returns Ok(()) if allowed, or Err with VERIFICATION_JAIL_BLOCKED code if blocked.
+    ///
+    /// `close_task_id`: when `Some(id)`, scopes the verification-jail check to
+    /// only the task being closed. Unrelated tasks held by the same agent will
+    /// not block this close (cas-a3ca). Pass `None` for all other mutations —
+    /// those still enforce the full any-unverified-task jail.
     pub(crate) fn authorize_agent_action(
         &self,
         tool: &str,
         action: &str,
         is_mutating: bool,
+        close_task_id: Option<&str>,
     ) -> Result<(), McpError> {
         if !is_mutating {
             return Ok(());
@@ -704,20 +712,29 @@ impl CasCore {
             Err(_) => return Ok(()), // No agent registered = no jail enforcement
         };
 
-        match self.check_pending_verification(&agent_id)? {
+        match self.check_pending_verification(&agent_id, close_task_id)? {
             Some((task_id, task_title)) => {
                 // cas-778a: factory workers cannot spawn task-verifier themselves
                 // (it's an internal agent). Give them the correct escalation path
                 // (forward to supervisor) instead of an impossible instruction.
                 // Non-worker callers (supervisors, non-factory contexts) retain
                 // the existing Task() spawn suggestion which is correct for them.
+                //
+                // cas-8aaf: the coordination tool alias differs by harness.
+                // Claude workers use mcp__cas__coordination, Codex workers use
+                // mcp__cs__coordination. worker_coordination_tool() reads
+                // CAS_FACTORY_WORKER_CLI (injected by the PTY spawn) to select
+                // the right alias so the suggestion is executable by this worker.
                 let guidance = if is_factory_worker {
+                    let coord_tool = worker_coordination_tool();
+                    let sup_ver_tool = supervisor_verification_tool();
                     format!(
-                        "Forward to supervisor via: \
-                         mcp__cas__coordination action=message target=supervisor \
+                        "Message supervisor via: \
+                         {coord_tool} action=message target=supervisor \
                          summary=\"Ready to close {task_id}\" \
-                         message=\"Task {task_id} is ready to close. \
-                         Please verify and close on my behalf.\""
+                         message=\"Task {task_id} requires verification before close. \
+                         Please run verification (task-verifier or direct {sup_ver_tool}) for task {task_id} \
+                         and close on my behalf if approved.\""
                     )
                 } else {
                     format!(
@@ -739,14 +756,21 @@ impl CasCore {
         }
     }
 
-    /// Check if an agent has any tasks with pending verification
+    /// Check if an agent has any tasks with pending verification.
     ///
-    /// Returns Some((task_id, task_title)) if the agent has an in-progress task
+    /// Returns `Some((task_id, task_title))` if the agent has an in-progress task
     /// that requires verification but hasn't been verified yet.
-    /// Returns None if the agent can proceed with new tasks.
+    /// Returns `None` if the agent can proceed.
+    ///
+    /// `close_task_id`: when `Some(id)`, only the named task is evaluated —
+    /// unrelated tasks leased by the same agent are skipped. This scopes the
+    /// jail check for `task.close id=X` to X itself so that a different
+    /// in-progress task (unverified) cannot block closing an already-verified
+    /// task (cas-a3ca).
     pub(crate) fn check_pending_verification(
         &self,
         agent_id: &str,
+        close_task_id: Option<&str>,
     ) -> Result<Option<(String, String)>, McpError> {
         let config = self.load_config();
 
@@ -771,6 +795,17 @@ impl CasCore {
             // Only check active leases
             if lease.status != crate::types::LeaseStatus::Active {
                 continue;
+            }
+
+            // cas-a3ca: when called for a specific task.close, only evaluate
+            // the task being closed. An unrelated in-progress task (e.g. task B
+            // started after task A was verified) must not block closing task A.
+            // The jail scopes to the requested task; other tasks' verification
+            // state is irrelevant to whether THIS task can be closed.
+            if let Some(target_id) = close_task_id {
+                if lease.task_id != target_id {
+                    continue;
+                }
             }
 
             // Get the task

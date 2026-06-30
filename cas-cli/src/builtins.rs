@@ -1177,6 +1177,62 @@ This is the body content."#;
     }
 
     #[test]
+    fn test_report_evidence_guidance_prefers_safe_sources() {
+        for (label, skill_content, details_content) in [
+            (
+                "claude",
+                include_str!("builtins/skills/cas-worker.md"),
+                include_str!("builtins/skills/cas-worker/references/details.md"),
+            ),
+            (
+                "codex",
+                include_str!("builtins/codex/skills/cas-worker.md"),
+                include_str!("builtins/codex/skills/cas-worker/references/details.md"),
+            ),
+        ] {
+            for required in [
+                "Report / evidence tasks",
+                "MCP task/search/coordination surfaces",
+                ".cas/logs",
+                "read-only SQLite URI",
+                "copied snapshot",
+            ] {
+                assert!(
+                    skill_content.contains(required) || details_content.contains(required),
+                    "{label} worker guidance missing report/evidence safety marker: {required:?}"
+                );
+            }
+            assert!(
+                details_content.contains("Do **not** use unrestricted `sqlite3 /path/to/.cas/cas.db`"),
+                "{label} worker details should explicitly discourage unrestricted live sqlite3 access"
+            );
+        }
+
+        for (label, planning_content) in [
+            (
+                "claude",
+                include_str!("builtins/skills/cas-supervisor/references/planning.md"),
+            ),
+            (
+                "codex",
+                include_str!("builtins/codex/skills/cas-supervisor/references/planning.md"),
+            ),
+        ] {
+            for required in [
+                "Evidence-source plan",
+                "MCP/log/recording/task-record sources",
+                ".cas/cas.db",
+                "read-only URI or copied-snapshot access",
+            ] {
+                assert!(
+                    planning_content.contains(required),
+                    "{label} supervisor planning guidance missing report/evidence template marker: {required:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_builtin_cas_brainstorm_disallowed_tools() {
         for (label, skills) in [
             ("BUILTIN_SKILLS", BUILTIN_SKILLS),

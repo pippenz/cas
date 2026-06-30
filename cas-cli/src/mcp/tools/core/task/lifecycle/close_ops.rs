@@ -1,6 +1,7 @@
 use crate::harness_policy::{
     is_supervisor_from_env, is_worker_without_subagents_from_env, supervisor_harness_from_env,
-    supervisor_verification_tool, verification_policy, worker_harness_from_env,
+    supervisor_verification_tool, verification_policy, worker_coordination_tool,
+    worker_harness_from_env,
 };
 use crate::mcp::tools::core::imports::*;
 
@@ -451,8 +452,6 @@ impl CasCore {
                         } else {
                             String::new()
                         };
-                        let supervisor_verification_tool = supervisor_verification_tool();
-
                         return Ok(Self::tool_error(format!(
                             "⚠️ VERIFICATION FAILED\n\n\
                             Task {} has a rejected verification with {} issue(s) ({} blocking).\n\n\
@@ -464,9 +463,14 @@ impl CasCore {
                             blocking,
                             v.summary,
                             if is_worker_without_subagents {
-                                "To fix: Address the issues in this worker.\n\
-                                    Then ask supervisor to run verification (task-verifier or direct {supervisor_verification_tool}) and close the task on your behalf."
-                                    .to_string()
+                                // cas-8aaf: use harness-appropriate tool aliases.
+                                let sup_ver = supervisor_verification_tool();
+                                format!(
+                                    "To fix: Address the issues in this worker.\n\
+                                     Then ask supervisor to run verification \
+                                     (task-verifier or direct {sup_ver}) \
+                                     and close the task on your behalf."
+                                )
                             } else {
                                 format!(
                                     "To fix: Address the issues and run the {verifier_agent} agent again."
@@ -474,9 +478,15 @@ impl CasCore {
                             },
                             close_reason_note,
                             if is_worker_without_subagents {
+                                // cas-8aaf: use harness-appropriate coordination tool.
+                                let coord = worker_coordination_tool();
+                                let sup_ver = supervisor_verification_tool();
                                 format!(
-                                    "Suggested message: mcp__cas__coordination action=message target=supervisor message=\"Task {} is ready for re-verification. Please verify (task-verifier or direct {}) and close if approved.\"",
-                                    req.id, supervisor_verification_tool
+                                    "Suggested message: {coord} action=message target=supervisor \
+                                     message=\"Task {id} is ready for re-verification. \
+                                     Please verify (task-verifier or direct {sup_ver}) \
+                                     and close if approved.\"",
+                                    id = req.id
                                 )
                             } else {
                                 format!(
@@ -499,7 +509,7 @@ impl CasCore {
                         // VERIFICATION REQUIRED loop.
                         let elapsed_mins =
                             (chrono::Utc::now() - v.created_at).num_seconds() / 60;
-                        let supervisor_verification_tool = supervisor_verification_tool();
+                        let supervisor_verification_tool_name = supervisor_verification_tool();
 
                         // Clear pending_verification so the jail releases.
                         let mut task_to_update = task.clone();
@@ -555,7 +565,11 @@ impl CasCore {
                             1. Re-dispatch verifier: Task(subagent_type=\"task-verifier\", prompt=\"Verify task {}\")\n\
                             2. Or record verdict directly: {} action=add task_id={} status=approved summary=\"...\"\n\
                             3. Then call cas_task_close again.",
-                            req.id, elapsed_mins, req.id, supervisor_verification_tool, req.id
+                            req.id,
+                            elapsed_mins,
+                            req.id,
+                            supervisor_verification_tool_name,
+                            req.id
                         )));
                     }
                     Ok(None) | Ok(Some(_)) => {
@@ -773,7 +787,7 @@ impl CasCore {
                                 "The agent will check for TODO comments, stubs, incomplete implementations,\n\
                                 AND validate the close reason doesn't admit incomplete work."
                             };
-                            let supervisor_verification_tool = supervisor_verification_tool();
+                            let supervisor_verification_tool_name = supervisor_verification_tool();
 
                             // Send verification blocked activity event (for supervisor visibility)
                             if let Ok(agent_id) = self.get_agent_id() {
@@ -817,12 +831,23 @@ impl CasCore {
                             }
 
                             let verification_gate = if is_factory_worker {
+                                // cas-8aaf: use harness-appropriate coordination tool alias.
+                                // Claude workers use mcp__cas__coordination, Codex workers
+                                // use mcp__cs__coordination (CAS_FACTORY_WORKER_CLI drives
+                                // the selection via worker_coordination_tool()).
+                                let coord = worker_coordination_tool();
+                                let close_reason_hint = req
+                                    .reason
+                                    .as_deref()
+                                    .map(|r| format!(" Close reason: {r}."))
+                                    .unwrap_or_default();
                                 format!(
                                     "🔒 Factory worker verification gate: this close will only succeed after a task-verifier records a verdict.\n\n\
                                      Forward to supervisor (workers cannot spawn task-verifier directly):\n\n\
-                                     mcp__cas__coordination action=message target=supervisor \
+                                     {coord} action=message target=supervisor \
                                      summary=\"Ready to close {id}\" \
-                                     message=\"Task {id} is ready to close. Please verify and close on my behalf.\"",
+                                     message=\"Task {id} is ready to close.{close_reason_hint} \
+                                     Please run task-verifier for task {id} and close on my behalf if approved.\"",
                                     id = req.id
                                 )
                             } else if supervisor_is_assignee {
@@ -831,7 +856,10 @@ impl CasCore {
                                      Task(subagent_type=\"{}\", prompt=\"Verify task {}\")\n\n\
                                      Or record verification directly:\n\
                                      {} action=add task_id={} status=approved summary=\"Self-verified: <reason>\"",
-                                    verifier_agent, req.id, supervisor_verification_tool, req.id
+                                    verifier_agent,
+                                    req.id,
+                                    supervisor_verification_tool_name,
+                                    req.id
                                 )
                             } else {
                                 format!(
@@ -853,17 +881,27 @@ impl CasCore {
                                 verification_desc,
                                 close_reason_section.as_str(),
                                 if is_worker_without_subagents {
+                                    // cas-8aaf: harness-appropriate supervisor verification tool.
+                                    let sup_ver = supervisor_verification_tool();
                                     format!(
-                                        "Ask supervisor to run verification (task-verifier or direct {}) and close task {} on your behalf.",
-                                        supervisor_verification_tool, req.id
+                                        "Ask supervisor to run verification \
+                                         (task-verifier or direct {sup_ver}) \
+                                         and close task {} on your behalf.",
+                                        req.id
                                     )
                                 } else {
                                     String::new()
                                 },
                                 if is_worker_without_subagents {
+                                    // cas-8aaf: harness-appropriate coordination tool.
+                                    let coord = worker_coordination_tool();
+                                    let sup_ver = supervisor_verification_tool();
                                     format!(
-                                        "Suggested message: mcp__cas__coordination action=message target=supervisor message=\"Please verify task {} (task-verifier or direct {}) and close it if approved.\"",
-                                        req.id, supervisor_verification_tool
+                                        "Suggested message: {coord} action=message \
+                                         target=supervisor message=\"Please verify task {id} \
+                                         (task-verifier or direct {sup_ver}) \
+                                         and close it if approved.\"",
+                                        id = req.id
                                     )
                                 } else {
                                     "After verification passes, call cas_task_close again."

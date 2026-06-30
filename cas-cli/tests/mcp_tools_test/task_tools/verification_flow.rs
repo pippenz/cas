@@ -3695,3 +3695,592 @@ async fn test_worker_close_succeeds_when_skipped_row_write_fails_option_b() {
         "verifications table must be empty — the trigger must have blocked the Skipped row insert"
     );
 }
+
+// =============================================================================
+// cas-8aaf: Codex/Claude close-block message correctness
+//
+// Regression guard for the VERIFICATION_JAIL_BLOCKED guidance routing fix.
+//
+// When a factory worker hits the verification jail (legacy owner=worker config),
+// the suggested action must use the correct MCP alias for the worker's harness:
+//   - Claude workers: mcp__cas__coordination
+//   - Codex workers:  mcp__cs__coordination
+//
+// Under default supervisor-owned review (owner=supervisor), Codex workers must
+// NOT hit the jail at all — verification_required_for_task_type() returns false
+// for Codex harnesses that don't support subagents.
+// =============================================================================
+
+/// Guard that installs factory-worker env vars for a Codex worker context.
+/// Sets CAS_FACTORY_WORKER_CLI=codex in addition to the standard ROLE/MODE so
+/// worker_harness_from_env() returns Codex and is_worker_without_subagents_from_env()
+/// returns true.
+struct CodexWorkerEnv;
+
+impl CodexWorkerEnv {
+    fn enter() -> Self {
+        unsafe {
+            std::env::set_var("CAS_AGENT_ROLE", "worker");
+            std::env::set_var("CAS_FACTORY_MODE", "1");
+            std::env::set_var("CAS_FACTORY_WORKER_CLI", "codex");
+        }
+        Self
+    }
+}
+
+impl Drop for CodexWorkerEnv {
+    fn drop(&mut self) {
+        unsafe {
+            std::env::remove_var("CAS_AGENT_ROLE");
+            std::env::remove_var("CAS_FACTORY_MODE");
+            std::env::remove_var("CAS_FACTORY_WORKER_CLI");
+        }
+    }
+}
+
+/// cas-8aaf: a Codex factory worker under supervisor-owned review (the default)
+/// must NOT hit VERIFICATION_JAIL_BLOCKED on close. The Codex harness does not
+/// support subagents, so verification_required_for_task_type() returns false and
+/// the jail short-circuits.
+///
+/// This pins the fix from pty.rs injecting CAS_FACTORY_WORKER_CLI=codex into
+/// the `cs` MCP server env — without it worker_harness_from_env() defaults to
+/// Claude, which DOES require verification, breaking every Codex worker close.
+#[tokio::test]
+async fn test_codex_worker_close_not_jailed_under_supervisor_owned_review_cas_8aaf() {
+    let (_temp, core) = setup_cas();
+    let _env_lock = env_test_lock();
+
+    // No config.toml written => default code_review.owner = "supervisor" (cas-865b).
+    let service = CasService::new(core, None);
+    let _env = CodexWorkerEnv::enter();
+
+    let created = service
+        .task(Parameters(task_req(serde_json::json!({
+            "action": "create",
+            "title": "cas-8aaf: Codex close not jailed under supervisor-owned review",
+            "priority": 2,
+            "task_type": "task",
+        }))))
+        .await
+        .expect("create");
+    let id = extract_task_id(&extract_text(created))
+        .expect("id")
+        .to_string();
+    service
+        .task(Parameters(task_req(serde_json::json!({
+            "action": "start",
+            "id": id.clone(),
+        }))))
+        .await
+        .expect("start");
+
+    // Close. Must NOT return VERIFICATION_JAIL_BLOCKED — Codex workers don't
+    // support subagents so verification is bypassed under supervisor_owned review.
+    let result = service
+        .task(Parameters(task_req(serde_json::json!({
+            "action": "close",
+            "id": id.clone(),
+            "reason": "All acceptance criteria satisfied. No reviewable code changes.",
+        }))))
+        .await
+        .expect("close must not error for Codex worker under supervisor-owned review");
+    let text = extract_text(result);
+    assert!(
+        !text.contains("VERIFICATION_JAIL_BLOCKED"),
+        "Codex worker under owner=supervisor must not hit verification jail; got: {text}"
+    );
+}
+
+/// cas-8aaf: a Claude factory worker under legacy owner=worker config that hits
+/// the verification jail must receive mcp__cas__coordination guidance (not
+/// Task(subagent_type="task-verifier"), which is the non-factory-worker branch).
+///
+/// This pins the existing behavior and guards against the guidance regressing to
+/// the non-factory branch. Complements the Codex variant below.
+#[tokio::test]
+async fn test_claude_worker_jail_close_block_recommends_cas_coordination_cas_8aaf() {
+    let (temp, core) = setup_cas();
+    let _env_lock = env_test_lock();
+    let cas_dir = temp.path().join(".cas");
+
+    // Opt into legacy owner=worker so the jail fires for Claude workers.
+    std::fs::write(
+        cas_dir.join("config.toml"),
+        "[code_review]\nowner = \"worker\"\n",
+    )
+    .expect("write legacy code_review config");
+
+    let service = CasService::new(core, None);
+    // Claude worker: CAS_FACTORY_WORKER_CLI not set => defaults to Claude harness.
+    let _env = FactoryWorkerEnv::enter();
+
+    let created = service
+        .task(Parameters(task_req(serde_json::json!({
+            "action": "create",
+            "title": "cas-8aaf: Claude worker jail guidance uses mcp__cas__coordination",
+            "priority": 2,
+            "task_type": "task",
+        }))))
+        .await
+        .expect("create");
+    let id = extract_task_id(&extract_text(created))
+        .expect("id")
+        .to_string();
+    service
+        .task(Parameters(task_req(serde_json::json!({
+            "action": "start",
+            "id": id.clone(),
+        }))))
+        .await
+        .expect("start");
+
+    let err = service
+        .task(Parameters(task_req(serde_json::json!({
+            "action": "close",
+            "id": id.clone(),
+            "reason": "Done.",
+        }))))
+        .await
+        .expect_err("close must be blocked for Claude worker under owner=worker");
+    let msg = err.message.to_string();
+    assert!(
+        msg.contains("VERIFICATION_JAIL_BLOCKED"),
+        "Claude worker under owner=worker must hit jail; got: {msg}"
+    );
+    // cas-778a + cas-8aaf: Claude factory workers must use mcp__cas__coordination.
+    assert!(
+        msg.contains("mcp__cas__coordination"),
+        "Claude worker jail must recommend mcp__cas__coordination; got: {msg}"
+    );
+    // Must NOT instruct spawning task-verifier (workers can't do it) or use Codex alias.
+    assert!(
+        !msg.contains("Task(subagent_type=\"task-verifier\""),
+        "Claude factory worker jail must not suggest Task() spawn; got: {msg}"
+    );
+    assert!(
+        !msg.contains("mcp__cs__coordination"),
+        "Claude factory worker jail must not suggest Codex alias; got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn test_claude_worker_jail_guidance_uses_codex_supervisor_verification_alias_cas_1544() {
+    let (temp, core) = setup_cas();
+    let _env_lock = env_test_lock();
+    let cas_dir = temp.path().join(".cas");
+
+    std::fs::write(
+        cas_dir.join("config.toml"),
+        "[code_review]\nowner = \"worker\"\n",
+    )
+    .expect("write legacy code_review config");
+
+    let service = CasService::new(core, None);
+    let _env = FactoryWorkerEnv::enter();
+    let _supervisor = ScopedSupervisorCliEnv::set(Some("codex"));
+
+    let created = service
+        .task(Parameters(task_req(serde_json::json!({
+            "action": "create",
+            "title": "cas-1544: Claude worker jail guidance uses Codex supervisor verification alias",
+            "priority": 2,
+            "task_type": "task",
+        }))))
+        .await
+        .expect("create");
+    let id = extract_task_id(&extract_text(created))
+        .expect("id")
+        .to_string();
+    service
+        .task(Parameters(task_req(serde_json::json!({
+            "action": "start",
+            "id": id.clone(),
+        }))))
+        .await
+        .expect("start");
+
+    let err = service
+        .task(Parameters(task_req(serde_json::json!({
+            "action": "close",
+            "id": id.clone(),
+            "reason": "Done.",
+        }))))
+        .await
+        .expect_err("close must be blocked for Claude worker under owner=worker");
+    let msg = err.message.to_string();
+    assert!(
+        msg.contains("mcp__cas__coordination"),
+        "Claude worker must keep its own coordination alias: {msg}"
+    );
+    assert!(
+        msg.contains("mcp__cs__verification"),
+        "Worker guidance must recommend the Codex supervisor verification alias when CAS_FACTORY_SUPERVISOR_CLI=codex: {msg}"
+    );
+    assert!(
+        !msg.contains("direct mcp__cas__verification"),
+        "Worker guidance must not fall back to the Claude supervisor verification alias in a Codex supervisor factory: {msg}"
+    );
+}
+
+/// cas-8aaf: a Codex factory worker under legacy owner=worker config must NOT
+/// be jailed. Because Codex doesn't support subagents, verification_policy()
+/// returns task_mode=Bypassed, so verification_required_for_task_type() returns
+/// false. The check_pending_verification loop skips the task and the jail never
+/// fires — even under owner=worker. This is correct: Codex workers cannot run
+/// the task-verifier subagent, so jailing them would deadlock every close.
+///
+/// Pre-fix (CAS_FACTORY_WORKER_CLI absent → defaults to Claude → verification
+/// required), Codex workers would hit VERIFICATION_JAIL_BLOCKED with the wrong
+/// guidance. Post-fix, harness is detected correctly and the jail bypasses.
+#[tokio::test]
+async fn test_codex_worker_not_jailed_even_under_owner_worker_cas_8aaf() {
+    let (temp, core) = setup_cas();
+    let _env_lock = env_test_lock();
+    let cas_dir = temp.path().join(".cas");
+
+    // Force legacy owner=worker to confirm Codex workers are still bypassed.
+    std::fs::write(
+        cas_dir.join("config.toml"),
+        "[code_review]\nowner = \"worker\"\n",
+    )
+    .expect("write legacy code_review config");
+
+    let service = CasService::new(core, None);
+    // Codex worker env: CAS_FACTORY_WORKER_CLI=codex makes harness=Codex.
+    let _env = CodexWorkerEnv::enter();
+
+    let created = service
+        .task(Parameters(task_req(serde_json::json!({
+            "action": "create",
+            "title": "cas-8aaf: Codex worker bypasses jail even under owner=worker",
+            "priority": 2,
+            "task_type": "task",
+        }))))
+        .await
+        .expect("create");
+    let id = extract_task_id(&extract_text(created))
+        .expect("id")
+        .to_string();
+    service
+        .task(Parameters(task_req(serde_json::json!({
+            "action": "start",
+            "id": id.clone(),
+        }))))
+        .await
+        .expect("start");
+
+    // Close must succeed: verification_required_for_task_type returns false for
+    // Codex (no subagent support), so the jail check skips the task entirely.
+    let result = service
+        .task(Parameters(task_req(serde_json::json!({
+            "action": "close",
+            "id": id.clone(),
+            "reason": "Done.",
+        }))))
+        .await
+        .expect("Codex worker close must not be jailed even under owner=worker");
+    let text = extract_text(result);
+    assert!(
+        !text.contains("VERIFICATION_JAIL_BLOCKED"),
+        "Codex worker must bypass verification jail (harness has no subagent support); got: {text}"
+    );
+}
+
+// =============================================================================
+// cas-a3ca: verification jail must scope to the requested task
+//
+// Regression guard for the cross-task verification jail leakage that
+// surfaced during the cas-3cb7 smoke test. Worker `safety-triage` completed
+// and verified cas-cdee, then started cas-8236 before cas-cdee could close.
+// The subsequent `task.close id=cas-cdee` was blocked with
+// VERIFICATION_JAIL_BLOCKED naming cas-8236 (the in-progress, unverified
+// task), not cas-cdee. The close gate was evaluating ALL agent leases, not
+// just the one being closed.
+//
+// Fix: `check_pending_verification` now accepts `close_task_id: Option<&str>`.
+// When Some(id), leases for tasks OTHER than id are skipped — only the
+// requested task's own verification state can block its close.
+// =============================================================================
+
+/// cas-a3ca (positive path): close of verified task A must not be blocked by
+/// unrelated in-progress task B held by the same agent.
+///
+/// Sequence: create+start+verify A, create+start B (no verification),
+/// `task.close id=A` → must succeed.
+///
+/// Uses legacy owner=worker so the jail fires for task.close (under
+/// owner=supervisor factory workers are fully exempt from close-time jail).
+#[tokio::test]
+async fn test_close_verified_task_not_blocked_by_unrelated_unverified_task_cas_a3ca() {
+    let (temp, core) = setup_cas();
+    let _env_lock = env_test_lock();
+    let cas_dir = temp.path().join(".cas");
+
+    // Legacy owner=worker so the jail check fires for task.close
+    std::fs::write(
+        cas_dir.join("config.toml"),
+        "[code_review]\nowner = \"worker\"\n",
+    )
+    .expect("write legacy code_review config");
+
+    let service = CasService::new(core, None);
+    // Claude factory worker — CAS_FACTORY_WORKER_CLI not set → defaults to
+    // Claude harness (supports subagents → verification required for tasks).
+    let _env = FactoryWorkerEnv::enter();
+
+    // --- Task A: create, start, add approved verification ---
+    let id_a = extract_task_id(&extract_text(
+        service
+            .task(Parameters(task_req(serde_json::json!({
+                "action": "create",
+                "title": "cas-a3ca: task A — completed and verified",
+                "priority": 2,
+                "task_type": "task",
+            }))))
+            .await
+            .expect("create A"),
+    ))
+    .expect("id A")
+    .to_string();
+
+    service
+        .task(Parameters(task_req(serde_json::json!({
+            "action": "start",
+            "id": id_a.clone(),
+        }))))
+        .await
+        .expect("start A");
+
+    // Add approved verification for A
+    {
+        let verification_store =
+            open_verification_store(&cas_dir).expect("open verification store");
+        let ver = Verification::approved(
+            format!("ver-a3ca-a-{}", id_a),
+            id_a.clone(),
+            "verified by supervisor".to_string(),
+        );
+        verification_store.add(&ver).expect("add verification for A");
+    }
+
+    // --- Task B: create, start — deliberately NOT verified ---
+    let id_b = extract_task_id(&extract_text(
+        service
+            .task(Parameters(task_req(serde_json::json!({
+                "action": "create",
+                "title": "cas-a3ca: task B — in progress, unverified",
+                "priority": 2,
+                "task_type": "task",
+            }))))
+            .await
+            .expect("create B"),
+    ))
+    .expect("id B")
+    .to_string();
+
+    service
+        .task(Parameters(task_req(serde_json::json!({
+            "action": "start",
+            "id": id_b.clone(),
+        }))))
+        .await
+        .expect("start B");
+
+    // --- Close A: must succeed despite B being in-progress and unverified ---
+    //
+    // Pre-fix: `check_pending_verification` iterated all agent leases, found
+    // task B (unverified), returned Some((B, title)) → jail blocked close of A
+    // with "VERIFICATION_JAIL_BLOCKED" naming B, not A.
+    //
+    // Post-fix: jail passes `close_task_id = Some(A)`, so only A's lease is
+    // evaluated. A has an approved verification → no block.
+    let result = service
+        .task(Parameters(task_req(serde_json::json!({
+            "action": "close",
+            "id": id_a.clone(),
+            "reason": "cas-a3ca: verified task A close must not be blocked by unverified task B",
+        }))))
+        .await
+        .expect("close A must succeed when A is verified, even if B is unverified");
+
+    let text = extract_text(result);
+    assert!(
+        !text.contains("VERIFICATION_JAIL_BLOCKED"),
+        "close of verified task A must not be blocked by unverified task B; got: {text}"
+    );
+    // Confirm A is actually closed (not just a soft pass)
+    assert!(
+        text.to_lowercase().contains("closed") || text.to_lowercase().contains("success"),
+        "expected A to be closed; got: {text}"
+    );
+}
+
+/// cas-a3ca (negative path / jail still fires for the requested task): closing
+/// task A when A ITSELF has no verification must still be blocked.
+///
+/// This guards against a regression where the task-scoping change accidentally
+/// disabled the jail for the task being closed.
+#[tokio::test]
+async fn test_close_unverified_task_still_blocked_by_own_missing_verification_cas_a3ca() {
+    let (temp, core) = setup_cas();
+    let _env_lock = env_test_lock();
+    let cas_dir = temp.path().join(".cas");
+
+    // Legacy owner=worker so the jail fires for task.close
+    std::fs::write(
+        cas_dir.join("config.toml"),
+        "[code_review]\nowner = \"worker\"\n",
+    )
+    .expect("write legacy code_review config");
+
+    let service = CasService::new(core, None);
+    let _env = FactoryWorkerEnv::enter();
+
+    // Task A: in progress, NO verification
+    let id_a = extract_task_id(&extract_text(
+        service
+            .task(Parameters(task_req(serde_json::json!({
+                "action": "create",
+                "title": "cas-a3ca: task A — unverified, must be blocked at close",
+                "priority": 2,
+                "task_type": "task",
+            }))))
+            .await
+            .expect("create A"),
+    ))
+    .expect("id A")
+    .to_string();
+
+    service
+        .task(Parameters(task_req(serde_json::json!({
+            "action": "start",
+            "id": id_a.clone(),
+        }))))
+        .await
+        .expect("start A");
+
+    // Attempt to close A without any verification — must be blocked
+    let err = service
+        .task(Parameters(task_req(serde_json::json!({
+            "action": "close",
+            "id": id_a.clone(),
+            "reason": "unverified — should be blocked",
+        }))))
+        .await
+        .expect_err("close of unverified A must be blocked");
+
+    let msg = err.message.to_string();
+    assert!(
+        msg.contains("VERIFICATION_JAIL_BLOCKED"),
+        "close of unverified task A must hit the jail; got: {msg}"
+    );
+    // Error must name task A, not some other task
+    assert!(
+        msg.contains(&id_a),
+        "VERIFICATION_JAIL_BLOCKED must name task A ({id_a}); got: {msg}"
+    );
+}
+
+/// cas-a3ca (replay sequence): the exact cas-cdee/cas-8236 scenario.
+///
+/// Worker has task A (verified, merge-ready) and starts task B while A's close
+/// is delayed. `task.close id=A` must succeed — the fact that B is in-progress
+/// and unverified is irrelevant to A's close.
+#[tokio::test]
+async fn test_cdee_cas8236_sequence_close_verified_task_while_second_task_in_progress_cas_a3ca() {
+    let (temp, core) = setup_cas();
+    let _env_lock = env_test_lock();
+    let cas_dir = temp.path().join(".cas");
+
+    std::fs::write(
+        cas_dir.join("config.toml"),
+        "[code_review]\nowner = \"worker\"\n",
+    )
+    .expect("write owner=worker config");
+
+    let service = CasService::new(core, None);
+    let _env = FactoryWorkerEnv::enter();
+
+    // cas-cdee analogue: completed and supervisor-verified
+    let id_cdee = extract_task_id(&extract_text(
+        service
+            .task(Parameters(task_req(serde_json::json!({
+                "action": "create",
+                "title": "cas-a3ca replay: cas-cdee analogue — verified",
+                "priority": 2,
+                "task_type": "task",
+            }))))
+            .await
+            .expect("create cdee"),
+    ))
+    .expect("id cdee")
+    .to_string();
+
+    service
+        .task(Parameters(task_req(serde_json::json!({
+            "action": "start",
+            "id": id_cdee.clone(),
+        }))))
+        .await
+        .expect("start cdee");
+
+    {
+        let verification_store =
+            open_verification_store(&cas_dir).expect("open verification store");
+        let ver = Verification::approved(
+            format!("ver-a3ca-cdee-{}", id_cdee),
+            id_cdee.clone(),
+            "supervisor-verified, merge landed on main".to_string(),
+        );
+        verification_store
+            .add(&ver)
+            .expect("add verification for cdee analogue");
+    }
+
+    // cas-8236 analogue: worker started this BEFORE closing cdee
+    let id_8236 = extract_task_id(&extract_text(
+        service
+            .task(Parameters(task_req(serde_json::json!({
+                "action": "create",
+                "title": "cas-a3ca replay: cas-8236 analogue — in progress, unverified",
+                "priority": 2,
+                "task_type": "task",
+            }))))
+            .await
+            .expect("create 8236"),
+    ))
+    .expect("id 8236")
+    .to_string();
+
+    service
+        .task(Parameters(task_req(serde_json::json!({
+            "action": "start",
+            "id": id_8236.clone(),
+        }))))
+        .await
+        .expect("start 8236");
+
+    // Now retry the close of cdee — this is where the bug was.
+    // Pre-fix: blocked with VERIFICATION_JAIL_BLOCKED naming cas-8236.
+    // Post-fix: close of cdee succeeds because cdee has approved verification.
+    let result = service
+        .task(Parameters(task_req(serde_json::json!({
+            "action": "close",
+            "id": id_cdee.clone(),
+            "reason": "cas-cdee replay: verified and merged, close must not be blocked by 8236",
+        }))))
+        .await
+        .expect("close cdee must succeed — verified task must not be blocked by unverified 8236");
+
+    let text = extract_text(result);
+    assert!(
+        !text.contains("VERIFICATION_JAIL_BLOCKED"),
+        "close of verified cdee analogue must not be blocked by unverified 8236 analogue; got: {text}"
+    );
+    // Must not name the wrong task in any error
+    assert!(
+        !text.contains(&id_8236),
+        "close error must not reference the unrelated task {id_8236}; got: {text}"
+    );
+}
