@@ -10,7 +10,7 @@ use rmcp::service::Peer;
 use rmcp::service::RoleServer;
 
 use crate::config::Config;
-use crate::harness_policy::verification_required_for_task_type;
+use crate::harness_policy::{verification_required_for_task_type, worker_coordination_tool};
 use crate::store::{
     AgentStore, EntityStore, RuleStore, SkillStore, Store, TaskStore, VerificationStore,
     WorktreeStore, open_agent_store, open_entity_store, open_rule_store, open_skill_store,
@@ -711,13 +711,21 @@ impl CasCore {
                 // (forward to supervisor) instead of an impossible instruction.
                 // Non-worker callers (supervisors, non-factory contexts) retain
                 // the existing Task() spawn suggestion which is correct for them.
+                //
+                // cas-8aaf: the coordination tool alias differs by harness.
+                // Claude workers use mcp__cas__coordination, Codex workers use
+                // mcp__cs__coordination. worker_coordination_tool() reads
+                // CAS_FACTORY_WORKER_CLI (injected by the PTY spawn) to select
+                // the right alias so the suggestion is executable by this worker.
                 let guidance = if is_factory_worker {
+                    let coord_tool = worker_coordination_tool();
                     format!(
-                        "Forward to supervisor via: \
-                         mcp__cas__coordination action=message target=supervisor \
+                        "Message supervisor via: \
+                         {coord_tool} action=message target=supervisor \
                          summary=\"Ready to close {task_id}\" \
-                         message=\"Task {task_id} is ready to close. \
-                         Please verify and close on my behalf.\""
+                         message=\"Task {task_id} requires verification before close. \
+                         Please run verification (task-verifier for task {task_id}) \
+                         and close on my behalf if approved.\""
                     )
                 } else {
                     format!(
