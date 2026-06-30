@@ -839,12 +839,15 @@ fn builtin_skill_dir_names(skills: &[BuiltinFile]) -> HashSet<String> {
 /// these hold:
 ///   1. its name is `cas-*` prefixed (we never touch user-authored skills),
 ///   2. it is not one of the builtin skill dirs we just wrote (`keep`), and
-///   3. its `SKILL.md` does not carry the `managed_by: cas` marker.
+///   3. its `SKILL.md` is genuinely absent OR present-and-unmanaged (no
+///      `managed_by: cas` marker). Any other read error (permission denied,
+///      I/O) preserves the directory — we only delete when we can positively
+///      confirm it is not a managed builtin.
 ///
 /// The managed-by check is the critical safety net: a freshly-synced builtin
 /// always carries the marker, so even if `keep` is somehow incomplete the
-/// builtin survives. Non-`cas-` dirs and dirs missing a `SKILL.md` are left
-/// untouched. Used by `cas update --user` (`sync_user_builtins`) so that legacy
+/// builtin survives. Non-`cas-` dirs are left untouched. Used by
+/// `cas update --user` (`sync_user_builtins`) so that legacy
 /// orphans like `cas-playwright-debug` — which the project-level sync already
 /// prunes but the user-level path historically never did — are removed from
 /// `~/.claude/skills` and `~/.codex/skills` on every downstream host.
@@ -876,13 +879,18 @@ pub fn prune_stale_cas_skill_dirs(
             continue;
         }
 
-        // Preserve anything still carrying the managed_by: cas marker — that
-        // is a builtin we own and would re-create on the next sync anyway.
+        // Only delete when we can positively confirm this is not a managed
+        // builtin: SKILL.md is either genuinely absent, or present without the
+        // managed_by: cas marker. A permission/I/O read error (anything other
+        // than NotFound) preserves the dir — never destroy on uncertainty.
         let skill_file = path.join("SKILL.md");
-        if let Ok(content) = std::fs::read_to_string(&skill_file) {
-            if is_managed_by_cas(&content) {
-                continue;
-            }
+        let safe_to_remove = match std::fs::read_to_string(&skill_file) {
+            Ok(content) => !is_managed_by_cas(&content),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+            Err(_) => false,
+        };
+        if !safe_to_remove {
+            continue;
         }
 
         std::fs::remove_dir_all(&path)?;
@@ -2229,6 +2237,36 @@ This is the body content."#;
             claude_ref.content, codex_ref.content,
             "auth-fixture-template.md .claude and .codex copies must be byte-identical",
         );
+    }
+
+    // cas-e0d1: pin the opt-in description so a future sync or hand-edit can't
+    // silently re-introduce auto-trigger phrasing into either mirror — that
+    // would resurrect the wall-clock regression the rewrite fixed.
+    #[test]
+    fn test_cas_nuxt_playwright_description_is_opt_in() {
+        for (label, set) in [
+            ("BUILTIN_SKILLS", BUILTIN_SKILLS),
+            ("CODEX_BUILTIN_SKILLS", CODEX_BUILTIN_SKILLS),
+        ] {
+            let entry = set
+                .iter()
+                .find(|b| b.path == "skills/cas-nuxt-playwright/SKILL.md")
+                .unwrap_or_else(|| panic!("{label} missing cas-nuxt-playwright SKILL.md"));
+            assert!(
+                entry.content.contains("Opt-in only")
+                    && entry
+                        .content
+                        .contains("invoke ONLY when the operator explicitly asks"),
+                "{label}: cas-nuxt-playwright description must keep explicit opt-in wording"
+            );
+            assert!(
+                !entry
+                    .content
+                    .contains("Trigger when editing files under tests/"),
+                "{label}: cas-nuxt-playwright description must NOT re-introduce \
+                 auto-trigger phrasing"
+            );
+        }
     }
 
     // cas-e0d1: the user-level prune must drop legacy non-managed cas-* orphans
