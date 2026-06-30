@@ -206,6 +206,12 @@ enum ControlEvent {
     MouseScrollDown,
     MouseClick { col: u16, row: u16 },
     DropImage { col: u16, row: u16, path: String },
+    /// Bracketed paste from the client. The client coalesces a paste into one
+    /// event (stripping the terminal's \x1b[200~/\x1b[201~ markers), so we carry
+    /// the literal payload here and re-wrap it as bracketed paste when injecting
+    /// into the focused pane — otherwise embedded newlines reach the inner CLI as
+    /// bare Enter keys and submit the prompt mid-paste (cas-5702).
+    Paste { payload: String },
     SetSelectMode(bool),
 }
 

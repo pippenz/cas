@@ -216,6 +216,24 @@ impl FactoryDaemon {
                                         );
                                     }
                                 }
+                                ControlEvent::Paste { payload } => {
+                                    // Re-wrap the literal payload as a bracketed
+                                    // paste and inject it into the focused pane in
+                                    // one shot. Delivering it as a single paste
+                                    // (not the raw byte stream that the input parser
+                                    // walks one byte at a time) keeps embedded
+                                    // newlines/control bytes literal, so the inner
+                                    // CLI stops submitting mid-paste (cas-5702).
+                                    if self.app.focused_accepts_input() {
+                                        let bytes = bracketed_paste_bytes(&payload);
+                                        if let Err(e) = self.app.mux.send_input(&bytes).await {
+                                            tracing::warn!(
+                                                "Failed to deliver paste payload: {}",
+                                                e
+                                            );
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -311,6 +329,15 @@ impl FactoryDaemon {
                                             });
                                         }
                                     }
+                                }
+                            }
+                        } else if let Some(rest) = cmd_str.strip_prefix("paste;") {
+                            // Format: paste;base64_payload — the literal pasted
+                            // text, base64-encoded so newlines / ';' / the BEL
+                            // control suffix can't corrupt the framing (cas-5702).
+                            if let Ok(decoded) = URL_SAFE_NO_PAD.decode(rest) {
+                                if let Ok(payload) = String::from_utf8(decoded) {
+                                    events.push(ControlEvent::Paste { payload });
                                 }
                             }
                         } else if let Some(mode_str) = cmd_str.strip_prefix("mode;") {

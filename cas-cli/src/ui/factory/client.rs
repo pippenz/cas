@@ -44,14 +44,15 @@ pub fn attach(session_name: Option<String>) -> anyhow::Result<()> {
     attach_unix(&session)
 }
 
+// Control sequence constants (must match daemon.rs)
+const CONTROL_PREFIX: &[u8] = b"\x1b]777;";
+const CONTROL_SUFFIX: u8 = 0x07; // BEL
+
 /// Attach via Unix socket (local daemon mode)
 ///
 /// The daemon renders the full TUI and broadcasts raw terminal output.
 /// This client just forwards bytes between the terminal and socket.
 fn attach_unix(session: &SessionInfo) -> anyhow::Result<()> {
-    // Control sequence constants (must match daemon.rs)
-    const CONTROL_PREFIX: &[u8] = b"\x1b]777;";
-    const CONTROL_SUFFIX: u8 = 0x07; // BEL
 
     let sock_path = PathBuf::from(&session.metadata.socket_path);
 
@@ -201,7 +202,14 @@ fn attach_unix(session: &SessionInfo) -> anyhow::Result<()> {
                 }
                 Event::Paste(text) => {
                     if !contains_dropped_image_path(&text) {
-                        let _ = stream.write_all(text.as_bytes());
+                        // Forward the paste as a framed control event rather than
+                        // raw bytes. crossterm already stripped the terminal's
+                        // \x1b[200~/\x1b[201~ markers, so raw passthrough lets the
+                        // daemon's byte parser treat embedded newlines as Enter and
+                        // submit the prompt mid-paste. The daemon re-wraps this
+                        // payload as a bracketed paste before injecting it into the
+                        // focused pane (cas-5702).
+                        let _ = stream.write_all(&encode_paste_control(&text));
                     } else {
                         // Preserve the original drop payload and route it as a drop event.
                         let encoded_payload = URL_SAFE_NO_PAD.encode(text.as_bytes());
@@ -244,6 +252,20 @@ fn attach_unix(session: &SessionInfo) -> anyhow::Result<()> {
     let _ = io::stdout().flush();
 
     Ok(())
+}
+
+/// Frame a paste payload as a `paste;<base64>` control event for the daemon.
+/// base64 keeps newlines, `;`, and the BEL control suffix from corrupting the
+/// CONTROL_PREFIX..CONTROL_SUFFIX framing; the daemon decodes it and re-wraps it
+/// as a bracketed paste before injecting it into the focused pane (cas-5702).
+fn encode_paste_control(text: &str) -> Vec<u8> {
+    let encoded_payload = URL_SAFE_NO_PAD.encode(text.as_bytes());
+    let cmd = format!("paste;{encoded_payload}");
+    let mut msg = Vec::new();
+    msg.extend_from_slice(CONTROL_PREFIX);
+    msg.extend_from_slice(cmd.as_bytes());
+    msg.push(CONTROL_SUFFIX);
+    msg
 }
 
 fn contains_dropped_image_path(text: &str) -> bool {
@@ -503,5 +525,28 @@ mod tests {
             state: KeyEventState::empty(),
         };
         assert_eq!(key_to_bytes(&key), vec![0x04]);
+    }
+
+    // cas-5702: a multi-line paste must be carried as a base64 control event so
+    // the daemon can re-wrap it as a single bracketed paste. The wire bytes must
+    // NOT contain a bare newline/carriage-return (which the inner CLI would treat
+    // as Enter and submit the prompt mid-paste), and must round-trip exactly.
+    #[test]
+    fn encode_paste_control_frames_multiline_without_bare_newlines() {
+        let text = "\nfirst line\nsecond line\r\nthird; with semicolon";
+        let frame = encode_paste_control(text);
+
+        assert!(frame.starts_with(CONTROL_PREFIX));
+        assert_eq!(*frame.last().unwrap(), CONTROL_SUFFIX);
+        // No bare submit-triggering bytes survive on the wire.
+        assert!(!frame.contains(&b'\n'));
+        assert!(!frame.contains(&b'\r'));
+
+        // The payload between the framing decodes back to the exact original.
+        let body = &frame[CONTROL_PREFIX.len()..frame.len() - 1];
+        let cmd = std::str::from_utf8(body).unwrap();
+        let b64 = cmd.strip_prefix("paste;").expect("paste; prefix");
+        let decoded = URL_SAFE_NO_PAD.decode(b64).unwrap();
+        assert_eq!(String::from_utf8(decoded).unwrap(), text);
     }
 }
