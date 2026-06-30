@@ -2662,3 +2662,103 @@ async fn test_reset_alive_worker_task_with_force_succeeds_and_logs_audit() {
         "audit note must mention force/bypassed; notes: {notes}"
     );
 }
+
+// =============================================================================
+// cas-dbbb: factory-mode session UUID → display-name normalization in task.update
+// =============================================================================
+
+/// When CAS_FACTORY_MODE is set and a supervisor assigns a task using a
+/// worker's session UUID instead of their display name, `task.update` must
+/// automatically normalize the assignee to the display name so `task mine`
+/// can dispatch correctly.
+///
+/// Smoke-test evidence (2026-06-30): director auto-prompts were using session
+/// IDs as the `assignee=` value. `task.update` silently accepted them, but
+/// `task mine` on the target worker returned nothing because it matches against
+/// display name / CAS_AGENT_NAME, not agent IDs.
+#[tokio::test]
+async fn test_factory_mode_normalizes_session_uuid_assignee_to_display_name() {
+    let (temp, service) = setup_cas();
+    let _env_lock = env_test_lock();
+    let cas_dir = temp.path().join(".cas");
+    let agent_store = open_agent_store(&cas_dir).expect("open agent store");
+    let task_store = cas::store::open_task_store(&cas_dir).expect("open task store");
+
+    // Register a worker with a distinct session ID and display name.
+    const WORKER_SESSION: &str = "sess-uuid-abcdef-1234";
+    const WORKER_NAME: &str = "calm-owl";
+
+    let worker =
+        cas::types::Agent::new(WORKER_SESSION.to_string(), WORKER_NAME.to_string());
+    agent_store.register(&worker).expect("register worker");
+
+    // Set CAS_FACTORY_MODE so the normalization branch activates.
+    // SAFETY: we hold the process-wide env lock for the full test body.
+    unsafe { std::env::set_var("CAS_FACTORY_MODE", "1") }
+
+    // Create a task.
+    let created = service
+        .cas_task_create(Parameters(make_task_create_req(
+            "UUID-normalization test (cas-dbbb)",
+        )))
+        .await
+        .expect("create task");
+    let task_id = extract_task_id(&extract_text(created))
+        .expect("task id")
+        .to_string();
+
+    // Assign by session UUID — mimics a director prompt that used the wrong identifier.
+    let update_result = service
+        .cas_task_update(Parameters(TaskUpdateRequest {
+            depth: None,
+            id: task_id.clone(),
+            title: None,
+            notes: None,
+            priority: None,
+            labels: None,
+            description: None,
+            design: None,
+            acceptance_criteria: None,
+            demo_statement: None,
+            execution_note: None,
+            external_ref: None,
+            assignee: Some(WORKER_SESSION.to_string()),
+            status: None,
+            epic: None,
+            epic_verification_owner: None,
+        }))
+        .await
+        .expect("task update with session UUID must succeed");
+
+    // Restore env before assertions so a panic doesn't poison sibling tests.
+    // SAFETY: still holding env lock.
+    unsafe { std::env::remove_var("CAS_FACTORY_MODE") }
+
+    let text = extract_text(update_result);
+
+    // Response must warn that the value was normalized.
+    assert!(
+        text.to_lowercase().contains("session id") || text.contains("Normalized"),
+        "cas-dbbb: update with session UUID must emit normalization warning; got: {text}"
+    );
+    assert!(
+        text.contains(WORKER_NAME),
+        "cas-dbbb: normalization warning must include display name '{WORKER_NAME}'; got: {text}"
+    );
+
+    // The stored assignee must be the display name, not the session UUID.
+    // (task show does not render the assignee field; read from store directly.)
+    let task = task_store.get(&task_id).expect("get task after update");
+    assert_eq!(
+        task.assignee.as_deref(),
+        Some(WORKER_NAME),
+        "cas-dbbb: stored assignee must be display name '{WORKER_NAME}' after normalization; \
+         got: {:?}",
+        task.assignee
+    );
+    assert_ne!(
+        task.assignee.as_deref(),
+        Some(WORKER_SESSION),
+        "cas-dbbb: stored assignee must NOT retain session UUID '{WORKER_SESSION}' after normalization"
+    );
+}
