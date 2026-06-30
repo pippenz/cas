@@ -58,6 +58,10 @@ Claude Code's React-Ink UI throws `<Box> can't be nested inside <Text>` when str
 
 Writing to disk is always safe; the risk is only when the content streams back through the Ink renderer.
 
+## Don't assume — always verify
+
+When diagnosing a bug or reasoning about behavior, **verify the claim against the actual code/data before acting on it.** Trace the real path, read the real handler, confirm the symptom maps to the line you think it does. Do not propose, implement, or ship a fix on a plausible-but-unconfirmed theory. A diagnosis is only "done" when you can point at the concrete evidence (the file:line, the test output, the reproduced behavior). Environment details the user gives (OS, terminal, hardware) are clues to verify against, not facts to wave away. This applies to root-cause analysis, "this already works", "that's the harness not us", and every other confident assertion.
+
 ## CAS system bugs are in-repo fixes
 
 This repo **is** the CAS source. When a bug is reported in the verifier, hooks, factory orchestration, MCP dispatch, the task-verifier agent, worker prompts, or built-in skills — regardless of which downstream project (gabber-studio, OpenClaw, etc.) surfaced it — the fix lands here as a Rust or markdown change via a task assigned to a worker. Do not file the bug with team-lead, do not "report upstream", do not treat cas-src IS CAS as an external dependency. Other projects consume CAS; they do not modify it. If you catch yourself wanting to escalate a CAS bug, stop and create the fix task in this repo instead.
