@@ -117,6 +117,37 @@ fn factory_pane_configs_none_effort_omits_effort_flag() {
     );
 }
 
+#[test]
+fn factory_pane_configs_codex_worker_inherits_supervisor_cli_in_cs_env_cas_1544() {
+    let config = MuxConfig {
+        cwd: PathBuf::from("/tmp/test"),
+        workers: 1,
+        include_director: false,
+        supervisor_cli: crate::harness::SupervisorCli::Codex,
+        worker_cli: crate::harness::SupervisorCli::Codex,
+        ..MuxConfig::default()
+    };
+    let configs = Mux::factory_pane_configs(&config);
+
+    let (_, worker_config) = configs
+        .iter()
+        .find(|(name, _)| name == "worker-1")
+        .expect("worker-1 config must be present");
+    let all_args = worker_config.args.join(" ");
+    assert!(
+        all_args.contains("mcp_servers.cs.env.CAS_FACTORY_SUPERVISOR_CLI=\"codex\""),
+        "Codex worker cs MCP env must inherit the supervisor CLI alias for verification guidance: {all_args}"
+    );
+    assert!(
+        worker_config
+            .env
+            .iter()
+            .any(|(k, v)| k == "CAS_FACTORY_SUPERVISOR_CLI" && v == "codex"),
+        "worker process env must also carry CAS_FACTORY_SUPERVISOR_CLI=codex: {:?}",
+        worker_config.env
+    );
+}
+
 // ── end cas-d571 ──────────────────────────────────────────────────────────────
 
 // ── cas-3fed: per-worker spec storage + factory wiring ────────────────────────

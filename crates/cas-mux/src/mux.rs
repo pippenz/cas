@@ -127,6 +127,8 @@ pub struct Mux {
     /// Populated by `Mux::factory` from `MuxConfig.resolved_worker_specs`.
     /// Also settable at runtime via `set_worker_spec`.
     worker_specs: HashMap<String, WorkerSpec>,
+    /// Supervisor CLI for propagating harness context into worker spawns.
+    supervisor_cli: SupervisorCli,
 }
 
 impl Mux {
@@ -142,6 +144,7 @@ impl Mux {
             cols,
             default_worker_spec: WorkerSpec::builtin_default(),
             worker_specs: HashMap::new(),
+            supervisor_cli: SupervisorCli::Claude,
         }
     }
 
@@ -284,6 +287,7 @@ impl Mux {
                 worker_cwd,
                 config.cas_root.as_ref(),
                 &config.supervisor_name,
+                config.supervisor_cli,
                 cli,
                 model_opt.as_deref(),
                 effort_opt.as_deref(),
@@ -325,6 +329,7 @@ impl Mux {
             model: config.worker_model.clone(),
             effort: default_effort,
         });
+        mux.supervisor_cli = config.supervisor_cli;
 
         // Populate per-worker specs from the cascade resolver output so that
         // subsequent `add_worker` calls (dynamic spawns) inherit the same
@@ -362,6 +367,7 @@ impl Mux {
                 worker_cwd,
                 config.cas_root.as_ref(),
                 &config.supervisor_name,
+                config.supervisor_cli,
                 cli,
                 model_opt.as_deref(),
                 effort_opt.as_deref(),
@@ -609,6 +615,7 @@ impl Mux {
             cwd,
             cas_root,
             supervisor_name,
+            self.supervisor_cli,
             effective.cli,
             effective.model.as_deref(),
             effort_str.as_deref(),
@@ -654,6 +661,7 @@ impl Mux {
             cwd,
             cas_root,
             supervisor_name,
+            self.supervisor_cli,
             effective.cli,
             effective.model.as_deref(),
             effort_str.as_deref(),

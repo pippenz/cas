@@ -223,12 +223,13 @@ impl Pane {
         cwd: PathBuf,
         cas_root: Option<&PathBuf>,
         supervisor_name: &str,
+        supervisor_cli: SupervisorCli,
         cli: SupervisorCli,
         model: Option<&str>,
         effort: Option<&str>,
         teams: Option<&TeamsSpawnConfig>,
     ) -> PtyConfig {
-        match cli {
+        let mut config = match cli {
             SupervisorCli::Claude => PtyConfig::claude(
                 name,
                 "worker",
@@ -251,7 +252,19 @@ impl Pane {
                 effort,
                 teams,
             ),
+        };
+        config.env.push((
+            "CAS_FACTORY_SUPERVISOR_CLI".to_string(),
+            supervisor_cli.as_str().to_string(),
+        ));
+        if cli == SupervisorCli::Codex {
+            config.args.push("-c".to_string());
+            config.args.push(format!(
+                "mcp_servers.cs.env.CAS_FACTORY_SUPERVISOR_CLI=\"{}\"",
+                supervisor_cli.as_str()
+            ));
         }
+        config
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -260,6 +273,7 @@ impl Pane {
         cwd: PathBuf,
         cas_root: Option<&PathBuf>,
         supervisor_name: &str,
+        supervisor_cli: SupervisorCli,
         cli: SupervisorCli,
         model: Option<&str>,
         effort: Option<&str>,
@@ -268,7 +282,7 @@ impl Pane {
         teams: Option<&TeamsSpawnConfig>,
     ) -> Result<Self> {
         let config = Self::build_worker_config(
-            name, cwd, cas_root, supervisor_name, cli, model, effort, teams,
+            name, cwd, cas_root, supervisor_name, supervisor_cli, cli, model, effort, teams,
         );
         let pty = Pty::spawn(name, config)?;
         Self::with_pty(name, PaneKind::Worker, pty, rows, cols)
