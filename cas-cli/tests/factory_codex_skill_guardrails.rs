@@ -54,6 +54,38 @@ fn codex_factory_skills_use_cs_prefix_only() {
 }
 
 #[test]
+fn codex_worker_recovery_uses_cs_alias_not_cas(/* cas-5b4f */) {
+    // The Codex worker recovery guide is rendered only into Codex worker
+    // sessions, where every CAS tool surfaces under the `mcp__cs__` alias.
+    // It must never hardcode `mcp__cas__` coordination/task instructions — those
+    // are unreachable for a Codex worker. Mirrors the file-level
+    // `codex_factory_skills_use_cs_prefix_only` convention.
+    let root = repo_root();
+    let codex_recovery = load(
+        &root.join("cas-cli/src/builtins/codex/skills/cas-worker/references/recovery.md"),
+    );
+
+    assert!(
+        codex_recovery.contains("mcp__cs__coordination"),
+        "codex worker recovery.md should give executable mcp__cs__coordination guidance"
+    );
+    assert!(
+        !codex_recovery.contains("mcp__cas__"),
+        "codex worker recovery.md must not hardcode the Claude `mcp__cas__` alias \
+         (Codex workers only have mcp__cs__ tools)"
+    );
+
+    // AC: the Claude worker recovery doc must stay correct for the Claude alias.
+    let claude_recovery = load(
+        &root.join("cas-cli/src/builtins/skills/cas-worker/references/recovery.md"),
+    );
+    assert!(
+        claude_recovery.contains("mcp__cas__coordination"),
+        "claude worker recovery.md should retain mcp__cas__coordination guidance"
+    );
+}
+
+#[test]
 fn codex_builtin_supervisor_guide_includes_core_workflow() {
     let root = repo_root();
     let guide = root.join("cas-cli/src/builtins/codex/skills/cas-supervisor.md");
