@@ -324,9 +324,11 @@ impl CasCore {
         // Auto-claim the task with a lease
         let agent_id = self.get_agent_id()?;
 
-        // Check if agent has pending verification (blocks starting new tasks)
+        // Check if agent has pending verification (blocks starting new tasks).
+        // Pass None so all leases are evaluated — start intentionally blocks
+        // across all unverified tasks, not just the one being started.
         if let Some((blocked_task_id, blocked_task_title)) =
-            self.check_pending_verification(&agent_id)?
+            self.check_pending_verification(&agent_id, None)?
         {
             // Allow if starting the same task that's blocking (resuming work)
             if blocked_task_id != req.id {
