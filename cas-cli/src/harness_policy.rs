@@ -142,6 +142,39 @@ pub fn is_worker_without_subagents_from_env() -> bool {
     is_worker_from_env() && !worker_harness_from_env().capabilities().supports_subagents
 }
 
+/// Returns the MCP coordination tool name appropriate for the current factory
+/// worker's harness. Claude workers use `mcp__cas__coordination`, Codex workers
+/// use `mcp__cs__coordination`.
+///
+/// Use this when building jail/guidance messages that include a suggested tool
+/// call the worker can actually execute — the alias depends on which harness
+/// is running the MCP server (Claude vs Codex).
+///
+/// cas-8aaf: Codex MCP servers register under the `cs` alias; Claude MCP
+/// servers register under the `cas` alias. Hardcoding `mcp__cas__coordination`
+/// in guidance given to Codex workers produces an instruction they cannot follow.
+pub fn worker_coordination_tool() -> &'static str {
+    if worker_harness_from_env() == SupervisorCli::Codex {
+        "mcp__cs__coordination"
+    } else {
+        "mcp__cas__coordination"
+    }
+}
+
+/// Returns the MCP verification tool name appropriate for the current
+/// supervisor's harness (for embedding in guidance that tells the worker what
+/// to ask the supervisor to run).
+///
+/// Claude supervisors use `mcp__cas__verification`, Codex supervisors use
+/// `mcp__cs__verification`.
+pub fn supervisor_verification_tool() -> &'static str {
+    if supervisor_harness_from_env() == SupervisorCli::Codex {
+        "mcp__cs__verification"
+    } else {
+        "mcp__cas__verification"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -299,5 +332,75 @@ mod tests {
         let p = verification_policy(SupervisorCli::Codex, SupervisorCli::Codex);
         assert!(!p.task_required());
         assert!(!p.epic_required());
+    }
+
+    // ----------------------------------------------------------------------
+    // cas-8aaf: MCP alias helpers
+    // ----------------------------------------------------------------------
+
+    struct EnvWorkerCliGuard(Option<String>);
+    impl Drop for EnvWorkerCliGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.0 {
+                    Some(v) => std::env::set_var("CAS_FACTORY_WORKER_CLI", v),
+                    None => std::env::remove_var("CAS_FACTORY_WORKER_CLI"),
+                }
+            }
+        }
+    }
+    fn set_worker_cli(cli: Option<&str>) -> EnvWorkerCliGuard {
+        let prev = std::env::var("CAS_FACTORY_WORKER_CLI").ok();
+        unsafe {
+            match cli {
+                Some(v) => std::env::set_var("CAS_FACTORY_WORKER_CLI", v),
+                None => std::env::remove_var("CAS_FACTORY_WORKER_CLI"),
+            }
+        }
+        EnvWorkerCliGuard(prev)
+    }
+
+    #[test]
+    fn worker_coordination_tool_defaults_to_cas_when_unset() {
+        let _g = env_lock();
+        let _c = set_worker_cli(None);
+        assert_eq!(
+            super::worker_coordination_tool(),
+            "mcp__cas__coordination",
+            "no CAS_FACTORY_WORKER_CLI set → default Claude → mcp__cas__coordination"
+        );
+    }
+
+    #[test]
+    fn worker_coordination_tool_returns_cas_for_claude_harness() {
+        let _g = env_lock();
+        let _c = set_worker_cli(Some("claude"));
+        assert_eq!(
+            super::worker_coordination_tool(),
+            "mcp__cas__coordination",
+            "CAS_FACTORY_WORKER_CLI=claude → mcp__cas__coordination"
+        );
+    }
+
+    #[test]
+    fn worker_coordination_tool_returns_cs_for_codex_harness() {
+        let _g = env_lock();
+        let _c = set_worker_cli(Some("codex"));
+        assert_eq!(
+            super::worker_coordination_tool(),
+            "mcp__cs__coordination",
+            "CAS_FACTORY_WORKER_CLI=codex → mcp__cs__coordination"
+        );
+    }
+
+    #[test]
+    fn supervisor_verification_tool_returns_cas_when_supervisor_unset() {
+        let _g = env_lock();
+        // CAS_FACTORY_SUPERVISOR_CLI unset → defaults to Claude.
+        assert_eq!(
+            super::supervisor_verification_tool(),
+            "mcp__cas__verification",
+            "default supervisor harness (Claude) → mcp__cas__verification"
+        );
     }
 }
