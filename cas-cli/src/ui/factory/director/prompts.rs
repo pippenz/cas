@@ -836,4 +836,218 @@ mod tests {
              Got: None"
         );
     }
+
+    // ── cas-efc4: Heterogeneous Claude+Codex smoke regression tests ───────────
+    //
+    // Verifies that `generate_prompt` routes MCP tool prefixes correctly when the
+    // supervisor and worker use different CLI harnesses (AC3 + AC5).  All
+    // homogeneous tests above use codex()+codex() or claude()+claude(); these
+    // tests specifically exercise the mixed-harness surfaces identified in the
+    // cas-efc4 scope: director assignment hints (cas-dbbb), harness-aware tool
+    // aliases in prompts (cas-8aaf at the prompt layer), and stale-guidance
+    // suppression for idle/completed events (cas-6aaf).
+
+    /// cas-efc4 AC3 / cas-dbbb: TaskAssigned to a Codex worker from a Claude
+    /// supervisor.  The prompt is sent TO the worker, so it must use the
+    /// worker's MCP prefix (`mcp__cs__`).  The response instruction appended at
+    /// the end must also use the Codex prefix so the worker can reply.
+    #[test]
+    fn test_efc4_task_assigned_codex_worker_claude_supervisor_uses_worker_prefix() {
+        let event = DirectorEvent::TaskAssigned {
+            task_id: "cas-efc4-t1".to_string(),
+            task_title: "Smoke test task".to_string(),
+            worker: "codex-worker".to_string(),
+        };
+        let data = make_data(0);
+        let config = default_config();
+
+        // Claude supervisor, Codex worker
+        let prompt = generate_prompt(&event, &data, "supervisor", &config, claude(), codex())
+            .expect("TaskAssigned must produce a prompt");
+
+        assert_eq!(
+            prompt.target, "codex-worker",
+            "cas-efc4 AC3: prompt must target the Codex worker"
+        );
+        assert!(
+            prompt.text.contains("mcp__cs__task action=show"),
+            "cas-efc4 AC3: show command must use Codex prefix mcp__cs__: {}",
+            prompt.text
+        );
+        assert!(
+            prompt.text.contains("mcp__cs__task action=start"),
+            "cas-efc4 AC3: start command must use Codex prefix mcp__cs__: {}",
+            prompt.text
+        );
+        // Response instruction: Codex worker replies to Claude supervisor using
+        // its own coordination tool.
+        assert!(
+            prompt.text.contains("mcp__cs__coordination action=message"),
+            "cas-efc4 AC3: response instruction must use Codex coordination tool: {}",
+            prompt.text
+        );
+        assert!(
+            !prompt.text.contains("mcp__cas__task action=start"),
+            "cas-efc4 AC3: must NOT leak Claude prefix into Codex worker prompt: {}",
+            prompt.text
+        );
+    }
+
+    /// cas-efc4 AC3 (other direction): TaskAssigned to a Claude worker from a
+    /// Codex supervisor.  Worker tools must be `mcp__cas__`, NOT `mcp__cs__`.
+    #[test]
+    fn test_efc4_task_assigned_claude_worker_codex_supervisor_uses_cas_prefix() {
+        let event = DirectorEvent::TaskAssigned {
+            task_id: "cas-efc4-t2".to_string(),
+            task_title: "Another smoke task".to_string(),
+            worker: "claude-worker".to_string(),
+        };
+        let data = make_data(0);
+        let config = default_config();
+
+        // Codex supervisor, Claude worker
+        let prompt = generate_prompt(&event, &data, "supervisor", &config, codex(), claude())
+            .expect("TaskAssigned must produce a prompt");
+
+        assert_eq!(
+            prompt.target, "claude-worker",
+            "cas-efc4 AC3: prompt must target the Claude worker"
+        );
+        assert!(
+            prompt.text.contains("mcp__cas__task action=start"),
+            "cas-efc4 AC3: start command must use Claude prefix mcp__cas__: {}",
+            prompt.text
+        );
+        assert!(
+            !prompt.text.contains("mcp__cs__task action=start"),
+            "cas-efc4 AC3: must NOT use Codex prefix for Claude worker: {}",
+            prompt.text
+        );
+        assert!(
+            prompt.text.contains("mcp__cas__coordination action=message"),
+            "cas-efc4 AC3: response instruction must use Claude coordination tool: {}",
+            prompt.text
+        );
+    }
+
+    /// cas-efc4 AC5 / cas-8aaf (prompt layer): TaskCompleted for a Codex worker
+    /// reported to a Claude supervisor.  The prompt goes TO the supervisor.
+    ///
+    /// Two independent prefixes appear in the text:
+    /// - The body's close instruction uses the *worker's* prefix (`mcp__cs__`)
+    ///   so the supervisor copies the correct command when relaying to the worker.
+    /// - The response-instruction footer uses the *supervisor's* prefix
+    ///   (`mcp__cas__`) because it tells the supervisor (a Claude agent) how to
+    ///   reply — the supervisor always uses its own tools.
+    ///
+    /// This is the key invariant: body commands describe what the WORKER should
+    /// run (worker_prefix); response instruction describes what the RECIPIENT
+    /// (supervisor here) should use to reply (supervisor_cli prefix).
+    #[test]
+    fn test_efc4_task_completed_codex_worker_claude_supervisor_close_uses_worker_prefix() {
+        let event = DirectorEvent::TaskCompleted {
+            task_id: "cas-efc4-t3".to_string(),
+            task_title: "Done task".to_string(),
+            worker: "codex-worker".to_string(),
+        };
+        let data = make_data(0);
+        let config = default_config();
+
+        let prompt = generate_prompt(&event, &data, "supervisor", &config, claude(), codex())
+            .expect("TaskCompleted must produce a prompt");
+
+        assert_eq!(
+            prompt.target, "supervisor",
+            "cas-efc4 AC5: TaskCompleted prompt goes to supervisor"
+        );
+        // Body close hint: uses the worker's prefix (Codex worker → mcp__cs__)
+        assert!(
+            prompt.text.contains("mcp__cs__task action=close"),
+            "cas-efc4 AC5: close instruction in body must use Codex worker prefix mcp__cs__: {}",
+            prompt.text
+        );
+        assert!(
+            !prompt.text.contains("mcp__cas__task action=close"),
+            "cas-efc4 AC5: close instruction must NOT use Claude prefix for Codex worker: {}",
+            prompt.text
+        );
+        // Response instruction footer: supervisor (Claude) uses its own tool to
+        // reply back to the Codex worker — supervisor_cli = Claude → mcp__cas__
+        assert!(
+            prompt.text.contains("mcp__cas__coordination action=message"),
+            "cas-efc4 AC5: response instruction (to supervisor) must use Claude coordination prefix: {}",
+            prompt.text
+        );
+        assert!(
+            prompt.text.contains("target=codex-worker"),
+            "cas-efc4 AC5: response instruction must address the Codex worker: {}",
+            prompt.text
+        );
+    }
+
+    /// cas-efc4 AC5 / cas-dbbb: WorkerIdle for a Codex worker with a Claude
+    /// supervisor.
+    ///
+    /// Prefix routing in the heterogeneous case:
+    /// - Body commands address the SUPERVISOR's actions (assigning tasks, checking
+    ///   ready queue) → `supervisor_prefix` = `mcp__cas__` (Claude).
+    /// - Response instruction tells the SUPERVISOR how to reply → `supervisor_cli`
+    ///   = Claude → `mcp__cas__coordination`.
+    /// - cas-889d invariant: assignee value must be the Codex worker's session ID,
+    ///   NOT the display name, so `task mine` finds it correctly.
+    #[test]
+    fn test_efc4_worker_idle_codex_worker_claude_supervisor_prefixes() {
+        let event = DirectorEvent::WorkerIdle {
+            worker: "codex-worker".to_string(),
+        };
+        // 2 ready tasks so the "ready tasks exist" branch fires (non-empty assign cmd)
+        let mut data = make_data(2);
+        data.agent_id_to_name
+            .insert("sess-id-codex".to_string(), "codex-worker".to_string());
+
+        let config = default_config();
+
+        // Claude supervisor, Codex worker
+        let prompt = generate_prompt(&event, &data, "supervisor", &config, claude(), codex())
+            .expect("WorkerIdle must produce a prompt");
+
+        assert_eq!(
+            prompt.target, "supervisor",
+            "cas-efc4 AC5: WorkerIdle prompt goes to the supervisor"
+        );
+        // Assign command uses supervisor's prefix (Claude supervisor acts)
+        assert!(
+            prompt.text.contains("mcp__cas__task action=update"),
+            "cas-efc4 AC5: assign command must use Claude supervisor prefix: {}",
+            prompt.text
+        );
+        // Ready-check uses supervisor's prefix
+        assert!(
+            prompt.text.contains("mcp__cas__task action=ready"),
+            "cas-efc4 AC5: ready-check must use Claude supervisor prefix: {}",
+            prompt.text
+        );
+        // cas-889d / cas-dbbb: assignee must be the session ID, not the display name
+        assert!(
+            prompt.text.contains("assignee=sess-id-codex"),
+            "cas-efc4 / cas-dbbb: assignee must use session ID, not display name: {}",
+            prompt.text
+        );
+        // Response instruction: supervisor (Claude) uses its own tool to reply
+        assert!(
+            prompt.text.contains("mcp__cas__coordination action=message"),
+            "cas-efc4 AC5: response instruction (to supervisor) must use Claude coordination prefix: {}",
+            prompt.text
+        );
+        assert!(
+            !prompt.text.contains("mcp__cs__task action=update"),
+            "cas-efc4 AC5: body assign command must NOT use Codex prefix (supervisor acts): {}",
+            prompt.text
+        );
+        assert!(
+            prompt.text.contains("target=codex-worker"),
+            "cas-efc4 AC5: response instruction must address the Codex worker: {}",
+            prompt.text
+        );
+    }
 }
