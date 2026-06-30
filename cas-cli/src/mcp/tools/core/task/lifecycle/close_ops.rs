@@ -554,6 +554,13 @@ impl CasCore {
                             let _ = crate::mcp::socket::send_event(&self.cas_root, &event);
                         }
 
+                        // cas-7998: the manual-verdict fallback runs in the
+                        // supervisor's harness (the supervisor is the one who
+                        // re-dispatches or records the verdict), so the direct
+                        // verification alias must track the supervisor CLI —
+                        // hardcoding mcp__cas__verification hands a Codex
+                        // supervisor an alias they cannot call.
+                        let sup_ver = supervisor_verification_tool();
                         return Ok(Self::tool_error(format!(
                             "⚠️ VERIFICATION TIMED OUT\n\n\
                             Task {} was awaiting verification for {} minutes with no verdict \
@@ -563,7 +570,7 @@ impl CasCore {
                             spawned, or failed silently.\n\n\
                             To proceed:\n\
                             1. Re-dispatch verifier: Task(subagent_type=\"task-verifier\", prompt=\"Verify task {}\")\n\
-                            2. Or record verdict directly: mcp__cas__verification action=add task_id={} status=approved summary=\"...\"\n\
+                            2. Or record verdict directly: {sup_ver} action=add task_id={} status=approved summary=\"...\"\n\
                             3. Then call cas_task_close again.",
                             req.id, elapsed_mins, req.id, req.id
                         )));
@@ -831,10 +838,18 @@ impl CasCore {
                                 // use mcp__cs__coordination (CAS_FACTORY_WORKER_CLI drives
                                 // the selection via worker_coordination_tool()).
                                 let coord = worker_coordination_tool();
+                                // cas-7998: escape the free-text reason so a
+                                // quote/newline can't break the quoted
+                                // `message="..."` argument below.
                                 let close_reason_hint = req
                                     .reason
                                     .as_deref()
-                                    .map(|r| format!(" Close reason: {r}."))
+                                    .map(|r| {
+                                        format!(
+                                            " Close reason: {}.",
+                                            escape_close_reason_for_quoted_command(r)
+                                        )
+                                    })
                                     .unwrap_or_default();
                                 format!(
                                     "🔒 Factory worker verification gate: this close will only succeed after a task-verifier records a verdict.\n\n\
@@ -846,11 +861,16 @@ impl CasCore {
                                     id = req.id
                                 )
                             } else if supervisor_is_assignee {
+                                // cas-7998: the supervisor self-verifies in their
+                                // own harness, so the direct verification alias
+                                // must match the supervisor CLI (mcp__cs__ for a
+                                // Codex supervisor, mcp__cas__ for Claude).
+                                let sup_ver = supervisor_verification_tool();
                                 format!(
                                     "You implemented this task yourself. Spawn a task-verifier to review your work:\n\n\
                                      Task(subagent_type=\"{}\", prompt=\"Verify task {}\")\n\n\
                                      Or record verification directly:\n\
-                                     mcp__cas__verification action=add task_id={} \
+                                     {sup_ver} action=add task_id={} \
                                      status=approved summary=\"Self-verified: <reason>\"",
                                     verifier_agent, req.id, req.id
                                 )
@@ -2032,6 +2052,24 @@ pub(crate) fn light_skip_decision_note() -> String {
      review queue hop bypassed). Reason: task depth=light. Data-state guards \
      (merge-state, uncommitted-work, additive-only, commit-claim) still ran."
         .to_string()
+}
+
+/// cas-7998: sanitize a free-text close reason for safe embedding inside a
+/// double-quoted `message="..."` argument of a suggested coordination command.
+///
+/// The verification-jail guidance prints a ready-to-run coordination call such
+/// as `mcp__cas__coordination action=message ... message="Task X is ready to
+/// close. Close reason: <reason>. ..."`. A raw reason containing a double quote
+/// would prematurely terminate that quoted argument, and an embedded newline
+/// would split the single-line command — in both cases the worker copies a
+/// broken instruction. Collapse every run of whitespace (spaces, tabs,
+/// newlines, CRs) into a single space and backslash-escape `\` then `"` so the
+/// resulting text always stays inside one balanced double-quoted argument.
+pub(crate) fn escape_close_reason_for_quoted_command(reason: &str) -> String {
+    let collapsed = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Escape backslashes first so a pre-existing `\` before a quote can't
+    // combine with the quote-escape we add and break the escaping.
+    collapsed.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 /// A single additive-only violation: a file whose git status indicates it
@@ -4143,6 +4181,71 @@ mod code_review_gate_tests {
             "must name the P0 code-review gate skip: {note}"
         );
     }
+
+    /// cas-7998: a close reason containing a double quote must be escaped so it
+    /// can't terminate the surrounding `message="..."` argument early. Embedding
+    /// the escaped reason in a representative quoted command must leave the
+    /// double quotes balanced (every `"` is either the argument delimiter or a
+    /// backslash-escaped literal).
+    #[test]
+    fn escape_close_reason_neutralizes_embedded_quotes() {
+        let raw = "fixed the \"flaky\" test";
+        let escaped = escape_close_reason_for_quoted_command(raw);
+        assert!(
+            !escaped.contains('\u{0022}') || escaped.contains("\\\""),
+            "raw double quotes must be backslash-escaped: {escaped}"
+        );
+        // No unescaped quote survives.
+        assert!(
+            !escaped.replace("\\\"", "").contains('"'),
+            "every embedded quote must be escaped: {escaped}"
+        );
+        let command = format!("message=\"Task X is ready to close. Close reason: {escaped}.\"");
+        // Count unescaped quotes: strip escaped ones first, then the remaining
+        // quotes are only the two argument delimiters → even count.
+        let unescaped_quotes = command.replace("\\\"", "").matches('"').count();
+        assert_eq!(
+            unescaped_quotes, 2,
+            "exactly the two delimiter quotes may remain unescaped: {command}"
+        );
+    }
+
+    /// cas-7998: newlines/tabs/CRs in a close reason must collapse to single
+    /// spaces so the suggested single-line coordination command can't be split.
+    #[test]
+    fn escape_close_reason_collapses_newlines_and_whitespace() {
+        let raw = "line one\nline two\r\n\tindented   spaced";
+        let escaped = escape_close_reason_for_quoted_command(raw);
+        assert!(
+            !escaped.contains('\n') && !escaped.contains('\r') && !escaped.contains('\t'),
+            "no raw line/tab control chars may survive: {escaped:?}"
+        );
+        assert_eq!(
+            escaped, "line one line two indented spaced",
+            "whitespace runs must collapse to single spaces: {escaped:?}"
+        );
+    }
+
+    /// cas-7998: a backslash already present in the reason is escaped before the
+    /// quote-escape, so a trailing `\` followed by a quote can't combine into a
+    /// stray escape that re-opens the argument.
+    #[test]
+    fn escape_close_reason_escapes_backslash_before_quote() {
+        let raw = "path C:\\dir then \"q\"";
+        let escaped = escape_close_reason_for_quoted_command(raw);
+        assert!(
+            escaped.contains("C:\\\\dir"),
+            "backslashes must be doubled: {escaped}"
+        );
+        // The quote after the escaped backslash is itself escaped, so stripping
+        // escaped backslashes then escaped quotes leaves no bare quote.
+        let no_esc_backslash = escaped.replace("\\\\", "");
+        assert!(
+            !no_esc_backslash.replace("\\\"", "").contains('"'),
+            "quote must remain escaped even adjacent to a backslash: {escaped}"
+        );
+    }
+
     use cas_types::{AutofixClass, Finding, FindingSeverity, Owner, ReviewOutcome};
     use tempfile::TempDir;
 

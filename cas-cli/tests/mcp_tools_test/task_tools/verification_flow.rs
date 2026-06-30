@@ -4260,3 +4260,236 @@ async fn test_codex_worker_epic_close_jail_recommends_cs_coordination_cas_1b80()
         "Codex worker jail must not suggest Task() spawn; got: {msg}"
     );
 }
+
+// =============================================================================
+// cas-7998: harness-aware supervisor verification alias + close-reason quoting
+//
+// Two guidance paths in close_ops still hardcoded `mcp__cas__verification`,
+// handing a Codex supervisor an alias they cannot call:
+//   1. the `supervisor_is_assignee` self-verify branch in the VERIFICATION
+//      REQUIRED gate, and
+//   2. the VERIFICATION TIMED OUT auto-escalation arm.
+// Both must resolve via supervisor_verification_tool() (mcp__cs__verification
+// for a Codex supervisor). Separately, the factory-worker jail message embeds
+// the free-text close reason inside a quoted `message="..."` coordination
+// command; a reason containing a quote/newline must be escaped (covered by the
+// escape_close_reason_for_quoted_command unit tests in close_ops.rs).
+// =============================================================================
+
+/// RAII guard that pins CAS_FACTORY_SUPERVISOR_CLI for the duration of a test
+/// and removes it on drop, so supervisor_verification_tool() resolves the Codex
+/// alias. setup_cas() clears this var, so removing it on drop restores the
+/// process to the same baseline.
+struct ScopedSupervisorCliEnv;
+
+impl ScopedSupervisorCliEnv {
+    fn set(cli: &str) -> Self {
+        // SAFETY: env-sensitive tests serialize via env_test_lock(); see setup_cas().
+        unsafe {
+            std::env::set_var("CAS_FACTORY_SUPERVISOR_CLI", cli);
+        }
+        Self
+    }
+}
+
+impl Drop for ScopedSupervisorCliEnv {
+    fn drop(&mut self) {
+        unsafe {
+            std::env::remove_var("CAS_FACTORY_SUPERVISOR_CLI");
+        }
+    }
+}
+
+/// Drive the `supervisor_is_assignee` self-verify branch and assert the direct
+/// verification alias tracks the supervisor harness. Returns the rendered
+/// guidance so each harness variant can assert on it.
+async fn supervisor_self_assignee_close_guidance(supervisor_cli: Option<&str>) -> String {
+    let (temp, service) = setup_cas();
+    let _env_lock = env_test_lock();
+    let cas_dir = temp.path().join(".cas");
+    let task_store = open_task_store(&cas_dir).unwrap();
+    let agent_store = open_agent_store(&cas_dir).expect("open agent store");
+
+    // get_agent_id() returns this session id in the test harness (setup_cas()).
+    let sup_id = format!("test-session-{}", std::process::id());
+    // Refresh the supervisor agent's heartbeat so the assignee-inactive bypass
+    // does NOT fire — we need to reach the self-assignee jail branch, not the
+    // orphan skip-verification hatch. (setup_cas() registers this agent Active,
+    // but a fresh heartbeat keeps the test robust against clock skew.)
+    agent_store
+        .heartbeat(&sup_id)
+        .expect("refresh supervisor heartbeat");
+
+    let created = service
+        .cas_task_create(Parameters(TaskCreateRequest {
+            depth: None,
+            title: "cas-7998: supervisor self-assigned task".to_string(),
+            description: None,
+            priority: 2,
+            task_type: "task".to_string(),
+            labels: None,
+            notes: None,
+            blocked_by: None,
+            design: None,
+            acceptance_criteria: None,
+            external_ref: None,
+            assignee: None,
+            demo_statement: None,
+            execution_note: None,
+            epic: None,
+        }))
+        .await
+        .expect("create");
+    let id = extract_task_id(&extract_text(created))
+        .expect("id")
+        .to_string();
+
+    // Assign the task to the supervisor themselves and mark it in-progress.
+    let mut task = task_store.get(&id).expect("task exists");
+    task.status = cas::types::TaskStatus::InProgress;
+    task.assignee = Some(sup_id.clone());
+    task_store.update(&task).expect("update task");
+
+    let _sup = ScopedSupervisorEnv::new();
+    let _cli = supervisor_cli.map(ScopedSupervisorCliEnv::set);
+
+    let response = extract_text(
+        service
+            .cas_task_close(Parameters(TaskCloseRequest {
+                id: id.clone(),
+                reason: Some("Self-implemented; ready to self-verify".to_string()),
+                bypass_code_review: None,
+                code_review_findings: None,
+            }))
+            .await
+            .expect("close returns a result"),
+    );
+    assert!(
+        response.contains("VERIFICATION REQUIRED"),
+        "supervisor self-assignee must hit the verification gate: {response}"
+    );
+    assert!(
+        response.contains("You implemented this task yourself"),
+        "must take the supervisor-self-assignee branch: {response}"
+    );
+    response
+}
+
+/// cas-7998 (AC3): a Codex supervisor closing their own task must receive the
+/// Codex verification alias in the self-verify guidance.
+#[tokio::test]
+async fn test_supervisor_self_assignee_close_uses_codex_verification_alias_cas_7998() {
+    let response = supervisor_self_assignee_close_guidance(Some("codex")).await;
+    assert!(
+        response.contains("mcp__cs__verification"),
+        "Codex supervisor self-verify guidance must use mcp__cs__verification: {response}"
+    );
+    assert!(
+        !response.contains("mcp__cas__verification"),
+        "Codex supervisor must not be handed the Claude verification alias: {response}"
+    );
+}
+
+/// cas-7998 (AC3): a Claude supervisor (default) still receives the Claude
+/// verification alias — the harness-aware change must not regress the common
+/// path.
+#[tokio::test]
+async fn test_supervisor_self_assignee_close_uses_claude_verification_alias_cas_7998() {
+    let response = supervisor_self_assignee_close_guidance(None).await;
+    assert!(
+        response.contains("mcp__cas__verification"),
+        "Claude supervisor self-verify guidance must use mcp__cas__verification: {response}"
+    );
+    assert!(
+        !response.contains("mcp__cs__verification"),
+        "Claude supervisor must not be handed the Codex verification alias: {response}"
+    );
+}
+
+/// cas-7998 (AC2): the VERIFICATION TIMED OUT auto-escalation arm must use the
+/// supervisor harness's verification alias for the "record verdict directly"
+/// fallback. A Codex supervisor must see mcp__cs__verification, not the Claude
+/// alias they cannot call.
+#[tokio::test]
+async fn test_timeout_escalation_uses_codex_supervisor_verification_alias_cas_7998() {
+    let (temp, service) = setup_cas();
+    let _env_lock = env_test_lock();
+    let cas_dir = temp.path().join(".cas");
+    let verification_store = open_verification_store(&cas_dir).unwrap();
+
+    let created = service
+        .cas_task_create(Parameters(TaskCreateRequest {
+            depth: None,
+            title: "cas-7998: timeout escalation alias".to_string(),
+            description: None,
+            priority: 2,
+            task_type: "task".to_string(),
+            labels: None,
+            notes: None,
+            blocked_by: None,
+            design: None,
+            acceptance_criteria: None,
+            external_ref: None,
+            assignee: None,
+            demo_statement: None,
+            execution_note: None,
+            epic: None,
+        }))
+        .await
+        .expect("create");
+    let id = extract_task_id(&extract_text(created))
+        .expect("id")
+        .to_string();
+    service
+        .cas_task_start(Parameters(IdRequest { id: id.clone() }))
+        .await
+        .expect("start");
+
+    // First close arms pending_verification + writes the dispatch-request row.
+    let _ = service
+        .cas_task_close(Parameters(TaskCloseRequest {
+            id: id.clone(),
+            reason: Some("Completed".to_string()),
+            bypass_code_review: None,
+            code_review_findings: None,
+        }))
+        .await
+        .expect("first close returns a result");
+
+    // Age the dispatch row beyond the jail timeout so the retry auto-escalates.
+    let mut dispatch = verification_store
+        .get_latest_for_task(&id)
+        .expect("get dispatch row")
+        .expect("dispatch row exists");
+    dispatch.created_at = chrono::Utc::now() - chrono::Duration::seconds(700);
+    verification_store
+        .update(&dispatch)
+        .expect("age dispatch row");
+
+    // Codex supervisor harness drives the alias selection in the timeout arm.
+    let _cli = ScopedSupervisorCliEnv::set("codex");
+
+    let text = extract_text(
+        service
+            .cas_task_close(Parameters(TaskCloseRequest {
+                id: id.clone(),
+                reason: Some("Completed".to_string()),
+                bypass_code_review: None,
+                code_review_findings: None,
+            }))
+            .await
+            .expect("second close returns a result"),
+    );
+    assert!(
+        text.contains("VERIFICATION TIMED OUT"),
+        "retry after timeout must report escalation: {text}"
+    );
+    assert!(
+        text.contains("mcp__cs__verification"),
+        "Codex supervisor timeout guidance must use mcp__cs__verification: {text}"
+    );
+    assert!(
+        !text.contains("mcp__cas__verification"),
+        "Codex supervisor timeout guidance must not use the Claude alias: {text}"
+    );
+}
