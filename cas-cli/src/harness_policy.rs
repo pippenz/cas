@@ -44,6 +44,13 @@ pub fn supervisor_harness_from_env() -> SupervisorCli {
         .unwrap_or(SupervisorCli::Claude)
 }
 
+pub fn supervisor_verification_tool() -> &'static str {
+    match supervisor_harness_from_env() {
+        SupervisorCli::Codex => "mcp__cs__verification",
+        _ => "mcp__cas__verification",
+    }
+}
+
 pub fn is_supervisor_from_env() -> bool {
     std::env::var("CAS_AGENT_ROLE")
         .map(|r| r.eq_ignore_ascii_case("supervisor"))
@@ -189,6 +196,28 @@ mod tests {
         EnvRoleGuard(prev)
     }
 
+    struct EnvSupervisorCliGuard(Option<String>);
+    impl Drop for EnvSupervisorCliGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.0 {
+                    Some(v) => std::env::set_var("CAS_FACTORY_SUPERVISOR_CLI", v),
+                    None => std::env::remove_var("CAS_FACTORY_SUPERVISOR_CLI"),
+                }
+            }
+        }
+    }
+    fn set_supervisor_cli(cli: Option<&str>) -> EnvSupervisorCliGuard {
+        let prev = std::env::var("CAS_FACTORY_SUPERVISOR_CLI").ok();
+        unsafe {
+            match cli {
+                Some(v) => std::env::set_var("CAS_FACTORY_SUPERVISOR_CLI", v),
+                None => std::env::remove_var("CAS_FACTORY_SUPERVISOR_CLI"),
+            }
+        }
+        EnvSupervisorCliGuard(prev)
+    }
+
     #[test]
     fn is_supervisor_reads_field() {
         assert!(is_supervisor(&input_with_role(Some("supervisor"))));
@@ -267,6 +296,27 @@ mod tests {
         assert!(!is_supervisor(&input));
         assert!(!is_worker(&input));
         assert!(!is_factory_agent(&input));
+    }
+
+    #[test]
+    fn supervisor_verification_tool_returns_cs_for_codex_supervisor() {
+        let _g = env_lock();
+        let _supervisor = set_supervisor_cli(Some("codex"));
+        assert_eq!(supervisor_verification_tool(), "mcp__cs__verification");
+    }
+
+    #[test]
+    fn supervisor_verification_tool_returns_cas_for_claude_supervisor() {
+        let _g = env_lock();
+        let _supervisor = set_supervisor_cli(Some("claude"));
+        assert_eq!(supervisor_verification_tool(), "mcp__cas__verification");
+    }
+
+    #[test]
+    fn supervisor_verification_tool_defaults_to_cas_when_supervisor_unset() {
+        let _g = env_lock();
+        let _supervisor = set_supervisor_cli(None);
+        assert_eq!(supervisor_verification_tool(), "mcp__cas__verification");
     }
 
     // ----------------------------------------------------------------------

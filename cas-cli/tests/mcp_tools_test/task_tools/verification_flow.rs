@@ -1888,6 +1888,32 @@ impl Drop for FactoryWorkerEnv {
     }
 }
 
+struct ScopedSupervisorCliEnv(Option<String>);
+
+impl ScopedSupervisorCliEnv {
+    fn set(value: Option<&str>) -> Self {
+        let prev = std::env::var("CAS_FACTORY_SUPERVISOR_CLI").ok();
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var("CAS_FACTORY_SUPERVISOR_CLI", v),
+                None => std::env::remove_var("CAS_FACTORY_SUPERVISOR_CLI"),
+            }
+        }
+        Self(prev)
+    }
+}
+
+impl Drop for ScopedSupervisorCliEnv {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.0 {
+                Some(v) => std::env::set_var("CAS_FACTORY_SUPERVISOR_CLI", v),
+                None => std::env::remove_var("CAS_FACTORY_SUPERVISOR_CLI"),
+            }
+        }
+    }
+}
+
 /// Build a TaskRequest with only the fields a test needs, via JSON so we
 /// don't have to list every Optional field on the struct.
 fn task_req(value: serde_json::Value) -> cas_mcp::TaskRequest {
@@ -2383,6 +2409,67 @@ async fn test_task_close_succeeds_after_verifier_clearance() {
         final_task.status,
         cas::types::TaskStatus::Closed,
         "task must be persisted as Closed after the successful close"
+    );
+}
+
+#[tokio::test]
+async fn test_supervisor_close_guidance_uses_cs_verification_for_codex_supervisor_cas_1544() {
+    let (temp, core) = setup_cas();
+    let _env_lock = env_test_lock();
+    let cas_dir = temp.path().join(".cas");
+    let task_store = open_task_store(&cas_dir).expect("task store");
+    let service = CasService::new(core, None);
+    let _supervisor_cli = ScopedSupervisorCliEnv::set(Some("codex"));
+    let _role_reset = ScopedSupervisorEnv::new();
+
+    let created = service
+        .task(Parameters(task_req(serde_json::json!({
+            "action": "create",
+            "title": "Codex supervisor verification alias",
+            "priority": 2,
+            "task_type": "task",
+        }))))
+        .await
+        .expect("create");
+    let id = extract_task_id(&extract_text(created))
+        .expect("id")
+        .to_string();
+    service
+        .task(Parameters(task_req(serde_json::json!({
+            "action": "start",
+            "id": id.clone(),
+        }))))
+        .await
+        .expect("start");
+
+    let mut task = task_store.get(&id).expect("task after start");
+    task.assignee = Some(format!("test-session-{}", std::process::id()));
+    task.updated_at = chrono::Utc::now();
+    task_store.update(&task).expect("pin assignee to active supervisor session");
+
+    let closed = service
+        .task(Parameters(task_req(serde_json::json!({
+            "action": "close",
+            "id": id.clone(),
+            "reason": "Completed under Codex supervisor.",
+        }))))
+        .await
+        .expect("close guidance should render");
+    let text = extract_text(closed);
+    assert!(
+        text.contains("mcp__cs__verification action=add"),
+        "Codex supervisor guidance must recommend the cs verification tool: {text}"
+    );
+    assert!(
+        !text.contains("mcp__cas__verification action=add"),
+        "Codex supervisor guidance must not recommend the Claude verification alias: {text}"
+    );
+
+    let task = task_store.get(&id).expect("task after close attempt");
+    assert_eq!(
+        task.status,
+        cas::types::TaskStatus::InProgress,
+        "verification guidance path should not close the task"
     );
 }
 

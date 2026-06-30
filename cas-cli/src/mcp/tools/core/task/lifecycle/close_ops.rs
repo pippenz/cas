@@ -1,6 +1,6 @@
 use crate::harness_policy::{
     is_supervisor_from_env, is_worker_without_subagents_from_env, supervisor_harness_from_env,
-    verification_policy, worker_harness_from_env,
+    supervisor_verification_tool, verification_policy, worker_harness_from_env,
 };
 use crate::mcp::tools::core::imports::*;
 
@@ -451,6 +451,7 @@ impl CasCore {
                         } else {
                             String::new()
                         };
+                        let supervisor_verification_tool = supervisor_verification_tool();
 
                         return Ok(Self::tool_error(format!(
                             "⚠️ VERIFICATION FAILED\n\n\
@@ -464,7 +465,7 @@ impl CasCore {
                             v.summary,
                             if is_worker_without_subagents {
                                 "To fix: Address the issues in this worker.\n\
-                                    Then ask supervisor to run verification (task-verifier or direct mcp__cas__verification) and close the task on your behalf."
+                                    Then ask supervisor to run verification (task-verifier or direct {supervisor_verification_tool}) and close the task on your behalf."
                                     .to_string()
                             } else {
                                 format!(
@@ -474,8 +475,8 @@ impl CasCore {
                             close_reason_note,
                             if is_worker_without_subagents {
                                 format!(
-                                    "Suggested message: mcp__cas__coordination action=message target=supervisor message=\"Task {} is ready for re-verification. Please verify (task-verifier or direct mcp__cas__verification) and close if approved.\"",
-                                    req.id
+                                    "Suggested message: mcp__cas__coordination action=message target=supervisor message=\"Task {} is ready for re-verification. Please verify (task-verifier or direct {}) and close if approved.\"",
+                                    req.id, supervisor_verification_tool
                                 )
                             } else {
                                 format!(
@@ -498,6 +499,7 @@ impl CasCore {
                         // VERIFICATION REQUIRED loop.
                         let elapsed_mins =
                             (chrono::Utc::now() - v.created_at).num_seconds() / 60;
+                        let supervisor_verification_tool = supervisor_verification_tool();
 
                         // Clear pending_verification so the jail releases.
                         let mut task_to_update = task.clone();
@@ -551,9 +553,9 @@ impl CasCore {
                             spawned, or failed silently.\n\n\
                             To proceed:\n\
                             1. Re-dispatch verifier: Task(subagent_type=\"task-verifier\", prompt=\"Verify task {}\")\n\
-                            2. Or record verdict directly: mcp__cas__verification action=add task_id={} status=approved summary=\"...\"\n\
+                            2. Or record verdict directly: {} action=add task_id={} status=approved summary=\"...\"\n\
                             3. Then call cas_task_close again.",
-                            req.id, elapsed_mins, req.id, req.id
+                            req.id, elapsed_mins, req.id, supervisor_verification_tool, req.id
                         )));
                     }
                     Ok(None) | Ok(Some(_)) => {
@@ -771,6 +773,7 @@ impl CasCore {
                                 "The agent will check for TODO comments, stubs, incomplete implementations,\n\
                                 AND validate the close reason doesn't admit incomplete work."
                             };
+                            let supervisor_verification_tool = supervisor_verification_tool();
 
                             // Send verification blocked activity event (for supervisor visibility)
                             if let Ok(agent_id) = self.get_agent_id() {
@@ -827,8 +830,8 @@ impl CasCore {
                                     "You implemented this task yourself. Spawn a task-verifier to review your work:\n\n\
                                      Task(subagent_type=\"{}\", prompt=\"Verify task {}\")\n\n\
                                      Or record verification directly:\n\
-                                     mcp__cas__verification action=add task_id={} status=approved summary=\"Self-verified: <reason>\"",
-                                    verifier_agent, req.id, req.id
+                                     {} action=add task_id={} status=approved summary=\"Self-verified: <reason>\"",
+                                    verifier_agent, req.id, supervisor_verification_tool, req.id
                                 )
                             } else {
                                 format!(
@@ -851,16 +854,16 @@ impl CasCore {
                                 close_reason_section.as_str(),
                                 if is_worker_without_subagents {
                                     format!(
-                                        "Ask supervisor to run verification (task-verifier or direct mcp__cas__verification) and close task {} on your behalf.",
-                                        req.id
+                                        "Ask supervisor to run verification (task-verifier or direct {}) and close task {} on your behalf.",
+                                        supervisor_verification_tool, req.id
                                     )
                                 } else {
                                     String::new()
                                 },
                                 if is_worker_without_subagents {
                                     format!(
-                                        "Suggested message: mcp__cas__coordination action=message target=supervisor message=\"Please verify task {} (task-verifier or direct mcp__cas__verification) and close it if approved.\"",
-                                        req.id
+                                        "Suggested message: mcp__cas__coordination action=message target=supervisor message=\"Please verify task {} (task-verifier or direct {}) and close it if approved.\"",
+                                        req.id, supervisor_verification_tool
                                     )
                                 } else {
                                     "After verification passes, call cas_task_close again."
