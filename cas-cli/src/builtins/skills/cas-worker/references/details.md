@@ -14,6 +14,20 @@ Pick the right tool for the job:
 
 See the `cas-search` skill for detailed search guidance including code symbol search and hybrid queries.
 
+## Report / Evidence Tasks
+
+Start with sources that cannot mutate the live CAS DB:
+
+- MCP task/search/coordination surfaces for task records, notes, already-surfaced messages, and searchable project context
+- `.cas/logs/*.log` for daemon and lifecycle timelines
+- Local git/worktree status and exported report artifacts already present in the repo or worktree
+
+If those still do not answer the question:
+
+1. Add a progress or decision note explaining why task/log artifacts were insufficient.
+2. Prefer inspecting a copied snapshot of `.cas/cas.db`.
+3. If you must inspect the live DB, open it with a read-only SQLite URI such as `file:/abs/path/to/.cas/cas.db?mode=ro`. Do **not** use unrestricted `sqlite3 /path/to/.cas/cas.db` for routine report/evidence work.
+
 ## Syncing (Isolated Mode)
 
 If the supervisor asks you to sync, safely rebase without losing WIP:

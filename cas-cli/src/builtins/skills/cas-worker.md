@@ -29,6 +29,7 @@ You execute tasks assigned by the Supervisor. You may be working in an isolated 
 
 - **Spike** (`task_type=spike`) — produces understanding, not code. Deliverable is a decision/comparison/recommendation captured via `note_type=decision`. Spike acceptance criteria are question-based.
 - **Demo statements** — if a task has a `demo_statement`, the work must produce that observable outcome.
+- **Report / evidence tasks** — Deliverable is a report, incident summary, or evidence packet. Prefer MCP task/search/coordination surfaces, `.cas/logs`, task notes, and existing local artifacts over direct live `.cas/cas.db` inspection. If DB access is truly necessary, note why the safer surfaces were insufficient and use a read-only SQLite URI or a copied snapshot.
 
 ## Task Depth
 

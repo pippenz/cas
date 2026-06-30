@@ -35,6 +35,7 @@ Every task spec must include:
 - **Layer boundary** — Which files/modules the worker owns and must not touch outside of; boundary violation is a rejection condition
 - **Explicit non-goals** — What the task deliberately does NOT do, stated to prevent scope creep
 - **Test guidance** — Name the specific scenarios the worker must test, including at least one error path. Don't leave test design entirely to the worker.
+- **Evidence-source plan** — For report/investigation/evidence tasks, explicitly name the MCP/log/recording/task-record sources the worker should use. Treat live `.cas/cas.db` access as an exception: only require it when safer surfaces are insufficient, and then specify read-only URI or copied-snapshot access.
 
 For EPIC subtasks specifically, shape the spec prose using the Implementation Unit Template below. `Spec Requirements` enumerates *what must be present*; the template specifies *how the prose is shaped*.
 
