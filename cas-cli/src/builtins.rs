@@ -9,6 +9,7 @@
 //! guidance that gets injected into supervisor/worker context.
 
 use cas_mux::SupervisorCli;
+use std::collections::HashSet;
 use std::path::Path;
 
 /// Factory supervisor guide - embedded at compile time (source of truth)
@@ -816,6 +817,94 @@ pub fn sync_all_builtins_for_harness(
         SupervisorCli::Claude => sync_all_builtins(target_dir),
         SupervisorCli::Codex => sync_all_codex_builtins(target_dir),
     }
+}
+
+/// Collect the set of skill directory names (`cas-foo`) owned by a builtins
+/// slice. Builtin skill paths look like `skills/<dir>/SKILL.md` (or a nested
+/// `references/...`); we extract `<dir>` so the prune below can recognize the
+/// dirs CAS just wrote and never remove them.
+fn builtin_skill_dir_names(skills: &[BuiltinFile]) -> HashSet<String> {
+    skills
+        .iter()
+        .filter_map(|b| b.path.strip_prefix("skills/"))
+        .filter_map(|rest| rest.split('/').next())
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// Prune stale, non-managed `cas-*` skill directories from a `skills/` dir.
+///
+/// This mirrors the project-level prune in `SkillSyncer::sync_all`
+/// (`cas-cli/src/sync/skills.rs`): a directory is removed only when ALL of
+/// these hold:
+///   1. its name is `cas-*` prefixed (we never touch user-authored skills),
+///   2. it is not one of the builtin skill dirs we just wrote (`keep`), and
+///   3. its `SKILL.md` does not carry the `managed_by: cas` marker.
+///
+/// The managed-by check is the critical safety net: a freshly-synced builtin
+/// always carries the marker, so even if `keep` is somehow incomplete the
+/// builtin survives. Non-`cas-` dirs and dirs missing a `SKILL.md` are left
+/// untouched. Used by `cas update --user` (`sync_user_builtins`) so that legacy
+/// orphans like `cas-playwright-debug` — which the project-level sync already
+/// prunes but the user-level path historically never did — are removed from
+/// `~/.claude/skills` and `~/.codex/skills` on every downstream host.
+///
+/// Returns the names of the directories that were removed.
+pub fn prune_stale_cas_skill_dirs(
+    skills_dir: &Path,
+    keep: &HashSet<String>,
+) -> std::io::Result<Vec<String>> {
+    let mut removed = Vec::new();
+    if !skills_dir.exists() {
+        return Ok(removed);
+    }
+
+    for entry in std::fs::read_dir(skills_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        let name = match path.file_name().and_then(|s| s.to_str()) {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+
+        // Only ever touch cas-* dirs we are not currently writing.
+        if !name.starts_with("cas-") || keep.contains(&name) {
+            continue;
+        }
+
+        // Preserve anything still carrying the managed_by: cas marker — that
+        // is a builtin we own and would re-create on the next sync anyway.
+        let skill_file = path.join("SKILL.md");
+        if let Ok(content) = std::fs::read_to_string(&skill_file) {
+            if is_managed_by_cas(&content) {
+                continue;
+            }
+        }
+
+        std::fs::remove_dir_all(&path)?;
+        removed.push(name);
+    }
+
+    Ok(removed)
+}
+
+/// Prune stale non-managed `cas-*` skill dirs from a harness's user-level
+/// `skills/` directory, keeping the builtins that harness owns. Thin wrapper
+/// over [`prune_stale_cas_skill_dirs`] that selects the right builtin set.
+pub fn prune_stale_user_skills_for_harness(
+    harness: SupervisorCli,
+    harness_dir: &Path,
+) -> std::io::Result<Vec<String>> {
+    let builtins = match harness {
+        SupervisorCli::Claude => BUILTIN_SKILLS,
+        SupervisorCli::Codex => CODEX_BUILTIN_SKILLS,
+    };
+    let keep = builtin_skill_dir_names(builtins);
+    prune_stale_cas_skill_dirs(&harness_dir.join("skills"), &keep)
 }
 
 #[derive(Default, Debug)]
@@ -2139,6 +2228,80 @@ This is the body content."#;
         assert_eq!(
             claude_ref.content, codex_ref.content,
             "auth-fixture-template.md .claude and .codex copies must be byte-identical",
+        );
+    }
+
+    // cas-e0d1: the user-level prune must drop legacy non-managed cas-* orphans
+    // (e.g. cas-playwright-debug) while preserving managed builtins and any
+    // non-cas user skill. Covers all three guard branches plus idempotency.
+    #[test]
+    fn test_prune_stale_cas_skill_dirs_orphan_removed_managed_and_non_cas_kept() {
+        use std::collections::HashSet;
+        use tempfile::tempdir;
+
+        let temp = tempdir().unwrap();
+        let skills_dir = temp.path().join("skills");
+
+        let write_skill = |dir: &str, body: &str| {
+            let p = skills_dir.join(dir);
+            std::fs::create_dir_all(&p).unwrap();
+            std::fs::write(p.join("SKILL.md"), body).unwrap();
+            p
+        };
+
+        // 1. Legacy non-managed cas-* orphan (no marker, not a builtin) — REMOVED.
+        let orphan = write_skill(
+            "cas-playwright-debug",
+            "---\nname: cas-playwright-debug\nuser-invocable: true\n---\n# legacy\n",
+        );
+        // 2. Managed builtin carrying the marker but NOT in `keep` — preserved by
+        //    the managed_by: cas marker guard.
+        let managed = write_skill(
+            "cas-nuxt-playwright",
+            "---\nname: cas-nuxt-playwright\nmanaged_by: cas\n---\n# keep\n",
+        );
+        // 3. Builtin present in `keep` but missing the marker — preserved by the
+        //    builtin-name guard.
+        let kept_by_name =
+            write_skill("cas-codemap", "---\nname: cas-codemap\n---\n# no marker\n");
+        // 4. Non-cas user-authored skill — never touched.
+        let non_cas = write_skill("my-skill", "---\nname: my-skill\n---\n# user\n");
+
+        let mut keep = HashSet::new();
+        keep.insert("cas-codemap".to_string());
+
+        let removed = prune_stale_cas_skill_dirs(&skills_dir, &keep).unwrap();
+
+        assert_eq!(removed, vec!["cas-playwright-debug".to_string()]);
+        assert!(!orphan.exists(), "non-managed cas-* orphan should be removed");
+        assert!(
+            managed.exists(),
+            "managed_by: cas builtin should be preserved via marker guard"
+        );
+        assert!(
+            kept_by_name.exists(),
+            "builtin in keep set should be preserved via name guard"
+        );
+        assert!(non_cas.exists(), "non-cas dir should be untouched");
+
+        // Idempotent: a second pass with nothing stale removes nothing.
+        let removed2 = prune_stale_cas_skill_dirs(&skills_dir, &keep).unwrap();
+        assert!(removed2.is_empty(), "second prune should be a no-op");
+    }
+
+    // cas-e0d1: builtin_skill_dir_names extracts `<dir>` from `skills/<dir>/...`
+    // paths so the real builtin set protects those dirs from the prune.
+    #[test]
+    fn test_builtin_skill_dir_names_extracts_dirs_and_protects_nuxt_playwright() {
+        let names = builtin_skill_dir_names(BUILTIN_SKILLS);
+        assert!(
+            names.contains("cas-nuxt-playwright"),
+            "builtin skill dir set should contain cas-nuxt-playwright"
+        );
+        // The legacy orphan is NOT a builtin, so it is never in the keep set.
+        assert!(
+            !names.contains("cas-playwright-debug"),
+            "cas-playwright-debug is not a builtin and must not be in the keep set"
         );
     }
 

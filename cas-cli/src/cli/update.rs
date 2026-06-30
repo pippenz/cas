@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use clap::Args;
 
-use crate::builtins::sync_all_builtins_for_harness;
+use crate::builtins::{prune_stale_user_skills_for_harness, sync_all_builtins_for_harness};
 use crate::cli::Cli;
 use crate::cli::factory_tooling;
 use crate::cli::hook::{configure_claude_hooks, configure_codex_mcp_server, configure_mcp_server};
@@ -458,8 +458,16 @@ fn sync_user_builtins(cli: &Cli) -> anyhow::Result<()> {
     // Claude: gated on dir existence — if a user has no ~/.claude, they're
     // not using Claude Code globally and we don't want to materialize an
     // empty dir for them.
+    let mut claude_pruned: Vec<String> = Vec::new();
+    let mut codex_pruned: Vec<String> = Vec::new();
+
     let claude_result = if claude_dir.exists() {
         let r = sync_all_builtins_for_harness(cas_mux::SupervisorCli::Claude, &claude_dir)?;
+        // Prune legacy non-managed cas-* orphans (e.g. cas-playwright-debug) the
+        // project-level sync already drops but the user-level path historically
+        // never did (cas-e0d1).
+        claude_pruned =
+            prune_stale_user_skills_for_harness(cas_mux::SupervisorCli::Claude, &claude_dir)?;
         if !cli.json {
             let mut out = io::stdout();
             let mut fmt = Formatter::stdout(&mut out, theme.clone());
@@ -478,6 +486,10 @@ fn sync_user_builtins(cli: &Cli) -> anyhow::Result<()> {
             } else {
                 fmt.success("~/.claude: built-ins up to date")?;
             }
+            for name in &claude_pruned {
+                fmt.write_raw(&format!("    - skills/{name} (removed stale orphan)"))?;
+                fmt.newline()?;
+            }
         }
         Some(r)
     } else {
@@ -492,6 +504,8 @@ fn sync_user_builtins(cli: &Cli) -> anyhow::Result<()> {
 
     let codex_result = if codex_dir.exists() {
         let r = sync_all_builtins_for_harness(cas_mux::SupervisorCli::Codex, &codex_dir)?;
+        codex_pruned =
+            prune_stale_user_skills_for_harness(cas_mux::SupervisorCli::Codex, &codex_dir)?;
         if !cli.json {
             let mut out = io::stdout();
             let mut fmt = Formatter::stdout(&mut out, theme.clone());
@@ -506,6 +520,10 @@ fn sync_user_builtins(cli: &Cli) -> anyhow::Result<()> {
             } else {
                 fmt.success("~/.codex: built-ins up to date")?;
             }
+            for name in &codex_pruned {
+                fmt.write_raw(&format!("    - skills/{name} (removed stale orphan)"))?;
+                fmt.newline()?;
+            }
         }
         Some(r)
     } else {
@@ -519,8 +537,10 @@ fn sync_user_builtins(cli: &Cli) -> anyhow::Result<()> {
         let codex_total = codex_result.as_ref().map(|r| r.total_updated()).unwrap_or(0);
         let claude_present = claude_dir.exists();
         let codex_present = codex_dir.exists();
+        let claude_pruned_n = claude_pruned.len();
+        let codex_pruned_n = codex_pruned.len();
         println!(
-            r#"{{"claude_present":{claude_present},"claude_builtins_updated":{claude_total},"codex_present":{codex_present},"codex_builtins_updated":{codex_total}}}"#
+            r#"{{"claude_present":{claude_present},"claude_builtins_updated":{claude_total},"claude_skills_pruned":{claude_pruned_n},"codex_present":{codex_present},"codex_builtins_updated":{codex_total},"codex_skills_pruned":{codex_pruned_n}}}"#
         );
     }
 
