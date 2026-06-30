@@ -724,14 +724,26 @@ impl Pty {
         let writer = Arc::new(Mutex::new(writer));
 
         if is_codex {
+            // Codex blocks at startup until it gets a reply to its cursor-position
+            // (DSR) probe, so feed it a synthetic cursor-position report a few times
+            // to unstick rendering.
+            //
+            // This MUST NOT use `tokio::spawn`. `Pty::spawn` is a *synchronous*
+            // constructor and is routinely called from threads with no ambient Tokio
+            // runtime (the factory daemon's blocking spawn path), where `tokio::spawn`
+            // panics with "there is no reactor running" and takes the whole supervisor
+            // down at INIT (cas-e202). Use a detached std thread + `blocking_lock`,
+            // mirroring `reader_loop` below, so the keep-alive has zero runtime
+            // dependency. `blocking_lock` is safe here because this is a fresh OS
+            // thread, never a Tokio worker thread.
             let writer = Arc::clone(&writer);
-            tokio::spawn(async move {
+            std::thread::spawn(move || {
                 for _ in 0..10 {
-                    let mut locked = writer.lock().await;
+                    let mut locked = writer.blocking_lock();
                     let _ = locked.write_all(b"\x1b[1;1R");
                     let _ = locked.flush();
                     drop(locked);
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    std::thread::sleep(std::time::Duration::from_millis(200));
                 }
             });
         }
