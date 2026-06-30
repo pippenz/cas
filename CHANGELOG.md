@@ -7,6 +7,11 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [2.24.2] - 2026-06-30
+
+### Fixed
+- **Codex factory no longer panics at INIT with "there is no reactor running" (cas-e202).** Starting a factory on the `codex` profile crashed the supervisor before any agent came up: `Pty::spawn` is a synchronous constructor, but its codex-only branch used `tokio::spawn` to drive the startup cursor-position (DSR) keep-alive, which panics when called from the factory daemon's runtime-free spawn thread. The keep-alive now runs on a detached `std::thread` with `blocking_lock`, mirroring the reader loop that already locks the same Mutex off-runtime — zero Tokio-runtime dependency. The Claude path was never affected (it has no `tokio::spawn`).
+
 ## [2.24.1] - 2026-06-26
 
 ### Fixed
