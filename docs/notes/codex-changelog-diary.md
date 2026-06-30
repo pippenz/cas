@@ -24,13 +24,16 @@ verify on upgrade) · 🔧 fix shipped · 🏗 EPIC · ⏭ n/a
 
 ## Version status
 
-- **CAS validated against:** Codex CLI **0.128.0** (local install; `crates/cas-pty/src/pty.rs:317`
-  comment pins the effort approach to 0.128).
-- **Latest stable:** **0.138.0** (2026-06-08). **0.139.0** in alpha.
-- **Gap:** ~10 minor versions. The seed entries below are a *triage pass* against the touchpoints,
-  not a per-item code audit — upgrade-time re-verification is the trigger for promoting any 👀 to a
-  task. (Contrast the Claude Code diary's .166/.162 entries, which were deep-verified for specific
-  user questions.)
+- **CAS validated against:** Codex CLI **0.128.0** (the `crates/cas-pty/src/pty.rs` effort-approach
+  comment pins to 0.128).
+- **Locally installed:** **0.142.4** (`codex-cli 0.142.4`, checked 2026-06-30).
+- **Latest stable:** **0.142.4** (2026-06-29). **0.143.0** in alpha.
+- **Gap:** ~14 minor versions between the validated pin (0.128) and what's installed/latest (0.142).
+  The entries below are a *triage pass* against the touchpoints, not a per-item code audit —
+  upgrade-time re-verification is the trigger for promoting any 👀 to a task. (Contrast the Claude
+  Code diary's .166/.162 entries, which were deep-verified for specific user questions.) The
+  **0.130–0.135 block is a backfill** (lighter fidelity, consolidated) added 2026-06-30 to extend
+  coverage below the original 0.136 seed floor.
 
 ## CAS ↔ Codex touchpoints (what a release can break)
 
@@ -61,14 +64,149 @@ The load-bearing surface, all in `crates/cas-pty/src/pty.rs::PtyConfig::codex` u
 
 | Codex version | Headline | CAS verdict | Pointer |
 |---------------|----------|-------------|---------|
-| 0.139.0-alpha | (pre-release; not tracked until stable) | — | — |
+| 0.143.0-alpha | (pre-release; not tracked until stable) | — | — |
+| 0.142.0–.4 | **Rollout token budgets (turns abort when exhausted)** · env-scoped command/network approvals · AGENTS.md from foreign envs · `SkillsManager→SkillsService` + skill-frontmatter repair | 👀 watch | this doc |
+| 0.141.0 | **Hook trust bypass persists through `codex exec`; blocking PostToolUse rejects code-mode** · per-thread plugin stdio MCP activation · MCP tool timeout→300s | 👀 watch | this doc |
+| 0.140.0 | **`/import` Claude Code setup/config/chats** · corrupted-SQLite auto-recover · encrypted MCP-OAuth secret storage · hooks.json unsupported-field warnings | 👀 watch | this doc |
+| 0.139.0 | Sandbox preserves approval/escalation + proxy-only net · `oneOf`/`allOf` in tool schemas · `-P` profile alias · multi-agent v2 `interrupt_agent` | 👀 watch | this doc |
 | 0.138.0 | Effort-order-from-model, skills→extension bridge, AGENTS.md symlink fix, multi-agent v2 catalog | 👀 watch | this doc |
 | 0.137.0 | Skills plumbing → dedicated crates, malformed-skills-as-warning, permission env identity, multi-agent v2 | 👀 watch | this doc |
 | 0.136.0 | deny-read enforced in approval-bypass paths, rmcp 1.7.0, command-safety hardening | 👀 watch | this doc |
+| 0.130.0–0.135.0 | **Backfill (consolidated):** `--profile` becomes primary + legacy profile configs rejected · subagent identity in hook inputs · AGENTS.md invalid-UTF-8 warns-not-drops · MCP `$ref`/`$defs` + readOnlyHint concurrency · memory→dedicated SQLite | 👀 / ✅ | this doc |
 
 ---
 
 ## Entries
+
+### 0.142.0–.4 — rollout token budgets · env-scoped approvals · AGENTS.md from foreign envs · SkillsService
+
+Reviewed 2026-06-30 (eager-leopard-33 / supervisor). Triage pass vs touchpoints. This is the version
+band **currently installed locally** (`codex-cli 0.142.4`).
+
+- **"Configurable rollout token budgets track usage across agent threads… and abort turns when
+  exhausted" (#28746, #28494, #28707, #29423).** → 👀 **watch — most load-bearing item for the factory.**
+  A Codex worker turn can now *abort* when a rollout token budget is exhausted. CAS doesn't set a budget
+  (so the default applies, which should be unbounded/off), but **verify on the 0.142 bump** that factory
+  workers don't pick up a low default budget that kills long turns mid-task. If Codex ever defaults this
+  on, CAS needs to either raise it via `-c` or surface "turn aborted: budget" distinctly from a stall.
+- **"Command approvals scoped by execution environment" (#28738) + "network approvals scoped by
+  environment" (#28899) + "Report remote sandbox denials semantically" (#29424).** → 👀 **touchpoint:
+  `--yolo`/approval.** Approvals are now keyed to the exec environment. CAS workers bypass via `--yolo`;
+  confirm the env-scoping doesn't reintroduce a prompt on the bypass path for worktree/CAS-root access.
+- **"core: load AGENTS.md from foreign environments" (#28958) + remote envs preserve AGENTS.md discovery
+  (#28983, #29099).** → 👀 **touchpoint: AGENTS.md.** Worker priming rides AGENTS.md in worktrees; this
+  is the continuing accuracy work from 0.138. Likely *helps*; verify worker role priming still lands.
+- **`SkillsManager` → `SkillsService` (#28705) + "Repair invalid skill frontmatter scalars" (#28628) +
+  "Support plugin manifest path lists / multiple skill paths" (#28790).** → 👀 **touchpoint:
+  `.codex/skills/`.** The skills subsystem keeps churning (started 0.137). The frontmatter-repair is
+  safer for our generated `.codex/skills/*.md`, but **verify the synced mirror still loads** post-bump.
+- **"App-server clients can configure multi-agent delegation as disabled / explicit-request-only /
+  proactive" (#28685, #28792, #29324) + "Parent agents receive terminal subagent errors instead of
+  empty success" (#28375).** → 👀 strategic (multi-agent v2; same posture as 0.137/0.138 — feed it,
+  don't compete). The terminal-error propagation is a genuine reliability win if CAS ever consumes
+  Codex-native subagents.
+- **Indexed web-search mode, scheduled UTC time reminders + current-time tool, `/usage` reset-credit
+  redemption, plugin catalog sections.** → ⏭ n/a (orthogonal to the CAS launch surface).
+
+### 0.141.0 — hook trust bypass in `codex exec` · per-thread plugin stdio MCP · MCP timeout 300s
+
+Reviewed 2026-06-30. Triage pass.
+
+- **"Hook trust bypass now persists through `codex exec` thread start and resume, while blocking
+  `PostToolUse` hooks correctly reject code-mode tool calls" (#26434, #28365).** → 👀 **note: Codex
+  hooks.** Codex now has its own hooks.json + PostToolUse path. CAS's Codex worker model relies on
+  `--yolo` + env (no Codex hook system in the loop, per the touchpoints list), so this is mostly
+  informational — but if CAS ever adopts Codex hooks for parity with the Claude path, the trust-bypass
+  + code-mode-rejection semantics are the relevant surface.
+- **"Selected executor plugins can activate their stdio MCP servers per thread" (#27870, #27884,
+  #27893…).** → 👀 **touchpoint: MCP (`cs`).** How stdio MCP servers (our `cs`) get activated is moving
+  to per-thread/plugin-scoped activation. **Verify `mcp__cs__*` still loads** from `.codex/config.toml`
+  on every worker thread after the bump — this is the highest-risk item in 0.141 for CAS.
+- **"`[mcp] Increase default tool timeout to 300 seconds" (#28234).** → ✅ helpful; longer ceiling for
+  `cs` MCP calls (e.g. a slow `mcp__cs__search`), no downside.
+- **"TUI input prompts can auto-resolve after inactivity" (#28235) + "let steer interrupt wait_agent"
+  (#28341).** → 👀 minor: a `request_user_input` auto-resolution timer could auto-answer a worker's
+  prompt — but `--yolo` workers shouldn't be prompting. Note in case a worker hangs on an input dialog.
+- Noise relay E2E remote transport, P-521 TLS, bounded image cache. → ⏭ n/a (remote-exec/TUI).
+
+### 0.140.0 — `/import` from Claude Code · corrupted-SQLite auto-recover · encrypted MCP-OAuth secrets
+
+Reviewed 2026-06-30. Triage pass.
+
+- **"Added `/import` for selectively importing setup, project configuration, and recent chats from
+  Claude Code" (#27070, #27071, #27703).** → 👀 **strategic / onboarding.** Codex can now pull a Claude
+  Code setup. Interesting for the cross-harness story (CAS supports both) and for onboarding a user who
+  already has a CC config — but it imports *Codex-side* setup, not CAS's MCP/skill wiring, so it's not a
+  substitute for `cas integrate`. Flag for the onboarding-doc pass; no code action.
+- **"Corrupted SQLite state databases are now backed up and rebuilt automatically… including malformed
+  database-directory cases" (#26859, #27719); 0.131 added fail-closed when state can't open.** → 👀
+  minor. Codex's *own* state SQLite, separate from CAS's project-local `cas.db`
+  (memory `reference_cas_project_local_dbs`). Echoes the CAS finding that a SQLite restore breaks a live
+  MCP connection (memory `feedback_sqlite_restore_breaks_mcp_connection`) — different DB, same hazard
+  class; no overlap expected.
+- **"Managed Amazon Bedrock API-key auth and encrypted local storage for CLI and MCP OAuth credentials"
+  (#27443, #27689, #27504, #27535, #27539, #27541).** → 👀 **touchpoint: MCP (`cs`).** Encrypted secret
+  namespaces for MCP OAuth. Our `cs` server is local stdio with no OAuth, so N/A in practice — but
+  verify the new secret-storage path doesn't change how `.codex/config.toml` MCP entries are read.
+- **"hooks.json warns on unsupported top-level fields" (#26426) + "avoid duplicate hooks.json discovery
+  with profiles" (#26418).** → 👀 note (Codex hooks; see 0.141). **Typing `@` opens unified mentions for
+  files/plugins/skills (#27499); removed experimental `/realtime` voice (#27801).** → ⏭ n/a.
+
+### 0.139.0 — sandbox preserves approval/escalation · oneOf/allOf tool schemas · `-P` profile alias
+
+Reviewed 2026-06-30. Triage pass.
+
+- **"Sandbox execution now preserves approved escalation decisions and enforces configured proxy-only
+  networking more consistently" (#24981, #27035).** → 👀 **touchpoint: `--yolo`/sandbox.** Directly on
+  the bypass path — verify `--yolo` workers keep full read/exec on the worktree + CAS root and that
+  proxy-only networking (if a host sets it) doesn't block worker network access.
+- **"Tool and connector input schemas now preserve `oneOf` and `allOf`, and large schemas keep more
+  shallow structure when compacted" (#24118, #27084).** → 👀 **touchpoint: MCP (`cs`).** Our
+  `mcp__cs__*` tool schemas pass through Codex's schema handling; richer `oneOf`/`allOf` preservation is
+  a fidelity win for the CAS tool surface. Smoke `cs` tool calls on upgrade.
+- **`cli: add -P sandbox permissions profile alias` (#27054); multi-agent v2 `close_agent`→
+  `interrupt_agent` rename (#26994).** → ✅ no action (profile is an alias; CAS uses `--yolo`, not
+  profiles) / 👀 strategic (multi-agent v2 naming churn — informational).
+- **"Exclude external tool output from memories" (#26821).** → ✅ no action; Codex's own "memories"
+  concept, orthogonal to CAS memory exposed via `cs`.
+
+### 0.130.0–0.135.0 — backfill (consolidated, lighter fidelity)
+
+Reviewed 2026-06-30. Added to extend coverage **below the original 0.136 seed floor** ("going back a
+ways"). These versions are well behind both the 0.128 validated pin and the 0.142 install, so this is a
+single consolidated triage rather than per-item entries — promote anything here to a real entry only if
+an upgrade actually lands on one of these.
+
+- **`--profile` made the primary profile selector across CLI/TUI/sandbox; legacy profile configs
+  rejected through migration guidance (0.134, #23708…); managed `requirements.toml` permission profiles
+  (0.133).** → 👀 **touchpoint: approval.** CAS workers use `--yolo`, not named profiles — but if any
+  CAS-written or host `.codex` config still carries a *legacy* profile block, a 0.134+ Codex would
+  reject it with a migration error. Verify no legacy profile config ships in the CAS-managed `.codex`.
+- **Subagent identity now included in hook inputs + richer extension/hook context (0.134, #23963,
+  #22882); subagent start/stop lifecycle events for extensions (0.133, #22782…).** → 👀 note (Codex
+  hooks/extensions; same informational status as 0.140/0.141 — CAS Codex path doesn't use Codex hooks
+  yet).
+- **AGENTS instruction loading hardened: local global reads + warnings for invalid UTF-8 instead of
+  silent drops (0.133, #23343, #23232).** → 👀 **touchpoint: AGENTS.md.** Strictly better — a malformed
+  AGENTS.md now warns instead of silently dropping worker priming. The lineage of the 0.138 symlink fix
+  and 0.142 foreign-env loading.
+- **MCP: per-server env targeting + OAuth for streamable HTTP (0.134, #23583, #24120); `$ref`/`$defs`
+  preserved + oversized schemas compacted (0.134, #23357); read-only MCP tools run concurrently with
+  `readOnlyHint` (0.134, #23750); removed extra skills roots + string-keyed MCP tool maps (0.130).** →
+  👀 **touchpoint: MCP (`cs`).** Schema-fidelity + concurrency improvements that the `oneOf`/`allOf`
+  work (0.139) builds on; all strictly helpful to the CAS tool surface. The "extra skills roots
+  removed" (0.130) is the early signal of the skills-subsystem consolidation that runs through 0.142.
+- **State/SQLite safety: fail-closed when local state can't open + preserve SQLite data (0.131,
+  #21831…); memory runtime state moved to a dedicated SQLite DB (0.135, #24591); memory summaries
+  versioned/rebuilt when stale (0.132, #23148).** → ✅ no action; Codex's own state/memory DBs, separate
+  from CAS `cas.db`. Same hazard class as the 0.140 auto-recover note, no overlap.
+- **Git/worktree: "use root worktree hooks consistently, ignore repo hook/fsmonitor config in helper
+  commands" (0.131, #21969, #22843).** → 👀 minor touchpoint: factory workers run in worktrees; this
+  makes Codex's internal git helpers ignore repo-level hook/fsmonitor config, which is *safer* for the
+  CAS factory-commit guard (memory `factory_commit_guard_blocks_main`) — no conflict expected.
+- **`CODEX_NON_INTERACTIVE=1` install mode (0.135, #21567); bundled patched zsh helper (0.135).** → ✅
+  no action; useful for scripted/CI Codex installs in an onboarding context. TUI/markdown/vim/Windows
+  polish across all six → ⏭ n/a.
 
 ### 0.138.0 — reasoning-effort order · skills→extension bridge · AGENTS.md symlink fix
 
@@ -143,5 +281,13 @@ Reviewed 2026-06-09. Triage pass.
   `-c model_reasoning_effort=` TOML override (cleaner, version-stable). See 0.138 entry.
 - **Multi-agent v2 strategic posture:** decide CAS's stance toward Codex's native multi-agent
   orchestration (mirror of the Claude Code Workflow/Agent-Teams fork). See 0.137/0.138 entries.
-- **0.128 → 0.138 upgrade validation:** when bumping the local/factory Codex, run the touchpoint
+- **0.128 → 0.142 upgrade validation:** when bumping the local/factory Codex, run the touchpoint
   checklist above (effort key, skills load, AGENTS.md pickup, `--yolo` deny-read, `cs` MCP smoke).
+  **Add for 0.139+:** (a) **rollout token budget** (0.142) — confirm workers don't inherit a low
+  default that aborts long turns; (b) **per-thread plugin stdio MCP activation** (0.141) — confirm
+  `mcp__cs__*` loads on every worker thread; (c) **env-scoped command/network approvals** (0.142) —
+  confirm `--yolo` bypass still holds; (d) **legacy `.codex` permission-profile blocks** (0.134) —
+  reject-on-migration could break worker startup.
+- **Codex hooks adoption (optional):** Codex now has hooks.json + PostToolUse with trust-bypass
+  semantics (0.140/0.141). If CAS ever wants Claude-path parity (PreToolUse auto-approve, jail
+  exemptions) on the Codex side instead of relying solely on `--yolo` + env, that's the surface.

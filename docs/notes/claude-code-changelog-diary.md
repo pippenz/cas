@@ -39,6 +39,17 @@ When a new Claude Code version ships:
 
 | CC version | Headline | CAS verdict | Pointer |
 |------------|----------|-------------|---------|
+| 2.1.196 | MCP self-approval tightening · streaming idle watchdog **default-on** · `/code-review` −25% tokens | ✅ no action / 👀 watch | this doc |
+| 2.1.195 | **Hook matchers with hyphenated identifiers now exact-match** (CAS uses `matcher:"task-verifier"`) | 🟢 already aligned | this doc |
+| 2.1.193 | `autoMode.classifyAllShell` · OTEL `assistant_response` logging default | ✅ no action | — |
+| 2.1.191 | **Comma-separated hook matchers silently never firing — fixed**; permanent stop-agent | ✅ no action | this doc |
+| 2.1.187 | **Schema structured-output reliability** · subagent depth · agent-worktree leak cleanup | 👀 watch | this doc |
+| 2.1.186 | **`Agent(type)`/`Agent(x,y)` enforced for named spawns** · `claude mcp login/logout` | ✅ no action | this doc |
+| 2.1.183 | **tmux teammate pane launch + spawn keystroke-leak fix** · destructive-git auto-block | 👀 touchpoint | this doc |
+| 2.1.181 | Bun 1.4 · foreground-subagent depth cap · `mcp get/list` tools-fetch status | ✅ no action | — |
+| 2.1.178 | **Agent Teams: `TeamCreate`/`TeamDelete` removed → implicit team** · nested skills · `disallowedTools` MCP specs | 🟢 already covered | this doc |
+| 2.1.176 | skill hot-reload · hook `if`-conditions for Read/Edit/Write paths · Fable 5 auto-mode fallback | ✅ no action | — |
+| 2.1.174 | **skill hot-reload only re-announces changed skills** · Workflow `agent()` attribution | 🟢 already covered | this doc |
 | 2.1.170 | **Claude Fable 5** (Mythos-class model) GA + VS Code / inherited-env transcript-save fix | 👀 evaluate | this doc |
 | 2.1.169 | **`--safe-mode`**, `/cd`, **`disableBundledSkills`**, `agents --json` state/id, managed-MCP enforcement fixes | ✅ no action / 👀 noted | this doc |
 | 2.1.168 | Bug-fix rollup | ⏭ n/a | — |
@@ -55,6 +66,131 @@ When a new Claude Code version ships:
 ---
 
 ## Entries
+
+### 2.1.196 — MCP self-approval tightening · streaming idle watchdog default-on · /code-review token cut
+
+Reviewed 2026-06-30 (eager-leopard-33 / supervisor). Sweep of 2.1.171–2.1.196.
+
+- **Security: `claude mcp list`/`get` no longer spawn `.mcp.json` servers that a repo self-approved
+  via a committed `.claude/settings.json`; untrusted workspaces show `⏸ Pending approval`.** → ✅ no
+  action; strictly safer for anyone inspecting the CAS MCP registration. CAS registers `mcp__cas__*`
+  through user/project config on the *trusted* factory root, not via a committed self-approval, so the
+  tightening doesn't touch worker startup. **Smoke on upgrade:** confirm workers in worktrees off the
+  trusted root still get `mcp__cas__*` (worktrees inherit parent-repo trust → expected fine).
+- **Streaming idle watchdog now ON by default for all providers — aborts + retries when a response
+  stream produces no events for 5 min (`CLAUDE_ENABLE_STREAM_WATCHDOG=0` to disable).** → 👀 **watch.**
+  A factory-worker turn that legitimately stalls >5 min inside a single long tool with no streamed
+  output would now abort + retry. Low risk (CAS turns stream tool calls regularly), but if a worker
+  starts thrashing on a long build/test step, the disable env is the lever.
+- **`/code-review` merged five cleanup finders into one (~−25% tokens).** → ✅ no action. That's CC's
+  *built-in* `/code-review`; CAS ships its own `cas-code-review` Workflow + skill (Phase C, cas-b667) —
+  a separate surface, no shared code. Logged so the token-cut isn't mistaken for a CAS change.
+
+### 2.1.195 — hook matchers: hyphenated identifiers now exact-match
+
+Reviewed 2026-06-30. **Highest-relevance item in this sweep for CAS.**
+
+- **"Fixed hook matchers with hyphenated identifiers (e.g. `code-reviewer`, `mcp__brave-search`)
+  accidentally substring-matching — they now exact-match."** → 🟢 **already aligned — verify on
+  upgrade.** CAS registers a `SubagentStart` hook with **`matcher: "task-verifier"`**
+  (`cas-cli/src/cli/hook/config_gen.rs:262`) to unjail the verification jail when the `task-verifier`
+  agent spawns — a hyphenated identifier, exactly the affected class. CAS's *intent* has always been
+  exact-match (fire only for the `task-verifier` agent), so 2.1.195 makes the matcher behave as
+  designed and removes any spurious substring hits. **No CAS change needed**; on the bump, smoke-test
+  that `cas hook SubagentStart` still fires when a task-verifier agent spawns (the close-time
+  verification path depends on it).
+- `CLAUDE_CODE_DISABLE_MOUSE_CLICKS` and the voice/plugin fixes are host-side → ⏭ n/a.
+
+### 2.1.191 — comma-separated hook matchers never firing (fixed) · permanent stop-agent
+
+Reviewed 2026-06-30.
+
+- **"Fixed hooks with comma-separated matchers (e.g. `"Bash,PowerShell"`) silently never firing."** →
+  ✅ **no action — CAS was never on the broken path.** CAS's broad tool hook uses a **regex
+  alternation** (`matcher: "Read|Write|Edit|Glob|Grep|Bash|NotebookEdit"`, config_gen.rs), not a
+  comma list, and its only other matcher is the single-token `task-verifier`. Grepped the generated
+  config: no CAS matcher uses commas, so none were silently dead. Recorded so the next person doesn't
+  re-audit it.
+- Permanent stop-agent + `/rewind`-before-`/clear` are host UX → ⏭ n/a.
+
+### 2.1.187 / 2.1.186 — Agent(type) enforcement · schema structured-output reliability · subagent depth
+
+Reviewed 2026-06-30. Two adjacent releases with the same CAS angle.
+
+- **`Agent(type)` deny rules and `Agent(x,y)` allowed-types restrictions are now enforced for named
+  subagent spawns (2.1.186).** → ✅ no action. CAS gates tools through its own PreToolUse hook + skill
+  `disallowed-tools` frontmatter (cas-5be8), **not** host `Agent()` permission rules. Stricter host
+  enforcement is orthogonal and strictly safer.
+- **`--json-schema` / Workflow `agent({schema})` structured output hardened: the model can no longer
+  re-call `StructuredOutput` indefinitely after a success, follow-up turns reliably return structured
+  output (2.1.187), and schema-validation-failure loops now abort after 5 attempts (2.1.186).** → 👀
+  **watch — benefits CAS.** The `cas-code-review` Workflow and its Steps 3-4 persona dispatch use
+  schema-validated `agent({schema})`; these fixes directly de-flake that path. No CAS change; pick up
+  the reliability win on the bump.
+- **`claude mcp login <name>` / `logout <name>` CLI (2.1.186).** → ✅ no action; convenience for
+  authenticating an MCP server from the CLI (CAS's `mcp__cas__*` is local stdio, no OAuth, so N/A in
+  practice but harmless).
+- Subagent depth-tracking fixes + automatic cleanup of leaked agent-worktree registrations (2.1.187).
+  → ✅ no action; CAS factory uses its own tmux workers + worktrees, not CC background-agent worktrees.
+
+### 2.1.183 — tmux teammate pane launch + spawn keystroke-leak fix · destructive-git auto-block
+
+Reviewed 2026-06-30. **Touches the factory spawn path.**
+
+- **"Fixed tmux teammate panes failing to launch when the shell has slow rc-file initialization, and
+  keystrokes typed during agent spawn leaking into the new tmux pane instead of the leader prompt."** →
+  👀 **touchpoint: factory tmux workers.** CAS factory spawns workers in tmux panes (cas-pty PTY +
+  agent-teams CLI flags; memory `reference_cas_factory_uses_cc_agent_teams_cli_flags`). Slow rc-file
+  init + spawn-time keystroke leak is precisely the flake class we've hit. This host fix should *help*
+  CAS spawn reliability; **verify on upgrade** that worker panes come up clean and supervisor
+  keystrokes typed during a spawn don't leak into the new worker pane.
+- **Auto mode now blocks destructive git (`reset --hard`, `checkout -- .`, `clean -fd`, `stash drop`),
+  amend of non-agent commits, and `terraform/pulumi/cdk destroy`.** → ✅ no action — same shape as the
+  .160 sensitive-file note: factory workers run `--dangerously-skip-permissions` (bypassPermissions),
+  which short-circuits auto-mode classification. Non-factory users get the safety net.
+- **"Fixed background tasks started by a teammate being killed when the teammate finishes a turn."** →
+  ✅ no action / 👀 noted. Relevant only if CAS leaned on CC-native turn-scoped teammate background
+  tasks — it doesn't; factory workers are long-lived tmux sessions.
+- WebSearch-in-subagents fix; MCP auth-stub tools no longer exposed in headless/SDK → ✅ no action.
+
+### 2.1.178 — Agent Teams: TeamCreate/TeamDelete removed → implicit team · nested skills · disallowedTools MCP specs
+
+Reviewed 2026-06-30. **Strategically the most important entry in this sweep.**
+
+- **"Agent teams: removed the `TeamCreate` and `TeamDelete` tools. With
+  `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`, every session now has one implicit team — spawn teammates
+  directly with the Agent tool's `name` parameter. The `team_name` parameter is still accepted but
+  ignored."** → 🟢 **already covered — confirms CAS's posture.** CAS factory already rides CC agent
+  teams through **CLI flags + PTY env** (`--team-name` / `--agent-id` at spawn; memory
+  `reference_cas_factory_uses_cc_agent_teams_cli_flags`), **never** via the `TeamCreate`/`TeamDelete`
+  tools. Their removal is a no-op for CAS. Caveat to watch: the now-ignored *`team_name` tool
+  parameter* is a different surface from the CAS CLI `--team-name` *flag* — the flag is unaffected, but
+  if any CAS worker prompt still instructs a model to call `TeamCreate`, that's now dead. (We use the
+  implicit-team model already; no such instruction found at review time — `teams.rs` is the only
+  matcher hit and it's the factory daemon's own team wiring, not a `TeamCreate` call.)
+- **Nested `.claude/skills` now load with `<dir>:<name>` on name clash; closest-dir
+  agent/workflow/output-style wins.** → ✅ no action, 👀 namespace note. CAS syncs builtin skills into
+  `.claude/skills` (+ `.codex/skills`); nested-load + clash-qualification is host behavior CAS rides.
+  No collision expected (CAS skills live at the project `.claude/skills` root).
+- **MCP server-level specs (`mcp__server`, `mcp__server__*`, `mcp__*`) in subagent `disallowedTools`
+  no longer silently ignored.** → 🟢 already covered; CAS's disallowed-tools gating (cas-5be8) relies
+  on these specs being honored, so the fix makes host enforcement match CAS's intent.
+- **Compaction now honors `--fallback-model`; Linux sandbox no longer fails when `.claude/skills` or
+  `.claude/hooks` is a symlink.** → ✅ no action; the symlink fix is mildly relevant — CAS's user-level
+  skill fallback can symlink `.claude/skills` (memory `project_user_level_skill_fallback`).
+
+### 2.1.174 — skill hot-reload only re-announces changed skills · Workflow agent() attribution
+
+Reviewed 2026-06-30.
+
+- **"Fixed skill hot-reload re-sending the entire skill listing when a single skill changed; only
+  changed skills are now re-announced."** → 🟢 **already covered / direct win.** CAS hot-syncs builtin
+  `SKILL.md` into worker worktrees without a daemon restart (memory
+  `project_skill_hot_sync_no_daemon_restart`); with this fix, editing one CAS skill no longer re-floods
+  the model with the full listing. Strictly better for that workflow.
+- Workflow `agent()` subagents now carry per-agent attribution headers. → ✅ no action; improves
+  `cas-code-review` Workflow dispatch readability. (2.1.175's `enforceAvailableModels` and 2.1.176's
+  hook `if`-condition path matching are host-config niceties → ✅ no action.)
 
 ### 2.1.170 — Claude Fable 5 (Mythos-class model) GA · VS Code transcript-save fix
 
