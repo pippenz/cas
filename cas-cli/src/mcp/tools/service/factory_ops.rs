@@ -435,19 +435,11 @@ impl CasService {
                 } else {
                     liveness_label_for(elapsed)
                 };
-                let clone_path = agent.metadata.get("clone_path").cloned();
-                let clone_info = clone_path
-                    .as_ref()
-                    .map(|p| format!("\n    Clone: {p}"))
-                    .unwrap_or_default();
+                let worktree_status = collect_worker_worktree_status(&self.inner.cas_root, agent);
+                let clone_path = worktree_status.clone_path;
+                let clone_info = worktree_status.clone_info;
                 // cas-844bf: git introspection — branch/HEAD/ahead-behind/dirty/PR
-                let git_info = clone_path
-                    .as_ref()
-                    .map(|p| {
-                        let gs = collect_worker_git_status(std::path::Path::new(p.as_str()));
-                        format_worker_git_status(&gs)
-                    })
-                    .unwrap_or_default();
+                let git_info = worktree_status.git_info;
                 // Surface transcript path only for hard-dead workers so the
                 // supervisor can salvage whatever was in-flight when the CC
                 // client died (cas-2749 AC: transcript-path-surfacing on
@@ -1166,6 +1158,42 @@ fn supervisor_owned_workers() -> Option<std::collections::HashSet<String>> {
     )
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkerWorktreeStatus {
+    clone_path: Option<String>,
+    clone_info: String,
+    git_info: String,
+}
+
+fn collect_worker_worktree_status(
+    cas_root: &std::path::Path,
+    agent: &cas_types::Agent,
+) -> WorkerWorktreeStatus {
+    let metadata_clone_path = agent.metadata.get("clone_path").cloned();
+    let inferred_path = cas_root.join("worktrees").join(&agent.name);
+
+    let resolved_path = metadata_clone_path
+        .clone()
+        .filter(|path| std::path::Path::new(path).exists())
+        .or_else(|| inferred_path.exists().then(|| inferred_path.display().to_string()));
+
+    if let Some(clone_path) = resolved_path {
+        let gs = collect_worker_git_status(std::path::Path::new(&clone_path));
+        return WorkerWorktreeStatus {
+            clone_info: format!("\n    Clone: {clone_path}"),
+            git_info: format_worker_git_status(&gs),
+            clone_path: Some(clone_path),
+        };
+    }
+
+    let missing_path = metadata_clone_path.unwrap_or_else(|| inferred_path.display().to_string());
+    WorkerWorktreeStatus {
+        clone_info: format!("\n    Clone: {missing_path} [missing-worktree]"),
+        git_info: "\n    git: missing-worktree".to_string(),
+        clone_path: Some(missing_path),
+    }
+}
+
 fn run_git(path: &std::path::Path, args: &[&str]) -> std::result::Result<String, String> {
     let output = std::process::Command::new("git")
         .args(args)
@@ -1841,6 +1869,7 @@ pub(crate) fn format_worker_git_status(gs: &WorkerGitStatus) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cas_types::AgentRole;
 
     /// Session id used across the glob tests. Stable UUID shape, unique
     /// across fake projects so the glob doesn't collide with anything else
@@ -2546,6 +2575,68 @@ mod tests {
         (tmp, sha)
     }
 
+    fn setup_factory_project_with_worker_worktrees(
+        workers: &[&str],
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
+        use std::process::Command;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(&project)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@cas"])
+            .current_dir(&project)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "CAS Test"])
+            .current_dir(&project)
+            .output()
+            .unwrap();
+
+        std::fs::write(project.join("README"), "init").unwrap();
+        Command::new("git")
+            .args(["add", "README"])
+            .current_dir(&project)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&project)
+            .output()
+            .unwrap();
+
+        let cas_root = project.join(".cas");
+        let worktree_root = cas_root.join("worktrees");
+        std::fs::create_dir_all(&worktree_root).unwrap();
+
+        for worker in workers {
+            let branch = format!("factory/{worker}");
+            let worktree_path = worktree_root.join(worker);
+            let status = Command::new("git")
+                .args([
+                    "worktree",
+                    "add",
+                    "-b",
+                    &branch,
+                    worktree_path.to_str().unwrap(),
+                    "HEAD",
+                ])
+                .current_dir(&project)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git worktree add must succeed for {worker}");
+        }
+
+        (tmp, project)
+    }
+
     /// AC3 (cas-844bf): collect_worker_git_status returns the correct branch
     /// and HEAD SHA for a worktree that is on a real factory/<name> branch with
     /// at least one commit.
@@ -2635,5 +2726,84 @@ mod tests {
             out.contains("not pushed") || out.contains("none"),
             "unpushed state must be visible in output: {out}"
         );
+    }
+
+    #[test]
+    fn worker_status_infers_missing_codex_clone_path_from_factory_worktree_layout() {
+        let (_tmp, project) =
+            setup_factory_project_with_worker_worktrees(&["claude-jester", "codex-jester"]);
+        let cas_root = project.join(".cas");
+        let claude_path = cas_root.join("worktrees/claude-jester");
+        let codex_path = cas_root.join("worktrees/codex-jester");
+
+        let mut claude = cas_types::Agent::new_with_role(
+            "claude-session".to_string(),
+            "claude-jester".to_string(),
+            AgentRole::Worker,
+        );
+        claude.metadata.insert(
+            "clone_path".to_string(),
+            claude_path.to_string_lossy().to_string(),
+        );
+        let codex = cas_types::Agent::new_with_role(
+            "codex-session".to_string(),
+            "codex-jester".to_string(),
+            AgentRole::Worker,
+        );
+
+        let claude_status = collect_worker_worktree_status(&cas_root, &claude);
+        let codex_status = collect_worker_worktree_status(&cas_root, &codex);
+
+        assert_eq!(
+            codex_status.clone_path.as_deref(),
+            Some(codex_path.to_string_lossy().as_ref()),
+            "Codex worker must infer the on-disk worktree path when metadata is absent"
+        );
+        for (name, status) in [("claude", claude_status), ("codex", codex_status)] {
+            assert!(
+                status.clone_info.contains("Clone:"),
+                "{name} record must include Clone info: {:?}",
+                status
+            );
+            assert!(
+                status.git_info.contains("git: factory/"),
+                "{name} record must include git branch metadata: {:?}",
+                status
+            );
+            assert!(
+                status.git_info.contains("[clean]"),
+                "{name} record must include cleanliness metadata: {:?}",
+                status
+            );
+        }
+    }
+
+    #[test]
+    fn worker_status_reports_missing_worktree_instead_of_omitting_clone_metadata() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let cas_root = tmp.path().join(".cas");
+        std::fs::create_dir_all(&cas_root).unwrap();
+        let agent = cas_types::Agent::new_with_role(
+            "codex-session".to_string(),
+            "codex-jester".to_string(),
+            AgentRole::Worker,
+        );
+
+        let status = collect_worker_worktree_status(&cas_root, &agent);
+        let expected_path = cas_root.join("worktrees/codex-jester");
+        let expected_path_str = expected_path.to_string_lossy().to_string();
+
+        assert_eq!(status.clone_path.as_deref(), Some(expected_path_str.as_str()));
+        assert!(
+            status.clone_info.contains("[missing-worktree]"),
+            "missing worktree state must be explicit: {:?}",
+            status
+        );
+        assert!(
+            status.clone_info.contains(&expected_path_str),
+            "the expected worktree path must still be surfaced: {:?}",
+            status
+        );
+        assert_eq!(status.git_info, "\n    git: missing-worktree");
     }
 }
