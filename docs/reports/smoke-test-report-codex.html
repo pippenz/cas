@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Codex Smoke Test Report</title>
+  <style>
+    :root {
+      --paper: #f7f1e3;
+      --sheet: #fffdf7;
+      --ink: #1f2933;
+      --muted: #5b6875;
+      --line: #d8ccb7;
+      --accent: #b85c38;
+      --accent-soft: #f2dfd3;
+      --good: #2f6b3a;
+      --warn: #8c5a14;
+      --shadow: rgba(31, 41, 51, 0.08);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font-family: Georgia, "Times New Roman", serif;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top left, #fff8e8 0, transparent 28rem),
+        linear-gradient(180deg, #efe2c8 0, var(--paper) 18rem, #f9f4ea 100%);
+      line-height: 1.55;
+    }
+
+    main {
+      width: min(1100px, calc(100vw - 2rem));
+      margin: 2rem auto 3rem;
+    }
+
+    .masthead {
+      background: var(--sheet);
+      border: 1px solid var(--line);
+      box-shadow: 0 18px 40px var(--shadow);
+      padding: 2rem;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .masthead::after {
+      content: "";
+      position: absolute;
+      inset: auto -4rem -4rem auto;
+      width: 13rem;
+      height: 13rem;
+      border-radius: 50%;
+      background: var(--accent-soft);
+      opacity: 0.7;
+    }
+
+    .eyebrow {
+      display: inline-block;
+      margin-bottom: 0.75rem;
+      padding: 0.25rem 0.6rem;
+      border: 1px solid var(--line);
+      background: #fff6ea;
+      color: var(--accent);
+      font-size: 0.8rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    h1, h2, h3 {
+      margin: 0 0 0.75rem;
+      line-height: 1.1;
+      font-weight: 700;
+    }
+
+    h1 {
+      max-width: 12ch;
+      font-size: clamp(2.2rem, 6vw, 4.4rem);
+    }
+
+    h2 {
+      font-size: 1.4rem;
+      border-bottom: 1px solid var(--line);
+      padding-bottom: 0.45rem;
+    }
+
+    p {
+      margin: 0 0 1rem;
+    }
+
+    .lede {
+      max-width: 65ch;
+      font-size: 1.08rem;
+      color: var(--muted);
+    }
+
+    .grid {
+      display: grid;
+      gap: 1rem;
+      margin-top: 1rem;
+    }
+
+    .summary {
+      grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+    }
+
+    .card,
+    section {
+      background: var(--sheet);
+      border: 1px solid var(--line);
+      box-shadow: 0 12px 28px var(--shadow);
+    }
+
+    .card {
+      padding: 1rem;
+    }
+
+    .metric {
+      font-size: 2rem;
+      font-weight: 700;
+      color: var(--accent);
+    }
+
+    section {
+      margin-top: 1rem;
+      padding: 1.35rem;
+    }
+
+    .two-up {
+      display: grid;
+      gap: 1rem;
+      grid-template-columns: repeat(auto-fit, minmax(290px, 1fr));
+    }
+
+    ol {
+      margin: 0;
+      padding-left: 1.3rem;
+    }
+
+    li + li {
+      margin-top: 0.6rem;
+    }
+
+    .label {
+      display: inline-block;
+      margin-bottom: 0.65rem;
+      padding: 0.15rem 0.5rem;
+      font-size: 0.78rem;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      border: 1px solid var(--line);
+      background: #fbf3e5;
+    }
+
+    .verdict {
+      font-weight: 700;
+    }
+
+    .good {
+      color: var(--good);
+    }
+
+    .warn {
+      color: var(--warn);
+    }
+
+    .ledger {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.96rem;
+    }
+
+    .ledger th,
+    .ledger td {
+      text-align: left;
+      vertical-align: top;
+      padding: 0.8rem 0.7rem;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .ledger th {
+      width: 18%;
+      color: var(--muted);
+      font-weight: 700;
+    }
+
+    code {
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      font-size: 0.92em;
+      background: #f3eadb;
+      padding: 0.1rem 0.3rem;
+      border-radius: 0.2rem;
+    }
+
+    .note {
+      color: var(--muted);
+      font-size: 0.95rem;
+    }
+
+    @media (max-width: 700px) {
+      main {
+        width: min(100vw - 1rem, 100%);
+        margin: 0.5rem auto 2rem;
+      }
+
+      .masthead,
+      section,
+      .card {
+        padding: 1rem;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header class="masthead">
+      <div class="eyebrow">Codex-authored report for cas-621f</div>
+      <h1>Two workers, fourteen jokes, one small verification jam.</h1>
+      <p class="lede">
+        This report reconstructs the June 30, 2026 factory smoke test from local task records,
+        the shared CAS log, visible coordination messages already surfaced during execution, and
+        clean-worktree checks for both worker worktrees. It is intentionally independent of the
+        parallel Claude report. No Claude HTML report existed in <code>docs/reports/</code> at the time
+        this Codex report was authored, so <code>smoke-test-report-codex.html</code> avoids filename conflict by default.
+      </p>
+      <div class="grid summary">
+        <div class="card">
+          <div class="metric">14</div>
+          <p>Total jokes delivered across both workers.</p>
+        </div>
+        <div class="card">
+          <div class="metric">2/2</div>
+          <p>Worker worktrees checked locally and found clean by <code>git status --short</code> and <code>git diff --stat</code>.</p>
+        </div>
+        <div class="card">
+          <div class="metric">1</div>
+          <p>Lifecycle interruption observed: Codex close hit verification jail before supervisor approval cleared it.</p>
+        </div>
+      </div>
+    </header>
+
+    <section>
+      <h2>Observed outcome</h2>
+      <p>
+        The smoke test succeeded. Both workers produced seven computer jokes, both avoided repository
+        edits during the joke tasks, and both communicated with the supervisor through CAS coordination
+        messages. Claude closed cleanly within the task record. Codex required one supervisor-mediated
+        verification step before its close was accepted.
+      </p>
+      <p class="note">
+        Director behavior is only partially observable from local artifacts: the shared log records
+        director event deliveries, but not the full body of every director prompt. Where this report
+        draws conclusions about the director, those points are labeled as inference from delivery traces
+        and downstream worker/supervisor actions.
+      </p>
+    </section>
+
+    <section>
+      <h2>Worker outputs</h2>
+      <div class="two-up">
+        <div class="card">
+          <div class="label">claude-jester / cas-73ba</div>
+          <ol>
+            <li><strong>Why do programmers prefer dark mode?</strong> Because light attracts bugs.</li>
+            <li><strong>A SQL query walks into a bar, approaches two tables and asks...</strong> "Can I join you?"</li>
+            <li><strong>Why don't programmers like nature?</strong> It has too many bugs and no documentation.</li>
+            <li><strong>How many programmers does it take to change a light bulb?</strong> None &mdash; that's a hardware problem.</li>
+            <li><strong>A programmer's wife says:</strong> "Go to the store, get a gallon of milk, and if they have eggs, get a dozen." He comes home with 12 gallons of milk. "They had eggs."</li>
+            <li><strong>Why was the JavaScript developer sad?</strong> Because they didn't Node how to Express their feelings.</li>
+            <li><strong>There are 10 types of people in the world:</strong> those who understand binary, and those who don't.</li>
+          </ol>
+        </div>
+        <div class="card">
+          <div class="label">codex-jester / cas-2650</div>
+          <ol>
+            <li>Why do programmers prefer dark mode? Because light attracts bugs.</li>
+            <li>There are 10 kinds of people in the world: those who understand binary and those who don't.</li>
+            <li>I told my computer I needed a break, and now it won't stop sending me beach wallpapers.</li>
+            <li>Why did the developer go broke? Because he used up all his cache.</li>
+            <li>My code doesn't have bugs. It just develops random features.</li>
+            <li>Why was the computer cold? It left its Windows open.</li>
+            <li>I asked the keyboard for advice, but it just kept giving me mixed signals.</li>
+          </ol>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>CAS rule-following assessment</h2>
+      <table class="ledger">
+        <tr>
+          <th>claude-jester</th>
+          <td>
+            <div class="verdict good">Pass with minimal friction.</div>
+            <p>
+              Claude followed the core worker rules visible from local evidence: it stayed within task scope,
+              avoided repository edits for the joke task, delivered the requested output, and closed the task.
+              The <code>cas-73ba</code> task record shows a clean close and explicitly notes that no files were edited.
+            </p>
+          </td>
+        </tr>
+        <tr>
+          <th>codex-jester</th>
+          <td>
+            <div class="verdict good">Pass with one lifecycle blocker handled correctly.</div>
+            <p>
+              Codex followed the one-task-at-a-time rule, posted progress notes, delivered the jokes, verified
+              a clean worktree, and reported the exact verification-jail blocker rather than retrying or spawning
+              a verifier. The subsequent supervisor-approved close matches the expected worker behavior under the
+              CAS worker instructions.
+            </p>
+          </td>
+        </tr>
+      </table>
+    </section>
+
+    <section>
+      <h2>Supervisor and director behavior</h2>
+      <table class="ledger">
+        <tr>
+          <th>Supervisor</th>
+          <td>
+            <div class="verdict good">Effective and rule-aligned.</div>
+            <p>
+              The supervisor translated the smoke test into explicit worker instructions, acknowledged execution
+              plans, requested clean-worktree proof, and handled the verification-jail event appropriately by
+              supplying the approved verification needed for the Codex close. This is directly evidenced by the
+              visible coordination messages and the <code>cas-2650</code> task note trail.
+            </p>
+          </td>
+        </tr>
+        <tr>
+          <th>Director</th>
+          <td>
+            <div class="verdict warn">Active, but only partly transparent from local artifacts.</div>
+            <p>
+              Direct local evidence shows multiple <code>director_events</code> deliveries to the supervisor and both
+              workers during the smoke test and follow-up reporting window. The director appears to have been
+              responsive in assigning and nudging work, but the log does not preserve full prompt bodies for each
+              director event, so a stronger quality judgment would be inference rather than proof.
+            </p>
+          </td>
+        </tr>
+      </table>
+    </section>
+
+    <section>
+      <h2>Notable smoke-test observations</h2>
+      <div class="two-up">
+        <div class="card">
+          <div class="label">What worked</div>
+          <p>
+            Parallel worker execution was easy to observe. The shared log records clean worker spawn activity for
+            both <code>claude-jester</code> and <code>codex-jester</code>, prompt delivery latencies were short, and both
+            workers produced their outputs quickly after task assignment.
+          </p>
+        </div>
+        <div class="card">
+          <div class="label">What wobbled</div>
+          <p>
+            The Codex branch of the smoke test exposed a verification-jail edge in which a no-edit task still
+            needed supervisor verification before close. That did not break completion, but it did add one manual
+            handoff step to an otherwise simple smoke test.
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Evidence ledger</h2>
+      <table class="ledger">
+        <tr>
+          <th>Task records</th>
+          <td>
+            <code>mcp__cs__task action=show id=cas-73ba</code><br>
+            <code>mcp__cs__task action=show id=cas-2650</code>
+          </td>
+        </tr>
+        <tr>
+          <th>Shared log</th>
+          <td><code>/home/pippenz/Petrastella/cas-src/.cas/logs/cas-2026-06-30.log</code></td>
+        </tr>
+        <tr>
+          <th>Worktree paths</th>
+          <td>
+            <code>/home/pippenz/Petrastella/cas-src/.cas/worktrees/claude-jester</code><br>
+            <code>/home/pippenz/Petrastella/cas-src/.cas/worktrees/codex-jester</code>
+          </td>
+        </tr>
+        <tr>
+          <th>Worktree proof</th>
+          <td>
+            Local <code>git status --short</code> and <code>git diff --stat</code> checks in both worker worktrees
+            produced no output during evidence review.
+          </td>
+        </tr>
+        <tr>
+          <th>Coordination evidence</th>
+          <td>
+            Supervisor and worker coordination messages already surfaced during the smoke test were used to recover
+            the exact joke payloads and the Codex verification-jail handoff. This report intentionally avoids any
+            further live database exploration.
+          </td>
+        </tr>
+      </table>
+    </section>
+  </main>
+</body>
+</html>
