@@ -139,9 +139,11 @@ impl CasCore {
             _ => {} // Assigned to this agent - allow claim
         }
 
-        // Check if agent has pending verification (blocks claiming new tasks)
+        // Check if agent has pending verification (blocks claiming new tasks).
+        // Pass None so all leases are evaluated — claim intentionally blocks
+        // across all unverified tasks, not just the one being claimed.
         if let Some((blocked_task_id, blocked_task_title)) =
-            self.check_pending_verification(&agent_id)?
+            self.check_pending_verification(&agent_id, None)?
         {
             // Allow if claiming the same task that's blocking (resuming work)
             if blocked_task_id != req.task_id {
