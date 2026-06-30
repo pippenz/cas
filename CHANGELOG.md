@@ -7,6 +7,11 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [2.24.3] - 2026-06-30
+
+### Fixed
+- **Pasting multi-line text into a factory pane no longer submits the first line and queues the rest (cas-5702).** The client coalesces a paste into one event (the terminal strips the bracketed-paste markers), but it was forwarding the raw bytes to the pane, so the daemon's input parser walked them one at a time and every embedded newline reached the inner CLI as an Enter key — submitting mid-paste and dropping the remainder into the prompt queue. Paste is now carried as a single control event and re-wrapped as a bracketed paste before injection (mirroring the image-drop path), so the whole block — including any embedded newlines or control bytes — lands as one literal multi-line input.
+
 ## [2.24.2] - 2026-06-30
 
 ### Fixed
