@@ -1352,26 +1352,69 @@ code_review_findings: None,
 // itself lives inside close_ops.rs and is unaffected — these tests verify
 // that directly.
 
-/// Small RAII guard so CAS_AGENT_ROLE is always cleared on drop, even on
-/// panic, to avoid leaking the var into sibling tests that don't set it.
-struct ScopedSupervisorEnv;
+/// Shared RAII guard that **snapshots** the prior value of each factory env
+/// var it mutates and restores it on drop — setting it back to its previous
+/// value, or removing it only if it was originally absent — instead of
+/// blindly `remove_var`-ing. This prevents a guard from clobbering a
+/// pre-existing factory env value owned by the surrounding test/process
+/// (cas-7cc9: the old guards unconditionally removed CAS_AGENT_ROLE /
+/// CAS_FACTORY_MODE / CAS_FACTORY_WORKER_CLI / CAS_FACTORY_SUPERVISOR_CLI on
+/// drop, leaking test pollution and breaking sibling factory env assumptions).
+///
+/// Every caller acquires `env_test_lock()` for the guard's full lifetime, so
+/// these process-global mutations never race another test thread.
+struct ScopedFactoryEnv {
+    /// (key, prior value) captured at construction, replayed on drop.
+    saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+}
 
-impl ScopedSupervisorEnv {
-    fn new() -> Self {
-        // SAFETY: setup_cas documents the same --test-threads=1-or-accept-race
-        // contract. We set during the test body only and unconditionally
-        // remove on drop.
+impl ScopedFactoryEnv {
+    /// Apply each `(key, desired)` pair, capturing the prior value first:
+    /// `Some(v)` sets `key=v`; `None` removes `key`. On drop every key is
+    /// restored to the value captured here.
+    fn apply(vars: &[(&'static str, Option<&str>)]) -> Self {
+        let mut saved = Vec::with_capacity(vars.len());
+        // SAFETY: callers hold env_test_lock() for the guard's lifetime, so
+        // no other test thread can observe a torn read of these vars.
         unsafe {
-            std::env::set_var("CAS_AGENT_ROLE", "supervisor");
+            for (key, desired) in vars {
+                saved.push((*key, std::env::var_os(key)));
+                match desired {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
         }
-        Self
+        Self { saved }
     }
 }
 
-impl Drop for ScopedSupervisorEnv {
+impl Drop for ScopedFactoryEnv {
     fn drop(&mut self) {
+        // SAFETY: same env_test_lock() contract as `apply`.
         unsafe {
-            std::env::remove_var("CAS_AGENT_ROLE");
+            for (key, prior) in self.saved.drain(..) {
+                match prior {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+}
+
+/// Small RAII guard so CAS_AGENT_ROLE is set to `supervisor` for the test
+/// body and restored to its prior value on drop, even on panic.
+struct ScopedSupervisorEnv {
+    _env: ScopedFactoryEnv,
+}
+
+impl ScopedSupervisorEnv {
+    fn new() -> Self {
+        // SAFETY: setup_cas documents the same env_test_lock contract; the
+        // guard snapshots and restores rather than blindly removing.
+        Self {
+            _env: ScopedFactoryEnv::apply(&[("CAS_AGENT_ROLE", Some("supervisor"))]),
         }
     }
 }
@@ -1863,27 +1906,24 @@ code_review_findings: None,
 //      row, which is what the hook + task-verifier subagent would have done.
 // =============================================================================
 
-/// Guard that installs factory-worker env vars for the duration of a test
-/// and clears them on drop. Matches the pattern in `setup_cas()` —
-/// cargo test is single-threaded or accepts the race on env vars.
-struct FactoryWorkerEnv;
+/// Guard that installs Claude factory-worker env vars for the duration of a
+/// test and restores the prior environment on drop. Explicitly clears
+/// CAS_FACTORY_WORKER_CLI so a `codex` value leaked from a sibling
+/// CodexWorkerEnv guard can't make worker_harness_from_env() report Codex in
+/// this Claude-worker context (cas-7cc9 / R2: the old guard left
+/// CAS_FACTORY_WORKER_CLI untouched on enter and omitted it on drop).
+struct FactoryWorkerEnv {
+    _env: ScopedFactoryEnv,
+}
 
 impl FactoryWorkerEnv {
     fn enter() -> Self {
-        // SAFETY: see setup_cas() comment — tests accept the race on env vars.
-        unsafe {
-            std::env::set_var("CAS_AGENT_ROLE", "worker");
-            std::env::set_var("CAS_FACTORY_MODE", "1");
-        }
-        Self
-    }
-}
-
-impl Drop for FactoryWorkerEnv {
-    fn drop(&mut self) {
-        unsafe {
-            std::env::remove_var("CAS_AGENT_ROLE");
-            std::env::remove_var("CAS_FACTORY_MODE");
+        Self {
+            _env: ScopedFactoryEnv::apply(&[
+                ("CAS_AGENT_ROLE", Some("worker")),
+                ("CAS_FACTORY_MODE", Some("1")),
+                ("CAS_FACTORY_WORKER_CLI", None),
+            ]),
         }
     }
 }
@@ -3627,27 +3667,163 @@ async fn test_worker_close_succeeds_when_skipped_row_write_fails_option_b() {
 /// Guard that installs factory-worker env vars for a Codex worker context.
 /// Sets CAS_FACTORY_WORKER_CLI=codex in addition to the standard ROLE/MODE so
 /// worker_harness_from_env() returns Codex and is_worker_without_subagents_from_env()
-/// returns true.
-struct CodexWorkerEnv;
+/// returns true. Snapshots and restores the prior value of each var on drop
+/// (cas-7cc9) rather than blindly removing it, so a surrounding factory env
+/// is left exactly as it was found.
+struct CodexWorkerEnv {
+    _env: ScopedFactoryEnv,
+}
 
 impl CodexWorkerEnv {
     fn enter() -> Self {
-        unsafe {
-            std::env::set_var("CAS_AGENT_ROLE", "worker");
-            std::env::set_var("CAS_FACTORY_MODE", "1");
-            std::env::set_var("CAS_FACTORY_WORKER_CLI", "codex");
+        Self {
+            _env: ScopedFactoryEnv::apply(&[
+                ("CAS_AGENT_ROLE", Some("worker")),
+                ("CAS_FACTORY_MODE", Some("1")),
+                ("CAS_FACTORY_WORKER_CLI", Some("codex")),
+            ]),
         }
-        Self
     }
 }
 
-impl Drop for CodexWorkerEnv {
-    fn drop(&mut self) {
-        unsafe {
-            std::env::remove_var("CAS_AGENT_ROLE");
-            std::env::remove_var("CAS_FACTORY_MODE");
-            std::env::remove_var("CAS_FACTORY_WORKER_CLI");
-        }
+// =============================================================================
+// cas-7cc9 — env guards must snapshot/restore prior values, not blind-remove.
+//
+// Regression coverage for the R2 finding off cas-8aaf's headless review: the
+// factory env guards (CodexWorkerEnv / FactoryWorkerEnv / ScopedSupervisorEnv /
+// ScopedSupervisorCliEnv) used to unconditionally `remove_var` their vars on
+// drop, clobbering any pre-existing factory env owned by the surrounding
+// test/process. After the fix they snapshot the prior value and restore it (or
+// remove only vars that were originally absent). These tests hold
+// env_test_lock() for their whole body and do not call setup_cas(), so they
+// exercise the guard against a deliberately non-empty starting environment.
+// =============================================================================
+
+/// CodexWorkerEnv must leave pre-existing factory env values exactly as it
+/// found them: prior values are restored on drop, not removed. (AC1, AC3)
+#[test]
+fn test_codex_worker_env_restores_prior_factory_values_on_drop_cas_7cc9() {
+    let _env_lock = env_test_lock();
+
+    // Establish a non-empty prior environment that differs from what the
+    // guard installs, so a blind remove-on-drop would be observable.
+    // SAFETY: env_test_lock held for the entire test body.
+    unsafe {
+        std::env::set_var("CAS_AGENT_ROLE", "supervisor");
+        std::env::set_var("CAS_FACTORY_MODE", "0");
+        std::env::set_var("CAS_FACTORY_WORKER_CLI", "claude");
+    }
+
+    {
+        let _env = CodexWorkerEnv::enter();
+        // Inside the guard the Codex-worker values are active.
+        assert_eq!(std::env::var("CAS_AGENT_ROLE").as_deref(), Ok("worker"));
+        assert_eq!(std::env::var("CAS_FACTORY_MODE").as_deref(), Ok("1"));
+        assert_eq!(
+            std::env::var("CAS_FACTORY_WORKER_CLI").as_deref(),
+            Ok("codex")
+        );
+    }
+
+    // After drop the prior values are restored verbatim — NOT removed.
+    assert_eq!(
+        std::env::var("CAS_AGENT_ROLE").as_deref(),
+        Ok("supervisor"),
+        "prior CAS_AGENT_ROLE must survive the guard scope"
+    );
+    assert_eq!(
+        std::env::var("CAS_FACTORY_MODE").as_deref(),
+        Ok("0"),
+        "prior CAS_FACTORY_MODE must survive the guard scope"
+    );
+    assert_eq!(
+        std::env::var("CAS_FACTORY_WORKER_CLI").as_deref(),
+        Ok("claude"),
+        "prior CAS_FACTORY_WORKER_CLI must survive the guard scope"
+    );
+
+    // Clean up the values this test introduced so no sibling depends on them.
+    // SAFETY: still holding env_test_lock.
+    unsafe {
+        std::env::remove_var("CAS_AGENT_ROLE");
+        std::env::remove_var("CAS_FACTORY_MODE");
+        std::env::remove_var("CAS_FACTORY_WORKER_CLI");
+    }
+}
+
+/// CodexWorkerEnv must remove vars that were originally absent (so it doesn't
+/// leak its own injected values), confirming the snapshot==None branch. (AC2, AC4)
+#[test]
+fn test_codex_worker_env_removes_originally_absent_vars_on_drop_cas_7cc9() {
+    let _env_lock = env_test_lock();
+
+    // Start from a clean slate: these vars are absent before the guard.
+    // SAFETY: env_test_lock held for the entire test body.
+    unsafe {
+        std::env::remove_var("CAS_AGENT_ROLE");
+        std::env::remove_var("CAS_FACTORY_MODE");
+        std::env::remove_var("CAS_FACTORY_WORKER_CLI");
+    }
+
+    {
+        let _env = CodexWorkerEnv::enter();
+        assert_eq!(
+            std::env::var("CAS_FACTORY_WORKER_CLI").as_deref(),
+            Ok("codex")
+        );
+    }
+
+    // Originally-absent vars must be removed again, leaving no pollution.
+    assert!(
+        std::env::var_os("CAS_AGENT_ROLE").is_none(),
+        "CAS_AGENT_ROLE must be removed when it was originally absent"
+    );
+    assert!(
+        std::env::var_os("CAS_FACTORY_MODE").is_none(),
+        "CAS_FACTORY_MODE must be removed when it was originally absent"
+    );
+    assert!(
+        std::env::var_os("CAS_FACTORY_WORKER_CLI").is_none(),
+        "CAS_FACTORY_WORKER_CLI must be removed when it was originally absent"
+    );
+}
+
+/// FactoryWorkerEnv (Claude-worker context) must clear a leaked
+/// CAS_FACTORY_WORKER_CLI on enter so worker_harness_from_env() can't report
+/// Codex, and must restore the leaked value on drop instead of omitting it
+/// (cas-7cc9 / R2). (AC1, AC2)
+#[test]
+fn test_factory_worker_env_clears_and_restores_worker_cli_cas_7cc9() {
+    let _env_lock = env_test_lock();
+
+    // Simulate a `codex` CLI value leaked from a sibling Codex context.
+    // SAFETY: env_test_lock held for the entire test body.
+    unsafe {
+        std::env::set_var("CAS_FACTORY_WORKER_CLI", "codex");
+    }
+
+    {
+        let _env = FactoryWorkerEnv::enter();
+        // A Claude-worker context must not observe a stale codex CLI.
+        assert!(
+            std::env::var_os("CAS_FACTORY_WORKER_CLI").is_none(),
+            "FactoryWorkerEnv must clear a leaked CAS_FACTORY_WORKER_CLI on enter"
+        );
+        assert_eq!(std::env::var("CAS_AGENT_ROLE").as_deref(), Ok("worker"));
+        assert_eq!(std::env::var("CAS_FACTORY_MODE").as_deref(), Ok("1"));
+    }
+
+    // The leaked prior value is restored on drop, not blindly removed.
+    assert_eq!(
+        std::env::var("CAS_FACTORY_WORKER_CLI").as_deref(),
+        Ok("codex"),
+        "FactoryWorkerEnv must restore the prior CAS_FACTORY_WORKER_CLI on drop"
+    );
+
+    // Clean up so no sibling inherits the simulated leak.
+    // SAFETY: still holding env_test_lock.
+    unsafe {
+        std::env::remove_var("CAS_FACTORY_WORKER_CLI");
     }
 }
 
@@ -4258,5 +4434,232 @@ async fn test_codex_worker_epic_close_jail_recommends_cs_coordination_cas_1b80()
     assert!(
         !msg.contains("Task(subagent_type=\"task-verifier\""),
         "Codex worker jail must not suggest Task() spawn; got: {msg}"
+    );
+}
+
+// =============================================================================
+// cas-7998: harness-aware supervisor verification alias + close-reason quoting
+//
+// Two guidance paths in close_ops still hardcoded `mcp__cas__verification`,
+// handing a Codex supervisor an alias they cannot call:
+//   1. the `supervisor_is_assignee` self-verify branch in the VERIFICATION
+//      REQUIRED gate, and
+//   2. the VERIFICATION TIMED OUT auto-escalation arm.
+// Both must resolve via supervisor_verification_tool() (mcp__cs__verification
+// for a Codex supervisor). Separately, the factory-worker jail message embeds
+// the free-text close reason inside a quoted `message="..."` coordination
+// command; a reason containing a quote/newline must be escaped (covered by the
+// escape_close_reason_for_quoted_command unit tests in close_ops.rs).
+// =============================================================================
+
+/// RAII guard that pins CAS_FACTORY_SUPERVISOR_CLI for the duration of a test
+/// so supervisor_verification_tool() resolves the Codex alias, then restores
+/// the prior value on drop (cas-7cc9: snapshot/restore via ScopedFactoryEnv
+/// instead of an unconditional remove). setup_cas() clears this var, so callers
+/// that run after it see the same baseline as before.
+struct ScopedSupervisorCliEnv {
+    _env: ScopedFactoryEnv,
+}
+
+impl ScopedSupervisorCliEnv {
+    fn set(cli: &str) -> Self {
+        // SAFETY: env-sensitive tests serialize via env_test_lock(); see setup_cas().
+        Self {
+            _env: ScopedFactoryEnv::apply(&[("CAS_FACTORY_SUPERVISOR_CLI", Some(cli))]),
+        }
+    }
+}
+
+/// Drive the `supervisor_is_assignee` self-verify branch and assert the direct
+/// verification alias tracks the supervisor harness. Returns the rendered
+/// guidance so each harness variant can assert on it.
+async fn supervisor_self_assignee_close_guidance(supervisor_cli: Option<&str>) -> String {
+    let (temp, service) = setup_cas();
+    let _env_lock = env_test_lock();
+    let cas_dir = temp.path().join(".cas");
+    let task_store = open_task_store(&cas_dir).unwrap();
+    let agent_store = open_agent_store(&cas_dir).expect("open agent store");
+
+    // get_agent_id() returns this session id in the test harness (setup_cas()).
+    let sup_id = format!("test-session-{}", std::process::id());
+    // Refresh the supervisor agent's heartbeat so the assignee-inactive bypass
+    // does NOT fire — we need to reach the self-assignee jail branch, not the
+    // orphan skip-verification hatch. (setup_cas() registers this agent Active,
+    // but a fresh heartbeat keeps the test robust against clock skew.)
+    agent_store
+        .heartbeat(&sup_id)
+        .expect("refresh supervisor heartbeat");
+
+    let created = service
+        .cas_task_create(Parameters(TaskCreateRequest {
+            depth: None,
+            title: "cas-7998: supervisor self-assigned task".to_string(),
+            description: None,
+            priority: 2,
+            task_type: "task".to_string(),
+            labels: None,
+            notes: None,
+            blocked_by: None,
+            design: None,
+            acceptance_criteria: None,
+            external_ref: None,
+            assignee: None,
+            demo_statement: None,
+            execution_note: None,
+            epic: None,
+        }))
+        .await
+        .expect("create");
+    let id = extract_task_id(&extract_text(created))
+        .expect("id")
+        .to_string();
+
+    // Assign the task to the supervisor themselves and mark it in-progress.
+    let mut task = task_store.get(&id).expect("task exists");
+    task.status = cas::types::TaskStatus::InProgress;
+    task.assignee = Some(sup_id.clone());
+    task_store.update(&task).expect("update task");
+
+    let _sup = ScopedSupervisorEnv::new();
+    let _cli = supervisor_cli.map(ScopedSupervisorCliEnv::set);
+
+    let response = extract_text(
+        service
+            .cas_task_close(Parameters(TaskCloseRequest {
+                id: id.clone(),
+                reason: Some("Self-implemented; ready to self-verify".to_string()),
+                bypass_code_review: None,
+                code_review_findings: None,
+            }))
+            .await
+            .expect("close returns a result"),
+    );
+    assert!(
+        response.contains("VERIFICATION REQUIRED"),
+        "supervisor self-assignee must hit the verification gate: {response}"
+    );
+    assert!(
+        response.contains("You implemented this task yourself"),
+        "must take the supervisor-self-assignee branch: {response}"
+    );
+    response
+}
+
+/// cas-7998 (AC3): a Codex supervisor closing their own task must receive the
+/// Codex verification alias in the self-verify guidance.
+#[tokio::test]
+async fn test_supervisor_self_assignee_close_uses_codex_verification_alias_cas_7998() {
+    let response = supervisor_self_assignee_close_guidance(Some("codex")).await;
+    assert!(
+        response.contains("mcp__cs__verification"),
+        "Codex supervisor self-verify guidance must use mcp__cs__verification: {response}"
+    );
+    assert!(
+        !response.contains("mcp__cas__verification"),
+        "Codex supervisor must not be handed the Claude verification alias: {response}"
+    );
+}
+
+/// cas-7998 (AC3): a Claude supervisor (default) still receives the Claude
+/// verification alias — the harness-aware change must not regress the common
+/// path.
+#[tokio::test]
+async fn test_supervisor_self_assignee_close_uses_claude_verification_alias_cas_7998() {
+    let response = supervisor_self_assignee_close_guidance(None).await;
+    assert!(
+        response.contains("mcp__cas__verification"),
+        "Claude supervisor self-verify guidance must use mcp__cas__verification: {response}"
+    );
+    assert!(
+        !response.contains("mcp__cs__verification"),
+        "Claude supervisor must not be handed the Codex verification alias: {response}"
+    );
+}
+
+/// cas-7998 (AC2): the VERIFICATION TIMED OUT auto-escalation arm must use the
+/// supervisor harness's verification alias for the "record verdict directly"
+/// fallback. A Codex supervisor must see mcp__cs__verification, not the Claude
+/// alias they cannot call.
+#[tokio::test]
+async fn test_timeout_escalation_uses_codex_supervisor_verification_alias_cas_7998() {
+    let (temp, service) = setup_cas();
+    let _env_lock = env_test_lock();
+    let cas_dir = temp.path().join(".cas");
+    let verification_store = open_verification_store(&cas_dir).unwrap();
+
+    let created = service
+        .cas_task_create(Parameters(TaskCreateRequest {
+            depth: None,
+            title: "cas-7998: timeout escalation alias".to_string(),
+            description: None,
+            priority: 2,
+            task_type: "task".to_string(),
+            labels: None,
+            notes: None,
+            blocked_by: None,
+            design: None,
+            acceptance_criteria: None,
+            external_ref: None,
+            assignee: None,
+            demo_statement: None,
+            execution_note: None,
+            epic: None,
+        }))
+        .await
+        .expect("create");
+    let id = extract_task_id(&extract_text(created))
+        .expect("id")
+        .to_string();
+    service
+        .cas_task_start(Parameters(IdRequest { id: id.clone() }))
+        .await
+        .expect("start");
+
+    // First close arms pending_verification + writes the dispatch-request row.
+    let _ = service
+        .cas_task_close(Parameters(TaskCloseRequest {
+            id: id.clone(),
+            reason: Some("Completed".to_string()),
+            bypass_code_review: None,
+            code_review_findings: None,
+        }))
+        .await
+        .expect("first close returns a result");
+
+    // Age the dispatch row beyond the jail timeout so the retry auto-escalates.
+    let mut dispatch = verification_store
+        .get_latest_for_task(&id)
+        .expect("get dispatch row")
+        .expect("dispatch row exists");
+    dispatch.created_at = chrono::Utc::now() - chrono::Duration::seconds(700);
+    verification_store
+        .update(&dispatch)
+        .expect("age dispatch row");
+
+    // Codex supervisor harness drives the alias selection in the timeout arm.
+    let _cli = ScopedSupervisorCliEnv::set("codex");
+
+    let text = extract_text(
+        service
+            .cas_task_close(Parameters(TaskCloseRequest {
+                id: id.clone(),
+                reason: Some("Completed".to_string()),
+                bypass_code_review: None,
+                code_review_findings: None,
+            }))
+            .await
+            .expect("second close returns a result"),
+    );
+    assert!(
+        text.contains("VERIFICATION TIMED OUT"),
+        "retry after timeout must report escalation: {text}"
+    );
+    assert!(
+        text.contains("mcp__cs__verification"),
+        "Codex supervisor timeout guidance must use mcp__cs__verification: {text}"
+    );
+    assert!(
+        !text.contains("mcp__cas__verification"),
+        "Codex supervisor timeout guidance must not use the Claude alias: {text}"
     );
 }

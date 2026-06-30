@@ -500,6 +500,10 @@ fn push_codex_mcp_server_args(args: &mut Vec<String>, session_id: &str, name: &s
     args.push("mcp_servers.cs.env.CAS_FACTORY_MODE=\"1\"".to_string());
     args.push("-c".to_string());
     args.push("mcp_servers.cs.env.CAS_FACTORY_WORKER_CLI=\"codex\"".to_string());
+    if role == "supervisor" {
+        args.push("-c".to_string());
+        args.push("mcp_servers.cs.env.CAS_FACTORY_SUPERVISOR_CLI=\"codex\"".to_string());
+    }
 }
 
 /// Returns `true` when the installed `claude` CLI supports the `--effort` flag.
@@ -1407,6 +1411,10 @@ mod tests {
         assert!(
             all_args.contains("mcp_servers.cs.env.CAS_AGENT_ROLE=\"supervisor\""),
             "codex supervisor must inject CAS_AGENT_ROLE=supervisor into the cs MCP env; got: {all_args}"
+        );
+        assert!(
+            all_args.contains("mcp_servers.cs.env.CAS_FACTORY_SUPERVISOR_CLI=\"codex\""),
+            "codex supervisor must inject CAS_FACTORY_SUPERVISOR_CLI=codex into the cs MCP env; got: {all_args}"
         );
     }
 
