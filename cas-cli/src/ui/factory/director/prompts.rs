@@ -115,15 +115,53 @@ pub fn generate_prompt(
                 return None;
             }
 
-            let text = format!(
-                "Worker {worker} has completed task {task_id} ({task_title}).\n\n\
-                 Next steps:\n\
-                 - Tell the worker to close their own task: {worker_prefix}task action=close id={task_id}\n\
-                 - If close triggers verification, the worker handles it (not you)\n\
-                 - Then assign another task to this worker, OR\n\
-                 - If all subtasks are done, YOU verify and close the epic\n\n\
-                 Remember: workers close their own tasks, supervisors close epics."
-            );
+            // cas-6aaf: check current task state before emitting guidance.
+            //
+            // `TaskCompleted` fires when a task disappears from `in_progress_tasks`,
+            // which happens when it transitions to `Closed`. However, lease churn
+            // can also cause a task to temporarily regress to `Open` (lease expired
+            // → status reset to Open). We check the current snapshot to distinguish
+            // the two cases and avoid emitting "please close" guidance for a task
+            // the worker has already closed.
+            //
+            // State resolution:
+            //   - task absent from ready+in_progress → closed (expected path)
+            //   - task in ready_tasks as Open       → lease expired, still needs close
+            //   - task in in_progress_tasks         → still being worked (edge case)
+            let in_ready = data
+                .ready_tasks
+                .iter()
+                .any(|t| t.id == *task_id && t.status == cas_types::TaskStatus::Open);
+            let in_progress = data
+                .in_progress_tasks
+                .iter()
+                .any(|t| t.id == *task_id);
+
+            let text = if in_ready {
+                // Task regressed to Open (lease expired) — worker needs to close it.
+                format!(
+                    "Worker {worker} was working on task {task_id} ({task_title}) but \
+                     it is now Open (lease may have expired).\n\n\
+                     Next steps:\n\
+                     - Ask the worker to close: {worker_prefix}task action=close id={task_id}\n\
+                     - If they have uncommitted work, they should commit first, then close\n\
+                     - If close triggers verification, the worker handles it (not you)\n\n\
+                     Remember: workers close their own tasks, supervisors close epics."
+                )
+            } else if in_progress {
+                // Still in progress — stale event, nothing to do.
+                return None;
+            } else {
+                // Task is already closed (the normal path after a successful close).
+                // Do NOT instruct the supervisor to ask the worker to close it again.
+                format!(
+                    "Worker {worker} has closed task {task_id} ({task_title}).\n\n\
+                     Next steps:\n\
+                     - Assign another task to this worker, OR\n\
+                     - If all subtasks are done, verify and close the epic\n\n\
+                     Remember: workers close their own tasks, supervisors close epics."
+                )
+            };
 
             Some(Prompt {
                 target: supervisor_name.to_string(),
@@ -397,13 +435,17 @@ mod tests {
         assert!(prompt.text.contains("target=supervisor"));
     }
 
+    /// cas-6aaf: TaskCompleted with task already closed (the normal path).
+    /// The prompt must NOT instruct the supervisor to ask the worker to close
+    /// the task — it was already closed when the event fired.
     #[test]
-    fn test_task_completed_prompt() {
+    fn test_task_completed_prompt_already_closed() {
         let event = DirectorEvent::TaskCompleted {
             task_id: "task-123".to_string(),
             task_title: "Implement feature X".to_string(),
             worker: "swift-fox".to_string(),
         };
+        // Task not present in any active set = already closed.
         let data = make_data(0);
         let config = default_config();
 
@@ -413,13 +455,119 @@ mod tests {
         assert_eq!(prompt.target, "supervisor");
         assert!(prompt.text.contains("swift-fox"));
         assert!(prompt.text.contains("task-123"));
-        assert!(prompt.text.contains("completed"));
-        // Should clarify verification ownership
+        // Must say "closed" not "completed" — reflects actual final state.
+        assert!(
+            prompt.text.contains("closed"),
+            "cas-6aaf: TaskCompleted prompt must say 'closed' (task is already closed): {}",
+            prompt.text
+        );
+        // Must NOT instruct supervisor to close an already-closed task.
+        assert!(
+            !prompt.text.to_lowercase().contains("task action=close"),
+            "cas-6aaf: TaskCompleted must not emit close instruction for already-closed task: {}",
+            prompt.text
+        );
+        // Should clarify verification ownership.
         assert!(prompt.text.contains("workers close their own tasks"));
         assert!(prompt.text.contains("supervisors close epics"));
-        // Response instructions should point to the worker
+        // Response instructions should point to the worker.
         assert!(prompt.text.contains("To respond to this message, use:"));
         assert!(prompt.text.contains("target=swift-fox"));
+    }
+
+    /// cas-6aaf: TaskCompleted when task regressed to Open (lease expired).
+    /// The supervisor SHOULD be asked to have the worker close it — the task
+    /// is still open and needs attention.
+    #[test]
+    fn test_task_completed_prompt_lease_expired_still_open() {
+        let event = DirectorEvent::TaskCompleted {
+            task_id: "task-123".to_string(),
+            task_title: "Implement feature X".to_string(),
+            worker: "swift-fox".to_string(),
+        };
+        // Task is in ready_tasks as Open — lease expired, not yet closed.
+        let task = TaskSummary {
+            id: "task-123".to_string(),
+            title: "Implement feature X".to_string(),
+            status: TaskStatus::Open,
+            priority: Priority::MEDIUM,
+            assignee: Some("swift-fox".to_string()),
+            task_type: TaskType::Task,
+            epic: None,
+            branch: None,
+            updated_at: None,
+        };
+        let data = DirectorData {
+            ready_tasks: vec![task],
+            in_progress_tasks: vec![],
+            epic_tasks: vec![],
+            agents: vec![],
+            activity: vec![],
+            agent_id_to_name: HashMap::new(),
+            changes: vec![],
+            git_loaded: true,
+            reminders: vec![],
+            epic_closed_counts: HashMap::new(),
+        };
+        let config = default_config();
+
+        let prompt =
+            generate_prompt(&event, &data, "supervisor", &config, codex(), codex()).unwrap();
+
+        // When lease expired and task regressed to Open, supervisor should ask worker to close.
+        assert!(
+            prompt.text.to_lowercase().contains("task action=close"),
+            "cas-6aaf: TaskCompleted for lease-expired Open task must include close instruction: {}",
+            prompt.text
+        );
+        assert!(
+            prompt.text.contains("task-123"),
+            "Prompt must identify the task: {}",
+            prompt.text
+        );
+    }
+
+    /// cas-6aaf: TaskCompleted when task is still InProgress returns None
+    /// (stale event, nothing actionable).
+    #[test]
+    fn test_task_completed_prompt_still_in_progress_suppressed() {
+        let event = DirectorEvent::TaskCompleted {
+            task_id: "task-123".to_string(),
+            task_title: "Implement feature X".to_string(),
+            worker: "swift-fox".to_string(),
+        };
+        // Task is still in in_progress — stale event.
+        let task = TaskSummary {
+            id: "task-123".to_string(),
+            title: "Implement feature X".to_string(),
+            status: TaskStatus::InProgress,
+            priority: Priority::MEDIUM,
+            assignee: Some("swift-fox".to_string()),
+            task_type: TaskType::Task,
+            epic: None,
+            branch: None,
+            updated_at: None,
+        };
+        let data = DirectorData {
+            ready_tasks: vec![],
+            in_progress_tasks: vec![task],
+            epic_tasks: vec![],
+            agents: vec![],
+            activity: vec![],
+            agent_id_to_name: HashMap::new(),
+            changes: vec![],
+            git_loaded: true,
+            reminders: vec![],
+            epic_closed_counts: HashMap::new(),
+        };
+        let config = default_config();
+
+        let prompt = generate_prompt(&event, &data, "supervisor", &config, codex(), codex());
+        assert!(
+            prompt.is_none(),
+            "cas-6aaf: TaskCompleted must be suppressed when task is still in_progress: {:?}",
+            prompt.map(|p| p.text)
+        );
     }
 
     #[test]
