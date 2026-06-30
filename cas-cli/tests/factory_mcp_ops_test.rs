@@ -905,3 +905,195 @@ async fn test_coordination_interrupt_action_is_urgent() {
         "action=interrupt must enqueue urgent even when the urgent flag is omitted"
     );
 }
+
+// =============================================================================
+// cas-efc4: Heterogeneous Claude+Codex smoke regression tests
+//
+// Covers the surfaces landed by cas-8aaf / cas-a3ca / cas-4491 / cas-dbbb:
+// heterogeneous spawn config (AC1+AC2), model/effort spec propagation (AC2),
+// and worker_status metadata for both harness types (AC4).
+// The prompt-layer heterogeneous tests (AC3, AC5) live in director/prompts.rs.
+// =============================================================================
+
+/// cas-efc4 AC1+AC2: Spawning a Codex worker followed by a Claude worker in the
+/// same supervisor session must queue two distinct SpawnRequests.  The Codex
+/// entry must carry a worker_spec that encodes the harness; the default-Claude
+/// entry must have no spec (session defaults apply).
+///
+/// This pins the spawn-queue contract for heterogeneous sessions so a
+/// regression in `build_spawn_spec_json` or the `spawn_workers` handler is
+/// caught at test time, not at factory-start time.
+#[tokio::test]
+async fn test_efc4_heterogeneous_codex_then_claude_spawn_queued_correctly() {
+    let env = FactoryTestEnv::new();
+    env.create_epic("Heterogeneous Smoke Epic");
+
+    // --- Codex worker with model + effort overrides ---
+    let mut codex_req = factory_req("spawn_workers");
+    codex_req.count = Some(1);
+    codex_req.cli = Some("codex".to_string());
+    codex_req.model = Some("o3".to_string());
+    codex_req.effort = Some("high".to_string());
+    codex_req.worker_names = Some("codex-alpha".to_string());
+    env.service
+        .factory(Parameters(codex_req))
+        .await
+        .expect("codex spawn should succeed");
+
+    // --- Claude worker with no overrides (session defaults) ---
+    let mut claude_req = factory_req("spawn_workers");
+    claude_req.count = Some(1);
+    claude_req.worker_names = Some("claude-beta".to_string());
+    env.service
+        .factory(Parameters(claude_req))
+        .await
+        .expect("claude spawn should succeed");
+
+    let entries = env.spawn_queue().peek(10).expect("peek spawn queue");
+    assert_eq!(
+        entries.len(),
+        2,
+        "should have exactly 2 spawn queue entries (one Codex, one Claude)"
+    );
+
+    // First entry: Codex with spec
+    let codex_entry = &entries[0];
+    let spec_json = codex_entry
+        .worker_spec
+        .as_deref()
+        .expect("cas-efc4 AC2: Codex spawn entry must carry a worker_spec");
+    assert!(
+        spec_json.contains("codex"),
+        "cas-efc4 AC1: worker_spec must encode the Codex harness: {spec_json}"
+    );
+    assert!(
+        spec_json.contains("o3"),
+        "cas-efc4 AC2: worker_spec must encode the model override: {spec_json}"
+    );
+    assert!(
+        spec_json.contains("high"),
+        "cas-efc4 AC2: worker_spec must encode the effort override: {spec_json}"
+    );
+
+    // Second entry: Claude with no spec
+    let claude_entry = &entries[1];
+    assert!(
+        claude_entry.worker_spec.is_none(),
+        "cas-efc4 AC1: default-Claude spawn must have no worker_spec (session defaults): {:?}",
+        claude_entry.worker_spec
+    );
+}
+
+/// cas-efc4 AC2: Model and effort overrides must reach the spawn-queue spec
+/// for both Codex and Claude harnesses.  Tests the cross-product so that a
+/// future change to `build_spawn_spec_json` for one harness doesn't silently
+/// break the other.
+#[tokio::test]
+async fn test_efc4_model_and_effort_reach_spawn_spec_for_each_harness() {
+    let env = FactoryTestEnv::new();
+    env.create_epic("Spec Propagation Epic");
+
+    // Codex with model+effort
+    let mut codex_req = factory_req("spawn_workers");
+    codex_req.count = Some(1);
+    codex_req.cli = Some("codex".to_string());
+    codex_req.model = Some("o4-mini".to_string());
+    codex_req.effort = Some("xhigh".to_string());
+    env.service
+        .factory(Parameters(codex_req))
+        .await
+        .expect("codex+model+effort spawn should succeed");
+
+    // Claude with model+effort
+    let mut claude_req = factory_req("spawn_workers");
+    claude_req.count = Some(1);
+    claude_req.cli = Some("claude".to_string());
+    claude_req.model = Some("claude-opus-4-5".to_string());
+    claude_req.effort = Some("medium".to_string());
+    env.service
+        .factory(Parameters(claude_req))
+        .await
+        .expect("claude+model+effort spawn should succeed");
+
+    let entries = env.spawn_queue().peek(10).expect("peek");
+    assert_eq!(entries.len(), 2, "expected 2 spec-carrying entries");
+
+    let codex_spec = entries[0]
+        .worker_spec
+        .as_deref()
+        .expect("codex entry must have spec");
+    assert!(codex_spec.contains("codex"), "codex harness in spec: {codex_spec}");
+    assert!(codex_spec.contains("o4-mini"), "codex model in spec: {codex_spec}");
+    assert!(codex_spec.contains("xhigh"), "codex effort in spec: {codex_spec}");
+
+    let claude_spec = entries[1]
+        .worker_spec
+        .as_deref()
+        .expect("claude entry must have spec when cli given");
+    assert!(claude_spec.contains("claude"), "claude harness in spec: {claude_spec}");
+    assert!(
+        claude_spec.contains("claude-opus-4-5"),
+        "claude model in spec: {claude_spec}"
+    );
+    assert!(
+        claude_spec.contains("medium"),
+        "claude effort in spec: {claude_spec}"
+    );
+}
+
+/// cas-efc4 AC4: `worker_status` must surface worktree/git metadata
+/// (`clone_path`) for workers of **both** harness types registered in the same
+/// session.  Exercises the cas-4491 rendering path across harnesses so that a
+/// regression only affecting one type is caught here.
+#[tokio::test]
+async fn test_efc4_worker_status_shows_clone_path_for_both_harnesses() {
+    // Acquire env mutex — prevents concurrent tests that set CAS_AGENT_ROLE
+    // from activating supervisor scoping and filtering our test workers out.
+    let _guard = EnvGuard::set(&[]);
+    let env = FactoryTestEnv::new();
+
+    // Claude worker with clone_path metadata
+    let mut claude_meta = HashMap::new();
+    claude_meta.insert(
+        "clone_path".to_string(),
+        "/tmp/cas-worktrees/claude-worker".to_string(),
+    );
+    env.register_worker_with_metadata("claude-worker", claude_meta);
+
+    // Codex worker with clone_path metadata
+    let mut codex_meta = HashMap::new();
+    codex_meta.insert(
+        "clone_path".to_string(),
+        "/tmp/cas-worktrees/codex-worker".to_string(),
+    );
+    env.register_worker_with_metadata("codex-worker", codex_meta);
+
+    let req = factory_req("worker_status");
+    let result = env
+        .service
+        .factory(Parameters(req))
+        .await
+        .expect("worker_status should succeed");
+    let text = get_text(&result);
+
+    assert!(
+        text.contains("Workers (2)"),
+        "cas-efc4 AC4: should report 2 active workers: {text}"
+    );
+    assert!(
+        text.contains("claude-worker"),
+        "cas-efc4 AC4: Claude worker must appear in status: {text}"
+    );
+    assert!(
+        text.contains("codex-worker"),
+        "cas-efc4 AC4: Codex worker must appear in status: {text}"
+    );
+    assert!(
+        text.contains("/tmp/cas-worktrees/claude-worker"),
+        "cas-efc4 AC4: Claude worker clone_path must be rendered: {text}"
+    );
+    assert!(
+        text.contains("/tmp/cas-worktrees/codex-worker"),
+        "cas-efc4 AC4: Codex worker clone_path must be rendered: {text}"
+    );
+}
