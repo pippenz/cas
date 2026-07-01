@@ -72,8 +72,35 @@ impl FactoryDaemon {
     ///
     /// Returns true only for sources that were known factory workers but have
     /// since been removed. External sources (openclaw, bridge, etc.) pass through.
+    ///
+    /// Worker names are reusable: `dead_workers` is insert-only (a name enters it
+    /// on shutdown/crash and is never cleared), but a *new, live* worker can be
+    /// spawned into a retired worker's name — most commonly a Codex worker
+    /// respawned into the name a Claude worker vacated (cas-5a5c). If we keyed the
+    /// drop on the name alone, every message from that live worker would be
+    /// silently discarded (marked processed with no delivery), which is exactly
+    /// the bug that made Codex workers appear to "not communicate": the supervisor
+    /// never saw their completion/blocker messages.
+    ///
+    /// So a source counts as dead only when its name is in `dead_workers` AND no
+    /// currently-live worker owns that name. If a live worker holds the name, its
+    /// messages must flow.
     fn is_dead_worker_source(&self, source: &str) -> bool {
-        self.dead_workers.contains(source)
+        Self::source_is_dead(&self.dead_workers, self.app.worker_names(), source)
+    }
+
+    /// Pure liveness rule behind [`Self::is_dead_worker_source`], split out so it
+    /// is exhaustively unit-testable without constructing a full daemon (cas-5a5c).
+    ///
+    /// A source is dead iff its name is in the insert-only `dead` set AND no
+    /// currently-`live` worker owns that name (name reuse — e.g. a Codex worker
+    /// respawned into a retired Claude worker's name — must NOT be treated as dead).
+    fn source_is_dead(
+        dead: &std::collections::HashSet<String>,
+        live: &[String],
+        source: &str,
+    ) -> bool {
+        dead.contains(source) && !live.iter().any(|w| w == source)
     }
 
     /// Detect idle-like messages that don't carry new information.
@@ -696,6 +723,11 @@ impl FactoryDaemon {
                     match self.app.finish_worker_spawn(result, teams_config, pending_spec) {
                         Ok(name) => {
                             tracing::info!("Spawned worker (async): {}", name);
+                            // A worker may reuse a retired name (e.g. a Codex worker
+                            // spawned into a Claude worker's old name). Clear it from
+                            // the insert-only dead set so its messages aren't dropped
+                            // as "from a dead worker" (cas-5a5c).
+                            self.dead_workers.remove(&name);
                             // Register new worker with native Agent Teams
                             if let Some(ref teams) = self.teams {
                                 let worker_cwd = self
@@ -889,6 +921,10 @@ impl FactoryDaemon {
                 // Respawn reuses existing worktree - fast enough to run synchronously
                 match self.app.respawn_worker(&name, teams_config) {
                     Ok(()) => {
+                        // The respawned worker is live again under the same name;
+                        // clear it from the insert-only dead set so its messages
+                        // are no longer dropped as "from a dead worker" (cas-5a5c).
+                        self.dead_workers.remove(&name);
                         if self.app.record_enabled() {
                             if let Err(e) = self.app.start_recording_for_pane(&name).await {
                                 tracing::error!(
@@ -1276,6 +1312,33 @@ mod tests {
             "worker-1 must not match worker-10"
         );
         assert!(is_exact_agent_name_match(&worker_10, "worker-10"));
+    }
+
+    /// Regression for cas-5a5c: a worker name is reusable. When a Claude worker
+    /// shuts down, its name enters the insert-only `dead_workers` set; a Codex
+    /// worker later respawned into that same name must still be able to send
+    /// messages. Keying the drop on the name alone silently discarded every
+    /// message from the live Codex worker (marked processed, never delivered),
+    /// which is what made Codex workers appear to "not communicate".
+    #[test]
+    fn test_source_is_dead_respects_live_name_reuse() {
+        use std::collections::HashSet;
+
+        let mut dead: HashSet<String> = HashSet::new();
+        dead.insert("backend-admin".to_string());
+        dead.insert("frontend-dry".to_string());
+
+        // No live worker owns the retired name → genuinely dead, drop its messages.
+        assert!(FactoryDaemon::source_is_dead(&dead, &[], "backend-admin"));
+
+        // A live worker was respawned into the same name → NOT dead, must deliver.
+        let live = vec!["backend-admin".to_string(), "frontend-dry".to_string()];
+        assert!(!FactoryDaemon::source_is_dead(&dead, &live, "backend-admin"));
+        assert!(!FactoryDaemon::source_is_dead(&dead, &live, "frontend-dry"));
+
+        // A source never in the dead set (external sender / fresh worker) passes.
+        assert!(!FactoryDaemon::source_is_dead(&dead, &live, "openclaw"));
+        assert!(!FactoryDaemon::source_is_dead(&dead, &[], "supervisor"));
     }
 
     #[test]
