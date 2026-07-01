@@ -1082,6 +1082,86 @@ reasoning_effort = "high"
         );
     }
 
+    /// Round-trip via TOML deserialization for the new `Option<String>`
+    /// top-level `harness` field (cas-fbac). Explicit values at every level
+    /// (top-level + both role overrides) must survive the String -> Option
+    /// type change unchanged.
+    #[test]
+    fn harness_for_role_toml_roundtrip() {
+        let toml_str = r#"
+[llm]
+harness = "codex"
+
+[llm.supervisor]
+harness = "claude"
+
+[llm.worker]
+harness = "codex"
+"#;
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            llm: LlmConfig,
+        }
+        let parsed: Wrapper = toml::from_str(toml_str).expect("valid toml");
+        let llm = parsed.llm;
+        assert_eq!(
+            llm.harness_for_role("supervisor"),
+            "claude",
+            "supervisor harness override must survive TOML deserialization"
+        );
+        assert_eq!(
+            llm.harness_for_role("worker"),
+            "codex",
+            "worker harness override must survive TOML deserialization"
+        );
+        // Top-level fallback still works after round-trip
+        assert_eq!(
+            llm.harness_for_role("orchestrator"),
+            "codex",
+            "top-level harness must survive TOML deserialization"
+        );
+    }
+
+    /// cas-fbac guardrail: a genuinely empty `[llm]` section round-trips
+    /// (serialize -> deserialize) to worker=codex / supervisor=claude —
+    /// pinning both sides of the stock-floor split in a single test, via a
+    /// real serialize+deserialize cycle rather than just `LlmConfig::default()`.
+    ///
+    /// Also confirms the `skip_serializing_if = "Option::is_none"` attribute
+    /// on `harness` still holds: an unset harness must NOT be written to disk
+    /// as a literal `harness = "..."` line (that would defeat the whole
+    /// point of distinguishing "unset" from "explicitly claude"), matching
+    /// the `model`/`reasoning_effort` precedent this field now mirrors.
+    #[test]
+    fn harness_empty_config_roundtrips_and_resolves_worker_codex_supervisor_claude() {
+        let llm = LlmConfig::default();
+        let serialized = toml::to_string(&llm).expect("serialize default LlmConfig");
+        assert!(
+            !serialized.contains("harness"),
+            "unset top-level harness must be omitted from serialized TOML \
+             (skip_serializing_if), not written as an explicit value; got:\n{serialized}"
+        );
+
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct Wrapper {
+            llm: LlmConfig,
+        }
+        let wrapped = toml::to_string(&Wrapper { llm }).expect("serialize wrapped LlmConfig");
+        let parsed: Wrapper = toml::from_str(&wrapped).expect("deserialize round-tripped TOML");
+        let llm = parsed.llm;
+
+        assert_eq!(
+            llm.harness_for_role("worker"),
+            "codex",
+            "round-tripped empty config: worker must resolve to the Codex stock floor"
+        );
+        assert_eq!(
+            llm.harness_for_role("supervisor"),
+            "claude",
+            "round-tripped empty config: supervisor must stay on the literal claude default"
+        );
+    }
+
     // ── cas-05e3 / cas-fbac: stock worker default ───────────────────────────
     // The worker role gets a harness + model + reasoning_effort floor when
     // nothing is configured. New installs and upgraders without an
