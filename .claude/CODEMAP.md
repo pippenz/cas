@@ -4,7 +4,7 @@
 ## Top-level layout
 - `cas-cli/` — Rust binary crate (`cas`); CLI commands, hooks, factory TUI, MCP server, bridge HTTP server, daemon
 - `crates/` — 16 workspace member crates (see Workspace section)
-- `docs/` — planning artifacts (brainstorms, ideation, guides, notes, requests/inbox, reviews, spikes, onboarding); requests/completed/ archives closed work
+- `docs/` — planning artifacts (brainstorms, ideation, guides, notes, requests/inbox, reviews, spikes, onboarding, release-notes, reports); requests/completed/ archives closed work
 - `migration/` — one-shot migration scripts and phase logs (Phase 2/3/7/8 cloud move)
 - `scripts/` — `worktree-boot.sh` + provisioning (`provision-hetzner.sh`); release/install scripts live in `~/.local/bin/`
 - `homebrew/` — `cas.rb` Homebrew formula + update script
@@ -61,7 +61,7 @@ Binary entrypoint and the only crate users interact with directly. Contains ever
   - `known_repos.rs`, `open.rs` — known-repos DB and project picker
   - `update/`, `update.rs`, `update_transaction.rs`, `update_tests/` — `cas update` rewrites managed_by:cas files atomically
   - `mcp_cmd.rs`, `memory.rs`, `queue.rs`, `worktree.rs`, `doctor.rs`, `status.rs`, `list.rs`, `sweep.rs`, `bridge.rs`, `changelog.rs`, `claude_md.rs`, `interactive.rs`
-  - `config/`, `config_tui/`, `config_tui.rs` — config read/write + the config TUI
+  - `config/`, `config_tui/`, `config_tui.rs` — config read/write + the config TUI; `config/settings.rs` holds `STOCK_WORKER_{HARNESS,MODEL,REASONING_EFFORT}` (codex/gpt-5.5/medium floors) + `{model,harness,reasoning_effort}_for_role`; `config/access/io.rs` `Config::load` (project `.cas/config.toml` only — no user merge); `config/meta/seed/` seeds
   - `statusline/`, `statusline.rs` — `cas statusline` for shell prompts
 - `hooks/` — hook input handling
   - `mod.rs`, `handlers.rs`, `handlers/` — `SessionStart`, `PreToolUse`, `PostToolUse`, `Stop`, `Notification` handlers
@@ -150,6 +150,8 @@ Planning artifacts only — product/domain content lives in `docs/PRODUCT_OVERVI
 - `ideation/` — survivor lists from the `cas-ideate` skill
 - `requests/` — cross-team BUG/FEATURE inboxes (`README.md` documents the protocol); active BUGs: `BUG-phantom-director-nudges-team-lead-as-idle-worker.md`, `BUG-factory-liveness-signals-disagree.md`, `BUG-codex-worker-cas-mcp-tools-not-exposed.md` (+`.jsonl` rollout), `BUG-codex-worker-stalls-in-task-lifecycle-gates.md`, `BUG-epic-and-worker-branch-off-supervisor-head.md`, `BUG-personal-projects-pushed-team-scoped.md`, `BUG-cloud-sync-slug-fragmentation-and-queue-stall.md`, `BUG-team-push-not-chunked.md`; FEATUREs: `FEATURE-designmd-skill.md`, `FEATURE-release-notes-rubric-and-claude-breadcrumb.md`, `FEATURE-nuxt-playwright-skill.md`; `team-memories-filter-policy.md`; RESPONSE/SHIPPED/RESOLVED markers track closed threads; `artifacts/` holds attachments
 - `guides/` — user-facing guides (`task-depth.md` — deep vs light speed-mode, cas-9d74)
+- `release-notes/` — `YYYY-MM-DD-<topic>-slack.md` postable drafts for #cas-internal (mandatory on every main merge; rubric at `docs/RELEASE_SLACK_RUBRIC.md`)
+- `reports/` — generated smoke-test outputs (`smoke-test-<date>-<harness>-<name>.{html,pdf}`, e.g. claude-jester / codex-jester)
 - `notes/` — working notes + design records: `2026-06-02-cc160-hook-surface.md` (CC hook EPIC), `2026-06-22-mid-turn-interrupt-redirect-design.md` (cas-321da), `claude-code-changelog-diary.md` + `codex-changelog-diary.md` (rolling harness-release → CAS-response ledgers)
 - `reviews/` — archived cas-code-review outputs (e.g. `2026-06-07-cas-073f.md`, the isolated-worker commit-leak EPIC review)
 - `requests/completed/` — archived closed work (25 files): recent SHIPPED-isolated-worker-commits-to-supervisor-main, SHIPPED-worker-pane-mouse-wheel-alt-screen; bulk move 2026-05-18 of cloud-client-404, cloud-push-skipped, factory-session-observations, factory-write-permission-deadlock, EPIC-mcp-server-robustness, FEATURE-cloud-sync-pull-* etc.
