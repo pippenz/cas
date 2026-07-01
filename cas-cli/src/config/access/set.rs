@@ -2,10 +2,40 @@ use crate::config::*;
 
 impl Config {
     pub fn set(&mut self, key: &str, value: &str) -> Result<(), MemError> {
-        // Validate using metadata if available
-        if let Some(meta) = meta::registry().get(key) {
-            meta.validate(value).map_err(MemError::Parse)?;
-        }
+        // "(default)" is the seed sentinel used for fields whose default is
+        // not a single literal value (llm.harness/model/reasoning_effort —
+        // see cas-05e3/cas-fbac): resolution depends on role, so there's no
+        // one concrete string to show as `default:` in the registry.
+        // `cas config reset <key>` / the TUI 'd' key / the interactive
+        // editor all call `set(key, meta.default)`, which for these fields
+        // means `set(key, "(default)")` — meaning "clear the field back to
+        // unset", NOT "set it to the literal value `(default)`". The
+        // documented way to clear one of these fields directly
+        // (`cas config set llm.harness ""`) means the same thing.
+        //
+        // Both spellings must be resolved to an empty string BEFORE running
+        // `meta.validate`, not after: a `Constraint::OneOf` field (like
+        // llm.harness) rejects "(default)" AND "" outright (neither is
+        // "claude" or "codex"). That turned `cas config reset llm.harness`
+        // into a hard error the moment llm.harness's seed default stopped
+        // being the literal "claude", and left plain `set(key, "")` with no
+        // way to reach the clear branch at all (cas-fbac). Scoped to fields
+        // whose `default` is literally "(default)" — every other field's
+        // constraints (e.g. `NotEmpty`) still apply to "" unchanged. Every
+        // match arm below already treats an empty string as "clear this
+        // field to None", so routing both spellings to "" here reuses that
+        // existing clear-path instead of adding a second one.
+        let value = if let Some(meta) = meta::registry().get(key) {
+            let is_default_shaped = meta.default == "(default)";
+            if is_default_shaped && (value == "(default)" || value.is_empty()) {
+                ""
+            } else {
+                meta.validate(value).map_err(MemError::Parse)?;
+                value
+            }
+        } else {
+            value
+        };
 
         match key {
             // Sync section
@@ -580,7 +610,11 @@ impl Config {
             // LLM section
             "llm.harness" => {
                 let llm = self.llm.get_or_insert_with(LlmConfig::default);
-                llm.harness = value.to_string();
+                llm.harness = if value.is_empty() {
+                    None
+                } else {
+                    Some(value.to_string())
+                };
             }
             "llm.model" => {
                 let llm = self.llm.get_or_insert_with(LlmConfig::default);

@@ -202,7 +202,7 @@ fn test_supervisor_cli_explicit_prevents_config_override() {
     let cas_dir = TempDir::new().unwrap();
     let mut project_cfg = Config::default();
     project_cfg.llm = Some(LlmConfig {
-        harness: "claude".into(),
+        harness: Some("claude".into()),
         model: None,
         reasoning_effort: None,
         supervisor: Some(LlmRoleConfig {
@@ -248,7 +248,7 @@ fn test_plain_factory_picks_up_persisted_default() {
     let cas_dir = TempDir::new().unwrap();
     let mut project_cfg = Config::default();
     project_cfg.llm = Some(LlmConfig {
-        harness: "claude".into(),
+        harness: Some("claude".into()),
         model: None,
         reasoning_effort: None,
         supervisor: Some(LlmRoleConfig {

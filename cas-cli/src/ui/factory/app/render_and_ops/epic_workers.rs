@@ -11,8 +11,13 @@ fn bool_prop(value: bool) -> &'static str {
 /// Exists as a standalone function so unit tests can verify the on-disk
 /// config-read path directly, without needing a full `FactoryApp`.
 ///
-/// Falls back to `SupervisorCli::Claude` when the config file is absent
-/// or unparseable — degraded but not broken.
+/// Falls back to `SupervisorCli::Claude` only when the config file is
+/// *unparseable* (`Config::load` returns `Err`) or the persisted harness
+/// string doesn't parse as a known `SupervisorCli` — degraded but not
+/// broken. An *absent* config file is NOT degraded: `Config::load` returns
+/// `Ok(Config::default())` for a missing file, so it flows through
+/// `harness_for_role("worker")` like any other empty config and resolves to
+/// the worker-only stock floor, `STOCK_WORKER_HARNESS` = `"codex"` (cas-fbac).
 ///
 /// In production code the equivalent logic lives inside
 /// `FactoryApp::sync_worker_config_from_live_settings`, which also
@@ -890,9 +895,14 @@ mod tests {
         );
     }
 
-    /// Absent config (no config.toml) falls back to Claude — the safe default.
+    /// Absent config (no config.toml) resolves through the empty-config
+    /// cascade to the worker-only stock floor — Codex (cas-fbac). This is
+    /// NOT the same code path as a genuinely unparseable/unreadable config;
+    /// `Config::load` returns `Ok(Config::default())` for a missing file, so
+    /// it goes through `harness_for_role("worker")` like any other config
+    /// and only the parse-failure branch below falls back to Claude.
     #[test]
-    fn resolve_live_worker_harness_defaults_to_claude_when_config_absent() {
+    fn resolve_live_worker_harness_defaults_to_codex_when_config_absent() {
         let temp = TempDir::new().unwrap();
         let empty_cas_dir = temp.path().join(".cas");
         std::fs::create_dir_all(&empty_cas_dir).unwrap();
@@ -900,8 +910,8 @@ mod tests {
         let harness = resolve_live_worker_harness(&empty_cas_dir);
         assert_eq!(
             harness,
-            cas_mux::SupervisorCli::Claude,
-            "missing config must fall back to SupervisorCli::Claude"
+            cas_mux::SupervisorCli::Codex,
+            "missing config must resolve to the worker stock floor SupervisorCli::Codex"
         );
     }
 

@@ -290,7 +290,12 @@ impl Config {
                     .unwrap_or_else(|| "not set".to_string()),
             ),
             // LLM section
-            "llm.harness" => Some(self.llm().harness.clone()),
+            "llm.harness" => Some(
+                self.llm()
+                    .harness
+                    .clone()
+                    .unwrap_or_else(|| "(default)".to_string()),
+            ),
             "llm.model" => Some(
                 self.llm()
                     .model
