@@ -536,13 +536,13 @@ pub struct TelemetryConfig {
 /// supervisor default).
 ///
 /// See cas-05e3.
-pub const STOCK_WORKER_MODEL: &str = "claude-sonnet-4-6";
+pub const STOCK_WORKER_MODEL: &str = "claude-sonnet-5";
 
 /// Stock worker reasoning effort used as the final fallback for
 /// `[llm.worker.reasoning_effort]`. Same chain rules as
 /// [`STOCK_WORKER_MODEL`]: applied only when both the role override and
 /// the top-level `[llm] reasoning_effort` are unset. See cas-05e3.
-pub const STOCK_WORKER_REASONING_EFFORT: &str = "high";
+pub const STOCK_WORKER_REASONING_EFFORT: &str = "xhigh";
 
 /// LLM configuration for harness and model selection
 ///
@@ -1070,8 +1070,8 @@ reasoning_effort = "high"
             "empty config must resolve worker reasoning_effort to the stock default"
         );
         // Sanity-check the constant values match the spec.
-        assert_eq!(STOCK_WORKER_MODEL, "claude-sonnet-4-6");
-        assert_eq!(STOCK_WORKER_REASONING_EFFORT, "high");
+        assert_eq!(STOCK_WORKER_MODEL, "claude-sonnet-5");
+        assert_eq!(STOCK_WORKER_REASONING_EFFORT, "xhigh");
     }
 
     /// Existing-user preservation: a top-level `[llm] model = "X"` (no
