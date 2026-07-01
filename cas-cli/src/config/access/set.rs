@@ -580,7 +580,11 @@ impl Config {
             // LLM section
             "llm.harness" => {
                 let llm = self.llm.get_or_insert_with(LlmConfig::default);
-                llm.harness = value.to_string();
+                llm.harness = if value.is_empty() {
+                    None
+                } else {
+                    Some(value.to_string())
+                };
             }
             "llm.model" => {
                 let llm = self.llm.get_or_insert_with(LlmConfig::default);

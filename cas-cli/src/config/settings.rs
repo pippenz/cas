@@ -535,14 +535,30 @@ pub struct TelemetryConfig {
 /// `cas-cli/src/ui/factory/daemon/runtime/teams.rs:402,526` for the
 /// supervisor default).
 ///
-/// See cas-05e3.
-pub const STOCK_WORKER_MODEL: &str = "claude-sonnet-5";
+/// See cas-05e3, cas-fbac.
+pub const STOCK_WORKER_MODEL: &str = "gpt-5.5";
 
 /// Stock worker reasoning effort used as the final fallback for
 /// `[llm.worker.reasoning_effort]`. Same chain rules as
 /// [`STOCK_WORKER_MODEL`]: applied only when both the role override and
-/// the top-level `[llm] reasoning_effort` are unset. See cas-05e3.
-pub const STOCK_WORKER_REASONING_EFFORT: &str = "xhigh";
+/// the top-level `[llm] reasoning_effort` are unset. See cas-05e3, cas-fbac.
+pub const STOCK_WORKER_REASONING_EFFORT: &str = "medium";
+
+/// Stock worker harness used as the final fallback for `[llm.worker.harness]`.
+/// Same chain rules as [`STOCK_WORKER_MODEL`]: applied only when both the
+/// role override and the top-level `[llm] harness` are unset.
+///
+/// Added in cas-fbac alongside the GPT-5.5 model flip. The model constant
+/// alone cannot flip the harness — [`harness_for_role`][LlmConfig::harness_for_role]
+/// used to resolve unconditionally to `"claude"` for every role (the
+/// top-level `harness` field was a plain `String`, never `None`), so a
+/// worker with no explicit config would have come up as the **Claude**
+/// harness attempting to run the Codex model string `"gpt-5.5"` — broken.
+/// This constant plus the `Option<String>` top-level `harness` field give
+/// the worker role its own stock floor, exactly mirroring the model/effort
+/// treatment, while the supervisor and any other role keep resolving to the
+/// literal `"claude"` default when unset.
+pub const STOCK_WORKER_HARNESS: &str = "codex";
 
 /// LLM configuration for harness and model selection
 ///
@@ -551,9 +567,17 @@ pub const STOCK_WORKER_REASONING_EFFORT: &str = "xhigh";
 /// for supervisor vs worker agents.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmConfig {
-    /// Which CLI harness to use: "claude" or "codex"
-    #[serde(default = "default_harness")]
-    pub harness: String,
+    /// Which CLI harness to use: "claude" or "codex".
+    ///
+    /// `None` = use the backend's own default via [`LlmConfig::harness_for_role`]:
+    /// the literal `"claude"` for supervisor/unknown roles, or
+    /// [`STOCK_WORKER_HARNESS`] for the worker role. Mirrors [`model`]'s
+    /// `Option<String>` shape (added in cas-fbac) so "unset" is
+    /// distinguishable from an explicit `harness = "claude"`.
+    ///
+    /// [`model`]: LlmConfig::model
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
 
     /// Model to use within the harness (e.g., "claude-sonnet-4-5-20250929", "gpt-5.3-codex")
     /// If not set, the harness uses its default model.
@@ -589,14 +613,10 @@ pub struct LlmRoleConfig {
     pub reasoning_effort: Option<String>,
 }
 
-fn default_harness() -> String {
-    "claude".to_string()
-}
-
 impl Default for LlmConfig {
     fn default() -> Self {
         Self {
-            harness: default_harness(),
+            harness: None,
             model: None,
             reasoning_effort: None,
             supervisor: None,
@@ -606,14 +626,30 @@ impl Default for LlmConfig {
 }
 
 impl LlmConfig {
-    /// Resolve the harness for a given role, falling back to the top-level setting.
+    /// Resolve the harness for a given role.
+    ///
+    /// Three-step fallback chain (cas-fbac, mirroring [`model_for_role`]):
+    /// 1. `[llm.<role>.harness]` — role-specific override (highest priority).
+    /// 2. `[llm.harness]` — top-level fallback.
+    /// 3. **Worker-only stock floor:** if `role == "worker"` AND both above
+    ///    are unset, returns [`STOCK_WORKER_HARNESS`] (`"codex"`). Every
+    ///    other role falls back to the literal `"claude"` — harness (unlike
+    ///    model/effort) always resolves to a concrete CLI, never "use the
+    ///    backend's own default", so there is no `None` case here.
+    ///
+    /// [`model_for_role`]: LlmConfig::model_for_role
     pub fn harness_for_role(&self, role: &str) -> &str {
         let role_override = match role {
             "supervisor" => self.supervisor.as_ref().and_then(|r| r.harness.as_deref()),
             "worker" => self.worker.as_ref().and_then(|r| r.harness.as_deref()),
             _ => None,
         };
-        role_override.unwrap_or(&self.harness)
+        let resolved = role_override.or(self.harness.as_deref());
+        match (resolved, role) {
+            (Some(h), _) => h,
+            (None, "worker") => STOCK_WORKER_HARNESS,
+            (None, _) => "claude",
+        }
     }
 
     /// Resolve the model for a given role.
@@ -1046,19 +1082,25 @@ reasoning_effort = "high"
         );
     }
 
-    // ── cas-05e3: stock worker default ─────────────────────────────────────
-    // The worker role gets a model + reasoning_effort floor when nothing is
-    // configured. New installs and upgraders without an `[llm.worker]` block
-    // pick this up automatically; explicit config at either level still wins.
-    // Supervisor MUST stay on `None` so future regressions can't silently
+    // ── cas-05e3 / cas-fbac: stock worker default ───────────────────────────
+    // The worker role gets a harness + model + reasoning_effort floor when
+    // nothing is configured. New installs and upgraders without an
+    // `[llm.worker]` block pick this up automatically; explicit config at
+    // either level still wins. Supervisor MUST stay on `None` (model/effort)
+    // / literal `"claude"` (harness) so future regressions can't silently
     // switch the supervisor lane onto the worker stock.
 
-    /// Empty config → worker resolves to the stock model + effort. The whole
-    /// point of cas-05e3 is that brand-new installs work without editing
-    /// `.cas/config.toml`.
+    /// Empty config → worker resolves to the stock harness + model + effort.
+    /// The whole point of cas-05e3/cas-fbac is that brand-new installs work
+    /// without editing `.cas/config.toml`.
     #[test]
     fn worker_stock_default_kicks_in_when_nothing_configured() {
         let llm = LlmConfig::default();
+        assert_eq!(
+            llm.harness_for_role("worker"),
+            STOCK_WORKER_HARNESS,
+            "empty config must resolve worker harness to the stock default"
+        );
         assert_eq!(
             llm.model_for_role("worker"),
             Some(STOCK_WORKER_MODEL),
@@ -1069,9 +1111,11 @@ reasoning_effort = "high"
             Some(STOCK_WORKER_REASONING_EFFORT),
             "empty config must resolve worker reasoning_effort to the stock default"
         );
-        // Sanity-check the constant values match the spec.
-        assert_eq!(STOCK_WORKER_MODEL, "claude-sonnet-5");
-        assert_eq!(STOCK_WORKER_REASONING_EFFORT, "xhigh");
+        // Sanity-check the constant values match the spec (cas-fbac: Codex
+        // GPT-5.5 @ medium, replacing the v2.26.0 Claude Sonnet 5 @ xhigh default).
+        assert_eq!(STOCK_WORKER_HARNESS, "codex");
+        assert_eq!(STOCK_WORKER_MODEL, "gpt-5.5");
+        assert_eq!(STOCK_WORKER_REASONING_EFFORT, "medium");
     }
 
     /// Existing-user preservation: a top-level `[llm] model = "X"` (no
@@ -1153,12 +1197,19 @@ reasoning_effort = "high"
 
     /// Supervisor stock-leak guard. `model_for_role("supervisor")` and
     /// `reasoning_effort_for_role("supervisor")` MUST return None when
-    /// nothing is configured. The stock is a worker-only concept; a future
-    /// change that accidentally applies it to supervisor would break the
-    /// supervisor's default-Opus lane (`teams.rs:402,526`).
+    /// nothing is configured, and `harness_for_role("supervisor")` MUST stay
+    /// on the literal `"claude"` default. The stock is a worker-only concept;
+    /// a future change that accidentally applies it to supervisor would break
+    /// the supervisor's default-Opus lane (`teams.rs:402,526`) or silently
+    /// spawn the supervisor under Codex (cas-fbac).
     #[test]
     fn supervisor_does_not_receive_worker_stock_default() {
         let llm = LlmConfig::default();
+        assert_eq!(
+            llm.harness_for_role("supervisor"),
+            "claude",
+            "supervisor harness must stay \"claude\" on empty config — stock is worker-only"
+        );
         assert_eq!(
             llm.model_for_role("supervisor"),
             None,
