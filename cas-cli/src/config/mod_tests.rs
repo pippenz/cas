@@ -176,3 +176,81 @@ fn test_worktrees_global_sweep_debounce_secs_invalid() {
     );
     assert_eq!(config.worktrees().global_sweep_debounce_secs, 3600);
 }
+
+// ── cas-fbac: llm.harness reset/clear must not hard-error ──────────────────
+//
+// llm.harness's seed `default:` is the sentinel "(default)" (it resolves per
+// role, not to one literal — see cas-05e3/cas-fbac), but its constraint is
+// `Constraint::OneOf(["claude", "codex"])`. `Config::set` used to validate
+// unconditionally before dispatch, so `set(key, "(default)")` — exactly what
+// `cas config reset` / the TUI 'd' key / the interactive editor send — and
+// plain `set(key, "")` both failed OneOf validation instead of clearing the
+// field. These tests pin the fix: both spellings must clear `harness` back
+// to `None` without error, which restores the worker-stock-floor / literal-
+// claude split from `harness_for_role`.
+
+#[test]
+fn test_llm_harness_reset_sentinel_clears_to_stock_floor() {
+    let mut config = Config::default();
+    config.set("llm.harness", "claude").unwrap();
+    assert_eq!(config.llm().harness, Some("claude".to_string()));
+
+    // Exactly what `cas config reset llm.harness` / TUI 'd' / the interactive
+    // editor do: `config.set(key, meta.default)`.
+    let meta = meta::registry().get("llm.harness").unwrap();
+    assert_eq!(
+        meta.default, "(default)",
+        "this test assumes llm.harness's seed default is still the sentinel"
+    );
+    config
+        .set("llm.harness", meta.default)
+        .expect("reset sentinel must not hard-error on a OneOf-constrained field");
+
+    assert_eq!(
+        config.llm().harness,
+        None,
+        "reset must clear harness back to unset, not persist the literal \"(default)\" string"
+    );
+    assert_eq!(config.llm().harness_for_role("worker"), "codex");
+    assert_eq!(config.llm().harness_for_role("supervisor"), "claude");
+}
+
+#[test]
+fn test_llm_harness_set_empty_string_clears_to_stock_floor() {
+    let mut config = Config::default();
+    config.set("llm.harness", "claude").unwrap();
+
+    config
+        .set("llm.harness", "")
+        .expect("clearing via an empty string must not hard-error on a OneOf-constrained field");
+
+    assert_eq!(config.llm().harness, None);
+    assert_eq!(config.llm().harness_for_role("worker"), "codex");
+    assert_eq!(config.llm().harness_for_role("supervisor"), "claude");
+}
+
+#[test]
+fn test_llm_harness_still_rejects_invalid_values() {
+    // The (default)/"" clear-path carve-out must not weaken OneOf validation
+    // for genuinely invalid input.
+    let mut config = Config::default();
+    assert!(config.set("llm.harness", "chatgpt").is_err());
+    assert_eq!(config.llm().harness, None);
+}
+
+#[test]
+fn test_llm_harness_top_level_override_suppresses_worker_stock_floor() {
+    // Coverage gap flagged in review: a top-level `llm.harness = "claude"`
+    // with no `[llm.worker]` block must still win over the worker stock
+    // floor — proving step 2 of the fallback chain (top-level override)
+    // suppresses step 3 (worker-only stock default).
+    let mut config = Config::default();
+    config.set("llm.harness", "claude").unwrap();
+
+    assert_eq!(
+        config.llm().harness_for_role("worker"),
+        "claude",
+        "explicit top-level harness must suppress the codex stock floor for workers"
+    );
+    assert_eq!(config.llm().harness_for_role("supervisor"), "claude");
+}
