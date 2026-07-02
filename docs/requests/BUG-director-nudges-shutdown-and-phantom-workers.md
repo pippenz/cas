@@ -1,7 +1,7 @@
 ---
 from: pantheon factory supervisor (live session)
-date: 2026-07-01
-priority: P1
+date: 2026-07-01 (updated 2026-07-02 — recurrence + new severe symptom)
+priority: P0 (was P1) — see 2026-07-02 recurrence: director directed a cherry-pick to the production branch (`main`)
 related: BUG-director-coordinator-fabricates-completions-and-bad-nudges.md (idle-spam + wrong-key guidance), BUG-factory-liveness-signals-disagree.md, cas-c790, cas-e98e
 ---
 
@@ -56,3 +56,34 @@ The director also repeated the known wrong-key guidance (`assignee=<display-name
 #    Any "<name> is ready/idle" or "assign ... assignee=<name>" where <name> in L1
 #    (or not in the current worker_status) = stale/phantom nudge = confirmed.
 ```
+
+---
+
+## Recurrence 2026-07-02 (same session c5c67e82) — NEW, more severe symptom: **harmful merge guidance** + stale/out-of-order delivery
+
+**Reporter:** factory supervisor `bright-condor-9`, epic `cas-2ebb` (analytics asset-class filter), workers `jolly-otter-79` + `sturdy-condor-11`.
+
+Beyond the stale-roster nudges above, the director this session did three new things. #1 is the serious one — it is not just noise, it is **actively dangerous guidance**:
+
+### 1. Directed a prod-corrupting merge ("cherry-pick to main") — P0-class advice
+On epic completion the director emitted:
+
+> 🎉 All subtasks of epic 'Analytics asset-class filter…' (cas-2ebb) are now closed!
+> Next steps: **Cherry-pick worker commits to main** · Verify the integrated result · Close the epic …
+
+This is wrong on two counts and a supervisor that trusted it would ship unreviewed code to production:
+- The epic was integrated via the correct flow — worker branches → `--no-ff` merges into the epic → epic → `develop` → (PR) → `staging`. There are no loose worker commits to cherry-pick.
+- **`main` is the production branch.** "Cherry-pick worker commits to main" bypasses `develop`/`staging`/review entirely and drops raw factory commits onto prod. In this repo that is an explicit never-do (a standing rule the human operator has restated). The director should never emit branch/merge instructions, and certainly not ones that target `main`.
+
+The generic "next steps" template appears to hard-code a `main`-centric cherry-pick workflow that does not match projects using a `develop → staging → main` promotion flow. It should not prescribe a merge strategy at all.
+
+### 2. False "idle" for an actively-InProgress worker
+The director sent `"sturdy-condor-11 is idle with no assigned tasks"` while `cas-3009` was **InProgress** and the worker was mid-edit on `analytics.vue` (verified: `task show cas-3009` → `Status: InProgress`, updated timestamp *after* the assignment, and the worker's own progress note landed ~same minute). Acting on this (reassigning) would have collided two workers on one task.
+
+### 3. Stale, out-of-order message delivery (minutes-late echoes)
+A batch of director + worker messages with source timestamps `13:00–13:03Z` was delivered to the supervisor much later in the session, **after** the referenced work (`cas-3456`, `cas-3009`, the whole epic) had already been merged and closed and the workers had stood down. The director re-emitted "worker idle / assign work / all subtasks closed → cherry-pick" for an epic that was already fully shipped. A supervisor replaying these at face value would re-open settled work.
+
+### Added acceptance criteria (extend the list above)
+5. The director MUST NOT emit branch/merge/promotion instructions. Specifically it must never tell a supervisor to "cherry-pick … to `main`" (or otherwise write to the production branch). Integration strategy is repo-specific and owned by the supervisor/human, not the coordinator. If a "next steps" template exists, strip the merge prescription.
+6. Completion / "all subtasks closed" and idle/assign nudges must be gated on **current** authoritative state at emit time (live `worker_status` + live task status), not on queued/append-only events. A worker whose task is `InProgress` must never be reported idle; an epic already closed must not generate "next steps" nudges.
+7. Message delivery should carry and respect ordering/freshness so minutes-stale echoes are not replayed as current directives (or are clearly marked stale).
