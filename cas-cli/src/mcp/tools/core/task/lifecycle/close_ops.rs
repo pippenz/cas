@@ -2266,19 +2266,56 @@ pub(crate) fn run_factory_branch_merge_gate(
     if stranded == 0 {
         return MergeStateGateOutcome::Proceed;
     }
+
+    // cas-c631: `epic/<slug>` branches are created locally by the supervisor
+    // (see cas-supervisor EPIC workflow) and are, by convention, never pushed
+    // to origin — the epic ships to `main` as a single PR once complete, not
+    // per-worker. Telling a worker to "open a PR targeting {parent_branch}"
+    // when `parent_branch` is one of these local-only epic branches sends
+    // them straight at a `gh pr create --base epic/<slug>` call that fails
+    // (no such ref on origin), which is exactly the recurring close-time
+    // friction this task exists to fix. Detect that case by the naming
+    // convention (cheap, deterministic, matches the same `starts_with(
+    // "epic/")` check used elsewhere for epic branches, e.g.
+    // `mcp/tools/mod.rs` and `worktree/manager/epic_ops.rs`) and hand the
+    // worker a supervisor-merge-request handoff instead of PR instructions.
+    let parent_is_local_epic_branch = parent_branch.starts_with("epic/");
+
+    let remediation = if parent_is_local_epic_branch {
+        format!(
+            "Remediation:\n\
+             1. {parent_branch} is a local-only epic branch (not pushed to origin) \
+             — do NOT run `gh pr create --base {parent_branch}`, it has no \
+             matching ref on origin and the PR will fail.\n\
+             2. Push {factory_branch} to origin so your commit is durable: \
+             `git push origin {factory_branch}`\n\
+             3. Message your supervisor to merge {factory_branch} into \
+             {parent_branch} (e.g. `mcp__cas__coordination action=message \
+             target=supervisor summary=\"ready to merge\" message=\"{factory_branch} \
+             ready for {parent_branch}\"`) — they merge with \
+             `git merge --no-ff {factory_branch}` on the epic branch.\n\
+             4. Once merged, retry mcp__cas__task action=close",
+        )
+    } else {
+        format!(
+            "Remediation:\n\
+             1. Push {factory_branch} to its remote\n\
+             2. Open a PR targeting {parent_branch}\n\
+             3. Merge the PR (or `git fetch --prune` if it was already merged \
+             and your local ref is stale)\n\
+             4. Retry mcp__cas__task action=close",
+        )
+    };
+
     MergeStateGateOutcome::Reject(format!(
         "⚠️ MERGE REQUIRED\n\n\
          task close rejected: {factory_branch} has {stranded} commit(s) not on \
          {parent_branch}.\n\n\
-         Push the branch and merge a PR before closing. This guard cannot be \
-         bypassed (use of bypass_code_review=true does not skip merge-state \
-         checks — it is a data-state guard, not a review gate).\n\n\
-         Remediation:\n\
-         1. Push {factory_branch} to its remote\n\
-         2. Open a PR targeting {parent_branch}\n\
-         3. Merge the PR (or `git fetch --prune` if it was already merged \
-         and your local ref is stale)\n\
-         4. Retry mcp__cas__task action=close",
+         The branch must be merged into {parent_branch} before closing. This \
+         guard cannot be bypassed (use of bypass_code_review=true does not \
+         skip merge-state checks — it is a data-state guard, not a review \
+         gate).\n\n\
+         {remediation}",
     ))
 }
 
@@ -4984,9 +5021,17 @@ mod merge_state_gate_tests {
     /// into `factory/<worker>`, and return the tempdir on the worker
     /// branch. Caller adds whatever commits it wants on top.
     fn init_factory_repo(worker: &str) -> TempDir {
+        init_factory_repo_with_parent(worker, "main")
+    }
+
+    /// Same as [`init_factory_repo`] but the initial (parent) branch is
+    /// named `parent_branch` instead of the hardcoded `main` — used by
+    /// cas-c631's regression coverage to simulate a local-only
+    /// `epic/<slug>` parent branch.
+    fn init_factory_repo_with_parent(worker: &str, parent_branch: &str) -> TempDir {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path();
-        git(p, &["init", "-q", "-b", "main"]);
+        git(p, &["init", "-q", "-b", parent_branch]);
         std::fs::write(p.join("seed.txt"), "seed\n").unwrap();
         git(p, &["add", "seed.txt"]);
         git(p, &["commit", "-q", "-m", "seed"]);
@@ -5058,6 +5103,61 @@ mod merge_state_gate_tests {
                 assert!(
                     msg.contains("bypass_code_review=true"),
                     "remediation must call out bypass-immunity: {msg}"
+                );
+                assert!(
+                    msg.contains("Open a PR targeting main"),
+                    "plain (non-epic) parent branch must keep the PR-based \
+                     remediation unchanged: {msg}"
+                );
+            }
+            other => panic!("expected Reject for stranded factory branch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn worker_task_close_on_local_epic_branch_points_at_supervisor_merge_not_pr() {
+        // cas-c631: when the parent branch is a local-only `epic/<slug>`
+        // branch (the supervisor's EPIC workflow convention — never pushed
+        // to origin), the remediation must NOT tell the worker to open a PR
+        // against it (that `gh pr create --base epic/<slug>` call fails with
+        // no matching origin ref — the exact recurring friction this task
+        // fixes). It must instead hand the worker a push + supervisor-merge
+        // handoff.
+        let parent = "epic/epic-triage-fix-the-docs-requests-bug-backlog-veri-cas-fff9";
+        let dir = init_factory_repo_with_parent("worker", parent);
+        std::fs::write(dir.path().join("a.rs"), "// a\n").unwrap();
+        git(dir.path(), &["add", "a.rs"]);
+        git(dir.path(), &["commit", "-q", "-m", "feat: a"]);
+
+        let task = worker_task("worker");
+        let req = base_req(&task.id);
+        let out = run_factory_branch_merge_gate(&task, &req, parent, dir.path());
+
+        match out {
+            MergeStateGateOutcome::Reject(msg) => {
+                assert!(msg.contains("MERGE REQUIRED"), "missing header: {msg}");
+                assert!(
+                    msg.contains("factory/worker"),
+                    "missing factory branch name: {msg}"
+                );
+                assert!(msg.contains(parent), "missing parent branch name: {msg}");
+                assert!(
+                    msg.contains("bypass_code_review=true"),
+                    "remediation must still call out bypass-immunity: {msg}"
+                );
+                assert!(
+                    !msg.contains("Open a PR targeting"),
+                    "must NOT tell the worker to open a PR against a local-only \
+                     epic branch: {msg}"
+                );
+                assert!(
+                    msg.contains("do NOT run `gh pr create"),
+                    "must explicitly warn against gh pr create on the missing \
+                     origin ref: {msg}"
+                );
+                assert!(
+                    msg.contains("supervisor to merge"),
+                    "must hand the worker a supervisor-merge-request handoff: {msg}"
                 );
             }
             other => panic!("expected Reject for stranded factory branch, got {other:?}"),
