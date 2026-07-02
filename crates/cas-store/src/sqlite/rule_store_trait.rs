@@ -17,8 +17,40 @@ impl RuleStore for SqliteRuleStore {
 
     fn generate_id(&self) -> Result<String> {
         let conn = self.conn.lock().unwrap();
-        let next = crate::shared_db::next_sequence_val(&conn, "rule")?;
-        Ok(format!("rule-{next:03}"))
+        loop {
+            let next = crate::shared_db::next_sequence_val(&conn, "rule")?;
+            let id = format!("rule-{next:03}");
+            let exists: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM rules WHERE id = ?1)",
+                params![&id],
+                |row| row.get(0),
+            )?;
+
+            if !exists {
+                return Ok(id);
+            }
+
+            let max_existing: i64 = conn.query_row(
+                "SELECT COALESCE(
+                    MAX(CASE
+                        WHEN id GLOB 'rule-[0-9]*' THEN CAST(SUBSTR(id, 6) AS INTEGER)
+                    END),
+                    ?1
+                 ) FROM rules",
+                params![next],
+                |row| row.get(0),
+            )?;
+
+            conn.execute(
+                "INSERT INTO id_sequences (name, next_val) VALUES ('rule', ?1)
+                 ON CONFLICT(name) DO UPDATE SET next_val =
+                    CASE
+                        WHEN next_val < excluded.next_val THEN excluded.next_val
+                        ELSE next_val
+                    END",
+                params![max_existing],
+            )?;
+        }
     }
 
     fn add(&self, rule: &Rule) -> Result<()> {

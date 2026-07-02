@@ -1,5 +1,11 @@
 # BUG: `mcp__cas__rule action=create` fails with `UNIQUE constraint failed: rules.id`
 
+## Resolution
+
+Fixed in `cas-6064`. The current repro was an existing `rules` table with rows like `rule-001` but no seeded `id_sequences` row: `cas_rule_create` generated an ID through `SqliteRuleStore::generate_id`, then the insert failed with `UNIQUE constraint failed: rules.id`.
+
+`crates/cas-store/src/sqlite/rule_store_trait.rs` now checks whether the generated `rule-NNN` already exists. On collision it computes the current max numeric `rule-*` suffix from the `rules` table, fast-forwards the `id_sequences` entry for `rule`, and retries before returning an ID. The regression test `test_sqlite_rule_generate_id_skips_existing_rules_without_sequence_seed` covers the old pre-sequence database shape by adding `rule-001`, generating a new ID, and inserting the new rule successfully.
+
 **Reported:** 2026-06-26 (gabber-studio project)
 **Severity:** High — the rule store is unwritable; users cannot create new CAS rules.
 
