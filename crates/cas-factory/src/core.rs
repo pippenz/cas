@@ -493,6 +493,7 @@ mod tests {
             minions_theme: false,
             resolved_worker_specs: vec![],
             resolved_supervisor_spec: None,
+            stall_threshold_secs: crate::config::DEFAULT_STALL_THRESHOLD_SECS,
         }
     }
 

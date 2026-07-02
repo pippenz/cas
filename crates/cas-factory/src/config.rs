@@ -101,6 +101,18 @@ fn default_true() -> bool {
     true
 }
 
+/// Default `[factory] stall_threshold_secs` — how long a worker can go with
+/// an in-progress task, a fresh heartbeat, but zero observable activity
+/// before the director emits a `WorkerStalled` notification (cas-9829).
+///
+/// 300s (5 minutes) is "a few minutes" per the reported bug: the stalled
+/// worker in the wild sat quiet for 10+ minutes before a supervisor caught
+/// it manually, so 5 minutes gives one auto-nudge and one escalation cycle
+/// well before that pain threshold, without false-firing on a worker mid
+/// long-running build/test step (`RECENT_ACTIVITY_SECS` in
+/// `events.rs` already tolerates gaps up to 120s for the idle gate).
+pub const DEFAULT_STALL_THRESHOLD_SECS: u64 = 300;
+
 /// Auto-prompting configuration for factory mode events
 ///
 /// Controls which events trigger automatic prompt injection into agent terminals.
@@ -134,6 +146,11 @@ pub struct AutoPromptConfig {
     /// Prompt supervisor when a worker registers and is ready (default: true)
     #[serde(default = "default_true")]
     pub on_worker_ready: bool,
+
+    /// Notify supervisor when a worker stalls (alive heartbeat, in-progress
+    /// task, no observable activity past the stall threshold) (default: true)
+    #[serde(default = "default_true")]
+    pub on_worker_stalled: bool,
 }
 
 impl Default for AutoPromptConfig {
@@ -146,6 +163,7 @@ impl Default for AutoPromptConfig {
             on_worker_idle: true,
             on_epic_completed: true,
             on_worker_ready: true,
+            on_worker_stalled: true,
         }
     }
 }
@@ -203,6 +221,11 @@ pub struct FactoryConfig {
     pub resolved_worker_specs: Vec<cas_mux::WorkerSpec>,
     /// Resolved supervisor spec (populated by the cascade resolver).
     pub resolved_supervisor_spec: Option<cas_mux::WorkerSpec>,
+    /// Seconds a worker may hold an in-progress task with a fresh heartbeat
+    /// but no observable activity before the director flags it stalled
+    /// (cas-9829). Sourced from `.cas/config.toml` `[factory]
+    /// stall_threshold_secs`; defaults to [`DEFAULT_STALL_THRESHOLD_SECS`].
+    pub stall_threshold_secs: u64,
 }
 
 impl Default for FactoryConfig {
@@ -230,6 +253,7 @@ impl Default for FactoryConfig {
             minions_theme: false,
             resolved_worker_specs: vec![],
             resolved_supervisor_spec: None,
+            stall_threshold_secs: DEFAULT_STALL_THRESHOLD_SECS,
         }
     }
 }

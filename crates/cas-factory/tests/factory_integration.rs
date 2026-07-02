@@ -200,6 +200,7 @@ fn test_config() -> FactoryConfig {
         minions_theme: false,
         resolved_worker_specs: vec![],
         resolved_supervisor_spec: None,
+        stall_threshold_secs: cas_factory::DEFAULT_STALL_THRESHOLD_SECS,
     }
 }
 

@@ -334,6 +334,21 @@ impl CasService {
                 .unwrap_or_default()
         };
 
+        // cas-9829: configurable stall threshold (`[factory]
+        // stall_threshold_secs` in `.cas/config.toml`, default
+        // `cas_factory::DEFAULT_STALL_THRESHOLD_SECS`) used below to mark a
+        // worker row `⚠ STALLED` when it has an in-progress task but no
+        // observable activity past the threshold — the same signal the
+        // director uses for the `WorkerStalled` auto-nudge/escalation, now
+        // surfaced for a supervisor manually polling `worker_status`.
+        let stall_threshold_secs: i64 = {
+            use crate::config::Config;
+            Config::load(&self.inner.cas_root)
+                .unwrap_or_default()
+                .factory()
+                .stall_threshold_secs as i64
+        };
+
         // cas-86c5: wider activity window (10 min) for the per-worker "last
         // activity" line in worker_status. A worker in the investigation phase
         // emits checkpoint events but no edits; showing "last activity: 45s ago
@@ -495,11 +510,34 @@ impl CasService {
                 // (no edits yet, but recent checkpoint events) from one that
                 // is truly stalled. A clean diff + fresh checkpoint is normal
                 // during the analysis phase; no events for >5 min is a stall.
-                let activity_info = match last_worker_activity_secs(&activity_events, &agent.id) {
-                    Some((secs, phase)) => {
+                // cas-9829: a worker with an in-progress task and no
+                // activity past `stall_threshold_secs` is STALLED, not
+                // merely "investigating" — the soft hedge reads as fine and
+                // is easy to skim past in a supervisor's manual poll.
+                let has_in_progress_task = store
+                    .list_agent_leases(&agent.id)
+                    .map(|leases| !leases.is_empty())
+                    .unwrap_or(false);
+                let last_activity = last_worker_activity_secs(&activity_events, &agent.id);
+                let stalled = is_worker_stalled(
+                    has_in_progress_task,
+                    last_activity.map(|(secs, _)| secs),
+                    stall_threshold_secs,
+                );
+                let activity_info = match (last_activity, stalled) {
+                    (Some((secs, phase)), true) => {
+                        format!(
+                            "\n    last activity: {secs}s ago ({phase}) ⚠ STALLED (no activity ≥{stall_threshold_secs}s while task in progress)"
+                        )
+                    }
+                    (Some((secs, phase)), false) => {
                         format!("\n    last activity: {secs}s ago ({phase})")
                     }
-                    None => "\n    last activity: none in last 10m (may be investigating or idle)".to_string(),
+                    (None, true) => {
+                        "\n    ⚠ STALLED: no activity in last 10m while task in progress"
+                            .to_string()
+                    }
+                    (None, false) => "\n    last activity: none in last 10m (may be investigating or idle)".to_string(),
                 };
                 output.push_str(&format!(
                     "  • {} (heartbeat: {}){}{}{}{}{}{}\n    session: {}\n",
@@ -1367,6 +1405,30 @@ pub(crate) fn last_worker_activity_secs(
         .min_by_key(|(elapsed, _)| *elapsed)
 }
 
+/// cas-9829: whether a `worker_status` row should render the `⚠ STALLED`
+/// marker instead of the soft "may be investigating or idle" hedge.
+///
+/// True when the worker has an in-progress task (a claimed lease) AND
+/// either:
+/// - its last observable activity is at/past `stall_threshold_secs`, or
+/// - no activity was observed at all within the query window (`None`).
+///
+/// A worker with no in-progress task is never "stalled" in this sense —
+/// idle-with-no-task is a distinct, already-signaled state (`WorkerIdle`).
+fn is_worker_stalled(
+    has_in_progress_task: bool,
+    last_activity_secs_ago: Option<i64>,
+    stall_threshold_secs: i64,
+) -> bool {
+    if !has_in_progress_task {
+        return false;
+    }
+    match last_activity_secs_ago {
+        Some(secs) => secs >= stall_threshold_secs,
+        None => true,
+    }
+}
+
 /// cas-8240 two-band liveness label for `factory_worker_status`:
 ///
 /// * `elapsed >= WORKER_DEAD_SECS` → `" [DEAD]"` (hard escalation —
@@ -1991,6 +2053,28 @@ mod tests {
         assert_ne!(stale, dead, "stale and DEAD bands must render distinct labels");
         assert!(stale.contains("stale"));
         assert!(dead.contains("DEAD"));
+    }
+
+    // --- cas-9829: is_worker_stalled helper ----------------------------------
+
+    #[test]
+    fn is_worker_stalled_false_without_in_progress_task() {
+        // Idle worker with no observed activity at all — not "stalled",
+        // that's the pre-existing "may be investigating or idle" case.
+        assert!(!is_worker_stalled(false, None, 300));
+        assert!(!is_worker_stalled(false, Some(1_000), 300));
+    }
+
+    #[test]
+    fn is_worker_stalled_true_when_no_activity_observed_with_task() {
+        assert!(is_worker_stalled(true, None, 300));
+    }
+
+    #[test]
+    fn is_worker_stalled_compares_against_threshold() {
+        assert!(!is_worker_stalled(true, Some(299), 300));
+        assert!(is_worker_stalled(true, Some(300), 300));
+        assert!(is_worker_stalled(true, Some(301), 300));
     }
 
     // --- cas-86c5: last_worker_activity_secs helper -------------------------

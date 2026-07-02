@@ -1607,3 +1607,256 @@ fn test_c790_worker_idle_still_fires_for_real_workers() {
          guard is added. Events: {ev1:?}, {ev2:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// cas-9829: activity-based WorkerStalled detection
+// ---------------------------------------------------------------------------
+
+/// Build an agent with an in-progress task, a configurable heartbeat age,
+/// and an optional `latest_activity` age (`None` = no activity ever
+/// recorded).
+fn make_agent_working_stalled(
+    id: &str,
+    name: &str,
+    task_id: &str,
+    heartbeat_ago_secs: i64,
+    activity_ago_secs: Option<i64>,
+    base_utc: chrono::DateTime<chrono::Utc>,
+) -> AgentSummary {
+    use chrono::Duration as CDuration;
+    AgentSummary {
+        id: id.to_string(),
+        name: name.to_string(),
+        status: AgentStatus::Active,
+        current_task: Some(task_id.to_string()),
+        latest_activity: activity_ago_secs
+            .map(|secs| ("tool_call".to_string(), base_utc - CDuration::seconds(secs))),
+        last_heartbeat: Some(base_utc - CDuration::seconds(heartbeat_ago_secs)),
+        pending_messages: 0,
+    }
+}
+
+fn stalled_data_for(agent: AgentSummary) -> DirectorData {
+    let id = agent.id.clone();
+    let name = agent.name.clone();
+    let task_id = agent.current_task.clone();
+    let in_progress_tasks = match &task_id {
+        Some(tid) => vec![make_task(tid, "Stalled task", TaskStatus::InProgress, Some(&id))],
+        None => vec![],
+    };
+    DirectorData {
+        ready_tasks: vec![],
+        in_progress_tasks,
+        epic_tasks: vec![],
+        agents: vec![agent],
+        activity: vec![],
+        agent_id_to_name: [(id, name)].into_iter().collect(),
+        changes: vec![],
+        git_loaded: true,
+        reminders: vec![],
+        epic_closed_counts: HashMap::new(),
+    }
+}
+
+/// A worker with a fresh heartbeat, an in-progress task, and activity older
+/// than the stall threshold must fire a non-escalating `WorkerStalled`
+/// (auto-nudge) on first detection, per the cas-9829 bug report: heartbeat
+/// alone said "healthy" while the worker had produced nothing for 10+
+/// minutes.
+#[test]
+fn test_9829_worker_stalled_fires_auto_nudge_on_first_detection() {
+    let base_utc = chrono::Utc::now();
+    let t0 = std::time::Instant::now();
+
+    let mut detector =
+        DirectorEventDetector::new(vec!["lively-crow".to_string()], "supervisor".to_string());
+    detector.set_stall_threshold_secs(300);
+
+    let data = stalled_data_for(make_agent_working_stalled(
+        "agent-1",
+        "lively-crow",
+        "cas-0b7d",
+        5,          // fresh heartbeat
+        Some(310),  // activity 310s ago, past the 300s threshold
+        base_utc,
+    ));
+    detector.initialize(&data);
+
+    let events = detector.detect_changes_at(&data, None, t0, base_utc);
+
+    let nudge = events.iter().find(|e| {
+        matches!(
+            e,
+            DirectorEvent::WorkerStalled { worker, task_id, escalate: false, .. }
+                if worker == "lively-crow" && task_id == "cas-0b7d"
+        )
+    });
+    assert!(
+        nudge.is_some(),
+        "expected a non-escalating WorkerStalled auto-nudge on first stall detection: {events:?}"
+    );
+}
+
+/// A worker still stalled after the auto-nudge must escalate to the
+/// supervisor on the next detection — the nudge fires once, not forever.
+#[test]
+fn test_9829_worker_stalled_escalates_after_nudge() {
+    let base_utc = chrono::Utc::now();
+    let t0 = std::time::Instant::now();
+
+    let mut detector =
+        DirectorEventDetector::new(vec!["lively-crow".to_string()], "supervisor".to_string());
+    detector.set_stall_threshold_secs(300);
+
+    let data = stalled_data_for(make_agent_working_stalled(
+        "agent-1",
+        "lively-crow",
+        "cas-0b7d",
+        5,
+        Some(310),
+        base_utc,
+    ));
+    detector.initialize(&data);
+
+    let ev1 = detector.detect_changes_at(&data, None, t0, base_utc);
+    assert!(
+        ev1.iter()
+            .any(|e| matches!(e, DirectorEvent::WorkerStalled { escalate: false, .. })),
+        "first tick must be the non-escalating nudge: {ev1:?}"
+    );
+
+    // Still stalled on the next tick (nothing changed) — must escalate, and
+    // must NOT re-emit the nudge.
+    let ev2 = detector.detect_changes_at(&data, None, t0, base_utc);
+    assert!(
+        ev2.iter().any(|e| matches!(
+            e,
+            DirectorEvent::WorkerStalled { worker, escalate: true, .. } if worker == "lively-crow"
+        )),
+        "second tick while still stalled must escalate to the supervisor: {ev2:?}"
+    );
+    assert!(
+        !ev2.iter()
+            .any(|e| matches!(e, DirectorEvent::WorkerStalled { escalate: false, .. })),
+        "the nudge must not re-fire once already sent: {ev2:?}"
+    );
+}
+
+/// Once activity resumes (elapsed drops back under the threshold), the
+/// stall streak must clear so a future stall re-nudges from scratch instead
+/// of staying silently suppressed forever.
+#[test]
+fn test_9829_worker_stalled_streak_resets_when_activity_resumes() {
+    let base_utc = chrono::Utc::now();
+    let t0 = std::time::Instant::now();
+
+    let mut detector =
+        DirectorEventDetector::new(vec!["lively-crow".to_string()], "supervisor".to_string());
+    detector.set_stall_threshold_secs(300);
+
+    let stalled = stalled_data_for(make_agent_working_stalled(
+        "agent-1",
+        "lively-crow",
+        "cas-0b7d",
+        5,
+        Some(310),
+        base_utc,
+    ));
+    detector.initialize(&stalled);
+    let ev1 = detector.detect_changes_at(&stalled, None, t0, base_utc);
+    assert!(
+        ev1.iter()
+            .any(|e| matches!(e, DirectorEvent::WorkerStalled { escalate: false, .. })),
+        "expected the initial nudge: {ev1:?}"
+    );
+
+    // Worker resumes activity (e.g. responded to the nudge).
+    let active = stalled_data_for(make_agent_working_stalled(
+        "agent-1",
+        "lively-crow",
+        "cas-0b7d",
+        5,
+        Some(10),
+        base_utc,
+    ));
+    let ev2 = detector.detect_changes_at(&active, None, t0, base_utc);
+    assert!(
+        !ev2.iter().any(|e| matches!(e, DirectorEvent::WorkerStalled { .. })),
+        "resumed activity must suppress WorkerStalled: {ev2:?}"
+    );
+
+    // Goes stale again — must nudge again (streak was cleared), not jump
+    // straight to escalate. Advance `Instant` past `DEBOUNCE_DURATION` (30s)
+    // so the generic per-key debounce in `debounce_events` isn't the thing
+    // suppressing re-emission — this test is isolating the streak-reset
+    // logic specifically, not the debounce window.
+    let t1 = t0 + std::time::Duration::from_secs(31);
+    let ev3 = detector.detect_changes_at(&stalled, None, t1, base_utc);
+    assert!(
+        ev3.iter()
+            .any(|e| matches!(e, DirectorEvent::WorkerStalled { escalate: false, .. })),
+        "a fresh stall after activity resumed must re-nudge, not escalate: {ev3:?}"
+    );
+}
+
+/// A worker with a stale heartbeat (not just stale activity) is not "alive"
+/// by the fresh-heartbeat gate — that's the existing `[stale]`/`[DEAD]`
+/// liveness signal's territory, not a stall. WorkerStalled must not fire.
+#[test]
+fn test_9829_worker_stalled_requires_fresh_heartbeat() {
+    let base_utc = chrono::Utc::now();
+    let t0 = std::time::Instant::now();
+
+    let mut detector =
+        DirectorEventDetector::new(vec!["lively-crow".to_string()], "supervisor".to_string());
+    detector.set_stall_threshold_secs(300);
+
+    let data = stalled_data_for(make_agent_working_stalled(
+        "agent-1",
+        "lively-crow",
+        "cas-0b7d",
+        200, // heartbeat stale (> FRESH_HEARTBEAT_SECS = 60)
+        Some(400),
+        base_utc,
+    ));
+    detector.initialize(&data);
+
+    let events = detector.detect_changes_at(&data, None, t0, base_utc);
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, DirectorEvent::WorkerStalled { .. })),
+        "a stale heartbeat must not produce WorkerStalled — that's the dead/stale liveness \
+         signal's job: {events:?}"
+    );
+}
+
+/// The stall threshold is configurable — a worker stalled past a
+/// tightened threshold fires even though it's well under the 300s default.
+#[test]
+fn test_9829_worker_stalled_threshold_is_configurable() {
+    let base_utc = chrono::Utc::now();
+    let t0 = std::time::Instant::now();
+
+    let mut detector =
+        DirectorEventDetector::new(vec!["lively-crow".to_string()], "supervisor".to_string());
+    detector.set_stall_threshold_secs(60);
+
+    let data = stalled_data_for(make_agent_working_stalled(
+        "agent-1",
+        "lively-crow",
+        "cas-0b7d",
+        5,
+        Some(65), // past the tightened 60s threshold, well under the 300s default
+        base_utc,
+    ));
+    detector.initialize(&data);
+
+    let events = detector.detect_changes_at(&data, None, t0, base_utc);
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, DirectorEvent::WorkerStalled { escalate: false, .. })),
+        "a lowered stall_threshold_secs must be honored: {events:?}"
+    );
+}
