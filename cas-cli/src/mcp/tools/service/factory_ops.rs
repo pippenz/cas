@@ -1078,7 +1078,7 @@ impl CasService {
         req: FactoryRequest,
     ) -> Result<CallToolResult, McpError> {
         use crate::store::{open_agent_store, open_prompt_queue_store, open_worktree_store};
-        use cas_types::{AgentRole, WorktreeStatus};
+        use cas_types::{AgentRole, AgentStatus, WorktreeStatus};
         use std::path::Path;
 
         let stale_after = req.older_than_secs.unwrap_or(120);
@@ -1097,6 +1097,18 @@ impl CasService {
             }
             if agent_store.mark_stale(&agent.id).is_ok() {
                 stale_marked += 1;
+            }
+        }
+
+        let mut dead_agent_records_purged = 0usize;
+        for status in [AgentStatus::Stale, AgentStatus::Shutdown] {
+            for agent in agent_store.list(Some(status)).unwrap_or_default() {
+                if agent.role == AgentRole::Supervisor || agent.role == AgentRole::Director {
+                    continue;
+                }
+                if agent_store.unregister(&agent.id).is_ok() {
+                    dead_agent_records_purged += 1;
+                }
             }
         }
 
@@ -1132,7 +1144,7 @@ impl CasService {
         }
 
         Ok(Self::success(format!(
-            "Factory GC cleanup complete.\n\nStale agents marked: {stale_marked}\nOrphan worktrees marked removed: {orphan_marked_removed}\nPrompt queue entries cleared: {cleared_prompts}"
+            "Factory GC cleanup complete.\n\nStale agents marked: {stale_marked}\nDead agent records purged: {dead_agent_records_purged}\nOrphan worktrees marked removed: {orphan_marked_removed}\nPrompt queue entries cleared: {cleared_prompts}"
         )))
     }
 }
