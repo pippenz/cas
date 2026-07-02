@@ -508,6 +508,46 @@ pub(crate) fn epic_branch_name(title: &str) -> String {
     format!("epic/{}", slugify(title))
 }
 
+/// cas-889d / cas-9eae: determine whether a task belongs to the current
+/// factory session for director visibility purposes (i.e. whether it
+/// should remain in the `ready_tasks`/`in_progress_tasks` buckets the
+/// event detector watches for disappearance).
+///
+/// A task is visible when either:
+///   - its `epic` field matches the currently-tracked `epic_id`, OR
+///   - it has no epic link yet (a read race between the task-list and
+///     dependency-list queries — a newly created task may not yet have
+///     its parent-child dependency visible) AND its assignee is a
+///     current-session worker, checked by BOTH display name
+///     (`allowed_names`) and session ID (`allowed_session_ids`).
+///
+/// The dual assignee check exists because `Task.assignee` is always a
+/// session ID in the DB, but some construction paths (tests, legacy
+/// manual assignment) use the display name. Dropping a genuinely
+/// in-progress task from this view — because only one of the two
+/// representations was checked — causes the event detector
+/// (`DirectorEventDetector::detect_changes_at`) to see it "disappear"
+/// from the tracked active sets and fire a fabricated `TaskCompleted`,
+/// which the director then broadcasts as "has closed task X" even though
+/// the task's real status never left `InProgress`. This is the standalone,
+/// directly-testable form of the predicate used by
+/// `filter_director_agents_to_current_session` — extracted so the
+/// invariant that ultimately gates the "has closed task" broadcast has
+/// unit coverage without constructing a full `FactoryApp`.
+pub(crate) fn task_belongs_to_current_session(
+    task: &cas_factory::TaskSummary,
+    epic_id: &str,
+    allowed_names: &std::collections::HashSet<String>,
+    allowed_session_ids: &std::collections::HashSet<String>,
+) -> bool {
+    task.epic.as_deref() == Some(epic_id)
+        || (task.epic.is_none()
+            && task
+                .assignee
+                .as_ref()
+                .is_some_and(|a| allowed_names.contains(a) || allowed_session_ids.contains(a)))
+}
+
 impl FactoryApp {
     fn filter_director_agents_to_current_session(&mut self) {
         let mut allowed = std::collections::HashSet::with_capacity(self.worker_names.len() + 1);
@@ -544,13 +584,7 @@ impl FactoryApp {
             let allowed_session_ids: std::collections::HashSet<String> =
                 self.director_data.agent_id_to_name.keys().cloned().collect();
             let belongs_to_session = |t: &cas_factory::TaskSummary| -> bool {
-                t.epic.as_deref() == Some(&epic_id)
-                    || (t.epic.is_none()
-                        && t.assignee.as_ref().is_some_and(|a| {
-                            // Accept both display-name keyed (legacy/manual) and
-                            // session-ID keyed (standard DB path) assignees.
-                            allowed.contains(a) || allowed_session_ids.contains(a)
-                        }))
+                task_belongs_to_current_session(t, &epic_id, &allowed, &allowed_session_ids)
             };
             self.director_data
                 .ready_tasks
@@ -1142,6 +1176,128 @@ mod tests {
             git_loaded,
             reminders: Vec::new(),
             epic_closed_counts: HashMap::new(),
+        }
+    }
+
+    // ── task_belongs_to_current_session (cas-889d / cas-9eae) ────────────────
+    //
+    // Locks in the invariant that ultimately gates the director's "has
+    // closed task" broadcast: an in-progress task must never be dropped
+    // from the director's visible set (and thus mistaken for a completion)
+    // just because its `assignee` uses a different representation
+    // (session ID vs display name) than the one being checked.
+    mod task_belongs_to_current_session_tests {
+        use std::collections::HashSet;
+
+        use cas_factory::TaskSummary;
+        use cas_types::{Priority, TaskStatus, TaskType};
+
+        use super::super::task_belongs_to_current_session;
+
+        fn task(epic: Option<&str>, assignee: Option<&str>) -> TaskSummary {
+            TaskSummary {
+                id: "cas-test1".to_string(),
+                title: "Test task".to_string(),
+                status: TaskStatus::InProgress,
+                priority: Priority::MEDIUM,
+                assignee: assignee.map(str::to_string),
+                task_type: TaskType::Bug,
+                epic: epic.map(str::to_string),
+                branch: None,
+                updated_at: None,
+            }
+        }
+
+        fn set(items: &[&str]) -> HashSet<String> {
+            items.iter().map(|s| s.to_string()).collect()
+        }
+
+        /// The bug-report scenario: task is correctly tagged to the active
+        /// epic, but its assignee is a session ID that happens not to be in
+        /// EITHER lookup set (e.g. a worker that just crashed/reconnected).
+        /// Epic membership alone must be sufficient — assignee format must
+        /// never exclude an epic-tagged in-progress task.
+        #[test]
+        fn epic_tagged_task_is_visible_regardless_of_assignee_shape() {
+            let t = task(Some("cas-ff98"), Some("sess-id-abc123"));
+            assert!(task_belongs_to_current_session(
+                &t,
+                "cas-ff98",
+                &set(&[]),
+                &set(&[]),
+            ));
+        }
+
+        /// cas-889d: task has no epic link yet (read race) and its assignee
+        /// is a session ID — must be visible via `allowed_session_ids`, not
+        /// just `allowed_names`. Before cas-889d this was dropped, which is
+        /// the root cause of the false "has closed task" broadcast in
+        /// cas-9eae: the task disappeared from the director's tracked set
+        /// while still genuinely `InProgress`.
+        #[test]
+        fn epic_less_task_visible_via_session_id_assignee() {
+            let t = task(None, Some("sess-id-abc123"));
+            assert!(task_belongs_to_current_session(
+                &t,
+                "cas-ff98",
+                &set(&["swift-fox"]),        // display names only
+                &set(&["sess-id-abc123"]),   // session IDs (the fix)
+            ));
+        }
+
+        /// Same read-race case, but assignee is display-name keyed (legacy
+        /// manual assignment path) — must still be visible via
+        /// `allowed_names`.
+        #[test]
+        fn epic_less_task_visible_via_display_name_assignee() {
+            let t = task(None, Some("swift-fox"));
+            assert!(task_belongs_to_current_session(
+                &t,
+                "cas-ff98",
+                &set(&["swift-fox"]),
+                &set(&["sess-id-abc123"]),
+            ));
+        }
+
+        /// Negative control: no epic link and an assignee absent from both
+        /// lookup sets (cross-project leakage / a worker from a different
+        /// session) must stay excluded.
+        #[test]
+        fn epic_less_task_with_unknown_assignee_is_excluded() {
+            let t = task(None, Some("sess-id-other-session"));
+            assert!(!task_belongs_to_current_session(
+                &t,
+                "cas-ff98",
+                &set(&["swift-fox"]),
+                &set(&["sess-id-abc123"]),
+            ));
+        }
+
+        /// Negative control: task belongs to a DIFFERENT epic than the one
+        /// currently tracked — must stay excluded even if the assignee is a
+        /// current-session worker (prevents cross-epic task leakage).
+        #[test]
+        fn task_tagged_to_a_different_epic_is_excluded() {
+            let t = task(Some("cas-other-epic"), Some("sess-id-abc123"));
+            assert!(!task_belongs_to_current_session(
+                &t,
+                "cas-ff98",
+                &set(&["swift-fox"]),
+                &set(&["sess-id-abc123"]),
+            ));
+        }
+
+        /// Negative control: no epic link and no assignee at all — nothing
+        /// to match against, must stay excluded.
+        #[test]
+        fn epic_less_unassigned_task_is_excluded() {
+            let t = task(None, None);
+            assert!(!task_belongs_to_current_session(
+                &t,
+                "cas-ff98",
+                &set(&["swift-fox"]),
+                &set(&["sess-id-abc123"]),
+            ));
         }
     }
 

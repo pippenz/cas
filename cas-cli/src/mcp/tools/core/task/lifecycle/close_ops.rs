@@ -2679,9 +2679,45 @@ pub(crate) fn check_zero_commit_close(
     if has_review_findings {
         return ZeroCommitCloseOutcome::Proceed;
     }
-    // Count commits: if > 0, this is case 1 (docs-only), not case 3.
-    if count_worker_branch_commits(worker_worktree_path, parent_branch) > 0 {
-        return ZeroCommitCloseOutcome::Proceed;
+    // Count commits: if > 0, this MAY be case 1 (docs-only) — but it can
+    // also be a sync-only merge/fast-forward-forced commit (cas-9eae
+    // "sync ≠ work"): `git merge --no-ff <parent>` on a branch with no
+    // unique work produces a commit that advances the count while
+    // contributing an empty diff. "Did HEAD move / is there a commit" is
+    // not sufficient; require an actual non-empty diff vs `parent_branch`.
+    let commit_count = count_worker_branch_commits(worker_worktree_path, parent_branch);
+    if commit_count > 0 {
+        let has_diff = !get_worker_diff_stat(worker_worktree_path, parent_branch)
+            .trim()
+            .is_empty();
+        if has_diff {
+            return ZeroCommitCloseOutcome::Proceed;
+        }
+        // Case 3b: commit(s) exist but the diff vs parent is empty — a
+        // sync/merge-only close, not task work.
+        let task_type_str = format!("{task_type:?}").to_lowercase();
+        let wt_display = worker_worktree_path.display();
+        return ZeroCommitCloseOutcome::AmbiguousCodeTask(format!(
+            "⚠️ NO-DIFF CLOSE ON CODE TASK\n\n\
+            task close rejected: this is a {task_type_str} task with no \
+            code_review_findings, no execution_note, and {commit_count} \
+            commit(s) on the worker branch that produce an EMPTY diff vs \
+            {parent_branch} (a sync/merge-only commit, e.g. `git merge \
+            --no-ff` with no unique work, not task work). That combination \
+            is ambiguous — either the work wasn't committed yet, or this \
+            task was resolved without code.\n\n\
+            📂 Worker worktree: {wt_display}\n\
+            📊 Commits on branch: {commit_count} (zero-diff vs {parent_branch})\n\n\
+            To resolve:\n\
+            1. If you wrote code but forgot to commit: stage and commit your \
+               changes, then retry close.\n\
+            2. If this task was resolved without code (fixed by a sibling task, \
+               docs-only, characterization-only): update the task with an \
+               execution_note to signal intentional no-code work:\n\
+               `mcp__cas__task action=update id={task_id} execution_note=additive-only`\n\
+            3. Supervisors may bypass this gate with bypass_code_review=true \
+               (logged as a decision note)."
+        ));
     }
     // Case 3: ambiguous zero-commit close.
     let task_type_str = format!("{task_type:?}").to_lowercase();
@@ -5930,6 +5966,68 @@ mod zero_change_close_tests {
             matches!(outcome, ZeroCommitCloseOutcome::Proceed),
             "when review findings are present, the cas-490f gate owns the rejection"
         );
+    }
+
+    /// cas-9eae ("sync ≠ work"): a worker who merely syncs their branch to
+    /// the parent tip via a non-fast-forward merge (`git merge --no-ff`)
+    /// produces a commit `count_worker_branch_commits` > 0 with a
+    /// completely empty diff — no task-relevant content whatsoever. The
+    /// bug doc's confirmed repro (cas-0b7d, cli=claude worker
+    /// vivid-octopus-81) is exactly this: "the worker did produce a HEAD
+    /// change (a fast-forward/merge to the epic tip) but zero task-relevant
+    /// diff, so any guard that only checks 'did HEAD move?' would be
+    /// fooled." A pure fast-forward sync (no `--no-ff`) already yields 0
+    /// commits and is caught by `case3_zero_commit_bug_task_no_hint_rejects`
+    /// above; this test locks in the non-fast-forward variant, which the
+    /// commit-count-only check does not catch.
+    #[test]
+    fn case3_sync_only_merge_commit_with_empty_diff_rejects() {
+        let dir = init_worker_repo();
+        // Advance "main" (the parent/epic branch) with an unrelated commit
+        // so the worker's merge is not itself a no-op.
+        git(dir.path(), &["checkout", "-q", "main"]);
+        std::fs::write(dir.path().join("epic_progress.txt"), "epic moved on\n").unwrap();
+        git(dir.path(), &["add", "epic_progress.txt"]);
+        git(dir.path(), &["commit", "-q", "-m", "unrelated epic progress"]);
+        git(dir.path(), &["checkout", "-q", "factory/test-worker"]);
+        // Worker never touches any file — just syncs to the new parent tip
+        // via a forced merge commit (not a fast-forward).
+        git(
+            dir.path(),
+            &["merge", "--no-ff", "-m", "sync to epic tip", "main"],
+        );
+
+        // The merge commit means count_worker_branch_commits() > 0, so a
+        // commit-count-only gate would wrongly Proceed here.
+        assert!(
+            count_worker_branch_commits(dir.path(), "main") > 0,
+            "sanity: the sync merge must itself count as a commit beyond the old base"
+        );
+
+        let outcome = check_zero_commit_close(
+            dir.path(),
+            "main",
+            "cas-test1",
+            &TaskType::Bug,
+            None,  // no execution_note
+            false, // no review findings
+        );
+        match outcome {
+            ZeroCommitCloseOutcome::AmbiguousCodeTask(msg) => {
+                assert!(
+                    msg.contains("ZERO-COMMIT CLOSE ON CODE TASK")
+                        || msg.contains("NO-DIFF CLOSE"),
+                    "rejection must name a zero-work gate: {msg}"
+                );
+            }
+            ZeroCommitCloseOutcome::Proceed => {
+                panic!(
+                    "sync-only merge commit with zero task-relevant diff must still \
+                     be rejected as ambiguous — 'did HEAD move' is not sufficient, \
+                     per cas-9eae"
+                );
+            }
+        }
     }
 }
 
