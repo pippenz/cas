@@ -29,10 +29,25 @@ const C496_SESSION: &str = "c496-0000-test-session-0000-000000000001";
 
 /// Create a `cas` command rooted in `dir`.
 ///
-/// Critically, this function *removes* `CAS_AGENT_ROLE` and `CAS_FACTORY_MODE`
-/// from the subprocess environment even when the test runner is itself a
-/// factory worker. Without this, the subprocess would see `is_factory_worker=true`
-/// and bypass the jail, making the deny assertions silent no-ops.
+/// Critically, this function *removes* `CAS_AGENT_ROLE`, `CAS_FACTORY_MODE`,
+/// `CAS_FACTORY_WORKER_CLI`, and `CAS_FACTORY_SUPERVISOR_CLI` from the
+/// subprocess environment even when the test runner is itself a factory
+/// worker/supervisor. Without this, the subprocess would see
+/// `is_factory_worker=true` and bypass the jail, making the deny assertions
+/// silent no-ops.
+///
+/// `CAS_FACTORY_WORKER_CLI` in particular (cas-5d96): `pre_tool.rs` gates the
+/// entire verification-jail block on
+/// `worker_harness_from_env().capabilities().supports_subagents` — true for
+/// Claude, false for Codex (one-shot, no subagent spawn). When this test
+/// runs inside a live factory session where the ambient env has
+/// `CAS_FACTORY_WORKER_CLI=codex` (e.g. Codex is the configured default
+/// worker harness), that value leaked into the subprocess and silently
+/// skipped the whole jail check, making the hook return an empty `{}`
+/// decision instead of `deny` — this is exactly the "hook returns empty
+/// decision" precondition failure reported in cas-5d96. Root cause was test
+/// hermeticity, not a jail-logic regression: removing the var here restores
+/// the deny.
 fn cas_cmd(dir: &TempDir) -> Command {
     let mut cmd = Command::cargo_bin("cas").expect("cas binary must be built");
     cmd.current_dir(dir.path());
@@ -40,6 +55,8 @@ fn cas_cmd(dir: &TempDir) -> Command {
     cmd.env_remove("CAS_ROOT");
     cmd.env_remove("CAS_AGENT_ROLE");
     cmd.env_remove("CAS_FACTORY_MODE");
+    cmd.env_remove("CAS_FACTORY_WORKER_CLI");
+    cmd.env_remove("CAS_FACTORY_SUPERVISOR_CLI");
     cmd.env("CAS_SKIP_FACTORY_TOOLING", "1");
     cmd
 }
