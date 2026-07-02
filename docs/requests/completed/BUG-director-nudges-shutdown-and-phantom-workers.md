@@ -7,6 +7,16 @@ related: BUG-director-coordinator-fabricates-completions-and-bad-nudges.md (idle
 
 # BUG — `director` emits ready/idle nudges for SHUT-DOWN and phantom workers (stale roster after `shutdown_workers`)
 
+## Resolution (cas-c9f0, 2026-07-02)
+
+Resolved and moved to completed after verifying the stale-roster, phantom-worker, busy-worker, harmful-merge, and stale-message criteria against current code.
+
+- Shutdown roster eviction: already fixed in current code. `shutdown_worker` marks the exact worker record shutdown, kills the PTY process tree, removes the worker from `worker_names`, refreshes director data, calls `event_detector.remove_worker`, and rebuilds the pane grid in `cas-cli/src/ui/factory/app/render_and_ops/epic_workers.rs:456`-`516` (process-tree kill from commit `484521ca`; roster/event removal predates the current task). Batch shutdown clones the current `worker_names` and calls the same path for each worker in `epic_workers.rs:721`-`800`.
+- Stale or phantom idle/ready nudges: hardened by cas-c9f0. Current director data is already filtered to the current session's `worker_names` plus supervisor in `cas-cli/src/ui/factory/app/mod.rs:512`-`524`, and prompts are generated only after that filter in `app/mod.rs:651`-`666`. The prompt layer now refuses to emit a `WorkerIdle` nudge unless the current snapshot still contains the worker's live session row in `cas-cli/src/ui/factory/director/prompts.rs:216`-`223`; regression coverage is `test_worker_idle_suppressed_when_worker_absent_from_live_snapshot` in `prompts.rs:683`-`698`.
+- Busy worker reported idle: already fixed/proven. The event detector resets idle state when `current_task` is present in `cas-cli/src/ui/factory/director/events.rs:628`-`636`, and the prompt layer suppresses workers with active InProgress work or assigned Open work in `prompts.rs:225`-`257`. The session-id-assignee filter that prevents false disappearances is in `cas-cli/src/ui/factory/app/mod.rs:532`-`553` (commit `5c8a9f95`).
+- Harmful branch/merge guidance: fixed by cas-c9f0. The `EpicAllSubtasksClosed` prompt now only asks the supervisor to verify, close the epic, and stand down idle workers in `cas-cli/src/ui/factory/director/prompts.rs:376`-`382`; it contains no cherry-pick/main instruction. Regression coverage is `test_epic_all_subtasks_closed_has_no_branch_or_main_instructions` in `prompts.rs:716`-`735`.
+- Stale/out-of-order directive risk: mitigated for the affected director directives by current-state prompt gates. Task completion prompts re-check the current ready/in-progress snapshot before emission in `prompts.rs:141`-`176`; idle prompts re-check the live worker row and busy task snapshot in `prompts.rs:216`-`257`; epic completion no longer prescribes branch/promotion actions in `prompts.rs:376`-`382`.
+
 **Reporter:** factory supervisor `bright-condor-9`, live pantheon session `c5c67e82-...`, 2026-07-01
 **Severity:** P1 — the director urged me (repeatedly) to assign real epic tasks to workers that no longer exist. A supervisor that trusts it would assign work into a void (task assigned to a dead session id/name → never executed) while believing the fleet is larger than it is.
 

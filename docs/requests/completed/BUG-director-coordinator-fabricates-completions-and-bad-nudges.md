@@ -7,6 +7,15 @@ related: cas-c790 (phantom director nudges lead as idle worker), cas-e98e (liven
 
 # BUG — `director` coordinator fabricates "completed" notices, emits wrong assign-by-name guidance, and idle-spams the supervisor
 
+## Resolution (cas-c9f0, 2026-07-02)
+
+Resolved and moved to completed after verifying each acceptance criterion against current code.
+
+- Fabricated completions: already fixed in current code. There is no remaining source emitter for the exact `"has completed task"` string in `cas-cli/src`; the completion prompt now says `"has closed task"` and suppresses stale still-in-progress events in `cas-cli/src/ui/factory/director/prompts.rs:141`-`176`. The detector only emits `TaskCompleted` when a previously `InProgress` task disappears from active sets and has not already been announced in `cas-cli/src/ui/factory/director/events.rs:557`-`591` (core guard from commit `ffe89b21`). Current-session task filtering also keeps session-id assignees visible so in-progress tasks do not disappear falsely in `cas-cli/src/ui/factory/app/mod.rs:532`-`553` (commit `5c8a9f95`).
+- Wrong assignment guidance: fixed by cas-c9f0. Worker idle nudges resolve the live session id before emitting and use `assignee={worker_session_id}` in `cas-cli/src/ui/factory/director/prompts.rs:27`-`37` and `cas-cli/src/ui/factory/director/prompts.rs:221`-`279`; registration nudges use `assignee={agent_id}` in `cas-cli/src/ui/factory/director/prompts.rs:320`-`349`. Regression coverage is `test_worker_idle_assignee_uses_session_id` and `test_agent_registered_assignee_uses_session_id` in `cas-cli/src/ui/factory/director/prompts.rs:902`-`996`.
+- Idle/ready spam for busy or non-worker agents: already fixed/proven and hardened by cas-c9f0. The event detector excludes supervisors/team leads from idle tracking in `cas-cli/src/ui/factory/director/events.rs:615`-`623` and `events.rs:936`-`949`, resets idle state for workers with a current task or pending messages in `events.rs:628`-`648`, and suppresses between-turn gaps with fresh heartbeat plus recent activity in `events.rs:650`-`688`. The prompt layer also suppresses supervisors, stale absent workers, in-progress assignments, and assigned-but-not-started Open tasks in `cas-cli/src/ui/factory/director/prompts.rs:207`-`257`. Regression coverage includes the busy/assigned prompt tests plus `test_worker_idle_suppressed_when_worker_absent_from_live_snapshot` in `prompts.rs:683`-`698`.
+- Ready-count mismatch: fixed by cas-c9f0. Idle/ready prompts no longer embed cached counts; they direct the supervisor to live `task action=ready` in `prompts.rs:263`-`290` and `prompts.rs:336`-`348`, with coverage in `test_worker_ready_prompt` / `test_worker_ready_no_tasks` at `prompts.rs:737`-`774`.
+
 **Reporter:** factory supervisor `sharp-pelican-14`, live session `4faf90cc-...`, 2026-06-26
 **Severity:** P1 — the director's messages are actively misleading. A supervisor that trusts them will close/merge non-existent work, assign tasks with a key that doesn't resolve, and chase phantom idle workers. This session is a continuous reproduction.
 
