@@ -1,5 +1,12 @@
 # BUG: Codex factory worker not given CAS MCP tools; wrong tool prefix; stops after startup
 
+## Resolution
+
+Resolved by `cas-bbc2` (`32a3796`, `fix(cas-bbc2): spawn-inject CAS MCP server into Codex agents + single-task worker prompt`).
+`PtyConfig::codex` now calls `push_codex_mcp_server_args` for every Codex agent before adding role-specific instructions, injecting `mcp_servers.cs.command="cas"`, `mcp_servers.cs.args=["serve"]`, and the required CAS session/factory identity environment. The injected server uses the `cs` alias, so Codex workers receive `mcp__cs__*` tools even in projects with Claude-only `.mcp.json` configuration and no `.codex/config.toml`.
+
+The same change corrected the reported Codex prompt surface: Codex worker/supervisor instructions use the `mcp__cs__` alias and enforce a single-task worker loop. Existing regression coverage in `crates/cas-pty/src/pty.rs` checks worker and supervisor MCP injection, the `mcp__cs__` prefix, and one-task-at-a-time wording. No additional runtime fix was needed for this request.
+
 **Date:** 2026-06-24
 **Reporter:** supervisor (Petra Stella Cloud factory session quick-salmon-65, session ae28fe25-14ab-49bc-a770-3cd42259c88a)
 **Severity:** P1 — `cli=codex` factory workers cannot reach CAS tooling natively and produce zero code
