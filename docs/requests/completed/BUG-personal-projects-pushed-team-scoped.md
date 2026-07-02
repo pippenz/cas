@@ -6,6 +6,8 @@ priority: P1
 
 # Personal projects get registered + pushed as team-scoped (OpenClaw, Penguinz)
 
+Resolution: Already fixed by `7a84903` (`fix(cloud): personal projects must not be team-promoted on push (cas-f8e3)`); regression coverage was completed in `3d2d6b4`.
+
 ## Problem
 
 Daniel reported that `openclaw` and `Penguinz` are **personal** projects — they were never meant to be shared with the Petra Stella team. But on the cloud they were fully **team-scoped** under team `2a57bec9-5dfa-4a8f-b711-31f9aeb8d6cb`: a `projects` registry row each, a `project_aliases` row, and **every one** of their `sync_entities` rows tagged with the team id. That means their content was visible to all team members via team pull, and they showed up in the cas-4854 team-task explorer dashboard as if they were team projects.

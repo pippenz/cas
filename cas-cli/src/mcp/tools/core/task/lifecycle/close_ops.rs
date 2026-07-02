@@ -2266,19 +2266,56 @@ pub(crate) fn run_factory_branch_merge_gate(
     if stranded == 0 {
         return MergeStateGateOutcome::Proceed;
     }
+
+    // cas-c631: `epic/<slug>` branches are created locally by the supervisor
+    // (see cas-supervisor EPIC workflow) and are, by convention, never pushed
+    // to origin — the epic ships to `main` as a single PR once complete, not
+    // per-worker. Telling a worker to "open a PR targeting {parent_branch}"
+    // when `parent_branch` is one of these local-only epic branches sends
+    // them straight at a `gh pr create --base epic/<slug>` call that fails
+    // (no such ref on origin), which is exactly the recurring close-time
+    // friction this task exists to fix. Detect that case by the naming
+    // convention (cheap, deterministic, matches the same `starts_with(
+    // "epic/")` check used elsewhere for epic branches, e.g.
+    // `mcp/tools/mod.rs` and `worktree/manager/epic_ops.rs`) and hand the
+    // worker a supervisor-merge-request handoff instead of PR instructions.
+    let parent_is_local_epic_branch = parent_branch.starts_with("epic/");
+
+    let remediation = if parent_is_local_epic_branch {
+        format!(
+            "Remediation:\n\
+             1. {parent_branch} is a local-only epic branch (not pushed to origin) \
+             — do NOT run `gh pr create --base {parent_branch}`, it has no \
+             matching ref on origin and the PR will fail.\n\
+             2. Push {factory_branch} to origin so your commit is durable: \
+             `git push origin {factory_branch}`\n\
+             3. Message your supervisor to merge {factory_branch} into \
+             {parent_branch} (e.g. `mcp__cas__coordination action=message \
+             target=supervisor summary=\"ready to merge\" message=\"{factory_branch} \
+             ready for {parent_branch}\"`) — they merge with \
+             `git merge --no-ff {factory_branch}` on the epic branch.\n\
+             4. Once merged, retry mcp__cas__task action=close",
+        )
+    } else {
+        format!(
+            "Remediation:\n\
+             1. Push {factory_branch} to its remote\n\
+             2. Open a PR targeting {parent_branch}\n\
+             3. Merge the PR (or `git fetch --prune` if it was already merged \
+             and your local ref is stale)\n\
+             4. Retry mcp__cas__task action=close",
+        )
+    };
+
     MergeStateGateOutcome::Reject(format!(
         "⚠️ MERGE REQUIRED\n\n\
          task close rejected: {factory_branch} has {stranded} commit(s) not on \
          {parent_branch}.\n\n\
-         Push the branch and merge a PR before closing. This guard cannot be \
-         bypassed (use of bypass_code_review=true does not skip merge-state \
-         checks — it is a data-state guard, not a review gate).\n\n\
-         Remediation:\n\
-         1. Push {factory_branch} to its remote\n\
-         2. Open a PR targeting {parent_branch}\n\
-         3. Merge the PR (or `git fetch --prune` if it was already merged \
-         and your local ref is stale)\n\
-         4. Retry mcp__cas__task action=close",
+         The branch must be merged into {parent_branch} before closing. This \
+         guard cannot be bypassed (use of bypass_code_review=true does not \
+         skip merge-state checks — it is a data-state guard, not a review \
+         gate).\n\n\
+         {remediation}",
     ))
 }
 
@@ -2679,9 +2716,45 @@ pub(crate) fn check_zero_commit_close(
     if has_review_findings {
         return ZeroCommitCloseOutcome::Proceed;
     }
-    // Count commits: if > 0, this is case 1 (docs-only), not case 3.
-    if count_worker_branch_commits(worker_worktree_path, parent_branch) > 0 {
-        return ZeroCommitCloseOutcome::Proceed;
+    // Count commits: if > 0, this MAY be case 1 (docs-only) — but it can
+    // also be a sync-only merge/fast-forward-forced commit (cas-9eae
+    // "sync ≠ work"): `git merge --no-ff <parent>` on a branch with no
+    // unique work produces a commit that advances the count while
+    // contributing an empty diff. "Did HEAD move / is there a commit" is
+    // not sufficient; require an actual non-empty diff vs `parent_branch`.
+    let commit_count = count_worker_branch_commits(worker_worktree_path, parent_branch);
+    if commit_count > 0 {
+        let has_diff = !get_worker_diff_stat(worker_worktree_path, parent_branch)
+            .trim()
+            .is_empty();
+        if has_diff {
+            return ZeroCommitCloseOutcome::Proceed;
+        }
+        // Case 3b: commit(s) exist but the diff vs parent is empty — a
+        // sync/merge-only close, not task work.
+        let task_type_str = format!("{task_type:?}").to_lowercase();
+        let wt_display = worker_worktree_path.display();
+        return ZeroCommitCloseOutcome::AmbiguousCodeTask(format!(
+            "⚠️ NO-DIFF CLOSE ON CODE TASK\n\n\
+            task close rejected: this is a {task_type_str} task with no \
+            code_review_findings, no execution_note, and {commit_count} \
+            commit(s) on the worker branch that produce an EMPTY diff vs \
+            {parent_branch} (a sync/merge-only commit, e.g. `git merge \
+            --no-ff` with no unique work, not task work). That combination \
+            is ambiguous — either the work wasn't committed yet, or this \
+            task was resolved without code.\n\n\
+            📂 Worker worktree: {wt_display}\n\
+            📊 Commits on branch: {commit_count} (zero-diff vs {parent_branch})\n\n\
+            To resolve:\n\
+            1. If you wrote code but forgot to commit: stage and commit your \
+               changes, then retry close.\n\
+            2. If this task was resolved without code (fixed by a sibling task, \
+               docs-only, characterization-only): update the task with an \
+               execution_note to signal intentional no-code work:\n\
+               `mcp__cas__task action=update id={task_id} execution_note=additive-only`\n\
+            3. Supervisors may bypass this gate with bypass_code_review=true \
+               (logged as a decision note)."
+        ));
     }
     // Case 3: ambiguous zero-commit close.
     let task_type_str = format!("{task_type:?}").to_lowercase();
@@ -4948,9 +5021,17 @@ mod merge_state_gate_tests {
     /// into `factory/<worker>`, and return the tempdir on the worker
     /// branch. Caller adds whatever commits it wants on top.
     fn init_factory_repo(worker: &str) -> TempDir {
+        init_factory_repo_with_parent(worker, "main")
+    }
+
+    /// Same as [`init_factory_repo`] but the initial (parent) branch is
+    /// named `parent_branch` instead of the hardcoded `main` — used by
+    /// cas-c631's regression coverage to simulate a local-only
+    /// `epic/<slug>` parent branch.
+    fn init_factory_repo_with_parent(worker: &str, parent_branch: &str) -> TempDir {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path();
-        git(p, &["init", "-q", "-b", "main"]);
+        git(p, &["init", "-q", "-b", parent_branch]);
         std::fs::write(p.join("seed.txt"), "seed\n").unwrap();
         git(p, &["add", "seed.txt"]);
         git(p, &["commit", "-q", "-m", "seed"]);
@@ -5022,6 +5103,61 @@ mod merge_state_gate_tests {
                 assert!(
                     msg.contains("bypass_code_review=true"),
                     "remediation must call out bypass-immunity: {msg}"
+                );
+                assert!(
+                    msg.contains("Open a PR targeting main"),
+                    "plain (non-epic) parent branch must keep the PR-based \
+                     remediation unchanged: {msg}"
+                );
+            }
+            other => panic!("expected Reject for stranded factory branch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn worker_task_close_on_local_epic_branch_points_at_supervisor_merge_not_pr() {
+        // cas-c631: when the parent branch is a local-only `epic/<slug>`
+        // branch (the supervisor's EPIC workflow convention — never pushed
+        // to origin), the remediation must NOT tell the worker to open a PR
+        // against it (that `gh pr create --base epic/<slug>` call fails with
+        // no matching origin ref — the exact recurring friction this task
+        // fixes). It must instead hand the worker a push + supervisor-merge
+        // handoff.
+        let parent = "epic/epic-triage-fix-the-docs-requests-bug-backlog-veri-cas-fff9";
+        let dir = init_factory_repo_with_parent("worker", parent);
+        std::fs::write(dir.path().join("a.rs"), "// a\n").unwrap();
+        git(dir.path(), &["add", "a.rs"]);
+        git(dir.path(), &["commit", "-q", "-m", "feat: a"]);
+
+        let task = worker_task("worker");
+        let req = base_req(&task.id);
+        let out = run_factory_branch_merge_gate(&task, &req, parent, dir.path());
+
+        match out {
+            MergeStateGateOutcome::Reject(msg) => {
+                assert!(msg.contains("MERGE REQUIRED"), "missing header: {msg}");
+                assert!(
+                    msg.contains("factory/worker"),
+                    "missing factory branch name: {msg}"
+                );
+                assert!(msg.contains(parent), "missing parent branch name: {msg}");
+                assert!(
+                    msg.contains("bypass_code_review=true"),
+                    "remediation must still call out bypass-immunity: {msg}"
+                );
+                assert!(
+                    !msg.contains("Open a PR targeting"),
+                    "must NOT tell the worker to open a PR against a local-only \
+                     epic branch: {msg}"
+                );
+                assert!(
+                    msg.contains("do NOT run `gh pr create"),
+                    "must explicitly warn against gh pr create on the missing \
+                     origin ref: {msg}"
+                );
+                assert!(
+                    msg.contains("supervisor to merge"),
+                    "must hand the worker a supervisor-merge-request handoff: {msg}"
                 );
             }
             other => panic!("expected Reject for stranded factory branch, got {other:?}"),
@@ -5930,6 +6066,68 @@ mod zero_change_close_tests {
             matches!(outcome, ZeroCommitCloseOutcome::Proceed),
             "when review findings are present, the cas-490f gate owns the rejection"
         );
+    }
+
+    /// cas-9eae ("sync ≠ work"): a worker who merely syncs their branch to
+    /// the parent tip via a non-fast-forward merge (`git merge --no-ff`)
+    /// produces a commit `count_worker_branch_commits` > 0 with a
+    /// completely empty diff — no task-relevant content whatsoever. The
+    /// bug doc's confirmed repro (cas-0b7d, cli=claude worker
+    /// vivid-octopus-81) is exactly this: "the worker did produce a HEAD
+    /// change (a fast-forward/merge to the epic tip) but zero task-relevant
+    /// diff, so any guard that only checks 'did HEAD move?' would be
+    /// fooled." A pure fast-forward sync (no `--no-ff`) already yields 0
+    /// commits and is caught by `case3_zero_commit_bug_task_no_hint_rejects`
+    /// above; this test locks in the non-fast-forward variant, which the
+    /// commit-count-only check does not catch.
+    #[test]
+    fn case3_sync_only_merge_commit_with_empty_diff_rejects() {
+        let dir = init_worker_repo();
+        // Advance "main" (the parent/epic branch) with an unrelated commit
+        // so the worker's merge is not itself a no-op.
+        git(dir.path(), &["checkout", "-q", "main"]);
+        std::fs::write(dir.path().join("epic_progress.txt"), "epic moved on\n").unwrap();
+        git(dir.path(), &["add", "epic_progress.txt"]);
+        git(dir.path(), &["commit", "-q", "-m", "unrelated epic progress"]);
+        git(dir.path(), &["checkout", "-q", "factory/test-worker"]);
+        // Worker never touches any file — just syncs to the new parent tip
+        // via a forced merge commit (not a fast-forward).
+        git(
+            dir.path(),
+            &["merge", "--no-ff", "-m", "sync to epic tip", "main"],
+        );
+
+        // The merge commit means count_worker_branch_commits() > 0, so a
+        // commit-count-only gate would wrongly Proceed here.
+        assert!(
+            count_worker_branch_commits(dir.path(), "main") > 0,
+            "sanity: the sync merge must itself count as a commit beyond the old base"
+        );
+
+        let outcome = check_zero_commit_close(
+            dir.path(),
+            "main",
+            "cas-test1",
+            &TaskType::Bug,
+            None,  // no execution_note
+            false, // no review findings
+        );
+        match outcome {
+            ZeroCommitCloseOutcome::AmbiguousCodeTask(msg) => {
+                assert!(
+                    msg.contains("ZERO-COMMIT CLOSE ON CODE TASK")
+                        || msg.contains("NO-DIFF CLOSE"),
+                    "rejection must name a zero-work gate: {msg}"
+                );
+            }
+            ZeroCommitCloseOutcome::Proceed => {
+                panic!(
+                    "sync-only merge commit with zero task-relevant diff must still \
+                     be rejected as ambiguous — 'did HEAD move' is not sufficient, \
+                     per cas-9eae"
+                );
+            }
+        }
     }
 }
 

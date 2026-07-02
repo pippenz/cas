@@ -20,7 +20,7 @@ use cas::store::{
     AgentStore, PromptQueueStore, SpawnQueueStore, TaskStore, init_cas_dir, open_agent_store,
     open_prompt_queue_store, open_spawn_queue_store, open_task_store,
 };
-use cas::types::{Agent, Task, TaskStatus, TaskType};
+use cas::types::{Agent, AgentStatus, Task, TaskStatus, TaskType};
 use cas_mcp::types::{CoordinationRequest, FactoryRequest};
 use cas_types::AgentRole;
 use rmcp::handler::server::wrapper::Parameters;
@@ -127,6 +127,16 @@ impl FactoryTestEnv {
         let mut agent = Agent::new(id.clone(), name.to_string());
         agent.role = AgentRole::Supervisor;
         store.register(&agent).expect("register supervisor");
+        id
+    }
+
+    fn register_worker_with_status(&self, name: &str, status: AgentStatus) -> String {
+        let store = self.agent_store();
+        let id = Agent::generate_fallback_id();
+        let mut agent = Agent::new(id.clone(), name.to_string());
+        agent.role = AgentRole::Worker;
+        agent.status = status;
+        store.register(&agent).expect("register worker with status");
         id
     }
 
@@ -311,7 +321,10 @@ async fn test_spawn_workers_cli_codex_enqueues_spec() {
     req.cli = Some("codex".to_string());
 
     let result = env.service.factory(Parameters(req)).await;
-    assert!(result.is_ok(), "spawn_workers with cli=codex should succeed");
+    assert!(
+        result.is_ok(),
+        "spawn_workers with cli=codex should succeed"
+    );
 
     let entries = env.spawn_queue().peek(10).expect("peek");
     assert_eq!(entries.len(), 1, "should have one queue entry");
@@ -523,11 +536,8 @@ async fn test_worker_status_prunes_stale_worker_and_keeps_live_one() {
     // Live worker: default heartbeat = now, stays in Active.
     env.register_worker("live-fox");
     // Stale worker: heartbeat backdated 40s so list_stale(30) catches it.
-    let stale_id = env.register_stale_worker_with_clone_path(
-        "dead-wolf",
-        "/tmp/cas-worktrees/dead-wolf",
-        40,
-    );
+    let stale_id =
+        env.register_stale_worker_with_clone_path("dead-wolf", "/tmp/cas-worktrees/dead-wolf", 40);
 
     let req = factory_req("worker_status");
     let result = env
@@ -560,6 +570,77 @@ async fn test_worker_status_prunes_stale_worker_and_keeps_live_one() {
     assert!(
         text.contains("30s heartbeat age"),
         "footer must reference the 30s worker threshold. Got:\n{text}"
+    );
+}
+
+/// cas-9829: a worker holding an in-progress task lease whose last observed
+/// activity is at/past the configured `stall_threshold_secs` must render
+/// `⚠ STALLED`, not the soft "may be investigating or idle" hedge — that
+/// hedge is exactly what let a genuinely stalled worker go unnoticed in the
+/// reported bug (worker printed a plan, then produced nothing for 10+
+/// minutes while heartbeating fine). A worker with NO claimed task must
+/// never be marked STALLED — that's the pre-existing WorkerIdle state, a
+/// different signal entirely.
+///
+/// `stall_threshold_secs` is set to `0` via `.cas/config.toml` so the
+/// claim's own registration-time activity event (which is necessarily
+/// "0s ago" in a synchronous test) already counts as past-threshold —
+/// this deterministically exercises the render wiring without needing to
+/// fabricate a real time gap.
+#[tokio::test]
+async fn test_9829_worker_status_marks_stalled_worker_with_in_progress_task() {
+    let _guard = EnvGuard::set(&[]);
+    let env = FactoryTestEnv::new();
+    std::fs::write(
+        env.cas_root.join("config.toml"),
+        "[factory]\nstall_threshold_secs = 0\n",
+    )
+    .expect("write config.toml");
+
+    let busy_id = env.register_worker("busy-badger");
+    let task_store = env.task_store();
+    let task = Task::new("cas-0b7d".to_string(), "Stalled task".to_string());
+    task_store.add(&task).expect("add task");
+    env.agent_store()
+        .try_claim("cas-0b7d", &busy_id, 600, None)
+        .expect("claim task")
+        .is_success();
+
+    env.register_worker("idle-ibis"); // no claimed task — must stay soft-worded
+
+    let req = factory_req("worker_status");
+    let result = env
+        .service
+        .factory(Parameters(req))
+        .await
+        .expect("worker_status call should succeed");
+    let text = get_text(&result);
+
+    assert!(
+        text.contains("busy-badger"),
+        "busy worker must appear in the listing. Got:\n{text}"
+    );
+    // Find the busy-badger's own row/block for a precise assertion (avoid a
+    // STALLED marker from the wrong worker satisfying the check).
+    let badger_block = text
+        .split("• ")
+        .find(|block| block.starts_with("busy-badger"))
+        .expect("busy-badger row must be present");
+    assert!(
+        badger_block.contains("⚠ STALLED"),
+        "worker with an in-progress task past the stall threshold must be marked STALLED. Got:\n{badger_block}"
+    );
+
+    // A worker with no claimed task is never "stalled" in this sense — an
+    // idle worker with no task is the pre-existing WorkerIdle state, not a
+    // stall, regardless of how fresh/stale its activity looks.
+    let ibis_block = text
+        .split("• ")
+        .find(|block| block.starts_with("idle-ibis"))
+        .expect("idle-ibis row must be present");
+    assert!(
+        !ibis_block.contains("⚠ STALLED"),
+        "a worker with no claimed task must never be marked STALLED. Got:\n{ibis_block}"
     );
 }
 
@@ -748,6 +829,59 @@ async fn test_gc_cleanup_with_force() {
     assert_eq!(pq.pending_count().expect("count"), 0);
 }
 
+#[tokio::test]
+async fn test_gc_cleanup_purges_stale_and_shutdown_worker_records() {
+    let env = FactoryTestEnv::new();
+
+    let stale_id = env.register_worker_with_status("stale-wolf", AgentStatus::Stale);
+    let shutdown_id = env.register_worker_with_status("shutdown-fox", AgentStatus::Shutdown);
+
+    let req = factory_req("gc_cleanup");
+    let result = env.service.factory(Parameters(req)).await;
+    assert!(result.is_ok());
+
+    let text = get_text(&result.unwrap());
+    assert!(
+        text.contains("Dead agent records purged: 2"),
+        "Should report purged dead agent records: {text}"
+    );
+
+    let store = env.agent_store();
+    assert!(
+        store.get(&stale_id).is_err(),
+        "stale worker should be purged"
+    );
+    assert!(
+        store.get(&shutdown_id).is_err(),
+        "shutdown worker should be purged"
+    );
+}
+
+#[tokio::test]
+async fn test_gc_cleanup_preserves_stale_supervisors() {
+    let env = FactoryTestEnv::new();
+
+    let supervisor_id = env.register_supervisor("stale-supervisor");
+    let store = env.agent_store();
+    let mut supervisor = store.get(&supervisor_id).expect("get supervisor");
+    supervisor.status = AgentStatus::Stale;
+    store.update(&supervisor).expect("mark supervisor stale");
+
+    let req = factory_req("gc_cleanup");
+    let result = env.service.factory(Parameters(req)).await;
+    assert!(result.is_ok());
+
+    let text = get_text(&result.unwrap());
+    assert!(
+        text.contains("Dead agent records purged: 0"),
+        "Should not purge supervisor/director records: {text}"
+    );
+    assert!(
+        store.get(&supervisor_id).is_ok(),
+        "stale supervisor record should be preserved"
+    );
+}
+
 // =============================================================================
 // Sequence tests
 // =============================================================================
@@ -798,7 +932,12 @@ async fn test_unknown_action() {
 // =============================================================================
 
 /// Minimal CoordinationRequest for the `message`/`interrupt` actions.
-fn coord_msg(action: &str, target: &str, message: &str, urgent: Option<bool>) -> CoordinationRequest {
+fn coord_msg(
+    action: &str,
+    target: &str,
+    message: &str,
+    urgent: Option<bool>,
+) -> CoordinationRequest {
     CoordinationRequest {
         action: action.to_string(),
         id: None,
@@ -848,7 +987,10 @@ fn coord_msg(action: &str, target: &str, message: &str, urgent: Option<bool>) ->
 /// the unchanged inbox/queue delivery path. Regression guard.
 #[tokio::test]
 async fn test_coordination_message_default_is_not_urgent() {
-    let _guard = EnvGuard::set(&[("CAS_AGENT_ROLE", "supervisor"), ("CAS_AGENT_NAME", "supervisor")]);
+    let _guard = EnvGuard::set(&[
+        ("CAS_AGENT_ROLE", "supervisor"),
+        ("CAS_AGENT_NAME", "supervisor"),
+    ]);
     let env = FactoryTestEnv::new();
     env.register_worker("swift-fox");
 
@@ -866,7 +1008,10 @@ async fn test_coordination_message_default_is_not_urgent() {
 /// the response advertises interrupt-and-redirect delivery.
 #[tokio::test]
 async fn test_coordination_message_urgent_flag_enqueues_urgent() {
-    let _guard = EnvGuard::set(&[("CAS_AGENT_ROLE", "supervisor"), ("CAS_AGENT_NAME", "supervisor")]);
+    let _guard = EnvGuard::set(&[
+        ("CAS_AGENT_ROLE", "supervisor"),
+        ("CAS_AGENT_NAME", "supervisor"),
+    ]);
     let env = FactoryTestEnv::new();
     env.register_worker("swift-fox");
 
@@ -874,11 +1019,17 @@ async fn test_coordination_message_urgent_flag_enqueues_urgent() {
     let result = env.service.coordination(Parameters(req)).await;
     assert!(result.is_ok(), "urgent message should succeed: {result:?}");
     let text = get_text(&result.unwrap());
-    assert!(text.contains("URGENT"), "response should mark URGENT: {text}");
+    assert!(
+        text.contains("URGENT"),
+        "response should mark URGENT: {text}"
+    );
 
     let prompts = env.prompt_queue().peek_all(10).expect("peek");
     assert_eq!(prompts.len(), 1);
-    assert!(prompts[0].urgent, "urgent=true must persist on the queue row");
+    assert!(
+        prompts[0].urgent,
+        "urgent=true must persist on the queue row"
+    );
     assert_eq!(
         prompts[0].priority,
         cas_store::NotificationPriority::Critical,
@@ -889,14 +1040,25 @@ async fn test_coordination_message_urgent_flag_enqueues_urgent() {
 /// `action=interrupt` is sugar for `message` with urgent=true.
 #[tokio::test]
 async fn test_coordination_interrupt_action_is_urgent() {
-    let _guard = EnvGuard::set(&[("CAS_AGENT_ROLE", "supervisor"), ("CAS_AGENT_NAME", "supervisor")]);
+    let _guard = EnvGuard::set(&[
+        ("CAS_AGENT_ROLE", "supervisor"),
+        ("CAS_AGENT_NAME", "supervisor"),
+    ]);
     let env = FactoryTestEnv::new();
     env.register_worker("swift-fox");
 
     // urgent intentionally None — the action alone must force urgent.
-    let req = coord_msg("interrupt", "swift-fox", "abort and re-read the ticket", None);
+    let req = coord_msg(
+        "interrupt",
+        "swift-fox",
+        "abort and re-read the ticket",
+        None,
+    );
     let result = env.service.coordination(Parameters(req)).await;
-    assert!(result.is_ok(), "interrupt action should succeed: {result:?}");
+    assert!(
+        result.is_ok(),
+        "interrupt action should succeed: {result:?}"
+    );
 
     let prompts = env.prompt_queue().peek_all(10).expect("peek");
     assert_eq!(prompts.len(), 1);
@@ -1022,15 +1184,27 @@ async fn test_efc4_model_and_effort_reach_spawn_spec_for_each_harness() {
         .worker_spec
         .as_deref()
         .expect("codex entry must have spec");
-    assert!(codex_spec.contains("codex"), "codex harness in spec: {codex_spec}");
-    assert!(codex_spec.contains("o4-mini"), "codex model in spec: {codex_spec}");
-    assert!(codex_spec.contains("xhigh"), "codex effort in spec: {codex_spec}");
+    assert!(
+        codex_spec.contains("codex"),
+        "codex harness in spec: {codex_spec}"
+    );
+    assert!(
+        codex_spec.contains("o4-mini"),
+        "codex model in spec: {codex_spec}"
+    );
+    assert!(
+        codex_spec.contains("xhigh"),
+        "codex effort in spec: {codex_spec}"
+    );
 
     let claude_spec = entries[1]
         .worker_spec
         .as_deref()
         .expect("claude entry must have spec when cli given");
-    assert!(claude_spec.contains("claude"), "claude harness in spec: {claude_spec}");
+    assert!(
+        claude_spec.contains("claude"),
+        "claude harness in spec: {claude_spec}"
+    );
     assert!(
         claude_spec.contains("claude-opus-4-5"),
         "claude model in spec: {claude_spec}"

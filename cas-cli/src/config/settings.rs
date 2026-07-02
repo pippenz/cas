@@ -126,6 +126,19 @@ pub struct FactoryConfig {
     /// cargo builds under contention.
     #[serde(default = "default_true")]
     pub nice_cargo: bool,
+
+    /// Seconds a worker may hold an in-progress task with a fresh heartbeat
+    /// but zero observable activity (no file edits, commits, or subagent
+    /// events) before the director flags it `WorkerStalled` and notifies
+    /// the supervisor (cas-9829). Distinct from heartbeat liveness — a
+    /// worker can heartbeat every tick while having produced nothing for
+    /// the current task; this is the "alive but stuck" signal that gap
+    /// left silent.
+    ///
+    /// Default [`cas_factory::DEFAULT_STALL_THRESHOLD_SECS`] (5 minutes,
+    /// "a few minutes" per the bug report).
+    #[serde(default = "default_stall_threshold_secs")]
+    pub stall_threshold_secs: u64,
 }
 
 fn default_stale_threshold() -> u32 {
@@ -136,6 +149,10 @@ fn default_auto() -> String {
     "auto".to_string()
 }
 
+fn default_stall_threshold_secs() -> u64 {
+    cas_factory::DEFAULT_STALL_THRESHOLD_SECS
+}
+
 impl Default for FactoryConfig {
     fn default() -> Self {
         Self {
@@ -144,6 +161,7 @@ impl Default for FactoryConfig {
             stale_threshold_commits: default_stale_threshold(),
             cargo_build_jobs: default_auto(),
             nice_cargo: true,
+            stall_threshold_secs: default_stall_threshold_secs(),
         }
     }
 }
@@ -841,6 +859,28 @@ mod tests {
         let fc = parsed.get("factory").expect("section present");
         assert_eq!(fc.cargo_build_jobs, FactoryConfig::default().cargo_build_jobs);
         assert_eq!(fc.nice_cargo, FactoryConfig::default().nice_cargo);
+        assert_eq!(
+            fc.stall_threshold_secs,
+            FactoryConfig::default().stall_threshold_secs
+        );
+    }
+
+    /// cas-9829: `stall_threshold_secs` defaults to a few minutes
+    /// (`cas_factory::DEFAULT_STALL_THRESHOLD_SECS`) and is overridable via
+    /// `.cas/config.toml`. A regression that silently ignored the TOML
+    /// value would leave every operator stuck with the default, unable to
+    /// tune stall detection for their workload.
+    #[test]
+    fn factory_config_stall_threshold_secs_configurable() {
+        let toml_str = "[factory]\nstall_threshold_secs = 120\n";
+        let parsed: std::collections::HashMap<String, FactoryConfig> =
+            toml::from_str(toml_str).expect("valid toml");
+        let fc = parsed.get("factory").expect("section present");
+        assert_eq!(fc.stall_threshold_secs, 120);
+        assert_eq!(
+            FactoryConfig::default().stall_threshold_secs,
+            cas_factory::DEFAULT_STALL_THRESHOLD_SECS
+        );
     }
 
     /// cas-39f5: the `[memory]` section must default `session_learn_auto`

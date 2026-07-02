@@ -291,6 +291,58 @@ fn test_create_epic_branch() {
 }
 
 #[test]
+fn test_create_epic_branch_uses_trunk_not_current_head() {
+    let (_temp, repo_path) = create_test_repo();
+    let config = WorktreeConfig::default();
+
+    let trunk = Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(&repo_path)
+        .output()
+        .unwrap();
+    let trunk = String::from_utf8_lossy(&trunk.stdout).trim().to_string();
+    let trunk_sha = Command::new("git")
+        .args(["rev-parse", &trunk])
+        .current_dir(&repo_path)
+        .output()
+        .unwrap();
+    let trunk_sha = String::from_utf8_lossy(&trunk_sha.stdout)
+        .trim()
+        .to_string();
+
+    Command::new("git")
+        .args(["checkout", "-q", "-b", "feature/supervisor-head"])
+        .current_dir(&repo_path)
+        .output()
+        .unwrap();
+    std::fs::write(repo_path.join("feature.txt"), "feature-only").unwrap();
+    Command::new("git")
+        .args(["add", "feature.txt"])
+        .current_dir(&repo_path)
+        .output()
+        .unwrap();
+    Command::new("git")
+        .args(["commit", "-m", "feature-only"])
+        .current_dir(&repo_path)
+        .output()
+        .unwrap();
+
+    let manager = WorktreeManager::new(&repo_path, config).unwrap();
+    let branch = manager.create_epic_branch("Base Regression").unwrap();
+    let epic_sha = Command::new("git")
+        .args(["rev-parse", &branch])
+        .current_dir(&repo_path)
+        .output()
+        .unwrap();
+    let epic_sha = String::from_utf8_lossy(&epic_sha.stdout).trim().to_string();
+
+    assert_eq!(
+        epic_sha, trunk_sha,
+        "epic branch must be created from trunk {trunk}, not current feature HEAD"
+    );
+}
+
+#[test]
 fn test_create_epic_branch_idempotent() {
     let (_temp, repo_path) = create_test_repo();
     let config = WorktreeConfig::default();

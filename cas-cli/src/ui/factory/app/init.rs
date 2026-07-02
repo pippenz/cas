@@ -185,6 +185,7 @@ impl FactoryApp {
 
         let mut event_detector =
             DirectorEventDetector::new(worker_names.clone(), supervisor_name.clone());
+        event_detector.set_stall_threshold_secs(config.stall_threshold_secs);
         event_detector.initialize(&director_data);
 
         let notifier = Notifier::new(config.notify);
@@ -345,6 +346,9 @@ impl FactoryApp {
         // Resolve theme: explicit config overrides auto-detection
         let cas_config = Config::load(&cas_dir).unwrap_or_default();
         let theme = ActiveTheme::resolve(cas_config.theme.as_ref());
+        // cas-9829: activity-based stall detection threshold, sourced from
+        // `.cas/config.toml` `[factory] stall_threshold_secs`.
+        event_detector.set_stall_threshold_secs(cas_config.factory().stall_threshold_secs);
 
         let app = Self {
             mux,

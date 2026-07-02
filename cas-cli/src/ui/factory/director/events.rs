@@ -72,6 +72,24 @@ pub enum DirectorEvent {
     },
     /// A worker became idle (no in-progress tasks)
     WorkerIdle { worker: String },
+    /// A worker has an in-progress task and a fresh heartbeat, but no
+    /// observable activity (file edit, commit, subagent event, ...) for
+    /// longer than the configured stall threshold (cas-9829). Heartbeat
+    /// alone cannot distinguish "healthy" from "printed a plan and
+    /// stopped" — this is the activity-based signal that fills that gap.
+    ///
+    /// `escalate = false` on first detection in a stall streak: the
+    /// director auto-nudges the worker once (re-injects the task prompt)
+    /// instead of paging the supervisor immediately, since a single
+    /// re-poke often unsticks a stalled agent. `escalate = true` once the
+    /// worker is still stalled after that nudge — the supervisor is
+    /// notified at that point.
+    WorkerStalled {
+        worker: String,
+        task_id: String,
+        elapsed_secs: u64,
+        escalate: bool,
+    },
     /// A new agent registered
     AgentRegistered {
         agent_id: String,
@@ -96,6 +114,7 @@ impl DirectorEvent {
             Self::TaskCompleted { worker, .. } => Some(worker),
             Self::TaskBlocked { worker, .. } => Some(worker),
             Self::WorkerIdle { worker } => Some(worker),
+            Self::WorkerStalled { worker, .. } => Some(worker),
             Self::AgentRegistered { agent_name, .. } => Some(agent_name),
             Self::EpicStarted { .. } => None, // Broadcast or supervisor
             Self::EpicCompleted { .. } => None,
@@ -129,6 +148,20 @@ impl DirectorEvent {
             }
             Self::WorkerIdle { worker } => {
                 format!("{worker} is idle")
+            }
+            Self::WorkerStalled {
+                worker,
+                task_id,
+                elapsed_secs,
+                escalate,
+            } => {
+                if *escalate {
+                    format!(
+                        "{worker} still stalled on {task_id} after {elapsed_secs}s (nudged, escalating to supervisor)"
+                    )
+                } else {
+                    format!("{worker} stalled on {task_id}: no activity for {elapsed_secs}s")
+                }
             }
             Self::AgentRegistered { agent_name, .. } => {
                 format!("{agent_name} registered")
@@ -174,6 +207,11 @@ impl DirectorEvent {
             Self::WorkerIdle { worker } => {
                 format!("idle:{worker}")
             }
+            Self::WorkerStalled {
+                worker, escalate, ..
+            } => {
+                format!("stalled:{worker}:{escalate}")
+            }
             Self::AgentRegistered { agent_id, .. } => {
                 format!("registered:{agent_id}")
             }
@@ -196,6 +234,7 @@ impl DirectorEvent {
             Self::TaskCompleted { .. } => "task_completed",
             Self::TaskBlocked { .. } => "task_blocked",
             Self::WorkerIdle { .. } => "worker_idle",
+            Self::WorkerStalled { .. } => "worker_stalled",
             Self::AgentRegistered { .. } => "agent_registered",
             Self::EpicStarted { .. } => "epic_started",
             Self::EpicCompleted { .. } => "epic_completed",
@@ -235,6 +274,17 @@ impl DirectorEvent {
             }),
             Self::WorkerIdle { worker } => serde_json::json!({
                 "worker": worker,
+            }),
+            Self::WorkerStalled {
+                worker,
+                task_id,
+                elapsed_secs,
+                escalate,
+            } => serde_json::json!({
+                "worker": worker,
+                "task_id": task_id,
+                "elapsed_secs": elapsed_secs,
+                "escalate": escalate,
             }),
             Self::AgentRegistered {
                 agent_id,
@@ -365,6 +415,20 @@ pub struct DirectorEventDetector {
     /// Key is `"{task_id}:{assignee_id}"`. A genuine reassignment to a
     /// *different* worker produces a new key and is therefore not suppressed.
     task_assigned_announced: HashSet<String>,
+    /// Workers that have already received the one-shot stall auto-nudge in
+    /// the current stall streak (cas-9829). Cleared once the worker's
+    /// activity resumes (elapsed drops back under the threshold) or the
+    /// worker leaves the active set, so a fresh stall streak nudges again.
+    stall_nudged: HashSet<String>,
+    /// Workers for whom the stall has already been escalated to the
+    /// supervisor in the current streak. Cleared alongside `stall_nudged`.
+    stall_escalated: HashSet<String>,
+    /// Seconds of no observable activity (with a fresh heartbeat and an
+    /// in-progress task) before a worker is flagged `WorkerStalled`.
+    /// Defaults to `cas_factory::DEFAULT_STALL_THRESHOLD_SECS`; overridden
+    /// via [`Self::set_stall_threshold_secs`] from `.cas/config.toml`
+    /// `[factory] stall_threshold_secs`.
+    stall_threshold_secs: u64,
 }
 
 impl DirectorEventDetector {
@@ -380,12 +444,24 @@ impl DirectorEventDetector {
             idle_already_emitted: HashSet::new(),
             task_completed_announced: HashSet::new(),
             task_assigned_announced: HashSet::new(),
+            stall_nudged: HashSet::new(),
+            stall_escalated: HashSet::new(),
+            stall_threshold_secs: cas_factory::DEFAULT_STALL_THRESHOLD_SECS,
         }
     }
 
     /// Initialize with current state (call after first data load)
     pub fn initialize(&mut self, data: &DirectorData) {
         self.last_state = DirectorState::from_data(data);
+    }
+
+    /// Override the stall-detection threshold (default
+    /// `cas_factory::DEFAULT_STALL_THRESHOLD_SECS`). Call once after
+    /// construction, before the first `detect_changes`/`detect_changes_at`,
+    /// with the value resolved from `.cas/config.toml`
+    /// `[factory] stall_threshold_secs` (cas-9829).
+    pub fn set_stall_threshold_secs(&mut self, secs: u64) {
+        self.stall_threshold_secs = secs;
     }
 
     /// Add a worker to the tracked list (call when spawning workers dynamically)
@@ -625,13 +701,70 @@ impl DirectorEventDetector {
 
             seen_factory_agents.insert(agent.id.clone());
 
-            if agent.current_task.is_some() {
+            if let Some(task_id) = &agent.current_task {
                 // Agent is working — reset the idle streak. The next time this
                 // agent's `current_task` goes to `None`, the counter starts
                 // again from zero, which is exactly what we want: sustained idle
                 // from THIS point on, not a stale count from an earlier streak.
                 self.consecutive_idle_ticks.remove(&agent.id);
                 self.idle_already_emitted.remove(&agent.id);
+
+                // Stall detection (cas-9829): heartbeat alone cannot tell a
+                // healthy in-progress worker from one that printed a plan and
+                // stopped — a worker can heartbeat every tick while producing
+                // zero tool calls/file edits/commits for the task it holds.
+                // Require BOTH signals to diverge: a fresh heartbeat (the
+                // worker process is alive) AND a `latest_activity` timestamp
+                // older than `stall_threshold_secs` (it has genuinely gone
+                // quiet, not just mid-turn). When either signal is absent
+                // (no heartbeat data, no activity ever recorded) the gate
+                // stays inactive rather than guessing.
+                let has_fresh_heartbeat = agent
+                    .last_heartbeat
+                    .map(|hb| {
+                        let age_secs = (now_utc - hb).num_seconds();
+                        age_secs >= 0 && age_secs < FRESH_HEARTBEAT_SECS
+                    })
+                    .unwrap_or(false);
+                let stalled_elapsed_secs = agent.latest_activity.as_ref().and_then(|(_, ts)| {
+                    let age_secs = (now_utc - *ts).num_seconds();
+                    (age_secs >= self.stall_threshold_secs as i64).then_some(age_secs)
+                });
+
+                if has_fresh_heartbeat {
+                    if let Some(elapsed) = stalled_elapsed_secs {
+                        if !self.stall_nudged.contains(&agent.id) {
+                            // First detection in this streak: auto-nudge the
+                            // worker (re-inject the task prompt) before
+                            // paging the supervisor — a single re-poke often
+                            // unsticks these (see bug report cas-9829).
+                            events.push(DirectorEvent::WorkerStalled {
+                                worker: resolved_name.clone(),
+                                task_id: task_id.clone(),
+                                elapsed_secs: elapsed as u64,
+                                escalate: false,
+                            });
+                            self.stall_nudged.insert(agent.id.clone());
+                        } else if !self.stall_escalated.contains(&agent.id) {
+                            // Still stalled after the nudge — escalate to
+                            // the supervisor.
+                            events.push(DirectorEvent::WorkerStalled {
+                                worker: resolved_name.clone(),
+                                task_id: task_id.clone(),
+                                elapsed_secs: elapsed as u64,
+                                escalate: true,
+                            });
+                            self.stall_escalated.insert(agent.id.clone());
+                        }
+                    } else {
+                        // Activity is fresh (or was never observed) — clear
+                        // any prior streak so a future stall re-nudges from
+                        // scratch instead of silently staying suppressed.
+                        self.stall_nudged.remove(&agent.id);
+                        self.stall_escalated.remove(&agent.id);
+                    }
+                }
+
                 continue;
             }
 
@@ -711,6 +844,10 @@ impl DirectorEventDetector {
         self.consecutive_idle_ticks
             .retain(|id, _| seen_factory_agents.contains(id));
         self.idle_already_emitted
+            .retain(|id| seen_factory_agents.contains(id));
+        self.stall_nudged
+            .retain(|id| seen_factory_agents.contains(id));
+        self.stall_escalated
             .retain(|id| seen_factory_agents.contains(id));
 
         // Detect new agent registrations

@@ -33,115 +33,23 @@ impl CloudSyncer {
             .as_ref()
             .ok_or_else(|| CasError::Other("Not logged in".to_string()))?;
 
-        // Group by entity type and operation
+        // Group deletes for the existing one-per-entity delete path. Upserts
+        // stay associated with their queue rows below so sub-batches can be
+        // marked synced/failed independently.
         let grouped = self.group_queued_items(&queued);
-
-        // Build payload for upserts
-        let mut payload = serde_json::Map::new();
-        if !grouped.upsert_entries.is_empty() {
-            payload.insert(
-                "entries".to_string(),
-                serde_json::json!(grouped.upsert_entries),
-            );
-        }
-        if !grouped.upsert_tasks.is_empty() {
-            payload.insert("tasks".to_string(), serde_json::json!(grouped.upsert_tasks));
-        }
-        if !grouped.upsert_rules.is_empty() {
-            payload.insert("rules".to_string(), serde_json::json!(grouped.upsert_rules));
-        }
-        if !grouped.upsert_skills.is_empty() {
-            payload.insert(
-                "skills".to_string(),
-                serde_json::json!(grouped.upsert_skills),
-            );
-        }
-        if !grouped.upsert_sessions.is_empty() {
-            payload.insert(
-                "sessions".to_string(),
-                serde_json::json!(grouped.upsert_sessions),
-            );
-        }
-        if !grouped.upsert_verifications.is_empty() {
-            payload.insert(
-                "verifications".to_string(),
-                serde_json::json!(grouped.upsert_verifications),
-            );
-        }
-        if !grouped.upsert_events.is_empty() {
-            payload.insert(
-                "events".to_string(),
-                serde_json::json!(grouped.upsert_events),
-            );
-        }
-        if !grouped.upsert_prompts.is_empty() {
-            payload.insert(
-                "prompts".to_string(),
-                serde_json::json!(grouped.upsert_prompts),
-            );
-        }
-        if !grouped.upsert_file_changes.is_empty() {
-            payload.insert(
-                "file_changes".to_string(),
-                serde_json::json!(grouped.upsert_file_changes),
-            );
-        }
-        if !grouped.upsert_commit_links.is_empty() {
-            payload.insert(
-                "commit_links".to_string(),
-                serde_json::json!(grouped.upsert_commit_links),
-            );
-        }
-        if !grouped.upsert_agents.is_empty() {
-            payload.insert(
-                "agents".to_string(),
-                serde_json::json!(grouped.upsert_agents),
-            );
-        }
-        if !grouped.upsert_worktrees.is_empty() {
-            payload.insert(
-                "worktrees".to_string(),
-                serde_json::json!(grouped.upsert_worktrees),
-            );
-        }
 
         // Include project_canonical_id (required for project scoping)
         let project_id = get_project_canonical_id()
             .ok_or_else(|| CasError::Other("Cannot sync: not inside a CAS project directory".to_string()))?;
-        payload.insert(
-            "project_canonical_id".to_string(),
-            serde_json::json!(project_id),
-        );
 
         // cas-8ca5 / contract §5: include the normalized git remote so the
         // server's project resolver can map an unpinned machine onto the team's
         // canonical bucket instead of fragmenting onto github.com/<org>/<repo>.
         // Lowercased to match the server's `normalizeGitRemote` rule.
-        if let Ok(cas_root) = crate::store::find_cas_root() {
-            if let Some(remote) = crate::cloud::derive_canonical_id_from_git_remote(&cas_root) {
-                payload.insert(
-                    "git_remote".to_string(),
-                    serde_json::json!(remote.to_lowercase()),
-                );
-            }
-        }
-
-        // Include client version info for server-side compatibility checks
-        Self::insert_client_version(&mut payload);
-
-        // Track if we have upserts to push
-        let has_upserts = !grouped.upsert_entries.is_empty()
-            || !grouped.upsert_tasks.is_empty()
-            || !grouped.upsert_rules.is_empty()
-            || !grouped.upsert_skills.is_empty()
-            || !grouped.upsert_sessions.is_empty()
-            || !grouped.upsert_verifications.is_empty()
-            || !grouped.upsert_events.is_empty()
-            || !grouped.upsert_prompts.is_empty()
-            || !grouped.upsert_file_changes.is_empty()
-            || !grouped.upsert_commit_links.is_empty()
-            || !grouped.upsert_agents.is_empty()
-            || !grouped.upsert_worktrees.is_empty();
+        let git_remote = crate::store::find_cas_root()
+            .ok()
+            .and_then(|cas_root| crate::cloud::derive_canonical_id_from_git_remote(&cas_root))
+            .map(|remote| remote.to_lowercase());
 
         let has_deletes = !grouped.delete_entries.is_empty()
             || !grouped.delete_tasks.is_empty()
@@ -156,159 +64,34 @@ impl CloudSyncer {
             || !grouped.delete_agents.is_empty()
             || !grouped.delete_worktrees.is_empty();
 
-        let mut last_error = None;
-
-        // POST upserts to team endpoint with retry (only if there are upserts)
-        if has_upserts {
-            let push_url = format!(
-                "{}/api/teams/{}/sync/push",
-                self.cloud_config.endpoint, team_id
+        for (entity_type, entity_key) in [
+            (EntityType::Entry, "entries"),
+            (EntityType::Task, "tasks"),
+            (EntityType::Rule, "rules"),
+            (EntityType::Skill, "skills"),
+            (EntityType::Session, "sessions"),
+            (EntityType::Verification, "verifications"),
+            (EntityType::Event, "events"),
+            (EntityType::Prompt, "prompts"),
+            (EntityType::FileChange, "file_changes"),
+            (EntityType::CommitLink, "commit_links"),
+            (EntityType::Agent, "agents"),
+            (EntityType::Worktree, "worktrees"),
+        ] {
+            let (synced, errors) = self.push_team_upserts_for_type(
+                team_id,
+                &queued,
+                entity_type,
+                entity_key,
+                token,
+                &project_id,
+                git_remote.as_deref(),
             );
-
-            // Serialize and compress once, reuse across retries
-            let json_bytes = serde_json::to_vec(&payload)
-                .map_err(|e| CasError::Other(format!("JSON serialization failed: {e}")))?;
-            let compressed = Self::gzip_json(&json_bytes)?;
-
-            for attempt in 0..3 {
-                if attempt > 0 {
-                    std::thread::sleep(self.config.backoff_duration(attempt as u32));
-                }
-
-                let response = ureq::post(&push_url)
-                    .timeout(self.config.timeout)
-                    .set("Authorization", &format!("Bearer {token}"))
-                    .set("Content-Type", "application/json")
-                    .set("Content-Encoding", "gzip")
-                    .send_bytes(&compressed);
-
-                match response {
-                    Ok(resp) => {
-                        if resp.status() == 200 || resp.status() == 201 {
-                            // Parse response for sync counts
-                            if let Ok(body) = resp.into_json::<TeamPushResponse>() {
-                                result.pushed_entries = body.synced.entries;
-                                result.pushed_tasks = body.synced.tasks;
-                                result.pushed_rules = body.synced.rules;
-                                result.pushed_skills = body.synced.skills;
-                                result.pushed_sessions = body.synced.sessions;
-                                result.pushed_verifications = body.synced.verifications;
-                                result.pushed_events = body.synced.events;
-                                result.pushed_prompts = body.synced.prompts;
-                                result.pushed_file_changes = body.synced.file_changes;
-                                result.pushed_commit_links = body.synced.commit_links;
-                                result.pushed_agents = body.synced.agents;
-                                result.pushed_worktrees = body.synced.worktrees;
-
-                                // cas-8ca5 / contract §5: adopt the server's
-                                // canonical id when our git remote matches the
-                                // returned git_remote. Stops an unpinned machine
-                                // from continuing to sync the fragmented
-                                // per-remote bucket instead of the team's slug.
-                                if let Ok(cas_root) = crate::store::find_cas_root() {
-                                    let local_remote =
-                                        crate::cloud::derive_canonical_id_from_git_remote(&cas_root);
-                                    let current_pin =
-                                        crate::cloud::canonical_id_from_config_toml(&cas_root);
-                                    if let Some(adopted) = crate::cloud::should_adopt_canonical_id(
-                                        local_remote.as_deref(),
-                                        body.git_remote.as_deref(),
-                                        body.canonical_id.as_deref(),
-                                        current_pin.as_deref(),
-                                    ) {
-                                        match crate::cloud::set_canonical_id_in_config_toml(
-                                            &cas_root, &adopted,
-                                        ) {
-                                            Ok(()) => {
-                                                crate::cloud::invalidate_cached_project_id();
-                                                tracing::info!(
-                                                    canonical_id = %adopted,
-                                                    "cas-8ca5: adopted server canonical project id"
-                                                );
-                                                eprintln!(
-                                                    "[CAS sync] adopted team canonical project id \
-                                                     '{adopted}' (matched git remote)"
-                                                );
-                                            }
-                                            Err(e) => {
-                                                tracing::warn!(
-                                                    error = %e,
-                                                    "cas-8ca5: failed to persist adopted canonical_id"
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-                            } else {
-                                // If parsing fails, count what we sent
-                                result.pushed_entries = grouped.upsert_entries.len();
-                                result.pushed_tasks = grouped.upsert_tasks.len();
-                                result.pushed_rules = grouped.upsert_rules.len();
-                                result.pushed_skills = grouped.upsert_skills.len();
-                                result.pushed_sessions = grouped.upsert_sessions.len();
-                                result.pushed_verifications = grouped.upsert_verifications.len();
-                                result.pushed_events = grouped.upsert_events.len();
-                                result.pushed_prompts = grouped.upsert_prompts.len();
-                                result.pushed_file_changes = grouped.upsert_file_changes.len();
-                                result.pushed_commit_links = grouped.upsert_commit_links.len();
-                                result.pushed_agents = grouped.upsert_agents.len();
-                                result.pushed_worktrees = grouped.upsert_worktrees.len();
-                            }
-                            last_error = None;
-                            break;
-                        } else {
-                            let status = resp.status();
-                            let body = resp.into_string().unwrap_or_default();
-                            last_error = Some(CasError::Other(format!(
-                                "Team push failed with status {status}: {body}"
-                            )));
-                            // Don't retry 4xx errors
-                            if (400..500).contains(&status) {
-                                break;
-                            }
-                        }
-                    }
-                    Err(ureq::Error::Status(code, resp)) => {
-                        let body = resp.into_string().unwrap_or_default();
-                        last_error = Some(CasError::Other(format!(
-                            "Team push failed with status {code}: {body}"
-                        )));
-                        if (400..500).contains(&code) {
-                            break;
-                        }
-                    }
-                    Err(ureq::Error::Transport(e)) => {
-                        last_error = Some(CasError::Other(format!("Network error: {e}")));
-                    }
-                }
-            }
+            Self::add_team_count(&mut result, entity_key, synced);
+            result.errors.extend(errors);
         }
 
-        if let Some(ref err) = last_error {
-            // Mark every queued item as failed (increments retry_count).
-            // Previously this re-enqueued via enqueue_for_team which reset
-            // retry_count to 0 on conflict, preventing items from ever
-            // reaching the `failed` bucket (defect B / cas-8dd8).
-            // `ref err` borrows (not moves) so `last_error.is_none()` below
-            // can still read the option for the deletes gate.
-            for item in &queued {
-                let _ = self.queue.mark_failed(item.id, &err.to_string());
-            }
-            result.errors.push(err.to_string());
-        } else {
-            // Success: mark every queued item synced (delete from queue).
-            // Items that were dropped by group_queued_items (null payload for
-            // upsert) are also deleted — they were silently un-pushable; the
-            // server accepted the rest, so we remove them to prevent permanent
-            // residue.  Unpushable items will be re-enqueued by a future
-            // write; the personal-push path handles the poison-head case by
-            // calling mark_failed instead (cas-8dd8).
-            for item in &queued {
-                let _ = self.queue.mark_synced(item.id);
-            }
-        }
-
-        if last_error.is_none() && has_deletes {
+        if result.errors.is_empty() && has_deletes {
             // Process deletes (after successful upserts or if no upserts)
             let (deleted_count, delete_errors) = self.send_team_deletes(team_id, &grouped, token);
             // Track successful deletes (deleted_count is total across all types)
@@ -319,6 +102,13 @@ impl CloudSyncer {
             }
             if !delete_errors.is_empty() {
                 result.errors.extend(delete_errors);
+            } else {
+                for item in queued
+                    .iter()
+                    .filter(|item| item.operation == SyncOperation::Delete)
+                {
+                    let _ = self.queue.mark_synced(item.id);
+                }
             }
         }
 
@@ -332,6 +122,233 @@ impl CloudSyncer {
 
         result.duration_ms = start.elapsed().as_millis() as u64;
         Ok(result)
+    }
+
+    fn push_team_upserts_for_type(
+        &self,
+        team_id: &str,
+        queued: &[QueuedSync],
+        entity_type: EntityType,
+        entity_key: &str,
+        token: &str,
+        project_id: &str,
+        git_remote: Option<&str>,
+    ) -> (usize, Vec<String>) {
+        let mut upserts = Vec::new();
+
+        for item in queued
+            .iter()
+            .filter(|item| item.operation == SyncOperation::Upsert && item.entity_type == entity_type)
+        {
+            match item.payload.as_deref() {
+                Some(payload) => match serde_json::from_str::<serde_json::Value>(payload) {
+                    Ok(value) => upserts.push((item, value)),
+                    Err(_) => {
+                        let _ = self
+                            .queue
+                            .mark_failed(item.id, "invalid JSON payload for team upsert");
+                    }
+                },
+                None => {
+                    let _ = self
+                        .queue
+                        .mark_failed(item.id, "missing payload for team upsert operation");
+                }
+            }
+        }
+
+        let mut synced = 0;
+        let mut errors = Vec::new();
+
+        for sub_batch in self.split_into_sub_batches(upserts) {
+            let (batch_items, values): (Vec<&QueuedSync>, Vec<serde_json::Value>) =
+                sub_batch.into_iter().unzip();
+            let sent_count = values.len();
+
+            match self.push_team_sub_batch(
+                team_id,
+                entity_key,
+                values,
+                token,
+                project_id,
+                git_remote,
+            ) {
+                Ok(response) => {
+                    synced += response
+                        .as_ref()
+                        .map(|body| Self::team_count_for(body, entity_key))
+                        .unwrap_or(sent_count);
+
+                    if let Some(body) = response.as_ref() {
+                        self.maybe_adopt_team_canonical_id(body);
+                    }
+
+                    for item in &batch_items {
+                        let _ = self.queue.mark_synced(item.id);
+                    }
+                }
+                Err(e) => {
+                    for item in &batch_items {
+                        let _ = self.queue.mark_failed(item.id, &e.to_string());
+                    }
+                    errors.push(format!("{entity_key} push failed: {e}"));
+                }
+            }
+        }
+
+        (synced, errors)
+    }
+
+    fn push_team_sub_batch(
+        &self,
+        team_id: &str,
+        entity_key: &str,
+        values: Vec<serde_json::Value>,
+        token: &str,
+        project_id: &str,
+        git_remote: Option<&str>,
+    ) -> Result<Option<TeamPushResponse>, CasError> {
+        let push_url = format!(
+            "{}/api/teams/{}/sync/push",
+            self.cloud_config.endpoint, team_id
+        );
+
+        let mut payload = serde_json::Map::new();
+        payload.insert(entity_key.to_string(), serde_json::Value::Array(values));
+        payload.insert(
+            "project_canonical_id".to_string(),
+            serde_json::json!(project_id),
+        );
+        if let Some(remote) = git_remote {
+            payload.insert("git_remote".to_string(), serde_json::json!(remote));
+        }
+        Self::insert_client_version(&mut payload);
+
+        let json_bytes = serde_json::to_vec(&payload)
+            .map_err(|e| CasError::Other(format!("JSON serialization failed: {e}")))?;
+        let compressed = Self::gzip_json(&json_bytes)?;
+
+        let mut last_error = None;
+        for attempt in 0..3 {
+            if attempt > 0 {
+                std::thread::sleep(self.config.backoff_duration(attempt as u32));
+            }
+
+            let response = ureq::post(&push_url)
+                .timeout(self.config.timeout)
+                .set("Authorization", &format!("Bearer {token}"))
+                .set("Content-Type", "application/json")
+                .set("Content-Encoding", "gzip")
+                .send_bytes(&compressed);
+
+            match response {
+                Ok(resp) => {
+                    if resp.status() == 200 || resp.status() == 201 {
+                        let body = resp.into_string().unwrap_or_default();
+                        if body.is_empty() {
+                            return Ok(None);
+                        }
+                        return Ok(serde_json::from_str::<TeamPushResponse>(&body).ok());
+                    }
+
+                    let status = resp.status();
+                    let body = resp.into_string().unwrap_or_default();
+                    last_error = Some(CasError::Other(format!(
+                        "Team push failed with status {status}: {body}"
+                    )));
+                    if (400..500).contains(&status) {
+                        break;
+                    }
+                }
+                Err(ureq::Error::Status(code, resp)) => {
+                    let body = resp.into_string().unwrap_or_default();
+                    last_error = Some(CasError::Other(format!(
+                        "Team push failed with status {code}: {body}"
+                    )));
+                    if (400..500).contains(&code) {
+                        break;
+                    }
+                }
+                Err(ureq::Error::Transport(e)) => {
+                    last_error = Some(CasError::Other(format!("Network error: {e}")));
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| CasError::Other("Team push failed".to_string())))
+    }
+
+    fn team_count_for(response: &TeamPushResponse, entity_key: &str) -> usize {
+        match entity_key {
+            "entries" => response.synced.entries,
+            "tasks" => response.synced.tasks,
+            "rules" => response.synced.rules,
+            "skills" => response.synced.skills,
+            "sessions" => response.synced.sessions,
+            "verifications" => response.synced.verifications,
+            "events" => response.synced.events,
+            "prompts" => response.synced.prompts,
+            "file_changes" => response.synced.file_changes,
+            "commit_links" => response.synced.commit_links,
+            "agents" => response.synced.agents,
+            "worktrees" => response.synced.worktrees,
+            _ => 0,
+        }
+    }
+
+    fn add_team_count(result: &mut SyncResult, entity_key: &str, count: usize) {
+        match entity_key {
+            "entries" => result.pushed_entries += count,
+            "tasks" => result.pushed_tasks += count,
+            "rules" => result.pushed_rules += count,
+            "skills" => result.pushed_skills += count,
+            "sessions" => result.pushed_sessions += count,
+            "verifications" => result.pushed_verifications += count,
+            "events" => result.pushed_events += count,
+            "prompts" => result.pushed_prompts += count,
+            "file_changes" => result.pushed_file_changes += count,
+            "commit_links" => result.pushed_commit_links += count,
+            "agents" => result.pushed_agents += count,
+            "worktrees" => result.pushed_worktrees += count,
+            _ => {}
+        }
+    }
+
+    fn maybe_adopt_team_canonical_id(&self, body: &TeamPushResponse) {
+        // cas-8ca5 / contract §5: adopt the server's canonical id when our git
+        // remote matches the returned git_remote. Stops an unpinned machine from
+        // continuing to sync the fragmented per-remote bucket instead of the
+        // team's slug.
+        if let Ok(cas_root) = crate::store::find_cas_root() {
+            let local_remote = crate::cloud::derive_canonical_id_from_git_remote(&cas_root);
+            let current_pin = crate::cloud::canonical_id_from_config_toml(&cas_root);
+            if let Some(adopted) = crate::cloud::should_adopt_canonical_id(
+                local_remote.as_deref(),
+                body.git_remote.as_deref(),
+                body.canonical_id.as_deref(),
+                current_pin.as_deref(),
+            ) {
+                match crate::cloud::set_canonical_id_in_config_toml(&cas_root, &adopted) {
+                    Ok(()) => {
+                        crate::cloud::invalidate_cached_project_id();
+                        tracing::info!(
+                            canonical_id = %adopted,
+                            "cas-8ca5: adopted server canonical project id"
+                        );
+                        eprintln!(
+                            "[CAS sync] adopted team canonical project id \
+                             '{adopted}' (matched git remote)"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "cas-8ca5: failed to persist adopted canonical_id"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Group queued items by entity type and operation

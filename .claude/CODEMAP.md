@@ -4,7 +4,7 @@
 ## Top-level layout
 - `cas-cli/` — Rust binary crate (`cas`); CLI commands, hooks, factory TUI, MCP server, bridge HTTP server, daemon
 - `crates/` — 16 workspace member crates (see Workspace section)
-- `docs/` — planning artifacts (brainstorms, ideation, guides, notes, requests/inbox, reviews, spikes, onboarding); requests/completed/ archives closed work
+- `docs/` — planning artifacts (brainstorms, ideation, guides, notes, requests/inbox, reviews, spikes, onboarding, release-notes, reports); requests/completed/ archives closed work
 - `migration/` — one-shot migration scripts and phase logs (Phase 2/3/7/8 cloud move)
 - `scripts/` — `worktree-boot.sh` + provisioning (`provision-hetzner.sh`); release/install scripts live in `~/.local/bin/`
 - `homebrew/` — `cas.rb` Homebrew formula + update script
@@ -61,7 +61,7 @@ Binary entrypoint and the only crate users interact with directly. Contains ever
   - `known_repos.rs`, `open.rs` — known-repos DB and project picker
   - `update/`, `update.rs`, `update_transaction.rs`, `update_tests/` — `cas update` rewrites managed_by:cas files atomically
   - `mcp_cmd.rs`, `memory.rs`, `queue.rs`, `worktree.rs`, `doctor.rs`, `status.rs`, `list.rs`, `sweep.rs`, `bridge.rs`, `changelog.rs`, `claude_md.rs`, `interactive.rs`
-  - `config/`, `config_tui/`, `config_tui.rs` — config read/write + the config TUI
+  - `config/`, `config_tui/`, `config_tui.rs` — config read/write + the config TUI; `config/settings.rs` holds `STOCK_WORKER_{HARNESS,MODEL,REASONING_EFFORT}` (codex/gpt-5.5/medium floors) + `{model,harness,reasoning_effort}_for_role`; `config/access/io.rs` `Config::load` (project `.cas/config.toml` only — no user merge); `config/meta/seed/` seeds
   - `statusline/`, `statusline.rs` — `cas statusline` for shell prompts
 - `hooks/` — hook input handling
   - `mod.rs`, `handlers.rs`, `handlers/` — `SessionStart`, `PreToolUse`, `PostToolUse`, `Stop`, `Notification` handlers
@@ -73,7 +73,7 @@ Binary entrypoint and the only crate users interact with directly. Contains ever
 - `mcp/` — MCP server
   - `daemon.rs`, `mod.rs`, `socket.rs` — server lifecycle, unix socket
   - `server/` — request routing (`mod.rs`, `prompts.rs`, `resources.rs`, `runtime.rs`)
-  - `tools/core/` — every MCP tool, grouped: `agent_coordination/` (factory ops + `task_claiming` with supervisor force-transfer, cas-3ed5), `memory.rs` (auto-promote team_id from CloudConfig, cas-6d96), `rules.rs`, `search.rs`, `skills.rs`, `system.rs`, `task/` (close_ops with commit-claim gate + zero-commit routing — cas-490f, cas-ee2b), `workflow/`, `knowledge.rs`, `maintenance.rs`
+  - `tools/core/` — every MCP tool, grouped: `agent_coordination/` (factory ops + `task_claiming` with supervisor force-transfer, cas-3ed5), `memory.rs` (auto-promote team_id from CloudConfig, cas-6d96), `rules.rs`, `search.rs`, `skills.rs`, `system.rs`, `task/` (close_ops with commit-claim gate + zero-commit routing — cas-490f, cas-ee2b — plus a zero-diff guard rejecting sync-only merge commits with an empty diff, cas-9eae), `workflow/`, `knowledge.rs`, `maintenance.rs`
   - `tools/service/`, `tools/types/` — tool plumbing; `RememberRequest.personal: Option<bool>` (cas-6d96)
   - `daemon_tests/`
 - `store/` — storage adapter on top of cas-store
@@ -94,7 +94,7 @@ Binary entrypoint and the only crate users interact with directly. Contains ever
   - `factory/daemon/` — daemon process lifecycle, cloud client, runtime (ws_client, gui_client, queue_and_events, teams, fork_first)
   - `factory/app/` — `FactoryApp` state, render/ops, panels_and_modes; `sidecar_and_selection.rs` houses `ScrollAction::AltScreen` + arrow-key forwarding for alt-screen TUIs (cas-3b18 / cas-d5fa lineage)
   - `factory/renderer/` — buffer composition for pane drawing
-  - `factory/director/` — director pane prompts and rendering
+  - `factory/director/` — director pane: `events.rs` (`DirectorEvent`, incl. `WorkerStalled` activity-based stall nudge→escalate, cas-9829), `prompts.rs` (idle/ready/stall nudge text; assignee guidance uses display name per cas-dbbb), rendering
   - `factory/buffer_backend.rs`, `factory/phoenix.rs`, `factory/notification.rs`, `factory/status_bar.rs`, `factory/input.rs`, `factory/layout.rs`, `factory/session.rs`, `factory/client.rs`, `factory/client_input.rs` (mouse-event → PTY plumbing)
   - `components/`, `widgets/`, `markdown/`, `theme/`
 - `bridge/` — HTTP bridge server (web UI backend); `bridge/server/factory.rs` is the factory-start endpoint
@@ -123,7 +123,7 @@ Factory orchestration: spawn pipeline, lease management, merge gates, per-worker
 
 - `lib.rs` — public surface (`FactoryCore`, `FactoryConfig`, spec resolver re-exports)
 - `core.rs` — `FactoryCore` (worker lifecycle, lease ownership, status reporting)
-- `config.rs` — `FactoryConfig` (workers, names, supervisor/worker `cli`/`model`/`effort`, resolved specs)
+- `config.rs` — `FactoryConfig` (workers, names, supervisor/worker `cli`/`model`/`effort`, resolved specs, `stall_threshold_secs` for worker-stall detection — cas-9829)
 - `spec_resolver.rs` — `resolve_specs(workers, sources)` 6-layer cascade (built-in → user `~/.cas/config.toml` → project `.cas/config.toml` → CLI flags → `--worker-spec` JSON)
 - `tests/spec_resolver.rs` — 22 unit tests covering each cascade layer
 - `director.rs` — `DirectorEventDetector.detect_changes` with idle-vs-pending guard (cas-afb7) + heartbeat-vs-activity guard (cas-1ec7); `AgentSummary.pending_messages` + `has_recent_worker_io_activity`
@@ -148,11 +148,13 @@ Planning artifacts only — product/domain content lives in `docs/PRODUCT_OVERVI
 
 - `brainstorms/` — `YYYY-MM-DD-<topic>-requirements.md` from the `cas-brainstorm` skill
 - `ideation/` — survivor lists from the `cas-ideate` skill
-- `requests/` — cross-team BUG/FEATURE inboxes (`README.md` documents the protocol); active BUGs: `BUG-phantom-director-nudges-team-lead-as-idle-worker.md`, `BUG-factory-liveness-signals-disagree.md`, `BUG-codex-worker-cas-mcp-tools-not-exposed.md` (+`.jsonl` rollout), `BUG-codex-worker-stalls-in-task-lifecycle-gates.md`, `BUG-epic-and-worker-branch-off-supervisor-head.md`, `BUG-personal-projects-pushed-team-scoped.md`, `BUG-cloud-sync-slug-fragmentation-and-queue-stall.md`, `BUG-team-push-not-chunked.md`; FEATUREs: `FEATURE-designmd-skill.md`, `FEATURE-release-notes-rubric-and-claude-breadcrumb.md`, `FEATURE-nuxt-playwright-skill.md`; `team-memories-filter-policy.md`; RESPONSE/SHIPPED/RESOLVED markers track closed threads; `artifacts/` holds attachments
+- `requests/` — cross-team BUG/FEATURE inbox (`README.md` documents the protocol). `BUG-*.md`/`FEATURE-*.md` are the live queue (high churn — don't rely on this line for what's open; `ls docs/requests/`). `RESPONSE-`/`SHIPPED-`/`RESOLVED-` prefixes track closed threads; resolved docs are `git mv`'d into `requests/completed/` with a resolution note; `artifacts/` holds attachments; `team-memories-filter-policy.md` is a standing policy doc
 - `guides/` — user-facing guides (`task-depth.md` — deep vs light speed-mode, cas-9d74)
+- `release-notes/` — `YYYY-MM-DD-<topic>-slack.md` postable drafts for #cas-internal (mandatory on every main merge; rubric at `docs/RELEASE_SLACK_RUBRIC.md`)
+- `reports/` — generated smoke-test outputs (`smoke-test-<date>-<harness>-<name>.{html,pdf}`, e.g. claude-jester / codex-jester)
 - `notes/` — working notes + design records: `2026-06-02-cc160-hook-surface.md` (CC hook EPIC), `2026-06-22-mid-turn-interrupt-redirect-design.md` (cas-321da), `claude-code-changelog-diary.md` + `codex-changelog-diary.md` (rolling harness-release → CAS-response ledgers)
 - `reviews/` — archived cas-code-review outputs (e.g. `2026-06-07-cas-073f.md`, the isolated-worker commit-leak EPIC review)
-- `requests/completed/` — archived closed work (25 files): recent SHIPPED-isolated-worker-commits-to-supervisor-main, SHIPPED-worker-pane-mouse-wheel-alt-screen; bulk move 2026-05-18 of cloud-client-404, cloud-push-skipped, factory-session-observations, factory-write-permission-deadlock, EPIC-mcp-server-robustness, FEATURE-cloud-sync-pull-* etc.
+- `requests/completed/` — archive of resolved BUG/FEATURE docs, each carrying a resolution note (fixing commit/task). Grows steadily; includes the 2026-07-02 cas-fff9 backlog-triage batch (director/liveness cluster, phantom-close, worker-stall, team-push chunking, rule-id collision, branch-base, cloud-sync, etc.)
 - `spikes/` — investigation outputs (e.g., `2026-05-01-factory-agent-teams-enrollment-spike.md`)
 - `onboarding/` — onboarding notes (`macbook-from-zero.md`, etc.)
 - Standalone planning docs at `docs/` root: `compound-engineering-roadmap.md`, `verifier-dispatch-trace.md`, `FEATURE-REQUEST-TEAM-PROJECT-MEMORIES.md`, `SCOPE-PROJECT-ID-REQUIRED.md`, `session-2026-05-15-orchestration-issues.md`

@@ -6,6 +6,15 @@ priority: P2
 
 # Phantom "director" coordinator messages the team-lead as an "idle worker" and tells it to self-assign tasks — on a single-session run the user never started a teammate for
 
+## Resolution (cas-c9f0, 2026-07-02)
+
+Resolved and moved to completed after verifying each acceptance criterion against current code.
+
+- Role-gated idle nudges / no supervisor self-assignment: already fixed and hardened by cas-c9f0. The event detector excludes the supervisor/team lead from `WorkerIdle` tracking in `cas-cli/src/ui/factory/director/events.rs:615`-`623` and `events.rs:936`-`949`; the prompt layer suppresses supervisor idle events in `cas-cli/src/ui/factory/director/prompts.rs:207`-`214` and suppresses supervisor registration nudges in `prompts.rs:308`-`311`. Idle assignment guidance uses the worker's display name (canonical — `task mine` matches on it; a session-id assignee is silently normalized back to the display name by cas-dbbb, `update.rs:176`-`186`), not the session id, in `prompts.rs:199`-`294`, with `test_worker_idle_assignee_uses_display_name` at `prompts.rs:913`-`933`.
+- Config-only director identity/color: already fixed in current code. The director member is explicitly documented as the daemon's system/auto-prompt identity in `cas-cli/src/ui/factory/daemon/runtime/teams.rs:16`-`30`; it is registered with `agent_type: "director"`, `color: DIRECTOR_AGENT_COLOR`, and `backend_type: None` so it is not presented as a live tmux peer in `teams.rs:436`-`461`. Inbox delivery uses the supplied color when writing messages in `teams.rs:633`-`710`, keeping the envelope aligned with the config record.
+- Ready-count mismatch: fixed by cas-c9f0. The idle and registration nudge templates no longer embed the director snapshot count; they direct the supervisor to live `task action=ready` in `cas-cli/src/ui/factory/director/prompts.rs:263`-`290` and `prompts.rs:336`-`348`. Coverage is `test_worker_ready_prompt` and `test_worker_ready_no_tasks` in `prompts.rs:737`-`774`.
+- Config-only member visibility: treated as nice-to-have and not required to resolve the unsafe nudge. The hazardous behavior was the peer-style, self-assignment nudge; current code uses non-interactive director metadata (`backend_type: None`) and role gates prevent the lead from being targeted as an idle worker.
+
 A factory/team session launched in tmux team-lead mode received, **at session start**, a coordination message from a `director` teammate instructing it to assign ready tasks **to itself**:
 
 > Worker zen-hawk-97 is idle with no assigned tasks.

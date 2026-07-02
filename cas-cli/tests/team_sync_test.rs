@@ -10,9 +10,12 @@
 //! - `team_auto_promote=Some(false)` kill-switch → suppresses push even
 //!   when team_id is set.
 //! - Empty queue with team configured → silent early return.
-//! - HTTP 500 failure → `push_team` re-enqueues items, helper still
-//!   returns `Ok(())` (isolation contract — personal push and pull must
-//!   not be blocked by team push errors).
+//! - HTTP 500 failure → `push_team` leaves items pending by marking the
+//!   attempted rows failed, while the helper still returns `Ok(())`
+//!   (isolation contract — personal push and pull must not be blocked by
+//!   team push errors).
+//! - Large team upserts → `push_team` sends bounded gzip-compressed
+//!   per-entity requests instead of one unbounded multi-entity payload.
 //!
 //! Lives in `cas-cli/tests/` (integration-test tree) rather than
 //! co-located with the impl because the verifier flagged the inline
@@ -23,7 +26,10 @@ mod common;
 use common::{TEST_TEAM, make_cli_json, make_cloud_config};
 
 use cas::cli::cloud::execute_team_push;
-use cas::cloud::{CloudConfig, EntityType, SyncOperation, SyncQueue};
+use cas::cloud::{CloudConfig, CloudSyncer, CloudSyncerConfig, EntityType, SyncOperation, SyncQueue};
+use flate2::read::GzDecoder;
+use std::io::Read;
+use std::sync::Arc;
 use tempfile::TempDir;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -46,14 +52,23 @@ fn make_cas_root_with_team_item() -> TempDir {
     tmp
 }
 
+fn decode_gzip_json(body: &[u8]) -> serde_json::Value {
+    let mut decoder = GzDecoder::new(body);
+    let mut decoded = Vec::new();
+    decoder
+        .read_to_end(&mut decoded)
+        .expect("request body should be valid gzip");
+    serde_json::from_slice(&decoded).expect("request body should decode to JSON")
+}
+
 /// Happy path: team configured + queued items → POST fires against
 /// `/api/teams/{uuid}/sync/push`, queue is drained.
 ///
 /// NOTE: server contract includes `project_canonical_id` in the payload
 /// so the server can auto-register the project. The payload is
 /// gzip-compressed before send so wiremock body matchers can't cheaply
-/// verify the field; that contract is covered by the push_team unit
-/// tests in `cas-cli/src/cloud/syncer/team_push.rs`.
+/// verify the field; that contract is covered by
+/// `team_push_chunks_upserts_by_payload_budget` below.
 #[tokio::test]
 async fn team_push_drains_queue_when_team_configured() {
     let server = MockServer::start().await;
@@ -172,8 +187,8 @@ async fn team_push_silent_when_queue_empty() {
 
 /// Isolation contract: team push HTTP failure must not block the caller's
 /// pull step. `execute_team_push` returns `Ok(())` even on 5xx; push_team
-/// re-enqueues the drained items internally so they survive the failed
-/// attempt for the next sync cycle.
+/// marks the attempted items failed so they survive the failed attempt for
+/// the next sync cycle until retry limits are exhausted.
 #[tokio::test]
 async fn team_push_http_failure_is_isolated() {
     let server = MockServer::start().await;
@@ -198,12 +213,94 @@ async fn team_push_http_failure_is_isolated() {
         "helper must return Ok even when team push fails (partial-failure isolation): {result:?}"
     );
 
-    // Item re-enqueued by push_team on error — still in queue for next sync.
+    // Item remains pending after push_team records the failed attempt.
     let queue = SyncQueue::open(tmp.path()).unwrap();
     let remaining = queue.pending_for_team(TEST_TEAM, 100, 5).unwrap();
     assert_eq!(
         remaining.len(),
         1,
-        "team items re-enqueued on http failure (preserves data for next sync)"
+        "team items remain pending on http failure (preserves data for next sync)"
     );
+}
+
+#[tokio::test]
+async fn team_push_chunks_upserts_by_payload_budget() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!("/api/teams/{TEST_TEAM}/sync/push")))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "synced": {
+                    "entries": 1,
+                    "tasks": 0, "rules": 0, "skills": 0,
+                    "sessions": 0, "verifications": 0, "events": 0,
+                    "prompts": 0, "file_changes": 0, "commit_links": 0,
+                    "agents": 0, "worktrees": 0,
+                }
+            })),
+        )
+        .expect(3)
+        .mount(&server)
+        .await;
+
+    let cfg = make_cloud_config(server.uri());
+    let tmp = TempDir::new().unwrap();
+    let queue = Arc::new(SyncQueue::open(tmp.path()).unwrap());
+    queue.init().unwrap();
+
+    for i in 0..3 {
+        let id = format!("p-large-{i}");
+        let payload = serde_json::json!({
+            "id": id,
+            "scope": "project",
+            "content": "x".repeat(900),
+        })
+        .to_string();
+        queue
+            .enqueue_for_team(EntityType::Entry, &id, SyncOperation::Upsert, Some(&payload), TEST_TEAM)
+            .unwrap();
+    }
+
+    let mut sync_config = CloudSyncerConfig::default();
+    sync_config.max_payload_bytes = 1_250;
+    sync_config.backoff_base_ms = 1;
+
+    let syncer = CloudSyncer::new(queue.clone(), cfg, sync_config);
+    let result = tokio::task::spawn_blocking(move || syncer.push_team(TEST_TEAM))
+        .await
+        .unwrap()
+        .expect("team push should succeed");
+
+    assert_eq!(result.pushed_entries, 3);
+    assert!(result.errors.is_empty());
+    assert_eq!(
+        queue.pending_for_team(TEST_TEAM, 10, 5).unwrap().len(),
+        0,
+        "all chunks should be marked synced"
+    );
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 3, "team push should split into 3 requests");
+
+    for request in requests {
+        let payload = decode_gzip_json(&request.body);
+        let encoded_len = serde_json::to_vec(&payload).unwrap().len();
+        assert!(
+            encoded_len <= 1_250,
+            "team push request should stay under max_payload_bytes; got {encoded_len}"
+        );
+        assert_eq!(
+            payload["entries"].as_array().unwrap().len(),
+            1,
+            "each request should contain only one large entry"
+        );
+        assert!(
+            payload.get("tasks").is_none(),
+            "chunked team push should send one entity type per request"
+        );
+        assert!(
+            payload["project_canonical_id"].as_str().is_some(),
+            "team push chunks should include project_canonical_id"
+        );
+    }
 }

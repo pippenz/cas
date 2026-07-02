@@ -33,7 +33,10 @@ pub mod recording;
 pub mod session;
 pub mod spec_resolver;
 pub use changes::{FileChangeInfo, GitFileStatus, SourceChangesInfo};
-pub use config::{AutoPromptConfig, EpicState, FactoryConfig, NotifyBackend, NotifyConfig};
+pub use config::{
+    AutoPromptConfig, DEFAULT_STALL_THRESHOLD_SECS, EpicState, FactoryConfig, NotifyBackend,
+    NotifyConfig,
+};
 pub use core::{FactoryCore, FactoryError, FactoryEvent, PaneId, PaneInfo, Result};
 pub use spec_resolver::{ConfigSources, SpecResolverError, resolve_specs, resolve_supervisor_spec};
 pub use director::{AgentSummary, DirectorData, DirectorStores, EpicGroup, TaskSummary};
