@@ -1,5 +1,7 @@
 # BUG: `task start` is blocked while a *sibling* task is merge-gated "verification-pending"
 
+Resolution: Already fixed by commit `2491fb97` (`cas-6a99`), which skips `pending_worktree_merge` tasks in `check_pending_verification` and added `test_task_start_not_blocked_by_merge_gated_sibling_cas_6a99`.
+
 **Reported:** 2026-06-26 (gabber-studio, factory mode)
 **Severity:** Medium — forces workers to do tracked work with no formal `start`, leaving CAS task state inconsistent in any supervisor-deferred-merge workflow.
 
@@ -26,7 +28,7 @@ Starting task B should NOT be blocked by task A merely being `verification-pendi
 ## Suggested fixes (any one)
 - Don't gate `task start` on a sibling's `verification-pending` state when there's no explicit dependency edge.
 - Treat "merge-gated / awaiting-merge" as a distinct, non-blocking state (separate from "actively-being-verified").
-- Provide a supervisor/worker override to start the next task with an audit note (mirrors the existing dual-gate close workaround).
+- Provide a supervisor/worker override to start the next task with an audit note (mirrors the existing dual-gate close fallback).
 
-## Workaround used
-Worker proceeded with `cas-9fd3` on the same branch **without** a formal `start`; supervisor will reconcile both tasks' CAS state at merge (close both once the bundled PR lands on staging). Related: the verification-jail merge-gap and the dual-gate-close workaround already documented internally.
+## Operational fallback used
+Worker proceeded with `cas-9fd3` on the same branch **without** a formal `start`; supervisor will reconcile both tasks' CAS state at merge (close both once the bundled PR lands on staging). Related: the verification-jail merge-gap and the dual-gate-close fallback already documented internally.
