@@ -1949,7 +1949,10 @@ mod spawn_isolation_tests {
         std::fs::create_dir(&repo).unwrap();
         init_repo(&repo);
 
-        let process_cwd = std::env::current_dir().unwrap();
+        // Use the fixture repo as the simulated supervisor checkout. Reading
+        // the process cwd makes this test depend on unrelated tests that may
+        // temporarily chdir into a tempdir.
+        let process_cwd = repo.clone();
         let cas_dir = repo.join(".cas");
         std::fs::create_dir_all(&cas_dir).unwrap();
 

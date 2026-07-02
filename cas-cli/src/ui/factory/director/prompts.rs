@@ -13,17 +13,27 @@ use cas_types::TaskStatus;
 ///
 /// `DirectorData::ready_tasks` conflates `Open` and `Blocked` (see
 /// `crates/cas-factory/src/director.rs`). Blocked tasks cannot be started, and
-/// Closed tasks never appear in `ready_tasks` at all, but this count is used
-/// in the `WorkerIdle` / `AgentRegistered` prompts to tell the supervisor how
-/// many tasks are available — if we reported the raw length the supervisor
-/// would be told "there are N ready tasks" and then find nothing to assign
-/// when N of them are actually blocked. Count only `Open` and only tasks
-/// without an assignee already set. See cas-177f.
+/// Closed tasks never appear in `ready_tasks` at all, but this count decides
+/// whether the `WorkerIdle` / `AgentRegistered` prompts should offer an assign
+/// command. Count only `Open` and only tasks without an assignee already set.
+/// See cas-177f.
 fn dispatchable_ready_count(data: &DirectorData) -> usize {
     data.ready_tasks
         .iter()
         .filter(|t| t.status == TaskStatus::Open && t.assignee.is_none())
         .count()
+}
+
+fn live_worker_session_id(data: &DirectorData, worker_name: &str) -> Option<String> {
+    data.agents
+        .iter()
+        .find(|agent| agent.name == worker_name)
+        .map(|agent| agent.id.clone())
+        .or_else(|| {
+            data.agent_id_to_name
+                .iter()
+                .find_map(|(id, name)| (name == worker_name).then(|| id.clone()))
+        })
 }
 
 /// A prompt to be injected into an agent's terminal
@@ -132,10 +142,7 @@ pub fn generate_prompt(
                 .ready_tasks
                 .iter()
                 .any(|t| t.id == *task_id && t.status == cas_types::TaskStatus::Open);
-            let in_progress = data
-                .in_progress_tasks
-                .iter()
-                .any(|t| t.id == *task_id);
+            let in_progress = data.in_progress_tasks.iter().any(|t| t.id == *task_id);
 
             let text = if in_ready {
                 // Task regressed to Open (lease expired) — worker needs to close it.
@@ -203,6 +210,15 @@ pub fn generate_prompt(
                 return None;
             }
 
+            // Defense-in-depth for stale queued events: only emit an idle nudge
+            // when the current authoritative snapshot still contains this worker.
+            // If the worker was shut down, crashed, or belonged to another session,
+            // a stale WorkerIdle event must not tell the supervisor to assign into
+            // the void.
+            let Some(worker_session_id) = live_worker_session_id(data, worker) else {
+                return None;
+            };
+
             // Guard (cas-889d / cas-dbbb): suppress idle nudge if the worker already
             // has an active in_progress task OR an assigned-but-not-yet-started Open
             // task in the current snapshot. Checking in_progress_tasks alone misses
@@ -218,21 +234,20 @@ pub fn generate_prompt(
             // Checking by both display-name assignee (canonical DB path) and session-ID
             // assignee (legacy assignment path via agent_id_to_name) makes this robust
             // to either convention.
-            let worker_is_busy = data
-                .in_progress_tasks
-                .iter()
-                .chain(
-                    data.ready_tasks
-                        .iter()
-                        .filter(|t| t.status == TaskStatus::Open),
-                )
-                .any(|t| {
-                    t.assignee.as_deref() == Some(worker.as_str())
-                        || data
-                            .agent_id_to_name
+            let worker_is_busy =
+                data.in_progress_tasks
+                    .iter()
+                    .chain(
+                        data.ready_tasks
                             .iter()
-                            .any(|(id, name)| name == worker && t.assignee.as_deref() == Some(id))
-                });
+                            .filter(|t| t.status == TaskStatus::Open),
+                    )
+                    .any(|t| {
+                        t.assignee.as_deref() == Some(worker.as_str())
+                            || data.agent_id_to_name.iter().any(|(id, name)| {
+                                name == worker && t.assignee.as_deref() == Some(id)
+                            })
+                    });
             if worker_is_busy {
                 return None;
             }
@@ -253,15 +268,10 @@ pub fn generate_prompt(
                 // under-assign or over-assign, so we remove the specific count and
                 // direct them to the live command instead.
                 //
-                // cas-dbbb: use the worker's display name (not session ID) for
-                // `assignee=`. `task mine` matches on agent_name (the display
-                // name) and CAS_AGENT_NAME env — worker display names dispatch
-                // correctly. Session IDs stored as `assignee` are silently accepted
-                // by `task update` but do NOT match `task mine`'s identity set.
                 format!(
                     "Worker {worker} is idle with no assigned tasks.\n\
                      Ready tasks exist — check live: `{supervisor_prefix}task action=ready`\n\
-                     Assign work: {supervisor_prefix}task action=update id=<task-id> assignee={worker}"
+                     Assign work: {supervisor_prefix}task action=update id=<task-id> assignee={worker_session_id}"
                 )
             } else {
                 // Do NOT suggest "closing the epic" here — the task snapshot may
@@ -320,21 +330,17 @@ pub fn generate_prompt(
             }
 
             let ready_count = dispatchable_ready_count(data);
-
-            // cas-dbbb: use agent_name (display name) for `assignee=`, not agent_id
-            // (session UUID). `task mine` matches on agent_name and CAS_AGENT_NAME
-            // env var. Assigning by session UUID is silently accepted by `task update`
-            // but does NOT appear in `task mine` for the target worker.
             let text = if ready_count > 0 {
                 format!(
                     "Worker {agent_name} is ready and waiting for tasks.\n\
-                     There are {ready_count} ready tasks available.\n\
-                     Assign work: {supervisor_prefix}task action=update id=<task-id> assignee={agent_name}"
+                     Ready tasks exist — check live: `{supervisor_prefix}task action=ready`\n\
+                     Assign work: {supervisor_prefix}task action=update id=<task-id> assignee={agent_id}"
                 )
             } else {
                 format!(
                     "Worker {agent_name} is ready and waiting for tasks.\n\
-                     No ready tasks are available yet."
+                     No dispatchable tasks in current snapshot — verify with \
+                     `{supervisor_prefix}task action=ready` before acting."
                 )
             };
 
@@ -364,9 +370,8 @@ pub fn generate_prompt(
             }
 
             let text = format!(
-                "🎉 All subtasks of epic '{epic_title}' ({epic_id}) are now closed!\n\n\
+                "All subtasks of epic '{epic_title}' ({epic_id}) are now closed.\n\n\
                  Next steps:\n\
-                 - Cherry-pick worker commits to main\n\
                  - Verify the integrated result\n\
                  - Close the epic: {supervisor_prefix}task action=close id={epic_id} reason=\"All subtasks complete\"\n\
                  - Shut down idle workers if no more work"
@@ -382,10 +387,10 @@ pub fn generate_prompt(
 
 #[cfg(test)]
 mod tests {
-    use crate::ui::factory::director::data::TaskSummary;
+    use crate::ui::factory::director::data::{AgentSummary, TaskSummary};
     use crate::ui::factory::director::prompts::*;
     use cas_mux::SupervisorCli;
-    use cas_types::{Priority, TaskStatus, TaskType};
+    use cas_types::{AgentStatus, Priority, TaskStatus, TaskType};
     use std::collections::HashMap;
 
     fn make_data(ready_count: usize) -> DirectorData {
@@ -407,9 +412,19 @@ mod tests {
             ready_tasks,
             in_progress_tasks: vec![],
             epic_tasks: vec![],
-            agents: vec![],
+            agents: vec![AgentSummary {
+                id: "sess-id-abc123".to_string(),
+                name: "swift-fox".to_string(),
+                status: AgentStatus::Active,
+                current_task: None,
+                latest_activity: None,
+                last_heartbeat: Some(chrono::Utc::now()),
+                pending_messages: 0,
+            }],
             activity: vec![],
-            agent_id_to_name: HashMap::new(),
+            agent_id_to_name: [("sess-id-abc123".to_string(), "swift-fox".to_string())]
+                .into_iter()
+                .collect(),
             changes: vec![],
             git_loaded: true,
             reminders: vec![],
@@ -662,6 +677,23 @@ mod tests {
     }
 
     #[test]
+    fn test_worker_idle_suppressed_when_worker_absent_from_live_snapshot() {
+        let event = DirectorEvent::WorkerIdle {
+            worker: "stale-worker".to_string(),
+        };
+        let data = make_data(2);
+        let config = default_config();
+
+        let prompt = generate_prompt(&event, &data, "supervisor", &config, codex(), codex());
+
+        assert!(
+            prompt.is_none(),
+            "WorkerIdle must not emit for a worker absent from current DirectorData: {:?}",
+            prompt.map(|p| p.text)
+        );
+    }
+
+    #[test]
     fn test_epic_completed_no_prompt() {
         let event = DirectorEvent::EpicCompleted {
             epic_id: "epic-456".to_string(),
@@ -675,6 +707,27 @@ mod tests {
             prompt.is_none(),
             "EpicCompleted should not generate a prompt"
         );
+    }
+
+    #[test]
+    fn test_epic_all_subtasks_closed_has_no_branch_or_main_instructions() {
+        let event = DirectorEvent::EpicAllSubtasksClosed {
+            epic_id: "epic-456".to_string(),
+            epic_title: "Test Epic".to_string(),
+        };
+        let data = make_data(0);
+        let config = default_config();
+
+        let prompt =
+            generate_prompt(&event, &data, "supervisor", &config, codex(), codex()).unwrap();
+        let lower = prompt.text.to_lowercase();
+
+        assert!(
+            !lower.contains("cherry-pick") && !lower.contains("main"),
+            "Epic completion prompt must not prescribe branch/merge/main instructions: {}",
+            prompt.text
+        );
+        assert!(prompt.text.contains("task action=close id=epic-456"));
     }
 
     #[test]
@@ -692,7 +745,9 @@ mod tests {
         assert_eq!(prompt.target, "supervisor");
         assert!(prompt.text.contains("calm-owl"));
         assert!(prompt.text.contains("ready"));
-        assert!(prompt.text.contains("3 ready tasks"));
+        assert!(!prompt.text.contains("3 ready tasks"));
+        assert!(prompt.text.contains("task action=ready"));
+        assert!(prompt.text.contains("assignee=agent-123"));
     }
 
     #[test]
@@ -710,7 +765,8 @@ mod tests {
         assert_eq!(prompt.target, "supervisor");
         assert!(prompt.text.contains("calm-owl"));
         assert!(prompt.text.contains("ready"));
-        assert!(prompt.text.contains("No ready tasks"));
+        assert!(prompt.text.contains("No dispatchable tasks"));
+        assert!(prompt.text.contains("task action=ready"));
     }
 
     #[test]
@@ -839,36 +895,29 @@ mod tests {
         }
     }
 
-    /// cas-dbbb: WorkerIdle assignee template must use the worker's display name
-    /// (not the session ID). `task mine` matches on agent_name and CAS_AGENT_NAME
-    /// env var — worker names dispatch correctly. Session IDs are silently accepted
-    /// by `task update` but do NOT appear in `task mine` for the target worker
-    /// (confirmed in smoke test 2026-06-30: session-ID assignments left tasks in
-    /// Ready/Open with no visible assignee; name-based assignments dispatched).
+    /// WorkerIdle assignment guidance must use the worker's live session ID,
+    /// not only the display name. This keeps the prompt tied to the current
+    /// authoritative agent row and avoids assigning work to a stale reused name.
     #[test]
-    fn test_dbbb_worker_idle_assignee_uses_display_name() {
+    fn test_worker_idle_assignee_uses_session_id() {
         let event = DirectorEvent::WorkerIdle {
             worker: "swift-fox".to_string(),
         };
 
-        // Populate agent_id_to_name — the display name must be used regardless.
-        let mut data = make_data(2);
-        data.agent_id_to_name
-            .insert("sess-id-abc123".to_string(), "swift-fox".to_string());
+        let data = make_data(2);
 
         let config = default_config();
         let prompt =
             generate_prompt(&event, &data, "supervisor", &config, codex(), codex()).unwrap();
 
-        // The assignee= value must be the display name, not the session ID.
         assert!(
-            prompt.text.contains("assignee=swift-fox"),
-            "cas-dbbb: WorkerIdle must use display name in assignee field, got: {}",
+            prompt.text.contains("assignee=sess-id-abc123"),
+            "WorkerIdle must use the live session ID in assignee field, got: {}",
             prompt.text
         );
         assert!(
-            !prompt.text.contains("assignee=sess-id-abc123"),
-            "cas-dbbb: WorkerIdle must NOT use session ID in assignee field, got: {}",
+            !prompt.text.contains("assignee=swift-fox"),
+            "WorkerIdle must not use only the display name in assignee field, got: {}",
             prompt.text
         );
     }
@@ -917,13 +966,10 @@ mod tests {
         );
     }
 
-    /// cas-dbbb: AgentRegistered assignee template must use the display name
-    /// (`agent_name`), not the session ID (`agent_id`). `task mine` matches on
-    /// agent_name and CAS_AGENT_NAME env var. Session-ID assignments are silently
-    /// accepted by `task update` but the task does not appear in `task mine` for
-    /// the target worker (confirmed in 2026-06-30 smoke test).
+    /// AgentRegistered assignment guidance must use the registered session ID,
+    /// not only the display name, so the prompt cannot target a stale reused name.
     #[test]
-    fn test_dbbb_agent_registered_assignee_uses_display_name() {
+    fn test_agent_registered_assignee_uses_session_id() {
         let event = DirectorEvent::AgentRegistered {
             agent_id: "sess-id-abc123".to_string(),
             agent_name: "calm-owl".to_string(),
@@ -934,13 +980,13 @@ mod tests {
             generate_prompt(&event, &data, "supervisor", &config, codex(), codex()).unwrap();
 
         assert!(
-            prompt.text.contains("assignee=calm-owl"),
-            "cas-dbbb: AgentRegistered must use display name in assignee field, got: {}",
+            prompt.text.contains("assignee=sess-id-abc123"),
+            "AgentRegistered must use session ID in assignee field, got: {}",
             prompt.text
         );
         assert!(
-            !prompt.text.contains("assignee=sess-id-abc123"),
-            "cas-dbbb: AgentRegistered must NOT use session ID in assignee field, got: {}",
+            !prompt.text.contains("assignee=calm-owl"),
+            "AgentRegistered must not use only display name in assignee field, got: {}",
             prompt.text
         );
     }
@@ -1016,8 +1062,7 @@ mod tests {
             agent_id: "sess-id-xyz".to_string(),
             agent_name: "swift-fox".to_string(),
         };
-        let prompt2 =
-            generate_prompt(&reg_event, &data, "supervisor", &config, codex(), codex());
+        let prompt2 = generate_prompt(&reg_event, &data, "supervisor", &config, codex(), codex());
         assert!(
             prompt2.is_none(),
             "cas-dbbb: AgentRegistered must be suppressed when worker has an assigned Open task: \
@@ -1049,9 +1094,19 @@ mod tests {
             ready_tasks: vec![blocked_task],
             in_progress_tasks: vec![],
             epic_tasks: vec![],
-            agents: vec![],
+            agents: vec![AgentSummary {
+                id: "sess-id-abc123".to_string(),
+                name: "swift-fox".to_string(),
+                status: AgentStatus::Active,
+                current_task: None,
+                latest_activity: None,
+                last_heartbeat: Some(chrono::Utc::now()),
+                pending_messages: 0,
+            }],
             activity: vec![],
-            agent_id_to_name: HashMap::new(),
+            agent_id_to_name: [("sess-id-abc123".to_string(), "swift-fox".to_string())]
+                .into_iter()
+                .collect(),
             changes: vec![],
             git_loaded: true,
             reminders: vec![],
@@ -1199,8 +1254,7 @@ mod tests {
         let config = default_config();
 
         // "supervisor" is distinct from "swift-fox" — nudge must fire.
-        let prompt =
-            generate_prompt(&event, &data, "supervisor", &config, codex(), codex());
+        let prompt = generate_prompt(&event, &data, "supervisor", &config, codex(), codex());
 
         assert!(
             prompt.is_some(),
@@ -1296,7 +1350,9 @@ mod tests {
             prompt.text
         );
         assert!(
-            prompt.text.contains("mcp__cas__coordination action=message"),
+            prompt
+                .text
+                .contains("mcp__cas__coordination action=message"),
             "cas-efc4 AC3: response instruction must use Claude coordination tool: {}",
             prompt.text
         );
@@ -1352,7 +1408,9 @@ mod tests {
         );
         // Response instruction: supervisor (Claude) uses its own coordination tool
         assert!(
-            prompt.text.contains("mcp__cas__coordination action=message"),
+            prompt
+                .text
+                .contains("mcp__cas__coordination action=message"),
             "cas-efc4 AC5: response instruction must use Claude supervisor prefix: {}",
             prompt.text
         );
@@ -1409,7 +1467,9 @@ mod tests {
         );
         // Response instruction: supervisor (Claude) uses its own coordination tool
         assert!(
-            prompt.text.contains("mcp__cas__coordination action=message"),
+            prompt
+                .text
+                .contains("mcp__cas__coordination action=message"),
             "cas-efc4 AC5: response instruction must use Claude supervisor prefix: {}",
             prompt.text
         );
@@ -1423,19 +1483,29 @@ mod tests {
     ///   ready queue) → `supervisor_prefix` = `mcp__cas__` (Claude).
     /// - Response instruction tells the SUPERVISOR how to reply → `supervisor_cli`
     ///   = Claude → `mcp__cas__coordination`.
-    /// - cas-dbbb: assignee= uses the worker's DISPLAY NAME (`worker`), not a
-    ///   session ID. `task mine` matches on agent_name (the display name registered
-    ///   as CAS_AGENT_NAME), so display names dispatch correctly. Session IDs stored
-    ///   as `assignee` are silently accepted by `task update` but do NOT match
-    ///   `task mine`'s identity set.
+    /// - assignee= uses the worker's live session ID from the current snapshot.
     #[test]
     fn test_efc4_worker_idle_codex_worker_claude_supervisor_prefixes() {
         let event = DirectorEvent::WorkerIdle {
             worker: "codex-worker".to_string(),
         };
         // 2 ready tasks so the "ready tasks exist" branch fires (non-empty assign cmd).
-        // No agent_id_to_name needed: cas-dbbb uses the display name directly.
-        let data = make_data(2);
+        let mut data = make_data(2);
+        data.agents = vec![AgentSummary {
+            id: "sess-id-codex-worker".to_string(),
+            name: "codex-worker".to_string(),
+            status: AgentStatus::Active,
+            current_task: None,
+            latest_activity: None,
+            last_heartbeat: Some(chrono::Utc::now()),
+            pending_messages: 0,
+        }];
+        data.agent_id_to_name = [(
+            "sess-id-codex-worker".to_string(),
+            "codex-worker".to_string(),
+        )]
+        .into_iter()
+        .collect();
         let config = default_config();
 
         // Claude supervisor, Codex worker
@@ -1458,20 +1528,21 @@ mod tests {
             "cas-efc4 AC5: ready-check must use Claude supervisor prefix: {}",
             prompt.text
         );
-        // cas-dbbb: assignee must be the display name ("codex-worker"), not a session ID
         assert!(
-            prompt.text.contains("assignee=codex-worker"),
-            "cas-efc4 / cas-dbbb: assignee must use worker display name, not session ID: {}",
+            prompt.text.contains("assignee=sess-id-codex-worker"),
+            "cas-efc4: assignee must use worker session ID: {}",
             prompt.text
         );
         assert!(
-            !prompt.text.contains("assignee=sess-id"),
-            "cas-efc4 / cas-dbbb: assignee must NOT be a session ID: {}",
+            !prompt.text.contains("assignee=codex-worker"),
+            "cas-efc4: assignee must not use only worker display name: {}",
             prompt.text
         );
         // Response instruction: supervisor (Claude) uses its own tool to reply
         assert!(
-            prompt.text.contains("mcp__cas__coordination action=message"),
+            prompt
+                .text
+                .contains("mcp__cas__coordination action=message"),
             "cas-efc4 AC5: response instruction (to supervisor) must use Claude coordination prefix: {}",
             prompt.text
         );
