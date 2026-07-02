@@ -215,7 +215,13 @@ pub fn generate_prompt(
             // If the worker was shut down, crashed, or belonged to another session,
             // a stale WorkerIdle event must not tell the supervisor to assign into
             // the void.
-            let Some(worker_session_id) = live_worker_session_id(data, worker) else {
+            // Liveness gate only — the assignee interpolation below uses the
+            // display name (`worker`), not this session ID. `task mine` matches
+            // on display name, and `task update assignee=<session-id>` gets
+            // silently normalized back to the display name (update.rs:176-186,
+            // cas-dbbb). Advertising the session id here just adds a spurious
+            // normalization warning on every assignment.
+            let Some(_worker_session_id) = live_worker_session_id(data, worker) else {
                 return None;
             };
 
@@ -271,7 +277,7 @@ pub fn generate_prompt(
                 format!(
                     "Worker {worker} is idle with no assigned tasks.\n\
                      Ready tasks exist — check live: `{supervisor_prefix}task action=ready`\n\
-                     Assign work: {supervisor_prefix}task action=update id=<task-id> assignee={worker_session_id}"
+                     Assign work: {supervisor_prefix}task action=update id=<task-id> assignee={worker}"
                 )
             } else {
                 // Do NOT suggest "closing the epic" here — the task snapshot may
@@ -334,7 +340,7 @@ pub fn generate_prompt(
                 format!(
                     "Worker {agent_name} is ready and waiting for tasks.\n\
                      Ready tasks exist — check live: `{supervisor_prefix}task action=ready`\n\
-                     Assign work: {supervisor_prefix}task action=update id=<task-id> assignee={agent_id}"
+                     Assign work: {supervisor_prefix}task action=update id=<task-id> assignee={agent_name}"
                 )
             } else {
                 format!(
@@ -747,7 +753,7 @@ mod tests {
         assert!(prompt.text.contains("ready"));
         assert!(!prompt.text.contains("3 ready tasks"));
         assert!(prompt.text.contains("task action=ready"));
-        assert!(prompt.text.contains("assignee=agent-123"));
+        assert!(prompt.text.contains("assignee=calm-owl"));
     }
 
     #[test]
@@ -895,11 +901,16 @@ mod tests {
         }
     }
 
-    /// WorkerIdle assignment guidance must use the worker's live session ID,
-    /// not only the display name. This keeps the prompt tied to the current
-    /// authoritative agent row and avoids assigning work to a stale reused name.
+    /// WorkerIdle assignment guidance must use the worker's display name, not
+    /// the session ID. `task mine` matches on display name, and
+    /// `task update assignee=<session-id>` gets silently normalized back to
+    /// the display name (update.rs:176-186, cas-dbbb) — so the session ID
+    /// form just produces a spurious warning. The live-session-ID lookup
+    /// (`live_worker_session_id`) still gates whether a prompt fires at all
+    /// (cas-c790 defense-in-depth), it just isn't interpolated into the
+    /// assignee field.
     #[test]
-    fn test_worker_idle_assignee_uses_session_id() {
+    fn test_worker_idle_assignee_uses_display_name() {
         let event = DirectorEvent::WorkerIdle {
             worker: "swift-fox".to_string(),
         };
@@ -911,13 +922,13 @@ mod tests {
             generate_prompt(&event, &data, "supervisor", &config, codex(), codex()).unwrap();
 
         assert!(
-            prompt.text.contains("assignee=sess-id-abc123"),
-            "WorkerIdle must use the live session ID in assignee field, got: {}",
+            prompt.text.contains("assignee=swift-fox"),
+            "WorkerIdle must use the display name in assignee field, got: {}",
             prompt.text
         );
         assert!(
-            !prompt.text.contains("assignee=swift-fox"),
-            "WorkerIdle must not use only the display name in assignee field, got: {}",
+            !prompt.text.contains("assignee=sess-id-abc123"),
+            "WorkerIdle must not use the session ID in assignee field, got: {}",
             prompt.text
         );
     }
@@ -966,10 +977,13 @@ mod tests {
         );
     }
 
-    /// AgentRegistered assignment guidance must use the registered session ID,
-    /// not only the display name, so the prompt cannot target a stale reused name.
+    /// AgentRegistered assignment guidance must use the registered display
+    /// name, not the session ID — same rationale as WorkerIdle above
+    /// (cas-dbbb: `task mine` matches display name; session-id assignees get
+    /// silently normalized back to it, so advertising the session id here
+    /// just adds a spurious warning).
     #[test]
-    fn test_agent_registered_assignee_uses_session_id() {
+    fn test_agent_registered_assignee_uses_display_name() {
         let event = DirectorEvent::AgentRegistered {
             agent_id: "sess-id-abc123".to_string(),
             agent_name: "calm-owl".to_string(),
@@ -980,13 +994,13 @@ mod tests {
             generate_prompt(&event, &data, "supervisor", &config, codex(), codex()).unwrap();
 
         assert!(
-            prompt.text.contains("assignee=sess-id-abc123"),
-            "AgentRegistered must use session ID in assignee field, got: {}",
+            prompt.text.contains("assignee=calm-owl"),
+            "AgentRegistered must use display name in assignee field, got: {}",
             prompt.text
         );
         assert!(
-            !prompt.text.contains("assignee=calm-owl"),
-            "AgentRegistered must not use only display name in assignee field, got: {}",
+            !prompt.text.contains("assignee=sess-id-abc123"),
+            "AgentRegistered must not use the session ID in assignee field, got: {}",
             prompt.text
         );
     }
@@ -1483,7 +1497,8 @@ mod tests {
     ///   ready queue) → `supervisor_prefix` = `mcp__cas__` (Claude).
     /// - Response instruction tells the SUPERVISOR how to reply → `supervisor_cli`
     ///   = Claude → `mcp__cas__coordination`.
-    /// - assignee= uses the worker's live session ID from the current snapshot.
+    /// - assignee= uses the worker's display name (cas-dbbb); the live session
+    ///   ID lookup still gates whether the prompt fires at all.
     #[test]
     fn test_efc4_worker_idle_codex_worker_claude_supervisor_prefixes() {
         let event = DirectorEvent::WorkerIdle {
@@ -1529,13 +1544,13 @@ mod tests {
             prompt.text
         );
         assert!(
-            prompt.text.contains("assignee=sess-id-codex-worker"),
-            "cas-efc4: assignee must use worker session ID: {}",
+            prompt.text.contains("assignee=codex-worker"),
+            "cas-efc4: assignee must use worker display name: {}",
             prompt.text
         );
         assert!(
-            !prompt.text.contains("assignee=codex-worker"),
-            "cas-efc4: assignee must not use only worker display name: {}",
+            !prompt.text.contains("assignee=sess-id-codex-worker"),
+            "cas-efc4: assignee must not use the worker session ID: {}",
             prompt.text
         );
         // Response instruction: supervisor (Claude) uses its own tool to reply
