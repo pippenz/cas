@@ -6,7 +6,9 @@ priority: P1
 
 # Cloud sync: git-remote slug auto-derivation fragments a team off its canonical bucket; the push queue poison-head stalls all drainage; touching a task leaks duplicate queue items
 
-A user reported that SOW-10 tasks created on one machine (Linux) were **invisible on a second machine** (Mac) after `cas cloud sync` on both. The tasks were never actually missing from the cloud — they were in the canonical `ozer` project bucket the whole time. The Mac simply **read a different bucket**, because CAS 2.20 auto-derives the cloud project slug from the **git remote** instead of the established short slug. While diagnosing this, two further sync defects surfaced: the local push queue has a **poison-head FIFO stall** (pushes report success while draining nothing), and **touching a task enqueues duplicate items** that never fully clear. One workaround step also revealed that **pushing under a pinned slug silently re-homes ~17k entities between cloud buckets**.
+Resolution: Already fixed by the cloud-sync reliability work merged in `34203e2` and released in `v2.21.0`: `be42057` fixed queue poison-head and duplicate NULL-team_id enqueue behavior, `28ac14c` added the `--rehome` guard and truthful push counts, and `b4d55d9`/`034a8a9` added bucket-ambiguity warning plus concrete team-show slug resolution.
+
+A user reported that SOW-10 tasks created on one machine (Linux) were **invisible on a second machine** (Mac) after `cas cloud sync` on both. The tasks were never actually missing from the cloud — they were in the canonical `ozer` project bucket the whole time. The Mac simply **read a different bucket**, because CAS 2.20 auto-derives the cloud project slug from the **git remote** instead of the established short slug. While diagnosing this, two further sync defects surfaced: the local push queue has a **poison-head FIFO stall** (pushes report success while draining nothing), and **touching a task enqueues duplicate items** that never fully clear. One diagnostic step also revealed that **pushing under a pinned slug silently re-homes ~17k entities between cloud buckets**.
 
 ## Affected version
 
