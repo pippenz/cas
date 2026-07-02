@@ -1,5 +1,20 @@
 # BUG: Codex factory worker stalls in task-lifecycle gates, produces zero code
 
+## Resolution
+
+Resolved in current code before this request was processed:
+
+- `cas-bbc2` made Codex agents self-contained by spawn-injecting the CAS MCP server in `crates/cas-pty/src/pty.rs` via `mcp_servers.cs.command="cas"` and `mcp_servers.cs.args=["serve"]`, so workers no longer have to reverse-engineer or hand-launch `cas serve`.
+- `cas-bbc2` also rewrote the Codex worker startup path to choose exactly one assigned task, start only that task, implement/commit/push/close it, and avoid batch-starting multiple assignments into the one-unverified-in-progress jail.
+- `cas-3522` injects `CAS_SESSION_ID` into the Codex `cs` MCP server environment, allowing first-tool-call auto-registration and removing the old `session_start` dance.
+- `cas-8aaf` injects `CAS_FACTORY_MODE=1` and `CAS_FACTORY_WORKER_CLI=codex` into the Codex `cs` MCP server environment, so verification-jail and close guidance use the Codex-capable `mcp__cs__*` aliases.
+- `Pty::spawn` now preflights Codex spawns and refuses loudly when the spawn-injected `cas` MCP binary is not on `PATH`, instead of launching a tool-less worker.
+
+Verification evidence:
+
+- `crates/cas-pty/src/pty.rs` contains regression tests for Codex MCP injection, one-task startup wording, session-id injection, factory env injection, and the absence of `session_start`.
+- `cas-cli/tests/mcp_tools_test/task_tools/verification_flow.rs` verifies Codex verification-jail guidance uses `mcp__cs__coordination`.
+
 **Date:** 2026-06-23
 **Reporter:** supervisor (factory session, epic cas-167a)
 **Severity:** High — `cli=codex` factory workers are effectively non-functional for multi-task assignments
@@ -70,7 +85,7 @@ file-level instructions provided via supervisor message).
    the coordination phase.
 4. Confirm/repair the one-in-progress-per-worker invariant (it allowed 2, blocked the 3rd).
 5. Consider a supervisor-owned-lifecycle mode for Codex workers (worker only codes/commits/pushes;
-   supervisor owns start/close) — this is the workaround that unblocked us.
+   supervisor owns start/close) — this was the operator mitigation that unblocked the session.
 
 ## Repro
 
