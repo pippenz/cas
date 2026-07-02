@@ -148,6 +148,33 @@ fn test_sqlite_rule_store_full_lifecycle() {
     store.close().expect("Failed to close store");
 }
 
+#[test]
+fn test_sqlite_rule_generate_id_skips_existing_rules_without_sequence_seed() {
+    let temp = setup_temp_dir();
+    let store = SqliteRuleStore::open(temp.path()).expect("Failed to create store");
+    store.init().expect("Failed to init store");
+
+    let existing = Rule::new(
+        "rule-001".to_string(),
+        "Existing rule from a pre-sequence database".to_string(),
+    );
+    store.add(&existing).expect("Failed to add existing rule");
+
+    let id = store.generate_id().expect("Failed to generate ID");
+    assert_ne!(
+        id, "rule-001",
+        "generated ID must not collide with an existing rule when id_sequences is missing"
+    );
+
+    let new_rule = Rule::new(id.clone(), "New rule after sequence recovery".to_string());
+    store
+        .add(&new_rule)
+        .expect("generated ID should insert without UNIQUE constraint failure");
+    assert!(store.get(&id).is_ok());
+
+    store.close().expect("Failed to close store");
+}
+
 // =============================================================================
 // SqliteTaskStore Integration Tests
 // =============================================================================
