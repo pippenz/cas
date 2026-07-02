@@ -395,7 +395,7 @@ impl CloudSyncer {
 
     /// Split upsert entries into sub-batches that each stay under max_payload_bytes.
     /// Takes ownership of entries to avoid cloning serde_json::Value.
-    fn split_into_sub_batches<'a>(
+    pub(crate) fn split_into_sub_batches<'a>(
         &self,
         entries: Vec<(&'a QueuedSync, serde_json::Value)>,
     ) -> Vec<Vec<(&'a QueuedSync, serde_json::Value)>> {

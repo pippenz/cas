@@ -2,9 +2,32 @@
 from: Petra Stella Cloud team
 date: 2026-06-01
 priority: P1
+status: completed
+resolved_by: cas-585c
 ---
 
 # Team push bundles all entity types into one unbounded request → 413 on the cloud
+
+## Resolution
+
+Fixed in `cas-585c`. Current code still reproduced the reported failure before
+the change: `CloudSyncer::push_team` in `cas-cli/src/cloud/syncer/team_push.rs`
+was building one combined team-push map for all upsert entity types, serializing
+it once, and POSTing it once to `/api/teams/{team_id}/sync/push`, while the
+personal push path already chunked with `split_into_sub_batches` in
+`cas-cli/src/cloud/syncer/push.rs`.
+
+Team push now mirrors the personal push shape for upserts: it iterates entity
+types, splits each entity type into size-limited sub-batches using the shared
+splitter, sends one gzip POST per sub-batch, aggregates `SyncResult` counts, and
+marks only the rows in the successful or failed sub-batch. Deletes remain on the
+existing one-per-entity delete path.
+
+Regression coverage: `team_push_chunks_upserts_by_payload_budget` in
+`cas-cli/tests/team_sync_test.rs` fails before the fix by observing the original
+single bundled request behavior, then passes after the fix by confirming three
+large team entry upserts drain as three bounded requests with correct aggregate
+counts and queue cleanup.
 
 `cas cloud sync` consistently fails the team-push leg with `413 Payload too large` once the team queue grows past ~2 MB compressed. Personal push on the same run succeeds because it chunks; team push does not chunk at all.
 
