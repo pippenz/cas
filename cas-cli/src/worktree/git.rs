@@ -228,9 +228,9 @@ impl GitOperations {
     ///
     /// Uses git's own mechanisms in priority order:
     /// 1. Remote origin HEAD (authoritative if remote exists)
-    /// 2. HEAD symref target (what git init / clone set up)
-    /// 3. `init.defaultBranch` config
-    /// 4. Check common branch names that actually exist as refs
+    /// 2. `init.defaultBranch` config
+    /// 3. Check common branch names that actually exist as refs
+    /// 4. HEAD symref target
     /// 5. "main" as absolute last resort
     pub fn detect_default_branch(&self) -> String {
         // 1. Remote origin HEAD - most authoritative when a remote exists
@@ -249,23 +249,7 @@ impl GitOperations {
             }
         }
 
-        // 2. HEAD symref - what the repo was initialized with (works even with no commits)
-        if let Ok(output) = Command::new("git")
-            .args(["symbolic-ref", "HEAD"])
-            .current_dir(&self.repo_root)
-            .output()
-        {
-            if output.status.success() {
-                let refname = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if let Some(branch) = refname.strip_prefix("refs/heads/") {
-                    if !branch.is_empty() {
-                        return branch.to_string();
-                    }
-                }
-            }
-        }
-
-        // 3. git config init.defaultBranch
+        // 2. git config init.defaultBranch
         if let Ok(output) = Command::new("git")
             .args(["config", "init.defaultBranch"])
             .current_dir(&self.repo_root)
@@ -279,10 +263,29 @@ impl GitOperations {
             }
         }
 
-        // 4. Check common branch names that actually exist as refs
+        // 3. Check common branch names that actually exist as refs. This must
+        // precede HEAD so factory branch creation does not accidentally anchor
+        // to the supervisor's current feature/epic branch in local-only repos.
         for candidate in &["main", "master", "develop", "trunk"] {
             if self.branch_exists(candidate).unwrap_or(false) {
                 return candidate.to_string();
+            }
+        }
+
+        // 4. HEAD symref - useful in empty repos or repos with an uncommon
+        // default branch name and no configured/remote default.
+        if let Ok(output) = Command::new("git")
+            .args(["symbolic-ref", "HEAD"])
+            .current_dir(&self.repo_root)
+            .output()
+        {
+            if output.status.success() {
+                let refname = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if let Some(branch) = refname.strip_prefix("refs/heads/") {
+                    if !branch.is_empty() {
+                        return branch.to_string();
+                    }
+                }
             }
         }
 

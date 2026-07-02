@@ -41,6 +41,12 @@ pub(super) fn resolve_live_worker_harness(
 /// worktree. The daemon reaper (Unit 3) reads this to drive TTL-based salvage.
 const DIRTY_ON_SHUTDOWN_KEY: &str = "dirty_on_shutdown";
 
+fn worker_base_for_spawn(epic_branch: Option<&str>, manager: &WorktreeManager) -> String {
+    epic_branch
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| manager.git().detect_default_branch())
+}
+
 /// Stamp `dirty_on_shutdown=true` (plus path + file count) onto the agent
 /// record so the daemon reaper (Unit 3) can later salvage and reclaim the
 /// orphaned worktree. Returns error only on store-level failures.
@@ -301,10 +307,10 @@ impl FactoryApp {
                 let worktree_path = manager.worktree_path_for_worker(&worker_name);
                 let branch_name = manager.branch_name_for_worker(&worker_name);
                 let repo_root = manager.repo_root().to_path_buf();
-                let parent_branch = manager
-                    .git()
-                    .current_branch()
-                    .unwrap_or_else(|_| manager.git().detect_default_branch());
+                // Dynamic spawns must match startup spawns: worker branches are
+                // cut from the active epic branch when present, otherwise from
+                // the detected trunk. Never use the supervisor's incidental HEAD.
+                let parent_branch = worker_base_for_spawn(self.epic_branch.as_deref(), manager);
                 Some(WorktreePrep {
                     worktree_path,
                     branch_name,
@@ -652,9 +658,11 @@ impl FactoryApp {
             anyhow::bail!("Worker '{name}' is already active");
         }
 
-        // Check if worktree exists (for worktree mode, always branch from current branch)
+        // Check if worktree exists. If it has to be created, use the same base
+        // selection as normal worker spawn.
         let (cwd, cas_root) = if let Some(manager) = &mut self.worktree_manager {
-            let worktree = match manager.ensure_worker_worktree(name) {
+            let worker_base = worker_base_for_spawn(self.epic_branch.as_deref(), manager);
+            let worktree = match manager.ensure_worker_worktree_from(name, &worker_base) {
                 Ok(worktree) => worktree,
                 Err(e) => {
                     crate::telemetry::track(
@@ -798,6 +806,90 @@ impl FactoryApp {
         );
 
         Ok(shutdown_count)
+    }
+}
+
+#[cfg(test)]
+mod spawn_base_tests {
+    use super::*;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    fn init_repo(dir: &std::path::Path) {
+        Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(dir)
+            .output()
+            .expect("git init");
+        Command::new("git")
+            .args(["config", "user.email", "test@cas.test"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "CAS Test"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        std::fs::write(dir.join("README.md"), "# test").unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "initial"])
+            .current_dir(dir)
+            .output()
+            .expect("git commit");
+    }
+
+    #[test]
+    fn dynamic_worker_spawn_base_uses_epic_or_trunk_not_current_head() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo);
+
+        Command::new("git")
+            .args(["branch", "epic/current", "main"])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["checkout", "-q", "-b", "feature/supervisor-head"])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+
+        let config = WorktreeConfig {
+            enabled: true,
+            base_path: repo
+                .join(".cas")
+                .join("worktrees")
+                .to_string_lossy()
+                .to_string(),
+            branch_prefix: "factory/".to_string(),
+            auto_merge: false,
+            cleanup_on_close: false,
+            promote_entries_on_merge: false,
+        };
+        let manager = WorktreeManager::new(&repo, config).unwrap();
+        assert_eq!(
+            manager.git().current_branch().unwrap(),
+            "feature/supervisor-head"
+        );
+
+        assert_eq!(
+            worker_base_for_spawn(Some("epic/current"), &manager),
+            "epic/current",
+            "dynamic isolated workers should branch from the active epic branch"
+        );
+        assert_eq!(
+            worker_base_for_spawn(None, &manager),
+            "main",
+            "without an active epic, dynamic isolated workers should branch from trunk, not supervisor HEAD"
+        );
     }
 }
 

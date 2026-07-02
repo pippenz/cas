@@ -350,7 +350,7 @@ pub struct FactoryApp {
     /// text selection works. Set via F10 toggle on the client.
     pub select_mode: bool,
     /// Workers currently in the spawning pipeline (after prepare, before finish).
-    /// These appear as booting placeholder panes in the layout.
+    /// These appear as booting panes in the layout.
     pub pending_workers: Vec<PendingWorkerState>,
     /// When the error message was set (for auto-dismiss)
     error_set_at: Option<Instant>,
@@ -1949,7 +1949,7 @@ mod spawn_isolation_tests {
         std::fs::create_dir(&repo).unwrap();
         init_repo(&repo);
 
-        let process_cwd = std::env::current_dir().unwrap();
+        let process_cwd = repo.clone();
         let cas_dir = repo.join(".cas");
         std::fs::create_dir_all(&cas_dir).unwrap();
 

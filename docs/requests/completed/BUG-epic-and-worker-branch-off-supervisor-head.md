@@ -2,9 +2,20 @@
 from: Petra Stella — Ozer factory session
 date: 2026-06-09
 priority: P2
+resolution: fixed
+resolved: 2026-07-02
 ---
 
 # Epic creation and `spawn_workers` branch off the supervisor's current HEAD, not the configured main branch
+
+## Resolution
+
+Fixed in `cas-8937` on 2026-07-02.
+
+- Epic creation paths now create epic branches from the detected trunk/default branch instead of the supervisor's incidental checkout.
+- Default-branch detection now prefers remote/default/trunk refs over the current `HEAD` symref, so local-only factory sessions do not accidentally treat a checked-out feature or epic branch as trunk.
+- Initial fork-first workers, dynamic `spawn_workers`, and respawned workers now create worker worktrees from the active epic branch when one exists, otherwise from the detected trunk.
+- Regression coverage now proves default-branch detection ignores a checked-out feature branch, epic branch creation uses trunk instead of current `HEAD`, and dynamic worker base selection chooses active epic/trunk instead of supervisor `HEAD`.
 
 In factory mode, both the epic branch (created by `task create` with `task_type=epic`) and worker worktrees (created by `coordination spawn_workers`) are based on **whatever branch the supervisor happens to have checked out**, rather than the repo's configured main/trunk branch. When the supervisor is sitting on an unrelated feature/epic branch, the new epic and all its workers silently inherit that branch's lineage — a contaminated base that is missing recent trunk commits and carries unrelated ones. Nothing in the output surfaces the chosen base, so it's invisible unless the supervisor manually inspects SHAs.
 
@@ -38,7 +49,7 @@ Net effect: the worker began implementing on a tree **missing 6 staging commits*
 - Base worker worktrees on the associated epic branch (or expose a `base`/`from` ref on `spawn_workers`).
 - Echo the resolved base branch + SHA in both the epic-create and spawn outputs so the supervisor can catch a wrong base immediately.
 
-## Workaround (current)
+## Pre-Fix Operator Mitigation
 
 Supervisor must `git checkout <main>` (e.g. `staging`) and pull before `task create epic`, and ensure workers are spawned from the epic branch; otherwise realign each worker worktree post-spawn (`git -C <worktree> fetch && git rebase --onto <epic> <bad-base>`).
 

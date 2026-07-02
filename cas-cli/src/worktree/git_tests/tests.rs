@@ -68,6 +68,25 @@ fn test_current_branch() {
 }
 
 #[test]
+fn test_detect_default_branch_ignores_current_feature_head() {
+    let (_temp, repo_path) = create_test_repo();
+    let git = GitOperations::new(repo_path.clone());
+    let trunk = git.current_branch().unwrap();
+
+    Command::new("git")
+        .args(["checkout", "-q", "-b", "feature/supervisor-head"])
+        .current_dir(&repo_path)
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        git.detect_default_branch(),
+        trunk,
+        "default branch detection must prefer the existing trunk ref over incidental supervisor HEAD"
+    );
+}
+
+#[test]
 fn test_create_and_remove_worktree() {
     let (temp, repo_path) = create_test_repo();
     let git = GitOperations::new(repo_path);
@@ -257,7 +276,7 @@ fn test_fix_symlinked_submodules() {
     // Create vendor directory
     std::fs::create_dir_all(repo_path.join("vendor")).unwrap();
 
-    // Create a symlink for the submodule (simulating the workaround)
+    // Create a symlink for the submodule (simulating the legacy mitigation)
     let symlink_path = repo_path.join("vendor/test");
     let target = repo_path.join(".git"); // Just point to something that exists
     #[cfg(unix)]

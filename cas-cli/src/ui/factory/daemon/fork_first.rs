@@ -197,8 +197,9 @@ impl DaemonInitPhase {
     pub fn run_with_progress(mut self) -> anyhow::Result<FactoryDaemon> {
         use crate::config::Config;
         use crate::store::find_cas_root;
+        use crate::ui::factory::app::{EpicState, detect_epic_state, epic_branch_name};
         use crate::ui::factory::director::DirectorData;
-        use crate::worktree::{WorktreeConfig, WorktreeManager};
+        use crate::worktree::{GitOperations, WorktreeConfig, WorktreeManager};
         use cas_mux::{Mux, MuxConfig};
 
         tracing::info!("Daemon init phase starting, waiting for parent to connect...");
@@ -263,21 +264,48 @@ impl DaemonInitPhase {
         };
         self.send_progress("Setting up worktree manager", 2, 6, true)?;
 
-        // Step 3: Preparing worker directories
-        self.send_progress("Preparing worker directories", 3, 6, false)?;
+        // Step 3: Loading CAS data
+        self.send_progress("Loading CAS data", 3, 6, false)?;
+        let director_data = DirectorData::load(&cas_dir, Some(&worktree_root))?;
+        let epic_state = detect_epic_state(&director_data, None);
+        let git_ops = GitOperations::new(self.factory_config.cwd.clone());
+        let trunk = git_ops.detect_default_branch();
+        let epic_branch = if let EpicState::Active { epic_title, .. } = &epic_state {
+            let branch_name = epic_branch_name(epic_title);
+            if let (Ok(head_sha), Ok(trunk_sha)) =
+                (git_ops.ref_sha("HEAD"), git_ops.ref_sha(&trunk))
+            {
+                if head_sha != trunk_sha {
+                    tracing::warn!(
+                        "supervisor HEAD ({}) differs from trunk '{}' ({}); epic branch will be based on trunk",
+                        &head_sha[..head_sha.len().min(8)],
+                        trunk,
+                        &trunk_sha[..trunk_sha.len().min(8)]
+                    );
+                }
+            }
+            if git_ops.create_branch_from(&branch_name, &trunk)? {
+                tracing::info!("Created epic branch {} from trunk '{}'", branch_name, trunk);
+            } else {
+                tracing::info!("Using existing epic branch: {}", branch_name);
+            }
+            Some(branch_name)
+        } else {
+            None
+        };
+        self.send_progress("Loading CAS data", 3, 6, true)?;
+
+        // Step 4: Preparing worker directories
+        self.send_progress("Preparing worker directories", 4, 6, false)?;
         let mut worker_cwds = HashMap::new();
         if let Some(ref mut manager) = worktree_manager {
+            let worker_base = epic_branch.as_deref().unwrap_or(trunk.as_str());
             for name in &self.worker_names {
-                let worktree = manager.ensure_worker_worktree(name)?;
+                let worktree = manager.ensure_worker_worktree_from(name, worker_base)?;
                 worker_cwds.insert(name.clone(), worktree.path.clone());
             }
         }
-        self.send_progress("Preparing worker directories", 3, 6, true)?;
-
-        // Step 4: Loading CAS data
-        self.send_progress("Loading CAS data", 4, 6, false)?;
-        let director_data = DirectorData::load(&cas_dir, Some(&worktree_root))?;
-        self.send_progress("Loading CAS data", 4, 6, true)?;
+        self.send_progress("Preparing worker directories", 4, 6, true)?;
 
         // Step 5: Clean up stale agents from previous sessions
         self.send_progress("Cleaning up stale agents", 5, 6, false)?;
