@@ -573,6 +573,77 @@ async fn test_worker_status_prunes_stale_worker_and_keeps_live_one() {
     );
 }
 
+/// cas-9829: a worker holding an in-progress task lease whose last observed
+/// activity is at/past the configured `stall_threshold_secs` must render
+/// `⚠ STALLED`, not the soft "may be investigating or idle" hedge — that
+/// hedge is exactly what let a genuinely stalled worker go unnoticed in the
+/// reported bug (worker printed a plan, then produced nothing for 10+
+/// minutes while heartbeating fine). A worker with NO claimed task must
+/// never be marked STALLED — that's the pre-existing WorkerIdle state, a
+/// different signal entirely.
+///
+/// `stall_threshold_secs` is set to `0` via `.cas/config.toml` so the
+/// claim's own registration-time activity event (which is necessarily
+/// "0s ago" in a synchronous test) already counts as past-threshold —
+/// this deterministically exercises the render wiring without needing to
+/// fabricate a real time gap.
+#[tokio::test]
+async fn test_9829_worker_status_marks_stalled_worker_with_in_progress_task() {
+    let _guard = EnvGuard::set(&[]);
+    let env = FactoryTestEnv::new();
+    std::fs::write(
+        env.cas_root.join("config.toml"),
+        "[factory]\nstall_threshold_secs = 0\n",
+    )
+    .expect("write config.toml");
+
+    let busy_id = env.register_worker("busy-badger");
+    let task_store = env.task_store();
+    let task = Task::new("cas-0b7d".to_string(), "Stalled task".to_string());
+    task_store.add(&task).expect("add task");
+    env.agent_store()
+        .try_claim("cas-0b7d", &busy_id, 600, None)
+        .expect("claim task")
+        .is_success();
+
+    env.register_worker("idle-ibis"); // no claimed task — must stay soft-worded
+
+    let req = factory_req("worker_status");
+    let result = env
+        .service
+        .factory(Parameters(req))
+        .await
+        .expect("worker_status call should succeed");
+    let text = get_text(&result);
+
+    assert!(
+        text.contains("busy-badger"),
+        "busy worker must appear in the listing. Got:\n{text}"
+    );
+    // Find the busy-badger's own row/block for a precise assertion (avoid a
+    // STALLED marker from the wrong worker satisfying the check).
+    let badger_block = text
+        .split("• ")
+        .find(|block| block.starts_with("busy-badger"))
+        .expect("busy-badger row must be present");
+    assert!(
+        badger_block.contains("⚠ STALLED"),
+        "worker with an in-progress task past the stall threshold must be marked STALLED. Got:\n{badger_block}"
+    );
+
+    // A worker with no claimed task is never "stalled" in this sense — an
+    // idle worker with no task is the pre-existing WorkerIdle state, not a
+    // stall, regardless of how fresh/stale its activity looks.
+    let ibis_block = text
+        .split("• ")
+        .find(|block| block.starts_with("idle-ibis"))
+        .expect("idle-ibis row must be present");
+    assert!(
+        !ibis_block.contains("⚠ STALLED"),
+        "a worker with no claimed task must never be marked STALLED. Got:\n{ibis_block}"
+    );
+}
+
 // =============================================================================
 // worker_activity tests
 // =============================================================================

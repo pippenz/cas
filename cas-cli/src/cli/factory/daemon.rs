@@ -161,6 +161,8 @@ pub(super) fn execute_daemon(
             .as_ref()
             .map(|t| t.variant == crate::ui::theme::ThemeVariant::Minions)
             .unwrap_or(false),
+        // cas-9829: activity-based stall detection threshold.
+        stall_threshold_secs: cas_config.factory().stall_threshold_secs,
     };
 
     let daemon_config = DaemonConfig {

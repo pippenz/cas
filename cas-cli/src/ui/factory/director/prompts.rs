@@ -299,6 +299,60 @@ pub fn generate_prompt(
             })
         }
 
+        DirectorEvent::WorkerStalled {
+            worker,
+            task_id,
+            elapsed_secs,
+            escalate,
+        } => {
+            if !config.on_worker_stalled {
+                return None;
+            }
+
+            // Guard (cas-c790 pattern): supervisor is never a "worker" for
+            // this purpose; and only nudge/escalate for a worker that's
+            // still in the live snapshot (stale queued event otherwise).
+            if worker == supervisor_name || live_worker_session_id(data, worker).is_none() {
+                return None;
+            }
+
+            let elapsed_mins = elapsed_secs / 60;
+
+            if !escalate {
+                // First detection: auto-nudge the worker directly — a
+                // single re-poke often unsticks a stalled agent (cas-9829).
+                let text = format!(
+                    "You have gone quiet on task {task_id} for about {elapsed_mins}m \
+                     (heartbeat is fine, but no tool calls/file edits/commits observed).\n\n\
+                     If you are still working, post a progress note now: \
+                     {worker_prefix}task action=notes id={task_id} notes=\"...\" note_type=progress\n\
+                     If you are blocked, report it: \
+                     {worker_prefix}task action=notes id={task_id} notes=\"...\" note_type=blocker\n\
+                     If you are done, close the task: {worker_prefix}task action=close id={task_id}"
+                );
+
+                Some(Prompt {
+                    target: worker.clone(),
+                    text: with_response_instructions(&text, supervisor_name, worker_cli),
+                })
+            } else {
+                // Still stalled after the nudge — escalate to the supervisor.
+                let text = format!(
+                    "Worker {worker} has been stalled on task {task_id} for about \
+                     {elapsed_mins}m — alive heartbeat, no activity, and an auto-nudge \
+                     did not unstick it.\n\n\
+                     Check: {supervisor_prefix}coordination action=worker_status\n\
+                     If it's still stuck, consider shutdown + respawn (safe if the \
+                     worktree is clean)."
+                );
+
+                Some(Prompt {
+                    target: supervisor_name.to_string(),
+                    text: with_response_instructions(&text, worker, supervisor_cli),
+                })
+            }
+        }
+
         DirectorEvent::AgentRegistered {
             agent_id,
             agent_name,
@@ -1570,6 +1624,97 @@ mod tests {
             prompt.text.contains("target=codex-worker"),
             "cas-efc4 AC5: response instruction must address the Codex worker: {}",
             prompt.text
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // cas-9829: WorkerStalled prompt generation
+    // -------------------------------------------------------------------
+
+    /// First-detection (`escalate = false`) must nudge the worker directly,
+    /// not the supervisor — a single re-poke often unsticks a stalled agent.
+    #[test]
+    fn test_9829_worker_stalled_nudge_targets_worker() {
+        let event = DirectorEvent::WorkerStalled {
+            worker: "swift-fox".to_string(),
+            task_id: "cas-0b7d".to_string(),
+            elapsed_secs: 310,
+            escalate: false,
+        };
+        let data = make_data(0);
+        let config = default_config();
+
+        let prompt =
+            generate_prompt(&event, &data, "supervisor", &config, codex(), codex()).unwrap();
+
+        assert_eq!(
+            prompt.target, "swift-fox",
+            "the one-shot auto-nudge must go straight to the stalled worker"
+        );
+        assert!(prompt.text.contains("cas-0b7d"));
+        assert!(prompt.text.contains("5m")); // 310s -> 5m
+    }
+
+    /// Once escalated, the prompt must go to the supervisor and name the
+    /// stalled worker/task so they can act (check status, respawn, etc.).
+    #[test]
+    fn test_9829_worker_stalled_escalation_targets_supervisor() {
+        let event = DirectorEvent::WorkerStalled {
+            worker: "swift-fox".to_string(),
+            task_id: "cas-0b7d".to_string(),
+            elapsed_secs: 620,
+            escalate: true,
+        };
+        let data = make_data(0);
+        let config = default_config();
+
+        let prompt =
+            generate_prompt(&event, &data, "supervisor", &config, codex(), codex()).unwrap();
+
+        assert_eq!(prompt.target, "supervisor");
+        assert!(prompt.text.contains("swift-fox"));
+        assert!(prompt.text.contains("cas-0b7d"));
+    }
+
+    /// `on_worker_stalled = false` must suppress both the nudge and the
+    /// escalation — the master per-event kill switch other event types get.
+    #[test]
+    fn test_9829_worker_stalled_respects_config_toggle() {
+        let mut config = default_config();
+        config.on_worker_stalled = false;
+        let data = make_data(0);
+
+        for escalate in [false, true] {
+            let event = DirectorEvent::WorkerStalled {
+                worker: "swift-fox".to_string(),
+                task_id: "cas-0b7d".to_string(),
+                elapsed_secs: 400,
+                escalate,
+            };
+            assert!(
+                generate_prompt(&event, &data, "supervisor", &config, codex(), codex()).is_none(),
+                "on_worker_stalled=false must suppress WorkerStalled (escalate={escalate})"
+            );
+        }
+    }
+
+    /// A stale queued WorkerStalled event for a worker no longer in the live
+    /// snapshot (shutdown/crashed/reassigned) must not fire — same
+    /// defense-in-depth guard WorkerIdle uses.
+    #[test]
+    fn test_9829_worker_stalled_suppressed_for_unknown_worker() {
+        let event = DirectorEvent::WorkerStalled {
+            worker: "ghost-worker".to_string(),
+            task_id: "cas-0b7d".to_string(),
+            elapsed_secs: 400,
+            escalate: false,
+        };
+        let data = make_data(0);
+        let config = default_config();
+
+        assert!(
+            generate_prompt(&event, &data, "supervisor", &config, codex(), codex()).is_none(),
+            "WorkerStalled must not fire for a worker absent from the live snapshot"
         );
     }
 }

@@ -955,6 +955,9 @@ pub fn execute(args: &FactoryArgs, cli: &Cli, cas_root: Option<&std::path::Path>
     let cas_config = Config::load(&preflight.cas_root).unwrap_or_default();
     let auto_prompt = cas_config.orchestration().auto_prompt;
     let llm = cas_config.llm();
+    // cas-9829: activity-based stall detection threshold, `[factory]
+    // stall_threshold_secs` in `.cas/config.toml`.
+    let stall_threshold_secs = cas_config.factory().stall_threshold_secs;
 
     // cas-0bf4: the factory.cargo_build_jobs + factory.nice_cargo config
     // bridge now fires in cli::run BEFORE the telemetry background thread
@@ -1044,6 +1047,7 @@ pub fn execute(args: &FactoryArgs, cli: &Cli, cas_root: Option<&std::path::Path>
         teams_configs,
         lead_session_id: Some(lead_session_id),
         minions_theme: is_minions,
+        stall_threshold_secs,
     };
 
     let phone_home = !args.no_phone_home;

@@ -55,6 +55,18 @@ impl Notifier {
                 icon: "dialog-information",
                 urgency: Urgency::Low,
             }),
+            // Only surface a desktop notification once the stall is
+            // escalated to the supervisor — the first-detection auto-nudge
+            // is worker-directed and low-stakes, so it stays out of the
+            // desktop channel to avoid alert fatigue (cas-9829).
+            DirectorEvent::WorkerStalled { escalate, .. } if *escalate => {
+                Some(NotificationMeta {
+                    title: "Worker Stalled",
+                    icon: "dialog-warning",
+                    urgency: Urgency::Normal,
+                })
+            }
+            DirectorEvent::WorkerStalled { .. } => None,
             DirectorEvent::EpicCompleted { .. } => Some(NotificationMeta {
                 title: "Epic Completed!",
                 icon: "starred",
@@ -102,6 +114,14 @@ impl Notifier {
             }
             DirectorEvent::WorkerIdle { worker } => {
                 format!("{worker} is waiting for work")
+            }
+            DirectorEvent::WorkerStalled {
+                worker,
+                elapsed_secs,
+                escalate: true,
+                ..
+            } => {
+                format!("{worker} stalled for {}m despite a nudge", elapsed_secs / 60)
             }
             DirectorEvent::EpicCompleted { epic_id } => {
                 format!("All tasks in {epic_id} are done")
@@ -264,5 +284,34 @@ mod tests {
         };
         assert!(event.description().contains("swift-fox"));
         assert!(event.description().contains("cas-123"));
+    }
+
+    /// cas-9829: the first-detection auto-nudge (escalate=false) is
+    /// worker-directed and low-stakes — it must NOT produce a desktop
+    /// notification (would be alert fatigue for something the director is
+    /// already handling automatically). The escalation (escalate=true) DOES
+    /// need a desktop notification since the supervisor must act.
+    #[test]
+    fn test_9829_worker_stalled_notification_only_on_escalation() {
+        let nudge = DirectorEvent::WorkerStalled {
+            worker: "swift-fox".to_string(),
+            task_id: "cas-0b7d".to_string(),
+            elapsed_secs: 310,
+            escalate: false,
+        };
+        assert!(
+            Notifier::event_meta(&nudge).is_none(),
+            "the one-shot nudge must not trigger a desktop notification"
+        );
+
+        let escalation = DirectorEvent::WorkerStalled {
+            worker: "swift-fox".to_string(),
+            task_id: "cas-0b7d".to_string(),
+            elapsed_secs: 620,
+            escalate: true,
+        };
+        let meta = Notifier::event_meta(&escalation)
+            .expect("escalation must trigger a desktop notification");
+        assert_eq!(meta.title, "Worker Stalled");
     }
 }
