@@ -179,6 +179,22 @@ async fn run_server_impl() -> anyhow::Result<()> {
 
     let core = CasCore::with_daemon(cas_root.clone(), activity, daemon.clone());
 
+    // Loud pending-migration warning (2026-07-06 serve-brick follow-through):
+    // serve never runs DDL itself — migrations apply via `cas update` — so a
+    // new binary on an old store runs degraded (writes touching new columns
+    // fail) until the user migrates. Say so at startup instead of failing
+    // silently one INSERT at a time.
+    if let Ok(status) = crate::migration::check_migrations(&cas_root) {
+        if status.has_pending() {
+            eprintln!(
+                "[CAS] WARNING: {} schema migration(s) pending for {} — factory/agent \
+                 features may fail until you run `cas update --schema-only` in this project.",
+                status.pending.len(),
+                cas_root.display()
+            );
+        }
+    }
+
     // Eagerly initialize all stores before serving MCP requests.
     // This moves cold-start overhead (connection open, schema init) out of the
     // first tool call path, preventing timeouts on the initial request.

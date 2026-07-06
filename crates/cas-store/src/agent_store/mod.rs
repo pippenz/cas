@@ -75,7 +75,13 @@ CREATE INDEX IF NOT EXISTS idx_agents_machine ON agents(machine_id);
 CREATE INDEX IF NOT EXISTS idx_agents_heartbeat ON agents(last_heartbeat);
 CREATE INDEX IF NOT EXISTS idx_agents_parent ON agents(parent_id);
 CREATE INDEX IF NOT EXISTS idx_agents_ppid ON agents(ppid);
-CREATE INDEX IF NOT EXISTS idx_agents_factory_session ON agents(factory_session);
+-- NOTE: idx_agents_factory_session is deliberately NOT here. This baseline
+-- runs at every store open, BEFORE migrations. On a pre-m204 database the
+-- CREATE TABLE above no-ops (old table, no factory_session column) and an
+-- index on that column would abort store init — which bricked `cas serve`
+-- on every existing store (2026-07-06 regression). The index lives in
+-- migration m205, which runs after the column exists on every path.
+-- General rule: never index a migration-added column from a baseline schema.
 
 -- Task leases table: tracks exclusive task claims
 CREATE TABLE IF NOT EXISTS task_leases (

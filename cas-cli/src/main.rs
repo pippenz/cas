@@ -91,7 +91,7 @@ fn main() -> ExitCode {
                     _ => ExitCode::FAILURE,
                 }
             } else {
-                let _ = fmt.error(&e.to_string());
+                let _ = fmt.error(&format!("{e:#}"));
                 ExitCode::FAILURE
             }
         }

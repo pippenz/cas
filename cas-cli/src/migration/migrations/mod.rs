@@ -180,6 +180,7 @@ mod m201_spawn_queue_add_worker_spec;
 mod m202_tasks_add_depth;
 mod m203_spawn_queue_add_factory_session;
 mod m204_agents_add_factory_session;
+mod m205_agents_factory_session_index;
 
 /// All migrations in order. IDs must be sequential and never reused.
 pub const MIGRATIONS: &[Migration] = &[
@@ -363,6 +364,10 @@ pub const MIGRATIONS: &[Migration] = &[
     m203_spawn_queue_add_factory_session::MIGRATION,
     // Scope factory agent visibility to the owning factory session (cas-7baa)
     m204_agents_add_factory_session::MIGRATION,
+    // idx_agents_factory_session moved out of baseline AGENT_SCHEMA (2026-07-06
+    // serve-brick hotfix): baselines run at store open BEFORE migrations, so a
+    // baseline index on the m204-added column aborted init on pre-m204 DBs.
+    m205_agents_factory_session_index::MIGRATION,
 ];
 
 #[cfg(test)]
