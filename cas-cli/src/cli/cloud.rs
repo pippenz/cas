@@ -616,12 +616,8 @@ fn execute_team_set(args: &CloudTeamSetArgs, cli: &Cli, cas_root: &Path) -> anyh
 
     match probe_team_membership(&config.endpoint, &token, &uuid) {
         TeamProbeOutcome::Member => {
-            // The membership probe endpoint doesn't return the slug. Set
-            // team_id directly and leave team_slug None so downstream
-            // callers (execute_projects, hooks/context.rs) fall through to
-            // their "show UUID" / "your team" default instead of rendering
-            // a sentinel string. A future cloud-side slug resolver (tracked
-            // in T7 docs) can populate team_slug when it lands.
+            // UUID input has no local slug to persist; slug/zero-arg inputs
+            // resolve through cached memberships and carry the slug forward.
             config.team_id = Some(uuid.clone());
             config.team_slug = target.slug().map(ToString::to_string);
             config.save_to_cas_dir(cas_root)?;
@@ -750,7 +746,11 @@ fn load_user_cloud_config_or_default() -> CloudConfig {
         .unwrap_or_default()
 }
 
-fn find_team_display<'a>(team_id: &str, project: &'a CloudConfig, user: &'a CloudConfig) -> (Option<&'a str>, Option<&'a str>) {
+fn find_team_display<'a>(
+    team_id: &str,
+    project: &'a CloudConfig,
+    user: &'a CloudConfig,
+) -> (Option<&'a str>, Option<&'a str>) {
     if project.team_id.as_deref() == Some(team_id) {
         if let Some(slug) = project.team_slug.as_deref() {
             return (Some(slug), None);
@@ -845,13 +845,6 @@ fn execute_team_auto(
     Ok(())
 }
 
-pub(crate) fn personal_scope_notice_message(notice: &PersonalScopeNotice) -> String {
-    format!(
-        "This project syncs to personal scope. You're a member of {} ({}). Link it with `cas cloud team set {}` or `cas cloud team auto on`.",
-        notice.team_name, notice.team_slug, notice.team_slug
-    )
-}
-
 fn print_personal_scope_notice(cli: &Cli, notice: &PersonalScopeNotice) {
     if cli.json {
         eprintln!(
@@ -864,7 +857,7 @@ fn print_personal_scope_notice(cli: &Cli, notice: &PersonalScopeNotice) {
             })
         );
     } else {
-        println!("{}", personal_scope_notice_message(notice));
+        eprintln!("{}", notice.message());
     }
 }
 
@@ -1394,9 +1387,7 @@ pub fn check_canonical_id_rehome(
     // Fail-open: if the metadata read errors (malformed DB, etc.) we let the
     // push proceed. The guard will re-run on the next invocation once the DB
     // is healthy. The metadata is only authoritative when it exists.
-    let stored = queue
-        .get_metadata("last_push_canonical_id")
-        .unwrap_or(None);
+    let stored = queue.get_metadata("last_push_canonical_id").unwrap_or(None);
     match stored {
         None => Ok(()), // First push — no prior slug on record
         Some(ref stored_id) if stored_id == project_id => Ok(()), // Unchanged, safe
@@ -1971,9 +1962,7 @@ fn execute_pull(args: &CloudPullArgs, cli: &Cli, cas_root: &Path) -> anyhow::Res
             queue.delete_metadata("last_pull_at")?;
             if let Some(team_id) = config.active_team_id() {
                 if let Some(project_id) = crate::cloud::get_project_canonical_id() {
-                    queue.delete_metadata(&format!(
-                        "last_team_pull_at_{team_id}_{project_id}"
-                    ))?;
+                    queue.delete_metadata(&format!("last_team_pull_at_{team_id}_{project_id}"))?;
                 }
             }
         }
@@ -2094,7 +2083,12 @@ fn execute_pull(args: &CloudPullArgs, cli: &Cli, cas_root: &Path) -> anyhow::Res
 /// `pub(crate)` so `cli/auth.rs` can call it without going through the public
 /// API surface.
 pub(crate) fn print_backfill_notice(cli: &Cli, outcome: &BackfillOutcome) {
-    if let BackfillOutcome::AppliedSetDefault { team_id, team_slug, team_name } = outcome {
+    if let BackfillOutcome::AppliedSetDefault {
+        team_id,
+        team_slug,
+        team_name,
+    } = outcome
+    {
         if !cli.json {
             eprintln!();
             eprintln!("  ✓ Team membership detected — syncing to team scope");
@@ -2137,10 +2131,11 @@ pub fn execute_sync(args: &CloudSyncArgs, cli: &Cli, cas_root: &Path) -> anyhow:
     // fetch is more than 24 h old.  Best-effort — failure is logged but does
     // not abort sync.
     if !args.dry_run {
-        let user_cfg = user_level_cloud_json_path()
-            .and_then(|p| {
-                p.parent().map(|d| CloudConfig::load_from_cas_dir(d).ok()).flatten()
-            });
+        let user_cfg = user_level_cloud_json_path().and_then(|p| {
+            p.parent()
+                .map(|d| CloudConfig::load_from_cas_dir(d).ok())
+                .flatten()
+        });
         let stale = user_cfg
             .as_ref()
             .map(|cfg| teams_cache_stale(cfg, 86_400))
@@ -2823,9 +2818,8 @@ fn execute_team_memories(
         })?
         .clone();
 
-    let canonical_id = crate::cloud::get_project_canonical_id().ok_or_else(|| {
-        anyhow::anyhow!("Not inside a CAS project directory.")
-    })?;
+    let canonical_id = crate::cloud::get_project_canonical_id()
+        .ok_or_else(|| anyhow::anyhow!("Not inside a CAS project directory."))?;
 
     let token = config
         .token
@@ -3204,20 +3198,13 @@ fn execute_purge_foreign(
              DELETE FROM skills;",
         )?;
         // Reset last_pull_at so re-pull fetches everything
-        conn.execute(
-            "DELETE FROM sync_metadata WHERE key = 'last_pull_at'",
-            [],
-        )?;
+        conn.execute("DELETE FROM sync_metadata WHERE key = 'last_pull_at'", [])?;
     }
 
     // Step 3: Re-pull from cloud with project-scoped filtering
     let queue = SyncQueue::open(cas_root)?;
     queue.init()?;
-    let syncer = CloudSyncer::new(
-        Arc::new(queue),
-        config,
-        CloudSyncerConfig::default(),
-    );
+    let syncer = CloudSyncer::new(Arc::new(queue), config, CloudSyncerConfig::default());
 
     let pull_result = syncer.pull(
         store.as_ref(),
@@ -3245,8 +3232,16 @@ fn execute_purge_foreign(
             r#"{{"project_id":"{}","backup":"{}","entities_before":{{"entries":{},"tasks":{},"rules":{},"skills":{},"total":{}}},"entities_after":{{"entries":{},"tasks":{},"rules":{},"skills":{},"total":{}}},"purged":{},"pull_errors":{}}}"#,
             project_id,
             backup_path.display(),
-            entries_before, tasks_before, rules_before, skills_before, total_before,
-            entries_after, tasks_after, rules_after, skills_after, total_after,
+            entries_before,
+            tasks_before,
+            rules_before,
+            skills_before,
+            total_before,
+            entries_after,
+            tasks_after,
+            rules_after,
+            skills_after,
+            total_after,
             purged,
             serde_json::to_string(&pull_result.errors).unwrap_or_default(),
         );
@@ -3462,7 +3457,9 @@ mod team_cmd_tests {
 
     #[test]
     fn team_auto_on_writes_true_and_resolves_effective_team() {
-        let _guard = crate::cloud::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = crate::cloud::CLOUD_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let project = TempDir::new().unwrap();
         let user = TempDir::new().unwrap();
 
@@ -3475,7 +3472,9 @@ mod team_cmd_tests {
         user_cfg.save_to_cas_dir(user.path()).unwrap();
 
         let user_cloud_json = user.path().join("cloud.json");
-        unsafe { std::env::set_var("CAS_USER_CLOUD_JSON", &user_cloud_json); }
+        unsafe {
+            std::env::set_var("CAS_USER_CLOUD_JSON", &user_cloud_json);
+        }
         execute_team_auto(&CloudTeamAutoCommands::On, &cli_json(), project.path()).unwrap();
         let saved = CloudConfig::load_from_cas_dir(project.path()).unwrap();
         assert_eq!(saved.team_auto_promote, Some(true));
@@ -3485,12 +3484,16 @@ mod team_cmd_tests {
                 .as_deref(),
             Some("team-1")
         );
-        unsafe { std::env::remove_var("CAS_USER_CLOUD_JSON"); }
+        unsafe {
+            std::env::remove_var("CAS_USER_CLOUD_JSON");
+        }
     }
 
     #[test]
     fn team_auto_off_writes_false_kill_switch() {
-        let _guard = crate::cloud::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = crate::cloud::CLOUD_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let project = TempDir::new().unwrap();
         let mut project_cfg = CloudConfig::default();
         project_cfg.set_team("team-1", "petra-stella");
@@ -3505,7 +3508,9 @@ mod team_cmd_tests {
 
     #[test]
     fn team_auto_clear_writes_none() {
-        let _guard = crate::cloud::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = crate::cloud::CLOUD_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let project = TempDir::new().unwrap();
         let mut project_cfg = CloudConfig::default();
         project_cfg.team_auto_promote = Some(false);
@@ -3514,6 +3519,21 @@ mod team_cmd_tests {
         execute_team_auto(&CloudTeamAutoCommands::Clear, &cli_json(), project.path()).unwrap();
         let saved = CloudConfig::load_from_cas_dir(project.path()).unwrap();
         assert_eq!(saved.team_auto_promote, None);
+    }
+
+    #[test]
+    fn find_team_display_prefers_project_slug_for_direct_team_match() {
+        let mut project = CloudConfig::default();
+        project.set_team("team-1", "project-slug");
+        let user = config_with_teams(vec![make_team_info(
+            "team-1",
+            "user-cache-slug",
+            "User Cache Name",
+        )]);
+
+        let (slug, name) = find_team_display("team-1", &project, &user);
+        assert_eq!(slug, Some("project-slug"));
+        assert_eq!(name, None);
     }
 
     #[test]
@@ -3685,10 +3705,7 @@ mod team_cmd_tests {
     // Pure-function tests — no live cloud, no wiremock. Each creates an
     // in-memory projects slice and asserts the ambiguity detector's output.
 
-    fn make_project(
-        canonical_id: &str,
-        memory_count: u32,
-    ) -> crate::cloud::TeamProject {
+    fn make_project(canonical_id: &str, memory_count: u32) -> crate::cloud::TeamProject {
         crate::cloud::TeamProject {
             id: format!("id-{canonical_id}"),
             canonical_id: canonical_id.to_string(),
@@ -3731,9 +3748,7 @@ mod team_cmd_tests {
     fn bucket_ambiguity_no_warn_when_resolved_not_in_list() {
         // If the resolved canonical_id isn't in the team projects list yet
         // (brand-new project that hasn't synced), skip the warning.
-        let projects = vec![
-            make_project("other-project", 10_000),
-        ];
+        let projects = vec![make_project("other-project", 10_000)];
         assert!(
             check_bucket_ambiguity("new-project", &projects).is_none(),
             "should not warn when resolved id is absent from project list"
@@ -3744,10 +3759,7 @@ mod team_cmd_tests {
     fn bucket_ambiguity_no_warn_when_richest_below_threshold() {
         // All projects are small; the 50-memory guard suppresses the warning
         // so new teams don't see noise on early setup.
-        let projects = vec![
-            make_project("slug-a", 5),
-            make_project("slug-b", 40),
-        ];
+        let projects = vec![make_project("slug-a", 5), make_project("slug-b", 40)];
         assert!(
             check_bucket_ambiguity("slug-a", &projects).is_none(),
             "should not warn when richest other project is < 50 memories"
@@ -3771,10 +3783,7 @@ mod team_cmd_tests {
     #[test]
     fn bucket_ambiguity_warns_just_below_10_pct_boundary() {
         // resolved = 9, richest = 100. 9 * 10 = 90 < 100 → warn.
-        let projects = vec![
-            make_project("slug-small", 9),
-            make_project("slug-big", 100),
-        ];
+        let projects = vec![make_project("slug-small", 9), make_project("slug-big", 100)];
         assert!(
             check_bucket_ambiguity("slug-small", &projects).is_some(),
             "should warn when resolved count * 10 < richest count"

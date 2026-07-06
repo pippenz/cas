@@ -346,8 +346,13 @@ impl EmbeddedDaemon {
         let mut code_index_interval =
             tokio::time::interval(Duration::from_secs(self.config.code_index_interval_secs));
         // Proxy config hot-reload interval (no-op when mcp-proxy feature is disabled)
-        let proxy_config_secs = if cfg!(feature = "mcp-proxy") { 3 } else { 86400 };
-        let mut proxy_config_interval = tokio::time::interval(Duration::from_secs(proxy_config_secs));
+        let proxy_config_secs = if cfg!(feature = "mcp-proxy") {
+            3
+        } else {
+            86400
+        };
+        let mut proxy_config_interval =
+            tokio::time::interval(Duration::from_secs(proxy_config_secs));
 
         // Skip the first immediate tick for maintenance tasks
         cloud_sync_interval.tick().await;
@@ -491,7 +496,9 @@ impl EmbeddedDaemon {
                     tracing::warn!(error = %e, "Final cloud sync failed — items may sync next startup");
                 }
                 Err(_) => {
-                    tracing::warn!("Final cloud sync timed out after 10s — items may sync next startup");
+                    tracing::warn!(
+                        "Final cloud sync timed out after 10s — items may sync next startup"
+                    );
                 }
             }
         }
@@ -1013,10 +1020,7 @@ impl EmbeddedDaemon {
         tokio::task::spawn_blocking(move || {
             match maybe_mark_personal_scope_notice(&cas_root) {
                 Ok(Some(notice)) => {
-                    let msg = format!(
-                        "This project syncs to personal scope. You're a member of {} ({}). Link it with `cas cloud team set {}` or `cas cloud team auto on`.",
-                        notice.team_name, notice.team_slug, notice.team_slug
-                    );
+                    let msg = notice.message();
                     eprintln!("[CAS] {msg}");
                     tracing::info!(target: "cas::sync", team_id = %notice.team_id, team_slug = %notice.team_slug, "{}", msg);
                 }
