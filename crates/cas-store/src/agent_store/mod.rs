@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS agents (
     cc_session_id TEXT,
     parent_id TEXT,
     machine_id TEXT,
+    factory_session TEXT,
     registered_at TEXT NOT NULL,
     last_heartbeat TEXT NOT NULL,
     active_tasks INTEGER NOT NULL DEFAULT 0,
@@ -74,6 +75,7 @@ CREATE INDEX IF NOT EXISTS idx_agents_machine ON agents(machine_id);
 CREATE INDEX IF NOT EXISTS idx_agents_heartbeat ON agents(last_heartbeat);
 CREATE INDEX IF NOT EXISTS idx_agents_parent ON agents(parent_id);
 CREATE INDEX IF NOT EXISTS idx_agents_ppid ON agents(ppid);
+CREATE INDEX IF NOT EXISTS idx_agents_factory_session ON agents(factory_session);
 
 -- Task leases table: tracks exclusive task claims
 CREATE TABLE IF NOT EXISTS task_leases (
@@ -402,6 +404,7 @@ impl SqliteAgentStore {
                 .ok()
                 .and_then(Self::parse_optional_u32_from_value),
             cc_session_id: row.get(7)?,
+            factory_session: row.get(15).ok(),
             parent_id: row.get(8)?,
             machine_id: row.get(9)?,
             registered_at: Self::parse_datetime(&row.get::<_, String>(10)?)

@@ -10,7 +10,7 @@ impl SqliteAgentStore {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare_cached(
             "SELECT id, name, agent_type, role, status, pid, ppid, cc_session_id, parent_id,
-             machine_id, registered_at, last_heartbeat, active_tasks, metadata, pid_starttime
+             machine_id, registered_at, last_heartbeat, active_tasks, metadata, pid_starttime, factory_session
              FROM agents WHERE parent_id = ? AND status = 'active'
              ORDER BY registered_at DESC",
         )?;
@@ -98,8 +98,9 @@ impl SqliteAgentStore {
     }
     pub(crate) fn coord_list_all_working_epics(&self) -> Result<Vec<String>> {
         let conn = self.lock_conn()?;
-        let mut stmt =
-            conn.prepare_cached("SELECT DISTINCT epic_id FROM working_epics ORDER BY started_at DESC")?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT DISTINCT epic_id FROM working_epics ORDER BY started_at DESC",
+        )?;
 
         let epic_ids = stmt
             .query_map([], |row| row.get::<_, String>(0))?

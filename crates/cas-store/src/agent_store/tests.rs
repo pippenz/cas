@@ -75,6 +75,33 @@ fn test_agent_pid_starttime_round_trips_through_register_and_update() {
 }
 
 #[test]
+fn test_agent_factory_session_round_trips_through_register_and_update() {
+    let (_temp, store) = create_test_store();
+
+    let mut agent = Agent::new("agent-factory".to_string(), "factory worker".to_string());
+    agent.factory_session = Some("factory-session-a".to_string());
+    store.register(&agent).unwrap();
+
+    let retrieved = store.get("agent-factory").unwrap();
+    assert_eq!(
+        retrieved.factory_session.as_deref(),
+        Some("factory-session-a"),
+        "INSERT must persist factory_session and SELECT must read it back"
+    );
+
+    let mut updated = retrieved;
+    updated.factory_session = Some("factory-session-b".to_string());
+    store.update(&updated).unwrap();
+
+    let re_retrieved = store.get("agent-factory").unwrap();
+    assert_eq!(
+        re_retrieved.factory_session.as_deref(),
+        Some("factory-session-b"),
+        "UPDATE must overwrite factory_session"
+    );
+}
+
+#[test]
 fn test_agent_pid_starttime_none_round_trips_as_null() {
     // Legacy / non-Linux path: no fingerprint → column is NULL → typed
     // field reads back as None (not Some(0) or a parse-defaulted value).
@@ -705,7 +732,10 @@ fn test_re_registration_preserves_startup_confirmed() {
     let (temp, store) = create_test_store();
 
     // Register agent, heartbeat to confirm startup
-    let agent = Agent::new("agent-reregister".to_string(), "ReRegister Test".to_string());
+    let agent = Agent::new(
+        "agent-reregister".to_string(),
+        "ReRegister Test".to_string(),
+    );
     store.register(&agent).unwrap();
     store.heartbeat("agent-reregister").unwrap();
 
@@ -721,7 +751,10 @@ fn test_re_registration_preserves_startup_confirmed() {
     assert_eq!(confirmed, 1);
 
     // Re-register (simulates SessionStart hook re-firing)
-    let agent2 = Agent::new("agent-reregister".to_string(), "ReRegister Test v2".to_string());
+    let agent2 = Agent::new(
+        "agent-reregister".to_string(),
+        "ReRegister Test v2".to_string(),
+    );
     store.register(&agent2).unwrap();
 
     // startup_confirmed must still be 1 (not reset to 0)
@@ -732,7 +765,10 @@ fn test_re_registration_preserves_startup_confirmed() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(confirmed, 1, "Re-registration must not reset startup_confirmed");
+    assert_eq!(
+        confirmed, 1,
+        "Re-registration must not reset startup_confirmed"
+    );
 
     // Backdate registered_at and verify NOT detected as failed startup
     let old_time = (Utc::now() - Duration::seconds(120)).to_rfc3339();
@@ -742,7 +778,10 @@ fn test_re_registration_preserves_startup_confirmed() {
     )
     .unwrap();
     let failed = store.list_failed_startup(60).unwrap();
-    assert!(failed.is_empty(), "Confirmed agent must not appear as failed startup after re-registration");
+    assert!(
+        failed.is_empty(),
+        "Confirmed agent must not appear as failed startup after re-registration"
+    );
 }
 
 #[test]
@@ -766,7 +805,10 @@ fn test_revive_sets_startup_confirmed() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(confirmed, 1, "Revived agent must have startup_confirmed = 1");
+    assert_eq!(
+        confirmed, 1,
+        "Revived agent must have startup_confirmed = 1"
+    );
 
     // Backdate and verify NOT detected as failed startup
     let old_time = (Utc::now() - Duration::seconds(120)).to_rfc3339();
@@ -776,7 +818,10 @@ fn test_revive_sets_startup_confirmed() {
     )
     .unwrap();
     let failed = store.list_failed_startup(60).unwrap();
-    assert!(failed.is_empty(), "Revived agent must not be detected as failed startup");
+    assert!(
+        failed.is_empty(),
+        "Revived agent must not be detected as failed startup"
+    );
 }
 
 #[test]
@@ -801,7 +846,10 @@ fn test_lease_release_atomically_decrements_active_tasks() {
     store.release_lease("task-a", "agent-atomic").unwrap();
 
     let agent = store.get("agent-atomic").unwrap();
-    assert_eq!(agent.active_tasks, 1, "active_tasks should decrement atomically on release");
+    assert_eq!(
+        agent.active_tasks, 1,
+        "active_tasks should decrement atomically on release"
+    );
 
     // Verify lease status changed
     let lease = store.get_lease("task-a").unwrap();
@@ -832,7 +880,10 @@ fn test_lease_release_for_task_atomically_decrements_active_tasks() {
     assert!(released, "Should return true when a lease was released");
 
     let agent = store.get("agent-fortask").unwrap();
-    assert_eq!(agent.active_tasks, 0, "active_tasks should decrement atomically on task-close release");
+    assert_eq!(
+        agent.active_tasks, 0,
+        "active_tasks should decrement atomically on task-close release"
+    );
 
     // Verify release was logged with "Task closed" note
     let history = store.get_lease_history("task-close", Some(1)).unwrap();
@@ -866,7 +917,13 @@ fn test_agent_unregister_releases_leases_atomically() {
 
     // Leases should be released (not active)
     let lease1 = store.get_lease("task-u1").unwrap();
-    assert!(lease1.is_none(), "Lease should be released after unregister");
+    assert!(
+        lease1.is_none(),
+        "Lease should be released after unregister"
+    );
     let lease2 = store.get_lease("task-u2").unwrap();
-    assert!(lease2.is_none(), "Lease should be released after unregister");
+    assert!(
+        lease2.is_none(),
+        "Lease should be released after unregister"
+    );
 }

@@ -35,6 +35,7 @@ mod tests {
                 cc_session_id TEXT,
                 parent_id TEXT,
                 machine_id TEXT,
+                factory_session TEXT,
                 registered_at TEXT NOT NULL,
                 last_heartbeat TEXT NOT NULL,
                 active_tasks INTEGER NOT NULL DEFAULT 0,

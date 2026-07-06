@@ -546,6 +546,7 @@ fn agent_info_to_agent(info: AgentInfo) -> Agent {
         pid: info.pid,
         ppid: None,
         cc_session_id: None,
+        factory_session: None,
         parent_id: None,
         machine_id: info.machine_id,
         registered_at: last_heartbeat,
