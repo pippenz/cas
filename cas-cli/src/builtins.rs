@@ -2307,7 +2307,22 @@ This is the body content."#;
             "model-selection.md .claude and .codex copies must be byte-identical",
         );
         // The four tiers and the escalation rule are the contract of the rubric.
-        for required in ["light", "standard", "heavy", "frontier", "tier:", "Escalate on failure"] {
+        for required in [
+            "light",
+            "standard",
+            "heavy",
+            "frontier",
+            "tier:",
+            "Escalate on failure",
+            "Routing Axes",
+            "Cost",
+            "Intelligence",
+            "Taste",
+            "Taste-sensitive work routes to a high-taste tier",
+            "effort=high` is the ceiling",
+            "Escalate on judgment",
+            "Cost is a tiebreaker only",
+        ] {
             assert!(
                 claude.content.contains(required),
                 "model-selection.md missing required tier-rubric marker: {required:?}"
