@@ -1177,7 +1177,7 @@ impl CasService {
     ) -> Result<CallToolResult, McpError> {
         use crate::store::open_task_store;
         use crate::ui::factory::{metadata_path, persist_session_metadata_pinned_epic_id_at};
-        use cas_types::TaskType;
+        use cas_types::{TaskStatus, TaskType};
 
         let factory_session = current_factory_session().ok_or_else(|| {
             Self::error(
@@ -1231,6 +1231,15 @@ impl CasService {
                     "focus_epic: task {epic_id} is not an Epic (task_type={:?}). \
                      This action only operates on Epic-type tasks.",
                     epic.task_type
+                ),
+            ));
+        }
+        if epic.status == TaskStatus::Closed {
+            return Err(Self::error(
+                ErrorCode::INVALID_PARAMS,
+                format!(
+                    "focus_epic: task {epic_id} is Closed. \
+                     Closed epics cannot be pinned as the active factory focus.",
                 ),
             ));
         }

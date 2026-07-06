@@ -274,6 +274,53 @@ fn factory_req(action: &str) -> FactoryRequest {
     }
 }
 
+fn coord_req(action: &str) -> CoordinationRequest {
+    CoordinationRequest {
+        action: action.to_string(),
+        id: None,
+        task_id: None,
+        target: None,
+        message: None,
+        summary: None,
+        urgent: None,
+        force: None,
+        clear: None,
+        limit: None,
+        name: None,
+        agent_type: None,
+        parent_id: None,
+        session_id: None,
+        prompt: None,
+        max_iterations: None,
+        completion_promise: None,
+        reason: None,
+        stale_threshold_secs: None,
+        supervisor_id: None,
+        event_type: None,
+        payload: None,
+        priority: None,
+        notification_id: None,
+        count: None,
+        worker_names: None,
+        branch: None,
+        older_than_secs: None,
+        isolate: None,
+        cli: None,
+        model: None,
+        effort: None,
+        remind_message: None,
+        remind_delay_secs: None,
+        remind_event: None,
+        remind_filter: None,
+        remind_id: None,
+        remind_ttl_secs: None,
+        all: None,
+        status: None,
+        orphans: None,
+        dry_run: None,
+    }
+}
+
 fn get_text(result: &rmcp::model::CallToolResult) -> String {
     result
         .content
@@ -327,7 +374,10 @@ async fn test_focus_epic_pins_valid_epic_and_records_activity() {
         .expect("focus_epic should succeed");
 
     let text = get_text(&result);
-    assert!(text.contains(&epic_id), "response should name pinned epic: {text}");
+    assert!(
+        text.contains(&epic_id),
+        "response should name pinned epic: {text}"
+    );
     let metadata = read_session_metadata("session-focus-pin");
     assert_eq!(metadata.epic_id, Some("cas-session".to_string()));
     assert_eq!(metadata.pinned_epic_id, Some(epic_id.clone()));
@@ -365,6 +415,17 @@ async fn test_focus_epic_rejects_missing_and_non_epic_without_mutation() {
         None
     );
 
+    let mut nonexistent = factory_req("focus_epic");
+    nonexistent.id = Some("cas-does-not-exist".to_string());
+    assert!(
+        env.service.factory(Parameters(nonexistent)).await.is_err(),
+        "nonexistent id should fail"
+    );
+    assert_eq!(
+        read_session_metadata("session-focus-invalid").pinned_epic_id,
+        None
+    );
+
     let store = env.task_store();
     let task_id = store.generate_id().expect("generate_id");
     let task = Task::new(task_id.clone(), "Regular Task".to_string());
@@ -380,6 +441,34 @@ async fn test_focus_epic_rejects_missing_and_non_epic_without_mutation() {
         read_session_metadata("session-focus-invalid").pinned_epic_id,
         None
     );
+}
+
+#[tokio::test]
+async fn test_focus_epic_rejects_closed_epic_without_mutation() {
+    let home = TempDir::new().expect("home tempdir");
+    let home_path = home.path().to_str().unwrap();
+    let _guard = EnvGuard::set(&[
+        ("CAS_FACTORY_SESSION", "session-focus-closed"),
+        ("HOME", home_path),
+    ]);
+    let env = FactoryTestEnv::new();
+    let epic_id = env.create_epic("Closed Epic");
+    let store = env.task_store();
+    let mut epic = store.get(&epic_id).expect("get epic");
+    epic.status = TaskStatus::Closed;
+    store.update(&epic).expect("close epic");
+    write_session_metadata("session-focus-closed", Some("cas-session"));
+
+    let mut req = factory_req("focus_epic");
+    req.id = Some(epic_id);
+    assert!(
+        env.service.factory(Parameters(req)).await.is_err(),
+        "closed epic id should fail"
+    );
+
+    let metadata = read_session_metadata("session-focus-closed");
+    assert_eq!(metadata.epic_id, Some("cas-session".to_string()));
+    assert_eq!(metadata.pinned_epic_id, None);
 }
 
 #[tokio::test]
@@ -409,6 +498,50 @@ async fn test_focus_epic_clear_removes_pin_and_preserves_session_default() {
         .expect("clear should succeed");
 
     let metadata = read_session_metadata("session-focus-clear");
+    assert_eq!(metadata.epic_id, Some("cas-session".to_string()));
+    assert_eq!(metadata.pinned_epic_id, None);
+
+    let events = env.event_store().list_recent(10).unwrap();
+    assert!(
+        events.iter().any(|event| {
+            event.event_type == EventType::SupervisorInjected
+                && event.entity_id == "session-focus-clear"
+                && event.session_id.as_deref() == Some("session-focus-clear")
+        }),
+        "clear=true should record a supervisor activity event"
+    );
+}
+
+#[tokio::test]
+async fn test_coordination_focus_epic_routes_clear_field() {
+    let home = TempDir::new().expect("home tempdir");
+    let home_path = home.path().to_str().unwrap();
+    let _guard = EnvGuard::set(&[
+        ("CAS_FACTORY_SESSION", "session-focus-coordination"),
+        ("HOME", home_path),
+    ]);
+    let env = FactoryTestEnv::new();
+    let epic_id = env.create_epic("Coordination Epic");
+    write_session_metadata("session-focus-coordination", Some("cas-session"));
+
+    let mut pin = coord_req("focus_epic");
+    pin.id = Some(epic_id.clone());
+    env.service
+        .coordination(Parameters(pin))
+        .await
+        .expect("coordination focus_epic should pin");
+    assert_eq!(
+        read_session_metadata("session-focus-coordination").pinned_epic_id,
+        Some(epic_id)
+    );
+
+    let mut clear = coord_req("focus_epic");
+    clear.clear = Some(true);
+    env.service
+        .coordination(Parameters(clear))
+        .await
+        .expect("coordination focus_epic should forward clear=true");
+    let metadata = read_session_metadata("session-focus-coordination");
     assert_eq!(metadata.epic_id, Some("cas-session".to_string()));
     assert_eq!(metadata.pinned_epic_id, None);
 }
@@ -1229,6 +1362,7 @@ async fn test_gc_cleanup_preserves_stale_supervisors() {
 
 #[tokio::test]
 async fn test_spawn_then_shutdown_sequence() {
+    let _guard = EnvGuard::set_optional(&[("CAS_FACTORY_SESSION", None)]);
     let env = FactoryTestEnv::new();
     env.create_epic("Sequence Epic");
     env.register_worker("alpha");

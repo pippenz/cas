@@ -1,7 +1,8 @@
 //! Factory application state and orchestration
 
 use std::collections::{HashMap, HashSet};
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -1224,33 +1225,110 @@ pub(crate) fn persist_session_metadata_epic_id_at(
     path: &std::path::Path,
     epic_id: &str,
 ) -> std::io::Result<()> {
-    let data = fs::read_to_string(path)?;
-    let mut metadata = serde_json::from_str::<SessionMetadata>(&data)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    metadata.epic_id = Some(epic_id.to_string());
-    let json = serde_json::to_string_pretty(&metadata)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    fs::write(path, json)
+    update_session_metadata_at(path, |metadata| {
+        metadata.epic_id = Some(epic_id.to_string());
+    })
 }
 
 pub(crate) fn persist_session_metadata_pinned_epic_id_at(
     path: &std::path::Path,
     pinned_epic_id: Option<&str>,
 ) -> std::io::Result<()> {
+    update_session_metadata_at(path, |metadata| {
+        metadata.pinned_epic_id = pinned_epic_id.map(str::to_string);
+    })
+}
+
+pub(crate) fn update_session_metadata_at(
+    path: &std::path::Path,
+    mutator: impl FnOnce(&mut SessionMetadata),
+) -> std::io::Result<()> {
+    use fs2::FileExt;
+
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("session metadata path has no parent: {}", path.display()),
+        )
+    })?;
+    fs::create_dir_all(parent)?;
+    let lock_path = path.with_extension("json.lock");
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    lock_file.lock_exclusive()?;
+
     let data = fs::read_to_string(path)?;
     let mut metadata = serde_json::from_str::<SessionMetadata>(&data)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    metadata.pinned_epic_id = pinned_epic_id.map(str::to_string);
+    mutator(&mut metadata);
     let json = serde_json::to_string_pretty(&metadata)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    fs::write(path, json)
+    atomic_write_session_metadata(path, &json)
+}
+
+fn atomic_write_session_metadata(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("session metadata path has no parent: {}", path.display()),
+        )
+    })?;
+    let file_name = path.file_name().and_then(|s| s.to_str()).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("non-UTF8 session metadata file name: {}", path.display()),
+        )
+    })?;
+
+    if let Ok(md) = fs::symlink_metadata(path) {
+        if md.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "{} is a symlink; refusing to write through it",
+                    path.display()
+                ),
+            ));
+        }
+    }
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp_path = parent.join(format!(
+        ".{file_name}.cas-session.{}.{nanos}.tmp",
+        std::process::id()
+    ));
+
+    let result = (|| -> std::io::Result<()> {
+        {
+            let mut f = File::options()
+                .create_new(true)
+                .write(true)
+                .open(&tmp_path)?;
+            f.write_all(contents.as_bytes())?;
+            f.flush()?;
+        }
+        fs::rename(&tmp_path, path)
+    })();
+    if let Err(err) = result {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
 
-    use cas_factory::{FileChangeInfo, GitFileStatus, SourceChangesInfo};
+    use cas_factory::{EpicState, FileChangeInfo, GitFileStatus, SourceChangesInfo, TaskSummary};
+    use cas_types::{Priority, TaskStatus, TaskType};
 
     use super::{DirectorData, merge_director_data_preserving_git};
 
@@ -1266,6 +1344,67 @@ mod tests {
             git_loaded,
             reminders: Vec::new(),
             epic_closed_counts: HashMap::new(),
+        }
+    }
+
+    fn data_with_epics(epics: Vec<TaskSummary>) -> DirectorData {
+        DirectorData {
+            ready_tasks: Vec::new(),
+            in_progress_tasks: Vec::new(),
+            epic_tasks: epics,
+            agents: Vec::new(),
+            activity: Vec::new(),
+            agent_id_to_name: HashMap::new(),
+            changes: Vec::new(),
+            git_loaded: false,
+            reminders: Vec::new(),
+            epic_closed_counts: HashMap::new(),
+        }
+    }
+
+    fn epic_summary(id: &str, title: &str, status: TaskStatus) -> TaskSummary {
+        TaskSummary {
+            id: id.to_string(),
+            title: title.to_string(),
+            status,
+            priority: Priority::MEDIUM,
+            assignee: None,
+            task_type: TaskType::Epic,
+            epic: None,
+            branch: Some(format!("epic/{id}")),
+            updated_at: None,
+        }
+    }
+
+    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct EnvGuard {
+        saved: Vec<(String, Option<String>)>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl EnvGuard {
+        fn set(vars: &[(&str, &str)]) -> Self {
+            let lock = ENV_MUTEX.lock().unwrap();
+            let mut saved = Vec::with_capacity(vars.len());
+            for (key, value) in vars {
+                let key = (*key).to_string();
+                let prev = std::env::var(&key).ok();
+                unsafe { std::env::set_var(&key, value) };
+                saved.push((key, prev));
+            }
+            Self { saved, _lock: lock }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, prev) in self.saved.drain(..) {
+                match prev {
+                    Some(value) => unsafe { std::env::set_var(&key, value) },
+                    None => unsafe { std::env::remove_var(&key) },
+                }
+            }
         }
     }
 
@@ -1839,6 +1978,166 @@ mod tests {
             super::preferred_epic_id_from_metadata(&cleared),
             Some("cas-session".to_string())
         );
+    }
+
+    #[test]
+    fn locked_session_metadata_updates_preserve_concurrent_epic_and_pin_writes() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        let metadata = crate::ui::factory::session::create_metadata(
+            "test-session",
+            12345,
+            "supervisor",
+            &[],
+            Some("cas-epic-initial"),
+            Some("/tmp/project"),
+            None,
+        );
+        std::fs::write(&path, serde_json::to_string_pretty(&metadata).unwrap()).unwrap();
+
+        let barrier = Arc::new(Barrier::new(2));
+        let epic_path = path.clone();
+        let epic_barrier = barrier.clone();
+        let epic_thread = thread::spawn(move || {
+            epic_barrier.wait();
+            for i in 0..100 {
+                super::persist_session_metadata_epic_id_at(&epic_path, &format!("cas-epic-{i}"))
+                    .unwrap();
+            }
+        });
+
+        let pin_path = path.clone();
+        let pin_thread = thread::spawn(move || {
+            barrier.wait();
+            for i in 0..100 {
+                super::persist_session_metadata_pinned_epic_id_at(
+                    &pin_path,
+                    Some(&format!("cas-pin-{i}")),
+                )
+                .unwrap();
+            }
+        });
+
+        epic_thread.join().unwrap();
+        pin_thread.join().unwrap();
+
+        let updated: crate::ui::factory::protocol::SessionMetadata =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(updated.epic_id, Some("cas-epic-99".to_string()));
+        assert_eq!(updated.pinned_epic_id, Some("cas-pin-99".to_string()));
+        assert!(
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| !entry.file_name().to_string_lossy().ends_with(".tmp")),
+            "atomic write helper must not leave temp files behind"
+        );
+    }
+
+    #[test]
+    fn apply_session_metadata_focus_updates_current_id_and_epic_state() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set(&[
+            ("HOME", home.path().to_str().unwrap()),
+            ("CAS_FACTORY_SESSION", "session-apply-pin"),
+        ]);
+        let metadata_path = crate::ui::factory::session::metadata_path("session-apply-pin");
+        std::fs::create_dir_all(metadata_path.parent().unwrap()).unwrap();
+        let mut metadata = crate::ui::factory::session::create_metadata(
+            "session-apply-pin",
+            12345,
+            "supervisor",
+            &[],
+            Some("cas-session"),
+            Some("/tmp/project"),
+            None,
+        );
+        metadata.pinned_epic_id = Some("cas-pinned".to_string());
+        std::fs::write(
+            &metadata_path,
+            serde_json::to_string_pretty(&metadata).unwrap(),
+        )
+        .unwrap();
+
+        let mut app = super::FactoryApp::for_test();
+        app.current_epic_id = Some("cas-session".to_string());
+        app.epic_state = EpicState::Active {
+            epic_id: "cas-session".to_string(),
+            epic_title: "Session Epic".to_string(),
+        };
+        app.director_data = data_with_epics(vec![
+            epic_summary("cas-session", "Session Epic", TaskStatus::Open),
+            epic_summary("cas-pinned", "Pinned Epic", TaskStatus::Open),
+        ]);
+
+        app.apply_session_metadata_focus();
+
+        assert_eq!(app.current_epic_id, Some("cas-pinned".to_string()));
+        match app.epic_state {
+            EpicState::Active {
+                ref epic_id,
+                ref epic_title,
+            } => {
+                assert_eq!(epic_id, "cas-pinned");
+                assert_eq!(epic_title, "Pinned Epic");
+            }
+            ref other => panic!("expected Active pinned epic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_session_metadata_focus_short_circuits_when_metadata_matches_current() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set(&[
+            ("HOME", home.path().to_str().unwrap()),
+            ("CAS_FACTORY_SESSION", "session-apply-same"),
+        ]);
+        let metadata_path = crate::ui::factory::session::metadata_path("session-apply-same");
+        std::fs::create_dir_all(metadata_path.parent().unwrap()).unwrap();
+        let mut metadata = crate::ui::factory::session::create_metadata(
+            "session-apply-same",
+            12345,
+            "supervisor",
+            &[],
+            Some("cas-session"),
+            Some("/tmp/project"),
+            None,
+        );
+        metadata.pinned_epic_id = Some("cas-pinned".to_string());
+        std::fs::write(
+            &metadata_path,
+            serde_json::to_string_pretty(&metadata).unwrap(),
+        )
+        .unwrap();
+
+        let mut app = super::FactoryApp::for_test();
+        app.current_epic_id = Some("cas-pinned".to_string());
+        app.epic_state = EpicState::Active {
+            epic_id: "cas-pinned".to_string(),
+            epic_title: "Preserved Existing State".to_string(),
+        };
+        app.director_data = data_with_epics(vec![epic_summary(
+            "cas-other",
+            "Other InProgress Epic",
+            TaskStatus::InProgress,
+        )]);
+
+        app.apply_session_metadata_focus();
+
+        assert_eq!(app.current_epic_id, Some("cas-pinned".to_string()));
+        match app.epic_state {
+            EpicState::Active {
+                ref epic_id,
+                ref epic_title,
+            } => {
+                assert_eq!(epic_id, "cas-pinned");
+                assert_eq!(epic_title, "Preserved Existing State");
+            }
+            ref other => panic!("expected preserved Active state, got {other:?}"),
+        }
     }
 
     #[test]
