@@ -118,13 +118,7 @@ fn format_reminder(
     // Layout: " {icon} " (4) + "{status:<12} " (13) + message
     let prefix_width = 4 + 13;
     let max_msg_len = available_width.saturating_sub(prefix_width);
-    let msg = if max_msg_len < 4 {
-        String::new()
-    } else if reminder.message.len() > max_msg_len {
-        format!("{}...", &reminder.message[..max_msg_len.saturating_sub(3)])
-    } else {
-        reminder.message.clone()
-    };
+    let msg = truncate_message(&reminder.message, max_msg_len);
 
     let icon_style = if is_fired {
         styles.text_success
@@ -144,4 +138,42 @@ fn format_reminder(
     ]);
 
     ListItem::new(line)
+}
+
+/// Truncate a reminder message to the available width, never cutting inside
+/// a multi-byte character (a raw byte slice here panicked factory boot when
+/// the cut landed inside an em-dash).
+fn truncate_message(message: &str, max_msg_len: usize) -> String {
+    if max_msg_len < 4 {
+        String::new()
+    } else {
+        crate::ui::widgets::truncate(message, max_msg_len)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_message;
+
+    #[test]
+    fn truncation_never_splits_multibyte_char() {
+        // Exact reminder message that panicked boot: byte 65 falls inside
+        // the '—' (bytes 64..67) when truncated to width 82 (65 + 3 + 14).
+        let message = "cas-7c03 (fork-first CAS_FACTORY_SESSION fix) reported complete — review fair-wolf-45's branch, run cas-code-review, merge to main, close task, post Slack release notes.";
+        for width in 4..=message.len() + 4 {
+            let out = truncate_message(message, width);
+            assert!(out.len() <= width, "width {width}: {out:?}");
+        }
+        assert!(truncate_message(message, 68).ends_with("..."));
+    }
+
+    #[test]
+    fn narrow_width_yields_empty() {
+        assert_eq!(truncate_message("anything", 3), "");
+    }
+
+    #[test]
+    fn short_message_untruncated() {
+        assert_eq!(truncate_message("check CI", 40), "check CI");
+    }
 }
