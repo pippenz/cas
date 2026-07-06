@@ -11,6 +11,14 @@ fn env_value<'a>(config: &'a crate::pty::PtyConfig, key: &str) -> Option<&'a str
         .map(|(_, v)| v.as_str())
 }
 
+fn codex_factory_session_arg(config: &crate::pty::PtyConfig) -> Option<&str> {
+    config
+        .args
+        .iter()
+        .find(|arg| arg.starts_with("mcp_servers.cs.env.CAS_FACTORY_SESSION="))
+        .map(String::as_str)
+}
+
 // ── cas-d571: effort config flows through Mux::factory() to PTY args ─────────
 // Tests the full MuxConfig → Mux::factory_pane_configs() → PtyConfig.args chain.
 // Uses `factory_pane_configs` (config-only, no spawn) so tests run without a
@@ -155,6 +163,46 @@ fn build_add_worker_config_propagates_factory_session_for_dynamic_spawns() {
         "dynamic Codex cs MCP env must include CAS_FACTORY_SESSION; args={:?}",
         pty_config.args
     );
+}
+
+#[test]
+fn factory_session_codex_toml_arg_sanitizes_quote_and_newline() {
+    let raw_session = "factory\"bad\nsession";
+    let config = MuxConfig {
+        cwd: PathBuf::from("/tmp/test"),
+        workers: 1,
+        worker_names: vec!["codex-worker".to_string()],
+        factory_session: Some(raw_session.to_string()),
+        include_director: false,
+        supervisor_cli: SupervisorCli::Codex,
+        worker_cli: SupervisorCli::Codex,
+        ..MuxConfig::default()
+    };
+
+    let configs = Mux::factory_pane_configs(&config);
+
+    for (name, pty_config) in configs {
+        assert_eq!(
+            env_value(&pty_config, "CAS_FACTORY_SESSION"),
+            Some(raw_session),
+            "{name} plain PTY env should keep the raw session value"
+        );
+        let toml_arg =
+            codex_factory_session_arg(&pty_config).expect("Codex cs MCP session env arg");
+        assert_eq!(
+            toml_arg,
+            "mcp_servers.cs.env.CAS_FACTORY_SESSION=\"factory_bad_session\""
+        );
+        assert_eq!(
+            toml_arg.matches('"').count(),
+            2,
+            "{name} TOML arg should contain only the wrapping quotes"
+        );
+        assert!(
+            !toml_arg.contains('\n'),
+            "{name} TOML arg must not contain raw newlines"
+        );
+    }
 }
 
 /// cas-34f7f: when MuxConfig effort fields are None, --effort must be OMITTED

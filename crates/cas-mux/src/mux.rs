@@ -4,7 +4,7 @@
 
 use crate::error::{Error, Result};
 use crate::harness::SupervisorCli;
-use crate::pane::{Pane, PaneId, PaneKind};
+use crate::pane::{Pane, PaneId, PaneKind, push_factory_session_env};
 use crate::pty::{PtyConfig, PtyEvent, TeamsSpawnConfig};
 use crate::spec::WorkerSpec;
 use cas_factory_protocol::ServerMessage;
@@ -307,8 +307,8 @@ impl Mux {
                 effort_opt.as_deref(),
                 teams,
             );
-            let pty_config =
-                Self::with_factory_session_env(pty_config, cli, config.factory_session.as_deref());
+            let mut pty_config = pty_config;
+            push_factory_session_env(&mut pty_config, cli, config.factory_session.as_deref());
             result.push((name.clone(), pty_config));
         }
 
@@ -324,8 +324,9 @@ impl Mux {
             config.supervisor_effort.as_deref(),
             sup_teams,
         );
-        let sup_config = Self::with_factory_session_env(
-            sup_config,
+        let mut sup_config = sup_config;
+        push_factory_session_env(
+            &mut sup_config,
             config.supervisor_cli,
             config.factory_session.as_deref(),
         );
@@ -633,7 +634,7 @@ impl Mux {
     ) -> PtyConfig {
         let effective = self.effective_worker_spec(name, spec);
         let effort_str = effective.effort.map(|e| e.as_claude_arg().to_string());
-        let config = Pane::build_worker_config(
+        let mut config = Pane::build_worker_config(
             name,
             cwd,
             cas_root,
@@ -644,7 +645,8 @@ impl Mux {
             effort_str.as_deref(),
             teams,
         );
-        Self::with_factory_session_env(config, effective.cli, self.factory_session.as_deref())
+        push_factory_session_env(&mut config, effective.cli, self.factory_session.as_deref());
+        config
     }
 
     /// Add a worker pane at runtime
@@ -704,25 +706,6 @@ impl Mux {
         self.worker_specs.insert(name.to_string(), effective);
         self.add_pane(pane);
         Ok(id)
-    }
-
-    fn with_factory_session_env(
-        mut config: PtyConfig,
-        cli: SupervisorCli,
-        factory_session: Option<&str>,
-    ) -> PtyConfig {
-        if let Some(session) = factory_session {
-            config
-                .env
-                .push(("CAS_FACTORY_SESSION".to_string(), session.to_string()));
-            if cli == SupervisorCli::Codex {
-                config.args.push("-c".to_string());
-                config.args.push(format!(
-                    "mcp_servers.cs.env.CAS_FACTORY_SESSION=\"{session}\""
-                ));
-            }
-        }
-        config
     }
 
     /// Add a new shell pane to the mux.

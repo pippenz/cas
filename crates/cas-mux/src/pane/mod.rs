@@ -1164,7 +1164,7 @@ impl Pane {
     }
 }
 
-fn push_factory_session_env(
+pub(crate) fn push_factory_session_env(
     config: &mut PtyConfig,
     cli: SupervisorCli,
     factory_session: Option<&str>,
@@ -1174,10 +1174,24 @@ fn push_factory_session_env(
             .env
             .push(("CAS_FACTORY_SESSION".to_string(), session.to_string()));
         if cli == SupervisorCli::Codex {
+            let session = sanitize_factory_session_for_toml_arg(session);
             config.args.push("-c".to_string());
             config.args.push(format!(
                 "mcp_servers.cs.env.CAS_FACTORY_SESSION=\"{session}\""
             ));
         }
     }
+}
+
+fn sanitize_factory_session_for_toml_arg(session: &str) -> String {
+    session
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
