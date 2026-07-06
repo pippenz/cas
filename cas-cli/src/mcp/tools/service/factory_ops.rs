@@ -144,8 +144,15 @@ impl CasService {
         )
         .map_err(|e| Self::error(ErrorCode::INVALID_PARAMS, e))?;
 
+        let factory_session = std::env::var("CAS_FACTORY_SESSION").ok();
         let request_id = queue
-            .enqueue_spawn(count, &worker_names, isolate, spec_json_owned.as_deref())
+            .enqueue_spawn(
+                count,
+                &worker_names,
+                isolate,
+                spec_json_owned.as_deref(),
+                factory_session.as_deref(),
+            )
             .map_err(|e| {
                 Self::error(
                     ErrorCode::INTERNAL_ERROR,
@@ -258,8 +265,9 @@ impl CasService {
 
         let count = req.count;
         let force = req.force.unwrap_or(false);
+        let factory_session = std::env::var("CAS_FACTORY_SESSION").ok();
         let request_id = queue
-            .enqueue_shutdown(count, &worker_names, force)
+            .enqueue_shutdown(count, &worker_names, force, factory_session.as_deref())
             .map_err(|e| {
                 Self::error(
                     ErrorCode::INTERNAL_ERROR,
