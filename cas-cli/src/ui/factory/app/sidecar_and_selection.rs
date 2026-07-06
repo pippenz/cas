@@ -544,44 +544,11 @@ impl FactoryApp {
     /// Must match the item count produced by `tasks::render_with_focus()`,
     /// including epic headers, subtasks (when not collapsed), separators, and standalone tasks.
     fn task_display_item_count(&self) -> usize {
-        let (epic_groups, standalone) = self.director_data.tasks_by_epic();
-        let agent_filter = self.agent_filter.as_deref();
-        let mut count = 0;
-
-        for group in &epic_groups {
-            let visible_subtasks: usize = group
-                .subtasks
-                .iter()
-                .filter(|t| match agent_filter {
-                    None => true,
-                    Some(filter) => t.assignee.as_deref() == Some(filter),
-                })
-                .count();
-
-            if agent_filter.is_some() && visible_subtasks == 0 {
-                continue;
-            }
-
-            count += 1; // epic header row
-
-            if !self.collapsed_epics.contains(&group.epic.id) {
-                count += visible_subtasks;
-            }
-        }
-
-        let filtered_standalone_count = standalone
-            .iter()
-            .filter(|t| match agent_filter {
-                None => true,
-                Some(filter) => t.assignee.as_deref() == Some(filter),
-            })
-            .count();
-
-        if count > 0 && filtered_standalone_count > 0 {
-            count += 1; // separator row
-        }
-        count += filtered_standalone_count;
-        count
+        let scoped = crate::ui::factory::director::tasks::ScopedTaskView::new(
+            &self.director_data,
+            self.current_epic_id.as_deref(),
+        );
+        scoped.visible_row_count(self.agent_filter.as_deref(), &self.collapsed_epics)
     }
 
     /// Get the ID of the selected task (if any).
@@ -590,11 +557,14 @@ impl FactoryApp {
     /// to correctly map the selected display index to a task ID.
     fn get_selected_task_id(&self) -> Option<String> {
         let selected = self.panels.tasks.list_state.selected()?;
-        let (epic_groups, standalone) = self.director_data.tasks_by_epic();
+        let scoped = crate::ui::factory::director::tasks::ScopedTaskView::new(
+            &self.director_data,
+            self.current_epic_id.as_deref(),
+        );
         let agent_filter = self.agent_filter.as_deref();
         let mut idx = 0;
 
-        for group in &epic_groups {
+        for group in &scoped.epic_groups {
             let filtered_subtasks: Vec<_> = group
                 .subtasks
                 .iter()
@@ -623,7 +593,8 @@ impl FactoryApp {
             }
         }
 
-        let filtered_standalone: Vec<_> = standalone
+        let filtered_standalone: Vec<_> = scoped
+            .standalone
             .iter()
             .filter(|t| match agent_filter {
                 None => true,
@@ -651,11 +622,14 @@ impl FactoryApp {
     /// Get the selected task (if any).
     pub fn get_selected_task(&self) -> Option<&crate::ui::factory::director::TaskSummary> {
         let selected = self.panels.tasks.list_state.selected()?;
-        let (epic_groups, standalone) = self.director_data.tasks_by_epic();
+        let scoped = crate::ui::factory::director::tasks::ScopedTaskView::new(
+            &self.director_data,
+            self.current_epic_id.as_deref(),
+        );
         let agent_filter = self.agent_filter.as_deref();
         let mut idx = 0;
 
-        for group in &epic_groups {
+        for group in &scoped.epic_groups {
             let filtered_subtask_indices: Vec<usize> = group
                 .subtasks
                 .iter()
@@ -692,7 +666,8 @@ impl FactoryApp {
             }
         }
 
-        let filtered_standalone: Vec<_> = standalone
+        let filtered_standalone: Vec<_> = scoped
+            .standalone
             .iter()
             .filter(|t| match agent_filter {
                 None => true,
@@ -913,7 +888,10 @@ mod tests {
             .unwrap()
             .feed(b"\x1b[?1049h")
             .unwrap();
-        assert!(app.mux.focused_is_in_alt_screen(), "precondition: pane in alt-screen");
+        assert!(
+            app.mux.focused_is_in_alt_screen(),
+            "precondition: pane in alt-screen"
+        );
         app
     }
 
@@ -952,7 +930,11 @@ mod tests {
             "show_help must suppress alt-screen wheel forwarding (up)"
         );
         // Re-arm alt-screen (handle_scroll_up performed host scrollback)
-        app.mux.get_mut("test-pane").unwrap().feed(b"\x1b[?1049h").unwrap();
+        app.mux
+            .get_mut("test-pane")
+            .unwrap()
+            .feed(b"\x1b[?1049h")
+            .unwrap();
         assert_eq!(
             app.handle_scroll_down(),
             ScrollAction::Done,
@@ -972,10 +954,7 @@ mod tests {
         // Activate MC and ensure mc_focus is None (default after entering MC)
         app.factory_view_mode = crate::ui::factory::renderer::FactoryViewMode::MissionControl;
         app.mc_focus = crate::ui::factory::renderer::MissionControlFocus::None;
-        assert!(
-            app.is_mission_control(),
-            "precondition: MC is active"
-        );
+        assert!(app.is_mission_control(), "precondition: MC is active");
         assert_eq!(
             app.handle_scroll_up(),
             ScrollAction::Done,
@@ -1120,13 +1099,11 @@ mod tests {
     #[test]
     fn scroll_arrow_consts_have_exact_byte_shape_cas_72c3() {
         assert_eq!(
-            SCROLL_UP_ARROWS,
-            b"\x1b[5~",
+            SCROLL_UP_ARROWS, b"\x1b[5~",
             "SCROLL_UP_ARROWS must be the PgUp sequence (ESC [ 5 ~)"
         );
         assert_eq!(
-            SCROLL_DOWN_ARROWS,
-            b"\x1b[6~",
+            SCROLL_DOWN_ARROWS, b"\x1b[6~",
             "SCROLL_DOWN_ARROWS must be the PgDn sequence (ESC [ 6 ~)"
         );
     }
@@ -1202,8 +1179,7 @@ mod tests {
         // (mc_focus_none guard, P1 #1 regression).
         {
             let mut app = app_with_alt_screen();
-            app.factory_view_mode =
-                crate::ui::factory::renderer::FactoryViewMode::MissionControl;
+            app.factory_view_mode = crate::ui::factory::renderer::FactoryViewMode::MissionControl;
             app.mc_focus = crate::ui::factory::renderer::MissionControlFocus::None;
             assert_eq!(daemon_mouse_scroll_up_label(&mut app), "noop");
         }

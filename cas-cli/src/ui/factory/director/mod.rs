@@ -18,8 +18,8 @@ mod reminders;
 pub(crate) mod tasks;
 
 pub use data::{AgentSummary, DirectorData, DirectorStores, TaskSummary};
-pub use events::{DirectorEvent, DirectorEventDetector};
 pub(crate) use events::pick_best_open_branch_epic;
+pub use events::{DirectorEvent, DirectorEventDetector};
 pub use panel::PanelRegistry;
 pub use prompts::{Prompt, generate_prompt, with_response_instructions};
 // PanelAreas, SidecarFocus, SidecarState, ViewMode, DiffLine, DiffLineType, render, render_with_state are already public in this module
@@ -132,6 +132,8 @@ pub struct SidecarState<'a> {
     pub activity_state: &'a mut ListState,
     /// Optional agent filter (filter tasks/activity by this agent name)
     pub agent_filter: Option<&'a str>,
+    /// Current display-focused epic ID.
+    pub focused_epic_id: Option<&'a str>,
     /// Section collapse flags
     pub factory_collapsed: bool,
     pub tasks_collapsed: bool,
@@ -230,6 +232,10 @@ pub fn render_with_state(
         .split(area);
 
     let agent_filter = state.as_ref().and_then(|s| s.agent_filter);
+    let focused_epic_id = state
+        .as_ref()
+        .and_then(|s| s.focused_epic_id)
+        .or(focused_epic_id);
 
     // Get collapsed_epics from state (or empty set if no state)
     #[allow(clippy::incompatible_msrv)]
@@ -267,6 +273,7 @@ pub fn render_with_state(
         focus == SidecarFocus::Tasks,
         state.as_ref().and_then(|s| s.tasks_state.selected()),
         agent_filter,
+        focused_epic_id,
         tasks_collapsed,
         collapsed_epics,
         state.as_mut().map(|s| &mut *s.tasks_state),
