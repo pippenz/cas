@@ -8,9 +8,11 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::cli::Cli;
-use crate::cloud::{BackfillOutcome, CloudConfig, FetchTeamsOutcome, SyncQueue,
+use crate::cloud::{
+    BackfillOutcome, CloudConfig, FetchTeamsOutcome, PersonalScopeNotice, SyncQueue, TeamInfo,
     fetch_and_cache_teams, get_project_canonical_id, maybe_apply_team_backfill,
-    teams_cache_stale, user_level_cloud_json_path};
+    maybe_mark_personal_scope_notice, teams_cache_stale, user_level_cloud_json_path,
+};
 use crate::ui::components::Formatter;
 use crate::ui::theme::ActiveTheme;
 
@@ -60,11 +62,14 @@ pub enum CloudTeamCommands {
     /// Requires cached team memberships — run `cas cloud login` first if you see
     /// "team not found" errors.
     Default(CloudTeamDefaultArgs),
-    /// Set the per-project team override by UUID (advanced / escape hatch)
+    /// Set the per-project team override by slug or UUID
     ///
-    /// Writes `team_id` to `<project>/.cas/cloud.json`. Prefer
-    /// `cas cloud team default <slug>` for the normal first-time setup path.
+    /// Writes `team_id` to `<project>/.cas/cloud.json`. Slugs are resolved
+    /// against cached memberships from `~/.cas/cloud.json`.
     Set(CloudTeamSetArgs),
+    /// Configure whether this project inherits the user-level team default
+    #[command(subcommand)]
+    Auto(CloudTeamAutoCommands),
     /// Show the currently configured team
     Show,
     /// Clear the configured team (no more team-scoped sync)
@@ -88,8 +93,19 @@ pub struct CloudTeamDefaultArgs {
 
 #[derive(Parser)]
 pub struct CloudTeamSetArgs {
-    /// Team UUID (e.g., 550e8400-e29b-41d4-a716-446655440000)
-    pub id: String,
+    /// Team slug or UUID (e.g., petra-stella or 550e8400-e29b-41d4-a716-446655440000)
+    pub id: Option<String>,
+}
+
+/// Subcommands for `cas cloud team auto`.
+#[derive(Subcommand)]
+pub enum CloudTeamAutoCommands {
+    /// Inherit the user-level default team for this project
+    On,
+    /// Disable team scope for this project, even if a team_id is configured
+    Off,
+    /// Clear the auto-promotion override
+    Clear,
 }
 
 /// Subcommands for `cas cloud project` (cas-1ced).
@@ -258,14 +274,102 @@ fn parse_team_uuid(input: &str) -> Result<String, String> {
     }
 }
 
-/// Wrap a `parse_team_uuid` error with endpoint-aware guidance on where to
-/// find the team UUID. Kept separate so the parser stays pure.
-fn format_uuid_error(short: &str, endpoint: &str) -> String {
-    // Strip any trailing slash so the interpolated URL is clean.
-    let base = endpoint.trim_end_matches('/');
-    format!(
-        "{short}.\n\n  Slug resolution is not yet supported. Find your team UUID at:\n    {base}/dashboard/teams\n\n  If a teammate has already set up cloud sync, check their\n  `~/.cas/cloud.json` for the `team_id` field and pass that UUID to\n  `cas cloud team set <uuid>`."
-    )
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TeamSetTarget {
+    Uuid(String),
+    CachedTeam {
+        query: Option<String>,
+        team: TeamInfo,
+    },
+}
+
+impl TeamSetTarget {
+    fn uuid(&self) -> &str {
+        match self {
+            TeamSetTarget::Uuid(uuid) => uuid,
+            TeamSetTarget::CachedTeam { team, .. } => &team.id,
+        }
+    }
+
+    fn slug(&self) -> Option<&str> {
+        match self {
+            TeamSetTarget::Uuid(_) => None,
+            TeamSetTarget::CachedTeam { team, .. } => Some(&team.slug),
+        }
+    }
+
+    fn name(&self) -> Option<&str> {
+        match self {
+            TeamSetTarget::Uuid(_) => None,
+            TeamSetTarget::CachedTeam { team, .. } => Some(&team.name),
+        }
+    }
+}
+
+fn cached_team_options(config: &CloudConfig) -> String {
+    if config.teams.is_empty() {
+        "No cached teams found.".to_string()
+    } else {
+        let available = config
+            .teams
+            .iter()
+            .map(|t| format!("{} ({})", t.slug, t.name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("Available cached teams: {available}.")
+    }
+}
+
+fn resolve_team_set_target(
+    arg: Option<&str>,
+    user_config: &CloudConfig,
+    allow_uuid_passthrough: bool,
+) -> anyhow::Result<TeamSetTarget> {
+    if let Some(input) = arg {
+        if allow_uuid_passthrough && let Ok(uuid) = parse_team_uuid(input) {
+            return Ok(TeamSetTarget::Uuid(uuid));
+        }
+
+        if let Some(team) = user_config
+            .teams
+            .iter()
+            .find(|t| t.slug == input || t.id == input)
+        {
+            return Ok(TeamSetTarget::CachedTeam {
+                query: Some(input.to_string()),
+                team: team.clone(),
+            });
+        }
+
+        anyhow::bail!(
+            "Team slug {:?} not found in cached memberships.\n{}\nRun `cas cloud login` to refresh team membership.",
+            input,
+            cached_team_options(user_config)
+        );
+    }
+
+    match user_config.teams.as_slice() {
+        [team] => Ok(TeamSetTarget::CachedTeam {
+            query: None,
+            team: team.clone(),
+        }),
+        [] => anyhow::bail!(
+            "No cached team memberships found.\nRun `cas cloud login` to refresh team membership."
+        ),
+        _ => anyhow::bail!(
+            "Multiple cached teams found; pass one explicitly.\n{}\nRun `cas cloud login` to refresh team membership.",
+            cached_team_options(user_config)
+        ),
+    }
+}
+
+fn load_user_cloud_config_for_team_resolution() -> anyhow::Result<CloudConfig> {
+    let path = user_level_cloud_json_path().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Cannot determine home directory. Run `cas cloud login` to refresh team membership."
+        )
+    })?;
+    Ok(CloudConfig::load_from(&path)?)
 }
 
 /// Result of probing team membership via `GET /api/teams/{uuid}/projects`.
@@ -312,11 +416,7 @@ fn probe_team_membership(endpoint: &str, token: &str, team_uuid: &str) -> TeamPr
 /// can exercise the slug-resolution wiring against a wiremock server (matches
 /// the same pattern used by `execute_sync` / `execute_team_pull`).
 #[doc(hidden)]
-pub fn execute_team(
-    cmd: &CloudTeamCommands,
-    cli: &Cli,
-    cas_root: &Path,
-) -> anyhow::Result<()> {
+pub fn execute_team(cmd: &CloudTeamCommands, cli: &Cli, cas_root: &Path) -> anyhow::Result<()> {
     match cmd {
         CloudTeamCommands::Default(args) => {
             // `default` writes to the user-level ~/.cas/cloud.json, not the
@@ -328,6 +428,7 @@ pub fn execute_team(
             execute_team_default_inner(args, cli, &user_cas_dir)
         }
         CloudTeamCommands::Set(args) => execute_team_set(args, cli, cas_root),
+        CloudTeamCommands::Auto(cmd) => execute_team_auto(cmd, cli, cas_root),
         CloudTeamCommands::Show => execute_team_show(cli, cas_root).map(|_| ()),
         CloudTeamCommands::Clear => execute_team_clear(cli),
     }
@@ -443,20 +544,14 @@ fn execute_team_default_inner(
         return Ok(());
     }
 
-    // Slug-or-UUID lookup against cached teams[].
     let query = args
         .slug_or_uuid
         .as_deref()
         .expect("slug_or_uuid is required unless --personal is set");
 
-    let matched = config
-        .teams
-        .iter()
-        .find(|t| t.slug == query || t.id == query)
-        .cloned();
-
-    match matched {
-        Some(team) => {
+    match resolve_team_set_target(Some(query), &config, false)? {
+        TeamSetTarget::Uuid(_) => unreachable!("team default does not allow UUID passthrough"),
+        TeamSetTarget::CachedTeam { team, .. } => {
             config.default_team_id = Some(team.id.clone());
             config.save_to_cas_dir(user_cas_dir)?;
 
@@ -491,30 +586,10 @@ fn execute_team_default_inner(
             }
             Ok(())
         }
-        None => {
-            let hint = if config.teams.is_empty() {
-                "Run `cas cloud login` to refresh team membership.".to_string()
-            } else {
-                let available: Vec<&str> = config.teams.iter().map(|t| t.slug.as_str()).collect();
-                format!(
-                    "Available teams: {}.\nRun `cas cloud login` to refresh team membership.",
-                    available.join(", ")
-                )
-            };
-            anyhow::bail!(
-                "Team {:?} not found in cached memberships.\n{}",
-                query,
-                hint
-            )
-        }
     }
 }
 
-fn execute_team_set(
-    args: &CloudTeamSetArgs,
-    cli: &Cli,
-    cas_root: &Path,
-) -> anyhow::Result<()> {
+fn execute_team_set(args: &CloudTeamSetArgs, cli: &Cli, cas_root: &Path) -> anyhow::Result<()> {
     // Load config before parsing so the error path can build an
     // endpoint-aware dashboard URL ("find your team UUID at …").
     // `load_from_cas_dir` (rather than `load()`) so the test harness can
@@ -522,9 +597,16 @@ fn execute_team_set(
     // through the rest of the cloud-cmd dispatcher.
     let mut config = CloudConfig::load_from_cas_dir(cas_root)?;
 
-    let uuid = parse_team_uuid(&args.id).map_err(|short| {
-        anyhow::anyhow!("{}", format_uuid_error(&short, &config.endpoint))
-    })?;
+    let target = match args.id.as_deref() {
+        Some(input) if parse_team_uuid(input).is_ok() => {
+            TeamSetTarget::Uuid(parse_team_uuid(input).expect("checked above"))
+        }
+        other => {
+            let user_config = load_user_cloud_config_for_team_resolution()?;
+            resolve_team_set_target(other, &user_config, true)?
+        }
+    };
+    let uuid = target.uuid().to_string();
 
     let token = config
         .token
@@ -534,14 +616,10 @@ fn execute_team_set(
 
     match probe_team_membership(&config.endpoint, &token, &uuid) {
         TeamProbeOutcome::Member => {
-            // The membership probe endpoint doesn't return the slug. Set
-            // team_id directly and leave team_slug None so downstream
-            // callers (execute_projects, hooks/context.rs) fall through to
-            // their "show UUID" / "your team" default instead of rendering
-            // a sentinel string. A future cloud-side slug resolver (tracked
-            // in T7 docs) can populate team_slug when it lands.
+            // UUID input has no local slug to persist; slug/zero-arg inputs
+            // resolve through cached memberships and carry the slug forward.
             config.team_id = Some(uuid.clone());
-            config.team_slug = None;
+            config.team_slug = target.slug().map(ToString::to_string);
             config.save_to_cas_dir(cas_root)?;
 
             // cas-1ced: eagerly resolve project canonical_id so the first
@@ -586,7 +664,8 @@ fn execute_team_set(
                 let out = serde_json::json!({
                     "status": "ok",
                     "team_id": uuid,
-                    "team_slug": serde_json::Value::Null,
+                    "team_slug": target.slug(),
+                    "team_name": target.name(),
                     "canonical_id": resolved,
                     "canonical_id_source": source,
                 });
@@ -600,6 +679,26 @@ fn execute_team_set(
                 fmt.write_colored("  \u{2713} ", success_color)?;
                 fmt.write_raw("Active team set")?;
                 fmt.newline()?;
+                if let TeamSetTarget::CachedTeam { query, team } = &target {
+                    fmt.write_muted("  Resolved: ")?;
+                    match query {
+                        Some(q) => {
+                            fmt.write_raw("'")?;
+                            fmt.write_raw(q)?;
+                            fmt.write_raw("' \u{2192} ")?;
+                        }
+                        None => {
+                            fmt.write_raw("single cached team '")?;
+                            fmt.write_raw(&team.slug)?;
+                            fmt.write_raw("' \u{2192} ")?;
+                        }
+                    }
+                    fmt.write_raw(&team.id)?;
+                    fmt.write_raw(" (")?;
+                    fmt.write_raw(&team.name)?;
+                    fmt.write_raw(")")?;
+                    fmt.newline()?;
+                }
                 fmt.write_muted("  UUID: ")?;
                 fmt.write_raw(&uuid)?;
                 fmt.newline()?;
@@ -638,6 +737,127 @@ fn execute_team_set(
         TeamProbeOutcome::Error(msg) => {
             anyhow::bail!("Failed to verify team membership: {msg}")
         }
+    }
+}
+
+fn load_user_cloud_config_or_default() -> CloudConfig {
+    user_level_cloud_json_path()
+        .and_then(|p| CloudConfig::load_from(&p).ok())
+        .unwrap_or_default()
+}
+
+fn find_team_display<'a>(
+    team_id: &str,
+    project: &'a CloudConfig,
+    user: &'a CloudConfig,
+) -> (Option<&'a str>, Option<&'a str>) {
+    if project.team_id.as_deref() == Some(team_id) {
+        if let Some(slug) = project.team_slug.as_deref() {
+            return (Some(slug), None);
+        }
+    }
+    if let Some(team) = user.teams.iter().find(|t| t.id == team_id) {
+        return (Some(team.slug.as_str()), Some(team.name.as_str()));
+    }
+    (None, None)
+}
+
+fn execute_team_auto(
+    cmd: &CloudTeamAutoCommands,
+    cli: &Cli,
+    cas_root: &Path,
+) -> anyhow::Result<()> {
+    let mut config = CloudConfig::load_from_cas_dir(cas_root)?;
+    match cmd {
+        CloudTeamAutoCommands::On => config.team_auto_promote = Some(true),
+        CloudTeamAutoCommands::Off => config.team_auto_promote = Some(false),
+        CloudTeamAutoCommands::Clear => config.team_auto_promote = None,
+    }
+    config.save_to_cas_dir(cas_root)?;
+
+    let user_config = load_user_cloud_config_or_default();
+    let effective_team = config.active_team_id_with_user_config(Some(&user_config));
+
+    if cli.json {
+        let (team_slug, team_name) = effective_team
+            .as_deref()
+            .map(|id| find_team_display(id, &config, &user_config))
+            .unwrap_or((None, None));
+        println!(
+            "{}",
+            serde_json::json!({
+                "status": "ok",
+                "team_auto_promote": config.team_auto_promote,
+                "effective_team_id": effective_team,
+                "effective_team_slug": team_slug,
+                "effective_team_name": team_name,
+            })
+        );
+        return Ok(());
+    }
+
+    let theme = ActiveTheme::default();
+    let mut out = io::stdout();
+    let mut fmt = Formatter::stdout(&mut out, theme);
+    let success_color = fmt.theme().palette.status_success;
+    let warning_color = fmt.theme().palette.status_warning;
+    fmt.newline()?;
+    fmt.write_colored("  \u{2713} ", success_color)?;
+    match cmd {
+        CloudTeamAutoCommands::On => fmt.write_raw("Team auto-promotion enabled")?,
+        CloudTeamAutoCommands::Off => fmt.write_raw("Team auto-promotion disabled")?,
+        CloudTeamAutoCommands::Clear => fmt.write_raw("Team auto-promotion override cleared")?,
+    }
+    fmt.newline()?;
+
+    match effective_team.as_deref() {
+        Some(team_id) => {
+            let (team_slug, team_name) = find_team_display(team_id, &config, &user_config);
+            fmt.write_muted("  Effective team: ")?;
+            match (team_slug, team_name) {
+                (Some(slug), Some(name)) => {
+                    fmt.write_raw(name)?;
+                    fmt.write_raw(" (")?;
+                    fmt.write_raw(slug)?;
+                    fmt.write_raw(")")?;
+                }
+                (Some(slug), None) => fmt.write_raw(slug)?,
+                _ => fmt.write_raw(team_id)?,
+            }
+            fmt.newline()?;
+            fmt.write_muted("  UUID: ")?;
+            fmt.write_raw(team_id)?;
+            fmt.newline()?;
+        }
+        None => {
+            fmt.write_colored("  \u{26A0} ", warning_color)?;
+            if matches!(cmd, CloudTeamAutoCommands::On) {
+                fmt.write_raw(
+                    "No effective team resolved. Set a user default with `cas cloud team default <slug>` or refresh memberships with `cas cloud login`.",
+                )?;
+            } else {
+                fmt.write_raw("Effective scope: personal")?;
+            }
+            fmt.newline()?;
+        }
+    }
+
+    Ok(())
+}
+
+fn print_personal_scope_notice(cli: &Cli, notice: &PersonalScopeNotice) {
+    if cli.json {
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "event": "personal_scope_team_available",
+                "team_id": notice.team_id,
+                "team_slug": notice.team_slug,
+                "team_name": notice.team_name,
+            })
+        );
+    } else {
+        eprintln!("{}", notice.message());
     }
 }
 
@@ -1167,9 +1387,7 @@ pub fn check_canonical_id_rehome(
     // Fail-open: if the metadata read errors (malformed DB, etc.) we let the
     // push proceed. The guard will re-run on the next invocation once the DB
     // is healthy. The metadata is only authoritative when it exists.
-    let stored = queue
-        .get_metadata("last_push_canonical_id")
-        .unwrap_or(None);
+    let stored = queue.get_metadata("last_push_canonical_id").unwrap_or(None);
     match stored {
         None => Ok(()), // First push — no prior slug on record
         Some(ref stored_id) if stored_id == project_id => Ok(()), // Unchanged, safe
@@ -1744,9 +1962,7 @@ fn execute_pull(args: &CloudPullArgs, cli: &Cli, cas_root: &Path) -> anyhow::Res
             queue.delete_metadata("last_pull_at")?;
             if let Some(team_id) = config.active_team_id() {
                 if let Some(project_id) = crate::cloud::get_project_canonical_id() {
-                    queue.delete_metadata(&format!(
-                        "last_team_pull_at_{team_id}_{project_id}"
-                    ))?;
+                    queue.delete_metadata(&format!("last_team_pull_at_{team_id}_{project_id}"))?;
                 }
             }
         }
@@ -1867,7 +2083,12 @@ fn execute_pull(args: &CloudPullArgs, cli: &Cli, cas_root: &Path) -> anyhow::Res
 /// `pub(crate)` so `cli/auth.rs` can call it without going through the public
 /// API surface.
 pub(crate) fn print_backfill_notice(cli: &Cli, outcome: &BackfillOutcome) {
-    if let BackfillOutcome::AppliedSetDefault { team_id, team_slug, team_name } = outcome {
+    if let BackfillOutcome::AppliedSetDefault {
+        team_id,
+        team_slug,
+        team_name,
+    } = outcome
+    {
         if !cli.json {
             eprintln!();
             eprintln!("  ✓ Team membership detected — syncing to team scope");
@@ -1910,10 +2131,11 @@ pub fn execute_sync(args: &CloudSyncArgs, cli: &Cli, cas_root: &Path) -> anyhow:
     // fetch is more than 24 h old.  Best-effort — failure is logged but does
     // not abort sync.
     if !args.dry_run {
-        let user_cfg = user_level_cloud_json_path()
-            .and_then(|p| {
-                p.parent().map(|d| CloudConfig::load_from_cas_dir(d).ok()).flatten()
-            });
+        let user_cfg = user_level_cloud_json_path().and_then(|p| {
+            p.parent()
+                .map(|d| CloudConfig::load_from_cas_dir(d).ok())
+                .flatten()
+        });
         let stale = user_cfg
             .as_ref()
             .map(|cfg| teams_cache_stale(cfg, 86_400))
@@ -1960,6 +2182,16 @@ pub fn execute_sync(args: &CloudSyncArgs, cli: &Cli, cas_root: &Path) -> anyhow:
     if !args.dry_run {
         let outcome = maybe_apply_team_backfill();
         print_backfill_notice(cli, &outcome);
+        match maybe_mark_personal_scope_notice(cas_root) {
+            Ok(Some(notice)) => print_personal_scope_notice(cli, &notice),
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "could not persist personal-scope team availability notice"
+                );
+            }
+        }
     }
 
     execute_push(
@@ -2586,9 +2818,8 @@ fn execute_team_memories(
         })?
         .clone();
 
-    let canonical_id = crate::cloud::get_project_canonical_id().ok_or_else(|| {
-        anyhow::anyhow!("Not inside a CAS project directory.")
-    })?;
+    let canonical_id = crate::cloud::get_project_canonical_id()
+        .ok_or_else(|| anyhow::anyhow!("Not inside a CAS project directory."))?;
 
     let token = config
         .token
@@ -2967,20 +3198,13 @@ fn execute_purge_foreign(
              DELETE FROM skills;",
         )?;
         // Reset last_pull_at so re-pull fetches everything
-        conn.execute(
-            "DELETE FROM sync_metadata WHERE key = 'last_pull_at'",
-            [],
-        )?;
+        conn.execute("DELETE FROM sync_metadata WHERE key = 'last_pull_at'", [])?;
     }
 
     // Step 3: Re-pull from cloud with project-scoped filtering
     let queue = SyncQueue::open(cas_root)?;
     queue.init()?;
-    let syncer = CloudSyncer::new(
-        Arc::new(queue),
-        config,
-        CloudSyncerConfig::default(),
-    );
+    let syncer = CloudSyncer::new(Arc::new(queue), config, CloudSyncerConfig::default());
 
     let pull_result = syncer.pull(
         store.as_ref(),
@@ -3008,8 +3232,16 @@ fn execute_purge_foreign(
             r#"{{"project_id":"{}","backup":"{}","entities_before":{{"entries":{},"tasks":{},"rules":{},"skills":{},"total":{}}},"entities_after":{{"entries":{},"tasks":{},"rules":{},"skills":{},"total":{}}},"purged":{},"pull_errors":{}}}"#,
             project_id,
             backup_path.display(),
-            entries_before, tasks_before, rules_before, skills_before, total_before,
-            entries_after, tasks_after, rules_after, skills_after, total_after,
+            entries_before,
+            tasks_before,
+            rules_before,
+            skills_before,
+            total_before,
+            entries_after,
+            tasks_after,
+            rules_after,
+            skills_after,
+            total_after,
             purged,
             serde_json::to_string(&pull_result.errors).unwrap_or_default(),
         );
@@ -3109,24 +3341,199 @@ mod team_cmd_tests {
         assert!(err.contains("expected a team UUID"));
     }
 
-    #[test]
-    fn format_uuid_error_uses_endpoint_dashboard_url() {
-        let msg = format_uuid_error(
-            "expected a team UUID, got `petra-stella`",
-            "https://cas.dev",
-        );
-        assert!(msg.contains("got `petra-stella`"));
-        assert!(msg.contains("https://cas.dev/dashboard/teams"));
-        assert!(msg.contains("Slug resolution is not yet supported"));
-        assert!(msg.contains("cloud.json"));
+    fn make_team_info(id: &str, slug: &str, name: &str) -> TeamInfo {
+        TeamInfo {
+            id: id.to_string(),
+            slug: slug.to_string(),
+            name: name.to_string(),
+            role: "member".to_string(),
+        }
+    }
+
+    fn config_with_teams(teams: Vec<TeamInfo>) -> CloudConfig {
+        let mut config = CloudConfig::default();
+        config.teams = teams;
+        config
+    }
+
+    fn cli_json() -> Cli {
+        Cli {
+            json: true,
+            full: false,
+            verbose: false,
+            command: None,
+        }
     }
 
     #[test]
-    fn format_uuid_error_strips_trailing_slash_on_endpoint() {
-        let msg = format_uuid_error("expected a team UUID, got `x`", "https://custom.host/");
-        // Should not produce a double-slash in the URL.
-        assert!(msg.contains("https://custom.host/dashboard/teams"));
-        assert!(!msg.contains("//dashboard"));
+    fn team_set_resolution_uuid_passthrough() {
+        let config = config_with_teams(vec![]);
+        let target =
+            resolve_team_set_target(Some("550e8400-e29b-41d4-a716-446655440000"), &config, true)
+                .unwrap();
+        assert_eq!(
+            target,
+            TeamSetTarget::Uuid("550e8400-e29b-41d4-a716-446655440000".to_string())
+        );
+    }
+
+    #[test]
+    fn team_set_resolution_slug_hit() {
+        let team = make_team_info(
+            "550e8400-e29b-41d4-a716-446655440000",
+            "petra-stella",
+            "Petra Stella",
+        );
+        let config = config_with_teams(vec![team.clone()]);
+        let target = resolve_team_set_target(Some("petra-stella"), &config, true).unwrap();
+        assert_eq!(
+            target,
+            TeamSetTarget::CachedTeam {
+                query: Some("petra-stella".to_string()),
+                team,
+            }
+        );
+    }
+
+    #[test]
+    fn team_set_resolution_slug_miss_lists_cached_slugs() {
+        let config = config_with_teams(vec![make_team_info(
+            "550e8400-e29b-41d4-a716-446655440000",
+            "petra-stella",
+            "Petra Stella",
+        )]);
+        let err = resolve_team_set_target(Some("missing-team"), &config, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("missing-team"));
+        assert!(err.contains("petra-stella"));
+        assert!(err.contains("cas cloud login"));
+        assert!(!err.contains("Slug resolution is not yet supported"));
+    }
+
+    #[test]
+    fn team_set_resolution_zero_arg_single_team() {
+        let team = make_team_info(
+            "550e8400-e29b-41d4-a716-446655440000",
+            "petra-stella",
+            "Petra Stella",
+        );
+        let config = config_with_teams(vec![team.clone()]);
+        let target = resolve_team_set_target(None, &config, true).unwrap();
+        assert_eq!(target, TeamSetTarget::CachedTeam { query: None, team });
+    }
+
+    #[test]
+    fn team_set_resolution_zero_arg_multi_team_errors_with_options() {
+        let config = config_with_teams(vec![
+            make_team_info(
+                "550e8400-e29b-41d4-a716-446655440000",
+                "petra-stella",
+                "Petra Stella",
+            ),
+            make_team_info(
+                "650e8400-e29b-41d4-a716-446655440000",
+                "ozer-health",
+                "Ozer Health",
+            ),
+        ]);
+        let err = resolve_team_set_target(None, &config, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Multiple cached teams"));
+        assert!(err.contains("petra-stella"));
+        assert!(err.contains("ozer-health"));
+    }
+
+    #[test]
+    fn team_set_resolution_empty_cache_errors_with_login_hint() {
+        let config = config_with_teams(vec![]);
+        let err = resolve_team_set_target(None, &config, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("No cached team memberships"));
+        assert!(err.contains("cas cloud login"));
+    }
+
+    #[test]
+    fn team_auto_on_writes_true_and_resolves_effective_team() {
+        let _guard = crate::cloud::CLOUD_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let project = TempDir::new().unwrap();
+        let user = TempDir::new().unwrap();
+
+        let project_cfg = CloudConfig::default();
+        project_cfg.save_to_cas_dir(project.path()).unwrap();
+
+        let mut user_cfg = CloudConfig::default();
+        user_cfg.default_team_id = Some("team-1".to_string());
+        user_cfg.teams = vec![make_team_info("team-1", "petra-stella", "Petra Stella")];
+        user_cfg.save_to_cas_dir(user.path()).unwrap();
+
+        let user_cloud_json = user.path().join("cloud.json");
+        unsafe {
+            std::env::set_var("CAS_USER_CLOUD_JSON", &user_cloud_json);
+        }
+        execute_team_auto(&CloudTeamAutoCommands::On, &cli_json(), project.path()).unwrap();
+        let saved = CloudConfig::load_from_cas_dir(project.path()).unwrap();
+        assert_eq!(saved.team_auto_promote, Some(true));
+        assert_eq!(
+            saved
+                .active_team_id_with_user_config(Some(&user_cfg))
+                .as_deref(),
+            Some("team-1")
+        );
+        unsafe {
+            std::env::remove_var("CAS_USER_CLOUD_JSON");
+        }
+    }
+
+    #[test]
+    fn team_auto_off_writes_false_kill_switch() {
+        let _guard = crate::cloud::CLOUD_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let project = TempDir::new().unwrap();
+        let mut project_cfg = CloudConfig::default();
+        project_cfg.set_team("team-1", "petra-stella");
+        project_cfg.team_auto_promote = Some(true);
+        project_cfg.save_to_cas_dir(project.path()).unwrap();
+
+        execute_team_auto(&CloudTeamAutoCommands::Off, &cli_json(), project.path()).unwrap();
+        let saved = CloudConfig::load_from_cas_dir(project.path()).unwrap();
+        assert_eq!(saved.team_auto_promote, Some(false));
+        assert_eq!(saved.active_team_id_with_user_config(None), None);
+    }
+
+    #[test]
+    fn team_auto_clear_writes_none() {
+        let _guard = crate::cloud::CLOUD_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let project = TempDir::new().unwrap();
+        let mut project_cfg = CloudConfig::default();
+        project_cfg.team_auto_promote = Some(false);
+        project_cfg.save_to_cas_dir(project.path()).unwrap();
+
+        execute_team_auto(&CloudTeamAutoCommands::Clear, &cli_json(), project.path()).unwrap();
+        let saved = CloudConfig::load_from_cas_dir(project.path()).unwrap();
+        assert_eq!(saved.team_auto_promote, None);
+    }
+
+    #[test]
+    fn find_team_display_prefers_project_slug_for_direct_team_match() {
+        let mut project = CloudConfig::default();
+        project.set_team("team-1", "project-slug");
+        let user = config_with_teams(vec![make_team_info(
+            "team-1",
+            "user-cache-slug",
+            "User Cache Name",
+        )]);
+
+        let (slug, name) = find_team_display("team-1", &project, &user);
+        assert_eq!(slug, Some("project-slug"));
+        assert_eq!(name, None);
     }
 
     #[test]
@@ -3298,10 +3705,7 @@ mod team_cmd_tests {
     // Pure-function tests — no live cloud, no wiremock. Each creates an
     // in-memory projects slice and asserts the ambiguity detector's output.
 
-    fn make_project(
-        canonical_id: &str,
-        memory_count: u32,
-    ) -> crate::cloud::TeamProject {
+    fn make_project(canonical_id: &str, memory_count: u32) -> crate::cloud::TeamProject {
         crate::cloud::TeamProject {
             id: format!("id-{canonical_id}"),
             canonical_id: canonical_id.to_string(),
@@ -3344,9 +3748,7 @@ mod team_cmd_tests {
     fn bucket_ambiguity_no_warn_when_resolved_not_in_list() {
         // If the resolved canonical_id isn't in the team projects list yet
         // (brand-new project that hasn't synced), skip the warning.
-        let projects = vec![
-            make_project("other-project", 10_000),
-        ];
+        let projects = vec![make_project("other-project", 10_000)];
         assert!(
             check_bucket_ambiguity("new-project", &projects).is_none(),
             "should not warn when resolved id is absent from project list"
@@ -3357,10 +3759,7 @@ mod team_cmd_tests {
     fn bucket_ambiguity_no_warn_when_richest_below_threshold() {
         // All projects are small; the 50-memory guard suppresses the warning
         // so new teams don't see noise on early setup.
-        let projects = vec![
-            make_project("slug-a", 5),
-            make_project("slug-b", 40),
-        ];
+        let projects = vec![make_project("slug-a", 5), make_project("slug-b", 40)];
         assert!(
             check_bucket_ambiguity("slug-a", &projects).is_none(),
             "should not warn when richest other project is < 50 memories"
@@ -3384,10 +3783,7 @@ mod team_cmd_tests {
     #[test]
     fn bucket_ambiguity_warns_just_below_10_pct_boundary() {
         // resolved = 9, richest = 100. 9 * 10 = 90 < 100 → warn.
-        let projects = vec![
-            make_project("slug-small", 9),
-            make_project("slug-big", 100),
-        ];
+        let projects = vec![make_project("slug-small", 9), make_project("slug-big", 100)];
         assert!(
             check_bucket_ambiguity("slug-small", &projects).is_some(),
             "should warn when resolved count * 10 < richest count"

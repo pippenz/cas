@@ -53,7 +53,9 @@ pub fn get_project_canonical_id() -> Option<String> {
         return Some(id.clone());
     }
     // Not yet resolved — try now. Only cache Some results.
-    let result = find_cas_root().ok().and_then(|root| resolve_canonical_id(&root));
+    let result = find_cas_root()
+        .ok()
+        .and_then(|root| resolve_canonical_id(&root));
     if result.is_some() {
         *cached = result.clone();
     }
@@ -121,7 +123,9 @@ pub fn set_canonical_id_in_config_toml(
     let mut doc: toml::Value = match std::fs::read_to_string(&toml_path) {
         Ok(content) => toml::from_str(&content)
             .map_err(|e| CasError::Other(format!("Failed to parse config.toml: {e}")))?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml::Value::Table(toml::value::Table::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            toml::Value::Table(toml::value::Table::new())
+        }
         Err(e) => return Err(CasError::Other(format!("Failed to read config.toml: {e}"))),
     };
 
@@ -295,7 +299,8 @@ pub fn fallback_project_id_from_path(cas_root: &Path) -> Option<String> {
     use sha2::{Digest, Sha256};
 
     let project_dir = cas_root.parent().unwrap_or(cas_root);
-    let canonical = std::fs::canonicalize(project_dir).unwrap_or_else(|_| project_dir.to_path_buf());
+    let canonical =
+        std::fs::canonicalize(project_dir).unwrap_or_else(|_| project_dir.to_path_buf());
     let path_bytes = canonical.as_os_str().as_encoded_bytes();
     if path_bytes.is_empty() {
         return None;
@@ -475,6 +480,31 @@ pub struct CloudConfig {
     /// Not written to disk when `false` so pre-T6 files stay clean.
     #[serde(default, skip_serializing_if = "is_false")]
     pub team_backfill_notified: bool,
+
+    /// Set to `true` after this project has shown the one-time notice that it
+    /// is syncing to personal scope while the user has a usable team.
+    ///
+    /// This is project-local. It never changes `team_id`, `team_slug`, or
+    /// `team_auto_promote`; it only suppresses repeated informational notices.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub personal_scope_notice_shown: bool,
+}
+
+/// Display data for the one-time personal-scope notice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersonalScopeNotice {
+    pub team_id: String,
+    pub team_slug: String,
+    pub team_name: String,
+}
+
+impl PersonalScopeNotice {
+    pub fn message(&self) -> String {
+        format!(
+            "This project syncs to personal scope. You're a member of {} ({}). Link it with `cas cloud team set {}` or `cas cloud team auto on`.",
+            self.team_name, self.team_slug, self.team_slug
+        )
+    }
 }
 
 /// `skip_serializing_if` predicate for bool fields that default to `false`.
@@ -562,8 +592,90 @@ impl Default for CloudConfig {
             default_team_id: None,
             teams_fetched_at: None,
             team_backfill_notified: false,
+            personal_scope_notice_shown: false,
         }
     }
+}
+
+fn usable_team_from_user_config(user_cfg: &CloudConfig) -> Option<PersonalScopeNotice> {
+    if let Some(default_team_id) = user_cfg.default_team_id.as_deref() {
+        if let Some(team) = user_cfg.teams.iter().find(|t| t.id == default_team_id) {
+            return Some(PersonalScopeNotice {
+                team_id: team.id.clone(),
+                team_slug: team.slug.clone(),
+                team_name: team.name.clone(),
+            });
+        }
+        return Some(PersonalScopeNotice {
+            team_id: default_team_id.to_string(),
+            team_slug: default_team_id.to_string(),
+            team_name: default_team_id.to_string(),
+        });
+    }
+
+    match user_cfg.teams.as_slice() {
+        [team] => Some(PersonalScopeNotice {
+            team_id: team.id.clone(),
+            team_slug: team.slug.clone(),
+            team_name: team.name.clone(),
+        }),
+        _ => None,
+    }
+}
+
+/// Return the personal-scope notice data when a project is currently personal
+/// but the user has a usable team. Pure helper for unit tests.
+pub fn personal_scope_notice_for_configs(
+    project_cfg: &CloudConfig,
+    user_cfg: &CloudConfig,
+) -> Option<PersonalScopeNotice> {
+    if project_cfg.personal_scope_notice_shown {
+        return None;
+    }
+    if project_cfg
+        .active_team_id_with_user_config(Some(user_cfg))
+        .is_some()
+    {
+        return None;
+    }
+    usable_team_from_user_config(user_cfg)
+}
+
+/// Mark and return the one-time personal-scope notice for this project.
+///
+/// This intentionally never mutates team scope. The only persisted change is
+/// `personal_scope_notice_shown = true` in project `.cas/cloud.json`.
+pub fn maybe_mark_personal_scope_notice(
+    cas_root: &Path,
+) -> Result<Option<PersonalScopeNotice>, CasError> {
+    maybe_mark_personal_scope_notice_with_hook(cas_root, || {})
+}
+
+fn maybe_mark_personal_scope_notice_with_hook<F>(
+    cas_root: &Path,
+    before_mark: F,
+) -> Result<Option<PersonalScopeNotice>, CasError>
+where
+    F: FnOnce(),
+{
+    let project_cfg = CloudConfig::load_from_cas_dir(cas_root)?;
+    let user_cfg = user_level_cloud_json_path()
+        .and_then(|p| CloudConfig::load_from(&p).ok())
+        .unwrap_or_default();
+
+    if personal_scope_notice_for_configs(&project_cfg, &user_cfg).is_none() {
+        return Ok(None);
+    }
+
+    before_mark();
+
+    let mut fresh_project_cfg = CloudConfig::load_from_cas_dir(cas_root)?;
+    let notice = personal_scope_notice_for_configs(&fresh_project_cfg, &user_cfg);
+    if notice.is_some() {
+        fresh_project_cfg.personal_scope_notice_shown = true;
+        fresh_project_cfg.save_to_cas_dir(cas_root)?;
+    }
+    Ok(notice)
 }
 
 impl CloudConfig {
@@ -703,7 +815,10 @@ impl CloudConfig {
     ///    Only reached when Step 1.5 passed.
     ///
     /// 4. `None` — ambiguous (0 or 2+ teams) or no user config at all.
-    pub fn active_team_id_with_user_config(&self, user_cfg: Option<&CloudConfig>) -> Option<String> {
+    pub fn active_team_id_with_user_config(
+        &self,
+        user_cfg: Option<&CloudConfig>,
+    ) -> Option<String> {
         // Step 0 — hard kill-switch.
         if matches!(self.team_auto_promote, Some(false)) {
             return None;
@@ -758,8 +873,7 @@ impl CloudConfig {
     /// [`active_team_id_with_user_config`][Self::active_team_id_with_user_config]
     /// directly.
     pub fn active_team_id(&self) -> Option<String> {
-        let user_cfg = user_level_cloud_json_path()
-            .and_then(|p| CloudConfig::load_from(&p).ok());
+        let user_cfg = user_level_cloud_json_path().and_then(|p| CloudConfig::load_from(&p).ok());
         self.active_team_id_with_user_config(user_cfg.as_ref())
     }
 
@@ -822,7 +936,9 @@ mod tests {
 
     #[test]
     fn test_default_config() {
-        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = super::CLOUD_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let config = CloudConfig::default();
         assert_eq!(config.endpoint, "https://petra-stella-cloud.vercel.app");
         assert!(config.token.is_none());
@@ -831,7 +947,9 @@ mod tests {
 
     #[test]
     fn test_save_and_load() {
-        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = super::CLOUD_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("cloud.json");
 
@@ -851,7 +969,9 @@ mod tests {
 
     #[test]
     fn test_logout() {
-        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = super::CLOUD_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let mut config = CloudConfig {
             token: Some("test_token".to_string()),
             email: Some("test@example.com".to_string()),
@@ -869,7 +989,9 @@ mod tests {
 
     #[test]
     fn test_set_and_clear_team() {
-        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = super::CLOUD_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let mut config = CloudConfig::default();
         assert!(!config.has_team());
         assert!(config.team_id.is_none());
@@ -888,56 +1010,82 @@ mod tests {
 
     #[test]
     fn test_active_team_id_returns_none_when_no_team_set() {
-        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = super::CLOUD_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         // Ensure no user-level config leaks in from ~/.cas/cloud.json.
-        unsafe { std::env::set_var("CAS_USER_CLOUD_JSON", "/nonexistent/path/cloud.json"); }
+        unsafe {
+            std::env::set_var("CAS_USER_CLOUD_JSON", "/nonexistent/path/cloud.json");
+        }
         let config = CloudConfig::default();
         assert_eq!(config.active_team_id(), None);
-        unsafe { std::env::remove_var("CAS_USER_CLOUD_JSON"); }
+        unsafe {
+            std::env::remove_var("CAS_USER_CLOUD_JSON");
+        }
     }
 
     #[test]
     fn test_active_team_id_returns_team_when_team_id_explicitly_set() {
-        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = super::CLOUD_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         // team_id is explicitly set via `cas cloud team set` → Step 1 returns it
         // regardless of team_auto_promote value (Step 1 precedes Step 1.5 guard).
-        unsafe { std::env::set_var("CAS_USER_CLOUD_JSON", "/nonexistent/path/cloud.json"); }
+        unsafe {
+            std::env::set_var("CAS_USER_CLOUD_JSON", "/nonexistent/path/cloud.json");
+        }
         let mut config = CloudConfig::default();
         config.set_team("team-abc", "my-team");
         assert_eq!(config.active_team_id().as_deref(), Some("team-abc"));
         assert!(config.team_auto_promote.is_none()); // Step 1 fires before Step 1.5
-        unsafe { std::env::remove_var("CAS_USER_CLOUD_JSON"); }
+        unsafe {
+            std::env::remove_var("CAS_USER_CLOUD_JSON");
+        }
     }
 
     #[test]
     fn test_active_team_id_returns_team_when_auto_promote_is_true() {
-        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        unsafe { std::env::set_var("CAS_USER_CLOUD_JSON", "/nonexistent/path/cloud.json"); }
+        let _guard = super::CLOUD_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        unsafe {
+            std::env::set_var("CAS_USER_CLOUD_JSON", "/nonexistent/path/cloud.json");
+        }
         let mut config = CloudConfig::default();
         config.set_team("team-abc", "my-team");
         config.team_auto_promote = Some(true);
         assert_eq!(config.active_team_id().as_deref(), Some("team-abc"));
-        unsafe { std::env::remove_var("CAS_USER_CLOUD_JSON"); }
+        unsafe {
+            std::env::remove_var("CAS_USER_CLOUD_JSON");
+        }
     }
 
     #[test]
     fn test_active_team_id_suppressed_by_auto_promote_false() {
-        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = super::CLOUD_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         // The coarse kill-switch from Decision 3 of filter-policy.md —
         // team_id still set, but dual-enqueue is disabled.
-        unsafe { std::env::set_var("CAS_USER_CLOUD_JSON", "/nonexistent/path/cloud.json"); }
+        unsafe {
+            std::env::set_var("CAS_USER_CLOUD_JSON", "/nonexistent/path/cloud.json");
+        }
         let mut config = CloudConfig::default();
         config.set_team("team-abc", "my-team");
         config.team_auto_promote = Some(false);
         assert_eq!(config.active_team_id(), None);
-        unsafe { std::env::remove_var("CAS_USER_CLOUD_JSON"); }
+        unsafe {
+            std::env::remove_var("CAS_USER_CLOUD_JSON");
+        }
     }
 
     // ── cas-ea2f5: resolution-chain unit tests (test-first, added before impl) ──
 
     #[test]
     fn test_active_team_id_user_default_team_fallback_requires_opt_in() {
-        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = super::CLOUD_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         // cas-f8e3: a project WITHOUT team_id AND WITHOUT team_auto_promote=Some(true)
         // is personal — user-level default_team_id must NOT apply.
         let project_cfg = CloudConfig::default(); // no team_id, team_auto_promote=None
@@ -954,7 +1102,9 @@ mod tests {
 
     #[test]
     fn test_active_team_id_user_default_team_fallback_with_explicit_opt_in() {
-        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = super::CLOUD_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         // team_auto_promote=Some(true) explicitly opts the project in to
         // inheriting the user-level default_team_id.
         let mut project_cfg = CloudConfig::default(); // no team_id
@@ -963,14 +1113,18 @@ mod tests {
         user_cfg.default_team_id = Some("user-default-team".to_string());
 
         assert_eq!(
-            project_cfg.active_team_id_with_user_config(Some(&user_cfg)).as_deref(),
+            project_cfg
+                .active_team_id_with_user_config(Some(&user_cfg))
+                .as_deref(),
             Some("user-default-team"),
         );
     }
 
     #[test]
     fn test_active_team_id_single_team_auto_pick_requires_opt_in() {
-        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = super::CLOUD_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         // cas-f8e3: a project WITHOUT team_id AND WITHOUT team_auto_promote=Some(true)
         // is personal — single-team auto-pick must NOT apply.
         let project_cfg = CloudConfig::default();
@@ -992,7 +1146,9 @@ mod tests {
 
     #[test]
     fn test_active_team_id_single_team_auto_pick_with_explicit_opt_in() {
-        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = super::CLOUD_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         // team_auto_promote=Some(true) opts the project in to single-team auto-pick.
         let mut project_cfg = CloudConfig::default();
         project_cfg.team_auto_promote = Some(true);
@@ -1005,22 +1161,148 @@ mod tests {
         }];
 
         assert_eq!(
-            project_cfg.active_team_id_with_user_config(Some(&user_cfg)).as_deref(),
+            project_cfg
+                .active_team_id_with_user_config(Some(&user_cfg))
+                .as_deref(),
             Some("solo-team-id"),
         );
     }
 
     #[test]
+    fn personal_scope_notice_fires_once_for_single_team_user() {
+        let _guard = super::CLOUD_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let project = TempDir::new().unwrap();
+        let user = TempDir::new().unwrap();
+
+        let project_cfg = CloudConfig::default();
+        project_cfg.save_to_cas_dir(project.path()).unwrap();
+
+        let mut user_cfg = CloudConfig::default();
+        user_cfg.teams = vec![TeamInfo {
+            id: "solo-team-id".to_string(),
+            slug: "solo".to_string(),
+            name: "Solo".to_string(),
+            role: "member".to_string(),
+        }];
+        user_cfg.save_to_cas_dir(user.path()).unwrap();
+
+        let user_cloud_json = user.path().join("cloud.json");
+        unsafe {
+            std::env::set_var("CAS_USER_CLOUD_JSON", &user_cloud_json);
+        }
+
+        let first = maybe_mark_personal_scope_notice(project.path())
+            .unwrap()
+            .expect("single-team personal project should emit notice");
+        assert_eq!(first.team_slug, "solo");
+        let saved = CloudConfig::load_from_cas_dir(project.path()).unwrap();
+        assert!(saved.personal_scope_notice_shown);
+        assert!(saved.team_id.is_none());
+        assert!(saved.team_auto_promote.is_none());
+
+        let second = maybe_mark_personal_scope_notice(project.path()).unwrap();
+        assert!(second.is_none(), "notice must be one-time per project");
+        unsafe {
+            std::env::remove_var("CAS_USER_CLOUD_JSON");
+        }
+    }
+
+    #[test]
+    fn personal_scope_notice_rechecks_fresh_config_before_marking() {
+        let _guard = super::CLOUD_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let project = TempDir::new().unwrap();
+        let user = TempDir::new().unwrap();
+
+        CloudConfig::default()
+            .save_to_cas_dir(project.path())
+            .unwrap();
+
+        let mut user_cfg = CloudConfig::default();
+        user_cfg.teams = vec![TeamInfo {
+            id: "solo-team-id".to_string(),
+            slug: "solo".to_string(),
+            name: "Solo".to_string(),
+            role: "member".to_string(),
+        }];
+        user_cfg.save_to_cas_dir(user.path()).unwrap();
+
+        let user_cloud_json = user.path().join("cloud.json");
+        unsafe {
+            std::env::set_var("CAS_USER_CLOUD_JSON", &user_cloud_json);
+        }
+
+        let notice = maybe_mark_personal_scope_notice_with_hook(project.path(), || {
+            let mut concurrent = CloudConfig::load_from_cas_dir(project.path()).unwrap();
+            concurrent.set_team("solo-team-id", "solo");
+            concurrent.save_to_cas_dir(project.path()).unwrap();
+        })
+        .unwrap();
+
+        assert!(
+            notice.is_none(),
+            "fresh re-check should suppress notice after concurrent team link"
+        );
+        let saved = CloudConfig::load_from_cas_dir(project.path()).unwrap();
+        assert_eq!(saved.team_id.as_deref(), Some("solo-team-id"));
+        assert_eq!(saved.team_slug.as_deref(), Some("solo"));
+        assert!(!saved.personal_scope_notice_shown);
+        unsafe {
+            std::env::remove_var("CAS_USER_CLOUD_JSON");
+        }
+    }
+
+    #[test]
+    fn personal_scope_notice_suppressed_for_team_linked_project() {
+        let _guard = super::CLOUD_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let mut project_cfg = CloudConfig::default();
+        project_cfg.team_auto_promote = Some(true);
+        let mut user_cfg = CloudConfig::default();
+        user_cfg.default_team_id = Some("team-1".to_string());
+        assert!(
+            personal_scope_notice_for_configs(&project_cfg, &user_cfg).is_none(),
+            "opted-in project resolves to team scope, so no personal-scope notice"
+        );
+    }
+
+    #[test]
+    fn personal_scope_notice_suppressed_for_user_with_no_teams() {
+        let _guard = super::CLOUD_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let project_cfg = CloudConfig::default();
+        let user_cfg = CloudConfig::default();
+        assert!(personal_scope_notice_for_configs(&project_cfg, &user_cfg).is_none());
+    }
+
+    #[test]
     fn test_active_team_id_multi_team_ambiguous_returns_none() {
-        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = super::CLOUD_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         // No project-level team_id → personal regardless of user team count.
         // Even with team_auto_promote=Some(true), ambiguous (2+ teams) returns None.
         let mut project_cfg = CloudConfig::default();
         project_cfg.team_auto_promote = Some(true); // opt in to user-level fallback
         let mut user_cfg = CloudConfig::default();
         user_cfg.teams = vec![
-            TeamInfo { id: "t1".to_string(), slug: "a".to_string(), name: "A".to_string(), role: "member".to_string() },
-            TeamInfo { id: "t2".to_string(), slug: "b".to_string(), name: "B".to_string(), role: "member".to_string() },
+            TeamInfo {
+                id: "t1".to_string(),
+                slug: "a".to_string(),
+                name: "A".to_string(),
+                role: "member".to_string(),
+            },
+            TeamInfo {
+                id: "t2".to_string(),
+                slug: "b".to_string(),
+                name: "B".to_string(),
+                role: "member".to_string(),
+            },
         ];
 
         assert_eq!(
@@ -1031,7 +1313,9 @@ mod tests {
 
     #[test]
     fn test_active_team_id_project_override_beats_user_default() {
-        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = super::CLOUD_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         // Project-level team_id wins over user-level default_team_id.
         let mut project_cfg = CloudConfig::default();
         project_cfg.set_team("project-team", "proj");
@@ -1039,14 +1323,18 @@ mod tests {
         user_cfg.default_team_id = Some("user-default-team".to_string());
 
         assert_eq!(
-            project_cfg.active_team_id_with_user_config(Some(&user_cfg)).as_deref(),
+            project_cfg
+                .active_team_id_with_user_config(Some(&user_cfg))
+                .as_deref(),
             Some("project-team"),
         );
     }
 
     #[test]
     fn test_active_team_id_kill_switch_beats_user_config() {
-        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = super::CLOUD_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         // team_auto_promote=Some(false) short-circuits to None even when user
         // config would otherwise supply a team.
         let mut project_cfg = CloudConfig::default();
@@ -1062,7 +1350,9 @@ mod tests {
 
     #[test]
     fn test_active_team_id_no_user_config_no_project_team() {
-        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = super::CLOUD_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         // Neither project nor user config has team info → None.
         let project_cfg = CloudConfig::default();
         assert_eq!(project_cfg.active_team_id_with_user_config(None), None);
@@ -1070,7 +1360,9 @@ mod tests {
 
     #[test]
     fn test_team_sync_timestamps() {
-        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = super::CLOUD_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let mut config = CloudConfig::default();
 
         // Initially no timestamps
@@ -1097,7 +1389,9 @@ mod tests {
 
     #[test]
     fn test_team_memory_sync_timestamps() {
-        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = super::CLOUD_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("cloud.json");
 
@@ -1193,7 +1487,9 @@ mod tests {
         // Every char after the `local:` prefix must be a lowercase ASCII hex digit.
         let suffix = &first[6..];
         assert!(
-            suffix.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            suffix
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
             "fallback suffix should be lowercase hex, got {suffix:?}"
         );
     }
@@ -1342,7 +1638,11 @@ mod tests {
         // Second call: resolver still returns None — should retry (not return cached None)
         let result2 = get_id(&|| None);
         assert_eq!(result2, None);
-        assert_eq!(call_count.load(Ordering::SeqCst), 2, "None must not be cached — resolver should be called again");
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            2,
+            "None must not be cached — resolver should be called again"
+        );
 
         // Third call: resolver now succeeds (simulates cwd moved into a CAS project)
         let result3 = get_id(&|| Some("my-project".to_string()));
@@ -1352,12 +1652,18 @@ mod tests {
         // Fourth call: should return cached value without calling resolver
         let result4 = get_id(&|| panic!("resolver should not be called when cache has Some"));
         assert_eq!(result4, Some("my-project".to_string()));
-        assert_eq!(call_count.load(Ordering::SeqCst), 3, "Some must be cached — resolver should not be called again");
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            3,
+            "Some must be cached — resolver should not be called again"
+        );
     }
 
     #[test]
     fn test_team_sync_timestamps_persist() {
-        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = super::CLOUD_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("cloud.json");
 
@@ -1468,8 +1774,14 @@ mod tests {
         set_canonical_id_in_config_toml(cas_root, "github.com/foo/bar").unwrap();
 
         let content = std::fs::read_to_string(cas_root.join("config.toml")).unwrap();
-        assert!(content.contains("session_learn_auto"), "pre-existing [memory] block must survive — got:\n{content}");
-        assert!(content.contains("github.com/foo/bar"), "new canonical_id must be written — got:\n{content}");
+        assert!(
+            content.contains("session_learn_auto"),
+            "pre-existing [memory] block must survive — got:\n{content}"
+        );
+        assert!(
+            content.contains("github.com/foo/bar"),
+            "new canonical_id must be written — got:\n{content}"
+        );
     }
 
     // ── default_endpoint env-var tests ──────────────────────────────────────
@@ -1485,7 +1797,9 @@ mod tests {
     }
     impl EnvGuard {
         fn new() -> Self {
-            let g = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let g = super::CLOUD_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
             // SAFETY: serialized via CLOUD_ENV_LOCK — no other test mutates
             // CAS_CLOUD_ENDPOINT while we hold the guard.
             unsafe {
@@ -1495,11 +1809,15 @@ mod tests {
         }
         fn set(&self, k: &str, v: &str) {
             // SAFETY: serialized via CLOUD_ENV_LOCK.
-            unsafe { std::env::set_var(k, v); }
+            unsafe {
+                std::env::set_var(k, v);
+            }
         }
         fn unset(&self, k: &str) {
             // SAFETY: serialized via CLOUD_ENV_LOCK.
-            unsafe { std::env::remove_var(k); }
+            unsafe {
+                std::env::remove_var(k);
+            }
         }
     }
     impl Drop for EnvGuard {
@@ -1589,7 +1907,9 @@ mod tests {
     #[test]
     fn test_team_info_roundtrip() {
         // TeamInfo serialises and deserialises cleanly.
-        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = super::CLOUD_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let team = TeamInfo {
             id: "tid-abc".to_string(),
             slug: "petra-stella".to_string(),
@@ -1605,7 +1925,9 @@ mod tests {
     fn test_teams_and_default_team_id_roundtrip() {
         // CloudConfig with populated teams[] and default_team_id survives
         // save/load without data loss.
-        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = super::CLOUD_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("cloud.json");
 
@@ -1647,7 +1969,9 @@ mod tests {
         // Backwards compat: a cloud.json written before cas-6462 (no `teams`
         // or `default_team_id` keys) must deserialise without error, yielding
         // an empty Vec and None respectively.
-        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = super::CLOUD_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("cloud.json");
 
@@ -1671,7 +1995,9 @@ mod tests {
     fn test_empty_teams_not_written_to_disk() {
         // When teams is empty and default_team_id is None, neither key should
         // appear in the serialised JSON — keeping legacy cloud.json files clean.
-        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = super::CLOUD_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let config = CloudConfig {
             token: Some("tok".to_string()),
             ..Default::default()
@@ -1796,7 +2122,12 @@ mod tests {
             None,
         );
         assert_eq!(
-            should_adopt_canonical_id(Some("github.com/r/x"), Some("github.com/r/x"), Some("   "), None),
+            should_adopt_canonical_id(
+                Some("github.com/r/x"),
+                Some("github.com/r/x"),
+                Some("   "),
+                None
+            ),
             None,
         );
     }
@@ -1809,7 +2140,9 @@ mod tests {
 
     #[test]
     fn f8e3_personal_project_not_promoted_via_user_default_team_id() {
-        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = super::CLOUD_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         // Simulates: user has `default_team_id` in ~/.cas/cloud.json but the
         // project's .cas/cloud.json has no team_id and no team_auto_promote.
         // This was the exact path that caused openclaw/penguinz to be promoted.
@@ -1827,7 +2160,9 @@ mod tests {
 
     #[test]
     fn f8e3_personal_project_not_promoted_via_single_team_auto_pick() {
-        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = super::CLOUD_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         // Simulates: user is a member of exactly 1 team (auto-pick previously
         // fired) but the project is personal.
         let project_cfg = CloudConfig::default(); // no team_id, team_auto_promote=None
@@ -1849,10 +2184,14 @@ mod tests {
 
     #[test]
     fn f8e3_explicitly_linked_project_still_team_promoted() {
-        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = super::CLOUD_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         // Sanity: a project with `team_id` set (via `cas cloud team set`) still
         // works correctly — Step 1 fires before the Step 1.5 guard.
-        unsafe { std::env::set_var("CAS_USER_CLOUD_JSON", "/nonexistent/path/cloud.json"); }
+        unsafe {
+            std::env::set_var("CAS_USER_CLOUD_JSON", "/nonexistent/path/cloud.json");
+        }
         let mut project_cfg = CloudConfig::default();
         project_cfg.set_team("2a57bec9-5dfa-4a8f-b711-31f9aeb8d6cb", "petra-stella");
         // No user-level config needed — Step 1 is sufficient.
@@ -1862,12 +2201,16 @@ mod tests {
             Some("2a57bec9-5dfa-4a8f-b711-31f9aeb8d6cb"),
             "cas-f8e3: a project with explicit team_id must still be team-linked (Step 1)"
         );
-        unsafe { std::env::remove_var("CAS_USER_CLOUD_JSON"); }
+        unsafe {
+            std::env::remove_var("CAS_USER_CLOUD_JSON");
+        }
     }
 
     #[test]
     fn f8e3_team_auto_promote_true_enables_user_level_fallback() {
-        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = super::CLOUD_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         // Opt-in path: project sets team_auto_promote=Some(true) to explicitly
         // inherit the user-level team without running `cas cloud team set`.
         let mut project_cfg = CloudConfig::default(); // no team_id
@@ -1876,7 +2219,9 @@ mod tests {
         user_cfg.default_team_id = Some("2a57bec9-5dfa-4a8f-b711-31f9aeb8d6cb".to_string());
 
         assert_eq!(
-            project_cfg.active_team_id_with_user_config(Some(&user_cfg)).as_deref(),
+            project_cfg
+                .active_team_id_with_user_config(Some(&user_cfg))
+                .as_deref(),
             Some("2a57bec9-5dfa-4a8f-b711-31f9aeb8d6cb"),
             "cas-f8e3: team_auto_promote=Some(true) is the explicit opt-in for \
              user-level fallback when team_id is not set"
@@ -1885,7 +2230,9 @@ mod tests {
 
     #[test]
     fn f8e3_clear_team_resets_opt_in_making_project_personal() {
-        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = super::CLOUD_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         // `cas cloud team clear` should leave the project in a state where
         // user-level auto-pick no longer fires.
         let mut cfg = CloudConfig::default();
