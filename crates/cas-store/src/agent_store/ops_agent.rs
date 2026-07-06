@@ -55,7 +55,7 @@ impl SqliteAgentStore {
                 active_tasks = excluded.active_tasks,
                 metadata = excluded.metadata,
                 pid_starttime = excluded.pid_starttime,
-                factory_session = excluded.factory_session",
+                factory_session = COALESCE(excluded.factory_session, factory_session)",
             params![
                 agent.id,
                 agent.name,
@@ -116,7 +116,7 @@ impl SqliteAgentStore {
             let rows = conn.execute(
                 "UPDATE agents SET name = ?1, agent_type = ?2, role = ?3, status = ?4, pid = ?5,
              ppid = ?6, cc_session_id = ?7, parent_id = ?8, machine_id = ?9, last_heartbeat = ?10,
-             active_tasks = ?11, metadata = ?12, pid_starttime = ?13, factory_session = ?14
+             active_tasks = ?11, metadata = ?12, pid_starttime = ?13, factory_session = COALESCE(?14, factory_session)
              WHERE id = ?15",
                 params![
                     agent.name,

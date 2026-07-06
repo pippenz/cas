@@ -5,6 +5,41 @@ use chrono::{Duration, Utc};
 use rusqlite::params;
 use tempfile::TempDir;
 
+static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+struct EnvGuard {
+    saved: Vec<(String, Option<String>)>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl EnvGuard {
+    fn set(vars: &[(&str, Option<&str>)]) -> Self {
+        let lock = ENV_MUTEX.lock().unwrap();
+        let mut saved = Vec::with_capacity(vars.len());
+        for (key, value) in vars {
+            let key = (*key).to_string();
+            let prev = std::env::var(&key).ok();
+            match value {
+                Some(value) => unsafe { std::env::set_var(&key, value) },
+                None => unsafe { std::env::remove_var(&key) },
+            }
+            saved.push((key, prev));
+        }
+        Self { saved, _lock: lock }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        for (key, prev) in self.saved.drain(..) {
+            match prev {
+                Some(value) => unsafe { std::env::set_var(&key, value) },
+                None => unsafe { std::env::remove_var(&key) },
+            }
+        }
+    }
+}
+
 fn create_test_store() -> (TempDir, SqliteAgentStore) {
     let temp = TempDir::new().unwrap();
     let store = SqliteAgentStore::open(temp.path()).unwrap();
@@ -98,6 +133,53 @@ fn test_agent_factory_session_round_trips_through_register_and_update() {
         re_retrieved.factory_session.as_deref(),
         Some("factory-session-b"),
         "UPDATE must overwrite factory_session"
+    );
+}
+
+#[test]
+fn test_agent_factory_session_stamps_from_env_and_survives_absent_reregister() {
+    let _guard = EnvGuard::set(&[("CAS_FACTORY_SESSION", Some("env-session-a"))]);
+    let (_temp, store) = create_test_store();
+
+    let agent = Agent::new("agent-env-factory".to_string(), "env factory".to_string());
+    assert!(agent.factory_session.is_none());
+    store.register(&agent).unwrap();
+
+    let retrieved = store.get("agent-env-factory").unwrap();
+    assert_eq!(retrieved.factory_session.as_deref(), Some("env-session-a"));
+
+    unsafe { std::env::remove_var("CAS_FACTORY_SESSION") };
+    let mut reregister = Agent::new("agent-env-factory".to_string(), "env factory 2".to_string());
+    reregister.factory_session = None;
+    store.register(&reregister).unwrap();
+
+    let retrieved = store.get("agent-env-factory").unwrap();
+    assert_eq!(
+        retrieved.factory_session.as_deref(),
+        Some("env-session-a"),
+        "re-register without struct/env session must not erase existing tag"
+    );
+}
+
+#[test]
+fn test_agent_factory_session_update_none_preserves_existing_tag() {
+    let _guard = EnvGuard::set(&[("CAS_FACTORY_SESSION", None)]);
+    let (_temp, store) = create_test_store();
+
+    let mut agent = Agent::new("agent-update-preserve".to_string(), "preserve".to_string());
+    agent.factory_session = Some("session-original".to_string());
+    store.register(&agent).unwrap();
+
+    let mut updated = store.get("agent-update-preserve").unwrap();
+    updated.name = "preserved after update".to_string();
+    updated.factory_session = None;
+    store.update(&updated).unwrap();
+
+    let retrieved = store.get("agent-update-preserve").unwrap();
+    assert_eq!(
+        retrieved.factory_session.as_deref(),
+        Some("session-original"),
+        "update without struct session must preserve existing tag"
     );
 }
 

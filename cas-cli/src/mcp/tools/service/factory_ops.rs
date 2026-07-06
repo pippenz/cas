@@ -80,16 +80,6 @@ fn current_factory_session() -> Option<String> {
         .filter(|s| !s.trim().is_empty())
 }
 
-fn agent_visible_to_factory_session(
-    agent: &cas_types::Agent,
-    factory_session: Option<&str>,
-) -> bool {
-    match factory_session {
-        Some(session) => agent.factory_session.as_deref() == Some(session),
-        None => true,
-    }
-}
-
 fn parse_worker_name_filter(filter: Option<&String>) -> std::collections::HashSet<String> {
     filter
         .into_iter()
@@ -169,7 +159,7 @@ impl CasService {
         )
         .map_err(|e| Self::error(ErrorCode::INVALID_PARAMS, e))?;
 
-        let factory_session = std::env::var("CAS_FACTORY_SESSION").ok();
+        let factory_session = current_factory_session();
         let request_id = queue
             .enqueue_spawn(
                 count,
@@ -252,7 +242,7 @@ impl CasService {
                 .iter()
                 .filter(|a| {
                     a.role == AgentRole::Worker
-                        && agent_visible_to_factory_session(a, factory_session.as_deref())
+                        && a.visible_to_factory_session(factory_session.as_deref())
                         && owned.as_ref().is_none_or(|set| set.contains(&a.name))
                 })
                 .map(|a| a.name.clone())
@@ -405,7 +395,7 @@ impl CasService {
         let factory_session = current_factory_session();
         if let Ok(stale_agents) = store.list_stale(worker_stale_threshold_secs) {
             for agent in stale_agents {
-                if !agent_visible_to_factory_session(&agent, factory_session.as_deref()) {
+                if !agent.visible_to_factory_session(factory_session.as_deref()) {
                     continue;
                 }
                 if agent.role == AgentRole::Supervisor || agent.role == AgentRole::Director {
@@ -431,7 +421,7 @@ impl CasService {
                 )
             })?
             .into_iter()
-            .filter(|a| agent_visible_to_factory_session(a, factory_session.as_deref()))
+            .filter(|a| a.visible_to_factory_session(factory_session.as_deref()))
             .collect();
 
         if agents.is_empty() {
@@ -634,7 +624,7 @@ impl CasService {
             )
         })?;
         let mut visible_workers: Vec<_> = agent_store
-            .list(Some(AgentStatus::Active))
+            .list(None)
             .map_err(|e| {
                 Self::error(
                     ErrorCode::INTERNAL_ERROR,
@@ -644,7 +634,8 @@ impl CasService {
             .into_iter()
             .filter(|a| {
                 a.role == AgentRole::Worker
-                    && agent_visible_to_factory_session(a, factory_session.as_deref())
+                    && matches!(a.status, AgentStatus::Active | AgentStatus::Idle)
+                    && a.visible_to_factory_session(factory_session.as_deref())
                     && owned.as_ref().is_none_or(|set| set.contains(&a.name))
             })
             .collect();
@@ -758,7 +749,7 @@ impl CasService {
             .unwrap_or_else(|_| "unknown".to_string());
 
         // Enqueue /clear directly without XML wrapping - this is a raw command
-        let factory_session = std::env::var("CAS_FACTORY_SESSION").ok();
+        let factory_session = current_factory_session();
         if let Some(ref session) = factory_session {
             queue
                 .enqueue_with_session(&source, &target, "/clear", session)
@@ -900,7 +891,7 @@ impl CasService {
             .into_iter()
             .filter(|a| {
                 a.role == AgentRole::Worker
-                    && agent_visible_to_factory_session(a, factory_session.as_deref())
+                    && a.visible_to_factory_session(factory_session.as_deref())
                     && owned.as_ref().is_none_or(|set| set.contains(&a.name))
             })
             .collect();

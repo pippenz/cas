@@ -255,6 +255,38 @@ fn two_concurrent_factory_sessions_are_isolated_with_legacy_null_compatibility()
             .any(|prompt| prompt.target == "same-worker-name")
     );
 
+    stores
+        .prompt_queue
+        .enqueue_with_session(
+            "supervisor-b",
+            "same-worker-name",
+            "direct to B worker",
+            "session-b",
+        )
+        .expect("enqueue session-b direct prompt");
+
+    let director_a_with_messages = load_director_for_session(&stores.cas_dir, "session-a");
+    let worker_a_summary = director_a_with_messages
+        .agents
+        .iter()
+        .find(|agent| agent.id == "worker-a-id")
+        .expect("session-a worker summary");
+    assert_eq!(
+        worker_a_summary.pending_messages, 1,
+        "session-a same-name worker should count only session-a direct messages"
+    );
+
+    let director_b_with_messages = load_director_for_session(&stores.cas_dir, "session-b");
+    let worker_b_summary = director_b_with_messages
+        .agents
+        .iter()
+        .find(|agent| agent.id == "worker-b-id")
+        .expect("session-b worker summary");
+    assert_eq!(
+        worker_b_summary.pending_messages, 1,
+        "session-b same-name worker should count only session-b direct messages"
+    );
+
     // 4. Legacy NULL prompt rows keep the historical target/all_workers
     // delivery behavior even for a session-scoped daemon.
     stores

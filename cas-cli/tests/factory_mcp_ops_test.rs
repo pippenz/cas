@@ -220,6 +220,21 @@ impl EnvGuard {
         }
         Self { saved, _lock: lock }
     }
+
+    fn set_optional(vars: &[(&str, Option<&str>)]) -> Self {
+        let lock = ENV_MUTEX.lock().unwrap();
+        let mut saved = Vec::with_capacity(vars.len());
+        for (key, value) in vars {
+            let key = (*key).to_string();
+            let prev = std::env::var(&key).ok();
+            match value {
+                Some(value) => unsafe { std::env::set_var(&key, value) },
+                None => unsafe { std::env::remove_var(&key) },
+            }
+            saved.push((key, prev));
+        }
+        Self { saved, _lock: lock }
+    }
 }
 
 impl Drop for EnvGuard {
@@ -555,7 +570,7 @@ async fn test_worker_status_shows_agents() {
 
 #[tokio::test]
 async fn test_worker_status_scopes_agents_to_factory_session() {
-    let _guard = EnvGuard::set(&[("CAS_FACTORY_SESSION", "session-a")]);
+    let _guard = EnvGuard::set_optional(&[("CAS_FACTORY_SESSION", None)]);
     let env = FactoryTestEnv::new();
 
     env.register_supervisor_in_session("sup-a", "session-a");
@@ -567,10 +582,8 @@ async fn test_worker_status_scopes_agents_to_factory_session() {
     plain.factory_session = None;
     let agent_store = env.agent_store();
     agent_store.register(&plain).expect("register plain worker");
-    agent_store
-        .update(&plain)
-        .expect("clear plain worker session");
 
+    unsafe { std::env::set_var("CAS_FACTORY_SESSION", "session-a") };
     let req = factory_req("worker_status");
     let result = env
         .service
@@ -651,6 +664,52 @@ async fn test_worker_status_prunes_stale_worker_and_keeps_live_one() {
     assert!(
         text.contains("30s heartbeat age"),
         "footer must reference the 30s worker threshold. Got:\n{text}"
+    );
+}
+
+#[tokio::test]
+async fn test_worker_status_prune_skips_stale_workers_in_other_factory_sessions() {
+    let _guard = EnvGuard::set(&[("CAS_FACTORY_SESSION", "session-a")]);
+    let env = FactoryTestEnv::new();
+
+    env.register_worker_in_session("live-a", "session-a");
+
+    let store = env.agent_store();
+    let stale_b_id = Agent::generate_fallback_id();
+    let mut stale_b = Agent::new(stale_b_id.clone(), "stale-b".to_string());
+    stale_b.role = AgentRole::Worker;
+    stale_b.status = AgentStatus::Active;
+    stale_b.factory_session = Some("session-b".to_string());
+    let staleness = chrono::Duration::seconds(40);
+    stale_b.last_heartbeat = chrono::Utc::now() - staleness;
+    stale_b.registered_at = chrono::Utc::now() - staleness;
+    store
+        .register(&stale_b)
+        .expect("register stale session-b worker");
+
+    let req = factory_req("worker_status");
+    let result = env
+        .service
+        .factory(Parameters(req))
+        .await
+        .expect("worker_status call should succeed");
+    let text = get_text(&result);
+
+    assert!(
+        text.contains("live-a"),
+        "same-session live worker should appear: {text}"
+    );
+    assert!(
+        !text.contains("stale-b"),
+        "other-session stale worker should remain hidden: {text}"
+    );
+    let stale_after = store
+        .get(&stale_b_id)
+        .expect("session-b stale worker should still exist");
+    assert_eq!(
+        stale_after.status,
+        AgentStatus::Active,
+        "session-a worker_status prune must not mark stale workers in session-b"
     );
 }
 
@@ -783,6 +842,37 @@ async fn test_worker_activity_scopes_session_and_honors_target_filter() {
     assert!(
         text.contains("No recent worker activity"),
         "target outside caller session should produce no activity: {text}"
+    );
+}
+
+#[tokio::test]
+async fn test_worker_activity_includes_idle_workers() {
+    let _guard = EnvGuard::set(&[("CAS_FACTORY_SESSION", "session-a")]);
+    let env = FactoryTestEnv::new();
+
+    let store = env.agent_store();
+    let idle_id = Agent::generate_fallback_id();
+    let mut idle_worker = Agent::new(idle_id.clone(), "idle-worker".to_string());
+    idle_worker.role = AgentRole::Worker;
+    idle_worker.status = AgentStatus::Idle;
+    idle_worker.factory_session = Some("session-a".to_string());
+    store
+        .register(&idle_worker)
+        .expect("register idle worker in session");
+    env.record_worker_file_event(&idle_id, "idle-worker edited src/lib.rs");
+
+    let mut req = factory_req("worker_activity");
+    req.target = Some("idle-worker".to_string());
+    let result = env
+        .service
+        .factory(Parameters(req))
+        .await
+        .expect("worker_activity should include idle worker");
+
+    let text = get_text(&result);
+    assert!(
+        text.contains("idle-worker edited"),
+        "Idle workers with recent events should still report activity: {text}"
     );
 }
 
