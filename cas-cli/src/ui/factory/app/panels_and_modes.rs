@@ -136,10 +136,13 @@ impl FactoryApp {
 
     /// Get the epic ID if the display index points to an epic header
     fn get_epic_at_display_index(&self, target_idx: usize) -> Option<String> {
-        let (epic_groups, _standalone) = self.director_data.tasks_by_epic();
+        let scoped = crate::ui::factory::director::tasks::ScopedTaskView::new(
+            &self.director_data,
+            self.current_epic_id.as_deref(),
+        );
         let mut idx = 0;
 
-        for group in &epic_groups {
+        for group in &scoped.epic_groups {
             // Filter subtasks by agent if needed
             let visible_subtasks: Vec<_> = if let Some(agent_id) = &self.agent_filter {
                 group

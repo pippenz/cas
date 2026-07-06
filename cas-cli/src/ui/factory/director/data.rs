@@ -5,4 +5,4 @@
 //! between TUI and desktop applications.
 
 // Re-export all types from cas-factory
-pub use cas_factory::{AgentSummary, DirectorData, DirectorStores, TaskSummary};
+pub use cas_factory::{AgentSummary, DirectorData, DirectorStores, EpicGroup, TaskSummary};

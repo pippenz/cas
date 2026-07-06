@@ -32,8 +32,9 @@ pub fn render_status_strip(
 
     let mut left_spans: Vec<Span> = Vec::new();
 
-    let active_epic =
-        focused_epic_id.and_then(|epic_id| data.epic_tasks.iter().find(|e| e.id == epic_id));
+    let active_epic = focused_epic_id
+        .filter(|epic_id| super::tasks::epic_has_session_agent_subtask(data, epic_id))
+        .and_then(|epic_id| data.epic_tasks.iter().find(|e| e.id == epic_id));
 
     if let Some(epic) = active_epic {
         // Count subtask statuses from live task lists
