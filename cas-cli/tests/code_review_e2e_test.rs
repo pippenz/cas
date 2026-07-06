@@ -41,13 +41,11 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use cas_store::code_review::{
-    AutofixOutcome, ExitReason, FixerResult, RouteOutcome, autofix_loop,
-    close_gate::{GateDecision, evaluate_gate, format_block_message},
-    merge_findings, route_residual_to_tasks,
+    autofix_loop,
+    close_gate::{evaluate_gate, format_block_message, GateDecision},
+    merge_findings, route_residual_to_tasks, AutofixOutcome, ExitReason, FixerResult, RouteOutcome,
 };
-use cas_types::{
-    AutofixClass, Finding, FindingSeverity, Owner, ReviewOutcome, ReviewerOutput,
-};
+use cas_types::{AutofixClass, Finding, FindingSeverity, Owner, ReviewOutcome, ReviewerOutput};
 
 // --------------------------------------------------------------------------
 // Fixture helpers
@@ -85,6 +83,7 @@ fn envelope(reviewer: &str, findings: Vec<Finding>) -> ReviewerOutput {
         findings,
         residual_risks: vec![],
         testing_gaps: vec![],
+        skipped_reason: None,
     }
 }
 
@@ -138,8 +137,7 @@ fn run_pipeline(envelopes: Vec<ReviewerOutput>) -> PipelineResult {
             // them gone from the patched tree).
             let to_remove = titles_for_rereview.borrow().clone();
             let mut next = stripped_handle.borrow().clone();
-            next.pr_introduced
-                .retain(|f| !to_remove.contains(&f.title));
+            next.pr_introduced.retain(|f| !to_remove.contains(&f.title));
             *stripped_handle.borrow_mut() = next.clone();
             Ok(next)
         },
@@ -173,8 +171,7 @@ fn run_pipeline(envelopes: Vec<ReviewerOutput>) -> PipelineResult {
         mode: "autofix".to_string(),
     };
     let envelope_json = serde_json::to_string(&envelope).expect("envelope serializes");
-    let parsed: ReviewOutcome =
-        serde_json::from_str(&envelope_json).expect("envelope round-trips");
+    let parsed: ReviewOutcome = serde_json::from_str(&envelope_json).expect("envelope round-trips");
     parsed.validate().expect("envelope validates");
 
     let decision = evaluate_gate(&parsed.residual);

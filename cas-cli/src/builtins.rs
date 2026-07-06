@@ -1873,6 +1873,33 @@ This is the body content."#;
     }
 
     #[test]
+    fn test_cas_code_review_documents_gpt55_independent_persona() {
+        for (label, skills) in [
+            ("claude", BUILTIN_SKILLS),
+            ("codex", CODEX_BUILTIN_SKILLS),
+        ] {
+            let entry = skills
+                .iter()
+                .find(|b| b.path == "skills/cas-code-review/SKILL.md")
+                .unwrap_or_else(|| panic!("{label}: skills/cas-code-review/SKILL.md missing"));
+            for required in [
+                "gpt-5.5:independent",
+                "Sonnet-low wrapper",
+                "codex exec -s read-only -m gpt-5.5",
+                "5+ changed files",
+                "300+ changed lines",
+                "skipped_reason",
+                "distinct from a successful zero-finding review",
+            ] {
+                assert!(
+                    entry.content.contains(required),
+                    "{label}: cas-code-review SKILL.md missing gpt-5.5 independent persona marker: {required:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_code_reviewer_agent_is_deprecation_stub() {
         // EPIC cas-0750: the legacy code-reviewer agent is replaced by the
         // cas-code-review skill. The file is kept in BUILTIN_AGENTS only to
@@ -1952,6 +1979,21 @@ This is the body content."#;
             workflow_content.contains("REVIEWER_OUTPUT_SCHEMA"),
             "workflow script must define the reviewer output schema"
         );
+        for required in [
+            "gpt-5.5:independent",
+            "gpt55_independent",
+            "fileCount >= 5 || changeLines >= 300",
+            "codex exec -s read-only -m gpt-5.5",
+            "skipped_reason",
+            "gpt55_independent_skipped",
+            "skipped_personas",
+            "effort: 'low'",
+        ] {
+            assert!(
+                workflow_content.contains(required),
+                "workflow script missing gpt-5.5 independent persona marker: {required:?}"
+            );
+        }
 
         let overwritten = std::fs::read_to_string(&stale_agent).unwrap();
         assert!(

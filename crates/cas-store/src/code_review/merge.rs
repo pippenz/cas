@@ -124,14 +124,15 @@ pub struct MergedFindings {
 pub fn merge_findings(envelopes: Vec<ReviewerOutput>) -> Result<MergedFindings, MergeError> {
     // Stage 1: schema validation.
     for env in &envelopes {
-        env.validate().map_err(|e| MergeError::InvalidReviewerOutput {
-            reviewer: if env.reviewer.trim().is_empty() {
-                "<unknown>".to_string()
-            } else {
-                env.reviewer.clone()
-            },
-            reason: e.to_string(),
-        })?;
+        env.validate()
+            .map_err(|e| MergeError::InvalidReviewerOutput {
+                reviewer: if env.reviewer.trim().is_empty() {
+                    "<unknown>".to_string()
+                } else {
+                    env.reviewer.clone()
+                },
+                reason: e.to_string(),
+            })?;
     }
 
     // Stage 2: confidence gate + attach reviewer name to each finding.
@@ -203,9 +204,9 @@ fn cluster_by_fingerprint(gated: Vec<(String, Finding)>) -> Vec<Cluster> {
         let base_key = format!("{file_key}\u{001f}{title_key}");
         // Find any existing cluster with the same base key whose anchor
         // line is within the bucket radius.
-        let hit = clusters.iter_mut().find(|c| {
-            c.fingerprint_key == base_key && within_radius(c.anchor_line, f.line)
-        });
+        let hit = clusters
+            .iter_mut()
+            .find(|c| c.fingerprint_key == base_key && within_radius(c.anchor_line, f.line));
         match hit {
             Some(c) => c.entries.push((reviewer, f)),
             None => {
@@ -295,8 +296,7 @@ fn merge_cluster(cluster: Cluster) -> (Finding, Vec<MergeDiagnostic>) {
     // Conservative routing for owner.
     let (owner, owner_diag) = resolve_owner(&entries, &contributors, &fingerprint);
     // Conservative routing for autofix_class.
-    let (autofix_class, class_diag) =
-        resolve_autofix_class(&entries, &contributors, &fingerprint);
+    let (autofix_class, class_diag) = resolve_autofix_class(&entries, &contributors, &fingerprint);
 
     // Use the title / file / line / why / suggested_fix from the
     // highest-confidence entry (deterministic across ties via first-seen).
@@ -486,6 +486,7 @@ mod tests {
             findings,
             residual_risks: vec![],
             testing_gaps: vec![],
+            skipped_reason: None,
         }
     }
 
@@ -507,6 +508,7 @@ mod tests {
             )],
             residual_risks: vec![],
             testing_gaps: vec![],
+            skipped_reason: None,
         };
         let err = merge_findings(vec![bad]).unwrap_err();
         match err {
@@ -1176,7 +1178,11 @@ mod tests {
 
         // pr_introduced should have: shared unwrap (merged), testing gap,
         // security finding — 3 in total. Maintainability dropped by gate.
-        let titles: Vec<_> = merged.pr_introduced.iter().map(|f| f.title.clone()).collect();
+        let titles: Vec<_> = merged
+            .pr_introduced
+            .iter()
+            .map(|f| f.title.clone())
+            .collect();
         assert_eq!(merged.pr_introduced.len(), 3, "titles were: {titles:?}");
 
         // Pre-existing: project-standards rule drift.

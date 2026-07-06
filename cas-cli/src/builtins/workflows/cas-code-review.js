@@ -71,6 +71,7 @@ const REVIEWER_OUTPUT_SCHEMA = {
     findings:       { type: 'array', items: FINDING_SCHEMA },
     residual_risks: { type: 'array', items: { type: 'string' } },
     testing_gaps:   { type: 'array', items: { type: 'string' } },
+    skipped_reason: { type: 'string' },
   },
 }
 
@@ -268,6 +269,43 @@ evidence (array ≥1 code-grounded string), pre_existing (bool).
 Do NOT emit any prose outside the JSON envelope.`
 }
 
+function buildGpt55IndependentPrompt(diffText, fileList, intentSummary, baseSha) {
+  return `# Persona: gpt-5.5:independent
+Run as a thin Sonnet-low wrapper around codex exec. Your job is adapter, not reviewer.
+
+Steps:
+1. Compose a self-contained, direct codex prompt. It must embed the intent summary, base SHA, changed file list, and literal diff below. Do not rely on conversation context.
+2. End the codex prompt with: "If you find nothing, say so explicitly and name the review target you inspected."
+3. Run codex with an explicit Bash timeout and read-only sandbox, for example:
+   /usr/bin/timeout 600 codex exec -s read-only -m gpt-5.5 -C "$PWD" "<prompt>"
+4. If codex is absent, auth is expired, or the command cannot run, return:
+   {"reviewer":"gpt-5.5:independent","findings":[],"skipped_reason":"<specific reason>","residual_risks":[],"testing_gaps":[]}
+5. If codex runs and reports no issues, return findings: [] with no skipped_reason.
+6. If codex reports issues, map only concrete, diff-grounded issues into Finding objects.
+
+Review focus: independent broad read. Look for important correctness, testing, maintainability, security, performance, or integration issues missed by lane-specific reviewers. Avoid nitpicks.
+
+## Review target
+
+Intent:
+${intentSummary}
+
+Base SHA:
+${baseSha}
+
+Changed files:
+${fileList}
+
+Literal diff:
+\`\`\`diff
+${diffText}
+\`\`\`
+
+Output ONLY a JSON object matching:
+{"reviewer":"gpt-5.5:independent","findings":[...],"residual_risks":[...],"testing_gaps":[...],"skipped_reason":"optional"}
+Use skipped_reason only when codex did not run. No prose outside JSON.`
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // SETUP_SCHEMA — Phase C (inlined; Workflow scripts cannot import from ES modules)
 // Combined Steps 1-2 agent output: intent extraction + persona selection in one call.
@@ -290,7 +328,8 @@ const SETUP_SCHEMA = {
 // WORKFLOW BODY — Steps 1-4 (Phase C: Steps 1-2 now inside Workflow)
 //
 // Skill wrapper passes: diff_text, file_list, base_sha, commit_log,
-//   task_context (optional), mode, task_id (optional)
+//   task_context (optional), mode, task_id (optional),
+//   gpt55_independent / enable_gpt55_independent / independent_review (optional)
 // Workflow handles: intent extraction, persona selection, dispatch, merge
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -304,6 +343,9 @@ const {
   task_context: taskContext,
   mode = 'headless',
   task_id: taskId,
+  gpt55_independent: gpt55IndependentArg,
+  enable_gpt55_independent: enableGpt55IndependentArg,
+  independent_review: independentReviewArg,
 } = args ?? {}
 
 if (!diffText || !diffText.trim() || diffText.trim() === 'EMPTY_DIFF') {
@@ -317,7 +359,7 @@ if (!baseSha) {
 }
 
 const changeLines = diffText.split('\n').filter(l => l.startsWith('+') || l.startsWith('-')).length
-const fileCount = fileList ? fileList.split('\n').filter(Boolean).length : '?'
+const fileCount = fileList ? fileList.split('\n').filter(Boolean).length : 0
 log(`Diff: ${changeLines} changed lines, ${fileCount} files`)
 
 // ── COMBINED SETUP AGENT (Steps 1 + 2 in one call) ───────────────────────
@@ -361,6 +403,15 @@ Return a single JSON object matching this schema exactly. No prose outside the J
 const intentSummary = setup?.intent_summary ?? '(intent extraction failed)'
 const isFallowSkipped = !!setup?.fallow_skip_reason
 const fallowRuns = !isFallowSkipped
+const gpt55Explicit = gpt55IndependentArg === true
+  || gpt55IndependentArg === 'true'
+  || enableGpt55IndependentArg === true
+  || enableGpt55IndependentArg === 'true'
+  || independentReviewArg === 'gpt-5.5'
+  || independentReviewArg === 'gpt55'
+  || independentReviewArg === 'gpt-5.5:independent'
+const gpt55BroadDiff = fileCount >= 5 || changeLines >= 300
+const gpt55Runs = gpt55Explicit || gpt55BroadDiff
 
 // Build the active persona list from setup flags + always-on
 const toRun = [...ALWAYS_ON_PERSONAS]
@@ -368,12 +419,13 @@ if (setup?.activate_security) toRun.push('security')
 if (setup?.activate_performance) toRun.push('performance')
 if (setup?.activate_adversarial) toRun.push('adversarial')
 if (fallowRuns) toRun.push('fallow')
+if (gpt55Runs) toRun.push('gpt-5.5:independent')
 
-const personasToDispatch = toRun.filter(name => name !== 'fallow')
+const personasToDispatch = toRun.filter(name => name !== 'fallow' && name !== 'gpt-5.5:independent')
 
 log(`Intent: ${intentSummary.split('\n')[0]}`)
 log(`Active personas: ${toRun.join(', ')}`)
-log(`Conditional: security=${setup?.activate_security}, performance=${setup?.activate_performance}, adversarial=${setup?.activate_adversarial}, fallow=${fallowRuns}`)
+log(`Conditional: security=${setup?.activate_security}, performance=${setup?.activate_performance}, adversarial=${setup?.activate_adversarial}, fallow=${fallowRuns}, gpt55=${gpt55Runs}`)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PHASE 2: PARALLEL PERSONA DISPATCH (Step 3)
@@ -397,7 +449,29 @@ if (fallowRuns) {
   )
 }
 
-const allOutputs = [...personaResults, fallowResult].filter(Boolean)
+let gpt55Result = null
+if (gpt55Runs) {
+  gpt55Result = await agent(
+    buildGpt55IndependentPrompt(diffText, fileList ?? '', intentSummary, baseSha),
+    {
+      label: 'gpt-5.5:independent',
+      phase: 'Review',
+      schema: REVIEWER_OUTPUT_SCHEMA,
+      model: 'sonnet',
+      effort: 'low',
+    }
+  )
+}
+
+const allOutputs = [...personaResults, fallowResult, gpt55Result].filter(Boolean)
+const gpt55Skipped = !!gpt55Result?.skipped_reason
+const skippedPersonas = []
+if (gpt55Skipped) {
+  skippedPersonas.push({
+    reviewer: 'gpt-5.5:independent',
+    reason: gpt55Result.skipped_reason,
+  })
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PHASE 3: DETERMINISTIC MERGE (Step 4 — pure JS, Phase A validated)
@@ -423,12 +497,16 @@ return {
     activated: toRun,
     fallow_skipped: isFallowSkipped,
     fallow_skip_reason: setup?.fallow_skip_reason ?? null,
-    personas_run: personasToDispatch.length + (fallowRuns ? 1 : 0),
+    gpt55_independent: gpt55Runs,
+    gpt55_independent_skipped: gpt55Skipped,
+    gpt55_independent_skip_reason: gpt55Result?.skipped_reason ?? null,
+    skipped_personas: skippedPersonas,
+    personas_run: personasToDispatch.length + (fallowRuns ? 1 : 0) + (gpt55Runs && !gpt55Skipped ? 1 : 0),
   },
   stats: {
     total_findings: residual.length + pre_existing.length,
     p0, p1, p2, p3,
-    personas_run: personasToDispatch.length + (fallowRuns ? 1 : 0),
+    personas_run: personasToDispatch.length + (fallowRuns ? 1 : 0) + (gpt55Runs && !gpt55Skipped ? 1 : 0),
     task_id: taskId ?? null,
   },
 }

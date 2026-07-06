@@ -285,6 +285,9 @@ pub struct ReviewerOutput {
     /// Testing gaps the reviewer noticed (e.g., "no test covers the retry path").
     #[serde(default)]
     pub testing_gaps: Vec<String>,
+    /// Non-empty when the reviewer persona did not actually run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skipped_reason: Option<String>,
 }
 
 impl ReviewerOutput {
@@ -322,6 +325,9 @@ impl fmt::Display for ReviewerOutput {
             for g in &self.testing_gaps {
                 writeln!(f, "    - {g}")?;
             }
+        }
+        if let Some(reason) = &self.skipped_reason {
+            writeln!(f, "  skipped_reason: {reason}")?;
         }
         Ok(())
     }
@@ -445,7 +451,10 @@ mod tests {
     fn empty_title_rejected() {
         let mut f = valid_finding();
         f.title = "   ".to_string();
-        assert_eq!(f.validate().unwrap_err(), FindingValidationError::EmptyTitle);
+        assert_eq!(
+            f.validate().unwrap_err(),
+            FindingValidationError::EmptyTitle
+        );
     }
 
     #[test]
@@ -612,6 +621,7 @@ mod tests {
             findings: vec![valid_finding()],
             residual_risks: vec!["retry path not verified".to_string()],
             testing_gaps: vec!["no integration test".to_string()],
+            skipped_reason: None,
         };
         let json = serde_json::to_string(&out).unwrap();
         let back: ReviewerOutput = serde_json::from_str(&json).unwrap();
@@ -626,6 +636,7 @@ mod tests {
             findings: vec![],
             residual_risks: vec![],
             testing_gaps: vec![],
+            skipped_reason: None,
         };
         assert_eq!(
             out.validate().unwrap_err(),
@@ -642,6 +653,7 @@ mod tests {
             findings: vec![bad],
             residual_risks: vec![],
             testing_gaps: vec![],
+            skipped_reason: None,
         };
         assert!(matches!(
             out.validate().unwrap_err(),
@@ -655,7 +667,26 @@ mod tests {
         let out: ReviewerOutput = serde_json::from_str(json).unwrap();
         assert!(out.residual_risks.is_empty());
         assert!(out.testing_gaps.is_empty());
+        assert_eq!(out.skipped_reason, None);
         out.validate().unwrap();
+    }
+
+    #[test]
+    fn reviewer_output_accepts_skipped_reason() {
+        let json = r#"{
+            "reviewer":"gpt-5.5:independent",
+            "findings":[],
+            "residual_risks":[],
+            "testing_gaps":[],
+            "skipped_reason":"codex CLI not installed"
+        }"#;
+        let out = parse_reviewer_output(json).unwrap();
+        assert_eq!(out.reviewer, "gpt-5.5:independent");
+        assert!(out.findings.is_empty());
+        assert_eq!(
+            out.skipped_reason.as_deref(),
+            Some("codex CLI not installed")
+        );
     }
 
     #[test]
@@ -665,6 +696,7 @@ mod tests {
             findings: vec![valid_finding()],
             residual_risks: vec![],
             testing_gaps: vec![],
+            skipped_reason: None,
         };
         let json = serde_json::to_string(&out).unwrap();
         let parsed = parse_reviewer_output(&json).unwrap();
@@ -701,6 +733,7 @@ mod tests {
             findings: vec![valid_finding()],
             residual_risks: vec!["r1".to_string()],
             testing_gaps: vec!["g1".to_string()],
+            skipped_reason: None,
         };
         let s = out.to_string();
         assert!(s.contains("== reviewer: correctness (1 findings) =="));

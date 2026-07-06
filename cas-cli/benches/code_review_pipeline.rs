@@ -39,16 +39,14 @@
 //! the merge stage actually exercises dedup + agreement boost rather
 //! than just walking a flat list.
 
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
 use cas_store::code_review::{
     autofix_loop,
     close_gate::{evaluate_gate, format_block_message},
     merge_findings, route_residual_to_tasks, FixerResult,
 };
-use cas_types::{
-    AutofixClass, Finding, FindingSeverity, Owner, ReviewOutcome, ReviewerOutput,
-};
+use cas_types::{AutofixClass, Finding, FindingSeverity, Owner, ReviewOutcome, ReviewerOutput};
 
 /// Generate a synthetic 7-persona envelope set with `n` total findings,
 /// roughly 30% overlap to exercise dedup, 60% manual / 30% safe_auto /
@@ -78,10 +76,10 @@ fn generate_envelopes(n: usize) -> Vec<ReviewerOutput> {
             format!("Unique issue {i}")
         };
         let severity = match i % 100 {
-            0 => FindingSeverity::P0,             // 1%
-            1..=9 => FindingSeverity::P1,         // 9%
-            10..=69 => FindingSeverity::P2,       // 60%
-            _ => FindingSeverity::P3,             // 30%
+            0 => FindingSeverity::P0,       // 1%
+            1..=9 => FindingSeverity::P1,   // 9%
+            10..=69 => FindingSeverity::P2, // 60%
+            _ => FindingSeverity::P3,       // 30%
         };
         let class = match i % 10 {
             0..=5 => AutofixClass::Manual,
@@ -117,6 +115,7 @@ fn generate_envelopes(n: usize) -> Vec<ReviewerOutput> {
             findings,
             residual_risks: vec![],
             testing_gaps: vec![],
+            skipped_reason: None,
         })
         .collect()
 }
