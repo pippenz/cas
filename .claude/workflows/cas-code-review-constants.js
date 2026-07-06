@@ -67,8 +67,46 @@ export const REVIEWER_OUTPUT_SCHEMA = Object.freeze({
     findings:       { type: 'array', items: FINDING_SCHEMA },
     residual_risks: { type: 'array', items: { type: 'string' } },
     testing_gaps:   { type: 'array', items: { type: 'string' } },
+    skipped_reason: { type: 'string' },
   },
 })
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GPT-5.5 INDEPENDENT PERSONA HELPERS
+// Runtime Workflow scripts keep inline copies of these functions because they
+// cannot import ES modules.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function gpt55ShouldRun(args = {}, fileCount, changeLines) {
+  const {
+    gpt55_independent: gpt55IndependentArg,
+    enable_gpt55_independent: enableGpt55IndependentArg,
+    independent_review: independentReviewArg,
+  } = args ?? {}
+  const gpt55Explicit = gpt55IndependentArg === true
+    || gpt55IndependentArg === 'true'
+    || enableGpt55IndependentArg === true
+    || enableGpt55IndependentArg === 'true'
+    || independentReviewArg === 'gpt-5.5'
+    || independentReviewArg === 'gpt55'
+    || independentReviewArg === 'gpt-5.5:independent'
+  const gpt55BroadDiff = fileCount >= 5 || changeLines >= 300
+  return gpt55Explicit || gpt55BroadDiff
+}
+
+function gpt55SkippedPersonas(gpt55Result) {
+  if (!gpt55Result?.skipped_reason) return []
+  return [{
+    reviewer: 'gpt-5.5:independent',
+    reason: gpt55Result.skipped_reason,
+  }]
+}
+
+function personasRunCount(personasToDispatchCount, fallowRuns, gpt55Runs, gpt55Skipped) {
+  return personasToDispatchCount + (fallowRuns ? 1 : 0) + (gpt55Runs && !gpt55Skipped ? 1 : 0)
+}
+
+export { gpt55ShouldRun, gpt55SkippedPersonas, personasRunCount }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // SETUP_SCHEMA — Phase C (cas-7c64)

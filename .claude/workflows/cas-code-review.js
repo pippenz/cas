@@ -306,6 +306,35 @@ Output ONLY a JSON object matching:
 Use skipped_reason only when codex did not run. No prose outside JSON.`
 }
 
+function gpt55ShouldRun(args = {}, fileCount, changeLines) {
+  const {
+    gpt55_independent: gpt55IndependentArg,
+    enable_gpt55_independent: enableGpt55IndependentArg,
+    independent_review: independentReviewArg,
+  } = args ?? {}
+  const gpt55Explicit = gpt55IndependentArg === true
+    || gpt55IndependentArg === 'true'
+    || enableGpt55IndependentArg === true
+    || enableGpt55IndependentArg === 'true'
+    || independentReviewArg === 'gpt-5.5'
+    || independentReviewArg === 'gpt55'
+    || independentReviewArg === 'gpt-5.5:independent'
+  const gpt55BroadDiff = fileCount >= 5 || changeLines >= 300
+  return gpt55Explicit || gpt55BroadDiff
+}
+
+function gpt55SkippedPersonas(gpt55Result) {
+  if (!gpt55Result?.skipped_reason) return []
+  return [{
+    reviewer: 'gpt-5.5:independent',
+    reason: gpt55Result.skipped_reason,
+  }]
+}
+
+function personasRunCount(personasToDispatchCount, fallowRuns, gpt55Runs, gpt55Skipped) {
+  return personasToDispatchCount + (fallowRuns ? 1 : 0) + (gpt55Runs && !gpt55Skipped ? 1 : 0)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // SETUP_SCHEMA — Phase C (inlined; Workflow scripts cannot import from ES modules)
 // Combined Steps 1-2 agent output: intent extraction + persona selection in one call.
@@ -343,9 +372,6 @@ const {
   task_context: taskContext,
   mode = 'headless',
   task_id: taskId,
-  gpt55_independent: gpt55IndependentArg,
-  enable_gpt55_independent: enableGpt55IndependentArg,
-  independent_review: independentReviewArg,
 } = args ?? {}
 
 if (!diffText || !diffText.trim() || diffText.trim() === 'EMPTY_DIFF') {
@@ -403,15 +429,7 @@ Return a single JSON object matching this schema exactly. No prose outside the J
 const intentSummary = setup?.intent_summary ?? '(intent extraction failed)'
 const isFallowSkipped = !!setup?.fallow_skip_reason
 const fallowRuns = !isFallowSkipped
-const gpt55Explicit = gpt55IndependentArg === true
-  || gpt55IndependentArg === 'true'
-  || enableGpt55IndependentArg === true
-  || enableGpt55IndependentArg === 'true'
-  || independentReviewArg === 'gpt-5.5'
-  || independentReviewArg === 'gpt55'
-  || independentReviewArg === 'gpt-5.5:independent'
-const gpt55BroadDiff = fileCount >= 5 || changeLines >= 300
-const gpt55Runs = gpt55Explicit || gpt55BroadDiff
+const gpt55Runs = gpt55ShouldRun(args ?? {}, fileCount, changeLines)
 
 // Build the active persona list from setup flags + always-on
 const toRun = [...ALWAYS_ON_PERSONAS]
@@ -454,7 +472,7 @@ if (gpt55Runs) {
   gpt55Result = await agent(
     buildGpt55IndependentPrompt(diffText, fileList ?? '', intentSummary, baseSha),
     {
-      label: 'gpt-5.5:independent',
+      label: 'review:gpt-5.5:independent',
       phase: 'Review',
       schema: REVIEWER_OUTPUT_SCHEMA,
       model: 'sonnet',
@@ -465,13 +483,8 @@ if (gpt55Runs) {
 
 const allOutputs = [...personaResults, fallowResult, gpt55Result].filter(Boolean)
 const gpt55Skipped = !!gpt55Result?.skipped_reason
-const skippedPersonas = []
-if (gpt55Skipped) {
-  skippedPersonas.push({
-    reviewer: 'gpt-5.5:independent',
-    reason: gpt55Result.skipped_reason,
-  })
-}
+const skippedPersonas = gpt55SkippedPersonas(gpt55Result)
+const personasRun = personasRunCount(personasToDispatch.length, fallowRuns, gpt55Runs, gpt55Skipped)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PHASE 3: DETERMINISTIC MERGE (Step 4 — pure JS, Phase A validated)
@@ -501,12 +514,12 @@ return {
     gpt55_independent_skipped: gpt55Skipped,
     gpt55_independent_skip_reason: gpt55Result?.skipped_reason ?? null,
     skipped_personas: skippedPersonas,
-    personas_run: personasToDispatch.length + (fallowRuns ? 1 : 0) + (gpt55Runs && !gpt55Skipped ? 1 : 0),
+    personas_run: personasRun,
   },
   stats: {
     total_findings: residual.length + pre_existing.length,
     p0, p1, p2, p3,
-    personas_run: personasToDispatch.length + (fallowRuns ? 1 : 0) + (gpt55Runs && !gpt55Skipped ? 1 : 0),
+    personas_run: personasRun,
     task_id: taskId ?? null,
   },
 }

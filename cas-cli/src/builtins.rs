@@ -1085,6 +1085,32 @@ pub fn worker_guidance() -> String {
 mod tests {
     use crate::builtins::*;
 
+    fn extract_js_function(source: &str, name: &str) -> String {
+        let needle = format!("function {name}(");
+        let start = source
+            .find(&needle)
+            .unwrap_or_else(|| panic!("missing JS function {name}"));
+        let after_name = &source[start..];
+        let open_rel = after_name
+            .find('{')
+            .unwrap_or_else(|| panic!("missing opening brace for JS function {name}"));
+        let open = start + open_rel;
+        let mut depth = 0usize;
+        for (offset, ch) in source[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return source[start..=open + offset].to_string();
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("missing closing brace for JS function {name}");
+    }
+
     #[test]
     fn test_extract_body_with_frontmatter() {
         let content = r#"---
@@ -1982,7 +2008,7 @@ This is the body content."#;
         for required in [
             "gpt-5.5:independent",
             "gpt55_independent",
-            "fileCount >= 5 || changeLines >= 300",
+            "gpt55ShouldRun",
             "codex exec -s read-only -m gpt-5.5",
             "skipped_reason",
             "gpt55_independent_skipped",
@@ -1992,6 +2018,15 @@ This is the body content."#;
             assert!(
                 workflow_content.contains(required),
                 "workflow script missing gpt-5.5 independent persona marker: {required:?}"
+            );
+        }
+        let constants_content =
+            include_str!("../../.claude/workflows/cas-code-review-constants.js");
+        for helper in ["gpt55ShouldRun", "gpt55SkippedPersonas", "personasRunCount"] {
+            assert_eq!(
+                extract_js_function(&workflow_content, helper),
+                extract_js_function(constants_content, helper),
+                "workflow inline helper {helper} must match cas-code-review-constants.js"
             );
         }
 

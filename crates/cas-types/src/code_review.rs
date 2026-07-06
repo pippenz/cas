@@ -742,4 +742,18 @@ mod tests {
         assert!(s.contains("testing_gaps:"));
         assert!(s.contains("- g1"));
     }
+
+    #[test]
+    fn reviewer_output_display_includes_skipped_reason() {
+        let out = ReviewerOutput {
+            reviewer: "gpt-5.5:independent".to_string(),
+            findings: vec![],
+            residual_risks: vec![],
+            testing_gaps: vec![],
+            skipped_reason: Some("codex CLI not installed".to_string()),
+        };
+        let s = out.to_string();
+        assert!(s.contains("== reviewer: gpt-5.5:independent (0 findings) =="));
+        assert!(s.contains("skipped_reason: codex CLI not installed"));
+    }
 }
