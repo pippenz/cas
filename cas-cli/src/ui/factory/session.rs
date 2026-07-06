@@ -409,6 +409,7 @@ pub fn create_metadata(
             })
             .collect(),
         epic_id: epic_id.map(|s| s.to_string()),
+        pinned_epic_id: None,
         project_dir: project_dir.map(|s| s.to_string()),
         team_name: None,
     }
@@ -463,6 +464,7 @@ mod tests {
         assert_eq!(meta.supervisor.name, "supervisor");
         assert_eq!(meta.workers.len(), 2);
         assert_eq!(meta.epic_id, Some("epic-123".to_string()));
+        assert_eq!(meta.pinned_epic_id, None);
         assert_eq!(meta.project_dir, Some("/home/user/my-project".to_string()));
         assert_eq!(meta.ws_port, Some(8080));
     }

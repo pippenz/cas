@@ -258,6 +258,7 @@ fn factory_req(action: &str) -> FactoryRequest {
         target: None,
         message: None,
         force: None,
+        clear: None,
         branch: None,
         older_than_secs: None,
         isolate: None,
@@ -283,6 +284,133 @@ fn get_text(result: &rmcp::model::CallToolResult) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn write_session_metadata(session_name: &str, epic_id: Option<&str>) {
+    let path = cas::ui::factory::metadata_path(session_name);
+    std::fs::create_dir_all(path.parent().expect("metadata parent")).unwrap();
+    let metadata = cas::ui::factory::create_metadata(
+        session_name,
+        12345,
+        "supervisor",
+        &[],
+        epic_id,
+        Some("/tmp/project"),
+        None,
+    );
+    std::fs::write(path, serde_json::to_string_pretty(&metadata).unwrap()).unwrap();
+}
+
+fn read_session_metadata(session_name: &str) -> cas::ui::factory::SessionMetadata {
+    let path = cas::ui::factory::metadata_path(session_name);
+    serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+}
+
+#[tokio::test]
+async fn test_focus_epic_pins_valid_epic_and_records_activity() {
+    let home = TempDir::new().expect("home tempdir");
+    let home_path = home.path().to_str().unwrap();
+    let _guard = EnvGuard::set(&[
+        ("CAS_FACTORY_SESSION", "session-focus-pin"),
+        ("HOME", home_path),
+    ]);
+    let env = FactoryTestEnv::new();
+    let epic_id = env.create_epic("Focused Epic");
+    write_session_metadata("session-focus-pin", Some("cas-session"));
+
+    let mut req = factory_req("focus_epic");
+    req.id = Some(epic_id.clone());
+    let result = env
+        .service
+        .factory(Parameters(req))
+        .await
+        .expect("focus_epic should succeed");
+
+    let text = get_text(&result);
+    assert!(text.contains(&epic_id), "response should name pinned epic: {text}");
+    let metadata = read_session_metadata("session-focus-pin");
+    assert_eq!(metadata.epic_id, Some("cas-session".to_string()));
+    assert_eq!(metadata.pinned_epic_id, Some(epic_id.clone()));
+
+    let events = env.event_store().list_recent(10).unwrap();
+    assert!(
+        events.iter().any(|event| {
+            event.event_type == EventType::SupervisorInjected
+                && event.entity_id == epic_id
+                && event.session_id.as_deref() == Some("session-focus-pin")
+        }),
+        "focus_epic should record an activity event"
+    );
+}
+
+#[tokio::test]
+async fn test_focus_epic_rejects_missing_and_non_epic_without_mutation() {
+    let home = TempDir::new().expect("home tempdir");
+    let home_path = home.path().to_str().unwrap();
+    let _guard = EnvGuard::set(&[
+        ("CAS_FACTORY_SESSION", "session-focus-invalid"),
+        ("HOME", home_path),
+    ]);
+    let env = FactoryTestEnv::new();
+    write_session_metadata("session-focus-invalid", Some("cas-session"));
+
+    let mut missing = factory_req("focus_epic");
+    missing.id = None;
+    assert!(
+        env.service.factory(Parameters(missing)).await.is_err(),
+        "missing id without clear=true should fail"
+    );
+    assert_eq!(
+        read_session_metadata("session-focus-invalid").pinned_epic_id,
+        None
+    );
+
+    let store = env.task_store();
+    let task_id = store.generate_id().expect("generate_id");
+    let task = Task::new(task_id.clone(), "Regular Task".to_string());
+    store.add(&task).expect("add task");
+
+    let mut non_epic = factory_req("focus_epic");
+    non_epic.id = Some(task_id);
+    assert!(
+        env.service.factory(Parameters(non_epic)).await.is_err(),
+        "non-epic id should fail"
+    );
+    assert_eq!(
+        read_session_metadata("session-focus-invalid").pinned_epic_id,
+        None
+    );
+}
+
+#[tokio::test]
+async fn test_focus_epic_clear_removes_pin_and_preserves_session_default() {
+    let home = TempDir::new().expect("home tempdir");
+    let home_path = home.path().to_str().unwrap();
+    let _guard = EnvGuard::set(&[
+        ("CAS_FACTORY_SESSION", "session-focus-clear"),
+        ("HOME", home_path),
+    ]);
+    let env = FactoryTestEnv::new();
+    let epic_id = env.create_epic("Focused Epic");
+    write_session_metadata("session-focus-clear", Some("cas-session"));
+
+    let mut pin = factory_req("focus_epic");
+    pin.id = Some(epic_id);
+    env.service
+        .factory(Parameters(pin))
+        .await
+        .expect("pin should succeed");
+
+    let mut clear = factory_req("focus_epic");
+    clear.clear = Some(true);
+    env.service
+        .factory(Parameters(clear))
+        .await
+        .expect("clear should succeed");
+
+    let metadata = read_session_metadata("session-focus-clear");
+    assert_eq!(metadata.epic_id, Some("cas-session".to_string()));
+    assert_eq!(metadata.pinned_epic_id, None);
 }
 
 // =============================================================================
@@ -1160,6 +1288,7 @@ fn coord_msg(
         summary: Some("test".to_string()),
         urgent,
         force: None,
+        clear: None,
         limit: None,
         name: None,
         agent_type: None,

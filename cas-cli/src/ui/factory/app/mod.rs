@@ -657,6 +657,7 @@ impl FactoryApp {
 
         // Sync session_id → pane_name mappings from agent store
         self.sync_session_mappings();
+        self.apply_session_metadata_focus();
 
         // Detect state changes BEFORE filtering so new epics are visible to the
         // event detector. This allows EpicStarted to fire and update epic_state,
@@ -728,6 +729,17 @@ impl FactoryApp {
                 "failed to persist factory session epic focus"
             );
         }
+    }
+
+    fn apply_session_metadata_focus(&mut self) {
+        let preferred_epic_id = preferred_epic_id_from_session_metadata();
+        if self.current_epic_id.as_deref() == preferred_epic_id.as_deref() {
+            return;
+        }
+
+        let epic_state = detect_epic_state(&self.director_data, preferred_epic_id.as_deref());
+        self.current_epic_id = epic_state.epic_id().map(str::to_string);
+        self.epic_state = epic_state;
     }
 
     /// Get the focused pane kind
@@ -1190,7 +1202,22 @@ pub(crate) fn preferred_epic_id_from_session_metadata_named(session_name: &str) 
     let path = metadata_path(session_name);
     let data = fs::read_to_string(path).ok()?;
     let metadata = serde_json::from_str::<SessionMetadata>(&data).ok()?;
-    metadata.epic_id.filter(|id| !id.trim().is_empty())
+    preferred_epic_id_from_metadata(&metadata)
+}
+
+pub(crate) fn preferred_epic_id_from_metadata(metadata: &SessionMetadata) -> Option<String> {
+    metadata
+        .pinned_epic_id
+        .as_ref()
+        .filter(|id| !id.trim().is_empty())
+        .cloned()
+        .or_else(|| {
+            metadata
+                .epic_id
+                .as_ref()
+                .filter(|id| !id.trim().is_empty())
+                .cloned()
+        })
 }
 
 pub(crate) fn persist_session_metadata_epic_id_at(
@@ -1201,6 +1228,19 @@ pub(crate) fn persist_session_metadata_epic_id_at(
     let mut metadata = serde_json::from_str::<SessionMetadata>(&data)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     metadata.epic_id = Some(epic_id.to_string());
+    let json = serde_json::to_string_pretty(&metadata)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    fs::write(path, json)
+}
+
+pub(crate) fn persist_session_metadata_pinned_epic_id_at(
+    path: &std::path::Path,
+    pinned_epic_id: Option<&str>,
+) -> std::io::Result<()> {
+    let data = fs::read_to_string(path)?;
+    let mut metadata = serde_json::from_str::<SessionMetadata>(&data)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    metadata.pinned_epic_id = pinned_epic_id.map(str::to_string);
     let json = serde_json::to_string_pretty(&metadata)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     fs::write(path, json)
@@ -1743,6 +1783,84 @@ mod tests {
         assert_eq!(updated.ws_port, Some(4242));
         assert_eq!(updated.team_name, Some("team-a".to_string()));
         assert_eq!(updated.project_dir, Some("/tmp/project".to_string()));
+    }
+
+    #[test]
+    fn preferred_epic_id_from_metadata_uses_pin_before_session_default() {
+        let mut metadata = crate::ui::factory::session::create_metadata(
+            "test-session",
+            12345,
+            "supervisor",
+            &[],
+            Some("cas-session"),
+            Some("/tmp/project"),
+            None,
+        );
+
+        assert_eq!(
+            super::preferred_epic_id_from_metadata(&metadata),
+            Some("cas-session".to_string())
+        );
+
+        metadata.pinned_epic_id = Some("cas-pinned".to_string());
+        assert_eq!(
+            super::preferred_epic_id_from_metadata(&metadata),
+            Some("cas-pinned".to_string())
+        );
+    }
+
+    #[test]
+    fn persist_session_metadata_pinned_epic_id_roundtrips_and_clears() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        let metadata = crate::ui::factory::session::create_metadata(
+            "test-session",
+            12345,
+            "supervisor",
+            &["worker-1".to_string()],
+            Some("cas-session"),
+            Some("/tmp/project"),
+            Some(4242),
+        );
+        std::fs::write(&path, serde_json::to_string_pretty(&metadata).unwrap()).unwrap();
+
+        super::persist_session_metadata_pinned_epic_id_at(&path, Some("cas-pinned")).unwrap();
+        let updated: crate::ui::factory::protocol::SessionMetadata =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(updated.epic_id, Some("cas-session".to_string()));
+        assert_eq!(updated.pinned_epic_id, Some("cas-pinned".to_string()));
+
+        super::persist_session_metadata_pinned_epic_id_at(&path, None).unwrap();
+        let cleared: crate::ui::factory::protocol::SessionMetadata =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(cleared.epic_id, Some("cas-session".to_string()));
+        assert_eq!(cleared.pinned_epic_id, None);
+        assert_eq!(
+            super::preferred_epic_id_from_metadata(&cleared),
+            Some("cas-session".to_string())
+        );
+    }
+
+    #[test]
+    fn session_metadata_without_pinned_epic_id_still_parses() {
+        let old_json = r#"{
+            "name": "test-session",
+            "created_at": "2026-07-06T12:00:00Z",
+            "daemon_pid": 12345,
+            "socket_path": "/tmp/factory.sock",
+            "supervisor": {
+                "name": "supervisor",
+                "pid": null,
+                "worktree_path": null
+            },
+            "workers": [],
+            "epic_id": "cas-session"
+        }"#;
+
+        let metadata: crate::ui::factory::protocol::SessionMetadata =
+            serde_json::from_str(old_json).unwrap();
+        assert_eq!(metadata.epic_id, Some("cas-session".to_string()));
+        assert_eq!(metadata.pinned_epic_id, None);
     }
 
     /// Regression test for cas-4181: factory TUI epic hijack.

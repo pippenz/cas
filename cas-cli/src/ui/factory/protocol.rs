@@ -314,6 +314,9 @@ pub struct SessionMetadata {
     pub workers: Vec<AgentInfo>,
     /// Epic ID if active
     pub epic_id: Option<String>,
+    /// Explicit supervisor-pinned epic ID for display focus
+    #[serde(default)]
+    pub pinned_epic_id: Option<String>,
     /// Project directory this session belongs to (for multi-project isolation)
     #[serde(default)]
     pub project_dir: Option<String>,

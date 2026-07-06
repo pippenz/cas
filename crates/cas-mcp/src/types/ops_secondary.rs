@@ -354,7 +354,7 @@ pub struct TeamRequest {
 pub struct FactoryRequest {
     /// Action to perform
     #[schemars(
-        description = "Action: 'spawn_workers', 'shutdown_workers', 'worker_status', 'worker_activity', 'clear_context', 'my_context', 'sync_all_workers', 'gc_report', 'gc_cleanup', 'epic_status' (per-child branch merge state), 'remind' (create reminder), 'remind_list' (list reminders), 'remind_cancel' (cancel a reminder)"
+        description = "Action: 'spawn_workers', 'shutdown_workers', 'worker_status', 'worker_activity', 'clear_context', 'my_context', 'sync_all_workers', 'gc_report', 'gc_cleanup', 'epic_status' (per-child branch merge state), 'focus_epic' (pin or clear displayed epic focus), 'remind' (create reminder), 'remind_list' (list reminders), 'remind_cancel' (cancel a reminder)"
     )]
     pub action: String,
 
@@ -398,6 +398,11 @@ pub struct FactoryRequest {
     )]
     #[serde(default)]
     pub force: Option<bool>,
+
+    /// Clear the pinned epic focus for focus_epic
+    #[schemars(description = "Clear the pinned epic focus (focus_epic only)")]
+    #[serde(default)]
+    pub clear: Option<bool>,
 
     /// Branch/ref target for sync operations
     #[schemars(description = "Target branch/ref for sync actions (e.g., 'epic/my-epic')")]
@@ -484,7 +489,7 @@ pub struct FactoryRequest {
 ///   session_start, session_end, loop_start, loop_cancel, loop_status, lease_history,
 ///   queue_notify, queue_poll, queue_peek, queue_ack, message, message_ack, message_status.
 /// Factory actions: spawn_workers, shutdown_workers, worker_status, worker_activity,
-///   clear_context, my_context, sync_all_workers, gc_report, gc_cleanup,
+///   clear_context, my_context, sync_all_workers, gc_report, gc_cleanup, focus_epic,
 ///   remind, remind_list, remind_cancel.
 /// Worktree actions: worktree_create, worktree_list, worktree_show, worktree_cleanup,
 ///   worktree_merge, worktree_status.
@@ -492,7 +497,7 @@ pub struct FactoryRequest {
 pub struct CoordinationRequest {
     /// Action to perform
     #[schemars(
-        description = "Action: agent ops (register, unregister, whoami, heartbeat, agent_list, agent_cleanup, session_start, session_end, loop_start, loop_cancel, loop_status, lease_history, queue_notify, queue_poll, queue_peek, queue_ack, message, interrupt, message_ack, message_status), factory ops (spawn_workers, shutdown_workers, worker_status, worker_activity, clear_context, my_context, sync_all_workers, gc_report, gc_cleanup, remind, remind_list, remind_cancel), worktree ops (worktree_create, worktree_list, worktree_show, worktree_cleanup, worktree_merge, worktree_status). Only available in factory mode. 'interrupt' is shorthand for 'message' with urgent=true (breaks the target's in-flight turn, then injects). For shutdown_workers, supervisor should verify worktree cleanliness/policy before issuing shutdown."
+        description = "Action: agent ops (register, unregister, whoami, heartbeat, agent_list, agent_cleanup, session_start, session_end, loop_start, loop_cancel, loop_status, lease_history, queue_notify, queue_poll, queue_peek, queue_ack, message, interrupt, message_ack, message_status), factory ops (spawn_workers, shutdown_workers, worker_status, worker_activity, clear_context, my_context, sync_all_workers, gc_report, gc_cleanup, focus_epic, remind, remind_list, remind_cancel), worktree ops (worktree_create, worktree_list, worktree_show, worktree_cleanup, worktree_merge, worktree_status). Only available in factory mode. 'interrupt' is shorthand for 'message' with urgent=true (breaks the target's in-flight turn, then injects). For shutdown_workers, supervisor should verify worktree cleanliness/policy before issuing shutdown."
     )]
     pub action: String,
 
@@ -539,6 +544,11 @@ pub struct CoordinationRequest {
     #[schemars(description = "Force operation even with uncommitted changes")]
     #[serde(default)]
     pub force: Option<bool>,
+
+    /// Clear the pinned epic focus for focus_epic
+    #[schemars(description = "Clear the pinned epic focus (focus_epic only)")]
+    #[serde(default)]
+    pub clear: Option<bool>,
 
     /// Maximum items to return
     #[schemars(description = "Maximum items to return")]
@@ -798,6 +808,7 @@ impl CoordinationRequest {
             target: self.target.clone(),
             message: self.message.clone(),
             force: self.force,
+            clear: self.clear,
             branch: self.branch.clone(),
             older_than_secs: self.older_than_secs,
             isolate: self.isolate,

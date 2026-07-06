@@ -108,6 +108,7 @@ fn coord_req(action: &str) -> CoordinationRequest {
         summary: None,
         urgent: None,
         force: None,
+        clear: None,
         limit: None,
         name: None,
         agent_type: None,
