@@ -17,10 +17,13 @@ use std::sync::Arc;
 
 use cas::mcp::{CasCore, CasService};
 use cas::store::{
-    AgentStore, PromptQueueStore, SpawnQueueStore, TaskStore, init_cas_dir, open_agent_store,
-    open_prompt_queue_store, open_spawn_queue_store, open_task_store,
+    AgentStore, EventStore, PromptQueueStore, SpawnQueueStore, TaskStore, init_cas_dir,
+    open_agent_store, open_event_store, open_prompt_queue_store, open_spawn_queue_store,
+    open_task_store,
 };
-use cas::types::{Agent, AgentStatus, Task, TaskStatus, TaskType};
+use cas::types::{
+    Agent, AgentStatus, Event, EventEntityType, EventType, Task, TaskStatus, TaskType,
+};
 use cas_mcp::types::{CoordinationRequest, FactoryRequest};
 use cas_types::AgentRole;
 use rmcp::handler::server::wrapper::Parameters;
@@ -73,6 +76,40 @@ impl FactoryTestEnv {
         agent.role = AgentRole::Worker;
         store.register(&agent).expect("register worker");
         id
+    }
+
+    fn register_worker_in_session(&self, name: &str, factory_session: &str) -> String {
+        let store = self.agent_store();
+        let id = Agent::generate_fallback_id();
+        let mut agent = Agent::new(id.clone(), name.to_string());
+        agent.role = AgentRole::Worker;
+        agent.factory_session = Some(factory_session.to_string());
+        store.register(&agent).expect("register worker in session");
+        id
+    }
+
+    fn register_supervisor_in_session(&self, name: &str, factory_session: &str) -> String {
+        let store = self.agent_store();
+        let id = Agent::generate_fallback_id();
+        let mut agent = Agent::new(id.clone(), name.to_string());
+        agent.role = AgentRole::Supervisor;
+        agent.factory_session = Some(factory_session.to_string());
+        store
+            .register(&agent)
+            .expect("register supervisor in session");
+        id
+    }
+
+    fn record_worker_file_event(&self, worker_id: &str, summary: &str) {
+        let store = self.event_store();
+        let event = Event::new(
+            EventType::WorkerFileEdited,
+            EventEntityType::Agent,
+            worker_id,
+            summary.to_string(),
+        )
+        .with_session(worker_id.to_string());
+        store.record(&event).expect("record worker activity");
     }
 
     fn register_worker_with_metadata(
@@ -146,6 +183,10 @@ impl FactoryTestEnv {
 
     fn task_store(&self) -> Arc<dyn TaskStore> {
         open_task_store(&self.cas_root).expect("open task store")
+    }
+
+    fn event_store(&self) -> Arc<dyn EventStore> {
+        open_event_store(&self.cas_root).expect("open event store")
     }
 
     fn spawn_queue(&self) -> Arc<dyn SpawnQueueStore> {
@@ -512,6 +553,46 @@ async fn test_worker_status_shows_agents() {
     );
 }
 
+#[tokio::test]
+async fn test_worker_status_scopes_agents_to_factory_session() {
+    let _guard = EnvGuard::set(&[("CAS_FACTORY_SESSION", "session-a")]);
+    let env = FactoryTestEnv::new();
+
+    env.register_supervisor_in_session("sup-a", "session-a");
+    env.register_worker_in_session("worker-a", "session-a");
+    env.register_worker_in_session("worker-b", "session-b");
+
+    let mut plain = Agent::new("plain-agent".to_string(), "plain-worker".to_string());
+    plain.role = AgentRole::Worker;
+    plain.factory_session = None;
+    let agent_store = env.agent_store();
+    agent_store.register(&plain).expect("register plain worker");
+    agent_store
+        .update(&plain)
+        .expect("clear plain worker session");
+
+    let req = factory_req("worker_status");
+    let result = env
+        .service
+        .factory(Parameters(req))
+        .await
+        .expect("worker_status should succeed");
+
+    let text = get_text(&result);
+    assert!(
+        text.contains("worker-a"),
+        "same-session worker visible: {text}"
+    );
+    assert!(
+        !text.contains("worker-b"),
+        "other-session worker must be hidden: {text}"
+    );
+    assert!(
+        !text.contains("plain-worker"),
+        "NULL-session plain CC worker must be hidden from factory director: {text}"
+    );
+}
+
 /// cas-5b1c integration coverage: a worker whose heartbeat is older than
 /// `WORKER_STALE_SECS` (30s) is pruned out of the Active listing on the
 /// next `factory_worker_status` call and reported in the "Filtered stale
@@ -660,6 +741,48 @@ async fn test_worker_activity_empty() {
     assert!(
         text.contains("No recent worker activity"),
         "Should report no activity: {text}"
+    );
+}
+
+#[tokio::test]
+async fn test_worker_activity_scopes_session_and_honors_target_filter() {
+    let _guard = EnvGuard::set(&[("CAS_FACTORY_SESSION", "session-a")]);
+    let env = FactoryTestEnv::new();
+
+    let worker_a = env.register_worker_in_session("worker-a", "session-a");
+    let worker_b = env.register_worker_in_session("worker-b", "session-b");
+    env.record_worker_file_event(&worker_a, "worker-a edited src/lib.rs");
+    env.record_worker_file_event(&worker_b, "worker-b edited src/lib.rs");
+
+    let mut req = factory_req("worker_activity");
+    req.target = Some("worker-a".to_string());
+    let result = env
+        .service
+        .factory(Parameters(req))
+        .await
+        .expect("worker_activity should succeed");
+
+    let text = get_text(&result);
+    assert!(
+        text.contains("worker-a edited"),
+        "targeted same-session activity should be visible: {text}"
+    );
+    assert!(
+        !text.contains("worker-b edited"),
+        "other-session activity must be hidden: {text}"
+    );
+
+    let mut req = factory_req("worker_activity");
+    req.target = Some("worker-b".to_string());
+    let result = env
+        .service
+        .factory(Parameters(req))
+        .await
+        .expect("worker_activity should succeed for hidden target");
+    let text = get_text(&result);
+    assert!(
+        text.contains("No recent worker activity"),
+        "target outside caller session should produce no activity: {text}"
     );
 }
 
