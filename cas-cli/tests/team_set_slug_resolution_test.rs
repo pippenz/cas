@@ -38,7 +38,7 @@ use cas::cli::cloud::{
     CloudProjectCommands, CloudProjectSetArgs, CloudTeamCommands, CloudTeamSetArgs,
     execute_project, execute_team, execute_team_show_for_test,
 };
-use cas::cloud::CloudConfig;
+use cas::cloud::{CloudConfig, TeamInfo};
 use tempfile::TempDir;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -51,16 +51,30 @@ static ENV_LOCK: Mutex<()> = Mutex::new(());
 struct CasRootGuard {
     _lock: std::sync::MutexGuard<'static, ()>,
     prev: Option<std::ffi::OsString>,
+    prev_user_cloud_json: Option<std::ffi::OsString>,
 }
 
 impl CasRootGuard {
     fn set(cas_root: &Path) -> Self {
         let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var_os("CAS_ROOT");
+        let prev_user_cloud_json = std::env::var_os("CAS_USER_CLOUD_JSON");
         // SAFETY: env mutation on an integration-test process, guarded by
         // ENV_LOCK so no other test can race the var concurrently.
         unsafe { std::env::set_var("CAS_ROOT", cas_root) };
-        Self { _lock: lock, prev }
+        Self {
+            _lock: lock,
+            prev,
+            prev_user_cloud_json,
+        }
+    }
+
+    fn set_with_user_cloud_json(cas_root: &Path, user_cloud_json: &Path) -> Self {
+        let guard = Self::set(cas_root);
+        // SAFETY: env mutation on an integration-test process, guarded by
+        // ENV_LOCK held by `guard`.
+        unsafe { std::env::set_var("CAS_USER_CLOUD_JSON", user_cloud_json) };
+        guard
     }
 }
 
@@ -71,6 +85,10 @@ impl Drop for CasRootGuard {
             match &self.prev {
                 Some(v) => std::env::set_var("CAS_ROOT", v),
                 None => std::env::remove_var("CAS_ROOT"),
+            }
+            match &self.prev_user_cloud_json {
+                Some(v) => std::env::set_var("CAS_USER_CLOUD_JSON", v),
+                None => std::env::remove_var("CAS_USER_CLOUD_JSON"),
             }
         }
     }
@@ -86,6 +104,23 @@ fn seed_cas_root(endpoint: &str) -> TempDir {
     cfg.endpoint = endpoint.to_string();
     cfg.token = Some("test-token".to_string());
     cfg.save_to_cas_dir(cas_dir).unwrap();
+    tmp
+}
+
+fn make_team(id: &str, slug: &str, name: &str) -> TeamInfo {
+    TeamInfo {
+        id: id.to_string(),
+        slug: slug.to_string(),
+        name: name.to_string(),
+        role: "member".to_string(),
+    }
+}
+
+fn seed_user_cloud_json(teams: Vec<TeamInfo>) -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    let mut cfg = CloudConfig::default();
+    cfg.teams = teams;
+    cfg.save_to_cas_dir(tmp.path()).unwrap();
     tmp
 }
 
@@ -138,17 +173,13 @@ async fn team_set_preserves_existing_config_toml_canonical_id() {
     let _env = CasRootGuard::set(&cas_root);
 
     let args = CloudTeamSetArgs {
-        id: TEST_TEAM.to_string(),
+        id: Some(TEST_TEAM.to_string()),
     };
     let cli = make_cli_json();
     let cas_root_owned = cas_root.clone();
     tokio::task::spawn_blocking(move || {
-        execute_team(
-            &CloudTeamCommands::Set(args),
-            &cli,
-            &cas_root_owned,
-        )
-        .expect("team set must succeed");
+        execute_team(&CloudTeamCommands::Set(args), &cli, &cas_root_owned)
+            .expect("team set must succeed");
     })
     .await
     .unwrap();
@@ -159,6 +190,38 @@ async fn team_set_preserves_existing_config_toml_canonical_id() {
         toml.contains("github.com/teamco/already-set"),
         "existing canonical_id must be preserved, got:\n{toml}"
     );
+}
+
+/// AC: `team set <slug>` resolves the slug from user-level cached teams[]
+/// before running the existing membership probe, then writes the resolved UUID
+/// and slug to the per-project cloud.json.
+#[tokio::test]
+async fn team_set_resolves_slug_from_cached_memberships() {
+    let server = MockServer::start().await;
+    mount_membership_ok(&server).await;
+
+    let tmp = seed_cas_root(&server.uri());
+    let cas_root = tmp.path().to_path_buf();
+    let user = seed_user_cloud_json(vec![make_team(TEST_TEAM, "petra-stella", "Petra Stella")]);
+    let user_cloud_json = user.path().join("cloud.json");
+
+    let _env = CasRootGuard::set_with_user_cloud_json(&cas_root, &user_cloud_json);
+
+    let args = CloudTeamSetArgs {
+        id: Some("petra-stella".to_string()),
+    };
+    let cli = make_cli_json();
+    let cas_root_owned = cas_root.clone();
+    tokio::task::spawn_blocking(move || {
+        execute_team(&CloudTeamCommands::Set(args), &cli, &cas_root_owned)
+            .expect("team set by slug must succeed");
+    })
+    .await
+    .unwrap();
+
+    let loaded = CloudConfig::load_from_cas_dir(&cas_root).unwrap();
+    assert_eq!(loaded.team_id.as_deref(), Some(TEST_TEAM));
+    assert_eq!(loaded.team_slug.as_deref(), Some("petra-stella"));
 }
 
 /// AC: `team set` with a git origin but no config.toml derives the slug from
@@ -176,17 +239,13 @@ async fn team_set_derives_canonical_id_from_https_git_remote() {
     let _env = CasRootGuard::set(&cas_root);
 
     let args = CloudTeamSetArgs {
-        id: TEST_TEAM.to_string(),
+        id: Some(TEST_TEAM.to_string()),
     };
     let cli = make_cli_json();
     let cas_root_owned = cas_root.clone();
     tokio::task::spawn_blocking(move || {
-        execute_team(
-            &CloudTeamCommands::Set(args),
-            &cli,
-            &cas_root_owned,
-        )
-        .expect("team set must succeed");
+        execute_team(&CloudTeamCommands::Set(args), &cli, &cas_root_owned)
+            .expect("team set must succeed");
     })
     .await
     .unwrap();
@@ -222,17 +281,13 @@ async fn team_set_derives_canonical_id_from_ssh_git_remote() {
     let _env = CasRootGuard::set(&cas_root);
 
     let args = CloudTeamSetArgs {
-        id: TEST_TEAM.to_string(),
+        id: Some(TEST_TEAM.to_string()),
     };
     let cli = make_cli_json();
     let cas_root_owned = cas_root.clone();
     tokio::task::spawn_blocking(move || {
-        execute_team(
-            &CloudTeamCommands::Set(args),
-            &cli,
-            &cas_root_owned,
-        )
-        .expect("team set must succeed");
+        execute_team(&CloudTeamCommands::Set(args), &cli, &cas_root_owned)
+            .expect("team set must succeed");
     })
     .await
     .unwrap();
@@ -256,26 +311,18 @@ async fn team_set_does_not_default_to_basename_when_neither_source_resolves() {
     let tmp = seed_cas_root(&server.uri());
     let cas_root = tmp.path().to_path_buf();
 
-    let basename = cas_root
-        .file_name()
-        .unwrap()
-        .to_string_lossy()
-        .to_string();
+    let basename = cas_root.file_name().unwrap().to_string_lossy().to_string();
 
     let _env = CasRootGuard::set(&cas_root);
 
     let args = CloudTeamSetArgs {
-        id: TEST_TEAM.to_string(),
+        id: Some(TEST_TEAM.to_string()),
     };
     let cli = make_cli_json();
     let cas_root_owned = cas_root.clone();
     tokio::task::spawn_blocking(move || {
-        execute_team(
-            &CloudTeamCommands::Set(args),
-            &cli,
-            &cas_root_owned,
-        )
-        .expect("team set must succeed (deferred output is not an error)");
+        execute_team(&CloudTeamCommands::Set(args), &cli, &cas_root_owned)
+            .expect("team set must succeed (deferred output is not an error)");
     })
     .await
     .unwrap();
@@ -307,12 +354,8 @@ async fn project_set_writes_canonical_id_to_config_toml() {
     let cli = make_cli_json();
     let cas_root_owned = cas_root.clone();
     tokio::task::spawn_blocking(move || {
-        execute_project(
-            &CloudProjectCommands::Set(args),
-            &cli,
-            &cas_root_owned,
-        )
-        .expect("project set must succeed");
+        execute_project(&CloudProjectCommands::Set(args), &cli, &cas_root_owned)
+            .expect("project set must succeed");
     })
     .await
     .unwrap();
