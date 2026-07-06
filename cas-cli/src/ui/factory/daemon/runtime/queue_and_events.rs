@@ -632,7 +632,7 @@ impl FactoryDaemon {
     /// processed one-per-tick in the main loop.
     pub(super) fn enqueue_spawn_requests(&mut self) -> anyhow::Result<()> {
         let queue = open_spawn_queue_store(self.app.cas_dir())?;
-        let requests = queue.poll(10)?;
+        let requests = queue.poll(&self.session_name, 10)?;
 
         for request in requests {
             tracing::info!("Enqueuing spawn request: {:?}", request.action);

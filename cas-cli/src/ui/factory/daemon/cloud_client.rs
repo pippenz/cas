@@ -934,7 +934,13 @@ fn handle_cloud_command(
                 }
             };
             match crate::store::open_spawn_queue_store(cas_dir) {
-                Ok(queue) => match queue.enqueue_spawn(count, &names, isolate, spec_json_owned.as_deref()) {
+                Ok(queue) => match queue.enqueue_spawn(
+                    count,
+                    &names,
+                    isolate,
+                    spec_json_owned.as_deref(),
+                    factory_session,
+                ) {
                     Ok(id) => {
                         tracing::info!("Cloud spawn_workers queued (id={}): count={}", id, count)
                     }
@@ -963,7 +969,7 @@ fn handle_cloud_command(
                 .and_then(|f| f.as_bool())
                 .unwrap_or(false);
             match crate::store::open_spawn_queue_store(cas_dir) {
-                Ok(queue) => match queue.enqueue_shutdown(count, &names, force) {
+                Ok(queue) => match queue.enqueue_shutdown(count, &names, force, factory_session) {
                     Ok(id) => tracing::info!("Cloud shutdown_workers queued (id={})", id),
                     Err(e) => tracing::error!("Failed to enqueue cloud shutdown: {}", e),
                 },
