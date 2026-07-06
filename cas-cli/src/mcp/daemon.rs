@@ -23,6 +23,7 @@ pub use cas_mcp::{ActivityTracker, EmbeddedDaemonConfig, EmbeddedDaemonStatus};
 
 use crate::cloud::{
     CloudConfig, CloudCoordinator, CloudSyncer, CloudSyncerConfig, SyncQueue, SyncResult,
+    maybe_mark_personal_scope_notice,
 };
 use crate::daemon::{CodeWatcher, DaemonConfig, DaemonRunResult, WatcherConfig};
 use crate::error::CasError;
@@ -1010,6 +1011,25 @@ impl EmbeddedDaemon {
 
         // Run in blocking task (ureq is synchronous)
         tokio::task::spawn_blocking(move || {
+            match maybe_mark_personal_scope_notice(&cas_root) {
+                Ok(Some(notice)) => {
+                    let msg = format!(
+                        "This project syncs to personal scope. You're a member of {} ({}). Link it with `cas cloud team set {}` or `cas cloud team auto on`.",
+                        notice.team_name, notice.team_slug, notice.team_slug
+                    );
+                    eprintln!("[CAS] {msg}");
+                    tracing::info!(target: "cas::sync", team_id = %notice.team_id, team_slug = %notice.team_slug, "{}", msg);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        target: "cas::sync",
+                        error = %e,
+                        "could not persist personal-scope team availability notice"
+                    );
+                }
+            }
+
             // Open stores without cloud sync wrappers (to avoid recursion)
             // We use the base stores here since we're doing the sync ourselves
             let store = open_store(&cas_root)?;

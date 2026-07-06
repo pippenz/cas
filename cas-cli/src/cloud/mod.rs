@@ -28,8 +28,9 @@ mod syncer;
 // T6: first-run backfill — `pub` so integration tests can call the inner seam.
 pub use backfill::{BackfillOutcome, maybe_apply_team_backfill, maybe_apply_team_backfill_inner};
 pub use config::{
-    CloudConfig, TeamInfo, canonical_id_from_config_toml, derive_canonical_id_from_git_remote,
-    get_project_canonical_id, invalidate_cached_project_id, resolve_canonical_id,
+    CloudConfig, PersonalScopeNotice, TeamInfo, canonical_id_from_config_toml,
+    derive_canonical_id_from_git_remote, get_project_canonical_id, invalidate_cached_project_id,
+    maybe_mark_personal_scope_notice, personal_scope_notice_for_configs, resolve_canonical_id,
     set_canonical_id_in_config_toml, should_adopt_canonical_id,
 };
 pub(crate) use config::{default_endpoint, is_acceptable_endpoint, user_level_cloud_json_path};

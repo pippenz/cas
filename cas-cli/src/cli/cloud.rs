@@ -9,9 +9,9 @@ use std::time::Duration;
 
 use crate::cli::Cli;
 use crate::cloud::{
-    BackfillOutcome, CloudConfig, FetchTeamsOutcome, SyncQueue, TeamInfo, fetch_and_cache_teams,
-    get_project_canonical_id, maybe_apply_team_backfill, teams_cache_stale,
-    user_level_cloud_json_path,
+    BackfillOutcome, CloudConfig, FetchTeamsOutcome, PersonalScopeNotice, SyncQueue, TeamInfo,
+    fetch_and_cache_teams, get_project_canonical_id, maybe_apply_team_backfill,
+    maybe_mark_personal_scope_notice, teams_cache_stale, user_level_cloud_json_path,
 };
 use crate::ui::components::Formatter;
 use crate::ui::theme::ActiveTheme;
@@ -67,6 +67,9 @@ pub enum CloudTeamCommands {
     /// Writes `team_id` to `<project>/.cas/cloud.json`. Slugs are resolved
     /// against cached memberships from `~/.cas/cloud.json`.
     Set(CloudTeamSetArgs),
+    /// Configure whether this project inherits the user-level team default
+    #[command(subcommand)]
+    Auto(CloudTeamAutoCommands),
     /// Show the currently configured team
     Show,
     /// Clear the configured team (no more team-scoped sync)
@@ -92,6 +95,17 @@ pub struct CloudTeamDefaultArgs {
 pub struct CloudTeamSetArgs {
     /// Team slug or UUID (e.g., petra-stella or 550e8400-e29b-41d4-a716-446655440000)
     pub id: Option<String>,
+}
+
+/// Subcommands for `cas cloud team auto`.
+#[derive(Subcommand)]
+pub enum CloudTeamAutoCommands {
+    /// Inherit the user-level default team for this project
+    On,
+    /// Disable team scope for this project, even if a team_id is configured
+    Off,
+    /// Clear the auto-promotion override
+    Clear,
 }
 
 /// Subcommands for `cas cloud project` (cas-1ced).
@@ -414,6 +428,7 @@ pub fn execute_team(cmd: &CloudTeamCommands, cli: &Cli, cas_root: &Path) -> anyh
             execute_team_default_inner(args, cli, &user_cas_dir)
         }
         CloudTeamCommands::Set(args) => execute_team_set(args, cli, cas_root),
+        CloudTeamCommands::Auto(cmd) => execute_team_auto(cmd, cli, cas_root),
         CloudTeamCommands::Show => execute_team_show(cli, cas_root).map(|_| ()),
         CloudTeamCommands::Clear => execute_team_clear(cli),
     }
@@ -726,6 +741,130 @@ fn execute_team_set(args: &CloudTeamSetArgs, cli: &Cli, cas_root: &Path) -> anyh
         TeamProbeOutcome::Error(msg) => {
             anyhow::bail!("Failed to verify team membership: {msg}")
         }
+    }
+}
+
+fn load_user_cloud_config_or_default() -> CloudConfig {
+    user_level_cloud_json_path()
+        .and_then(|p| CloudConfig::load_from(&p).ok())
+        .unwrap_or_default()
+}
+
+fn find_team_display<'a>(team_id: &str, project: &'a CloudConfig, user: &'a CloudConfig) -> (Option<&'a str>, Option<&'a str>) {
+    if project.team_id.as_deref() == Some(team_id) {
+        if let Some(slug) = project.team_slug.as_deref() {
+            return (Some(slug), None);
+        }
+    }
+    if let Some(team) = user.teams.iter().find(|t| t.id == team_id) {
+        return (Some(team.slug.as_str()), Some(team.name.as_str()));
+    }
+    (None, None)
+}
+
+fn execute_team_auto(
+    cmd: &CloudTeamAutoCommands,
+    cli: &Cli,
+    cas_root: &Path,
+) -> anyhow::Result<()> {
+    let mut config = CloudConfig::load_from_cas_dir(cas_root)?;
+    match cmd {
+        CloudTeamAutoCommands::On => config.team_auto_promote = Some(true),
+        CloudTeamAutoCommands::Off => config.team_auto_promote = Some(false),
+        CloudTeamAutoCommands::Clear => config.team_auto_promote = None,
+    }
+    config.save_to_cas_dir(cas_root)?;
+
+    let user_config = load_user_cloud_config_or_default();
+    let effective_team = config.active_team_id_with_user_config(Some(&user_config));
+
+    if cli.json {
+        let (team_slug, team_name) = effective_team
+            .as_deref()
+            .map(|id| find_team_display(id, &config, &user_config))
+            .unwrap_or((None, None));
+        println!(
+            "{}",
+            serde_json::json!({
+                "status": "ok",
+                "team_auto_promote": config.team_auto_promote,
+                "effective_team_id": effective_team,
+                "effective_team_slug": team_slug,
+                "effective_team_name": team_name,
+            })
+        );
+        return Ok(());
+    }
+
+    let theme = ActiveTheme::default();
+    let mut out = io::stdout();
+    let mut fmt = Formatter::stdout(&mut out, theme);
+    let success_color = fmt.theme().palette.status_success;
+    let warning_color = fmt.theme().palette.status_warning;
+    fmt.newline()?;
+    fmt.write_colored("  \u{2713} ", success_color)?;
+    match cmd {
+        CloudTeamAutoCommands::On => fmt.write_raw("Team auto-promotion enabled")?,
+        CloudTeamAutoCommands::Off => fmt.write_raw("Team auto-promotion disabled")?,
+        CloudTeamAutoCommands::Clear => fmt.write_raw("Team auto-promotion override cleared")?,
+    }
+    fmt.newline()?;
+
+    match effective_team.as_deref() {
+        Some(team_id) => {
+            let (team_slug, team_name) = find_team_display(team_id, &config, &user_config);
+            fmt.write_muted("  Effective team: ")?;
+            match (team_slug, team_name) {
+                (Some(slug), Some(name)) => {
+                    fmt.write_raw(name)?;
+                    fmt.write_raw(" (")?;
+                    fmt.write_raw(slug)?;
+                    fmt.write_raw(")")?;
+                }
+                (Some(slug), None) => fmt.write_raw(slug)?,
+                _ => fmt.write_raw(team_id)?,
+            }
+            fmt.newline()?;
+            fmt.write_muted("  UUID: ")?;
+            fmt.write_raw(team_id)?;
+            fmt.newline()?;
+        }
+        None => {
+            fmt.write_colored("  \u{26A0} ", warning_color)?;
+            if matches!(cmd, CloudTeamAutoCommands::On) {
+                fmt.write_raw(
+                    "No effective team resolved. Set a user default with `cas cloud team default <slug>` or refresh memberships with `cas cloud login`.",
+                )?;
+            } else {
+                fmt.write_raw("Effective scope: personal")?;
+            }
+            fmt.newline()?;
+        }
+    }
+
+    Ok(())
+}
+
+pub(crate) fn personal_scope_notice_message(notice: &PersonalScopeNotice) -> String {
+    format!(
+        "This project syncs to personal scope. You're a member of {} ({}). Link it with `cas cloud team set {}` or `cas cloud team auto on`.",
+        notice.team_name, notice.team_slug, notice.team_slug
+    )
+}
+
+fn print_personal_scope_notice(cli: &Cli, notice: &PersonalScopeNotice) {
+    if cli.json {
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "event": "personal_scope_team_available",
+                "team_id": notice.team_id,
+                "team_slug": notice.team_slug,
+                "team_name": notice.team_name,
+            })
+        );
+    } else {
+        println!("{}", personal_scope_notice_message(notice));
     }
 }
 
@@ -2048,6 +2187,16 @@ pub fn execute_sync(args: &CloudSyncArgs, cli: &Cli, cas_root: &Path) -> anyhow:
     if !args.dry_run {
         let outcome = maybe_apply_team_backfill();
         print_backfill_notice(cli, &outcome);
+        match maybe_mark_personal_scope_notice(cas_root) {
+            Ok(Some(notice)) => print_personal_scope_notice(cli, &notice),
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "could not persist personal-scope team availability notice"
+                );
+            }
+        }
     }
 
     execute_push(
@@ -3212,6 +3361,15 @@ mod team_cmd_tests {
         config
     }
 
+    fn cli_json() -> Cli {
+        Cli {
+            json: true,
+            full: false,
+            verbose: false,
+            command: None,
+        }
+    }
+
     #[test]
     fn team_set_resolution_uuid_passthrough() {
         let config = config_with_teams(vec![]);
@@ -3300,6 +3458,62 @@ mod team_cmd_tests {
             .to_string();
         assert!(err.contains("No cached team memberships"));
         assert!(err.contains("cas cloud login"));
+    }
+
+    #[test]
+    fn team_auto_on_writes_true_and_resolves_effective_team() {
+        let _guard = crate::cloud::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let project = TempDir::new().unwrap();
+        let user = TempDir::new().unwrap();
+
+        let project_cfg = CloudConfig::default();
+        project_cfg.save_to_cas_dir(project.path()).unwrap();
+
+        let mut user_cfg = CloudConfig::default();
+        user_cfg.default_team_id = Some("team-1".to_string());
+        user_cfg.teams = vec![make_team_info("team-1", "petra-stella", "Petra Stella")];
+        user_cfg.save_to_cas_dir(user.path()).unwrap();
+
+        let user_cloud_json = user.path().join("cloud.json");
+        unsafe { std::env::set_var("CAS_USER_CLOUD_JSON", &user_cloud_json); }
+        execute_team_auto(&CloudTeamAutoCommands::On, &cli_json(), project.path()).unwrap();
+        let saved = CloudConfig::load_from_cas_dir(project.path()).unwrap();
+        assert_eq!(saved.team_auto_promote, Some(true));
+        assert_eq!(
+            saved
+                .active_team_id_with_user_config(Some(&user_cfg))
+                .as_deref(),
+            Some("team-1")
+        );
+        unsafe { std::env::remove_var("CAS_USER_CLOUD_JSON"); }
+    }
+
+    #[test]
+    fn team_auto_off_writes_false_kill_switch() {
+        let _guard = crate::cloud::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let project = TempDir::new().unwrap();
+        let mut project_cfg = CloudConfig::default();
+        project_cfg.set_team("team-1", "petra-stella");
+        project_cfg.team_auto_promote = Some(true);
+        project_cfg.save_to_cas_dir(project.path()).unwrap();
+
+        execute_team_auto(&CloudTeamAutoCommands::Off, &cli_json(), project.path()).unwrap();
+        let saved = CloudConfig::load_from_cas_dir(project.path()).unwrap();
+        assert_eq!(saved.team_auto_promote, Some(false));
+        assert_eq!(saved.active_team_id_with_user_config(None), None);
+    }
+
+    #[test]
+    fn team_auto_clear_writes_none() {
+        let _guard = crate::cloud::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let project = TempDir::new().unwrap();
+        let mut project_cfg = CloudConfig::default();
+        project_cfg.team_auto_promote = Some(false);
+        project_cfg.save_to_cas_dir(project.path()).unwrap();
+
+        execute_team_auto(&CloudTeamAutoCommands::Clear, &cli_json(), project.path()).unwrap();
+        let saved = CloudConfig::load_from_cas_dir(project.path()).unwrap();
+        assert_eq!(saved.team_auto_promote, None);
     }
 
     #[test]

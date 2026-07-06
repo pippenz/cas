@@ -475,6 +475,22 @@ pub struct CloudConfig {
     /// Not written to disk when `false` so pre-T6 files stay clean.
     #[serde(default, skip_serializing_if = "is_false")]
     pub team_backfill_notified: bool,
+
+    /// Set to `true` after this project has shown the one-time notice that it
+    /// is syncing to personal scope while the user has a usable team.
+    ///
+    /// This is project-local. It never changes `team_id`, `team_slug`, or
+    /// `team_auto_promote`; it only suppresses repeated informational notices.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub personal_scope_notice_shown: bool,
+}
+
+/// Display data for the one-time personal-scope notice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersonalScopeNotice {
+    pub team_id: String,
+    pub team_slug: String,
+    pub team_name: String,
 }
 
 /// `skip_serializing_if` predicate for bool fields that default to `false`.
@@ -562,8 +578,73 @@ impl Default for CloudConfig {
             default_team_id: None,
             teams_fetched_at: None,
             team_backfill_notified: false,
+            personal_scope_notice_shown: false,
         }
     }
+}
+
+fn usable_team_from_user_config(user_cfg: &CloudConfig) -> Option<PersonalScopeNotice> {
+    if let Some(default_team_id) = user_cfg.default_team_id.as_deref() {
+        if let Some(team) = user_cfg.teams.iter().find(|t| t.id == default_team_id) {
+            return Some(PersonalScopeNotice {
+                team_id: team.id.clone(),
+                team_slug: team.slug.clone(),
+                team_name: team.name.clone(),
+            });
+        }
+        return Some(PersonalScopeNotice {
+            team_id: default_team_id.to_string(),
+            team_slug: default_team_id.to_string(),
+            team_name: default_team_id.to_string(),
+        });
+    }
+
+    match user_cfg.teams.as_slice() {
+        [team] => Some(PersonalScopeNotice {
+            team_id: team.id.clone(),
+            team_slug: team.slug.clone(),
+            team_name: team.name.clone(),
+        }),
+        _ => None,
+    }
+}
+
+/// Return the personal-scope notice data when a project is currently personal
+/// but the user has a usable team. Pure helper for unit tests.
+pub fn personal_scope_notice_for_configs(
+    project_cfg: &CloudConfig,
+    user_cfg: &CloudConfig,
+) -> Option<PersonalScopeNotice> {
+    if project_cfg.personal_scope_notice_shown {
+        return None;
+    }
+    if project_cfg
+        .active_team_id_with_user_config(Some(user_cfg))
+        .is_some()
+    {
+        return None;
+    }
+    usable_team_from_user_config(user_cfg)
+}
+
+/// Mark and return the one-time personal-scope notice for this project.
+///
+/// This intentionally never mutates team scope. The only persisted change is
+/// `personal_scope_notice_shown = true` in project `.cas/cloud.json`.
+pub fn maybe_mark_personal_scope_notice(
+    cas_root: &Path,
+) -> Result<Option<PersonalScopeNotice>, CasError> {
+    let mut project_cfg = CloudConfig::load_from_cas_dir(cas_root)?;
+    let user_cfg = user_level_cloud_json_path()
+        .and_then(|p| CloudConfig::load_from(&p).ok())
+        .unwrap_or_default();
+
+    let notice = personal_scope_notice_for_configs(&project_cfg, &user_cfg);
+    if notice.is_some() {
+        project_cfg.personal_scope_notice_shown = true;
+        project_cfg.save_to_cas_dir(cas_root)?;
+    }
+    Ok(notice)
 }
 
 impl CloudConfig {
@@ -1008,6 +1089,62 @@ mod tests {
             project_cfg.active_team_id_with_user_config(Some(&user_cfg)).as_deref(),
             Some("solo-team-id"),
         );
+    }
+
+    #[test]
+    fn personal_scope_notice_fires_once_for_single_team_user() {
+        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let project = TempDir::new().unwrap();
+        let user = TempDir::new().unwrap();
+
+        let project_cfg = CloudConfig::default();
+        project_cfg.save_to_cas_dir(project.path()).unwrap();
+
+        let mut user_cfg = CloudConfig::default();
+        user_cfg.teams = vec![TeamInfo {
+            id: "solo-team-id".to_string(),
+            slug: "solo".to_string(),
+            name: "Solo".to_string(),
+            role: "member".to_string(),
+        }];
+        user_cfg.save_to_cas_dir(user.path()).unwrap();
+
+        let user_cloud_json = user.path().join("cloud.json");
+        unsafe { std::env::set_var("CAS_USER_CLOUD_JSON", &user_cloud_json); }
+
+        let first = maybe_mark_personal_scope_notice(project.path())
+            .unwrap()
+            .expect("single-team personal project should emit notice");
+        assert_eq!(first.team_slug, "solo");
+        let saved = CloudConfig::load_from_cas_dir(project.path()).unwrap();
+        assert!(saved.personal_scope_notice_shown);
+        assert!(saved.team_id.is_none());
+        assert!(saved.team_auto_promote.is_none());
+
+        let second = maybe_mark_personal_scope_notice(project.path()).unwrap();
+        assert!(second.is_none(), "notice must be one-time per project");
+        unsafe { std::env::remove_var("CAS_USER_CLOUD_JSON"); }
+    }
+
+    #[test]
+    fn personal_scope_notice_suppressed_for_team_linked_project() {
+        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let mut project_cfg = CloudConfig::default();
+        project_cfg.team_auto_promote = Some(true);
+        let mut user_cfg = CloudConfig::default();
+        user_cfg.default_team_id = Some("team-1".to_string());
+        assert!(
+            personal_scope_notice_for_configs(&project_cfg, &user_cfg).is_none(),
+            "opted-in project resolves to team scope, so no personal-scope notice"
+        );
+    }
+
+    #[test]
+    fn personal_scope_notice_suppressed_for_user_with_no_teams() {
+        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let project_cfg = CloudConfig::default();
+        let user_cfg = CloudConfig::default();
+        assert!(personal_scope_notice_for_configs(&project_cfg, &user_cfg).is_none());
     }
 
     #[test]
