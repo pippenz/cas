@@ -21,6 +21,7 @@ pub fn render_status_strip(
     area: Rect,
     data: &DirectorData,
     theme: &ActiveTheme,
+    focused_epic_id: Option<&str>,
 ) {
     let palette = &theme.palette;
     let styles = &theme.styles;
@@ -31,12 +32,8 @@ pub fn render_status_strip(
 
     let mut left_spans: Vec<Span> = Vec::new();
 
-    // Find the active epic
-    let active_epic = data
-        .epic_tasks
-        .iter()
-        .find(|e| e.status == TaskStatus::InProgress)
-        .or_else(|| data.epic_tasks.first());
+    let active_epic =
+        focused_epic_id.and_then(|epic_id| data.epic_tasks.iter().find(|e| e.id == epic_id));
 
     if let Some(epic) = active_epic {
         // Count subtask statuses from live task lists

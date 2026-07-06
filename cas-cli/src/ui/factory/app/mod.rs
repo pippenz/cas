@@ -17,6 +17,8 @@ use crate::types::Worktree;
 use crate::ui::factory::input::{InputMode, LayoutSizes};
 use crate::ui::factory::layout::{FactoryLayout, PaneGrid};
 use crate::ui::factory::notification::Notifier;
+use crate::ui::factory::protocol::SessionMetadata;
+use crate::ui::factory::session::metadata_path;
 use crate::ui::theme::ActiveTheme;
 use crate::ui::widgets::TreeItemType;
 use crate::worktree::WorktreeManager;
@@ -674,11 +676,7 @@ impl FactoryApp {
                 epic_title,
             } = event
             {
-                self.current_epic_id = Some(epic_id.clone());
-                self.epic_state = EpicState::Active {
-                    epic_id: epic_id.clone(),
-                    epic_title: epic_title.clone(),
-                };
+                self.set_active_epic(epic_id, epic_title);
             }
         }
 
@@ -703,6 +701,33 @@ impl FactoryApp {
             .collect();
 
         Ok((prompts, events))
+    }
+
+    fn set_active_epic(&mut self, epic_id: &str, epic_title: &str) {
+        self.current_epic_id = Some(epic_id.to_string());
+        self.epic_state = EpicState::Active {
+            epic_id: epic_id.to_string(),
+            epic_title: epic_title.to_string(),
+        };
+        self.persist_current_epic_id();
+    }
+
+    fn persist_current_epic_id(&self) {
+        let Some(session_name) = self.factory_session.as_deref() else {
+            return;
+        };
+        let Some(epic_id) = self.current_epic_id.as_deref() else {
+            return;
+        };
+        let path = metadata_path(session_name);
+        if let Err(err) = persist_session_metadata_epic_id_at(&path, epic_id) {
+            tracing::warn!(
+                session = %session_name,
+                epic_id,
+                error = %err,
+                "failed to persist factory session epic focus"
+            );
+        }
     }
 
     /// Get the focused pane kind
@@ -1154,6 +1179,31 @@ pub(crate) fn detect_epic_state(
     // Completing state is transitioned to via handle_epic_events() when EpicCompleted fires
     // Initial state detection only identifies Active epics; Completing is a transient state
     EpicState::Idle
+}
+
+pub(crate) fn preferred_epic_id_from_session_metadata() -> Option<String> {
+    let session_name = std::env::var("CAS_FACTORY_SESSION").ok()?;
+    preferred_epic_id_from_session_metadata_named(&session_name)
+}
+
+pub(crate) fn preferred_epic_id_from_session_metadata_named(session_name: &str) -> Option<String> {
+    let path = metadata_path(session_name);
+    let data = fs::read_to_string(path).ok()?;
+    let metadata = serde_json::from_str::<SessionMetadata>(&data).ok()?;
+    metadata.epic_id.filter(|id| !id.trim().is_empty())
+}
+
+pub(crate) fn persist_session_metadata_epic_id_at(
+    path: &std::path::Path,
+    epic_id: &str,
+) -> std::io::Result<()> {
+    let data = fs::read_to_string(path)?;
+    let mut metadata = serde_json::from_str::<SessionMetadata>(&data)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    metadata.epic_id = Some(epic_id.to_string());
+    let json = serde_json::to_string_pretty(&metadata)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    fs::write(path, json)
 }
 
 #[cfg(test)]
@@ -1619,21 +1669,11 @@ mod tests {
         use cas_types::{Priority, TaskStatus, TaskType};
 
         let preferred_id = "cas-preferred";
-        let active_id = "cas-active";
+        let unrelated_id = "cas-unrelated";
 
         let data = DirectorData {
             ready_tasks: Vec::new(),
-            in_progress_tasks: vec![TaskSummary {
-                id: "task-ip".to_string(),
-                title: "In-progress subtask".to_string(),
-                status: TaskStatus::InProgress,
-                priority: Priority::MEDIUM,
-                assignee: None,
-                task_type: TaskType::Task,
-                epic: Some(active_id.to_string()),
-                branch: None,
-                updated_at: None,
-            }],
+            in_progress_tasks: Vec::new(),
             epic_tasks: vec![
                 TaskSummary {
                     id: preferred_id.to_string(),
@@ -1647,14 +1687,14 @@ mod tests {
                     updated_at: None,
                 },
                 TaskSummary {
-                    id: active_id.to_string(),
-                    title: "Active Epic".to_string(),
-                    status: TaskStatus::Open,
+                    id: unrelated_id.to_string(),
+                    title: "Unrelated InProgress Epic".to_string(),
+                    status: TaskStatus::InProgress,
                     priority: Priority::MEDIUM,
                     assignee: None,
                     task_type: TaskType::Epic,
                     epic: None,
-                    branch: Some("epic/active".to_string()),
+                    branch: Some("epic/unrelated".to_string()),
                     updated_at: None,
                 },
             ],
@@ -1667,15 +1707,42 @@ mod tests {
             epic_closed_counts: HashMap::new(),
         };
 
-        // Preferred epic should win even though active_id has in-progress subtasks
+        // Preferred epic should win even though another epic is explicitly InProgress.
         let state = super::detect_epic_state(&data, Some(preferred_id));
         match state {
             EpicState::Active { epic_id, .. } => {
                 assert_eq!(epic_id, preferred_id,
-                    "preferred_epic_id should take priority over subtask heuristic");
+                    "preferred_epic_id should take priority over unrelated InProgress epics");
             }
             other => panic!("Expected Active, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn persist_session_metadata_epic_id_roundtrips_existing_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        let mut metadata = crate::ui::factory::session::create_metadata(
+            "test-session",
+            12345,
+            "supervisor",
+            &["worker-1".to_string()],
+            Some("cas-old"),
+            Some("/tmp/project"),
+            Some(4242),
+        );
+        metadata.team_name = Some("team-a".to_string());
+        std::fs::write(&path, serde_json::to_string_pretty(&metadata).unwrap()).unwrap();
+
+        super::persist_session_metadata_epic_id_at(&path, "cas-new").unwrap();
+
+        let updated: crate::ui::factory::protocol::SessionMetadata =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(updated.epic_id, Some("cas-new".to_string()));
+        assert_eq!(updated.name, "test-session");
+        assert_eq!(updated.ws_port, Some(4242));
+        assert_eq!(updated.team_name, Some("team-a".to_string()));
+        assert_eq!(updated.project_dir, Some("/tmp/project".to_string()));
     }
 
     /// Regression test for cas-4181: factory TUI epic hijack.

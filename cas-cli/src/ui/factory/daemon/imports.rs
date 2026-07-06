@@ -17,6 +17,7 @@ pub(super) use crate::store::{
 pub(super) use crate::ui::factory::app::{
     EpicStateChange, FactoryApp, FactoryConfig, WorkerSpawnResult,
     ScrollAction, SCROLL_DOWN_ARROWS, SCROLL_LINES, SCROLL_UP_ARROWS,
+    preferred_epic_id_from_session_metadata,
 };
 pub(super) use crate::ui::factory::buffer_backend::BufferBackend;
 pub(super) use crate::ui::factory::director::with_response_instructions;

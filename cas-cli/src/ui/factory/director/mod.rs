@@ -165,6 +165,7 @@ pub fn render_with_state(
     area: Rect,
     data: &DirectorData,
     theme: &ActiveTheme,
+    focused_epic_id: Option<&str>,
     supervisor_name: &str,
     mut state: Option<&mut SidecarState>,
 ) -> PanelAreas {
@@ -252,6 +253,7 @@ pub fn render_with_state(
         chunks[factory_idx],
         data,
         theme,
+        focused_epic_id,
         focus == SidecarFocus::Factory,
         state.as_ref().and_then(|s| s.agents_state.selected()),
         supervisor_name,

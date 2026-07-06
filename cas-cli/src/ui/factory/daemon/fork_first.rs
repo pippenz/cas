@@ -268,7 +268,8 @@ impl DaemonInitPhase {
         // Step 3: Loading CAS data
         self.send_progress("Loading CAS data", 3, 6, false)?;
         let director_data = DirectorData::load(&cas_dir, Some(&worktree_root))?;
-        let epic_state = detect_epic_state(&director_data, None);
+        let preferred_epic_id = preferred_epic_id_from_session_metadata();
+        let epic_state = detect_epic_state(&director_data, preferred_epic_id.as_deref());
         let git_ops = GitOperations::new(self.factory_config.cwd.clone());
         let trunk = git_ops.detect_default_branch();
         let epic_branch = if let EpicState::Active { epic_title, .. } = &epic_state {
@@ -480,7 +481,7 @@ impl DaemonInitPhase {
             std::process::id(),
             &self.supervisor_name,
             &self.worker_names,
-            None, // Epic ID loaded later
+            epic_state.epic_id(),
             Some(&project_dir),
             None, // No WebSocket port - using Unix socket
         );

@@ -21,6 +21,7 @@ pub fn render_with_focus(
     area: Rect,
     data: &DirectorData,
     theme: &ActiveTheme,
+    focused_epic_id: Option<&str>,
     focused: bool,
     selected_agent: Option<usize>,
     supervisor_name: &str,
@@ -75,7 +76,8 @@ pub fn render_with_focus(
     }
 
     // Layout: epic progress, worker list, summary
-    let has_epic = !data.epic_tasks.is_empty();
+    let has_epic = focused_epic_id
+        .is_some_and(|epic_id| data.epic_tasks.iter().any(|epic| epic.id == epic_id));
     let epic_height = if has_epic { 2 } else { 0 };
     let summary_height = 1;
     let worker_height = inner
@@ -105,7 +107,7 @@ pub fn render_with_focus(
 
     // Epic progress (if any)
     if has_epic {
-        render_epic_progress(frame, chunks[chunk_idx], data, theme);
+        render_epic_progress(frame, chunks[chunk_idx], data, theme, focused_epic_id);
         chunk_idx += 1;
 
         // Separator
@@ -133,7 +135,13 @@ pub fn render_with_focus(
 }
 
 /// Render epic status bar
-fn render_epic_progress(frame: &mut Frame, area: Rect, data: &DirectorData, theme: &ActiveTheme) {
+fn render_epic_progress(
+    frame: &mut Frame,
+    area: Rect,
+    data: &DirectorData,
+    theme: &ActiveTheme,
+    focused_epic_id: Option<&str>,
+) {
     if area.height == 0 || area.width < 10 {
         return;
     }
@@ -141,12 +149,8 @@ fn render_epic_progress(frame: &mut Frame, area: Rect, data: &DirectorData, them
     let styles = &theme.styles;
     let palette = &theme.palette;
 
-    // Find active epic (in_progress status)
-    let active_epic = data
-        .epic_tasks
-        .iter()
-        .find(|e| e.status == TaskStatus::InProgress)
-        .or_else(|| data.epic_tasks.first());
+    let active_epic =
+        focused_epic_id.and_then(|epic_id| data.epic_tasks.iter().find(|e| e.id == epic_id));
 
     let Some(epic) = active_epic else {
         return;

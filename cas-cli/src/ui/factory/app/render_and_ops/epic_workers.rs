@@ -127,7 +127,6 @@ impl FactoryApp {
                     epic_title,
                 } => {
                     // Transition to Active state and track explicitly
-                    self.current_epic_id = Some(epic_id.clone());
                     let previous = std::mem::replace(
                         &mut self.epic_state,
                         EpicState::Active {
@@ -135,6 +134,8 @@ impl FactoryApp {
                             epic_title: epic_title.clone(),
                         },
                     );
+                    self.current_epic_id = Some(epic_id.clone());
+                    self.persist_current_epic_id();
 
                     changes.push(EpicStateChange::Started {
                         epic_id: epic_id.clone(),

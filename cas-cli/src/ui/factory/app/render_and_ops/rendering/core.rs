@@ -93,7 +93,13 @@ impl FactoryApp {
         self.mc_activity_area = mc.activity_area;
 
         // Status strip — compact epic progress + task counts + worker chips
-        mission_epic::render_status_strip(frame, mc.status_strip, &self.director_data, &self.theme);
+        mission_epic::render_status_strip(
+            frame,
+            mc.status_strip,
+            &self.director_data,
+            &self.theme,
+            self.current_epic_id.as_deref(),
+        );
 
         // WORKERS panel — live content from DirectorData (focused border when selected)
         mission_workers::render_workers_panel_with_focus(
@@ -840,6 +846,7 @@ impl FactoryApp {
                     layout.sidecar_area,
                     &self.director_data,
                     &self.theme,
+                    self.current_epic_id.as_deref(),
                     &self.supervisor_name,
                     Some(&mut state),
                 );

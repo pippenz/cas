@@ -10,7 +10,8 @@ use crate::orchestration::names::generate_unique;
 use crate::store::find_cas_root;
 use crate::ui::factory::app::{
     AutoPromptConfig, EpicState, FactoryApp, FactoryConfig, detect_epic_state, epic_branch_name,
-    queue_codex_worker_intro_prompt, queue_supervisor_intro_prompt,
+    preferred_epic_id_from_session_metadata, queue_codex_worker_intro_prompt,
+    queue_supervisor_intro_prompt,
 };
 use crate::ui::factory::director::DirectorStores;
 use crate::ui::factory::director::{
@@ -53,7 +54,8 @@ impl FactoryApp {
         let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
 
         let director_data = DirectorData::load_fast(&cas_dir)?;
-        let epic_state = detect_epic_state(&director_data, None);
+        let preferred_epic_id = preferred_epic_id_from_session_metadata();
+        let epic_state = detect_epic_state(&director_data, preferred_epic_id.as_deref());
 
         // Detect the configured trunk once — used both for epic branch creation
         // and as the base for worker worktrees when no epic is active.
@@ -333,7 +335,8 @@ impl FactoryApp {
             DirectorEventDetector::new(worker_names.clone(), supervisor_name.clone());
         event_detector.initialize(&director_data);
 
-        let epic_state = detect_epic_state(&director_data, None);
+        let preferred_epic_id = preferred_epic_id_from_session_metadata();
+        let epic_state = detect_epic_state(&director_data, preferred_epic_id.as_deref());
         let epic_branch = match &epic_state {
             EpicState::Active { epic_title, .. } => Some(epic_branch_name(epic_title)),
             _ => None,
