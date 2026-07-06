@@ -5,6 +5,41 @@ use chrono::{Duration, Utc};
 use rusqlite::params;
 use tempfile::TempDir;
 
+static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+struct EnvGuard {
+    saved: Vec<(String, Option<String>)>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl EnvGuard {
+    fn set(vars: &[(&str, Option<&str>)]) -> Self {
+        let lock = ENV_MUTEX.lock().unwrap();
+        let mut saved = Vec::with_capacity(vars.len());
+        for (key, value) in vars {
+            let key = (*key).to_string();
+            let prev = std::env::var(&key).ok();
+            match value {
+                Some(value) => unsafe { std::env::set_var(&key, value) },
+                None => unsafe { std::env::remove_var(&key) },
+            }
+            saved.push((key, prev));
+        }
+        Self { saved, _lock: lock }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        for (key, prev) in self.saved.drain(..) {
+            match prev {
+                Some(value) => unsafe { std::env::set_var(&key, value) },
+                None => unsafe { std::env::remove_var(&key) },
+            }
+        }
+    }
+}
+
 fn create_test_store() -> (TempDir, SqliteAgentStore) {
     let temp = TempDir::new().unwrap();
     let store = SqliteAgentStore::open(temp.path()).unwrap();
@@ -71,6 +106,80 @@ fn test_agent_pid_starttime_round_trips_through_register_and_update() {
         re_retrieved.pid_starttime,
         Some(2_000_000),
         "UPDATE must overwrite pid_starttime"
+    );
+}
+
+#[test]
+fn test_agent_factory_session_round_trips_through_register_and_update() {
+    let (_temp, store) = create_test_store();
+
+    let mut agent = Agent::new("agent-factory".to_string(), "factory worker".to_string());
+    agent.factory_session = Some("factory-session-a".to_string());
+    store.register(&agent).unwrap();
+
+    let retrieved = store.get("agent-factory").unwrap();
+    assert_eq!(
+        retrieved.factory_session.as_deref(),
+        Some("factory-session-a"),
+        "INSERT must persist factory_session and SELECT must read it back"
+    );
+
+    let mut updated = retrieved;
+    updated.factory_session = Some("factory-session-b".to_string());
+    store.update(&updated).unwrap();
+
+    let re_retrieved = store.get("agent-factory").unwrap();
+    assert_eq!(
+        re_retrieved.factory_session.as_deref(),
+        Some("factory-session-b"),
+        "UPDATE must overwrite factory_session"
+    );
+}
+
+#[test]
+fn test_agent_factory_session_stamps_from_env_and_survives_absent_reregister() {
+    let _guard = EnvGuard::set(&[("CAS_FACTORY_SESSION", Some("env-session-a"))]);
+    let (_temp, store) = create_test_store();
+
+    let agent = Agent::new("agent-env-factory".to_string(), "env factory".to_string());
+    assert!(agent.factory_session.is_none());
+    store.register(&agent).unwrap();
+
+    let retrieved = store.get("agent-env-factory").unwrap();
+    assert_eq!(retrieved.factory_session.as_deref(), Some("env-session-a"));
+
+    unsafe { std::env::remove_var("CAS_FACTORY_SESSION") };
+    let mut reregister = Agent::new("agent-env-factory".to_string(), "env factory 2".to_string());
+    reregister.factory_session = None;
+    store.register(&reregister).unwrap();
+
+    let retrieved = store.get("agent-env-factory").unwrap();
+    assert_eq!(
+        retrieved.factory_session.as_deref(),
+        Some("env-session-a"),
+        "re-register without struct/env session must not erase existing tag"
+    );
+}
+
+#[test]
+fn test_agent_factory_session_update_none_preserves_existing_tag() {
+    let _guard = EnvGuard::set(&[("CAS_FACTORY_SESSION", None)]);
+    let (_temp, store) = create_test_store();
+
+    let mut agent = Agent::new("agent-update-preserve".to_string(), "preserve".to_string());
+    agent.factory_session = Some("session-original".to_string());
+    store.register(&agent).unwrap();
+
+    let mut updated = store.get("agent-update-preserve").unwrap();
+    updated.name = "preserved after update".to_string();
+    updated.factory_session = None;
+    store.update(&updated).unwrap();
+
+    let retrieved = store.get("agent-update-preserve").unwrap();
+    assert_eq!(
+        retrieved.factory_session.as_deref(),
+        Some("session-original"),
+        "update without struct session must preserve existing tag"
     );
 }
 
@@ -705,7 +814,10 @@ fn test_re_registration_preserves_startup_confirmed() {
     let (temp, store) = create_test_store();
 
     // Register agent, heartbeat to confirm startup
-    let agent = Agent::new("agent-reregister".to_string(), "ReRegister Test".to_string());
+    let agent = Agent::new(
+        "agent-reregister".to_string(),
+        "ReRegister Test".to_string(),
+    );
     store.register(&agent).unwrap();
     store.heartbeat("agent-reregister").unwrap();
 
@@ -721,7 +833,10 @@ fn test_re_registration_preserves_startup_confirmed() {
     assert_eq!(confirmed, 1);
 
     // Re-register (simulates SessionStart hook re-firing)
-    let agent2 = Agent::new("agent-reregister".to_string(), "ReRegister Test v2".to_string());
+    let agent2 = Agent::new(
+        "agent-reregister".to_string(),
+        "ReRegister Test v2".to_string(),
+    );
     store.register(&agent2).unwrap();
 
     // startup_confirmed must still be 1 (not reset to 0)
@@ -732,7 +847,10 @@ fn test_re_registration_preserves_startup_confirmed() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(confirmed, 1, "Re-registration must not reset startup_confirmed");
+    assert_eq!(
+        confirmed, 1,
+        "Re-registration must not reset startup_confirmed"
+    );
 
     // Backdate registered_at and verify NOT detected as failed startup
     let old_time = (Utc::now() - Duration::seconds(120)).to_rfc3339();
@@ -742,7 +860,10 @@ fn test_re_registration_preserves_startup_confirmed() {
     )
     .unwrap();
     let failed = store.list_failed_startup(60).unwrap();
-    assert!(failed.is_empty(), "Confirmed agent must not appear as failed startup after re-registration");
+    assert!(
+        failed.is_empty(),
+        "Confirmed agent must not appear as failed startup after re-registration"
+    );
 }
 
 #[test]
@@ -766,7 +887,10 @@ fn test_revive_sets_startup_confirmed() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(confirmed, 1, "Revived agent must have startup_confirmed = 1");
+    assert_eq!(
+        confirmed, 1,
+        "Revived agent must have startup_confirmed = 1"
+    );
 
     // Backdate and verify NOT detected as failed startup
     let old_time = (Utc::now() - Duration::seconds(120)).to_rfc3339();
@@ -776,7 +900,10 @@ fn test_revive_sets_startup_confirmed() {
     )
     .unwrap();
     let failed = store.list_failed_startup(60).unwrap();
-    assert!(failed.is_empty(), "Revived agent must not be detected as failed startup");
+    assert!(
+        failed.is_empty(),
+        "Revived agent must not be detected as failed startup"
+    );
 }
 
 #[test]
@@ -801,7 +928,10 @@ fn test_lease_release_atomically_decrements_active_tasks() {
     store.release_lease("task-a", "agent-atomic").unwrap();
 
     let agent = store.get("agent-atomic").unwrap();
-    assert_eq!(agent.active_tasks, 1, "active_tasks should decrement atomically on release");
+    assert_eq!(
+        agent.active_tasks, 1,
+        "active_tasks should decrement atomically on release"
+    );
 
     // Verify lease status changed
     let lease = store.get_lease("task-a").unwrap();
@@ -832,7 +962,10 @@ fn test_lease_release_for_task_atomically_decrements_active_tasks() {
     assert!(released, "Should return true when a lease was released");
 
     let agent = store.get("agent-fortask").unwrap();
-    assert_eq!(agent.active_tasks, 0, "active_tasks should decrement atomically on task-close release");
+    assert_eq!(
+        agent.active_tasks, 0,
+        "active_tasks should decrement atomically on task-close release"
+    );
 
     // Verify release was logged with "Task closed" note
     let history = store.get_lease_history("task-close", Some(1)).unwrap();
@@ -866,7 +999,13 @@ fn test_agent_unregister_releases_leases_atomically() {
 
     // Leases should be released (not active)
     let lease1 = store.get_lease("task-u1").unwrap();
-    assert!(lease1.is_none(), "Lease should be released after unregister");
+    assert!(
+        lease1.is_none(),
+        "Lease should be released after unregister"
+    );
     let lease2 = store.get_lease("task-u2").unwrap();
-    assert!(lease2.is_none(), "Lease should be released after unregister");
+    assert!(
+        lease2.is_none(),
+        "Lease should be released after unregister"
+    );
 }

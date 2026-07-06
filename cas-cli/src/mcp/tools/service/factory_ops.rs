@@ -69,9 +69,24 @@ pub(crate) fn build_spawn_spec_json(
         effort: parsed_effort,
     };
 
-    let json = serde_json::to_string(&spec)
-        .map_err(|e| format!("failed to serialize WorkerSpec: {e}"))?;
+    let json =
+        serde_json::to_string(&spec).map_err(|e| format!("failed to serialize WorkerSpec: {e}"))?;
     Ok(Some(json))
+}
+
+fn current_factory_session() -> Option<String> {
+    std::env::var("CAS_FACTORY_SESSION")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+}
+
+fn parse_worker_name_filter(filter: Option<&String>) -> std::collections::HashSet<String> {
+    filter
+        .into_iter()
+        .flat_map(|names| names.split(','))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 impl CasService {
@@ -144,8 +159,15 @@ impl CasService {
         )
         .map_err(|e| Self::error(ErrorCode::INVALID_PARAMS, e))?;
 
+        let factory_session = current_factory_session();
         let request_id = queue
-            .enqueue_spawn(count, &worker_names, isolate, spec_json_owned.as_deref())
+            .enqueue_spawn(
+                count,
+                &worker_names,
+                isolate,
+                spec_json_owned.as_deref(),
+                factory_session.as_deref(),
+            )
             .map_err(|e| {
                 Self::error(
                     ErrorCode::INTERNAL_ERROR,
@@ -215,10 +237,12 @@ impl CasService {
 
             // Get worker names, scoped to this supervisor's workers when applicable
             let owned = supervisor_owned_workers();
+            let factory_session = current_factory_session();
             let known_workers: std::collections::HashSet<String> = known_agents
                 .iter()
                 .filter(|a| {
                     a.role == AgentRole::Worker
+                        && a.visible_to_factory_session(factory_session.as_deref())
                         && owned.as_ref().is_none_or(|set| set.contains(&a.name))
                 })
                 .map(|a| a.name.clone())
@@ -258,8 +282,9 @@ impl CasService {
 
         let count = req.count;
         let force = req.force.unwrap_or(false);
+        let factory_session = current_factory_session();
         let request_id = queue
-            .enqueue_shutdown(count, &worker_names, force)
+            .enqueue_shutdown(count, &worker_names, force, factory_session.as_deref())
             .map_err(|e| {
                 Self::error(
                     ErrorCode::INTERNAL_ERROR,
@@ -354,8 +379,7 @@ impl CasService {
         // emits checkpoint events but no edits; showing "last activity: 45s ago
         // (checkpoint)" is the signal that tells the supervisor NOT to reset.
         const ACTIVITY_WINDOW_SECS: i64 = 600;
-        let activity_cutoff =
-            chrono::Utc::now() - chrono::Duration::seconds(ACTIVITY_WINDOW_SECS);
+        let activity_cutoff = chrono::Utc::now() - chrono::Duration::seconds(ACTIVITY_WINDOW_SECS);
         let activity_events: Vec<cas_types::Event> = {
             use cas_store::{EventStore, SqliteEventStore};
             SqliteEventStore::open(&self.inner.cas_root)
@@ -368,8 +392,12 @@ impl CasService {
         let mut active_io_suppressed: std::collections::HashSet<String> =
             std::collections::HashSet::new();
         let mut stale_pruned = 0usize;
+        let factory_session = current_factory_session();
         if let Ok(stale_agents) = store.list_stale(worker_stale_threshold_secs) {
             for agent in stale_agents {
+                if !agent.visible_to_factory_session(factory_session.as_deref()) {
+                    continue;
+                }
                 if agent.role == AgentRole::Supervisor || agent.role == AgentRole::Director {
                     continue;
                 }
@@ -384,12 +412,17 @@ impl CasService {
             }
         }
 
-        let agents = store.list(Some(AgentStatus::Active)).map_err(|e| {
-            Self::error(
-                ErrorCode::INTERNAL_ERROR,
-                format!("Failed to list agents: {e}"),
-            )
-        })?;
+        let agents: Vec<_> = store
+            .list(Some(AgentStatus::Active))
+            .map_err(|e| {
+                Self::error(
+                    ErrorCode::INTERNAL_ERROR,
+                    format!("Failed to list agents: {e}"),
+                )
+            })?
+            .into_iter()
+            .filter(|a| a.visible_to_factory_session(factory_session.as_deref()))
+            .collect();
 
         if agents.is_empty() {
             return Ok(Self::success(
@@ -477,10 +510,7 @@ impl CasService {
                 // but for now `id` is the right key and has been correct
                 // since cas-2749.
                 let transcript_info = if elapsed >= WORKER_DEAD_SECS {
-                    let session_id = agent
-                        .cc_session_id
-                        .as_deref()
-                        .unwrap_or(&agent.id);
+                    let session_id = agent.cc_session_id.as_deref().unwrap_or(&agent.id);
                     format_transcript_block(clone_path.as_deref(), session_id)
                 } else {
                     String::new()
@@ -537,7 +567,10 @@ impl CasService {
                         "\n    ⚠ STALLED: no activity in last 10m while task in progress"
                             .to_string()
                     }
-                    (None, false) => "\n    last activity: none in last 10m (may be investigating or idle)".to_string(),
+                    (None, false) => {
+                        "\n    last activity: none in last 10m (may be investigating or idle)"
+                            .to_string()
+                    }
                 };
                 output.push_str(&format!(
                     "  • {} (heartbeat: {}){}{}{}{}{}{}\n    session: {}\n",
@@ -567,8 +600,9 @@ impl CasService {
         &self,
         req: FactoryRequest,
     ) -> Result<CallToolResult, McpError> {
+        use crate::store::open_agent_store;
         use cas_store::{EventStore, SqliteEventStore};
-        use cas_types::EventType;
+        use cas_types::{AgentRole, AgentStatus, EventType};
 
         let event_store = SqliteEventStore::open(&self.inner.cas_root).map_err(|e| {
             Self::error(
@@ -577,9 +611,44 @@ impl CasService {
             )
         })?;
 
-        // Filter by worker name if specified, otherwise scope to this supervisor's workers
-        let worker_filter = req.worker_names.as_ref();
+        // Filter by worker name if specified, otherwise scope to this supervisor's workers.
+        // `target` is accepted as a legacy alias for manual calls.
+        let target_filter = req.worker_names.as_ref().or(req.target.as_ref());
+        let requested_names = parse_worker_name_filter(target_filter);
         let owned = supervisor_owned_workers();
+        let factory_session = current_factory_session();
+        let agent_store = open_agent_store(&self.inner.cas_root).map_err(|e| {
+            Self::error(
+                ErrorCode::INTERNAL_ERROR,
+                format!("Failed to open agent store: {e}"),
+            )
+        })?;
+        let mut visible_workers: Vec<_> = agent_store
+            .list(None)
+            .map_err(|e| {
+                Self::error(
+                    ErrorCode::INTERNAL_ERROR,
+                    format!("Failed to list agents: {e}"),
+                )
+            })?
+            .into_iter()
+            .filter(|a| {
+                a.role == AgentRole::Worker
+                    && matches!(a.status, AgentStatus::Active | AgentStatus::Idle)
+                    && a.visible_to_factory_session(factory_session.as_deref())
+                    && owned.as_ref().is_none_or(|set| set.contains(&a.name))
+            })
+            .collect();
+
+        if !requested_names.is_empty() {
+            visible_workers
+                .retain(|a| requested_names.contains(&a.name) || requested_names.contains(&a.id));
+        }
+
+        let visible_worker_ids: std::collections::HashSet<String> =
+            visible_workers.iter().map(|a| a.id.clone()).collect();
+        let visible_worker_names: std::collections::HashSet<String> =
+            visible_workers.iter().map(|a| a.name.clone()).collect();
 
         // Get recent worker activity events
         let events = event_store.list_recent(50).map_err(|e| {
@@ -605,20 +674,11 @@ impl CasService {
                 )
             })
             .filter(|e| {
-                let name_matches = |name: &str| {
-                    e.session_id
-                        .as_ref()
-                        .map(|s| s.contains(name))
-                        .unwrap_or(false)
-                        || e.entity_id.contains(name)
-                };
-                if let Some(filter) = worker_filter {
-                    name_matches(filter.as_str())
-                } else if let Some(set) = &owned {
-                    set.iter().any(|w| name_matches(w.as_str()))
-                } else {
-                    true
-                }
+                e.session_id
+                    .as_ref()
+                    .is_some_and(|id| visible_worker_ids.contains(id))
+                    || visible_worker_ids.contains(&e.entity_id)
+                    || visible_worker_names.contains(&e.entity_id)
             })
             .take(20)
             .collect();
@@ -689,7 +749,7 @@ impl CasService {
             .unwrap_or_else(|_| "unknown".to_string());
 
         // Enqueue /clear directly without XML wrapping - this is a raw command
-        let factory_session = std::env::var("CAS_FACTORY_SESSION").ok();
+        let factory_session = current_factory_session();
         if let Some(ref session) = factory_session {
             queue
                 .enqueue_with_session(&source, &target, "/clear", session)
@@ -819,6 +879,7 @@ impl CasService {
         })?;
 
         let owned = supervisor_owned_workers();
+        let factory_session = current_factory_session();
         let mut workers: Vec<_> = store
             .list(Some(AgentStatus::Active))
             .map_err(|e| {
@@ -830,6 +891,7 @@ impl CasService {
             .into_iter()
             .filter(|a| {
                 a.role == AgentRole::Worker
+                    && a.visible_to_factory_session(factory_session.as_deref())
                     && owned.as_ref().is_none_or(|set| set.contains(&a.name))
             })
             .collect();
@@ -1102,10 +1164,8 @@ impl CasService {
             )
         })?;
 
-        let close_project_root =
-            self.inner.cas_root.parent().unwrap_or(&self.inner.cas_root);
-        let statuses =
-            collect_epic_branch_statuses(&subtasks, parent_branch, close_project_root);
+        let close_project_root = self.inner.cas_root.parent().unwrap_or(&self.inner.cas_root);
+        let statuses = collect_epic_branch_statuses(&subtasks, parent_branch, close_project_root);
         let report = render_epic_status_report(epic_id, parent_branch, &statuses);
 
         Ok(Self::success(report))
@@ -1225,7 +1285,11 @@ fn collect_worker_worktree_status(
     let resolved_path = metadata_clone_path
         .clone()
         .filter(|path| std::path::Path::new(path).exists())
-        .or_else(|| inferred_path.exists().then(|| inferred_path.display().to_string()));
+        .or_else(|| {
+            inferred_path
+                .exists()
+                .then(|| inferred_path.display().to_string())
+        });
 
     if let Some(clone_path) = resolved_path {
         let gs = collect_worker_git_status(std::path::Path::new(&clone_path));
@@ -1345,10 +1409,7 @@ fn format_relative_time(dt: chrono::DateTime<chrono::Utc>) -> String {
 /// Matching is done by `session_id == agent_id` (the CC session UUID, set
 /// identically in `agent.id` and `event.session_id` since daemon.rs stores
 /// both from the same session_id field).
-pub(crate) fn has_recent_worker_io_activity(
-    events: &[cas_types::Event],
-    agent_id: &str,
-) -> bool {
+pub(crate) fn has_recent_worker_io_activity(events: &[cas_types::Event], agent_id: &str) -> bool {
     use cas_types::EventType;
     events.iter().any(|e| {
         matches!(
@@ -1386,10 +1447,7 @@ pub(crate) fn last_worker_activity_secs(
     use cas_types::EventType;
     events
         .iter()
-        .filter(|e| {
-            e.session_id.as_deref() == Some(agent_id)
-                || e.entity_id == agent_id
-        })
+        .filter(|e| e.session_id.as_deref() == Some(agent_id) || e.entity_id == agent_id)
         .map(|e| {
             let elapsed = (chrono::Utc::now() - e.created_at).num_seconds().max(0);
             let phase: &'static str = match e.event_type {
@@ -1573,8 +1631,7 @@ pub(crate) fn resolve_transcript(
         1 => TranscriptResolution::Resolved(matches.remove(0)),
         _ => TranscriptResolution::Ambiguous {
             matches,
-            synthesized: synthesized
-                .unwrap_or_else(|| synthesized_unknown_clone_path(session_id)),
+            synthesized: synthesized.unwrap_or_else(|| synthesized_unknown_clone_path(session_id)),
             truncated,
         },
     }
@@ -1856,7 +1913,11 @@ pub(crate) fn collect_worker_git_status(worktree_path: &std::path::Path) -> Work
         let origin_ref = format!("origin/{branch}");
         let exists = run_git(
             worktree_path,
-            &["rev-parse", "--verify", &format!("refs/remotes/{origin_ref}")],
+            &[
+                "rev-parse",
+                "--verify",
+                &format!("refs/remotes/{origin_ref}"),
+            ],
         )
         .is_ok();
         if exists {
@@ -1874,14 +1935,7 @@ pub(crate) fn collect_worker_git_status(worktree_path: &std::path::Path) -> Work
     } else {
         std::process::Command::new("gh")
             .args([
-                "pr",
-                "list",
-                "--head",
-                &branch,
-                "--json",
-                "url",
-                "--jq",
-                ".[0].url",
+                "pr", "list", "--head", &branch, "--json", "url", "--jq", ".[0].url",
             ])
             .current_dir(worktree_path)
             .output()
@@ -1954,9 +2008,7 @@ mod tests {
     /// the `projects` subdir path. `projects` is populated with `dirs`
     /// entries, each containing a `<session_id>.jsonl` for sessions in
     /// that dir's `contains_sessions` list.
-    fn fake_projects_dir(
-        dirs: &[(&str, &[&str])],
-    ) -> (tempfile::TempDir, std::path::PathBuf) {
+    fn fake_projects_dir(dirs: &[(&str, &[&str])]) -> (tempfile::TempDir, std::path::PathBuf) {
         let tmp = tempfile::tempdir().expect("tempdir");
         let projects = tmp.path().join("projects");
         std::fs::create_dir_all(&projects).unwrap();
@@ -2050,7 +2102,10 @@ mod tests {
         // would fail here.
         let stale = liveness_label_for(WORKER_STALE_SECS);
         let dead = liveness_label_for(WORKER_DEAD_SECS);
-        assert_ne!(stale, dead, "stale and DEAD bands must render distinct labels");
+        assert_ne!(
+            stale, dead,
+            "stale and DEAD bands must render distinct labels"
+        );
         assert!(stale.contains("stale"));
         assert!(dead.contains("DEAD"));
     }
@@ -2106,9 +2161,11 @@ mod tests {
     /// No events for THIS agent (events exist for another) → None.
     #[test]
     fn last_worker_activity_returns_none_when_no_events_for_agent() {
-        let events = vec![
-            make_event(cas_types::EventType::WorkerFileEdited, "other-agent", 10),
-        ];
+        let events = vec![make_event(
+            cas_types::EventType::WorkerFileEdited,
+            "other-agent",
+            10,
+        )];
         let got = last_worker_activity_secs(&events, "my-agent");
         assert!(
             got.is_none(),
@@ -2119,23 +2176,30 @@ mod tests {
     /// WorkerFileEdited → "editing" phase label.
     #[test]
     fn last_worker_activity_phase_file_edited_is_editing() {
-        let events = vec![
-            make_event(cas_types::EventType::WorkerFileEdited, "agent-x", 5),
-        ];
-        let (elapsed, phase) = last_worker_activity_secs(&events, "agent-x")
-            .expect("must find the event");
+        let events = vec![make_event(
+            cas_types::EventType::WorkerFileEdited,
+            "agent-x",
+            5,
+        )];
+        let (elapsed, phase) =
+            last_worker_activity_secs(&events, "agent-x").expect("must find the event");
         assert_eq!(phase, "editing");
-        assert!(elapsed >= 4 && elapsed <= 7, "elapsed should be ~5s: {elapsed}");
+        assert!(
+            elapsed >= 4 && elapsed <= 7,
+            "elapsed should be ~5s: {elapsed}"
+        );
     }
 
     /// WorkerGitCommit → "checkpoint" phase label (cas-86c5: renamed from session-stop).
     #[test]
     fn last_worker_activity_phase_git_commit_is_checkpoint() {
-        let events = vec![
-            make_event(cas_types::EventType::WorkerGitCommit, "agent-y", 20),
-        ];
-        let (_, phase) = last_worker_activity_secs(&events, "agent-y")
-            .expect("must find the event");
+        let events = vec![make_event(
+            cas_types::EventType::WorkerGitCommit,
+            "agent-y",
+            20,
+        )];
+        let (_, phase) =
+            last_worker_activity_secs(&events, "agent-y").expect("must find the event");
         assert_eq!(phase, "checkpoint");
     }
 
@@ -2143,13 +2207,19 @@ mod tests {
     #[test]
     fn last_worker_activity_returns_freshest_event() {
         let events = vec![
-            make_event(cas_types::EventType::WorkerGitCommit, "agent-z", 120),  // 2m old
-            make_event(cas_types::EventType::WorkerFileEdited, "agent-z", 15),  // 15s old
+            make_event(cas_types::EventType::WorkerGitCommit, "agent-z", 120), // 2m old
+            make_event(cas_types::EventType::WorkerFileEdited, "agent-z", 15), // 15s old
         ];
-        let (elapsed, phase) = last_worker_activity_secs(&events, "agent-z")
-            .expect("must find an event");
-        assert_eq!(phase, "editing", "freshest event should be the FileEdited at 15s");
-        assert!(elapsed >= 14 && elapsed <= 17, "elapsed should be ~15s: {elapsed}");
+        let (elapsed, phase) =
+            last_worker_activity_secs(&events, "agent-z").expect("must find an event");
+        assert_eq!(
+            phase, "editing",
+            "freshest event should be the FileEdited at 15s"
+        );
+        assert!(
+            elapsed >= 14 && elapsed <= 17,
+            "elapsed should be ~15s: {elapsed}"
+        );
     }
 
     // --- cas-900b: glob-first transcript resolution -------------------------
@@ -2176,16 +2246,13 @@ mod tests {
     fn resolve_transcript_returns_synthesized_on_no_match() {
         // cas-900b AC (2): no match → Synthesized fallback, preserves
         // legacy reconstruct semantics.
-        let (_tmp, projects) = fake_projects_dir(&[
-            ("-home-alice-workspace-one", &["unrelated"]),
-        ]);
+        let (_tmp, projects) = fake_projects_dir(&[("-home-alice-workspace-one", &["unrelated"])]);
         let got = resolve_transcript(
             Some(&projects),
             Some("/home/alice/workspace/one"),
             TEST_SESSION,
         );
-        let expected =
-            synthesized_transcript_path("/home/alice/workspace/one", TEST_SESSION);
+        let expected = synthesized_transcript_path("/home/alice/workspace/one", TEST_SESSION);
         assert_eq!(got, TranscriptResolution::Synthesized(expected));
     }
 
@@ -2238,9 +2305,7 @@ mod tests {
         // codepoint) BUT the real CC escape might differ. With glob-first,
         // we don't care what escape CC chose — if the file exists, we find
         // it via session_id alone.
-        let (_tmp, projects) = fake_projects_dir(&[
-            ("-home-usér-projet-café", &[TEST_SESSION]),
-        ]);
+        let (_tmp, projects) = fake_projects_dir(&[("-home-usér-projet-café", &[TEST_SESSION])]);
         let got = resolve_transcript(
             Some(&projects),
             Some("/home/usér/projet/café"),
@@ -2616,11 +2681,7 @@ mod tests {
             r#"{{"type":"user","message":{{"content":"hello"}}}}"#
         )
         .unwrap();
-        writeln!(
-            tmp.as_file(),
-            r#"{{"type":"attachment","content":"data"}}"#
-        )
-        .unwrap();
+        writeln!(tmp.as_file(), r#"{{"type":"attachment","content":"data"}}"#).unwrap();
 
         let total = read_context_usage_from_tail(path);
         assert!(total.is_none(), "no assistant entry → should return None");
@@ -2644,21 +2705,53 @@ mod tests {
         let dir = tmp.path();
 
         // Init
-        Command::new("git").args(["init", "-b", "main"]).current_dir(dir).output().unwrap();
-        Command::new("git").args(["config", "user.email", "test@cas"]).current_dir(dir).output().unwrap();
-        Command::new("git").args(["config", "user.name", "CAS Test"]).current_dir(dir).output().unwrap();
+        Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@cas"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "CAS Test"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
 
         // Initial commit on main
         std::fs::write(dir.join("README"), "init").unwrap();
-        Command::new("git").args(["add", "README"]).current_dir(dir).output().unwrap();
-        Command::new("git").args(["commit", "-m", "init"]).current_dir(dir).output().unwrap();
+        Command::new("git")
+            .args(["add", "README"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
 
         // Create factory branch and make one commit
         let branch = format!("factory/{worker}");
-        Command::new("git").args(["checkout", "-b", &branch]).current_dir(dir).output().unwrap();
+        Command::new("git")
+            .args(["checkout", "-b", &branch])
+            .current_dir(dir)
+            .output()
+            .unwrap();
         std::fs::write(dir.join("work.rs"), "// task").unwrap();
-        Command::new("git").args(["add", "work.rs"]).current_dir(dir).output().unwrap();
-        Command::new("git").args(["commit", "-m", "feat: worker work"]).current_dir(dir).output().unwrap();
+        Command::new("git")
+            .args(["add", "work.rs"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "feat: worker work"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
 
         // Get the short SHA for assertions
         let sha_out = Command::new("git")
@@ -2727,7 +2820,10 @@ mod tests {
                 .current_dir(&project)
                 .status()
                 .unwrap();
-            assert!(status.success(), "git worktree add must succeed for {worker}");
+            assert!(
+                status.success(),
+                "git worktree add must succeed for {worker}"
+            );
         }
 
         (tmp, project)
@@ -2773,14 +2869,26 @@ mod tests {
             pr_url: "https://github.com/org/repo/pull/42".to_string(),
         };
         let out = format_worker_git_status(&gs);
-        assert!(!out.is_empty(), "format_worker_git_status must not return empty string");
-        assert!(out.contains("factory/myworker"), "must contain branch name: {out}");
+        assert!(
+            !out.is_empty(),
+            "format_worker_git_status must not return empty string"
+        );
+        assert!(
+            out.contains("factory/myworker"),
+            "must contain branch name: {out}"
+        );
         assert!(out.contains("abc1234"), "must contain HEAD sha: {out}");
         assert!(out.contains("ahead"), "must contain 'ahead' label: {out}");
         assert!(out.contains("behind"), "must contain 'behind' label: {out}");
         assert!(out.contains("PR"), "must contain 'PR' label: {out}");
-        assert!(out.contains("origin/factory/myworker"), "must contain pushed_ref: {out}");
-        assert!(out.contains("https://github.com"), "must contain PR URL: {out}");
+        assert!(
+            out.contains("origin/factory/myworker"),
+            "must contain pushed_ref: {out}"
+        );
+        assert!(
+            out.contains("https://github.com"),
+            "must contain PR URL: {out}"
+        );
     }
 
     /// AC2 (cas-844bf): when gh is unavailable / not pushed, pr_url and
@@ -2813,7 +2921,10 @@ mod tests {
             pr_url: "none".to_string(),
         };
         let out = format_worker_git_status(&gs);
-        assert!(!out.is_empty(), "format must not return empty for dirty worker: {out}");
+        assert!(
+            !out.is_empty(),
+            "format must not return empty for dirty worker: {out}"
+        );
         assert!(
             out.contains("dirty") || out.contains("[dirty]"),
             "dirty state must be visible in output: {out}"
@@ -2889,7 +3000,10 @@ mod tests {
         let expected_path = cas_root.join("worktrees/codex-jester");
         let expected_path_str = expected_path.to_string_lossy().to_string();
 
-        assert_eq!(status.clone_path.as_deref(), Some(expected_path_str.as_str()));
+        assert_eq!(
+            status.clone_path.as_deref(),
+            Some(expected_path_str.as_str())
+        );
         assert!(
             status.clone_info.contains("[missing-worktree]"),
             "missing worktree state must be explicit: {:?}",

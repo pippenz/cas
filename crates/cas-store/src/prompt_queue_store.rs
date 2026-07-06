@@ -28,6 +28,9 @@ pub struct QueuedPrompt {
     pub created_at: DateTime<Utc>,
     /// When the prompt was processed (None if pending)
     pub processed_at: Option<DateTime<Utc>>,
+    /// Owning factory session for session-scoped delivery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub factory_session: Option<String>,
     /// Short summary for UI display
     pub summary: Option<String>,
     /// Message priority (lower = higher priority)
@@ -145,7 +148,15 @@ pub trait PromptQueueStore: Send + Sync {
         summary: Option<&str>,
         priority: Option<NotificationPriority>,
     ) -> Result<i64> {
-        self.enqueue_urgent(source, target, prompt, factory_session, summary, priority, false)
+        self.enqueue_urgent(
+            source,
+            target,
+            prompt,
+            factory_session,
+            summary,
+            priority,
+            false,
+        )
     }
 
     /// Queue a prompt with all options, including the cas-c931 `urgent` flag.
@@ -168,6 +179,18 @@ pub trait PromptQueueStore: Send + Sync {
     /// Poll for pending prompts for a specific target (marks as processed)
     fn poll_for_target(&self, target: &str, limit: usize) -> Result<Vec<QueuedPrompt>>;
 
+    /// Poll for pending prompts for a specific target within a factory session.
+    ///
+    /// `None` preserves legacy behavior. When a session is supplied, tagged
+    /// rows only match that session, while NULL-session legacy rows still use
+    /// the historical target/all_workers matching path.
+    fn poll_for_target_with_session(
+        &self,
+        target: &str,
+        factory_session: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<QueuedPrompt>>;
+
     /// Poll all pending prompts (for Factory TUI to process)
     fn poll_all(&self, limit: usize) -> Result<Vec<QueuedPrompt>>;
 
@@ -176,9 +199,9 @@ pub trait PromptQueueStore: Send + Sync {
 
     /// Peek at pending prompts for specific targets only.
     ///
-    /// Only returns messages whose target is in `targets`.
-    /// When `factory_session` is provided, also returns session-tagged messages
-    /// for that session (even if target doesn't match — belt-and-suspenders).
+    /// Only returns legacy NULL-session messages whose target is in `targets`.
+    /// When `factory_session` is provided, also returns all session-tagged
+    /// messages for that exact session.
     /// This prevents one factory daemon from consuming messages meant for
     /// another daemon's workers/supervisor in multi-session setups.
     fn peek_for_targets(
@@ -246,6 +269,7 @@ impl SqlitePromptQueueStore {
         let acked_at = acked_at_str.and_then(|s| Self::parse_datetime(&s));
         // Column 9 = urgent (cas-c931). Tolerate absence on legacy rows/tables.
         let urgent: bool = row.get::<_, i64>(9).map(|v| v != 0).unwrap_or(false);
+        let factory_session: Option<String> = row.get(10).unwrap_or(None);
 
         Ok(QueuedPrompt {
             id: row.get(0)?,
@@ -254,6 +278,7 @@ impl SqlitePromptQueueStore {
             prompt: row.get(3)?,
             created_at: Self::parse_datetime(&row.get::<_, String>(4)?).unwrap_or_else(Utc::now),
             processed_at,
+            factory_session,
             summary,
             priority: NotificationPriority::from(priority),
             acked_at,
@@ -335,102 +360,138 @@ impl PromptQueueStore for SqlitePromptQueueStore {
         urgent: bool,
     ) -> Result<i64> {
         crate::shared_db::with_write_retry(|| {
-        let conn = self.conn.lock().unwrap();
-        let now = Utc::now().to_rfc3339();
-        let prio: i32 = priority.unwrap_or(NotificationPriority::Normal).into();
-        let urgent_flag: i64 = if urgent { 1 } else { 0 };
+            let conn = self.conn.lock().unwrap();
+            let now = Utc::now().to_rfc3339();
+            let prio: i32 = priority.unwrap_or(NotificationPriority::Normal).into();
+            let urgent_flag: i64 = if urgent { 1 } else { 0 };
 
-        conn.execute(
+            conn.execute(
             "INSERT INTO prompt_queue (source, target, prompt, created_at, factory_session, summary, priority, urgent) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             params![source, target, prompt, now, factory_session, summary, prio, urgent_flag],
         )?;
 
-        let id = conn.last_insert_rowid();
-        let _ = capture_message_event(&conn, source, target);
-        Ok(id)
+            let id = conn.last_insert_rowid();
+            let _ = capture_message_event(&conn, source, target);
+            Ok(id)
         }) // with_write_retry
     }
 
     fn poll_for_target(&self, target: &str, limit: usize) -> Result<Vec<QueuedPrompt>> {
-        crate::shared_db::with_write_retry(|| {
-        let conn = self.conn.lock().unwrap();
-        let now = Utc::now().to_rfc3339();
+        self.poll_for_target_with_session(target, None, limit)
+    }
 
-        // Get pending prompts for this target or "all_workers"
-        let mut stmt = conn.prepare_cached(
-            "SELECT id, source, target, prompt, created_at, processed_at, summary, priority, acked_at, urgent
+    fn poll_for_target_with_session(
+        &self,
+        target: &str,
+        factory_session: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<QueuedPrompt>> {
+        crate::shared_db::with_write_retry(|| {
+            let conn = self.conn.lock().unwrap();
+            let now = Utc::now().to_rfc3339();
+
+            let (sql, prompt_params): (&str, Vec<Box<dyn rusqlite::ToSql>>) = if let Some(session) =
+                factory_session
+            {
+                (
+                    "SELECT id, source, target, prompt, created_at, processed_at, summary, priority, acked_at, urgent, factory_session
+             FROM prompt_queue
+             WHERE processed_at IS NULL
+               AND (
+                    (factory_session = ? AND (target = ? OR target = 'all_workers'))
+                    OR (factory_session IS NULL AND (target = ? OR target = 'all_workers'))
+               )
+             ORDER BY priority ASC, id ASC
+             LIMIT ?",
+                    vec![
+                        Box::new(session.to_string()),
+                        Box::new(target.to_string()),
+                        Box::new(target.to_string()),
+                        Box::new(limit as i64),
+                    ],
+                )
+            } else {
+                (
+                    "SELECT id, source, target, prompt, created_at, processed_at, summary, priority, acked_at, urgent, factory_session
              FROM prompt_queue
              WHERE (target = ? OR target = 'all_workers') AND processed_at IS NULL
              ORDER BY priority ASC, id ASC
              LIMIT ?",
-        )?;
+                    vec![Box::new(target.to_string()), Box::new(limit as i64)],
+                )
+            };
 
-        let prompts: Vec<QueuedPrompt> = stmt
-            .query_map(params![target, limit as i64], Self::prompt_from_row)?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+            let mut stmt = conn.prepare_cached(sql)?;
 
-        // Mark them as processed
-        if !prompts.is_empty() {
-            let ids: Vec<i64> = prompts.iter().map(|p| p.id).collect();
-            let placeholders: Vec<String> = ids.iter().map(|_| "?".to_string()).collect();
-            let sql = format!(
-                "UPDATE prompt_queue SET processed_at = ? WHERE id IN ({})",
-                placeholders.join(", ")
-            );
+            let prompts: Vec<QueuedPrompt> = stmt
+                .query_map(
+                    rusqlite::params_from_iter(prompt_params.iter().map(|p| p.as_ref())),
+                    Self::prompt_from_row,
+                )?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
 
-            let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(now)];
-            for id in ids {
-                params.push(Box::new(id));
+            // Mark them as processed
+            if !prompts.is_empty() {
+                let ids: Vec<i64> = prompts.iter().map(|p| p.id).collect();
+                let placeholders: Vec<String> = ids.iter().map(|_| "?".to_string()).collect();
+                let sql = format!(
+                    "UPDATE prompt_queue SET processed_at = ? WHERE id IN ({})",
+                    placeholders.join(", ")
+                );
+
+                let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(now)];
+                for id in ids {
+                    params.push(Box::new(id));
+                }
+
+                conn.execute(
+                    &sql,
+                    rusqlite::params_from_iter(params.iter().map(|p| p.as_ref())),
+                )?;
             }
 
-            conn.execute(
-                &sql,
-                rusqlite::params_from_iter(params.iter().map(|p| p.as_ref())),
-            )?;
-        }
-
-        Ok(prompts)
+            Ok(prompts)
         }) // with_write_retry
     }
 
     fn poll_all(&self, limit: usize) -> Result<Vec<QueuedPrompt>> {
         crate::shared_db::with_write_retry(|| {
-        let conn = self.conn.lock().unwrap();
-        let now = Utc::now().to_rfc3339();
+            let conn = self.conn.lock().unwrap();
+            let now = Utc::now().to_rfc3339();
 
-        let mut stmt = conn.prepare_cached(
-            "SELECT id, source, target, prompt, created_at, processed_at, summary, priority, acked_at, urgent
+            let mut stmt = conn.prepare_cached(
+            "SELECT id, source, target, prompt, created_at, processed_at, summary, priority, acked_at, urgent, factory_session
              FROM prompt_queue
              WHERE processed_at IS NULL
              ORDER BY priority ASC, id ASC
              LIMIT ?",
         )?;
 
-        let prompts: Vec<QueuedPrompt> = stmt
-            .query_map(params![limit as i64], Self::prompt_from_row)?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+            let prompts: Vec<QueuedPrompt> = stmt
+                .query_map(params![limit as i64], Self::prompt_from_row)?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
 
-        // Mark them as processed
-        if !prompts.is_empty() {
-            let ids: Vec<i64> = prompts.iter().map(|p| p.id).collect();
-            let placeholders: Vec<String> = ids.iter().map(|_| "?".to_string()).collect();
-            let sql = format!(
-                "UPDATE prompt_queue SET processed_at = ? WHERE id IN ({})",
-                placeholders.join(", ")
-            );
+            // Mark them as processed
+            if !prompts.is_empty() {
+                let ids: Vec<i64> = prompts.iter().map(|p| p.id).collect();
+                let placeholders: Vec<String> = ids.iter().map(|_| "?".to_string()).collect();
+                let sql = format!(
+                    "UPDATE prompt_queue SET processed_at = ? WHERE id IN ({})",
+                    placeholders.join(", ")
+                );
 
-            let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(now)];
-            for id in ids {
-                params.push(Box::new(id));
+                let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(now)];
+                for id in ids {
+                    params.push(Box::new(id));
+                }
+
+                conn.execute(
+                    &sql,
+                    rusqlite::params_from_iter(params.iter().map(|p| p.as_ref())),
+                )?;
             }
 
-            conn.execute(
-                &sql,
-                rusqlite::params_from_iter(params.iter().map(|p| p.as_ref())),
-            )?;
-        }
-
-        Ok(prompts)
+            Ok(prompts)
         }) // with_write_retry
     }
 
@@ -438,7 +499,7 @@ impl PromptQueueStore for SqlitePromptQueueStore {
         let conn = self.conn.lock().unwrap();
 
         let mut stmt = conn.prepare_cached(
-            "SELECT id, source, target, prompt, created_at, processed_at, summary, priority, acked_at, urgent
+            "SELECT id, source, target, prompt, created_at, processed_at, summary, priority, acked_at, urgent, factory_session
              FROM prompt_queue
              WHERE processed_at IS NULL
              ORDER BY priority ASC, id ASC
@@ -464,15 +525,22 @@ impl PromptQueueStore for SqlitePromptQueueStore {
 
         let conn = self.conn.lock().unwrap();
 
-        // Build WHERE clause: match by target OR by factory_session.
-        // Target matching catches legacy messages (no session tag).
-        // Session matching catches new messages even if target list is stale.
+        // Target matching catches only legacy messages with no session tag.
+        // Session matching catches tagged messages for exactly this daemon's session.
         let mut conditions = Vec::new();
         let mut param_values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
         if !targets.is_empty() {
             let placeholders: Vec<&str> = std::iter::repeat_n("?", targets.len()).collect();
-            conditions.push(format!("target IN ({})", placeholders.join(", ")));
+            let target_clause = if factory_session.is_some() {
+                format!(
+                    "(factory_session IS NULL AND target IN ({}))",
+                    placeholders.join(", ")
+                )
+            } else {
+                format!("target IN ({})", placeholders.join(", "))
+            };
+            conditions.push(target_clause);
             for t in targets {
                 param_values.push(Box::new(t.to_string()));
             }
@@ -485,7 +553,7 @@ impl PromptQueueStore for SqlitePromptQueueStore {
 
         let where_clause = conditions.join(" OR ");
         let sql = format!(
-            "SELECT id, source, target, prompt, created_at, processed_at, summary, priority, acked_at, urgent
+            "SELECT id, source, target, prompt, created_at, processed_at, summary, priority, acked_at, urgent, factory_session
              FROM prompt_queue
              WHERE processed_at IS NULL
                AND ({where_clause})
@@ -508,30 +576,30 @@ impl PromptQueueStore for SqlitePromptQueueStore {
 
     fn mark_processed(&self, prompt_id: i64) -> Result<()> {
         crate::shared_db::with_write_retry(|| {
-        let conn = self.conn.lock().unwrap();
-        let now = Utc::now().to_rfc3339();
+            let conn = self.conn.lock().unwrap();
+            let now = Utc::now().to_rfc3339();
 
-        conn.execute(
-            "UPDATE prompt_queue SET processed_at = ? WHERE id = ?",
-            params![now, prompt_id],
-        )?;
+            conn.execute(
+                "UPDATE prompt_queue SET processed_at = ? WHERE id = ?",
+                params![now, prompt_id],
+            )?;
 
-        Ok(())
+            Ok(())
         }) // with_write_retry
     }
 
     fn ack(&self, prompt_id: i64) -> Result<()> {
         crate::shared_db::with_write_retry(|| {
-        let conn = self.conn.lock().unwrap();
-        let now = Utc::now().to_rfc3339();
+            let conn = self.conn.lock().unwrap();
+            let now = Utc::now().to_rfc3339();
 
-        conn.execute(
-            "UPDATE prompt_queue SET acked_at = ? WHERE id = ? AND acked_at IS NULL",
-            params![now, prompt_id],
-        )?;
+            conn.execute(
+                "UPDATE prompt_queue SET acked_at = ? WHERE id = ? AND acked_at IS NULL",
+                params![now, prompt_id],
+            )?;
 
-        // rows_affected == 0 means either not found or already acked — both idempotent
-        Ok(())
+            // rows_affected == 0 means either not found or already acked — both idempotent
+            Ok(())
         }) // with_write_retry
     }
 
@@ -540,7 +608,7 @@ impl PromptQueueStore for SqlitePromptQueueStore {
         let cutoff = (Utc::now() - chrono::Duration::seconds(timeout_secs)).to_rfc3339();
 
         let mut stmt = conn.prepare_cached(
-            "SELECT id, source, target, prompt, created_at, processed_at, summary, priority, acked_at, urgent
+            "SELECT id, source, target, prompt, created_at, processed_at, summary, priority, acked_at, urgent, factory_session
              FROM prompt_queue
              WHERE processed_at IS NOT NULL
                AND processed_at < ?
@@ -592,23 +660,23 @@ impl PromptQueueStore for SqlitePromptQueueStore {
 
     fn clear(&self) -> Result<usize> {
         crate::shared_db::with_write_retry(|| {
-        let conn = self.conn.lock().unwrap();
-        let rows = conn.execute("DELETE FROM prompt_queue", [])?;
-        Ok(rows)
+            let conn = self.conn.lock().unwrap();
+            let rows = conn.execute("DELETE FROM prompt_queue", [])?;
+            Ok(rows)
         }) // with_write_retry
     }
 
     fn cleanup_old(&self, older_than_secs: i64) -> Result<usize> {
         crate::shared_db::with_write_retry(|| {
-        let conn = self.conn.lock().unwrap();
-        let cutoff = (Utc::now() - chrono::Duration::seconds(older_than_secs)).to_rfc3339();
+            let conn = self.conn.lock().unwrap();
+            let cutoff = (Utc::now() - chrono::Duration::seconds(older_than_secs)).to_rfc3339();
 
-        let rows = conn.execute(
-            "DELETE FROM prompt_queue WHERE processed_at IS NOT NULL AND processed_at < ?",
-            params![cutoff],
-        )?;
+            let rows = conn.execute(
+                "DELETE FROM prompt_queue WHERE processed_at IS NOT NULL AND processed_at < ?",
+                params![cutoff],
+            )?;
 
-        Ok(rows)
+            Ok(rows)
         }) // with_write_retry
     }
 
@@ -748,6 +816,13 @@ mod tests {
             .unwrap();
         assert_eq!(prompts_a.len(), 3); // 2 session-tagged + 1 legacy by target match
         assert!(prompts_a.iter().all(|p| p.target != "worker-b1"));
+        assert_eq!(
+            prompts_a
+                .iter()
+                .filter(|p| p.factory_session.as_deref() == Some("session-a"))
+                .count(),
+            2
+        );
 
         // Session B should only see its own messages
         let targets_b = &["supervisor-b", "worker-b1", "all_workers"];
@@ -756,6 +831,7 @@ mod tests {
             .unwrap();
         assert_eq!(prompts_b.len(), 1);
         assert_eq!(prompts_b[0].target, "worker-b1");
+        assert_eq!(prompts_b[0].factory_session.as_deref(), Some("session-b"));
     }
 
     #[test]
@@ -770,17 +846,53 @@ mod tests {
         let all = store.peek_all(10).unwrap();
         assert_eq!(all.len(), 1);
 
-        // peek_for_targets with wrong session but matching target still sees it
+        // A tagged row must not leak to another session even when target matches.
         let by_target = store
             .peek_for_targets(&["worker-1"], Some("other-session"), 10)
             .unwrap();
-        assert_eq!(by_target.len(), 1); // target match
+        assert_eq!(by_target.len(), 0);
 
         // peek_for_targets with wrong target but matching session still sees it
         let by_session = store
             .peek_for_targets(&["nonexistent"], Some("my-session"), 10)
             .unwrap();
         assert_eq!(by_session.len(), 1); // session match
+        assert_eq!(by_session[0].factory_session.as_deref(), Some("my-session"));
+    }
+
+    #[test]
+    fn test_tagged_delivery_does_not_cross_sessions_on_name_collision() {
+        let (_temp, store) = create_test_store();
+
+        store
+            .enqueue_with_session("supervisor-a", "worker", "session A", "session-a")
+            .unwrap();
+        store
+            .enqueue_with_session("supervisor-b", "worker", "session B", "session-b")
+            .unwrap();
+        store
+            .enqueue("legacy-supervisor", "worker", "legacy")
+            .unwrap();
+
+        let session_a = store
+            .peek_for_targets(&["worker"], Some("session-a"), 10)
+            .unwrap();
+        assert_eq!(session_a.len(), 2);
+        assert!(session_a.iter().any(|p| p.prompt == "session A"));
+        assert!(session_a.iter().any(|p| p.prompt == "legacy"));
+        assert!(!session_a.iter().any(|p| p.prompt == "session B"));
+
+        let session_b = store
+            .poll_for_target_with_session("worker", Some("session-b"), 10)
+            .unwrap();
+        assert_eq!(session_b.len(), 2);
+        assert!(session_b.iter().any(|p| p.prompt == "session B"));
+        assert!(session_b.iter().any(|p| p.prompt == "legacy"));
+        assert!(!session_b.iter().any(|p| p.prompt == "session A"));
+
+        let remaining = store.peek_all(10).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].prompt, "session A");
     }
 
     #[test]
@@ -1062,7 +1174,10 @@ mod tests {
         let prompts = store.peek_all(10).unwrap();
         assert_eq!(prompts.len(), 1);
         assert_eq!(prompts[0].prompt, "legacy");
-        assert!(!prompts[0].urgent, "legacy rows must read back urgent=false");
+        assert!(
+            !prompts[0].urgent,
+            "legacy rows must read back urgent=false"
+        );
 
         // New urgent inserts work after migration.
         store

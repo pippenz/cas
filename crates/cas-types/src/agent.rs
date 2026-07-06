@@ -179,6 +179,14 @@ pub struct Agent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cc_session_id: Option<String>,
 
+    /// Owning factory session for agents spawned inside a factory.
+    ///
+    /// This is distinct from `cc_session_id`: each agent has its own Claude
+    /// Code session, while all agents in the same factory share one
+    /// `CAS_FACTORY_SESSION` value. `None` preserves legacy/non-factory rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub factory_session: Option<String>,
+
     /// Parent agent ID (for Task tool sub-agents, links to parent's agent ID)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<String>,
@@ -240,6 +248,7 @@ impl Agent {
             pid: None,
             ppid: None,
             cc_session_id: None,
+            factory_session: None,
             parent_id: None,
             machine_id: None,
             registered_at: now,
@@ -289,6 +298,17 @@ impl Agent {
     pub fn with_role(mut self, role: AgentRole) -> Self {
         self.role = role;
         self
+    }
+
+    /// Whether this agent is visible to a caller in the given factory session.
+    ///
+    /// `Some(session)` enforces strict same-session visibility. `None` preserves
+    /// legacy/non-factory behavior and does not filter by factory ownership.
+    pub fn visible_to_factory_session(&self, session: Option<&str>) -> bool {
+        match session {
+            Some(session) => self.factory_session.as_deref() == Some(session),
+            None => true,
+        }
     }
 
     /// Generate a fallback ID for agents without a Claude Code session

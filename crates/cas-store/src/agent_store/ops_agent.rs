@@ -19,6 +19,11 @@ impl SqliteAgentStore {
             let conn = self.lock_conn()?;
             let metadata_json =
                 serde_json::to_string(&agent.metadata).unwrap_or_else(|_| "{}".to_string());
+            let env_factory_session = std::env::var("CAS_FACTORY_SESSION").ok();
+            let factory_session = agent
+                .factory_session
+                .as_deref()
+                .or(env_factory_session.as_deref());
             let existed = conn
                 .query_row(
                     "SELECT 1 FROM agents WHERE id = ?1",
@@ -34,8 +39,8 @@ impl SqliteAgentStore {
             // live agent that re-registers doesn't get falsely detected as failed-startup.
             conn.execute(
             "INSERT INTO agents (id, name, agent_type, role, status, pid, ppid, cc_session_id, parent_id,
-             machine_id, registered_at, last_heartbeat, active_tasks, metadata, pid_starttime, startup_confirmed)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, 0)
+             machine_id, registered_at, last_heartbeat, active_tasks, metadata, pid_starttime, factory_session, startup_confirmed)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, 0)
              ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
                 agent_type = excluded.agent_type,
@@ -49,7 +54,8 @@ impl SqliteAgentStore {
                 last_heartbeat = excluded.last_heartbeat,
                 active_tasks = excluded.active_tasks,
                 metadata = excluded.metadata,
-                pid_starttime = excluded.pid_starttime",
+                pid_starttime = excluded.pid_starttime,
+                factory_session = COALESCE(excluded.factory_session, factory_session)",
             params![
                 agent.id,
                 agent.name,
@@ -66,6 +72,7 @@ impl SqliteAgentStore {
                 agent.active_tasks,
                 metadata_json,
                 agent.pid_starttime.map(|v| v as i64),
+                factory_session,
             ],
         )?;
 
@@ -92,7 +99,7 @@ impl SqliteAgentStore {
         let conn = self.lock_conn()?;
         conn.query_row(
             "SELECT id, name, agent_type, role, status, pid, ppid, cc_session_id, parent_id,
-             machine_id, registered_at, last_heartbeat, active_tasks, metadata, pid_starttime
+             machine_id, registered_at, last_heartbeat, active_tasks, metadata, pid_starttime, factory_session
              FROM agents WHERE id = ?",
             params![id],
             Self::agent_from_row,
@@ -102,82 +109,83 @@ impl SqliteAgentStore {
     }
     pub(crate) fn agent_update(&self, agent: &Agent) -> Result<()> {
         crate::shared_db::with_write_retry(|| {
-        let conn = self.lock_conn()?;
-        let metadata_json =
-            serde_json::to_string(&agent.metadata).unwrap_or_else(|_| "{}".to_string());
+            let conn = self.lock_conn()?;
+            let metadata_json =
+                serde_json::to_string(&agent.metadata).unwrap_or_else(|_| "{}".to_string());
 
-        let rows = conn.execute(
-            "UPDATE agents SET name = ?1, agent_type = ?2, role = ?3, status = ?4, pid = ?5,
+            let rows = conn.execute(
+                "UPDATE agents SET name = ?1, agent_type = ?2, role = ?3, status = ?4, pid = ?5,
              ppid = ?6, cc_session_id = ?7, parent_id = ?8, machine_id = ?9, last_heartbeat = ?10,
-             active_tasks = ?11, metadata = ?12, pid_starttime = ?13
-             WHERE id = ?14",
-            params![
-                agent.name,
-                agent.agent_type.to_string(),
-                agent.role.to_string(),
-                agent.status.to_string(),
-                agent.pid,
-                agent.ppid,
-                agent.cc_session_id,
-                agent.parent_id,
-                agent.machine_id,
-                agent.last_heartbeat.to_rfc3339(),
-                agent.active_tasks,
-                metadata_json,
-                agent.pid_starttime.map(|v| v as i64),
-                agent.id,
-            ],
-        )?;
+             active_tasks = ?11, metadata = ?12, pid_starttime = ?13, factory_session = COALESCE(?14, factory_session)
+             WHERE id = ?15",
+                params![
+                    agent.name,
+                    agent.agent_type.to_string(),
+                    agent.role.to_string(),
+                    agent.status.to_string(),
+                    agent.pid,
+                    agent.ppid,
+                    agent.cc_session_id,
+                    agent.parent_id,
+                    agent.machine_id,
+                    agent.last_heartbeat.to_rfc3339(),
+                    agent.active_tasks,
+                    metadata_json,
+                    agent.pid_starttime.map(|v| v as i64),
+                    agent.factory_session.as_deref(),
+                    agent.id,
+                ],
+            )?;
 
-        if rows == 0 {
-            return Err(StoreError::NotFound(format!(
-                "Agent not found: {}",
-                agent.id
-            )));
-        }
-        Ok(())
+            if rows == 0 {
+                return Err(StoreError::NotFound(format!(
+                    "Agent not found: {}",
+                    agent.id
+                )));
+            }
+            Ok(())
         }) // with_write_retry
     }
     pub(crate) fn agent_unregister(&self, id: &str) -> Result<()> {
         crate::shared_db::with_write_retry(|| {
-        let conn = self.lock_conn()?;
-        let tx = ImmediateTx::new(&conn)?;
+            let conn = self.lock_conn()?;
+            let tx = ImmediateTx::new(&conn)?;
 
-        // Get agent name before deleting (for event summary)
-        let agent_name: Option<String> = tx
-            .query_row("SELECT name FROM agents WHERE id = ?", params![id], |row| {
-                row.get(0)
-            })
-            .optional()?;
+            // Get agent name before deleting (for event summary)
+            let agent_name: Option<String> = tx
+                .query_row("SELECT name FROM agents WHERE id = ?", params![id], |row| {
+                    row.get(0)
+                })
+                .optional()?;
 
-        // Release all leases first (due to foreign key)
-        tx.execute(
-            "UPDATE task_leases SET status = 'released' WHERE agent_id = ?",
-            params![id],
-        )?;
+            // Release all leases first (due to foreign key)
+            tx.execute(
+                "UPDATE task_leases SET status = 'released' WHERE agent_id = ?",
+                params![id],
+            )?;
 
-        let rows = tx.execute("DELETE FROM agents WHERE id = ?", params![id])?;
-        if rows == 0 {
-            return Err(StoreError::NotFound(format!("Agent not found: {id}")));
-        }
+            let rows = tx.execute("DELETE FROM agents WHERE id = ?", params![id])?;
+            if rows == 0 {
+                return Err(StoreError::NotFound(format!("Agent not found: {id}")));
+            }
 
-        // Record event for sidecar activity feed (use name if available, else id)
-        let display_name = agent_name
-            .filter(|n| !n.is_empty())
-            .unwrap_or_else(|| id.to_string());
-        let event = Event::new(
-            EventType::AgentShutdown,
-            EventEntityType::Agent,
-            id,
-            format!("Agent unregistered: {display_name}"),
-        );
-        let _ = record_event_with_conn(&tx, &event);
+            // Record event for sidecar activity feed (use name if available, else id)
+            let display_name = agent_name
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| id.to_string());
+            let event = Event::new(
+                EventType::AgentShutdown,
+                EventEntityType::Agent,
+                id,
+                format!("Agent unregistered: {display_name}"),
+            );
+            let _ = record_event_with_conn(&tx, &event);
 
-        // Capture event for recording playback
-        let _ = capture_agent_event(&tx, RecordingEventType::AgentLeft, id, None);
+            // Capture event for recording playback
+            let _ = capture_agent_event(&tx, RecordingEventType::AgentLeft, id, None);
 
-        tx.commit()?;
-        Ok(())
+            tx.commit()?;
+            Ok(())
         }) // with_write_retry
     }
     pub(crate) fn agent_list(&self, status: Option<AgentStatus>) -> Result<Vec<Agent>> {
@@ -186,13 +194,13 @@ impl SqliteAgentStore {
         let (sql, params): (&str, Vec<String>) = match status {
             Some(s) => (
                 "SELECT id, name, agent_type, role, status, pid, ppid, cc_session_id, parent_id,
-                 machine_id, registered_at, last_heartbeat, active_tasks, metadata, pid_starttime
+                 machine_id, registered_at, last_heartbeat, active_tasks, metadata, pid_starttime, factory_session
                  FROM agents WHERE status = ? ORDER BY registered_at DESC",
                 vec![s.to_string()],
             ),
             None => (
                 "SELECT id, name, agent_type, role, status, pid, ppid, cc_session_id, parent_id,
-                 machine_id, registered_at, last_heartbeat, active_tasks, metadata, pid_starttime
+                 machine_id, registered_at, last_heartbeat, active_tasks, metadata, pid_starttime, factory_session
                  FROM agents ORDER BY registered_at DESC",
                 vec![],
             ),
@@ -215,7 +223,7 @@ impl SqliteAgentStore {
 
         let mut stmt = conn.prepare_cached(
             "SELECT id, name, agent_type, role, status, pid, ppid, cc_session_id, parent_id,
-             machine_id, registered_at, last_heartbeat, active_tasks, metadata, pid_starttime
+             machine_id, registered_at, last_heartbeat, active_tasks, metadata, pid_starttime, factory_session
              FROM agents
              WHERE status IN ('active', 'idle') AND last_heartbeat < ?
              ORDER BY last_heartbeat ASC",
@@ -274,77 +282,77 @@ impl SqliteAgentStore {
     }
     pub(crate) fn agent_mark_stale(&self, id: &str) -> Result<()> {
         crate::shared_db::with_write_retry(|| {
-        let conn = self.lock_conn()?;
-        let tx = ImmediateTx::new(&conn)?;
+            let conn = self.lock_conn()?;
+            let tx = ImmediateTx::new(&conn)?;
 
-        // Get all active leases for this agent before revoking
-        let mut stmt = tx.prepare_cached(
-            "SELECT task_id, epoch FROM task_leases WHERE agent_id = ? AND status = 'active'",
-        )?;
-        let leases_to_revoke: Vec<(String, i64)> = stmt
-            .query_map(params![id], |row| {
-                Ok((row.get(0)?, row.get::<_, i64>(1).unwrap_or(1)))
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        drop(stmt);
+            // Get all active leases for this agent before revoking
+            let mut stmt = tx.prepare_cached(
+                "SELECT task_id, epoch FROM task_leases WHERE agent_id = ? AND status = 'active'",
+            )?;
+            let leases_to_revoke: Vec<(String, i64)> = stmt
+                .query_map(params![id], |row| {
+                    Ok((row.get(0)?, row.get::<_, i64>(1).unwrap_or(1)))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            drop(stmt);
 
-        // Mark agent as stale (was: dead)
-        tx.execute(
-            "UPDATE agents SET status = 'stale' WHERE id = ?",
-            params![id],
-        )?;
+            // Mark agent as stale (was: dead)
+            tx.execute(
+                "UPDATE agents SET status = 'stale' WHERE id = ?",
+                params![id],
+            )?;
 
-        // Revoke all active task leases
-        tx.execute(
+            // Revoke all active task leases
+            tx.execute(
             "UPDATE task_leases SET status = 'revoked' WHERE agent_id = ? AND status = 'active'",
             params![id],
         )?;
 
-        // Revoke all active worktree leases
-        tx.execute(
+            // Revoke all active worktree leases
+            tx.execute(
             "UPDATE worktree_leases SET status = 'revoked' WHERE agent_id = ? AND status = 'active'",
             params![id],
         )?;
 
-        // Log revoked events for each lease
-        for (task_id, epoch) in &leases_to_revoke {
-            Self::log_lease_event(
-                &tx,
-                task_id,
-                id,
-                "revoked",
-                *epoch as u64,
-                Some(r#"{"reason":"agent_stale"}"#),
-                None,
-            )?;
-        }
+            // Log revoked events for each lease
+            for (task_id, epoch) in &leases_to_revoke {
+                Self::log_lease_event(
+                    &tx,
+                    task_id,
+                    id,
+                    "revoked",
+                    *epoch as u64,
+                    Some(r#"{"reason":"agent_stale"}"#),
+                    None,
+                )?;
+            }
 
-        tx.commit()?;
-        Ok(())
+            tx.commit()?;
+            Ok(())
         }) // with_write_retry
     }
     pub(crate) fn agent_revive(&self, id: &str) -> Result<()> {
         crate::shared_db::with_write_retry(|| {
-        let conn = self.lock_conn()?;
-        let now = Utc::now().to_rfc3339();
+            let conn = self.lock_conn()?;
+            let now = Utc::now().to_rfc3339();
 
-        // Revive agent: set status to active, update heartbeat, and confirm startup.
-        // Only works if agent exists and is in stale/shutdown/dead state.
-        // Setting startup_confirmed = 1 prevents the agent from being immediately
-        // re-detected as failed-startup after revival.
-        let rows = conn.execute(
-            "UPDATE agents SET status = 'active', last_heartbeat = ?, startup_confirmed = 1
+            // Revive agent: set status to active, update heartbeat, and confirm startup.
+            // Only works if agent exists and is in stale/shutdown/dead state.
+            // Setting startup_confirmed = 1 prevents the agent from being immediately
+            // re-detected as failed-startup after revival.
+            let rows = conn.execute(
+                "UPDATE agents SET status = 'active', last_heartbeat = ?, startup_confirmed = 1
              WHERE id = ? AND status IN ('dead', 'shutdown', 'stale')",
-            params![now, id],
-        )?;
+                params![now, id],
+            )?;
 
-        if rows == 0 {
-            return Err(StoreError::NotFound(format!(
-                "Agent not found or already active: {id}"
-            )));
-        }
+            if rows == 0 {
+                return Err(StoreError::NotFound(format!(
+                    "Agent not found or already active: {id}"
+                )));
+            }
 
-        Ok(())
+            Ok(())
         }) // with_write_retry
     }
     pub(crate) fn agent_list_failed_startup(&self, timeout_secs: i64) -> Result<Vec<Agent>> {
@@ -353,7 +361,7 @@ impl SqliteAgentStore {
 
         let mut stmt = conn.prepare_cached(
             "SELECT id, name, agent_type, role, status, pid, ppid, cc_session_id, parent_id,
-             machine_id, registered_at, last_heartbeat, active_tasks, metadata, pid_starttime
+             machine_id, registered_at, last_heartbeat, active_tasks, metadata, pid_starttime, factory_session
              FROM agents
              WHERE status IN ('active', 'idle') AND startup_confirmed = 0 AND registered_at < ?
              ORDER BY registered_at ASC",
@@ -370,7 +378,7 @@ impl SqliteAgentStore {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare_cached(
             "SELECT id, name, agent_type, role, status, pid, ppid, cc_session_id, parent_id,
-             machine_id, registered_at, last_heartbeat, active_tasks, metadata, pid_starttime
+             machine_id, registered_at, last_heartbeat, active_tasks, metadata, pid_starttime, factory_session
              FROM agents WHERE ppid = ? AND status IN ('active', 'idle', 'stale', 'dead', 'shutdown')
              ORDER BY last_heartbeat DESC LIMIT 1",
         )?;
@@ -384,7 +392,7 @@ impl SqliteAgentStore {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare_cached(
             "SELECT id, name, agent_type, role, status, pid, ppid, cc_session_id, parent_id,
-             machine_id, registered_at, last_heartbeat, active_tasks, metadata, pid_starttime
+             machine_id, registered_at, last_heartbeat, active_tasks, metadata, pid_starttime, factory_session
              FROM agents WHERE pid = ? AND status IN ('active', 'idle', 'stale', 'dead', 'shutdown')
              ORDER BY last_heartbeat DESC LIMIT 1",
         )?;

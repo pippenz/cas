@@ -13,8 +13,7 @@ use cas_store::{
     SqliteTaskStore, SqliteWorktreeStore, WorktreeStore,
 };
 use cas_types::{
-    AgentRole, AgentStatus, Event, EventType, Priority, Task, TaskStatus, TaskType,
-    WorktreeStatus,
+    AgentRole, AgentStatus, Event, EventType, Priority, Task, TaskStatus, TaskType, WorktreeStatus,
 };
 
 use crate::changes::{FileChangeInfo, GitFileStatus, SourceChangesInfo};
@@ -158,8 +157,7 @@ impl DirectorData {
         cas_dir: &Path,
         worktree_root: Option<&Path>,
     ) -> anyhow::Result<()> {
-        self.changes =
-            load_all_git_changes(cas_dir, worktree_root, &self.agent_id_to_name, None)?;
+        self.changes = load_all_git_changes(cas_dir, worktree_root, &self.agent_id_to_name, None)?;
         self.git_loaded = true;
         Ok(())
     }
@@ -304,7 +302,11 @@ impl DirectorData {
             owned_agent = SqliteAgentStore::open(cas_dir)?;
             &owned_agent
         };
-        let agents_list = AgentStore::list(agent_store, None)?;
+        let factory_session = std::env::var("CAS_FACTORY_SESSION").ok();
+        let agents_list: Vec<_> = AgentStore::list(agent_store, None)?
+            .into_iter()
+            .filter(|a| a.visible_to_factory_session(factory_session.as_deref()))
+            .collect();
 
         // Compute per-agent pending message counts (best-effort, non-fatal).
         // These are used by the idle detector to suppress `WorkerIdle` when a
@@ -313,12 +315,15 @@ impl DirectorData {
         let agent_names_for_pq: Vec<&str> = agents_list.iter().map(|a| a.name.as_str()).collect();
         let pending_msgs: Vec<QueuedPrompt> =
             if let Some(pq) = stores.and_then(|s| s.prompt_queue_store.as_ref()) {
-                pq.peek_for_targets(&agent_names_for_pq, None, 500)
+                pq.peek_for_targets(&agent_names_for_pq, factory_session.as_deref(), 500)
                     .unwrap_or_default()
             } else {
                 SqlitePromptQueueStore::open(cas_dir)
                     .ok()
-                    .and_then(|pq| pq.peek_for_targets(&agent_names_for_pq, None, 500).ok())
+                    .and_then(|pq| {
+                        pq.peek_for_targets(&agent_names_for_pq, factory_session.as_deref(), 500)
+                            .ok()
+                    })
                     .unwrap_or_default()
             };
         let mut pending_counts: HashMap<String, u32> = HashMap::new();
@@ -687,8 +692,7 @@ fn get_git_changes(repo_path: &Path) -> Vec<FileChangeInfo> {
         let staged = first_char != ' ' && first_char != '?';
 
         // Get line counts from diff (untracked files won't appear in diff, use 0)
-        let (lines_added, lines_removed) =
-            line_counts.get(&file_path).copied().unwrap_or((0, 0));
+        let (lines_added, lines_removed) = line_counts.get(&file_path).copied().unwrap_or((0, 0));
 
         changes.push(FileChangeInfo {
             file_path,
@@ -727,11 +731,8 @@ fn parse_diff_numstat(output: &str, line_counts: &mut HashMap<String, (usize, us
         };
         let added = added_s.parse().unwrap_or(0);
         let removed = removed_s.parse().unwrap_or(0);
-        let entry = line_counts
-            .entry(file_s.to_string())
-            .or_insert((0, 0));
+        let entry = line_counts.entry(file_s.to_string()).or_insert((0, 0));
         entry.0 += added;
         entry.1 += removed;
     }
 }
-

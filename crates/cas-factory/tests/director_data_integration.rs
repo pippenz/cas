@@ -72,6 +72,7 @@ fn create_test_agent(id: &str, name: &str, role: AgentRole, status: AgentStatus)
         pid: None,
         ppid: None,
         cc_session_id: Some(id.to_string()),
+        factory_session: None,
         parent_id: None,
         machine_id: None,
         registered_at: now,
@@ -300,6 +301,7 @@ fn test_director_data_filters_inactive_agents() {
         pid: None,
         ppid: None,
         cc_session_id: None,
+        factory_session: None,
         parent_id: None,
         machine_id: None,
         registered_at: now,
@@ -620,7 +622,14 @@ fn test_tasks_by_epic_follows_focus_switch() {
 
     // Epic A touched at t1, epic B touched more recently at t2 -> B first.
     let tasks = vec![
-        summary_at("cas-a", TaskStatus::Open, TaskType::Epic, Priority::HIGH, None, t0),
+        summary_at(
+            "cas-a",
+            TaskStatus::Open,
+            TaskType::Epic,
+            Priority::HIGH,
+            None,
+            t0,
+        ),
         summary_at(
             "cas-a-0",
             TaskStatus::Open,
@@ -629,7 +638,14 @@ fn test_tasks_by_epic_follows_focus_switch() {
             Some("cas-a"),
             t1,
         ),
-        summary_at("cas-b", TaskStatus::Open, TaskType::Epic, Priority::HIGH, None, t0),
+        summary_at(
+            "cas-b",
+            TaskStatus::Open,
+            TaskType::Epic,
+            Priority::HIGH,
+            None,
+            t0,
+        ),
         summary_at(
             "cas-b-0",
             TaskStatus::Open,
@@ -641,7 +657,10 @@ fn test_tasks_by_epic_follows_focus_switch() {
     ];
 
     let (groups, _) = data_from_tasks(tasks).tasks_by_epic();
-    assert_eq!(groups[0].epic.id, "cas-b", "most-recently-touched epic leads");
+    assert_eq!(
+        groups[0].epic.id, "cas-b",
+        "most-recently-touched epic leads"
+    );
     assert_eq!(groups[1].epic.id, "cas-a");
 }
 
@@ -651,7 +670,14 @@ fn test_tasks_by_epic_follows_focus_switch() {
 fn test_tasks_by_epic_single_epic_unchanged() {
     let now = chrono::Utc::now();
     let tasks = vec![
-        summary_at("cas-only", TaskStatus::InProgress, TaskType::Epic, Priority::HIGH, None, now),
+        summary_at(
+            "cas-only",
+            TaskStatus::InProgress,
+            TaskType::Epic,
+            Priority::HIGH,
+            None,
+            now,
+        ),
         summary_at(
             "cas-only-0",
             TaskStatus::InProgress,

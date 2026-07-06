@@ -178,6 +178,8 @@ pub mod m199_known_repos;
 mod m200_agents_add_pid_starttime;
 mod m201_spawn_queue_add_worker_spec;
 mod m202_tasks_add_depth;
+mod m203_spawn_queue_add_factory_session;
+mod m204_agents_add_factory_session;
 
 /// All migrations in order. IDs must be sequential and never reused.
 pub const MIGRATIONS: &[Migration] = &[
@@ -357,6 +359,10 @@ pub const MIGRATIONS: &[Migration] = &[
     m201_spawn_queue_add_worker_spec::MIGRATION,
     // Add depth column to tasks for per-task speed mode (EPIC cas-1255 / cas-0344)
     m202_tasks_add_depth::MIGRATION,
+    // Scope spawn/shutdown requests to the owning factory session (cas-0f7f)
+    m203_spawn_queue_add_factory_session::MIGRATION,
+    // Scope factory agent visibility to the owning factory session (cas-7baa)
+    m204_agents_add_factory_session::MIGRATION,
 ];
 
 #[cfg(test)]
