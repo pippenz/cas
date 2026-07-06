@@ -1,5 +1,21 @@
 # Recovery — Failure Modes and What to Do
 
+## Close hit ⚠️ MERGE REQUIRED (merge-state guard)
+
+The most common close rejection: your `factory/<name>` branch has commits not yet on the task's parent branch. This is a **data-state guard** — nobody can bypass it; `bypass_code_review=true` does not apply.
+
+1. **Read the guard text** — it names the parent branch and the unmerged commit count, and includes the correct remediation for your case.
+2. **Parent is `epic/<slug>`**: `git push origin factory/<name>`, then message the supervisor to merge your branch into the epic:
+   ```
+   mcp__cas__coordination action=message target=supervisor \
+     summary="factory/<name> pushed, needs epic merge before close" \
+     message="<task-id> done. Pushed factory/<name> (<sha>). Please merge into epic/<slug> so close can pass."
+   ```
+   Do **NOT** `gh pr create --base epic/...` — epic branches are supervisor-local; the ref doesn't exist on origin and the call always fails.
+3. **Parent is `main`/`master`/`staging`**: push and complete the project's PR/merge flow, then retry close.
+4. **Guard still counts unmerged commits after a confirmed merge** → squash-merge SHA drift makes already-merged commits look missing. Send the supervisor the exact guard text (they reset the stale branch ref). Do not retry-loop against the guard.
+5. **Never route around it** with `action=update status=closed` plus a hand-written `verification action=add` — that forges the verification record and the audit trail. Rejection loops are a supervisor conversation, not a workaround opportunity.
+
 ## Close hit VERIFICATION_JAIL_BLOCKED
 
 1. **Forward ONCE** to supervisor — include task ID, brief summary of completion state, and exact error text.

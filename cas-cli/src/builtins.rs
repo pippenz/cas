@@ -193,6 +193,12 @@ pub const BUILTIN_SKILLS: &[BuiltinFile] = &[
         ),
     },
     BuiltinFile {
+        path: "skills/cas-supervisor/references/model-selection.md",
+        content: include_str!(
+            "builtins/skills/cas-supervisor/references/model-selection.md"
+        ),
+    },
+    BuiltinFile {
         path: "skills/cas-supervisor-checklist/SKILL.md",
         content: include_str!("builtins/skills/cas-supervisor-checklist.md"),
     },
@@ -439,6 +445,12 @@ pub const CODEX_BUILTIN_SKILLS: &[BuiltinFile] = &[
         path: "skills/cas-supervisor/references/filing-cas-bugs.md",
         content: include_str!(
             "builtins/codex/skills/cas-supervisor/references/filing-cas-bugs.md"
+        ),
+    },
+    BuiltinFile {
+        path: "skills/cas-supervisor/references/model-selection.md",
+        content: include_str!(
+            "builtins/codex/skills/cas-supervisor/references/model-selection.md"
         ),
     },
     BuiltinFile {
@@ -2237,6 +2249,104 @@ This is the body content."#;
             claude_ref.content, codex_ref.content,
             "auth-fixture-template.md .claude and .codex copies must be byte-identical",
         );
+    }
+
+    /// cas-6219: the supervisor's model-selection rubric must be registered on
+    /// both surfaces, stay byte-identical across mirrors (reference files carry
+    /// no alias divergence today — cas-62ab owns the eventual mcp__cs__ sweep),
+    /// and remain discoverable from the skill body that fits the 8 KB cap.
+    #[test]
+    fn test_supervisor_model_selection_reference_registered_and_mirrored() {
+        let claude = BUILTIN_SKILLS
+            .iter()
+            .find(|b| b.path == "skills/cas-supervisor/references/model-selection.md")
+            .expect("BUILTIN_SKILLS missing cas-supervisor model-selection.md");
+        let codex = CODEX_BUILTIN_SKILLS
+            .iter()
+            .find(|b| b.path == "skills/cas-supervisor/references/model-selection.md")
+            .expect("CODEX_BUILTIN_SKILLS missing cas-supervisor model-selection.md");
+        assert_eq!(
+            claude.content, codex.content,
+            "model-selection.md .claude and .codex copies must be byte-identical",
+        );
+        // The four tiers and the escalation rule are the contract of the rubric.
+        for required in ["light", "standard", "heavy", "frontier", "tier:", "Escalate on failure"] {
+            assert!(
+                claude.content.contains(required),
+                "model-selection.md missing required tier-rubric marker: {required:?}"
+            );
+        }
+        // Discoverable from the SessionStart-injected body on both surfaces.
+        for (label, guide) in [
+            ("claude cas-supervisor.md", SUPERVISOR_GUIDE),
+            (
+                "codex cas-supervisor.md",
+                include_str!("builtins/codex/skills/cas-supervisor.md"),
+            ),
+        ] {
+            assert!(
+                guide.contains("references/model-selection.md"),
+                "{label} must point at the model-selection rubric"
+            );
+        }
+    }
+
+    /// MERGE REQUIRED was the single most frequent worker close rejection in
+    /// downstream factory logs (gabber-studio, ozer) with zero skill guidance,
+    /// and its friction normalized a verification-forging "dual-gate" bypass
+    /// (`status=closed` + hand-written `verification action=add`). Pin the
+    /// remediation guidance and the bypass ban on both surfaces so neither
+    /// mirror silently drops them.
+    #[test]
+    fn test_worker_merge_state_guidance_present_and_mirrored() {
+        for (label, set) in [
+            ("BUILTIN_SKILLS", BUILTIN_SKILLS),
+            ("CODEX_BUILTIN_SKILLS", CODEX_BUILTIN_SKILLS),
+        ] {
+            for path in [
+                "skills/cas-worker/references/close-gate.md",
+                "skills/cas-worker/references/recovery.md",
+            ] {
+                let entry = set
+                    .iter()
+                    .find(|b| b.path == path)
+                    .unwrap_or_else(|| panic!("{label} missing {path}"));
+                for required in ["MERGE REQUIRED", "gh pr create", "status=closed"] {
+                    assert!(
+                        entry.content.contains(required),
+                        "{label} {path} missing merge-state guidance marker: {required:?}"
+                    );
+                }
+            }
+        }
+        // recovery.md mirrors intentionally diverge by MCP alias (cas-5b4f):
+        // the Codex copy's executable remediation must use the cs alias.
+        let codex_recovery = CODEX_BUILTIN_SKILLS
+            .iter()
+            .find(|b| b.path == "skills/cas-worker/references/recovery.md")
+            .expect("CODEX_BUILTIN_SKILLS missing recovery.md");
+        assert!(
+            codex_recovery
+                .content
+                .contains("mcp__cs__coordination action=message target=supervisor"),
+            "codex recovery.md MERGE REQUIRED section must use the mcp__cs__ alias"
+        );
+        // The SessionStart-injected body must surface the MERGE REQUIRED close
+        // outcome and the literal-`supervisor` messaging target on both surfaces.
+        for (label, guide) in [
+            ("claude cas-worker.md", WORKER_GUIDE),
+            (
+                "codex cas-worker.md",
+                include_str!("builtins/codex/skills/cas-worker.md"),
+            ),
+        ] {
+            for required in ["MERGE REQUIRED", "literal string `supervisor`"] {
+                assert!(
+                    guide.contains(required),
+                    "{label} missing worker-protocol marker: {required:?}"
+                );
+            }
+        }
     }
 
     // cas-e0d1: pin the opt-in description so a future sync or hand-edit can't
