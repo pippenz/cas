@@ -133,17 +133,27 @@ When workers share the main directory, there's no branch merging — workers com
 ## Phase 4: Complete
 
 1. Verify all tasks closed: `mcp__cas__task action=list status=open epic=<epic-id>`
-2. Run tests
-3. Run integration review against the full EPIC diff — per-cherry-pick reviews catch per-task issues; this step catches cross-task integration issues (e.g., two tasks individually clean but semantically conflicting):
-   From inside the epic branch checkout, invoke:
+2. Hold the main merge. The epic branch is not ready for base until the assembled diff has passed review and the final gate.
+3. Run integration review against the full EPIC diff — per-cherry-pick reviews catch per-task issues; this step catches cross-task integration issues (e.g., two tasks individually clean but semantically conflicting). From inside the epic branch checkout, invoke:
    `/cas-code-review mode=interactive base_sha=<base-branch>`
    (substitute `main`, `develop`, or your actual base branch name for `<base-branch>`)
-   Address any P0 findings before merging.
-4. **Isolated mode only**: Merge epic to base branch and cleanup worktrees (can be 10GB+ each):
+   For large diffs, write the literal diff to a file first:
+   ```bash
+   git diff <base-branch>..HEAD > /tmp/<epic-id>-diff.patch
+   ```
+   Stay on the epic branch and pass that file path in the review context so personas read the literal assembled diff while exploring the correct tree.
+4. Turn any review finding that needs worker action into a bounded epic-child fix-round task before messaging a worker. Put the finding, required fix, acceptance criteria, and proof command in the task description; the coordination message only points at the task ID.
+5. After the fix lands, rerun the full gate yourself and capture the real exit code:
+   ```bash
+   cargo test --no-fail-fast > /tmp/<epic-id>-cargo-test.log 2>&1; echo $?
+   ```
+   Never pipe the test run to `tail`; that captures the pipe status, not the cargo status.
+6. **Isolated mode only**: Merge epic to base branch and cleanup worktrees (can be 10GB+ each) only after the review loop is clean and the full gate exits 0:
    ```bash
    git checkout <base-branch> && git merge epic/<slug>
    mcp__cas__coordination action=shutdown_workers count=0
    git worktree remove <path>  # for each worker worktree
    git branch -d epic/<slug>
    ```
-5. Shutdown workers: `mcp__cas__coordination action=shutdown_workers count=0`
+7. Close the epic and post release notes.
+8. Shutdown workers: `mcp__cas__coordination action=shutdown_workers count=0`

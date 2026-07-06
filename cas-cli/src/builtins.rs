@@ -2420,6 +2420,80 @@ This is the body content."#;
         }
     }
 
+    /// cas-1dbf: lessons from the codex-worker fix-round loop must stay in the
+    /// supervisor reference layer, mirrored across Claude and Codex surfaces.
+    #[test]
+    fn test_supervisor_fix_round_recovery_guidance_present_and_mirrored() {
+        for path in [
+            "skills/cas-supervisor/references/code-review-queue.md",
+            "skills/cas-supervisor/references/worker-recovery.md",
+            "skills/cas-supervisor/references/workflow.md",
+        ] {
+            let claude = BUILTIN_SKILLS
+                .iter()
+                .find(|b| b.path == path)
+                .unwrap_or_else(|| panic!("BUILTIN_SKILLS missing {path}"));
+            let codex = CODEX_BUILTIN_SKILLS
+                .iter()
+                .find(|b| b.path == path)
+                .unwrap_or_else(|| panic!("CODEX_BUILTIN_SKILLS missing {path}"));
+            assert_eq!(
+                claude.content, codex.content,
+                "{path} .claude and .codex copies must be byte-identical",
+            );
+        }
+
+        let code_review_queue = BUILTIN_SKILLS
+            .iter()
+            .find(|b| b.path == "skills/cas-supervisor/references/code-review-queue.md")
+            .expect("BUILTIN_SKILLS missing cas-supervisor code-review-queue.md");
+        for required in [
+            "create the task first",
+            "epic-level review fix rounds",
+            "messages are not durable task state",
+        ] {
+            assert!(
+                code_review_queue.content.contains(required),
+                "code-review-queue.md missing fix-round marker: {required:?}"
+            );
+        }
+
+        let worker_recovery = BUILTIN_SKILLS
+            .iter()
+            .find(|b| b.path == "skills/cas-supervisor/references/worker-recovery.md")
+            .expect("BUILTIN_SKILLS missing cas-supervisor worker-recovery.md");
+        for required in [
+            "Verify Lifecycle Notifications Before Acting",
+            "cas-dbbe",
+            "Injected but Unwoken Worker",
+            "processed_at, acked_at",
+            "urgent=true",
+            "Do not kill or respawn",
+        ] {
+            assert!(
+                worker_recovery.content.contains(required),
+                "worker-recovery.md missing recovery marker: {required:?}"
+            );
+        }
+
+        let workflow = BUILTIN_SKILLS
+            .iter()
+            .find(|b| b.path == "skills/cas-supervisor/references/workflow.md")
+            .expect("BUILTIN_SKILLS missing cas-supervisor workflow.md");
+        for required in [
+            "Hold the main merge",
+            "git diff <base-branch>..HEAD > /tmp/<epic-id>-diff.patch",
+            "bounded epic-child fix-round task",
+            "cargo test --no-fail-fast > /tmp/<epic-id>-cargo-test.log 2>&1; echo $?",
+            "Never pipe the test run to `tail`",
+        ] {
+            assert!(
+                workflow.content.contains(required),
+                "workflow.md missing epic-review marker: {required:?}"
+            );
+        }
+    }
+
     /// MERGE REQUIRED was the single most frequent worker close rejection in
     /// downstream factory logs (gabber-studio, ozer) with zero skill guidance,
     /// and its friction normalized a verification-forging "dual-gate" bypass

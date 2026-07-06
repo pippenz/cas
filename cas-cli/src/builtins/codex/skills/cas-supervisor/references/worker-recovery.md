@@ -27,9 +27,17 @@ The Bun/React-Ink crash signature is the visual fingerprint captured in the cas-
 
 **Anti-pattern:** "pane looks broken → `shutdown_workers`". That pathway has destroyed in-progress work multiple times (silent-owl-56 2026-04-23 shipped cas-4181 through what looked like a crashed pane). The `is-wedged` / `debug` / `kill` triad replaces it.
 
+## Verify Lifecycle Notifications Before Acting
+
+Director and task-lifecycle notifications are hints, not ground truth. A known bug (tracking pointer `cas-dbbe`) produced false `task_completed` notifications around task start, including five false completions in one session. Before closing, reassigning, respawning, or merging because of a notification:
+
+- Run `mcp__cas__task action=show id=<task-id>` and trust the task status over the notification text.
+- Check the worker branch tip or worktree commits before assuming work exists: `git -C .cas/worktrees/<worker> log --oneline -5`.
+- Check liveness with `mcp__cas__coordination action=worker_status` before declaring a worker idle or dead.
+
 ## Worker Failure Recovery
 
-Workers fail in production. These are the three observed failure modes and their recovery procedures. All three have occurred in real factory sessions.
+Workers fail in production. These are recurring observed failure modes and their recovery procedures. Each has occurred in real factory sessions.
 
 ### Dead or Silent Worker
 
@@ -47,6 +55,27 @@ Workers fail in production. These are the three observed failure modes and their
 4. Shut down the dead worker: `mcp__cas__coordination action=shutdown_workers count=0` (then respawn the count you need)
 5. Spawn a fresh worker: `mcp__cas__coordination action=spawn_workers count=1 isolate=true`
 6. Reassign the task to the new worker. If partial work was cherry-picked, include that context in the assignment message so the new worker builds on it rather than redoing it.
+
+### Injected but Unwoken Worker
+
+**Signature:** Heartbeat is fresh, worktree is clean, and there is zero activity for 10+ minutes after a supervisor message. The prompt was injected into the worker session, but the worker did not acknowledge or act. This is most often triggered by long multi-line payloads sent to Codex workers.
+
+**Diagnosis:**
+1. Confirm a fresh heartbeat with `mcp__cas__coordination action=worker_status`
+2. Confirm no work started: `git -C .cas/worktrees/<worker> status --short`
+3. Check prompt delivery state:
+   ```bash
+   sqlite3 .cas/cas.db "SELECT id, processed_at, acked_at FROM prompt_queue WHERE target='<name>' ORDER BY id DESC LIMIT 5"
+   ```
+   If the latest relevant row has `processed_at` set and `acked_at` NULL, the prompt was injected but not acknowledged.
+
+**Recovery:**
+1. Ensure the work exists as an assigned task with full spec and acceptance criteria.
+2. Send a short urgent wake that points only at the task:
+   ```
+   mcp__cas__coordination action=message target=<worker> urgent=true summary="Task <id> assigned" message="Task <id> is assigned. Run mcp__cas__task action=show id=<id>."
+   ```
+3. Do not kill or respawn. There is no evidence of a dead process or dirty worktree; the fix is a durable task plus a short wake.
 
 ### Pre-compaction Triage via worker_status context indicator (cas-573c)
 
