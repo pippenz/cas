@@ -2291,6 +2291,64 @@ This is the body content."#;
         }
     }
 
+    /// MERGE REQUIRED was the single most frequent worker close rejection in
+    /// downstream factory logs (gabber-studio, ozer) with zero skill guidance,
+    /// and its friction normalized a verification-forging "dual-gate" bypass
+    /// (`status=closed` + hand-written `verification action=add`). Pin the
+    /// remediation guidance and the bypass ban on both surfaces so neither
+    /// mirror silently drops them.
+    #[test]
+    fn test_worker_merge_state_guidance_present_and_mirrored() {
+        for (label, set) in [
+            ("BUILTIN_SKILLS", BUILTIN_SKILLS),
+            ("CODEX_BUILTIN_SKILLS", CODEX_BUILTIN_SKILLS),
+        ] {
+            for path in [
+                "skills/cas-worker/references/close-gate.md",
+                "skills/cas-worker/references/recovery.md",
+            ] {
+                let entry = set
+                    .iter()
+                    .find(|b| b.path == path)
+                    .unwrap_or_else(|| panic!("{label} missing {path}"));
+                for required in ["MERGE REQUIRED", "gh pr create", "status=closed"] {
+                    assert!(
+                        entry.content.contains(required),
+                        "{label} {path} missing merge-state guidance marker: {required:?}"
+                    );
+                }
+            }
+        }
+        // recovery.md mirrors intentionally diverge by MCP alias (cas-5b4f):
+        // the Codex copy's executable remediation must use the cs alias.
+        let codex_recovery = CODEX_BUILTIN_SKILLS
+            .iter()
+            .find(|b| b.path == "skills/cas-worker/references/recovery.md")
+            .expect("CODEX_BUILTIN_SKILLS missing recovery.md");
+        assert!(
+            codex_recovery
+                .content
+                .contains("mcp__cs__coordination action=message target=supervisor"),
+            "codex recovery.md MERGE REQUIRED section must use the mcp__cs__ alias"
+        );
+        // The SessionStart-injected body must surface the MERGE REQUIRED close
+        // outcome and the literal-`supervisor` messaging target on both surfaces.
+        for (label, guide) in [
+            ("claude cas-worker.md", WORKER_GUIDE),
+            (
+                "codex cas-worker.md",
+                include_str!("builtins/codex/skills/cas-worker.md"),
+            ),
+        ] {
+            for required in ["MERGE REQUIRED", "literal string `supervisor`"] {
+                assert!(
+                    guide.contains(required),
+                    "{label} missing worker-protocol marker: {required:?}"
+                );
+            }
+        }
+    }
+
     // cas-e0d1: pin the opt-in description so a future sync or hand-edit can't
     // silently re-introduce auto-trigger phrasing into either mirror — that
     // would resurrect the wall-clock regression the rewrite fixed.

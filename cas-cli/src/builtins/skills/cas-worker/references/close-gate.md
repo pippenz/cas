@@ -12,16 +12,28 @@ Run all 6 self-verification checks before `mcp__cas__task action=close`. The gat
 
 If the task you're closing is `depth=light` (check the `Depth:` line in `task show`), **skip the 6 pre-close self-checks below** and close once it runs on localhost. Light is speed mode: minimal diff, no gold-plating, the human is the evaluator — there is no DoD to chase. You must still not claim a proof you didn't run. For `depth=deep` or unset, run the full gate below.
 
+## Check 0 — merge state (the rejection you WILL hit)
+
+Close runs a merge-state guard before anything else: every commit on your `factory/<name>` branch must already be on the task's parent branch, or close rejects with `⚠️ MERGE REQUIRED`. This is a **data-state guard** — `bypass_code_review=true` does not skip it, and neither can the supervisor. Get merged *before* attempting close:
+
+- **Parent is `epic/<slug>`** — epic branches are supervisor-local by convention. Push your factory branch (`git push origin factory/<name>`), then message the supervisor to merge it into the epic. **Never `gh pr create --base epic/...`** — that ref doesn't exist on origin; the call always fails.
+- **Parent is `main`/`master`/`staging`** — push and complete the project's PR/merge flow (or the merge flow the supervisor stated at assignment), then close.
+- **Guard still fires after a confirmed merge?** Squash-merges rewrite SHAs, so the guard can count already-merged commits as missing. Send the supervisor the exact guard text — they fix the stale branch ref. Do not retry-loop.
+
+**Never bypass the close path.** Setting `status=closed` via `action=update` and hand-writing a `mcp__cas__verification action=add` record forges the verification audit trail — the task looks verified when nobody verified it. If close keeps rejecting, that is a supervisor conversation, not a workaround opportunity.
+
 **Code review is not your job at close** under the v2.13.0+ default `[code_review] owner = "supervisor"`. The supervisor runs `/cas-code-review` at cherry-pick + EPIC merge time. Do not invoke the multi-persona review yourself unless your supervisor explicitly tells you to, or your project has opted in to legacy `owner = "worker"` in `.cas/config.toml` — the worker-inline path adds ~14 min and ~100K tokens per close, which is exactly what the v2.13.0 flip was designed to eliminate.
 
 ## Pre-Close Self-Verification
 
 ### 1. No shortcut markers
 ```bash
-# Must return zero results in your changed files
-rg 'TODO|FIXME|XXX|HACK' <changed_files>
-rg 'for now|temporarily|placeholder|stub|workaround' <changed_files>
+# Must return zero UNEXPLAINED results in your changed lines
+git diff -U0 <base> | rg 'TODO|FIXME|XXX|HACK'
+git diff -U0 <base> | rg 'for now|temporarily|placeholder|stub|workaround'
 ```
+
+Triage hits, don't grind: scope to your changed lines (as above), and legit occurrences — UI `placeholder=` attributes, pre-existing comments in untouched lines, test-fixture names — don't block close. Record a one-line justification for anything you leave; only new, unexplained markers are failures.
 
 Also check for language-specific incomplete markers:
 - **TypeScript**: `throw new Error('Not implemented')`
@@ -32,7 +44,7 @@ Also check for language-specific incomplete markers:
 For every new function, class, module, route, or handler you created:
 ```bash
 # Verify it's actually called/imported somewhere outside its definition
-rg 'your_new_symbol' src/
+rg 'your_new_symbol'            # repo-wide; scope to source dirs in monorepos, e.g. apps/ packages/ src/
 ```
 If zero external references → you built it but didn't wire it in. Fix before closing.
 
@@ -72,6 +84,8 @@ If tests fail in code you didn't modify:
 | Test files only (`tests/**/*.rs`) with no API change | `cargo build --workspace --tests` at minimum |
 
 **Why per-crate isn't enough:** when you add a field to a `pub struct` in a shared crate, that crate's own tests pass (the new field has a `Default`). But downstream crates that name every field in a struct literal fail with `E0063`. `cargo test -p <crate>` never sees this — only `cargo test --workspace` or `cargo build --workspace --tests` catches it.
+
+**JS/TS monorepos (pnpm/turbo):** same blast-radius logic. Changed a shared package or exported type → run the *consuming* apps' typecheck and tests (`pnpm -r typecheck`, `pnpm --filter <app> test`), not just the package's own suite. A changed interface compiles fine in its own package and breaks only where it's consumed.
 
 **Historical note (cas-c0e0):** two fields were added to `FactoryConfig` (cas-factory). Per-crate tests passed. `cas-cli` constructors failed E0063 at workspace scope. The regression shipped to main as commit `3dc7488` and was caught only during manual merge.
 
