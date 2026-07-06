@@ -228,6 +228,10 @@ pub const BUILTIN_SKILLS: &[BuiltinFile] = &[
         content: include_str!("builtins/skills/verify-before-claim/SKILL.md"),
     },
     BuiltinFile {
+        path: "skills/cas-codex-exec/SKILL.md",
+        content: include_str!("builtins/skills/cas-codex-exec/SKILL.md"),
+    },
+    BuiltinFile {
         path: "skills/cas-brainstorm/SKILL.md",
         content: include_str!("builtins/skills/cas-brainstorm/SKILL.md"),
     },
@@ -478,6 +482,10 @@ pub const CODEX_BUILTIN_SKILLS: &[BuiltinFile] = &[
     BuiltinFile {
         path: "skills/verify-before-claim/SKILL.md",
         content: include_str!("builtins/codex/skills/verify-before-claim/SKILL.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-codex-exec/SKILL.md",
+        content: include_str!("builtins/codex/skills/cas-codex-exec/SKILL.md"),
     },
     BuiltinFile {
         path: "skills/cas-brainstorm/SKILL.md",
@@ -1077,6 +1085,32 @@ pub fn worker_guidance() -> String {
 mod tests {
     use crate::builtins::*;
 
+    fn extract_js_function(source: &str, name: &str) -> String {
+        let needle = format!("function {name}(");
+        let start = source
+            .find(&needle)
+            .unwrap_or_else(|| panic!("missing JS function {name}"));
+        let after_name = &source[start..];
+        let open_rel = after_name
+            .find('{')
+            .unwrap_or_else(|| panic!("missing opening brace for JS function {name}"));
+        let open = start + open_rel;
+        let mut depth = 0usize;
+        for (offset, ch) in source[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return source[start..=open + offset].to_string();
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("missing closing brace for JS function {name}");
+    }
+
     #[test]
     fn test_extract_body_with_frontmatter() {
         let content = r#"---
@@ -1640,6 +1674,35 @@ This is the body content."#;
         }
     }
 
+    #[test]
+    fn test_builtin_skills_contains_cas_codex_exec() {
+        let claude = BUILTIN_SKILLS
+            .iter()
+            .find(|b| b.path == "skills/cas-codex-exec/SKILL.md")
+            .expect("BUILTIN_SKILLS missing cas-codex-exec SKILL.md");
+        let codex = CODEX_BUILTIN_SKILLS
+            .iter()
+            .find(|b| b.path == "skills/cas-codex-exec/SKILL.md")
+            .expect("CODEX_BUILTIN_SKILLS missing cas-codex-exec SKILL.md");
+        assert_eq!(
+            claude.content, codex.content,
+            "cas-codex-exec SKILL.md .claude and .codex copies must be byte-identical",
+        );
+        for required in [
+            "name: cas-codex-exec",
+            "managed_by: cas",
+            "token-heavy READ-ONLY investigation",
+            "codex exec -s read-only -m gpt-5.5",
+            "If you find nothing, say so explicitly and name what you inspected.",
+            "If `codex` is not installed",
+        ] {
+            assert!(
+                claude.content.contains(required),
+                "cas-codex-exec SKILL.md missing required marker: {required:?}"
+            );
+        }
+    }
+
     /// Extract the `description:` value from a SKILL.md frontmatter block.
     /// CAS skill descriptions are single-line YAML scalars (long, but a
     /// single physical line terminated by `\n`). Panics if the field is
@@ -1836,6 +1899,33 @@ This is the body content."#;
     }
 
     #[test]
+    fn test_cas_code_review_documents_gpt55_independent_persona() {
+        for (label, skills) in [
+            ("claude", BUILTIN_SKILLS),
+            ("codex", CODEX_BUILTIN_SKILLS),
+        ] {
+            let entry = skills
+                .iter()
+                .find(|b| b.path == "skills/cas-code-review/SKILL.md")
+                .unwrap_or_else(|| panic!("{label}: skills/cas-code-review/SKILL.md missing"));
+            for required in [
+                "gpt-5.5:independent",
+                "Sonnet-low wrapper",
+                "codex exec -s read-only -m gpt-5.5",
+                "5+ changed files",
+                "300+ changed lines",
+                "skipped_reason",
+                "distinct from a successful zero-finding review",
+            ] {
+                assert!(
+                    entry.content.contains(required),
+                    "{label}: cas-code-review SKILL.md missing gpt-5.5 independent persona marker: {required:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_code_reviewer_agent_is_deprecation_stub() {
         // EPIC cas-0750: the legacy code-reviewer agent is replaced by the
         // cas-code-review skill. The file is kept in BUILTIN_AGENTS only to
@@ -1915,6 +2005,30 @@ This is the body content."#;
             workflow_content.contains("REVIEWER_OUTPUT_SCHEMA"),
             "workflow script must define the reviewer output schema"
         );
+        for required in [
+            "gpt-5.5:independent",
+            "gpt55_independent",
+            "gpt55ShouldRun",
+            "codex exec -s read-only -m gpt-5.5",
+            "skipped_reason",
+            "gpt55_independent_skipped",
+            "skipped_personas",
+            "effort: 'low'",
+        ] {
+            assert!(
+                workflow_content.contains(required),
+                "workflow script missing gpt-5.5 independent persona marker: {required:?}"
+            );
+        }
+        let constants_content =
+            include_str!("../../.claude/workflows/cas-code-review-constants.js");
+        for helper in ["gpt55ShouldRun", "gpt55SkippedPersonas", "personasRunCount"] {
+            assert_eq!(
+                extract_js_function(&workflow_content, helper),
+                extract_js_function(constants_content, helper),
+                "workflow inline helper {helper} must match cas-code-review-constants.js"
+            );
+        }
 
         let overwritten = std::fs::read_to_string(&stale_agent).unwrap();
         assert!(
@@ -2270,7 +2384,22 @@ This is the body content."#;
             "model-selection.md .claude and .codex copies must be byte-identical",
         );
         // The four tiers and the escalation rule are the contract of the rubric.
-        for required in ["light", "standard", "heavy", "frontier", "tier:", "Escalate on failure"] {
+        for required in [
+            "light",
+            "standard",
+            "heavy",
+            "frontier",
+            "tier:",
+            "Escalate on failure",
+            "Routing Axes",
+            "Cost",
+            "Intelligence",
+            "Taste",
+            "Taste-sensitive work routes to a high-taste tier",
+            "effort=high` is the ceiling",
+            "Escalate on judgment",
+            "Cost is a tiebreaker only",
+        ] {
             assert!(
                 claude.content.contains(required),
                 "model-selection.md missing required tier-rubric marker: {required:?}"
@@ -2287,6 +2416,80 @@ This is the body content."#;
             assert!(
                 guide.contains("references/model-selection.md"),
                 "{label} must point at the model-selection rubric"
+            );
+        }
+    }
+
+    /// cas-1dbf: lessons from the codex-worker fix-round loop must stay in the
+    /// supervisor reference layer, mirrored across Claude and Codex surfaces.
+    #[test]
+    fn test_supervisor_fix_round_recovery_guidance_present_and_mirrored() {
+        for path in [
+            "skills/cas-supervisor/references/code-review-queue.md",
+            "skills/cas-supervisor/references/worker-recovery.md",
+            "skills/cas-supervisor/references/workflow.md",
+        ] {
+            let claude = BUILTIN_SKILLS
+                .iter()
+                .find(|b| b.path == path)
+                .unwrap_or_else(|| panic!("BUILTIN_SKILLS missing {path}"));
+            let codex = CODEX_BUILTIN_SKILLS
+                .iter()
+                .find(|b| b.path == path)
+                .unwrap_or_else(|| panic!("CODEX_BUILTIN_SKILLS missing {path}"));
+            assert_eq!(
+                claude.content, codex.content,
+                "{path} .claude and .codex copies must be byte-identical",
+            );
+        }
+
+        let code_review_queue = BUILTIN_SKILLS
+            .iter()
+            .find(|b| b.path == "skills/cas-supervisor/references/code-review-queue.md")
+            .expect("BUILTIN_SKILLS missing cas-supervisor code-review-queue.md");
+        for required in [
+            "create the task first",
+            "epic-level review fix rounds",
+            "messages are not durable task state",
+        ] {
+            assert!(
+                code_review_queue.content.contains(required),
+                "code-review-queue.md missing fix-round marker: {required:?}"
+            );
+        }
+
+        let worker_recovery = BUILTIN_SKILLS
+            .iter()
+            .find(|b| b.path == "skills/cas-supervisor/references/worker-recovery.md")
+            .expect("BUILTIN_SKILLS missing cas-supervisor worker-recovery.md");
+        for required in [
+            "Verify Lifecycle Notifications Before Acting",
+            "cas-dbbe",
+            "Injected but Unwoken Worker",
+            "processed_at, acked_at",
+            "urgent=true",
+            "Do not kill or respawn",
+        ] {
+            assert!(
+                worker_recovery.content.contains(required),
+                "worker-recovery.md missing recovery marker: {required:?}"
+            );
+        }
+
+        let workflow = BUILTIN_SKILLS
+            .iter()
+            .find(|b| b.path == "skills/cas-supervisor/references/workflow.md")
+            .expect("BUILTIN_SKILLS missing cas-supervisor workflow.md");
+        for required in [
+            "Hold the main merge",
+            "git diff <base-branch>..HEAD > /tmp/<epic-id>-diff.patch",
+            "bounded epic-child fix-round task",
+            "cargo test --no-fail-fast > /tmp/<epic-id>-cargo-test.log 2>&1; echo $?",
+            "Never pipe the test run to `tail`",
+        ] {
+            assert!(
+                workflow.content.contains(required),
+                "workflow.md missing epic-review marker: {required:?}"
             );
         }
     }

@@ -33,6 +33,9 @@ import {
   CONDITIONAL_PERSONAS,
   REVIEWER_OUTPUT_SCHEMA,
   WORKFLOW_META,
+  gpt55ShouldRun,
+  gpt55SkippedPersonas,
+  personasRunCount,
 } from './cas-code-review-constants.js'
 
 import { mergeFindings } from './merge-findings.js'
@@ -176,6 +179,55 @@ describe('REVIEWER_OUTPUT_SCHEMA', () => {
     const findingSchema = REVIEWER_OUTPUT_SCHEMA.properties.findings.items
     const evid = findingSchema.properties.evidence
     assert.equal(evid.minItems, 1)
+  })
+
+  test('allows skipped_reason for skipped reviewer envelopes', () => {
+    assert.equal(REVIEWER_OUTPUT_SCHEMA.properties.skipped_reason.type, 'string')
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GPT-5.5 INDEPENDENT PERSONA HELPERS
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('gpt-5.5 independent activation helpers', () => {
+  test('activates at broad file-count boundary', () => {
+    assert.equal(gpt55ShouldRun({}, 4, 299), false)
+    assert.equal(gpt55ShouldRun({}, 5, 299), true)
+  })
+
+  test('activates at broad changed-line boundary', () => {
+    assert.equal(gpt55ShouldRun({}, 4, 299), false)
+    assert.equal(gpt55ShouldRun({}, 4, 300), true)
+  })
+
+  test('activates for every explicit arg variant', () => {
+    for (const args of [
+      { gpt55_independent: true },
+      { gpt55_independent: 'true' },
+      { enable_gpt55_independent: true },
+      { enable_gpt55_independent: 'true' },
+      { independent_review: 'gpt-5.5' },
+      { independent_review: 'gpt55' },
+      { independent_review: 'gpt-5.5:independent' },
+    ]) {
+      assert.equal(gpt55ShouldRun(args, 0, 0), true, JSON.stringify(args))
+    }
+  })
+
+  test('skipped persona accounting preserves reason and excludes skipped run', () => {
+    const skipped = gpt55SkippedPersonas({ skipped_reason: 'codex CLI not installed' })
+    assert.deepEqual(skipped, [{
+      reviewer: 'gpt-5.5:independent',
+      reason: 'codex CLI not installed',
+    }])
+    assert.equal(personasRunCount(4, true, true, true), 5)
+    assert.equal(personasRunCount(4, true, true, false), 6)
+  })
+
+  test('non-skipped gpt55 result has no skipped persona entry', () => {
+    assert.deepEqual(gpt55SkippedPersonas({ findings: [] }), [])
+    assert.deepEqual(gpt55SkippedPersonas(null), [])
   })
 })
 

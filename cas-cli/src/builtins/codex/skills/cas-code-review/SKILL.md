@@ -47,11 +47,13 @@ Return shape: `{"residual": [], "pre_existing": [], "mode": "<mode>", "skipped_r
 
    The Workflow internally handles:
    - **Step 1** (intent): extracts a 2-3 line intent summary from commit_log / task_context
-   - **Step 2** (selection): LLM-judged activation of conditional personas (security, performance, adversarial, fallow)
-   - **Step 3** (dispatch): parallel persona dispatch, schema-validated, all on Sonnet per R13
+   - **Step 2** (selection): LLM-judged activation of conditional personas (security, performance, adversarial, fallow) plus optional diff-breadth activation of `gpt-5.5:independent`
+   - **Step 3** (dispatch): parallel persona dispatch, schema-validated, all on Sonnet per R13; `gpt-5.5:independent` is a Sonnet-low wrapper that runs `codex exec -s read-only -m gpt-5.5` with a Bash timeout
    - **Step 4** (merge): deterministic 7-step JS merge pipeline (Phase A validated, 30 unit tests)
 
    The Workflow returns `{ residual, pre_existing, intent_summary, activation, stats }`.
+
+   `gpt-5.5:independent` is opt-in for broad diffs only: 5+ changed files, 300+ changed lines, or an explicit Workflow arg (`gpt55_independent: true`). It never runs on tiny diffs because Step 0 returns before the Workflow. If codex is absent or auth fails, the wrapper returns `findings: []` with `skipped_reason`; activation records that as a skipped persona, distinct from a successful zero-finding review.
 
 ## Step 5: Mode-specific output
 

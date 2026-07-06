@@ -17,7 +17,28 @@ Pay for reasoning only where reasoning is the bottleneck. Every worker slot has 
 | **heavy** | `cli=claude model=sonnet effort=high` | Cross-cutting refactors, concurrency/lifecycle code, migrations, gnarly debugging, P0/P1 critical-path units |
 | **frontier** | `cli=claude model=opus effort=high` | Architecture-defining units, high-blast-radius changes, tasks that already bounced twice. Sparingly — every frontier worker should map to named tasks. |
 
+Token-heavy read-only investigation belongs in a `cas-codex-exec` shell-out, not a worker and not your own context window.
+
 Model slugs: Claude accepts the `sonnet` / `opus` / `haiku` aliases. Codex subscription accounts must use plain `gpt-5.5` — `-codex`-suffixed slugs are rejected by the API.
+
+## Routing Axes
+
+Use tier labels as defaults, then check three axes before spawning:
+
+| Tier | Cost | Intelligence | Taste |
+|---|---|---|---|
+| **light** | Very low — Codex subscription capacity is effectively free for normal factory use | High: can solve hard problems when the task is well bounded | Low: often produces awkward public APIs, stiff prose, and code that works but does not feel native |
+| **standard** | Very low — same Codex budget, more reasoning effort | High: good default for bounded engineering work | Low-to-mid: fine for internal scaffolding; review anything user-facing before it ships |
+| **heavy** | Constrained — Claude subscription budget is the scarce pool | Mid-high: strong at messy codebases, lifecycle bugs, and tradeoff analysis | Mid-high: good default for public surfaces, docs, prompts, and naming |
+| **frontier** | Highest — reserve for work where quality or risk justifies it | High: best for ambiguous architecture and second-pass rescue work | High: best for taste-sensitive output that must land cleanly |
+
+Glossary:
+
+- **Cost** is the budget we actually spend. Codex subscription runs are cheap enough to use for drafts and investigation; Claude subscription workers are the constrained resource.
+- **Intelligence** is how hard a problem the model can handle unsupervised: ambiguity, hidden coupling, long reasoning chains, and unfamiliar code.
+- **Taste** is the quality of what ships: UI/UX judgment, API and SDK shape, naming, code style, prompts, docs, release notes, and error-message wording.
+
+Taste-sensitive work routes to a high-taste tier even when the task is mechanically simple. Skill wording, supervisor guidance, release notes, public docs, API/SDK surfaces, and user-facing error text are not "light" just because the diff is small.
 
 ## Reading the task signals
 
@@ -31,6 +52,8 @@ Score each task while breaking down the EPIC:
 - Everything else → **standard** (the default is the default for a reason)
 
 Effort is the main cost lever on subscription-metered backends. For long-running heavy work, prefer switching model tier (`cli=claude model=sonnet effort=high`) over pinning codex at `high`/`xhigh` — sustained deep-effort runs on a metered subscription burn budget disproportionately fast.
+
+For Claude workers, `effort=high` is the ceiling. `xhigh`/`max` increase per-step reasoning, not step count or run length; on hard multi-step work they tend to overthink each move, produce heavier diffs, and multiply cost. Escalate the model tier or split the task before raising Claude effort above `high`.
 
 ## Workflow
 
@@ -46,6 +69,7 @@ Effort is the main cost lever on subscription-metered backends. For long-running
    Tiers change the fleet's composition, not its size — worker-count strategy (3–4 max, sized by independent file groups) still applies.
 3. **Route by tier** — assign `tier:*`-labelled tasks to a matching worker; standard tasks go to anyone. Name heavier workers so routing stays legible (`hv-*`, `fr-*`).
 4. **Escalate on failure** — a task rejected or verification-failed twice moves up one tier: reassign to an existing heavier worker or spawn one. Don't re-run the same task on the same tier hoping for different output.
-5. **De-escalate the tail** — when only light tasks remain, don't leave a heavy/frontier worker idle-burning; shut it down and let a cheaper worker sweep the tail.
+5. **Escalate on judgment** — the two-rejection rule is a floor, not a permission gate. If a cheaper worker's draft gathers facts but misses the quality bar, escalate before verification fails. Judge the output, not the price tag; use cheap tiers for information and drafts, then pay for what ships. Cost is a tiebreaker only.
+6. **De-escalate the tail** — when only light tasks remain, don't leave a heavy/frontier worker idle-burning; shut it down and let a cheaper worker sweep the tail.
 
 Per-spawn overrides beat `.cas/config.toml` `[factory.defaults]` / `[[factory.workers]]` for that spawn only — check the project config before assuming what the floor actually is.

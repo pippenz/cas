@@ -21,8 +21,10 @@ See **workflow.md Phase 3, step 5** for the exact review invocation sequence:
 
 ## After review
 
-1. **Deliver the verdict** — Send the worker a coordination message with the findings summary and any P0/P1 issues to address. If clean, confirm they can consider the task complete.
-2. **Record the verification** (optional) — `mcp__cas__verification action=add task_id=<id> status=approved summary="..."` to create an audit trail.
+1. **If clean, record the approval** — Tell the worker the review passed and, optionally, add `mcp__cas__verification action=add task_id=<id> status=approved summary="..."` for the audit trail.
+2. **If changes are required, create the task first** — File an epic-child task with the finding, expected fix, acceptance criteria, and proof command in the task description. Then send a short coordination message that points at the task ID and tells the worker to run `mcp__cas__task action=show id=<id>`.
+
+Do this for both per-task review findings and epic-level review fix rounds. Do not deliver actionable findings only as a coordination message: messages are not durable task state, and a one-shot Codex worker recovering through `task mine` will otherwise see nothing to do.
 
 ## Config
 
