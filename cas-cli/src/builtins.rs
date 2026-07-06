@@ -193,6 +193,12 @@ pub const BUILTIN_SKILLS: &[BuiltinFile] = &[
         ),
     },
     BuiltinFile {
+        path: "skills/cas-supervisor/references/model-selection.md",
+        content: include_str!(
+            "builtins/skills/cas-supervisor/references/model-selection.md"
+        ),
+    },
+    BuiltinFile {
         path: "skills/cas-supervisor-checklist/SKILL.md",
         content: include_str!("builtins/skills/cas-supervisor-checklist.md"),
     },
@@ -439,6 +445,12 @@ pub const CODEX_BUILTIN_SKILLS: &[BuiltinFile] = &[
         path: "skills/cas-supervisor/references/filing-cas-bugs.md",
         content: include_str!(
             "builtins/codex/skills/cas-supervisor/references/filing-cas-bugs.md"
+        ),
+    },
+    BuiltinFile {
+        path: "skills/cas-supervisor/references/model-selection.md",
+        content: include_str!(
+            "builtins/codex/skills/cas-supervisor/references/model-selection.md"
         ),
     },
     BuiltinFile {
@@ -2237,6 +2249,46 @@ This is the body content."#;
             claude_ref.content, codex_ref.content,
             "auth-fixture-template.md .claude and .codex copies must be byte-identical",
         );
+    }
+
+    /// cas-6219: the supervisor's model-selection rubric must be registered on
+    /// both surfaces, stay byte-identical across mirrors (reference files carry
+    /// no alias divergence today — cas-62ab owns the eventual mcp__cs__ sweep),
+    /// and remain discoverable from the skill body that fits the 8 KB cap.
+    #[test]
+    fn test_supervisor_model_selection_reference_registered_and_mirrored() {
+        let claude = BUILTIN_SKILLS
+            .iter()
+            .find(|b| b.path == "skills/cas-supervisor/references/model-selection.md")
+            .expect("BUILTIN_SKILLS missing cas-supervisor model-selection.md");
+        let codex = CODEX_BUILTIN_SKILLS
+            .iter()
+            .find(|b| b.path == "skills/cas-supervisor/references/model-selection.md")
+            .expect("CODEX_BUILTIN_SKILLS missing cas-supervisor model-selection.md");
+        assert_eq!(
+            claude.content, codex.content,
+            "model-selection.md .claude and .codex copies must be byte-identical",
+        );
+        // The four tiers and the escalation rule are the contract of the rubric.
+        for required in ["light", "standard", "heavy", "frontier", "tier:", "Escalate on failure"] {
+            assert!(
+                claude.content.contains(required),
+                "model-selection.md missing required tier-rubric marker: {required:?}"
+            );
+        }
+        // Discoverable from the SessionStart-injected body on both surfaces.
+        for (label, guide) in [
+            ("claude cas-supervisor.md", SUPERVISOR_GUIDE),
+            (
+                "codex cas-supervisor.md",
+                include_str!("builtins/codex/skills/cas-supervisor.md"),
+            ),
+        ] {
+            assert!(
+                guide.contains("references/model-selection.md"),
+                "{label} must point at the model-selection rubric"
+            );
+        }
     }
 
     // cas-e0d1: pin the opt-in description so a future sync or hand-edit can't

@@ -60,7 +60,7 @@ mcp__cs__coordination action=spawn_workers count=2 cli=codex worker_names="alice
 # cas factory --workers 2 --worker-spec '{"cli":"Codex","name":"alice"}'
 ```
 
-`cli`, `model`, and `effort` are per-spawn overrides. See [references/reference.md](cas-supervisor/references/reference.md) for the full `spawn_workers` parameter table.
+`cli`, `model`, and `effort` are per-spawn overrides — match them to task complexity via [references/model-selection.md](cas-supervisor/references/model-selection.md); parameter table in [references/reference.md](cas-supervisor/references/reference.md).
 
 ## References
 
@@ -70,6 +70,7 @@ Each file below is a focused chunk of the operational guide. Open the one you ne
 - **[intake.md](cas-supervisor/references/intake.md)** — Adversarial posture, 8-point intake gate, when to fire `/cas-ideate` and `/cas-brainstorm`.
 - **[planning.md](cas-supervisor/references/planning.md)** — Planning gates, trajectory gate, spec requirements, Implementation Unit Template, EPIC sizing, dependency patterns, breakdown guidelines.
 - **[workflow.md](cas-supervisor/references/workflow.md)** — Worker modes, count strategy, Phase 1–4, merge/sync, blocker handling.
+- **[model-selection.md](cas-supervisor/references/model-selection.md)** — Tier rubric: model/effort per task, spawn mix, escalation.
 - **[worker-recovery.md](cas-supervisor/references/worker-recovery.md)** — `is-wedged` triage, dead/silent worker, garbage output, verification jail, resource-contention crashes.
 - **[reference.md](cas-supervisor/references/reference.md)** — Exact valid actions and field names, dispatch two-step pattern, `update` vs `transfer`, message field requirements, and urgent/interrupt delivery (mid-turn course-correction; discards in-flight work).
 - **[code-review-queue.md](cas-supervisor/references/code-review-queue.md)** — Supervisor-owned code review mode: queue monitoring, running full review, delivering verdict (cas-b51a).

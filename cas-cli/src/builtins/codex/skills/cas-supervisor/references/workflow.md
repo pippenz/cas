@@ -56,6 +56,8 @@ In shared mode, file-overlap analysis is even more critical — two workers edit
    mcp__cas__coordination action=spawn_workers count=1 cli=codex worker_names="alice" isolate=true
    ```
    `cli`, `model`, and `effort` are per-spawn overrides; omit to use the session default.
+   Spawn the tier mix the ready backlog needs — one `spawn_workers` call per tier; rubric
+   and routing in [model-selection.md](model-selection.md).
    Full parameter table in [reference.md](reference.md#spawn_workers-parameters).
 2. Verify workers appear in TUI before assigning (stale DB records are not real workers)
 3. Assign tasks: `mcp__cas__task action=update id=<id> assignee=<worker>`

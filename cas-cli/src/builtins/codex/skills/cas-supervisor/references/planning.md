@@ -146,3 +146,5 @@ When breaking an epic into subtasks, apply these patterns:
 **Spikes** — If a task's primary output is understanding (not code), create it as a spike: `task_type=spike`. Spikes have question-based acceptance criteria (e.g., "Which auth library fits our constraints?") and produce a decision or recommendation, not implementation.
 
 **Fit checks** — When multiple approaches exist, create a spike first to compare options. Document the comparison in the spec's `design_notes` before committing to an approach. This prevents wasted implementation effort on the wrong path.
+
+**Model tier** — Decide each task's worker tier while breaking down: default standard; tag deviations with `labels="tier:light"` / `"tier:heavy"` / `"tier:frontier"` and note non-obvious rationale in `design`. Tier rubric, spawn mix, and escalation workflow in [model-selection.md](model-selection.md).
