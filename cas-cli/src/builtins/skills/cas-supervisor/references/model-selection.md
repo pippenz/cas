@@ -17,6 +17,8 @@ Pay for reasoning only where reasoning is the bottleneck. Every worker slot has 
 | **heavy** | `cli=claude model=sonnet effort=high` | Cross-cutting refactors, concurrency/lifecycle code, migrations, gnarly debugging, P0/P1 critical-path units |
 | **frontier** | `cli=claude model=opus effort=high` | Architecture-defining units, high-blast-radius changes, tasks that already bounced twice. Sparingly — every frontier worker should map to named tasks. |
 
+Token-heavy read-only investigation belongs in a `cas-codex-exec` shell-out, not a worker and not your own context window.
+
 Model slugs: Claude accepts the `sonnet` / `opus` / `haiku` aliases. Codex subscription accounts must use plain `gpt-5.5` — `-codex`-suffixed slugs are rejected by the API.
 
 ## Reading the task signals

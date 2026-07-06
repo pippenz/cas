@@ -228,6 +228,10 @@ pub const BUILTIN_SKILLS: &[BuiltinFile] = &[
         content: include_str!("builtins/skills/verify-before-claim/SKILL.md"),
     },
     BuiltinFile {
+        path: "skills/cas-codex-exec/SKILL.md",
+        content: include_str!("builtins/skills/cas-codex-exec/SKILL.md"),
+    },
+    BuiltinFile {
         path: "skills/cas-brainstorm/SKILL.md",
         content: include_str!("builtins/skills/cas-brainstorm/SKILL.md"),
     },
@@ -478,6 +482,10 @@ pub const CODEX_BUILTIN_SKILLS: &[BuiltinFile] = &[
     BuiltinFile {
         path: "skills/verify-before-claim/SKILL.md",
         content: include_str!("builtins/codex/skills/verify-before-claim/SKILL.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-codex-exec/SKILL.md",
+        content: include_str!("builtins/codex/skills/cas-codex-exec/SKILL.md"),
     },
     BuiltinFile {
         path: "skills/cas-brainstorm/SKILL.md",
@@ -1636,6 +1644,35 @@ This is the body content."#;
             assert!(
                 CODEX_BUILTIN_SKILLS.iter().any(|b| b.path == p),
                 "{p} missing from CODEX_BUILTIN_SKILLS"
+            );
+        }
+    }
+
+    #[test]
+    fn test_builtin_skills_contains_cas_codex_exec() {
+        let claude = BUILTIN_SKILLS
+            .iter()
+            .find(|b| b.path == "skills/cas-codex-exec/SKILL.md")
+            .expect("BUILTIN_SKILLS missing cas-codex-exec SKILL.md");
+        let codex = CODEX_BUILTIN_SKILLS
+            .iter()
+            .find(|b| b.path == "skills/cas-codex-exec/SKILL.md")
+            .expect("CODEX_BUILTIN_SKILLS missing cas-codex-exec SKILL.md");
+        assert_eq!(
+            claude.content, codex.content,
+            "cas-codex-exec SKILL.md .claude and .codex copies must be byte-identical",
+        );
+        for required in [
+            "name: cas-codex-exec",
+            "managed_by: cas",
+            "token-heavy READ-ONLY investigation",
+            "codex exec -s read-only -m gpt-5.5",
+            "If you find nothing, say so explicitly and name what you inspected.",
+            "If `codex` is not installed",
+        ] {
+            assert!(
+                claude.content.contains(required),
+                "cas-codex-exec SKILL.md missing required marker: {required:?}"
             );
         }
     }
