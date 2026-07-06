@@ -300,6 +300,17 @@ impl Agent {
         self
     }
 
+    /// Whether this agent is visible to a caller in the given factory session.
+    ///
+    /// `Some(session)` enforces strict same-session visibility. `None` preserves
+    /// legacy/non-factory behavior and does not filter by factory ownership.
+    pub fn visible_to_factory_session(&self, session: Option<&str>) -> bool {
+        match session {
+            Some(session) => self.factory_session.as_deref() == Some(session),
+            None => true,
+        }
+    }
+
     /// Generate a fallback ID for agents without a Claude Code session
     ///
     /// Use this only for CLI tools, workers, or CI agents that don't have

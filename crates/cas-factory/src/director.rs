@@ -13,8 +13,7 @@ use cas_store::{
     SqliteTaskStore, SqliteWorktreeStore, WorktreeStore,
 };
 use cas_types::{
-    Agent, AgentRole, AgentStatus, Event, EventType, Priority, Task, TaskStatus, TaskType,
-    WorktreeStatus,
+    AgentRole, AgentStatus, Event, EventType, Priority, Task, TaskStatus, TaskType, WorktreeStatus,
 };
 
 use crate::changes::{FileChangeInfo, GitFileStatus, SourceChangesInfo};
@@ -33,13 +32,6 @@ pub struct DirectorStores {
     /// idle detector to suppress `WorkerIdle` while a worker has unread
     /// messages in the prompt queue (spawn-race fix, cas-afb7).
     pub prompt_queue_store: Option<SqlitePromptQueueStore>,
-}
-
-fn factory_session_agent_visible(agent: &Agent, factory_session: Option<&str>) -> bool {
-    match factory_session {
-        Some(session) => agent.factory_session.as_deref() == Some(session),
-        None => true,
-    }
 }
 
 impl DirectorStores {
@@ -313,7 +305,7 @@ impl DirectorData {
         let factory_session = std::env::var("CAS_FACTORY_SESSION").ok();
         let agents_list: Vec<_> = AgentStore::list(agent_store, None)?
             .into_iter()
-            .filter(|a| factory_session_agent_visible(a, factory_session.as_deref()))
+            .filter(|a| a.visible_to_factory_session(factory_session.as_deref()))
             .collect();
 
         // Compute per-agent pending message counts (best-effort, non-fatal).
