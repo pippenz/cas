@@ -221,6 +221,7 @@ impl FactoryCore {
             self.config.supervisor_model.as_deref(),
             self.config.supervisor_effort.as_deref(),
             None, // teams: cas-factory doesn't use native Agent Teams yet
+            None,
         )
         .map_err(|e| FactoryError::Mux(e.to_string()))?;
 

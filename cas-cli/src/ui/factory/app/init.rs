@@ -160,6 +160,7 @@ impl FactoryApp {
         let mux_config = MuxConfig {
             cwd: config.cwd.clone(),
             cas_root: cas_root_for_mux,
+            factory_session: None,
             worker_cwds,
             workers: worker_names.len(),
             worker_names: worker_names.clone(),

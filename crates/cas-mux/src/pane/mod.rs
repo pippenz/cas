@@ -280,10 +280,20 @@ impl Pane {
         rows: u16,
         cols: u16,
         teams: Option<&TeamsSpawnConfig>,
+        factory_session: Option<&str>,
     ) -> Result<Self> {
-        let config = Self::build_worker_config(
-            name, cwd, cas_root, supervisor_name, supervisor_cli, cli, model, effort, teams,
+        let mut config = Self::build_worker_config(
+            name,
+            cwd,
+            cas_root,
+            supervisor_name,
+            supervisor_cli,
+            cli,
+            model,
+            effort,
+            teams,
         );
+        push_factory_session_env(&mut config, cli, factory_session);
         let pty = Pty::spawn(name, config)?;
         Self::with_pty(name, PaneKind::Worker, pty, rows, cols)
     }
@@ -349,10 +359,20 @@ impl Pane {
         model: Option<&str>,
         effort: Option<&str>,
         teams: Option<&TeamsSpawnConfig>,
+        factory_session: Option<&str>,
     ) -> Result<Self> {
-        let config = Self::build_supervisor_config(
-            name, cwd, cas_root, cli, worker_cli, worker_names, model, effort, teams,
+        let mut config = Self::build_supervisor_config(
+            name,
+            cwd,
+            cas_root,
+            cli,
+            worker_cli,
+            worker_names,
+            model,
+            effort,
+            teams,
         );
+        push_factory_session_env(&mut config, cli, factory_session);
         let pty = Pty::spawn(name, config)?;
         Self::with_pty(name, PaneKind::Supervisor, pty, rows, cols)
     }
@@ -1141,5 +1161,23 @@ impl Pane {
 
     pub fn is_recording(&self) -> bool {
         self.recorder.is_some()
+    }
+}
+
+fn push_factory_session_env(
+    config: &mut PtyConfig,
+    cli: SupervisorCli,
+    factory_session: Option<&str>,
+) {
+    if let Some(session) = factory_session {
+        config
+            .env
+            .push(("CAS_FACTORY_SESSION".to_string(), session.to_string()));
+        if cli == SupervisorCli::Codex {
+            config.args.push("-c".to_string());
+            config.args.push(format!(
+                "mcp_servers.cs.env.CAS_FACTORY_SESSION=\"{session}\""
+            ));
+        }
     }
 }

@@ -1,6 +1,15 @@
+use crate::harness::SupervisorCli;
 use crate::mux::*;
 use crate::spec::{Effort, WorkerSpec};
 use std::path::PathBuf;
+
+fn env_value<'a>(config: &'a crate::pty::PtyConfig, key: &str) -> Option<&'a str> {
+    config
+        .env
+        .iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.as_str())
+}
 
 // ── cas-d571: effort config flows through Mux::factory() to PTY args ─────────
 // Tests the full MuxConfig → Mux::factory_pane_configs() → PtyConfig.args chain.
@@ -76,6 +85,75 @@ fn factory_pane_configs_worker_effort_reaches_pty_args() {
         configs.last().unwrap().0,
         config.supervisor_name,
         "supervisor must be the last entry in factory_pane_configs output"
+    );
+}
+
+#[test]
+fn factory_pane_configs_propagates_factory_session_to_process_and_codex_mcp_env() {
+    let config = MuxConfig {
+        cwd: PathBuf::from("/tmp/test"),
+        workers: 1,
+        worker_names: vec!["codex-worker".to_string()],
+        supervisor_name: "codex-supervisor".to_string(),
+        factory_session: Some("factory-session-a".to_string()),
+        include_director: false,
+        supervisor_cli: SupervisorCli::Codex,
+        worker_cli: SupervisorCli::Codex,
+        ..MuxConfig::default()
+    };
+
+    let configs = Mux::factory_pane_configs(&config);
+
+    for (name, pty_config) in configs {
+        assert_eq!(
+            env_value(&pty_config, "CAS_FACTORY_SESSION"),
+            Some("factory-session-a"),
+            "{name} PTY env must include CAS_FACTORY_SESSION"
+        );
+        assert!(
+            pty_config.args.contains(
+                &"mcp_servers.cs.env.CAS_FACTORY_SESSION=\"factory-session-a\"".to_string()
+            ),
+            "{name} Codex cs MCP env must include CAS_FACTORY_SESSION; args={:?}",
+            pty_config.args
+        );
+    }
+}
+
+#[test]
+fn build_add_worker_config_propagates_factory_session_for_dynamic_spawns() {
+    let mut mux = Mux::factory(MuxConfig {
+        cwd: PathBuf::from("/tmp/test"),
+        workers: 0,
+        worker_names: vec![],
+        factory_session: Some("factory-session-dynamic".to_string()),
+        include_director: false,
+        supervisor_cli: SupervisorCli::Claude,
+        worker_cli: SupervisorCli::Codex,
+        ..MuxConfig::default()
+    })
+    .expect("factory config should build");
+
+    mux.set_default_worker_spec(WorkerSpec::codex_default("dynamic-worker"));
+    let pty_config = mux.build_add_worker_config(
+        "dynamic-worker",
+        PathBuf::from("/tmp/test"),
+        None,
+        "supervisor",
+        None,
+        None,
+    );
+
+    assert_eq!(
+        env_value(&pty_config, "CAS_FACTORY_SESSION"),
+        Some("factory-session-dynamic")
+    );
+    assert!(
+        pty_config.args.contains(
+            &"mcp_servers.cs.env.CAS_FACTORY_SESSION=\"factory-session-dynamic\"".to_string()
+        ),
+        "dynamic Codex cs MCP env must include CAS_FACTORY_SESSION; args={:?}",
+        pty_config.args
     );
 }
 
@@ -159,10 +237,7 @@ fn factory_pane_configs_codex_worker_inherits_supervisor_cli_in_cs_env_cas_1544(
 fn effective_command(pty: &crate::pty::PtyConfig) -> &str {
     if pty.command == "nice" {
         // nice -n <level> <binary> [args...] → binary is at index 2
-        pty.args
-            .get(2)
-            .map(String::as_str)
-            .unwrap_or("nice")
+        pty.args.get(2).map(String::as_str).unwrap_or("nice")
     } else {
         &pty.command
     }
@@ -575,7 +650,10 @@ async fn interrupt_and_inject_errors_on_missing_pane() {
     let res = mux
         .interrupt_and_inject("nope", "hi", std::time::Duration::from_millis(0))
         .await;
-    assert!(res.is_err(), "missing pane must surface an error, not panic");
+    assert!(
+        res.is_err(),
+        "missing pane must surface an error, not panic"
+    );
 }
 
 #[tokio::test]
@@ -590,7 +668,11 @@ async fn interrupt_and_inject_breaks_then_injects_by_name() {
     // enforced by interrupt_and_inject internally. Just assert the by-name
     // delivery completes Ok against a live PTY-backed pane.
     let res = mux
-        .interrupt_and_inject("w1", "STOP and switch tasks", std::time::Duration::from_millis(0))
+        .interrupt_and_inject(
+            "w1",
+            "STOP and switch tasks",
+            std::time::Duration::from_millis(0),
+        )
         .await;
     assert!(res.is_ok(), "urgent redirect to a live pane must succeed");
 }

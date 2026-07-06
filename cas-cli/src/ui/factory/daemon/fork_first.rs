@@ -202,6 +202,7 @@ impl DaemonInitPhase {
         use crate::worktree::{GitOperations, WorktreeConfig, WorktreeManager};
         use cas_mux::{Mux, MuxConfig};
 
+        unsafe { std::env::set_var("CAS_FACTORY_SESSION", &self.session_name) };
         tracing::info!("Daemon init phase starting, waiting for parent to connect...");
 
         // Wait for parent to connect (with timeout)
@@ -363,6 +364,7 @@ impl DaemonInitPhase {
         let mux_config = MuxConfig {
             cwd: self.factory_config.cwd.clone(),
             cas_root: Some(cas_dir.clone()),
+            factory_session: Some(self.session_name.clone()),
             worker_cwds: worker_cwds.clone(),
             workers: self.worker_names.len(),
             worker_names: self.worker_names.clone(),
@@ -401,7 +403,7 @@ impl DaemonInitPhase {
         self.send_progress("Spawning agents", 6, 6, true)?;
 
         // Create the FactoryApp (clone configs that don't implement Copy)
-        let app = FactoryApp::from_init_result(
+        let mut app = FactoryApp::from_init_result(
             cas_dir,
             mux,
             worktree_manager,
@@ -420,6 +422,7 @@ impl DaemonInitPhase {
             self.factory_config.lead_session_id.clone(),
             self.factory_config.cwd.clone(),
         )?;
+        app.set_factory_session(self.session_name.clone());
 
         // Defer cloud phone-home client start to daemon.run() where a Tokio
         // runtime is available.  In the fork-first path, run_with_progress()

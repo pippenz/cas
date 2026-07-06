@@ -25,6 +25,7 @@ async fn main() -> anyhow::Result<()> {
     let config = MuxConfig {
         cwd,
         cas_root: None,
+        factory_session: None,
         worker_cwds: std::collections::HashMap::new(),
         workers: 2,
         worker_names: vec!["swift-fox".to_string(), "calm-owl".to_string()],

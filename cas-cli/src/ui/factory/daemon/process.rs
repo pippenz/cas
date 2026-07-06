@@ -198,6 +198,9 @@ pub async fn run_daemon_after_fork(
     listener: UnixListener,
     session_name: String,
 ) -> anyhow::Result<()> {
+    unsafe { std::env::set_var("CAS_FACTORY_SESSION", &session_name) };
+    app.set_factory_session(session_name.clone());
+
     let trace_path = daemon_trace_log_path(&session_name);
     let trace_file = open_log_file_truncate(&trace_path)?;
     let subscriber = tracing_subscriber::fmt()

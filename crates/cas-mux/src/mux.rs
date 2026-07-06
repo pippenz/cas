@@ -21,6 +21,8 @@ pub struct MuxConfig {
     /// Path to the .cas directory (if set, passes CAS_ROOT env var to agents)
     /// This allows workers in clone directories to access the main repo's CAS state.
     pub cas_root: Option<PathBuf>,
+    /// Factory session name to tag spawned agent processes and their MCP servers.
+    pub factory_session: Option<String>,
     /// Per-worker working directories (worker_name -> clone path)
     /// Workers not in this map use the default `cwd`.
     pub worker_cwds: HashMap<String, PathBuf>,
@@ -65,6 +67,7 @@ impl Default for MuxConfig {
         Self {
             cwd: std::env::current_dir().unwrap_or_default(),
             cas_root: None,
+            factory_session: None,
             worker_cwds: HashMap::new(),
             workers: 2,
             worker_names: vec![],
@@ -129,6 +132,8 @@ pub struct Mux {
     worker_specs: HashMap<String, WorkerSpec>,
     /// Supervisor CLI for propagating harness context into worker spawns.
     supervisor_cli: SupervisorCli,
+    /// Factory session propagated into dynamically spawned agents.
+    factory_session: Option<String>,
 }
 
 impl Mux {
@@ -145,6 +150,7 @@ impl Mux {
             default_worker_spec: WorkerSpec::builtin_default(),
             worker_specs: HashMap::new(),
             supervisor_cli: SupervisorCli::Claude,
+            factory_session: None,
         }
     }
 
@@ -155,7 +161,10 @@ impl Mux {
     /// [`set_worker_spec`][Self::set_worker_spec]. This setter is kept only
     /// for backwards-compatibility with callers that pass `worker_cli` as a
     /// scalar flag.
-    #[deprecated(since = "0.1.0", note = "use set_default_worker_spec or set_worker_spec")]
+    #[deprecated(
+        since = "0.1.0",
+        note = "use set_default_worker_spec or set_worker_spec"
+    )]
     pub fn set_worker_cli(&mut self, worker_cli: SupervisorCli) {
         self.default_worker_spec.cli = worker_cli;
     }
@@ -165,7 +174,10 @@ impl Mux {
     /// # Deprecated
     /// Prefer [`set_default_worker_spec`][Self::set_default_worker_spec] or
     /// [`set_worker_spec`][Self::set_worker_spec].
-    #[deprecated(since = "0.1.0", note = "use set_default_worker_spec or set_worker_spec")]
+    #[deprecated(
+        since = "0.1.0",
+        note = "use set_default_worker_spec or set_worker_spec"
+    )]
     pub fn set_worker_model(&mut self, model: Option<String>) {
         self.default_worker_spec.model = model;
     }
@@ -179,7 +191,10 @@ impl Mux {
     /// The effort string is parsed to an [`Effort`][crate::spec::Effort] enum;
     /// unrecognised values are silently cleared (effort falls back to the
     /// backend default).
-    #[deprecated(since = "0.1.0", note = "use set_default_worker_spec or set_worker_spec")]
+    #[deprecated(
+        since = "0.1.0",
+        note = "use set_default_worker_spec or set_worker_spec"
+    )]
     pub fn set_worker_effort(&mut self, effort: Option<String>) {
         self.default_worker_spec.effort = effort
             .as_deref()
@@ -279,8 +294,7 @@ impl Mux {
             let teams = config.teams_configs.get(name);
 
             // Resolve per-worker spec via the shared helper.
-            let (cli, model_opt, effort_opt) =
-                Self::resolve_worker_spec_from_config(name, config);
+            let (cli, model_opt, effort_opt) = Self::resolve_worker_spec_from_config(name, config);
 
             let pty_config = Pane::build_worker_config(
                 name,
@@ -293,6 +307,8 @@ impl Mux {
                 effort_opt.as_deref(),
                 teams,
             );
+            let pty_config =
+                Self::with_factory_session_env(pty_config, cli, config.factory_session.as_deref());
             result.push((name.clone(), pty_config));
         }
 
@@ -308,6 +324,11 @@ impl Mux {
             config.supervisor_effort.as_deref(),
             sup_teams,
         );
+        let sup_config = Self::with_factory_session_env(
+            sup_config,
+            config.supervisor_cli,
+            config.factory_session.as_deref(),
+        );
         result.push((config.supervisor_name.clone(), sup_config));
 
         result
@@ -316,6 +337,7 @@ impl Mux {
     /// Create a multiplexer with factory configuration
     pub fn factory(config: MuxConfig) -> Result<Self> {
         let mut mux = Self::new(config.rows, config.cols);
+        mux.factory_session = config.factory_session.clone();
 
         // Build the default spec from singular fields (backward compat with
         // callers that only pass worker_cli/worker_model/worker_effort).
@@ -359,8 +381,7 @@ impl Mux {
             let teams = config.teams_configs.get(name);
 
             // Resolve per-worker spec via the shared helper.
-            let (cli, model_opt, effort_opt) =
-                Self::resolve_worker_spec_from_config(name, &config);
+            let (cli, model_opt, effort_opt) = Self::resolve_worker_spec_from_config(name, &config);
 
             let pane = Pane::worker(
                 name,
@@ -374,6 +395,7 @@ impl Mux {
                 pane_rows,
                 pane_cols,
                 teams,
+                config.factory_session.as_deref(),
             )?;
             mux.add_pane(pane);
         }
@@ -392,6 +414,7 @@ impl Mux {
             config.supervisor_model.as_deref(),
             config.supervisor_effort.as_deref(),
             sup_teams,
+            config.factory_session.as_deref(),
         )?;
         mux.add_pane(supervisor);
 
@@ -610,7 +633,7 @@ impl Mux {
     ) -> PtyConfig {
         let effective = self.effective_worker_spec(name, spec);
         let effort_str = effective.effort.map(|e| e.as_claude_arg().to_string());
-        Pane::build_worker_config(
+        let config = Pane::build_worker_config(
             name,
             cwd,
             cas_root,
@@ -620,7 +643,8 @@ impl Mux {
             effective.model.as_deref(),
             effort_str.as_deref(),
             teams,
-        )
+        );
+        Self::with_factory_session_env(config, effective.cli, self.factory_session.as_deref())
     }
 
     /// Add a worker pane at runtime
@@ -668,6 +692,7 @@ impl Mux {
             self.rows,
             self.cols,
             teams,
+            self.factory_session.as_deref(),
         )?;
         let id = pane.id().to_string();
         // Persist the resolved spec so `effective_worker_spec(name, None)` is
@@ -679,6 +704,25 @@ impl Mux {
         self.worker_specs.insert(name.to_string(), effective);
         self.add_pane(pane);
         Ok(id)
+    }
+
+    fn with_factory_session_env(
+        mut config: PtyConfig,
+        cli: SupervisorCli,
+        factory_session: Option<&str>,
+    ) -> PtyConfig {
+        if let Some(session) = factory_session {
+            config
+                .env
+                .push(("CAS_FACTORY_SESSION".to_string(), session.to_string()));
+            if cli == SupervisorCli::Codex {
+                config.args.push("-c".to_string());
+                config.args.push(format!(
+                    "mcp_servers.cs.env.CAS_FACTORY_SESSION=\"{session}\""
+                ));
+            }
+        }
+        config
     }
 
     /// Add a new shell pane to the mux.
