@@ -155,6 +155,14 @@ impl PtyConfig {
         if let Some(worker_cli) = factory_worker_cli {
             env.push(("CAS_FACTORY_WORKER_CLI".to_string(), worker_cli.to_string()));
         }
+        if role == "worker" {
+            if let Some(model) = model {
+                env.push(("CAS_FACTORY_WORKER_MODEL".to_string(), model.to_string()));
+            }
+            if let Some(effort) = effort {
+                env.push(("CAS_FACTORY_WORKER_EFFORT".to_string(), effort.to_string()));
+            }
+        }
 
         // cas-0bf4: cap cargo parallelism inside factory worker processes
         // so a 4-worker factory doesn't stack `num_cpus`-way rustc jobs
@@ -322,6 +330,14 @@ impl PtyConfig {
         if let Some(worker_cli) = factory_worker_cli {
             env.push(("CAS_FACTORY_WORKER_CLI".to_string(), worker_cli.to_string()));
         }
+        if role == "worker" {
+            if let Some(model) = model {
+                env.push(("CAS_FACTORY_WORKER_MODEL".to_string(), model.to_string()));
+            }
+            if let Some(effort) = effort {
+                env.push(("CAS_FACTORY_WORKER_EFFORT".to_string(), effort.to_string()));
+            }
+        }
 
         // cas-0bf4: see equivalent comment in `claude()`.
         push_worker_cargo_env(&mut env, role);
@@ -461,7 +477,9 @@ fn push_codex_mcp_server_args(args: &mut Vec<String>, session_id: &str, name: &s
     // this the `cs` server comes up identity-less and whoami/task fail with
     // "Agent not registered" until the worker brute-forces a manual `register`.
     args.push("-c".to_string());
-    args.push(format!("mcp_servers.cs.env.CAS_SESSION_ID=\"{session_id}\""));
+    args.push(format!(
+        "mcp_servers.cs.env.CAS_SESSION_ID=\"{session_id}\""
+    ));
     // cas-7592: also inject CAS_AGENT_NAME and CAS_AGENT_ROLE into the `cs` MCP
     // env. Codex does NOT forward the codex process env into MCP servers, so
     // without these the eager auto-registration (mcp/server/runtime.rs) falls
@@ -532,10 +550,7 @@ pub(crate) fn claude_supports_effort_flag() -> bool {
     }
 
     *CACHE.get_or_init(|| {
-        let Ok(output) = std::process::Command::new("claude")
-            .arg("--help")
-            .output()
-        else {
+        let Ok(output) = std::process::Command::new("claude").arg("--help").output() else {
             return false;
         };
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -679,8 +694,8 @@ impl Pty {
         // niced wrapper form (cas-0bf4) so the preflight covers both. Refuse loudly
         // with remediation rather than spawning a worker that comes up with zero
         // CAS tools and flails.
-        let codex_spawn = is_codex
-            || (config.command == "nice" && config.args.iter().any(|a| a == "codex"));
+        let codex_spawn =
+            is_codex || (config.command == "nice" && config.args.iter().any(|a| a == "codex"));
         if codex_spawn && !cas_binary_on_path() {
             return Err(Error::pty(
                 "Codex agent cannot start: the `cas` MCP server binary is not on PATH. \
@@ -1073,9 +1088,9 @@ mod tests {
             None,
             None,
             None,
-            None,  // model
-            None,  // effort
-            None,  // teams
+            None, // model
+            None, // effort
+            None, // teams
         );
         assert_eq!(config.command, "claude");
         assert!(
@@ -1109,9 +1124,9 @@ mod tests {
             Some(&cas_root),
             None,
             None,
-            None,  // model
-            None,  // effort
-            None,  // teams
+            None, // model
+            None, // effort
+            None, // teams
         );
         assert!(
             config
@@ -1130,9 +1145,9 @@ mod tests {
             None,
             Some("test-supervisor"),
             None,
-            None,  // model
-            None,  // effort
-            None,  // teams
+            None, // model
+            None, // effort
+            None, // teams
         );
         assert!(
             config
@@ -1151,9 +1166,9 @@ mod tests {
             None,
             None,
             None,
-            None,  // model
-            None,  // effort
-            None,  // teams
+            None, // model
+            None, // effort
+            None, // teams
         );
         assert!(
             config
@@ -1173,8 +1188,8 @@ mod tests {
             None,
             None,
             Some("claude-opus-4-6"),
-            None,  // effort
-            None,  // teams
+            None, // effort
+            None, // teams
         );
         assert!(config.args.contains(&"--model".to_string()));
         assert!(config.args.contains(&"claude-opus-4-6".to_string()));
@@ -1189,9 +1204,9 @@ mod tests {
             None,
             None,
             None,
-            None,  // model
-            None,  // effort
-            None,  // teams
+            None, // model
+            None, // effort
+            None, // teams
         );
         assert!(!config.args.contains(&"--model".to_string()));
     }
@@ -1206,8 +1221,8 @@ mod tests {
             None,
             None,
             Some("gpt-5.3-codex"),
-            None,  // effort
-            None,  // teams
+            None, // effort
+            None, // teams
         );
         assert!(config.args.contains(&"--model".to_string()));
         assert!(config.args.contains(&"gpt-5.3-codex".to_string()));
@@ -1222,9 +1237,9 @@ mod tests {
             None,
             None,
             None,
-            None,  // model
-            None,  // effort
-            None,  // teams
+            None, // model
+            None, // effort
+            None, // teams
         );
         let all_args = config.args.join(" ");
         assert!(
@@ -1619,7 +1634,10 @@ mod tests {
             }
         }
         let _ = std::fs::remove_dir_all(&dir);
-        assert!(!found, "cas_binary_on_path must be false when no `cas` is on PATH");
+        assert!(
+            !found,
+            "cas_binary_on_path must be false when no `cas` is on PATH"
+        );
     }
 
     #[tokio::test]
@@ -1631,9 +1649,9 @@ mod tests {
             None,
             None,
             None,
-            None,  // model
-            None,  // effort
-            None,  // teams
+            None, // model
+            None, // effort
+            None, // teams
         );
         let all_args = config.args.join(" ");
         assert!(
@@ -1735,8 +1753,8 @@ mod tests {
             None,
             None,
             None,
-            None,  // model
-            None,  // effort
+            None, // model
+            None, // effort
             Some(&teams),
         );
         assert!(config.args.contains(&"--team-name".to_string()));
@@ -1765,7 +1783,9 @@ mod tests {
         // does not race with other tests that set CAS_FACTORY_EFFORT_SUPPORTED=0.
         let _e = ScopedEnv::new();
         // SAFETY: ENV_LOCK held by ScopedEnv.
-        unsafe { std::env::set_var("CAS_FACTORY_EFFORT_SUPPORTED", "1"); }
+        unsafe {
+            std::env::set_var("CAS_FACTORY_EFFORT_SUPPORTED", "1");
+        }
         let config = PtyConfig::claude(
             "test-agent",
             "worker",
@@ -1773,9 +1793,9 @@ mod tests {
             None,
             None,
             None,
-            None,  // model
-            Some("low"),  // effort override
-            None,  // teams
+            None,        // model
+            Some("low"), // effort override
+            None,        // teams
         );
         let effort_idx = config
             .args
@@ -1783,7 +1803,8 @@ mod tests {
             .position(|a| a == "--effort")
             .expect("--effort must be present");
         assert_eq!(
-            config.args[effort_idx + 1], "low",
+            config.args[effort_idx + 1],
+            "low",
             "custom effort should override hardcoded default"
         );
     }
@@ -1793,14 +1814,18 @@ mod tests {
     #[tokio::test]
     async fn test_pty_config_claude_supervisor_no_effort_omits_flag() {
         let _e = ScopedEnv::new();
-        unsafe { std::env::set_var("CAS_FACTORY_EFFORT_SUPPORTED", "1"); }
+        unsafe {
+            std::env::set_var("CAS_FACTORY_EFFORT_SUPPORTED", "1");
+        }
         let config = PtyConfig::claude(
             "sup",
             "supervisor",
             PathBuf::from("/tmp"),
-            None, None, None,
-            None,  // model
-            None,  // no effort — must NOT default to "xhigh" anymore
+            None,
+            None,
+            None,
+            None, // model
+            None, // no effort — must NOT default to "xhigh" anymore
             None,
         );
         assert!(
@@ -1814,14 +1839,18 @@ mod tests {
     #[tokio::test]
     async fn test_pty_config_claude_worker_no_effort_omits_flag() {
         let _e = ScopedEnv::new();
-        unsafe { std::env::set_var("CAS_FACTORY_EFFORT_SUPPORTED", "1"); }
+        unsafe {
+            std::env::set_var("CAS_FACTORY_EFFORT_SUPPORTED", "1");
+        }
         let config = PtyConfig::claude(
             "wrk",
             "worker",
             PathBuf::from("/tmp"),
-            None, None, None,
-            None,  // model
-            None,  // no effort — must NOT default to "high" anymore
+            None,
+            None,
+            None,
+            None, // model
+            None, // no effort — must NOT default to "high" anymore
             None,
         );
         assert!(
@@ -1835,12 +1864,16 @@ mod tests {
     #[tokio::test]
     async fn test_pty_config_claude_worker_with_explicit_effort() {
         let _e = ScopedEnv::new();
-        unsafe { std::env::set_var("CAS_FACTORY_EFFORT_SUPPORTED", "1"); }
+        unsafe {
+            std::env::set_var("CAS_FACTORY_EFFORT_SUPPORTED", "1");
+        }
         let config = PtyConfig::claude(
             "wrk",
             "worker",
             PathBuf::from("/tmp"),
-            None, None, None,
+            None,
+            None,
+            None,
             None,
             Some("medium"),
             None,
@@ -1861,7 +1894,9 @@ mod tests {
             "wrk",
             "worker",
             PathBuf::from("/tmp"),
-            None, None, None,
+            None,
+            None,
+            None,
             None,
             Some("high"),
             None,
@@ -1881,9 +1916,11 @@ mod tests {
             "wrk",
             "worker",
             PathBuf::from("/tmp"),
-            None, None, None,
             None,
-            None,  // no effort
+            None,
+            None,
+            None,
+            None, // no effort
             None,
         );
         let all_args = config.args.join(" ");
@@ -1901,7 +1938,9 @@ mod tests {
         // claude CLI reports support (forced via env var to avoid a live probe).
         let _e = ScopedEnv::new();
         // SAFETY: ENV_LOCK held by ScopedEnv.
-        unsafe { std::env::set_var("CAS_FACTORY_EFFORT_SUPPORTED", "1"); }
+        unsafe {
+            std::env::set_var("CAS_FACTORY_EFFORT_SUPPORTED", "1");
+        }
 
         let config = PtyConfig::claude(
             "test-agent",
@@ -1929,7 +1968,9 @@ mod tests {
         // so the subprocess does not crash with an unrecognised-flag error.
         let _e = ScopedEnv::new();
         // SAFETY: ENV_LOCK held by ScopedEnv.
-        unsafe { std::env::set_var("CAS_FACTORY_EFFORT_SUPPORTED", "0"); }
+        unsafe {
+            std::env::set_var("CAS_FACTORY_EFFORT_SUPPORTED", "0");
+        }
 
         let config = PtyConfig::claude(
             "test-agent",
@@ -1960,7 +2001,9 @@ mod tests {
         // nor a role-default value should appear.
         let _e = ScopedEnv::new();
         // SAFETY: ENV_LOCK held by ScopedEnv.
-        unsafe { std::env::set_var("CAS_FACTORY_EFFORT_SUPPORTED", "0"); }
+        unsafe {
+            std::env::set_var("CAS_FACTORY_EFFORT_SUPPORTED", "0");
+        }
 
         let config = PtyConfig::claude(
             "sup",
@@ -1989,12 +2032,16 @@ mod tests {
     async fn test_claude_supports_effort_flag_env_override() {
         // Verify the env var bypass works for both true and false.
         let _e = ScopedEnv::new();
-        unsafe { std::env::set_var("CAS_FACTORY_EFFORT_SUPPORTED", "1"); }
+        unsafe {
+            std::env::set_var("CAS_FACTORY_EFFORT_SUPPORTED", "1");
+        }
         assert!(
             claude_supports_effort_flag(),
             "env override '1' must return true"
         );
-        unsafe { std::env::set_var("CAS_FACTORY_EFFORT_SUPPORTED", "0"); }
+        unsafe {
+            std::env::set_var("CAS_FACTORY_EFFORT_SUPPORTED", "0");
+        }
         assert!(
             !claude_supports_effort_flag(),
             "env override '0' must return false"
@@ -2013,9 +2060,9 @@ mod tests {
             None,
             None,
             None,
-            None,  // model
-            Some("medium"),  // effort
-            None,  // teams
+            None,           // model
+            Some("medium"), // effort
+            None,           // teams
         );
         // Multiple `-c` flags exist now that the CAS MCP server is spawn-injected
         // (cas-bbc2), so locate the effort override by its value rather than
@@ -2043,12 +2090,15 @@ mod tests {
             None,
             None,
             None,
-            None,  // model
-            None,  // effort — None means no override; Codex CLI server-side default applies
-            None,  // teams
+            None, // model
+            None, // effort — None means no override; Codex CLI server-side default applies
+            None, // teams
         );
         assert!(
-            !config.args.iter().any(|a| a.starts_with("model_reasoning_effort")),
+            !config
+                .args
+                .iter()
+                .any(|a| a.starts_with("model_reasoning_effort")),
             "no model_reasoning_effort arg should be emitted when effort is None"
         );
         // The CAS MCP server injection (cas-bbc2) always emits `-c` flags, so we
@@ -2086,8 +2136,8 @@ mod tests {
             None,
             None,
             None,
-            None,  // model
-            None,  // effort
+            None, // model
+            None, // effort
             Some(&teams),
         );
         // Lead also gets --teammate-mode so it polls its inbox
@@ -2123,7 +2173,7 @@ mod tests {
             None,
             None,
             None,
-            None,  // effort
+            None, // effort
             Some(&teams),
         );
         assert!(
@@ -2161,7 +2211,7 @@ mod tests {
             None,
             None,
             None,
-            None,  // effort
+            None, // effort
             Some(&teams),
         );
         assert!(
@@ -2198,7 +2248,7 @@ mod tests {
             None,
             None,
             None,
-            None,  // effort
+            None, // effort
             Some(&teams),
         );
         assert!(
@@ -2216,8 +2266,8 @@ mod tests {
     // suite runs with multiple threads. Scope is per-test: each test
     // clears its own env on entry and on the exit via the guard.
     mod cas_0bf4_resource_contention {
-        use crate::pty::*;
         use crate::pty::tests::ScopedEnv;
+        use crate::pty::*;
 
         #[test]
         fn cargo_build_jobs_honours_explicit_env_override() {
@@ -2248,7 +2298,10 @@ mod tests {
             let got = cargo_build_jobs_for_worker()
                 .expect("available_parallelism should succeed on test host");
             let n: usize = got.parse().expect("computed CARGO_BUILD_JOBS must parse");
-            assert!(n >= 2, "floor of 2 must hold even on 1–4 core hosts: got {n}");
+            assert!(
+                n >= 2,
+                "floor of 2 must hold even on 1–4 core hosts: got {n}"
+            );
         }
 
         #[test]
@@ -2280,11 +2333,7 @@ mod tests {
         fn maybe_wrap_with_nice_is_noop_without_env_sentinel() {
             let _e = ScopedEnv::new();
             // No CAS_FACTORY_NICE_WORKER set — passthrough for workers too.
-            let (cmd, args) = maybe_wrap_with_nice(
-                "claude",
-                vec!["--foo".to_string()],
-                "worker",
-            );
+            let (cmd, args) = maybe_wrap_with_nice("claude", vec!["--foo".to_string()], "worker");
             assert_eq!(cmd, "claude");
             assert_eq!(args, vec!["--foo".to_string()]);
         }
@@ -2334,7 +2383,10 @@ mod tests {
                 std::env::set_var("CAS_FACTORY_NICE_WORKER", "true"); // not "1"
             }
             let (cmd, _args) = maybe_wrap_with_nice("claude", vec![], "worker");
-            assert_eq!(cmd, "claude", "only the exact value '1' activates nice-wrap");
+            assert_eq!(
+                cmd, "claude",
+                "only the exact value '1' activates nice-wrap"
+            );
         }
 
         #[test]
@@ -2351,7 +2403,7 @@ mod tests {
                 None,
                 None,
                 None,
-                None,  // effort
+                None, // effort
                 None,
             );
             assert!(
@@ -2377,7 +2429,7 @@ mod tests {
                 None,
                 None,
                 None,
-                None,  // effort
+                None, // effort
                 None,
             );
             assert!(
@@ -2400,7 +2452,7 @@ mod tests {
                 None,
                 None,
                 None,
-                None,  // effort
+                None, // effort
                 None,
             );
             assert_eq!(config.command, "nice");
@@ -2422,7 +2474,10 @@ mod tests {
                 let got = cargo_build_jobs_for_worker()
                     .expect("available_parallelism should succeed on test host");
                 let n: usize = got.parse().expect("computed value must parse as integer");
-                assert!(n >= 2, "variant {variant:?} should fall through to auto-compute, got {got}");
+                assert!(
+                    n >= 2,
+                    "variant {variant:?} should fall through to auto-compute, got {got}"
+                );
             }
         }
 
@@ -2437,8 +2492,11 @@ mod tests {
             }
             let (cmd, args) = maybe_wrap_with_nice("claude", vec![], "worker");
             assert_eq!(cmd, "nice");
-            assert_eq!(args[..2], ["-n".to_string(), "10".to_string()],
-                "non-numeric NICE_LEVEL must fall back to default 10");
+            assert_eq!(
+                args[..2],
+                ["-n".to_string(), "10".to_string()],
+                "non-numeric NICE_LEVEL must fall back to default 10"
+            );
         }
 
         #[test]
@@ -2471,7 +2529,7 @@ mod tests {
                 None,
                 None,
                 None,
-                None,  // effort
+                None, // effort
                 None,
             );
             assert!(
@@ -2497,7 +2555,7 @@ mod tests {
                 None,
                 None,
                 None,
-                None,  // effort
+                None, // effort
                 None,
             );
             assert!(
@@ -2520,7 +2578,7 @@ mod tests {
                 None,
                 None,
                 None,
-                None,  // effort
+                None, // effort
                 None,
             );
             assert_eq!(config.command, "nice");
@@ -2542,7 +2600,7 @@ mod tests {
                 None,
                 None,
                 None,
-                None,  // effort
+                None, // effort
                 None,
             );
             assert_eq!(
@@ -2596,9 +2654,7 @@ mod tests {
         while std::time::Instant::now() < deadline && !saw_esc {
             match tokio::time::timeout(std::time::Duration::from_millis(250), pty.recv()).await {
                 Ok(Some(PtyEvent::Output(data))) => {
-                    let rendered_caret = data
-                        .windows(2)
-                        .any(|w| w == [0x5e, 0x5b]); // "^["
+                    let rendered_caret = data.windows(2).any(|w| w == [0x5e, 0x5b]); // "^["
                     if data.contains(&0x1b) || rendered_caret {
                         saw_esc = true;
                     }

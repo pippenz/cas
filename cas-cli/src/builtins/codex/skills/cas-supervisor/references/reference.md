@@ -20,7 +20,7 @@ Wrong field names and invalid actions waste dispatch cycles. This section covers
 | `model` | string | Model name override (e.g. `claude-opus-4-5`). Passed as `--model`. |
 | `effort` | string | Reasoning effort override: `minimal`, `low`, `medium`, `high`, `xhigh`. Passed as `--effort` (Claude) or `--config model_reasoning_effort=<v>` (Codex). |
 
-`cli`, `model`, and `effort` are per-spawn overrides — they apply to the workers spawned by this call only, not to the session default. Omit any field to inherit the session default.
+`cli`, `model`, and `effort` are per-spawn controls — they apply to the workers spawned by this call only, not to the session default. Supervisors MUST pass explicit `model=` and `effort=` on every `spawn_workers` call; omitted fields are only a fallback and produce an acknowledgement warning.
 
 **Task ID is always `id`** — not `task_id`, `taskId`, or `_id`.
 
