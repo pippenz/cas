@@ -747,6 +747,7 @@ fn test_agent_summary_fields() {
         latest_activity: Some(("Edited file".to_string(), now)),
         last_heartbeat: Some(now),
         pending_messages: 0,
+        active_lease: None,
     };
 
     assert_eq!(summary.id, "agent-123");

@@ -70,6 +70,16 @@ pub struct TaskSummary {
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// Task state carried by an active lease even when the agent currently appears
+/// idle to the director.
+#[derive(Debug, Clone)]
+pub struct ActiveLeaseSummary {
+    pub task_id: String,
+    pub task_title: String,
+    pub task_status: TaskStatus,
+    pub close_rejected_reason: Option<String>,
+}
+
 /// A summary of an agent for display
 #[derive(Debug, Clone)]
 pub struct AgentSummary {
@@ -85,6 +95,10 @@ pub struct AgentSummary {
     /// this agent. Used by the idle detector to suppress `WorkerIdle` when
     /// the worker has unread messages (spawn race mitigation, cas-afb7).
     pub pending_messages: u32,
+    /// Active task lease state, resolved directly from task_leases. This stays
+    /// separate from `current_task` because an agent can appear idle while a
+    /// task row remains InProgress after a rejected close.
+    pub active_lease: Option<ActiveLeaseSummary>,
 }
 
 /// A group of tasks under an epic
@@ -206,6 +220,8 @@ impl DirectorData {
                 assignee_tasks.insert(assignee.clone(), task.id.clone());
             }
         }
+        let task_by_id: HashMap<String, &Task> =
+            tasks.iter().map(|task| (task.id.clone(), task)).collect();
 
         // Build map: child_id -> parent_epic_id
         let child_to_epic: HashMap<String, String> = parent_child_deps
@@ -293,6 +309,34 @@ impl DirectorData {
                     .or_insert_with(|| (event.summary.clone(), event.created_at));
             }
         }
+        let mut close_rejections: HashMap<(String, String), String> = HashMap::new();
+        for event in &activity {
+            if event.event_type != EventType::WorkerVerificationBlocked {
+                continue;
+            }
+            let Some(session_id) = event.session_id.as_ref() else {
+                continue;
+            };
+            let Some(metadata) = event.metadata.as_ref() else {
+                continue;
+            };
+            if metadata
+                .get("close_rejected")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                if let Some(task_id) = metadata.get("task_id").and_then(|v| v.as_str()) {
+                    let reason = metadata
+                        .get("reason")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(event.summary.as_str())
+                        .to_string();
+                    close_rejections
+                        .entry((session_id.clone(), task_id.to_string()))
+                        .or_insert(reason);
+                }
+            }
+        }
 
         // Load agents
         let owned_agent;
@@ -347,6 +391,20 @@ impl DirectorData {
                 let current_task = assignee_tasks.get(&a.name).cloned();
                 let latest_activity = agent_latest_activity.get(&a.id).cloned();
                 let pending_messages = pending_counts.get(&a.name).copied().unwrap_or(0);
+                let active_lease = agent_store
+                    .list_agent_leases(&a.id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|lease| task_by_id.get(&lease.task_id).copied())
+                    .find(|task| task.status == TaskStatus::InProgress)
+                    .map(|task| ActiveLeaseSummary {
+                        task_id: task.id.clone(),
+                        task_title: task.title.clone(),
+                        task_status: task.status,
+                        close_rejected_reason: close_rejections
+                            .get(&(a.id.clone(), task.id.clone()))
+                            .cloned(),
+                    });
                 AgentSummary {
                     id: a.id,
                     name: a.name,
@@ -355,6 +413,7 @@ impl DirectorData {
                     latest_activity,
                     last_heartbeat: Some(a.last_heartbeat),
                     pending_messages,
+                    active_lease,
                 }
             })
             .collect();

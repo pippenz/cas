@@ -546,6 +546,7 @@ mod tests {
             latest_activity: None,
             last_heartbeat: Some(chrono::Utc::now()),
             pending_messages: 0,
+            active_lease: None,
         }
     }
 

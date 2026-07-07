@@ -145,6 +145,34 @@ impl VerificationSkipReason {
 }
 
 impl CasCore {
+    fn record_close_rejection_activity(&self, task_id: &str, reason: &str, message: &str) {
+        let Ok(agent_id) = self.get_agent_id() else {
+            return;
+        };
+        let Ok(event_store) = cas_store::SqliteEventStore::open(&self.cas_root) else {
+            return;
+        };
+        use cas_store::EventStore;
+        use cas_types::{Event, EventEntityType, EventType};
+
+        let event = Event::new(
+            EventType::WorkerVerificationBlocked,
+            EventEntityType::Agent,
+            &agent_id,
+            format!("task close rejected: {task_id} {reason}"),
+        )
+        .with_session(agent_id)
+        .with_metadata(serde_json::json!({
+            "task_id": task_id,
+            "close_rejected": true,
+            "reason": reason,
+            "message": message,
+        }));
+        if let Err(e) = event_store.record(&event) {
+            tracing::warn!(task_id = %task_id, error = %e, "failed to record close rejection activity");
+        }
+    }
+
     pub async fn cas_task_close(
         &self,
         Parameters(req): Parameters<TaskCloseRequest>,
@@ -284,6 +312,7 @@ impl CasCore {
             ) {
                 MergeStateGateOutcome::Proceed => {}
                 MergeStateGateOutcome::Reject(msg) => {
+                    self.record_close_rejection_activity(&req.id, "MERGE REQUIRED", &msg);
                     return Ok(Self::tool_error(msg));
                 }
             }
