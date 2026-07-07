@@ -1064,6 +1064,75 @@ mod tests {
         );
     }
 
+    /// cas-627f: the flagship close-rejected notification, exercised end to
+    /// end through BOTH pipeline steps a live director tick actually runs:
+    /// `revalidate_event_for_delivery` (delivery-time recheck) THEN
+    /// `generate_prompt`. Before the cas-627f fix, `active_lease` for a
+    /// parked `AwaitingMerge` task resolved to `None` once
+    /// `park_task_awaiting_merge` released the lease (confirmed P1,
+    /// docs/reviews/2026-07-07-cas-b646-epic.md) — the event detector's
+    /// `active_task: None` WorkerIdle event would be silently dropped by the
+    /// revalidation step's `worker_has_open_or_in_progress_assignment`
+    /// guard, so the operator never saw this notification at all. This test
+    /// starts from that same `active_task: None` shape the detector
+    /// produces and asserts the notification survives BOTH steps and names
+    /// the task id, the `AwaitingMerge` status, and the close-rejected
+    /// reason.
+    #[test]
+    fn test_worker_idle_awaiting_merge_close_rejected_survives_revalidate_and_names_task() {
+        let event = DirectorEvent::WorkerIdle {
+            worker: "swift-fox".to_string(),
+            active_task: None,
+        };
+        let mut data = make_data(0);
+        data.in_progress_tasks = vec![TaskSummary {
+            id: "cas-1234".to_string(),
+            title: "Fix close gate".to_string(),
+            status: TaskStatus::AwaitingMerge,
+            priority: Priority::MEDIUM,
+            assignee: Some("swift-fox".to_string()),
+            task_type: TaskType::Task,
+            epic: None,
+            branch: None,
+            updated_at: None,
+        }];
+        data.agents[0].active_lease = Some(ActiveLeaseSummary {
+            task_id: "cas-1234".to_string(),
+            task_title: "Fix close gate".to_string(),
+            task_status: TaskStatus::AwaitingMerge,
+            close_rejected_reason: Some("MERGE REQUIRED".to_string()),
+        });
+        let config = default_config();
+
+        let revalidated = revalidate_event_for_delivery(&event, &data, "supervisor")
+            .expect("close-rejected WorkerIdle must survive delivery-time revalidation");
+
+        let prompt = generate_prompt(
+            &revalidated,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        )
+        .expect("close-rejected WorkerIdle must produce an operator notification");
+
+        assert_eq!(prompt.target, "supervisor");
+        assert!(prompt.text.contains("cas-1234"), "{}", prompt.text);
+        assert!(
+            prompt.text.to_lowercase().contains("awaiting_merge")
+                || prompt.text.contains("AwaitingMerge"),
+            "notification must name the AwaitingMerge status: {}",
+            prompt.text
+        );
+        assert!(
+            prompt.text.contains("MERGE REQUIRED"),
+            "notification must carry the close-rejected reason: {}",
+            prompt.text
+        );
+    }
+
     /// Regression for cas-b67d D-3: the zero-ready-task nudge must NOT instruct
     /// the supervisor to close the epic. The director snapshot may be stale; the
     /// epic may have open children that just aren't visible in this refresh cycle.

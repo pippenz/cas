@@ -660,15 +660,56 @@ impl FactoryApp {
         &self.auto_prompt
     }
 
-    pub fn revalidate_events_for_delivery(&self, events: &[DirectorEvent]) -> Vec<DirectorEvent> {
+    /// Revalidate detected events against a fresh, delivery-time snapshot and
+    /// generate prompts from the survivors — in one combined pass.
+    ///
+    /// cas-627f: `revalidate_events_for_delivery` and
+    /// `generate_prompts_for_delivery` used to be two separate public
+    /// methods, each independently calling
+    /// `load_unfiltered_director_data_for_delivery` — a full
+    /// `DirectorData::load_with_stores` (all tasks + parent deps, 50 recent
+    /// events, every agent's leases). The daemon tick
+    /// (`daemon/runtime/lifecycle.rs`) called both back-to-back on EVERY
+    /// `refresh_interval` (2s) tick, even when `events` was empty — a
+    /// regression from main, where an idle tick performed zero extra DB
+    /// loads. Confirmed P1 (docs/reviews/2026-07-07-cas-b646-epic.md). Now:
+    /// short-circuit before touching the DB when there is nothing to
+    /// revalidate, and share a single load between revalidation and prompt
+    /// generation so the two steps can never observe two different
+    /// snapshots.
+    pub fn revalidate_and_prompt_for_delivery(
+        &self,
+        events: &[DirectorEvent],
+    ) -> (Vec<DirectorEvent>, Vec<Prompt>) {
+        if events.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+
         let unfiltered_data = self.load_unfiltered_director_data_for_delivery();
 
-        events
+        let delivery_events: Vec<DirectorEvent> = events
             .iter()
             .filter_map(|event| {
                 revalidate_event_for_delivery(event, &unfiltered_data, &self.supervisor_name)
             })
-            .collect()
+            .collect();
+
+        let prompts: Vec<Prompt> = delivery_events
+            .iter()
+            .filter_map(|event| {
+                generate_prompt(
+                    event,
+                    &self.director_data,
+                    &unfiltered_data,
+                    &self.supervisor_name,
+                    &self.auto_prompt,
+                    self.supervisor_cli,
+                    self.worker_cli,
+                )
+            })
+            .collect();
+
+        (delivery_events, prompts)
     }
 
     fn load_unfiltered_director_data_for_delivery(&self) -> DirectorData {
@@ -682,29 +723,17 @@ impl FactoryApp {
         .unwrap_or_else(|_| self.unfiltered_director_data.clone())
     }
 
-    pub fn generate_prompts_for_delivery(&self, events: &[DirectorEvent]) -> Vec<Prompt> {
-        let unfiltered_data = self.load_unfiltered_director_data_for_delivery();
-
-        events
-            .iter()
-            .filter_map(|event| {
-                generate_prompt(
-                    event,
-                    &self.director_data,
-                    &unfiltered_data,
-                    &self.supervisor_name,
-                    &self.auto_prompt,
-                    self.supervisor_cli,
-                    self.worker_cli,
-                )
-            })
-            .collect()
-    }
-
     /// Refresh CAS data from stores and detect state changes
     ///
-    /// Returns a tuple of (prompts, events) for further processing.
-    pub fn refresh_data(&mut self) -> anyhow::Result<(Vec<Prompt>, Vec<DirectorEvent>)> {
+    /// Returns the detected events. Prompt generation happens later, at
+    /// delivery time, against a fresh snapshot (see
+    /// `revalidate_and_prompt_for_delivery`) — this method used to also
+    /// build a `Vec<Prompt>` here, but every caller discarded it (the daemon
+    /// tick regenerates prompts from the delivery-revalidated events; the
+    /// other two callers ignore the whole `Result`), so it was pure wasted
+    /// work on every refresh. Removed rather than kept as a second,
+    /// drift-prone prompt-generation path (cas-627f).
+    pub fn refresh_data(&mut self) -> anyhow::Result<Vec<DirectorEvent>> {
         let next_fingerprint = CasDbFingerprint::from_cas_dir(&self.cas_dir);
         let db_changed = match self.last_db_fingerprint {
             Some(prev) => prev != next_fingerprint,
@@ -748,7 +777,7 @@ impl FactoryApp {
         } else {
             self.refresh_branch_visibility_cache();
             self.last_refresh = Instant::now();
-            return Ok((Vec::new(), Vec::new()));
+            return Ok(Vec::new());
         }
 
         self.refresh_branch_visibility_cache();
@@ -777,28 +806,7 @@ impl FactoryApp {
             self.filter_director_agents_to_current_session();
         }
 
-        // Generate prompts from events (respecting auto-prompt config). The
-        // filtered `self.director_data` remains correct for epic-scoped prompt
-        // wording (e.g. WorkerIdle's ready-task count, cas-405f); the
-        // unfiltered snapshot is passed separately for TaskCompleted's
-        // render-time safety net (cas-6aaf / cas-dbbe), which must be able to
-        // see tasks outside the tracked epic to avoid a false "has closed".
-        let prompts: Vec<Prompt> = events
-            .iter()
-            .filter_map(|event| {
-                generate_prompt(
-                    event,
-                    &self.director_data,
-                    &self.unfiltered_director_data,
-                    &self.supervisor_name,
-                    &self.auto_prompt,
-                    self.supervisor_cli,
-                    self.worker_cli,
-                )
-            })
-            .collect();
-
-        Ok((prompts, events))
+        Ok(events)
     }
 
     fn set_active_epic(

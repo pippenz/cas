@@ -398,6 +398,18 @@ impl DirectorData {
                 let current_task = assignee_tasks.get(&a.name).cloned();
                 let latest_activity = agent_latest_activity.get(&a.id).cloned();
                 let pending_messages = pending_counts.get(&a.name).copied().unwrap_or(0);
+                // cas-627f: `list_agent_leases` returns only status='active'
+                // rows, but `park_task_awaiting_merge` (cas-8d5b) deliberately
+                // RELEASES the worker's lease as part of parking — so the
+                // one-task gate doesn't block the worker's next `task start`.
+                // That means a parked AwaitingMerge task can never be found
+                // via the lease table once parked, which made the flagship
+                // close-rejected `WorkerIdle` notification unreachable
+                // (confirmed P1, docs/reviews/2026-07-07-cas-b646-epic.md).
+                // Fall back to resolving by assignee + AwaitingMerge status
+                // directly from the task table — `park_task_awaiting_merge`
+                // preserves `assignee`, so this is a reliable second source
+                // for exactly the one status the lease table can't carry.
                 let active_lease = agent_store
                     .list_agent_leases(&a.id)
                     .unwrap_or_default()
@@ -408,6 +420,12 @@ impl DirectorData {
                             task.status,
                             TaskStatus::InProgress | TaskStatus::AwaitingMerge
                         )
+                    })
+                    .or_else(|| {
+                        tasks.iter().find(|task| {
+                            task.status == TaskStatus::AwaitingMerge
+                                && task.assignee.as_deref() == Some(a.name.as_str())
+                        })
                     })
                     .map(|task| ActiveLeaseSummary {
                         task_id: task.id.clone(),
