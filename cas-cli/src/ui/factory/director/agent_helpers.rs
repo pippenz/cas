@@ -38,20 +38,36 @@ pub fn agent_status_icon(
     minions: bool,
 ) -> (&'static str, Color) {
     if is_disconnected(agent) {
-        let icon = if minions { MinionsIcons::AGENT_DEAD } else { "\u{2298}" };
+        let icon = if minions {
+            MinionsIcons::AGENT_DEAD
+        } else {
+            "\u{2298}"
+        };
         (icon, palette.agent_dead)
     } else {
         match agent.status {
             AgentStatus::Active => {
-                let icon = if minions { MinionsIcons::AGENT_ACTIVE } else { Icons::CIRCLE_FILLED };
+                let icon = if minions {
+                    MinionsIcons::AGENT_ACTIVE
+                } else {
+                    Icons::CIRCLE_FILLED
+                };
                 (icon, palette.agent_active)
             }
             AgentStatus::Idle => {
-                let icon = if minions { MinionsIcons::AGENT_IDLE } else { Icons::CIRCLE_HALF };
+                let icon = if minions {
+                    MinionsIcons::AGENT_IDLE
+                } else {
+                    Icons::CIRCLE_HALF
+                };
                 (icon, palette.agent_idle)
             }
             _ => {
-                let icon = if minions { MinionsIcons::AGENT_DEAD } else { Icons::CIRCLE_EMPTY };
+                let icon = if minions {
+                    MinionsIcons::AGENT_DEAD
+                } else {
+                    Icons::CIRCLE_EMPTY
+                };
                 (icon, palette.agent_dead)
             }
         }
@@ -116,6 +132,25 @@ pub fn find_agent_task<'a>(
         .iter()
         .chain(data.ready_tasks.iter())
         .find(|t| &t.id == task_id)
+}
+
+/// Find the current in-progress task for an agent by explicit current_task,
+/// agent ID, or display name.
+pub fn find_agent_in_progress_task<'a>(
+    agent: &cas_factory::AgentSummary,
+    data: &'a DirectorData,
+) -> Option<&'a cas_factory::TaskSummary> {
+    if let Some(task_id) = agent.current_task.as_ref() {
+        if let Some(task) = data.in_progress_tasks.iter().find(|t| &t.id == task_id) {
+            return Some(task);
+        }
+    }
+
+    data.in_progress_tasks.iter().find(|task| {
+        task.assignee
+            .as_deref()
+            .is_some_and(|assignee| assignee == agent.id || assignee == agent.name)
+    })
 }
 
 /// Map a task status to a display icon.

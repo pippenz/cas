@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
 use cas_mux::{Mux, PaneKind};
+use chrono::{DateTime, Utc};
 use ratatui::layout::Rect;
 
 use super::director::{
@@ -351,6 +352,8 @@ pub struct FactoryApp {
     supervisor_name: String,
     /// Factory session name (for prompt queue isolation)
     factory_session: Option<String>,
+    /// Factory session creation timestamp for elapsed-time display.
+    session_created_at: Option<DateTime<Utc>>,
     /// Supervisor CLI mode (claude/codex)
     supervisor_cli: cas_mux::SupervisorCli,
     /// Worker CLI mode (claude/codex)
@@ -747,7 +750,9 @@ impl FactoryApp {
     fn can_adopt_detected_epic_started(&self, epic_id: &str, source: EpicFocusSource) -> bool {
         match source {
             EpicFocusSource::Pinned | EpicFocusSource::SessionDefault => true,
-            EpicFocusSource::Inference => inferred_epic_is_displayable(&self.director_data, epic_id),
+            EpicFocusSource::Inference => {
+                inferred_epic_is_displayable(&self.director_data, epic_id)
+            }
         }
     }
 
@@ -1031,6 +1036,14 @@ impl FactoryApp {
 
     /// Set factory session name
     pub fn set_factory_session(&mut self, name: String) {
+        self.session_created_at = std::fs::read_to_string(metadata_path(&name))
+            .ok()
+            .and_then(|json| serde_json::from_str::<SessionMetadata>(&json).ok())
+            .and_then(|metadata| {
+                DateTime::parse_from_rfc3339(&metadata.created_at)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&Utc))
+            });
         self.factory_session = Some(name);
     }
 

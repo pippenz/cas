@@ -309,12 +309,9 @@ fn render_worker_list(
         };
 
         // Build task info
-        let task_info = if let Some(task_id) = &agent.current_task {
-            if let Some(t) = agent_helpers::find_agent_task(agent, data) {
-                format!("{}: {}", task_id, t.title)
-            } else {
-                task_id.clone()
-            }
+        let current_task = agent_helpers::find_agent_in_progress_task(agent, data);
+        let task_info = if let Some(task) = current_task {
+            format!("▸ {} {}", task.id, task.title)
         } else if let Some((activity, _)) = &agent.latest_activity {
             activity.clone()
         } else {
@@ -334,7 +331,7 @@ fn render_worker_list(
             Span::styled(": ", styles.text_muted),
             Span::styled(
                 task_display,
-                if agent.current_task.is_some() {
+                if current_task.is_some() {
                     styles.text_primary
                 } else {
                     styles.text_muted
@@ -484,8 +481,8 @@ fn render_summary_bar(
 mod tests {
     use std::collections::HashMap;
 
-    use cas_factory::{DirectorData, TaskSummary};
-    use cas_types::{Priority, TaskStatus, TaskType};
+    use cas_factory::{AgentSummary, DirectorData, TaskSummary};
+    use cas_types::{AgentStatus, Priority, TaskStatus, TaskType};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -537,6 +534,18 @@ mod tests {
             git_loaded: false,
             reminders: Vec::new(),
             epic_closed_counts: HashMap::new(),
+        }
+    }
+
+    fn agent(id: &str, name: &str) -> AgentSummary {
+        AgentSummary {
+            id: id.to_string(),
+            name: name.to_string(),
+            status: AgentStatus::Active,
+            current_task: None,
+            latest_activity: None,
+            last_heartbeat: Some(chrono::Utc::now()),
+            pending_messages: 0,
         }
     }
 
@@ -674,5 +683,64 @@ mod tests {
         assert!(text.contains("EPIC: cas-foreign"));
         assert!(text.contains("BRANCH: epic/epic-factory-tui-visual-information-overhaul"));
         assert!(text.contains("↑3 ↓1"));
+    }
+
+    #[test]
+    fn factory_radar_worker_rows_show_task_chips_for_id_and_display_name_assignees() {
+        let mut data = data_with_unrelated_epic();
+        data.agents = vec![
+            agent("agent-id-1", "worker-one"),
+            agent("agent-id-2", "worker-two"),
+            agent("agent-id-3", "worker-three"),
+        ];
+        data.in_progress_tasks = vec![
+            TaskSummary {
+                id: "cas-id1".to_string(),
+                title: "Assigned by agent id".to_string(),
+                status: TaskStatus::InProgress,
+                priority: Priority::MEDIUM,
+                assignee: Some("agent-id-1".to_string()),
+                task_type: TaskType::Task,
+                epic: Some("cas-foreign".to_string()),
+                branch: None,
+                updated_at: None,
+            },
+            TaskSummary {
+                id: "cas-name2".to_string(),
+                title: "Assigned by display name".to_string(),
+                status: TaskStatus::InProgress,
+                priority: Priority::MEDIUM,
+                assignee: Some("worker-two".to_string()),
+                task_type: TaskType::Task,
+                epic: Some("cas-foreign".to_string()),
+                branch: None,
+                updated_at: None,
+            },
+        ];
+        let backend = TestBackend::new(120, 14);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = ActiveTheme::default();
+
+        terminal
+            .draw(|frame| {
+                render_with_focus(
+                    frame,
+                    frame.area(),
+                    &data,
+                    &theme,
+                    Some("cas-foreign"),
+                    None,
+                    false,
+                    None,
+                    "supervisor",
+                    false,
+                );
+            })
+            .unwrap();
+
+        let text = buffer_text(&terminal);
+        assert!(text.contains("worker-one: ▸ cas-id1 Assigned by agent id"));
+        assert!(text.contains("worker-two: ▸ cas-name2 Assigned by display name"));
+        assert!(text.contains("worker-three: idle"));
     }
 }

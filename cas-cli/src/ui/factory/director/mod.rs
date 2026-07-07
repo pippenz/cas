@@ -193,61 +193,17 @@ pub fn render_with_state(
         .map(|s| s.activity_collapsed)
         .unwrap_or(false);
 
-    let has_reminders = !data.reminders.is_empty();
-
     let focus = state
         .as_ref()
         .map(|s| s.focus)
         .unwrap_or(SidecarFocus::None);
     tracing::debug!("render_with_state: focus={:?}, area={:?}", focus, area);
 
-    // Calculate constraints based on collapse state (collapsed = 1 line header only)
-    // Reminders panel is only included when there are active reminders
-    let mut constraints: Vec<Constraint> = vec![
-        if factory_collapsed {
-            Constraint::Length(1)
-        } else {
-            Constraint::Percentage(if has_reminders { 25 } else { 28 })
-        },
-        if tasks_collapsed {
-            Constraint::Length(1)
-        } else {
-            Constraint::Percentage(if has_reminders { 23 } else { 26 })
-        },
-    ];
-
-    if has_reminders {
-        constraints.push(if reminders_collapsed {
-            Constraint::Length(1)
-        } else {
-            Constraint::Percentage(14)
-        });
-    }
-
-    constraints.push(if changes_collapsed {
-        Constraint::Length(1)
-    } else {
-        Constraint::Percentage(if has_reminders { 19 } else { 23 })
-    });
-    constraints.push(if activity_collapsed {
-        Constraint::Length(1)
-    } else {
-        Constraint::Percentage(if has_reminders { 19 } else { 23 })
-    });
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(constraints)
-        .split(area);
-
     let agent_filter = state.as_ref().and_then(|s| s.agent_filter);
     let focused_epic_id = state
         .as_ref()
         .and_then(|s| s.focused_epic_id)
         .or(focused_epic_id);
-    let focused_epic_branch_status = state.as_ref().and_then(|s| s.focused_epic_branch_status);
-
-    // Get collapsed_epics from state (or empty set if no state)
     #[allow(clippy::incompatible_msrv)]
     static EMPTY_SET: std::sync::LazyLock<std::collections::HashSet<String>> =
         std::sync::LazyLock::new(std::collections::HashSet::new);
@@ -256,12 +212,59 @@ pub fn render_with_state(
         .map(|s| s.collapsed_epics)
         .unwrap_or(&EMPTY_SET);
 
-    // Track chunk indices (reminders panel shifts subsequent indices)
+    let has_reminders = !data.reminders.is_empty();
+    let has_changes = data.changes.iter().any(|source| !source.changes.is_empty());
+    let visible_task_rows = tasks::ScopedTaskView::new(data, focused_epic_id)
+        .visible_row_count(agent_filter, collapsed_epics);
+    let effective_tasks_collapsed = tasks_collapsed || visible_task_rows == 0;
+    let effective_reminders_collapsed = reminders_collapsed || !has_reminders;
+    let effective_changes_collapsed = changes_collapsed || !has_changes;
+
+    // Calculate constraints based on collapse state (collapsed = 1 line header only)
+    // Empty sections render as one-line headers without mutating manual collapse state.
+    let mut constraints: Vec<Constraint> = vec![
+        if factory_collapsed {
+            Constraint::Length(1)
+        } else {
+            Constraint::Percentage(if has_reminders { 25 } else { 28 })
+        },
+        if effective_tasks_collapsed {
+            Constraint::Length(1)
+        } else {
+            Constraint::Percentage(if has_reminders { 23 } else { 26 })
+        },
+    ];
+
+    constraints.push(if effective_reminders_collapsed {
+        Constraint::Length(1)
+    } else {
+        Constraint::Percentage(14)
+    });
+
+    constraints.push(if effective_changes_collapsed {
+        Constraint::Length(1)
+    } else {
+        Constraint::Percentage(if has_reminders { 19 } else { 23 })
+    });
+    constraints.push(if activity_collapsed {
+        Constraint::Length(1)
+    } else {
+        Constraint::Min(0)
+    });
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(area);
+
+    let focused_epic_branch_status = state.as_ref().and_then(|s| s.focused_epic_branch_status);
+
+    // Track chunk indices
     let factory_idx = 0;
     let tasks_idx = 1;
-    let reminders_idx = if has_reminders { Some(2) } else { None };
-    let changes_idx = if has_reminders { 3 } else { 2 };
-    let activity_idx = if has_reminders { 4 } else { 3 };
+    let reminders_idx = 2;
+    let changes_idx = 3;
+    let activity_idx = 4;
 
     // Render each section with focus indicator and collapse state
     factory_radar::render_with_focus(
@@ -285,26 +288,21 @@ pub fn render_with_state(
         state.as_ref().and_then(|s| s.tasks_state.selected()),
         agent_filter,
         focused_epic_id,
-        tasks_collapsed,
+        effective_tasks_collapsed,
         collapsed_epics,
         state.as_mut().map(|s| &mut *s.tasks_state),
     );
 
-    // Render reminders panel (only when reminders exist)
-    let reminders_area = if let Some(idx) = reminders_idx {
-        reminders::render_with_focus(
-            frame,
-            chunks[idx],
-            data,
-            theme,
-            focus == SidecarFocus::Reminders,
-            reminders_collapsed,
-            state.as_mut().map(|s| &mut *s.reminders_state),
-        );
-        chunks[idx]
-    } else {
-        Rect::default()
-    };
+    reminders::render_with_focus(
+        frame,
+        chunks[reminders_idx],
+        data,
+        theme,
+        focus == SidecarFocus::Reminders,
+        effective_reminders_collapsed,
+        state.as_mut().map(|s| &mut *s.reminders_state),
+    );
+    let reminders_area = chunks[reminders_idx];
 
     // Get collapsed_dirs from state (or empty set if no state)
     let collapsed_dirs = state
@@ -319,7 +317,7 @@ pub fn render_with_state(
         theme,
         focus == SidecarFocus::Changes,
         state.as_ref().and_then(|s| s.changes_state.selected()),
-        changes_collapsed,
+        effective_changes_collapsed,
         state.as_mut().map(|s| &mut *s.changes_state),
         collapsed_dirs,
     );
@@ -396,6 +394,21 @@ mod tests {
         }
     }
 
+    fn empty_data() -> DirectorData {
+        DirectorData {
+            ready_tasks: Vec::new(),
+            in_progress_tasks: Vec::new(),
+            epic_tasks: Vec::new(),
+            agents: Vec::new(),
+            activity: Vec::new(),
+            agent_id_to_name: HashMap::new(),
+            changes: Vec::new(),
+            git_loaded: false,
+            reminders: Vec::new(),
+            epic_closed_counts: HashMap::new(),
+        }
+    }
+
     fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
         terminal
             .backend()
@@ -458,5 +471,118 @@ mod tests {
         let text = buffer_text(&terminal);
         assert!(text.contains("EPIC: cas-state"));
         assert!(!text.contains("EPIC: cas-param"));
+    }
+
+    #[test]
+    fn empty_sidecar_sections_collapse_to_headers_and_activity_gains_space() {
+        let data = empty_data();
+        let backend = TestBackend::new(90, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = ActiveTheme::default();
+        let mut tasks_state = ListState::default();
+        let mut agents_state = ListState::default();
+        let mut reminders_state = ListState::default();
+        let mut changes_state = ListState::default();
+        let mut activity_state = ListState::default();
+        let collapsed_epics = HashSet::new();
+        let collapsed_dirs = HashSet::new();
+        let mut changes_item_types = Vec::new();
+        let mut areas = super::PanelAreas::default();
+
+        terminal
+            .draw(|frame| {
+                let mut state = SidecarState {
+                    focus: SidecarFocus::None,
+                    tasks_state: &mut tasks_state,
+                    agents_state: &mut agents_state,
+                    reminders_state: &mut reminders_state,
+                    changes_state: &mut changes_state,
+                    activity_state: &mut activity_state,
+                    agent_filter: None,
+                    focused_epic_id: None,
+                    focused_epic_branch_status: None,
+                    factory_collapsed: false,
+                    tasks_collapsed: false,
+                    reminders_collapsed: false,
+                    changes_collapsed: false,
+                    activity_collapsed: false,
+                    collapsed_epics: &collapsed_epics,
+                    collapsed_dirs: &collapsed_dirs,
+                    changes_item_types: &mut changes_item_types,
+                };
+                areas = render_with_state(
+                    frame,
+                    frame.area(),
+                    &data,
+                    &theme,
+                    None,
+                    "supervisor",
+                    Some(&mut state),
+                );
+            })
+            .unwrap();
+
+        let text = buffer_text(&terminal);
+        assert!(text.contains("▸ TASKS (0)"));
+        assert!(text.contains("▸ REMINDERS (0)"));
+        assert!(text.contains("▸ CHANGES (0)"));
+        assert_eq!(areas.tasks.height, 1);
+        assert_eq!(areas.reminders.height, 1);
+        assert_eq!(areas.changes.height, 1);
+        assert!(areas.activity.height > areas.factory.height);
+    }
+
+    #[test]
+    fn manual_sidecar_collapse_still_overrides_non_empty_sections() {
+        let data = data_with_two_epics();
+        let backend = TestBackend::new(90, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = ActiveTheme::default();
+        let mut tasks_state = ListState::default();
+        let mut agents_state = ListState::default();
+        let mut reminders_state = ListState::default();
+        let mut changes_state = ListState::default();
+        let mut activity_state = ListState::default();
+        let collapsed_epics = HashSet::new();
+        let collapsed_dirs = HashSet::new();
+        let mut changes_item_types = Vec::new();
+        let mut areas = super::PanelAreas::default();
+
+        terminal
+            .draw(|frame| {
+                let mut state = SidecarState {
+                    focus: SidecarFocus::Tasks,
+                    tasks_state: &mut tasks_state,
+                    agents_state: &mut agents_state,
+                    reminders_state: &mut reminders_state,
+                    changes_state: &mut changes_state,
+                    activity_state: &mut activity_state,
+                    agent_filter: None,
+                    focused_epic_id: Some("cas-state"),
+                    focused_epic_branch_status: None,
+                    factory_collapsed: false,
+                    tasks_collapsed: true,
+                    reminders_collapsed: false,
+                    changes_collapsed: false,
+                    activity_collapsed: false,
+                    collapsed_epics: &collapsed_epics,
+                    collapsed_dirs: &collapsed_dirs,
+                    changes_item_types: &mut changes_item_types,
+                };
+                areas = render_with_state(
+                    frame,
+                    frame.area(),
+                    &data,
+                    &theme,
+                    None,
+                    "supervisor",
+                    Some(&mut state),
+                );
+            })
+            .unwrap();
+
+        let text = buffer_text(&terminal);
+        assert!(text.contains("▸ TASKS (2)"));
+        assert_eq!(areas.tasks.height, 1);
     }
 }

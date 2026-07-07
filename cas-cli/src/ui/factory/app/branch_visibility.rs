@@ -121,6 +121,24 @@ impl BranchVisibilityCache {
     }
 
     #[cfg(test)]
+    pub(crate) fn insert_epic_ahead_behind(
+        &self,
+        epic_id: &str,
+        branch: &str,
+        ahead: u32,
+        behind: u32,
+    ) {
+        self.snapshot.lock().unwrap().epic_ahead_behind.insert(
+            epic_id.to_string(),
+            BranchAheadBehind {
+                branch: branch.to_string(),
+                ahead,
+                behind,
+            },
+        );
+    }
+
+    #[cfg(test)]
     fn mark_refreshed(&self, now: Instant) {
         self.snapshot.lock().unwrap().refreshed_at = Some(now);
     }
