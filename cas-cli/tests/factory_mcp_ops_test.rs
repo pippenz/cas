@@ -1740,6 +1740,138 @@ async fn test_coordination_message_to_unregistered_target_reports_queued_pending
     assert_eq!(prompts[0].target, "not-born-yet");
 }
 
+/// cas-6913 AC1: "queue-before-register -> register -> poll sees it".
+/// A message queued to a worker name before that worker exists in the
+/// agent store must be delivered into the worker's OWN prompt loop at
+/// registration time (surfaced directly in the register response text —
+/// no PTY-injection timing dependency), and must remain pollable
+/// afterward (at-least-once, matching this queue's existing philosophy).
+#[tokio::test]
+async fn test_agent_register_surfaces_pending_prompt_queue_mail() {
+    let env = FactoryTestEnv::new();
+
+    // Step 1: queue-before-register.
+    env.prompt_queue()
+        .enqueue_urgent(
+            "supervisor",
+            "not-born-yet",
+            "start with task cas-abc1",
+            None,
+            Some("assignment"),
+            None,
+            false,
+        )
+        .expect("enqueue pre-registration message");
+
+    // Step 2: register.
+    let mut req = coord_req("register");
+    req.name = Some("not-born-yet".to_string());
+    req.session_id = Some("session-not-born-yet".to_string());
+    let result = env.service.coordination(Parameters(req)).await;
+    assert!(result.is_ok(), "register should succeed: {result:?}");
+    let text = get_text(&result.unwrap());
+    assert!(
+        text.contains("start with task cas-abc1"),
+        "registration response should surface the pending message: {text}"
+    );
+    assert!(
+        text.contains("waiting for you"),
+        "response should explain why the message appears: {text}"
+    );
+
+    // Step 3: poll sees it — surfacing in the register response must not
+    // consume the message. The daemon's normal poll loop still delivers it.
+    let still_pending = env
+        .prompt_queue()
+        .poll_for_target("not-born-yet", 10)
+        .expect("poll");
+    assert_eq!(
+        still_pending.len(),
+        1,
+        "message must remain pollable after being surfaced at registration"
+    );
+}
+
+/// Codex workers register via `action=session_start`, not `action=register`
+/// (see cas-e7c8 / the ToolSearch two-step guidance) — this is the literal
+/// path the source bug doc's repro hit ("Worker zealous-hawk-40 (codex
+/// CLI)"). Must get the same treatment as the Claude `register` path.
+#[tokio::test]
+async fn test_agent_session_start_surfaces_pending_prompt_queue_mail() {
+    let env = FactoryTestEnv::new();
+
+    env.prompt_queue()
+        .enqueue_urgent(
+            "supervisor",
+            "codex-worker-1",
+            "branch base: epic/foo. proof command: cargo test.",
+            None,
+            Some("assignment"),
+            None,
+            false,
+        )
+        .expect("enqueue pre-registration message");
+
+    let mut req = coord_req("session_start");
+    req.name = Some("codex-worker-1".to_string());
+    req.session_id = Some("session-codex-worker-1".to_string());
+    let result = env.service.coordination(Parameters(req)).await;
+    assert!(result.is_ok(), "session_start should succeed: {result:?}");
+    let text = get_text(&result.unwrap());
+    assert!(
+        text.contains("branch base: epic/foo"),
+        "session_start response should surface the pending message: {text}"
+    );
+}
+
+/// No pending mail must add no noise — registration stays a clean,
+/// unchanged response for the overwhelmingly common case.
+#[tokio::test]
+async fn test_agent_register_with_no_pending_mail_stays_unchanged() {
+    let env = FactoryTestEnv::new();
+
+    let mut req = coord_req("register");
+    req.name = Some("fresh-worker".to_string());
+    req.session_id = Some("session-fresh-worker".to_string());
+    let result = env.service.coordination(Parameters(req)).await;
+    assert!(result.is_ok(), "register should succeed: {result:?}");
+    let text = get_text(&result.unwrap());
+    assert!(
+        !text.contains("waiting for you"),
+        "no pending mail should mean no pending-mail section: {text}"
+    );
+}
+
+/// A message queued for a DIFFERENT worker must never leak into this
+/// worker's registration response.
+#[tokio::test]
+async fn test_agent_register_does_not_leak_other_agents_mail() {
+    let env = FactoryTestEnv::new();
+
+    env.prompt_queue()
+        .enqueue_urgent(
+            "supervisor",
+            "someone-else",
+            "top secret instructions for someone-else",
+            None,
+            Some("assignment"),
+            None,
+            false,
+        )
+        .expect("enqueue message for a different worker");
+
+    let mut req = coord_req("register");
+    req.name = Some("fresh-worker".to_string());
+    req.session_id = Some("session-fresh-worker".to_string());
+    let result = env.service.coordination(Parameters(req)).await;
+    assert!(result.is_ok(), "register should succeed: {result:?}");
+    let text = get_text(&result.unwrap());
+    assert!(
+        !text.contains("top secret instructions"),
+        "another agent's queued message must not leak into this registration: {text}"
+    );
+}
+
 /// `action=interrupt` is sugar for `message` with urgent=true.
 #[tokio::test]
 async fn test_coordination_interrupt_action_is_urgent() {
