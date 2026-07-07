@@ -78,10 +78,16 @@ pub fn render_with_focus(
     }
 
     // Layout: epic progress/placeholder, worker list, summary
-    let epic_height = if focused_epic_branch_status.is_some() {
-        3
+    //
+    // cas-582d: unfocused used to get a fixed 2-line placeholder no matter
+    // how much there was to show. It now renders a live-epics overview
+    // (header + one row per live epic + pin-hint footer), so give it room
+    // scaled to that content — capped so the worker list, the other primary
+    // orientation source, never starves.
+    let epic_height = if focused_epic_id.is_some() {
+        if focused_epic_branch_status.is_some() { 3 } else { 2 }
     } else {
-        2
+        unfocused_epic_progress_height(data, inner.height)
     };
     let summary_height = 1;
     let worker_height = inner
@@ -153,17 +159,17 @@ fn render_epic_progress(
     let palette = &theme.palette;
 
     let Some(focused_epic_id) = focused_epic_id else {
-        render_unfocused_epic_placeholder(frame, area, theme);
+        render_unfocused_overview(frame, area, data, theme);
         return;
     };
 
     if !focused_epic_is_renderable_source_blind(data, focused_epic_id) {
-        render_unfocused_epic_placeholder(frame, area, theme);
+        render_unfocused_overview(frame, area, data, theme);
         return;
     }
 
     let Some(epic) = data.epic_tasks.iter().find(|e| e.id == focused_epic_id) else {
-        render_unfocused_epic_placeholder(frame, area, theme);
+        render_unfocused_overview(frame, area, data, theme);
         return;
     };
 
@@ -260,6 +266,111 @@ fn render_unfocused_epic_placeholder(frame: &mut Frame, area: Rect, theme: &Acti
         styles.text_muted,
     ));
     frame.render_widget(Paragraph::new(line), area);
+}
+
+/// Max rows the unfocused overview will list before collapsing the rest
+/// into a "+K more" summary line.
+const MAX_UNFOCUSED_EPIC_ROWS: usize = 4;
+
+/// Live, session-visible epics for the unfocused overview.
+///
+/// Reuses `data.tasks_by_epic()` (the same primitive backing the TASKS
+/// panel's own unfocused hint, cas-6945) filtered through
+/// `focused_epic_is_renderable_source_blind` so a session never surfaces a
+/// cross-project epic's id/title/counts it has no assignee-based claim to
+/// — the same privacy gate the focused-epic path already enforces below.
+fn unfocused_live_epic_groups(
+    data: &DirectorData,
+) -> Vec<cas_factory::EpicGroup> {
+    data.tasks_by_epic()
+        .0
+        .into_iter()
+        .filter(|group| focused_epic_is_renderable_source_blind(data, &group.epic.id))
+        .collect()
+}
+
+/// Height needed for the unfocused epic-progress chunk: a header line, one
+/// row per live epic (capped), and the focus_epic pin-hint footer. Falls
+/// back to the original 2-line placeholder height when there is nothing to
+/// show. Never claims more than half the panel so the worker list — the
+/// other primary orientation source — always keeps room.
+fn unfocused_epic_progress_height(data: &DirectorData, panel_height: u16) -> u16 {
+    let live_epic_count = unfocused_live_epic_groups(data).len();
+    if live_epic_count == 0 {
+        return 2;
+    }
+
+    let rows = live_epic_count.min(MAX_UNFOCUSED_EPIC_ROWS) as u16;
+    let desired = 2 + rows; // header line + hint line + epic rows
+    desired.min(panel_height / 2).max(2)
+}
+
+/// Render the unfocused epic-progress chunk as a live-epics overview
+/// instead of a bare placeholder: a header, one row per live epic (id,
+/// truncated title, active/queued subtask counts), a "+K more" line if the
+/// list is longer than fits, and the focus_epic pin hint as a one-line
+/// footer. Falls back to the original single-line placeholder when there
+/// are no session-visible live epics to show.
+fn render_unfocused_overview(frame: &mut Frame, area: Rect, data: &DirectorData, theme: &ActiveTheme) {
+    if area.height == 0 || area.width < 10 {
+        return;
+    }
+
+    let visible_groups = unfocused_live_epic_groups(data);
+    if visible_groups.is_empty() {
+        render_unfocused_epic_placeholder(frame, area, theme);
+        return;
+    }
+
+    let styles = &theme.styles;
+    let mut lines: Vec<Line> = Vec::new();
+
+    lines.push(Line::from(Span::styled(
+        format!("Live epics ({}):", visible_groups.len()),
+        styles.text_info.add_modifier(Modifier::BOLD),
+    )));
+
+    // Reserve the last line for the pin hint; show as many epic rows as fit
+    // in what's left.
+    let row_budget = (area.height as usize).saturating_sub(2).max(1);
+    let shown_count = visible_groups.len().min(row_budget);
+
+    for group in visible_groups.iter().take(shown_count) {
+        let active = group
+            .subtasks
+            .iter()
+            .filter(|t| t.status == TaskStatus::InProgress)
+            .count();
+        let queued = group.subtasks.len().saturating_sub(active);
+        let counts = format!("  {active} active, {queued} queued");
+        let title_budget = (area.width as usize)
+            .saturating_sub(group.epic.id.len() + 4 + counts.len())
+            .max(4) as u16;
+        let title = truncate_to_width(&group.epic.title, title_budget, 0);
+
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {} ", group.epic.id), styles.text_info),
+            Span::styled(title, styles.text_primary),
+            Span::styled(counts, styles.text_muted),
+        ]));
+    }
+
+    let remaining = visible_groups.len() - shown_count;
+    if remaining > 0 && lines.len() < area.height as usize {
+        lines.push(Line::from(Span::styled(
+            format!("  … +{remaining} more"),
+            styles.text_muted.add_modifier(Modifier::ITALIC),
+        )));
+    }
+
+    if lines.len() < area.height as usize {
+        lines.push(Line::from(Span::styled(
+            "Pin: coordination action=focus_epic id=<epic>",
+            styles.text_muted,
+        )));
+    }
+
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 fn focused_epic_is_renderable_source_blind(data: &DirectorData, epic_id: &str) -> bool {
@@ -743,5 +854,198 @@ mod tests {
         assert!(text.contains("worker-one: ▸ cas-id1 Assigned by agent id"));
         assert!(text.contains("worker-two: ▸ cas-name2 Assigned by display name"));
         assert!(text.contains("worker-three: idle"));
+    }
+
+    fn subtask(
+        id: &str,
+        title: &str,
+        status: TaskStatus,
+        epic: &str,
+        assignee: Option<&str>,
+    ) -> TaskSummary {
+        TaskSummary {
+            id: id.to_string(),
+            title: title.to_string(),
+            status,
+            priority: Priority::MEDIUM,
+            assignee: assignee.map(str::to_string),
+            task_type: TaskType::Task,
+            epic: Some(epic.to_string()),
+            branch: None,
+            updated_at: None,
+        }
+    }
+
+    fn data_with_two_live_epics() -> DirectorData {
+        DirectorData {
+            ready_tasks: vec![
+                subtask("cas-a1", "Alpha queued", TaskStatus::Open, "cas-alpha", None),
+                subtask(
+                    "cas-b1",
+                    "Beta queued",
+                    TaskStatus::Open,
+                    "cas-beta",
+                    Some("worker-one"),
+                ),
+            ],
+            in_progress_tasks: vec![subtask(
+                "cas-a2",
+                "Alpha active",
+                TaskStatus::InProgress,
+                "cas-alpha",
+                None,
+            )],
+            epic_tasks: vec![
+                task("cas-alpha", "Alpha Epic", TaskStatus::Open, TaskType::Epic),
+                task("cas-beta", "Beta Epic", TaskStatus::Open, TaskType::Epic),
+            ],
+            agents: Vec::new(),
+            activity: Vec::new(),
+            agent_id_to_name: HashMap::from([(
+                "worker-one".to_string(),
+                "worker-one".to_string(),
+            )]),
+            changes: Vec::new(),
+            git_loaded: false,
+            reminders: Vec::new(),
+            epic_closed_counts: HashMap::new(),
+        }
+    }
+
+    /// cas-582d AC1/AC3: unfocused with multiple live epics must list them
+    /// (not the bare "No focused epic" dead-zone), with basic progress
+    /// counts and the pin hint demoted to a single footer line.
+    #[test]
+    fn factory_radar_unfocused_overview_lists_multiple_live_epics() {
+        let data = data_with_two_live_epics();
+        let backend = TestBackend::new(90, 14);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = ActiveTheme::default();
+
+        terminal
+            .draw(|frame| {
+                render_with_focus(
+                    frame,
+                    frame.area(),
+                    &data,
+                    &theme,
+                    None,
+                    None,
+                    false,
+                    None,
+                    "supervisor",
+                    false,
+                );
+            })
+            .unwrap();
+
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains("Live epics (2):"),
+            "should show a live-epics overview header: {text}"
+        );
+        assert!(text.contains("cas-alpha"), "missing alpha epic id: {text}");
+        assert!(
+            text.contains("1 active, 1 queued"),
+            "alpha epic counts wrong: {text}"
+        );
+        assert!(text.contains("cas-beta"), "missing beta epic id: {text}");
+        assert!(
+            text.contains("0 active, 1 queued"),
+            "beta epic counts wrong: {text}"
+        );
+        assert!(
+            text.contains("Pin: coordination action=focus_epic id=<epic>"),
+            "pin hint should still appear as a footer line: {text}"
+        );
+        assert!(
+            !text.contains("No focused epic"),
+            "bare dead-zone placeholder must not render when live epics exist: {text}"
+        );
+    }
+
+    /// cas-582d AC3: unfocused with no session-visible live epics still
+    /// falls back to the original single-line placeholder — including the
+    /// case where the only epic present is foreign (source-blind gate),
+    /// proving the overview never leaks a cross-project epic id/title.
+    #[test]
+    fn factory_radar_unfocused_overview_falls_back_when_no_live_epics() {
+        let data = data_with_unrelated_epic();
+        let backend = TestBackend::new(90, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = ActiveTheme::default();
+
+        terminal
+            .draw(|frame| {
+                render_with_focus(
+                    frame,
+                    frame.area(),
+                    &data,
+                    &theme,
+                    None,
+                    None,
+                    false,
+                    None,
+                    "supervisor",
+                    false,
+                );
+            })
+            .unwrap();
+
+        let text = buffer_text(&terminal);
+        assert!(text.contains("No focused epic"));
+        assert!(text.contains("coordination action=focus_epic id=<epic>"));
+        assert!(
+            !text.contains("Live epics"),
+            "must not claim a live-epics overview when nothing is session-visible: {text}"
+        );
+        assert!(
+            !text.contains("cas-foreign"),
+            "foreign epic id must not leak into the unfocused overview: {text}"
+        );
+    }
+
+    /// cas-582d AC3: the worker-with-task row must still render correctly
+    /// alongside the new live-epics overview when unfocused — proving the
+    /// dynamic epic-progress sizing doesn't starve or corrupt the worker
+    /// list.
+    #[test]
+    fn factory_radar_unfocused_overview_worker_row_shows_current_task() {
+        let mut data = data_with_two_live_epics();
+        data.agents = vec![agent("agent-1", "worker-one")];
+        // `find_agent_in_progress_task` only matches `in_progress_tasks`
+        // (ready/queued tasks don't count as "current"), so assign the
+        // in-progress alpha subtask to the worker.
+        data.in_progress_tasks[0].assignee = Some("worker-one".to_string());
+        let backend = TestBackend::new(90, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = ActiveTheme::default();
+
+        terminal
+            .draw(|frame| {
+                render_with_focus(
+                    frame,
+                    frame.area(),
+                    &data,
+                    &theme,
+                    None,
+                    None,
+                    false,
+                    None,
+                    "supervisor",
+                    false,
+                );
+            })
+            .unwrap();
+
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains("Live epics (2):"),
+            "overview should still render: {text}"
+        );
+        assert!(
+            text.contains("worker-one: ▸ cas-a2 Alpha active"),
+            "worker row with current task should still render unfocused: {text}"
+        );
     }
 }
