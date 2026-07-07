@@ -2552,6 +2552,77 @@ This is the body content."#;
         }
     }
 
+    /// cas-e7c8: a haiku/low-tier worker (lt-defects, 2026-07-07) called
+    /// `ToolSearch(select:mcp__cas__task)` seven times in a row and never
+    /// once issued the follow-up `mcp__cas__task` call — it never
+    /// distinguished "load the schema" from "call the tool". Pins the
+    /// step-0 clarification in cas-worker.md and the matching recovery.md
+    /// escape hatch on both mirrors so this guidance can't silently erode.
+    #[test]
+    fn test_worker_toolsearch_two_step_guidance_present_and_mirrored() {
+        for (label, guide) in [
+            ("claude cas-worker.md", WORKER_GUIDE),
+            (
+                "codex cas-worker.md",
+                include_str!("builtins/codex/skills/cas-worker.md"),
+            ),
+        ] {
+            for required in [
+                "Tool loading is two steps, not one",
+                "does **not** execute the tool",
+                "not another ToolSearch",
+            ] {
+                assert!(
+                    guide.contains(required),
+                    "{label} missing ToolSearch two-step marker: {required:?}"
+                );
+            }
+        }
+
+        for (label, set) in [
+            ("BUILTIN_SKILLS", BUILTIN_SKILLS),
+            ("CODEX_BUILTIN_SKILLS", CODEX_BUILTIN_SKILLS),
+        ] {
+            let path = "skills/cas-worker/references/recovery.md";
+            let entry = set
+                .iter()
+                .find(|b| b.path == path)
+                .unwrap_or_else(|| panic!("{label} missing {path}"));
+            for required in [
+                "ToolSearch resolved the tool but you still can't call it",
+                "Do not re-run ToolSearch for a tool it already resolved",
+            ] {
+                assert!(
+                    entry.content.contains(required),
+                    "{label} {path} missing ToolSearch-resolved recovery marker: {required:?}"
+                );
+            }
+        }
+
+        // recovery.md mirrors intentionally diverge by MCP alias (cas-5b4f) —
+        // the new section must follow the same convention as the rest of the file.
+        let claude_recovery = BUILTIN_SKILLS
+            .iter()
+            .find(|b| b.path == "skills/cas-worker/references/recovery.md")
+            .expect("BUILTIN_SKILLS missing recovery.md");
+        assert!(
+            claude_recovery
+                .content
+                .contains("literally named `mcp__cas__task`"),
+            "claude recovery.md ToolSearch section must use the mcp__cas__ alias"
+        );
+        let codex_recovery = CODEX_BUILTIN_SKILLS
+            .iter()
+            .find(|b| b.path == "skills/cas-worker/references/recovery.md")
+            .expect("CODEX_BUILTIN_SKILLS missing recovery.md");
+        assert!(
+            codex_recovery
+                .content
+                .contains("literally named `mcp__cs__task`"),
+            "codex recovery.md ToolSearch section must use the mcp__cs__ alias"
+        );
+    }
+
     // cas-e0d1: pin the opt-in description so a future sync or hand-edit can't
     // silently re-introduce auto-trigger phrasing into either mirror — that
     // would resurrect the wall-clock regression the rewrite fixed.

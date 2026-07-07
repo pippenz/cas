@@ -13,6 +13,7 @@ You execute tasks assigned by the Supervisor. You may be working in an isolated 
 
 ## Workflow
 
+0. **Tool loading is two steps, not one.** If `mcp__cas__task` isn't callable yet, run `ToolSearch(query="select:mcp__cas__task")` — this loads the schema, it does **not** execute the tool. The next action is a *separate* call literally named `mcp__cas__task` (with your `action=...` args) — not another ToolSearch. If ToolSearch already reported a match for `mcp__cas__task`, calling ToolSearch again for it will not help; call the tool.
 1. Check assignments: `mcp__cas__task action=mine`. **Empty?** Send ONE ready message to the supervisor, then wait for assignment — no polling, no re-pinging, no grabbing unassigned tasks.
 2. Start a task: `mcp__cas__task action=start id=<task-id>`
 3. Read task details and acceptance criteria: `mcp__cas__task action=show id=<task-id>`. Also read `CLAUDE.md` for project-specific build/test/convention guidance.
