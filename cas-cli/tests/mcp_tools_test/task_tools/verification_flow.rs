@@ -1,9 +1,10 @@
 use crate::support::*;
 use cas::mcp::tools::*;
 use cas::store::{
-    init_cas_dir, open_agent_store, open_task_store, open_verification_store, open_worktree_store,
+    EventStore, init_cas_dir, open_agent_store, open_event_store, open_task_store,
+    open_verification_store, open_worktree_store,
 };
-use cas::types::{AgentRole, TaskStatus, Verification, VerificationType, Worktree};
+use cas::types::{AgentRole, EventType, TaskStatus, Verification, VerificationType, Worktree};
 use rmcp::handler::server::wrapper::Parameters;
 use tempfile::TempDir;
 
@@ -460,6 +461,31 @@ async fn test_merge_required_close_parks_awaiting_merge_and_releases_gate_cas_8d
         "MERGE REQUIRED close must release A's active lease"
     );
 
+    // cas-627f: the flagship close-rejected `WorkerIdle` notification is
+    // built from `AgentSummary::active_lease`, which used to be resolved
+    // ONLY from `list_agent_leases` (status='active' rows). Since the
+    // assertion above just proved A's lease is released, `active_lease`
+    // must now fall back to resolving A by assignee + AwaitingMerge status
+    // directly from the task table — confirmed P1,
+    // docs/reviews/2026-07-07-cas-b646-epic.md.
+    let director_data =
+        cas_factory::DirectorData::load_fast(&cas_dir).expect("load director data");
+    let agent_summary = director_data
+        .agents
+        .iter()
+        .find(|a| a.name == "test-agent")
+        .expect("test-agent present in director data");
+    let active_lease = agent_summary.active_lease.as_ref().expect(
+        "active_lease must resolve for the parked AwaitingMerge task even with the lease released",
+    );
+    assert_eq!(active_lease.task_id, id_a);
+    assert_eq!(active_lease.task_status, TaskStatus::AwaitingMerge);
+    assert_eq!(
+        active_lease.close_rejected_reason.as_deref(),
+        Some("MERGE REQUIRED"),
+        "close_rejected_reason must carry the rejection reason for the operator notification"
+    );
+
     let id_b = extract_task_id(&extract_text(
         service
             .cas_task_create(Parameters(simple_task_req("Task B")))
@@ -512,6 +538,193 @@ async fn test_merge_required_close_parks_awaiting_merge_and_releases_gate_cas_8d
     assert_eq!(
         task_store.get(&id_a).expect("A exists").status,
         TaskStatus::Closed
+    );
+}
+
+/// cas-627f: a worker retrying `close` on an already-parked (AwaitingMerge)
+/// task — the documented #1 worker failure mode while waiting on a
+/// supervisor merge — must get the same rejection message WITHOUT
+/// `park_task_awaiting_merge` re-running: no duplicate audit note appended
+/// to `task.notes`, no duplicate `WorkerVerificationBlocked` close-rejection
+/// activity event recorded.
+#[tokio::test]
+async fn test_repeated_merge_required_close_does_not_duplicate_park_audit_cas_627f() {
+    use std::process::Command;
+
+    let (temp, service) = setup_cas();
+    let _env_lock = env_test_lock();
+    let cas_dir = temp.path().join(".cas");
+    let agent_store = open_agent_store(&cas_dir).expect("open agent store");
+    {
+        let mut agent = agent_store
+            .list(None)
+            .expect("list agents")
+            .into_iter()
+            .find(|agent| agent.name == "test-agent")
+            .expect("test agent exists");
+        agent.role = AgentRole::Worker;
+        agent_store.update(&agent).expect("mark test agent worker");
+    }
+
+    std::fs::write(
+        cas_dir.join("config.toml"),
+        "[verification]\nenabled = true\n",
+    )
+    .expect("write config");
+
+    let repo = temp.path();
+    let git = |args: &[&str]| {
+        let ok = Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .status()
+            .expect("git")
+            .success();
+        assert!(ok, "git {args:?} failed");
+    };
+    git(&["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("seed.txt"), "seed\n").unwrap();
+    git(&["add", "seed.txt"]);
+    git(&["commit", "-q", "-m", "seed"]);
+    git(&["checkout", "-q", "-b", "epic/cas-627f"]);
+    git(&["checkout", "-q", "-b", "factory/test-agent"]);
+    std::fs::write(repo.join("worker.txt"), "worker\n").unwrap();
+    git(&["add", "worker.txt"]);
+    git(&["commit", "-q", "-m", "worker change"]);
+
+    let task_store = open_task_store(&cas_dir).expect("open task store");
+
+    let epic_id = extract_task_id(&extract_text(
+        service
+            .cas_task_create(Parameters(TaskCreateRequest {
+                depth: None,
+                title: "Merge epic".to_string(),
+                description: None,
+                priority: 2,
+                task_type: "epic".to_string(),
+                labels: None,
+                notes: None,
+                blocked_by: None,
+                design: None,
+                acceptance_criteria: None,
+                external_ref: None,
+                assignee: None,
+                demo_statement: None,
+                execution_note: None,
+                epic: None,
+            }))
+            .await
+            .expect("create epic"),
+    ))
+    .expect("epic id")
+    .to_string();
+    {
+        let mut epic = task_store.get(&epic_id).expect("epic exists");
+        epic.branch = Some("epic/cas-627f".to_string());
+        task_store.update(&epic).expect("update epic branch");
+    }
+
+    let id_a = extract_task_id(&extract_text(
+        service
+            .cas_task_create(Parameters(TaskCreateRequest {
+                epic: Some(epic_id.clone()),
+                ..simple_task_req("Task A")
+            }))
+            .await
+            .expect("create A"),
+    ))
+    .expect("id A")
+    .to_string();
+    service
+        .cas_task_start(Parameters(IdRequest { id: id_a.clone() }))
+        .await
+        .expect("start A");
+    {
+        let mut task_a = task_store.get(&id_a).expect("A exists after start");
+        task_a.assignee = Some("test-agent".to_string());
+        task_store.update(&task_a).expect("set A assignee");
+    }
+
+    let close_req = || TaskCloseRequest {
+        id: id_a.clone(),
+        reason: Some("ready for merge".to_string()),
+        bypass_code_review: None,
+        code_review_findings: None,
+    };
+
+    let first_close = extract_text(
+        service
+            .cas_task_close(Parameters(close_req()))
+            .await
+            .expect("first close returns"),
+    );
+    assert!(
+        first_close.contains("MERGE REQUIRED"),
+        "first close must reject on stranded factory branch: {first_close}"
+    );
+
+    let parked_once = task_store.get(&id_a).expect("A exists");
+    assert_eq!(parked_once.status, TaskStatus::AwaitingMerge);
+    let notes_after_first = parked_once.notes.clone();
+
+    let event_store = open_event_store(&cas_dir).expect("open event store");
+    let close_rejected_count = |store: &dyn EventStore| {
+        store
+            .list_recent(50)
+            .expect("list recent events")
+            .into_iter()
+            .filter(|e| {
+                e.event_type == EventType::WorkerVerificationBlocked
+                    && e.metadata
+                        .as_ref()
+                        .and_then(|m| m.get("close_rejected"))
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                    && e.metadata
+                        .as_ref()
+                        .and_then(|m| m.get("task_id"))
+                        .and_then(|v| v.as_str())
+                        == Some(id_a.as_str())
+            })
+            .count()
+    };
+    let rejection_events_after_first = close_rejected_count(event_store.as_ref());
+    assert_eq!(
+        rejection_events_after_first, 1,
+        "first rejection should record exactly one close_rejected activity event"
+    );
+
+    // Retry close on the already-parked task — same stranded branch, no
+    // supervisor merge has happened yet.
+    let second_close = extract_text(
+        service
+            .cas_task_close(Parameters(close_req()))
+            .await
+            .expect("second close returns"),
+    );
+    assert!(
+        second_close.contains("MERGE REQUIRED"),
+        "retry must repeat the same rejection message: {second_close}"
+    );
+
+    let parked_twice = task_store.get(&id_a).expect("A exists");
+    assert_eq!(parked_twice.status, TaskStatus::AwaitingMerge);
+    assert_eq!(
+        parked_twice.notes, notes_after_first,
+        "repeated close on an already-parked task must not append a duplicate audit note"
+    );
+
+    let rejection_events_after_second = close_rejected_count(event_store.as_ref());
+    assert_eq!(
+        rejection_events_after_second, 1,
+        "repeated close on an already-parked task must not emit a duplicate \
+         close-rejection activity event"
     );
 }
 

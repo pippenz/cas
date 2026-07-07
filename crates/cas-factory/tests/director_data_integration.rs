@@ -203,6 +203,67 @@ fn test_director_data_loads_in_progress_tasks() {
 }
 
 #[test]
+fn test_director_data_active_lease_resolves_awaiting_merge_via_assignee_after_lease_release() {
+    // cas-627f: `park_task_awaiting_merge` (cas-8d5b) parks a merge-gate-
+    // rejected close as `AwaitingMerge` and DELIBERATELY releases the
+    // worker's lease (so the one-task gate doesn't block their next `task
+    // start`). Confirmed P1: `active_lease` used to be resolved solely from
+    // `list_agent_leases`, which returns only `status='active'` rows — so a
+    // parked task's lease vanished from that view and `active_lease` came
+    // back `None`, making the flagship close-rejected `WorkerIdle`
+    // notification unreachable. `active_lease` must still resolve here via
+    // the task table (assignee + `AwaitingMerge` status) even with zero
+    // active lease rows for this agent.
+    let temp_dir = setup_test_cas_dir();
+    let cas_dir = temp_dir.path();
+
+    let task_store = init_task_store(cas_dir);
+    let agent_store = init_agent_store(cas_dir);
+    init_event_store(cas_dir);
+
+    let worker = create_test_agent(
+        "worker-1",
+        "swift-fox",
+        AgentRole::Worker,
+        AgentStatus::Idle,
+    );
+    agent_store.register(&worker).expect("Failed to add worker");
+
+    let task = create_test_task(
+        "cas-0001",
+        "Parked Task",
+        TaskStatus::AwaitingMerge,
+        TaskType::Task,
+        Priority::HIGH,
+        Some("swift-fox"),
+    );
+    task_store.add(&task).expect("Failed to add task");
+
+    // No lease is ever created for this agent/task — mirrors the released
+    // state after park_task_awaiting_merge runs.
+    let leases = agent_store
+        .list_agent_leases("worker-1")
+        .expect("list_agent_leases should not error");
+    assert!(
+        leases.is_empty(),
+        "test setup: no active lease should exist for the parked task"
+    );
+
+    let data = DirectorData::load_fast(cas_dir).expect("Failed to load DirectorData");
+
+    let agent_summary = data
+        .agents
+        .iter()
+        .find(|a| a.name == "swift-fox")
+        .expect("swift-fox should be present in agents");
+    let lease = agent_summary.active_lease.as_ref().expect(
+        "active_lease should resolve for a parked AwaitingMerge task even with no active lease row",
+    );
+    assert_eq!(lease.task_id, "cas-0001");
+    assert_eq!(lease.task_status, TaskStatus::AwaitingMerge);
+}
+
+#[test]
 fn test_director_data_excludes_epics_from_regular_tasks() {
     let temp_dir = setup_test_cas_dir();
     let cas_dir = temp_dir.path();

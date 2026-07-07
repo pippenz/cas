@@ -333,9 +333,16 @@ impl FactoryDaemon {
                 // via `RUST_LOG=cas::coordination=debug`.
                 let refresh_started = std::time::Instant::now();
                 let tick_interval_ms = last_refresh.elapsed().as_secs_f64() * 1000.0;
-                if let Ok((_prompts, events)) = self.app.refresh_data() {
-                    let delivery_events = self.app.revalidate_events_for_delivery(&events);
-                    let prompts = self.app.generate_prompts_for_delivery(&delivery_events);
+                if let Ok(events) = self.app.refresh_data() {
+                    // cas-627f: combined into one call so an idle tick with
+                    // zero events short-circuits before touching the DB at
+                    // all, and a non-idle tick shares a single unfiltered
+                    // load between revalidation and prompt generation
+                    // instead of two independent (and possibly divergent)
+                    // full DirectorData loads. See
+                    // `revalidate_and_prompt_for_delivery` doc comment.
+                    let (delivery_events, prompts) =
+                        self.app.revalidate_and_prompt_for_delivery(&events);
                     tracing::debug!(
                         target: "cas::coordination",
                         stage = "director_refresh",

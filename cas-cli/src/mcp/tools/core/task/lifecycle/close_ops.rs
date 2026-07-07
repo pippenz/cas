@@ -183,6 +183,21 @@ impl CasCore {
         let mut parked = task.clone();
         let now = chrono::Utc::now();
         parked.status = TaskStatus::AwaitingMerge;
+        // cas-627f: investigated as a possible verification-jail escape
+        // (parking clears `pending_verification` before the verification
+        // policy block ever runs) — REFUTED. `pending_verification` is only
+        // ever a SETTER in this file; the actual close-time gate is
+        // `verification_store.get_latest_for_task` (checked independently,
+        // further down, and re-evaluated correctly on the next close
+        // attempt once the merge gate stops rejecting). The only consumer
+        // that reads this flag for jailing is
+        // `check_pending_verification` (mcp/server/mod.rs), which iterates
+        // ACTIVE leases only — the lease release two lines below already
+        // exempts this task from that jail on its own, making this clear
+        // redundant-but-harmless rather than a bypass. The hook-level
+        // `list_pending_verification` jail (pre_tool.rs) exempts factory
+        // workers outright, and `park_task_awaiting_merge` only fires for
+        // factory-branch merge gates in the first place.
         parked.pending_verification = false;
         parked.pending_worktree_merge = false;
         parked.updated_at = now;
@@ -352,12 +367,25 @@ impl CasCore {
             match run_factory_branch_merge_gate(&task, &req, &parent_branch, close_project_root) {
                 MergeStateGateOutcome::Proceed => {}
                 MergeStateGateOutcome::Reject(msg) => {
-                    self.park_task_awaiting_merge(
-                        task_store.as_ref(),
-                        &task,
-                        "MERGE REQUIRED",
-                        &msg,
-                    );
+                    // cas-627f: a worker looping `close` before the
+                    // supervisor merges (the documented #1 worker failure
+                    // mode) used to re-run `park_task_awaiting_merge` on
+                    // EVERY retry — appending a duplicate audit note to
+                    // `task.notes` and emitting a duplicate
+                    // `WorkerVerificationBlocked` close-rejection activity
+                    // event each time, unboundedly. Park (and record the
+                    // rejection activity) only the first time a task
+                    // transitions into `AwaitingMerge`; once it's already
+                    // parked, a retry gets the same rejection message with
+                    // no further state mutation.
+                    if task.status != TaskStatus::AwaitingMerge {
+                        self.park_task_awaiting_merge(
+                            task_store.as_ref(),
+                            &task,
+                            "MERGE REQUIRED",
+                            &msg,
+                        );
+                    }
                     return Ok(Self::tool_error(msg));
                 }
             }
