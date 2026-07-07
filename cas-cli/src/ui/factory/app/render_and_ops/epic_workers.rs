@@ -423,6 +423,7 @@ impl FactoryApp {
 
         // Update pane grid for navigation
         self.pane_grid = PaneGrid::new(&self.worker_names, &self.supervisor_name, self.is_tabbed);
+        self.sync_worker_pane_branch_titles();
 
         // Sync pane sizes to accommodate new worker
         let _ = self.sync_pane_sizes();
@@ -693,6 +694,7 @@ impl FactoryApp {
 
         // Update pane grid for navigation
         self.pane_grid = PaneGrid::new(&self.worker_names, &self.supervisor_name, self.is_tabbed);
+        self.sync_worker_pane_branch_titles();
 
         // Sync pane sizes
         let _ = self.sync_pane_sizes();

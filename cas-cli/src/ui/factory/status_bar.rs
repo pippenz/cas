@@ -181,6 +181,12 @@ impl StatusBar {
                 Style::default().fg(kind_color).add_modifier(Modifier::BOLD),
             ));
             left_spans.push(Span::styled(format!(" [{kind_str}]"), styles.text_muted));
+            if let Some(branch_label) =
+                Self::branch_label_for_width(app.focused_pane_branch(), area.width)
+            {
+                left_spans.push(Span::raw(" │ "));
+                left_spans.push(Span::styled(branch_label, styles.text_muted));
+            }
         }
 
         // Sidecar focus indicator
@@ -567,6 +573,50 @@ impl StatusBar {
         format!("{prefix}…")
     }
 
+    fn branch_label_for_width(branch: Option<&str>, width: u16) -> Option<String> {
+        let branch = branch.filter(|branch| !branch.is_empty())?;
+        let max_branch_chars = match width {
+            0..=49 => return None,
+            50..=69 => 12,
+            70..=99 => 20,
+            _ => 32,
+        };
+        Some(format!(
+            "branch {}",
+            Self::truncate_middle(branch, max_branch_chars)
+        ))
+    }
+
+    fn truncate_middle(text: &str, max_chars: usize) -> String {
+        let len = text.chars().count();
+        if len <= max_chars {
+            return text.to_string();
+        }
+        if max_chars <= 1 {
+            return "…".to_string();
+        }
+        if max_chars <= 4 {
+            return text
+                .chars()
+                .take(max_chars - 1)
+                .chain("…".chars())
+                .collect();
+        }
+
+        let head_len = (max_chars - 1) / 2;
+        let tail_len = max_chars - 1 - head_len;
+        let head: String = text.chars().take(head_len).collect();
+        let tail: String = text
+            .chars()
+            .rev()
+            .take(tail_len)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        format!("{head}…{tail}")
+    }
+
     /// Trim leading spans until the rendered width fits.
     /// We drop from the front so the most critical tail hints (e.g., quit key)
     /// remain visible on narrow terminals.
@@ -788,5 +838,28 @@ impl StatusBar {
             (Some((n1, n2, n3)), Some((c1, c2, c3))) => (n1, n2, n3) > (c1, c2, c3),
             _ => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StatusBar;
+
+    #[test]
+    fn branch_label_drops_before_shortcut_hints_on_narrow_width() {
+        assert_eq!(
+            StatusBar::branch_label_for_width(Some("factory/fast-octopus-98"), 49),
+            None
+        );
+        assert_eq!(
+            StatusBar::branch_label_for_width(Some("factory/fast-octopus-98"), 70),
+            Some("branch factory/f…octopus-98".to_string())
+        );
+    }
+
+    #[test]
+    fn branch_label_degrades_on_cache_miss() {
+        assert_eq!(StatusBar::branch_label_for_width(None, 120), None);
+        assert_eq!(StatusBar::branch_label_for_width(Some(""), 120), None);
     }
 }

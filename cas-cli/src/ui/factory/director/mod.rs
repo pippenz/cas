@@ -134,6 +134,8 @@ pub struct SidecarState<'a> {
     pub agent_filter: Option<&'a str>,
     /// Current display-focused epic ID.
     pub focused_epic_id: Option<&'a str>,
+    /// Cached branch/ahead-behind status for the current display-focused epic.
+    pub focused_epic_branch_status: Option<EpicBranchStatus<'a>>,
     /// Section collapse flags
     pub factory_collapsed: bool,
     pub tasks_collapsed: bool,
@@ -146,6 +148,13 @@ pub struct SidecarState<'a> {
     pub collapsed_dirs: &'a std::collections::HashSet<String>,
     /// Output: tree item types from changes panel (for scroll bounds)
     pub changes_item_types: &'a mut Vec<TreeItemType>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EpicBranchStatus<'a> {
+    pub branch: &'a str,
+    pub ahead: u32,
+    pub behind: u32,
 }
 
 /// Panel areas for click detection
@@ -236,6 +245,7 @@ pub fn render_with_state(
         .as_ref()
         .and_then(|s| s.focused_epic_id)
         .or(focused_epic_id);
+    let focused_epic_branch_status = state.as_ref().and_then(|s| s.focused_epic_branch_status);
 
     // Get collapsed_epics from state (or empty set if no state)
     #[allow(clippy::incompatible_msrv)]
@@ -260,6 +270,7 @@ pub fn render_with_state(
         data,
         theme,
         focused_epic_id,
+        focused_epic_branch_status,
         focus == SidecarFocus::Factory,
         state.as_ref().and_then(|s| s.agents_state.selected()),
         supervisor_name,
@@ -422,6 +433,7 @@ mod tests {
                     activity_state: &mut activity_state,
                     agent_filter: None,
                     focused_epic_id: Some("cas-state"),
+                    focused_epic_branch_status: None,
                     factory_collapsed: false,
                     tasks_collapsed: false,
                     reminders_collapsed: false,

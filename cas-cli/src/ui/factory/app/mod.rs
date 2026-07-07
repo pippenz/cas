@@ -24,11 +24,15 @@ use crate::ui::theme::ActiveTheme;
 use crate::ui::widgets::TreeItemType;
 use crate::worktree::WorktreeManager;
 
+mod branch_visibility;
 mod imports;
 mod init;
 mod panels_and_modes;
 mod render_and_ops;
 mod sidecar_and_selection;
+
+pub(crate) use branch_visibility::BranchAheadBehind;
+use branch_visibility::{BranchVisibilityCache, format_pane_title_with_branch};
 
 // Re-export from cas-factory for backward compatibility
 pub use cas_factory::{AutoPromptConfig, EpicState, FactoryConfig};
@@ -333,6 +337,8 @@ pub struct FactoryApp {
     last_git_refresh: Instant,
     /// Interval for expensive git refresh operations
     git_refresh_interval: Duration,
+    /// Cached branch labels and epic ahead/behind status for render paths.
+    branch_visibility: BranchVisibilityCache,
     /// Theme for rendering
     theme: ActiveTheme,
     /// Worker names (for reference)
@@ -658,6 +664,7 @@ impl FactoryApp {
             return Ok((Vec::new(), Vec::new()));
         }
 
+        self.refresh_branch_visibility_cache();
         self.last_db_fingerprint = Some(next_fingerprint);
         self.last_refresh = Instant::now();
 
@@ -806,6 +813,86 @@ impl FactoryApp {
             self.focused_kind(),
             Some(PaneKind::Supervisor | PaneKind::Worker | PaneKind::Shell)
         )
+    }
+
+    pub(crate) fn focused_pane_branch(&self) -> Option<&str> {
+        let pane = self.mux.focused()?;
+        match pane.kind() {
+            PaneKind::Supervisor => self.branch_visibility.branch_for_path(&self.project_dir),
+            PaneKind::Worker => {
+                let path = self
+                    .worktree_manager
+                    .as_ref()
+                    .map(|manager| manager.worktree_path_for_worker(pane.id()));
+                let path = path.as_deref().unwrap_or(&self.project_dir);
+                self.branch_visibility.branch_for_path(path)
+            }
+            PaneKind::Director | PaneKind::Shell => None,
+        }
+    }
+
+    pub(crate) fn focused_epic_branch_status(&self) -> Option<&BranchAheadBehind> {
+        let epic_id = self.current_epic_id.as_deref()?;
+        self.branch_visibility.epic_ahead_behind(epic_id)
+    }
+
+    fn refresh_branch_visibility_cache(&mut self) {
+        let worker_paths: Vec<(String, PathBuf)> = self
+            .worktree_manager
+            .as_ref()
+            .map(|manager| manager.worker_cwds().into_iter().collect())
+            .unwrap_or_default();
+        let epic_branches: Vec<(String, String)> = self
+            .director_data
+            .epic_tasks
+            .iter()
+            .filter_map(|epic| {
+                epic.branch
+                    .as_ref()
+                    .map(|branch| (epic.id.clone(), branch.clone()))
+            })
+            .collect();
+
+        self.branch_visibility.refresh(
+            &self.project_dir,
+            &worker_paths,
+            &epic_branches,
+            Instant::now(),
+        );
+        self.sync_worker_pane_branch_titles();
+    }
+
+    pub(crate) fn sync_worker_pane_branch_titles(&mut self) {
+        let worker_branches: HashMap<String, Option<String>> = self
+            .worker_names
+            .iter()
+            .map(|worker| {
+                let branch = self
+                    .worktree_manager
+                    .as_ref()
+                    .map(|manager| manager.worktree_path_for_worker(worker))
+                    .and_then(|path| {
+                        self.branch_visibility
+                            .branch_for_path(&path)
+                            .map(str::to_string)
+                    })
+                    .or_else(|| {
+                        self.branch_visibility
+                            .branch_for_path(&self.project_dir)
+                            .map(str::to_string)
+                    });
+                (worker.clone(), branch)
+            })
+            .collect();
+
+        for pane in self.mux.panes_mut() {
+            if *pane.kind() == PaneKind::Worker {
+                let branch = worker_branches
+                    .get(pane.id())
+                    .and_then(|branch| branch.as_deref());
+                pane.set_title(format_pane_title_with_branch(pane.id(), branch));
+            }
+        }
     }
 
     /// Get all worker names for layout (real + pending booting workers)

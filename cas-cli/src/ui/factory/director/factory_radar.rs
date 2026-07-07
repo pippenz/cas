@@ -9,6 +9,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 
+use crate::ui::factory::director::EpicBranchStatus;
 use crate::ui::factory::director::agent_helpers;
 use crate::ui::factory::director::data::DirectorData;
 use crate::ui::theme::{ActiveTheme, Icons};
@@ -22,6 +23,7 @@ pub fn render_with_focus(
     data: &DirectorData,
     theme: &ActiveTheme,
     focused_epic_id: Option<&str>,
+    focused_epic_branch_status: Option<EpicBranchStatus<'_>>,
     focused: bool,
     selected_agent: Option<usize>,
     supervisor_name: &str,
@@ -76,7 +78,11 @@ pub fn render_with_focus(
     }
 
     // Layout: epic progress/placeholder, worker list, summary
-    let epic_height = 2;
+    let epic_height = if focused_epic_branch_status.is_some() {
+        3
+    } else {
+        2
+    };
     let summary_height = 1;
     let worker_height = inner
         .height
@@ -97,7 +103,14 @@ pub fn render_with_focus(
     let mut chunk_idx = 0;
 
     // Epic progress or explicit unfocused placeholder
-    render_epic_progress(frame, chunks[chunk_idx], data, theme, focused_epic_id);
+    render_epic_progress(
+        frame,
+        chunks[chunk_idx],
+        data,
+        theme,
+        focused_epic_id,
+        focused_epic_branch_status,
+    );
     chunk_idx += 1;
 
     // Separator
@@ -130,6 +143,7 @@ fn render_epic_progress(
     data: &DirectorData,
     theme: &ActiveTheme,
     focused_epic_id: Option<&str>,
+    focused_epic_branch_status: Option<EpicBranchStatus<'_>>,
 ) {
     if area.height == 0 || area.width < 10 {
         return;
@@ -184,7 +198,14 @@ fn render_epic_progress(
         ),
     ]);
 
-    // Line 2: Task counts with visual indicator
+    let branch_line = focused_epic_branch_status.map(|status| {
+        Line::from(Span::styled(
+            format_branch_status(status, area.width),
+            styles.text_muted,
+        ))
+    });
+
+    // Task counts with visual indicator
     // Show: "▓▓▓░░░░░  3 active, 5 queued"
     let bar_width = (area.width as usize).saturating_sub(22).max(4); // Space for counts
     let active_width = if total_visible > 0 {
@@ -202,18 +223,34 @@ fn render_epic_progress(
 
     let counts = format!(" {in_progress_count} active, {queued_count} queued");
 
-    let line2 = Line::from(vec![
+    let progress_line = Line::from(vec![
         Span::styled(bar, Style::default().fg(palette.agent_active)),
         Span::styled(counts, styles.text_muted),
     ]);
 
-    let lines = if area.height >= 2 {
-        vec![line1, line2]
+    let lines = if area.height >= 3 {
+        if let Some(branch_line) = branch_line {
+            vec![line1, branch_line, progress_line]
+        } else {
+            vec![line1, progress_line]
+        }
+    } else if area.height >= 2 {
+        vec![line1, progress_line]
     } else {
         vec![line1]
     };
 
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn format_branch_status(status: EpicBranchStatus<'_>, width: u16) -> String {
+    let suffix = format!(" ↑{} ↓{}", status.ahead, status.behind);
+    let prefix = "BRANCH: ";
+    let branch_budget = (width as usize)
+        .saturating_sub(prefix.len() + suffix.chars().count())
+        .max(4);
+    let branch = truncate_to_width(status.branch, branch_budget as u16, 0);
+    format!("{prefix}{branch}{suffix}")
 }
 
 fn render_unfocused_epic_placeholder(frame: &mut Frame, area: Rect, theme: &ActiveTheme) {
@@ -529,6 +566,7 @@ mod tests {
                     &data,
                     &theme,
                     Some("cas-foreign"),
+                    None,
                     false,
                     None,
                     "supervisor",
@@ -559,6 +597,7 @@ mod tests {
                     &data,
                     &theme,
                     Some("cas-foreign"),
+                    None,
                     false,
                     None,
                     "supervisor",
@@ -588,6 +627,7 @@ mod tests {
                     &data,
                     &theme,
                     Some("cas-foreign"),
+                    None,
                     false,
                     None,
                     "supervisor",
@@ -599,5 +639,40 @@ mod tests {
         let text = buffer_text(&terminal);
         assert!(text.contains("EPIC: cas-foreign"));
         assert!(!text.contains("No focused epic"));
+    }
+
+    #[test]
+    fn factory_radar_renders_epic_branch_ahead_behind() {
+        let mut data = data_with_unrelated_epic();
+        data.ready_tasks[0].assignee = Some("session-agent".to_string());
+        let backend = TestBackend::new(110, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = ActiveTheme::default();
+
+        terminal
+            .draw(|frame| {
+                render_with_focus(
+                    frame,
+                    frame.area(),
+                    &data,
+                    &theme,
+                    Some("cas-foreign"),
+                    Some(crate::ui::factory::director::EpicBranchStatus {
+                        branch: "epic/epic-factory-tui-visual-information-overhaul-osc-8-cas-ebc1",
+                        ahead: 3,
+                        behind: 1,
+                    }),
+                    false,
+                    None,
+                    "supervisor",
+                    false,
+                );
+            })
+            .unwrap();
+
+        let text = buffer_text(&terminal);
+        assert!(text.contains("EPIC: cas-foreign"));
+        assert!(text.contains("BRANCH: epic/epic-factory-tui-visual-information-overhaul"));
+        assert!(text.contains("↑3 ↓1"));
     }
 }

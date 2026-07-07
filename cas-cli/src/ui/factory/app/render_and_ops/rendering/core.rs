@@ -825,6 +825,9 @@ impl FactoryApp {
     fn render_sidecar(&mut self, frame: &mut Frame, layout: &FactoryLayout) {
         match &self.view_mode {
             ViewMode::Overview => {
+                let focused_epic_branch_status = self
+                    .focused_epic_branch_status()
+                    .map(|status| (status.branch.clone(), status.ahead, status.behind));
                 let mut state = SidecarState {
                     focus: self.sidecar_focus,
                     tasks_state: &mut self.panels.tasks.list_state,
@@ -834,6 +837,13 @@ impl FactoryApp {
                     activity_state: &mut self.panels.activity.list_state,
                     agent_filter: self.agent_filter.as_deref(),
                     focused_epic_id: self.current_epic_id.as_deref(),
+                    focused_epic_branch_status: focused_epic_branch_status.as_ref().map(|status| {
+                        crate::ui::factory::director::EpicBranchStatus {
+                            branch: status.0.as_str(),
+                            ahead: status.1,
+                            behind: status.2,
+                        }
+                    }),
                     factory_collapsed: self.panels.factory.collapsed,
                     tasks_collapsed: self.panels.tasks.collapsed,
                     reminders_collapsed: self.panels.reminders.collapsed,
