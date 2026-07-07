@@ -1167,7 +1167,11 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
         return value.to_string();
     }
     if max_chars <= 3 {
-        return "...".to_string();
+        // cas-6185c: the ellipsis indicator itself must never exceed the
+        // caller's budget. A bare "..." (3 chars) for max_chars=0/1/2 used
+        // to overflow by 1-3 chars — clamp it to whatever fits, degrading
+        // to a partial ellipsis ("..", ".") or nothing at max_chars=0.
+        return "...".chars().take(max_chars).collect();
     }
     value
         .chars()
@@ -1328,8 +1332,28 @@ mod tests {
     }
 
     #[test]
-    fn truncate_chars_max_chars_at_or_below_ellipsis_width_returns_bare_ellipsis() {
+    fn truncate_chars_max_chars_at_ellipsis_width_returns_bare_ellipsis() {
         assert_eq!(truncate_chars("a much longer title than this", 3), "...");
-        assert_eq!(truncate_chars("a much longer title than this", 0), "...");
+    }
+
+    /// cas-6185c AC5: below the ellipsis width (0/1/2), the result must
+    /// never exceed `max_chars` — a bare "..." (3 chars) used to be
+    /// returned unconditionally, silently overflowing the caller's budget
+    /// by up to 3 characters.
+    #[test]
+    fn truncate_chars_below_ellipsis_width_never_exceeds_max_chars() {
+        let long = "a much longer title than this";
+
+        let t2 = truncate_chars(long, 2);
+        assert_eq!(t2.chars().count(), 2, "max_chars=2 result: {t2:?}");
+        assert_eq!(t2, "..");
+
+        let t1 = truncate_chars(long, 1);
+        assert_eq!(t1.chars().count(), 1, "max_chars=1 result: {t1:?}");
+        assert_eq!(t1, ".");
+
+        let t0 = truncate_chars(long, 0);
+        assert_eq!(t0.chars().count(), 0, "max_chars=0 result: {t0:?}");
+        assert_eq!(t0, "");
     }
 }
