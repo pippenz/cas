@@ -290,8 +290,30 @@ pub struct FactoryApp {
     cas_dir: PathBuf,
     /// Cached store handles (avoid re-opening on every 2s refresh)
     director_stores: Option<DirectorStores>,
-    /// Director panel data
+    /// Director panel data. **Mutated in place** by
+    /// `filter_director_agents_to_current_session()` on every `db_changed`
+    /// tick — scoped to the currently-tracked epic for TUI display purposes.
+    /// Do NOT feed this to `DirectorEventDetector::detect_changes` (see
+    /// `unfiltered_director_data`).
     director_data: DirectorData,
+    /// Canonical, NEVER-epic-filtered snapshot of the same load that seeds
+    /// `director_data`. Refreshed alongside `director_data` on every
+    /// `db_changed` tick but never mutated by the epic-scoping filter.
+    ///
+    /// Exists because `filter_director_agents_to_current_session` mutates
+    /// `director_data` in place, and on a subsequent tick where `db_changed`
+    /// is false (nothing changed in the DB) but `git_due` is true,
+    /// `director_data` is NOT reloaded — it stays as the FILTERED leftover
+    /// from the last `db_changed` tick. Feeding that stale-filtered snapshot
+    /// into `detect_changes` makes every task belonging to a
+    /// currently-untracked epic (a second epic being worked concurrently in
+    /// the same session) look like it "disappeared from active sets",
+    /// firing a fabricated `TaskCompleted` — the director broadcasts "has
+    /// closed task X" for a task that never closed (cas-dbbe). Change
+    /// detection and the `TaskCompleted` render-time safety net
+    /// (`generate_prompt`, cas-6aaf) must always read the true, unfiltered
+    /// task state via this field instead.
+    unfiltered_director_data: DirectorData,
     /// Current input mode
     pub input_mode: InputMode,
     /// Buffer for inject mode text input
@@ -660,6 +682,14 @@ impl FactoryApp {
             )?;
             self.director_data =
                 merge_director_data_preserving_git(&self.director_data, loaded, git_due);
+            // cas-dbbe: snapshot the fresh, still-unfiltered load BEFORE
+            // `filter_director_agents_to_current_session()` (below) mutates
+            // `self.director_data` in place. This canonical copy is what
+            // change detection and the TaskCompleted safety net read, so a
+            // second epic worked concurrently in this session never looks
+            // like it "disappeared" just because it's outside the
+            // currently-tracked epic's display scope.
+            self.unfiltered_director_data = self.director_data.clone();
             if git_due {
                 self.last_git_refresh = Instant::now();
             }
@@ -684,28 +714,37 @@ impl FactoryApp {
         self.sync_session_mappings();
         self.apply_session_metadata_focus();
 
-        // Detect state changes BEFORE filtering so new epics are visible to the
-        // event detector. This allows EpicStarted to fire and update epic_state,
-        // which the filter depends on for subsequent refresh cycles.
+        // Detect state changes against the UNFILTERED snapshot (cas-dbbe) so new
+        // epics are visible to the event detector, and so a second epic worked
+        // concurrently in this session is never epic-scoped out of the
+        // comparison and mistaken for a completed task. This allows EpicStarted
+        // to fire and update epic_state, which the filter depends on for
+        // subsequent refresh cycles.
         // Pass the currently-tracked epic id so `EpicStarted` is gated on
         // strict improvement: a stray zero-subtask Open-with-branch epic
         // cannot hijack `epic_state` mid-session (see task cas-4181).
         let events = self
             .event_detector
-            .detect_changes(&self.director_data, self.epic_state.epic_id());
+            .detect_changes(&self.unfiltered_director_data, self.epic_state.epic_id());
 
         // Now filter to current session (agents + tasks scoped to active epic)
         if db_changed {
             self.filter_director_agents_to_current_session();
         }
 
-        // Generate prompts from events (respecting auto-prompt config)
+        // Generate prompts from events (respecting auto-prompt config). The
+        // filtered `self.director_data` remains correct for epic-scoped prompt
+        // wording (e.g. WorkerIdle's ready-task count, cas-405f); the
+        // unfiltered snapshot is passed separately for TaskCompleted's
+        // render-time safety net (cas-6aaf / cas-dbbe), which must be able to
+        // see tasks outside the tracked epic to avoid a false "has closed".
         let prompts: Vec<Prompt> = events
             .iter()
             .filter_map(|event| {
                 generate_prompt(
                     event,
                     &self.director_data,
+                    &self.unfiltered_director_data,
                     &self.supervisor_name,
                     &self.auto_prompt,
                     self.supervisor_cli,
@@ -1925,6 +1964,195 @@ mod tests {
             data.epic_tasks.len(),
             1,
             "epic_tasks should have the new epic"
+        );
+    }
+
+    /// cas-dbbe: pins the exact mechanism behind the director's false "has
+    /// closed task X" broadcast, observed live when two epics are worked
+    /// concurrently in the same factory session (repro task IDs cas-fc44 /
+    /// cas-9dc0 on epic cas-6d83, cas-7baa / cas-c0f9 / cas-972c on epic
+    /// cas-604d — both epics active in the same session, different workers).
+    ///
+    /// `filter_director_agents_to_current_session` mutates `director_data`
+    /// in place, epic-scoping it to whatever epic the director currently
+    /// tracks. On a tick where nothing changed in the DB (`db_changed =
+    /// false`) but the git-refresh interval elapsed, `director_data` is NOT
+    /// reloaded — it stays as that filtered leftover. Feeding THAT into
+    /// `detect_changes` makes every task belonging to the OTHER
+    /// (untracked) epic look like it vanished, firing a fabricated
+    /// `TaskCompleted` even though the task never closed.
+    ///
+    /// First half proves the bug: feeding the detector the filtered
+    /// snapshot on the second tick fires a false completion for the
+    /// other-epic task. Second half proves the fix: feeding it the
+    /// preserved unfiltered snapshot (what `FactoryApp.unfiltered_director_data`
+    /// now holds) does not.
+    #[test]
+    fn cas_dbbe_stale_filtered_snapshot_falsely_completes_other_epic_task() {
+        use cas_factory::TaskSummary;
+        use cas_types::{Priority, TaskStatus, TaskType};
+
+        use super::{DirectorEvent, DirectorEventDetector};
+
+        let tracked_epic = "epic-604d";
+        let other_epic = "epic-6d83";
+
+        fn task(id: &str, epic: &str, assignee: &str) -> TaskSummary {
+            TaskSummary {
+                id: id.to_string(),
+                title: format!("Subtask {id}"),
+                status: TaskStatus::InProgress,
+                priority: Priority::MEDIUM,
+                assignee: Some(assignee.to_string()),
+                task_type: TaskType::Task,
+                epic: Some(epic.to_string()),
+                branch: None,
+                updated_at: None,
+            }
+        }
+
+        // Full, unfiltered snapshot: both epics' in-progress tasks visible —
+        // this is what a fresh `DirectorData::load_with_stores` returns, and
+        // what `FactoryApp.unfiltered_director_data` is meant to always hold.
+        let full_data = DirectorData {
+            ready_tasks: Vec::new(),
+            in_progress_tasks: vec![
+                task("cas-972c", tracked_epic, "jolly-koala-50"),
+                task("cas-9dc0", other_epic, "strong-jaguar-64"),
+            ],
+            epic_tasks: Vec::new(),
+            agents: Vec::new(),
+            activity: Vec::new(),
+            agent_id_to_name: HashMap::new(),
+            changes: Vec::new(),
+            git_loaded: true,
+            reminders: Vec::new(),
+            epic_closed_counts: HashMap::new(),
+        };
+
+        // Simulate `filter_director_agents_to_current_session` scoping the
+        // display copy to `tracked_epic` only — exactly what happens to
+        // `FactoryApp.director_data` at the end of a `db_changed` tick.
+        let mut filtered_data = full_data.clone();
+        filtered_data
+            .in_progress_tasks
+            .retain(|t| t.epic.as_deref() == Some(tracked_epic));
+        assert_eq!(
+            filtered_data.in_progress_tasks.len(),
+            1,
+            "sanity: filter should drop the other-epic task"
+        );
+
+        // --- Proves the bug: feeding the STALE FILTERED snapshot on the
+        // next tick (simulating db_changed=false, git_due=true leaving
+        // director_data un-reloaded) fires a false TaskCompleted for the
+        // other-epic task, which never actually closed.
+        let mut buggy_detector = DirectorEventDetector::new(
+            vec!["jolly-koala-50".to_string(), "strong-jaguar-64".to_string()],
+            "supervisor".to_string(),
+        );
+        buggy_detector.initialize(&full_data);
+        let buggy_events = buggy_detector.detect_changes(&filtered_data, Some(tracked_epic));
+        assert!(
+            buggy_events.iter().any(|e| matches!(
+                e,
+                DirectorEvent::TaskCompleted { task_id, .. } if task_id == "cas-9dc0"
+            )),
+            "bug reproduction failed: expected a fabricated TaskCompleted for the \
+             other-epic task when fed the stale-filtered snapshot; got {buggy_events:?}"
+        );
+
+        // --- Proves the fix: feeding the PRESERVED UNFILTERED snapshot on
+        // the next tick (what `unfiltered_director_data` now guarantees)
+        // must not report the other-epic task as completed — it's still
+        // genuinely InProgress.
+        let mut fixed_detector = DirectorEventDetector::new(
+            vec!["jolly-koala-50".to_string(), "strong-jaguar-64".to_string()],
+            "supervisor".to_string(),
+        );
+        fixed_detector.initialize(&full_data);
+        let fixed_events = fixed_detector.detect_changes(&full_data, Some(tracked_epic));
+        assert!(
+            !fixed_events.iter().any(|e| matches!(
+                e,
+                DirectorEvent::TaskCompleted { task_id, .. } if task_id == "cas-9dc0"
+            )),
+            "false completion survived the fix: other-epic task cas-9dc0 must not be \
+             reported completed while still InProgress; got {fixed_events:?}"
+        );
+    }
+
+    /// cas-dbbe: `filter_director_agents_to_current_session()` must mutate
+    /// only `director_data` (the TUI display copy) and must never touch
+    /// `unfiltered_director_data` — the canonical snapshot that change
+    /// detection and the `TaskCompleted` safety net rely on to see tasks
+    /// belonging to a second epic worked concurrently in the same session.
+    #[test]
+    fn cas_dbbe_filter_leaves_unfiltered_snapshot_untouched() {
+        use cas_factory::{EpicState, TaskSummary};
+        use cas_types::{Priority, TaskStatus, TaskType};
+
+        let tracked_epic = "epic-604d";
+        let other_epic = "epic-6d83";
+
+        fn task(id: &str, epic: &str, assignee: &str) -> TaskSummary {
+            TaskSummary {
+                id: id.to_string(),
+                title: format!("Subtask {id}"),
+                status: TaskStatus::InProgress,
+                priority: Priority::MEDIUM,
+                assignee: Some(assignee.to_string()),
+                task_type: TaskType::Task,
+                epic: Some(epic.to_string()),
+                branch: None,
+                updated_at: None,
+            }
+        }
+
+        let data = DirectorData {
+            ready_tasks: Vec::new(),
+            in_progress_tasks: vec![
+                task("cas-972c", tracked_epic, "jolly-koala-50"),
+                task("cas-9dc0", other_epic, "strong-jaguar-64"),
+            ],
+            epic_tasks: Vec::new(),
+            agents: Vec::new(),
+            activity: Vec::new(),
+            agent_id_to_name: HashMap::new(),
+            changes: Vec::new(),
+            git_loaded: true,
+            reminders: Vec::new(),
+            epic_closed_counts: HashMap::new(),
+        };
+
+        let mut app = super::FactoryApp::for_test();
+        app.worker_names = vec!["jolly-koala-50".to_string(), "strong-jaguar-64".to_string()];
+        app.epic_state = EpicState::Active {
+            epic_id: tracked_epic.to_string(),
+            epic_title: "Isolate concurrent factory sessions".to_string(),
+        };
+        app.director_data = data.clone();
+        app.unfiltered_director_data = data;
+
+        app.filter_director_agents_to_current_session();
+
+        assert_eq!(
+            app.director_data.in_progress_tasks.len(),
+            1,
+            "director_data (display copy) should be scoped to the tracked epic"
+        );
+        assert_eq!(
+            app.unfiltered_director_data.in_progress_tasks.len(),
+            2,
+            "unfiltered_director_data must retain the other epic's in-progress task \
+             untouched by the display filter"
+        );
+        assert!(
+            app.unfiltered_director_data
+                .in_progress_tasks
+                .iter()
+                .any(|t| t.id == "cas-9dc0"),
+            "other-epic task must still be present in the unfiltered snapshot"
         );
     }
 
