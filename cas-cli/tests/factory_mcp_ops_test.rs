@@ -1522,6 +1522,69 @@ async fn test_coordination_message_urgent_flag_enqueues_urgent() {
     );
 }
 
+/// cas-6913 AC2: a message to a target that IS registered must say so
+/// honestly — not just "queued", but "queued for next poll (target is
+/// registered)". Regression guard against re-collapsing the two cases.
+#[tokio::test]
+async fn test_coordination_message_to_registered_target_reports_delivery_status() {
+    let _guard = EnvGuard::set(&[
+        ("CAS_AGENT_ROLE", "supervisor"),
+        ("CAS_AGENT_NAME", "supervisor"),
+    ]);
+    let env = FactoryTestEnv::new();
+    env.register_worker("swift-fox");
+
+    let req = coord_msg("message", "swift-fox", "status update", None);
+    let result = env.service.coordination(Parameters(req)).await;
+    assert!(result.is_ok(), "message should succeed: {result:?}");
+    let text = get_text(&result.unwrap());
+    assert!(
+        text.contains("target is registered"),
+        "response should confirm the target is registered: {text}"
+    );
+    assert!(
+        !text.contains("not yet registered"),
+        "a registered target must not read as unregistered: {text}"
+    );
+}
+
+/// cas-6913 AC2: the defect this task exists to fix — "Message queued" reads
+/// as delivery confirmation even when the target name isn't in the agent
+/// store yet (the common spawn-then-immediately-assign race). The ack must
+/// say so honestly instead of implying success either way.
+#[tokio::test]
+async fn test_coordination_message_to_unregistered_target_reports_queued_pending_registration() {
+    let _guard = EnvGuard::set(&[
+        ("CAS_AGENT_ROLE", "supervisor"),
+        ("CAS_AGENT_NAME", "supervisor"),
+    ]);
+    let env = FactoryTestEnv::new();
+    // Deliberately do NOT register "not-born-yet" — simulates a message
+    // addressed to a worker name the supervisor already knows (e.g. from an
+    // explicit spawn_workers worker_names= request) before the daemon has
+    // finished spawning it.
+
+    let req = coord_msg("message", "not-born-yet", "start with task cas-abc1", None);
+    let result = env.service.coordination(Parameters(req)).await;
+    assert!(result.is_ok(), "message should still enqueue: {result:?}");
+    let text = get_text(&result.unwrap());
+    assert!(
+        text.contains("not yet registered"),
+        "response must honestly flag the target as not yet registered: {text}"
+    );
+    assert!(
+        !text.contains("target is registered"),
+        "an unregistered target must not read as registered: {text}"
+    );
+
+    // The message still lands in the queue — this is about honest
+    // reporting, not blocking the send. cas-7e20/daemon polling handles
+    // eventual delivery once the name is registered.
+    let prompts = env.prompt_queue().peek_all(10).expect("peek");
+    assert_eq!(prompts.len(), 1);
+    assert_eq!(prompts[0].target, "not-born-yet");
+}
+
 /// `action=interrupt` is sugar for `message` with urgent=true.
 #[tokio::test]
 async fn test_coordination_interrupt_action_is_urgent() {
