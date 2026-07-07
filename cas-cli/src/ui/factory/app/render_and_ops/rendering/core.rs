@@ -1,6 +1,62 @@
 use crate::ui::factory::app::imports::*;
+use crate::ui::factory::buffer_backend::HyperlinkMap;
+use std::sync::Arc;
 
 impl FactoryApp {
+    pub(crate) fn full_pane_hyperlink_map(&self) -> HyperlinkMap {
+        self.full_pane_hyperlinks.clone()
+    }
+
+    pub(crate) fn compact_pane_hyperlink_map(&self) -> HyperlinkMap {
+        self.compact_pane_hyperlinks.clone()
+    }
+
+    fn clear_pane_hyperlinks(hyperlink_map: &HyperlinkMap) {
+        if let Ok(mut hyperlinks) = hyperlink_map.lock() {
+            hyperlinks.clear();
+        }
+    }
+
+    fn prune_pane_hyperlinks(hyperlink_map: &HyperlinkMap, area: Rect) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+
+        if let Ok(mut hyperlinks) = hyperlink_map.lock() {
+            let x_end = area.x.saturating_add(area.width);
+            let y_end = area.y.saturating_add(area.height);
+            hyperlinks.retain(|(x, y), _| *x < area.x || *x >= x_end || *y < area.y || *y >= y_end);
+        }
+    }
+
+    pub(crate) fn prune_full_pane_hyperlinks(&self, area: Rect) {
+        Self::prune_pane_hyperlinks(&self.full_pane_hyperlinks, area);
+    }
+
+    fn record_pane_hyperlinks(
+        &self,
+        hyperlink_map: &HyperlinkMap,
+        pane: &cas_mux::Pane,
+        area: Rect,
+    ) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+
+        let Ok(mut hyperlinks) = hyperlink_map.lock() else {
+            return;
+        };
+
+        for row in 0..area.height {
+            let row_links = pane.row_hyperlinks(row);
+            for col in 0..area.width.min(row_links.len() as u16) {
+                if let Some(uri) = row_links[col as usize].as_ref() {
+                    hyperlinks.insert((area.x + col, area.y + row), Arc::from(uri.as_str()));
+                }
+            }
+        }
+    }
+
     fn sync_selected_worker_tab_with_focus(&mut self) {
         let Some(focused) = self.mux.focused() else {
             return;
@@ -18,6 +74,7 @@ impl FactoryApp {
     }
 
     pub fn render(&mut self, frame: &mut Frame) {
+        Self::clear_pane_hyperlinks(&self.full_pane_hyperlinks);
         use crate::ui::factory::renderer::FactoryViewMode;
         match self.factory_view_mode {
             FactoryViewMode::Panes => self.render_panes_view(frame),
@@ -211,6 +268,7 @@ impl FactoryApp {
         use ratatui::widgets::Paragraph;
 
         let area = frame.area();
+        Self::clear_pane_hyperlinks(&self.compact_pane_hyperlinks);
 
         // Split: 1-row status bar + rest for supervisor
         let chunks = Layout::default()
@@ -318,6 +376,7 @@ impl FactoryApp {
 
             let content = Paragraph::new(lines);
             frame.render_widget(content, supervisor_area);
+            self.record_pane_hyperlinks(&self.compact_pane_hyperlinks, pane, supervisor_area);
         }
     }
 
@@ -400,6 +459,7 @@ impl FactoryApp {
 
             let content = Paragraph::new(lines).block(block);
             frame.render_widget(content, area);
+            self.record_pane_hyperlinks(&self.full_pane_hyperlinks, pane, inner);
 
             // Show new-lines indicator when user has scrolled up
             let new_below = pane.new_lines_below();
@@ -798,6 +858,7 @@ impl FactoryApp {
 
             let content = Paragraph::new(lines).block(block);
             frame.render_widget(content, layout.supervisor_area);
+            self.record_pane_hyperlinks(&self.full_pane_hyperlinks, pane, inner);
 
             // Show new-lines indicator when user has scrolled up
             let new_below = pane.new_lines_below();
@@ -877,5 +938,146 @@ impl FactoryApp {
                 self.render_file_diff(frame, layout.sidecar_area, &file_path);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod hyperlink_tests {
+    use super::FactoryApp;
+    use crate::ui::factory::buffer_backend::BufferBackend;
+    use cas_mux::Pane;
+    use ratatui::backend::Backend;
+    use ratatui::buffer::Cell;
+    use ratatui::layout::Rect;
+    use std::sync::Arc;
+
+    #[test]
+    fn pane_hyperlinks_are_recorded_at_final_screen_offsets_for_two_panes() {
+        let app = FactoryApp::for_test();
+        let mut left = Pane::director("left", 1, 20).unwrap();
+        let mut right = Pane::director("right", 1, 20).unwrap();
+        left.feed(b"\x1b]8;;https://left.example\x1b\\left\x1b]8;;\x1b\\")
+            .unwrap();
+        right
+            .feed(b"\x1b]8;;https://right.example\x1b\\right\x1b]8;;\x1b\\")
+            .unwrap();
+
+        let map = app.full_pane_hyperlink_map();
+        FactoryApp::clear_pane_hyperlinks(&map);
+        app.record_pane_hyperlinks(
+            &map,
+            &left,
+            Rect {
+                x: 2,
+                y: 3,
+                width: 20,
+                height: 1,
+            },
+        );
+        app.record_pane_hyperlinks(
+            &map,
+            &right,
+            Rect {
+                x: 30,
+                y: 3,
+                width: 20,
+                height: 1,
+            },
+        );
+
+        let hyperlinks = map.lock().unwrap();
+        assert_eq!(
+            hyperlinks.get(&(2, 3)).map(AsRef::as_ref),
+            Some("https://left.example")
+        );
+        assert_eq!(
+            hyperlinks.get(&(30, 3)).map(AsRef::as_ref),
+            Some("https://right.example")
+        );
+        assert_eq!(hyperlinks.get(&(0, 0)), None);
+    }
+
+    #[test]
+    fn pane_hyperlinks_record_row_offsets_and_clip_to_area_width() {
+        let app = FactoryApp::for_test();
+        let mut pane = Pane::director("pane", 3, 20).unwrap();
+        pane.feed(b"plain\r\n\x1b]8;;https://row.example\x1b\\linked\x1b]8;;\x1b\\")
+            .unwrap();
+
+        let map = app.full_pane_hyperlink_map();
+        FactoryApp::clear_pane_hyperlinks(&map);
+        app.record_pane_hyperlinks(
+            &map,
+            &pane,
+            Rect {
+                x: 5,
+                y: 7,
+                width: 3,
+                height: 3,
+            },
+        );
+
+        let hyperlinks = map.lock().unwrap();
+        assert_eq!(
+            hyperlinks.get(&(5, 8)).map(AsRef::as_ref),
+            Some("https://row.example")
+        );
+        assert_eq!(
+            hyperlinks.get(&(7, 8)).map(AsRef::as_ref),
+            Some("https://row.example")
+        );
+        assert_eq!(hyperlinks.get(&(8, 8)), None);
+        assert_eq!(hyperlinks.get(&(5, 7)), None);
+    }
+
+    #[test]
+    fn overlay_pruning_removes_links_from_covered_cells_before_backend_emit() {
+        let app = FactoryApp::for_test();
+        let map = app.full_pane_hyperlink_map();
+        {
+            let mut hyperlinks = map.lock().unwrap();
+            hyperlinks.insert((3, 2), Arc::from("https://covered.example"));
+            hyperlinks.insert((8, 2), Arc::from("https://visible.example"));
+        }
+
+        app.prune_full_pane_hyperlinks(Rect {
+            x: 2,
+            y: 1,
+            width: 4,
+            height: 3,
+        });
+
+        let cells = [Cell::new("x"), Cell::new("y")];
+        let mut backend = BufferBackend::with_hyperlinks(12, 4, map);
+        backend
+            .draw(vec![(3, 2, &cells[0]), (8, 2, &cells[1])].into_iter())
+            .unwrap();
+
+        let output = String::from_utf8(backend.take_buffer()).unwrap();
+        assert!(!output.contains("https://covered.example"));
+        assert!(output.contains("https://visible.example"));
+    }
+
+    #[test]
+    fn full_and_compact_hyperlink_maps_are_independent() {
+        let app = FactoryApp::for_test();
+        let full = app.full_pane_hyperlink_map();
+        let compact = app.compact_pane_hyperlink_map();
+
+        full.lock()
+            .unwrap()
+            .insert((0, 0), Arc::from("https://full.example"));
+        compact
+            .lock()
+            .unwrap()
+            .insert((0, 0), Arc::from("https://compact.example"));
+
+        FactoryApp::clear_pane_hyperlinks(&full);
+
+        assert!(full.lock().unwrap().is_empty());
+        assert_eq!(
+            compact.lock().unwrap().get(&(0, 0)).map(AsRef::as_ref),
+            Some("https://compact.example")
+        );
     }
 }

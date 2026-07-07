@@ -15,6 +15,7 @@ use super::director::{
 };
 use crate::store::open_prompt_queue_store;
 use crate::types::Worktree;
+use crate::ui::factory::buffer_backend::HyperlinkMap;
 use crate::ui::factory::input::{InputMode, LayoutSizes};
 use crate::ui::factory::layout::{FactoryLayout, PaneGrid};
 use crate::ui::factory::notification::Notifier;
@@ -478,6 +479,10 @@ pub struct FactoryApp {
     mc_tasks_area: Rect,
     mc_changes_area: Rect,
     mc_activity_area: Rect,
+    /// Per-frame OSC 8 hyperlink metadata for the full terminal pipeline.
+    full_pane_hyperlinks: HyperlinkMap,
+    /// Per-frame OSC 8 hyperlink metadata for the compact terminal pipeline.
+    compact_pane_hyperlinks: HyperlinkMap,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

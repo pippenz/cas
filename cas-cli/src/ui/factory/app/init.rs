@@ -13,6 +13,7 @@ use crate::ui::factory::app::{
     preferred_epic_focus_from_session_metadata, queue_codex_worker_intro_prompt,
     queue_supervisor_intro_prompt, resolve_epic_state_for_focus,
 };
+use crate::ui::factory::buffer_backend::new_hyperlink_map;
 use crate::ui::factory::director::DirectorStores;
 use crate::ui::factory::director::{
     DirectorData, DirectorEventDetector, PanelAreas, SidecarFocus, ViewMode,
@@ -300,6 +301,8 @@ impl FactoryApp {
             mc_tasks_area: Rect::default(),
             mc_changes_area: Rect::default(),
             mc_activity_area: Rect::default(),
+            full_pane_hyperlinks: new_hyperlink_map(),
+            compact_pane_hyperlinks: new_hyperlink_map(),
         };
 
         queue_supervisor_intro_prompt(
@@ -465,6 +468,8 @@ impl FactoryApp {
             mc_tasks_area: Rect::default(),
             mc_changes_area: Rect::default(),
             mc_activity_area: Rect::default(),
+            full_pane_hyperlinks: new_hyperlink_map(),
+            compact_pane_hyperlinks: new_hyperlink_map(),
         };
 
         queue_supervisor_intro_prompt(
@@ -670,6 +675,8 @@ impl FactoryApp {
             mc_tasks_area: Rect::default(),
             mc_changes_area: Rect::default(),
             mc_activity_area: Rect::default(),
+            full_pane_hyperlinks: new_hyperlink_map(),
+            compact_pane_hyperlinks: new_hyperlink_map(),
         }
     }
 }
