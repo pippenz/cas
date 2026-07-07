@@ -32,7 +32,10 @@ mod render_and_ops;
 mod sidecar_and_selection;
 
 pub(crate) use branch_visibility::BranchAheadBehind;
-use branch_visibility::{BranchVisibilityCache, format_pane_title_with_branch};
+pub(crate) use branch_visibility::truncate_branch_middle;
+use branch_visibility::{
+    BranchVisibilityCache, branch_for_worker_title, format_pane_title_with_branch,
+};
 
 // Re-export from cas-factory for backward compatibility
 pub use cas_factory::{AutoPromptConfig, EpicState, FactoryConfig};
@@ -660,6 +663,7 @@ impl FactoryApp {
             )?;
             self.last_git_refresh = Instant::now();
         } else {
+            self.refresh_branch_visibility_cache();
             self.last_refresh = Instant::now();
             return Ok((Vec::new(), Vec::new()));
         }
@@ -815,7 +819,7 @@ impl FactoryApp {
         )
     }
 
-    pub(crate) fn focused_pane_branch(&self) -> Option<&str> {
+    pub(crate) fn focused_pane_branch(&self) -> Option<String> {
         let pane = self.mux.focused()?;
         match pane.kind() {
             PaneKind::Supervisor => self.branch_visibility.branch_for_path(&self.project_dir),
@@ -831,7 +835,7 @@ impl FactoryApp {
         }
     }
 
-    pub(crate) fn focused_epic_branch_status(&self) -> Option<&BranchAheadBehind> {
+    pub(crate) fn focused_epic_branch_status(&self) -> Option<BranchAheadBehind> {
         let epic_id = self.current_epic_id.as_deref()?;
         self.branch_visibility.epic_ahead_behind(epic_id)
     }
@@ -842,16 +846,7 @@ impl FactoryApp {
             .as_ref()
             .map(|manager| manager.worker_cwds().into_iter().collect())
             .unwrap_or_default();
-        let epic_branches: Vec<(String, String)> = self
-            .director_data
-            .epic_tasks
-            .iter()
-            .filter_map(|epic| {
-                epic.branch
-                    .as_ref()
-                    .map(|branch| (epic.id.clone(), branch.clone()))
-            })
-            .collect();
+        let epic_branches = self.branch_visible_epics_for_ahead_behind();
 
         self.branch_visibility.refresh(
             &self.project_dir,
@@ -862,25 +857,46 @@ impl FactoryApp {
         self.sync_worker_pane_branch_titles();
     }
 
+    fn branch_visible_epics_for_ahead_behind(&self) -> Vec<(String, String)> {
+        let mut visible_epic_ids: HashSet<String> = self
+            .current_epic_id
+            .iter()
+            .cloned()
+            .chain(
+                self.director_data
+                    .ready_tasks
+                    .iter()
+                    .chain(self.director_data.in_progress_tasks.iter())
+                    .filter_map(|task| task.epic.clone()),
+            )
+            .collect();
+
+        self.director_data
+            .epic_tasks
+            .iter()
+            .filter(|epic| visible_epic_ids.remove(&epic.id))
+            .filter_map(|epic| {
+                epic.branch
+                    .as_ref()
+                    .map(|branch| (epic.id.clone(), branch.clone()))
+            })
+            .collect()
+    }
+
     pub(crate) fn sync_worker_pane_branch_titles(&mut self) {
         let worker_branches: HashMap<String, Option<String>> = self
             .worker_names
             .iter()
             .map(|worker| {
-                let branch = self
+                let worktree_path = self
                     .worktree_manager
                     .as_ref()
-                    .map(|manager| manager.worktree_path_for_worker(worker))
-                    .and_then(|path| {
-                        self.branch_visibility
-                            .branch_for_path(&path)
-                            .map(str::to_string)
-                    })
-                    .or_else(|| {
-                        self.branch_visibility
-                            .branch_for_path(&self.project_dir)
-                            .map(str::to_string)
-                    });
+                    .map(|manager| manager.worktree_path_for_worker(worker));
+                let branch = branch_for_worker_title(
+                    &self.branch_visibility,
+                    worktree_path.as_deref(),
+                    &self.project_dir,
+                );
                 (worker.clone(), branch)
             })
             .collect();

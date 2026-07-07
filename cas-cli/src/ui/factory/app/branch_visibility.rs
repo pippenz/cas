@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const DEFAULT_BRANCH_VISIBILITY_TTL: Duration = Duration::from_secs(10);
@@ -14,8 +16,14 @@ pub(crate) struct BranchAheadBehind {
 
 #[derive(Debug, Clone)]
 pub(crate) struct BranchVisibilityCache {
-    refreshed_at: Option<Instant>,
     ttl: Duration,
+    snapshot: Arc<Mutex<BranchVisibilitySnapshot>>,
+    refresh_in_flight: Arc<AtomicBool>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct BranchVisibilitySnapshot {
+    refreshed_at: Option<Instant>,
     path_branches: HashMap<PathBuf, String>,
     epic_ahead_behind: HashMap<String, BranchAheadBehind>,
 }
@@ -23,30 +31,37 @@ pub(crate) struct BranchVisibilityCache {
 impl Default for BranchVisibilityCache {
     fn default() -> Self {
         Self {
-            refreshed_at: None,
             ttl: DEFAULT_BRANCH_VISIBILITY_TTL,
-            path_branches: HashMap::new(),
-            epic_ahead_behind: HashMap::new(),
+            snapshot: Arc::new(Mutex::new(BranchVisibilitySnapshot::default())),
+            refresh_in_flight: Arc::new(AtomicBool::new(false)),
         }
     }
 }
 
 impl BranchVisibilityCache {
     pub(crate) fn is_fresh(&self, now: Instant) -> bool {
-        self.refreshed_at
+        self.snapshot
+            .lock()
+            .ok()
+            .and_then(|snapshot| snapshot.refreshed_at)
             .is_some_and(|refreshed| now.saturating_duration_since(refreshed) < self.ttl)
     }
 
-    pub(crate) fn branch_for_path(&self, path: &Path) -> Option<&str> {
-        self.path_branches.get(path).map(String::as_str)
+    pub(crate) fn branch_for_path(&self, path: &Path) -> Option<String> {
+        self.snapshot.lock().ok()?.path_branches.get(path).cloned()
     }
 
-    pub(crate) fn epic_ahead_behind(&self, epic_id: &str) -> Option<&BranchAheadBehind> {
-        self.epic_ahead_behind.get(epic_id)
+    pub(crate) fn epic_ahead_behind(&self, epic_id: &str) -> Option<BranchAheadBehind> {
+        self.snapshot
+            .lock()
+            .ok()?
+            .epic_ahead_behind
+            .get(epic_id)
+            .cloned()
     }
 
     pub(crate) fn refresh(
-        &mut self,
+        &self,
         supervisor_path: &Path,
         worker_paths: &[(String, PathBuf)],
         epic_branches: &[(String, String)],
@@ -55,35 +70,37 @@ impl BranchVisibilityCache {
         if self.is_fresh(now) {
             return;
         }
-
-        let mut next_path_branches = HashMap::new();
-        if let Some(branch) = current_branch(supervisor_path) {
-            next_path_branches.insert(supervisor_path.to_path_buf(), branch);
+        if self.refresh_in_flight.swap(true, Ordering::AcqRel) {
+            return;
         }
-        for (_, path) in worker_paths {
-            if let Some(branch) = current_branch(path) {
-                next_path_branches.insert(path.clone(), branch);
+
+        let supervisor_path = supervisor_path.to_path_buf();
+        let worker_paths = worker_paths.to_vec();
+        let epic_branches = epic_branches.to_vec();
+        let snapshot = Arc::clone(&self.snapshot);
+        let refresh_in_flight = Arc::clone(&self.refresh_in_flight);
+
+        std::thread::spawn(move || {
+            let next = collect_snapshot(&supervisor_path, &worker_paths, &epic_branches, now);
+            if let Ok(mut current) = snapshot.lock() {
+                *current = next;
             }
-        }
+            refresh_in_flight.store(false, Ordering::Release);
+        });
+    }
 
-        let trunk = detect_trunk(supervisor_path);
-        let mut next_epic = HashMap::new();
-        for (epic_id, branch) in epic_branches {
-            if let Some((ahead, behind)) = ahead_behind(supervisor_path, branch, &trunk) {
-                next_epic.insert(
-                    epic_id.clone(),
-                    BranchAheadBehind {
-                        branch: branch.clone(),
-                        ahead,
-                        behind,
-                    },
-                );
-            }
+    #[cfg(test)]
+    fn refresh_now_for_test(
+        &self,
+        supervisor_path: &Path,
+        worker_paths: &[(String, PathBuf)],
+        epic_branches: &[(String, String)],
+        now: Instant,
+    ) {
+        let next = collect_snapshot(supervisor_path, worker_paths, epic_branches, now);
+        if let Ok(mut snapshot) = self.snapshot.lock() {
+            *snapshot = next;
         }
-
-        self.path_branches = next_path_branches;
-        self.epic_ahead_behind = next_epic;
-        self.refreshed_at = Some(now);
     }
 
     #[cfg(test)]
@@ -95,13 +112,66 @@ impl BranchVisibilityCache {
     }
 
     #[cfg(test)]
-    fn insert_path_branch(&mut self, path: PathBuf, branch: &str) {
-        self.path_branches.insert(path, branch.to_string());
+    fn insert_path_branch(&self, path: PathBuf, branch: &str) {
+        self.snapshot
+            .lock()
+            .unwrap()
+            .path_branches
+            .insert(path, branch.to_string());
     }
 
     #[cfg(test)]
-    fn mark_refreshed(&mut self, now: Instant) {
-        self.refreshed_at = Some(now);
+    fn mark_refreshed(&self, now: Instant) {
+        self.snapshot.lock().unwrap().refreshed_at = Some(now);
+    }
+}
+
+fn collect_snapshot(
+    supervisor_path: &Path,
+    worker_paths: &[(String, PathBuf)],
+    epic_branches: &[(String, String)],
+    now: Instant,
+) -> BranchVisibilitySnapshot {
+    let mut next_path_branches = HashMap::new();
+    if let Some(branch) = current_branch(supervisor_path) {
+        next_path_branches.insert(supervisor_path.to_path_buf(), branch);
+    }
+    for (_, path) in worker_paths {
+        if let Some(branch) = current_branch(path) {
+            next_path_branches.insert(path.clone(), branch);
+        }
+    }
+
+    let trunk = detect_trunk(supervisor_path);
+    let mut next_epic_ahead_behind = HashMap::new();
+    for (epic_id, branch) in epic_branches {
+        if let Some((ahead, behind)) = ahead_behind(supervisor_path, branch, &trunk) {
+            next_epic_ahead_behind.insert(
+                epic_id.clone(),
+                BranchAheadBehind {
+                    branch: branch.clone(),
+                    ahead,
+                    behind,
+                },
+            );
+        }
+    }
+
+    BranchVisibilitySnapshot {
+        refreshed_at: Some(now),
+        path_branches: next_path_branches,
+        epic_ahead_behind: next_epic_ahead_behind,
+    }
+}
+
+pub(crate) fn branch_for_worker_title(
+    cache: &BranchVisibilityCache,
+    worktree_path: Option<&Path>,
+    project_dir: &Path,
+) -> Option<String> {
+    match worktree_path {
+        Some(path) => cache.branch_for_path(path),
+        None => cache.branch_for_path(project_dir),
     }
 }
 
@@ -205,11 +275,48 @@ fn ahead_behind(path: &Path, branch: &str, base: &str) -> Option<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    fn git(repo: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .unwrap_or_else(|err| panic!("git {args:?} failed to spawn: {err}"));
+        assert!(
+            output.status.success(),
+            "git {args:?} failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn commit_file(repo: &Path, name: &str, contents: &str) {
+        fs::write(repo.join(name), contents).unwrap();
+        git(repo, &["add", name]);
+        git(repo, &["commit", "-m", name]);
+    }
+
+    fn scratch_diverged_repo() -> tempfile::TempDir {
+        let tempdir = tempfile::TempDir::new().unwrap();
+        let repo = tempdir.path();
+        git(repo, &["init", "-b", "main"]);
+        git(repo, &["config", "user.email", "test@example.invalid"]);
+        git(repo, &["config", "user.name", "Test User"]);
+        commit_file(repo, "base.txt", "base");
+        git(repo, &["checkout", "-b", "topic"]);
+        commit_file(repo, "topic.txt", "topic");
+        git(repo, &["checkout", "main"]);
+        commit_file(repo, "main-1.txt", "main 1");
+        commit_file(repo, "main-2.txt", "main 2");
+        commit_file(repo, "main-3.txt", "main 3");
+        tempdir
+    }
 
     #[test]
     fn cache_ttl_and_miss_degrade() {
         let now = Instant::now();
-        let mut cache = BranchVisibilityCache::with_ttl(Duration::from_secs(10));
+        let cache = BranchVisibilityCache::with_ttl(Duration::from_secs(10));
         let path = PathBuf::from("/tmp/worker");
 
         assert!(!cache.is_fresh(now));
@@ -219,7 +326,10 @@ mod tests {
         cache.mark_refreshed(now);
         assert!(cache.is_fresh(now + Duration::from_secs(9)));
         assert!(!cache.is_fresh(now + Duration::from_secs(10)));
-        assert_eq!(cache.branch_for_path(&path), Some("factory/worker"));
+        assert_eq!(
+            cache.branch_for_path(&path).as_deref(),
+            Some("factory/worker")
+        );
         assert_eq!(cache.branch_for_path(Path::new("/tmp/missing")), None);
     }
 
@@ -238,5 +348,57 @@ mod tests {
         assert!(title.starts_with("worker [factory/extre"));
         assert!(title.ends_with("r-worker]"));
         assert!(title.contains('…'));
+    }
+
+    #[test]
+    fn worker_title_cache_miss_does_not_fall_back_to_supervisor_branch() {
+        let cache = BranchVisibilityCache::default();
+        let project_dir = PathBuf::from("/repo");
+        let worker_dir = PathBuf::from("/repo/.cas/worktrees/worker");
+        cache.insert_path_branch(project_dir.clone(), "main");
+
+        assert_eq!(
+            branch_for_worker_title(&cache, Some(&worker_dir), &project_dir),
+            None
+        );
+        assert_eq!(
+            branch_for_worker_title(&cache, None, &project_dir).as_deref(),
+            Some("main")
+        );
+    }
+
+    #[test]
+    fn ahead_behind_orientation_matches_git_left_right_count() {
+        let tempdir = scratch_diverged_repo();
+
+        assert_eq!(ahead_behind(tempdir.path(), "topic", "main"), Some((1, 3)));
+    }
+
+    #[test]
+    fn refresh_collects_current_branches_and_focused_epic_ahead_behind() {
+        let tempdir = scratch_diverged_repo();
+        let now = Instant::now();
+        let cache = BranchVisibilityCache::default();
+
+        cache.refresh_now_for_test(
+            tempdir.path(),
+            &[],
+            &[("cas-epic".to_string(), "topic".to_string())],
+            now,
+        );
+
+        assert_eq!(
+            cache.branch_for_path(tempdir.path()).as_deref(),
+            Some("main")
+        );
+        assert_eq!(
+            cache.epic_ahead_behind("cas-epic"),
+            Some(BranchAheadBehind {
+                branch: "topic".to_string(),
+                ahead: 1,
+                behind: 3,
+            })
+        );
+        assert!(cache.is_fresh(now));
     }
 }

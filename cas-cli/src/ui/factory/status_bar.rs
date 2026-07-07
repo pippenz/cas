@@ -13,6 +13,7 @@ use ratatui::widgets::Paragraph;
 use serde::{Deserialize, Serialize};
 
 use crate::ui::factory::app::FactoryApp;
+use crate::ui::factory::app::truncate_branch_middle;
 use crate::ui::factory::input::InputMode;
 use crate::ui::theme::Styles;
 use cas_mux::PaneKind;
@@ -182,7 +183,7 @@ impl StatusBar {
             ));
             left_spans.push(Span::styled(format!(" [{kind_str}]"), styles.text_muted));
             if let Some(branch_label) =
-                Self::branch_label_for_width(app.focused_pane_branch(), area.width)
+                Self::branch_label_for_width(app.focused_pane_branch().as_deref(), area.width)
             {
                 left_spans.push(Span::raw(" │ "));
                 left_spans.push(Span::styled(branch_label, styles.text_muted));
@@ -583,38 +584,8 @@ impl StatusBar {
         };
         Some(format!(
             "branch {}",
-            Self::truncate_middle(branch, max_branch_chars)
+            truncate_branch_middle(branch, max_branch_chars)
         ))
-    }
-
-    fn truncate_middle(text: &str, max_chars: usize) -> String {
-        let len = text.chars().count();
-        if len <= max_chars {
-            return text.to_string();
-        }
-        if max_chars <= 1 {
-            return "…".to_string();
-        }
-        if max_chars <= 4 {
-            return text
-                .chars()
-                .take(max_chars - 1)
-                .chain("…".chars())
-                .collect();
-        }
-
-        let head_len = (max_chars - 1) / 2;
-        let tail_len = max_chars - 1 - head_len;
-        let head: String = text.chars().take(head_len).collect();
-        let tail: String = text
-            .chars()
-            .rev()
-            .take(tail_len)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
-        format!("{head}…{tail}")
     }
 
     /// Trim leading spans until the rendered width fits.
