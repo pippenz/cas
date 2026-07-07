@@ -111,8 +111,12 @@ impl BranchVisibilityCache {
         }
     }
 
+    // cas-eb7f: widened to `pub(crate)` (matching the sibling
+    // `insert_epic_ahead_behind`) so cross-module render-level tests (e.g.
+    // status_bar.rs) can seed a known branch without spawning a real git
+    // subprocess + background thread via `refresh()`.
     #[cfg(test)]
-    fn insert_path_branch(&self, path: PathBuf, branch: &str) {
+    pub(crate) fn insert_path_branch(&self, path: PathBuf, branch: &str) {
         self.snapshot
             .lock()
             .unwrap()
@@ -418,5 +422,65 @@ mod tests {
             })
         );
         assert!(cache.is_fresh(now));
+    }
+
+    /// cas-eb7f (review finding, cas-ebc1 final): the production `refresh()`
+    /// entry point's in-flight guard (an `AtomicBool` swap that prevents
+    /// overlapping refreshes) was only ever exercised indirectly via
+    /// `refresh_now_for_test`, which bypasses `refresh()` — and therefore
+    /// the guard — entirely. Deterministically proves the short-circuit: an
+    /// already-in-flight refresh must return without touching the snapshot
+    /// or clearing the flag (only the spawned thread's completion clears
+    /// it), and must not spawn a second thread.
+    #[test]
+    fn refresh_short_circuits_when_already_in_flight() {
+        let cache = BranchVisibilityCache::default();
+        // Simulate a refresh already in progress — no real thread needed to
+        // exercise the guard's own logic.
+        cache.refresh_in_flight.store(true, Ordering::Release);
+
+        cache.refresh(Path::new("/nonexistent-repo-path"), &[], &[], Instant::now());
+
+        // A short-circuited call must leave the flag exactly as it found
+        // it — clearing it here would be the pre-cas-eb7f bug class (a
+        // future refresh could then run concurrently with the "in-flight"
+        // one it thought it was guarding against).
+        assert!(
+            cache.refresh_in_flight.load(Ordering::Acquire),
+            "short-circuited refresh must not touch the in-flight flag"
+        );
+        // And no thread should have run to populate the snapshot.
+        assert_eq!(cache.branch_for_path(Path::new("/nonexistent-repo-path")), None);
+    }
+
+    /// Exercises the actual `refresh()` threaded path end-to-end (not the
+    /// `#[cfg(test)]`-only synchronous `refresh_now_for_test` shortcut every
+    /// other test in this file uses): the background thread must populate
+    /// the snapshot and clear the in-flight guard on completion.
+    #[test]
+    fn refresh_production_threaded_path_populates_snapshot_and_clears_guard() {
+        let tempdir = scratch_diverged_repo();
+        let cache = BranchVisibilityCache::default();
+
+        cache.refresh(tempdir.path(), &[], &[], Instant::now());
+
+        // Bounded poll for the background thread to finish — real git
+        // subprocess work, not a fixed sleep, so this isn't flaky on a
+        // slow CI box, but it also can't hang forever if the guard is
+        // broken and the thread never runs.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while cache.branch_for_path(tempdir.path()).is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(
+            cache.branch_for_path(tempdir.path()).as_deref(),
+            Some("main"),
+            "background thread must populate the snapshot"
+        );
+        assert!(
+            !cache.refresh_in_flight.load(Ordering::Acquire),
+            "in-flight guard must clear once the background thread completes"
+        );
     }
 }

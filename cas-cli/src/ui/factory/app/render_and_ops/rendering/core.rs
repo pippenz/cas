@@ -241,6 +241,10 @@ impl FactoryApp {
         );
 
         // TASKS column — reuse the director tasks renderer
+        let mission_control_scoped_tasks = crate::ui::factory::director::tasks::ScopedTaskView::new(
+            &self.director_data,
+            self.current_epic_id.as_deref(),
+        );
         crate::ui::factory::director::tasks::render_with_focus(
             frame,
             mc.tasks_area,
@@ -250,6 +254,7 @@ impl FactoryApp {
             None,
             None,
             self.current_epic_id.as_deref(),
+            &mission_control_scoped_tasks,
             false,
             &self.collapsed_epics,
             Some(&mut self.panels.tasks.list_state),
@@ -1150,17 +1155,24 @@ mod hyperlink_tests {
     }
 }
 
+/// cas-eb7f (review finding, cas-ebc1 final): char-count-counterpart of
+/// `crate::ui::widgets::utils::truncate` (byte-length based). Kept as a
+/// separate function — callers here pass a `max_chars` *character* budget
+/// (the identity header's epic-title slot), not a byte length — but unified
+/// on `truncate()`'s "..." ellipsis convention/threshold so titles don't
+/// visually truncate differently panel-to-panel depending on which helper
+/// rendered them.
 fn truncate_chars(value: &str, max_chars: usize) -> String {
     if value.chars().count() <= max_chars {
         return value.to_string();
     }
-    if max_chars <= 1 {
-        return "…".to_string();
+    if max_chars <= 3 {
+        return "...".to_string();
     }
     value
         .chars()
-        .take(max_chars.saturating_sub(1))
-        .chain("…".chars())
+        .take(max_chars - 3)
+        .chain("...".chars())
         .collect()
 }
 
@@ -1273,5 +1285,51 @@ mod tests {
             text.contains("01:30"),
             "elapsed session time must render without a focused epic"
         );
+    }
+
+    /// cas-eb7f (review finding, cas-ebc1 final): the only existing test that
+    /// renders an epic title never crosses the truncation threshold (27
+    /// chars against max_chars=28), so the char-counting/ellipsis-chaining
+    /// branch of `truncate_chars` was entirely unverified. Given this repo
+    /// shipped a hotfix for a char-boundary panic in a sibling truncation
+    /// helper (1ba84f1), an untested truncation function that runs on
+    /// arbitrary (including multi-byte) task titles is a real gap.
+    #[test]
+    fn truncate_chars_below_and_at_threshold_returns_unchanged() {
+        assert_eq!(truncate_chars("short", 28), "short");
+        let exact = "exactly28characterslong!!!!!";
+        assert_eq!(exact.chars().count(), 28, "fixture must be exactly 28 chars");
+        assert_eq!(truncate_chars(exact, 28), exact);
+    }
+
+    #[test]
+    fn truncate_chars_over_threshold_truncates_with_unified_ellipsis() {
+        // max_chars=28, kept prefix is (max_chars - 3) chars + "..."
+        // (cas-eb7f: unified with crate::ui::widgets::utils::truncate's
+        // "..." convention, not the old single "…" glyph).
+        let title = "This Title Is Definitely Long";
+        assert!(title.chars().count() > 28, "fixture must exceed max_chars");
+        let truncated = truncate_chars(title, 28);
+        assert_eq!(truncated.chars().count(), 28);
+        assert!(truncated.ends_with("..."));
+        let expected_prefix: String = title.chars().take(28 - 3).collect();
+        assert_eq!(truncated, format!("{expected_prefix}..."));
+    }
+
+    /// Multi-byte content must truncate on a char boundary, not a byte
+    /// index — the exact failure mode of the sibling hotfix (1ba84f1) this
+    /// finding referenced.
+    #[test]
+    fn truncate_chars_multibyte_content_does_not_panic_or_split_a_char() {
+        let title = "日本語のタイトルがとても長い場合のテスト"; // multi-byte, > 10 chars
+        let truncated = truncate_chars(title, 10);
+        assert_eq!(truncated.chars().count(), 10);
+        assert!(truncated.ends_with("..."));
+    }
+
+    #[test]
+    fn truncate_chars_max_chars_at_or_below_ellipsis_width_returns_bare_ellipsis() {
+        assert_eq!(truncate_chars("a much longer title than this", 3), "...");
+        assert_eq!(truncate_chars("a much longer title than this", 0), "...");
     }
 }

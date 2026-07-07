@@ -1725,14 +1725,32 @@ mod tests {
 
     static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    // cas-eb7f: this crate has (at least) two independent, uncoordinated
+    // locks guarding process-global env-var mutation: this file's own
+    // `ENV_MUTEX` (used by `EnvGuard`, below) and `crate::test_support::
+    // HOME_MUTEX` (used by `with_temp_home`, adopted more widely — e.g.
+    // worktree/discovery.rs, migration/mod.rs, store/known_repos.rs).
+    // Neither serializes against the other, so any test using one races
+    // under `cargo test`'s default parallelism against any test using the
+    // other whenever both mutate `HOME` — confirmed: `cargo test --no-fail-fast`
+    // intermittently failed both `set_factory_session_handles_missing_
+    // malformed_and_valid_created_at` (this file, EnvGuard) and unrelated
+    // `worktree::discovery::tests::*` (test_support::with_temp_home) when
+    // scheduled concurrently. `EnvGuard` now also holds `HOME_MUTEX` for its
+    // lifetime so it serializes against BOTH lock domains; always acquired
+    // ENV_MUTEX-then-HOME_MUTEX (never the reverse) to rule out deadlock.
     struct EnvGuard {
         saved: Vec<(String, Option<String>)>,
         _lock: std::sync::MutexGuard<'static, ()>,
+        _home_lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl EnvGuard {
         fn set(vars: &[(&str, &str)]) -> Self {
             let lock = ENV_MUTEX
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let home_lock = crate::test_support::HOME_MUTEX
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let mut saved = Vec::with_capacity(vars.len());
@@ -1742,11 +1760,18 @@ mod tests {
                 unsafe { std::env::set_var(&key, value) };
                 saved.push((key, prev));
             }
-            Self { saved, _lock: lock }
+            Self {
+                saved,
+                _lock: lock,
+                _home_lock: home_lock,
+            }
         }
 
         fn set_optional(vars: &[(&str, Option<&str>)]) -> Self {
             let lock = ENV_MUTEX
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let home_lock = crate::test_support::HOME_MUTEX
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let mut saved = Vec::with_capacity(vars.len());
@@ -1759,7 +1784,11 @@ mod tests {
                 }
                 saved.push((key, prev));
             }
-            Self { saved, _lock: lock }
+            Self {
+                saved,
+                _lock: lock,
+                _home_lock: home_lock,
+            }
         }
     }
 
@@ -2209,6 +2238,392 @@ mod tests {
                 .iter()
                 .any(|t| t.id == "cas-9dc0"),
             "other-epic task must still be present in the unfiltered snapshot"
+        );
+    }
+
+    /// cas-eb7f (review finding, cas-ebc1 final): `branch_visible_epics_for_ahead_behind`
+    /// had zero direct or indirect test coverage. Covers: current epic
+    /// included even with no referencing task; epics referenced only via
+    /// ready/in-progress tasks are also included; an epic with no branch is
+    /// silently dropped; an epic_tasks entry not referenced by anything
+    /// (current epic, ready, or in-progress) is excluded.
+    #[test]
+    fn branch_visible_epics_for_ahead_behind_selects_current_and_referenced_epics_with_branches() {
+        use cas_factory::TaskSummary;
+        use cas_types::{Priority, TaskStatus, TaskType};
+
+        fn epic(id: &str, branch: Option<&str>) -> TaskSummary {
+            TaskSummary {
+                id: id.to_string(),
+                title: format!("Epic {id}"),
+                status: TaskStatus::InProgress,
+                priority: Priority::HIGH,
+                assignee: None,
+                task_type: TaskType::Epic,
+                epic: None,
+                branch: branch.map(str::to_string),
+                updated_at: None,
+            }
+        }
+
+        fn subtask(id: &str, epic_id: &str, status: TaskStatus) -> TaskSummary {
+            TaskSummary {
+                id: id.to_string(),
+                title: format!("Subtask {id}"),
+                status,
+                priority: Priority::MEDIUM,
+                assignee: None,
+                task_type: TaskType::Task,
+                epic: Some(epic_id.to_string()),
+                branch: None,
+                updated_at: None,
+            }
+        }
+
+        let mut app = super::FactoryApp::for_test();
+        app.current_epic_id = Some("epic-current".to_string());
+        app.director_data = DirectorData {
+            ready_tasks: vec![subtask("cas-1", "epic-ready-ref", TaskStatus::Open)],
+            in_progress_tasks: vec![subtask(
+                "cas-2",
+                "epic-inprogress-ref",
+                TaskStatus::InProgress,
+            )],
+            epic_tasks: vec![
+                // Current epic: included even though no task references it.
+                epic("epic-current", Some("epic/current")),
+                // Referenced only via a ready task's `epic` field.
+                epic("epic-ready-ref", Some("epic/ready-ref")),
+                // Referenced only via an in-progress task's `epic` field.
+                epic("epic-inprogress-ref", Some("epic/inprogress-ref")),
+                // Referenced (by current_epic_id would not apply) but has NO
+                // branch — must be silently dropped, not (id, "").
+                epic("epic-no-branch", None),
+                // Not referenced by current_epic_id, ready, or in_progress —
+                // must be excluded entirely.
+                epic("epic-unrelated", Some("epic/unrelated")),
+            ],
+            agents: Vec::new(),
+            activity: Vec::new(),
+            agent_id_to_name: HashMap::new(),
+            changes: Vec::new(),
+            git_loaded: false,
+            reminders: Vec::new(),
+            epic_closed_counts: HashMap::new(),
+        };
+        // "epic-no-branch" has no task referencing it either, so it must be
+        // reachable only via the current_epic_id path to prove the
+        // no-branch filter specifically (not just absence from the set).
+        app.director_data
+            .ready_tasks
+            .push(subtask("cas-3", "epic-no-branch", TaskStatus::Open));
+
+        let mut visible = app.branch_visible_epics_for_ahead_behind();
+        visible.sort();
+
+        let mut expected = vec![
+            ("epic-current".to_string(), "epic/current".to_string()),
+            ("epic-ready-ref".to_string(), "epic/ready-ref".to_string()),
+            (
+                "epic-inprogress-ref".to_string(),
+                "epic/inprogress-ref".to_string(),
+            ),
+        ];
+        expected.sort();
+
+        assert_eq!(
+            visible, expected,
+            "must include current epic + ready/in-progress-referenced epics with a \
+             branch, and must exclude branch-less and unrelated epics"
+        );
+    }
+
+    /// Duplicate references (current_epic_id also referenced by a ready
+    /// task's `epic` field) must not produce a duplicate entry — the
+    /// underlying HashSet dedupes before the epic_tasks filter runs.
+    #[test]
+    fn branch_visible_epics_for_ahead_behind_dedupes_current_epic_referenced_by_a_task() {
+        use cas_factory::TaskSummary;
+        use cas_types::{Priority, TaskStatus, TaskType};
+
+        let mut app = super::FactoryApp::for_test();
+        app.current_epic_id = Some("epic-shared".to_string());
+        app.director_data = DirectorData {
+            ready_tasks: vec![TaskSummary {
+                id: "cas-1".to_string(),
+                title: "Subtask".to_string(),
+                status: TaskStatus::Open,
+                priority: Priority::MEDIUM,
+                assignee: None,
+                task_type: TaskType::Task,
+                epic: Some("epic-shared".to_string()),
+                branch: None,
+                updated_at: None,
+            }],
+            in_progress_tasks: Vec::new(),
+            epic_tasks: vec![TaskSummary {
+                id: "epic-shared".to_string(),
+                title: "Shared epic".to_string(),
+                status: TaskStatus::InProgress,
+                priority: Priority::HIGH,
+                assignee: None,
+                task_type: TaskType::Epic,
+                epic: None,
+                branch: Some("epic/shared".to_string()),
+                updated_at: None,
+            }],
+            agents: Vec::new(),
+            activity: Vec::new(),
+            agent_id_to_name: HashMap::new(),
+            changes: Vec::new(),
+            git_loaded: false,
+            reminders: Vec::new(),
+            epic_closed_counts: HashMap::new(),
+        };
+
+        let visible = app.branch_visible_epics_for_ahead_behind();
+
+        assert_eq!(
+            visible,
+            vec![("epic-shared".to_string(), "epic/shared".to_string())],
+            "current epic referenced by both current_epic_id and a task's epic \
+             field must yield exactly one entry, not a duplicate"
+        );
+    }
+
+    /// cas-eb7f (review finding, cas-ebc1 final): `set_factory_session`'s
+    /// rfc3339 `created_at` parsing had no test for the missing-file,
+    /// malformed-JSON, or non-RFC3339 cases — all of which currently
+    /// silently degrade to `None` via `.ok()`. Also proves the happy path
+    /// actually populates `session_created_at`, so a future format drift
+    /// between the metadata writer and this parser has a failing test.
+    ///
+    /// Builds `SessionMetadata` via the real struct + `serde_json::to_string`
+    /// (not a hand-written JSON literal) so this test can't drift from the
+    /// struct's actual required-field shape as fields are added.
+    ///
+    /// Uses this file's own `EnvGuard` (not `test_support::with_temp_home`)
+    /// to override `HOME` — `apply_session_metadata_focus_*` below also
+    /// mutates `HOME` via `EnvGuard`'s `ENV_MUTEX`, and that mutex does not
+    /// coordinate with `test_support::HOME_MUTEX`, so mixing the two here
+    /// races under parallel test execution (confirmed: using
+    /// `with_temp_home` intermittently failed both this test and the
+    /// `apply_session_metadata_focus_*` tests when scheduled concurrently).
+    #[test]
+    fn set_factory_session_handles_missing_malformed_and_valid_created_at() {
+        use crate::ui::factory::protocol::{AgentInfo, SessionMetadata};
+
+        fn sample_metadata(name: &str, created_at: &str) -> SessionMetadata {
+            SessionMetadata {
+                name: name.to_string(),
+                created_at: created_at.to_string(),
+                daemon_pid: 1,
+                socket_path: "socket".to_string(),
+                ws_port: None,
+                log_dir: None,
+                daemon_log_path: None,
+                daemon_trace_log_path: None,
+                server_log_path: None,
+                server_trace_log_path: None,
+                tui_log_path: None,
+                panic_log_path: None,
+                supervisor: AgentInfo {
+                    name: "supervisor".to_string(),
+                    pid: None,
+                    worktree_path: None,
+                },
+                workers: Vec::new(),
+                epic_id: None,
+                pinned_epic_id: None,
+                project_dir: None,
+                team_name: None,
+            }
+        }
+
+        let home = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set(&[("HOME", home.path().to_str().unwrap())]);
+        let sessions_dir = home.path().join(".cas").join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let mut app = super::FactoryApp::for_test();
+
+        // Missing metadata file entirely.
+        app.set_factory_session("no-such-session".to_string());
+        assert_eq!(
+            app.session_created_at, None,
+            "missing metadata file must degrade to None, not panic"
+        );
+
+        // Malformed JSON.
+        std::fs::write(sessions_dir.join("bad-json.json"), "{not valid json").unwrap();
+        app.set_factory_session("bad-json".to_string());
+        assert_eq!(
+            app.session_created_at, None,
+            "malformed JSON must degrade to None, not panic"
+        );
+
+        // Valid JSON (real struct shape), but created_at is not RFC3339.
+        let bad_date = sample_metadata("bad-date", "not-a-date");
+        std::fs::write(
+            sessions_dir.join("bad-date.json"),
+            serde_json::to_string(&bad_date).unwrap(),
+        )
+        .unwrap();
+        app.set_factory_session("bad-date".to_string());
+        assert_eq!(
+            app.session_created_at, None,
+            "non-RFC3339 created_at must degrade to None, not panic"
+        );
+
+        // Valid JSON with a valid RFC3339 created_at — the happy path.
+        let good = sample_metadata("good", "2026-01-01T12:30:00Z");
+        std::fs::write(
+            sessions_dir.join("good.json"),
+            serde_json::to_string(&good).unwrap(),
+        )
+        .unwrap();
+        app.set_factory_session("good".to_string());
+        assert_eq!(
+            app.session_created_at,
+            Some(
+                chrono::DateTime::parse_from_rfc3339("2026-01-01T12:30:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc)
+            ),
+            "valid RFC3339 created_at must populate session_created_at"
+        );
+    }
+
+    /// cas-eb7f (review finding, cas-ebc1 final): `sync_worker_pane_branch_titles`
+    /// and its epic_workers.rs call sites had no test proving the
+    /// `mux.panes_mut()` filter only touches `cas_mux::PaneKind::Worker` panes. Gives
+    /// both a Worker and a Director pane a distinct starting title, runs the
+    /// sync, and asserts the Worker pane's title changed while the Director
+    /// pane's did not — proving the wiring (not just that *a* title update
+    /// happened somewhere).
+    ///
+    /// Uses a real (but trivial, `cat`-backed) PTY for the Worker pane since
+    /// `cas_mux::Pane` has no non-PTY Worker constructor — mirrors the
+    /// environment-tolerant pattern in `crates/cas-pty/src/pty.rs`'s own
+    /// tests (skip if `cat` is unavailable, rather than failing the suite).
+    #[test]
+    fn sync_worker_pane_branch_titles_only_touches_worker_panes() {
+        let pty_config = cas_mux::PtyConfig {
+            command: "cat".to_string(),
+            args: vec![],
+            cwd: None,
+            env: vec![],
+            rows: 24,
+            cols: 80,
+        };
+        let Ok(pty) = cas_mux::Pty::spawn("test-worker-1", pty_config) else {
+            eprintln!("skipping: `cat` unavailable in this environment");
+            return;
+        };
+        let Ok(mut worker_pane) =
+            cas_mux::Pane::with_pty("worker-1", cas_mux::PaneKind::Worker, pty, 24, 80)
+        else {
+            eprintln!("skipping: PTY-backed pane construction failed");
+            return;
+        };
+        worker_pane.set_title("STALE-WORKER-TITLE");
+
+        let Ok(mut director_pane) = cas_mux::Pane::director("director", 24, 80) else {
+            eprintln!("skipping: director pane construction failed");
+            return;
+        };
+        director_pane.set_title("STALE-DIRECTOR-TITLE");
+
+        let mut app = super::FactoryApp::for_test();
+        app.worker_names = vec!["worker-1".to_string()];
+        app.mux.add_pane(worker_pane);
+        app.mux.add_pane(director_pane);
+
+        app.sync_worker_pane_branch_titles();
+
+        let mut saw_worker = false;
+        let mut saw_director = false;
+        for pane in app.mux.panes_mut() {
+            match pane.kind() {
+                cas_mux::PaneKind::Worker => {
+                    saw_worker = true;
+                    assert_ne!(
+                        pane.title(),
+                        "STALE-WORKER-TITLE",
+                        "Worker pane title must be rewritten by sync_worker_pane_branch_titles"
+                    );
+                }
+                cas_mux::PaneKind::Director => {
+                    saw_director = true;
+                    assert_eq!(
+                        pane.title(),
+                        "STALE-DIRECTOR-TITLE",
+                        "non-Worker panes must not be touched by sync_worker_pane_branch_titles"
+                    );
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_worker && saw_director, "both fixture panes must still be present");
+    }
+
+    /// cas-eb7f (review finding, cas-ebc1 final): the status bar's
+    /// branch-label integration point (`app.focused_pane_branch()` feeding
+    /// `StatusBar::branch_label_for_width`) only had unit coverage on the
+    /// pure formatting helper — no test rendered the status bar against a
+    /// real `FactoryApp`/focused pane to prove the wiring itself. Placed
+    /// here (not in status_bar.rs) because `FactoryApp`'s `project_dir` and
+    /// `branch_visibility` fields are private to this module.
+    #[test]
+    fn render_status_bar_surfaces_focused_worker_pane_branch_label() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let pty_config = cas_mux::PtyConfig {
+            command: "cat".to_string(),
+            args: vec![],
+            cwd: None,
+            env: vec![],
+            rows: 24,
+            cols: 80,
+        };
+        let Ok(pty) = cas_mux::Pty::spawn("status-bar-worker", pty_config) else {
+            eprintln!("skipping: `cat` unavailable in this environment");
+            return;
+        };
+        let Ok(worker_pane) =
+            cas_mux::Pane::with_pty("worker-1", cas_mux::PaneKind::Worker, pty, 24, 80)
+        else {
+            eprintln!("skipping: PTY-backed pane construction failed");
+            return;
+        };
+
+        let mut app = super::FactoryApp::for_test();
+        app.mux.add_pane(worker_pane);
+        assert!(app.mux.focus("worker-1"), "fixture pane must be focusable");
+        // worktree_manager is None in for_test(), so focused_pane_branch()
+        // falls back to project_dir for a focused Worker pane.
+        app.branch_visibility
+            .insert_path_branch(app.project_dir.clone(), "factory/status-branch");
+
+        let backend = TestBackend::new(120, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                crate::ui::factory::status_bar::StatusBar::render(frame, frame.area(), &app)
+            })
+            .unwrap();
+
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(
+            text.contains("branch factory/status-branch"),
+            "status bar must surface the focused pane's branch label; got: {text}"
         );
     }
 

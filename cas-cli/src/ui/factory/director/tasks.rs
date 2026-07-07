@@ -124,6 +124,15 @@ fn priority_color(priority: Priority, palette: &Palette) -> Color {
 }
 
 /// Render the tasks section with optional focus indicator, agent filter, and epic collapse
+///
+/// `scoped` must be a `ScopedTaskView` already built for `focused_epic_id`
+/// (same value passed to both) — cas-eb7f: this used to call
+/// `ScopedTaskView::new` internally, which meant `render_with_state`
+/// (director/mod.rs) rebuilt the identical clone-heavy view a second time
+/// per frame just to decide `effective_tasks_collapsed`. Callers now build
+/// it once and thread it through both the collapse decision and this render
+/// call. `focused_epic_id` itself is still needed directly here (not just to
+/// build `scoped`) for the cas-6945 unfocused-hint empty state below.
 #[allow(clippy::too_many_arguments)]
 pub fn render_with_focus(
     frame: &mut Frame,
@@ -134,13 +143,13 @@ pub fn render_with_focus(
     _selected: Option<usize>,
     agent_filter: Option<&str>,
     focused_epic_id: Option<&str>,
+    scoped: &ScopedTaskView,
     collapsed: bool,
     collapsed_epics: &HashSet<String>,
     tasks_state: Option<&mut ListState>,
 ) {
     let palette = &theme.palette;
     let styles = &theme.styles;
-    let scoped = ScopedTaskView::new(data, focused_epic_id);
     let task_count = scoped.visible_row_count(agent_filter, collapsed_epics);
     let border_style = if focused {
         styles.border_focused
@@ -621,6 +630,7 @@ mod tests {
         let theme = ActiveTheme::default();
         let backend = TestBackend::new(90, 10);
         let mut terminal = Terminal::new(backend).unwrap();
+        let scoped = ScopedTaskView::new(&data, None);
 
         terminal
             .draw(|frame| {
@@ -633,6 +643,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    &scoped,
                     false,
                     &HashSet::new(),
                     None,
