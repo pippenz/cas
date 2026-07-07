@@ -770,7 +770,7 @@ mod tests {
         let config = default_config();
 
         let prompt =
-            generate_prompt(&event, &data, "supervisor", &config, codex(), codex()).unwrap();
+            generate_prompt(&event, &data, &data, "supervisor", &config, codex(), codex()).unwrap();
         let lower = prompt.text.to_lowercase();
 
         assert_eq!(prompt.target, "supervisor");
