@@ -37,6 +37,31 @@ use crate::store::{
 };
 use crate::types::{Agent, AgentRole};
 
+pub(crate) fn apply_factory_worker_metadata(agent: &mut Agent, clone_path: Option<&str>) {
+    if let Some(path) = clone_path {
+        agent
+            .metadata
+            .insert("clone_path".to_string(), path.to_string());
+    } else if let Ok(path) = std::env::var("CAS_CLONE_PATH") {
+        agent.metadata.insert("clone_path".to_string(), path);
+    }
+
+    let is_worker = agent.role == AgentRole::Worker
+        || std::env::var("CAS_AGENT_ROLE")
+            .map(|role| role.eq_ignore_ascii_case("worker"))
+            .unwrap_or(false);
+    if !is_worker {
+        return;
+    }
+
+    if let Ok(model) = std::env::var("CAS_FACTORY_WORKER_MODEL") {
+        agent.metadata.insert("worker_model".to_string(), model);
+    }
+    if let Ok(effort) = std::env::var("CAS_FACTORY_WORKER_EFFORT") {
+        agent.metadata.insert("worker_effort".to_string(), effort);
+    }
+}
+
 /// Extension trait for EmbeddedDaemonConfig to convert to DaemonConfig
 ///
 /// This is CLI-specific since DaemonConfig is defined in cas-cli.
@@ -772,18 +797,7 @@ impl EmbeddedDaemon {
                 }
             }
 
-            // Store clone path in metadata for factory workers
-            if let Some(ref path) = clone_path {
-                agent
-                    .metadata
-                    .insert("clone_path".to_string(), path.clone());
-            }
-            if let Ok(model) = std::env::var("CAS_FACTORY_WORKER_MODEL") {
-                agent.metadata.insert("worker_model".to_string(), model);
-            }
-            if let Ok(effort) = std::env::var("CAS_FACTORY_WORKER_EFFORT") {
-                agent.metadata.insert("worker_effort".to_string(), effort);
-            }
+            apply_factory_worker_metadata(&mut agent, clone_path.as_deref());
 
             if store.register(&agent).is_ok() {
                 eprintln!(

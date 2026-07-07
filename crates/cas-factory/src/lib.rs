@@ -52,4 +52,7 @@ pub use session::state::{
     AgentState, SessionCache, SessionError, SessionId, SessionInfo, SessionState, SessionSummary,
     SessionType,
 };
-pub use spec_resolver::{ConfigSources, SpecResolverError, resolve_specs, resolve_supervisor_spec};
+pub use spec_resolver::{
+    ConfigSources, SpecResolverError, resolve_specs, resolve_supervisor_spec,
+    worker_slot_cli_configured, worker_slot_effort_configured,
+};

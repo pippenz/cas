@@ -5,7 +5,10 @@
 
 use std::io::Write as _;
 
-use cas_factory::{ConfigSources, resolve_specs, resolve_supervisor_spec};
+use cas_factory::{
+    ConfigSources, resolve_specs, resolve_supervisor_spec, worker_slot_cli_configured,
+    worker_slot_effort_configured,
+};
 use cas_mux::{Effort, SupervisorCli, WorkerSpec};
 use tempfile::NamedTempFile;
 
@@ -92,7 +95,11 @@ cli = "codex"
 
     assert_eq!(specs.len(), 2);
     for spec in &specs {
-        assert_eq!(spec.cli, SupervisorCli::Codex, "user config cli=codex should apply");
+        assert_eq!(
+            spec.cli,
+            SupervisorCli::Codex,
+            "user config cli=codex should apply"
+        );
         assert_eq!(spec.model, None);
         assert_eq!(spec.effort, Some(Effort::High)); // built-in default preserved
     }
@@ -156,8 +163,16 @@ effort = "medium"
     .unwrap();
 
     for spec in &specs {
-        assert_eq!(spec.cli, SupervisorCli::Claude, "project should override user cli");
-        assert_eq!(spec.effort, Some(Effort::Medium), "project should override user effort");
+        assert_eq!(
+            spec.cli,
+            SupervisorCli::Claude,
+            "project should override user cli"
+        );
+        assert_eq!(
+            spec.effort,
+            Some(Effort::Medium),
+            "project should override user effort"
+        );
     }
 }
 
@@ -210,6 +225,35 @@ effort = "minimal"
     assert_eq!(specs[2].name, None);
     assert_eq!(specs[2].cli, SupervisorCli::Claude);
     assert_eq!(specs[2].effort, Some(Effort::High));
+}
+
+#[test]
+fn parsed_config_detection_reports_defaults_and_per_worker_fields() {
+    let user = toml_file(
+        r#"
+[factory.defaults]
+cli = "codex"
+"#,
+    );
+    let project = toml_file(
+        r#"
+[[factory.workers]]
+name = "slot-zero"
+
+[[factory.workers]]
+name = "slot-one"
+effort = "high"
+"#,
+    );
+    let sources = ConfigSources {
+        user_config: Some(user.path().to_path_buf()),
+        project_config: Some(project.path().to_path_buf()),
+        ..Default::default()
+    };
+
+    assert!(worker_slot_cli_configured(0, &sources).unwrap());
+    assert!(!worker_slot_effort_configured(0, &sources).unwrap());
+    assert!(worker_slot_effort_configured(1, &sources).unwrap());
 }
 
 #[test]
@@ -270,8 +314,16 @@ effort = "low"
     .unwrap();
 
     for spec in &specs {
-        assert_eq!(spec.cli, SupervisorCli::Claude, "CLI flag overrides project cli");
-        assert_eq!(spec.effort, Some(Effort::Medium), "CLI flag overrides project effort");
+        assert_eq!(
+            spec.cli,
+            SupervisorCli::Claude,
+            "CLI flag overrides project cli"
+        );
+        assert_eq!(
+            spec.effort,
+            Some(Effort::Medium),
+            "CLI flag overrides project effort"
+        );
     }
 }
 
@@ -374,13 +426,7 @@ fn two_worker_spec_overrides_apply_independently() {
 
 #[test]
 fn worker_spec_unnamed_takes_cursor_slots_sequentially() {
-    let specs = resolve_json(
-        3,
-        &[
-            r#"{"cli":"codex"}"#,
-            r#"{"effort":"minimal"}"#,
-        ],
-    );
+    let specs = resolve_json(3, &[r#"{"cli":"codex"}"#, r#"{"effort":"minimal"}"#]);
 
     assert_eq!(specs[0].cli, SupervisorCli::Codex);
     assert_eq!(specs[1].effort, Some(Effort::Minimal));
@@ -392,7 +438,11 @@ fn worker_spec_overrides_beyond_slot_count_are_silently_dropped() {
     // 2 slots, 3 --worker-spec overrides → last one is ignored.
     let specs = resolve_json(
         2,
-        &[r#"{"cli":"codex"}"#, r#"{"effort":"low"}"#, r#"{"model":"gpt-5.5"}"#],
+        &[
+            r#"{"cli":"codex"}"#,
+            r#"{"effort":"low"}"#,
+            r#"{"model":"gpt-5.5"}"#,
+        ],
     );
 
     assert_eq!(specs.len(), 2);
@@ -411,10 +461,7 @@ fn invalid_json_worker_spec_returns_clear_error() {
         },
     );
 
-    assert!(
-        result.is_err(),
-        "invalid JSON should produce an error"
-    );
+    assert!(result.is_err(), "invalid JSON should produce an error");
     let msg = result.unwrap_err().to_string();
     assert!(
         msg.contains("--worker-spec"),
@@ -555,7 +602,10 @@ cli = "gpt"
 
     assert!(result.is_err());
     let msg = result.unwrap_err().to_string();
-    assert!(msg.contains("gpt"), "error should name the bad value; got: {msg}");
+    assert!(
+        msg.contains("gpt"),
+        "error should name the bad value; got: {msg}"
+    );
 }
 
 #[test]
@@ -593,9 +643,7 @@ fn all_effort_variants_roundtrip_through_toml() {
         ("high", Effort::High),
         ("xhigh", Effort::XHigh),
     ] {
-        let project = toml_file(&format!(
-            "[factory.defaults]\neffort = \"{toml_val}\"\n"
-        ));
+        let project = toml_file(&format!("[factory.defaults]\neffort = \"{toml_val}\"\n"));
 
         let specs = resolve_specs(
             1,
@@ -655,8 +703,16 @@ effort = "xhigh"
     })
     .unwrap();
 
-    assert_eq!(spec.cli, SupervisorCli::Claude, "[factory.supervisor] cli should win");
-    assert_eq!(spec.effort, Some(Effort::XHigh), "[factory.supervisor] effort should win");
+    assert_eq!(
+        spec.cli,
+        SupervisorCli::Claude,
+        "[factory.supervisor] cli should win"
+    );
+    assert_eq!(
+        spec.effort,
+        Some(Effort::XHigh),
+        "[factory.supervisor] effort should win"
+    );
 }
 
 #[test]
@@ -697,7 +753,11 @@ effort = "minimal"
     })
     .unwrap();
 
-    assert_eq!(spec.cli, SupervisorCli::Claude, "CLI flag must override [factory.supervisor]");
+    assert_eq!(
+        spec.cli,
+        SupervisorCli::Claude,
+        "CLI flag must override [factory.supervisor]"
+    );
     // effort from toml is preserved (cli_flag doesn't affect effort)
     assert_eq!(spec.effort, Some(Effort::Minimal));
 }
@@ -723,8 +783,16 @@ effort = "minimal"
     })
     .unwrap();
 
-    assert_eq!(spec.cli, SupervisorCli::Claude, "--supervisor-spec JSON should win");
-    assert_eq!(spec.effort, Some(Effort::XHigh), "--supervisor-spec JSON should win");
+    assert_eq!(
+        spec.cli,
+        SupervisorCli::Claude,
+        "--supervisor-spec JSON should win"
+    );
+    assert_eq!(
+        spec.effort,
+        Some(Effort::XHigh),
+        "--supervisor-spec JSON should win"
+    );
     // model not in JSON → falls through from [factory.supervisor]
     assert_eq!(spec.model.as_deref(), Some("gpt-5.5"));
 }
@@ -759,6 +827,14 @@ effort = "minimal"
     .unwrap();
 
     // Supervisor should see builtin defaults, NOT the worker TOML.
-    assert_eq!(spec.cli, SupervisorCli::Claude, "[[factory.workers]] must not affect supervisor");
-    assert_eq!(spec.effort, Some(Effort::High), "[[factory.workers]] must not affect supervisor");
+    assert_eq!(
+        spec.cli,
+        SupervisorCli::Claude,
+        "[[factory.workers]] must not affect supervisor"
+    );
+    assert_eq!(
+        spec.effort,
+        Some(Effort::High),
+        "[[factory.workers]] must not affect supervisor"
+    );
 }

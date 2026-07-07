@@ -38,6 +38,26 @@ pub struct PtyConfig {
     pub cols: u16,
 }
 
+fn push_factory_worker_metadata_env(
+    env: &mut Vec<(String, String)>,
+    role: &str,
+    factory_worker_cli: Option<&str>,
+    model: Option<&str>,
+    effort: Option<&str>,
+) {
+    if let Some(worker_cli) = factory_worker_cli {
+        env.push(("CAS_FACTORY_WORKER_CLI".to_string(), worker_cli.to_string()));
+    }
+    if role == "worker" {
+        if let Some(model) = model {
+            env.push(("CAS_FACTORY_WORKER_MODEL".to_string(), model.to_string()));
+        }
+        if let Some(effort) = effort {
+            env.push(("CAS_FACTORY_WORKER_EFFORT".to_string(), effort.to_string()));
+        }
+    }
+}
+
 /// Configuration for spawning an agent with native Claude Code Agent Teams flags.
 #[derive(Debug, Clone)]
 pub struct TeamsSpawnConfig {
@@ -152,17 +172,7 @@ impl PtyConfig {
         if let Some(sup) = supervisor_name {
             env.push(("CAS_SUPERVISOR_NAME".to_string(), sup.to_string()));
         }
-        if let Some(worker_cli) = factory_worker_cli {
-            env.push(("CAS_FACTORY_WORKER_CLI".to_string(), worker_cli.to_string()));
-        }
-        if role == "worker" {
-            if let Some(model) = model {
-                env.push(("CAS_FACTORY_WORKER_MODEL".to_string(), model.to_string()));
-            }
-            if let Some(effort) = effort {
-                env.push(("CAS_FACTORY_WORKER_EFFORT".to_string(), effort.to_string()));
-            }
-        }
+        push_factory_worker_metadata_env(&mut env, role, factory_worker_cli, model, effort);
 
         // cas-0bf4: cap cargo parallelism inside factory worker processes
         // so a 4-worker factory doesn't stack `num_cpus`-way rustc jobs
@@ -327,17 +337,7 @@ impl PtyConfig {
         if let Some(sup) = supervisor_name {
             env.push(("CAS_SUPERVISOR_NAME".to_string(), sup.to_string()));
         }
-        if let Some(worker_cli) = factory_worker_cli {
-            env.push(("CAS_FACTORY_WORKER_CLI".to_string(), worker_cli.to_string()));
-        }
-        if role == "worker" {
-            if let Some(model) = model {
-                env.push(("CAS_FACTORY_WORKER_MODEL".to_string(), model.to_string()));
-            }
-            if let Some(effort) = effort {
-                env.push(("CAS_FACTORY_WORKER_EFFORT".to_string(), effort.to_string()));
-            }
-        }
+        push_factory_worker_metadata_env(&mut env, role, factory_worker_cli, model, effort);
 
         // cas-0bf4: see equivalent comment in `claude()`.
         push_worker_cargo_env(&mut env, role);

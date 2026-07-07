@@ -39,26 +39,22 @@ After you assign tasks and send context to workers, **produce no more output**. 
 
 New session? Run these steps in order. Open the linked reference for detail.
 
-1. **Pre-flight binary check** — `cas --version` vs `git rev-parse --short HEAD`. If they don't match, see [references/preflight.md](cas-supervisor/references/preflight.md) before spawning workers.
-2. **Load context** — Run `/cas-supervisor-checklist` for session-start checklist, open EPICs, and worker availability.
-3. **Intake gate** — Assess all 8 intake checks against the user's request. Detail in [references/intake.md](cas-supervisor/references/intake.md).
-4. **Create EPIC** — `mcp__cas__task action=create task_type=epic title="..." description="..."`. Spec shape and templates in [references/planning.md](cas-supervisor/references/planning.md).
-5. **Spawn, assign, end turn** — `mcp__cas__coordination action=spawn_workers count=N isolate=true`, then assign with `update` (not `transfer`), send context, stop. Phases and merge flow in [references/workflow.md](cas-supervisor/references/workflow.md).
-6. **Pin epic focus** — `coordination action=focus_epic id=<epic-id>` shows the EPIC in TUI panels now.
+1. **Pre-flight binary check** — `cas --version` vs `git rev-parse --short HEAD`; see [preflight.md](cas-supervisor/references/preflight.md) on mismatch.
+2. **Load context** — Run `/cas-supervisor-checklist`.
+3. **Intake gate** — Assess the request; detail in [intake.md](cas-supervisor/references/intake.md).
+4. **Create EPIC** — `mcp__cas__task action=create task_type=epic title="..." description="..."`; templates in [planning.md](cas-supervisor/references/planning.md).
+5. **Pin epic focus** — `mcp__cas__coordination action=focus_epic id=<epic-id>` shows the EPIC in TUI panels now.
+6. **Spawn, assign, end turn** — `mcp__cas__coordination action=spawn_workers count=N isolate=true cli=codex model=gpt-5.5 effort=medium`, then assign with `update` (not `transfer`), send context, stop. Phases and merge flow in [references/workflow.md](cas-supervisor/references/workflow.md).
 
 ## Heterogeneous Teams (Claude supervisor + Codex workers)
 
-To spawn workers on a different CLI backend than the supervisor, pass `cli=` to `spawn_workers`:
+To spawn workers on a different CLI backend than the supervisor, pass complete `cli=`, `model=`, and `effort=` controls:
 
 ```
-# Spawn one Codex worker from a Claude supervisor session
-mcp__cas__coordination action=spawn_workers count=1 cli=codex
-
-# Spawn two workers with explicit names and Codex backend
-mcp__cas__coordination action=spawn_workers count=2 cli=codex worker_names="alice,bob"
+mcp__cas__coordination action=spawn_workers count=1 cli=codex model=gpt-5.5 effort=medium
 ```
 
-`cli`, `model`, and `effort` are per-spawn overrides — match them to task complexity via [references/model-selection.md](cas-supervisor/references/model-selection.md); parameter table in [references/reference.md](cas-supervisor/references/reference.md).
+Match controls to task complexity via [model-selection.md](cas-supervisor/references/model-selection.md); parameter table in [reference.md](cas-supervisor/references/reference.md).
 
 ## References
 

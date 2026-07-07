@@ -935,8 +935,11 @@ fn handle_cloud_command(
                 let cli = params.get("cli").and_then(|v| v.as_str());
                 let model = params.get("model").and_then(|v| v.as_str());
                 let effort = params.get("effort").and_then(|v| v.as_str());
-                match crate::mcp::tools::service::factory_ops::build_spawn_spec_json(
-                    cli, model, effort,
+                match crate::mcp::tools::service::factory_ops::build_spawn_spec_json_with_project_config(
+                    cli,
+                    model,
+                    effort,
+                    Some(cas_dir.join("config.toml")),
                 ) {
                     Ok(j) => Some(j),
                     Err(e) => {

@@ -33,13 +33,12 @@ pub(crate) const WORKER_STALE_SECS: i64 = 30;
 /// dead.
 pub(crate) const WORKER_DEAD_SECS: i64 = 75;
 
-fn parse_spawn_cli(cli: Option<&str>) -> Result<cas_mux::SupervisorCli, String> {
-    match cli {
-        Some(s) => s
-            .parse::<cas_mux::SupervisorCli>()
-            .map_err(|_| format!("invalid cli value {s:?}: expected 'claude' or 'codex'")),
-        None => Ok(cas_mux::SupervisorCli::Codex),
-    }
+fn parse_spawn_cli(cli: Option<&str>) -> Result<Option<cas_mux::SupervisorCli>, String> {
+    cli.map(|s| {
+        s.parse::<cas_mux::SupervisorCli>()
+            .map_err(|_| format!("invalid cli value {s:?}: expected 'claude' or 'codex'"))
+    })
+    .transpose()
 }
 
 fn parse_spawn_effort(effort: Option<&str>) -> Result<Option<cas_mux::Effort>, String> {
@@ -76,41 +75,11 @@ fn format_effort(effort: Option<cas_mux::Effort>) -> String {
         .unwrap_or_else(|| "(backend default)".to_string())
 }
 
-fn factory_defaults_effort_configured(project_config: Option<&std::path::PathBuf>) -> bool {
-    let mut paths = Vec::new();
-    if let Some(home) = dirs::home_dir() {
-        paths.push(home.join(".cas").join("config.toml"));
-    }
-    if let Some(path) = project_config {
-        paths.push(path.clone());
-    }
-
-    paths.into_iter().any(|path| {
-        let Ok(raw) = std::fs::read_to_string(path) else {
-            return false;
-        };
-        if raw.contains("[factory.defaults]")
-            && raw
-                .lines()
-                .any(|line| line.trim_start().starts_with("effort"))
-        {
-            return true;
-        }
-        let Ok(value) = raw.parse::<toml::Value>() else {
-            return false;
-        };
-        value
-            .get("factory")
-            .and_then(|v| v.get("defaults"))
-            .and_then(|v| v.get("effort"))
-            .is_some()
-    })
-}
-
 /// Build a JSON-serialized [`cas_mux::WorkerSpec`] from optional string overrides
 /// supplied via the MCP `spawn_workers` action or the cloud protocol.
 ///
 /// Returns `Err(String)` when a parameter value is invalid.
+#[cfg(test)]
 pub(crate) fn build_spawn_spec_json(
     cli: Option<&str>,
     model: Option<&str>,
@@ -119,7 +88,7 @@ pub(crate) fn build_spawn_spec_json(
     build_spawn_spec_json_with_project_config(cli, model, effort, None)
 }
 
-fn build_spawn_spec_json_with_project_config(
+pub(crate) fn build_spawn_spec_json_with_project_config(
     cli: Option<&str>,
     model: Option<&str>,
     effort: Option<&str>,
@@ -127,26 +96,31 @@ fn build_spawn_spec_json_with_project_config(
 ) -> Result<String, String> {
     let parsed_cli = parse_spawn_cli(cli)?;
     let parsed_effort = parse_spawn_effort(effort)?;
-    let defaults_effort_configured = factory_defaults_effort_configured(project_config.as_ref());
 
     let sources = cas_factory::ConfigSources {
         project_config,
-        cli_flag: Some(parsed_cli),
+        cli_flag: parsed_cli,
         model_flag: model.map(String::from),
         effort_flag: parsed_effort,
         ..Default::default()
     };
+    let configured_cli = cas_factory::worker_slot_cli_configured(0, &sources)
+        .map_err(|e| format!("failed to inspect worker cli config: {e}"))?;
+    let configured_effort = cas_factory::worker_slot_effort_configured(0, &sources)
+        .map_err(|e| format!("failed to inspect worker effort config: {e}"))?;
     let mut spec = cas_factory::resolve_specs(1, sources)
         .map_err(|e| format!("failed to resolve worker spec: {e}"))?
         .into_iter()
         .next()
         .ok_or_else(|| "failed to resolve worker spec: no worker slots returned".to_string())?;
 
+    if cli.is_none() && !configured_cli && spec.cli == cas_mux::SupervisorCli::Claude {
+        spec.cli = cas_mux::SupervisorCli::Codex;
+    }
     if model.is_none() && spec.model.is_none() {
         spec.model = Some(default_worker_model_for_cli(spec.cli).to_string());
     }
-    if effort.is_none() && !defaults_effort_configured && spec.effort == Some(cas_mux::Effort::High)
-    {
+    if effort.is_none() && !configured_effort && spec.effort == Some(cas_mux::Effort::High) {
         spec.effort = Some(default_worker_effort_for_cli(spec.cli));
     }
 
@@ -2347,6 +2321,52 @@ mod tests {
 
         assert_eq!(spec.cli, cas_mux::SupervisorCli::Claude);
         assert_eq!(spec.model.as_deref(), Some("opus"));
+        assert_eq!(spec.effort, Some(cas_mux::Effort::High));
+    }
+
+    #[test]
+    fn spawn_spec_omitted_cli_without_config_uses_stock_codex_defaults() {
+        let _home = HomeGuard::isolated();
+        let json = build_spawn_spec_json(None, None, None).unwrap();
+        let spec = decoded_spawn_spec(&json);
+
+        assert_eq!(spec.cli, cas_mux::SupervisorCli::Codex);
+        assert_eq!(
+            spec.model.as_deref(),
+            Some(crate::config::STOCK_WORKER_MODEL)
+        );
+        assert_eq!(
+            spec.effort,
+            Some(
+                crate::config::STOCK_WORKER_REASONING_EFFORT
+                    .parse::<cas_mux::Effort>()
+                    .unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn spawn_spec_omitted_cli_respects_project_factory_default() {
+        let _home = HomeGuard::isolated();
+        let tmp = tempfile::tempdir().expect("temp project config");
+        let config = tmp.path().join("config.toml");
+        std::fs::write(
+            &config,
+            r#"
+[factory.defaults]
+cli = "claude"
+model = "sonnet"
+effort = "high"
+"#,
+        )
+        .unwrap();
+
+        let json =
+            build_spawn_spec_json_with_project_config(None, None, None, Some(config)).unwrap();
+        let spec = decoded_spawn_spec(&json);
+
+        assert_eq!(spec.cli, cas_mux::SupervisorCli::Claude);
+        assert_eq!(spec.model.as_deref(), Some("sonnet"));
         assert_eq!(spec.effort, Some(cas_mux::Effort::High));
     }
 

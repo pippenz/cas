@@ -235,10 +235,8 @@ pub fn resolve_specs(
     let mut cursor: usize = 0;
 
     for json_str in &sources.worker_spec_jsons {
-        let parsed: WorkerSpecJson =
-            serde_json::from_str(json_str).map_err(|e| {
-                SpecResolverError::InvalidWorkerSpec(e.to_string())
-            })?;
+        let parsed: WorkerSpecJson = serde_json::from_str(json_str)
+            .map_err(|e| SpecResolverError::InvalidWorkerSpec(e.to_string()))?;
 
         let target_idx: Option<usize> = if let Some(ref name) = parsed.name {
             // Prefer an existing named slot; fall back to cursor.
@@ -264,6 +262,74 @@ pub fn resolve_specs(
     }
 
     Ok(specs)
+}
+
+/// Return whether any parsed config layer explicitly sets `cli` for a worker
+/// slot.
+///
+/// This deliberately reads through the same TOML schema as the resolver instead
+/// of scanning raw text. Callers use it only to distinguish the built-in
+/// resolver default from an explicit configured `cli = "..."`
+pub fn worker_slot_cli_configured(
+    slot: usize,
+    sources: &ConfigSources,
+) -> Result<bool, SpecResolverError> {
+    worker_slot_configured(
+        slot,
+        sources,
+        |defaults| defaults.cli.is_some(),
+        |worker| worker.cli.is_some(),
+    )
+}
+
+/// Return whether any parsed config layer explicitly sets `effort` for a
+/// worker slot.
+///
+/// This deliberately reads through the same TOML schema as the resolver instead
+/// of scanning raw text. Callers use it only to distinguish a built-in default
+/// from an explicit configured `effort = "high"`.
+pub fn worker_slot_effort_configured(
+    slot: usize,
+    sources: &ConfigSources,
+) -> Result<bool, SpecResolverError> {
+    worker_slot_configured(
+        slot,
+        sources,
+        |defaults| defaults.effort.is_some(),
+        |worker| worker.effort.is_some(),
+    )
+}
+
+fn worker_slot_configured(
+    slot: usize,
+    sources: &ConfigSources,
+    defaults_has_field: impl Fn(&FactoryDefaultsToml) -> bool,
+    worker_has_field: impl Fn(&FactoryWorkerToml) -> bool,
+) -> Result<bool, SpecResolverError> {
+    let user_path = sources
+        .user_config
+        .clone()
+        .or_else(|| dirs::home_dir().map(|h| h.join(".cas").join("config.toml")));
+
+    if let Some(ref path) = user_path
+        && let Some((defaults, _per_worker, _supervisor)) = load_config_file(path)?
+        && defaults.as_ref().is_some_and(&defaults_has_field)
+    {
+        return Ok(true);
+    }
+
+    if let Some(ref path) = sources.project_config
+        && let Some((defaults, per_worker, _supervisor)) = load_config_file(path)?
+    {
+        if defaults.as_ref().is_some_and(&defaults_has_field) {
+            return Ok(true);
+        }
+        if per_worker.get(slot).is_some_and(&worker_has_field) {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
 }
 
 /// Resolve a single [`WorkerSpec`] for the supervisor agent.
@@ -321,10 +387,8 @@ pub fn resolve_supervisor_spec(sources: ConfigSources) -> Result<WorkerSpec, Spe
 
     // ── Layer 6: --supervisor-spec JSON override ──────────────────────────
     if let Some(ref json_str) = sources.supervisor_spec_json {
-        let parsed: WorkerSpecJson =
-            serde_json::from_str(json_str).map_err(|e| {
-                SpecResolverError::InvalidWorkerSpec(e.to_string())
-            })?;
+        let parsed: WorkerSpecJson = serde_json::from_str(json_str)
+            .map_err(|e| SpecResolverError::InvalidWorkerSpec(e.to_string()))?;
         apply_json_spec(&mut spec, &parsed)?;
     }
 
@@ -359,7 +423,7 @@ fn load_config_file(
             return Err(SpecResolverError::ReadConfig {
                 path: path.to_path_buf(),
                 source: e,
-            })
+            });
         }
     };
     let config: ConfigFileToml =
@@ -368,7 +432,11 @@ fn load_config_file(
             source: e,
         })?;
     let factory = config.factory.unwrap_or_default();
-    Ok(Some((factory.defaults, factory.workers, factory.supervisor)))
+    Ok(Some((
+        factory.defaults,
+        factory.workers,
+        factory.supervisor,
+    )))
 }
 
 /// Apply a `[factory.defaults]` section to every spec in the vec.
@@ -428,10 +496,7 @@ fn apply_supervisor_toml(
 }
 
 /// Apply a parsed `--worker-spec` JSON override to a single spec.
-fn apply_json_spec(
-    spec: &mut WorkerSpec,
-    json: &WorkerSpecJson,
-) -> Result<(), SpecResolverError> {
+fn apply_json_spec(spec: &mut WorkerSpec, json: &WorkerSpecJson) -> Result<(), SpecResolverError> {
     if let Some(ref n) = json.name {
         spec.name = Some(n.clone());
     }

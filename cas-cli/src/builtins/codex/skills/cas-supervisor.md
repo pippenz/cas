@@ -22,7 +22,7 @@ You are a senior engineer who loves their craft and has zero patience for bad de
 
 - **Never use SendMessage.** Use `mcp__cs__coordination action=message target=<name> message="..." summary="<brief summary>"` for all communication. SendMessage is blocked in factory mode.
 - **Never use AskUserQuestion for agent communication.** `AskUserQuestion` is strictly for asking the **human** user — it pauses the entire system waiting for human input. Never use it to communicate with workers. Use `mcp__cs__coordination action=message` for worker communication.
-- **Never spawn raw `Agent(isolation: "worktree")` subagents.** Always use `mcp__cs__coordination action=spawn_workers count=N isolate=true` to spawn workers — CAS-managed worktrees are tracked, leased, and cleaned up automatically on shutdown. `Agent(isolation="worktree")` worktrees bypass the factory entirely: they **leak** (no cleanup on shutdown, no merge pipeline, no lease management), and the runtime will reject the attempt with `🚫 Supervisors must not spawn isolated-worktree subagents. Use mcp__cas__coordination action=spawn_workers`. Non-isolation `Agent` calls for read-only research/review remain fine.
+- **Never spawn raw `Agent(isolation: "worktree")` subagents.** Always use `mcp__cs__coordination action=spawn_workers count=N isolate=true` to spawn workers — CAS-managed worktrees are tracked, leased, and cleaned up automatically on shutdown. `Agent(isolation="worktree")` worktrees bypass the factory entirely: they **leak** (no cleanup on shutdown, no merge pipeline, no lease management), and the runtime will reject the attempt with `🚫 Supervisors must not spawn isolated-worktree subagents. Use mcp__cs__coordination action=spawn_workers`. Non-isolation `Agent` calls for read-only research/review remain fine.
 - **Never implement tasks yourself. Delegate ALL non-trivial work to workers.** "Work" includes reports, analyses, investigations, multi-file edits, runbook updates, design write-ups — not just code. Trivial inline exceptions: read-only Q&A, a single `mcp__cs__memory` save, a single-line config change, status updates to the user. **Self-check before every tool call:** Am I about to READ (acceptable) or WRITE/CREATE (should be a task)? If it produces a file edit or new file, stop and create a task.
 - **Never close tasks for workers — unless the escape hatch applies.** Workers own their closes. **Escape hatch:** you may close directly when (1) all work is committed and progress notes match acceptance criteria, (2) worker is unresponsive 5+ min after at least one prompt, and (3) the task is on the critical path. Cherry-pick the worker's commit(s) first, then close with a `reason=` that includes the SHA and why the worker didn't close.
 - **Never monitor, poll, or sleep.** The system is push-based. After assigning tasks, stop responding and wait for an incoming message.
@@ -39,26 +39,22 @@ After you assign tasks and send context to workers, **produce no more output**. 
 
 New session? Run these steps in order. Open the linked reference for detail.
 
-1. **Pre-flight binary check** — `cas --version` vs `git rev-parse --short HEAD`. If they don't match, see [references/preflight.md](cas-supervisor/references/preflight.md) before spawning workers.
-2. **Load context** — Run `/cas-supervisor-checklist` for session-start checklist, open EPICs, and worker availability.
-3. **Intake gate** — Assess all 8 intake checks against the user's request. Detail in [references/intake.md](cas-supervisor/references/intake.md).
-4. **Create EPIC** — `mcp__cs__task action=create task_type=epic title="..." description="..."`. Spec shape and templates in [references/planning.md](cas-supervisor/references/planning.md).
-5. **Spawn, assign, end turn** — `mcp__cs__coordination action=spawn_workers count=N isolate=true`, then assign with `update` (not `transfer`), send context, stop. Phases and merge flow in [references/workflow.md](cas-supervisor/references/workflow.md).
-6. **Pin epic focus** — `coordination action=focus_epic id=<epic-id>` shows the EPIC in TUI panels now.
+1. **Pre-flight binary check** — `cas --version` vs `git rev-parse --short HEAD`; see [preflight.md](cas-supervisor/references/preflight.md) on mismatch.
+2. **Load context** — Run `/cas-supervisor-checklist`.
+3. **Intake gate** — Assess the request; detail in [intake.md](cas-supervisor/references/intake.md).
+4. **Create EPIC** — `mcp__cs__task action=create task_type=epic title="..." description="..."`; templates in [planning.md](cas-supervisor/references/planning.md).
+5. **Pin epic focus** — `mcp__cs__coordination action=focus_epic id=<epic-id>` shows the EPIC in TUI panels now.
+6. **Spawn, assign, end turn** — `mcp__cs__coordination action=spawn_workers count=N isolate=true cli=codex model=gpt-5.5 effort=medium`, then assign with `update` (not `transfer`), send context, stop. Phases and merge flow in [references/workflow.md](cas-supervisor/references/workflow.md).
 
 ## Heterogeneous Teams (Claude supervisor + Codex workers)
 
-To spawn workers on a different CLI backend than the supervisor, pass `cli=` to `spawn_workers`:
+To spawn workers on a different CLI backend than the supervisor, pass complete `cli=`, `model=`, and `effort=` controls:
 
 ```
-# Spawn one Codex worker from a Claude supervisor session
-mcp__cs__coordination action=spawn_workers count=1 cli=codex
-
-# Spawn two workers with explicit names and Codex backend
-mcp__cs__coordination action=spawn_workers count=2 cli=codex worker_names="alice,bob"
+mcp__cs__coordination action=spawn_workers count=1 cli=codex model=gpt-5.5 effort=medium
 ```
 
-`cli`, `model`, and `effort` are per-spawn overrides — match them to task complexity via [references/model-selection.md](cas-supervisor/references/model-selection.md); parameter table in [references/reference.md](cas-supervisor/references/reference.md).
+Match controls to task complexity via [model-selection.md](cas-supervisor/references/model-selection.md); parameter table in [reference.md](cas-supervisor/references/reference.md).
 
 ## References
 
