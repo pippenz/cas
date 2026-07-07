@@ -21,6 +21,7 @@ pub fn render_with_focus(
     area: Rect,
     data: &DirectorData,
     theme: &ActiveTheme,
+    focused_epic_id: Option<&str>,
     focused: bool,
     selected_agent: Option<usize>,
     supervisor_name: &str,
@@ -74,27 +75,19 @@ pub fn render_with_focus(
         return;
     }
 
-    // Layout: epic progress, worker list, summary
-    let has_epic = !data.epic_tasks.is_empty();
-    let epic_height = if has_epic { 2 } else { 0 };
+    // Layout: epic progress/placeholder, worker list, summary
+    let epic_height = 2;
     let summary_height = 1;
     let worker_height = inner
         .height
         .saturating_sub(epic_height + summary_height + 1); // +1 for separator
 
-    let constraints = if has_epic {
-        vec![
-            Constraint::Length(epic_height),
-            Constraint::Length(1), // separator
-            Constraint::Length(worker_height),
-            Constraint::Length(summary_height),
-        ]
-    } else {
-        vec![
-            Constraint::Length(worker_height + 1), // no epic, more space for workers
-            Constraint::Length(summary_height),
-        ]
-    };
+    let constraints = vec![
+        Constraint::Length(epic_height),
+        Constraint::Length(1), // separator
+        Constraint::Length(worker_height),
+        Constraint::Length(summary_height),
+    ];
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -103,19 +96,17 @@ pub fn render_with_focus(
 
     let mut chunk_idx = 0;
 
-    // Epic progress (if any)
-    if has_epic {
-        render_epic_progress(frame, chunks[chunk_idx], data, theme);
-        chunk_idx += 1;
+    // Epic progress or explicit unfocused placeholder
+    render_epic_progress(frame, chunks[chunk_idx], data, theme, focused_epic_id);
+    chunk_idx += 1;
 
-        // Separator
-        let sep = Line::from(Span::styled(
-            "─".repeat(inner.width as usize),
-            styles.text_muted,
-        ));
-        frame.render_widget(Paragraph::new(sep), chunks[chunk_idx]);
-        chunk_idx += 1;
-    }
+    // Separator
+    let sep = Line::from(Span::styled(
+        "─".repeat(inner.width as usize),
+        styles.text_muted,
+    ));
+    frame.render_widget(Paragraph::new(sep), chunks[chunk_idx]);
+    chunk_idx += 1;
 
     // Worker list
     render_worker_list(
@@ -133,7 +124,13 @@ pub fn render_with_focus(
 }
 
 /// Render epic status bar
-fn render_epic_progress(frame: &mut Frame, area: Rect, data: &DirectorData, theme: &ActiveTheme) {
+fn render_epic_progress(
+    frame: &mut Frame,
+    area: Rect,
+    data: &DirectorData,
+    theme: &ActiveTheme,
+    focused_epic_id: Option<&str>,
+) {
     if area.height == 0 || area.width < 10 {
         return;
     }
@@ -141,14 +138,18 @@ fn render_epic_progress(frame: &mut Frame, area: Rect, data: &DirectorData, them
     let styles = &theme.styles;
     let palette = &theme.palette;
 
-    // Find active epic (in_progress status)
-    let active_epic = data
-        .epic_tasks
-        .iter()
-        .find(|e| e.status == TaskStatus::InProgress)
-        .or_else(|| data.epic_tasks.first());
+    let Some(focused_epic_id) = focused_epic_id else {
+        render_unfocused_epic_placeholder(frame, area, theme);
+        return;
+    };
 
-    let Some(epic) = active_epic else {
+    if !focused_epic_is_renderable_source_blind(data, focused_epic_id) {
+        render_unfocused_epic_placeholder(frame, area, theme);
+        return;
+    }
+
+    let Some(epic) = data.epic_tasks.iter().find(|e| e.id == focused_epic_id) else {
+        render_unfocused_epic_placeholder(frame, area, theme);
         return;
     };
 
@@ -213,6 +214,26 @@ fn render_epic_progress(frame: &mut Frame, area: Rect, data: &DirectorData, them
     };
 
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn render_unfocused_epic_placeholder(frame: &mut Frame, area: Rect, theme: &ActiveTheme) {
+    let styles = &theme.styles;
+    let line = Line::from(Span::styled(
+        "No focused epic - supervisor: coordination action=focus_epic id=<epic>",
+        styles.text_muted,
+    ));
+    frame.render_widget(Paragraph::new(line), area);
+}
+
+fn focused_epic_is_renderable_source_blind(data: &DirectorData, epic_id: &str) -> bool {
+    data.in_progress_tasks
+        .iter()
+        .chain(data.ready_tasks.iter())
+        .filter(|task| task.epic.as_deref() == Some(epic_id))
+        .all(|task| {
+            task.assignee.is_none()
+                || crate::ui::factory::director::tasks::task_assigned_to_session_agent(task, data)
+        })
 }
 
 /// Render worker list with current tasks
@@ -420,4 +441,163 @@ fn render_summary_bar(
 
     let line = Line::from(spans);
     frame.render_widget(Paragraph::new(line), area);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use cas_factory::{DirectorData, TaskSummary};
+    use cas_types::{Priority, TaskStatus, TaskType};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    use crate::ui::theme::ActiveTheme;
+
+    use super::render_with_focus;
+
+    fn task(id: &str, title: &str, status: TaskStatus, task_type: TaskType) -> TaskSummary {
+        TaskSummary {
+            id: id.to_string(),
+            title: title.to_string(),
+            status,
+            priority: Priority::MEDIUM,
+            assignee: None,
+            task_type,
+            epic: None,
+            branch: None,
+            updated_at: None,
+        }
+    }
+
+    fn data_with_unrelated_epic() -> DirectorData {
+        DirectorData {
+            ready_tasks: vec![TaskSummary {
+                id: "cas-foreign-child".to_string(),
+                title: "Foreign child".to_string(),
+                status: TaskStatus::Open,
+                priority: Priority::MEDIUM,
+                assignee: Some("other-agent".to_string()),
+                task_type: TaskType::Task,
+                epic: Some("cas-foreign".to_string()),
+                branch: None,
+                updated_at: None,
+            }],
+            in_progress_tasks: Vec::new(),
+            epic_tasks: vec![task(
+                "cas-foreign",
+                "Foreign in-progress epic",
+                TaskStatus::InProgress,
+                TaskType::Epic,
+            )],
+            agents: Vec::new(),
+            activity: Vec::new(),
+            agent_id_to_name: HashMap::from([(
+                "session-agent".to_string(),
+                "worker-one".to_string(),
+            )]),
+            changes: Vec::new(),
+            git_loaded: false,
+            reminders: Vec::new(),
+            epic_closed_counts: HashMap::new(),
+        }
+    }
+
+    fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    #[test]
+    fn factory_radar_renders_unfocused_placeholder_instead_of_foreign_epic() {
+        let data = data_with_unrelated_epic();
+        let backend = TestBackend::new(90, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = ActiveTheme::default();
+
+        terminal
+            .draw(|frame| {
+                render_with_focus(
+                    frame,
+                    frame.area(),
+                    &data,
+                    &theme,
+                    Some("cas-foreign"),
+                    false,
+                    None,
+                    "supervisor",
+                    false,
+                );
+            })
+            .unwrap();
+
+        let text = buffer_text(&terminal);
+        assert!(text.contains("No focused epic"));
+        assert!(text.contains("coordination action=focus_epic id=<epic>"));
+        assert!(!text.contains("EPIC: cas-foreign"));
+    }
+
+    #[test]
+    fn factory_radar_renders_session_owned_focused_epic_source_blind() {
+        let mut data = data_with_unrelated_epic();
+        data.ready_tasks[0].assignee = Some("session-agent".to_string());
+        let backend = TestBackend::new(90, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = ActiveTheme::default();
+
+        terminal
+            .draw(|frame| {
+                render_with_focus(
+                    frame,
+                    frame.area(),
+                    &data,
+                    &theme,
+                    Some("cas-foreign"),
+                    false,
+                    None,
+                    "supervisor",
+                    false,
+                );
+            })
+            .unwrap();
+
+        let text = buffer_text(&terminal);
+        assert!(text.contains("EPIC: cas-foreign"));
+        assert!(!text.contains("No focused epic"));
+    }
+
+    #[test]
+    fn factory_radar_renders_unassigned_focused_epic_source_blind() {
+        let mut data = data_with_unrelated_epic();
+        data.ready_tasks[0].assignee = None;
+        let backend = TestBackend::new(90, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = ActiveTheme::default();
+
+        terminal
+            .draw(|frame| {
+                render_with_focus(
+                    frame,
+                    frame.area(),
+                    &data,
+                    &theme,
+                    Some("cas-foreign"),
+                    false,
+                    None,
+                    "supervisor",
+                    false,
+                );
+            })
+            .unwrap();
+
+        let text = buffer_text(&terminal);
+        assert!(text.contains("EPIC: cas-foreign"));
+        assert!(!text.contains("No focused epic"));
+    }
 }

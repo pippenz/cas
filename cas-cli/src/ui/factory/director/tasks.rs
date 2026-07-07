@@ -9,8 +9,92 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, ListState};
 
-use crate::ui::factory::director::data::{DirectorData, TaskSummary};
+use crate::ui::factory::director::data::{DirectorData, EpicGroup, TaskSummary};
 use crate::ui::theme::{ActiveTheme, Icons, Palette, get_agent_color};
+
+#[derive(Debug, Clone)]
+pub(crate) struct ScopedTaskView {
+    pub epic_groups: Vec<EpicGroup>,
+    pub standalone: Vec<TaskSummary>,
+}
+
+impl ScopedTaskView {
+    pub(crate) fn new(data: &DirectorData, focused_epic_id: Option<&str>) -> Self {
+        let (epic_groups, standalone) = data.tasks_by_epic();
+        let epic_groups = match focused_epic_id {
+            Some(epic_id) => epic_groups
+                .into_iter()
+                .filter(|group| group.epic.id == epic_id)
+                .collect(),
+            None => Vec::new(),
+        };
+
+        let standalone = standalone
+            .into_iter()
+            .filter(|task| task_assigned_to_session_agent(task, data))
+            .collect();
+
+        Self {
+            epic_groups,
+            standalone,
+        }
+    }
+
+    pub(crate) fn visible_row_count(
+        &self,
+        agent_filter: Option<&str>,
+        collapsed_epics: &HashSet<String>,
+    ) -> usize {
+        let mut count = 0;
+
+        for group in &self.epic_groups {
+            let visible_subtasks = visible_subtask_count(group, agent_filter);
+            if agent_filter.is_some() && visible_subtasks == 0 {
+                continue;
+            }
+
+            count += 1;
+            if !collapsed_epics.contains(&group.epic.id) {
+                count += visible_subtasks;
+            }
+        }
+
+        let standalone_count = filtered_standalone_count(&self.standalone, agent_filter);
+        if count > 0 && standalone_count > 0 {
+            count += 1;
+        }
+        count + standalone_count
+    }
+}
+
+pub(crate) fn task_assigned_to_session_agent(task: &TaskSummary, data: &DirectorData) -> bool {
+    task.assignee.as_ref().is_some_and(|assignee| {
+        data.agent_id_to_name.contains_key(assignee)
+            || data.agent_id_to_name.values().any(|name| name == assignee)
+    })
+}
+
+pub(crate) fn task_matches_agent_filter(task: &TaskSummary, agent_filter: Option<&str>) -> bool {
+    match agent_filter {
+        None => true,
+        Some(filter) => task.assignee.as_deref() == Some(filter),
+    }
+}
+
+fn visible_subtask_count(group: &EpicGroup, agent_filter: Option<&str>) -> usize {
+    group
+        .subtasks
+        .iter()
+        .filter(|task| task_matches_agent_filter(task, agent_filter))
+        .count()
+}
+
+fn filtered_standalone_count(standalone: &[TaskSummary], agent_filter: Option<&str>) -> usize {
+    standalone
+        .iter()
+        .filter(|task| task_matches_agent_filter(task, agent_filter))
+        .count()
+}
 
 /// Get color for priority level
 fn priority_color(priority: Priority, palette: &Palette) -> Color {
@@ -33,13 +117,15 @@ pub fn render_with_focus(
     focused: bool,
     _selected: Option<usize>,
     agent_filter: Option<&str>,
+    focused_epic_id: Option<&str>,
     collapsed: bool,
     collapsed_epics: &HashSet<String>,
     tasks_state: Option<&mut ListState>,
 ) {
     let palette = &theme.palette;
     let styles = &theme.styles;
-    let task_count = data.in_progress_tasks.len() + data.ready_tasks.len();
+    let scoped = ScopedTaskView::new(data, focused_epic_id);
+    let task_count = scoped.visible_row_count(agent_filter, collapsed_epics);
     let border_style = if focused {
         styles.border_focused
     } else {
@@ -63,30 +149,22 @@ pub fn render_with_focus(
         return;
     }
 
-    // Get epic groups
-    let (epic_groups, standalone) = data.tasks_by_epic();
-
     // Filter standalone by agent if needed
-    let filtered_standalone: Vec<_> = standalone
+    let filtered_standalone: Vec<_> = scoped
+        .standalone
         .iter()
-        .filter(|t| match agent_filter {
-            None => true,
-            Some(filter) => t.assignee.as_deref() == Some(filter),
-        })
+        .filter(|t| task_matches_agent_filter(t, agent_filter))
         .collect();
 
     // Build list items with epic grouping
     let mut items: Vec<ListItem> = Vec::new();
 
-    for group in &epic_groups {
+    for group in &scoped.epic_groups {
         // Filter subtasks by agent if needed
         let filtered_subtasks: Vec<_> = group
             .subtasks
             .iter()
-            .filter(|t| match agent_filter {
-                None => true,
-                Some(filter) => t.assignee.as_deref() == Some(filter),
-            })
+            .filter(|t| task_matches_agent_filter(t, agent_filter))
             .collect();
 
         // Skip epic if no visible subtasks after filtering
@@ -141,7 +219,7 @@ pub fn render_with_focus(
     // Standalone tasks
     if !filtered_standalone.is_empty() {
         // Add separator if we had epics
-        if !epic_groups.is_empty() && !items.is_empty() {
+        if !scoped.epic_groups.is_empty() && !items.is_empty() {
             items.push(ListItem::new(Line::from(vec![Span::styled(
                 "─ Standalone ",
                 styles.text_muted,
@@ -252,10 +330,7 @@ fn render_task_item(
 
     // Add assignee badge
     if let Some(badge) = worker_badge {
-        spans.push(Span::styled(
-            badge,
-            Style::default().fg(palette.text_muted),
-        ));
+        spans.push(Span::styled(badge, Style::default().fg(palette.text_muted)));
     }
 
     ListItem::new(Line::from(spans))
@@ -271,5 +346,157 @@ fn truncate(text: &str, max_len: usize) -> String {
     } else {
         let truncated: String = text.chars().take(max_len - 3).collect();
         format!("{truncated}...")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{HashMap, HashSet};
+
+    use cas_factory::DirectorData;
+    use cas_types::{Priority, TaskStatus, TaskType};
+
+    use super::{ScopedTaskView, TaskSummary};
+
+    fn task(
+        id: &str,
+        title: &str,
+        task_type: TaskType,
+        epic: Option<&str>,
+        assignee: Option<&str>,
+    ) -> TaskSummary {
+        TaskSummary {
+            id: id.to_string(),
+            title: title.to_string(),
+            status: TaskStatus::Open,
+            priority: Priority::MEDIUM,
+            assignee: assignee.map(str::to_string),
+            task_type,
+            epic: epic.map(str::to_string),
+            branch: None,
+            updated_at: None,
+        }
+    }
+
+    fn data_for_scoping() -> DirectorData {
+        DirectorData {
+            ready_tasks: vec![
+                task(
+                    "cas-focused-1",
+                    "Focused worker-name subtask",
+                    TaskType::Task,
+                    Some("cas-focused"),
+                    Some("worker-one"),
+                ),
+                task(
+                    "cas-focused-2",
+                    "Focused worker-id subtask",
+                    TaskType::Task,
+                    Some("cas-focused"),
+                    Some("agent-1"),
+                ),
+                task(
+                    "cas-foreign-1",
+                    "Foreign epic subtask",
+                    TaskType::Task,
+                    Some("cas-foreign"),
+                    Some("other-worker"),
+                ),
+                task(
+                    "cas-standalone-name",
+                    "Session standalone by name",
+                    TaskType::Task,
+                    None,
+                    Some("worker-one"),
+                ),
+                task(
+                    "cas-standalone-id",
+                    "Session standalone by id",
+                    TaskType::Task,
+                    None,
+                    Some("agent-1"),
+                ),
+                task(
+                    "cas-standalone-foreign",
+                    "Foreign standalone",
+                    TaskType::Task,
+                    None,
+                    Some("other-worker"),
+                ),
+            ],
+            in_progress_tasks: Vec::new(),
+            epic_tasks: vec![
+                task("cas-focused", "Focused epic", TaskType::Epic, None, None),
+                task("cas-foreign", "Foreign epic", TaskType::Epic, None, None),
+            ],
+            agents: Vec::new(),
+            activity: Vec::new(),
+            agent_id_to_name: HashMap::from([("agent-1".to_string(), "worker-one".to_string())]),
+            changes: Vec::new(),
+            git_loaded: false,
+            reminders: Vec::new(),
+            epic_closed_counts: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn scoped_task_view_only_keeps_focused_epic_and_session_standalone_tasks() {
+        let data = data_for_scoping();
+        let scoped = ScopedTaskView::new(&data, Some("cas-focused"));
+
+        assert_eq!(scoped.epic_groups.len(), 1);
+        assert_eq!(scoped.epic_groups[0].epic.id, "cas-focused");
+        assert_eq!(scoped.epic_groups[0].subtasks.len(), 2);
+        assert!(
+            scoped
+                .epic_groups
+                .iter()
+                .all(|group| group.epic.id != "cas-foreign")
+        );
+
+        let standalone_ids: Vec<_> = scoped
+            .standalone
+            .iter()
+            .map(|task| task.id.as_str())
+            .collect();
+        assert_eq!(
+            standalone_ids,
+            vec!["cas-standalone-id", "cas-standalone-name"]
+        );
+    }
+
+    #[test]
+    fn scoped_task_view_has_no_foreign_epic_groups_when_unfocused() {
+        let data = data_for_scoping();
+        let scoped = ScopedTaskView::new(&data, None);
+
+        assert!(scoped.epic_groups.is_empty());
+        assert_eq!(scoped.standalone.len(), 2);
+    }
+
+    #[test]
+    fn scoped_task_view_keeps_focused_epic_without_session_agent_subtasks() {
+        let data = data_for_scoping();
+        let scoped = ScopedTaskView::new(&data, Some("cas-foreign"));
+
+        assert_eq!(scoped.epic_groups.len(), 1);
+        assert_eq!(scoped.epic_groups[0].epic.id, "cas-foreign");
+        assert_eq!(scoped.standalone.len(), 2);
+    }
+
+    #[test]
+    fn visible_row_count_tracks_agent_filter_and_epic_collapse() {
+        let data = data_for_scoping();
+        let scoped = ScopedTaskView::new(&data, Some("cas-focused"));
+
+        assert_eq!(scoped.visible_row_count(None, &HashSet::new()), 6);
+        assert_eq!(
+            scoped.visible_row_count(None, &HashSet::from(["cas-focused".to_string()])),
+            4
+        );
+        assert_eq!(
+            scoped.visible_row_count(Some("worker-one"), &HashSet::new()),
+            4
+        );
     }
 }

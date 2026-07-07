@@ -68,6 +68,7 @@ mod protocol;
 pub mod renderer;
 mod session;
 mod status_bar;
+pub(crate) use app::persist_session_metadata_pinned_epic_id_at;
 pub use app::{FactoryApp, FactoryConfig};
 pub use boot::{BootConfig, run_boot_screen_client};
 pub use client::{
@@ -81,7 +82,9 @@ pub use daemon::{
 };
 pub use layout::{Direction, MissionControlLayout, PANE_SIDECAR, PaneGrid};
 pub use notification::{Notifier, NotifyBackend, NotifyConfig};
-pub use protocol::{ClientMessage, DaemonMessage, PaneInfo, PaneKind, SessionState};
+pub use protocol::{
+    ClientMessage, DaemonMessage, PaneInfo, PaneKind, SessionMetadata, SessionState,
+};
 pub use renderer::{FactoryViewMode, MissionControlFocus};
 pub use session::{
     SessionInfo, SessionManager, create_metadata, daemon_log_path, daemon_trace_log_path,

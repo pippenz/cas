@@ -21,6 +21,7 @@ pub fn render_status_strip(
     area: Rect,
     data: &DirectorData,
     theme: &ActiveTheme,
+    focused_epic_id: Option<&str>,
 ) {
     let palette = &theme.palette;
     let styles = &theme.styles;
@@ -31,12 +32,8 @@ pub fn render_status_strip(
 
     let mut left_spans: Vec<Span> = Vec::new();
 
-    // Find the active epic
-    let active_epic = data
-        .epic_tasks
-        .iter()
-        .find(|e| e.status == TaskStatus::InProgress)
-        .or_else(|| data.epic_tasks.first());
+    let active_epic =
+        focused_epic_id.and_then(|epic_id| data.epic_tasks.iter().find(|e| e.id == epic_id));
 
     if let Some(epic) = active_epic {
         // Count subtask statuses from live task lists
@@ -164,4 +161,94 @@ pub fn render_status_strip(
 
     let paragraph = Paragraph::new(Line::from(all_spans)).style(styles.bg_elevated);
     frame.render_widget(paragraph, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use cas_factory::{DirectorData, TaskSummary};
+    use cas_types::{Priority, TaskStatus, TaskType};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    use crate::ui::theme::ActiveTheme;
+
+    use super::render_status_strip;
+
+    fn task(id: &str, task_type: TaskType, epic: Option<&str>) -> TaskSummary {
+        TaskSummary {
+            id: id.to_string(),
+            title: id.to_string(),
+            status: TaskStatus::Open,
+            priority: Priority::MEDIUM,
+            assignee: None,
+            task_type,
+            epic: epic.map(str::to_string),
+            branch: Some(format!("epic/{id}")).filter(|_| task_type == TaskType::Epic),
+            updated_at: None,
+        }
+    }
+
+    fn data_with_unassigned_subtask() -> DirectorData {
+        DirectorData {
+            ready_tasks: vec![task("cas-child", TaskType::Task, Some("cas-focused"))],
+            in_progress_tasks: Vec::new(),
+            epic_tasks: vec![task("cas-focused", TaskType::Epic, None)],
+            agents: Vec::new(),
+            activity: Vec::new(),
+            agent_id_to_name: HashMap::new(),
+            changes: Vec::new(),
+            git_loaded: false,
+            reminders: Vec::new(),
+            epic_closed_counts: HashMap::new(),
+        }
+    }
+
+    fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    #[test]
+    fn status_strip_renders_no_active_epic_without_resolved_focus() {
+        let data = data_with_unassigned_subtask();
+        let backend = TestBackend::new(90, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = ActiveTheme::default();
+
+        terminal
+            .draw(|frame| {
+                render_status_strip(frame, frame.area(), &data, &theme, None);
+            })
+            .unwrap();
+
+        let text = buffer_text(&terminal);
+        assert!(text.contains("No active epic"));
+        assert!(!text.contains("cas-focused"));
+    }
+
+    #[test]
+    fn status_strip_renders_resolved_focus_with_unassigned_subtasks() {
+        let data = data_with_unassigned_subtask();
+        let backend = TestBackend::new(90, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = ActiveTheme::default();
+
+        terminal
+            .draw(|frame| {
+                render_status_strip(frame, frame.area(), &data, &theme, Some("cas-focused"));
+            })
+            .unwrap();
+
+        let text = buffer_text(&terminal);
+        assert!(text.contains("cas-focused"));
+        assert!(!text.contains("No active epic"));
+    }
 }

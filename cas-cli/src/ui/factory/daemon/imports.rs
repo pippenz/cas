@@ -15,8 +15,9 @@ pub(super) use crate::store::{
     AgentStore, SpawnAction, open_agent_store, open_prompt_queue_store, open_spawn_queue_store,
 };
 pub(super) use crate::ui::factory::app::{
-    EpicStateChange, FactoryApp, FactoryConfig, WorkerSpawnResult,
-    ScrollAction, SCROLL_DOWN_ARROWS, SCROLL_LINES, SCROLL_UP_ARROWS,
+    EpicStateChange, FactoryApp, FactoryConfig, SCROLL_DOWN_ARROWS, SCROLL_LINES, SCROLL_UP_ARROWS,
+    ScrollAction, WorkerSpawnResult, preferred_epic_focus_from_session_metadata,
+    resolve_epic_state_for_focus,
 };
 pub(super) use crate::ui::factory::buffer_backend::BufferBackend;
 pub(super) use crate::ui::factory::director::with_response_instructions;

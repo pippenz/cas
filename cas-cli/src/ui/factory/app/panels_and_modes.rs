@@ -136,16 +136,21 @@ impl FactoryApp {
 
     /// Get the epic ID if the display index points to an epic header
     fn get_epic_at_display_index(&self, target_idx: usize) -> Option<String> {
-        let (epic_groups, _standalone) = self.director_data.tasks_by_epic();
+        use crate::ui::factory::director::tasks::task_matches_agent_filter;
+
+        let scoped = crate::ui::factory::director::tasks::ScopedTaskView::new(
+            &self.director_data,
+            self.current_epic_id.as_deref(),
+        );
         let mut idx = 0;
 
-        for group in &epic_groups {
+        for group in &scoped.epic_groups {
             // Filter subtasks by agent if needed
             let visible_subtasks: Vec<_> = if let Some(agent_id) = &self.agent_filter {
                 group
                     .subtasks
                     .iter()
-                    .filter(|t| t.assignee.as_deref() == Some(agent_id))
+                    .filter(|t| task_matches_agent_filter(t, Some(agent_id)))
                     .collect()
             } else {
                 group.subtasks.iter().collect()
@@ -1027,4 +1032,76 @@ impl FactoryApp {
     }
 
     // Render/operation methods are split into app_render_and_ops.rs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cas_factory::TaskSummary;
+    use cas_types::{Priority, TaskStatus, TaskType};
+    use std::collections::HashMap;
+
+    fn task(
+        id: &str,
+        task_type: TaskType,
+        epic: Option<&str>,
+        assignee: Option<&str>,
+    ) -> TaskSummary {
+        TaskSummary {
+            id: id.to_string(),
+            title: id.to_string(),
+            status: TaskStatus::Open,
+            priority: Priority::MEDIUM,
+            assignee: assignee.map(str::to_string),
+            task_type,
+            epic: epic.map(str::to_string),
+            branch: Some(format!("epic/{id}")).filter(|_| task_type == TaskType::Epic),
+            updated_at: None,
+        }
+    }
+
+    #[test]
+    fn get_epic_at_display_index_uses_current_epic_scoped_mapping() {
+        let mut app = FactoryApp::for_test();
+        app.current_epic_id = Some("cas-focused".to_string());
+        app.director_data = DirectorData {
+            ready_tasks: vec![
+                task(
+                    "cas-focused-child",
+                    TaskType::Task,
+                    Some("cas-focused"),
+                    None,
+                ),
+                task(
+                    "cas-foreign-child",
+                    TaskType::Task,
+                    Some("cas-foreign"),
+                    None,
+                ),
+            ],
+            in_progress_tasks: Vec::new(),
+            epic_tasks: vec![
+                task("cas-focused", TaskType::Epic, None, None),
+                task("cas-foreign", TaskType::Epic, None, None),
+            ],
+            agents: Vec::new(),
+            activity: Vec::new(),
+            agent_id_to_name: HashMap::new(),
+            changes: Vec::new(),
+            git_loaded: false,
+            reminders: Vec::new(),
+            epic_closed_counts: HashMap::new(),
+        };
+
+        assert_eq!(
+            app.get_epic_at_display_index(0),
+            Some("cas-focused".to_string())
+        );
+        assert_eq!(
+            app.get_epic_at_display_index(1),
+            None,
+            "subtask row must not map to hidden foreign epic"
+        );
+        assert_eq!(app.get_epic_at_display_index(2), None);
+    }
 }

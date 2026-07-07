@@ -445,7 +445,7 @@ impl CasService {
     // ========================================================================
 
     #[tool(
-        description = "Coordination operations combining agent, factory, and worktree management. Agent actions: register, unregister, whoami, heartbeat, agent_list, agent_cleanup, session_start, session_end, loop_start, loop_cancel, loop_status, lease_history, queue_notify, queue_poll, queue_peek, queue_ack, message, message_ack, message_status. Factory actions: spawn_workers, shutdown_workers, worker_status, worker_activity, clear_context, my_context, sync_all_workers, gc_report, gc_cleanup, epic_status (per-child branch merge state for an epic), remind, remind_list, remind_cancel. Worktree actions: worktree_create, worktree_list, worktree_show, worktree_cleanup, worktree_merge, worktree_status. Only available in factory mode. For shutdown_workers, supervisor should verify worktree cleanliness/policy before issuing shutdown."
+        description = "Coordination operations combining agent, factory, and worktree management. Agent actions: register, unregister, whoami, heartbeat, agent_list, agent_cleanup, session_start, session_end, loop_start, loop_cancel, loop_status, lease_history, queue_notify, queue_poll, queue_peek, queue_ack, message, message_ack, message_status. Factory actions: spawn_workers, shutdown_workers, worker_status, worker_activity, clear_context, my_context, sync_all_workers, gc_report, gc_cleanup, epic_status (per-child branch merge state for an epic), focus_epic, remind, remind_list, remind_cancel. Worktree actions: worktree_create, worktree_list, worktree_show, worktree_cleanup, worktree_merge, worktree_status. Only available in factory mode. For shutdown_workers, supervisor should verify worktree cleanliness/policy before issuing shutdown."
     )]
     pub async fn coordination(
         &self,
@@ -504,7 +504,7 @@ impl CasService {
                 // ---- Factory domain ----
                 "spawn_workers" | "shutdown_workers" | "worker_status" | "worker_activity"
                 | "clear_context" | "my_context" | "sync_all_workers" | "gc_report"
-                | "gc_cleanup" | "epic_status" | "remind" | "remind_list"
+                | "gc_cleanup" | "epic_status" | "focus_epic" | "remind" | "remind_list"
                 | "remind_cancel" => {
                     let factory_req = req.to_factory_request();
                     match action.as_str() {
@@ -521,6 +521,7 @@ impl CasService {
                         // Same data source as the epic-close gate so report
                         // and gate cannot disagree.
                         "epic_status" => this.factory_epic_status(factory_req).await,
+                        "focus_epic" => this.factory_focus_epic(factory_req).await,
                         "remind" => this.factory_remind(factory_req).await,
                         "remind_list" => this.factory_remind_list(factory_req).await,
                         "remind_cancel" => this.factory_remind_cancel(factory_req).await,
@@ -590,7 +591,7 @@ impl CasService {
                     format!(
                         "Unknown coordination action: '{action}'. Valid actions:\n\
                          Agent: register, unregister, whoami, heartbeat, agent_list, agent_cleanup, session_start, session_end, loop_start, loop_cancel, loop_status, lease_history, queue_notify, queue_poll, queue_peek, queue_ack, message, message_ack, message_status\n\
-                         Factory: spawn_workers, shutdown_workers, worker_status, worker_activity, clear_context, my_context, sync_all_workers, gc_report, gc_cleanup, epic_status, remind, remind_list, remind_cancel\n\
+                         Factory: spawn_workers, shutdown_workers, worker_status, worker_activity, clear_context, my_context, sync_all_workers, gc_report, gc_cleanup, epic_status, focus_epic, remind, remind_list, remind_cancel\n\
                          Worktree: worktree_create, worktree_list, worktree_show, worktree_cleanup, worktree_merge, worktree_status"
                     ),
                 )),
@@ -611,6 +612,7 @@ impl CasService {
                     | "gc_report"
                     | "gc_cleanup"
                     | "epic_status"
+                    | "focus_epic"
                     | "remind"
                     | "remind_list"
                     | "remind_cancel"
@@ -1064,6 +1066,7 @@ impl CasService {
             "gc_report" => self.factory_gc_report(req).await,
             "gc_cleanup" => self.factory_gc_cleanup(req).await,
             "epic_status" => self.factory_epic_status(req).await,
+            "focus_epic" => self.factory_focus_epic(req).await,
             "remind" => self.factory_remind(req).await,
             "remind_list" => self.factory_remind_list(req).await,
             "remind_cancel" => self.factory_remind_cancel(req).await,
