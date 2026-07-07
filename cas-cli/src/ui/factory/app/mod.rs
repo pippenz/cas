@@ -12,7 +12,7 @@ use ratatui::layout::Rect;
 
 use super::director::{
     DiffLine, DirectorData, DirectorEvent, DirectorEventDetector, DirectorStores, PanelAreas,
-    Prompt, SidecarFocus, ViewMode, generate_prompt,
+    Prompt, SidecarFocus, ViewMode, generate_prompt, revalidate_event_for_delivery,
 };
 use crate::store::open_prompt_queue_store;
 use crate::types::Worktree;
@@ -658,6 +658,47 @@ impl FactoryApp {
     /// Get the auto-prompt configuration
     pub fn auto_prompt_config(&self) -> &AutoPromptConfig {
         &self.auto_prompt
+    }
+
+    pub fn revalidate_events_for_delivery(&self, events: &[DirectorEvent]) -> Vec<DirectorEvent> {
+        let unfiltered_data = self.load_unfiltered_director_data_for_delivery();
+
+        events
+            .iter()
+            .filter_map(|event| {
+                revalidate_event_for_delivery(event, &unfiltered_data, &self.supervisor_name)
+            })
+            .collect()
+    }
+
+    fn load_unfiltered_director_data_for_delivery(&self) -> DirectorData {
+        let worktree_root = self.worktree_manager.as_ref().map(|m| m.worktree_root());
+        DirectorData::load_with_stores(
+            &self.cas_dir,
+            worktree_root.as_deref(),
+            false,
+            self.director_stores.as_ref(),
+        )
+        .unwrap_or_else(|_| self.unfiltered_director_data.clone())
+    }
+
+    pub fn generate_prompts_for_delivery(&self, events: &[DirectorEvent]) -> Vec<Prompt> {
+        let unfiltered_data = self.load_unfiltered_director_data_for_delivery();
+
+        events
+            .iter()
+            .filter_map(|event| {
+                generate_prompt(
+                    event,
+                    &self.director_data,
+                    &unfiltered_data,
+                    &self.supervisor_name,
+                    &self.auto_prompt,
+                    self.supervisor_cli,
+                    self.worker_cli,
+                )
+            })
+            .collect()
     }
 
     /// Refresh CAS data from stores and detect state changes

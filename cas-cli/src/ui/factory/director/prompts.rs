@@ -4,7 +4,7 @@
 //! into the appropriate agent's terminal.
 
 use crate::config::AutoPromptConfig;
-use crate::ui::factory::director::data::DirectorData;
+use crate::ui::factory::director::data::{DirectorData, TaskSummary};
 use crate::ui::factory::director::events::DirectorEvent;
 use cas_mux::SupervisorCli;
 use cas_types::TaskStatus;
@@ -34,6 +34,117 @@ fn live_worker_session_id(data: &DirectorData, worker_name: &str) -> Option<Stri
                 .iter()
                 .find_map(|(id, name)| (name == worker_name).then(|| id.clone()))
         })
+}
+
+fn task_assigned_to_worker(data: &DirectorData, task: &TaskSummary, worker: &str) -> bool {
+    task.assignee.as_deref() == Some(worker)
+        || data
+            .agent_id_to_name
+            .iter()
+            .any(|(id, name)| name == worker && task.assignee.as_deref() == Some(id.as_str()))
+}
+
+fn worker_has_open_or_in_progress_assignment(data: &DirectorData, worker: &str) -> bool {
+    data.in_progress_tasks
+        .iter()
+        .chain(
+            data.ready_tasks
+                .iter()
+                .filter(|task| task.status == TaskStatus::Open),
+        )
+        .any(|task| task_assigned_to_worker(data, task, worker))
+}
+
+pub fn revalidate_event_for_delivery(
+    event: &DirectorEvent,
+    unfiltered_data: &DirectorData,
+    supervisor_name: &str,
+) -> Option<DirectorEvent> {
+    match event {
+        DirectorEvent::AgentRegistered {
+            agent_id,
+            agent_name,
+        } => {
+            if agent_name == supervisor_name
+                || live_worker_session_id(unfiltered_data, agent_name).is_none()
+                || worker_has_open_or_in_progress_assignment(unfiltered_data, agent_name)
+            {
+                None
+            } else {
+                Some(DirectorEvent::AgentRegistered {
+                    agent_id: agent_id.clone(),
+                    agent_name: agent_name.clone(),
+                })
+            }
+        }
+        DirectorEvent::WorkerIdle { worker, .. } => {
+            if worker == supervisor_name
+                || live_worker_session_id(unfiltered_data, worker).is_none()
+            {
+                return None;
+            }
+
+            let active_task = unfiltered_data
+                .agents
+                .iter()
+                .find(|agent| agent.name == *worker)
+                .and_then(|agent| agent.active_lease.clone());
+
+            if active_task.is_none()
+                && worker_has_open_or_in_progress_assignment(unfiltered_data, worker)
+            {
+                return None;
+            }
+
+            Some(DirectorEvent::WorkerIdle {
+                worker: worker.clone(),
+                active_task,
+            })
+        }
+        DirectorEvent::WorkerStalled {
+            worker,
+            task_id,
+            elapsed_secs,
+            escalate,
+        } => {
+            if worker == supervisor_name
+                || live_worker_session_id(unfiltered_data, worker).is_none()
+            {
+                return None;
+            }
+
+            let still_stalled_task = unfiltered_data.in_progress_tasks.iter().any(|task| {
+                task.id == *task_id && task_assigned_to_worker(unfiltered_data, task, worker)
+            });
+
+            still_stalled_task.then(|| DirectorEvent::WorkerStalled {
+                worker: worker.clone(),
+                task_id: task_id.clone(),
+                elapsed_secs: *elapsed_secs,
+                escalate: *escalate,
+            })
+        }
+        DirectorEvent::TaskBlocked {
+            task_id,
+            task_title,
+            worker,
+        } => unfiltered_data
+            .ready_tasks
+            .iter()
+            .find(|task| task.id == *task_id)
+            .filter(|task| task.status == TaskStatus::Blocked)
+            .filter(|task| task_assigned_to_worker(unfiltered_data, task, worker))
+            .map(|task| DirectorEvent::TaskBlocked {
+                task_id: task.id.clone(),
+                task_title: if task.title.is_empty() {
+                    task_title.clone()
+                } else {
+                    task.title.clone()
+                },
+                worker: worker.clone(),
+            }),
+        _ => Some(event.clone()),
+    }
 }
 
 /// A prompt to be injected into an agent's terminal
@@ -160,7 +271,10 @@ pub fn generate_prompt(
                 .ready_tasks
                 .iter()
                 .any(|t| t.id == *task_id && t.status == cas_types::TaskStatus::Open);
-            let in_progress = unfiltered_data.in_progress_tasks.iter().any(|t| t.id == *task_id);
+            let in_progress = unfiltered_data
+                .in_progress_tasks
+                .iter()
+                .any(|t| t.id == *task_id);
 
             let text = if in_ready {
                 // Task regressed to Open (lease expired) — worker needs to close it.
@@ -534,6 +648,27 @@ mod tests {
         }
     }
 
+    fn open_task(id: &str, assignee: Option<&str>) -> TaskSummary {
+        TaskSummary {
+            id: id.to_string(),
+            title: format!("Task {id}"),
+            status: TaskStatus::Open,
+            priority: Priority::MEDIUM,
+            assignee: assignee.map(str::to_string),
+            task_type: TaskType::Task,
+            epic: None,
+            branch: None,
+            updated_at: None,
+        }
+    }
+
+    fn blocked_task(id: &str, assignee: Option<&str>) -> TaskSummary {
+        TaskSummary {
+            status: TaskStatus::Blocked,
+            ..open_task(id, assignee)
+        }
+    }
+
     fn default_config() -> AutoPromptConfig {
         AutoPromptConfig::default()
     }
@@ -547,6 +682,94 @@ mod tests {
     }
 
     #[test]
+    fn test_delivery_recheck_drops_worker_idle_after_assignment() {
+        let event = DirectorEvent::WorkerIdle {
+            worker: "swift-fox".to_string(),
+            active_task: None,
+        };
+        let mut data = make_data(0);
+        data.ready_tasks = vec![open_task("cas-next", Some("swift-fox"))];
+
+        let rechecked = revalidate_event_for_delivery(&event, &data, "supervisor");
+
+        assert!(
+            rechecked.is_none(),
+            "WorkerIdle generated before assignment must be dropped when delivery sees assigned work"
+        );
+    }
+
+    #[test]
+    fn test_delivery_recheck_rerenders_worker_idle_active_task_state() {
+        let event = DirectorEvent::WorkerIdle {
+            worker: "swift-fox".to_string(),
+            active_task: None,
+        };
+        let mut data = make_data(0);
+        data.agents[0].active_lease = Some(ActiveLeaseSummary {
+            task_id: "cas-merge".to_string(),
+            task_title: "Merge gated task".to_string(),
+            task_status: TaskStatus::AwaitingMerge,
+            close_rejected_reason: Some("MERGE REQUIRED: commit not on epic".to_string()),
+        });
+
+        let rechecked = revalidate_event_for_delivery(&event, &data, "supervisor")
+            .expect("idle event should remain valid with updated active lease payload");
+
+        match rechecked {
+            DirectorEvent::WorkerIdle {
+                active_task: Some(task),
+                ..
+            } => {
+                assert_eq!(task.task_id, "cas-merge");
+                assert_eq!(task.task_status, TaskStatus::AwaitingMerge);
+                assert_eq!(
+                    task.close_rejected_reason.as_deref(),
+                    Some("MERGE REQUIRED: commit not on epic")
+                );
+            }
+            other => panic!("expected WorkerIdle with active task payload, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_delivery_recheck_drops_stale_ready_and_blocked_signals() {
+        let ready_event = DirectorEvent::AgentRegistered {
+            agent_id: "sess-id-abc123".to_string(),
+            agent_name: "swift-fox".to_string(),
+        };
+        let mut assigned_data = make_data(0);
+        assigned_data.ready_tasks = vec![open_task("cas-next", Some("sess-id-abc123"))];
+
+        assert!(
+            revalidate_event_for_delivery(&ready_event, &assigned_data, "supervisor").is_none(),
+            "ready notification must drop when delivery sees assigned work"
+        );
+
+        let blocked_event = DirectorEvent::TaskBlocked {
+            task_id: "cas-block".to_string(),
+            task_title: "Old blocked title".to_string(),
+            worker: "swift-fox".to_string(),
+        };
+        let mut unblocked_data = make_data(0);
+        unblocked_data.ready_tasks = vec![open_task("cas-block", Some("swift-fox"))];
+
+        assert!(
+            revalidate_event_for_delivery(&blocked_event, &unblocked_data, "supervisor").is_none(),
+            "blocked notification must drop when delivery sees the task is no longer blocked"
+        );
+
+        let mut blocked_data = make_data(0);
+        blocked_data.ready_tasks = vec![blocked_task("cas-block", Some("swift-fox"))];
+        assert!(
+            matches!(
+                revalidate_event_for_delivery(&blocked_event, &blocked_data, "supervisor"),
+                Some(DirectorEvent::TaskBlocked { .. })
+            ),
+            "blocked notification should remain when delivery still sees the blocked task"
+        );
+    }
+
+    #[test]
     fn test_task_assigned_prompt() {
         let event = DirectorEvent::TaskAssigned {
             task_id: "task-123".to_string(),
@@ -556,8 +779,16 @@ mod tests {
         let data = make_data(0);
         let config = default_config();
 
-        let prompt =
-            generate_prompt(&event, &data, &data, "supervisor", &config, codex(), codex()).unwrap();
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        )
+        .unwrap();
 
         assert_eq!(prompt.target, "swift-fox");
         assert!(prompt.text.contains("task-123"));
@@ -582,8 +813,16 @@ mod tests {
         let data = make_data(0);
         let config = default_config();
 
-        let prompt =
-            generate_prompt(&event, &data, &data, "supervisor", &config, codex(), codex()).unwrap();
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        )
+        .unwrap();
 
         assert_eq!(prompt.target, "supervisor");
         assert!(prompt.text.contains("swift-fox"));
@@ -644,8 +883,16 @@ mod tests {
         };
         let config = default_config();
 
-        let prompt =
-            generate_prompt(&event, &data, &data, "supervisor", &config, codex(), codex()).unwrap();
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        )
+        .unwrap();
 
         // When lease expired and task regressed to Open, supervisor should ask worker to close.
         assert!(
@@ -695,7 +942,15 @@ mod tests {
         };
         let config = default_config();
 
-        let prompt = generate_prompt(&event, &data, &data, "supervisor", &config, codex(), codex());
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        );
         assert!(
             prompt.is_none(),
             "cas-6aaf: TaskCompleted must be suppressed when task is still in_progress: {:?}",
@@ -712,8 +967,16 @@ mod tests {
         let data = make_data(3); // 3 ready tasks in snapshot
         let config = default_config();
 
-        let prompt =
-            generate_prompt(&event, &data, &data, "supervisor", &config, codex(), codex()).unwrap();
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        )
+        .unwrap();
 
         assert_eq!(prompt.target, "supervisor");
         assert!(prompt.text.contains("swift-fox"));
@@ -743,8 +1006,16 @@ mod tests {
         let data = make_data(0); // No ready tasks
         let config = default_config();
 
-        let prompt =
-            generate_prompt(&event, &data, &data, "supervisor", &config, codex(), codex()).unwrap();
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        )
+        .unwrap();
 
         assert_eq!(prompt.target, "supervisor");
         let lower = prompt.text.to_lowercase();
@@ -769,8 +1040,16 @@ mod tests {
         let data = make_data(0);
         let config = default_config();
 
-        let prompt =
-            generate_prompt(&event, &data, &data, "supervisor", &config, codex(), codex()).unwrap();
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        )
+        .unwrap();
         let lower = prompt.text.to_lowercase();
 
         assert_eq!(prompt.target, "supervisor");
@@ -798,8 +1077,16 @@ mod tests {
         let data = make_data(0); // No ready tasks in snapshot
         let config = default_config();
 
-        let prompt =
-            generate_prompt(&event, &data, &data, "supervisor", &config, codex(), codex()).unwrap();
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        )
+        .unwrap();
 
         // Must never suggest closing the epic — the snapshot may be stale and
         // the epic might have live open children not visible in this refresh.
@@ -820,7 +1107,15 @@ mod tests {
         let data = make_data(2);
         let config = default_config();
 
-        let prompt = generate_prompt(&event, &data, &data, "supervisor", &config, codex(), codex());
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        );
 
         assert!(
             prompt.is_none(),
@@ -837,7 +1132,15 @@ mod tests {
         let data = make_data(0);
         let config = default_config();
 
-        let prompt = generate_prompt(&event, &data, &data, "supervisor", &config, codex(), codex());
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        );
 
         assert!(
             prompt.is_none(),
@@ -854,8 +1157,16 @@ mod tests {
         let data = make_data(0);
         let config = default_config();
 
-        let prompt =
-            generate_prompt(&event, &data, &data, "supervisor", &config, codex(), codex()).unwrap();
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        )
+        .unwrap();
         let lower = prompt.text.to_lowercase();
 
         assert!(
@@ -875,8 +1186,16 @@ mod tests {
         let data = make_data(3);
         let config = default_config();
 
-        let prompt =
-            generate_prompt(&event, &data, &data, "supervisor", &config, codex(), codex()).unwrap();
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        )
+        .unwrap();
 
         assert_eq!(prompt.target, "supervisor");
         assert!(prompt.text.contains("calm-owl"));
@@ -895,8 +1214,16 @@ mod tests {
         let data = make_data(0);
         let config = default_config();
 
-        let prompt =
-            generate_prompt(&event, &data, &data, "supervisor", &config, codex(), codex()).unwrap();
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        )
+        .unwrap();
 
         assert_eq!(prompt.target, "supervisor");
         assert!(prompt.text.contains("calm-owl"));
@@ -917,7 +1244,15 @@ mod tests {
             ..default_config()
         };
 
-        let prompt = generate_prompt(&event, &data, &data, "supervisor", &config, codex(), codex());
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        );
         assert!(prompt.is_none());
     }
 
@@ -931,7 +1266,15 @@ mod tests {
         let data = make_data(0);
         let config = default_config();
 
-        let prompt = generate_prompt(&event, &data, &data, "supervisor", &config, codex(), codex());
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        );
         assert!(prompt.is_none());
     }
 
@@ -948,7 +1291,15 @@ mod tests {
             ..default_config()
         };
 
-        let prompt = generate_prompt(&event, &data, &data, "supervisor", &config, codex(), codex());
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        );
         assert!(prompt.is_none());
     }
 
@@ -965,7 +1316,15 @@ mod tests {
             ..default_config()
         };
 
-        let prompt = generate_prompt(&event, &data, &data, "supervisor", &config, codex(), codex());
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        );
         assert!(prompt.is_none());
     }
 
@@ -992,9 +1351,16 @@ mod tests {
         let data = make_data(0);
         let config = default_config();
 
-        let prompt =
-            generate_prompt(&event, &data, &data, "supervisor", &config, claude(), claude())
-                .unwrap();
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            claude(),
+            claude(),
+        )
+        .unwrap();
         assert!(prompt.text.contains("mcp__cas__task action=start"));
         assert!(
             prompt
@@ -1050,8 +1416,16 @@ mod tests {
         let data = make_data(2);
 
         let config = default_config();
-        let prompt =
-            generate_prompt(&event, &data, &data, "supervisor", &config, codex(), codex()).unwrap();
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        )
+        .unwrap();
 
         assert!(
             prompt.text.contains("assignee=swift-fox"),
@@ -1081,7 +1455,15 @@ mod tests {
             .insert("sess-id-abc123".to_string(), "swift-fox".to_string());
 
         let config = default_config();
-        let prompt = generate_prompt(&event, &data, &data, "supervisor", &config, codex(), codex());
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        );
 
         assert!(
             prompt.is_none(),
@@ -1102,7 +1484,15 @@ mod tests {
         // in_progress task assigned by display name (legacy manual path).
         let data = make_data_with_in_progress("swift-fox");
         let config = default_config();
-        let prompt = generate_prompt(&event, &data, &data, "supervisor", &config, codex(), codex());
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        );
 
         assert!(
             prompt.is_none(),
@@ -1124,8 +1514,16 @@ mod tests {
         };
         let data = make_data(2);
         let config = default_config();
-        let prompt =
-            generate_prompt(&event, &data, &data, "supervisor", &config, codex(), codex()).unwrap();
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        )
+        .unwrap();
 
         assert!(
             prompt.text.contains("assignee=calm-owl"),
@@ -1151,7 +1549,15 @@ mod tests {
         // Busy by session ID.
         let data = make_data_with_in_progress("sess-id-abc123");
         let config = default_config();
-        let prompt = generate_prompt(&event, &data, &data, "supervisor", &config, codex(), codex());
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        );
 
         assert!(
             prompt.is_none(),
@@ -1198,8 +1604,15 @@ mod tests {
             worker: "swift-fox".to_string(),
             active_task: None,
         };
-        let prompt =
-            generate_prompt(&idle_event, &data, &data, "supervisor", &config, codex(), codex());
+        let prompt = generate_prompt(
+            &idle_event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        );
         assert!(
             prompt.is_none(),
             "cas-dbbb: WorkerIdle must be suppressed when worker has an assigned Open task \
@@ -1212,8 +1625,15 @@ mod tests {
             agent_id: "sess-id-xyz".to_string(),
             agent_name: "swift-fox".to_string(),
         };
-        let prompt2 =
-            generate_prompt(&reg_event, &data, &data, "supervisor", &config, codex(), codex());
+        let prompt2 = generate_prompt(
+            &reg_event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        );
         assert!(
             prompt2.is_none(),
             "cas-dbbb: AgentRegistered must be suppressed when worker has an assigned Open task: \
@@ -1270,7 +1690,15 @@ mod tests {
             active_task: None,
         };
         let config = default_config();
-        let prompt = generate_prompt(&event, &data, &data, "supervisor", &config, codex(), codex());
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        );
         assert!(
             prompt.is_some(),
             "cas-dbbb P2: WorkerIdle must NOT be suppressed when worker has only a Blocked task \
@@ -1316,7 +1744,15 @@ mod tests {
             active_task: None,
         };
         let config = default_config();
-        let prompt = generate_prompt(&event, &data, &data, "supervisor", &config, codex(), codex());
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        );
         assert!(
             prompt.is_none(),
             "cas-dbbb P2: WorkerIdle must be suppressed when worker has a session-ID assigned \
@@ -1360,7 +1796,15 @@ mod tests {
             agent_name: "calm-owl".to_string(),
         };
         let config = default_config();
-        let prompt = generate_prompt(&event, &data, &data, "supervisor", &config, codex(), codex());
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        );
         assert!(
             prompt.is_none(),
             "cas-dbbb P2: AgentRegistered must be suppressed when session ID (agent_id) is the \
@@ -1387,7 +1831,15 @@ mod tests {
         let config = default_config();
 
         // Pass "supervisor" as supervisor_name — the prompt must return None.
-        let prompt = generate_prompt(&event, &data, &data, "supervisor", &config, codex(), codex());
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        );
 
         assert!(
             prompt.is_none(),
@@ -1410,7 +1862,15 @@ mod tests {
         let config = default_config();
 
         // "supervisor" is distinct from "swift-fox" — nudge must fire.
-        let prompt = generate_prompt(&event, &data, &data, "supervisor", &config, codex(), codex());
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        );
 
         assert!(
             prompt.is_some(),
@@ -1444,8 +1904,16 @@ mod tests {
         let config = default_config();
 
         // Claude supervisor, Codex worker
-        let prompt = generate_prompt(&event, &data, &data, "supervisor", &config, claude(), codex())
-            .expect("TaskAssigned must produce a prompt");
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            claude(),
+            codex(),
+        )
+        .expect("TaskAssigned must produce a prompt");
 
         assert_eq!(
             prompt.target, "codex-worker",
@@ -1488,8 +1956,16 @@ mod tests {
         let config = default_config();
 
         // Codex supervisor, Claude worker
-        let prompt = generate_prompt(&event, &data, &data, "supervisor", &config, codex(), claude())
-            .expect("TaskAssigned must produce a prompt");
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            claude(),
+        )
+        .expect("TaskAssigned must produce a prompt");
 
         assert_eq!(
             prompt.target, "claude-worker",
@@ -1544,8 +2020,16 @@ mod tests {
         let data = make_data(0);
         let config = default_config();
 
-        let prompt = generate_prompt(&event, &data, &data, "supervisor", &config, claude(), codex())
-            .expect("TaskCompleted (closed path) must produce a prompt");
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            claude(),
+            codex(),
+        )
+        .expect("TaskCompleted (closed path) must produce a prompt");
 
         assert_eq!(
             prompt.target, "supervisor",
@@ -1603,8 +2087,16 @@ mod tests {
         });
         let config = default_config();
 
-        let prompt = generate_prompt(&event, &data, &data, "supervisor", &config, claude(), codex())
-            .expect("TaskCompleted (regressed) must produce a prompt");
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            claude(),
+            codex(),
+        )
+        .expect("TaskCompleted (regressed) must produce a prompt");
 
         assert_eq!(
             prompt.target, "supervisor",
@@ -1668,8 +2160,16 @@ mod tests {
         let config = default_config();
 
         // Claude supervisor, Codex worker
-        let prompt = generate_prompt(&event, &data, &data, "supervisor", &config, claude(), codex())
-            .expect("WorkerIdle must produce a prompt");
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            claude(),
+            codex(),
+        )
+        .expect("WorkerIdle must produce a prompt");
 
         assert_eq!(
             prompt.target, "supervisor",
@@ -1734,8 +2234,16 @@ mod tests {
         let data = make_data(0);
         let config = default_config();
 
-        let prompt =
-            generate_prompt(&event, &data, &data, "supervisor", &config, codex(), codex()).unwrap();
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        )
+        .unwrap();
 
         assert_eq!(
             prompt.target, "swift-fox",
@@ -1758,8 +2266,16 @@ mod tests {
         let data = make_data(0);
         let config = default_config();
 
-        let prompt =
-            generate_prompt(&event, &data, &data, "supervisor", &config, codex(), codex()).unwrap();
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        )
+        .unwrap();
 
         assert_eq!(prompt.target, "supervisor");
         assert!(prompt.text.contains("swift-fox"));
@@ -1782,8 +2298,16 @@ mod tests {
                 escalate,
             };
             assert!(
-                generate_prompt(&event, &data, &data, "supervisor", &config, codex(), codex())
-                    .is_none(),
+                generate_prompt(
+                    &event,
+                    &data,
+                    &data,
+                    "supervisor",
+                    &config,
+                    codex(),
+                    codex()
+                )
+                .is_none(),
                 "on_worker_stalled=false must suppress WorkerStalled (escalate={escalate})"
             );
         }
@@ -1804,8 +2328,16 @@ mod tests {
         let config = default_config();
 
         assert!(
-            generate_prompt(&event, &data, &data, "supervisor", &config, codex(), codex())
-                .is_none(),
+            generate_prompt(
+                &event,
+                &data,
+                &data,
+                "supervisor",
+                &config,
+                codex(),
+                codex()
+            )
+            .is_none(),
             "WorkerStalled must not fire for a worker absent from the live snapshot"
         );
     }
