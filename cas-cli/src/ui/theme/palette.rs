@@ -115,6 +115,14 @@ pub struct Palette {
     pub hint_key: Color,
     pub hint_key_primary: Color,
     pub hint_description: Color,
+
+    // Chip/badge foreground — fixed near-black, used for short badge labels
+    // (mode indicators, banners) rendered on saturated chip backgrounds
+    // (status_info/warning/success/accent). Those backgrounds are
+    // medium-bright in BOTH theme modes, so a fixed dark foreground beats
+    // reusing text_primary (which flips to near-white in dark mode and
+    // fails contrast against a medium-bright chip fill — see cas-7bf4).
+    pub chip_fg: Color,
 }
 
 impl Palette {
@@ -235,6 +243,9 @@ impl Palette {
             hint_key_primary: colors.primary_400,
             hint_description: colors.gray_400,
 
+            // Chip/badge foreground (cas-7bf4 contrast fix)
+            chip_fg: Color::Rgb(15, 16, 20),
+
             colors,
         }
     }
@@ -351,7 +362,142 @@ impl Palette {
             hint_key_primary: colors.primary_400,
             hint_description: colors.gray_500,
 
+            // Chip/badge foreground (cas-7bf4 contrast fix) — same fixed
+            // near-black as dark; chip backgrounds are medium-bright in
+            // both modes so one dark foreground covers both.
+            chip_fg: Color::Rgb(15, 16, 20),
+
             colors,
         }
+    }
+}
+
+/// WCAG 2.x contrast-ratio guard (cas-7bf4).
+///
+/// Asserts the declared fg/bg token pairings that were audited and fixed for
+/// the full-TUI contrast sweep. This is a REGRESSION GUARD, not a full
+/// re-audit: it pins the specific pairings that were broken (status bar mode
+/// chips, secondary/muted text, error text) against both theme modes so a
+/// future palette edit can't silently reintroduce them.
+///
+/// Threshold: 4.5:1 for normal/readable text (WCAG AA), matching the AC.
+/// Every pairing below was independently verified to render BELOW 4.5:1
+/// before the cas-7bf4 fix (see task notes for the full audit table) — this
+/// test would fail against the pre-fix palette.
+#[cfg(test)]
+mod contrast_guard {
+    use super::*;
+    use crate::ui::theme::colors::ColorPalette;
+
+    const AA_NORMAL_TEXT: f64 = 4.5;
+
+    fn channel_luminance(c: u8) -> f64 {
+        let c = f64::from(c) / 255.0;
+        if c <= 0.03928 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    fn relative_luminance(color: Color) -> f64 {
+        let Color::Rgb(r, g, b) = color else {
+            panic!("contrast guard requires concrete RGB colors, got {color:?}");
+        };
+        0.2126 * channel_luminance(r)
+            + 0.7152 * channel_luminance(g)
+            + 0.0722 * channel_luminance(b)
+    }
+
+    /// WCAG contrast ratio between two colors, order-independent.
+    fn contrast_ratio(a: Color, b: Color) -> f64 {
+        let (l1, l2) = (relative_luminance(a), relative_luminance(b));
+        let (lighter, darker) = if l1 >= l2 { (l1, l2) } else { (l2, l1) };
+        (lighter + 0.05) / (darker + 0.05)
+    }
+
+    fn assert_pair(label: &str, fg: Color, bg: Color, min: f64) {
+        let ratio = contrast_ratio(fg, bg);
+        assert!(
+            ratio >= min,
+            "{label}: fg={fg:?} bg={bg:?} ratio={ratio:.2} below required {min:.1}:1"
+        );
+    }
+
+    /// The chip/badge foreground must be legible against every saturated
+    /// background it's actually painted on (status bar mode indicators,
+    /// error banner, feedback selector, CAS/TERM badges) in both theme
+    /// modes. Before cas-7bf4 these used `text_primary`, which is
+    /// near-white in dark mode and failed badly here (~1.7-2.1:1) — chip_fg
+    /// is a fixed near-black chosen to work against both.
+    #[test]
+    fn chip_fg_passes_against_all_chip_backgrounds() {
+        for (mode, colors, is_dark) in [
+            ("dark", ColorPalette::dark(), true),
+            ("light", ColorPalette::light(), false),
+        ] {
+            let p = Palette::from_colors(colors, is_dark);
+            for (name, bg) in [
+                ("status_info", p.status_info),
+                ("status_warning", p.status_warning),
+                ("status_success", p.status_success),
+                ("accent", p.accent),
+                ("accent_dim", p.accent_dim),
+            ] {
+                assert_pair(
+                    &format!("{mode} chip_fg on {name}"),
+                    p.chip_fg,
+                    bg,
+                    AA_NORMAL_TEXT,
+                );
+            }
+        }
+    }
+
+    /// text_muted is rendered directly on bg_elevated (status bar hint
+    /// suffixes, the [SUP]/branch segment). Before cas-7bf4: dark 3.36:1,
+    /// light 2.52:1 — both below AA.
+    #[test]
+    fn text_muted_passes_against_bg_elevated() {
+        for (mode, colors, is_dark) in [
+            ("dark", ColorPalette::dark(), true),
+            ("light", ColorPalette::light(), false),
+        ] {
+            let p = Palette::from_colors(colors, is_dark);
+            assert_pair(
+                &format!("{mode} text_muted on bg_elevated"),
+                p.text_muted,
+                p.bg_elevated,
+                AA_NORMAL_TEXT,
+            );
+        }
+    }
+
+    /// status_error (text_error / disconnected-worker messaging) rendered
+    /// on bg_elevated. Before cas-7bf4: dark 4.02:1 — below AA.
+    #[test]
+    fn status_error_passes_against_bg_elevated() {
+        let p = Palette::from_colors(ColorPalette::dark(), true);
+        assert_pair(
+            "dark status_error on bg_elevated",
+            p.status_error,
+            p.bg_elevated,
+            AA_NORMAL_TEXT,
+        );
+    }
+
+    /// Sanity check that the guard itself can fail: a token pair known to
+    /// be broken (the pre-fix chip pattern: text_primary fg on a chip bg in
+    /// dark mode) must NOT pass at the AA threshold. This proves
+    /// `assert_pair`/`contrast_ratio` aren't tautologically true.
+    #[test]
+    fn guard_catches_the_pre_fix_chip_pattern() {
+        let p = Palette::from_colors(ColorPalette::dark(), true);
+        let ratio = contrast_ratio(p.text_primary, p.status_info);
+        assert!(
+            ratio < AA_NORMAL_TEXT,
+            "expected the pre-fix text_primary-on-status_info pattern to still read as broken \
+             (ratio={ratio:.2}); if this now passes, the fixture no longer represents the bug"
+        );
     }
 }

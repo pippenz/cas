@@ -361,7 +361,7 @@ impl FactoryApp {
         spans.push(Span::styled(
             " CAS ",
             Style::default()
-                .fg(palette.text_primary)
+                .fg(palette.chip_fg)
                 .bg(palette.accent_dim)
                 .add_modifier(Modifier::BOLD),
         ));
