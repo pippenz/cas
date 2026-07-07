@@ -329,4 +329,28 @@ mod cases {
             "scrolling empty pane down should be a silent no-op (Ok), not an error"
         );
     }
+
+    /// Regression (cas-ebc1 final review): the OSC 8 feed-time gate must detect
+    /// a hyperlink introducer split across 3+ tiny feed chunks. The old carry
+    /// logic kept the tail of the NEW chunk only, dropping earlier carried
+    /// bytes ("\x1b" then "]" lost the ESC).
+    #[test]
+    fn test_hyperlink_gate_detects_introducer_split_across_many_feeds() {
+        let mut pane = Pane::director("osc8-split", 4, 40).expect("create pane");
+        assert!(!pane.has_hyperlinks());
+        for chunk in [b"\x1b".as_ref(), b"]".as_ref(), b"8".as_ref(), b";".as_ref()] {
+            pane.feed(chunk).expect("feed chunk");
+        }
+        assert!(
+            pane.has_hyperlinks(),
+            "introducer split across 4 single-byte feeds must set has_hyperlinks"
+        );
+
+        // Non-link control sequences never set the flag.
+        let mut plain = Pane::director("osc8-plain", 4, 40).expect("create pane");
+        for chunk in [b"\x1b".as_ref(), b"[".as_ref(), b"1m".as_ref(), b"hi".as_ref()] {
+            plain.feed(chunk).expect("feed chunk");
+        }
+        assert!(!plain.has_hyperlinks());
+    }
 }

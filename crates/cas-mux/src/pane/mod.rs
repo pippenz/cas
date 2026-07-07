@@ -669,19 +669,17 @@ impl Pane {
             return;
         }
 
-        if self.partial_osc8.is_empty() {
-            self.has_hyperlinks = Self::contains_osc8_introducer(data);
-        } else {
-            let mut scan_buf = std::mem::take(&mut self.partial_osc8);
-            scan_buf.extend_from_slice(data);
-            self.has_hyperlinks = Self::contains_osc8_introducer(&scan_buf);
-        }
+        // Scan the carried tail together with the new chunk, and carry the
+        // tail of the COMBINED buffer — carrying from `data` alone loses
+        // introducer bytes when a link is split across 3+ tiny feeds.
+        let mut scan_buf = std::mem::take(&mut self.partial_osc8);
+        scan_buf.extend_from_slice(data);
+        self.has_hyperlinks = Self::contains_osc8_introducer(&scan_buf);
 
         if !self.has_hyperlinks {
-            let keep = data.len().min(3);
-            self.partial_osc8 = data[data.len().saturating_sub(keep)..].to_vec();
-        } else {
-            self.partial_osc8.clear();
+            let keep = scan_buf.len().min(3);
+            scan_buf.drain(..scan_buf.len() - keep);
+            self.partial_osc8 = scan_buf;
         }
     }
 

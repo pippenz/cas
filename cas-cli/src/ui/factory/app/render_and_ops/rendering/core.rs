@@ -133,7 +133,7 @@ impl FactoryApp {
         self.render_overlays(frame);
     }
 
-    fn identity_header_rows(area: Rect) -> u16 {
+    pub(crate) fn identity_header_rows(area: Rect) -> u16 {
         u16::from(area.height >= IDENTITY_HEADER_MIN_HEIGHT)
     }
 
@@ -182,10 +182,12 @@ impl FactoryApp {
                 ));
             }
 
-            if let Some(created_at) = self.session_created_at {
-                spans.push(Span::styled(" · ", styles.text_muted));
-                spans.push(Span::styled(format_elapsed(created_at), styles.text_muted));
-            }
+        }
+
+        // Session elapsed time is identity info, independent of epic focus.
+        if let Some(created_at) = self.session_created_at {
+            spans.push(Span::styled(" · ", styles.text_muted));
+            spans.push(Span::styled(format_elapsed(created_at), styles.text_muted));
         }
 
         spans.push(Span::styled(" · ", styles.text_muted));
@@ -1255,6 +1257,9 @@ mod tests {
         let mut app = FactoryApp::for_test();
         app.factory_session = Some("session-beta".to_string());
         app.worker_names = vec!["worker-one".to_string(), "worker-two".to_string()];
+        // Elapsed clock is session identity — it must render with NO epic focused
+        // (regression: it was nested inside the epic-focus block).
+        app.session_created_at = Some(chrono::Utc::now() - chrono::Duration::minutes(90));
 
         let backend = TestBackend::new(100, 24);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1264,5 +1269,9 @@ mod tests {
         assert!(text.contains("session-beta"));
         assert!(text.contains("2 workers"));
         assert!(!text.contains("EPIC "));
+        assert!(
+            text.contains("01:30"),
+            "elapsed session time must render without a focused epic"
+        );
     }
 }

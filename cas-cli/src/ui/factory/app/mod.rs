@@ -1140,7 +1140,9 @@ impl FactoryApp {
         // Include pending workers in layout so boot panes get space
         let all_names = self.layout_worker_names();
 
-        // Calculate actual layout areas and resize panes to match
+        // Calculate actual layout areas and resize panes to match.
+        // Must reserve the same identity-header rows as the render path,
+        // otherwise PTYs are sized taller than the visible pane area.
         let area = Rect::new(0, 0, cols, rows);
         let layout = FactoryLayout::calculate_from_names_with_header_rows(
             area,
@@ -1148,7 +1150,7 @@ impl FactoryApp {
             self.tabbed_workers,
             self.sidecar_collapsed,
             self.layout_sizes,
-            0,
+            Self::identity_header_rows(area),
         );
 
         // Resize only REAL worker panes (pending workers have no PTY)

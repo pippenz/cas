@@ -191,7 +191,7 @@ pub fn render_compact_activity_list(
 
 fn build_compact_activity_items_at(
     events: &[Event],
-    _agent_id_to_name: &HashMap<String, String>,
+    agent_id_to_name: &HashMap<String, String>,
     theme: &ActiveTheme,
     width: u16,
     max_items: usize,
@@ -203,7 +203,14 @@ fn build_compact_activity_items_at(
         .take(max_items)
         .enumerate()
         .map(|(idx, event)| {
-            compact_activity_item(event, theme, width, now, idx < COMPACT_WRAP_RECENT_COUNT)
+            compact_activity_item(
+                event,
+                agent_id_to_name,
+                theme,
+                width,
+                now,
+                idx < COMPACT_WRAP_RECENT_COUNT,
+            )
         })
         .collect();
 
@@ -219,6 +226,7 @@ fn build_compact_activity_items_at(
 
 fn compact_activity_item(
     event: &Event,
+    agent_id_to_name: &HashMap<String, String>,
     theme: &ActiveTheme,
     width: u16,
     now: DateTime<Utc>,
@@ -228,7 +236,14 @@ fn compact_activity_item(
     let time = format_relative_at(event.created_at, now);
     let icon = event.icon();
     let icon_style = event_category_style(&event.event_type, styles);
-    let summary_style = event_category_style(&event.event_type, styles);
+    // Summary keeps per-agent attribution color when the event's session
+    // resolves to a known agent; the icon carries the event-category style.
+    let summary_style = event
+        .session_id
+        .as_ref()
+        .and_then(|id| agent_id_to_name.get(id))
+        .map(|name| Style::default().fg(get_agent_color(name)))
+        .unwrap_or_else(|| event_category_style(&event.event_type, styles));
     let prefix = format!("{time:>4} {icon} ");
     let prefix_width = prefix.chars().count();
     let summary_width = (width as usize).saturating_sub(prefix_width).max(1);
