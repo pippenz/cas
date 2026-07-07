@@ -272,6 +272,13 @@ impl DirectorData {
                     TaskStatus::PendingSupervisorReview => {
                         in_progress_tasks.push(to_summary(task));
                     }
+                    // cas-8d5b: worker work is done, but the factory branch
+                    // is waiting on supervisor merge. Keep it visible in the
+                    // waiting/active panel without treating it as worker-
+                    // actionable ready work.
+                    TaskStatus::AwaitingMerge => {
+                        in_progress_tasks.push(to_summary(task));
+                    }
                 }
             }
         }
@@ -396,7 +403,12 @@ impl DirectorData {
                     .unwrap_or_default()
                     .into_iter()
                     .filter_map(|lease| task_by_id.get(&lease.task_id).copied())
-                    .find(|task| task.status == TaskStatus::InProgress)
+                    .find(|task| {
+                        matches!(
+                            task.status,
+                            TaskStatus::InProgress | TaskStatus::AwaitingMerge
+                        )
+                    })
                     .map(|task| ActiveLeaseSummary {
                         task_id: task.id.clone(),
                         task_title: task.title.clone(),

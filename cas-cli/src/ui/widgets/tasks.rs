@@ -163,6 +163,7 @@ pub fn build_task_item(
         TaskStatus::Closed => Icons::CHECK,
         // cas-b51a: awaiting supervisor code-review
         TaskStatus::PendingSupervisorReview => Icons::CLOCK,
+        TaskStatus::AwaitingMerge => Icons::CLOCK,
     };
 
     let status_color = match task.status {
@@ -172,6 +173,7 @@ pub fn build_task_item(
         TaskStatus::Open => palette.task_open,
         // cas-b51a: reuse warning color — task is "waiting" for supervisor
         TaskStatus::PendingSupervisorReview => palette.task_blocked,
+        TaskStatus::AwaitingMerge => palette.task_blocked,
     };
 
     let indent = if indented { "  " } else { "" };

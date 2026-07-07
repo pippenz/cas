@@ -361,6 +361,7 @@ impl CasCore {
                         if task.status != TaskStatus::Closed
                             && task.status != TaskStatus::Open
                             && task.status != TaskStatus::PendingSupervisorReview
+                            && task.status != TaskStatus::AwaitingMerge
                         {
                             let prior_status = task.status;
                             let prior_assignee = task.assignee.clone();

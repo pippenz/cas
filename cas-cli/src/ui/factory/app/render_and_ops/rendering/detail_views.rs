@@ -56,6 +56,7 @@ impl FactoryApp {
                     cas_types::TaskStatus::Blocked => palette.task_blocked,
                     // cas-b51a: reuse warning color — task awaits supervisor review
                     cas_types::TaskStatus::PendingSupervisorReview => palette.task_blocked,
+                    cas_types::TaskStatus::AwaitingMerge => palette.task_blocked,
                 }),
             ),
         ]));

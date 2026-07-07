@@ -90,7 +90,7 @@ pub fn build_plan_context_with_stores(
                 // cas-b51a: tasks awaiting supervisor review sort after
                 // closed tasks — they are logically "done" from the worker's
                 // perspective, just not yet approved by the supervisor.
-                TaskStatus::PendingSupervisorReview => 4,
+                TaskStatus::PendingSupervisorReview | TaskStatus::AwaitingMerge => 4,
             };
             status_order(&a.status)
                 .cmp(&status_order(&b.status))

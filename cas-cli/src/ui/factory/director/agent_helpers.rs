@@ -158,6 +158,7 @@ pub fn task_status_icon(status: TaskStatus) -> &'static str {
     match status {
         TaskStatus::InProgress => Icons::SPINNER_STATIC,
         TaskStatus::Blocked => Icons::BLOCKED,
+        TaskStatus::AwaitingMerge => Icons::CLOCK,
         _ => "",
     }
 }
