@@ -1,6 +1,36 @@
 use crate::ui::factory::app::imports::*;
+use crate::ui::factory::buffer_backend::HyperlinkMap;
 
 impl FactoryApp {
+    pub(crate) fn pane_hyperlink_map(&self) -> HyperlinkMap {
+        self.pane_hyperlinks.clone()
+    }
+
+    fn clear_pane_hyperlinks(&self) {
+        if let Ok(mut hyperlinks) = self.pane_hyperlinks.lock() {
+            hyperlinks.clear();
+        }
+    }
+
+    fn record_pane_hyperlinks(&self, pane: &cas_mux::Pane, area: Rect) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+
+        let Ok(mut hyperlinks) = self.pane_hyperlinks.lock() else {
+            return;
+        };
+
+        for row in 0..area.height {
+            let row_links = pane.row_hyperlinks(row);
+            for col in 0..area.width.min(row_links.len() as u16) {
+                if let Some(uri) = row_links[col as usize].as_ref() {
+                    hyperlinks.insert((area.x + col, area.y + row), uri.clone());
+                }
+            }
+        }
+    }
+
     fn sync_selected_worker_tab_with_focus(&mut self) {
         let Some(focused) = self.mux.focused() else {
             return;
@@ -18,6 +48,7 @@ impl FactoryApp {
     }
 
     pub fn render(&mut self, frame: &mut Frame) {
+        self.clear_pane_hyperlinks();
         use crate::ui::factory::renderer::FactoryViewMode;
         match self.factory_view_mode {
             FactoryViewMode::Panes => self.render_panes_view(frame),
@@ -211,6 +242,7 @@ impl FactoryApp {
         use ratatui::widgets::Paragraph;
 
         let area = frame.area();
+        self.clear_pane_hyperlinks();
 
         // Split: 1-row status bar + rest for supervisor
         let chunks = Layout::default()
@@ -318,6 +350,7 @@ impl FactoryApp {
 
             let content = Paragraph::new(lines);
             frame.render_widget(content, supervisor_area);
+            self.record_pane_hyperlinks(pane, supervisor_area);
         }
     }
 
@@ -400,6 +433,7 @@ impl FactoryApp {
 
             let content = Paragraph::new(lines).block(block);
             frame.render_widget(content, area);
+            self.record_pane_hyperlinks(pane, inner);
 
             // Show new-lines indicator when user has scrolled up
             let new_below = pane.new_lines_below();
@@ -798,6 +832,7 @@ impl FactoryApp {
 
             let content = Paragraph::new(lines).block(block);
             frame.render_widget(content, layout.supervisor_area);
+            self.record_pane_hyperlinks(pane, inner);
 
             // Show new-lines indicator when user has scrolled up
             let new_below = pane.new_lines_below();
@@ -867,5 +902,56 @@ impl FactoryApp {
                 self.render_file_diff(frame, layout.sidecar_area, &file_path);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod hyperlink_tests {
+    use super::FactoryApp;
+    use cas_mux::Pane;
+    use ratatui::layout::Rect;
+
+    #[test]
+    fn pane_hyperlinks_are_recorded_at_final_screen_offsets_for_two_panes() {
+        let app = FactoryApp::for_test();
+        let mut left = Pane::director("left", 1, 20).unwrap();
+        let mut right = Pane::director("right", 1, 20).unwrap();
+        left.feed(b"\x1b]8;;https://left.example\x1b\\left\x1b]8;;\x1b\\")
+            .unwrap();
+        right
+            .feed(b"\x1b]8;;https://right.example\x1b\\right\x1b]8;;\x1b\\")
+            .unwrap();
+
+        app.clear_pane_hyperlinks();
+        app.record_pane_hyperlinks(
+            &left,
+            Rect {
+                x: 2,
+                y: 3,
+                width: 20,
+                height: 1,
+            },
+        );
+        app.record_pane_hyperlinks(
+            &right,
+            Rect {
+                x: 30,
+                y: 3,
+                width: 20,
+                height: 1,
+            },
+        );
+
+        let map = app.pane_hyperlink_map();
+        let hyperlinks = map.lock().unwrap();
+        assert_eq!(
+            hyperlinks.get(&(2, 3)).map(String::as_str),
+            Some("https://left.example")
+        );
+        assert_eq!(
+            hyperlinks.get(&(30, 3)).map(String::as_str),
+            Some("https://right.example")
+        );
+        assert_eq!(hyperlinks.get(&(0, 0)), None);
     }
 }

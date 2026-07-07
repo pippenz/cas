@@ -17,7 +17,15 @@ use ratatui::backend::{Backend, WindowSize};
 use ratatui::buffer::Cell;
 use ratatui::layout::{Position, Size};
 use ratatui::style::{Color, Modifier};
+use std::collections::BTreeMap;
 use std::io;
+use std::sync::{Arc, Mutex};
+
+pub type HyperlinkMap = Arc<Mutex<BTreeMap<(u16, u16), String>>>;
+
+pub fn new_hyperlink_map() -> HyperlinkMap {
+    Arc::new(Mutex::new(BTreeMap::new()))
+}
 
 /// A ratatui backend that writes to a buffer
 pub struct BufferBackend {
@@ -28,16 +36,30 @@ pub struct BufferBackend {
     /// Terminal size
     width: u16,
     height: u16,
+    /// Per-frame hyperlink metadata keyed by final host terminal coordinates.
+    hyperlinks: HyperlinkMap,
 }
 
 impl BufferBackend {
     /// Create a new buffer backend with the given size
+    #[cfg(test)]
     pub fn new(width: u16, height: u16) -> Self {
         Self {
             buffer: Vec::with_capacity(16384),
             scratch: Vec::with_capacity(64),
             width,
             height,
+            hyperlinks: new_hyperlink_map(),
+        }
+    }
+
+    pub fn with_hyperlinks(width: u16, height: u16, hyperlinks: HyperlinkMap) -> Self {
+        Self {
+            buffer: Vec::with_capacity(16384),
+            scratch: Vec::with_capacity(64),
+            width,
+            height,
+            hyperlinks,
         }
     }
 
@@ -58,6 +80,17 @@ impl BufferBackend {
         crossterm::execute!(self.scratch, cmd)?;
         self.buffer.extend_from_slice(&self.scratch);
         Ok(())
+    }
+
+    fn write_osc8_open(&mut self, uri: &str) {
+        self.buffer.extend_from_slice(b"\x1b]8;;");
+        self.buffer
+            .extend(uri.bytes().filter(|b| !matches!(b, b'\x1b' | b'\x07')));
+        self.buffer.extend_from_slice(b"\x1b\\");
+    }
+
+    fn write_osc8_close(&mut self) {
+        self.buffer.extend_from_slice(b"\x1b]8;;\x1b\\");
     }
 
     /// Convert ratatui color to crossterm color
@@ -97,10 +130,19 @@ impl Backend for BufferBackend {
         let mut last_fg = Color::Reset;
         let mut last_bg = Color::Reset;
         let mut last_modifier = Modifier::empty();
+        let hyperlinks = self
+            .hyperlinks
+            .lock()
+            .map(|map| map.clone())
+            .unwrap_or_default();
+        let mut active_link: Option<String> = None;
 
         for (x, y, cell) in content {
             // Move cursor if not contiguous
             if last_pos != Some((x.saturating_sub(1), y)) {
+                if active_link.take().is_some() {
+                    self.write_osc8_close();
+                }
                 self.write_command(MoveTo(x, y))?;
             }
             last_pos = Some((x, y));
@@ -152,8 +194,23 @@ impl Backend for BufferBackend {
                 last_modifier = cell.modifier;
             }
 
+            let link = hyperlinks.get(&(x, y));
+            if active_link.as_ref() != link {
+                if active_link.take().is_some() {
+                    self.write_osc8_close();
+                }
+                if let Some(uri) = link {
+                    self.write_osc8_open(uri);
+                    active_link = Some(uri.clone());
+                }
+            }
+
             // Write the cell content
             self.write_command(Print(cell.symbol()))?;
+        }
+
+        if active_link.take().is_some() {
+            self.write_osc8_close();
         }
 
         // Reset attributes at the end
@@ -208,5 +265,92 @@ impl Backend for BufferBackend {
             columns_rows: Size::new(self.width, self.height),
             pixels: Size::new(self.width * 8, self.height * 16),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BufferBackend, new_hyperlink_map};
+    use ratatui::backend::Backend;
+    use ratatui::buffer::Cell;
+
+    fn cell(symbol: &'static str) -> Cell {
+        Cell::new(symbol)
+    }
+
+    #[test]
+    fn linked_cells_emit_osc8_around_contiguous_runs() {
+        let links = new_hyperlink_map();
+        {
+            let mut map = links.lock().unwrap();
+            map.insert((0, 0), "https://example.com".to_string());
+            map.insert((1, 0), "https://example.com".to_string());
+        }
+        let mut backend = BufferBackend::with_hyperlinks(10, 2, links);
+        let cells = [cell("c"), cell("l"), cell("i")];
+
+        backend
+            .draw(vec![(0, 0, &cells[0]), (1, 0, &cells[1]), (2, 0, &cells[2])].into_iter())
+            .unwrap();
+
+        let output = String::from_utf8(backend.take_buffer()).unwrap();
+        assert!(output.contains("\x1b]8;;https://example.com\x1b\\cl\x1b]8;;\x1b\\i"));
+    }
+
+    #[test]
+    fn different_links_close_and_reopen_at_run_boundaries() {
+        let links = new_hyperlink_map();
+        {
+            let mut map = links.lock().unwrap();
+            map.insert((0, 0), "https://one.example".to_string());
+            map.insert((1, 0), "https://two.example".to_string());
+        }
+        let mut backend = BufferBackend::with_hyperlinks(10, 2, links);
+        let cells = [cell("a"), cell("b")];
+
+        backend
+            .draw(vec![(0, 0, &cells[0]), (1, 0, &cells[1])].into_iter())
+            .unwrap();
+
+        let output = String::from_utf8(backend.take_buffer()).unwrap();
+        assert!(output.contains(
+            "\x1b]8;;https://one.example\x1b\\a\x1b]8;;\x1b\\\x1b]8;;https://two.example\x1b\\b\x1b]8;;\x1b\\"
+        ));
+    }
+
+    #[test]
+    fn unlinked_cells_emit_no_osc8() {
+        let mut backend = BufferBackend::new(10, 2);
+        let cells = [cell("x"), cell("y")];
+
+        backend
+            .draw(vec![(0, 0, &cells[0]), (1, 0, &cells[1])].into_iter())
+            .unwrap();
+
+        let output = String::from_utf8(backend.take_buffer()).unwrap();
+        assert!(!output.contains("\x1b]8;;"));
+    }
+
+    #[test]
+    fn cursor_jumps_close_active_link() {
+        let links = new_hyperlink_map();
+        {
+            let mut map = links.lock().unwrap();
+            map.insert((0, 0), "https://example.com".to_string());
+            map.insert((4, 0), "https://example.com".to_string());
+        }
+        let mut backend = BufferBackend::with_hyperlinks(10, 2, links);
+        let cells = [cell("a"), cell("b")];
+
+        backend
+            .draw(vec![(0, 0, &cells[0]), (4, 0, &cells[1])].into_iter())
+            .unwrap();
+
+        let output = String::from_utf8(backend.take_buffer()).unwrap();
+        assert_eq!(
+            output.matches("\x1b]8;;https://example.com\x1b\\").count(),
+            2
+        );
+        assert_eq!(output.matches("\x1b]8;;\x1b\\").count(), 2);
     }
 }

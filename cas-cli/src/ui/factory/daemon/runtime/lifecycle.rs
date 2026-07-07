@@ -241,7 +241,8 @@ impl FactoryDaemon {
         let session_started_at = Instant::now();
 
         // Create buffer backend for rendering
-        let backend = BufferBackend::new(self.cols, self.rows);
+        let backend =
+            BufferBackend::with_hyperlinks(self.cols, self.rows, self.app.pane_hyperlink_map());
         let mut terminal = Terminal::new(backend)?;
 
         // Set initial terminal title
@@ -462,7 +463,11 @@ impl FactoryDaemon {
                                 }
                             }
                             // Rebuild compact terminal
-                            let backend = BufferBackend::new(cc, cr);
+                            let backend = BufferBackend::with_hyperlinks(
+                                cc,
+                                cr,
+                                self.app.pane_hyperlink_map(),
+                            );
                             self.compact_terminal = Some(Terminal::new(backend)?);
                         }
                     }

@@ -805,6 +805,12 @@ impl Pane {
         Ok(Line::from(spans))
     }
 
+    pub fn row_hyperlinks(&self, row: u16) -> Vec<Option<String>> {
+        (0..self.cols)
+            .map(|col| self.terminal.hyperlink_at(col + 1, row + 1))
+            .collect()
+    }
+
     pub fn viewport_as_lines(&self) -> Result<Vec<Line<'static>>> {
         let mut lines = Vec::with_capacity(self.rows as usize);
         for row in 0..self.rows {
