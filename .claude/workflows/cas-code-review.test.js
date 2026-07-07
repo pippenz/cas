@@ -17,6 +17,7 @@
 
 import { test, describe } from 'node:test'
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 
 // Import the production script's exported symbols.
 // The script itself is NOT a standard module (it's a Workflow script).
@@ -33,6 +34,15 @@ import {
   CONDITIONAL_PERSONAS,
   REVIEWER_OUTPUT_SCHEMA,
   WORKFLOW_META,
+  DEFAULT_LARGE_DIFF_TOKEN_THRESHOLD,
+  INTERFACE_INTEGRATOR_SHARD,
+  estimateDiffTokens,
+  normalizeChangedFiles,
+  shouldShardReview,
+  subsystemForFile,
+  shardPersonas,
+  planReviewShards,
+  summarizeShardPlan,
   gpt55ShouldRun,
   gpt55SkippedPersonas,
   personasRunCount,
@@ -43,6 +53,46 @@ import { mergeFindings } from './merge-findings.js'
 const CANONICAL_ALWAYS_ON = ['correctness', 'testing', 'maintainability', 'project-standards']
 const CANONICAL_CONDITIONAL = ['security', 'performance', 'adversarial']
 const CANONICAL_ALL = [...CANONICAL_ALWAYS_ON, ...CANONICAL_CONDITIONAL, 'fallow']
+const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor
+
+async function runWorkflowDryRun(args, setupOverride = {}) {
+  const source = readFileSync(new URL('./cas-code-review.js', import.meta.url), 'utf8')
+    .replace('export const meta =', 'const meta =')
+  const labels = []
+  const logs = []
+  async function agent(_prompt, options = {}) {
+    labels.push(options.label)
+    if (options.label === 'setup') {
+      return {
+        intent_summary: 'Goal: exercise workflow dry-run.\nScope: synthetic diff.',
+        activate_security: false,
+        activate_adversarial: false,
+        activate_performance: false,
+        fallow_skip_reason: 'non-JS/TS repo',
+        ...setupOverride,
+      }
+    }
+    return {
+      reviewer: options.label,
+      findings: [],
+      residual_risks: [],
+      testing_gaps: [],
+    }
+  }
+  async function pipeline(items, fn) {
+    return Promise.all(items.map(fn))
+  }
+  function phase(name) {
+    logs.push(`phase:${name}`)
+  }
+  function log(message) {
+    logs.push(message)
+  }
+
+  const workflow = new AsyncFunction('args', 'agent', 'pipeline', 'phase', 'log', source)
+  const result = await workflow(args, agent, pipeline, phase, log)
+  return { result, labels, logs }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // META BLOCK
@@ -232,6 +282,163 @@ describe('gpt-5.5 independent activation helpers', () => {
 })
 
 // ─────────────────────────────────────────────────────────────────────────────
+// LARGE-DIFF SHARDING HELPERS (cas-33f1)
+// ─────────────────────────────────────────────────────────────────────────────
+
+const LARGE_DIFF = [
+  'diff --git a/cas-cli/src/ui/factory/director/prompts.rs b/cas-cli/src/ui/factory/director/prompts.rs',
+  'index 111..222 100644',
+  '--- a/cas-cli/src/ui/factory/director/prompts.rs',
+  '+++ b/cas-cli/src/ui/factory/director/prompts.rs',
+  '@@ -1,2 +1,4 @@',
+  '-pub fn old_prompt() {}',
+  '+pub fn generate_prompt() {}',
+  '+const DELIVERY_GATE: bool = true;',
+  'diff --git a/crates/cas-store/src/code_review/merge.rs b/crates/cas-store/src/code_review/merge.rs',
+  'index 111..222 100644',
+  '--- a/crates/cas-store/src/code_review/merge.rs',
+  '+++ b/crates/cas-store/src/code_review/merge.rs',
+  '@@ -10,2 +10,4 @@',
+  '-pub struct OldMerge;',
+  '+pub struct MergedFindings;',
+  '+impl MergedFindings { pub fn len(&self) -> usize { 0 } }',
+  'diff --git a/docs/reviews/example.md b/docs/reviews/example.md',
+  'index 111..222 100644',
+  '--- a/docs/reviews/example.md',
+  '+++ b/docs/reviews/example.md',
+  '@@ -1 +1 @@',
+  '-old',
+  '+new',
+].join('\n')
+
+describe('large-diff sharding helpers', () => {
+  test('default threshold is a positive token budget', () => {
+    assert.ok(DEFAULT_LARGE_DIFF_TOKEN_THRESHOLD > 1000)
+    assert.equal(estimateDiffTokens('12345678'), 2)
+  })
+
+  test('normalizes newline-separated changed files', () => {
+    assert.deepEqual(
+      normalizeChangedFiles(' a.rs\n\n docs/readme.md \n'),
+      ['a.rs', 'docs/readme.md']
+    )
+  })
+
+  test('below threshold disables sharding and preserves full coverage', () => {
+    const fileList = 'cas-cli/src/ui/factory/director/prompts.rs\n'
+    const plan = planReviewShards('tiny diff', fileList, ['correctness'], {
+      large_diff_token_threshold: 9999,
+    })
+    assert.equal(shouldShardReview('tiny diff', { large_diff_token_threshold: 9999 }), false)
+    assert.equal(plan.enabled, false)
+    assert.deepEqual(plan.shards, [])
+    assert.deepEqual(plan.coverage.missing_files, [])
+    assert.deepEqual(plan.coverage.covered_files, ['cas-cli/src/ui/factory/director/prompts.rs'])
+  })
+
+  test('over threshold creates subsystem shards plus one interface integrator shard', () => {
+    const fileList = [
+      'cas-cli/src/ui/factory/director/prompts.rs',
+      'crates/cas-store/src/code_review/merge.rs',
+      'docs/reviews/example.md',
+    ].join('\n')
+    const plan = planReviewShards(
+      LARGE_DIFF,
+      fileList,
+      ['correctness', 'testing', 'maintainability', 'project-standards', 'adversarial'],
+      { large_diff_token_threshold: 1 }
+    )
+
+    assert.equal(plan.enabled, true)
+    assert.ok(plan.shards.some(shard => shard.id === 'subsystem:factory-ui'))
+    assert.ok(plan.shards.some(shard => shard.id === 'subsystem:store-types'))
+    assert.ok(plan.shards.some(shard => shard.id === 'subsystem:docs-skills'))
+    assert.equal(plan.shards.filter(shard => shard.id === INTERFACE_INTEGRATOR_SHARD).length, 1)
+    assert.deepEqual(plan.coverage.missing_files, [])
+    assert.deepEqual(plan.coverage.duplicate_files, [])
+    assert.deepEqual([...plan.coverage.covered_files].sort(), fileList.split('\n').sort())
+  })
+
+  test('activation summaries omit full shard diff bodies', () => {
+    const plan = planReviewShards(
+      LARGE_DIFF,
+      'cas-cli/src/ui/factory/director/prompts.rs\ndocs/reviews/example.md',
+      ['correctness', 'project-standards'],
+      { large_diff_token_threshold: 1 }
+    )
+    const summary = summarizeShardPlan(plan)
+    assert.equal(summary.enabled, true)
+    assert.ok(summary.shards.every(shard => !('diff_text' in shard)))
+    assert.ok(summary.shards.every(shard => Number.isInteger(shard.diff_tokens)))
+  })
+
+  test('docs-only shards route fewer personas than code shards', () => {
+    const personas = ['correctness', 'testing', 'maintainability', 'project-standards', 'adversarial']
+    const docs = { kind: 'subsystem', subsystem: 'docs-skills' }
+    const code = { kind: 'subsystem', subsystem: 'factory-ui' }
+    const iface = { kind: 'interface', subsystem: 'cross-shard-interfaces' }
+
+    assert.deepEqual(shardPersonas(docs, personas), ['project-standards'])
+    assert.deepEqual(shardPersonas(code, personas), personas)
+    assert.deepEqual(shardPersonas(iface, personas), ['correctness', 'maintainability', 'adversarial'])
+  })
+
+  test('subsystem classifier groups by concern, not by file count chunks', () => {
+    assert.equal(subsystemForFile('cas-cli/src/ui/factory/director/prompts.rs'), 'factory-ui')
+    assert.equal(subsystemForFile('cas-cli/src/mcp/tools/core/task/lifecycle.rs'), 'mcp-task-lifecycle')
+    assert.equal(subsystemForFile('crates/cas-types/src/code_review.rs'), 'store-types')
+    assert.equal(subsystemForFile('docs/reviews/example.md'), 'docs-skills')
+  })
+})
+
+describe('large-diff Workflow dry-run dispatch', () => {
+  const fileList = [
+    'cas-cli/src/ui/factory/director/prompts.rs',
+    'docs/reviews/example.md',
+  ].join('\n')
+
+  test('below threshold preserves single full-diff persona dispatch shape', async () => {
+    const { result, labels } = await runWorkflowDryRun({
+      diff_text: LARGE_DIFF,
+      file_list: fileList,
+      base_sha: 'abc123',
+      commit_log: 'synthetic',
+      large_diff_token_threshold: 99999,
+    })
+
+    assert.deepEqual(labels, [
+      'setup',
+      'review:correctness',
+      'review:testing',
+      'review:maintainability',
+      'review:project-standards',
+    ])
+    assert.equal(result.activation.sharding, undefined)
+    assert.equal(result.stats.personas_run, 4)
+  })
+
+  test('over threshold dispatches subsystem shards and interface integrator', async () => {
+    const { result, labels } = await runWorkflowDryRun({
+      diff_text: LARGE_DIFF,
+      file_list: fileList,
+      base_sha: 'abc123',
+      commit_log: 'synthetic',
+      large_diff_token_threshold: 1,
+    }, {
+      activate_adversarial: true,
+    })
+
+    assert.equal(result.activation.sharding.enabled, true)
+    assert.deepEqual(result.activation.sharding.coverage.missing_files, [])
+    assert.ok(labels.includes('review:correctness:subsystem:factory-ui'))
+    assert.ok(labels.includes('review:project-standards:subsystem:docs-skills'))
+    assert.ok(labels.includes('review:correctness:interface-integrator'))
+    assert.ok(labels.includes('review:maintainability:interface-integrator'))
+    assert.ok(labels.includes('review:adversarial:interface-integrator'))
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
 // INTEGRATION: mergeFindings import still works through Phase A module
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -244,6 +451,27 @@ describe('mergeFindings integration (Phase A)', () => {
     const { residual, pre_existing } = mergeFindings([])
     assert.deepEqual(residual, [])
     assert.deepEqual(pre_existing, [])
+  })
+
+  test('mergeFindings deduplicates duplicate findings from shard persona runs', () => {
+    const finding = {
+      title: 'Shared contract may break callers',
+      severity: 'P1',
+      file: 'crates/cas-types/src/code_review.rs',
+      line: 42,
+      why_it_matters: 'Two shard personas reported the same interface risk.',
+      autofix_class: 'manual',
+      owner: 'human',
+      confidence: 0.75,
+      evidence: ['same file and line bucket'],
+      pre_existing: false,
+    }
+    const { residual } = mergeFindings([
+      { reviewer: 'review:correctness:interface-integrator', findings: [finding] },
+      { reviewer: 'review:maintainability:subsystem:store-types', findings: [{ ...finding, confidence: 0.70 }] },
+    ])
+    assert.equal(residual.length, 1)
+    assert.equal(residual[0].confidence, 0.85)
   })
 })
 
