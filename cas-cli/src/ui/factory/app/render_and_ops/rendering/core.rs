@@ -1,5 +1,7 @@
 use crate::ui::factory::app::imports::*;
 
+const IDENTITY_HEADER_MIN_HEIGHT: u16 = 20;
+
 impl FactoryApp {
     fn sync_selected_worker_tab_with_focus(&mut self) {
         let Some(focused) = self.mux.focused() else {
@@ -32,13 +34,14 @@ impl FactoryApp {
 
         // Calculate layout using all worker names (real + pending)
         let all_names = self.layout_worker_names();
+        let header_rows = Self::identity_header_rows(area);
         let layout = FactoryLayout::calculate_from_names_with_header_rows(
             area,
             &all_names,
             self.tabbed_workers,
             self.sidecar_collapsed,
             self.layout_sizes,
-            0,
+            header_rows,
         );
 
         // Store layout areas for click detection
@@ -55,6 +58,8 @@ impl FactoryApp {
                 PaneGrid::new(&self.worker_names, &self.supervisor_name, layout.is_tabbed);
         }
 
+        self.render_identity_header(frame, layout.header_bar);
+
         // Render worker panes (stacked vertically)
         self.render_workers(frame, &layout);
 
@@ -69,6 +74,67 @@ impl FactoryApp {
         self.render_error_banner(frame, layout.status_bar);
 
         self.render_overlays(frame);
+    }
+
+    fn identity_header_rows(area: Rect) -> u16 {
+        u16::from(area.height >= IDENTITY_HEADER_MIN_HEIGHT)
+    }
+
+    fn render_identity_header(&self, frame: &mut Frame, area: Rect) {
+        if area.height == 0 || area.width == 0 {
+            return;
+        }
+
+        use ratatui::style::Modifier;
+        use ratatui::text::{Line, Span};
+        use ratatui::widgets::Paragraph;
+
+        let styles = &self.theme.styles;
+        let session_name = self.factory_session.as_deref().unwrap_or("factory");
+        let worker_count = self.layout_worker_names().len();
+        let worker_label = if worker_count == 1 {
+            "1 worker".to_string()
+        } else {
+            format!("{worker_count} workers")
+        };
+
+        let mut spans = vec![Span::styled(
+            session_name.to_string(),
+            styles.text_primary.add_modifier(Modifier::BOLD),
+        )];
+
+        if let Some(epic_id) = self.current_epic_id.as_deref() {
+            if let Some(epic) = self
+                .director_data
+                .epic_tasks
+                .iter()
+                .find(|task| task.id == epic_id)
+            {
+                spans.push(Span::styled(" · ", styles.text_muted));
+                spans.push(Span::styled(
+                    format!("EPIC {} {}", epic.id, truncate_chars(&epic.title, 28)),
+                    styles.text_info,
+                ));
+            }
+
+            if let Some(branch) = self.focused_epic_branch_status() {
+                spans.push(Span::styled(" · ", styles.text_muted));
+                spans.push(Span::styled(
+                    crate::ui::factory::app::truncate_branch_middle(&branch.branch, 36),
+                    styles.text_muted,
+                ));
+            }
+
+            if let Some(created_at) = self.session_created_at {
+                spans.push(Span::styled(" · ", styles.text_muted));
+                spans.push(Span::styled(format_elapsed(created_at), styles.text_muted));
+            }
+        }
+
+        spans.push(Span::styled(" · ", styles.text_muted));
+        spans.push(Span::styled(worker_label, styles.text_muted));
+
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
     /// Render the Mission Control dashboard view.
@@ -877,5 +943,124 @@ impl FactoryApp {
                 self.render_file_diff(frame, layout.sidecar_area, &file_path);
             }
         }
+    }
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    if max_chars <= 1 {
+        return "…".to_string();
+    }
+    value
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .chain("…".chars())
+        .collect()
+}
+
+fn format_elapsed(created_at: chrono::DateTime<chrono::Utc>) -> String {
+    let elapsed_minutes = chrono::Utc::now()
+        .signed_duration_since(created_at)
+        .num_minutes()
+        .max(0);
+    let hours = elapsed_minutes / 60;
+    let minutes = elapsed_minutes % 60;
+    format!("{hours:02}:{minutes:02}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cas_factory::TaskSummary;
+    use cas_types::{Priority, TaskStatus, TaskType};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn epic_task(id: &str, title: &str, branch: &str) -> TaskSummary {
+        TaskSummary {
+            id: id.to_string(),
+            title: title.to_string(),
+            status: TaskStatus::InProgress,
+            priority: Priority::MEDIUM,
+            assignee: None,
+            task_type: TaskType::Epic,
+            epic: None,
+            branch: Some(branch.to_string()),
+            updated_at: None,
+        }
+    }
+
+    fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    #[test]
+    fn identity_header_renders_session_epic_branch_elapsed_and_worker_count() {
+        let mut app = FactoryApp::for_test();
+        app.factory_session = Some("session-alpha".to_string());
+        app.session_created_at = Some(chrono::Utc::now() - chrono::TimeDelta::minutes(125));
+        app.current_epic_id = Some("cas-epic".to_string());
+        app.worker_names = vec!["worker-one".to_string(), "worker-two".to_string()];
+        app.director_data.epic_tasks = vec![epic_task(
+            "cas-epic",
+            "Visual Information Overhaul",
+            "epic/factory-tui-overhaul",
+        )];
+        app.branch_visibility.insert_epic_ahead_behind(
+            "cas-epic",
+            "epic/factory-tui-overhaul",
+            2,
+            0,
+        );
+
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+
+        let text = buffer_text(&terminal);
+        assert!(text.contains("session-alpha"));
+        assert!(text.contains("EPIC cas-epic Visual Information Overhaul"));
+        assert!(text.contains("epic/factory-tui-overhaul"));
+        assert!(text.contains("02:05"));
+        assert!(text.contains("2 workers"));
+    }
+
+    #[test]
+    fn identity_header_hides_below_height_threshold() {
+        let mut app = FactoryApp::for_test();
+        app.factory_session = Some("session-alpha".to_string());
+        app.worker_names = vec!["worker-one".to_string()];
+
+        let backend = TestBackend::new(100, 19);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+
+        let text = buffer_text(&terminal);
+        assert!(!text.contains("session-alpha"));
+    }
+
+    #[test]
+    fn identity_header_degrades_without_focused_epic() {
+        let mut app = FactoryApp::for_test();
+        app.factory_session = Some("session-beta".to_string());
+        app.worker_names = vec!["worker-one".to_string(), "worker-two".to_string()];
+
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+
+        let text = buffer_text(&terminal);
+        assert!(text.contains("session-beta"));
+        assert!(text.contains("2 workers"));
+        assert!(!text.contains("EPIC "));
     }
 }
