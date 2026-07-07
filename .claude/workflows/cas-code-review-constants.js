@@ -14,10 +14,10 @@
 
 export const WORKFLOW_META = Object.freeze({
   name: 'cas-code-review',
-  description: 'cas-code-review Steps 3-4: schema-validated persona dispatch + deterministic merge',
+  description: 'cas-code-review Steps 1-4: intent extraction, persona selection, sharded dispatch, deterministic merge',
   phases: [
     { title: 'Resolve', detail: 'validate args + fallow pre-check' },
-    { title: 'Review', detail: 'parallel persona dispatch (schema-validated, Sonnet)' },
+    { title: 'Review', detail: 'parallel persona dispatch, sharded for large diffs (schema-validated, Sonnet)' },
     { title: 'Merge', detail: 'deterministic 7-step merge (pure JS, no LLM)' },
   ],
 })
@@ -106,7 +106,231 @@ function personasRunCount(personasToDispatchCount, fallowRuns, gpt55Runs, gpt55S
   return personasToDispatchCount + (fallowRuns ? 1 : 0) + (gpt55Runs && !gpt55Skipped ? 1 : 0)
 }
 
-export { gpt55ShouldRun, gpt55SkippedPersonas, personasRunCount }
+// ─────────────────────────────────────────────────────────────────────────────
+// LARGE-DIFF SHARDING HELPERS
+// ─────────────────────────────────────────────────────────────────────────────
+
+export const DEFAULT_LARGE_DIFF_TOKEN_THRESHOLD = 12000
+export const INTERFACE_INTEGRATOR_SHARD = 'interface-integrator'
+
+function estimateDiffTokens(diffText = '') {
+  return Math.ceil(String(diffText).length / 4)
+}
+
+function normalizeChangedFiles(fileList = '') {
+  return String(fileList)
+    .split('\n')
+    .map(path => path.trim())
+    .filter(Boolean)
+}
+
+function largeDiffThreshold(args = {}) {
+  const raw = args.large_diff_token_threshold
+    ?? args.review_shard_token_threshold
+    ?? args.shard_token_threshold
+  const n = Number(raw)
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_LARGE_DIFF_TOKEN_THRESHOLD
+}
+
+function shouldShardReview(diffText = '', args = {}) {
+  return estimateDiffTokens(diffText) > largeDiffThreshold(args)
+}
+
+function subsystemForFile(path = '') {
+  if (/^(docs\/|.*\.md$|\.claude\/skills\/|cas-cli\/src\/builtins\/(codex\/)?skills\/)/.test(path)) {
+    return 'docs-skills'
+  }
+  if (/^\.claude\/workflows\/|cas-cli\/src\/builtins\/workflows\//.test(path)) {
+    return 'code-review-workflow'
+  }
+  if (/^cas-cli\/src\/ui\/factory\/|^crates\/cas-factory/.test(path)) {
+    return 'factory-ui'
+  }
+  if (/^cas-cli\/src\/mcp\/tools\/core\/task\/|^cas-cli\/src\/mcp\/tools\/core\/agent_coordination\//.test(path)) {
+    return 'mcp-task-lifecycle'
+  }
+  if (/^crates\/cas-store\/|^crates\/cas-types\/|^crates\/cas-core\/src\/migration\//.test(path)) {
+    return 'store-types'
+  }
+  if (/(^|\/)(tests?|__tests__)\/|(_test|\.test|\.spec)\./.test(path)) {
+    return 'tests'
+  }
+  return 'code-other'
+}
+
+function isDocsOnlyShard(shard) {
+  return shard?.kind === 'subsystem' && shard.subsystem === 'docs-skills'
+}
+
+function isMechanicalTestShard(shard) {
+  return shard?.kind === 'subsystem' && shard.subsystem === 'tests'
+}
+
+function shardPersonas(shard, basePersonas = []) {
+  const unique = [...new Set(basePersonas)]
+  if (shard?.kind === 'interface') {
+    return unique.filter(name => ['correctness', 'maintainability', 'adversarial'].includes(name))
+  }
+  if (isDocsOnlyShard(shard)) {
+    return unique.includes('project-standards') ? ['project-standards'] : [unique[0]].filter(Boolean)
+  }
+  if (isMechanicalTestShard(shard)) {
+    return unique.includes('testing') ? ['testing'] : [unique[0]].filter(Boolean)
+  }
+  return unique
+}
+
+function extractDiffBlocksByFile(diffText = '') {
+  const blocks = new Map()
+  let currentFile = null
+  let current = []
+  for (const line of String(diffText).split('\n')) {
+    const m = line.match(/^diff --git a\/(.+?) b\/(.+)$/)
+    if (m) {
+      if (currentFile) blocks.set(currentFile, current.join('\n'))
+      currentFile = m[2]
+      current = [line]
+    } else if (currentFile) {
+      current.push(line)
+    }
+  }
+  if (currentFile) blocks.set(currentFile, current.join('\n'))
+  return blocks
+}
+
+function diffForFiles(diffText = '', files = []) {
+  const blocks = extractDiffBlocksByFile(diffText)
+  return files.map(file => blocks.get(file)).filter(Boolean).join('\n')
+}
+
+function interfaceDiff(diffText = '') {
+  const keep = []
+  let currentFile = null
+  let pendingHeader = []
+  let emittedHeader = false
+  const interesting = /^[+-]\s*(pub\s+)?(async\s+)?(fn|struct|enum|trait|impl|type|interface|class|export\s+(function|class|type|interface|const)|const\s+\w+\s*=|function)\b/
+  for (const line of String(diffText).split('\n')) {
+    const fileMatch = line.match(/^diff --git a\/(.+?) b\/(.+)$/)
+    if (fileMatch) {
+      currentFile = fileMatch[2]
+      pendingHeader = [line]
+      emittedHeader = false
+      continue
+    }
+    if (!currentFile) continue
+    if (/^(index |--- |\+\+\+ |@@ )/.test(line)) {
+      pendingHeader.push(line)
+      continue
+    }
+    if (interesting.test(line)) {
+      if (!emittedHeader) {
+        keep.push(...pendingHeader)
+        emittedHeader = true
+      }
+      keep.push(line)
+    }
+  }
+  return keep.join('\n')
+}
+
+function planReviewShards(diffText = '', fileList = '', basePersonas = [], args = {}) {
+  const changedFiles = normalizeChangedFiles(fileList)
+  const threshold = largeDiffThreshold(args)
+  const estimatedTokens = estimateDiffTokens(diffText)
+  if (estimatedTokens <= threshold) {
+    return {
+      enabled: false,
+      threshold,
+      estimated_tokens: estimatedTokens,
+      shards: [],
+      coverage: {
+        changed_files: changedFiles,
+        covered_files: changedFiles,
+        missing_files: [],
+        duplicate_files: [],
+        extra_files: [],
+      },
+    }
+  }
+
+  const groups = new Map()
+  for (const file of changedFiles) {
+    const subsystem = subsystemForFile(file)
+    if (!groups.has(subsystem)) groups.set(subsystem, [])
+    groups.get(subsystem).push(file)
+  }
+
+  const shards = [...groups.entries()].map(([subsystem, files]) => {
+    const shard = {
+      id: `subsystem:${subsystem}`,
+      kind: 'subsystem',
+      subsystem,
+      files,
+      diff_text: diffForFiles(diffText, files),
+    }
+    shard.personas = shardPersonas(shard, basePersonas)
+    return shard
+  })
+
+  const integrator = {
+    id: INTERFACE_INTEGRATOR_SHARD,
+    kind: 'interface',
+    subsystem: 'cross-shard-interfaces',
+    files: changedFiles,
+    diff_text: interfaceDiff(diffText),
+  }
+  integrator.personas = shardPersonas(integrator, basePersonas)
+  shards.push(integrator)
+
+  const covered = shards
+    .filter(shard => shard.kind === 'subsystem')
+    .flatMap(shard => shard.files)
+  const counts = covered.reduce((acc, file) => {
+    acc[file] = (acc[file] ?? 0) + 1
+    return acc
+  }, {})
+  const changedSet = new Set(changedFiles)
+  const coveredSet = new Set(covered)
+
+  return {
+    enabled: true,
+    threshold,
+    estimated_tokens: estimatedTokens,
+    shards,
+    coverage: {
+      changed_files: changedFiles,
+      covered_files: [...coveredSet],
+      missing_files: changedFiles.filter(file => !coveredSet.has(file)),
+      duplicate_files: Object.entries(counts).filter(([, count]) => count > 1).map(([file]) => file),
+      extra_files: covered.filter(file => !changedSet.has(file)),
+    },
+  }
+}
+
+function summarizeShardPlan(plan) {
+  if (!plan?.enabled) return plan
+  return {
+    ...plan,
+    shards: plan.shards.map(({ diff_text: diffText, ...shard }) => ({
+      ...shard,
+      diff_tokens: estimateDiffTokens(diffText ?? ''),
+    })),
+  }
+}
+
+export {
+  estimateDiffTokens,
+  normalizeChangedFiles,
+  largeDiffThreshold,
+  shouldShardReview,
+  subsystemForFile,
+  shardPersonas,
+  planReviewShards,
+  summarizeShardPlan,
+  gpt55ShouldRun,
+  gpt55SkippedPersonas,
+  personasRunCount,
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // SETUP_SCHEMA — Phase C (cas-7c64)
