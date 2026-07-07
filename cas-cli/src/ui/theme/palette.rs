@@ -123,6 +123,21 @@ pub struct Palette {
     // reusing text_primary (which flips to near-white in dark mode and
     // fails contrast against a medium-bright chip fill — see cas-7bf4).
     pub chip_fg: Color,
+
+    // Keybind hint-key foreground — status_info/success/warning/error/accent
+    // rendered as short (often bold) key labels directly on bg_elevated
+    // (the status bar's right-side hint row), NOT as a chip background.
+    // In dark mode these equal the status/accent colors unchanged (already
+    // ≥4.5:1 there). In light mode the status/accent colors themselves are
+    // too pale against bg_elevated (as low as 1.54:1) — these are darker
+    // variants of the SAME hue reserved for this foreground-on-bg_elevated
+    // role, split out precisely so status_info/success/warning/error/accent
+    // can stay bright for their OTHER role as chip backgrounds (cas-7bf4).
+    pub hint_info: Color,
+    pub hint_success: Color,
+    pub hint_warning: Color,
+    pub hint_error: Color,
+    pub hint_accent: Color,
 }
 
 impl Palette {
@@ -246,6 +261,15 @@ impl Palette {
             // Chip/badge foreground (cas-7bf4 contrast fix)
             chip_fg: Color::Rgb(15, 16, 20),
 
+            // Keybind hint-key foreground (cas-7bf4 contrast fix) — dark
+            // mode's status/accent colors already clear 4.5:1 against
+            // bg_elevated, so these are unchanged aliases.
+            hint_info: colors.info,
+            hint_success: colors.success,
+            hint_warning: colors.warning,
+            hint_error: colors.error,
+            hint_accent: colors.primary_400,
+
             colors,
         }
     }
@@ -366,6 +390,20 @@ impl Palette {
             // near-black as dark; chip backgrounds are medium-bright in
             // both modes so one dark foreground covers both.
             chip_fg: Color::Rgb(15, 16, 20),
+
+            // Keybind hint-key foreground (cas-7bf4 contrast fix) — light
+            // mode's info/success/warning/error/primary_400 are too pale
+            // against bg_elevated when used directly as this foreground
+            // (as low as 1.54:1); these are darker same-hue variants
+            // reserved for the hint-key role, each ≥4.5:1 against
+            // bg_elevated(198,200,210). The status/accent colors
+            // themselves stay unchanged so their chip-background role
+            // (fixed in this same task) is unaffected.
+            hint_info: Color::Rgb(29, 87, 122),
+            hint_success: Color::Rgb(24, 96, 48),
+            hint_warning: Color::Rgb(113, 76, 27),
+            hint_error: Color::Rgb(152, 46, 46),
+            hint_accent: Color::Rgb(20, 92, 87),
 
             colors,
         }
@@ -498,6 +536,53 @@ mod contrast_guard {
             ratio < AA_NORMAL_TEXT,
             "expected the pre-fix text_primary-on-status_info pattern to still read as broken \
              (ratio={ratio:.2}); if this now passes, the fixture no longer represents the bug"
+        );
+    }
+
+    /// Keybind hint-key colors (status bar right-side hint row: ^P focus,
+    /// ^Q quit, etc) rendered directly on bg_elevated. Before cas-7bf4 this
+    /// used text_info/success/warning/error/accent directly — dark mode
+    /// already cleared 4.5:1 (5.48-6.64), but light mode read as low as
+    /// 1.54:1 since those tokens are also used as bright chip backgrounds
+    /// elsewhere and can't be darkened without breaking that role. hint_*
+    /// are the split-out, foreground-only variants.
+    #[test]
+    fn hint_key_colors_pass_against_bg_elevated_both_modes() {
+        for (mode, colors, is_dark) in [
+            ("dark", ColorPalette::dark(), true),
+            ("light", ColorPalette::light(), false),
+        ] {
+            let p = Palette::from_colors(colors, is_dark);
+            for (name, fg) in [
+                ("hint_info", p.hint_info),
+                ("hint_success", p.hint_success),
+                ("hint_warning", p.hint_warning),
+                ("hint_error", p.hint_error),
+                ("hint_accent", p.hint_accent),
+            ] {
+                assert_pair(
+                    &format!("{mode} {name} on bg_elevated"),
+                    fg,
+                    p.bg_elevated,
+                    AA_NORMAL_TEXT,
+                );
+            }
+        }
+    }
+
+    /// Falsification fixture: the pre-fix light-mode hint-key pattern
+    /// (status_info/success/warning/accent used directly as a foreground on
+    /// bg_elevated) must still read as broken, proving this guard isn't
+    /// tautological.
+    #[test]
+    fn guard_catches_the_pre_fix_light_hint_pattern() {
+        let p = Palette::from_colors(ColorPalette::light(), false);
+        let ratio = contrast_ratio(p.accent, p.bg_elevated);
+        assert!(
+            ratio < 3.0,
+            "expected the pre-fix accent-as-hint-key-on-bg_elevated pattern to still read as \
+             broken (ratio={ratio:.2}); if this now passes, the fixture no longer represents \
+             the bug"
         );
     }
 }
