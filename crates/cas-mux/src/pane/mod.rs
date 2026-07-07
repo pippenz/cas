@@ -110,6 +110,8 @@ pub struct Pane {
     /// forwarded to the inner process (alt-screen, no scrollback) or handled
     /// by `Pane::scroll` (normal screen, scrollback available).
     in_alt_screen: bool,
+    /// Whether this pane has ever received an OSC 8 hyperlink sequence.
+    has_hyperlinks: bool,
     /// Partial DEC private mode sequence carried over from the previous `feed()` chunk.
     ///
     /// PTY output arrives in arbitrary-sized chunks; a DEC escape sequence such as
@@ -117,6 +119,8 @@ pub struct Pane {
     /// `PARTIAL_ESC_CAP` (16) bytes of a trailing partial sequence and prepending
     /// them to the next chunk means `update_alt_screen` always sees whole sequences.
     partial_esc: Vec<u8>,
+    /// Partial OSC 8 introducer carried over from the previous `feed()` chunk.
+    partial_osc8: Vec<u8>,
 }
 
 impl Pane {
@@ -155,7 +159,9 @@ impl Pane {
             total_bytes_received: 0,
             created_at: std::time::Instant::now(),
             in_alt_screen: false,
+            has_hyperlinks: false,
             partial_esc: Vec::new(),
+            partial_osc8: Vec::new(),
         })
     }
 
@@ -565,9 +571,9 @@ impl Pane {
             // safe). Sub-parameters/additional parameters are ignored: per
             // xterm semantics, the leading mode value is what controls the
             // alt-screen toggle.
-            let param: u32 = data[param_start..param_end]
-                .iter()
-                .fold(0u32, |acc, &b| acc.wrapping_mul(10).wrapping_add((b - b'0') as u32));
+            let param: u32 = data[param_start..param_end].iter().fold(0u32, |acc, &b| {
+                acc.wrapping_mul(10).wrapping_add((b - b'0') as u32)
+            });
             match (param, final_byte) {
                 (47 | 1047 | 1049, b'h') => state = true,
                 (47 | 1047 | 1049, b'l') => state = false,
@@ -650,7 +656,36 @@ impl Pane {
         self.in_alt_screen
     }
 
+    pub fn has_hyperlinks(&self) -> bool {
+        self.has_hyperlinks
+    }
+
+    fn contains_osc8_introducer(data: &[u8]) -> bool {
+        data.windows(4).any(|window| window == b"\x1b]8;")
+    }
+
+    fn update_hyperlink_presence(&mut self, data: &[u8]) {
+        if self.has_hyperlinks {
+            return;
+        }
+
+        // Scan the carried tail together with the new chunk, and carry the
+        // tail of the COMBINED buffer — carrying from `data` alone loses
+        // introducer bytes when a link is split across 3+ tiny feeds.
+        let mut scan_buf = std::mem::take(&mut self.partial_osc8);
+        scan_buf.extend_from_slice(data);
+        self.has_hyperlinks = Self::contains_osc8_introducer(&scan_buf);
+
+        if !self.has_hyperlinks {
+            let keep = scan_buf.len().min(3);
+            scan_buf.drain(..scan_buf.len() - keep);
+            self.partial_osc8 = scan_buf;
+        }
+    }
+
     pub fn feed(&mut self, data: &[u8]) -> Result<()> {
+        self.update_hyperlink_presence(data);
+
         // Track alt-screen mode transitions before handing data to the terminal.
         // If the previous chunk ended with an incomplete DEC sequence, prepend
         // those carry bytes so split sequences are always seen whole.
@@ -778,7 +813,10 @@ impl Pane {
         let text = self.dump_row(row)?;
         // Use style runs (pre-grouped by the VT) instead of per-cell styles
         // to avoid a separate O(cols) traversal + per-cell comparison.
-        let runs = self.terminal.row_style_runs(row).map_err(|e| Error::terminal(e.to_string()))?;
+        let runs = self
+            .terminal
+            .row_style_runs(row)
+            .map_err(|e| Error::terminal(e.to_string()))?;
 
         if runs.is_empty() {
             return Ok(Line::from(vec![Span::raw(text)]));
@@ -803,6 +841,16 @@ impl Pane {
         }
 
         Ok(Line::from(spans))
+    }
+
+    pub fn row_hyperlinks(&self, row: u16) -> Vec<Option<String>> {
+        if !self.has_hyperlinks {
+            return Vec::new();
+        }
+
+        (0..self.cols)
+            .map(|col| self.terminal.hyperlink_at(col + 1, row + 1))
+            .collect()
     }
 
     pub fn viewport_as_lines(&self) -> Result<Vec<Line<'static>>> {
@@ -1194,4 +1242,35 @@ fn sanitize_factory_session_for_toml_arg(session: &str) -> String {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod hyperlink_gate_tests {
+    use super::Pane;
+
+    #[test]
+    fn link_free_panes_skip_row_hyperlink_scan() {
+        let mut pane = Pane::director("plain", 2, 10).unwrap();
+        pane.feed(b"plain text").unwrap();
+
+        assert!(!pane.has_hyperlinks());
+        assert!(pane.row_hyperlinks(0).is_empty());
+    }
+
+    #[test]
+    fn split_osc8_introducer_enables_row_hyperlink_scan() {
+        let mut pane = Pane::director("linked", 1, 20).unwrap();
+        pane.feed(b"\x1b]").unwrap();
+        assert!(!pane.has_hyperlinks());
+
+        pane.feed(b"8;;https://split.example\x1b\\x\x1b]8;;\x1b\\")
+            .unwrap();
+
+        assert!(pane.has_hyperlinks());
+        let row_links = pane.row_hyperlinks(0);
+        assert_eq!(
+            row_links.first().and_then(Option::as_deref),
+            Some("https://split.example")
+        );
+    }
 }

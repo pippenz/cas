@@ -13,6 +13,7 @@ use crate::ui::factory::app::{
     preferred_epic_focus_from_session_metadata, queue_codex_worker_intro_prompt,
     queue_supervisor_intro_prompt, resolve_epic_state_for_focus,
 };
+use crate::ui::factory::buffer_backend::new_hyperlink_map;
 use crate::ui::factory::director::DirectorStores;
 use crate::ui::factory::director::{
     DirectorData, DirectorEventDetector, PanelAreas, SidecarFocus, ViewMode,
@@ -225,10 +226,12 @@ impl FactoryApp {
             last_db_fingerprint: None,
             last_git_refresh: Instant::now(),
             git_refresh_interval: Duration::from_secs(10),
+            branch_visibility: Default::default(),
             theme,
             worker_names,
             supervisor_name,
             factory_session: None,
+            session_created_at: None,
             supervisor_cli: config.supervisor_cli,
             worker_cli: config.worker_cli,
             error_message: None,
@@ -299,6 +302,8 @@ impl FactoryApp {
             mc_tasks_area: Rect::default(),
             mc_changes_area: Rect::default(),
             mc_activity_area: Rect::default(),
+            full_pane_hyperlinks: new_hyperlink_map(),
+            compact_pane_hyperlinks: new_hyperlink_map(),
         };
 
         queue_supervisor_intro_prompt(
@@ -389,10 +394,12 @@ impl FactoryApp {
             last_db_fingerprint: None,
             last_git_refresh: Instant::now(),
             git_refresh_interval: Duration::from_secs(10),
+            branch_visibility: Default::default(),
             theme,
             worker_names: worker_names.clone(),
             supervisor_name: supervisor_name.clone(),
             factory_session: None,
+            session_created_at: None,
             supervisor_cli,
             worker_cli,
             error_message: None,
@@ -463,6 +470,8 @@ impl FactoryApp {
             mc_tasks_area: Rect::default(),
             mc_changes_area: Rect::default(),
             mc_activity_area: Rect::default(),
+            full_pane_hyperlinks: new_hyperlink_map(),
+            compact_pane_hyperlinks: new_hyperlink_map(),
         };
 
         queue_supervisor_intro_prompt(
@@ -597,10 +606,12 @@ impl FactoryApp {
             last_db_fingerprint: None,
             last_git_refresh: std::time::Instant::now(),
             git_refresh_interval: std::time::Duration::from_secs(10),
+            branch_visibility: Default::default(),
             theme: ActiveTheme::default(),
             worker_names,
             supervisor_name: supervisor,
             factory_session: None,
+            session_created_at: None,
             supervisor_cli: SupervisorCli::Claude,
             worker_cli: SupervisorCli::Claude,
             error_message: None,
@@ -667,6 +678,8 @@ impl FactoryApp {
             mc_tasks_area: Rect::default(),
             mc_changes_area: Rect::default(),
             mc_activity_area: Rect::default(),
+            full_pane_hyperlinks: new_hyperlink_map(),
+            compact_pane_hyperlinks: new_hyperlink_map(),
         }
     }
 }

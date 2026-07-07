@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
 use cas_mux::{Mux, PaneKind};
+use chrono::{DateTime, Utc};
 use ratatui::layout::Rect;
 
 use super::director::{
@@ -15,6 +16,7 @@ use super::director::{
 };
 use crate::store::open_prompt_queue_store;
 use crate::types::Worktree;
+use crate::ui::factory::buffer_backend::HyperlinkMap;
 use crate::ui::factory::input::{InputMode, LayoutSizes};
 use crate::ui::factory::layout::{FactoryLayout, PaneGrid};
 use crate::ui::factory::notification::Notifier;
@@ -24,11 +26,18 @@ use crate::ui::theme::ActiveTheme;
 use crate::ui::widgets::TreeItemType;
 use crate::worktree::WorktreeManager;
 
+mod branch_visibility;
 mod imports;
 mod init;
 mod panels_and_modes;
 mod render_and_ops;
 mod sidecar_and_selection;
+
+pub(crate) use branch_visibility::BranchAheadBehind;
+pub(crate) use branch_visibility::truncate_branch_middle;
+use branch_visibility::{
+    BranchVisibilityCache, branch_for_worker_title, format_pane_title_with_branch,
+};
 
 // Re-export from cas-factory for backward compatibility
 pub use cas_factory::{AutoPromptConfig, EpicState, FactoryConfig};
@@ -333,6 +342,8 @@ pub struct FactoryApp {
     last_git_refresh: Instant,
     /// Interval for expensive git refresh operations
     git_refresh_interval: Duration,
+    /// Cached branch labels and epic ahead/behind status for render paths.
+    branch_visibility: BranchVisibilityCache,
     /// Theme for rendering
     theme: ActiveTheme,
     /// Worker names (for reference)
@@ -341,6 +352,8 @@ pub struct FactoryApp {
     supervisor_name: String,
     /// Factory session name (for prompt queue isolation)
     factory_session: Option<String>,
+    /// Factory session creation timestamp for elapsed-time display.
+    session_created_at: Option<DateTime<Utc>>,
     /// Supervisor CLI mode (claude/codex)
     supervisor_cli: cas_mux::SupervisorCli,
     /// Worker CLI mode (claude/codex)
@@ -469,6 +482,10 @@ pub struct FactoryApp {
     mc_tasks_area: Rect,
     mc_changes_area: Rect,
     mc_activity_area: Rect,
+    /// Per-frame OSC 8 hyperlink metadata for the full terminal pipeline.
+    full_pane_hyperlinks: HyperlinkMap,
+    /// Per-frame OSC 8 hyperlink metadata for the compact terminal pipeline.
+    compact_pane_hyperlinks: HyperlinkMap,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -654,10 +671,12 @@ impl FactoryApp {
             )?;
             self.last_git_refresh = Instant::now();
         } else {
+            self.refresh_branch_visibility_cache();
             self.last_refresh = Instant::now();
             return Ok((Vec::new(), Vec::new()));
         }
 
+        self.refresh_branch_visibility_cache();
         self.last_db_fingerprint = Some(next_fingerprint);
         self.last_refresh = Instant::now();
 
@@ -731,7 +750,9 @@ impl FactoryApp {
     fn can_adopt_detected_epic_started(&self, epic_id: &str, source: EpicFocusSource) -> bool {
         match source {
             EpicFocusSource::Pinned | EpicFocusSource::SessionDefault => true,
-            EpicFocusSource::Inference => inferred_epic_is_displayable(&self.director_data, epic_id),
+            EpicFocusSource::Inference => {
+                inferred_epic_is_displayable(&self.director_data, epic_id)
+            }
         }
     }
 
@@ -806,6 +827,98 @@ impl FactoryApp {
             self.focused_kind(),
             Some(PaneKind::Supervisor | PaneKind::Worker | PaneKind::Shell)
         )
+    }
+
+    pub(crate) fn focused_pane_branch(&self) -> Option<String> {
+        let pane = self.mux.focused()?;
+        match pane.kind() {
+            PaneKind::Supervisor => self.branch_visibility.branch_for_path(&self.project_dir),
+            PaneKind::Worker => {
+                let path = self
+                    .worktree_manager
+                    .as_ref()
+                    .map(|manager| manager.worktree_path_for_worker(pane.id()));
+                let path = path.as_deref().unwrap_or(&self.project_dir);
+                self.branch_visibility.branch_for_path(path)
+            }
+            PaneKind::Director | PaneKind::Shell => None,
+        }
+    }
+
+    pub(crate) fn focused_epic_branch_status(&self) -> Option<BranchAheadBehind> {
+        let epic_id = self.current_epic_id.as_deref()?;
+        self.branch_visibility.epic_ahead_behind(epic_id)
+    }
+
+    fn refresh_branch_visibility_cache(&mut self) {
+        let worker_paths: Vec<(String, PathBuf)> = self
+            .worktree_manager
+            .as_ref()
+            .map(|manager| manager.worker_cwds().into_iter().collect())
+            .unwrap_or_default();
+        let epic_branches = self.branch_visible_epics_for_ahead_behind();
+
+        self.branch_visibility.refresh(
+            &self.project_dir,
+            &worker_paths,
+            &epic_branches,
+            Instant::now(),
+        );
+        self.sync_worker_pane_branch_titles();
+    }
+
+    fn branch_visible_epics_for_ahead_behind(&self) -> Vec<(String, String)> {
+        let mut visible_epic_ids: HashSet<String> = self
+            .current_epic_id
+            .iter()
+            .cloned()
+            .chain(
+                self.director_data
+                    .ready_tasks
+                    .iter()
+                    .chain(self.director_data.in_progress_tasks.iter())
+                    .filter_map(|task| task.epic.clone()),
+            )
+            .collect();
+
+        self.director_data
+            .epic_tasks
+            .iter()
+            .filter(|epic| visible_epic_ids.remove(&epic.id))
+            .filter_map(|epic| {
+                epic.branch
+                    .as_ref()
+                    .map(|branch| (epic.id.clone(), branch.clone()))
+            })
+            .collect()
+    }
+
+    pub(crate) fn sync_worker_pane_branch_titles(&mut self) {
+        let worker_branches: HashMap<String, Option<String>> = self
+            .worker_names
+            .iter()
+            .map(|worker| {
+                let worktree_path = self
+                    .worktree_manager
+                    .as_ref()
+                    .map(|manager| manager.worktree_path_for_worker(worker));
+                let branch = branch_for_worker_title(
+                    &self.branch_visibility,
+                    worktree_path.as_deref(),
+                    &self.project_dir,
+                );
+                (worker.clone(), branch)
+            })
+            .collect();
+
+        for pane in self.mux.panes_mut() {
+            if *pane.kind() == PaneKind::Worker {
+                let branch = worker_branches
+                    .get(pane.id())
+                    .and_then(|branch| branch.as_deref());
+                pane.set_title(format_pane_title_with_branch(pane.id(), branch));
+            }
+        }
     }
 
     /// Get all worker names for layout (real + pending booting workers)
@@ -923,6 +1036,14 @@ impl FactoryApp {
 
     /// Set factory session name
     pub fn set_factory_session(&mut self, name: String) {
+        self.session_created_at = std::fs::read_to_string(metadata_path(&name))
+            .ok()
+            .and_then(|json| serde_json::from_str::<SessionMetadata>(&json).ok())
+            .and_then(|metadata| {
+                DateTime::parse_from_rfc3339(&metadata.created_at)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&Utc))
+            });
         self.factory_session = Some(name);
     }
 
@@ -1019,7 +1140,9 @@ impl FactoryApp {
         // Include pending workers in layout so boot panes get space
         let all_names = self.layout_worker_names();
 
-        // Calculate actual layout areas and resize panes to match
+        // Calculate actual layout areas and resize panes to match.
+        // Must reserve the same identity-header rows as the render path,
+        // otherwise PTYs are sized taller than the visible pane area.
         let area = Rect::new(0, 0, cols, rows);
         let layout = FactoryLayout::calculate_from_names_with_header_rows(
             area,
@@ -1027,7 +1150,7 @@ impl FactoryApp {
             self.tabbed_workers,
             self.sidecar_collapsed,
             self.layout_sizes,
-            0,
+            Self::identity_header_rows(area),
         );
 
         // Resize only REAL worker panes (pending workers have no PTY)

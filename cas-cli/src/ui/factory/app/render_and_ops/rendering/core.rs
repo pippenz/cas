@@ -1,6 +1,64 @@
 use crate::ui::factory::app::imports::*;
+use crate::ui::factory::buffer_backend::HyperlinkMap;
+use std::sync::Arc;
+
+const IDENTITY_HEADER_MIN_HEIGHT: u16 = 20;
 
 impl FactoryApp {
+    pub(crate) fn full_pane_hyperlink_map(&self) -> HyperlinkMap {
+        self.full_pane_hyperlinks.clone()
+    }
+
+    pub(crate) fn compact_pane_hyperlink_map(&self) -> HyperlinkMap {
+        self.compact_pane_hyperlinks.clone()
+    }
+
+    fn clear_pane_hyperlinks(hyperlink_map: &HyperlinkMap) {
+        if let Ok(mut hyperlinks) = hyperlink_map.lock() {
+            hyperlinks.clear();
+        }
+    }
+
+    fn prune_pane_hyperlinks(hyperlink_map: &HyperlinkMap, area: Rect) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+
+        if let Ok(mut hyperlinks) = hyperlink_map.lock() {
+            let x_end = area.x.saturating_add(area.width);
+            let y_end = area.y.saturating_add(area.height);
+            hyperlinks.retain(|(x, y), _| *x < area.x || *x >= x_end || *y < area.y || *y >= y_end);
+        }
+    }
+
+    pub(crate) fn prune_full_pane_hyperlinks(&self, area: Rect) {
+        Self::prune_pane_hyperlinks(&self.full_pane_hyperlinks, area);
+    }
+
+    fn record_pane_hyperlinks(
+        &self,
+        hyperlink_map: &HyperlinkMap,
+        pane: &cas_mux::Pane,
+        area: Rect,
+    ) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+
+        let Ok(mut hyperlinks) = hyperlink_map.lock() else {
+            return;
+        };
+
+        for row in 0..area.height {
+            let row_links = pane.row_hyperlinks(row);
+            for col in 0..area.width.min(row_links.len() as u16) {
+                if let Some(uri) = row_links[col as usize].as_ref() {
+                    hyperlinks.insert((area.x + col, area.y + row), Arc::from(uri.as_str()));
+                }
+            }
+        }
+    }
+
     fn sync_selected_worker_tab_with_focus(&mut self) {
         let Some(focused) = self.mux.focused() else {
             return;
@@ -18,6 +76,7 @@ impl FactoryApp {
     }
 
     pub fn render(&mut self, frame: &mut Frame) {
+        Self::clear_pane_hyperlinks(&self.full_pane_hyperlinks);
         use crate::ui::factory::renderer::FactoryViewMode;
         match self.factory_view_mode {
             FactoryViewMode::Panes => self.render_panes_view(frame),
@@ -32,13 +91,14 @@ impl FactoryApp {
 
         // Calculate layout using all worker names (real + pending)
         let all_names = self.layout_worker_names();
+        let header_rows = Self::identity_header_rows(area);
         let layout = FactoryLayout::calculate_from_names_with_header_rows(
             area,
             &all_names,
             self.tabbed_workers,
             self.sidecar_collapsed,
             self.layout_sizes,
-            0,
+            header_rows,
         );
 
         // Store layout areas for click detection
@@ -55,6 +115,8 @@ impl FactoryApp {
                 PaneGrid::new(&self.worker_names, &self.supervisor_name, layout.is_tabbed);
         }
 
+        self.render_identity_header(frame, layout.header_bar);
+
         // Render worker panes (stacked vertically)
         self.render_workers(frame, &layout);
 
@@ -69,6 +131,69 @@ impl FactoryApp {
         self.render_error_banner(frame, layout.status_bar);
 
         self.render_overlays(frame);
+    }
+
+    pub(crate) fn identity_header_rows(area: Rect) -> u16 {
+        u16::from(area.height >= IDENTITY_HEADER_MIN_HEIGHT)
+    }
+
+    fn render_identity_header(&self, frame: &mut Frame, area: Rect) {
+        if area.height == 0 || area.width == 0 {
+            return;
+        }
+
+        use ratatui::style::Modifier;
+        use ratatui::text::{Line, Span};
+        use ratatui::widgets::Paragraph;
+
+        let styles = &self.theme.styles;
+        let session_name = self.factory_session.as_deref().unwrap_or("factory");
+        let worker_count = self.layout_worker_names().len();
+        let worker_label = if worker_count == 1 {
+            "1 worker".to_string()
+        } else {
+            format!("{worker_count} workers")
+        };
+
+        let mut spans = vec![Span::styled(
+            session_name.to_string(),
+            styles.text_primary.add_modifier(Modifier::BOLD),
+        )];
+
+        if let Some(epic_id) = self.current_epic_id.as_deref() {
+            if let Some(epic) = self
+                .director_data
+                .epic_tasks
+                .iter()
+                .find(|task| task.id == epic_id)
+            {
+                spans.push(Span::styled(" · ", styles.text_muted));
+                spans.push(Span::styled(
+                    format!("EPIC {} {}", epic.id, truncate_chars(&epic.title, 28)),
+                    styles.text_info,
+                ));
+            }
+
+            if let Some(branch) = self.focused_epic_branch_status() {
+                spans.push(Span::styled(" · ", styles.text_muted));
+                spans.push(Span::styled(
+                    crate::ui::factory::app::truncate_branch_middle(&branch.branch, 36),
+                    styles.text_muted,
+                ));
+            }
+
+        }
+
+        // Session elapsed time is identity info, independent of epic focus.
+        if let Some(created_at) = self.session_created_at {
+            spans.push(Span::styled(" · ", styles.text_muted));
+            spans.push(Span::styled(format_elapsed(created_at), styles.text_muted));
+        }
+
+        spans.push(Span::styled(" · ", styles.text_muted));
+        spans.push(Span::styled(worker_label, styles.text_muted));
+
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
     /// Render the Mission Control dashboard view.
@@ -211,6 +336,7 @@ impl FactoryApp {
         use ratatui::widgets::Paragraph;
 
         let area = frame.area();
+        Self::clear_pane_hyperlinks(&self.compact_pane_hyperlinks);
 
         // Split: 1-row status bar + rest for supervisor
         let chunks = Layout::default()
@@ -318,6 +444,7 @@ impl FactoryApp {
 
             let content = Paragraph::new(lines);
             frame.render_widget(content, supervisor_area);
+            self.record_pane_hyperlinks(&self.compact_pane_hyperlinks, pane, supervisor_area);
         }
     }
 
@@ -400,6 +527,7 @@ impl FactoryApp {
 
             let content = Paragraph::new(lines).block(block);
             frame.render_widget(content, area);
+            self.record_pane_hyperlinks(&self.full_pane_hyperlinks, pane, inner);
 
             // Show new-lines indicator when user has scrolled up
             let new_below = pane.new_lines_below();
@@ -798,6 +926,7 @@ impl FactoryApp {
 
             let content = Paragraph::new(lines).block(block);
             frame.render_widget(content, layout.supervisor_area);
+            self.record_pane_hyperlinks(&self.full_pane_hyperlinks, pane, inner);
 
             // Show new-lines indicator when user has scrolled up
             let new_below = pane.new_lines_below();
@@ -825,6 +954,9 @@ impl FactoryApp {
     fn render_sidecar(&mut self, frame: &mut Frame, layout: &FactoryLayout) {
         match &self.view_mode {
             ViewMode::Overview => {
+                let focused_epic_branch_status = self
+                    .focused_epic_branch_status()
+                    .map(|status| (status.branch.clone(), status.ahead, status.behind));
                 let mut state = SidecarState {
                     focus: self.sidecar_focus,
                     tasks_state: &mut self.panels.tasks.list_state,
@@ -834,6 +966,13 @@ impl FactoryApp {
                     activity_state: &mut self.panels.activity.list_state,
                     agent_filter: self.agent_filter.as_deref(),
                     focused_epic_id: self.current_epic_id.as_deref(),
+                    focused_epic_branch_status: focused_epic_branch_status.as_ref().map(|status| {
+                        crate::ui::factory::director::EpicBranchStatus {
+                            branch: status.0.as_str(),
+                            ahead: status.1,
+                            behind: status.2,
+                        }
+                    }),
                     factory_collapsed: self.panels.factory.collapsed,
                     tasks_collapsed: self.panels.tasks.collapsed,
                     reminders_collapsed: self.panels.reminders.collapsed,
@@ -867,5 +1006,272 @@ impl FactoryApp {
                 self.render_file_diff(frame, layout.sidecar_area, &file_path);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod hyperlink_tests {
+    use super::FactoryApp;
+    use crate::ui::factory::buffer_backend::BufferBackend;
+    use cas_mux::Pane;
+    use ratatui::backend::Backend;
+    use ratatui::buffer::Cell;
+    use ratatui::layout::Rect;
+    use std::sync::Arc;
+
+    #[test]
+    fn pane_hyperlinks_are_recorded_at_final_screen_offsets_for_two_panes() {
+        let app = FactoryApp::for_test();
+        let mut left = Pane::director("left", 1, 20).unwrap();
+        let mut right = Pane::director("right", 1, 20).unwrap();
+        left.feed(b"\x1b]8;;https://left.example\x1b\\left\x1b]8;;\x1b\\")
+            .unwrap();
+        right
+            .feed(b"\x1b]8;;https://right.example\x1b\\right\x1b]8;;\x1b\\")
+            .unwrap();
+
+        let map = app.full_pane_hyperlink_map();
+        FactoryApp::clear_pane_hyperlinks(&map);
+        app.record_pane_hyperlinks(
+            &map,
+            &left,
+            Rect {
+                x: 2,
+                y: 3,
+                width: 20,
+                height: 1,
+            },
+        );
+        app.record_pane_hyperlinks(
+            &map,
+            &right,
+            Rect {
+                x: 30,
+                y: 3,
+                width: 20,
+                height: 1,
+            },
+        );
+
+        let hyperlinks = map.lock().unwrap();
+        assert_eq!(
+            hyperlinks.get(&(2, 3)).map(AsRef::as_ref),
+            Some("https://left.example")
+        );
+        assert_eq!(
+            hyperlinks.get(&(30, 3)).map(AsRef::as_ref),
+            Some("https://right.example")
+        );
+        assert_eq!(hyperlinks.get(&(0, 0)), None);
+    }
+
+    #[test]
+    fn pane_hyperlinks_record_row_offsets_and_clip_to_area_width() {
+        let app = FactoryApp::for_test();
+        let mut pane = Pane::director("pane", 3, 20).unwrap();
+        pane.feed(b"plain\r\n\x1b]8;;https://row.example\x1b\\linked\x1b]8;;\x1b\\")
+            .unwrap();
+
+        let map = app.full_pane_hyperlink_map();
+        FactoryApp::clear_pane_hyperlinks(&map);
+        app.record_pane_hyperlinks(
+            &map,
+            &pane,
+            Rect {
+                x: 5,
+                y: 7,
+                width: 3,
+                height: 3,
+            },
+        );
+
+        let hyperlinks = map.lock().unwrap();
+        assert_eq!(
+            hyperlinks.get(&(5, 8)).map(AsRef::as_ref),
+            Some("https://row.example")
+        );
+        assert_eq!(
+            hyperlinks.get(&(7, 8)).map(AsRef::as_ref),
+            Some("https://row.example")
+        );
+        assert_eq!(hyperlinks.get(&(8, 8)), None);
+        assert_eq!(hyperlinks.get(&(5, 7)), None);
+    }
+
+    #[test]
+    fn overlay_pruning_removes_links_from_covered_cells_before_backend_emit() {
+        let app = FactoryApp::for_test();
+        let map = app.full_pane_hyperlink_map();
+        {
+            let mut hyperlinks = map.lock().unwrap();
+            hyperlinks.insert((3, 2), Arc::from("https://covered.example"));
+            hyperlinks.insert((8, 2), Arc::from("https://visible.example"));
+        }
+
+        app.prune_full_pane_hyperlinks(Rect {
+            x: 2,
+            y: 1,
+            width: 4,
+            height: 3,
+        });
+
+        let cells = [Cell::new("x"), Cell::new("y")];
+        let mut backend = BufferBackend::with_hyperlinks(12, 4, map);
+        backend
+            .draw(vec![(3, 2, &cells[0]), (8, 2, &cells[1])].into_iter())
+            .unwrap();
+
+        let output = String::from_utf8(backend.take_buffer()).unwrap();
+        assert!(!output.contains("https://covered.example"));
+        assert!(output.contains("https://visible.example"));
+    }
+
+    #[test]
+    fn full_and_compact_hyperlink_maps_are_independent() {
+        let app = FactoryApp::for_test();
+        let full = app.full_pane_hyperlink_map();
+        let compact = app.compact_pane_hyperlink_map();
+
+        full.lock()
+            .unwrap()
+            .insert((0, 0), Arc::from("https://full.example"));
+        compact
+            .lock()
+            .unwrap()
+            .insert((0, 0), Arc::from("https://compact.example"));
+
+        FactoryApp::clear_pane_hyperlinks(&full);
+
+        assert!(full.lock().unwrap().is_empty());
+        assert_eq!(
+            compact.lock().unwrap().get(&(0, 0)).map(AsRef::as_ref),
+            Some("https://compact.example")
+        );
+    }
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    if max_chars <= 1 {
+        return "…".to_string();
+    }
+    value
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .chain("…".chars())
+        .collect()
+}
+
+fn format_elapsed(created_at: chrono::DateTime<chrono::Utc>) -> String {
+    let elapsed_minutes = chrono::Utc::now()
+        .signed_duration_since(created_at)
+        .num_minutes()
+        .max(0);
+    let hours = elapsed_minutes / 60;
+    let minutes = elapsed_minutes % 60;
+    format!("{hours:02}:{minutes:02}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cas_factory::TaskSummary;
+    use cas_types::{Priority, TaskStatus, TaskType};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn epic_task(id: &str, title: &str, branch: &str) -> TaskSummary {
+        TaskSummary {
+            id: id.to_string(),
+            title: title.to_string(),
+            status: TaskStatus::InProgress,
+            priority: Priority::MEDIUM,
+            assignee: None,
+            task_type: TaskType::Epic,
+            epic: None,
+            branch: Some(branch.to_string()),
+            updated_at: None,
+        }
+    }
+
+    fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    #[test]
+    fn identity_header_renders_session_epic_branch_elapsed_and_worker_count() {
+        let mut app = FactoryApp::for_test();
+        app.factory_session = Some("session-alpha".to_string());
+        app.session_created_at = Some(chrono::Utc::now() - chrono::TimeDelta::minutes(125));
+        app.current_epic_id = Some("cas-epic".to_string());
+        app.worker_names = vec!["worker-one".to_string(), "worker-two".to_string()];
+        app.director_data.epic_tasks = vec![epic_task(
+            "cas-epic",
+            "Visual Information Overhaul",
+            "epic/factory-tui-overhaul",
+        )];
+        app.branch_visibility.insert_epic_ahead_behind(
+            "cas-epic",
+            "epic/factory-tui-overhaul",
+            2,
+            0,
+        );
+
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+
+        let text = buffer_text(&terminal);
+        assert!(text.contains("session-alpha"));
+        assert!(text.contains("EPIC cas-epic Visual Information Overhaul"));
+        assert!(text.contains("epic/factory-tui-overhaul"));
+        assert!(text.contains("02:05"));
+        assert!(text.contains("2 workers"));
+    }
+
+    #[test]
+    fn identity_header_hides_below_height_threshold() {
+        let mut app = FactoryApp::for_test();
+        app.factory_session = Some("session-alpha".to_string());
+        app.worker_names = vec!["worker-one".to_string()];
+
+        let backend = TestBackend::new(100, 19);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+
+        let text = buffer_text(&terminal);
+        assert!(!text.contains("session-alpha"));
+    }
+
+    #[test]
+    fn identity_header_degrades_without_focused_epic() {
+        let mut app = FactoryApp::for_test();
+        app.factory_session = Some("session-beta".to_string());
+        app.worker_names = vec!["worker-one".to_string(), "worker-two".to_string()];
+        // Elapsed clock is session identity — it must render with NO epic focused
+        // (regression: it was nested inside the epic-focus block).
+        app.session_created_at = Some(chrono::Utc::now() - chrono::Duration::minutes(90));
+
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+
+        let text = buffer_text(&terminal);
+        assert!(text.contains("session-beta"));
+        assert!(text.contains("2 workers"));
+        assert!(!text.contains("EPIC "));
+        assert!(
+            text.contains("01:30"),
+            "elapsed session time must render without a focused epic"
+        );
     }
 }

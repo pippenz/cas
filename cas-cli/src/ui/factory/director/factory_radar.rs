@@ -9,6 +9,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 
+use crate::ui::factory::director::EpicBranchStatus;
 use crate::ui::factory::director::agent_helpers;
 use crate::ui::factory::director::data::DirectorData;
 use crate::ui::theme::{ActiveTheme, Icons};
@@ -22,6 +23,7 @@ pub fn render_with_focus(
     data: &DirectorData,
     theme: &ActiveTheme,
     focused_epic_id: Option<&str>,
+    focused_epic_branch_status: Option<EpicBranchStatus<'_>>,
     focused: bool,
     selected_agent: Option<usize>,
     supervisor_name: &str,
@@ -76,7 +78,11 @@ pub fn render_with_focus(
     }
 
     // Layout: epic progress/placeholder, worker list, summary
-    let epic_height = 2;
+    let epic_height = if focused_epic_branch_status.is_some() {
+        3
+    } else {
+        2
+    };
     let summary_height = 1;
     let worker_height = inner
         .height
@@ -97,7 +103,14 @@ pub fn render_with_focus(
     let mut chunk_idx = 0;
 
     // Epic progress or explicit unfocused placeholder
-    render_epic_progress(frame, chunks[chunk_idx], data, theme, focused_epic_id);
+    render_epic_progress(
+        frame,
+        chunks[chunk_idx],
+        data,
+        theme,
+        focused_epic_id,
+        focused_epic_branch_status,
+    );
     chunk_idx += 1;
 
     // Separator
@@ -130,6 +143,7 @@ fn render_epic_progress(
     data: &DirectorData,
     theme: &ActiveTheme,
     focused_epic_id: Option<&str>,
+    focused_epic_branch_status: Option<EpicBranchStatus<'_>>,
 ) {
     if area.height == 0 || area.width < 10 {
         return;
@@ -184,7 +198,14 @@ fn render_epic_progress(
         ),
     ]);
 
-    // Line 2: Task counts with visual indicator
+    let branch_line = focused_epic_branch_status.map(|status| {
+        Line::from(Span::styled(
+            format_branch_status(status, area.width),
+            styles.text_muted,
+        ))
+    });
+
+    // Task counts with visual indicator
     // Show: "▓▓▓░░░░░  3 active, 5 queued"
     let bar_width = (area.width as usize).saturating_sub(22).max(4); // Space for counts
     let active_width = if total_visible > 0 {
@@ -202,18 +223,34 @@ fn render_epic_progress(
 
     let counts = format!(" {in_progress_count} active, {queued_count} queued");
 
-    let line2 = Line::from(vec![
+    let progress_line = Line::from(vec![
         Span::styled(bar, Style::default().fg(palette.agent_active)),
         Span::styled(counts, styles.text_muted),
     ]);
 
-    let lines = if area.height >= 2 {
-        vec![line1, line2]
+    let lines = if area.height >= 3 {
+        if let Some(branch_line) = branch_line {
+            vec![line1, branch_line, progress_line]
+        } else {
+            vec![line1, progress_line]
+        }
+    } else if area.height >= 2 {
+        vec![line1, progress_line]
     } else {
         vec![line1]
     };
 
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn format_branch_status(status: EpicBranchStatus<'_>, width: u16) -> String {
+    let suffix = format!(" ↑{} ↓{}", status.ahead, status.behind);
+    let prefix = "BRANCH: ";
+    let branch_budget = (width as usize)
+        .saturating_sub(prefix.len() + suffix.chars().count())
+        .max(4);
+    let branch = truncate_to_width(status.branch, branch_budget as u16, 0);
+    format!("{prefix}{branch}{suffix}")
 }
 
 fn render_unfocused_epic_placeholder(frame: &mut Frame, area: Rect, theme: &ActiveTheme) {
@@ -272,12 +309,9 @@ fn render_worker_list(
         };
 
         // Build task info
-        let task_info = if let Some(task_id) = &agent.current_task {
-            if let Some(t) = agent_helpers::find_agent_task(agent, data) {
-                format!("{}: {}", task_id, t.title)
-            } else {
-                task_id.clone()
-            }
+        let current_task = agent_helpers::find_agent_in_progress_task(agent, data);
+        let task_info = if let Some(task) = current_task {
+            format!("▸ {} {}", task.id, task.title)
         } else if let Some((activity, _)) = &agent.latest_activity {
             activity.clone()
         } else {
@@ -297,7 +331,7 @@ fn render_worker_list(
             Span::styled(": ", styles.text_muted),
             Span::styled(
                 task_display,
-                if agent.current_task.is_some() {
+                if current_task.is_some() {
                     styles.text_primary
                 } else {
                     styles.text_muted
@@ -447,8 +481,8 @@ fn render_summary_bar(
 mod tests {
     use std::collections::HashMap;
 
-    use cas_factory::{DirectorData, TaskSummary};
-    use cas_types::{Priority, TaskStatus, TaskType};
+    use cas_factory::{AgentSummary, DirectorData, TaskSummary};
+    use cas_types::{AgentStatus, Priority, TaskStatus, TaskType};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -503,6 +537,18 @@ mod tests {
         }
     }
 
+    fn agent(id: &str, name: &str) -> AgentSummary {
+        AgentSummary {
+            id: id.to_string(),
+            name: name.to_string(),
+            status: AgentStatus::Active,
+            current_task: None,
+            latest_activity: None,
+            last_heartbeat: Some(chrono::Utc::now()),
+            pending_messages: 0,
+        }
+    }
+
     fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
         terminal
             .backend()
@@ -529,6 +575,7 @@ mod tests {
                     &data,
                     &theme,
                     Some("cas-foreign"),
+                    None,
                     false,
                     None,
                     "supervisor",
@@ -559,6 +606,7 @@ mod tests {
                     &data,
                     &theme,
                     Some("cas-foreign"),
+                    None,
                     false,
                     None,
                     "supervisor",
@@ -588,6 +636,7 @@ mod tests {
                     &data,
                     &theme,
                     Some("cas-foreign"),
+                    None,
                     false,
                     None,
                     "supervisor",
@@ -599,5 +648,99 @@ mod tests {
         let text = buffer_text(&terminal);
         assert!(text.contains("EPIC: cas-foreign"));
         assert!(!text.contains("No focused epic"));
+    }
+
+    #[test]
+    fn factory_radar_renders_epic_branch_ahead_behind() {
+        let mut data = data_with_unrelated_epic();
+        data.ready_tasks[0].assignee = Some("session-agent".to_string());
+        let backend = TestBackend::new(110, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = ActiveTheme::default();
+
+        terminal
+            .draw(|frame| {
+                render_with_focus(
+                    frame,
+                    frame.area(),
+                    &data,
+                    &theme,
+                    Some("cas-foreign"),
+                    Some(crate::ui::factory::director::EpicBranchStatus {
+                        branch: "epic/epic-factory-tui-visual-information-overhaul-osc-8-cas-ebc1",
+                        ahead: 3,
+                        behind: 1,
+                    }),
+                    false,
+                    None,
+                    "supervisor",
+                    false,
+                );
+            })
+            .unwrap();
+
+        let text = buffer_text(&terminal);
+        assert!(text.contains("EPIC: cas-foreign"));
+        assert!(text.contains("BRANCH: epic/epic-factory-tui-visual-information-overhaul"));
+        assert!(text.contains("↑3 ↓1"));
+    }
+
+    #[test]
+    fn factory_radar_worker_rows_show_task_chips_for_id_and_display_name_assignees() {
+        let mut data = data_with_unrelated_epic();
+        data.agents = vec![
+            agent("agent-id-1", "worker-one"),
+            agent("agent-id-2", "worker-two"),
+            agent("agent-id-3", "worker-three"),
+        ];
+        data.in_progress_tasks = vec![
+            TaskSummary {
+                id: "cas-id1".to_string(),
+                title: "Assigned by agent id".to_string(),
+                status: TaskStatus::InProgress,
+                priority: Priority::MEDIUM,
+                assignee: Some("agent-id-1".to_string()),
+                task_type: TaskType::Task,
+                epic: Some("cas-foreign".to_string()),
+                branch: None,
+                updated_at: None,
+            },
+            TaskSummary {
+                id: "cas-name2".to_string(),
+                title: "Assigned by display name".to_string(),
+                status: TaskStatus::InProgress,
+                priority: Priority::MEDIUM,
+                assignee: Some("worker-two".to_string()),
+                task_type: TaskType::Task,
+                epic: Some("cas-foreign".to_string()),
+                branch: None,
+                updated_at: None,
+            },
+        ];
+        let backend = TestBackend::new(120, 14);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = ActiveTheme::default();
+
+        terminal
+            .draw(|frame| {
+                render_with_focus(
+                    frame,
+                    frame.area(),
+                    &data,
+                    &theme,
+                    Some("cas-foreign"),
+                    None,
+                    false,
+                    None,
+                    "supervisor",
+                    false,
+                );
+            })
+            .unwrap();
+
+        let text = buffer_text(&terminal);
+        assert!(text.contains("worker-one: ▸ cas-id1 Assigned by agent id"));
+        assert!(text.contains("worker-two: ▸ cas-name2 Assigned by display name"));
+        assert!(text.contains("worker-three: idle"));
     }
 }
