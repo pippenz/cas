@@ -13,13 +13,14 @@ You execute tasks assigned by the Supervisor. You may be working in an isolated 
 
 ## Workflow
 
-1. Check assignments: `mcp__cas__task action=mine`. **Empty?** Send ONE ready message to the supervisor, then wait for assignment — no polling, no re-pinging, no grabbing unassigned tasks.
-2. Start a task: `mcp__cas__task action=start id=<task-id>`
-3. Read task details and acceptance criteria: `mcp__cas__task action=show id=<task-id>`. Also read `CLAUDE.md` for project-specific build/test/convention guidance.
+0. **Tool loading is two steps, not one.** If `mcp__cs__task` isn't callable yet, run `ToolSearch(query="select:mcp__cs__task")` — this loads the schema, it does **not** execute the tool. The next action is a *separate* call literally named `mcp__cs__task` (with your `action=...` args) — not another ToolSearch. If ToolSearch already reported a match for `mcp__cs__task`, calling ToolSearch again for it will not help; call the tool.
+1. Check assignments: `mcp__cs__task action=mine`. **Empty?** Send ONE ready message to the supervisor, then wait for assignment — no polling, no re-pinging, no grabbing unassigned tasks.
+2. Start a task: `mcp__cs__task action=start id=<task-id>`
+3. Read task details and acceptance criteria: `mcp__cs__task action=show id=<task-id>`. Also read `CLAUDE.md` for project-specific build/test/convention guidance.
 4. Implement. Commit after each logical unit. Follow project commit style (`git log --oneline -10`). Include task ID in commit messages. **Shared-directory (non-isolated) mode:** commit on your `factory/<name>` branch — the commit guard rejects commits on the checked-out branch (`main`/`staging`).
-5. Report progress: `mcp__cas__task action=notes id=<task-id> notes="..." note_type=progress`
+5. Report progress: `mcp__cs__task action=notes id=<task-id> notes="..." note_type=progress`
 6. Run pre-close self-verification — see [references/close-gate.md](cas-worker/references/close-gate.md). Then invoke the [`verify-before-claim`](../verify-before-claim/SKILL.md) skill: name the proof command for your claim, run it fresh, and capture exit code + tail before calling `task action=close`.
-7. Close: `mcp__cas__task action=close id=<task-id> reason="..."`
+7. Close: `mcp__cs__task action=close id=<task-id> reason="..."`
    - **Success** → message the supervisor.
    - **queued for supervisor review** → task is in `pending_supervisor_review`. No action needed; wait for supervisor feedback.
    - **verification-required** → message supervisor immediately. Do NOT spawn verifier agents or retry close.
@@ -61,19 +62,19 @@ Your scope is locked at assignment. The supervisor will reject work that violate
 - **Stay in your layer.** Only modify files/modules declared in your assignment. Crossing the boundary is automatic rejection.
 - **Match existing patterns.** Follow established conventions. Don't introduce new patterns without asking.
 - **No config surprises.** Don't hardcode values that should be configurable. Don't add config that wasn't requested.
-- **Document important choices.** Use `mcp__cas__task action=notes note_type=decision` for non-obvious decisions.
+- **Document important choices.** Use `mcp__cs__task action=notes note_type=decision` for non-obvious decisions.
 
 ## Communication
 
 ```
-mcp__cas__coordination action=message target=supervisor \
+mcp__cs__coordination action=message target=supervisor \
   summary="<brief preview>" message="<full body>"
 ```
 
 - **`target` is the literal string `supervisor`.** Using the supervisor's display name (e.g. `target="sturdy-finch-2"`) is rejected, even though kickoff messages show you that name.
 - **Both `summary` and `message` are required** on every send — `message` alone is rejected with `summary required`.
 - **You may ONLY message the supervisor.** Peer worker messaging is rejected with `"Workers can only message their supervisor"`. If you need something from another worker, ask the supervisor to relay.
-- Do not use the built-in `SendMessage` tool — it's disabled in factory mode. This includes your first ready-ping at spawn: use `mcp__cas__coordination action=message` from the very first message.
+- Do not use the built-in `SendMessage` tool — it's disabled in factory mode. This includes your first ready-ping at spawn: use `mcp__cs__coordination action=message` from the very first message.
 - Use task notes for ongoing updates (`note_type=progress|blocker|decision|discovery`). The supervisor sees these in the TUI.
 - Message the supervisor when you complete a task or need help.
 
@@ -81,8 +82,8 @@ mcp__cas__coordination action=message target=supervisor \
 
 Report immediately — don't spend time stuck:
 ```
-mcp__cas__task action=notes id=<task-id> notes="Blocked: <reason>" note_type=blocker
-mcp__cas__task action=update id=<task-id> status=blocked
+mcp__cs__task action=notes id=<task-id> notes="Blocked: <reason>" note_type=blocker
+mcp__cs__task action=update id=<task-id> status=blocked
 ```
 
 Before setting `status=blocked`, re-read with `action=show`. If the task already shows `Status: Closed`, do not update — the supervisor closed it concurrently. A stale `status=blocked` update can overwrite a completed close.

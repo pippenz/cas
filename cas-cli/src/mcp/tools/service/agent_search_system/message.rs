@@ -251,6 +251,28 @@ impl CasService {
                 .unwrap_or_else(|| source.clone())
         };
 
+        // cas-6913: "Message queued" reads as delivery confirmation, but a
+        // message addressed to a not-yet-registered worker name (the common
+        // spawn-then-immediately-assign sequence) sits in the queue until
+        // that name shows up in the agent store — the supervisor has no
+        // signal this happened. Check registration state up front so the
+        // response can say so honestly. `all_workers` is a broadcast, not a
+        // single-target claim, so it's always reported as delivered framing.
+        let target_is_registered = resolved_target == "all_workers"
+            || resolved_target == "supervisor"
+            || {
+                use crate::store::open_agent_store;
+                open_agent_store(&self.inner.cas_root)
+                    .ok()
+                    .and_then(|store| store.list(None).ok())
+                    .map(|agents| {
+                        agents
+                            .iter()
+                            .any(|a| a.name.eq_ignore_ascii_case(&resolved_target))
+                    })
+                    .unwrap_or(false)
+            };
+
         let factory_session = std::env::var("CAS_FACTORY_SESSION").ok();
         let urgent = req.urgent.unwrap_or(false);
         // Urgent messages break the target's in-flight turn, so they must jump
@@ -332,6 +354,19 @@ impl CasService {
             }
         }
 
+        // cas-6913: honest delivery-status line. Urgent takes priority in the
+        // wording since it describes the delivery MECHANISM (interrupt) —
+        // but an urgent message to an unregistered target still can't
+        // interrupt a turn that doesn't exist yet, so the registration
+        // caveat wins even for urgent sends.
+        let delivery_status = if !target_is_registered {
+            "Delivery: queued — target not yet registered, will deliver on registration\n"
+        } else if urgent {
+            "Delivery: interrupt-and-redirect (breaks the target's in-flight turn, then injects)\n"
+        } else {
+            "Delivery: queued for next poll (target is registered)\n"
+        };
+
         Ok(Self::success(format!(
             "{} queued\n\nID: {}\nFrom: {} ({})\nTo: {}\n{}Message: {}",
             if urgent { "URGENT message" } else { "Message" },
@@ -339,11 +374,7 @@ impl CasService {
             display_name,
             role,
             resolved_target,
-            if urgent {
-                "Delivery: interrupt-and-redirect (breaks the target's in-flight turn, then injects)\n"
-            } else {
-                ""
-            },
+            delivery_status,
             truncate_str(&message, 100)
         )))
     }

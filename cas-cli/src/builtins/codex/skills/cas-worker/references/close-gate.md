@@ -22,7 +22,7 @@ Close runs a merge-state guard before anything else: every commit on your `facto
 
 **Never bypass the close path.** Setting `status=closed` via `action=update` and hand-writing a `mcp__cas__verification action=add` record forges the verification audit trail — the task looks verified when nobody verified it. If close keeps rejecting, that is a supervisor conversation, not a workaround opportunity.
 
-**Code review is not your job at close** under the v2.13.0+ default `[code_review] owner = "supervisor"`. The supervisor runs `/cas-code-review` at cherry-pick + EPIC merge time. Do not invoke the multi-persona review yourself unless your supervisor explicitly tells you to, or your project has opted in to legacy `owner = "worker"` in `.cas/config.toml` — the worker-inline path adds ~14 min and ~100K tokens per close, which is exactly what the v2.13.0 flip was designed to eliminate.
+**Code review is not your job at close** under the v2.13.0+ default `[code_review] owner = "supervisor"`. The supervisor runs a lightweight gate when merging each worker diff, then one full `/cas-code-review` pass when the epic is code-complete. Do not invoke the multi-persona review yourself unless your supervisor explicitly tells you to, or your project has opted in to legacy `owner = "worker"` in `.cas/config.toml` — the worker-inline path adds ~14 min and ~100K tokens per close, which is exactly what the v2.13.0 flip was designed to eliminate.
 
 ## Pre-Close Self-Verification
 

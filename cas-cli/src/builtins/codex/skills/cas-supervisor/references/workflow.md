@@ -43,29 +43,37 @@ In shared mode, file-overlap analysis is even more critical — two workers edit
 
 1. Spawn workers:
    ```
-   mcp__cas__coordination action=spawn_workers count=N isolate=true
+   mcp__cas__coordination action=spawn_workers count=N isolate=true cli=codex model=gpt-5.5 effort=medium
    ```
    Omit `isolate` for shared mode.
+
+   **Hard rule:** every `spawn_workers` call MUST include explicit `model=` and
+   `effort=`. Include `cli=` as well when spawning outside the stock Codex lane.
+   Omitted fields fall back through the factory config cascade and stock floor;
+   the spawn acknowledgement nags because supervisors should make worker tier
+   selection intentional and visible.
 
    **Heterogeneous team example** — Claude supervisor spawning Codex workers:
    ```
    # All Codex workers
-   mcp__cas__coordination action=spawn_workers count=2 cli=codex isolate=true
+   mcp__cas__coordination action=spawn_workers count=2 cli=codex model=gpt-5.5 effort=medium isolate=true
 
    # Named workers with explicit Codex backend
-   mcp__cas__coordination action=spawn_workers count=1 cli=codex worker_names="alice" isolate=true
+   mcp__cas__coordination action=spawn_workers count=1 cli=codex model=gpt-5.5 effort=low worker_names="alice" isolate=true
    ```
-   `cli`, `model`, and `effort` are per-spawn overrides; omit to use the session default.
+   `cli`, `model`, and `effort` are per-spawn controls for the workers spawned
+   by that call.
    Spawn the tier mix the ready backlog needs — one `spawn_workers` call per tier; rubric
    and routing in [model-selection.md](model-selection.md).
    Full parameter table in [reference.md](reference.md#spawn_workers-parameters).
 2. Verify workers appear in TUI before assigning (stale DB records are not real workers)
 3. Assign tasks: `mcp__cas__task action=update id=<id> assignee=<worker>`
-4. Search for relevant context and send assignment message:
+4. Pin epic focus so the TUI shows it immediately: `mcp__cas__coordination action=focus_epic id=<epic-id>`. Without this, the TASKS/FACTORY panels stay empty until a worker's first `task action=start` on a subtask lets the panel infer the epic — and inference only fires once that subtask's `assignee` matches a live session agent (workers now get this for free: `task action=start` sets `assignee` automatically when unset, cas-6945). Clear with `action=focus_epic clear=true` when the epic wraps.
+5. Search for relevant context and send assignment message:
    ```
    mcp__cas__coordination action=message target=<worker> message="Task <id>: <description>. Context: <findings>. Run mcp__cas__task action=mine to see your tasks."
    ```
-5. **End your turn immediately.** Stop here. Do not monitor, poll, or run any commands. Workers will push a message to you when done or blocked. Your next action is triggered by their message, not by checking.
+6. **End your turn immediately.** Stop here. Do not monitor, poll, or run any commands. Workers will push a message to you when done or blocked. Your next action is triggered by their message, not by checking.
 
 ### Resuming an Existing EPIC
 
@@ -95,13 +103,18 @@ base branch ────────────────────► (sta
 3. Cherry-pick to base branch: `git cherry-pick <commit-sha>` (one per commit)
    - **If conflicts arise:** (a) non-overlapping additions (e.g., both workers added to Cargo.toml) — keep both entries, (b) semantic conflicts — review both changes and pick the correct merge, (c) if unsure — message the worker who committed for context before resolving
 4. Verify build after cherry-pick: `~/.cargo/bin/cargo build --quiet`
-5. Run code review against the cherry-picked range:
-   ```bash
-   # Capture the pre-cherry-pick HEAD as the review base
-   pre_cp=$(git rev-parse HEAD@{1})
-   ```
-   Then invoke: `/cas-code-review mode=interactive base_sha=<pre_cp> task_id=<task-id>`
-   Address any P0 findings before notifying other workers to sync.
+5. Run the lightweight per-merge gate. Do **not** run the full multi-persona
+   `/cas-code-review` pipeline here by default; that review runs once in
+   Phase 4 after the epic is code-complete. For this merge:
+   - Read the direct diff against the task spec and acceptance criteria.
+   - Check ownership boundaries, obvious defects, missing files/tests, and
+     whether the worker proved the right command.
+   - Run targeted mechanical verification only when warranted by the diff.
+   - Record the audit trail:
+     `mcp__cas__verification action=add task_id=<task-id> status=approved summary="<per-merge gate: diff read + proof checked>"`.
+   - If the single diff is exceptionally risky, you may run
+     `/cas-code-review mode=interactive base_sha=<pre-cp-sha> task_id=<task-id>`
+     by explicit judgment; this is an exception, not the default cadence.
 6. Message other active workers to sync onto the **local** branch (not `origin/`):
    ```
    mcp__cas__coordination action=message target=<other-worker> message="Branch updated after cherry-pick. Sync: git stash && git rebase <base-branch> && git stash pop"
@@ -134,7 +147,11 @@ When workers share the main directory, there's no branch merging — workers com
 
 1. Verify all tasks closed: `mcp__cas__task action=list status=open epic=<epic-id>`
 2. Hold the main merge. The epic branch is not ready for base until the assembled diff has passed review and the final gate.
-3. Run integration review against the full EPIC diff — per-cherry-pick reviews catch per-task issues; this step catches cross-task integration issues (e.g., two tasks individually clean but semantically conflicting). From inside the epic branch checkout, invoke:
+3. Run the single required full multi-persona review against the assembled EPIC
+   diff. The Phase 3 per-merge gate catches obvious per-task problems; this
+   step is the full `/cas-code-review` pass that catches cross-task integration
+   issues (e.g., two tasks individually clean but semantically conflicting).
+   From inside the epic branch checkout, invoke:
    `/cas-code-review mode=interactive base_sha=<base-branch>`
    (substitute `main`, `develop`, or your actual base branch name for `<base-branch>`)
    For large diffs, write the literal diff to a file first:

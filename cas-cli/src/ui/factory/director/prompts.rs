@@ -4,7 +4,7 @@
 //! into the appropriate agent's terminal.
 
 use crate::config::AutoPromptConfig;
-use crate::ui::factory::director::data::DirectorData;
+use crate::ui::factory::director::data::{DirectorData, TaskSummary};
 use crate::ui::factory::director::events::DirectorEvent;
 use cas_mux::SupervisorCli;
 use cas_types::TaskStatus;
@@ -34,6 +34,117 @@ fn live_worker_session_id(data: &DirectorData, worker_name: &str) -> Option<Stri
                 .iter()
                 .find_map(|(id, name)| (name == worker_name).then(|| id.clone()))
         })
+}
+
+fn task_assigned_to_worker(data: &DirectorData, task: &TaskSummary, worker: &str) -> bool {
+    task.assignee.as_deref() == Some(worker)
+        || data
+            .agent_id_to_name
+            .iter()
+            .any(|(id, name)| name == worker && task.assignee.as_deref() == Some(id.as_str()))
+}
+
+fn worker_has_open_or_in_progress_assignment(data: &DirectorData, worker: &str) -> bool {
+    data.in_progress_tasks
+        .iter()
+        .chain(
+            data.ready_tasks
+                .iter()
+                .filter(|task| task.status == TaskStatus::Open),
+        )
+        .any(|task| task_assigned_to_worker(data, task, worker))
+}
+
+pub fn revalidate_event_for_delivery(
+    event: &DirectorEvent,
+    unfiltered_data: &DirectorData,
+    supervisor_name: &str,
+) -> Option<DirectorEvent> {
+    match event {
+        DirectorEvent::AgentRegistered {
+            agent_id,
+            agent_name,
+        } => {
+            if agent_name == supervisor_name
+                || live_worker_session_id(unfiltered_data, agent_name).is_none()
+                || worker_has_open_or_in_progress_assignment(unfiltered_data, agent_name)
+            {
+                None
+            } else {
+                Some(DirectorEvent::AgentRegistered {
+                    agent_id: agent_id.clone(),
+                    agent_name: agent_name.clone(),
+                })
+            }
+        }
+        DirectorEvent::WorkerIdle { worker, .. } => {
+            if worker == supervisor_name
+                || live_worker_session_id(unfiltered_data, worker).is_none()
+            {
+                return None;
+            }
+
+            let active_task = unfiltered_data
+                .agents
+                .iter()
+                .find(|agent| agent.name == *worker)
+                .and_then(|agent| agent.active_lease.clone());
+
+            if active_task.is_none()
+                && worker_has_open_or_in_progress_assignment(unfiltered_data, worker)
+            {
+                return None;
+            }
+
+            Some(DirectorEvent::WorkerIdle {
+                worker: worker.clone(),
+                active_task,
+            })
+        }
+        DirectorEvent::WorkerStalled {
+            worker,
+            task_id,
+            elapsed_secs,
+            escalate,
+        } => {
+            if worker == supervisor_name
+                || live_worker_session_id(unfiltered_data, worker).is_none()
+            {
+                return None;
+            }
+
+            let still_stalled_task = unfiltered_data.in_progress_tasks.iter().any(|task| {
+                task.id == *task_id && task_assigned_to_worker(unfiltered_data, task, worker)
+            });
+
+            still_stalled_task.then(|| DirectorEvent::WorkerStalled {
+                worker: worker.clone(),
+                task_id: task_id.clone(),
+                elapsed_secs: *elapsed_secs,
+                escalate: *escalate,
+            })
+        }
+        DirectorEvent::TaskBlocked {
+            task_id,
+            task_title,
+            worker,
+        } => unfiltered_data
+            .ready_tasks
+            .iter()
+            .find(|task| task.id == *task_id)
+            .filter(|task| task.status == TaskStatus::Blocked)
+            .filter(|task| task_assigned_to_worker(unfiltered_data, task, worker))
+            .map(|task| DirectorEvent::TaskBlocked {
+                task_id: task.id.clone(),
+                task_title: if task.title.is_empty() {
+                    task_title.clone()
+                } else {
+                    task.title.clone()
+                },
+                worker: worker.clone(),
+            }),
+        _ => Some(event.clone()),
+    }
 }
 
 /// A prompt to be injected into an agent's terminal
@@ -74,9 +185,19 @@ pub fn with_response_instructions(
 ///
 /// Returns `Some(Prompt)` if a prompt should be sent for this event,
 /// or `None` if no prompt is needed or if the event type is disabled in config.
+///
+/// `data` may be epic-scoped (filtered to the currently-tracked epic, e.g. for
+/// `WorkerIdle`'s ready-task counting — cas-405f). `unfiltered_data` must
+/// always be the true, never-epic-filtered task snapshot; it backs
+/// `TaskCompleted`'s render-time safety net (cas-6aaf / cas-dbbe), which needs
+/// to see tasks outside the tracked epic to avoid confirming a false "has
+/// closed" for a task that's merely out of the current epic's display scope.
+/// Callers with only one snapshot available (e.g. most tests) may pass the
+/// same value for both.
 pub fn generate_prompt(
     event: &DirectorEvent,
     data: &DirectorData,
+    unfiltered_data: &DirectorData,
     supervisor_name: &str,
     config: &AutoPromptConfig,
     supervisor_cli: SupervisorCli,
@@ -134,15 +255,26 @@ pub fn generate_prompt(
             // the two cases and avoid emitting "please close" guidance for a task
             // the worker has already closed.
             //
+            // cas-dbbe: deliberately re-check against `unfiltered_data`, not
+            // `data`. `data` may be epic-scoped to whatever epic the director
+            // currently tracks; a task belonging to a SECOND epic being worked
+            // concurrently in the same session would be absent from `data`'s
+            // ready/in_progress lists regardless of its true status, which
+            // would make this safety net rubber-stamp a false "has closed"
+            // instead of catching it.
+            //
             // State resolution:
             //   - task absent from ready+in_progress → closed (expected path)
             //   - task in ready_tasks as Open       → lease expired, still needs close
             //   - task in in_progress_tasks         → still being worked (edge case)
-            let in_ready = data
+            let in_ready = unfiltered_data
                 .ready_tasks
                 .iter()
                 .any(|t| t.id == *task_id && t.status == cas_types::TaskStatus::Open);
-            let in_progress = data.in_progress_tasks.iter().any(|t| t.id == *task_id);
+            let in_progress = unfiltered_data
+                .in_progress_tasks
+                .iter()
+                .any(|t| t.id == *task_id);
 
             let text = if in_ready {
                 // Task regressed to Open (lease expired) — worker needs to close it.
@@ -196,7 +328,10 @@ pub fn generate_prompt(
             })
         }
 
-        DirectorEvent::WorkerIdle { worker } => {
+        DirectorEvent::WorkerIdle {
+            worker,
+            active_task,
+        } => {
             if !config.on_worker_idle {
                 return None;
             }
@@ -254,8 +389,45 @@ pub fn generate_prompt(
                                 name == worker && t.assignee.as_deref() == Some(id)
                             })
                     });
-            if worker_is_busy {
+            if worker_is_busy && active_task.is_none() {
                 return None;
+            }
+
+            if let Some(task) = active_task {
+                // cas-728b/cas-627f: Blocked and AwaitingMerge are
+                // supervisor-parked states, but this branch is already an
+                // INFORMATIONAL status update ("task X is still {status}"),
+                // not the worker-assistance "please assign this idle worker
+                // something" ping (that's the `ready_count` branch below,
+                // reached only when `active_task` is `None`). An earlier
+                // version of this fix unconditionally suppressed this arm
+                // for Blocked/AwaitingMerge — that re-hid the flagship
+                // close-rejected notification cas-627f spent real effort
+                // making reachable again (park releases the lease, so
+                // `active_lease` — and this `Some(task)` — was `None` for
+                // every parked task until that fix). Tick-by-tick repetition
+                // is already handled upstream: the event detector's
+                // `idle_already_emitted` gate (events.rs) fires `WorkerIdle`
+                // once per sustained idle streak, not every 2s tick, and
+                // `IDLE_RATE_LIMIT` floors any streak-reset repeat to once
+                // per 5 minutes. No additional suppression needed here.
+                let rejection = task
+                    .close_rejected_reason
+                    .as_deref()
+                    .map(|reason| format!(", close rejected ({reason})"))
+                    .unwrap_or_default();
+                let text = format!(
+                    "Worker {worker} is idle while task {} ({}) is still {}{}.\n\
+                     This is a worker-lifecycle idle signal, not a task completion.\n\
+                     Check live state: `{supervisor_prefix}task action=show id={}`\n\
+                     If close was rejected, resolve the rejection before acting on the task as closed.",
+                    task.task_id, task.task_title, task.task_status, rejection, task.task_id
+                );
+
+                return Some(Prompt {
+                    target: supervisor_name.to_string(),
+                    text: with_response_instructions(&text, worker, supervisor_cli),
+                });
             }
 
             // Count only truly-dispatchable tasks (Open + unassigned). See
@@ -337,13 +509,27 @@ pub fn generate_prompt(
                 })
             } else {
                 // Still stalled after the nudge — escalate to the supervisor.
+                //
+                // cas-728b: the old advice ("consider shutdown + respawn
+                // (safe if the worktree is clean)") pointed at the exact
+                // anti-pattern that destroyed in-flight work before
+                // (silent-owl-56, 2026-04-23): a clean worktree mid-task
+                // means un-persisted work + full in-flight context loss, not
+                // "safe". Point at the actual triage triad instead —
+                // `is-wedged` classifies before anyone kills anything.
                 let text = format!(
                     "Worker {worker} has been stalled on task {task_id} for about \
                      {elapsed_mins}m — alive heartbeat, no activity, and an auto-nudge \
                      did not unstick it.\n\n\
-                     Check: {supervisor_prefix}coordination action=worker_status\n\
-                     If it's still stuck, consider shutdown + respawn (safe if the \
-                     worktree is clean)."
+                     Triage before acting:\n\
+                     1. `cas factory is-wedged {worker}` — classifies Alive / Wedged / \
+                     Starved / Dead from PID + transcript evidence.\n\
+                     2. `cas factory debug {worker}` — tail the transcript to see the \
+                     last in-flight tool call.\n\
+                     3. Only `cas factory kill {worker}` if is-wedged reports Wedged or \
+                     Dead — a clean worktree does NOT mean safe to kill: it means \
+                     un-persisted work and full in-flight context loss if the worker \
+                     was still genuinely working."
                 );
 
                 Some(Prompt {
@@ -447,7 +633,7 @@ pub fn generate_prompt(
 
 #[cfg(test)]
 mod tests {
-    use crate::ui::factory::director::data::{AgentSummary, TaskSummary};
+    use crate::ui::factory::director::data::{ActiveLeaseSummary, AgentSummary, TaskSummary};
     use crate::ui::factory::director::prompts::*;
     use cas_mux::SupervisorCli;
     use cas_types::{AgentStatus, Priority, TaskStatus, TaskType};
@@ -480,6 +666,7 @@ mod tests {
                 latest_activity: None,
                 last_heartbeat: Some(chrono::Utc::now()),
                 pending_messages: 0,
+                active_lease: None,
             }],
             activity: vec![],
             agent_id_to_name: [("sess-id-abc123".to_string(), "swift-fox".to_string())]
@@ -489,6 +676,27 @@ mod tests {
             git_loaded: true,
             reminders: vec![],
             epic_closed_counts: HashMap::new(),
+        }
+    }
+
+    fn open_task(id: &str, assignee: Option<&str>) -> TaskSummary {
+        TaskSummary {
+            id: id.to_string(),
+            title: format!("Task {id}"),
+            status: TaskStatus::Open,
+            priority: Priority::MEDIUM,
+            assignee: assignee.map(str::to_string),
+            task_type: TaskType::Task,
+            epic: None,
+            branch: None,
+            updated_at: None,
+        }
+    }
+
+    fn blocked_task(id: &str, assignee: Option<&str>) -> TaskSummary {
+        TaskSummary {
+            status: TaskStatus::Blocked,
+            ..open_task(id, assignee)
         }
     }
 
@@ -505,6 +713,94 @@ mod tests {
     }
 
     #[test]
+    fn test_delivery_recheck_drops_worker_idle_after_assignment() {
+        let event = DirectorEvent::WorkerIdle {
+            worker: "swift-fox".to_string(),
+            active_task: None,
+        };
+        let mut data = make_data(0);
+        data.ready_tasks = vec![open_task("cas-next", Some("swift-fox"))];
+
+        let rechecked = revalidate_event_for_delivery(&event, &data, "supervisor");
+
+        assert!(
+            rechecked.is_none(),
+            "WorkerIdle generated before assignment must be dropped when delivery sees assigned work"
+        );
+    }
+
+    #[test]
+    fn test_delivery_recheck_rerenders_worker_idle_active_task_state() {
+        let event = DirectorEvent::WorkerIdle {
+            worker: "swift-fox".to_string(),
+            active_task: None,
+        };
+        let mut data = make_data(0);
+        data.agents[0].active_lease = Some(ActiveLeaseSummary {
+            task_id: "cas-merge".to_string(),
+            task_title: "Merge gated task".to_string(),
+            task_status: TaskStatus::AwaitingMerge,
+            close_rejected_reason: Some("MERGE REQUIRED: commit not on epic".to_string()),
+        });
+
+        let rechecked = revalidate_event_for_delivery(&event, &data, "supervisor")
+            .expect("idle event should remain valid with updated active lease payload");
+
+        match rechecked {
+            DirectorEvent::WorkerIdle {
+                active_task: Some(task),
+                ..
+            } => {
+                assert_eq!(task.task_id, "cas-merge");
+                assert_eq!(task.task_status, TaskStatus::AwaitingMerge);
+                assert_eq!(
+                    task.close_rejected_reason.as_deref(),
+                    Some("MERGE REQUIRED: commit not on epic")
+                );
+            }
+            other => panic!("expected WorkerIdle with active task payload, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_delivery_recheck_drops_stale_ready_and_blocked_signals() {
+        let ready_event = DirectorEvent::AgentRegistered {
+            agent_id: "sess-id-abc123".to_string(),
+            agent_name: "swift-fox".to_string(),
+        };
+        let mut assigned_data = make_data(0);
+        assigned_data.ready_tasks = vec![open_task("cas-next", Some("sess-id-abc123"))];
+
+        assert!(
+            revalidate_event_for_delivery(&ready_event, &assigned_data, "supervisor").is_none(),
+            "ready notification must drop when delivery sees assigned work"
+        );
+
+        let blocked_event = DirectorEvent::TaskBlocked {
+            task_id: "cas-block".to_string(),
+            task_title: "Old blocked title".to_string(),
+            worker: "swift-fox".to_string(),
+        };
+        let mut unblocked_data = make_data(0);
+        unblocked_data.ready_tasks = vec![open_task("cas-block", Some("swift-fox"))];
+
+        assert!(
+            revalidate_event_for_delivery(&blocked_event, &unblocked_data, "supervisor").is_none(),
+            "blocked notification must drop when delivery sees the task is no longer blocked"
+        );
+
+        let mut blocked_data = make_data(0);
+        blocked_data.ready_tasks = vec![blocked_task("cas-block", Some("swift-fox"))];
+        assert!(
+            matches!(
+                revalidate_event_for_delivery(&blocked_event, &blocked_data, "supervisor"),
+                Some(DirectorEvent::TaskBlocked { .. })
+            ),
+            "blocked notification should remain when delivery still sees the blocked task"
+        );
+    }
+
+    #[test]
     fn test_task_assigned_prompt() {
         let event = DirectorEvent::TaskAssigned {
             task_id: "task-123".to_string(),
@@ -514,8 +810,16 @@ mod tests {
         let data = make_data(0);
         let config = default_config();
 
-        let prompt =
-            generate_prompt(&event, &data, "supervisor", &config, codex(), codex()).unwrap();
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        )
+        .unwrap();
 
         assert_eq!(prompt.target, "swift-fox");
         assert!(prompt.text.contains("task-123"));
@@ -540,8 +844,16 @@ mod tests {
         let data = make_data(0);
         let config = default_config();
 
-        let prompt =
-            generate_prompt(&event, &data, "supervisor", &config, codex(), codex()).unwrap();
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        )
+        .unwrap();
 
         assert_eq!(prompt.target, "supervisor");
         assert!(prompt.text.contains("swift-fox"));
@@ -602,8 +914,16 @@ mod tests {
         };
         let config = default_config();
 
-        let prompt =
-            generate_prompt(&event, &data, "supervisor", &config, codex(), codex()).unwrap();
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        )
+        .unwrap();
 
         // When lease expired and task regressed to Open, supervisor should ask worker to close.
         assert!(
@@ -653,7 +973,15 @@ mod tests {
         };
         let config = default_config();
 
-        let prompt = generate_prompt(&event, &data, "supervisor", &config, codex(), codex());
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        );
         assert!(
             prompt.is_none(),
             "cas-6aaf: TaskCompleted must be suppressed when task is still in_progress: {:?}",
@@ -665,12 +993,21 @@ mod tests {
     fn test_worker_idle_with_ready_tasks() {
         let event = DirectorEvent::WorkerIdle {
             worker: "swift-fox".to_string(),
+            active_task: None,
         };
         let data = make_data(3); // 3 ready tasks in snapshot
         let config = default_config();
 
-        let prompt =
-            generate_prompt(&event, &data, "supervisor", &config, codex(), codex()).unwrap();
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        )
+        .unwrap();
 
         assert_eq!(prompt.target, "supervisor");
         assert!(prompt.text.contains("swift-fox"));
@@ -695,18 +1032,134 @@ mod tests {
     fn test_worker_idle_no_ready_tasks() {
         let event = DirectorEvent::WorkerIdle {
             worker: "swift-fox".to_string(),
+            active_task: None,
         };
         let data = make_data(0); // No ready tasks
         let config = default_config();
 
-        let prompt =
-            generate_prompt(&event, &data, "supervisor", &config, codex(), codex()).unwrap();
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        )
+        .unwrap();
 
         assert_eq!(prompt.target, "supervisor");
         let lower = prompt.text.to_lowercase();
         assert!(
             lower.contains("no ready tasks") || lower.contains("no dispatchable"),
             "Expected 'no ready tasks' or 'no dispatchable' in: {}",
+            prompt.text
+        );
+    }
+
+    #[test]
+    fn test_worker_idle_with_close_rejected_task_is_not_completion_worded() {
+        let event = DirectorEvent::WorkerIdle {
+            worker: "swift-fox".to_string(),
+            active_task: Some(ActiveLeaseSummary {
+                task_id: "cas-1234".to_string(),
+                task_title: "Fix close gate".to_string(),
+                task_status: TaskStatus::InProgress,
+                close_rejected_reason: Some("MERGE REQUIRED".to_string()),
+            }),
+        };
+        let data = make_data(0);
+        let config = default_config();
+
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        )
+        .unwrap();
+        let lower = prompt.text.to_lowercase();
+
+        assert_eq!(prompt.target, "supervisor");
+        assert!(prompt.text.contains("cas-1234"));
+        assert!(prompt.text.contains("in_progress"));
+        assert!(prompt.text.contains("MERGE REQUIRED"));
+        assert!(prompt.text.contains("not a task completion"));
+        assert!(
+            !lower.contains("done") && !lower.contains("finished"),
+            "idle close-rejection prompt must not use completion-flavored wording: {}",
+            prompt.text
+        );
+    }
+
+    /// cas-627f: the flagship close-rejected notification, exercised end to
+    /// end through BOTH pipeline steps a live director tick actually runs:
+    /// `revalidate_event_for_delivery` (delivery-time recheck) THEN
+    /// `generate_prompt`. Before the cas-627f fix, `active_lease` for a
+    /// parked `AwaitingMerge` task resolved to `None` once
+    /// `park_task_awaiting_merge` released the lease (confirmed P1,
+    /// docs/reviews/2026-07-07-cas-b646-epic.md) — the event detector's
+    /// `active_task: None` WorkerIdle event would be silently dropped by the
+    /// revalidation step's `worker_has_open_or_in_progress_assignment`
+    /// guard, so the operator never saw this notification at all. This test
+    /// starts from that same `active_task: None` shape the detector
+    /// produces and asserts the notification survives BOTH steps and names
+    /// the task id, the `AwaitingMerge` status, and the close-rejected
+    /// reason.
+    #[test]
+    fn test_worker_idle_awaiting_merge_close_rejected_survives_revalidate_and_names_task() {
+        let event = DirectorEvent::WorkerIdle {
+            worker: "swift-fox".to_string(),
+            active_task: None,
+        };
+        let mut data = make_data(0);
+        data.in_progress_tasks = vec![TaskSummary {
+            id: "cas-1234".to_string(),
+            title: "Fix close gate".to_string(),
+            status: TaskStatus::AwaitingMerge,
+            priority: Priority::MEDIUM,
+            assignee: Some("swift-fox".to_string()),
+            task_type: TaskType::Task,
+            epic: None,
+            branch: None,
+            updated_at: None,
+        }];
+        data.agents[0].active_lease = Some(ActiveLeaseSummary {
+            task_id: "cas-1234".to_string(),
+            task_title: "Fix close gate".to_string(),
+            task_status: TaskStatus::AwaitingMerge,
+            close_rejected_reason: Some("MERGE REQUIRED".to_string()),
+        });
+        let config = default_config();
+
+        let revalidated = revalidate_event_for_delivery(&event, &data, "supervisor")
+            .expect("close-rejected WorkerIdle must survive delivery-time revalidation");
+
+        let prompt = generate_prompt(
+            &revalidated,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        )
+        .expect("close-rejected WorkerIdle must produce an operator notification");
+
+        assert_eq!(prompt.target, "supervisor");
+        assert!(prompt.text.contains("cas-1234"), "{}", prompt.text);
+        assert!(
+            prompt.text.to_lowercase().contains("awaiting_merge")
+                || prompt.text.contains("AwaitingMerge"),
+            "notification must name the AwaitingMerge status: {}",
+            prompt.text
+        );
+        assert!(
+            prompt.text.contains("MERGE REQUIRED"),
+            "notification must carry the close-rejected reason: {}",
             prompt.text
         );
     }
@@ -719,12 +1172,21 @@ mod tests {
     fn test_worker_idle_no_close_epic_advice() {
         let event = DirectorEvent::WorkerIdle {
             worker: "swift-fox".to_string(),
+            active_task: None,
         };
         let data = make_data(0); // No ready tasks in snapshot
         let config = default_config();
 
-        let prompt =
-            generate_prompt(&event, &data, "supervisor", &config, codex(), codex()).unwrap();
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        )
+        .unwrap();
 
         // Must never suggest closing the epic — the snapshot may be stale and
         // the epic might have live open children not visible in this refresh.
@@ -740,11 +1202,20 @@ mod tests {
     fn test_worker_idle_suppressed_when_worker_absent_from_live_snapshot() {
         let event = DirectorEvent::WorkerIdle {
             worker: "stale-worker".to_string(),
+            active_task: None,
         };
         let data = make_data(2);
         let config = default_config();
 
-        let prompt = generate_prompt(&event, &data, "supervisor", &config, codex(), codex());
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        );
 
         assert!(
             prompt.is_none(),
@@ -761,7 +1232,15 @@ mod tests {
         let data = make_data(0);
         let config = default_config();
 
-        let prompt = generate_prompt(&event, &data, "supervisor", &config, codex(), codex());
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        );
 
         assert!(
             prompt.is_none(),
@@ -778,8 +1257,16 @@ mod tests {
         let data = make_data(0);
         let config = default_config();
 
-        let prompt =
-            generate_prompt(&event, &data, "supervisor", &config, codex(), codex()).unwrap();
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        )
+        .unwrap();
         let lower = prompt.text.to_lowercase();
 
         assert!(
@@ -799,8 +1286,16 @@ mod tests {
         let data = make_data(3);
         let config = default_config();
 
-        let prompt =
-            generate_prompt(&event, &data, "supervisor", &config, codex(), codex()).unwrap();
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        )
+        .unwrap();
 
         assert_eq!(prompt.target, "supervisor");
         assert!(prompt.text.contains("calm-owl"));
@@ -819,8 +1314,16 @@ mod tests {
         let data = make_data(0);
         let config = default_config();
 
-        let prompt =
-            generate_prompt(&event, &data, "supervisor", &config, codex(), codex()).unwrap();
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        )
+        .unwrap();
 
         assert_eq!(prompt.target, "supervisor");
         assert!(prompt.text.contains("calm-owl"));
@@ -841,7 +1344,15 @@ mod tests {
             ..default_config()
         };
 
-        let prompt = generate_prompt(&event, &data, "supervisor", &config, codex(), codex());
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        );
         assert!(prompt.is_none());
     }
 
@@ -855,7 +1366,15 @@ mod tests {
         let data = make_data(0);
         let config = default_config();
 
-        let prompt = generate_prompt(&event, &data, "supervisor", &config, codex(), codex());
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        );
         assert!(prompt.is_none());
     }
 
@@ -872,7 +1391,15 @@ mod tests {
             ..default_config()
         };
 
-        let prompt = generate_prompt(&event, &data, "supervisor", &config, codex(), codex());
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        );
         assert!(prompt.is_none());
     }
 
@@ -889,7 +1416,15 @@ mod tests {
             ..default_config()
         };
 
-        let prompt = generate_prompt(&event, &data, "supervisor", &config, codex(), codex());
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        );
         assert!(prompt.is_none());
     }
 
@@ -916,8 +1451,16 @@ mod tests {
         let data = make_data(0);
         let config = default_config();
 
-        let prompt =
-            generate_prompt(&event, &data, "supervisor", &config, claude(), claude()).unwrap();
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            claude(),
+            claude(),
+        )
+        .unwrap();
         assert!(prompt.text.contains("mcp__cas__task action=start"));
         assert!(
             prompt
@@ -967,13 +1510,22 @@ mod tests {
     fn test_worker_idle_assignee_uses_display_name() {
         let event = DirectorEvent::WorkerIdle {
             worker: "swift-fox".to_string(),
+            active_task: None,
         };
 
         let data = make_data(2);
 
         let config = default_config();
-        let prompt =
-            generate_prompt(&event, &data, "supervisor", &config, codex(), codex()).unwrap();
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        )
+        .unwrap();
 
         assert!(
             prompt.text.contains("assignee=swift-fox"),
@@ -994,6 +1546,7 @@ mod tests {
     fn test_889d_worker_idle_suppressed_when_busy_by_session_id() {
         let event = DirectorEvent::WorkerIdle {
             worker: "swift-fox".to_string(),
+            active_task: None,
         };
 
         // in_progress task assigned by session ID; agent_id_to_name maps it.
@@ -1002,7 +1555,15 @@ mod tests {
             .insert("sess-id-abc123".to_string(), "swift-fox".to_string());
 
         let config = default_config();
-        let prompt = generate_prompt(&event, &data, "supervisor", &config, codex(), codex());
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        );
 
         assert!(
             prompt.is_none(),
@@ -1017,12 +1578,21 @@ mod tests {
     fn test_889d_worker_idle_suppressed_when_busy_by_display_name() {
         let event = DirectorEvent::WorkerIdle {
             worker: "swift-fox".to_string(),
+            active_task: None,
         };
 
         // in_progress task assigned by display name (legacy manual path).
         let data = make_data_with_in_progress("swift-fox");
         let config = default_config();
-        let prompt = generate_prompt(&event, &data, "supervisor", &config, codex(), codex());
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        );
 
         assert!(
             prompt.is_none(),
@@ -1044,8 +1614,16 @@ mod tests {
         };
         let data = make_data(2);
         let config = default_config();
-        let prompt =
-            generate_prompt(&event, &data, "supervisor", &config, codex(), codex()).unwrap();
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        )
+        .unwrap();
 
         assert!(
             prompt.text.contains("assignee=calm-owl"),
@@ -1071,7 +1649,15 @@ mod tests {
         // Busy by session ID.
         let data = make_data_with_in_progress("sess-id-abc123");
         let config = default_config();
-        let prompt = generate_prompt(&event, &data, "supervisor", &config, codex(), codex());
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        );
 
         assert!(
             prompt.is_none(),
@@ -1116,8 +1702,17 @@ mod tests {
         // WorkerIdle must be suppressed.
         let idle_event = DirectorEvent::WorkerIdle {
             worker: "swift-fox".to_string(),
+            active_task: None,
         };
-        let prompt = generate_prompt(&idle_event, &data, "supervisor", &config, codex(), codex());
+        let prompt = generate_prompt(
+            &idle_event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        );
         assert!(
             prompt.is_none(),
             "cas-dbbb: WorkerIdle must be suppressed when worker has an assigned Open task \
@@ -1130,7 +1725,15 @@ mod tests {
             agent_id: "sess-id-xyz".to_string(),
             agent_name: "swift-fox".to_string(),
         };
-        let prompt2 = generate_prompt(&reg_event, &data, "supervisor", &config, codex(), codex());
+        let prompt2 = generate_prompt(
+            &reg_event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        );
         assert!(
             prompt2.is_none(),
             "cas-dbbb: AgentRegistered must be suppressed when worker has an assigned Open task: \
@@ -1170,6 +1773,7 @@ mod tests {
                 latest_activity: None,
                 last_heartbeat: Some(chrono::Utc::now()),
                 pending_messages: 0,
+                active_lease: None,
             }],
             activity: vec![],
             agent_id_to_name: [("sess-id-abc123".to_string(), "swift-fox".to_string())]
@@ -1183,9 +1787,18 @@ mod tests {
 
         let event = DirectorEvent::WorkerIdle {
             worker: "swift-fox".to_string(),
+            active_task: None,
         };
         let config = default_config();
-        let prompt = generate_prompt(&event, &data, "supervisor", &config, codex(), codex());
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        );
         assert!(
             prompt.is_some(),
             "cas-dbbb P2: WorkerIdle must NOT be suppressed when worker has only a Blocked task \
@@ -1228,9 +1841,18 @@ mod tests {
 
         let event = DirectorEvent::WorkerIdle {
             worker: "swift-fox".to_string(),
+            active_task: None,
         };
         let config = default_config();
-        let prompt = generate_prompt(&event, &data, "supervisor", &config, codex(), codex());
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        );
         assert!(
             prompt.is_none(),
             "cas-dbbb P2: WorkerIdle must be suppressed when worker has a session-ID assigned \
@@ -1274,7 +1896,15 @@ mod tests {
             agent_name: "calm-owl".to_string(),
         };
         let config = default_config();
-        let prompt = generate_prompt(&event, &data, "supervisor", &config, codex(), codex());
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        );
         assert!(
             prompt.is_none(),
             "cas-dbbb P2: AgentRegistered must be suppressed when session ID (agent_id) is the \
@@ -1295,12 +1925,21 @@ mod tests {
         // The worker name in the event is the supervisor's name.
         let event = DirectorEvent::WorkerIdle {
             worker: "supervisor".to_string(),
+            active_task: None,
         };
         let data = make_data(5); // 5 ready tasks — the worst-case scenario
         let config = default_config();
 
         // Pass "supervisor" as supervisor_name — the prompt must return None.
-        let prompt = generate_prompt(&event, &data, "supervisor", &config, codex(), codex());
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        );
 
         assert!(
             prompt.is_none(),
@@ -1316,13 +1955,22 @@ mod tests {
     fn test_c790_worker_idle_still_fires_for_real_workers() {
         let event = DirectorEvent::WorkerIdle {
             worker: "swift-fox".to_string(),
+            active_task: None,
         };
         // No in_progress tasks (so the busy guard doesn't suppress).
         let data = make_data(1);
         let config = default_config();
 
         // "supervisor" is distinct from "swift-fox" — nudge must fire.
-        let prompt = generate_prompt(&event, &data, "supervisor", &config, codex(), codex());
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        );
 
         assert!(
             prompt.is_some(),
@@ -1356,8 +2004,16 @@ mod tests {
         let config = default_config();
 
         // Claude supervisor, Codex worker
-        let prompt = generate_prompt(&event, &data, "supervisor", &config, claude(), codex())
-            .expect("TaskAssigned must produce a prompt");
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            claude(),
+            codex(),
+        )
+        .expect("TaskAssigned must produce a prompt");
 
         assert_eq!(
             prompt.target, "codex-worker",
@@ -1400,8 +2056,16 @@ mod tests {
         let config = default_config();
 
         // Codex supervisor, Claude worker
-        let prompt = generate_prompt(&event, &data, "supervisor", &config, codex(), claude())
-            .expect("TaskAssigned must produce a prompt");
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            claude(),
+        )
+        .expect("TaskAssigned must produce a prompt");
 
         assert_eq!(
             prompt.target, "claude-worker",
@@ -1456,8 +2120,16 @@ mod tests {
         let data = make_data(0);
         let config = default_config();
 
-        let prompt = generate_prompt(&event, &data, "supervisor", &config, claude(), codex())
-            .expect("TaskCompleted (closed path) must produce a prompt");
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            claude(),
+            codex(),
+        )
+        .expect("TaskCompleted (closed path) must produce a prompt");
 
         assert_eq!(
             prompt.target, "supervisor",
@@ -1515,8 +2187,16 @@ mod tests {
         });
         let config = default_config();
 
-        let prompt = generate_prompt(&event, &data, "supervisor", &config, claude(), codex())
-            .expect("TaskCompleted (regressed) must produce a prompt");
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            claude(),
+            codex(),
+        )
+        .expect("TaskCompleted (regressed) must produce a prompt");
 
         assert_eq!(
             prompt.target, "supervisor",
@@ -1557,6 +2237,7 @@ mod tests {
     fn test_efc4_worker_idle_codex_worker_claude_supervisor_prefixes() {
         let event = DirectorEvent::WorkerIdle {
             worker: "codex-worker".to_string(),
+            active_task: None,
         };
         // 2 ready tasks so the "ready tasks exist" branch fires (non-empty assign cmd).
         let mut data = make_data(2);
@@ -1568,6 +2249,7 @@ mod tests {
             latest_activity: None,
             last_heartbeat: Some(chrono::Utc::now()),
             pending_messages: 0,
+            active_lease: None,
         }];
         data.agent_id_to_name = [(
             "sess-id-codex-worker".to_string(),
@@ -1578,8 +2260,16 @@ mod tests {
         let config = default_config();
 
         // Claude supervisor, Codex worker
-        let prompt = generate_prompt(&event, &data, "supervisor", &config, claude(), codex())
-            .expect("WorkerIdle must produce a prompt");
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            claude(),
+            codex(),
+        )
+        .expect("WorkerIdle must produce a prompt");
 
         assert_eq!(
             prompt.target, "supervisor",
@@ -1644,8 +2334,16 @@ mod tests {
         let data = make_data(0);
         let config = default_config();
 
-        let prompt =
-            generate_prompt(&event, &data, "supervisor", &config, codex(), codex()).unwrap();
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        )
+        .unwrap();
 
         assert_eq!(
             prompt.target, "swift-fox",
@@ -1668,12 +2366,71 @@ mod tests {
         let data = make_data(0);
         let config = default_config();
 
-        let prompt =
-            generate_prompt(&event, &data, "supervisor", &config, codex(), codex()).unwrap();
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        )
+        .unwrap();
 
         assert_eq!(prompt.target, "supervisor");
         assert!(prompt.text.contains("swift-fox"));
         assert!(prompt.text.contains("cas-0b7d"));
+    }
+
+    /// cas-728b: the escalation advice used to say "consider shutdown +
+    /// respawn (safe if the worktree is clean)" — pointing supervisors at
+    /// the exact anti-pattern that destroyed in-flight work before
+    /// (silent-owl-56, 2026-04-23: a clean worktree mid-task means
+    /// un-persisted work, not "safe"). It must now point at the
+    /// `is-wedged` triage triad instead.
+    #[test]
+    fn test_728b_worker_stalled_escalation_points_at_is_wedged_triage_not_clean_worktree_shutdown()
+     {
+        let event = DirectorEvent::WorkerStalled {
+            worker: "swift-fox".to_string(),
+            task_id: "cas-0b7d".to_string(),
+            elapsed_secs: 620,
+            escalate: true,
+        };
+        let data = make_data(0);
+        let config = default_config();
+
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        )
+        .unwrap();
+
+        assert!(
+            !prompt.text.contains("safe if the"),
+            "the 'safe if the worktree is clean' anti-pattern must be gone: {}",
+            prompt.text
+        );
+        assert!(
+            prompt.text.contains("is-wedged swift-fox"),
+            "must point at `cas factory is-wedged <worker>` for triage: {}",
+            prompt.text
+        );
+        assert!(
+            prompt.text.contains("debug swift-fox"),
+            "must point at `cas factory debug <worker>` for transcript triage: {}",
+            prompt.text
+        );
+        assert!(
+            prompt.text.contains("kill swift-fox"),
+            "must name the actual kill command, gated on is-wedged's verdict: {}",
+            prompt.text
+        );
     }
 
     /// `on_worker_stalled = false` must suppress both the nudge and the
@@ -1692,7 +2449,16 @@ mod tests {
                 escalate,
             };
             assert!(
-                generate_prompt(&event, &data, "supervisor", &config, codex(), codex()).is_none(),
+                generate_prompt(
+                    &event,
+                    &data,
+                    &data,
+                    "supervisor",
+                    &config,
+                    codex(),
+                    codex()
+                )
+                .is_none(),
                 "on_worker_stalled=false must suppress WorkerStalled (escalate={escalate})"
             );
         }
@@ -1713,7 +2479,16 @@ mod tests {
         let config = default_config();
 
         assert!(
-            generate_prompt(&event, &data, "supervisor", &config, codex(), codex()).is_none(),
+            generate_prompt(
+                &event,
+                &data,
+                &data,
+                "supervisor",
+                &config,
+                codex(),
+                codex()
+            )
+            .is_none(),
             "WorkerStalled must not fire for a worker absent from the live snapshot"
         );
     }

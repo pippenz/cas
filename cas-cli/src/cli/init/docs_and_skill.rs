@@ -10,7 +10,7 @@ const CAS_DIRECTIVE_CONTENT: &str = r#"# IMPORTANT: USE CAS FOR TASK AND MEMORY 
 **DO NOT USE BUILT-IN TOOLS (TodoWrite, EnterPlanMode) FOR TASK TRACKING.**
 
 Use CAS MCP tools instead:
-First use each session — load MCP schemas: ToolSearch(query="select:mcp__cas__task,mcp__cas__memory,mcp__cas__search")
+First use each session — load MCP schemas: ToolSearch(query="select:mcp__cas__task,mcp__cas__memory,mcp__cas__search"). ToolSearch only loads the schema — it does not call the tool. Once it succeeds, call `mcp__cas__task` etc. directly; never re-run ToolSearch for a tool already resolved.
 - `mcp__cas__task` with action: create - Create tasks (NOT TodoWrite)
 - `mcp__cas__task` with action: start/close - Manage task status
 - `mcp__cas__task` with action: ready - See ready tasks
@@ -291,6 +291,20 @@ mod tests {
         assert!(
             section.contains(r#"ToolSearch(query="select:mcp__cas__task,mcp__cas__memory,mcp__cas__search")"#),
             "Managed block must contain the exact ToolSearch bootstrap query; got:\n{section}"
+        );
+    }
+
+    /// cas-e7c8: a haiku/low-tier worker never got past the ToolSearch
+    /// discovery step — it re-ran ToolSearch 7+ times instead of calling
+    /// `mcp__cas__task` directly. The CLAUDE.md-level bootstrap line is the
+    /// very first thing every session reads, so it must say explicitly that
+    /// ToolSearch only loads the schema and does not call the tool.
+    #[test]
+    fn template_clarifies_toolsearch_does_not_call_the_tool() {
+        let section = build_cas_section();
+        assert!(
+            section.contains("ToolSearch only loads the schema — it does not call the tool"),
+            "Managed block must clarify ToolSearch is a discovery step, not a call; got:\n{section}"
         );
     }
 

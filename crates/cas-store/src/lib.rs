@@ -126,7 +126,9 @@ pub use reminder_store::{
 };
 
 // Spawn queue store for worker lifecycle commands
-pub use spawn_queue_store::{SpawnAction, SpawnQueueStore, SpawnRequest, SqliteSpawnQueueStore};
+pub use spawn_queue_store::{
+    SPAWN_QUEUE_SCHEMA, SpawnAction, SpawnQueueStore, SpawnRequest, SqliteSpawnQueueStore,
+};
 
 // Prompt store for tracking user prompts (code attribution)
 pub use prompt_store::{

@@ -68,14 +68,29 @@ pub struct SpawnRequest {
     ///
     /// `None` preserves legacy/non-factory behavior: any daemon may process it.
     pub factory_session: Option<String>,
+    /// Task to pre-assign to the spawned worker (cas-6913).
+    ///
+    /// `Some(task_id)` only makes sense for single-worker spawn requests —
+    /// callers must validate cardinality before enqueueing (see
+    /// `factory_spawn_workers`). `None` preserves the pre-cas-6913 behavior
+    /// of no auto-assignment.
+    pub task_id: Option<String>,
     /// When the request was queued
     pub created_at: DateTime<Utc>,
     /// When the request was processed (None if pending)
     pub processed_at: Option<DateTime<Utc>>,
 }
 
-/// Schema for spawn queue table
-const SPAWN_QUEUE_SCHEMA: &str = r#"
+/// Schema for spawn queue table.
+///
+/// `pub` (re-exported from `cas-store`'s root, matching `AGENT_SCHEMA` /
+/// `TASK_SCHEMA`) so migration-side class-guard tests in `cas-cli` can
+/// assert the baseline (fresh-DB) shape and the post-migration (upgraded-DB)
+/// shape agree column-for-column — see m205's
+/// `baseline_agent_schema_applies_over_pre_m204_table` for the pattern this
+/// guards against: a column that exists on only one of the two paths is
+/// invisible to any test that only ever creates fresh DBs (hotfix 4efed95).
+pub const SPAWN_QUEUE_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS spawn_queue (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     action TEXT NOT NULL,
@@ -85,6 +100,7 @@ CREATE TABLE IF NOT EXISTS spawn_queue (
     isolate INTEGER NOT NULL DEFAULT 0,
     worker_spec TEXT,
     factory_session TEXT,
+    task_id TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     processed_at TEXT
 );
@@ -103,6 +119,13 @@ pub trait SpawnQueueStore: Send + Sync {
     /// `cas-cli` (which depend on `cas-mux`) produce from `cli`/`model`/`effort`
     /// overrides.  `None` means "use the session default".  This field is stored
     /// in the `worker_spec` column added by migration m201.
+    ///
+    /// `task_id` (cas-6913) pre-assigns a task to the spawned worker once the
+    /// spawn completes. Only meaningful for single-worker requests — callers
+    /// must validate cardinality before calling this (the store does not
+    /// enforce it, since the store doesn't know how many workers `count`
+    /// will actually produce). Stored in the `task_id` column added by
+    /// migration m206.
     fn enqueue_spawn(
         &self,
         count: i32,
@@ -110,6 +133,7 @@ pub trait SpawnQueueStore: Send + Sync {
         isolate: bool,
         spec_json: Option<&str>,
         factory_session: Option<&str>,
+        task_id: Option<&str>,
     ) -> Result<i64>;
 
     /// Queue a shutdown request
@@ -193,7 +217,8 @@ impl SqliteSpawnQueueStore {
         let isolate: i32 = row.get(5).unwrap_or(0);
         let worker_spec: Option<String> = row.get(6).unwrap_or_default();
         let factory_session: Option<String> = row.get(7).unwrap_or_default();
-        let processed_at_str: Option<String> = row.get(9)?;
+        let task_id: Option<String> = row.get(8).unwrap_or_default();
+        let processed_at_str: Option<String> = row.get(10)?;
 
         Ok(SpawnRequest {
             id: row.get(0)?,
@@ -204,7 +229,8 @@ impl SqliteSpawnQueueStore {
             isolate: isolate != 0,
             worker_spec,
             factory_session,
-            created_at: Self::parse_datetime(&row.get::<_, String>(8)?).unwrap_or_else(Utc::now),
+            task_id,
+            created_at: Self::parse_datetime(&row.get::<_, String>(9)?).unwrap_or_else(Utc::now),
             processed_at: processed_at_str.and_then(|s| Self::parse_datetime(&s)),
         })
     }
@@ -218,6 +244,7 @@ impl SqliteSpawnQueueStore {
         isolate: bool,
         spec_json: Option<&str>,
         factory_session: Option<&str>,
+        task_id: Option<&str>,
     ) -> Result<i64> {
         crate::shared_db::with_write_retry(|| {
             let conn = self.conn.lock().unwrap();
@@ -229,7 +256,7 @@ impl SqliteSpawnQueueStore {
             };
 
             conn.execute(
-                "INSERT INTO spawn_queue (action, count, worker_names, force, isolate, worker_spec, factory_session, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO spawn_queue (action, count, worker_names, force, isolate, worker_spec, factory_session, task_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     action.as_str(),
                     count,
@@ -238,6 +265,7 @@ impl SqliteSpawnQueueStore {
                     isolate as i32,
                     spec_json,
                     factory_session,
+                    task_id,
                     now
                 ],
             )?;
@@ -264,6 +292,7 @@ impl SpawnQueueStore for SqliteSpawnQueueStore {
         isolate: bool,
         spec_json: Option<&str>,
         factory_session: Option<&str>,
+        task_id: Option<&str>,
     ) -> Result<i64> {
         self.enqueue(
             SpawnAction::Spawn,
@@ -273,6 +302,7 @@ impl SpawnQueueStore for SqliteSpawnQueueStore {
             isolate,
             spec_json,
             factory_session,
+            task_id,
         )
     }
 
@@ -291,6 +321,7 @@ impl SpawnQueueStore for SqliteSpawnQueueStore {
             false,
             None,
             factory_session,
+            None,
         )
     }
 
@@ -307,6 +338,7 @@ impl SpawnQueueStore for SqliteSpawnQueueStore {
             false,
             None,
             factory_session,
+            None,
         )
     }
 
@@ -315,7 +347,7 @@ impl SpawnQueueStore for SqliteSpawnQueueStore {
         let now = Utc::now().to_rfc3339();
 
         let mut stmt = conn.prepare_cached(
-            "SELECT id, action, count, worker_names, force, isolate, worker_spec, factory_session, created_at, processed_at
+            "SELECT id, action, count, worker_names, force, isolate, worker_spec, factory_session, task_id, created_at, processed_at
              FROM spawn_queue
              WHERE processed_at IS NULL
                AND (factory_session = ? OR factory_session IS NULL)
@@ -357,7 +389,7 @@ impl SpawnQueueStore for SqliteSpawnQueueStore {
         let conn = self.conn.lock().unwrap();
 
         let mut stmt = conn.prepare_cached(
-            "SELECT id, action, count, worker_names, force, isolate, worker_spec, factory_session, created_at, processed_at
+            "SELECT id, action, count, worker_names, force, isolate, worker_spec, factory_session, task_id, created_at, processed_at
              FROM spawn_queue
              WHERE processed_at IS NULL
              ORDER BY created_at ASC
@@ -436,7 +468,7 @@ mod tests {
 
         // Queue a spawn request
         let id = store
-            .enqueue_spawn(2, &[], false, None, Some("session-a"))
+            .enqueue_spawn(2, &[], false, None, Some("session-a"), None)
             .unwrap();
         assert!(id > 0);
 
@@ -492,7 +524,7 @@ mod tests {
         let (_temp, store) = create_test_store();
 
         store
-            .enqueue_spawn(3, &[], false, None, Some("session-a"))
+            .enqueue_spawn(3, &[], false, None, Some("session-a"), None)
             .unwrap();
 
         // Peek should return request
@@ -512,10 +544,10 @@ mod tests {
         let (_temp, store) = create_test_store();
 
         store
-            .enqueue_spawn(1, &[], false, None, Some("session-a"))
+            .enqueue_spawn(1, &[], false, None, Some("session-a"), None)
             .unwrap();
         store
-            .enqueue_spawn(2, &[], false, None, Some("session-a"))
+            .enqueue_spawn(2, &[], false, None, Some("session-a"), None)
             .unwrap();
         store
             .enqueue_shutdown(None, &["worker-1".to_string()], false, Some("session-a"))
@@ -565,7 +597,7 @@ mod tests {
 
         // Queue a spawn request with isolate=true
         store
-            .enqueue_spawn(2, &[], true, None, Some("session-a"))
+            .enqueue_spawn(2, &[], true, None, Some("session-a"), None)
             .unwrap();
 
         let requests = store.poll("session-a", 10).unwrap();
@@ -575,12 +607,47 @@ mod tests {
 
         // Queue a spawn request with isolate=false
         store
-            .enqueue_spawn(1, &[], false, None, Some("session-a"))
+            .enqueue_spawn(1, &[], false, None, Some("session-a"), None)
             .unwrap();
 
         let requests = store.poll("session-a", 10).unwrap();
         assert_eq!(requests.len(), 1);
         assert!(!requests[0].isolate);
+    }
+
+    #[test]
+    fn test_enqueue_spawn_with_task_id_persists_and_dequeues() {
+        // cas-6913: verify task_id round-trips through the queue (poll and peek).
+        let (_temp, store) = create_test_store();
+
+        store
+            .enqueue_spawn(1, &[], false, None, Some("session-a"), Some("cas-abc1"))
+            .unwrap();
+
+        let peeked = store.peek(10).unwrap();
+        assert_eq!(peeked.len(), 1);
+        assert_eq!(peeked[0].task_id.as_deref(), Some("cas-abc1"));
+
+        let polled = store.poll("session-a", 10).unwrap();
+        assert_eq!(polled.len(), 1);
+        assert_eq!(polled[0].task_id.as_deref(), Some("cas-abc1"));
+    }
+
+    #[test]
+    fn test_enqueue_spawn_without_task_id_is_none() {
+        // Backwards compat: enqueue without task_id -> task_id is None.
+        let (_temp, store) = create_test_store();
+
+        store
+            .enqueue_spawn(1, &[], false, None, Some("session-a"), None)
+            .unwrap();
+
+        let requests = store.peek(10).unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0].task_id.is_none(),
+            "task_id should be None when not supplied"
+        );
     }
 
     #[test]
@@ -590,7 +657,7 @@ mod tests {
 
         let spec_json = r#"{"name":null,"cli":"codex","model":null,"effort":"high"}"#;
         store
-            .enqueue_spawn(1, &[], false, Some(spec_json), Some("session-a"))
+            .enqueue_spawn(1, &[], false, Some(spec_json), Some("session-a"), None)
             .unwrap();
 
         let requests = store.peek(10).unwrap();
@@ -611,7 +678,7 @@ mod tests {
         let (_temp, store) = create_test_store();
 
         store
-            .enqueue_spawn(1, &[], false, None, Some("session-a"))
+            .enqueue_spawn(1, &[], false, None, Some("session-a"), None)
             .unwrap();
 
         let requests = store.peek(10).unwrap();
@@ -627,7 +694,7 @@ mod tests {
         let (_temp, store) = create_test_store();
 
         store
-            .enqueue_spawn(1, &[], false, None, Some("session-a"))
+            .enqueue_spawn(1, &[], false, None, Some("session-a"), None)
             .unwrap();
         store
             .enqueue_shutdown(
@@ -660,7 +727,7 @@ mod tests {
         let (_temp, store) = create_test_store();
 
         store
-            .enqueue_spawn(1, &[], false, None, Some("session-a"))
+            .enqueue_spawn(1, &[], false, None, Some("session-a"), None)
             .unwrap();
 
         let requests = store.poll("session-b", 10).unwrap();
@@ -675,7 +742,7 @@ mod tests {
     fn test_legacy_null_session_rows_keep_single_session_behavior() {
         let (_temp, store) = create_test_store();
 
-        store.enqueue_spawn(2, &[], false, None, None).unwrap();
+        store.enqueue_spawn(2, &[], false, None, None, None).unwrap();
         store.enqueue_shutdown(Some(1), &[], true, None).unwrap();
 
         let requests = store.poll("any-session", 10).unwrap();

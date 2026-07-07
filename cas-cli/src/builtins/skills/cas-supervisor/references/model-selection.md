@@ -10,10 +10,10 @@ Pay for reasoning only where reasoning is the bottleneck. Every worker slot has 
 
 ## Tiers
 
-| Tier | Spawn overrides | Use for |
+| Tier | Spawn parameters | Use for |
 |---|---|---|
 | **light** | `cli=codex model=gpt-5.5 effort=low` | Chores, docs, mechanical renames, config bumps, `depth=light` tasks, test backfill that mirrors existing patterns |
-| **standard** | *(omit — session default)* | Normal feature/bug work with a clear spec and bounded blast radius. The stock floor is codex / gpt-5.5 / medium. |
+| **standard** | `cli=codex model=gpt-5.5 effort=medium` | Normal feature/bug work with a clear spec and bounded blast radius. The stock floor is codex / gpt-5.5 / medium. |
 | **heavy** | `cli=claude model=sonnet effort=high` | Cross-cutting refactors, concurrency/lifecycle code, migrations, gnarly debugging, P0/P1 critical-path units |
 | **frontier** | `cli=claude model=opus effort=high` | Architecture-defining units, high-blast-radius changes, tasks that already bounced twice. Sparingly — every frontier worker should map to named tasks. |
 
@@ -58,18 +58,21 @@ For Claude workers, `effort=high` is the ceiling. `xhigh`/`max` increase per-ste
 ## Workflow
 
 1. **Tag at breakdown** — tasks default to standard; tag deviations with a label: `labels="tier:light"` / `"tier:heavy"` / `"tier:frontier"`. Note non-obvious tier rationale in the task's `design` field.
-2. **Spawn the mix** — count tiers in the ready backlog, then issue one `spawn_workers` call per tier (a call's overrides apply to every worker in that call):
+2. **Spawn the mix** — count tiers in the ready backlog, then issue one `spawn_workers` call per tier (a call's parameters apply to every worker in that call):
    ```
-   # two standard workers on the session default
-   mcp__cas__coordination action=spawn_workers count=2 isolate=true
+   # two standard workers
+   mcp__cas__coordination action=spawn_workers count=2 isolate=true cli=codex model=gpt-5.5 effort=medium
 
    # one heavy worker for the tier:heavy tasks
    mcp__cas__coordination action=spawn_workers count=1 isolate=true cli=claude model=sonnet effort=high worker_names="hv-ada"
    ```
+   Every `spawn_workers` call MUST include explicit `model=` and `effort=`;
+   relying on omitted fields is a fallback path that emits an acknowledgement
+   warning, not an approved supervisor workflow.
    Tiers change the fleet's composition, not its size — worker-count strategy (3–4 max, sized by independent file groups) still applies.
 3. **Route by tier** — assign `tier:*`-labelled tasks to a matching worker; standard tasks go to anyone. Name heavier workers so routing stays legible (`hv-*`, `fr-*`).
 4. **Escalate on failure** — a task rejected or verification-failed twice moves up one tier: reassign to an existing heavier worker or spawn one. Don't re-run the same task on the same tier hoping for different output.
 5. **Escalate on judgment** — the two-rejection rule is a floor, not a permission gate. If a cheaper worker's draft gathers facts but misses the quality bar, escalate before verification fails. Judge the output, not the price tag; use cheap tiers for information and drafts, then pay for what ships. Cost is a tiebreaker only.
 6. **De-escalate the tail** — when only light tasks remain, don't leave a heavy/frontier worker idle-burning; shut it down and let a cheaper worker sweep the tail.
 
-Per-spawn overrides beat `.cas/config.toml` `[factory.defaults]` / `[[factory.workers]]` for that spawn only — check the project config before assuming what the floor actually is.
+Explicit per-spawn parameters beat `.cas/config.toml` `[factory.defaults]` / `[[factory.workers]]` for that spawn only — check the project config before assuming what the floor actually is.

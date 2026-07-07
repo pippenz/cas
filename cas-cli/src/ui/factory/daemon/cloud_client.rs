@@ -296,13 +296,25 @@ async fn cloud_client_task(
                 consecutive_failures += 1;
                 cloud_log(
                     &config.factory_id,
-                    &format!("ERROR: {e}, reconnecting in {backoff_secs}s (attempt {consecutive_failures}/{MAX_CONSECUTIVE_FAILURES})"),
+                    &format!(
+                        "ERROR: {e}, reconnecting in {backoff_secs}s (attempt {consecutive_failures}/{MAX_CONSECUTIVE_FAILURES})"
+                    ),
                 );
                 // Only log at warn level on the first failure; demote to debug after that
                 if consecutive_failures == 1 {
-                    tracing::warn!("Cloud client error: {}, reconnecting in {}s", e, backoff_secs);
+                    tracing::warn!(
+                        "Cloud client error: {}, reconnecting in {}s",
+                        e,
+                        backoff_secs
+                    );
                 } else {
-                    tracing::debug!("Cloud client error: {}, reconnecting in {}s (attempt {}/{})", e, backoff_secs, consecutive_failures, MAX_CONSECUTIVE_FAILURES);
+                    tracing::debug!(
+                        "Cloud client error: {}, reconnecting in {}s (attempt {}/{})",
+                        e,
+                        backoff_secs,
+                        consecutive_failures,
+                        MAX_CONSECUTIVE_FAILURES
+                    );
                 }
             }
         }
@@ -923,12 +935,18 @@ fn handle_cloud_command(
                 let cli = params.get("cli").and_then(|v| v.as_str());
                 let model = params.get("model").and_then(|v| v.as_str());
                 let effort = params.get("effort").and_then(|v| v.as_str());
-                match crate::mcp::tools::service::factory_ops::build_spawn_spec_json(
-                    cli, model, effort,
+                match crate::mcp::tools::service::factory_ops::build_spawn_spec_json_with_project_config(
+                    cli,
+                    model,
+                    effort,
+                    Some(cas_dir.join("config.toml")),
                 ) {
-                    Ok(j) => j,
+                    Ok(j) => Some(j),
                     Err(e) => {
-                        tracing::warn!("Cloud spawn_workers: invalid spec override ({}); ignoring", e);
+                        tracing::warn!(
+                            "Cloud spawn_workers: invalid spec override ({}); ignoring",
+                            e
+                        );
                         None
                     }
                 }
@@ -940,6 +958,9 @@ fn handle_cloud_command(
                     isolate,
                     spec_json_owned.as_deref(),
                     factory_session,
+                    // cas-6913: task_id pre-assignment is MCP-only for now —
+                    // the cloud relay protocol has no task_id field yet.
+                    None,
                 ) {
                     Ok(id) => {
                         tracing::info!("Cloud spawn_workers queued (id={}): count={}", id, count)

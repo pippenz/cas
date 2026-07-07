@@ -469,10 +469,7 @@ impl CasCore {
                     agent.agent_type = crate::types::AgentType::Worker;
                 }
 
-                // Set clone_path from CAS_CLONE_PATH env var (set by factory mode for workers)
-                if let Ok(clone_path) = std::env::var("CAS_CLONE_PATH") {
-                    agent.metadata.insert("clone_path".to_string(), clone_path);
-                }
+                crate::mcp::daemon::apply_factory_worker_metadata(&mut agent, None);
 
                 agent_store.register(&agent).map_err(|e| McpError {
                     code: ErrorCode::INTERNAL_ERROR,
@@ -568,10 +565,7 @@ impl CasCore {
             }
         }
 
-        // Set clone_path from CAS_CLONE_PATH env var (set by factory mode for workers)
-        if let Ok(clone_path) = std::env::var("CAS_CLONE_PATH") {
-            agent.metadata.insert("clone_path".to_string(), clone_path);
-        }
+        crate::mcp::daemon::apply_factory_worker_metadata(&mut agent, None);
 
         agent_store.register(&agent).map_err(|e| McpError {
             code: ErrorCode::INTERNAL_ERROR,
@@ -696,9 +690,7 @@ impl CasCore {
                 .code_review
                 .as_ref()
                 .map(|cr| cr.supervisor_owned())
-                .unwrap_or_else(|| {
-                    crate::config::CodeReviewConfig::default().supervisor_owned()
-                });
+                .unwrap_or_else(|| crate::config::CodeReviewConfig::default().supervisor_owned());
             if supervisor_owned {
                 return Ok(());
             }

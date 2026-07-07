@@ -103,9 +103,22 @@ struct WsConnection {
 #[derive(Debug)]
 enum PendingSpawn {
     /// Spawn a worker with an auto-generated name
-    Anonymous { isolate: bool, spec: Option<cas_mux::WorkerSpec> },
+    Anonymous {
+        isolate: bool,
+        spec: Option<cas_mux::WorkerSpec>,
+        /// cas-6913: task to pre-assign once this worker finishes spawning.
+        /// Only ever `Some` for single-worker requests — validated at the
+        /// MCP layer (`factory_spawn_workers`) before enqueueing.
+        task_id: Option<String>,
+    },
     /// Spawn a worker with a specific name
-    Named { name: String, isolate: bool, spec: Option<cas_mux::WorkerSpec> },
+    Named {
+        name: String,
+        isolate: bool,
+        spec: Option<cas_mux::WorkerSpec>,
+        /// cas-6913: task to pre-assign once this worker finishes spawning.
+        task_id: Option<String>,
+    },
     /// Shutdown workers
     Shutdown {
         count: Option<usize>,
@@ -152,10 +165,17 @@ pub struct FactoryDaemon {
     compact_rows: u16,
     /// Pending spawn/shutdown actions (processed one per tick to avoid blocking TUI)
     pending_spawns: VecDeque<PendingSpawn>,
-    /// In-flight background spawn task: (worker_name, per-spawn spec override, join_handle).
+    /// In-flight background spawn task: (worker_name, per-spawn spec override, task_id to
+    /// pre-assign (cas-6913), join_handle).
     /// One at a time, runs git worktree ops off main thread.
-    /// The spec carries the caller-supplied WorkerSpec through the async gap to finish_worker_spawn.
-    spawn_task: Option<(String, Option<cas_mux::WorkerSpec>, JoinHandle<anyhow::Result<WorkerSpawnResult>>)>,
+    /// The spec/task_id carry the caller-supplied overrides through the async gap to
+    /// finish_worker_spawn.
+    spawn_task: Option<(
+        String,
+        Option<cas_mux::WorkerSpec>,
+        Option<String>,
+        JoinHandle<anyhow::Result<WorkerSpawnResult>>,
+    )>,
     /// Cloud phone-home WebSocket client handle
     cloud_handle: Option<cloud_client::CloudClientHandle>,
     /// Whether cloud phone-home should be started (deferred from init for fork-first path)
@@ -257,6 +277,7 @@ mod tests {
             name: "alice".to_string(),
             isolate: false,
             spec: Some(codex_spec.clone()),
+            task_id: None,
         };
 
         // Step 2: queue_and_events extracts spec from spawn_task tuple after the blocking
@@ -299,6 +320,44 @@ mod tests {
             effective_cmd,
             config.command,
             config.args
+        );
+    }
+
+    /// cas-6913: verify a task_id survives the same PendingSpawn → spawn_task
+    /// tuple routing chain as the WorkerSpec above, so `finish_worker_spawn`
+    /// (which extracts it from the tuple, see queue_and_events.rs) actually
+    /// receives it and can pre-assign the task once the worker is up.
+    #[test]
+    fn pending_spawn_task_id_survives_named_and_anonymous_variants() {
+        let named = PendingSpawn::Named {
+            name: "alice".to_string(),
+            isolate: false,
+            spec: None,
+            task_id: Some("cas-abc1".to_string()),
+        };
+        let extracted = match named {
+            PendingSpawn::Named { task_id, .. } => task_id,
+            _ => panic!("unexpected PendingSpawn variant"),
+        };
+        assert_eq!(
+            extracted,
+            Some("cas-abc1".to_string()),
+            "PendingSpawn::Named must preserve the caller-supplied task_id"
+        );
+
+        let anonymous = PendingSpawn::Anonymous {
+            isolate: true,
+            spec: None,
+            task_id: Some("cas-xyz9".to_string()),
+        };
+        let extracted = match anonymous {
+            PendingSpawn::Anonymous { task_id, .. } => task_id,
+            _ => panic!("unexpected PendingSpawn variant"),
+        };
+        assert_eq!(
+            extracted,
+            Some("cas-xyz9".to_string()),
+            "PendingSpawn::Anonymous must preserve the caller-supplied task_id"
         );
     }
 }

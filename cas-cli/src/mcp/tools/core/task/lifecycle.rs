@@ -63,14 +63,13 @@ impl CasCore {
             }
         }
 
-        let execution_note = crate::mcp::tools::types::validate_execution_note(
-            req.execution_note.as_deref(),
-        )
-        .map_err(|msg| McpError {
-            code: ErrorCode::INVALID_PARAMS,
-            message: Cow::from(msg),
-            data: None,
-        })?;
+        let execution_note =
+            crate::mcp::tools::types::validate_execution_note(req.execution_note.as_deref())
+                .map_err(|msg| McpError {
+                    code: ErrorCode::INVALID_PARAMS,
+                    message: Cow::from(msg),
+                    data: None,
+                })?;
 
         // Absent/empty depth defaults to Deep (full rigor); an invalid value
         // is rejected with a clear error.
@@ -318,6 +317,15 @@ impl CasCore {
                 "Cannot start a task that is pending supervisor review. \
                 The work is already complete — wait for the supervisor to \
                 review and close it (or reopen it if rework is needed).",
+            ));
+        }
+
+        if task.status == TaskStatus::AwaitingMerge {
+            return Err(Self::error(
+                ErrorCode::INVALID_PARAMS,
+                "Cannot start a task that is awaiting merge. The worker work is \
+                already complete; wait for the supervisor to merge the factory \
+                branch, then retry task close.",
             ));
         }
 
@@ -587,6 +595,20 @@ impl CasCore {
         } else {
             None
         };
+
+        // cas-6945: `start` previously left `task.assignee` untouched, so the TUI's
+        // epic-focus inference gate (task_assigned_to_session_agent, tasks.rs) could
+        // never pass without the supervisor manually running
+        // `task action=update assignee=<worker>`. Default the assignee to the
+        // starting agent's display name — assignees are matched as display names,
+        // not session IDs (cas-dbbb, see task/update.rs) — whenever it's unset.
+        // Never clobber an existing assignee (e.g. the supervisor already assigned
+        // it to someone else, or this is a resume after reassignment).
+        if task.assignee.is_none() {
+            if let Ok(agent) = agent_store.get(&agent_id) {
+                task.assignee = Some(agent.name.clone());
+            }
+        }
 
         task.status = TaskStatus::InProgress;
         task.updated_at = chrono::Utc::now();

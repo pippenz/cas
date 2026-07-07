@@ -6,7 +6,7 @@ Wrong field names and invalid actions waste dispatch cycles. This section covers
 
 **Valid `mcp__cas__coordination` actions** (do not invent others):
 - *Agent*: `register`, `unregister`, `whoami`, `heartbeat`, `agent_list`, `agent_cleanup`, `session_start`, `session_end`, `loop_start`, `loop_cancel`, `loop_status`, `lease_history`, `queue_notify`, `queue_poll`, `queue_peek`, `queue_ack`, `message`, `message_ack`, `message_status`
-- *Factory*: `spawn_workers`, `shutdown_workers`, `worker_status`, `worker_activity`, `clear_context`, `my_context`, `sync_all_workers`, `gc_report`, `gc_cleanup`, `remind`, `remind_list`, `remind_cancel`
+- *Factory*: `spawn_workers`, `shutdown_workers`, `worker_status`, `worker_activity`, `clear_context`, `my_context`, `sync_all_workers`, `gc_report`, `gc_cleanup`, `epic_status`, `focus_epic`, `remind`, `remind_list`, `remind_cancel`
 - *Worktree*: `worktree_create`, `worktree_list`, `worktree_show`, `worktree_cleanup`, `worktree_merge`, `worktree_status`
 
 **`spawn_workers` parameters:**
@@ -16,11 +16,11 @@ Wrong field names and invalid actions waste dispatch cycles. This section covers
 | `count` | int | Number of workers to spawn |
 | `isolate` | bool | Each worker gets its own git worktree and branch (default false) |
 | `worker_names` | string | Comma-separated names for the spawned workers |
-| `cli` | string | CLI backend override: `claude` or `codex`. Overrides the daemon's session default for this spawn only. |
-| `model` | string | Model name override (e.g. `claude-opus-4-5`). Passed as `--model`. |
-| `effort` | string | Reasoning effort override: `minimal`, `low`, `medium`, `high`, `xhigh`. Passed as `--effort` (Claude) or `--config model_reasoning_effort=<v>` (Codex). |
+| `cli` | string | Explicit CLI backend for this spawn: `claude` or `codex`. If omitted, resolves through factory config, then stock fallback. |
+| `model` | string | Explicit model name (e.g. `claude-opus-4-5`). Passed as `--model`. If omitted, resolves through factory config, then backend stock fallback. |
+| `effort` | string | Explicit reasoning effort: `minimal`, `low`, `medium`, `high`, `xhigh`. Passed as `--effort` (Claude) or `--config model_reasoning_effort=<v>` (Codex). If omitted, resolves through factory config, then stock fallback. |
 
-`cli`, `model`, and `effort` are per-spawn overrides — they apply to the workers spawned by this call only, not to the session default. Omit any field to inherit the session default.
+`cli`, `model`, and `effort` are per-spawn controls — they apply to the workers spawned by this call only. Supervisors MUST pass explicit `model=` and `effort=` on every `spawn_workers` call; omitted fields resolve through the config cascade as a fallback and produce an acknowledgement warning.
 
 **Task ID is always `id`** — not `task_id`, `taskId`, or `_id`.
 

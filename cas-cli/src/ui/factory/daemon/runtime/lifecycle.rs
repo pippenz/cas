@@ -332,36 +332,45 @@ impl FactoryDaemon {
                 // for director-generated events. Logged at debug; enable
                 // via `RUST_LOG=cas::coordination=debug`.
                 let refresh_started = std::time::Instant::now();
-                let tick_interval_ms =
-                    last_refresh.elapsed().as_secs_f64() * 1000.0;
-                if let Ok((prompts, events)) = self.app.refresh_data() {
+                let tick_interval_ms = last_refresh.elapsed().as_secs_f64() * 1000.0;
+                if let Ok(events) = self.app.refresh_data() {
+                    // cas-627f: combined into one call so an idle tick with
+                    // zero events short-circuits before touching the DB at
+                    // all, and a non-idle tick shares a single unfiltered
+                    // load between revalidation and prompt generation
+                    // instead of two independent (and possibly divergent)
+                    // full DirectorData loads. See
+                    // `revalidate_and_prompt_for_delivery` doc comment.
+                    let (delivery_events, prompts) =
+                        self.app.revalidate_and_prompt_for_delivery(&events);
                     tracing::debug!(
                         target: "cas::coordination",
                         stage = "director_refresh",
                         channel = "director_events",
-                        event_count = events.len(),
+                        event_count = delivery_events.len(),
+                        stale_event_count = events.len().saturating_sub(delivery_events.len()),
                         prompt_count = prompts.len(),
                         tick_interval_ms,
                         "director refresh tick processed"
                     );
 
                     // Record events for export
-                    self.app.record_events(&events);
+                    self.app.record_events(&delivery_events);
 
                     // Send notifications for detected events
-                    self.app.notify_events(&events);
+                    self.app.notify_events(&delivery_events);
 
                     // Handle epic state transitions
-                    let changes = self.app.handle_epic_events(&events);
+                    let changes = self.app.handle_epic_events(&delivery_events);
                     for change in changes {
                         let _ = self.handle_epic_change(change).await;
                     }
 
                     // Process reminders (time-based and event-based)
-                    self.process_reminders(&events);
+                    self.process_reminders(&delivery_events);
 
                     // Push state and events to cloud (best-effort, no-op if not connected)
-                    self.push_cloud_events(&events);
+                    self.push_cloud_events(&delivery_events);
                     self.push_cloud_state();
 
                     // Inject prompts (config already checked in generate_prompt)
@@ -386,10 +395,8 @@ impl FactoryDaemon {
                                 Some(super::teams::DIRECTOR_AGENT_COLOR),
                             )
                             .await;
-                        let inject_ms =
-                            inject_started.elapsed().as_secs_f64() * 1000.0;
-                        let total_ms =
-                            refresh_started.elapsed().as_secs_f64() * 1000.0;
+                        let inject_ms = inject_started.elapsed().as_secs_f64() * 1000.0;
+                        let total_ms = refresh_started.elapsed().as_secs_f64() * 1000.0;
                         match inject_result {
                             Ok(()) => tracing::info!(
                                 target: "cas::coordination",

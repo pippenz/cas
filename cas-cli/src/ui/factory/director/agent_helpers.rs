@@ -158,6 +158,108 @@ pub fn task_status_icon(status: TaskStatus) -> &'static str {
     match status {
         TaskStatus::InProgress => Icons::SPINNER_STATIC,
         TaskStatus::Blocked => Icons::BLOCKED,
+        TaskStatus::AwaitingMerge => Icons::CLOCK,
         _ => "",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use cas_types::{Priority, TaskType};
+
+    use super::*;
+
+    fn agent(id: &str, name: &str, current_task: Option<&str>) -> cas_factory::AgentSummary {
+        cas_factory::AgentSummary {
+            id: id.to_string(),
+            name: name.to_string(),
+            status: AgentStatus::Active,
+            current_task: current_task.map(str::to_string),
+            latest_activity: None,
+            last_heartbeat: Some(Utc::now()),
+            pending_messages: 0,
+            active_lease: None,
+        }
+    }
+
+    fn task(id: &str, assignee: Option<&str>) -> cas_factory::TaskSummary {
+        cas_factory::TaskSummary {
+            id: id.to_string(),
+            title: format!("Task {id}"),
+            status: TaskStatus::InProgress,
+            priority: Priority::MEDIUM,
+            assignee: assignee.map(str::to_string),
+            task_type: TaskType::Task,
+            epic: None,
+            branch: None,
+            updated_at: None,
+        }
+    }
+
+    fn data(in_progress_tasks: Vec<cas_factory::TaskSummary>) -> DirectorData {
+        DirectorData {
+            ready_tasks: Vec::new(),
+            in_progress_tasks,
+            epic_tasks: Vec::new(),
+            agents: Vec::new(),
+            activity: Vec::new(),
+            agent_id_to_name: HashMap::new(),
+            changes: Vec::new(),
+            git_loaded: false,
+            reminders: Vec::new(),
+            epic_closed_counts: HashMap::new(),
+        }
+    }
+
+    /// cas-eb7f (review finding, cas-ebc1 final): the primary lookup path —
+    /// resolving via `agent.current_task` matched against
+    /// `data.in_progress_tasks` — was previously untested; the only existing
+    /// test always built agents with `current_task: None`, so it exercised
+    /// only the assignee-fallback branch. This is the common-case path a
+    /// healthy worker hits every render.
+    #[test]
+    fn find_agent_in_progress_task_resolves_via_current_task_id() {
+        let agent = agent("agent-1", "swift-fox", Some("cas-1234"));
+        // Deliberately give the matching task a DIFFERENT assignee than the
+        // agent's id/name, so the fallback branch could not accidentally
+        // produce the same answer — a regression to the fallback-only path
+        // would return None here, not silently pass.
+        let data = data(vec![task("cas-1234", Some("someone-else"))]);
+
+        let found = find_agent_in_progress_task(&agent, &data);
+
+        assert_eq!(
+            found.map(|t| t.id.as_str()),
+            Some("cas-1234"),
+            "must resolve via agent.current_task, not the assignee fallback"
+        );
+    }
+
+    /// A stale `current_task` (task no longer in `in_progress_tasks`, e.g.
+    /// just closed) must fall through to the assignee-based lookup rather
+    /// than returning `None` outright.
+    #[test]
+    fn find_agent_in_progress_task_falls_back_when_current_task_id_is_stale() {
+        let agent = agent("agent-1", "swift-fox", Some("cas-9999"));
+        let data = data(vec![task("cas-1234", Some("agent-1"))]);
+
+        let found = find_agent_in_progress_task(&agent, &data);
+
+        assert_eq!(
+            found.map(|t| t.id.as_str()),
+            Some("cas-1234"),
+            "stale current_task must fall through to the assignee match"
+        );
+    }
+
+    /// Negative control: no `current_task` and no matching assignee → `None`.
+    #[test]
+    fn find_agent_in_progress_task_returns_none_when_nothing_matches() {
+        let agent = agent("agent-1", "swift-fox", None);
+        let data = data(vec![task("cas-1234", Some("someone-else"))]);
+
+        assert!(find_agent_in_progress_task(&agent, &data).is_none());
     }
 }

@@ -90,6 +90,64 @@ fn worker_has_open_tasks(cas_dir: &std::path::Path, agent_id: &str) -> bool {
     }
 }
 
+/// cas-6913: pre-assign `task_id` to the just-spawned `worker_name`, so the
+/// worker's very first `task action=mine` shows it without the supervisor
+/// needing to send a follow-up assignment message. Assignees are display
+/// names, not session IDs (cas-dbbb, same convention as `task action=start`'s
+/// auto-assign in cas-6945's task/lifecycle.rs).
+///
+/// Best-effort and silent on failure by design: `finish_worker_spawn` calls
+/// this after the worker's PTY is already running, so raising an error here
+/// has nowhere useful to go — it would only orphan a live process. Every
+/// failure path is logged instead so it's diagnosable without being fatal.
+/// Never overwrites an existing assignee (e.g. a concurrent supervisor
+/// action beat the spawn to it).
+fn assign_task_to_new_worker(cas_dir: &std::path::Path, task_id: &str, worker_name: &str) {
+    let store = match open_task_store(cas_dir) {
+        Ok(store) => store,
+        Err(e) => {
+            tracing::error!(
+                task_id, worker_name, error = %e,
+                "cas-6913: failed to open task store for spawn-time task pre-assignment"
+            );
+            return;
+        }
+    };
+
+    let task = match store.get(task_id) {
+        Ok(task) => task,
+        Err(e) => {
+            tracing::error!(
+                task_id, worker_name, error = %e,
+                "cas-6913: task not found for spawn-time pre-assignment"
+            );
+            return;
+        }
+    };
+
+    if let Some(ref existing) = task.assignee {
+        tracing::warn!(
+            task_id, worker_name, existing_assignee = %existing,
+            "cas-6913: task already has an assignee — not overwriting at spawn-time pre-assignment"
+        );
+        return;
+    }
+
+    let mut updated = task;
+    updated.assignee = Some(worker_name.to_string());
+    match store.update(&updated) {
+        Ok(()) => {
+            tracing::info!(task_id, worker_name, "cas-6913: pre-assigned task to newly spawned worker");
+        }
+        Err(e) => {
+            tracing::error!(
+                task_id, worker_name, error = %e,
+                "cas-6913: failed to persist spawn-time task pre-assignment"
+            );
+        }
+    }
+}
+
 fn shutdown_scope(count: Option<usize>, names: &[String]) -> &'static str {
     if !names.is_empty() {
         "named"
@@ -236,7 +294,7 @@ impl FactoryApp {
                 return Err(e);
             }
         };
-        self.finish_worker_spawn(result, None, None)
+        self.finish_worker_spawn(result, None, None, None)
     }
 
     /// Phase 1: Prepare spawn data (fast, runs on main thread).
@@ -346,6 +404,7 @@ impl FactoryApp {
         result: WorkerSpawnResult,
         teams: Option<cas_mux::TeamsSpawnConfig>,
         spec: Option<cas_mux::WorkerSpec>,
+        task_id: Option<String>,
     ) -> anyhow::Result<String> {
         // cas-9bc6: re-read live LlmConfig so harness/model/effort changes made
         // via `cas config set` after daemon boot are reflected in this spawn.
@@ -412,6 +471,14 @@ impl FactoryApp {
 
         // Track the worker name
         self.worker_names.push(worker_name.clone());
+
+        // cas-6913: pre-assign the requested task now that the worker name
+        // is final. Best-effort — a failure here must not unwind the spawn,
+        // the worker's PTY is already running.
+        if let Some(ref task_id) = task_id {
+            assign_task_to_new_worker(self.cas_dir(), task_id, &worker_name);
+        }
+
         crate::ui::factory::app::queue_codex_worker_intro_prompt(
             self.cas_dir(),
             &worker_name,
@@ -948,6 +1015,60 @@ mod tests {
             .unwrap();
 
         assert!(!worker_has_open_tasks(&cas_dir, "agent-d"));
+    }
+
+    // --- cas-6913: spawn-time task pre-assignment -----------------------
+
+    /// AC3: `spawn_workers task_id=<id>` must result in the task's assignee
+    /// being the newly spawned worker's display name — the same field
+    /// `task action=mine` filters on (cas-dbbb convention) — so the
+    /// worker's very first `task mine` shows it.
+    #[test]
+    fn assign_task_to_new_worker_sets_assignee() {
+        let (_temp, cas_dir) = seeded_cas_dir();
+        let store = crate::store::open_task_store(&cas_dir).unwrap();
+        store
+            .add(&task_with("cas-abc1", None, TaskStatus::Open))
+            .unwrap();
+
+        assign_task_to_new_worker(&cas_dir, "cas-abc1", "swift-fox");
+
+        let updated = store.get("cas-abc1").unwrap();
+        assert_eq!(
+            updated.assignee.as_deref(),
+            Some("swift-fox"),
+            "task should be assigned to the newly spawned worker's display name"
+        );
+    }
+
+    /// Never overwrite an existing assignee — e.g. a concurrent supervisor
+    /// action (or a stale/replayed spawn) must not silently reassign work
+    /// away from whoever already has it.
+    #[test]
+    fn assign_task_to_new_worker_does_not_overwrite_existing_assignee() {
+        let (_temp, cas_dir) = seeded_cas_dir();
+        let store = crate::store::open_task_store(&cas_dir).unwrap();
+        store
+            .add(&task_with("cas-abc1", Some("other-worker"), TaskStatus::Open))
+            .unwrap();
+
+        assign_task_to_new_worker(&cas_dir, "cas-abc1", "swift-fox");
+
+        let updated = store.get("cas-abc1").unwrap();
+        assert_eq!(
+            updated.assignee.as_deref(),
+            Some("other-worker"),
+            "existing assignee must be preserved, not overwritten"
+        );
+    }
+
+    /// A missing task_id must not panic — best-effort, log-and-return.
+    #[test]
+    fn assign_task_to_new_worker_missing_task_does_not_panic() {
+        let (_temp, cas_dir) = seeded_cas_dir();
+        // No task seeded — "cas-missing" does not exist.
+        assign_task_to_new_worker(&cas_dir, "cas-missing", "swift-fox");
+        // Reaching this line without panicking is the assertion.
     }
 
     // --- cas-9bc6: resolve_live_worker_harness reads from disk, not cache ----

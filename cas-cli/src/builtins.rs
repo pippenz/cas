@@ -132,7 +132,9 @@ pub const BUILTIN_SKILLS: &[BuiltinFile] = &[
     },
     BuiltinFile {
         path: "skills/cas-memory-management/references/overlap-detection.md",
-        content: include_str!("builtins/skills/cas-memory-management/references/overlap-detection.md"),
+        content: include_str!(
+            "builtins/skills/cas-memory-management/references/overlap-detection.md"
+        ),
     },
     BuiltinFile {
         path: "skills/cas-search/SKILL.md",
@@ -182,21 +184,15 @@ pub const BUILTIN_SKILLS: &[BuiltinFile] = &[
     },
     BuiltinFile {
         path: "skills/cas-supervisor/references/code-review-queue.md",
-        content: include_str!(
-            "builtins/skills/cas-supervisor/references/code-review-queue.md"
-        ),
+        content: include_str!("builtins/skills/cas-supervisor/references/code-review-queue.md"),
     },
     BuiltinFile {
         path: "skills/cas-supervisor/references/filing-cas-bugs.md",
-        content: include_str!(
-            "builtins/skills/cas-supervisor/references/filing-cas-bugs.md"
-        ),
+        content: include_str!("builtins/skills/cas-supervisor/references/filing-cas-bugs.md"),
     },
     BuiltinFile {
         path: "skills/cas-supervisor/references/model-selection.md",
-        content: include_str!(
-            "builtins/skills/cas-supervisor/references/model-selection.md"
-        ),
+        content: include_str!("builtins/skills/cas-supervisor/references/model-selection.md"),
     },
     BuiltinFile {
         path: "skills/cas-supervisor-checklist/SKILL.md",
@@ -289,24 +285,18 @@ pub const BUILTIN_SKILLS: &[BuiltinFile] = &[
     },
     BuiltinFile {
         path: "skills/cas-code-review/references/personas/performance.md",
-        content: include_str!(
-            "builtins/skills/cas-code-review/references/personas/performance.md"
-        ),
+        content: include_str!("builtins/skills/cas-code-review/references/personas/performance.md"),
     },
     BuiltinFile {
         path: "skills/cas-code-review/references/personas/adversarial.md",
-        content: include_str!(
-            "builtins/skills/cas-code-review/references/personas/adversarial.md"
-        ),
+        content: include_str!("builtins/skills/cas-code-review/references/personas/adversarial.md"),
     },
     // fallow persona — 5th always-on reviewer. Thin Sonnet wrapper around
     // `fallow audit` that translates deterministic findings into the
     // ReviewerOutput envelope and self-skips on non-JS/TS repos / diffs.
     BuiltinFile {
         path: "skills/cas-code-review/references/personas/fallow.md",
-        content: include_str!(
-            "builtins/skills/cas-code-review/references/personas/fallow.md"
-        ),
+        content: include_str!("builtins/skills/cas-code-review/references/personas/fallow.md"),
     },
     // project-overview skill (EPIC cas-19a2b): generates
     // docs/PRODUCT_OVERVIEW.md for any project and writes a thin memory
@@ -390,11 +380,15 @@ pub const CODEX_BUILTIN_SKILLS: &[BuiltinFile] = &[
     },
     BuiltinFile {
         path: "skills/cas-memory-management/references/body-templates.md",
-        content: include_str!("builtins/codex/skills/cas-memory-management/references/body-templates.md"),
+        content: include_str!(
+            "builtins/codex/skills/cas-memory-management/references/body-templates.md"
+        ),
     },
     BuiltinFile {
         path: "skills/cas-memory-management/references/overlap-detection.md",
-        content: include_str!("builtins/codex/skills/cas-memory-management/references/overlap-detection.md"),
+        content: include_str!(
+            "builtins/codex/skills/cas-memory-management/references/overlap-detection.md"
+        ),
     },
     BuiltinFile {
         path: "skills/cas-search/SKILL.md",
@@ -447,15 +441,11 @@ pub const CODEX_BUILTIN_SKILLS: &[BuiltinFile] = &[
     },
     BuiltinFile {
         path: "skills/cas-supervisor/references/filing-cas-bugs.md",
-        content: include_str!(
-            "builtins/codex/skills/cas-supervisor/references/filing-cas-bugs.md"
-        ),
+        content: include_str!("builtins/codex/skills/cas-supervisor/references/filing-cas-bugs.md"),
     },
     BuiltinFile {
         path: "skills/cas-supervisor/references/model-selection.md",
-        content: include_str!(
-            "builtins/codex/skills/cas-supervisor/references/model-selection.md"
-        ),
+        content: include_str!("builtins/codex/skills/cas-supervisor/references/model-selection.md"),
     },
     BuiltinFile {
         path: "skills/cas-codex-supervisor-checklist/SKILL.md",
@@ -497,7 +487,9 @@ pub const CODEX_BUILTIN_SKILLS: &[BuiltinFile] = &[
     },
     BuiltinFile {
         path: "skills/cas-brainstorm/references/requirements-capture.md",
-        content: include_str!("builtins/codex/skills/cas-brainstorm/references/requirements-capture.md"),
+        content: include_str!(
+            "builtins/codex/skills/cas-brainstorm/references/requirements-capture.md"
+        ),
     },
     BuiltinFile {
         path: "skills/cas-ideate/SKILL.md",
@@ -505,7 +497,9 @@ pub const CODEX_BUILTIN_SKILLS: &[BuiltinFile] = &[
     },
     BuiltinFile {
         path: "skills/cas-ideate/references/post-ideation-workflow.md",
-        content: include_str!("builtins/codex/skills/cas-ideate/references/post-ideation-workflow.md"),
+        content: include_str!(
+            "builtins/codex/skills/cas-ideate/references/post-ideation-workflow.md"
+        ),
     },
     // cas-code-review (Phase 1 subsystem A, EPIC cas-0750) — codex mirror.
     BuiltinFile {
@@ -797,7 +791,11 @@ fn sync_all_builtins_inner(
 ///
 /// Counts are returned on `result.skills_updated` (workflow scripts don't have
 /// their own counter; they are a minor surface relative to skills).
-fn sync_workflows(target_dir: &Path, workflows: &[BuiltinFile], result: &mut SyncResult) -> std::io::Result<()> {
+fn sync_workflows(
+    target_dir: &Path,
+    workflows: &[BuiltinFile],
+    result: &mut SyncResult,
+) -> std::io::Result<()> {
     for wf in workflows {
         let target = target_dir.join(wf.path);
         if let Some(parent) = target.parent() {
@@ -805,7 +803,7 @@ fn sync_workflows(target_dir: &Path, workflows: &[BuiltinFile], result: &mut Syn
         }
         let needs_write = match std::fs::read_to_string(&target) {
             Ok(existing) => existing != wf.content,
-            Err(_) => true,  // file absent or unreadable → create
+            Err(_) => true, // file absent or unreadable → create
         };
         if needs_write {
             std::fs::write(&target, wf.content)?;
@@ -1346,7 +1344,8 @@ This is the body content."#;
                 );
             }
             assert!(
-                details_content.contains("Do **not** use unrestricted `sqlite3 /path/to/.cas/cas.db`"),
+                details_content
+                    .contains("Do **not** use unrestricted `sqlite3 /path/to/.cas/cas.db`"),
                 "{label} worker details should explicitly discourage unrestricted live sqlite3 access"
             );
         }
@@ -1465,9 +1464,11 @@ This is the body content."#;
                 .iter()
                 .any(|b| b.path == "skills/cas-brainstorm/references/handoff.md")
         );
-        assert!(BUILTIN_SKILLS.iter().any(
-            |b| b.path == "skills/cas-brainstorm/references/requirements-capture.md"
-        ));
+        assert!(
+            BUILTIN_SKILLS
+                .iter()
+                .any(|b| b.path == "skills/cas-brainstorm/references/requirements-capture.md")
+        );
         assert!(
             CODEX_BUILTIN_SKILLS
                 .iter()
@@ -1482,9 +1483,11 @@ This is the body content."#;
                 .iter()
                 .any(|b| b.path == "skills/cas-ideate/SKILL.md")
         );
-        assert!(BUILTIN_SKILLS.iter().any(
-            |b| b.path == "skills/cas-ideate/references/post-ideation-workflow.md"
-        ));
+        assert!(
+            BUILTIN_SKILLS
+                .iter()
+                .any(|b| b.path == "skills/cas-ideate/references/post-ideation-workflow.md")
+        );
         assert!(
             CODEX_BUILTIN_SKILLS
                 .iter()
@@ -1523,7 +1526,8 @@ This is the body content."#;
             // removed that mention when `[code_review] owner = "supervisor"`
             // became the default (v2.13.0+). Workers must NOT invoke
             // cas-code-review pre-close under the default ownership model —
-            // the supervisor owns review timing at cherry-pick / EPIC-merge.
+            // the supervisor owns review timing, with a lightweight
+            // per-merge gate and one full review at EPIC code-complete.
             // The assertion was silently failing on main from that commit
             // forward; cas-ec8f drops it here so the test reflects the
             // current ownership contract. The `close-gate.md` pointer is
@@ -1552,11 +1556,7 @@ This is the body content."#;
             // contract: close-gate.md documents the close gate, points
             // workers at cas-code-review with a "don't invoke pre-close"
             // caveat, and names the supervisor-owned default ownership flag.
-            for required in [
-                "Close Gate",
-                "cas-code-review",
-                "owner = \"supervisor\"",
-            ] {
+            for required in ["Close Gate", "cas-code-review", "owner = \"supervisor\""] {
                 assert!(
                     ref_content.contains(required),
                     "{label} cas-worker close-gate.md missing required marker: {required:?}"
@@ -1746,9 +1746,7 @@ This is the body content."#;
             let entry = skills
                 .iter()
                 .find(|b| b.path == "skills/cas-code-review/SKILL.md")
-                .unwrap_or_else(|| {
-                    panic!("{label}: skills/cas-code-review/SKILL.md missing")
-                });
+                .unwrap_or_else(|| panic!("{label}: skills/cas-code-review/SKILL.md missing"));
             let description = skill_description(entry.content);
 
             // (a) `autofix` must not be framed as "the primary path".
@@ -1760,7 +1758,7 @@ This is the body content."#;
                 !(description.contains("autofix") && description.contains("primary path")),
                 "{label}: cas-code-review description still frames `autofix` as 'the primary path'. \
                  Under owner=\"supervisor\" (default since v2.13.0) the primary path is supervisor-driven \
-                 interactive review at cherry-pick / EPIC-merge. Description: {description:?}",
+                 review cadence, not worker close-time autofix. Description: {description:?}",
             );
 
             // (b) "pre-close quality gate" is the other stale framing.
@@ -1900,10 +1898,7 @@ This is the body content."#;
 
     #[test]
     fn test_cas_code_review_documents_gpt55_independent_persona() {
-        for (label, skills) in [
-            ("claude", BUILTIN_SKILLS),
-            ("codex", CODEX_BUILTIN_SKILLS),
-        ] {
+        for (label, skills) in [("claude", BUILTIN_SKILLS), ("codex", CODEX_BUILTIN_SKILLS)] {
             let entry = skills
                 .iter()
                 .find(|b| b.path == "skills/cas-code-review/SKILL.md")
@@ -1990,9 +1985,9 @@ This is the body content."#;
         }
 
         // Phase B: verify the workflow content is the production script
-        let workflow_content = std::fs::read_to_string(
-            claude_dir.join("workflows/cas-code-review.js")
-        ).expect("workflow script must be synced");
+        let workflow_content =
+            std::fs::read_to_string(claude_dir.join("workflows/cas-code-review.js"))
+                .expect("workflow script must be synced");
         assert!(
             workflow_content.contains("cas-code-review"),
             "workflow script must reference cas-code-review"
@@ -2106,8 +2101,14 @@ This is the body content."#;
         // exemplar in the 2026-05-06 cas-4900 repro).
         let planning_path = claude_dir.join("skills/cas-supervisor/references/planning.md");
         let close_gate_path = claude_dir.join("skills/cas-worker/references/close-gate.md");
-        assert!(planning_path.exists(), "initial sync must have written planning.md");
-        assert!(close_gate_path.exists(), "initial sync must have written close-gate.md");
+        assert!(
+            planning_path.exists(),
+            "initial sync must have written planning.md"
+        );
+        assert!(
+            close_gate_path.exists(),
+            "initial sync must have written close-gate.md"
+        );
 
         let planning_src = BUILTIN_SKILLS
             .iter()
@@ -2128,7 +2129,10 @@ This is the body content."#;
         // Stage 2: delete close-gate.md outright. The next sync must
         // recreate it from BUILTIN_SKILLS source.
         std::fs::remove_file(&close_gate_path).unwrap();
-        assert!(!close_gate_path.exists(), "precondition: deletion took effect");
+        assert!(
+            !close_gate_path.exists(),
+            "precondition: deletion took effect"
+        );
 
         // Re-run sync. This is the call that was reported to silently
         // no-op in per-project context.
@@ -2238,7 +2242,9 @@ This is the body content."#;
     fn test_sync_result_tracks_silent_skips_for_cli_surfacing() {
         let mut result = SyncResult::default();
         assert!(!result.has_silent_skips());
-        result.skipped_files.push("skills/foo/references/bar.md".to_string());
+        result
+            .skipped_files
+            .push("skills/foo/references/bar.md".to_string());
         assert!(
             result.has_silent_skips(),
             "any populated skipped_files entry must flip has_silent_skips() to true"
@@ -2426,6 +2432,7 @@ This is the body content."#;
     fn test_supervisor_fix_round_recovery_guidance_present_and_mirrored() {
         for path in [
             "skills/cas-supervisor/references/code-review-queue.md",
+            "skills/cas-supervisor/references/planning.md",
             "skills/cas-supervisor/references/worker-recovery.md",
             "skills/cas-supervisor/references/workflow.md",
         ] {
@@ -2448,6 +2455,9 @@ This is the body content."#;
             .find(|b| b.path == "skills/cas-supervisor/references/code-review-queue.md")
             .expect("BUILTIN_SKILLS missing cas-supervisor code-review-queue.md");
         for required in [
+            "not the full-review trigger",
+            "Phase 3 uses a lightweight per-merge gate",
+            "single required full `/cas-code-review` run happens in Phase 4",
             "create the task first",
             "epic-level review fix rounds",
             "messages are not durable task state",
@@ -2481,7 +2491,12 @@ This is the body content."#;
             .find(|b| b.path == "skills/cas-supervisor/references/workflow.md")
             .expect("BUILTIN_SKILLS missing cas-supervisor workflow.md");
         for required in [
+            "Run the lightweight per-merge gate",
+            "Do **not** run the full multi-persona",
+            "Record the audit trail",
+            "exception, not the default cadence",
             "Hold the main merge",
+            "single required full multi-persona review",
             "git diff <base-branch>..HEAD > /tmp/<epic-id>-diff.patch",
             "bounded epic-child fix-round task",
             "cargo test --no-fail-fast > /tmp/<epic-id>-cargo-test.log 2>&1; echo $?",
@@ -2490,6 +2505,29 @@ This is the body content."#;
             assert!(
                 workflow.content.contains(required),
                 "workflow.md missing epic-review marker: {required:?}"
+            );
+        }
+        let phase3 = workflow
+            .content
+            .split("## Phase 4: Complete")
+            .next()
+            .expect("workflow.md must contain Phase 3 content before Phase 4");
+        assert!(
+            !phase3.contains("/cas-code-review mode=interactive base_sha=<pre_cp>"),
+            "workflow.md Phase 3 must not mandate the old full review invocation"
+        );
+
+        let planning = BUILTIN_SKILLS
+            .iter()
+            .find(|b| b.path == "skills/cas-supervisor/references/planning.md")
+            .expect("BUILTIN_SKILLS missing cas-supervisor planning.md");
+        for required in [
+            "Supervisors run a lightweight per-merge gate",
+            "one full multi-persona `/cas-code-review` against the assembled EPIC diff",
+        ] {
+            assert!(
+                planning.content.contains(required),
+                "planning.md missing review-cadence marker: {required:?}"
             );
         }
     }
@@ -2550,6 +2588,77 @@ This is the body content."#;
                 );
             }
         }
+    }
+
+    /// cas-e7c8: a haiku/low-tier worker (lt-defects, 2026-07-07) called
+    /// `ToolSearch(select:mcp__cas__task)` seven times in a row and never
+    /// once issued the follow-up `mcp__cas__task` call — it never
+    /// distinguished "load the schema" from "call the tool". Pins the
+    /// step-0 clarification in cas-worker.md and the matching recovery.md
+    /// escape hatch on both mirrors so this guidance can't silently erode.
+    #[test]
+    fn test_worker_toolsearch_two_step_guidance_present_and_mirrored() {
+        for (label, guide) in [
+            ("claude cas-worker.md", WORKER_GUIDE),
+            (
+                "codex cas-worker.md",
+                include_str!("builtins/codex/skills/cas-worker.md"),
+            ),
+        ] {
+            for required in [
+                "Tool loading is two steps, not one",
+                "does **not** execute the tool",
+                "not another ToolSearch",
+            ] {
+                assert!(
+                    guide.contains(required),
+                    "{label} missing ToolSearch two-step marker: {required:?}"
+                );
+            }
+        }
+
+        for (label, set) in [
+            ("BUILTIN_SKILLS", BUILTIN_SKILLS),
+            ("CODEX_BUILTIN_SKILLS", CODEX_BUILTIN_SKILLS),
+        ] {
+            let path = "skills/cas-worker/references/recovery.md";
+            let entry = set
+                .iter()
+                .find(|b| b.path == path)
+                .unwrap_or_else(|| panic!("{label} missing {path}"));
+            for required in [
+                "ToolSearch resolved the tool but you still can't call it",
+                "Do not re-run ToolSearch for a tool it already resolved",
+            ] {
+                assert!(
+                    entry.content.contains(required),
+                    "{label} {path} missing ToolSearch-resolved recovery marker: {required:?}"
+                );
+            }
+        }
+
+        // recovery.md mirrors intentionally diverge by MCP alias (cas-5b4f) —
+        // the new section must follow the same convention as the rest of the file.
+        let claude_recovery = BUILTIN_SKILLS
+            .iter()
+            .find(|b| b.path == "skills/cas-worker/references/recovery.md")
+            .expect("BUILTIN_SKILLS missing recovery.md");
+        assert!(
+            claude_recovery
+                .content
+                .contains("literally named `mcp__cas__task`"),
+            "claude recovery.md ToolSearch section must use the mcp__cas__ alias"
+        );
+        let codex_recovery = CODEX_BUILTIN_SKILLS
+            .iter()
+            .find(|b| b.path == "skills/cas-worker/references/recovery.md")
+            .expect("CODEX_BUILTIN_SKILLS missing recovery.md");
+        assert!(
+            codex_recovery
+                .content
+                .contains("literally named `mcp__cs__task`"),
+            "codex recovery.md ToolSearch section must use the mcp__cs__ alias"
+        );
     }
 
     // cas-e0d1: pin the opt-in description so a future sync or hand-edit can't
@@ -2613,8 +2722,7 @@ This is the body content."#;
         );
         // 3. Builtin present in `keep` but missing the marker — preserved by the
         //    builtin-name guard.
-        let kept_by_name =
-            write_skill("cas-codemap", "---\nname: cas-codemap\n---\n# no marker\n");
+        let kept_by_name = write_skill("cas-codemap", "---\nname: cas-codemap\n---\n# no marker\n");
         // 4. Non-cas user-authored skill — never touched.
         let non_cas = write_skill("my-skill", "---\nname: my-skill\n---\n# user\n");
 
@@ -2624,7 +2732,10 @@ This is the body content."#;
         let removed = prune_stale_cas_skill_dirs(&skills_dir, &keep).unwrap();
 
         assert_eq!(removed, vec!["cas-playwright-debug".to_string()]);
-        assert!(!orphan.exists(), "non-managed cas-* orphan should be removed");
+        assert!(
+            !orphan.exists(),
+            "non-managed cas-* orphan should be removed"
+        );
         assert!(
             managed.exists(),
             "managed_by: cas builtin should be preserved via marker guard"

@@ -33,45 +33,137 @@ pub(crate) const WORKER_STALE_SECS: i64 = 30;
 /// dead.
 pub(crate) const WORKER_DEAD_SECS: i64 = 75;
 
+fn parse_spawn_cli(cli: Option<&str>) -> Result<Option<cas_mux::SupervisorCli>, String> {
+    cli.map(|s| {
+        s.parse::<cas_mux::SupervisorCli>()
+            .map_err(|_| format!("invalid cli value {s:?}: expected 'claude' or 'codex'"))
+    })
+    .transpose()
+}
+
+fn parse_spawn_effort(effort: Option<&str>) -> Result<Option<cas_mux::Effort>, String> {
+    match effort {
+        Some(s) => Ok(Some(
+            s.parse::<cas_mux::Effort>()
+                .map_err(|e| format!("invalid effort value {s:?}: {e}"))?,
+        )),
+        None => Ok(None),
+    }
+}
+
+fn default_worker_model_for_cli(cli: cas_mux::SupervisorCli) -> &'static str {
+    match cli {
+        cas_mux::SupervisorCli::Claude => "sonnet",
+        cas_mux::SupervisorCli::Codex => crate::config::STOCK_WORKER_MODEL,
+    }
+}
+
+fn default_worker_effort_for_cli(_cli: cas_mux::SupervisorCli) -> cas_mux::Effort {
+    crate::config::STOCK_WORKER_REASONING_EFFORT
+        .parse::<cas_mux::Effort>()
+        .unwrap_or(cas_mux::Effort::Medium)
+}
+
+fn is_frontier_model(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    model.contains("opus") || model.contains("fable") || model.contains("mythos")
+}
+
+fn format_effort(effort: Option<cas_mux::Effort>) -> String {
+    effort
+        .map(|e| e.to_string())
+        .unwrap_or_else(|| "(backend default)".to_string())
+}
+
 /// Build a JSON-serialized [`cas_mux::WorkerSpec`] from optional string overrides
 /// supplied via the MCP `spawn_workers` action or the cloud protocol.
 ///
-/// Returns `Ok(None)` when all three parameters are absent (session defaults apply).
 /// Returns `Err(String)` when a parameter value is invalid.
+#[cfg(test)]
 pub(crate) fn build_spawn_spec_json(
     cli: Option<&str>,
     model: Option<&str>,
     effort: Option<&str>,
-) -> Result<Option<String>, String> {
-    if cli.is_none() && model.is_none() && effort.is_none() {
-        return Ok(None);
+) -> Result<String, String> {
+    build_spawn_spec_json_with_project_config(cli, model, effort, None)
+}
+
+pub(crate) fn build_spawn_spec_json_with_project_config(
+    cli: Option<&str>,
+    model: Option<&str>,
+    effort: Option<&str>,
+    project_config: Option<std::path::PathBuf>,
+) -> Result<String, String> {
+    let parsed_cli = parse_spawn_cli(cli)?;
+    let parsed_effort = parse_spawn_effort(effort)?;
+
+    let sources = cas_factory::ConfigSources {
+        project_config,
+        cli_flag: parsed_cli,
+        model_flag: model.map(String::from),
+        effort_flag: parsed_effort,
+        ..Default::default()
+    };
+    let configured_cli = cas_factory::worker_slot_cli_configured(0, &sources)
+        .map_err(|e| format!("failed to inspect worker cli config: {e}"))?;
+    let configured_effort = cas_factory::worker_slot_effort_configured(0, &sources)
+        .map_err(|e| format!("failed to inspect worker effort config: {e}"))?;
+    let mut spec = cas_factory::resolve_specs(1, sources)
+        .map_err(|e| format!("failed to resolve worker spec: {e}"))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "failed to resolve worker spec: no worker slots returned".to_string())?;
+
+    if cli.is_none() && !configured_cli && spec.cli == cas_mux::SupervisorCli::Claude {
+        spec.cli = cas_mux::SupervisorCli::Codex;
     }
-
-    let parsed_cli = match cli {
-        Some(s) => s
-            .parse::<cas_mux::SupervisorCli>()
-            .map_err(|_| format!("invalid cli value {s:?}: expected 'claude' or 'codex'"))?,
-        None => cas_mux::SupervisorCli::Claude,
-    };
-
-    let parsed_effort: Option<cas_mux::Effort> = match effort {
-        Some(s) => Some(
-            s.parse::<cas_mux::Effort>()
-                .map_err(|e| format!("invalid effort value {s:?}: {e}"))?,
-        ),
-        None => None,
-    };
-
-    let spec = cas_mux::WorkerSpec {
-        name: None,
-        cli: parsed_cli,
-        model: model.map(String::from),
-        effort: parsed_effort,
-    };
+    if model.is_none() && spec.model.is_none() {
+        spec.model = Some(default_worker_model_for_cli(spec.cli).to_string());
+    }
+    if effort.is_none() && !configured_effort && spec.effort == Some(cas_mux::Effort::High) {
+        spec.effort = Some(default_worker_effort_for_cli(spec.cli));
+    }
 
     let json =
         serde_json::to_string(&spec).map_err(|e| format!("failed to serialize WorkerSpec: {e}"))?;
-    Ok(Some(json))
+    Ok(json)
+}
+
+fn spawn_spec_summary(spec_json: &str) -> String {
+    match serde_json::from_str::<cas_mux::WorkerSpec>(spec_json) {
+        Ok(spec) => format!(
+            "{} model={} effort={}",
+            spec.cli.as_str(),
+            spec.model.as_deref().unwrap_or("(backend default)"),
+            format_effort(spec.effort)
+        ),
+        Err(_) => "unparseable worker spec".to_string(),
+    }
+}
+
+fn spawn_spec_warning(model_explicit: bool, effort_explicit: bool, spec_json: &str) -> String {
+    let mut warnings = Vec::new();
+    if !model_explicit || !effort_explicit {
+        warnings.push(
+            "Warning: spawn_workers should include explicit model= and effort=; omitted fields were resolved to safe worker defaults for this request."
+                .to_string(),
+        );
+    }
+    if !model_explicit {
+        if let Ok(spec) = serde_json::from_str::<cas_mux::WorkerSpec>(spec_json) {
+            if spec.model.as_deref().is_some_and(is_frontier_model) {
+                warnings.push(format!(
+                    "Warning: resolved worker model {} is frontier-tier but model= was omitted; pass model= explicitly to acknowledge the cost/risk.",
+                    spec.model.as_deref().unwrap_or("unknown")
+                ));
+            }
+        }
+    }
+    if warnings.is_empty() {
+        String::new()
+    } else {
+        format!("\n{}", warnings.join("\n"))
+    }
 }
 
 fn current_factory_session() -> Option<String> {
@@ -149,15 +241,57 @@ impl CasService {
             })
             .unwrap_or_default();
 
-        // cas-2992: build a WorkerSpec from the cli/model/effort override fields
-        // and serialize it to JSON for storage in the spawn queue.  None of the
-        // three fields being present → no spec override (session defaults apply).
-        let spec_json_owned: Option<String> = build_spawn_spec_json(
+        // cas-6913: task_id pre-assigns a task to the (single) spawned
+        // worker. Reject anything that would make "the spawned worker"
+        // ambiguous — a task can't be assigned to N workers at once — so a
+        // supervisor gets a clear error instead of silent no-op or a
+        // surprising assignment to whichever worker happens to finish
+        // spawning first.
+        if let Some(ref task_id) = req.task_id {
+            let requested_worker_count = if worker_names.is_empty() {
+                count
+            } else {
+                worker_names.len() as i32
+            };
+            if requested_worker_count != 1 {
+                return Err(Self::error(
+                    ErrorCode::INVALID_PARAMS,
+                    format!(
+                        "task_id can only be used with a single-worker spawn_workers request \
+                         (count=1, or exactly one name in worker_names) — got {requested_worker_count} \
+                         worker(s) requested. Assign the task after spawning instead: \
+                         mcp__cas__task action=update id={task_id} assignee=<worker-name>."
+                    ),
+                ));
+            }
+
+            let task = task_store.get(task_id).map_err(|e| {
+                Self::error(
+                    ErrorCode::INVALID_PARAMS,
+                    format!("task_id {task_id} not found: {e}"),
+                )
+            })?;
+            if task.status == TaskStatus::Closed {
+                return Err(Self::error(
+                    ErrorCode::INVALID_PARAMS,
+                    format!("task_id {task_id} is already closed — cannot pre-assign it to a spawned worker."),
+                ));
+            }
+        }
+
+        // Resolve a concrete WorkerSpec for every queued spawn. Omitting model
+        // or effort must never inherit the supervisor session's frontier-tier
+        // defaults by accident.
+        let spec_json_owned: String = build_spawn_spec_json_with_project_config(
             req.cli.as_deref(),
             req.model.as_deref(),
             req.effort.as_deref(),
+            Some(self.inner.cas_root.join("config.toml")),
         )
         .map_err(|e| Self::error(ErrorCode::INVALID_PARAMS, e))?;
+        let spec_summary = spawn_spec_summary(&spec_json_owned);
+        let spec_warning =
+            spawn_spec_warning(req.model.is_some(), req.effort.is_some(), &spec_json_owned);
 
         let factory_session = current_factory_session();
         let request_id = queue
@@ -165,8 +299,9 @@ impl CasService {
                 count,
                 &worker_names,
                 isolate,
-                spec_json_owned.as_deref(),
+                Some(spec_json_owned.as_str()),
                 factory_session.as_deref(),
+                req.task_id.as_deref(),
             )
             .map_err(|e| {
                 Self::error(
@@ -175,11 +310,19 @@ impl CasService {
                 )
             })?;
 
+        let task_id_note = req
+            .task_id
+            .as_ref()
+            .map(|id| format!("\nTask: {id} will be pre-assigned once the worker boots"))
+            .unwrap_or_default();
+
         let msg = if worker_names.is_empty() {
-            format!("Queued spawn request for {count} worker(s) (request ID: {request_id})")
+            format!(
+                "Queued spawn request for {count} worker(s) (request ID: {request_id})\nWorker spec: {spec_summary}{spec_warning}{task_id_note}"
+            )
         } else {
             format!(
-                "Queued spawn request for worker(s): {} (request ID: {})",
+                "Queued spawn request for worker(s): {} (request ID: {})\nWorker spec: {spec_summary}{spec_warning}{task_id_note}",
                 worker_names.join(", "),
                 request_id
             )
@@ -520,6 +663,17 @@ impl CasService {
                 // ("owned by worker-backfill (0a7f2802-...)") without manual
                 // table-lookup. cas-85bf.
                 let session_uuid = agent.cc_session_id.as_deref().unwrap_or(&agent.id);
+                let model_info = match (
+                    agent.metadata.get("worker_model"),
+                    agent.metadata.get("worker_effort"),
+                ) {
+                    (Some(model), Some(effort)) => {
+                        format!("\n    model: {model}\n    effort: {effort}")
+                    }
+                    (Some(model), None) => format!("\n    model: {model}\n    effort: unknown"),
+                    (None, Some(effort)) => format!("\n    model: unknown\n    effort: {effort}"),
+                    (None, None) => String::new(),
+                };
                 // Context usage (cas-573c): cheap tail-read of the session
                 // transcript to surface a coarse band so the supervisor can
                 // proactively preserve work before compaction. Falls back
@@ -573,13 +727,14 @@ impl CasService {
                     }
                 };
                 output.push_str(&format!(
-                    "  • {} (heartbeat: {}){}{}{}{}{}{}\n    session: {}\n",
+                    "  • {} (heartbeat: {}){}{}{}{}{}{}{}\n    session: {}\n",
                     &agent.name,
                     since,
                     liveness_label,
                     clone_info,
                     git_info,
                     transcript_info,
+                    model_info,
                     context_info,
                     activity_info,
                     session_uuid
@@ -2123,6 +2278,43 @@ mod tests {
     /// the test happens to create.
     const TEST_SESSION: &str = "cas-900b-test-0000-0000-000000000000";
 
+    struct HomeGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        old_home: Option<String>,
+        _tmp: tempfile::TempDir,
+    }
+
+    impl HomeGuard {
+        fn isolated() -> Self {
+            let lock = crate::hooks::test_env_lock();
+            let old_home = std::env::var("HOME").ok();
+            let tmp = tempfile::tempdir().expect("temp HOME");
+            unsafe {
+                std::env::set_var("HOME", tmp.path());
+            }
+            Self {
+                _lock: lock,
+                old_home,
+                _tmp: tmp,
+            }
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.old_home {
+                    Some(home) => std::env::set_var("HOME", home),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
+        }
+    }
+
+    fn decoded_spawn_spec(json: &str) -> cas_mux::WorkerSpec {
+        serde_json::from_str(json).expect("valid WorkerSpec JSON")
+    }
+
     /// Create a fake `~/.claude/projects/` layout in a tempdir and return
     /// the `projects` subdir path. `projects` is populated with `dirs`
     /// entries, each containing a `<session_id>.jsonl` for sessions in
@@ -2153,6 +2345,100 @@ mod tests {
             "~/.claude/projects/-home-pippenz-Petrastella-cas-src--cas-worktrees-crisp-badger-65/\
              064e7b23-331d-4dae-9c6a-721cbbe9c024.jsonl"
         );
+    }
+
+    #[test]
+    fn spawn_spec_cli_claude_without_model_effort_uses_safe_floor() {
+        let _home = HomeGuard::isolated();
+        let json = build_spawn_spec_json(Some("claude"), None, None).unwrap();
+        let spec = decoded_spawn_spec(&json);
+
+        assert_eq!(spec.cli, cas_mux::SupervisorCli::Claude);
+        assert_eq!(spec.model.as_deref(), Some("sonnet"));
+        assert_eq!(spec.effort, Some(cas_mux::Effort::Medium));
+    }
+
+    #[test]
+    fn spawn_spec_explicit_model_and_effort_are_unchanged() {
+        let _home = HomeGuard::isolated();
+        let json = build_spawn_spec_json(Some("claude"), Some("opus"), Some("high")).unwrap();
+        let spec = decoded_spawn_spec(&json);
+
+        assert_eq!(spec.cli, cas_mux::SupervisorCli::Claude);
+        assert_eq!(spec.model.as_deref(), Some("opus"));
+        assert_eq!(spec.effort, Some(cas_mux::Effort::High));
+    }
+
+    #[test]
+    fn spawn_spec_omitted_cli_without_config_uses_stock_codex_defaults() {
+        let _home = HomeGuard::isolated();
+        let json = build_spawn_spec_json(None, None, None).unwrap();
+        let spec = decoded_spawn_spec(&json);
+
+        assert_eq!(spec.cli, cas_mux::SupervisorCli::Codex);
+        assert_eq!(
+            spec.model.as_deref(),
+            Some(crate::config::STOCK_WORKER_MODEL)
+        );
+        assert_eq!(
+            spec.effort,
+            Some(
+                crate::config::STOCK_WORKER_REASONING_EFFORT
+                    .parse::<cas_mux::Effort>()
+                    .unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn spawn_spec_omitted_cli_respects_project_factory_default() {
+        let _home = HomeGuard::isolated();
+        let tmp = tempfile::tempdir().expect("temp project config");
+        let config = tmp.path().join("config.toml");
+        std::fs::write(
+            &config,
+            r#"
+[factory.defaults]
+cli = "claude"
+model = "sonnet"
+effort = "high"
+"#,
+        )
+        .unwrap();
+
+        let json =
+            build_spawn_spec_json_with_project_config(None, None, None, Some(config)).unwrap();
+        let spec = decoded_spawn_spec(&json);
+
+        assert_eq!(spec.cli, cas_mux::SupervisorCli::Claude);
+        assert_eq!(spec.model.as_deref(), Some("sonnet"));
+        assert_eq!(spec.effort, Some(cas_mux::Effort::High));
+    }
+
+    #[test]
+    fn spawn_spec_project_defaults_can_force_frontier_and_warning_nags() {
+        let _home = HomeGuard::isolated();
+        let tmp = tempfile::tempdir().expect("temp project config");
+        let config = tmp.path().join("config.toml");
+        std::fs::write(
+            &config,
+            r#"
+[factory.defaults]
+model = "opus"
+effort = "high"
+"#,
+        )
+        .unwrap();
+
+        let json =
+            build_spawn_spec_json_with_project_config(Some("claude"), None, None, Some(config))
+                .unwrap();
+        let spec = decoded_spawn_spec(&json);
+        let warning = spawn_spec_warning(false, false, &json);
+
+        assert_eq!(spec.model.as_deref(), Some("opus"));
+        assert_eq!(spec.effort, Some(cas_mux::Effort::High));
+        assert!(warning.contains("frontier-tier"), "{warning}");
     }
 
     #[test]
@@ -2600,8 +2886,8 @@ mod tests {
         // cas-573c + cas-844bf): git_info is the 4th positional arg,
         // context_info is the 6th, transcript_info is the 5th.
         let output = format!(
-            "  • {} (heartbeat: {}){}{}{}{}{}\n    session: {}\n",
-            NAME, "5s ago", "", "", "", "", "", UUID
+            "  • {} (heartbeat: {}){}{}{}{}{}{}{}\n    session: {}\n",
+            NAME, "5s ago", "", "", "", "", "\n    model: sonnet\n    effort: medium", "", "", UUID
         );
 
         assert!(
@@ -2615,6 +2901,10 @@ mod tests {
         assert!(
             output.contains("session:"),
             "output must have 'session:' label: {output}"
+        );
+        assert!(
+            output.contains("model: sonnet") && output.contains("effort: medium"),
+            "output must contain worker model and effort: {output}"
         );
     }
 

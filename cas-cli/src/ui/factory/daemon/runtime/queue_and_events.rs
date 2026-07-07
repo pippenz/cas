@@ -656,17 +656,34 @@ impl FactoryDaemon {
                                 None
                             }
                         });
+                    // cas-6913: task_id pre-assigns a task to the spawned
+                    // worker. The MCP layer (factory_spawn_workers) already
+                    // rejects any request where this would be ambiguous
+                    // (count != 1 / more than one worker_names entry), so
+                    // in practice this loop only ever runs once when
+                    // task_id is Some. Defensively `.take()` it anyway so a
+                    // future caller that enqueues the store directly with a
+                    // multi-worker request can't accidentally assign the
+                    // same task to every spawned worker.
+                    let mut task_id = request.task_id;
                     if request.worker_names.is_empty() {
                         self.app.spawning_count += count;
                         for _ in 0..count {
-                            self.pending_spawns
-                                .push_back(PendingSpawn::Anonymous { isolate, spec: spec.clone() });
+                            self.pending_spawns.push_back(PendingSpawn::Anonymous {
+                                isolate,
+                                spec: spec.clone(),
+                                task_id: task_id.take(),
+                            });
                         }
                     } else {
                         self.app.spawning_count += request.worker_names.len();
                         for name in request.worker_names {
-                            self.pending_spawns
-                                .push_back(PendingSpawn::Named { name, isolate, spec: spec.clone() });
+                            self.pending_spawns.push_back(PendingSpawn::Named {
+                                name,
+                                isolate,
+                                spec: spec.clone(),
+                                task_id: task_id.take(),
+                            });
                         }
                     }
                 }
@@ -695,11 +712,12 @@ impl FactoryDaemon {
     /// either: (a) check if the in-flight spawn finished, or (b) start a new one.
     pub(super) async fn process_pending_spawns(&mut self) {
         // Step 1: Check if in-flight background spawn completed
-        if let Some((_, _, ref handle)) = self.spawn_task {
+        if let Some((_, _, _, ref handle)) = self.spawn_task {
             if !handle.is_finished() {
                 return; // Still running, don't start another
             }
-            let (pending_name, pending_spec, handle) = self.spawn_task.take().unwrap();
+            let (pending_name, pending_spec, pending_task_id, handle) =
+                self.spawn_task.take().unwrap();
             // Remove from pending workers (boot pane transitions to real pane or disappears)
             self.app.remove_pending_worker(&pending_name);
             match handle.await {
@@ -720,7 +738,10 @@ impl FactoryDaemon {
                     if let Some(ref tc) = teams_config {
                         crate::ui::theme::register_agent_color(&tc.agent_name, &tc.agent_color);
                     }
-                    match self.app.finish_worker_spawn(result, teams_config, pending_spec) {
+                    match self
+                        .app
+                        .finish_worker_spawn(result, teams_config, pending_spec, pending_task_id)
+                    {
                         Ok(name) => {
                             tracing::info!("Spawned worker (async): {}", name);
                             // A worker may reuse a retired name (e.g. a Codex worker
@@ -799,7 +820,11 @@ impl FactoryDaemon {
         };
 
         match action {
-            PendingSpawn::Anonymous { isolate, spec } => {
+            PendingSpawn::Anonymous {
+                isolate,
+                spec,
+                task_id,
+            } => {
                 match self.app.prepare_worker_spawn(None, isolate) {
                     Ok(prep) => {
                         let worker_name = prep.worker_name.clone();
@@ -807,6 +832,7 @@ impl FactoryDaemon {
                         self.spawn_task = Some((
                             worker_name,
                             spec,
+                            task_id,
                             tokio::task::spawn_blocking(move || prep.run()),
                         ));
                     }
@@ -823,7 +849,12 @@ impl FactoryDaemon {
                     }
                 }
             }
-            PendingSpawn::Named { name, isolate, spec } => {
+            PendingSpawn::Named {
+                name,
+                isolate,
+                spec,
+                task_id,
+            } => {
                 match self.app.prepare_worker_spawn(Some(&name), isolate) {
                     Ok(prep) => {
                         let worker_name = prep.worker_name.clone();
@@ -831,6 +862,7 @@ impl FactoryDaemon {
                         self.spawn_task = Some((
                             worker_name,
                             spec,
+                            task_id,
                             tokio::task::spawn_blocking(move || prep.run()),
                         ));
                     }
@@ -1305,6 +1337,7 @@ mod tests {
             latest_activity: None,
             last_heartbeat: None,
             pending_messages: 0,
+            active_lease: None,
         };
 
         assert!(

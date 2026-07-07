@@ -16,6 +16,7 @@ impl CasCore {
 
         let requested_agent_type = req.agent_type.parse::<crate::types::AgentType>().ok();
         let requested_role = req.agent_type.parse::<crate::types::AgentRole>().ok();
+        let agent_name = req.name.clone();
 
         // Use explicit type/role hints when provided.
         let id = self.register_agent_with_hints(
@@ -26,7 +27,14 @@ impl CasCore {
             requested_role,
         )?;
 
-        Ok(Self::success(format!("Registered agent: {id}")))
+        // cas-6913: surface any prompt_queue messages that were queued to
+        // this agent's name before it existed in the agent store — see
+        // `pending_mail_for_registration` for the full rationale.
+        let pending_mail = self.pending_mail_for_registration(&agent_name);
+
+        Ok(Self::success(format!(
+            "Registered agent: {id}{pending_mail}"
+        )))
     }
 
     /// Start a session without Claude hooks (Codex-friendly)
@@ -133,7 +141,9 @@ impl CasCore {
         // eliminate.
         use crate::hooks::HookSpecificOutput;
         let context = match output.hook_specific_output {
-            Some(HookSpecificOutput::SessionStart { additional_context, .. }) => Some(additional_context),
+            Some(HookSpecificOutput::SessionStart {
+                additional_context, ..
+            }) => Some(additional_context),
             // None variants below are unreachable in practice (handle_session_start
             // never emits these shapes), but pattern-matching them explicitly
             // makes the invariant load-bearing on the type system rather than on
@@ -146,10 +156,10 @@ impl CasCore {
             | None => None,
         }
         .filter(|c| !c.is_empty())
-            .unwrap_or_else(|| {
-                build_context(&input, req.limit.unwrap_or(5), &self.cas_root)
-                    .unwrap_or_else(|_| String::new())
-            });
+        .unwrap_or_else(|| {
+            build_context(&input, req.limit.unwrap_or(5), &self.cas_root)
+                .unwrap_or_else(|_| String::new())
+        });
 
         // Write current_session for CLI parity (best effort)
         let _ = std::fs::write(self.cas_root.join("current_session"), &session_id);
@@ -167,6 +177,7 @@ impl CasCore {
                 } else if requested_agent_type == Some(crate::types::AgentType::Worker) {
                     existing.role = crate::types::AgentRole::Worker;
                 }
+                crate::mcp::daemon::apply_factory_worker_metadata(&mut existing, None);
                 let _ = store.update(&existing);
 
                 let _ = self.agent_id.set(Some(session_id.clone()));
@@ -189,7 +200,76 @@ impl CasCore {
             response.push_str(&context);
         }
 
+        // cas-6913: surface any prompt_queue messages queued to this agent's
+        // name before it existed in the agent store (the "first-claim
+        // stall" gap — see `pending_mail_for_registration`). This is the
+        // codex-worker session_start path, the exact repro in the source
+        // bug doc (BUG-worker-first-claim-stall-2026-07-07.md).
+        response.push_str(&self.pending_mail_for_registration(&agent_name));
+
         Ok(Self::success(response))
+    }
+
+    /// cas-6913 AC1 (deliver-on-register): render any `prompt_queue`
+    /// messages already addressed to `agent_name` (or `all_workers`) as
+    /// text to append to the registration response.
+    ///
+    /// This closes the "first-claim stall" gap at its root: registration
+    /// (`cas_agent_register` / `cas_agent_session_start`) previously had
+    /// zero wiring to `prompt_queue` at all, so a message queued to a
+    /// not-yet-registered worker name relied entirely on the daemon's
+    /// PTY-injection poll noticing the name later — a poll whose target
+    /// list is built from daemon-side bookkeeping that can lag behind
+    /// what the supervisor already knows (see task notes for the traced
+    /// mechanism). Returning the message text directly in the tool result
+    /// the agent's own registration call receives delivers it into the
+    /// agent's context immediately, with no PTY timing dependency.
+    ///
+    /// Deliberately does NOT mark messages processed/acked — the daemon's
+    /// normal poll loop still delivers them too, matching the at-least-once
+    /// philosophy already used elsewhere in this queue (see
+    /// `process_prompt_queue`'s "peek first, ack after injection" comment).
+    /// Best-effort: any store error degrades to an empty string rather than
+    /// failing registration itself.
+    fn pending_mail_for_registration(&self, agent_name: &str) -> String {
+        use crate::store::open_prompt_queue_store;
+
+        if agent_name.is_empty() {
+            return String::new();
+        }
+
+        let Ok(queue) = open_prompt_queue_store(&self.cas_root) else {
+            return String::new();
+        };
+        let factory_session = std::env::var("CAS_FACTORY_SESSION")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+        let Ok(pending) =
+            queue.peek_for_targets(&[agent_name, "all_workers"], factory_session.as_deref(), 20)
+        else {
+            return String::new();
+        };
+
+        if pending.is_empty() {
+            return String::new();
+        }
+
+        let mut out = format!(
+            "\n\n📬 {} message(s) were already waiting for you (queued before you registered):",
+            pending.len()
+        );
+        for msg in &pending {
+            let summary = msg
+                .summary
+                .as_deref()
+                .map(|s| format!(" — {s}"))
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "\n\n**From {}**{summary}\n{}",
+                msg.source, msg.prompt
+            ));
+        }
+        out
     }
 
     /// End a session without Claude hooks (Codex-friendly)

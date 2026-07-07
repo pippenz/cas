@@ -12,7 +12,7 @@ use ratatui::layout::Rect;
 
 use super::director::{
     DiffLine, DirectorData, DirectorEvent, DirectorEventDetector, DirectorStores, PanelAreas,
-    Prompt, SidecarFocus, ViewMode, generate_prompt,
+    Prompt, SidecarFocus, ViewMode, generate_prompt, revalidate_event_for_delivery,
 };
 use crate::store::open_prompt_queue_store;
 use crate::types::Worktree;
@@ -290,8 +290,30 @@ pub struct FactoryApp {
     cas_dir: PathBuf,
     /// Cached store handles (avoid re-opening on every 2s refresh)
     director_stores: Option<DirectorStores>,
-    /// Director panel data
+    /// Director panel data. **Mutated in place** by
+    /// `filter_director_agents_to_current_session()` on every `db_changed`
+    /// tick — scoped to the currently-tracked epic for TUI display purposes.
+    /// Do NOT feed this to `DirectorEventDetector::detect_changes` (see
+    /// `unfiltered_director_data`).
     director_data: DirectorData,
+    /// Canonical, NEVER-epic-filtered snapshot of the same load that seeds
+    /// `director_data`. Refreshed alongside `director_data` on every
+    /// `db_changed` tick but never mutated by the epic-scoping filter.
+    ///
+    /// Exists because `filter_director_agents_to_current_session` mutates
+    /// `director_data` in place, and on a subsequent tick where `db_changed`
+    /// is false (nothing changed in the DB) but `git_due` is true,
+    /// `director_data` is NOT reloaded — it stays as the FILTERED leftover
+    /// from the last `db_changed` tick. Feeding that stale-filtered snapshot
+    /// into `detect_changes` makes every task belonging to a
+    /// currently-untracked epic (a second epic being worked concurrently in
+    /// the same session) look like it "disappeared from active sets",
+    /// firing a fabricated `TaskCompleted` — the director broadcasts "has
+    /// closed task X" for a task that never closed (cas-dbbe). Change
+    /// detection and the `TaskCompleted` render-time safety net
+    /// (`generate_prompt`, cas-6aaf) must always read the true, unfiltered
+    /// task state via this field instead.
+    unfiltered_director_data: DirectorData,
     /// Current input mode
     pub input_mode: InputMode,
     /// Buffer for inject mode text input
@@ -638,10 +660,80 @@ impl FactoryApp {
         &self.auto_prompt
     }
 
+    /// Revalidate detected events against a fresh, delivery-time snapshot and
+    /// generate prompts from the survivors — in one combined pass.
+    ///
+    /// cas-627f: `revalidate_events_for_delivery` and
+    /// `generate_prompts_for_delivery` used to be two separate public
+    /// methods, each independently calling
+    /// `load_unfiltered_director_data_for_delivery` — a full
+    /// `DirectorData::load_with_stores` (all tasks + parent deps, 50 recent
+    /// events, every agent's leases). The daemon tick
+    /// (`daemon/runtime/lifecycle.rs`) called both back-to-back on EVERY
+    /// `refresh_interval` (2s) tick, even when `events` was empty — a
+    /// regression from main, where an idle tick performed zero extra DB
+    /// loads. Confirmed P1 (docs/reviews/2026-07-07-cas-b646-epic.md). Now:
+    /// short-circuit before touching the DB when there is nothing to
+    /// revalidate, and share a single load between revalidation and prompt
+    /// generation so the two steps can never observe two different
+    /// snapshots.
+    pub fn revalidate_and_prompt_for_delivery(
+        &self,
+        events: &[DirectorEvent],
+    ) -> (Vec<DirectorEvent>, Vec<Prompt>) {
+        if events.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+
+        let unfiltered_data = self.load_unfiltered_director_data_for_delivery();
+
+        let delivery_events: Vec<DirectorEvent> = events
+            .iter()
+            .filter_map(|event| {
+                revalidate_event_for_delivery(event, &unfiltered_data, &self.supervisor_name)
+            })
+            .collect();
+
+        let prompts: Vec<Prompt> = delivery_events
+            .iter()
+            .filter_map(|event| {
+                generate_prompt(
+                    event,
+                    &self.director_data,
+                    &unfiltered_data,
+                    &self.supervisor_name,
+                    &self.auto_prompt,
+                    self.supervisor_cli,
+                    self.worker_cli,
+                )
+            })
+            .collect();
+
+        (delivery_events, prompts)
+    }
+
+    fn load_unfiltered_director_data_for_delivery(&self) -> DirectorData {
+        let worktree_root = self.worktree_manager.as_ref().map(|m| m.worktree_root());
+        DirectorData::load_with_stores(
+            &self.cas_dir,
+            worktree_root.as_deref(),
+            false,
+            self.director_stores.as_ref(),
+        )
+        .unwrap_or_else(|_| self.unfiltered_director_data.clone())
+    }
+
     /// Refresh CAS data from stores and detect state changes
     ///
-    /// Returns a tuple of (prompts, events) for further processing.
-    pub fn refresh_data(&mut self) -> anyhow::Result<(Vec<Prompt>, Vec<DirectorEvent>)> {
+    /// Returns the detected events. Prompt generation happens later, at
+    /// delivery time, against a fresh snapshot (see
+    /// `revalidate_and_prompt_for_delivery`) — this method used to also
+    /// build a `Vec<Prompt>` here, but every caller discarded it (the daemon
+    /// tick regenerates prompts from the delivery-revalidated events; the
+    /// other two callers ignore the whole `Result`), so it was pure wasted
+    /// work on every refresh. Removed rather than kept as a second,
+    /// drift-prone prompt-generation path (cas-627f).
+    pub fn refresh_data(&mut self) -> anyhow::Result<Vec<DirectorEvent>> {
         let next_fingerprint = CasDbFingerprint::from_cas_dir(&self.cas_dir);
         let db_changed = match self.last_db_fingerprint {
             Some(prev) => prev != next_fingerprint,
@@ -660,6 +752,18 @@ impl FactoryApp {
             )?;
             self.director_data =
                 merge_director_data_preserving_git(&self.director_data, loaded, git_due);
+            // cas-dbbe: snapshot the fresh, still-unfiltered load BEFORE
+            // `filter_director_agents_to_current_session()` (below) mutates
+            // `self.director_data` in place. This canonical copy is what
+            // change detection and the TaskCompleted safety net read, so a
+            // second epic worked concurrently in this session never looks
+            // like it "disappeared" just because it's outside the
+            // currently-tracked epic's display scope. Only the fields those
+            // two consumers actually read are cloned (see
+            // `unfiltered_snapshot_from`) — cloning e.g. `changes` (git diff
+            // info per worktree, potentially the largest field) here would
+            // be pure waste.
+            self.unfiltered_director_data = unfiltered_snapshot_from(&self.director_data);
             if git_due {
                 self.last_git_refresh = Instant::now();
             }
@@ -673,7 +777,7 @@ impl FactoryApp {
         } else {
             self.refresh_branch_visibility_cache();
             self.last_refresh = Instant::now();
-            return Ok((Vec::new(), Vec::new()));
+            return Ok(Vec::new());
         }
 
         self.refresh_branch_visibility_cache();
@@ -684,37 +788,25 @@ impl FactoryApp {
         self.sync_session_mappings();
         self.apply_session_metadata_focus();
 
-        // Detect state changes BEFORE filtering so new epics are visible to the
-        // event detector. This allows EpicStarted to fire and update epic_state,
-        // which the filter depends on for subsequent refresh cycles.
+        // Detect state changes against the UNFILTERED snapshot (cas-dbbe) so new
+        // epics are visible to the event detector, and so a second epic worked
+        // concurrently in this session is never epic-scoped out of the
+        // comparison and mistaken for a completed task. This allows EpicStarted
+        // to fire and update epic_state, which the filter depends on for
+        // subsequent refresh cycles.
         // Pass the currently-tracked epic id so `EpicStarted` is gated on
         // strict improvement: a stray zero-subtask Open-with-branch epic
         // cannot hijack `epic_state` mid-session (see task cas-4181).
         let events = self
             .event_detector
-            .detect_changes(&self.director_data, self.epic_state.epic_id());
+            .detect_changes(&self.unfiltered_director_data, self.epic_state.epic_id());
 
         // Now filter to current session (agents + tasks scoped to active epic)
         if db_changed {
             self.filter_director_agents_to_current_session();
         }
 
-        // Generate prompts from events (respecting auto-prompt config)
-        let prompts: Vec<Prompt> = events
-            .iter()
-            .filter_map(|event| {
-                generate_prompt(
-                    event,
-                    &self.director_data,
-                    &self.supervisor_name,
-                    &self.auto_prompt,
-                    self.supervisor_cli,
-                    self.worker_cli,
-                )
-            })
-            .collect();
-
-        Ok((prompts, events))
+        Ok(events)
     }
 
     fn set_active_epic(
@@ -790,9 +882,24 @@ impl FactoryApp {
 
     fn apply_session_metadata_focus(&mut self) {
         let focus = preferred_epic_focus_from_session_metadata();
-        if self.current_epic_id.as_deref() == focus.epic_id.as_deref()
-            && (focus.epic_id.is_none() || self.current_epic_source == focus.source)
-        {
+
+        // cas-6945: only short-circuit when something is already tracked.
+        // The event detector's `EpicStarted` is edge-triggered on the
+        // epic's Open+branch/InProgress transition (see
+        // events::test_no_duplicate_epic_started_for_existing_open_with_branch).
+        // In the normal supervisor sequence the epic branch is auto-created
+        // at `task create` time, before any worker exists — so that
+        // transition happens, `EpicStarted` fires once, gets rejected by
+        // `inferred_epic_is_displayable` (no subtask has an assignee yet),
+        // and never refires even after a worker later starts a subtask and
+        // picks up an assignee (the `task action=start` fix, also
+        // cas-6945). Without retrying resolution on every tick while
+        // nothing is tracked, the epic silently never adopts. Once
+        // something IS tracked, behavior is unchanged from before.
+        let already_synced = self.current_epic_id.is_some()
+            && self.current_epic_id.as_deref() == focus.epic_id.as_deref()
+            && (focus.epic_id.is_none() || self.current_epic_source == focus.source);
+        if already_synced {
             return;
         }
 
@@ -1231,6 +1338,35 @@ fn merge_director_data_preserving_git(
     loaded
 }
 
+/// Build the `unfiltered_director_data` snapshot (cas-dbbe) from a cloned
+/// `director_data`, cloning only the fields its two consumers — change
+/// detection (`DirectorEventDetector::detect_changes`) and the
+/// `TaskCompleted` render-time safety net (`generate_prompt`) — actually
+/// read: `ready_tasks`, `in_progress_tasks`, `epic_tasks`, `agents`,
+/// `agent_id_to_name`. Neither consumer touches `changes`, `activity`,
+/// `reminders`, or `epic_closed_counts` (verified: `rg 'data\.(changes|
+/// activity|reminders|epic_closed_counts)' director/events.rs director/
+/// prompts.rs` — zero hits), and the epic-scoping filter never mutates
+/// those fields either, so they'd always be byte-identical to
+/// `director_data`'s copy anyway. `changes` in particular can be the
+/// largest field in `DirectorData` (one `FileChangeInfo` per changed file
+/// per source, across every active worktree) — deep-cloning it every
+/// `db_changed` tick for data nothing ever reads was pure waste.
+fn unfiltered_snapshot_from(data: &DirectorData) -> DirectorData {
+    DirectorData {
+        ready_tasks: data.ready_tasks.clone(),
+        in_progress_tasks: data.in_progress_tasks.clone(),
+        epic_tasks: data.epic_tasks.clone(),
+        agents: data.agents.clone(),
+        agent_id_to_name: data.agent_id_to_name.clone(),
+        activity: Vec::new(),
+        changes: Vec::new(),
+        git_loaded: false,
+        reminders: Vec::new(),
+        epic_closed_counts: HashMap::new(),
+    }
+}
+
 pub(crate) fn queue_supervisor_intro_prompt(
     cas_dir: &std::path::Path,
     supervisor_name: &str,
@@ -1563,7 +1699,9 @@ mod tests {
     use cas_factory::{EpicState, FileChangeInfo, GitFileStatus, SourceChangesInfo, TaskSummary};
     use cas_types::{Priority, TaskStatus, TaskType};
 
-    use super::{DirectorData, DirectorEvent, merge_director_data_preserving_git};
+    use super::{
+        DirectorData, DirectorEvent, merge_director_data_preserving_git, unfiltered_snapshot_from,
+    };
 
     fn data_with_changes(git_loaded: bool, changes: Vec<SourceChangesInfo>) -> DirectorData {
         DirectorData {
@@ -1592,6 +1730,39 @@ mod tests {
             git_loaded: false,
             reminders: Vec::new(),
             epic_closed_counts: HashMap::new(),
+        }
+    }
+
+    /// cas-728b simplify pass: hoisted from two byte-identical local copies
+    /// (one per cas_dbbe test) so this fixture builder isn't pasted a third
+    /// time by whichever test needs it next.
+    fn task(id: &str, epic: &str, assignee: &str) -> TaskSummary {
+        TaskSummary {
+            id: id.to_string(),
+            title: format!("Subtask {id}"),
+            status: TaskStatus::InProgress,
+            priority: Priority::MEDIUM,
+            assignee: Some(assignee.to_string()),
+            task_type: TaskType::Task,
+            epic: Some(epic.to_string()),
+            branch: None,
+            updated_at: None,
+        }
+    }
+
+    /// Epic-kind `TaskSummary` fixture, branch-focused (see `epic_summary`
+    /// above for the title/status-focused variant used elsewhere).
+    fn epic(id: &str, branch: Option<&str>) -> TaskSummary {
+        TaskSummary {
+            id: id.to_string(),
+            title: format!("Epic {id}"),
+            status: TaskStatus::InProgress,
+            priority: Priority::HIGH,
+            assignee: None,
+            task_type: TaskType::Epic,
+            epic: None,
+            branch: branch.map(str::to_string),
+            updated_at: None,
         }
     }
 
@@ -1630,14 +1801,32 @@ mod tests {
 
     static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    // cas-eb7f: this crate has (at least) two independent, uncoordinated
+    // locks guarding process-global env-var mutation: this file's own
+    // `ENV_MUTEX` (used by `EnvGuard`, below) and `crate::test_support::
+    // HOME_MUTEX` (used by `with_temp_home`, adopted more widely — e.g.
+    // worktree/discovery.rs, migration/mod.rs, store/known_repos.rs).
+    // Neither serializes against the other, so any test using one races
+    // under `cargo test`'s default parallelism against any test using the
+    // other whenever both mutate `HOME` — confirmed: `cargo test --no-fail-fast`
+    // intermittently failed both `set_factory_session_handles_missing_
+    // malformed_and_valid_created_at` (this file, EnvGuard) and unrelated
+    // `worktree::discovery::tests::*` (test_support::with_temp_home) when
+    // scheduled concurrently. `EnvGuard` now also holds `HOME_MUTEX` for its
+    // lifetime so it serializes against BOTH lock domains; always acquired
+    // ENV_MUTEX-then-HOME_MUTEX (never the reverse) to rule out deadlock.
     struct EnvGuard {
         saved: Vec<(String, Option<String>)>,
         _lock: std::sync::MutexGuard<'static, ()>,
+        _home_lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl EnvGuard {
         fn set(vars: &[(&str, &str)]) -> Self {
             let lock = ENV_MUTEX
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let home_lock = crate::test_support::HOME_MUTEX
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let mut saved = Vec::with_capacity(vars.len());
@@ -1647,11 +1836,18 @@ mod tests {
                 unsafe { std::env::set_var(&key, value) };
                 saved.push((key, prev));
             }
-            Self { saved, _lock: lock }
+            Self {
+                saved,
+                _lock: lock,
+                _home_lock: home_lock,
+            }
         }
 
         fn set_optional(vars: &[(&str, Option<&str>)]) -> Self {
             let lock = ENV_MUTEX
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let home_lock = crate::test_support::HOME_MUTEX
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let mut saved = Vec::with_capacity(vars.len());
@@ -1664,7 +1860,11 @@ mod tests {
                 }
                 saved.push((key, prev));
             }
-            Self { saved, _lock: lock }
+            Self {
+                saved,
+                _lock: lock,
+                _home_lock: home_lock,
+            }
         }
     }
 
@@ -1926,6 +2126,596 @@ mod tests {
             1,
             "epic_tasks should have the new epic"
         );
+    }
+
+    /// cas-dbbe: pins the exact mechanism behind the director's false "has
+    /// closed task X" broadcast, observed live when two epics are worked
+    /// concurrently in the same factory session (repro task IDs cas-fc44 /
+    /// cas-9dc0 on epic cas-6d83, cas-7baa / cas-c0f9 / cas-972c on epic
+    /// cas-604d — both epics active in the same session, different workers).
+    ///
+    /// `filter_director_agents_to_current_session` mutates `director_data`
+    /// in place, epic-scoping it to whatever epic the director currently
+    /// tracks. On a tick where nothing changed in the DB (`db_changed =
+    /// false`) but the git-refresh interval elapsed, `director_data` is NOT
+    /// reloaded — it stays as that filtered leftover. Feeding THAT into
+    /// `detect_changes` makes every task belonging to the OTHER
+    /// (untracked) epic look like it vanished, firing a fabricated
+    /// `TaskCompleted` even though the task never closed.
+    ///
+    /// First half proves the bug: feeding the detector the filtered
+    /// snapshot on the second tick fires a false completion for the
+    /// other-epic task. Second half proves the fix: feeding it the
+    /// preserved unfiltered snapshot (what `FactoryApp.unfiltered_director_data`
+    /// now holds) does not.
+    #[test]
+    fn cas_dbbe_stale_filtered_snapshot_falsely_completes_other_epic_task() {
+        use super::{DirectorEvent, DirectorEventDetector};
+
+        let tracked_epic = "epic-604d";
+        let other_epic = "epic-6d83";
+
+        // Full, unfiltered snapshot: both epics' in-progress tasks visible —
+        // this is what a fresh `DirectorData::load_with_stores` returns, and
+        // what `FactoryApp.unfiltered_director_data` is meant to always hold.
+        let full_data = DirectorData {
+            ready_tasks: Vec::new(),
+            in_progress_tasks: vec![
+                task("cas-972c", tracked_epic, "jolly-koala-50"),
+                task("cas-9dc0", other_epic, "strong-jaguar-64"),
+            ],
+            epic_tasks: Vec::new(),
+            agents: Vec::new(),
+            activity: Vec::new(),
+            agent_id_to_name: HashMap::new(),
+            changes: Vec::new(),
+            git_loaded: true,
+            reminders: Vec::new(),
+            epic_closed_counts: HashMap::new(),
+        };
+
+        // Simulate `filter_director_agents_to_current_session` scoping the
+        // display copy to `tracked_epic` only — exactly what happens to
+        // `FactoryApp.director_data` at the end of a `db_changed` tick.
+        let mut filtered_data = full_data.clone();
+        filtered_data
+            .in_progress_tasks
+            .retain(|t| t.epic.as_deref() == Some(tracked_epic));
+        assert_eq!(
+            filtered_data.in_progress_tasks.len(),
+            1,
+            "sanity: filter should drop the other-epic task"
+        );
+
+        // --- Proves the bug: feeding the STALE FILTERED snapshot on the
+        // next tick (simulating db_changed=false, git_due=true leaving
+        // director_data un-reloaded) fires a false TaskCompleted for the
+        // other-epic task, which never actually closed.
+        let mut buggy_detector = DirectorEventDetector::new(
+            vec!["jolly-koala-50".to_string(), "strong-jaguar-64".to_string()],
+            "supervisor".to_string(),
+        );
+        buggy_detector.initialize(&full_data);
+        let buggy_events = buggy_detector.detect_changes(&filtered_data, Some(tracked_epic));
+        assert!(
+            buggy_events.iter().any(|e| matches!(
+                e,
+                DirectorEvent::TaskCompleted { task_id, .. } if task_id == "cas-9dc0"
+            )),
+            "bug reproduction failed: expected a fabricated TaskCompleted for the \
+             other-epic task when fed the stale-filtered snapshot; got {buggy_events:?}"
+        );
+
+        // --- Proves the fix: feeding the PRESERVED UNFILTERED snapshot on
+        // the next tick (what `unfiltered_director_data` now guarantees)
+        // must not report the other-epic task as completed — it's still
+        // genuinely InProgress.
+        let mut fixed_detector = DirectorEventDetector::new(
+            vec!["jolly-koala-50".to_string(), "strong-jaguar-64".to_string()],
+            "supervisor".to_string(),
+        );
+        fixed_detector.initialize(&full_data);
+        let fixed_events = fixed_detector.detect_changes(&full_data, Some(tracked_epic));
+        assert!(
+            !fixed_events.iter().any(|e| matches!(
+                e,
+                DirectorEvent::TaskCompleted { task_id, .. } if task_id == "cas-9dc0"
+            )),
+            "false completion survived the fix: other-epic task cas-9dc0 must not be \
+             reported completed while still InProgress; got {fixed_events:?}"
+        );
+    }
+
+    /// cas-dbbe: `filter_director_agents_to_current_session()` must mutate
+    /// only `director_data` (the TUI display copy) and must never touch
+    /// `unfiltered_director_data` — the canonical snapshot that change
+    /// detection and the `TaskCompleted` safety net rely on to see tasks
+    /// belonging to a second epic worked concurrently in the same session.
+    #[test]
+    fn cas_dbbe_filter_leaves_unfiltered_snapshot_untouched() {
+        use cas_factory::EpicState;
+
+        let tracked_epic = "epic-604d";
+        let other_epic = "epic-6d83";
+
+        let data = DirectorData {
+            ready_tasks: Vec::new(),
+            in_progress_tasks: vec![
+                task("cas-972c", tracked_epic, "jolly-koala-50"),
+                task("cas-9dc0", other_epic, "strong-jaguar-64"),
+            ],
+            epic_tasks: Vec::new(),
+            agents: Vec::new(),
+            activity: Vec::new(),
+            agent_id_to_name: HashMap::new(),
+            changes: Vec::new(),
+            git_loaded: true,
+            reminders: Vec::new(),
+            epic_closed_counts: HashMap::new(),
+        };
+
+        let mut app = super::FactoryApp::for_test();
+        app.worker_names = vec!["jolly-koala-50".to_string(), "strong-jaguar-64".to_string()];
+        app.epic_state = EpicState::Active {
+            epic_id: tracked_epic.to_string(),
+            epic_title: "Isolate concurrent factory sessions".to_string(),
+        };
+        app.director_data = data.clone();
+        app.unfiltered_director_data = data;
+
+        app.filter_director_agents_to_current_session();
+
+        assert_eq!(
+            app.director_data.in_progress_tasks.len(),
+            1,
+            "director_data (display copy) should be scoped to the tracked epic"
+        );
+        assert_eq!(
+            app.unfiltered_director_data.in_progress_tasks.len(),
+            2,
+            "unfiltered_director_data must retain the other epic's in-progress task \
+             untouched by the display filter"
+        );
+        assert!(
+            app.unfiltered_director_data
+                .in_progress_tasks
+                .iter()
+                .any(|t| t.id == "cas-9dc0"),
+            "other-epic task must still be present in the unfiltered snapshot"
+        );
+    }
+
+    /// cas-eb7f (review finding, cas-ebc1 final): `branch_visible_epics_for_ahead_behind`
+    /// had zero direct or indirect test coverage. Covers: current epic
+    /// included even with no referencing task; epics referenced only via
+    /// ready/in-progress tasks are also included; an epic with no branch is
+    /// silently dropped; an epic_tasks entry not referenced by anything
+    /// (current epic, ready, or in-progress) is excluded.
+    #[test]
+    fn branch_visible_epics_for_ahead_behind_selects_current_and_referenced_epics_with_branches() {
+        use cas_factory::TaskSummary;
+        use cas_types::{Priority, TaskStatus, TaskType};
+
+        fn subtask(id: &str, epic_id: &str, status: TaskStatus) -> TaskSummary {
+            TaskSummary {
+                id: id.to_string(),
+                title: format!("Subtask {id}"),
+                status,
+                priority: Priority::MEDIUM,
+                assignee: None,
+                task_type: TaskType::Task,
+                epic: Some(epic_id.to_string()),
+                branch: None,
+                updated_at: None,
+            }
+        }
+
+        let mut app = super::FactoryApp::for_test();
+        app.current_epic_id = Some("epic-current".to_string());
+        app.director_data = DirectorData {
+            ready_tasks: vec![subtask("cas-1", "epic-ready-ref", TaskStatus::Open)],
+            in_progress_tasks: vec![subtask(
+                "cas-2",
+                "epic-inprogress-ref",
+                TaskStatus::InProgress,
+            )],
+            epic_tasks: vec![
+                // Current epic: included even though no task references it.
+                epic("epic-current", Some("epic/current")),
+                // Referenced only via a ready task's `epic` field.
+                epic("epic-ready-ref", Some("epic/ready-ref")),
+                // Referenced only via an in-progress task's `epic` field.
+                epic("epic-inprogress-ref", Some("epic/inprogress-ref")),
+                // Referenced (by current_epic_id would not apply) but has NO
+                // branch — must be silently dropped, not (id, "").
+                epic("epic-no-branch", None),
+                // Not referenced by current_epic_id, ready, or in_progress —
+                // must be excluded entirely.
+                epic("epic-unrelated", Some("epic/unrelated")),
+            ],
+            agents: Vec::new(),
+            activity: Vec::new(),
+            agent_id_to_name: HashMap::new(),
+            changes: Vec::new(),
+            git_loaded: false,
+            reminders: Vec::new(),
+            epic_closed_counts: HashMap::new(),
+        };
+        // "epic-no-branch" has no task referencing it either, so it must be
+        // reachable only via the current_epic_id path to prove the
+        // no-branch filter specifically (not just absence from the set).
+        app.director_data
+            .ready_tasks
+            .push(subtask("cas-3", "epic-no-branch", TaskStatus::Open));
+
+        let mut visible = app.branch_visible_epics_for_ahead_behind();
+        visible.sort();
+
+        let mut expected = vec![
+            ("epic-current".to_string(), "epic/current".to_string()),
+            ("epic-ready-ref".to_string(), "epic/ready-ref".to_string()),
+            (
+                "epic-inprogress-ref".to_string(),
+                "epic/inprogress-ref".to_string(),
+            ),
+        ];
+        expected.sort();
+
+        assert_eq!(
+            visible, expected,
+            "must include current epic + ready/in-progress-referenced epics with a \
+             branch, and must exclude branch-less and unrelated epics"
+        );
+    }
+
+    /// Duplicate references (current_epic_id also referenced by a ready
+    /// task's `epic` field) must not produce a duplicate entry — the
+    /// underlying HashSet dedupes before the epic_tasks filter runs.
+    #[test]
+    fn branch_visible_epics_for_ahead_behind_dedupes_current_epic_referenced_by_a_task() {
+        use cas_factory::TaskSummary;
+        use cas_types::{Priority, TaskStatus, TaskType};
+
+        let mut app = super::FactoryApp::for_test();
+        app.current_epic_id = Some("epic-shared".to_string());
+        app.director_data = DirectorData {
+            ready_tasks: vec![TaskSummary {
+                id: "cas-1".to_string(),
+                title: "Subtask".to_string(),
+                status: TaskStatus::Open,
+                priority: Priority::MEDIUM,
+                assignee: None,
+                task_type: TaskType::Task,
+                epic: Some("epic-shared".to_string()),
+                branch: None,
+                updated_at: None,
+            }],
+            in_progress_tasks: Vec::new(),
+            epic_tasks: vec![TaskSummary {
+                id: "epic-shared".to_string(),
+                title: "Shared epic".to_string(),
+                status: TaskStatus::InProgress,
+                priority: Priority::HIGH,
+                assignee: None,
+                task_type: TaskType::Epic,
+                epic: None,
+                branch: Some("epic/shared".to_string()),
+                updated_at: None,
+            }],
+            agents: Vec::new(),
+            activity: Vec::new(),
+            agent_id_to_name: HashMap::new(),
+            changes: Vec::new(),
+            git_loaded: false,
+            reminders: Vec::new(),
+            epic_closed_counts: HashMap::new(),
+        };
+
+        let visible = app.branch_visible_epics_for_ahead_behind();
+
+        assert_eq!(
+            visible,
+            vec![("epic-shared".to_string(), "epic/shared".to_string())],
+            "current epic referenced by both current_epic_id and a task's epic \
+             field must yield exactly one entry, not a duplicate"
+        );
+    }
+
+    /// cas-eb7f (review finding, cas-ebc1 final): `set_factory_session`'s
+    /// rfc3339 `created_at` parsing had no test for the missing-file,
+    /// malformed-JSON, or non-RFC3339 cases — all of which currently
+    /// silently degrade to `None` via `.ok()`. Also proves the happy path
+    /// actually populates `session_created_at`, so a future format drift
+    /// between the metadata writer and this parser has a failing test.
+    ///
+    /// Builds `SessionMetadata` via the real struct + `serde_json::to_string`
+    /// (not a hand-written JSON literal) so this test can't drift from the
+    /// struct's actual required-field shape as fields are added.
+    ///
+    /// Uses this file's own `EnvGuard` (not `test_support::with_temp_home`)
+    /// to override `HOME` — `apply_session_metadata_focus_*` below also
+    /// mutates `HOME` via `EnvGuard`'s `ENV_MUTEX`, and that mutex does not
+    /// coordinate with `test_support::HOME_MUTEX`, so mixing the two here
+    /// races under parallel test execution (confirmed: using
+    /// `with_temp_home` intermittently failed both this test and the
+    /// `apply_session_metadata_focus_*` tests when scheduled concurrently).
+    #[test]
+    fn set_factory_session_handles_missing_malformed_and_valid_created_at() {
+        use crate::ui::factory::protocol::{AgentInfo, SessionMetadata};
+
+        fn sample_metadata(name: &str, created_at: &str) -> SessionMetadata {
+            SessionMetadata {
+                name: name.to_string(),
+                created_at: created_at.to_string(),
+                daemon_pid: 1,
+                socket_path: "socket".to_string(),
+                ws_port: None,
+                log_dir: None,
+                daemon_log_path: None,
+                daemon_trace_log_path: None,
+                server_log_path: None,
+                server_trace_log_path: None,
+                tui_log_path: None,
+                panic_log_path: None,
+                supervisor: AgentInfo {
+                    name: "supervisor".to_string(),
+                    pid: None,
+                    worktree_path: None,
+                },
+                workers: Vec::new(),
+                epic_id: None,
+                pinned_epic_id: None,
+                project_dir: None,
+                team_name: None,
+            }
+        }
+
+        let home = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set(&[("HOME", home.path().to_str().unwrap())]);
+        let sessions_dir = home.path().join(".cas").join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let mut app = super::FactoryApp::for_test();
+
+        // Missing metadata file entirely.
+        app.set_factory_session("no-such-session".to_string());
+        assert_eq!(
+            app.session_created_at, None,
+            "missing metadata file must degrade to None, not panic"
+        );
+
+        // Malformed JSON.
+        std::fs::write(sessions_dir.join("bad-json.json"), "{not valid json").unwrap();
+        app.set_factory_session("bad-json".to_string());
+        assert_eq!(
+            app.session_created_at, None,
+            "malformed JSON must degrade to None, not panic"
+        );
+
+        // Valid JSON (real struct shape), but created_at is not RFC3339.
+        let bad_date = sample_metadata("bad-date", "not-a-date");
+        std::fs::write(
+            sessions_dir.join("bad-date.json"),
+            serde_json::to_string(&bad_date).unwrap(),
+        )
+        .unwrap();
+        app.set_factory_session("bad-date".to_string());
+        assert_eq!(
+            app.session_created_at, None,
+            "non-RFC3339 created_at must degrade to None, not panic"
+        );
+
+        // Valid JSON with a valid RFC3339 created_at — the happy path.
+        let good = sample_metadata("good", "2026-01-01T12:30:00Z");
+        std::fs::write(
+            sessions_dir.join("good.json"),
+            serde_json::to_string(&good).unwrap(),
+        )
+        .unwrap();
+        app.set_factory_session("good".to_string());
+        assert_eq!(
+            app.session_created_at,
+            Some(
+                chrono::DateTime::parse_from_rfc3339("2026-01-01T12:30:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc)
+            ),
+            "valid RFC3339 created_at must populate session_created_at"
+        );
+    }
+
+    /// cas-728b simplify pass: hoisted from two near-identical PTY scaffolds
+    /// (one per test below). `cas_mux::Pane` has no non-PTY Worker
+    /// constructor, so these tests spawn a trivial real `cat` process to get
+    /// one — mirrors the environment-tolerant pattern in
+    /// `crates/cas-pty/src/pty.rs`'s own tests. `pty_id` and `pane_id` are
+    /// separate because production panes use a display id distinct from the
+    /// underlying PTY's spawn id. Returns `None` on either spawn or
+    /// pane-construction failure; callers print their own skip message and
+    /// return early (a shared helper can't `return` out of the caller's
+    /// test fn).
+    fn spawn_cat_worker_pane(pty_id: &str, pane_id: &str) -> Option<cas_mux::Pane> {
+        let pty_config = cas_mux::PtyConfig {
+            command: "cat".to_string(),
+            args: vec![],
+            cwd: None,
+            env: vec![],
+            rows: 24,
+            cols: 80,
+        };
+        let pty = cas_mux::Pty::spawn(pty_id, pty_config).ok()?;
+        cas_mux::Pane::with_pty(pane_id, cas_mux::PaneKind::Worker, pty, 24, 80).ok()
+    }
+
+    /// cas-eb7f (review finding, cas-ebc1 final): `sync_worker_pane_branch_titles`
+    /// and its epic_workers.rs call sites had no test proving the
+    /// `mux.panes_mut()` filter only touches `cas_mux::PaneKind::Worker` panes. Gives
+    /// both a Worker and a Director pane a distinct starting title, runs the
+    /// sync, and asserts the Worker pane's title changed while the Director
+    /// pane's did not — proving the wiring (not just that *a* title update
+    /// happened somewhere).
+    #[test]
+    fn sync_worker_pane_branch_titles_only_touches_worker_panes() {
+        let Some(mut worker_pane) = spawn_cat_worker_pane("test-worker-1", "worker-1") else {
+            eprintln!("skipping: `cat`/PTY-backed pane unavailable in this environment");
+            return;
+        };
+        worker_pane.set_title("STALE-WORKER-TITLE");
+
+        let Ok(mut director_pane) = cas_mux::Pane::director("director", 24, 80) else {
+            eprintln!("skipping: director pane construction failed");
+            return;
+        };
+        director_pane.set_title("STALE-DIRECTOR-TITLE");
+
+        let mut app = super::FactoryApp::for_test();
+        app.worker_names = vec!["worker-1".to_string()];
+        app.mux.add_pane(worker_pane);
+        app.mux.add_pane(director_pane);
+
+        app.sync_worker_pane_branch_titles();
+
+        let mut saw_worker = false;
+        let mut saw_director = false;
+        for pane in app.mux.panes_mut() {
+            match pane.kind() {
+                cas_mux::PaneKind::Worker => {
+                    saw_worker = true;
+                    assert_ne!(
+                        pane.title(),
+                        "STALE-WORKER-TITLE",
+                        "Worker pane title must be rewritten by sync_worker_pane_branch_titles"
+                    );
+                }
+                cas_mux::PaneKind::Director => {
+                    saw_director = true;
+                    assert_eq!(
+                        pane.title(),
+                        "STALE-DIRECTOR-TITLE",
+                        "non-Worker panes must not be touched by sync_worker_pane_branch_titles"
+                    );
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_worker && saw_director, "both fixture panes must still be present");
+    }
+
+    /// cas-eb7f (review finding, cas-ebc1 final): the status bar's
+    /// branch-label integration point (`app.focused_pane_branch()` feeding
+    /// `StatusBar::branch_label_for_width`) only had unit coverage on the
+    /// pure formatting helper — no test rendered the status bar against a
+    /// real `FactoryApp`/focused pane to prove the wiring itself. Placed
+    /// here (not in status_bar.rs) because `FactoryApp`'s `project_dir` and
+    /// `branch_visibility` fields are private to this module.
+    #[test]
+    fn render_status_bar_surfaces_focused_worker_pane_branch_label() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let Some(worker_pane) = spawn_cat_worker_pane("status-bar-worker", "worker-1") else {
+            eprintln!("skipping: `cat`/PTY-backed pane unavailable in this environment");
+            return;
+        };
+
+        let mut app = super::FactoryApp::for_test();
+        app.mux.add_pane(worker_pane);
+        assert!(app.mux.focus("worker-1"), "fixture pane must be focusable");
+        // worktree_manager is None in for_test(), so focused_pane_branch()
+        // falls back to project_dir for a focused Worker pane.
+        app.branch_visibility
+            .insert_path_branch(app.project_dir.clone(), "factory/status-branch");
+
+        let backend = TestBackend::new(120, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                crate::ui::factory::status_bar::StatusBar::render(frame, frame.area(), &app)
+            })
+            .unwrap();
+
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(
+            text.contains("branch factory/status-branch"),
+            "status bar must surface the focused pane's branch label; got: {text}"
+        );
+    }
+
+    /// cas-728b simplify pass on cas-dbbe: `unfiltered_snapshot_from` must
+    /// trim `changes`/`activity`/`reminders`/`epic_closed_counts` — neither
+    /// `detect_changes` nor the `TaskCompleted` safety net reads them from
+    /// `unfiltered_director_data`, so cloning them every `db_changed` tick
+    /// (potentially the largest fields in `DirectorData`) was pure waste.
+    /// The fields the consumers DO read must survive intact.
+    #[test]
+    fn unfiltered_snapshot_from_trims_unread_fields_but_keeps_consumed_ones() {
+        use cas_types::AgentStatus;
+
+        let mut source = data_with_changes(
+            true,
+            vec![SourceChangesInfo {
+                source_name: "main".to_string(),
+                source_path: std::path::PathBuf::from("."),
+                agent_name: None,
+                changes: vec![FileChangeInfo {
+                    file_path: "src/main.rs".to_string(),
+                    lines_added: 3,
+                    lines_removed: 1,
+                    status: GitFileStatus::Modified,
+                    staged: false,
+                }],
+                total_added: 3,
+                total_removed: 1,
+            }],
+        );
+        // Populate the fields that ARE supposed to survive with real content
+        // so the "preserved" assertions below can't pass trivially on two
+        // empty Vecs.
+        source.ready_tasks = vec![task("cas-1", "epic-a", "unassigned")];
+        source.in_progress_tasks = vec![task("cas-2", "epic-a", "agent-1")];
+        source.epic_tasks = vec![epic("epic-a", Some("epic/a"))];
+        source.agents = vec![cas_factory::AgentSummary {
+            id: "agent-1".to_string(),
+            name: "swift-fox".to_string(),
+            status: AgentStatus::Active,
+            current_task: None,
+            latest_activity: None,
+            last_heartbeat: None,
+            pending_messages: 0,
+            active_lease: None,
+        }];
+        source
+            .agent_id_to_name
+            .insert("agent-1".to_string(), "swift-fox".to_string());
+
+        let snapshot = unfiltered_snapshot_from(&source);
+
+        // Trimmed: never read by detect_changes or generate_prompt's
+        // TaskCompleted safety net.
+        assert!(snapshot.changes.is_empty(), "changes must be trimmed");
+        assert!(snapshot.activity.is_empty(), "activity must be trimmed");
+        assert!(snapshot.reminders.is_empty(), "reminders must be trimmed");
+        assert!(
+            snapshot.epic_closed_counts.is_empty(),
+            "epic_closed_counts must be trimmed"
+        );
+        assert!(!snapshot.git_loaded, "git_loaded must reset to false");
+
+        // Preserved: what the two consumers actually read.
+        assert_eq!(snapshot.ready_tasks.len(), source.ready_tasks.len());
+        assert_eq!(
+            snapshot.in_progress_tasks.len(),
+            source.in_progress_tasks.len()
+        );
+        assert_eq!(snapshot.epic_tasks.len(), source.epic_tasks.len());
+        assert_eq!(snapshot.agents.len(), source.agents.len());
+        assert_eq!(snapshot.agent_id_to_name, source.agent_id_to_name);
     }
 
     #[test]
@@ -2753,6 +3543,75 @@ mod tests {
             }
             ref other => panic!("expected preserved Active state, got {other:?}"),
         }
+    }
+
+    /// cas-6945 follow-up (raised in review): the event detector's
+    /// `EpicStarted` only fires on the epic's state *transition*
+    /// (Open→Open-with-branch or →InProgress). In the real supervisor
+    /// flow, the branch is auto-created at `task create` time — before any
+    /// worker has started a subtask — so `EpicStarted` fires and is
+    /// rejected for lack of a displayable subtask on that very first tick,
+    /// then never refires (proven by
+    /// `events::test_no_duplicate_epic_started_for_existing_open_with_branch`:
+    /// an unchanged Open-with-branch epic does not re-emit `EpicStarted`
+    /// even when the caller passes `current_epic_id: None`). Without a
+    /// periodic retry, AC1 ("worker starts a subtask -> epic becomes
+    /// visible, no supervisor action") would silently fail whenever epic
+    /// creation predates the first subtask start — the normal sequence.
+    /// This test drives `apply_session_metadata_focus` through exactly
+    /// that two-tick sequence and asserts the later tick still adopts.
+    #[test]
+    fn apply_session_metadata_focus_retries_inference_once_assignee_lands_on_a_later_tick() {
+        let _guard = EnvGuard::set_optional(&[("CAS_FACTORY_SESSION", None)]);
+        let epic_id = "cas-late-assignee";
+        let mut app = super::FactoryApp::for_test();
+
+        // Tick 1: epic exists (Open, branch already set — as at creation
+        // time), but no subtask has an assignee yet. Mirrors the detector
+        // having already fired-and-been-rejected for this epic.
+        app.director_data = data_with_epics(vec![epic_summary(
+            epic_id,
+            "Late Epic",
+            TaskStatus::Open,
+        )]);
+        app.apply_session_metadata_focus();
+        assert_eq!(
+            app.current_epic_id, None,
+            "epic with no displayable subtask must stay unadopted"
+        );
+
+        // Tick 2 (later): a worker starts a subtask and gets an assignee
+        // for free (cas-6945 lifecycle.rs fix). The epic's own Open/branch
+        // state is unchanged since tick 1, so the event detector would NOT
+        // refire `EpicStarted` for it — the periodic retry must still pick
+        // it up.
+        app.director_data = DirectorData {
+            ready_tasks: vec![task_summary(
+                "cas-late-assignee-1",
+                "Subtask started by worker",
+                Some(epic_id),
+                Some("worker-one"),
+            )],
+            in_progress_tasks: Vec::new(),
+            epic_tasks: vec![epic_summary(epic_id, "Late Epic", TaskStatus::Open)],
+            agents: Vec::new(),
+            activity: Vec::new(),
+            agent_id_to_name: HashMap::from([(
+                "worker-one".to_string(),
+                "worker-one".to_string(),
+            )]),
+            changes: Vec::new(),
+            git_loaded: false,
+            reminders: Vec::new(),
+            epic_closed_counts: HashMap::new(),
+        };
+        app.apply_session_metadata_focus();
+
+        assert_eq!(app.current_epic_id.as_deref(), Some(epic_id));
+        assert_eq!(
+            app.current_epic_source,
+            Some(super::EpicFocusSource::Inference)
+        );
     }
 
     #[test]

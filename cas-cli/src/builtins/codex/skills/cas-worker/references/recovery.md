@@ -93,6 +93,12 @@ If `mcp__cs__*` tools stop responding or return connection errors:
 
 4. **Report to supervisor** via `mcp__cs__coordination action=message` with the error and diagnostic output. Supervisor will fix the MCP connection or respawn you.
 
+## ToolSearch resolved the tool but you still can't call it
+
+Symptom: `ToolSearch(query="select:mcp__cs__task")` returns a match for `mcp__cs__task` (or any `mcp__cs__*` tool), but you're unsure how to proceed and are tempted to run ToolSearch again "to make it callable."
+
+**Do not re-run ToolSearch for a tool it already resolved — that will not make it more callable.** A successful ToolSearch match means the tool is now loadable; the very next action is a *separate* tool call literally named `mcp__cs__task` (or whichever tool matched), passing your real arguments (e.g. `action=mine`). If that direct call then fails or the tool name is rejected as unknown, treat it as **Zero CAS Tools Available** below and report to the supervisor — don't loop on ToolSearch, and don't fall back to `cas task ...` as a shell command (no such CLI subcommand exists).
+
 ## Zero CAS Tools Available
 
 (no `mcp__cs__*` tools surfaced at all — not one call errors, they simply do not exist in your tool set)

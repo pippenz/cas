@@ -99,9 +99,9 @@ impl VerificationSkipReason {
             } => {
                 format!(" (verification skipped — assignee inactive for {m}m)")
             }
-            VerificationSkipReason::AssigneeInactive { minutes_stale: None } => {
-                " (verification skipped — assignee lease expired)".to_string()
-            }
+            VerificationSkipReason::AssigneeInactive {
+                minutes_stale: None,
+            } => " (verification skipped — assignee lease expired)".to_string(),
             VerificationSkipReason::AssigneeUnknown => {
                 " (verification skipped — assignee unknown)".to_string()
             }
@@ -126,10 +126,10 @@ impl VerificationSkipReason {
             } => format!(
                 "Closed via supervisor bypass — assignee inactive for {m} minute(s) at close time."
             ),
-            VerificationSkipReason::AssigneeInactive { minutes_stale: None } => {
-                "Closed via supervisor bypass — assignee lease had expired at close time."
-                    .to_string()
-            }
+            VerificationSkipReason::AssigneeInactive {
+                minutes_stale: None,
+            } => "Closed via supervisor bypass — assignee lease had expired at close time."
+                .to_string(),
             VerificationSkipReason::AssigneeUnknown => {
                 "Closed via supervisor bypass — assignee row not found in agent store (likely \
                  a stale or renamed agent)."
@@ -145,6 +145,94 @@ impl VerificationSkipReason {
 }
 
 impl CasCore {
+    fn record_close_rejection_activity(&self, task_id: &str, reason: &str, message: &str) {
+        let Ok(agent_id) = self.get_agent_id() else {
+            return;
+        };
+        let Ok(event_store) = cas_store::SqliteEventStore::open(&self.cas_root) else {
+            return;
+        };
+        use cas_store::EventStore;
+        use cas_types::{Event, EventEntityType, EventType};
+
+        let event = Event::new(
+            EventType::WorkerVerificationBlocked,
+            EventEntityType::Agent,
+            &agent_id,
+            format!("task close rejected: {task_id} {reason}"),
+        )
+        .with_session(agent_id)
+        .with_metadata(serde_json::json!({
+            "task_id": task_id,
+            "close_rejected": true,
+            "reason": reason,
+            "message": message,
+        }));
+        if let Err(e) = event_store.record(&event) {
+            tracing::warn!(task_id = %task_id, error = %e, "failed to record close rejection activity");
+        }
+    }
+
+    fn park_task_awaiting_merge(
+        &self,
+        task_store: &dyn cas_store::TaskStore,
+        task: &Task,
+        reason: &str,
+        message: &str,
+    ) {
+        let mut parked = task.clone();
+        let now = chrono::Utc::now();
+        parked.status = TaskStatus::AwaitingMerge;
+        // cas-627f: investigated as a possible verification-jail escape
+        // (parking clears `pending_verification` before the verification
+        // policy block ever runs) — REFUTED. `pending_verification` is only
+        // ever a SETTER in this file; the actual close-time gate is
+        // `verification_store.get_latest_for_task` (checked independently,
+        // further down, and re-evaluated correctly on the next close
+        // attempt once the merge gate stops rejecting). The only consumer
+        // that reads this flag for jailing is
+        // `check_pending_verification` (mcp/server/mod.rs), which iterates
+        // ACTIVE leases only — the lease release two lines below already
+        // exempts this task from that jail on its own, making this clear
+        // redundant-but-harmless rather than a bypass. The hook-level
+        // `list_pending_verification` jail (pre_tool.rs) exempts factory
+        // workers outright, and `park_task_awaiting_merge` only fires for
+        // factory-branch merge gates in the first place.
+        parked.pending_verification = false;
+        parked.pending_worktree_merge = false;
+        parked.updated_at = now;
+
+        let timestamp = now.format("%Y-%m-%d %H:%M");
+        let audit = format!(
+            "[{timestamp}] Close rejected: {reason}. Task parked as awaiting_merge; worker lease released until supervisor merge completes."
+        );
+        parked.notes = if parked.notes.is_empty() {
+            audit
+        } else {
+            format!("{}\n\n{}", parked.notes, audit)
+        };
+
+        if let Err(e) = task_store.update(&parked) {
+            tracing::warn!(
+                task_id = %task.id,
+                error = %e,
+                "failed to park task awaiting merge after close rejection"
+            );
+        }
+
+        if let Ok(agent_store) = self.open_agent_store() {
+            if let Err(e) = agent_store.release_lease_for_task(&task.id) {
+                tracing::warn!(
+                    task_id = %task.id,
+                    error = %e,
+                    "failed to release task lease after merge-gated close rejection"
+                );
+            }
+        }
+
+        self.record_close_rejection_activity(&task.id, reason, message);
+    }
+
     pub async fn cas_task_close(
         &self,
         Parameters(req): Parameters<TaskCloseRequest>,
@@ -276,14 +364,28 @@ impl CasCore {
                 .and_then(|p| p.branch)
                 .unwrap_or_else(|| "main".to_string());
             let close_project_root = self.cas_root.parent().unwrap_or(&self.cas_root);
-            match run_factory_branch_merge_gate(
-                &task,
-                &req,
-                &parent_branch,
-                close_project_root,
-            ) {
+            match run_factory_branch_merge_gate(&task, &req, &parent_branch, close_project_root) {
                 MergeStateGateOutcome::Proceed => {}
                 MergeStateGateOutcome::Reject(msg) => {
+                    // cas-627f: a worker looping `close` before the
+                    // supervisor merges (the documented #1 worker failure
+                    // mode) used to re-run `park_task_awaiting_merge` on
+                    // EVERY retry — appending a duplicate audit note to
+                    // `task.notes` and emitting a duplicate
+                    // `WorkerVerificationBlocked` close-rejection activity
+                    // event each time, unboundedly. Park (and record the
+                    // rejection activity) only the first time a task
+                    // transitions into `AwaitingMerge`; once it's already
+                    // parked, a retry gets the same rejection message with
+                    // no further state mutation.
+                    if task.status != TaskStatus::AwaitingMerge {
+                        self.park_task_awaiting_merge(
+                            task_store.as_ref(),
+                            &task,
+                            "MERGE REQUIRED",
+                            &msg,
+                        );
+                    }
                     return Ok(Self::tool_error(msg));
                 }
             }
@@ -332,9 +434,7 @@ impl CasCore {
                 .code_review
                 .as_ref()
                 .map(|cr| cr.supervisor_owned())
-                .unwrap_or_else(|| {
-                    crate::config::CodeReviewConfig::default().supervisor_owned()
-                });
+                .unwrap_or_else(|| crate::config::CodeReviewConfig::default().supervisor_owned());
 
         // Skip verification for orphaned tasks: if caller is supervisor and the
         // task's assignee is inactive (heartbeat expired or lease gone), allow
@@ -508,8 +608,7 @@ impl CasCore {
                         // within-task verification deadlock from cas-c29a. Auto-escalate
                         // so the supervisor sees a clean failure instead of an infinite
                         // VERIFICATION REQUIRED loop.
-                        let elapsed_mins =
-                            (chrono::Utc::now() - v.created_at).num_seconds() / 60;
+                        let elapsed_mins = (chrono::Utc::now() - v.created_at).num_seconds() / 60;
 
                         // Clear pending_verification so the jail releases.
                         let mut task_to_update = task.clone();
@@ -650,14 +749,13 @@ impl CasCore {
                             // the missing record without halting the worker.
                             match verification_store.generate_id() {
                                 Ok(ver_id) => {
-                                    let mut skipped_row =
-                                        Verification::skipped(
-                                            ver_id,
-                                            req.id.clone(),
-                                            "Worker-owned verification: cas-code-review autofix \
+                                    let mut skipped_row = Verification::skipped(
+                                        ver_id,
+                                        req.id.clone(),
+                                        "Worker-owned verification: cas-code-review autofix \
                                              returned clean ReviewOutcome envelope"
-                                                .to_string(),
-                                        );
+                                            .to_string(),
+                                    );
                                     skipped_row.verification_type = verification_type;
                                     // cas-eeab (Item 6): cache get_agent_id() once to avoid
                                     // the double-call that existed between the row assignment
@@ -716,8 +814,7 @@ impl CasCore {
                                     ),
                                     entity_id: Some(req.id.clone()),
                                 };
-                                let _ =
-                                    crate::mcp::socket::send_event(&self.cas_root, &event);
+                                let _ = crate::mcp::socket::send_event(&self.cas_root, &event);
                             }
                             // Fall through — do NOT arm jail, do NOT return error.
                         } else {
@@ -733,10 +830,7 @@ impl CasCore {
                                 .map(|aid| task.assignee.as_deref() == Some(aid.as_str()))
                                 .unwrap_or(false);
                             if is_assignee {
-                                self.auto_claim_for_verification(
-                                    &req.id,
-                                    task_store.as_ref(),
-                                )?;
+                                self.auto_claim_for_verification(&req.id, task_store.as_ref())?;
                             }
 
                             // Set pending_verification flag to enable verification jail
@@ -799,8 +893,7 @@ impl CasCore {
                                     description: format!("Awaiting verification: {}", req.id),
                                     entity_id: Some(req.id.clone()),
                                 };
-                                let _ =
-                                    crate::mcp::socket::send_event(&self.cas_root, &event);
+                                let _ = crate::mcp::socket::send_event(&self.cas_root, &event);
                             }
 
                             // Persist a durable dispatch-request row so the close
@@ -1157,8 +1250,7 @@ impl CasCore {
                             .map(|wt| wt.parent_branch.clone())
                     })
                     .unwrap_or_else(|| "main".to_string());
-                let violations =
-                    check_additive_only_branch_violations(worker_wt, &parent_branch);
+                let violations = check_additive_only_branch_violations(worker_wt, &parent_branch);
                 if !violations.is_empty() {
                     let file_list = violations
                         .iter()
@@ -1239,8 +1331,7 @@ impl CasCore {
                             .map(|wt| wt.parent_branch.clone())
                     })
                     .unwrap_or_else(|| "main".to_string());
-                let reviewable =
-                    has_worker_committed_reviewable_changes(worker_wt, &parent_branch);
+                let reviewable = has_worker_committed_reviewable_changes(worker_wt, &parent_branch);
                 (reviewable, Some(parent_branch))
             } else {
                 (has_reviewable_changes(close_project_root), None)
@@ -1357,8 +1448,7 @@ impl CasCore {
                         if task_to_pend.notes.is_empty() {
                             task_to_pend.notes = note;
                         } else {
-                            task_to_pend.notes =
-                                format!("{}\n\n{}", task_to_pend.notes, note);
+                            task_to_pend.notes = format!("{}\n\n{}", task_to_pend.notes, note);
                         }
                     }
                     if let Err(e) = task_store.update(&task_to_pend) {
@@ -1378,10 +1468,7 @@ impl CasCore {
                         let event = crate::mcp::socket::DaemonEvent::WorkerActivity {
                             session_id: agent_id,
                             event_type: "worker_pending_supervisor_review".to_string(),
-                            description: format!(
-                                "Task ready for supervisor review: {}",
-                                req.id
-                            ),
+                            description: format!("Task ready for supervisor review: {}", req.id),
                             entity_id: Some(req.id.clone()),
                         };
                         let _ = crate::mcp::socket::send_event(&self.cas_root, &event);
@@ -1452,9 +1539,10 @@ impl CasCore {
             // Only run the case-3 gate for isolated-worker tasks that
             // are not supervisor-bypassed.
             if !bypass_close_gates {
-                if let (Some(worker_wt), Some(parent)) =
-                    (worker_worktree_path.as_ref(), worker_review_parent_branch.as_deref())
-                {
+                if let (Some(worker_wt), Some(parent)) = (
+                    worker_worktree_path.as_ref(),
+                    worker_review_parent_branch.as_deref(),
+                ) {
                     match check_zero_commit_close(
                         worker_wt,
                         parent,
@@ -2190,9 +2278,7 @@ pub(crate) fn check_additive_only_branch_violations(
         .current_dir(worker_worktree_path)
         .output();
     match diff_out {
-        Ok(o) if o.status.success() => {
-            parse_name_status(&String::from_utf8_lossy(&o.stdout))
-        }
+        Ok(o) if o.status.success() => parse_name_status(&String::from_utf8_lossy(&o.stdout)),
         _ => Vec::new(),
     }
 }
@@ -2261,8 +2347,7 @@ pub(crate) fn run_factory_branch_merge_gate(
         return MergeStateGateOutcome::Proceed;
     };
     let factory_branch = format!("factory/{assignee}");
-    let stranded =
-        count_unmerged_factory_commits(repo_path, &factory_branch, parent_branch);
+    let stranded = count_unmerged_factory_commits(repo_path, &factory_branch, parent_branch);
     if stranded == 0 {
         return MergeStateGateOutcome::Proceed;
     }
@@ -2346,9 +2431,7 @@ pub(crate) fn count_unmerged_factory_commits(
         .current_dir(repo_path)
         .output();
     let merge_base = match merge_base_out {
-        Ok(o) if o.status.success() => {
-            String::from_utf8_lossy(&o.stdout).trim().to_string()
-        }
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
         _ => return 0,
     };
     if merge_base.is_empty() {
@@ -2578,9 +2661,7 @@ pub(crate) fn get_worker_diff_stat(
         .current_dir(worker_worktree_path)
         .output();
     match stat_out {
-        Ok(o) if o.status.success() => {
-            String::from_utf8_lossy(&o.stdout).trim().to_string()
-        }
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
         _ => String::new(),
     }
 }
@@ -2705,7 +2786,10 @@ pub(crate) fn check_zero_commit_close(
     has_review_findings: bool,
 ) -> ZeroCommitCloseOutcome {
     // Not a code-expecting task type → no ambiguity.
-    if !matches!(task_type, TaskType::Bug | TaskType::Feature | TaskType::Task) {
+    if !matches!(
+        task_type,
+        TaskType::Bug | TaskType::Feature | TaskType::Task
+    ) {
         return ZeroCommitCloseOutcome::Proceed;
     }
     // execution_note is set → worker explicitly signalled the no-code intent.
@@ -2892,9 +2976,7 @@ pub(crate) fn render_epic_status_report(
              Epic close will be hard-blocked until they are merged.\n",
         ));
     } else {
-        out.push_str(
-            "\n✓ All child factory branches are merged into the parent epic branch.\n",
-        );
+        out.push_str("\n✓ All child factory branches are merged into the parent epic branch.\n");
     }
     out
 }
@@ -2912,10 +2994,7 @@ fn format_unix_timestamp(ts: i64) -> String {
 /// Last-commit timestamp on `branch` (Unix epoch seconds), or `None`
 /// when the branch ref doesn't resolve or `git log` fails. Mirrors
 /// the shell-out style of [`count_unmerged_factory_commits`].
-pub(crate) fn last_commit_unix(
-    repo_path: &std::path::Path,
-    branch: &str,
-) -> Option<i64> {
+pub(crate) fn last_commit_unix(repo_path: &std::path::Path, branch: &str) -> Option<i64> {
     use std::process::Command;
     let out = Command::new("git")
         .args(["log", "-1", "--format=%ct", branch])
@@ -2925,7 +3004,10 @@ pub(crate) fn last_commit_unix(
     if !out.status.success() {
         return None;
     }
-    String::from_utf8_lossy(&out.stdout).trim().parse::<i64>().ok()
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse::<i64>()
+        .ok()
 }
 
 /// Outcome of the cas-8f8f epic-close per-child merge-state gate.
@@ -3041,7 +3123,10 @@ pub(crate) fn worker_review_envelope_is_clean(envelope: &str) -> bool {
     // and the `pre_existing`-array check below. Genuine pre-existing P0s
     // belong in `outcome.pre_existing[]`, not in `residual[]`.
     let residual_clean = matches!(evaluate_gate(&outcome.residual), GateDecision::Allow)
-        && !outcome.residual.iter().any(|f| f.severity == FindingSeverity::P0);
+        && !outcome
+            .residual
+            .iter()
+            .any(|f| f.severity == FindingSeverity::P0);
     // cas-fef4: no P0 smuggled through the top-level pre_existing array.
     let pre_existing_clean = outcome
         .pre_existing
@@ -3653,9 +3738,7 @@ mod additive_only_tests {
     #[test]
     fn branch_check_non_git_returns_empty() {
         let dir = tempdir().unwrap();
-        assert!(
-            check_additive_only_branch_violations(dir.path(), "main").is_empty()
-        );
+        assert!(check_additive_only_branch_violations(dir.path(), "main").is_empty());
     }
 
     #[test]
@@ -3699,7 +3782,10 @@ mod additive_only_tests {
         let dir = init_branched_repo();
         std::fs::write(dir.path().join("existing.txt"), "worker edit\n").unwrap();
         git(dir.path(), &["add", "existing.txt"]);
-        git(dir.path(), &["commit", "-q", "-m", "fix: edit existing.txt"]);
+        git(
+            dir.path(),
+            &["commit", "-q", "-m", "fix: edit existing.txt"],
+        );
         let v = check_additive_only_branch_violations(dir.path(), "main");
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].path, "existing.txt");
@@ -3710,7 +3796,10 @@ mod additive_only_tests {
     fn branch_check_deleting_commit_fails() {
         let dir = init_branched_repo();
         git(dir.path(), &["rm", "-q", "existing.txt"]);
-        git(dir.path(), &["commit", "-q", "-m", "chore: drop existing.txt"]);
+        git(
+            dir.path(),
+            &["commit", "-q", "-m", "chore: drop existing.txt"],
+        );
         let v = check_additive_only_branch_violations(dir.path(), "main");
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].path, "existing.txt");
@@ -3755,15 +3844,9 @@ mod additive_only_tests {
         let dir = init_repo();
         std::fs::write(dir.path().join("new.rs"), "fn main() {}\n").unwrap();
         git(dir.path(), &["add", "new.rs"]);
-        git(
-            dir.path(),
-            &["commit", "-q", "-m", "feat: add new.rs"],
-        );
+        git(dir.path(), &["commit", "-q", "-m", "feat: add new.rs"]);
         let v = check_uncommitted_work(dir.path());
-        assert!(
-            v.is_empty(),
-            "committed work must pass the gate: {v:?}"
-        );
+        assert!(v.is_empty(), "committed work must pass the gate: {v:?}");
     }
 }
 
@@ -3921,9 +4004,7 @@ pub(crate) fn run_lightweight_structural_lint(
                     violations.push(format!(
                         "Lines +{}–+{}: {} consecutive commented-out lines — \
                          remove or restore the code before review (>5-line threshold)",
-                        run_start,
-                        i,
-                        run
+                        run_start, i, run
                     ));
                 }
                 run = 0;
@@ -4540,9 +4621,8 @@ mod code_review_gate_tests {
         let t = base_task();
         let mut req = base_req(&t.id);
         // Whitespace-only mode passes serde but fails validate().
-        req.code_review_findings = Some(
-            r#"{"residual":[],"pre_existing":[],"mode":"   "}"#.to_string(),
-        );
+        req.code_review_findings =
+            Some(r#"{"residual":[],"pre_existing":[],"mode":"   "}"#.to_string());
         let out = run_code_review_gate(&t, &req, dir.path());
         match out {
             CodeReviewGateOutcome::Reject(msg) => {
@@ -4739,10 +4819,7 @@ mod code_review_gate_tests {
         t
     }
 
-    fn envelope_with_pre_existing(
-        residual: Vec<Finding>,
-        pre_existing: Vec<Finding>,
-    ) -> String {
+    fn envelope_with_pre_existing(residual: Vec<Finding>, pre_existing: Vec<Finding>) -> String {
         let env = ReviewOutcome {
             residual,
             pre_existing,
@@ -4883,8 +4960,7 @@ mod code_review_gate_tests {
         let dir = repo_with_staged(&[("src/foo.rs", "fn new() {}\n")]);
         let mut t = base_task();
         // Forged envelope: P0 in residual[] with pre_existing=true.
-        let forged =
-            envelope_with_pre_existing(vec![p0_finding_pre_existing_true()], Vec::new());
+        let forged = envelope_with_pre_existing(vec![p0_finding_pre_existing_true()], Vec::new());
         t.deliverables.review_envelope = Some(forged);
         let req = base_req(&t.id); // no findings in request — reads persisted
         let out = run_code_review_gate(&t, &req, dir.path());
@@ -4922,9 +4998,9 @@ mod code_review_gate_tests {
                     "must block on P0 in pre_existing[]: {msg}"
                 );
             }
-            other => panic!(
-                "expected Reject for persisted P0-in-pre_existing[] envelope, got {other:?}"
-            ),
+            other => {
+                panic!("expected Reject for persisted P0-in-pre_existing[] envelope, got {other:?}")
+            }
         }
     }
 
@@ -5202,9 +5278,7 @@ mod merge_state_gate_tests {
                     "rejection message must spell out bypass-immunity policy: {msg}"
                 );
             }
-            other => panic!(
-                "bypass_code_review must NOT skip merge-state guard, got {other:?}"
-            ),
+            other => panic!("bypass_code_review must NOT skip merge-state guard, got {other:?}"),
         }
     }
 
@@ -5293,7 +5367,10 @@ mod merge_state_gate_tests {
         for (i, name) in ["x.rs", "y.rs", "z.rs"].iter().enumerate() {
             std::fs::write(dir.path().join(name), format!("// {i}\n")).unwrap();
             git(dir.path(), &["add", name]);
-            git(dir.path(), &["commit", "-q", "-m", &format!("feat: {name}")]);
+            git(
+                dir.path(),
+                &["commit", "-q", "-m", &format!("feat: {name}")],
+            );
         }
         assert_eq!(
             count_unmerged_factory_commits(dir.path(), "factory/worker", "main"),
@@ -5515,9 +5592,7 @@ mod epic_status_gate_tests {
                     "rejection must point at the diagnostic action: {msg}"
                 );
             }
-            other => panic!(
-                "expected Reject for stranded child branch, got {other:?}"
-            ),
+            other => panic!("expected Reject for stranded child branch, got {other:?}"),
         }
     }
 
@@ -5559,9 +5634,7 @@ mod epic_status_gate_tests {
                     "rejection must spell out bypass-immunity policy: {msg}"
                 );
             }
-            other => panic!(
-                "bypass_code_review must NOT skip the epic merge gate, got {other:?}"
-            ),
+            other => panic!("bypass_code_review must NOT skip the epic merge gate, got {other:?}"),
         }
     }
 
@@ -5803,9 +5876,7 @@ mod commit_claim_integrity_tests {
                 );
             }
             CommitClaimGateOutcome::Proceed => {
-                panic!(
-                    "gate must reject zero-commit + findings = fabrication scenario (cas-ba91)"
-                );
+                panic!("gate must reject zero-commit + findings = fabrication scenario (cas-ba91)");
             }
         }
     }
@@ -5970,8 +6041,8 @@ mod zero_change_close_tests {
             "main",
             "cas-test1",
             &TaskType::Bug,
-            None,     // no execution_note
-            false,    // no review findings
+            None,  // no execution_note
+            false, // no review findings
         );
         assert!(
             matches!(outcome, ZeroCommitCloseOutcome::Proceed),
@@ -5990,8 +6061,8 @@ mod zero_change_close_tests {
             "main",
             "cas-test1",
             &TaskType::Bug,
-            None,   // no execution_note
-            false,  // no review findings
+            None,  // no execution_note
+            false, // no review findings
         );
         match outcome {
             ZeroCommitCloseOutcome::AmbiguousCodeTask(msg) => {
@@ -6034,14 +6105,8 @@ mod zero_change_close_tests {
     fn case4_zero_commits_on_chore_or_spike_proceeds() {
         let dir = init_worker_repo();
         for task_type in [TaskType::Chore, TaskType::Epic] {
-            let outcome = check_zero_commit_close(
-                dir.path(),
-                "main",
-                "cas-test1",
-                &task_type,
-                None,
-                false,
-            );
+            let outcome =
+                check_zero_commit_close(dir.path(), "main", "cas-test1", &task_type, None, false);
             assert!(
                 matches!(outcome, ZeroCommitCloseOutcome::Proceed),
                 "{task_type:?} task type must not be flagged as ambiguous"
@@ -6088,7 +6153,10 @@ mod zero_change_close_tests {
         git(dir.path(), &["checkout", "-q", "main"]);
         std::fs::write(dir.path().join("epic_progress.txt"), "epic moved on\n").unwrap();
         git(dir.path(), &["add", "epic_progress.txt"]);
-        git(dir.path(), &["commit", "-q", "-m", "unrelated epic progress"]);
+        git(
+            dir.path(),
+            &["commit", "-q", "-m", "unrelated epic progress"],
+        );
         git(dir.path(), &["checkout", "-q", "factory/test-worker"]);
         // Worker never touches any file — just syncs to the new parent tip
         // via a forced merge commit (not a fast-forward).
@@ -6115,8 +6183,7 @@ mod zero_change_close_tests {
         match outcome {
             ZeroCommitCloseOutcome::AmbiguousCodeTask(msg) => {
                 assert!(
-                    msg.contains("ZERO-COMMIT CLOSE ON CODE TASK")
-                        || msg.contains("NO-DIFF CLOSE"),
+                    msg.contains("ZERO-COMMIT CLOSE ON CODE TASK") || msg.contains("NO-DIFF CLOSE"),
                     "rejection must name a zero-work gate: {msg}"
                 );
             }
@@ -6226,8 +6293,7 @@ mod merge_reality_tests {
     #[test]
     fn ac1_empty_branch_no_remote_is_refused() {
         let dir = init_repo_worker_branch_empty();
-        let outcome =
-            check_factory_branch_merge_reality(dir.path(), "test-worker", "main");
+        let outcome = check_factory_branch_merge_reality(dir.path(), "test-worker", "main");
         assert!(
             matches!(outcome, MergeRealityOutcome::Refuse(_)),
             "factory branch exists with 0 commits and no remote push — must REFUSE"
@@ -6238,8 +6304,7 @@ mod merge_reality_tests {
     #[test]
     fn ac1_refusal_message_names_branches() {
         let dir = init_repo_worker_branch_empty();
-        let outcome =
-            check_factory_branch_merge_reality(dir.path(), "test-worker", "main");
+        let outcome = check_factory_branch_merge_reality(dir.path(), "test-worker", "main");
         if let MergeRealityOutcome::Refuse(msg) = outcome {
             assert!(
                 msg.contains("factory/test-worker"),
@@ -6262,8 +6327,7 @@ mod merge_reality_tests {
     #[test]
     fn ac3a_branch_with_unmerged_commit_proceeds() {
         let dir = init_repo_worker_branch_with_commit();
-        let outcome =
-            check_factory_branch_merge_reality(dir.path(), "test-worker", "main");
+        let outcome = check_factory_branch_merge_reality(dir.path(), "test-worker", "main");
         assert!(
             matches!(outcome, MergeRealityOutcome::Proceed),
             "factory branch with ≥1 unmerged commit must PROCEED from B2 \
@@ -6291,8 +6355,7 @@ mod merge_reality_tests {
                 &head_sha,
             ],
         );
-        let outcome =
-            check_factory_branch_merge_reality(dir.path(), "test-worker", "main");
+        let outcome = check_factory_branch_merge_reality(dir.path(), "test-worker", "main");
         assert!(
             matches!(outcome, MergeRealityOutcome::Proceed),
             "when remote tracking ref exists, branch was pushed — must PROCEED"
@@ -6314,8 +6377,7 @@ mod merge_reality_tests {
         git(p, &["add", "seed.txt"]);
         git(p, &["commit", "-q", "-m", "seed"]);
         // No factory/test-worker branch at all
-        let outcome =
-            check_factory_branch_merge_reality(p, "test-worker", "main");
+        let outcome = check_factory_branch_merge_reality(p, "test-worker", "main");
         assert!(
             matches!(outcome, MergeRealityOutcome::Proceed),
             "absent factory branch (push+merge+prune) must PROCEED"

@@ -16,11 +16,31 @@ use crate::ui::theme::{ActiveTheme, Icons, Palette, get_agent_color};
 pub(crate) struct ScopedTaskView {
     pub epic_groups: Vec<EpicGroup>,
     pub standalone: Vec<TaskSummary>,
+    /// cas-6945: when unfocused (`focused_epic_id` is `None`), the epics that
+    /// still have live (in-progress/ready) subtasks — populated so the panel
+    /// can offer an actionable hint instead of silently rendering empty.
+    /// Always empty when a focus is active.
+    pub unfocused_live_epics: Vec<(String, String)>,
 }
 
 impl ScopedTaskView {
     pub(crate) fn new(data: &DirectorData, focused_epic_id: Option<&str>) -> Self {
         let (epic_groups, standalone) = data.tasks_by_epic();
+
+        // cas-6185c: apply the same session-visibility gate the FACTORY-panel
+        // overview uses (epic_is_renderable_source_blind) — without it this
+        // hint leaked a cross-project epic's id/title whenever the session
+        // shared a CAS project's task DB with another session/project.
+        let unfocused_live_epics = if focused_epic_id.is_none() {
+            epic_groups
+                .iter()
+                .filter(|group| epic_is_renderable_source_blind(data, &group.epic.id))
+                .map(|group| (group.epic.id.clone(), group.epic.title.clone()))
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         let epic_groups = match focused_epic_id {
             Some(epic_id) => epic_groups
                 .into_iter()
@@ -37,6 +57,7 @@ impl ScopedTaskView {
         Self {
             epic_groups,
             standalone,
+            unfocused_live_epics,
         }
     }
 
@@ -74,6 +95,27 @@ pub(crate) fn task_assigned_to_session_agent(task: &TaskSummary, data: &Director
     })
 }
 
+/// cas-6185c: shared privacy gate for rendering an epic's id/title/subtask
+/// details when the session hasn't explicitly earned visibility into it.
+/// An epic is "source-blind renderable" only if every one of its live
+/// subtasks is either unassigned or assigned to a session agent — i.e. the
+/// session has SOME claim to it. Without this gate, a factory session
+/// sharing a CAS project's task DB with other, unrelated sessions/projects
+/// (cas-4181) can surface a cross-project epic's id/title in the UI.
+///
+/// Originally lived only in `factory_radar.rs` (cas-582d, FACTORY-panel
+/// overview) as `focused_epic_is_renderable_source_blind`; moved here and
+/// shared so the TASKS-panel unfocused hint (cas-6945) applies the exact
+/// same check instead of a parallel, easier-to-forget copy — three review
+/// shards independently found the drift (cas-6185c).
+pub(crate) fn epic_is_renderable_source_blind(data: &DirectorData, epic_id: &str) -> bool {
+    data.in_progress_tasks
+        .iter()
+        .chain(data.ready_tasks.iter())
+        .filter(|task| task.epic.as_deref() == Some(epic_id))
+        .all(|task| task.assignee.is_none() || task_assigned_to_session_agent(task, data))
+}
+
 pub(crate) fn task_matches_agent_filter(task: &TaskSummary, agent_filter: Option<&str>) -> bool {
     match agent_filter {
         None => true,
@@ -108,6 +150,15 @@ fn priority_color(priority: Priority, palette: &Palette) -> Color {
 }
 
 /// Render the tasks section with optional focus indicator, agent filter, and epic collapse
+///
+/// `scoped` must be a `ScopedTaskView` already built for `focused_epic_id`
+/// (same value passed to both) — cas-eb7f: this used to call
+/// `ScopedTaskView::new` internally, which meant `render_with_state`
+/// (director/mod.rs) rebuilt the identical clone-heavy view a second time
+/// per frame just to decide `effective_tasks_collapsed`. Callers now build
+/// it once and thread it through both the collapse decision and this render
+/// call. `focused_epic_id` itself is still needed directly here (not just to
+/// build `scoped`) for the cas-6945 unfocused-hint empty state below.
 #[allow(clippy::too_many_arguments)]
 pub fn render_with_focus(
     frame: &mut Frame,
@@ -118,13 +169,13 @@ pub fn render_with_focus(
     _selected: Option<usize>,
     agent_filter: Option<&str>,
     focused_epic_id: Option<&str>,
+    scoped: &ScopedTaskView,
     collapsed: bool,
     collapsed_epics: &HashSet<String>,
     tasks_state: Option<&mut ListState>,
 ) {
     let palette = &theme.palette;
     let styles = &theme.styles;
-    let scoped = ScopedTaskView::new(data, focused_epic_id);
     let task_count = scoped.visible_row_count(agent_filter, collapsed_epics);
     let border_style = if focused {
         styles.border_focused
@@ -246,14 +297,12 @@ pub fn render_with_focus(
         .border_style(border_style);
 
     let list = if items.is_empty() {
-        let empty_message = match agent_filter {
-            Some(agent) => format!("No tasks for {agent}"),
-            None => "No tasks".to_string(),
-        };
-        List::new(vec![ListItem::new(Line::from(vec![Span::styled(
-            empty_message,
-            styles.text_muted.add_modifier(Modifier::ITALIC),
-        )]))])
+        List::new(empty_state_items(
+            agent_filter,
+            focused_epic_id,
+            &scoped.unfocused_live_epics,
+            styles,
+        ))
         .block(block)
     } else {
         List::new(items)
@@ -292,6 +341,7 @@ fn render_task_item(
         TaskStatus::Closed => Icons::CHECK,
         // cas-b51a: awaiting supervisor code-review
         TaskStatus::PendingSupervisorReview => Icons::CLOCK,
+        TaskStatus::AwaitingMerge => Icons::CLOCK,
     };
 
     let status_color = match task.status {
@@ -301,6 +351,7 @@ fn render_task_item(
         TaskStatus::Open => palette.task_open,
         // cas-b51a: reuse warning color (same as blocked) — task is "waiting"
         TaskStatus::PendingSupervisorReview => palette.task_blocked,
+        TaskStatus::AwaitingMerge => palette.task_blocked,
     };
 
     // Priority indicator (P0, P1, etc.)
@@ -336,6 +387,51 @@ fn render_task_item(
     ListItem::new(Line::from(spans))
 }
 
+/// Build the ListItems shown when the panel has nothing to render.
+///
+/// cas-6945: previously this always rendered a flat "No tasks" line, which
+/// looked identical whether the session genuinely had no work OR the panel
+/// was simply unfocused with live epics sitting undisplayed (the reported
+/// "active task went invisible" regression). When unfocused and at least one
+/// epic still has live subtasks, surface them plus the `focus_epic` pin hint
+/// instead of a silent empty panel.
+fn empty_state_items(
+    agent_filter: Option<&str>,
+    focused_epic_id: Option<&str>,
+    unfocused_live_epics: &[(String, String)],
+    styles: &crate::ui::theme::Styles,
+) -> Vec<ListItem<'static>> {
+    if let Some(agent) = agent_filter {
+        return vec![ListItem::new(Line::from(vec![Span::styled(
+            format!("No tasks for {agent}"),
+            styles.text_muted.add_modifier(Modifier::ITALIC),
+        )]))];
+    }
+
+    if focused_epic_id.is_none() && !unfocused_live_epics.is_empty() {
+        let mut items = vec![ListItem::new(Line::from(vec![Span::styled(
+            "No epic focused — live epics:".to_string(),
+            styles.text_muted.add_modifier(Modifier::ITALIC),
+        )]))];
+        for (epic_id, title) in unfocused_live_epics {
+            items.push(ListItem::new(Line::from(vec![Span::styled(
+                format!("  {epic_id} {title}"),
+                styles.text_info,
+            )])));
+        }
+        items.push(ListItem::new(Line::from(vec![Span::styled(
+            "Pin: coordination action=focus_epic id=<epic>".to_string(),
+            styles.text_muted.add_modifier(Modifier::ITALIC),
+        )])));
+        return items;
+    }
+
+    vec![ListItem::new(Line::from(vec![Span::styled(
+        "No tasks".to_string(),
+        styles.text_muted.add_modifier(Modifier::ITALIC),
+    )]))]
+}
+
 /// Truncate text to max_len characters (UTF-8 safe)
 fn truncate(text: &str, max_len: usize) -> String {
     let char_count = text.chars().count();
@@ -356,7 +452,7 @@ mod tests {
     use cas_factory::DirectorData;
     use cas_types::{Priority, TaskStatus, TaskType};
 
-    use super::{ScopedTaskView, TaskSummary};
+    use super::{ScopedTaskView, TaskSummary, render_with_focus};
 
     fn task(
         id: &str,
@@ -474,6 +570,52 @@ mod tests {
         assert_eq!(scoped.standalone.len(), 2);
     }
 
+    /// cas-6945: unfocused (`None`) must still surface which epics have live
+    /// work, so the panel can hint instead of rendering silently empty.
+    ///
+    /// cas-6185c: `data_for_scoping()`'s "cas-foreign" epic is deliberately
+    /// NOT session-visible (its only live subtask is assigned to
+    /// "other-worker", absent from `agent_id_to_name`) — the hint must
+    /// apply the same `epic_is_renderable_source_blind` gate the
+    /// FACTORY-panel overview does and exclude it. Only "cas-focused"
+    /// (session-visible subtasks) survives.
+    #[test]
+    fn scoped_task_view_lists_live_epics_only_when_unfocused() {
+        let data = data_for_scoping();
+
+        let unfocused = ScopedTaskView::new(&data, None);
+        let hint_ids: Vec<_> = unfocused
+            .unfocused_live_epics
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .collect();
+        assert_eq!(hint_ids, vec!["cas-focused"]);
+
+        // Once a focus is active, the hint list is not populated — the
+        // caller relies on `epic_groups` instead.
+        let focused = ScopedTaskView::new(&data, Some("cas-focused"));
+        assert!(focused.unfocused_live_epics.is_empty());
+    }
+
+    /// cas-6185c AC1: THE regression this fix-round exists for — the
+    /// unfocused TASKS-panel hint must never leak a cross-project/foreign
+    /// epic's id or title, using the same `data_for_scoping()` fixture the
+    /// FACTORY-panel privacy test (factory_radar.rs) already exercises.
+    #[test]
+    fn scoped_task_view_unfocused_hint_never_leaks_foreign_epic() {
+        let data = data_for_scoping();
+
+        let unfocused = ScopedTaskView::new(&data, None);
+        assert!(
+            unfocused
+                .unfocused_live_epics
+                .iter()
+                .all(|(id, _)| id != "cas-foreign"),
+            "foreign epic (no session-visible subtask) must not appear in the unfocused hint: {:?}",
+            unfocused.unfocused_live_epics
+        );
+    }
+
     #[test]
     fn scoped_task_view_keeps_focused_epic_without_session_agent_subtasks() {
         let data = data_for_scoping();
@@ -497,6 +639,172 @@ mod tests {
         assert_eq!(
             scoped.visible_row_count(Some("worker-one"), &HashSet::new()),
             4
+        );
+    }
+
+    /// cas-6945: with no focus pinned and no session-owned standalone tasks,
+    /// the panel used to render a bare "No tasks" line even though an epic
+    /// still had live work — the reported "active task went invisible"
+    /// regression. It must now list the live epic and the pin hint instead.
+    #[test]
+    fn render_with_focus_hints_live_epics_when_unfocused() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        use crate::ui::theme::ActiveTheme;
+
+        let data = DirectorData {
+            ready_tasks: vec![task(
+                "cas-live-1",
+                "Live subtask",
+                TaskType::Task,
+                Some("cas-live"),
+                // cas-6185c: must be session-visible (unassigned, here) for
+                // the hint to include it post-privacy-gate — an assignee
+                // outside `agent_id_to_name` would now be correctly
+                // filtered as a foreign epic.
+                None,
+            )],
+            in_progress_tasks: Vec::new(),
+            epic_tasks: vec![task(
+                "cas-live",
+                "Live epic with unowned subtask",
+                TaskType::Epic,
+                None,
+                None,
+            )],
+            agents: Vec::new(),
+            activity: Vec::new(),
+            agent_id_to_name: HashMap::new(),
+            changes: Vec::new(),
+            git_loaded: false,
+            reminders: Vec::new(),
+            epic_closed_counts: HashMap::new(),
+        };
+
+        let theme = ActiveTheme::default();
+        let backend = TestBackend::new(90, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let scoped = ScopedTaskView::new(&data, None);
+
+        terminal
+            .draw(|frame| {
+                render_with_focus(
+                    frame,
+                    frame.area(),
+                    &data,
+                    &theme,
+                    false,
+                    None,
+                    None,
+                    None,
+                    &scoped,
+                    false,
+                    &HashSet::new(),
+                    None,
+                );
+            })
+            .unwrap();
+
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<Vec<_>>()
+            .join("");
+
+        assert!(
+            text.contains("cas-live"),
+            "unfocused hint should list the live epic ID: {text}"
+        );
+        assert!(
+            text.contains("focus_epic"),
+            "unfocused hint should point at the focus_epic pin action: {text}"
+        );
+        assert!(
+            !text.contains("No tasks"),
+            "must not fall back to the bare empty message when a live epic exists: {text}"
+        );
+    }
+
+    /// cas-6185c AC1: render-level proof that a foreign epic's id/title
+    /// never reaches the screen via the unfocused TASKS-panel hint, even
+    /// though the epic has live subtask activity that WOULD otherwise
+    /// qualify it for the hint.
+    #[test]
+    fn render_with_focus_unfocused_hint_does_not_render_foreign_epic() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        use crate::ui::theme::ActiveTheme;
+
+        let data = DirectorData {
+            ready_tasks: vec![task(
+                "cas-foreign-1",
+                "Foreign subtask",
+                TaskType::Task,
+                Some("cas-foreign"),
+                Some("other-worker"),
+            )],
+            in_progress_tasks: Vec::new(),
+            epic_tasks: vec![task(
+                "cas-foreign",
+                "Top Secret Cross-Project Epic",
+                TaskType::Epic,
+                None,
+                None,
+            )],
+            agents: Vec::new(),
+            activity: Vec::new(),
+            agent_id_to_name: HashMap::new(),
+            changes: Vec::new(),
+            git_loaded: false,
+            reminders: Vec::new(),
+            epic_closed_counts: HashMap::new(),
+        };
+
+        let theme = ActiveTheme::default();
+        let backend = TestBackend::new(90, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let scoped = ScopedTaskView::new(&data, None);
+
+        terminal
+            .draw(|frame| {
+                render_with_focus(
+                    frame,
+                    frame.area(),
+                    &data,
+                    &theme,
+                    false,
+                    None,
+                    None,
+                    None,
+                    &scoped,
+                    false,
+                    &HashSet::new(),
+                    None,
+                );
+            })
+            .unwrap();
+
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<Vec<_>>()
+            .join("");
+
+        assert!(
+            !text.contains("cas-foreign"),
+            "foreign epic id must not leak into the unfocused TASKS-panel hint: {text}"
+        );
+        assert!(
+            !text.contains("Top Secret"),
+            "foreign epic title must not leak into the unfocused TASKS-panel hint: {text}"
         );
     }
 }

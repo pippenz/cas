@@ -297,9 +297,8 @@ impl SqliteTaskStore {
         // Cycle checks only apply to "blocks" edges.
         // Uses a single recursive CTE instead of iterative BFS with N queries.
         if check_cycle && dep.dep_type == DependencyType::Blocks {
-            let would_cycle: bool = conn
-                .query_row(
-                    "WITH RECURSIVE reachable(node) AS (
+            let would_cycle: bool = conn.query_row(
+                "WITH RECURSIVE reachable(node) AS (
                          SELECT ?1
                          UNION
                          SELECT d.to_id FROM dependencies d
@@ -307,9 +306,9 @@ impl SqliteTaskStore {
                          WHERE d.dep_type = 'blocks'
                      )
                      SELECT COUNT(*) FROM reachable WHERE node = ?2",
-                    params![&dep.to_id, &dep.from_id],
-                    |row| Ok(row.get::<_, i64>(0)? > 0),
-                )?;
+                params![&dep.to_id, &dep.from_id],
+                |row| Ok(row.get::<_, i64>(0)? > 0),
+            )?;
 
             if would_cycle {
                 return Err(StoreError::Parse(format!(
@@ -592,10 +591,12 @@ impl TaskStore for SqliteTaskStore {
                         // is no dedicated supervisor-review event type yet.
                         TaskStatus::PendingSupervisorReview => (
                             EventType::TaskBlocked,
-                            format!(
-                                "Task pending supervisor review: {}",
-                                task.title
-                            ),
+                            format!("Task pending supervisor review: {}", task.title),
+                            RecordingEventType::TaskBlocked,
+                        ),
+                        TaskStatus::AwaitingMerge => (
+                            EventType::TaskBlocked,
+                            format!("Task awaiting merge: {}", task.title),
                             RecordingEventType::TaskBlocked,
                         ),
                     };
@@ -613,44 +614,44 @@ impl TaskStore for SqliteTaskStore {
 
     fn delete(&self, id: &str) -> Result<()> {
         crate::shared_db::with_write_retry(|| {
-        let conn = self.conn.lock().unwrap();
-        let tx = crate::shared_db::ImmediateTx::new(&conn)?;
+            let conn = self.conn.lock().unwrap();
+            let tx = crate::shared_db::ImmediateTx::new(&conn)?;
 
-        // Get task title before deleting for event summary
-        let title: Option<String> = tx
-            .query_row("SELECT title FROM tasks WHERE id = ?", params![id], |row| {
-                row.get(0)
-            })
-            .optional()?;
+            // Get task title before deleting for event summary
+            let title: Option<String> = tx
+                .query_row("SELECT title FROM tasks WHERE id = ?", params![id], |row| {
+                    row.get(0)
+                })
+                .optional()?;
 
-        // Delete associated dependencies first
-        tx.execute(
-            "DELETE FROM dependencies WHERE from_id = ? OR to_id = ?",
-            params![id, id],
-        )?;
-        // Delete associated task leases
-        tx.execute("DELETE FROM task_leases WHERE task_id = ?", params![id])?;
-        let rows = tx.execute("DELETE FROM tasks WHERE id = ?", params![id])?;
-        if rows == 0 {
-            return Err(StoreError::TaskNotFound(id.to_string()));
-        }
+            // Delete associated dependencies first
+            tx.execute(
+                "DELETE FROM dependencies WHERE from_id = ? OR to_id = ?",
+                params![id, id],
+            )?;
+            // Delete associated task leases
+            tx.execute("DELETE FROM task_leases WHERE task_id = ?", params![id])?;
+            let rows = tx.execute("DELETE FROM tasks WHERE id = ?", params![id])?;
+            if rows == 0 {
+                return Err(StoreError::TaskNotFound(id.to_string()));
+            }
 
-        // Record event for sidecar activity feed
-        if let Some(title) = title {
-            let event = Event::new(
-                EventType::TaskDeleted,
-                EventEntityType::Task,
-                id,
-                format!("Task deleted: {title}"),
-            );
-            let _ = record_event_with_conn(&tx, &event);
-        }
+            // Record event for sidecar activity feed
+            if let Some(title) = title {
+                let event = Event::new(
+                    EventType::TaskDeleted,
+                    EventEntityType::Task,
+                    id,
+                    format!("Task deleted: {title}"),
+                );
+                let _ = record_event_with_conn(&tx, &event);
+            }
 
-        // Capture event for recording playback
-        let _ = capture_task_event(&tx, RecordingEventType::TaskDeleted, id, None);
+            // Capture event for recording playback
+            let _ = capture_task_event(&tx, RecordingEventType::TaskDeleted, id, None);
 
-        tx.commit()?;
-        Ok(())
+            tx.commit()?;
+            Ok(())
         }) // with_write_retry
     }
 
@@ -759,8 +760,10 @@ impl TaskStore for SqliteTaskStore {
         );
 
         let mut blocker_stmt = conn.prepare(&sql)?;
-        let params: Vec<&dyn rusqlite::types::ToSql> =
-            task_ids.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
+        let params: Vec<&dyn rusqlite::types::ToSql> = task_ids
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
         let rows = blocker_stmt.query_map(params.as_slice(), |row| {
             let from_id: String = row.get(0)?;
             // task_from_row expects columns starting at index 0, but here they start at 1
@@ -777,8 +780,10 @@ impl TaskStore for SqliteTaskStore {
                 task_type: row.get::<_, String>(9)?.parse().unwrap_or(TaskType::Task),
                 assignee: row.get(10)?,
                 labels: Self::parse_labels(&row.get::<_, String>(11)?),
-                created_at: Self::parse_datetime(&row.get::<_, String>(12)?).unwrap_or_else(Utc::now),
-                updated_at: Self::parse_datetime(&row.get::<_, String>(13)?).unwrap_or_else(Utc::now),
+                created_at: Self::parse_datetime(&row.get::<_, String>(12)?)
+                    .unwrap_or_else(Utc::now),
+                updated_at: Self::parse_datetime(&row.get::<_, String>(13)?)
+                    .unwrap_or_else(Utc::now),
                 closed_at: row
                     .get::<_, Option<String>>(14)?
                     .and_then(|s| Self::parse_datetime(&s)),

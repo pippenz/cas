@@ -181,6 +181,7 @@ mod m202_tasks_add_depth;
 mod m203_spawn_queue_add_factory_session;
 mod m204_agents_add_factory_session;
 mod m205_agents_factory_session_index;
+mod m206_spawn_queue_add_task_id;
 
 /// All migrations in order. IDs must be sequential and never reused.
 pub const MIGRATIONS: &[Migration] = &[
@@ -368,6 +369,8 @@ pub const MIGRATIONS: &[Migration] = &[
     // serve-brick hotfix): baselines run at store open BEFORE migrations, so a
     // baseline index on the m204-added column aborted init on pre-m204 DBs.
     m205_agents_factory_session_index::MIGRATION,
+    // Add task_id column to spawn_queue for spawn-time task pre-assignment (cas-6913)
+    m206_spawn_queue_add_task_id::MIGRATION,
 ];
 
 #[cfg(test)]
