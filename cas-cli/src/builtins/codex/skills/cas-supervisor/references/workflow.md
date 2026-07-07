@@ -43,19 +43,26 @@ In shared mode, file-overlap analysis is even more critical — two workers edit
 
 1. Spawn workers:
    ```
-   mcp__cas__coordination action=spawn_workers count=N isolate=true
+   mcp__cas__coordination action=spawn_workers count=N isolate=true cli=codex model=gpt-5.5 effort=medium
    ```
    Omit `isolate` for shared mode.
+
+   **Hard rule:** every `spawn_workers` call MUST include explicit `model=` and
+   `effort=`. Include `cli=` as well when spawning outside the stock Codex lane.
+   The spawn acknowledgement nags when either field is omitted because silent
+   session-default inheritance can put workers on the supervisor's expensive
+   model/effort.
 
    **Heterogeneous team example** — Claude supervisor spawning Codex workers:
    ```
    # All Codex workers
-   mcp__cas__coordination action=spawn_workers count=2 cli=codex isolate=true
+   mcp__cas__coordination action=spawn_workers count=2 cli=codex model=gpt-5.5 effort=medium isolate=true
 
    # Named workers with explicit Codex backend
-   mcp__cas__coordination action=spawn_workers count=1 cli=codex worker_names="alice" isolate=true
+   mcp__cas__coordination action=spawn_workers count=1 cli=codex model=gpt-5.5 effort=low worker_names="alice" isolate=true
    ```
-   `cli`, `model`, and `effort` are per-spawn overrides; omit to use the session default.
+   `cli`, `model`, and `effort` are per-spawn controls for the workers spawned
+   by that call.
    Spawn the tier mix the ready backlog needs — one `spawn_workers` call per tier; rubric
    and routing in [model-selection.md](model-selection.md).
    Full parameter table in [reference.md](reference.md#spawn_workers-parameters).

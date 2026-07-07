@@ -677,8 +677,9 @@ async fn test_spawn_workers_invalid_cli_returns_error() {
 }
 
 #[tokio::test]
-async fn test_spawn_workers_no_cli_override_has_no_spec() {
-    // Without cli/model/effort fields, worker_spec should be None (session defaults).
+async fn test_spawn_workers_no_cli_override_queues_safe_worker_spec() {
+    // Without cli/model/effort fields, worker_spec resolves to the safe worker
+    // floor instead of inheriting the supervisor session defaults.
     let env = FactoryTestEnv::new();
     env.create_epic("Test Epic");
 
@@ -690,10 +691,14 @@ async fn test_spawn_workers_no_cli_override_has_no_spec() {
 
     let entries = env.spawn_queue().peek(10).expect("peek");
     assert_eq!(entries.len(), 1);
-    assert!(
-        entries[0].worker_spec.is_none(),
-        "no cli/model/effort → worker_spec should be None (session default)"
-    );
+    let spec_json = entries[0]
+        .worker_spec
+        .as_deref()
+        .expect("no cli/model/effort should still queue a resolved worker_spec");
+    let spec: cas_mux::WorkerSpec = serde_json::from_str(spec_json).expect("valid WorkerSpec");
+    assert_eq!(spec.cli, cas_mux::SupervisorCli::Codex);
+    assert_eq!(spec.model.as_deref(), Some("gpt-5.5"));
+    assert_eq!(spec.effort, Some(cas_mux::Effort::Medium));
 }
 
 // =============================================================================
@@ -809,6 +814,8 @@ async fn test_worker_status_shows_agents() {
 
     let mut meta = HashMap::new();
     meta.insert("clone_path".to_string(), "/tmp/worktree/wolf".to_string());
+    meta.insert("worker_model".to_string(), "sonnet".to_string());
+    meta.insert("worker_effort".to_string(), "high".to_string());
     env.register_worker_with_metadata("wolf", meta);
     env.register_worker("fox");
 
@@ -827,6 +834,8 @@ async fn test_worker_status_shows_agents() {
         text.contains("/tmp/worktree/wolf"),
         "Should show clone path: {text}"
     );
+    assert!(text.contains("model: sonnet"), "Should show model: {text}");
+    assert!(text.contains("effort: high"), "Should show effort: {text}");
 }
 
 #[tokio::test]
@@ -1613,13 +1622,17 @@ async fn test_efc4_heterogeneous_codex_then_claude_spawn_queued_correctly() {
         "cas-efc4 AC2: worker_spec must encode the effort override: {spec_json}"
     );
 
-    // Second entry: Claude with no spec
+    // Second entry: omitted overrides now resolves to the safe Codex worker floor
+    // instead of inheriting the supervisor/session defaults.
     let claude_entry = &entries[1];
-    assert!(
-        claude_entry.worker_spec.is_none(),
-        "cas-efc4 AC1: default-Claude spawn must have no worker_spec (session defaults): {:?}",
-        claude_entry.worker_spec
-    );
+    let spec_json = claude_entry
+        .worker_spec
+        .as_deref()
+        .expect("cas-23dc: omitted overrides must still queue a resolved worker_spec");
+    let spec: cas_mux::WorkerSpec = serde_json::from_str(spec_json).expect("valid WorkerSpec");
+    assert_eq!(spec.cli, cas_mux::SupervisorCli::Codex);
+    assert_eq!(spec.model.as_deref(), Some("gpt-5.5"));
+    assert_eq!(spec.effort, Some(cas_mux::Effort::Medium));
 }
 
 /// cas-efc4 AC2: Model and effort overrides must reach the spawn-queue spec

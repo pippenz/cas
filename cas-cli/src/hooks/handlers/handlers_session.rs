@@ -68,6 +68,12 @@ pub fn handle_session_start(
                         .metadata
                         .insert("clone_path".to_string(), path.clone());
                 }
+                if let Ok(model) = std::env::var("CAS_FACTORY_WORKER_MODEL") {
+                    agent.metadata.insert("worker_model".to_string(), model);
+                }
+                if let Ok(effort) = std::env::var("CAS_FACTORY_WORKER_EFFORT") {
+                    agent.metadata.insert("worker_effort".to_string(), effort);
+                }
 
                 if let Err(reg_err) = agent_store.register(&agent) {
                     eprintln!("cas: Failed to register agent: {reg_err}");
@@ -522,8 +528,8 @@ pub(crate) fn build_worker_worktree_assertion(cwd: &str, context: String) -> Str
 
     // Check 2: HEAD must be on a factory/<name> branch (allowlist).
     // Detached HEAD is also warned — fail-closed.
-    let worker_name = std::env::var("CAS_AGENT_NAME")
-        .unwrap_or_else(|_| "<worker-name>".to_string());
+    let worker_name =
+        std::env::var("CAS_AGENT_NAME").unwrap_or_else(|_| "<worker-name>".to_string());
     let branch_result = std::process::Command::new("git")
         .args(["-C", cwd, "symbolic-ref", "--short", "HEAD"])
         .output()
@@ -605,10 +611,7 @@ pub fn handle_session_end(
             agent_name.as_deref(),
             agent_role.as_deref(),
         ) {
-            eprintln!(
-                "cas: Wrote session-end manifest to {}",
-                path.display()
-            );
+            eprintln!("cas: Wrote session-end manifest to {}", path.display());
         }
     }
 
@@ -1364,10 +1367,7 @@ mod worker_worktree_assertion_tests {
     #[test]
     fn no_clone_path_passes_through() {
         let _lock = env_lock();
-        let _env = EnvGuard::set(&[
-            ("CAS_AGENT_ROLE", Some("worker")),
-            ("CAS_CLONE_PATH", None),
-        ]);
+        let _env = EnvGuard::set(&[("CAS_AGENT_ROLE", Some("worker")), ("CAS_CLONE_PATH", None)]);
         let ctx = "some context".to_string();
         let result = build_worker_worktree_assertion("/tmp/foo", ctx.clone());
         assert_eq!(result, ctx);
@@ -1503,7 +1503,10 @@ mod worker_worktree_assertion_tests {
 
         let original_ctx = "existing context".to_string();
         let result = build_worker_worktree_assertion(&ps, original_ctx.clone());
-        assert_eq!(result, original_ctx, "no warning on factory branch, got: {result}");
+        assert_eq!(
+            result, original_ctx,
+            "no warning on factory branch, got: {result}"
+        );
     }
 
     /// Existing context is preserved (warning is prepended, not replacing)
@@ -1519,8 +1522,14 @@ mod worker_worktree_assertion_tests {
 
         let original = "## Important context\nDo this first.".to_string();
         let result = build_worker_worktree_assertion(&p, original.clone());
-        assert!(result.contains("## Important context"), "original context must be preserved");
-        assert!(result.starts_with("<worker-worktree-alert"), "alert must be prepended");
+        assert!(
+            result.contains("## Important context"),
+            "original context must be preserved"
+        );
+        assert!(
+            result.starts_with("<worker-worktree-alert"),
+            "alert must be prepended"
+        );
     }
 
     /// SessionStart bundle size must stay under 12KB after adding the assertion

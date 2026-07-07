@@ -778,6 +778,12 @@ impl EmbeddedDaemon {
                     .metadata
                     .insert("clone_path".to_string(), path.clone());
             }
+            if let Ok(model) = std::env::var("CAS_FACTORY_WORKER_MODEL") {
+                agent.metadata.insert("worker_model".to_string(), model);
+            }
+            if let Ok(effort) = std::env::var("CAS_FACTORY_WORKER_EFFORT") {
+                agent.metadata.insert("worker_effort".to_string(), effort);
+            }
 
             if store.register(&agent).is_ok() {
                 eprintln!(
