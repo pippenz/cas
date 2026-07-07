@@ -214,9 +214,23 @@ pub fn render_with_state(
 
     let has_reminders = !data.reminders.is_empty();
     let has_changes = data.changes.iter().any(|source| !source.changes.is_empty());
-    let visible_task_rows = tasks::ScopedTaskView::new(data, focused_epic_id)
-        .visible_row_count(agent_filter, collapsed_epics);
-    let effective_tasks_collapsed = tasks_collapsed || visible_task_rows == 0;
+    // cas-eb7f: build ScopedTaskView exactly once per frame and thread it into
+    // both the collapse decision below and the render call further down —
+    // previously tasks::render_with_focus rebuilt the identical clone-heavy
+    // view a second time (data.tasks_by_epic() clones every task/epic).
+    let scoped_task_view = tasks::ScopedTaskView::new(data, focused_epic_id);
+    let visible_task_rows = scoped_task_view.visible_row_count(agent_filter, collapsed_epics);
+    // cas-eb7f: `visible_row_count()` counts only `epic_groups`/`standalone`,
+    // which are empty by construction whenever unfocused (ScopedTaskView::new
+    // clears epic_groups to Vec::new() when focused_epic_id is None). Without
+    // this guard, the cas-6945 "no epic focused — live epics: ..." hint would
+    // never be seen: `visible_task_rows == 0` would auto-collapse the panel to
+    // a 1-line header, and render_with_focus returns before ever reaching the
+    // hint's rendering when `collapsed` is true — silently reproducing the
+    // exact "active task went invisible" regression cas-6945 was filed for.
+    let has_unfocused_hint = !scoped_task_view.unfocused_live_epics.is_empty();
+    let effective_tasks_collapsed =
+        tasks_collapsed || (visible_task_rows == 0 && !has_unfocused_hint);
     let effective_reminders_collapsed = reminders_collapsed || !has_reminders;
     let effective_changes_collapsed = changes_collapsed || !has_changes;
 
@@ -288,6 +302,7 @@ pub fn render_with_state(
         state.as_ref().and_then(|s| s.tasks_state.selected()),
         agent_filter,
         focused_epic_id,
+        &scoped_task_view,
         effective_tasks_collapsed,
         collapsed_epics,
         state.as_mut().map(|s| &mut *s.tasks_state),
@@ -530,6 +545,99 @@ mod tests {
         assert_eq!(areas.reminders.height, 1);
         assert_eq!(areas.changes.height, 1);
         assert!(areas.activity.height > areas.factory.height);
+    }
+
+    /// cas-eb7f: `visible_row_count()` counts only `epic_groups`/`standalone`,
+    /// both empty by construction whenever unfocused — so a naive
+    /// `visible_task_rows == 0` auto-collapse would hide the cas-6945
+    /// "no epic focused — live epics: ..." hint behind a 1-line "TASKS (0)"
+    /// header, reproducing the exact "active task went invisible" bug
+    /// cas-6945 was filed to fix. A live epic with no session-owned
+    /// standalone task (so `visible_task_rows` is genuinely 0) must still
+    /// leave the panel expanded so the hint renders.
+    #[test]
+    fn render_with_state_does_not_auto_collapse_tasks_when_unfocused_hint_has_content() {
+        let data = DirectorData {
+            ready_tasks: vec![TaskSummary {
+                id: "cas-live-child".to_string(),
+                title: "Live child".to_string(),
+                status: TaskStatus::Open,
+                priority: Priority::MEDIUM,
+                assignee: Some("other-worker".to_string()),
+                task_type: TaskType::Task,
+                epic: Some("cas-live".to_string()),
+                branch: None,
+                updated_at: None,
+            }],
+            in_progress_tasks: Vec::new(),
+            epic_tasks: vec![task("cas-live", TaskType::Epic, None)],
+            agents: Vec::new(),
+            activity: Vec::new(),
+            agent_id_to_name: HashMap::new(),
+            changes: Vec::new(),
+            git_loaded: false,
+            reminders: Vec::new(),
+            epic_closed_counts: HashMap::new(),
+        };
+        let backend = TestBackend::new(90, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = ActiveTheme::default();
+        let mut tasks_state = ListState::default();
+        let mut agents_state = ListState::default();
+        let mut reminders_state = ListState::default();
+        let mut changes_state = ListState::default();
+        let mut activity_state = ListState::default();
+        let collapsed_epics = HashSet::new();
+        let collapsed_dirs = HashSet::new();
+        let mut changes_item_types = Vec::new();
+        let mut areas = super::PanelAreas::default();
+
+        terminal
+            .draw(|frame| {
+                let mut state = SidecarState {
+                    focus: SidecarFocus::None,
+                    tasks_state: &mut tasks_state,
+                    agents_state: &mut agents_state,
+                    reminders_state: &mut reminders_state,
+                    changes_state: &mut changes_state,
+                    activity_state: &mut activity_state,
+                    agent_filter: None,
+                    focused_epic_id: None,
+                    focused_epic_branch_status: None,
+                    factory_collapsed: false,
+                    tasks_collapsed: false,
+                    reminders_collapsed: false,
+                    changes_collapsed: false,
+                    activity_collapsed: false,
+                    collapsed_epics: &collapsed_epics,
+                    collapsed_dirs: &collapsed_dirs,
+                    changes_item_types: &mut changes_item_types,
+                };
+                areas = render_with_state(
+                    frame,
+                    frame.area(),
+                    &data,
+                    &theme,
+                    None,
+                    "supervisor",
+                    Some(&mut state),
+                );
+            })
+            .unwrap();
+
+        let text = buffer_text(&terminal);
+        assert!(
+            !text.contains("▸ TASKS (0)"),
+            "panel must not auto-collapse to a 1-line header while the \
+             unfocused-live-epics hint has content to show; got:\n{text}"
+        );
+        assert!(
+            areas.tasks.height > 1,
+            "collapsed-header height (1) means the hint never rendered"
+        );
+        assert!(text.contains("No epic focused"));
+        assert!(text.contains("cas-live"));
+        assert!(text.contains("focus_epic"));
     }
 
     #[test]
