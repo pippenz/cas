@@ -565,7 +565,13 @@ mod tests {
                 title: "Live child".to_string(),
                 status: TaskStatus::Open,
                 priority: Priority::MEDIUM,
-                assignee: Some("other-worker".to_string()),
+                // cas-6185c: must be session-visible (unassigned, here) —
+                // the unfocused hint now applies the same privacy gate as
+                // the FACTORY-panel overview, so an assignee outside
+                // `agent_id_to_name` would be correctly filtered out as a
+                // foreign epic, leaving the hint (and this test) with
+                // nothing to show.
+                assignee: None,
                 task_type: TaskType::Task,
                 epic: Some("cas-live".to_string()),
                 branch: None,
