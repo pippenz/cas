@@ -37,13 +37,14 @@ After you assign tasks and send context to workers, **produce no more output**. 
 
 ## Quick Start
 
-New session? Run these 5 steps in order. Open the linked reference for detail.
+New session? Run these steps in order. Open the linked reference for detail.
 
 1. **Pre-flight binary check** — `cas --version` vs `git rev-parse --short HEAD`. If they don't match, see [references/preflight.md](cas-supervisor/references/preflight.md) before spawning workers.
 2. **Load context** — Run `/cas-supervisor-checklist` for session-start checklist, open EPICs, and worker availability.
 3. **Intake gate** — Assess all 8 intake checks against the user's request. Detail in [references/intake.md](cas-supervisor/references/intake.md).
 4. **Create EPIC** — `mcp__cas__task action=create task_type=epic title="..." description="..."`. Spec shape and templates in [references/planning.md](cas-supervisor/references/planning.md).
 5. **Spawn, assign, end turn** — `mcp__cas__coordination action=spawn_workers count=N isolate=true`, then assign with `update` (not `transfer`), send context, stop. Phases and merge flow in [references/workflow.md](cas-supervisor/references/workflow.md).
+6. **Pin epic focus** — `coordination action=focus_epic id=<epic-id>` shows the EPIC in TUI panels now.
 
 ## Heterogeneous Teams (Claude supervisor + Codex workers)
 
@@ -55,9 +56,6 @@ mcp__cas__coordination action=spawn_workers count=1 cli=codex
 
 # Spawn two workers with explicit names and Codex backend
 mcp__cas__coordination action=spawn_workers count=2 cli=codex worker_names="alice,bob"
-
-# Or from the CLI before starting the daemon:
-# cas factory --workers 2 --worker-spec '{"cli":"Codex","name":"alice"}'
 ```
 
 `cli`, `model`, and `effort` are per-spawn overrides — match them to task complexity via [references/model-selection.md](cas-supervisor/references/model-selection.md); parameter table in [references/reference.md](cas-supervisor/references/reference.md).

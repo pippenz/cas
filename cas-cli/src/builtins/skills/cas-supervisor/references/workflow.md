@@ -61,11 +61,12 @@ In shared mode, file-overlap analysis is even more critical — two workers edit
    Full parameter table in [reference.md](reference.md#spawn_workers-parameters).
 2. Verify workers appear in TUI before assigning (stale DB records are not real workers)
 3. Assign tasks: `mcp__cas__task action=update id=<id> assignee=<worker>`
-4. Search for relevant context and send assignment message:
+4. Pin epic focus so the TUI shows it immediately: `mcp__cas__coordination action=focus_epic id=<epic-id>`. Without this, the TASKS/FACTORY panels stay empty until a worker's first `task action=start` on a subtask lets the panel infer the epic — and inference only fires once that subtask's `assignee` matches a live session agent (workers now get this for free: `task action=start` sets `assignee` automatically when unset, cas-6945). Clear with `action=focus_epic clear=true` when the epic wraps.
+5. Search for relevant context and send assignment message:
    ```
    mcp__cas__coordination action=message target=<worker> message="Task <id>: <description>. Context: <findings>. Run mcp__cas__task action=mine to see your tasks."
    ```
-5. **End your turn immediately.** Stop here. Do not monitor, poll, or run any commands. Workers will push a message to you when done or blocked. Your next action is triggered by their message, not by checking.
+6. **End your turn immediately.** Stop here. Do not monitor, poll, or run any commands. Workers will push a message to you when done or blocked. Your next action is triggered by their message, not by checking.
 
 ### Resuming an Existing EPIC
 

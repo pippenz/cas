@@ -16,11 +16,26 @@ use crate::ui::theme::{ActiveTheme, Icons, Palette, get_agent_color};
 pub(crate) struct ScopedTaskView {
     pub epic_groups: Vec<EpicGroup>,
     pub standalone: Vec<TaskSummary>,
+    /// cas-6945: when unfocused (`focused_epic_id` is `None`), the epics that
+    /// still have live (in-progress/ready) subtasks — populated so the panel
+    /// can offer an actionable hint instead of silently rendering empty.
+    /// Always empty when a focus is active.
+    pub unfocused_live_epics: Vec<(String, String)>,
 }
 
 impl ScopedTaskView {
     pub(crate) fn new(data: &DirectorData, focused_epic_id: Option<&str>) -> Self {
         let (epic_groups, standalone) = data.tasks_by_epic();
+
+        let unfocused_live_epics = if focused_epic_id.is_none() {
+            epic_groups
+                .iter()
+                .map(|group| (group.epic.id.clone(), group.epic.title.clone()))
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         let epic_groups = match focused_epic_id {
             Some(epic_id) => epic_groups
                 .into_iter()
@@ -37,6 +52,7 @@ impl ScopedTaskView {
         Self {
             epic_groups,
             standalone,
+            unfocused_live_epics,
         }
     }
 
@@ -246,14 +262,12 @@ pub fn render_with_focus(
         .border_style(border_style);
 
     let list = if items.is_empty() {
-        let empty_message = match agent_filter {
-            Some(agent) => format!("No tasks for {agent}"),
-            None => "No tasks".to_string(),
-        };
-        List::new(vec![ListItem::new(Line::from(vec![Span::styled(
-            empty_message,
-            styles.text_muted.add_modifier(Modifier::ITALIC),
-        )]))])
+        List::new(empty_state_items(
+            agent_filter,
+            focused_epic_id,
+            &scoped.unfocused_live_epics,
+            styles,
+        ))
         .block(block)
     } else {
         List::new(items)
@@ -336,6 +350,51 @@ fn render_task_item(
     ListItem::new(Line::from(spans))
 }
 
+/// Build the ListItems shown when the panel has nothing to render.
+///
+/// cas-6945: previously this always rendered a flat "No tasks" line, which
+/// looked identical whether the session genuinely had no work OR the panel
+/// was simply unfocused with live epics sitting undisplayed (the reported
+/// "active task went invisible" regression). When unfocused and at least one
+/// epic still has live subtasks, surface them plus the `focus_epic` pin hint
+/// instead of a silent empty panel.
+fn empty_state_items(
+    agent_filter: Option<&str>,
+    focused_epic_id: Option<&str>,
+    unfocused_live_epics: &[(String, String)],
+    styles: &crate::ui::theme::Styles,
+) -> Vec<ListItem<'static>> {
+    if let Some(agent) = agent_filter {
+        return vec![ListItem::new(Line::from(vec![Span::styled(
+            format!("No tasks for {agent}"),
+            styles.text_muted.add_modifier(Modifier::ITALIC),
+        )]))];
+    }
+
+    if focused_epic_id.is_none() && !unfocused_live_epics.is_empty() {
+        let mut items = vec![ListItem::new(Line::from(vec![Span::styled(
+            "No epic focused — live epics:".to_string(),
+            styles.text_muted.add_modifier(Modifier::ITALIC),
+        )]))];
+        for (epic_id, title) in unfocused_live_epics {
+            items.push(ListItem::new(Line::from(vec![Span::styled(
+                format!("  {epic_id} {title}"),
+                styles.text_info,
+            )])));
+        }
+        items.push(ListItem::new(Line::from(vec![Span::styled(
+            "Pin: coordination action=focus_epic id=<epic>".to_string(),
+            styles.text_muted.add_modifier(Modifier::ITALIC),
+        )])));
+        return items;
+    }
+
+    vec![ListItem::new(Line::from(vec![Span::styled(
+        "No tasks".to_string(),
+        styles.text_muted.add_modifier(Modifier::ITALIC),
+    )]))]
+}
+
 /// Truncate text to max_len characters (UTF-8 safe)
 fn truncate(text: &str, max_len: usize) -> String {
     let char_count = text.chars().count();
@@ -356,7 +415,7 @@ mod tests {
     use cas_factory::DirectorData;
     use cas_types::{Priority, TaskStatus, TaskType};
 
-    use super::{ScopedTaskView, TaskSummary};
+    use super::{ScopedTaskView, TaskSummary, render_with_focus};
 
     fn task(
         id: &str,
@@ -474,6 +533,27 @@ mod tests {
         assert_eq!(scoped.standalone.len(), 2);
     }
 
+    /// cas-6945: unfocused (`None`) must still surface which epics have live
+    /// work, so the panel can hint instead of rendering silently empty.
+    #[test]
+    fn scoped_task_view_lists_live_epics_only_when_unfocused() {
+        let data = data_for_scoping();
+
+        let unfocused = ScopedTaskView::new(&data, None);
+        let mut hint_ids: Vec<_> = unfocused
+            .unfocused_live_epics
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .collect();
+        hint_ids.sort();
+        assert_eq!(hint_ids, vec!["cas-focused", "cas-foreign"]);
+
+        // Once a focus is active, the hint list is not populated — the
+        // caller relies on `epic_groups` instead.
+        let focused = ScopedTaskView::new(&data, Some("cas-focused"));
+        assert!(focused.unfocused_live_epics.is_empty());
+    }
+
     #[test]
     fn scoped_task_view_keeps_focused_epic_without_session_agent_subtasks() {
         let data = data_for_scoping();
@@ -497,6 +577,87 @@ mod tests {
         assert_eq!(
             scoped.visible_row_count(Some("worker-one"), &HashSet::new()),
             4
+        );
+    }
+
+    /// cas-6945: with no focus pinned and no session-owned standalone tasks,
+    /// the panel used to render a bare "No tasks" line even though an epic
+    /// still had live work — the reported "active task went invisible"
+    /// regression. It must now list the live epic and the pin hint instead.
+    #[test]
+    fn render_with_focus_hints_live_epics_when_unfocused() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        use crate::ui::theme::ActiveTheme;
+
+        let data = DirectorData {
+            ready_tasks: vec![task(
+                "cas-live-1",
+                "Live subtask",
+                TaskType::Task,
+                Some("cas-live"),
+                Some("other-worker"),
+            )],
+            in_progress_tasks: Vec::new(),
+            epic_tasks: vec![task(
+                "cas-live",
+                "Live epic with unowned subtask",
+                TaskType::Epic,
+                None,
+                None,
+            )],
+            agents: Vec::new(),
+            activity: Vec::new(),
+            agent_id_to_name: HashMap::new(),
+            changes: Vec::new(),
+            git_loaded: false,
+            reminders: Vec::new(),
+            epic_closed_counts: HashMap::new(),
+        };
+
+        let theme = ActiveTheme::default();
+        let backend = TestBackend::new(90, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| {
+                render_with_focus(
+                    frame,
+                    frame.area(),
+                    &data,
+                    &theme,
+                    false,
+                    None,
+                    None,
+                    None,
+                    false,
+                    &HashSet::new(),
+                    None,
+                );
+            })
+            .unwrap();
+
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<Vec<_>>()
+            .join("");
+
+        assert!(
+            text.contains("cas-live"),
+            "unfocused hint should list the live epic ID: {text}"
+        );
+        assert!(
+            text.contains("focus_epic"),
+            "unfocused hint should point at the focus_epic pin action: {text}"
+        );
+        assert!(
+            !text.contains("No tasks"),
+            "must not fall back to the bare empty message when a live epic exists: {text}"
         );
     }
 }
