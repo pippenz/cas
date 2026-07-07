@@ -1,5 +1,5 @@
-use crate::ui::factory::app::imports::*;
 use crate::store::open_task_store;
+use crate::ui::factory::app::imports::*;
 use crate::worktree::RemoveOutcome;
 
 fn bool_prop(value: bool) -> &'static str {
@@ -23,17 +23,13 @@ fn bool_prop(value: bool) -> &'static str {
 /// `FactoryApp::sync_worker_config_from_live_settings`, which also
 /// re-reads model and effort in the same config load.
 #[cfg(test)]
-pub(super) fn resolve_live_worker_harness(
-    cas_dir: &std::path::Path,
-) -> cas_mux::SupervisorCli {
+pub(super) fn resolve_live_worker_harness(cas_dir: &std::path::Path) -> cas_mux::SupervisorCli {
     use std::str::FromStr;
     Config::load(cas_dir)
         .ok()
         .map(|c| c.llm())
         .as_ref()
-        .and_then(|llm| {
-            cas_mux::SupervisorCli::from_str(llm.harness_for_role("worker")).ok()
-        })
+        .and_then(|llm| cas_mux::SupervisorCli::from_str(llm.harness_for_role("worker")).ok())
         .unwrap_or(cas_mux::SupervisorCli::Claude)
 }
 
@@ -64,10 +60,9 @@ fn flag_agent_dirty_on_shutdown(
         "dirty_worktree_path".to_string(),
         path.display().to_string(),
     );
-    agent.metadata.insert(
-        "dirty_worktree_files".to_string(),
-        file_count.to_string(),
-    );
+    agent
+        .metadata
+        .insert("dirty_worktree_files".to_string(), file_count.to_string());
     agent_store.update(&agent)?;
     Ok(())
 }
@@ -79,8 +74,7 @@ fn worker_has_open_tasks(cas_dir: &std::path::Path, agent_id: &str) -> bool {
     match open_task_store(cas_dir) {
         Ok(store) => match store.list(None) {
             Ok(tasks) => tasks.iter().any(|t| {
-                t.assignee.as_deref() == Some(agent_id)
-                    && t.status != cas_types::TaskStatus::Closed
+                t.assignee.as_deref() == Some(agent_id) && t.status != cas_types::TaskStatus::Closed
             }),
             Err(e) => {
                 tracing::warn!(
@@ -90,9 +84,7 @@ fn worker_has_open_tasks(cas_dir: &std::path::Path, agent_id: &str) -> bool {
             }
         },
         Err(e) => {
-            tracing::warn!(
-                "worker_has_open_tasks: open_task_store failed: {e} — assuming busy"
-            );
+            tracing::warn!("worker_has_open_tasks: open_task_store failed: {e} — assuming busy");
             true
         }
     }
@@ -126,16 +118,7 @@ impl FactoryApp {
                     epic_id,
                     epic_title,
                 } => {
-                    // Transition to Active state and track explicitly
-                    let previous = std::mem::replace(
-                        &mut self.epic_state,
-                        EpicState::Active {
-                            epic_id: epic_id.clone(),
-                            epic_title: epic_title.clone(),
-                        },
-                    );
-                    self.current_epic_id = Some(epic_id.clone());
-                    self.persist_current_epic_id();
+                    let previous = self.set_active_epic(epic_id, epic_title);
 
                     changes.push(EpicStateChange::Started {
                         epic_id: epic_id.clone(),
@@ -158,6 +141,9 @@ impl FactoryApp {
                             epic_id: epic_id.clone(),
                             epic_title: title.clone(),
                         };
+                        self.current_epic_id = None;
+                        self.current_epic_source = None;
+                        self.clear_persisted_current_epic_id();
 
                         changes.push(EpicStateChange::Completed {
                             epic_id: epic_id.clone(),
@@ -176,6 +162,9 @@ impl FactoryApp {
     /// Reset epic state to idle (after merge completes)
     pub fn reset_epic_state(&mut self) {
         self.epic_state = EpicState::Idle;
+        self.current_epic_id = None;
+        self.current_epic_source = None;
+        self.clear_persisted_current_epic_id();
     }
 
     /// Re-read the live `LlmConfig` from disk and update the mux's worker CLI,
@@ -401,11 +390,9 @@ impl FactoryApp {
         // git state drift between prep and finish, or non-isolated workers that
         // somehow inherit the wrong cwd).
         if let Some(ref expected) = expected_branch {
-            if let Err(e) = crate::ui::factory::app::verify_isolated_worker_branch(
-                &worker_name,
-                &cwd,
-                expected,
-            ) {
+            if let Err(e) =
+                crate::ui::factory::app::verify_isolated_worker_branch(&worker_name, &cwd, expected)
+            {
                 tracing::error!(
                     worker = %worker_name,
                     cwd = %cwd.display(),
@@ -556,9 +543,7 @@ impl FactoryApp {
         let outcome = match manager.attempt_remove_worker(name) {
             Ok(o) => o,
             Err(e) => {
-                self.set_error(format!(
-                    "Worker '{name}' worktree cleanup failed: {e}"
-                ));
+                self.set_error(format!("Worker '{name}' worktree cleanup failed: {e}"));
                 return;
             }
         };
@@ -580,9 +565,7 @@ impl FactoryApp {
                     &warning.path,
                     warning.file_count,
                 ) {
-                    tracing::warn!(
-                        "Failed to flag dirty_on_shutdown for agent '{agent_id}': {e}"
-                    );
+                    tracing::warn!("Failed to flag dirty_on_shutdown for agent '{agent_id}': {e}");
                 }
             }
         }
@@ -978,8 +961,7 @@ mod tests {
     /// reads the current on-disk config rather than a stale in-memory value.
     #[test]
     fn resolve_live_worker_harness_returns_codex_after_config_change() {
-        let (_temp, cas_dir) =
-            cas_dir_with_config("[llm.worker]\nharness = \"codex\"\n");
+        let (_temp, cas_dir) = cas_dir_with_config("[llm.worker]\nharness = \"codex\"\n");
         let harness = resolve_live_worker_harness(&cas_dir);
         assert_eq!(
             harness,
@@ -1013,8 +995,7 @@ mod tests {
     /// → `cas config set claude` → next spawn reverts to claude.
     #[test]
     fn resolve_live_worker_harness_reflects_config_rewrites() {
-        let (_temp, cas_dir) =
-            cas_dir_with_config("[llm.worker]\nharness = \"codex\"\n");
+        let (_temp, cas_dir) = cas_dir_with_config("[llm.worker]\nharness = \"codex\"\n");
         assert_eq!(
             resolve_live_worker_harness(&cas_dir),
             cas_mux::SupervisorCli::Codex,
@@ -1037,8 +1018,7 @@ mod tests {
     /// Unknown/garbage harness string falls back to Claude.
     #[test]
     fn resolve_live_worker_harness_falls_back_on_unknown_harness_string() {
-        let (_temp, cas_dir) =
-            cas_dir_with_config("[llm.worker]\nharness = \"chatgpt\"\n");
+        let (_temp, cas_dir) = cas_dir_with_config("[llm.worker]\nharness = \"chatgpt\"\n");
         let harness = resolve_live_worker_harness(&cas_dir);
         assert_eq!(
             harness,

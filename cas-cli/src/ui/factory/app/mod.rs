@@ -35,9 +35,7 @@ pub use cas_factory::{AutoPromptConfig, EpicState, FactoryConfig};
 
 // Re-export scroll dispatch types so callers in sibling crates can use them
 // without reaching into the private `sidecar_and_selection` submodule.
-pub use sidecar_and_selection::{
-    SCROLL_DOWN_ARROWS, SCROLL_LINES, SCROLL_UP_ARROWS, ScrollAction,
-};
+pub use sidecar_and_selection::{SCROLL_DOWN_ARROWS, SCROLL_LINES, SCROLL_UP_ARROWS, ScrollAction};
 
 /// Booting state for a worker that is being spawned (after prepare, before finish)
 #[derive(Debug, Clone)]
@@ -134,10 +132,7 @@ impl WorkerSpawnPrep {
 
                 let _ = git.init_submodules(&wt.worktree_path);
                 // Ensure gitignored config is available (may be missing from prior run)
-                crate::worktree::symlink_project_config(
-                    &wt.repo_root,
-                    &wt.worktree_path,
-                );
+                crate::worktree::symlink_project_config(&wt.repo_root, &wt.worktree_path);
                 // (Re-)install the pre-commit guard on reuse — the hook may have been
                 // removed if the main repo was cloned fresh (cas-bea2 LAYER 2).
                 if let Err(e) = crate::ui::factory::daemon::runtime::teams::TeamsManager::install_worker_pre_commit_hook(&wt.worktree_path) {
@@ -262,13 +257,18 @@ pub(crate) fn verify_isolated_worker_branch(
                     "ISOLATION BUG: worker '{}' cwd {:?} resolved to branch '{}' \
                      (expected '{}'). Worker will commit to the wrong ref. \
                      See EPIC cas-073f.",
-                    worker_name, cwd, actual_branch, expected_branch
+                    worker_name,
+                    cwd,
+                    actual_branch,
+                    expected_branch
                 )
             }
         }
         Err(e) => anyhow::bail!(
             "post-spawn: could not verify git branch for worker '{}' in {:?}: {}",
-            worker_name, cwd, e
+            worker_name,
+            cwd,
+            e
         ),
     }
 }
@@ -382,6 +382,9 @@ pub struct FactoryApp {
     /// Explicit current epic ID — set when supervisor creates/starts an epic.
     /// Takes priority over passive scanning in detect_epic_state().
     current_epic_id: Option<String>,
+    /// Source of the current epic focus. Renderers stay source-blind; this is
+    /// used while resolving focus so only inference-derived epics are gated.
+    current_epic_source: Option<EpicFocusSource>,
     /// Sidecar panel focus
     pub sidecar_focus: SidecarFocus,
     /// Sidecar panel scroll/collapse state
@@ -584,8 +587,12 @@ impl FactoryApp {
             let epic_id = epic_id.to_string();
             // Collect session IDs of current-session agents (agent_id_to_name is already
             // filtered above to only contain current-session entries).
-            let allowed_session_ids: std::collections::HashSet<String> =
-                self.director_data.agent_id_to_name.keys().cloned().collect();
+            let allowed_session_ids: std::collections::HashSet<String> = self
+                .director_data
+                .agent_id_to_name
+                .keys()
+                .cloned()
+                .collect();
             let belongs_to_session = |t: &cas_factory::TaskSummary| -> bool {
                 task_belongs_to_current_session(t, &epic_id, &allowed, &allowed_session_ids)
             };
@@ -595,9 +602,7 @@ impl FactoryApp {
             self.director_data
                 .in_progress_tasks
                 .retain(|t| belongs_to_session(t));
-            self.director_data
-                .epic_tasks
-                .retain(|t| t.id == epic_id);
+            self.director_data.epic_tasks.retain(|t| t.id == epic_id);
         }
     }
 
@@ -677,6 +682,7 @@ impl FactoryApp {
                 epic_id,
                 epic_title,
             } = event
+                && inferred_epic_is_displayable(&self.director_data, epic_id)
             {
                 self.set_active_epic(epic_id, epic_title);
             }
@@ -705,13 +711,18 @@ impl FactoryApp {
         Ok((prompts, events))
     }
 
-    fn set_active_epic(&mut self, epic_id: &str, epic_title: &str) {
+    fn set_active_epic(&mut self, epic_id: &str, epic_title: &str) -> EpicState {
+        let previous = std::mem::replace(
+            &mut self.epic_state,
+            EpicState::Active {
+                epic_id: epic_id.to_string(),
+                epic_title: epic_title.to_string(),
+            },
+        );
         self.current_epic_id = Some(epic_id.to_string());
-        self.epic_state = EpicState::Active {
-            epic_id: epic_id.to_string(),
-            epic_title: epic_title.to_string(),
-        };
+        self.current_epic_source = Some(EpicFocusSource::SessionDefault);
         self.persist_current_epic_id();
+        previous
     }
 
     fn persist_current_epic_id(&self) {
@@ -732,14 +743,31 @@ impl FactoryApp {
         }
     }
 
+    fn clear_persisted_current_epic_id(&self) {
+        let Some(session_name) = self.factory_session.as_deref() else {
+            return;
+        };
+        let path = metadata_path(session_name);
+        if let Err(err) = clear_session_metadata_epic_id_at(&path) {
+            tracing::warn!(
+                session = %session_name,
+                error = %err,
+                "failed to clear factory session epic focus"
+            );
+        }
+    }
+
     fn apply_session_metadata_focus(&mut self) {
-        let preferred_epic_id = preferred_epic_id_from_session_metadata();
-        if self.current_epic_id.as_deref() == preferred_epic_id.as_deref() {
+        let focus = preferred_epic_focus_from_session_metadata();
+        if self.current_epic_id.as_deref() == focus.epic_id.as_deref() {
             return;
         }
 
-        let epic_state = detect_epic_state(&self.director_data, preferred_epic_id.as_deref());
+        let epic_state = resolve_epic_state_for_focus(&self.director_data, &focus);
         self.current_epic_id = epic_state.epic_id().map(str::to_string);
+        self.current_epic_source = epic_state
+            .epic_id()
+            .map(|_| focus.source.unwrap_or(EpicFocusSource::Inference));
         self.epic_state = epic_state;
     }
 
@@ -1139,15 +1167,25 @@ pub enum EpicStateChange {
     Completed { epic_id: String, epic_title: String },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EpicFocusSource {
+    Pinned,
+    SessionDefault,
+    Inference,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct SessionEpicFocus {
+    pub(crate) epic_id: Option<String>,
+    pub(crate) source: Option<EpicFocusSource>,
+}
+
 /// Detect the initial epic state from loaded data.
 ///
 /// If `preferred_epic_id` is set (from session metadata or explicit tracking),
 /// look it up directly instead of scanning all epics. Falls back to scanning
 /// if the preferred epic is not found or is closed.
-pub(crate) fn detect_epic_state(
-    data: &DirectorData,
-    preferred_epic_id: Option<&str>,
-) -> EpicState {
+pub(crate) fn detect_epic_state(data: &DirectorData, preferred_epic_id: Option<&str>) -> EpicState {
     use cas_types::TaskStatus;
 
     // If we have an explicit epic ID, try to use it directly (skip scanning)
@@ -1194,31 +1232,82 @@ pub(crate) fn detect_epic_state(
     EpicState::Idle
 }
 
-pub(crate) fn preferred_epic_id_from_session_metadata() -> Option<String> {
-    let session_name = std::env::var("CAS_FACTORY_SESSION").ok()?;
-    preferred_epic_id_from_session_metadata_named(&session_name)
+pub(crate) fn resolve_epic_state_for_focus(
+    data: &DirectorData,
+    focus: &SessionEpicFocus,
+) -> EpicState {
+    match focus.source {
+        Some(EpicFocusSource::Pinned | EpicFocusSource::SessionDefault) => {
+            detect_epic_state(data, focus.epic_id.as_deref())
+        }
+        Some(EpicFocusSource::Inference) | None => {
+            let state = detect_epic_state(data, None);
+            match state.epic_id() {
+                Some(epic_id) if inferred_epic_is_displayable(data, epic_id) => state,
+                Some(_) => EpicState::Idle,
+                None => state,
+            }
+        }
+    }
 }
 
+pub(crate) fn inferred_epic_is_displayable(data: &DirectorData, epic_id: &str) -> bool {
+    data.in_progress_tasks
+        .iter()
+        .chain(data.ready_tasks.iter())
+        .any(|task| task.epic.as_deref() == Some(epic_id))
+}
+
+#[cfg(test)]
 pub(crate) fn preferred_epic_id_from_session_metadata_named(session_name: &str) -> Option<String> {
-    let path = metadata_path(session_name);
-    let data = fs::read_to_string(path).ok()?;
-    let metadata = serde_json::from_str::<SessionMetadata>(&data).ok()?;
-    preferred_epic_id_from_metadata(&metadata)
+    preferred_epic_focus_from_session_metadata_named(session_name).epic_id
 }
 
+pub(crate) fn preferred_epic_focus_from_session_metadata() -> SessionEpicFocus {
+    let Some(session_name) = std::env::var("CAS_FACTORY_SESSION").ok() else {
+        return SessionEpicFocus::default();
+    };
+    preferred_epic_focus_from_session_metadata_named(&session_name)
+}
+
+pub(crate) fn preferred_epic_focus_from_session_metadata_named(
+    session_name: &str,
+) -> SessionEpicFocus {
+    let path = metadata_path(session_name);
+    let Some(data) = fs::read_to_string(path).ok() else {
+        return SessionEpicFocus::default();
+    };
+    let Some(metadata) = serde_json::from_str::<SessionMetadata>(&data).ok() else {
+        return SessionEpicFocus::default();
+    };
+    preferred_epic_focus_from_metadata(&metadata)
+}
+
+#[cfg(test)]
 pub(crate) fn preferred_epic_id_from_metadata(metadata: &SessionMetadata) -> Option<String> {
-    metadata
+    preferred_epic_focus_from_metadata(metadata).epic_id
+}
+
+pub(crate) fn preferred_epic_focus_from_metadata(metadata: &SessionMetadata) -> SessionEpicFocus {
+    if let Some(epic_id) = metadata
         .pinned_epic_id
         .as_ref()
         .filter(|id| !id.trim().is_empty())
-        .cloned()
-        .or_else(|| {
-            metadata
-                .epic_id
-                .as_ref()
-                .filter(|id| !id.trim().is_empty())
-                .cloned()
-        })
+    {
+        return SessionEpicFocus {
+            epic_id: Some(epic_id.clone()),
+            source: Some(EpicFocusSource::Pinned),
+        };
+    }
+
+    if let Some(epic_id) = metadata.epic_id.as_ref().filter(|id| !id.trim().is_empty()) {
+        return SessionEpicFocus {
+            epic_id: Some(epic_id.clone()),
+            source: Some(EpicFocusSource::SessionDefault),
+        };
+    }
+
+    SessionEpicFocus::default()
 }
 
 pub(crate) fn persist_session_metadata_epic_id_at(
@@ -1227,6 +1316,12 @@ pub(crate) fn persist_session_metadata_epic_id_at(
 ) -> std::io::Result<()> {
     update_session_metadata_at(path, |metadata| {
         metadata.epic_id = Some(epic_id.to_string());
+    })
+}
+
+pub(crate) fn clear_session_metadata_epic_id_at(path: &std::path::Path) -> std::io::Result<()> {
+    update_session_metadata_at(path, |metadata| {
+        metadata.epic_id = None;
     })
 }
 
@@ -1330,7 +1425,7 @@ mod tests {
     use cas_factory::{EpicState, FileChangeInfo, GitFileStatus, SourceChangesInfo, TaskSummary};
     use cas_types::{Priority, TaskStatus, TaskType};
 
-    use super::{DirectorData, merge_director_data_preserving_git};
+    use super::{DirectorData, DirectorEvent, merge_director_data_preserving_git};
 
     fn data_with_changes(git_loaded: bool, changes: Vec<SourceChangesInfo>) -> DirectorData {
         DirectorData {
@@ -1376,6 +1471,25 @@ mod tests {
         }
     }
 
+    fn task_summary(
+        id: &str,
+        title: &str,
+        epic: Option<&str>,
+        assignee: Option<&str>,
+    ) -> TaskSummary {
+        TaskSummary {
+            id: id.to_string(),
+            title: title.to_string(),
+            status: TaskStatus::Open,
+            priority: Priority::MEDIUM,
+            assignee: assignee.map(str::to_string),
+            task_type: TaskType::Task,
+            epic: epic.map(str::to_string),
+            branch: None,
+            updated_at: None,
+        }
+    }
+
     static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     struct EnvGuard {
@@ -1385,7 +1499,9 @@ mod tests {
 
     impl EnvGuard {
         fn set(vars: &[(&str, &str)]) -> Self {
-            let lock = ENV_MUTEX.lock().unwrap();
+            let lock = ENV_MUTEX
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let mut saved = Vec::with_capacity(vars.len());
             for (key, value) in vars {
                 let key = (*key).to_string();
@@ -1469,8 +1585,8 @@ mod tests {
             assert!(task_belongs_to_current_session(
                 &t,
                 "cas-ff98",
-                &set(&["swift-fox"]),        // display names only
-                &set(&["sess-id-abc123"]),   // session IDs (the fix)
+                &set(&["swift-fox"]),      // display names only
+                &set(&["sess-id-abc123"]), // session IDs (the fix)
             ));
         }
 
@@ -1592,10 +1708,8 @@ mod tests {
         };
 
         // Event detector sees the new epic and fires EpicStarted
-        let mut detector = DirectorEventDetector::new(
-            vec!["worker-1".to_string()],
-            "supervisor".to_string(),
-        );
+        let mut detector =
+            DirectorEventDetector::new(vec!["worker-1".to_string()], "supervisor".to_string());
         // Initialize with empty state so detector sees the new epic as new
         detector.initialize(&DirectorData {
             ready_tasks: Vec::new(),
@@ -1613,9 +1727,9 @@ mod tests {
         let events = detector.detect_changes(&data, None);
 
         // Verify EpicStarted was fired
-        let epic_started = events.iter().any(|e| {
-            matches!(e, DirectorEvent::EpicStarted { epic_id, .. } if epic_id == new_epic_id)
-        });
+        let epic_started = events.iter().any(
+            |e| matches!(e, DirectorEvent::EpicStarted { epic_id, .. } if epic_id == new_epic_id),
+        );
         assert!(epic_started, "EpicStarted event should fire for new epic");
 
         // THE FIX: Update epic_state from events BEFORE filtering
@@ -1635,17 +1749,28 @@ mod tests {
         // Filter tasks to active epic (simulating filter_director_agents_to_current_session)
         if let Some(eid) = epic_state.epic_id() {
             let eid = eid.to_string();
-            data.ready_tasks
-                .retain(|t| t.epic.as_deref() == Some(&eid));
+            data.ready_tasks.retain(|t| t.epic.as_deref() == Some(&eid));
             data.in_progress_tasks
                 .retain(|t| t.epic.as_deref() == Some(&eid));
             data.epic_tasks.retain(|t| t.id == eid);
         }
 
         // Tasks should be retained because epic_state now points to new epic
-        assert_eq!(data.ready_tasks.len(), 1, "ready_tasks should not be empty after filter");
-        assert_eq!(data.in_progress_tasks.len(), 1, "in_progress_tasks should not be empty after filter");
-        assert_eq!(data.epic_tasks.len(), 1, "epic_tasks should have the new epic");
+        assert_eq!(
+            data.ready_tasks.len(),
+            1,
+            "ready_tasks should not be empty after filter"
+        );
+        assert_eq!(
+            data.in_progress_tasks.len(),
+            1,
+            "in_progress_tasks should not be empty after filter"
+        );
+        assert_eq!(
+            data.epic_tasks.len(),
+            1,
+            "epic_tasks should have the new epic"
+        );
     }
 
     #[test]
@@ -1771,8 +1896,10 @@ mod tests {
         let state = super::detect_epic_state(&data, None);
         match state {
             EpicState::Active { epic_id, .. } => {
-                assert_eq!(epic_id, active_epic_id,
-                    "Should prefer epic with in-progress subtasks, not stale epic with higher ID");
+                assert_eq!(
+                    epic_id, active_epic_id,
+                    "Should prefer epic with in-progress subtasks, not stale epic with higher ID"
+                );
             }
             other => panic!("Expected Active, got {other:?}"),
         }
@@ -1835,8 +1962,10 @@ mod tests {
         let state = super::detect_epic_state(&data, None);
         match state {
             EpicState::Active { epic_id, .. } => {
-                assert_eq!(epic_id, active_epic_id,
-                    "Should prefer epic with ready subtasks over stale epic with no subtasks");
+                assert_eq!(
+                    epic_id, active_epic_id,
+                    "Should prefer epic with ready subtasks over stale epic with no subtasks"
+                );
             }
             other => panic!("Expected Active, got {other:?}"),
         }
@@ -1890,9 +2019,55 @@ mod tests {
         let state = super::detect_epic_state(&data, Some(preferred_id));
         match state {
             EpicState::Active { epic_id, .. } => {
-                assert_eq!(epic_id, preferred_id,
-                    "preferred_epic_id should take priority over unrelated InProgress epics");
+                assert_eq!(
+                    epic_id, preferred_id,
+                    "preferred_epic_id should take priority over unrelated InProgress epics"
+                );
             }
+            other => panic!("Expected Active, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn detect_epic_preferred_id_takes_priority_over_open_branch_subtask_heuristic() {
+        let preferred_id = "cas-preferred";
+        let heuristic_id = "cas-heuristic";
+
+        let data = DirectorData {
+            ready_tasks: vec![task_summary(
+                "cas-ready",
+                "Heuristic subtask",
+                Some(heuristic_id),
+                None,
+            )],
+            in_progress_tasks: vec![TaskSummary {
+                status: TaskStatus::InProgress,
+                ..task_summary(
+                    "cas-ip",
+                    "Active heuristic subtask",
+                    Some(heuristic_id),
+                    None,
+                )
+            }],
+            epic_tasks: vec![
+                epic_summary(preferred_id, "Preferred Epic", TaskStatus::Open),
+                epic_summary(heuristic_id, "Heuristic Epic", TaskStatus::Open),
+            ],
+            agents: Vec::new(),
+            activity: Vec::new(),
+            agent_id_to_name: HashMap::new(),
+            changes: Vec::new(),
+            git_loaded: false,
+            reminders: Vec::new(),
+            epic_closed_counts: HashMap::new(),
+        };
+
+        let state = super::detect_epic_state(&data, Some(preferred_id));
+        match state {
+            EpicState::Active { epic_id, .. } => assert_eq!(
+                epic_id, preferred_id,
+                "preferred_epic_id should beat the open-branch active-subtask heuristic"
+            ),
             other => panic!("Expected Active, got {other:?}"),
         }
     }
@@ -1945,6 +2120,164 @@ mod tests {
         assert_eq!(
             super::preferred_epic_id_from_metadata(&metadata),
             Some("cas-pinned".to_string())
+        );
+    }
+
+    #[test]
+    fn preferred_epic_id_from_session_metadata_named_filters_empty_missing_and_malformed() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set(&[("HOME", home.path().to_str().unwrap())]);
+
+        assert_eq!(
+            super::preferred_epic_id_from_session_metadata_named("missing-session"),
+            None,
+            "missing metadata file should resolve no preferred epic"
+        );
+
+        let blank_path = crate::ui::factory::session::metadata_path("blank-session");
+        std::fs::create_dir_all(blank_path.parent().unwrap()).unwrap();
+        let mut blank = crate::ui::factory::session::create_metadata(
+            "blank-session",
+            12345,
+            "supervisor",
+            &[],
+            Some("   "),
+            Some("/tmp/project"),
+            None,
+        );
+        blank.pinned_epic_id = Some("\t".to_string());
+        std::fs::write(&blank_path, serde_json::to_string_pretty(&blank).unwrap()).unwrap();
+        assert_eq!(
+            super::preferred_epic_id_from_session_metadata_named("blank-session"),
+            None,
+            "empty or whitespace pin/default ids should be filtered"
+        );
+
+        let malformed_path = crate::ui::factory::session::metadata_path("malformed-session");
+        std::fs::create_dir_all(malformed_path.parent().unwrap()).unwrap();
+        std::fs::write(&malformed_path, "{ not json").unwrap();
+        assert_eq!(
+            super::preferred_epic_id_from_session_metadata_named("malformed-session"),
+            None,
+            "malformed metadata should resolve no preferred epic"
+        );
+    }
+
+    #[test]
+    fn explicit_focus_sources_render_unassigned_window_but_inference_zero_subtask_is_gated() {
+        let focused_id = "cas-focused";
+        let zero_id = "cas-zero";
+        let data = DirectorData {
+            ready_tasks: vec![task_summary(
+                "cas-unassigned",
+                "Unassigned open subtask",
+                Some(focused_id),
+                None,
+            )],
+            in_progress_tasks: Vec::new(),
+            epic_tasks: vec![
+                epic_summary(focused_id, "Focused Epic", TaskStatus::Open),
+                epic_summary(zero_id, "Zero Subtask Epic", TaskStatus::InProgress),
+            ],
+            agents: Vec::new(),
+            activity: Vec::new(),
+            agent_id_to_name: HashMap::new(),
+            changes: Vec::new(),
+            git_loaded: false,
+            reminders: Vec::new(),
+            epic_closed_counts: HashMap::new(),
+        };
+
+        let pinned = super::resolve_epic_state_for_focus(
+            &data,
+            &super::SessionEpicFocus {
+                epic_id: Some(focused_id.to_string()),
+                source: Some(super::EpicFocusSource::Pinned),
+            },
+        );
+        assert_eq!(pinned.epic_id(), Some(focused_id));
+
+        let session_default = super::resolve_epic_state_for_focus(
+            &data,
+            &super::SessionEpicFocus {
+                epic_id: Some(focused_id.to_string()),
+                source: Some(super::EpicFocusSource::SessionDefault),
+            },
+        );
+        assert_eq!(session_default.epic_id(), Some(focused_id));
+
+        let zero_only = DirectorData {
+            ready_tasks: Vec::new(),
+            in_progress_tasks: Vec::new(),
+            epic_tasks: vec![epic_summary(
+                zero_id,
+                "Zero Subtask Epic",
+                TaskStatus::InProgress,
+            )],
+            agents: Vec::new(),
+            activity: Vec::new(),
+            agent_id_to_name: HashMap::new(),
+            changes: Vec::new(),
+            git_loaded: false,
+            reminders: Vec::new(),
+            epic_closed_counts: HashMap::new(),
+        };
+        assert_eq!(
+            super::resolve_epic_state_for_focus(&zero_only, &super::SessionEpicFocus::default())
+                .epic_id(),
+            None,
+            "inference-derived zero-subtask focus should not reach renderers"
+        );
+    }
+
+    #[test]
+    fn epic_completed_clears_current_and_session_default_without_clearing_pin() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set(&[
+            ("HOME", home.path().to_str().unwrap()),
+            ("CAS_FACTORY_SESSION", "session-complete-clear"),
+        ]);
+        let metadata_path = crate::ui::factory::session::metadata_path("session-complete-clear");
+        std::fs::create_dir_all(metadata_path.parent().unwrap()).unwrap();
+        let mut metadata = crate::ui::factory::session::create_metadata(
+            "session-complete-clear",
+            12345,
+            "supervisor",
+            &[],
+            Some("cas-current"),
+            Some("/tmp/project"),
+            None,
+        );
+        metadata.pinned_epic_id = Some("cas-pin".to_string());
+        std::fs::write(
+            &metadata_path,
+            serde_json::to_string_pretty(&metadata).unwrap(),
+        )
+        .unwrap();
+
+        let mut app = super::FactoryApp::for_test();
+        app.factory_session = Some("session-complete-clear".to_string());
+        app.current_epic_id = Some("cas-current".to_string());
+        app.current_epic_source = Some(super::EpicFocusSource::SessionDefault);
+        app.epic_state = EpicState::Active {
+            epic_id: "cas-current".to_string(),
+            epic_title: "Current Epic".to_string(),
+        };
+
+        let changes = app.handle_epic_events(&[DirectorEvent::EpicCompleted {
+            epic_id: "cas-current".to_string(),
+        }]);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(app.current_epic_id, None);
+
+        let updated: crate::ui::factory::protocol::SessionMetadata =
+            serde_json::from_str(&std::fs::read_to_string(&metadata_path).unwrap()).unwrap();
+        assert_eq!(updated.epic_id, None);
+        assert_eq!(updated.pinned_epic_id, Some("cas-pin".to_string()));
+        assert_eq!(
+            super::preferred_epic_id_from_session_metadata_named("session-complete-clear"),
+            Some("cas-pin".to_string()),
+            "reload should not resurrect the completed session-default epic"
         );
     }
 
@@ -2258,10 +2591,8 @@ mod tests {
         // Runtime path: event detector sees both epics as new Open-with-branch.
         // With current_epic_id pointing at the active epic, the strict-improvement
         // gate must suppress any EpicStarted for the stray hijacker.
-        let mut detector = DirectorEventDetector::new(
-            vec!["worker-1".to_string()],
-            "supervisor".to_string(),
-        );
+        let mut detector =
+            DirectorEventDetector::new(vec!["worker-1".to_string()], "supervisor".to_string());
         detector.initialize(&DirectorData {
             ready_tasks: Vec::new(),
             in_progress_tasks: Vec::new(),
@@ -2349,10 +2680,8 @@ mod tests {
             epic_closed_counts: HashMap::new(),
         };
 
-        let mut detector = DirectorEventDetector::new(
-            vec!["worker-1".to_string()],
-            "supervisor".to_string(),
-        );
+        let mut detector =
+            DirectorEventDetector::new(vec!["worker-1".to_string()], "supervisor".to_string());
         detector.initialize(&DirectorData {
             ready_tasks: Vec::new(),
             in_progress_tasks: Vec::new(),
@@ -2441,10 +2770,8 @@ mod tests {
             epic_closed_counts: HashMap::new(),
         };
 
-        let mut detector = DirectorEventDetector::new(
-            vec!["worker-1".to_string()],
-            "supervisor".to_string(),
-        );
+        let mut detector =
+            DirectorEventDetector::new(vec!["worker-1".to_string()], "supervisor".to_string());
         detector.initialize(&DirectorData {
             ready_tasks: Vec::new(),
             in_progress_tasks: Vec::new(),
@@ -2535,7 +2862,10 @@ mod spawn_isolation_tests {
         std::fs::create_dir_all(wt_path.parent().unwrap()).unwrap();
         Command::new("git")
             .args([
-                "worktree", "add", "-b", "factory/test-worker",
+                "worktree",
+                "add",
+                "-b",
+                "factory/test-worker",
                 wt_path.to_str().unwrap(),
                 "main",
             ])
@@ -2562,8 +2892,7 @@ mod spawn_isolation_tests {
 
         // Simulate the bug: the worker process started in the MAIN checkout,
         // not in its factory/worker-X worktree.
-        let err = verify_isolated_worker_branch("worker-x", &repo, "factory/worker-x")
-            .unwrap_err();
+        let err = verify_isolated_worker_branch("worker-x", &repo, "factory/worker-x").unwrap_err();
         assert!(
             err.to_string().contains("ISOLATION BUG"),
             "error must flag as an isolation bug; got: {err}"
@@ -2598,10 +2927,7 @@ mod spawn_isolation_tests {
 
         for i in 0..4usize {
             let worker_name = format!("w{i}");
-            let expected_wt_path = repo
-                .join(".cas")
-                .join("worktrees")
-                .join(&worker_name);
+            let expected_wt_path = repo.join(".cas").join("worktrees").join(&worker_name);
             let prep = WorkerSpawnPrep {
                 worker_name: worker_name.clone(),
                 worktree_info: Some(WorktreePrep {
@@ -2669,13 +2995,13 @@ mod spawn_isolation_tests {
         };
 
         match prep.run() {
-            Ok(_) => panic!(
-                "reuse branch must reject a stale non-worktree directory; got Ok"
-            ),
+            Ok(_) => panic!("reuse branch must reject a stale non-worktree directory; got Ok"),
             Err(e) => {
                 let msg = e.to_string();
                 assert!(
-                    msg.contains("stale") || msg.contains("branch") || msg.contains("worktree")
+                    msg.contains("stale")
+                        || msg.contains("branch")
+                        || msg.contains("worktree")
                         || msg.contains("Stale"),
                     "error must describe the rejection; got: {msg}"
                 );

@@ -335,3 +335,116 @@ pub fn render_with_state(
         activity: chunks[activity_idx],
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{HashMap, HashSet};
+
+    use cas_factory::{DirectorData, TaskSummary};
+    use cas_types::{Priority, TaskStatus, TaskType};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::widgets::ListState;
+
+    use crate::ui::theme::ActiveTheme;
+
+    use super::{SidecarFocus, SidecarState, render_with_state};
+
+    fn task(id: &str, task_type: TaskType, epic: Option<&str>) -> TaskSummary {
+        TaskSummary {
+            id: id.to_string(),
+            title: id.to_string(),
+            status: TaskStatus::Open,
+            priority: Priority::MEDIUM,
+            assignee: None,
+            task_type,
+            epic: epic.map(str::to_string),
+            branch: Some(format!("epic/{id}")).filter(|_| task_type == TaskType::Epic),
+            updated_at: None,
+        }
+    }
+
+    fn data_with_two_epics() -> DirectorData {
+        DirectorData {
+            ready_tasks: vec![
+                task("cas-state-child", TaskType::Task, Some("cas-state")),
+                task("cas-param-child", TaskType::Task, Some("cas-param")),
+            ],
+            in_progress_tasks: Vec::new(),
+            epic_tasks: vec![
+                task("cas-state", TaskType::Epic, None),
+                task("cas-param", TaskType::Epic, None),
+            ],
+            agents: Vec::new(),
+            activity: Vec::new(),
+            agent_id_to_name: HashMap::new(),
+            changes: Vec::new(),
+            git_loaded: false,
+            reminders: Vec::new(),
+            epic_closed_counts: HashMap::new(),
+        }
+    }
+
+    fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    #[test]
+    fn render_with_state_prefers_state_focused_epic_id_over_parameter() {
+        let data = data_with_two_epics();
+        let backend = TestBackend::new(90, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = ActiveTheme::default();
+        let mut tasks_state = ListState::default();
+        let mut agents_state = ListState::default();
+        let mut reminders_state = ListState::default();
+        let mut changes_state = ListState::default();
+        let mut activity_state = ListState::default();
+        let collapsed_epics = HashSet::new();
+        let collapsed_dirs = HashSet::new();
+        let mut changes_item_types = Vec::new();
+
+        terminal
+            .draw(|frame| {
+                let mut state = SidecarState {
+                    focus: SidecarFocus::Factory,
+                    tasks_state: &mut tasks_state,
+                    agents_state: &mut agents_state,
+                    reminders_state: &mut reminders_state,
+                    changes_state: &mut changes_state,
+                    activity_state: &mut activity_state,
+                    agent_filter: None,
+                    focused_epic_id: Some("cas-state"),
+                    factory_collapsed: false,
+                    tasks_collapsed: false,
+                    reminders_collapsed: false,
+                    changes_collapsed: false,
+                    activity_collapsed: false,
+                    collapsed_epics: &collapsed_epics,
+                    collapsed_dirs: &collapsed_dirs,
+                    changes_item_types: &mut changes_item_types,
+                };
+                render_with_state(
+                    frame,
+                    frame.area(),
+                    &data,
+                    &theme,
+                    Some("cas-param"),
+                    "supervisor",
+                    Some(&mut state),
+                );
+            })
+            .unwrap();
+
+        let text = buffer_text(&terminal);
+        assert!(text.contains("EPIC: cas-state"));
+        assert!(!text.contains("EPIC: cas-param"));
+    }
+}

@@ -197,7 +197,7 @@ impl DaemonInitPhase {
     pub fn run_with_progress(mut self) -> anyhow::Result<FactoryDaemon> {
         use crate::config::Config;
         use crate::store::find_cas_root;
-        use crate::ui::factory::app::{EpicState, detect_epic_state, epic_branch_name};
+        use crate::ui::factory::app::{EpicState, epic_branch_name};
         use crate::ui::factory::director::DirectorData;
         use crate::worktree::{GitOperations, WorktreeConfig, WorktreeManager};
         use cas_mux::{Mux, MuxConfig};
@@ -268,8 +268,8 @@ impl DaemonInitPhase {
         // Step 3: Loading CAS data
         self.send_progress("Loading CAS data", 3, 6, false)?;
         let director_data = DirectorData::load(&cas_dir, Some(&worktree_root))?;
-        let preferred_epic_id = preferred_epic_id_from_session_metadata();
-        let epic_state = detect_epic_state(&director_data, preferred_epic_id.as_deref());
+        let preferred_epic_focus = preferred_epic_focus_from_session_metadata();
+        let epic_state = resolve_epic_state_for_focus(&director_data, &preferred_epic_focus);
         let git_ops = GitOperations::new(self.factory_config.cwd.clone());
         let trunk = git_ops.detect_default_branch();
         let epic_branch = if let EpicState::Active { epic_title, .. } = &epic_state {

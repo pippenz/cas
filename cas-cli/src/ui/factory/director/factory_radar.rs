@@ -147,10 +147,6 @@ fn render_epic_progress(
         render_unfocused_epic_placeholder(frame, area, theme);
         return;
     };
-    if !super::tasks::epic_has_session_agent_subtask(data, focused_epic_id) {
-        render_unfocused_epic_placeholder(frame, area, theme);
-        return;
-    }
 
     // Count tasks for this epic
     let in_progress_count = data
@@ -503,7 +499,7 @@ mod tests {
     }
 
     #[test]
-    fn factory_radar_renders_unfocused_placeholder_instead_of_foreign_epic() {
+    fn factory_radar_renders_resolved_focused_epic_source_blind() {
         let data = data_with_unrelated_epic();
         let backend = TestBackend::new(90, 12);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -526,8 +522,7 @@ mod tests {
             .unwrap();
 
         let text = buffer_text(&terminal);
-        assert!(text.contains("No focused epic"));
-        assert!(text.contains("coordination action=focus_epic id=<epic>"));
-        assert!(!text.contains("EPIC: cas-foreign"));
+        assert!(text.contains("EPIC: cas-foreign"));
+        assert!(!text.contains("No focused epic"));
     }
 }

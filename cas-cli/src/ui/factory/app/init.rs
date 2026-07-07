@@ -9,9 +9,9 @@ use crate::config::Config;
 use crate::orchestration::names::generate_unique;
 use crate::store::find_cas_root;
 use crate::ui::factory::app::{
-    AutoPromptConfig, EpicState, FactoryApp, FactoryConfig, detect_epic_state, epic_branch_name,
-    preferred_epic_id_from_session_metadata, queue_codex_worker_intro_prompt,
-    queue_supervisor_intro_prompt,
+    AutoPromptConfig, EpicFocusSource, EpicState, FactoryApp, FactoryConfig, epic_branch_name,
+    preferred_epic_focus_from_session_metadata, queue_codex_worker_intro_prompt,
+    queue_supervisor_intro_prompt, resolve_epic_state_for_focus,
 };
 use crate::ui::factory::director::DirectorStores;
 use crate::ui::factory::director::{
@@ -54,8 +54,8 @@ impl FactoryApp {
         let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
 
         let director_data = DirectorData::load_fast(&cas_dir)?;
-        let preferred_epic_id = preferred_epic_id_from_session_metadata();
-        let epic_state = detect_epic_state(&director_data, preferred_epic_id.as_deref());
+        let preferred_epic_focus = preferred_epic_focus_from_session_metadata();
+        let epic_state = resolve_epic_state_for_focus(&director_data, &preferred_epic_focus);
 
         // Detect the configured trunk once — used both for epic branch creation
         // and as the base for worker worktrees when no epic is active.
@@ -247,6 +247,11 @@ impl FactoryApp {
             event_detector,
             notifier,
             current_epic_id: epic_state.epic_id().map(|s| s.to_string()),
+            current_epic_source: epic_state.epic_id().map(|_| {
+                preferred_epic_focus
+                    .source
+                    .unwrap_or(EpicFocusSource::Inference)
+            }),
             epic_state,
             sidecar_focus: SidecarFocus::None,
             panels: Default::default(),
@@ -335,8 +340,8 @@ impl FactoryApp {
             DirectorEventDetector::new(worker_names.clone(), supervisor_name.clone());
         event_detector.initialize(&director_data);
 
-        let preferred_epic_id = preferred_epic_id_from_session_metadata();
-        let epic_state = detect_epic_state(&director_data, preferred_epic_id.as_deref());
+        let preferred_epic_focus = preferred_epic_focus_from_session_metadata();
+        let epic_state = resolve_epic_state_for_focus(&director_data, &preferred_epic_focus);
         let epic_branch = match &epic_state {
             EpicState::Active { epic_title, .. } => Some(epic_branch_name(epic_title)),
             _ => None,
@@ -406,6 +411,11 @@ impl FactoryApp {
             event_detector,
             notifier,
             current_epic_id: epic_state.epic_id().map(|s| s.to_string()),
+            current_epic_source: epic_state.epic_id().map(|_| {
+                preferred_epic_focus
+                    .source
+                    .unwrap_or(EpicFocusSource::Inference)
+            }),
             epic_state,
             sidecar_focus: SidecarFocus::None,
             panels: Default::default(),
@@ -609,6 +619,7 @@ impl FactoryApp {
             event_detector,
             notifier,
             current_epic_id: None,
+            current_epic_source: None,
             epic_state: EpicState::Idle,
             sidecar_focus: SidecarFocus::None,
             panels: Default::default(),

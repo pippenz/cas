@@ -24,13 +24,7 @@ impl ScopedTaskView {
         let epic_groups = match focused_epic_id {
             Some(epic_id) => epic_groups
                 .into_iter()
-                .filter(|group| {
-                    group.epic.id == epic_id
-                        && group
-                            .subtasks
-                            .iter()
-                            .any(|task| task_assigned_to_session_agent(task, data))
-                })
+                .filter(|group| group.epic.id == epic_id)
                 .collect(),
             None => Vec::new(),
         };
@@ -80,16 +74,7 @@ pub(crate) fn task_assigned_to_session_agent(task: &TaskSummary, data: &Director
     })
 }
 
-pub(crate) fn epic_has_session_agent_subtask(data: &DirectorData, epic_id: &str) -> bool {
-    data.in_progress_tasks
-        .iter()
-        .chain(data.ready_tasks.iter())
-        .any(|task| {
-            task.epic.as_deref() == Some(epic_id) && task_assigned_to_session_agent(task, data)
-        })
-}
-
-fn task_matches_agent_filter(task: &TaskSummary, agent_filter: Option<&str>) -> bool {
+pub(crate) fn task_matches_agent_filter(task: &TaskSummary, agent_filter: Option<&str>) -> bool {
     match agent_filter {
         None => true,
         Some(filter) => task.assignee.as_deref() == Some(filter),
@@ -490,11 +475,12 @@ mod tests {
     }
 
     #[test]
-    fn scoped_task_view_rejects_focus_without_session_agent_subtasks() {
+    fn scoped_task_view_keeps_focused_epic_without_session_agent_subtasks() {
         let data = data_for_scoping();
         let scoped = ScopedTaskView::new(&data, Some("cas-foreign"));
 
-        assert!(scoped.epic_groups.is_empty());
+        assert_eq!(scoped.epic_groups.len(), 1);
+        assert_eq!(scoped.epic_groups[0].epic.id, "cas-foreign");
         assert_eq!(scoped.standalone.len(), 2);
     }
 
