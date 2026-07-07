@@ -470,8 +470,10 @@ pub struct FactoryApp {
     mc_tasks_area: Rect,
     mc_changes_area: Rect,
     mc_activity_area: Rect,
-    /// Per-frame OSC 8 hyperlink metadata keyed by final host terminal cell.
-    pane_hyperlinks: HyperlinkMap,
+    /// Per-frame OSC 8 hyperlink metadata for the full terminal pipeline.
+    full_pane_hyperlinks: HyperlinkMap,
+    /// Per-frame OSC 8 hyperlink metadata for the compact terminal pipeline.
+    compact_pane_hyperlinks: HyperlinkMap,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 use std::io;
 use std::sync::{Arc, Mutex};
 
-pub type HyperlinkMap = Arc<Mutex<BTreeMap<(u16, u16), String>>>;
+pub type HyperlinkMap = Arc<Mutex<BTreeMap<(u16, u16), Arc<str>>>>;
 
 pub fn new_hyperlink_map() -> HyperlinkMap {
     Arc::new(Mutex::new(BTreeMap::new()))
@@ -93,6 +93,12 @@ impl BufferBackend {
         self.buffer.extend_from_slice(b"\x1b]8;;\x1b\\");
     }
 
+    fn close_active_link(&mut self, active_link: &mut Option<Arc<str>>) {
+        if active_link.take().is_some() {
+            self.write_osc8_close();
+        }
+    }
+
     /// Convert ratatui color to crossterm color
     fn to_crossterm_color(color: Color) -> CrosstermColor {
         match color {
@@ -135,14 +141,12 @@ impl Backend for BufferBackend {
             .lock()
             .map(|map| map.clone())
             .unwrap_or_default();
-        let mut active_link: Option<String> = None;
+        let mut active_link: Option<Arc<str>> = None;
 
         for (x, y, cell) in content {
             // Move cursor if not contiguous
             if last_pos != Some((x.saturating_sub(1), y)) {
-                if active_link.take().is_some() {
-                    self.write_osc8_close();
-                }
+                self.close_active_link(&mut active_link);
                 self.write_command(MoveTo(x, y))?;
             }
             last_pos = Some((x, y));
@@ -196,12 +200,10 @@ impl Backend for BufferBackend {
 
             let link = hyperlinks.get(&(x, y));
             if active_link.as_ref() != link {
-                if active_link.take().is_some() {
-                    self.write_osc8_close();
-                }
+                self.close_active_link(&mut active_link);
                 if let Some(uri) = link {
                     self.write_osc8_open(uri);
-                    active_link = Some(uri.clone());
+                    active_link = Some(Arc::clone(uri));
                 }
             }
 
@@ -209,9 +211,7 @@ impl Backend for BufferBackend {
             self.write_command(Print(cell.symbol()))?;
         }
 
-        if active_link.take().is_some() {
-            self.write_osc8_close();
-        }
+        self.close_active_link(&mut active_link);
 
         // Reset attributes at the end
         self.write_command(SetAttribute(Attribute::Reset))?;
@@ -273,6 +273,7 @@ mod tests {
     use super::{BufferBackend, new_hyperlink_map};
     use ratatui::backend::Backend;
     use ratatui::buffer::Cell;
+    use std::sync::Arc;
 
     fn cell(symbol: &'static str) -> Cell {
         Cell::new(symbol)
@@ -283,8 +284,8 @@ mod tests {
         let links = new_hyperlink_map();
         {
             let mut map = links.lock().unwrap();
-            map.insert((0, 0), "https://example.com".to_string());
-            map.insert((1, 0), "https://example.com".to_string());
+            map.insert((0, 0), Arc::from("https://example.com"));
+            map.insert((1, 0), Arc::from("https://example.com"));
         }
         let mut backend = BufferBackend::with_hyperlinks(10, 2, links);
         let cells = [cell("c"), cell("l"), cell("i")];
@@ -302,8 +303,8 @@ mod tests {
         let links = new_hyperlink_map();
         {
             let mut map = links.lock().unwrap();
-            map.insert((0, 0), "https://one.example".to_string());
-            map.insert((1, 0), "https://two.example".to_string());
+            map.insert((0, 0), Arc::from("https://one.example"));
+            map.insert((1, 0), Arc::from("https://two.example"));
         }
         let mut backend = BufferBackend::with_hyperlinks(10, 2, links);
         let cells = [cell("a"), cell("b")];
@@ -336,8 +337,8 @@ mod tests {
         let links = new_hyperlink_map();
         {
             let mut map = links.lock().unwrap();
-            map.insert((0, 0), "https://example.com".to_string());
-            map.insert((4, 0), "https://example.com".to_string());
+            map.insert((0, 0), Arc::from("https://example.com"));
+            map.insert((4, 0), Arc::from("https://example.com"));
         }
         let mut backend = BufferBackend::with_hyperlinks(10, 2, links);
         let cells = [cell("a"), cell("b")];
@@ -352,5 +353,35 @@ mod tests {
             2
         );
         assert_eq!(output.matches("\x1b]8;;\x1b\\").count(), 2);
+    }
+
+    #[test]
+    fn osc8_uri_sanitization_strips_esc_and_bel() {
+        let links = new_hyperlink_map();
+        {
+            let mut map = links.lock().unwrap();
+            map.insert((0, 0), Arc::from("https://exa\x1bmple.com/\x07bad"));
+        }
+        let mut backend = BufferBackend::with_hyperlinks(10, 2, links);
+        let cells = [cell("x")];
+
+        backend.draw(vec![(0, 0, &cells[0])].into_iter()).unwrap();
+
+        let output = backend.take_buffer();
+        assert!(
+            output
+                .windows(b"https://example.com/bad".len())
+                .any(|w| w == b"https://example.com/bad")
+        );
+        assert!(
+            !output
+                .windows(b"https://exa\x1bmple.com".len())
+                .any(|w| w == b"https://exa\x1bmple.com")
+        );
+        assert!(
+            !output
+                .windows(b"com/\x07bad".len())
+                .any(|w| w == b"com/\x07bad")
+        );
     }
 }

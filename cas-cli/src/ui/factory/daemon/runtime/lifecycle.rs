@@ -241,8 +241,11 @@ impl FactoryDaemon {
         let session_started_at = Instant::now();
 
         // Create buffer backend for rendering
-        let backend =
-            BufferBackend::with_hyperlinks(self.cols, self.rows, self.app.pane_hyperlink_map());
+        let backend = BufferBackend::with_hyperlinks(
+            self.cols,
+            self.rows,
+            self.app.full_pane_hyperlink_map(),
+        );
         let mut terminal = Terminal::new(backend)?;
 
         // Set initial terminal title
@@ -466,7 +469,7 @@ impl FactoryDaemon {
                             let backend = BufferBackend::with_hyperlinks(
                                 cc,
                                 cr,
-                                self.app.pane_hyperlink_map(),
+                                self.app.compact_pane_hyperlink_map(),
                             );
                             self.compact_terminal = Some(Terminal::new(backend)?);
                         }

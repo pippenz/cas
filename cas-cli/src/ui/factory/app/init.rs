@@ -300,7 +300,8 @@ impl FactoryApp {
             mc_tasks_area: Rect::default(),
             mc_changes_area: Rect::default(),
             mc_activity_area: Rect::default(),
-            pane_hyperlinks: new_hyperlink_map(),
+            full_pane_hyperlinks: new_hyperlink_map(),
+            compact_pane_hyperlinks: new_hyperlink_map(),
         };
 
         queue_supervisor_intro_prompt(
@@ -465,7 +466,8 @@ impl FactoryApp {
             mc_tasks_area: Rect::default(),
             mc_changes_area: Rect::default(),
             mc_activity_area: Rect::default(),
-            pane_hyperlinks: new_hyperlink_map(),
+            full_pane_hyperlinks: new_hyperlink_map(),
+            compact_pane_hyperlinks: new_hyperlink_map(),
         };
 
         queue_supervisor_intro_prompt(
@@ -670,7 +672,8 @@ impl FactoryApp {
             mc_tasks_area: Rect::default(),
             mc_changes_area: Rect::default(),
             mc_activity_area: Rect::default(),
-            pane_hyperlinks: new_hyperlink_map(),
+            full_pane_hyperlinks: new_hyperlink_map(),
+            compact_pane_hyperlinks: new_hyperlink_map(),
         }
     }
 }

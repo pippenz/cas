@@ -21,6 +21,7 @@ impl FactoryApp {
             status_bar_area.width,
             1,
         );
+        self.prune_full_pane_hyperlinks(banner_area);
 
         let prefix = " ERROR ";
         let dismiss = "  Ctrl+E dismiss ";
@@ -79,6 +80,7 @@ impl FactoryApp {
         let dialog_x = (area.width.saturating_sub(dialog_width)) / 2;
         let dialog_y = (area.height.saturating_sub(dialog_height)) / 2;
         let dialog_area = Rect::new(dialog_x, dialog_y, dialog_width, dialog_height);
+        self.prune_full_pane_hyperlinks(dialog_area);
 
         // Clear area behind dialog
         frame.render_widget(Clear, dialog_area);
@@ -169,6 +171,7 @@ impl FactoryApp {
         let dialog_x = (area.width.saturating_sub(dialog_width)) / 2;
         let dialog_y = (area.height.saturating_sub(dialog_height)) / 2;
         let dialog_area = Rect::new(dialog_x, dialog_y, dialog_width, dialog_height);
+        self.prune_full_pane_hyperlinks(dialog_area);
 
         // Clear area behind dialog
         frame.render_widget(Clear, dialog_area);
@@ -391,6 +394,7 @@ impl FactoryApp {
         let dialog_x = (area.width.saturating_sub(dialog_width)) / 2;
         let dialog_y = (area.height.saturating_sub(dialog_height)) / 2;
         let dialog_area = Rect::new(dialog_x, dialog_y, dialog_width, dialog_height);
+        self.prune_full_pane_hyperlinks(dialog_area);
 
         // Clear area behind dialog
         frame.render_widget(Clear, dialog_area);
@@ -656,6 +660,7 @@ impl FactoryApp {
         let dialog_x = (area.width.saturating_sub(dialog_width)) / 2;
         let dialog_y = (area.height.saturating_sub(dialog_height)) / 2;
         let dialog_area = Rect::new(dialog_x, dialog_y, dialog_width, dialog_height);
+        self.prune_full_pane_hyperlinks(dialog_area);
 
         frame.render_widget(Clear, dialog_area);
 
@@ -891,6 +896,7 @@ impl FactoryApp {
         let dialog_x = (area.width.saturating_sub(dialog_width)) / 2;
         let dialog_y = (area.height.saturating_sub(dialog_height)) / 2;
         let dialog_area = Rect::new(dialog_x, dialog_y, dialog_width, dialog_height);
+        self.prune_full_pane_hyperlinks(dialog_area);
 
         // Clear area behind dialog
         frame.render_widget(Clear, dialog_area);
@@ -1007,6 +1013,7 @@ impl FactoryApp {
         let dialog_x = (area.width.saturating_sub(dialog_width)) / 2;
         let dialog_y = (area.height.saturating_sub(dialog_height)) / 2;
         let dialog_area = Rect::new(dialog_x, dialog_y, dialog_width, dialog_height);
+        self.prune_full_pane_hyperlinks(dialog_area);
 
         // Clear area behind dialog
         frame.render_widget(Clear, dialog_area);
@@ -1179,6 +1186,7 @@ impl FactoryApp {
         let x = (area.width.saturating_sub(help_width)) / 2;
         let y = (area.height.saturating_sub(help_height)) / 2;
         let help_area = Rect::new(x, y, help_width, help_height);
+        self.prune_full_pane_hyperlinks(help_area);
 
         frame.render_widget(Clear, help_area);
 
