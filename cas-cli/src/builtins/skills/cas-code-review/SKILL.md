@@ -1,12 +1,12 @@
 ---
 name: cas-code-review
-description: Multi-persona code review orchestrator (Workflow-backed, Phase C — cas-b667). Thin wrapper around the `cas-code-review` Workflow: pre-fetches diff, calls Workflow (which handles Steps 1-4 internally: intent extraction, persona selection, parallel dispatch, deterministic merge), then routes results via Step 5 (mode dispatch + CAS integration). Use `mode=interactive` for the standard supervisor-driven path, `mode=report-only` for read-only scans, `mode=headless` for skill-to-skill calls. Factory workers MUST NOT invoke this skill pre-close — the supervisor owns review timing under the default `[code_review] owner = "supervisor"` configuration.
+description: Multi-persona code review orchestrator (Workflow-backed, Phase C — cas-b667). Thin wrapper around the `cas-code-review` Workflow: pre-fetches diff, calls Workflow (which handles Steps 1-4 internally: intent extraction, persona selection, size-gated parallel dispatch, deterministic merge), then routes results via Step 5 (mode dispatch + CAS integration). Use `mode=interactive` for the standard supervisor-driven path, `mode=report-only` for read-only scans, `mode=headless` for skill-to-skill calls. Factory workers MUST NOT invoke this skill pre-close — the supervisor owns review timing under the default `[code_review] owner = "supervisor"` configuration.
 managed_by: cas
 ---
 
 # cas-code-review — Workflow-backed multi-persona code review
 
-**Architecture (Phase C, EPIC cas-b667):** This skill is a thin wrapper. Steps 1-4 (intent extraction, persona selection, dispatch, merge) run inside the `cas-code-review` Workflow (`.claude/workflows/cas-code-review.js`). This skill handles Step 0 (tiny-diff bypass), Step 5 (mode routing + CAS integration), and pre-fetches the diff.
+**Architecture (Phase C, EPIC cas-b667; large-diff mode cas-33f1):** This skill is a thin wrapper. Steps 1-4 (intent extraction, persona selection, size-gated dispatch, merge) run inside the `cas-code-review` Workflow (`.claude/workflows/cas-code-review.js`). This skill handles Step 0 (tiny-diff bypass), Step 5 (mode routing + CAS integration), and pre-fetches the diff.
 
 ## Step 0: Tiny-diff bypass
 
@@ -41,6 +41,10 @@ Return shape: `{"residual": [], "pre_existing": [], "mode": "<mode>", "skipped_r
        task_context,  // optional: task title+description+notes
        mode,          // current mode
        task_id,       // optional CAS task ID
+
+       // optional large-diff threshold override:
+       // large_diff_token_threshold, review_shard_token_threshold,
+       // or shard_token_threshold (default: 12000 estimated tokens)
      }
    })
    ```
@@ -48,10 +52,11 @@ Return shape: `{"residual": [], "pre_existing": [], "mode": "<mode>", "skipped_r
    The Workflow internally handles:
    - **Step 1** (intent): extracts a 2-3 line intent summary from commit_log / task_context
    - **Step 2** (selection): LLM-judged activation of conditional personas (security, performance, adversarial, fallow) plus optional diff-breadth activation of `gpt-5.5:independent`
-   - **Step 3** (dispatch): parallel persona dispatch, schema-validated, all on Sonnet per R13; `gpt-5.5:independent` is a Sonnet-low wrapper that runs `codex exec -s read-only -m gpt-5.5` with a Bash timeout
+   - **Step 3** (dispatch): parallel persona dispatch, schema-validated, all on Sonnet per R13. Diffs at or below the large-diff threshold keep the old single full-diff dispatch shape. Diffs over the threshold are grouped into subsystem shards by module/concern plus one `interface-integrator` shard for cross-shard contracts. The Workflow validates that subsystem shard file lists cover the full changed-file union and logs missing, duplicate, or extra paths instead of silently dropping files. Docs-only and mechanical test shards use a reduced persona set; code shards keep the risk-weighted activated personas. `gpt-5.5:independent` is a Sonnet-low wrapper that runs `codex exec -s read-only -m gpt-5.5` with a Bash timeout
    - **Step 4** (merge): deterministic 7-step JS merge pipeline (Phase A validated, 30 unit tests)
 
    The Workflow returns `{ residual, pre_existing, intent_summary, activation, stats }`.
+   When large-diff mode is enabled, `activation.sharding` records the threshold, estimated token count, shard IDs, shard file lists, routed personas, compact per-shard token counts, and coverage diagnostics. It does not include full shard diff bodies.
 
    `gpt-5.5:independent` is opt-in for broad diffs only: 5+ changed files, 300+ changed lines, or an explicit Workflow arg (`gpt55_independent: true`). It never runs on tiny diffs because Step 0 returns before the Workflow. If codex is absent or auth fails, the wrapper returns `findings: []` with `skipped_reason`; activation records that as a skipped persona, distinct from a successful zero-finding review.
 
