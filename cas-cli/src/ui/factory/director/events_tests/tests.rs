@@ -1,4 +1,4 @@
-use crate::ui::factory::director::data::AgentSummary;
+use crate::ui::factory::director::data::{ActiveLeaseSummary, AgentSummary};
 use crate::ui::factory::director::events::*;
 use cas_types::{AgentStatus, TaskType};
 
@@ -53,6 +53,7 @@ fn make_agent(id: &str, name: &str, current_task: Option<&str>) -> AgentSummary 
         latest_activity: None,
         last_heartbeat: Some(chrono::Utc::now()),
         pending_messages: 0,
+        active_lease: None,
     }
 }
 
@@ -212,7 +213,12 @@ fn test_detect_worker_idle() {
         DirectorEventDetector::new(vec!["swift-fox".to_string()], "supervisor".to_string());
 
     // Initial state: worker has task.
-    detector.initialize(&working_data_for("agent-1", "swift-fox", "task-1", "Test Task"));
+    detector.initialize(&working_data_for(
+        "agent-1",
+        "swift-fox",
+        "task-1",
+        "Test Task",
+    ));
 
     // Tick 1 of sustained idle — must NOT emit (debounce threshold is 2 ticks).
     let idle = idle_data_for("agent-1", "swift-fox");
@@ -230,7 +236,7 @@ fn test_detect_worker_idle() {
     assert!(
         events_tick2.iter().any(|e| matches!(
             e,
-            DirectorEvent::WorkerIdle { worker } if worker == "swift-fox"
+            DirectorEvent::WorkerIdle { worker, .. } if worker == "swift-fox"
         )),
         "WorkerIdle must fire once the agent has been idle for the consecutive-tick threshold"
     );
@@ -243,6 +249,53 @@ fn test_detect_worker_idle() {
             .any(|e| matches!(e, DirectorEvent::WorkerIdle { .. })),
         "WorkerIdle must not re-fire on every tick of a sustained idle streak"
     );
+}
+
+#[test]
+fn test_worker_idle_payload_includes_close_rejected_task_state() {
+    let mut detector =
+        DirectorEventDetector::new(vec!["swift-fox".to_string()], "supervisor".to_string());
+
+    let mut agent = make_agent("agent-1", "swift-fox", None);
+    agent.last_heartbeat = None;
+    agent.active_lease = Some(ActiveLeaseSummary {
+        task_id: "cas-1234".to_string(),
+        task_title: "Fix close gate".to_string(),
+        task_status: TaskStatus::InProgress,
+        close_rejected_reason: Some("MERGE REQUIRED".to_string()),
+    });
+
+    let data = DirectorData {
+        ready_tasks: vec![],
+        in_progress_tasks: vec![],
+        epic_tasks: vec![],
+        agents: vec![agent],
+        activity: vec![],
+        agent_id_to_name: [("agent-1".to_string(), "swift-fox".to_string())]
+            .into_iter()
+            .collect(),
+        changes: vec![],
+        git_loaded: true,
+        reminders: vec![],
+        epic_closed_counts: HashMap::new(),
+    };
+    detector.initialize(&data);
+
+    let _ = detector.detect_changes(&data, None);
+    let events = detector.detect_changes(&data, None);
+    let idle = events
+        .iter()
+        .find(|event| matches!(event, DirectorEvent::WorkerIdle { .. }))
+        .expect("sustained idle should emit WorkerIdle");
+    let payload = idle.to_json();
+
+    assert_eq!(payload["worker"], "swift-fox");
+    assert_eq!(payload["task_id"], "cas-1234");
+    assert_eq!(payload["task_state"], "in_progress");
+    assert_eq!(payload["close_rejected"], true);
+    assert_eq!(payload["close_rejected_reason"], "MERGE REQUIRED");
+    assert!(idle.description().contains("close rejected"));
+    assert!(!idle.description().to_lowercase().contains("finished"));
 }
 
 /// Regression test for cas-f9e8.
@@ -268,8 +321,7 @@ fn test_no_worker_idle_on_transient_close_then_start() {
     ));
 
     // Transient idle: one refresh tick catches the close-X → start-Y gap.
-    let events_transient =
-        detector.detect_changes(&idle_data_for("agent-1", "swift-fox"), None);
+    let events_transient = detector.detect_changes(&idle_data_for("agent-1", "swift-fox"), None);
     assert!(
         !events_transient
             .iter()
@@ -298,7 +350,7 @@ fn test_no_worker_idle_on_transient_close_then_start() {
     assert!(
         events_tick2.iter().any(|e| matches!(
             e,
-            DirectorEvent::WorkerIdle { worker } if worker == "swift-fox"
+            DirectorEvent::WorkerIdle { worker, .. } if worker == "swift-fox"
         )),
         "Sustained idle after a reset must still emit WorkerIdle once the threshold is met"
     );
@@ -641,7 +693,7 @@ fn test_idle_events_suppressed_for_removed_workers() {
     assert!(
         events.iter().any(|e| matches!(
             e,
-            DirectorEvent::WorkerIdle { worker } if worker == "calm-owl"
+            DirectorEvent::WorkerIdle { worker, .. } if worker == "calm-owl"
         )),
         "Expected idle event for calm-owl"
     );
@@ -650,7 +702,7 @@ fn test_idle_events_suppressed_for_removed_workers() {
     assert!(
         !events.iter().any(|e| matches!(
             e,
-            DirectorEvent::WorkerIdle { worker } if worker == "swift-fox"
+            DirectorEvent::WorkerIdle { worker, .. } if worker == "swift-fox"
         )),
         "Expected no idle event for removed worker swift-fox"
     );
@@ -707,7 +759,7 @@ fn test_idle_rate_limit_longer_than_general_debounce() {
     assert!(
         events.iter().any(|e| matches!(
             e,
-            DirectorEvent::WorkerIdle { worker } if worker == "swift-fox"
+            DirectorEvent::WorkerIdle { worker, .. } if worker == "swift-fox"
         )),
         "First idle event should emit"
     );
@@ -728,7 +780,7 @@ fn test_idle_rate_limit_longer_than_general_debounce() {
     assert!(
         !events2.iter().any(|e| matches!(
             e,
-            DirectorEvent::WorkerIdle { worker } if worker == "swift-fox"
+            DirectorEvent::WorkerIdle { worker, .. } if worker == "swift-fox"
         )),
         "Idle event should be rate-limited (within 5-minute window)"
     );
@@ -832,10 +884,9 @@ fn test_no_duplicate_epic_started_for_existing_open_with_branch() {
     let events = detector.detect_changes(&data2, None);
 
     assert!(
-        !events.iter().any(|e| matches!(
-            e,
-            DirectorEvent::EpicStarted { .. }
-        )),
+        !events
+            .iter()
+            .any(|e| matches!(e, DirectorEvent::EpicStarted { .. })),
         "Should not fire EpicStarted for already-tracked Open-with-branch epic"
     );
 }
@@ -1106,6 +1157,7 @@ fn test_no_worker_idle_while_pending_messages_in_queue() {
             latest_activity: None,
             last_heartbeat: Some(chrono::Utc::now()),
             pending_messages: 1,
+            active_lease: None,
         }],
         activity: vec![],
         agent_id_to_name: [("agent-1".to_string(), "swift-fox".to_string())]
@@ -1144,7 +1196,7 @@ fn test_no_worker_idle_while_pending_messages_in_queue() {
     assert!(
         events_after_drain_tick2.iter().any(|e| matches!(
             e,
-            DirectorEvent::WorkerIdle { worker } if worker == "swift-fox"
+            DirectorEvent::WorkerIdle { worker, .. } if worker == "swift-fox"
         )),
         "WorkerIdle must fire once pending messages are gone and idle threshold is met"
     );
@@ -1232,7 +1284,12 @@ fn test_task_completed_no_refire_on_oscillation() {
         DirectorEventDetector::new(vec!["swift-fox".to_string()], "supervisor".to_string());
 
     // Initial: task is in-progress.
-    detector.initialize(&working_data_for("agent-1", "swift-fox", "task-1", "Work Item"));
+    detector.initialize(&working_data_for(
+        "agent-1",
+        "swift-fox",
+        "task-1",
+        "Work Item",
+    ));
 
     // Tick: task disappears (closed / completed). Should emit TaskCompleted once.
     let events1 = detector.detect_changes(&idle_data_for("agent-1", "swift-fox"), None);
@@ -1276,18 +1333,19 @@ fn test_task_completed_state_guard_independent_of_debounce() {
         DirectorEventDetector::new(vec!["swift-fox".to_string()], "supervisor".to_string());
 
     // t=0: task InProgress.
-    detector.initialize(&working_data_for("agent-1", "swift-fox", "task-1", "Work Item"));
+    detector.initialize(&working_data_for(
+        "agent-1",
+        "swift-fox",
+        "task-1",
+        "Work Item",
+    ));
 
     let t0 = Instant::now();
     let t0_utc = chrono::Utc::now();
 
     // t=0: task disappears → first TaskCompleted.
-    let events1 = detector.detect_changes_at(
-        &idle_data_for("agent-1", "swift-fox"),
-        None,
-        t0,
-        t0_utc,
-    );
+    let events1 =
+        detector.detect_changes_at(&idle_data_for("agent-1", "swift-fox"), None, t0, t0_utc);
     assert!(
         events1.iter().any(|e| matches!(
             e,
@@ -1398,6 +1456,7 @@ fn make_agent_active(
         )),
         last_heartbeat: Some(base_utc - CDuration::seconds(heartbeat_ago_secs)),
         pending_messages: 0,
+        active_lease: None,
     }
 }
 
@@ -1441,7 +1500,9 @@ fn test_no_worker_idle_for_recently_active_worker() {
     for _ in 0..5 {
         let events = detector.detect_changes_at(&data, None, t0, base_utc);
         assert!(
-            !events.iter().any(|e| matches!(e, DirectorEvent::WorkerIdle { .. })),
+            !events
+                .iter()
+                .any(|e| matches!(e, DirectorEvent::WorkerIdle { .. })),
             "WorkerIdle must NOT fire for a worker with fresh heartbeat + recent activity: {events:?}"
         );
     }
@@ -1491,7 +1552,7 @@ fn test_supervisor_never_emits_worker_idle() {
     assert!(
         !events.iter().any(|e| matches!(
             e,
-            DirectorEvent::WorkerIdle { worker } if worker == "supervisor"
+            DirectorEvent::WorkerIdle { worker, .. } if worker == "supervisor"
         )),
         "Supervisor must never appear as an idle WORKER in WorkerIdle events: {events:?}"
     );
@@ -1519,7 +1580,8 @@ fn test_worker_idle_fires_when_heartbeat_stale() {
     // Tick 1: not yet at threshold.
     let ev1 = detector.detect_changes_at(&data, None, t0, base_utc);
     assert!(
-        !ev1.iter().any(|e| matches!(e, DirectorEvent::WorkerIdle { .. })),
+        !ev1.iter()
+            .any(|e| matches!(e, DirectorEvent::WorkerIdle { .. })),
         "Tick 1 with stale heartbeat must not fire (still below consecutive threshold): {ev1:?}"
     );
 
@@ -1528,7 +1590,7 @@ fn test_worker_idle_fires_when_heartbeat_stale() {
     assert!(
         ev2.iter().any(|e| matches!(
             e,
-            DirectorEvent::WorkerIdle { worker } if worker == "swift-fox"
+            DirectorEvent::WorkerIdle { worker, .. } if worker == "swift-fox"
         )),
         "WorkerIdle must fire for genuinely-idle worker (stale heartbeat) after threshold: {ev2:?}"
     );
@@ -1599,7 +1661,7 @@ fn test_c790_worker_idle_still_fires_for_real_workers() {
     let fired = ev1
         .iter()
         .chain(ev2.iter())
-        .any(|e| matches!(e, DirectorEvent::WorkerIdle { worker } if worker == "swift-fox"));
+        .any(|e| matches!(e, DirectorEvent::WorkerIdle { worker, .. } if worker == "swift-fox"));
 
     assert!(
         fired,
@@ -1633,6 +1695,7 @@ fn make_agent_working_stalled(
             .map(|secs| ("tool_call".to_string(), base_utc - CDuration::seconds(secs))),
         last_heartbeat: Some(base_utc - CDuration::seconds(heartbeat_ago_secs)),
         pending_messages: 0,
+        active_lease: None,
     }
 }
 
@@ -1641,7 +1704,12 @@ fn stalled_data_for(agent: AgentSummary) -> DirectorData {
     let name = agent.name.clone();
     let task_id = agent.current_task.clone();
     let in_progress_tasks = match &task_id {
-        Some(tid) => vec![make_task(tid, "Stalled task", TaskStatus::InProgress, Some(&id))],
+        Some(tid) => vec![make_task(
+            tid,
+            "Stalled task",
+            TaskStatus::InProgress,
+            Some(&id),
+        )],
         None => vec![],
     };
     DirectorData {
@@ -1676,8 +1744,8 @@ fn test_9829_worker_stalled_fires_auto_nudge_on_first_detection() {
         "agent-1",
         "lively-crow",
         "cas-0b7d",
-        5,          // fresh heartbeat
-        Some(310),  // activity 310s ago, past the 300s threshold
+        5,         // fresh heartbeat
+        Some(310), // activity 310s ago, past the 300s threshold
         base_utc,
     ));
     detector.initialize(&data);
@@ -1720,8 +1788,13 @@ fn test_9829_worker_stalled_escalates_after_nudge() {
 
     let ev1 = detector.detect_changes_at(&data, None, t0, base_utc);
     assert!(
-        ev1.iter()
-            .any(|e| matches!(e, DirectorEvent::WorkerStalled { escalate: false, .. })),
+        ev1.iter().any(|e| matches!(
+            e,
+            DirectorEvent::WorkerStalled {
+                escalate: false,
+                ..
+            }
+        )),
         "first tick must be the non-escalating nudge: {ev1:?}"
     );
 
@@ -1736,8 +1809,13 @@ fn test_9829_worker_stalled_escalates_after_nudge() {
         "second tick while still stalled must escalate to the supervisor: {ev2:?}"
     );
     assert!(
-        !ev2.iter()
-            .any(|e| matches!(e, DirectorEvent::WorkerStalled { escalate: false, .. })),
+        !ev2.iter().any(|e| matches!(
+            e,
+            DirectorEvent::WorkerStalled {
+                escalate: false,
+                ..
+            }
+        )),
         "the nudge must not re-fire once already sent: {ev2:?}"
     );
 }
@@ -1765,8 +1843,13 @@ fn test_9829_worker_stalled_streak_resets_when_activity_resumes() {
     detector.initialize(&stalled);
     let ev1 = detector.detect_changes_at(&stalled, None, t0, base_utc);
     assert!(
-        ev1.iter()
-            .any(|e| matches!(e, DirectorEvent::WorkerStalled { escalate: false, .. })),
+        ev1.iter().any(|e| matches!(
+            e,
+            DirectorEvent::WorkerStalled {
+                escalate: false,
+                ..
+            }
+        )),
         "expected the initial nudge: {ev1:?}"
     );
 
@@ -1781,7 +1864,8 @@ fn test_9829_worker_stalled_streak_resets_when_activity_resumes() {
     ));
     let ev2 = detector.detect_changes_at(&active, None, t0, base_utc);
     assert!(
-        !ev2.iter().any(|e| matches!(e, DirectorEvent::WorkerStalled { .. })),
+        !ev2.iter()
+            .any(|e| matches!(e, DirectorEvent::WorkerStalled { .. })),
         "resumed activity must suppress WorkerStalled: {ev2:?}"
     );
 
@@ -1793,8 +1877,13 @@ fn test_9829_worker_stalled_streak_resets_when_activity_resumes() {
     let t1 = t0 + std::time::Duration::from_secs(31);
     let ev3 = detector.detect_changes_at(&stalled, None, t1, base_utc);
     assert!(
-        ev3.iter()
-            .any(|e| matches!(e, DirectorEvent::WorkerStalled { escalate: false, .. })),
+        ev3.iter().any(|e| matches!(
+            e,
+            DirectorEvent::WorkerStalled {
+                escalate: false,
+                ..
+            }
+        )),
         "a fresh stall after activity resumed must re-nudge, not escalate: {ev3:?}"
     );
 }
@@ -1854,9 +1943,13 @@ fn test_9829_worker_stalled_threshold_is_configurable() {
 
     let events = detector.detect_changes_at(&data, None, t0, base_utc);
     assert!(
-        events
-            .iter()
-            .any(|e| matches!(e, DirectorEvent::WorkerStalled { escalate: false, .. })),
+        events.iter().any(|e| matches!(
+            e,
+            DirectorEvent::WorkerStalled {
+                escalate: false,
+                ..
+            }
+        )),
         "a lowered stall_threshold_secs must be honored: {events:?}"
     );
 }

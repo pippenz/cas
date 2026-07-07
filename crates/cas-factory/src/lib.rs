@@ -38,8 +38,9 @@ pub use config::{
     NotifyConfig,
 };
 pub use core::{FactoryCore, FactoryError, FactoryEvent, PaneId, PaneInfo, Result};
-pub use spec_resolver::{ConfigSources, SpecResolverError, resolve_specs, resolve_supervisor_spec};
-pub use director::{AgentSummary, DirectorData, DirectorStores, EpicGroup, TaskSummary};
+pub use director::{
+    ActiveLeaseSummary, AgentSummary, DirectorData, DirectorStores, EpicGroup, TaskSummary,
+};
 pub use notify::{DaemonNotifier, notify_daemon, notify_socket_path};
 pub use recording::RecordingManager;
 pub use session::lifecycle::SessionManager;
@@ -51,3 +52,4 @@ pub use session::state::{
     AgentState, SessionCache, SessionError, SessionId, SessionInfo, SessionState, SessionSummary,
     SessionType,
 };
+pub use spec_resolver::{ConfigSources, SpecResolverError, resolve_specs, resolve_supervisor_spec};

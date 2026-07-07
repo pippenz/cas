@@ -59,13 +59,11 @@ impl Notifier {
             // escalated to the supervisor — the first-detection auto-nudge
             // is worker-directed and low-stakes, so it stays out of the
             // desktop channel to avoid alert fatigue (cas-9829).
-            DirectorEvent::WorkerStalled { escalate, .. } if *escalate => {
-                Some(NotificationMeta {
-                    title: "Worker Stalled",
-                    icon: "dialog-warning",
-                    urgency: Urgency::Normal,
-                })
-            }
+            DirectorEvent::WorkerStalled { escalate, .. } if *escalate => Some(NotificationMeta {
+                title: "Worker Stalled",
+                icon: "dialog-warning",
+                urgency: Urgency::Normal,
+            }),
             DirectorEvent::WorkerStalled { .. } => None,
             DirectorEvent::EpicCompleted { .. } => Some(NotificationMeta {
                 title: "Epic Completed!",
@@ -112,7 +110,20 @@ impl Notifier {
             } => {
                 format!("{worker} blocked on {task_id} ({task_title})")
             }
-            DirectorEvent::WorkerIdle { worker } => {
+            DirectorEvent::WorkerIdle {
+                worker,
+                active_task: Some(task),
+            } => {
+                if let Some(reason) = task.close_rejected_reason.as_deref() {
+                    format!(
+                        "{worker} idle; {} is {} (close rejected: {reason})",
+                        task.task_id, task.task_status
+                    )
+                } else {
+                    format!("{worker} idle; {} is {}", task.task_id, task.task_status)
+                }
+            }
+            DirectorEvent::WorkerIdle { worker, .. } => {
                 format!("{worker} is waiting for work")
             }
             DirectorEvent::WorkerStalled {
@@ -121,7 +132,10 @@ impl Notifier {
                 escalate: true,
                 ..
             } => {
-                format!("{worker} stalled for {}m despite a nudge", elapsed_secs / 60)
+                format!(
+                    "{worker} stalled for {}m despite a nudge",
+                    elapsed_secs / 60
+                )
             }
             DirectorEvent::EpicCompleted { epic_id } => {
                 format!("All tasks in {epic_id} are done")

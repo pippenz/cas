@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use crate::ui::factory::director::data::{DirectorData, TaskSummary};
+use crate::ui::factory::director::data::{ActiveLeaseSummary, DirectorData, TaskSummary};
 use cas_types::TaskStatus;
 use chrono::DateTime;
 
@@ -70,8 +70,12 @@ pub enum DirectorEvent {
         task_title: String,
         worker: String,
     },
-    /// A worker became idle (no in-progress tasks)
-    WorkerIdle { worker: String },
+    /// A worker became idle. `active_task` is present when the worker appears
+    /// idle even though its active lease still points at an InProgress task.
+    WorkerIdle {
+        worker: String,
+        active_task: Option<ActiveLeaseSummary>,
+    },
     /// A worker has an in-progress task and a fresh heartbeat, but no
     /// observable activity (file edit, commit, subagent event, ...) for
     /// longer than the configured stall threshold (cas-9829). Heartbeat
@@ -100,10 +104,7 @@ pub enum DirectorEvent {
     /// All tasks in an epic are complete
     EpicCompleted { epic_id: String },
     /// All subtasks of an epic are closed but the epic itself is still open
-    EpicAllSubtasksClosed {
-        epic_id: String,
-        epic_title: String,
-    },
+    EpicAllSubtasksClosed { epic_id: String, epic_title: String },
 }
 
 impl DirectorEvent {
@@ -113,7 +114,7 @@ impl DirectorEvent {
             Self::TaskAssigned { worker, .. } => Some(worker),
             Self::TaskCompleted { worker, .. } => Some(worker),
             Self::TaskBlocked { worker, .. } => Some(worker),
-            Self::WorkerIdle { worker } => Some(worker),
+            Self::WorkerIdle { worker, .. } => Some(worker),
             Self::WorkerStalled { worker, .. } => Some(worker),
             Self::AgentRegistered { agent_name, .. } => Some(agent_name),
             Self::EpicStarted { .. } => None, // Broadcast or supervisor
@@ -146,7 +147,23 @@ impl DirectorEvent {
             } => {
                 format!("{worker} blocked on task {task_id} ({task_title})")
             }
-            Self::WorkerIdle { worker } => {
+            Self::WorkerIdle {
+                worker,
+                active_task: Some(task),
+            } => {
+                if let Some(reason) = task.close_rejected_reason.as_deref() {
+                    format!(
+                        "{worker} is idle — task {} {}, close rejected ({reason})",
+                        task.task_id, task.task_status
+                    )
+                } else {
+                    format!(
+                        "{worker} is idle — task {} {}",
+                        task.task_id, task.task_status
+                    )
+                }
+            }
+            Self::WorkerIdle { worker, .. } => {
                 format!("{worker} is idle")
             }
             Self::WorkerStalled {
@@ -179,7 +196,9 @@ impl DirectorEvent {
                 epic_id,
                 epic_title,
             } => {
-                format!("All subtasks of epic '{epic_title}' ({epic_id}) are closed — ready to close epic")
+                format!(
+                    "All subtasks of epic '{epic_title}' ({epic_id}) are closed — ready to close epic"
+                )
             }
         }
     }
@@ -204,7 +223,7 @@ impl DirectorEvent {
             } => {
                 format!("blocked:{task_id}:{worker}")
             }
-            Self::WorkerIdle { worker } => {
+            Self::WorkerIdle { worker, .. } => {
                 format!("idle:{worker}")
             }
             Self::WorkerStalled {
@@ -272,9 +291,25 @@ impl DirectorEvent {
                 "task_title": task_title,
                 "worker": worker,
             }),
-            Self::WorkerIdle { worker } => serde_json::json!({
-                "worker": worker,
-            }),
+            Self::WorkerIdle {
+                worker,
+                active_task,
+            } => {
+                let mut value = serde_json::json!({
+                    "worker": worker,
+                });
+                if let Some(task) = active_task {
+                    value["task_id"] = serde_json::Value::String(task.task_id.clone());
+                    value["task_title"] = serde_json::Value::String(task.task_title.clone());
+                    value["task_state"] = serde_json::Value::String(task.task_status.to_string());
+                    if let Some(reason) = task.close_rejected_reason.as_deref() {
+                        value["close_rejected"] = serde_json::Value::Bool(true);
+                        value["close_rejected_reason"] =
+                            serde_json::Value::String(reason.to_string());
+                    }
+                }
+                value
+            }
             Self::WorkerStalled {
                 worker,
                 task_id,
@@ -360,7 +395,9 @@ impl DirectorState {
         let mut epic_active_subtask_counts: HashMap<String, usize> = HashMap::new();
         for task in data.ready_tasks.iter().chain(data.in_progress_tasks.iter()) {
             if let Some(ref epic_id) = task.epic {
-                *epic_active_subtask_counts.entry(epic_id.clone()).or_insert(0) += 1;
+                *epic_active_subtask_counts
+                    .entry(epic_id.clone())
+                    .or_insert(0) += 1;
             }
         }
 
@@ -550,8 +587,7 @@ impl DirectorEventDetector {
         // still be dispatched.
         for (task_id, (new_status, new_assignee)) in &new_state.tasks {
             if let Some(assignee) = new_assignee {
-                let dispatchable =
-                    matches!(new_status, TaskStatus::Open | TaskStatus::InProgress);
+                let dispatchable = matches!(new_status, TaskStatus::Open | TaskStatus::InProgress);
 
                 // Check if this is a new assignment
                 let was_assigned = self
@@ -826,13 +862,12 @@ impl DirectorEventDetector {
                 .or_insert(0);
             *count += 1;
 
-            if *count >= IDLE_CONSECUTIVE_TICKS
-                && !self.idle_already_emitted.contains(&agent.id)
-            {
+            if *count >= IDLE_CONSECUTIVE_TICKS && !self.idle_already_emitted.contains(&agent.id) {
                 // `resolved_name` is guaranteed to be a worker (supervisor
                 // was excluded above). Re-use it directly — no re-resolve.
                 events.push(DirectorEvent::WorkerIdle {
                     worker: resolved_name.clone(),
+                    active_task: agent.active_lease.clone(),
                 });
                 self.idle_already_emitted.insert(agent.id.clone());
             }
@@ -916,12 +951,12 @@ impl DirectorEventDetector {
                     &data.ready_tasks,
                 ) {
                     // A tracked epic that has since been closed/deleted is
-                        // treated as vacant so a legitimate new Open-with-branch
-                        // epic can take over instead of the UI freezing on a
-                        // ghost id (cas-4181 adversarial finding).
-                        let cur_still_exists = current_epic_id
-                            .map(|cur| data.epic_tasks.iter().any(|e| e.id == cur))
-                            .unwrap_or(false);
+                    // treated as vacant so a legitimate new Open-with-branch
+                    // epic can take over instead of the UI freezing on a
+                    // ghost id (cas-4181 adversarial finding).
+                    let cur_still_exists = current_epic_id
+                        .map(|cur| data.epic_tasks.iter().any(|e| e.id == cur))
+                        .unwrap_or(false);
                     let effective_current = if cur_still_exists {
                         current_epic_id
                     } else {
