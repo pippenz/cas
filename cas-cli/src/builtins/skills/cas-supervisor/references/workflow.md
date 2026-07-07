@@ -103,13 +103,18 @@ base branch ────────────────────► (sta
 3. Cherry-pick to base branch: `git cherry-pick <commit-sha>` (one per commit)
    - **If conflicts arise:** (a) non-overlapping additions (e.g., both workers added to Cargo.toml) — keep both entries, (b) semantic conflicts — review both changes and pick the correct merge, (c) if unsure — message the worker who committed for context before resolving
 4. Verify build after cherry-pick: `~/.cargo/bin/cargo build --quiet`
-5. Run code review against the cherry-picked range:
-   ```bash
-   # Capture the pre-cherry-pick HEAD as the review base
-   pre_cp=$(git rev-parse HEAD@{1})
-   ```
-   Then invoke: `/cas-code-review mode=interactive base_sha=<pre_cp> task_id=<task-id>`
-   Address any P0 findings before notifying other workers to sync.
+5. Run the lightweight per-merge gate. Do **not** run the full multi-persona
+   `/cas-code-review` pipeline here by default; that review runs once in
+   Phase 4 after the epic is code-complete. For this merge:
+   - Read the direct diff against the task spec and acceptance criteria.
+   - Check ownership boundaries, obvious defects, missing files/tests, and
+     whether the worker proved the right command.
+   - Run targeted mechanical verification only when warranted by the diff.
+   - Record the audit trail:
+     `mcp__cas__verification action=add task_id=<task-id> status=approved summary="<per-merge gate: diff read + proof checked>"`.
+   - If the single diff is exceptionally risky, you may run
+     `/cas-code-review mode=interactive base_sha=<pre-cp-sha> task_id=<task-id>`
+     by explicit judgment; this is an exception, not the default cadence.
 6. Message other active workers to sync onto the **local** branch (not `origin/`):
    ```
    mcp__cas__coordination action=message target=<other-worker> message="Branch updated after cherry-pick. Sync: git stash && git rebase <base-branch> && git stash pop"
@@ -142,7 +147,11 @@ When workers share the main directory, there's no branch merging — workers com
 
 1. Verify all tasks closed: `mcp__cas__task action=list status=open epic=<epic-id>`
 2. Hold the main merge. The epic branch is not ready for base until the assembled diff has passed review and the final gate.
-3. Run integration review against the full EPIC diff — per-cherry-pick reviews catch per-task issues; this step catches cross-task integration issues (e.g., two tasks individually clean but semantically conflicting). From inside the epic branch checkout, invoke:
+3. Run the single required full multi-persona review against the assembled EPIC
+   diff. The Phase 3 per-merge gate catches obvious per-task problems; this
+   step is the full `/cas-code-review` pass that catches cross-task integration
+   issues (e.g., two tasks individually clean but semantically conflicting).
+   From inside the epic branch checkout, invoke:
    `/cas-code-review mode=interactive base_sha=<base-branch>`
    (substitute `main`, `develop`, or your actual base branch name for `<base-branch>`)
    For large diffs, write the literal diff to a file first:
