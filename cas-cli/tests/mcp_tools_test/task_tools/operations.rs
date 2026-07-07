@@ -1293,6 +1293,111 @@ async fn test_subtask_start_auto_starts_epic() {
 }
 
 // ============================================================================
+// cas-6945: `task action=start` must default `assignee` to the starting
+// agent's display name when unset, so the TUI's epic-focus inference gate
+// (task_assigned_to_session_agent) can adopt the epic without the supervisor
+// manually running `task action=update assignee=<worker>`.
+// ============================================================================
+
+#[tokio::test]
+async fn test_task_start_sets_assignee_when_unset() {
+    let (temp, service) = setup_cas();
+    let cas_dir = temp.path().join(".cas");
+
+    let create_req = TaskCreateRequest {
+        depth: None,
+        title: "Unassigned task".to_string(),
+        description: None,
+        priority: 2,
+        task_type: "task".to_string(),
+        labels: None,
+        notes: None,
+        blocked_by: None,
+        design: None,
+        acceptance_criteria: None,
+        external_ref: None,
+        assignee: None,
+        demo_statement: None,
+        execution_note: None,
+        epic: None,
+    };
+    let result = service
+        .cas_task_create(Parameters(create_req))
+        .await
+        .expect("task create should succeed");
+    let create_text = extract_text(result);
+    let task_id = extract_task_id(&create_text)
+        .expect("should have task ID")
+        .to_string();
+
+    service
+        .cas_task_start(Parameters(IdRequest {
+            id: task_id.to_string(),
+        }))
+        .await
+        .expect("task start should succeed");
+
+    let task_store = cas::store::open_task_store(&cas_dir).expect("open task store");
+    let task = task_store.get(&task_id).expect("task should exist");
+    assert_eq!(
+        task.assignee.as_deref(),
+        Some("test-agent"),
+        "Starting an unassigned task should set assignee to the starting agent's \
+         display name (test-agent)"
+    );
+}
+
+#[tokio::test]
+async fn test_task_start_preserves_existing_assignee() {
+    let (temp, service) = setup_cas();
+    let cas_dir = temp.path().join(".cas");
+
+    let create_req = TaskCreateRequest {
+        depth: None,
+        title: "Pre-assigned task".to_string(),
+        description: None,
+        priority: 2,
+        task_type: "task".to_string(),
+        labels: None,
+        notes: None,
+        blocked_by: None,
+        design: None,
+        acceptance_criteria: None,
+        external_ref: None,
+        assignee: Some("other-worker".to_string()),
+        demo_statement: None,
+        execution_note: None,
+        epic: None,
+    };
+    let result = service
+        .cas_task_create(Parameters(create_req))
+        .await
+        .expect("task create should succeed");
+    let create_text = extract_text(result);
+    let task_id = extract_task_id(&create_text)
+        .expect("should have task ID")
+        .to_string();
+
+    // Started by the "test-agent" session — must NOT clobber the existing
+    // "other-worker" assignee.
+    service
+        .cas_task_start(Parameters(IdRequest {
+            id: task_id.to_string(),
+        }))
+        .await
+        .expect("task start should succeed");
+
+    let task_store = cas::store::open_task_store(&cas_dir).expect("open task store");
+    let task = task_store.get(&task_id).expect("task should exist");
+    assert_eq!(
+        task.assignee.as_deref(),
+        Some("other-worker"),
+        "Starting a pre-assigned task must preserve the existing assignee, not \
+         overwrite it with the starting agent"
+    );
+}
+
+// ============================================================================
 // cas-5572 (EPIC cas-9508): Spawn-time `action=mine` race regression
 //
 // Reproduces the factory-session friction described in
