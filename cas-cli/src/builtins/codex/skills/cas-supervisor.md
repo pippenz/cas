@@ -71,7 +71,7 @@ Each file below is a focused chunk of the operational guide. Open the one you ne
 - **[model-selection.md](cas-supervisor/references/model-selection.md)** — Tier rubric: model/effort per task, spawn mix, escalation.
 - **[worker-recovery.md](cas-supervisor/references/worker-recovery.md)** — `is-wedged` triage, dead/silent worker, garbage output, verification jail, resource-contention crashes.
 - **[reference.md](cas-supervisor/references/reference.md)** — Exact valid actions and field names, dispatch two-step pattern, `update` vs `transfer`, message field requirements, and urgent/interrupt delivery (mid-turn course-correction; discards in-flight work).
-- **[code-review-queue.md](cas-supervisor/references/code-review-queue.md)** — Supervisor-owned code review mode: queue monitoring, running full review, delivering verdict (cas-b51a).
+- **[code-review-queue.md](cas-supervisor/references/code-review-queue.md)** — Supervisor-owned review cadence: queue visibility, per-merge gate, epic review (cas-b51a).
 - **[filing-cas-bugs.md](cas-supervisor/references/filing-cas-bugs.md)** — File every CAS-system bug as a tracked task, never chat-only or upstream (cas-src → in-repo; else `docs/requests/`).
 
 ## Context budgeting
