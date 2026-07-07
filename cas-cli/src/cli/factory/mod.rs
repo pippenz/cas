@@ -10,7 +10,11 @@ mod daemon;
 mod lifecycle;
 mod queries;
 mod remote_attach;
-mod wedged;
+// cas-728b: pub(crate) (not private) so the director's stall-detection
+// confirmation step (ui/factory/director/events.rs) can call
+// resolve_worker/transcript_mtime_age directly — the same transcript-mtime
+// liveness signal `cas factory is-wedged` reads (cas-4513).
+pub(crate) mod wedged;
 mod worktree_ops;
 
 use crate::cli::Cli;

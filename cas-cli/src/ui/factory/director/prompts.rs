@@ -394,6 +394,23 @@ pub fn generate_prompt(
             }
 
             if let Some(task) = active_task {
+                // cas-728b/cas-627f: Blocked and AwaitingMerge are
+                // supervisor-parked states, but this branch is already an
+                // INFORMATIONAL status update ("task X is still {status}"),
+                // not the worker-assistance "please assign this idle worker
+                // something" ping (that's the `ready_count` branch below,
+                // reached only when `active_task` is `None`). An earlier
+                // version of this fix unconditionally suppressed this arm
+                // for Blocked/AwaitingMerge — that re-hid the flagship
+                // close-rejected notification cas-627f spent real effort
+                // making reachable again (park releases the lease, so
+                // `active_lease` — and this `Some(task)` — was `None` for
+                // every parked task until that fix). Tick-by-tick repetition
+                // is already handled upstream: the event detector's
+                // `idle_already_emitted` gate (events.rs) fires `WorkerIdle`
+                // once per sustained idle streak, not every 2s tick, and
+                // `IDLE_RATE_LIMIT` floors any streak-reset repeat to once
+                // per 5 minutes. No additional suppression needed here.
                 let rejection = task
                     .close_rejected_reason
                     .as_deref()
@@ -492,13 +509,27 @@ pub fn generate_prompt(
                 })
             } else {
                 // Still stalled after the nudge — escalate to the supervisor.
+                //
+                // cas-728b: the old advice ("consider shutdown + respawn
+                // (safe if the worktree is clean)") pointed at the exact
+                // anti-pattern that destroyed in-flight work before
+                // (silent-owl-56, 2026-04-23): a clean worktree mid-task
+                // means un-persisted work + full in-flight context loss, not
+                // "safe". Point at the actual triage triad instead —
+                // `is-wedged` classifies before anyone kills anything.
                 let text = format!(
                     "Worker {worker} has been stalled on task {task_id} for about \
                      {elapsed_mins}m — alive heartbeat, no activity, and an auto-nudge \
                      did not unstick it.\n\n\
-                     Check: {supervisor_prefix}coordination action=worker_status\n\
-                     If it's still stuck, consider shutdown + respawn (safe if the \
-                     worktree is clean)."
+                     Triage before acting:\n\
+                     1. `cas factory is-wedged {worker}` — classifies Alive / Wedged / \
+                     Starved / Dead from PID + transcript evidence.\n\
+                     2. `cas factory debug {worker}` — tail the transcript to see the \
+                     last in-flight tool call.\n\
+                     3. Only `cas factory kill {worker}` if is-wedged reports Wedged or \
+                     Dead — a clean worktree does NOT mean safe to kill: it means \
+                     un-persisted work and full in-flight context loss if the worker \
+                     was still genuinely working."
                 );
 
                 Some(Prompt {
@@ -2349,6 +2380,57 @@ mod tests {
         assert_eq!(prompt.target, "supervisor");
         assert!(prompt.text.contains("swift-fox"));
         assert!(prompt.text.contains("cas-0b7d"));
+    }
+
+    /// cas-728b: the escalation advice used to say "consider shutdown +
+    /// respawn (safe if the worktree is clean)" — pointing supervisors at
+    /// the exact anti-pattern that destroyed in-flight work before
+    /// (silent-owl-56, 2026-04-23: a clean worktree mid-task means
+    /// un-persisted work, not "safe"). It must now point at the
+    /// `is-wedged` triage triad instead.
+    #[test]
+    fn test_728b_worker_stalled_escalation_points_at_is_wedged_triage_not_clean_worktree_shutdown()
+     {
+        let event = DirectorEvent::WorkerStalled {
+            worker: "swift-fox".to_string(),
+            task_id: "cas-0b7d".to_string(),
+            elapsed_secs: 620,
+            escalate: true,
+        };
+        let data = make_data(0);
+        let config = default_config();
+
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+        )
+        .unwrap();
+
+        assert!(
+            !prompt.text.contains("safe if the"),
+            "the 'safe if the worktree is clean' anti-pattern must be gone: {}",
+            prompt.text
+        );
+        assert!(
+            prompt.text.contains("is-wedged swift-fox"),
+            "must point at `cas factory is-wedged <worker>` for triage: {}",
+            prompt.text
+        );
+        assert!(
+            prompt.text.contains("debug swift-fox"),
+            "must point at `cas factory debug <worker>` for transcript triage: {}",
+            prompt.text
+        );
+        assert!(
+            prompt.text.contains("kill swift-fox"),
+            "must name the actual kill command, gated on is-wedged's verdict: {}",
+            prompt.text
+        );
     }
 
     /// `on_worker_stalled = false` must suppress both the nudge and the

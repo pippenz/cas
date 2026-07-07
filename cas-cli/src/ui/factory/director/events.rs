@@ -466,6 +466,37 @@ pub struct DirectorEventDetector {
     /// via [`Self::set_stall_threshold_secs`] from `.cas/config.toml`
     /// `[factory] stall_threshold_secs`.
     stall_threshold_secs: u64,
+    /// (cas-728b) UTC timestamp each agent's CURRENT `task_id` was first
+    /// observed by the director, keyed by agent id: `(task_id, first_seen)`.
+    /// Overwritten whenever `current_task` changes to a different id (or is
+    /// seen for the first time) — never refreshed while the same task
+    /// continues, so this is a one-shot grace baseline, not a sliding
+    /// window.
+    ///
+    /// Used to treat the task-start transition itself as activity: a
+    /// worker's first read/investigation turn on a dense task can run 5+
+    /// minutes with zero file-edit/commit/subagent checkpoints (the exact
+    /// false-positive class from the 2026-07-07 repros — two workers
+    /// flagged stalled ~5m after task start while still read-only
+    /// investigating). The stall predicate uses
+    /// `max(latest_activity_ts, task_start_ts)` as its baseline instead of
+    /// `latest_activity_ts` alone, so a stale-or-absent checkpoint
+    /// timestamp from before this task started can't fire a false stall in
+    /// the grace window right after start.
+    task_start_observed: HashMap<String, (String, DateTime<chrono::Utc>)>,
+    /// (cas-728b) CAS root directory, set via [`Self::set_cas_root`]. When
+    /// present, a checkpoint-age stall candidate is additionally confirmed
+    /// against transcript mtime — the same liveness signal
+    /// `cas factory is-wedged` reads (cas-4513) — before firing/escalating:
+    /// a transcript written to within `TRANSCRIPT_FRESH_WINDOW` means the
+    /// worker is actively producing output (reading, reasoning, tool
+    /// calls) even though no *checkpoint-class* event has landed yet, so
+    /// the checkpoint-age-only signal alone is unreliable. `None` (e.g. in
+    /// tests, or before the daemon has resolved a cas root) skips the
+    /// confirmation step and falls back to the checkpoint-only predicate —
+    /// preserves old behavior rather than going silent when the stronger
+    /// signal is unavailable.
+    cas_root: Option<std::path::PathBuf>,
 }
 
 impl DirectorEventDetector {
@@ -484,6 +515,8 @@ impl DirectorEventDetector {
             stall_nudged: HashSet::new(),
             stall_escalated: HashSet::new(),
             stall_threshold_secs: cas_factory::DEFAULT_STALL_THRESHOLD_SECS,
+            task_start_observed: HashMap::new(),
+            cas_root: None,
         }
     }
 
@@ -499,6 +532,42 @@ impl DirectorEventDetector {
     /// `[factory] stall_threshold_secs` (cas-9829).
     pub fn set_stall_threshold_secs(&mut self, secs: u64) {
         self.stall_threshold_secs = secs;
+    }
+
+    /// (cas-728b) Set the CAS root directory so stall-candidate confirmation
+    /// can consult transcript mtime the same way `cas factory is-wedged`
+    /// does. Call once after construction. Leaving this unset skips the
+    /// confirmation step (checkpoint-age-only predicate, the pre-cas-728b
+    /// behavior) — safe default for tests and any caller that hasn't
+    /// resolved a cas root yet.
+    pub fn set_cas_root(&mut self, cas_root: std::path::PathBuf) {
+        self.cas_root = Some(cas_root);
+    }
+
+    /// (cas-728b) Returns `true` if a checkpoint-age stall candidate should
+    /// still be treated as stalled after consulting transcript mtime —
+    /// `false` means the transcript was written to recently enough that the
+    /// worker is evidently still producing output, and the checkpoint-age
+    /// signal alone was a false positive.
+    ///
+    /// Defaults to `true` (proceed with the checkpoint-only verdict, the
+    /// pre-cas-728b behavior) whenever the stronger signal is unavailable:
+    /// no `cas_root` set, the worker isn't resolvable in the agent store,
+    /// or it has no resolvable transcript path. This mirrors the existing
+    /// "when either signal is absent, stay inactive rather than guessing"
+    /// philosophy already used for the heartbeat gate above — but inverted,
+    /// since here the checkpoint-age signal is already the fallback and we
+    /// must not let a *missing* confirmation signal silently suppress every
+    /// stall alert.
+    fn transcript_confirms_stall(&self, worker_name: &str) -> bool {
+        let Some(cas_root) = &self.cas_root else {
+            return true;
+        };
+        let Ok(resolved) = crate::cli::factory::wedged::resolve_worker(cas_root, worker_name)
+        else {
+            return true;
+        };
+        transcript_confirms_stall_for_path(resolved.transcript_path.as_deref())
     }
 
     /// Add a worker to the tracked list (call when spawning workers dynamically)
@@ -762,14 +831,82 @@ impl DirectorEventDetector {
                         age_secs >= 0 && age_secs < FRESH_HEARTBEAT_SECS
                     })
                     .unwrap_or(false);
-                let stalled_elapsed_secs = agent.latest_activity.as_ref().and_then(|(_, ts)| {
-                    let age_secs = (now_utc - *ts).num_seconds();
+
+                // cas-728b: treat a genuine task-start transition as
+                // activity. `latest_activity` only tracks checkpoint-class
+                // events (file edit, commit, subagent, verification) — a
+                // worker's first read/investigation turn on a dense task
+                // can run 5+ minutes producing none of those while
+                // `latest_activity` still holds a stale timestamp from
+                // before this task started (or none at all).
+                //
+                // "Just transitioned" is detected the same way
+                // `TaskAssigned` above detects an Open→InProgress edge:
+                // diffing `self.last_state` (the PREVIOUS tick's status)
+                // against this task's current status, not "first time this
+                // detector instance has observed the task_id" — that
+                // would incorrectly reset the grace baseline on every
+                // fresh `DirectorEventDetector` even for a task that's been
+                // InProgress for the same session's entire history (e.g.
+                // right after `initialize()` snapshots already-in-progress
+                // state).
+                let just_transitioned_to_in_progress = self
+                    .last_state
+                    .tasks
+                    .get(task_id)
+                    .map(|(old_status, _)| *old_status != TaskStatus::InProgress)
+                    .unwrap_or(true);
+                if just_transitioned_to_in_progress {
+                    self.task_start_observed
+                        .insert(agent.id.clone(), (task_id.clone(), now_utc));
+                }
+                let task_start_ts = self
+                    .task_start_observed
+                    .get(&agent.id)
+                    .filter(|(observed_task_id, _)| observed_task_id == task_id)
+                    .map(|(_, observed_at)| *observed_at);
+
+                // Baseline = whichever is MORE RECENT — real activity or
+                // task-start. Once a task has genuinely run past the
+                // threshold with zero activity since start, the grace
+                // period has naturally elapsed and the predicate applies
+                // exactly as before. Preserves the "no signal at all ⇒ gate
+                // stays inactive" behavior when NEITHER is available (task
+                // has been InProgress since before this detector started
+                // watching, and no checkpoint event was ever recorded).
+                let effective_activity_ts = match (
+                    agent.latest_activity.as_ref().map(|(_, ts)| *ts),
+                    task_start_ts,
+                ) {
+                    (Some(activity_ts), Some(start_ts)) => Some(activity_ts.max(start_ts)),
+                    (Some(activity_ts), None) => Some(activity_ts),
+                    (None, Some(start_ts)) => Some(start_ts),
+                    (None, None) => None,
+                };
+                let stalled_elapsed_secs = effective_activity_ts.and_then(|ts| {
+                    let age_secs = (now_utc - ts).num_seconds();
                     (age_secs >= self.stall_threshold_secs as i64).then_some(age_secs)
                 });
 
                 if has_fresh_heartbeat {
                     if let Some(elapsed) = stalled_elapsed_secs {
-                        if !self.stall_nudged.contains(&agent.id) {
+                        // cas-728b: confirm against transcript mtime — the
+                        // same liveness signal `cas factory is-wedged`
+                        // reads — before firing/escalating. A transcript
+                        // written to within TRANSCRIPT_FRESH_WINDOW means
+                        // the worker is actively producing output (reading,
+                        // reasoning, tool calls) even though no
+                        // checkpoint-class event has landed; the
+                        // checkpoint-age signal alone can't tell that apart
+                        // from a genuine stall. Re-consulted every tick a
+                        // candidate is seen, so it also debounces repeat
+                        // alerts for a worker that's confirmed alive —
+                        // it never re-enters the `stalled_elapsed_secs`
+                        // branch while its transcript stays fresh.
+                        if !self.transcript_confirms_stall(&resolved_name) {
+                            self.stall_nudged.remove(&agent.id);
+                            self.stall_escalated.remove(&agent.id);
+                        } else if !self.stall_nudged.contains(&agent.id) {
                             // First detection in this streak: auto-nudge the
                             // worker (re-inject the task prompt) before
                             // paging the supervisor — a single re-poke often
@@ -1126,6 +1263,26 @@ impl DirectorEventDetector {
             .get(agent_id)
             .cloned()
             .unwrap_or_else(|| agent_id.to_string())
+    }
+}
+
+/// (cas-728b) Pure decision given an already-resolved transcript path:
+/// `false` means the transcript was written to within
+/// `TRANSCRIPT_FRESH_WINDOW` (the worker is evidently still producing
+/// output, so a checkpoint-age stall candidate is a false positive);
+/// `true` means proceed with the checkpoint-age verdict (stale, missing,
+/// or unresolvable transcript — the confirming signal isn't available or
+/// doesn't contradict the checkpoint-age evidence). Split out from
+/// `DirectorEventDetector::transcript_confirms_stall` so this decision is
+/// unit-testable with a real temp file without needing a full
+/// `SqliteAgentStore` round-trip via `resolve_worker`.
+fn transcript_confirms_stall_for_path(transcript_path: Option<&std::path::Path>) -> bool {
+    let Some(path) = transcript_path else {
+        return true;
+    };
+    match crate::cli::factory::wedged::transcript_mtime_age(path) {
+        Some(age) if age < crate::cli::factory::wedged::TRANSCRIPT_FRESH_WINDOW => false,
+        _ => true,
     }
 }
 
