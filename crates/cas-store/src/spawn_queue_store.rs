@@ -81,8 +81,16 @@ pub struct SpawnRequest {
     pub processed_at: Option<DateTime<Utc>>,
 }
 
-/// Schema for spawn queue table
-const SPAWN_QUEUE_SCHEMA: &str = r#"
+/// Schema for spawn queue table.
+///
+/// `pub` (re-exported from `cas-store`'s root, matching `AGENT_SCHEMA` /
+/// `TASK_SCHEMA`) so migration-side class-guard tests in `cas-cli` can
+/// assert the baseline (fresh-DB) shape and the post-migration (upgraded-DB)
+/// shape agree column-for-column — see m205's
+/// `baseline_agent_schema_applies_over_pre_m204_table` for the pattern this
+/// guards against: a column that exists on only one of the two paths is
+/// invisible to any test that only ever creates fresh DBs (hotfix 4efed95).
+pub const SPAWN_QUEUE_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS spawn_queue (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     action TEXT NOT NULL,
