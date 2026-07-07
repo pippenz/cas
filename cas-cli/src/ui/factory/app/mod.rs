@@ -790,9 +790,24 @@ impl FactoryApp {
 
     fn apply_session_metadata_focus(&mut self) {
         let focus = preferred_epic_focus_from_session_metadata();
-        if self.current_epic_id.as_deref() == focus.epic_id.as_deref()
-            && (focus.epic_id.is_none() || self.current_epic_source == focus.source)
-        {
+
+        // cas-6945: only short-circuit when something is already tracked.
+        // The event detector's `EpicStarted` is edge-triggered on the
+        // epic's Open+branch/InProgress transition (see
+        // events::test_no_duplicate_epic_started_for_existing_open_with_branch).
+        // In the normal supervisor sequence the epic branch is auto-created
+        // at `task create` time, before any worker exists — so that
+        // transition happens, `EpicStarted` fires once, gets rejected by
+        // `inferred_epic_is_displayable` (no subtask has an assignee yet),
+        // and never refires even after a worker later starts a subtask and
+        // picks up an assignee (the `task action=start` fix, also
+        // cas-6945). Without retrying resolution on every tick while
+        // nothing is tracked, the epic silently never adopts. Once
+        // something IS tracked, behavior is unchanged from before.
+        let already_synced = self.current_epic_id.is_some()
+            && self.current_epic_id.as_deref() == focus.epic_id.as_deref()
+            && (focus.epic_id.is_none() || self.current_epic_source == focus.source);
+        if already_synced {
             return;
         }
 
@@ -2753,6 +2768,75 @@ mod tests {
             }
             ref other => panic!("expected preserved Active state, got {other:?}"),
         }
+    }
+
+    /// cas-6945 follow-up (raised in review): the event detector's
+    /// `EpicStarted` only fires on the epic's state *transition*
+    /// (Open→Open-with-branch or →InProgress). In the real supervisor
+    /// flow, the branch is auto-created at `task create` time — before any
+    /// worker has started a subtask — so `EpicStarted` fires and is
+    /// rejected for lack of a displayable subtask on that very first tick,
+    /// then never refires (proven by
+    /// `events::test_no_duplicate_epic_started_for_existing_open_with_branch`:
+    /// an unchanged Open-with-branch epic does not re-emit `EpicStarted`
+    /// even when the caller passes `current_epic_id: None`). Without a
+    /// periodic retry, AC1 ("worker starts a subtask -> epic becomes
+    /// visible, no supervisor action") would silently fail whenever epic
+    /// creation predates the first subtask start — the normal sequence.
+    /// This test drives `apply_session_metadata_focus` through exactly
+    /// that two-tick sequence and asserts the later tick still adopts.
+    #[test]
+    fn apply_session_metadata_focus_retries_inference_once_assignee_lands_on_a_later_tick() {
+        let _guard = EnvGuard::set_optional(&[("CAS_FACTORY_SESSION", None)]);
+        let epic_id = "cas-late-assignee";
+        let mut app = super::FactoryApp::for_test();
+
+        // Tick 1: epic exists (Open, branch already set — as at creation
+        // time), but no subtask has an assignee yet. Mirrors the detector
+        // having already fired-and-been-rejected for this epic.
+        app.director_data = data_with_epics(vec![epic_summary(
+            epic_id,
+            "Late Epic",
+            TaskStatus::Open,
+        )]);
+        app.apply_session_metadata_focus();
+        assert_eq!(
+            app.current_epic_id, None,
+            "epic with no displayable subtask must stay unadopted"
+        );
+
+        // Tick 2 (later): a worker starts a subtask and gets an assignee
+        // for free (cas-6945 lifecycle.rs fix). The epic's own Open/branch
+        // state is unchanged since tick 1, so the event detector would NOT
+        // refire `EpicStarted` for it — the periodic retry must still pick
+        // it up.
+        app.director_data = DirectorData {
+            ready_tasks: vec![task_summary(
+                "cas-late-assignee-1",
+                "Subtask started by worker",
+                Some(epic_id),
+                Some("worker-one"),
+            )],
+            in_progress_tasks: Vec::new(),
+            epic_tasks: vec![epic_summary(epic_id, "Late Epic", TaskStatus::Open)],
+            agents: Vec::new(),
+            activity: Vec::new(),
+            agent_id_to_name: HashMap::from([(
+                "worker-one".to_string(),
+                "worker-one".to_string(),
+            )]),
+            changes: Vec::new(),
+            git_loaded: false,
+            reminders: Vec::new(),
+            epic_closed_counts: HashMap::new(),
+        };
+        app.apply_session_metadata_focus();
+
+        assert_eq!(app.current_epic_id.as_deref(), Some(epic_id));
+        assert_eq!(
+            app.current_epic_source,
+            Some(super::EpicFocusSource::Inference)
+        );
     }
 
     #[test]
