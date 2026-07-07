@@ -267,6 +267,44 @@ impl CasService {
             })
             .unwrap_or_default();
 
+        // cas-6913: task_id pre-assigns a task to the (single) spawned
+        // worker. Reject anything that would make "the spawned worker"
+        // ambiguous — a task can't be assigned to N workers at once — so a
+        // supervisor gets a clear error instead of silent no-op or a
+        // surprising assignment to whichever worker happens to finish
+        // spawning first.
+        if let Some(ref task_id) = req.task_id {
+            let requested_worker_count = if worker_names.is_empty() {
+                count
+            } else {
+                worker_names.len() as i32
+            };
+            if requested_worker_count != 1 {
+                return Err(Self::error(
+                    ErrorCode::INVALID_PARAMS,
+                    format!(
+                        "task_id can only be used with a single-worker spawn_workers request \
+                         (count=1, or exactly one name in worker_names) — got {requested_worker_count} \
+                         worker(s) requested. Assign the task after spawning instead: \
+                         mcp__cas__task action=update id={task_id} assignee=<worker-name>."
+                    ),
+                ));
+            }
+
+            let task = task_store.get(task_id).map_err(|e| {
+                Self::error(
+                    ErrorCode::INVALID_PARAMS,
+                    format!("task_id {task_id} not found: {e}"),
+                )
+            })?;
+            if task.status == TaskStatus::Closed {
+                return Err(Self::error(
+                    ErrorCode::INVALID_PARAMS,
+                    format!("task_id {task_id} is already closed — cannot pre-assign it to a spawned worker."),
+                ));
+            }
+        }
+
         // Resolve a concrete WorkerSpec for every queued spawn. Omitting model
         // or effort must never inherit the supervisor session's frontier-tier
         // defaults by accident.
@@ -289,6 +327,7 @@ impl CasService {
                 isolate,
                 Some(spec_json_owned.as_str()),
                 factory_session.as_deref(),
+                req.task_id.as_deref(),
             )
             .map_err(|e| {
                 Self::error(
@@ -297,13 +336,19 @@ impl CasService {
                 )
             })?;
 
+        let task_id_note = req
+            .task_id
+            .as_ref()
+            .map(|id| format!("\nTask: {id} will be pre-assigned once the worker boots"))
+            .unwrap_or_default();
+
         let msg = if worker_names.is_empty() {
             format!(
-                "Queued spawn request for {count} worker(s) (request ID: {request_id})\nWorker spec: {spec_summary}{spec_warning}"
+                "Queued spawn request for {count} worker(s) (request ID: {request_id})\nWorker spec: {spec_summary}{spec_warning}{task_id_note}"
             )
         } else {
             format!(
-                "Queued spawn request for worker(s): {} (request ID: {})\nWorker spec: {spec_summary}{spec_warning}",
+                "Queued spawn request for worker(s): {} (request ID: {})\nWorker spec: {spec_summary}{spec_warning}{task_id_note}",
                 worker_names.join(", "),
                 request_id
             )

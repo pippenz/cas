@@ -255,6 +255,7 @@ fn factory_req(action: &str) -> FactoryRequest {
         id: None,
         count: None,
         worker_names: None,
+        task_id: None,
         target: None,
         message: None,
         force: None,
@@ -606,6 +607,160 @@ async fn test_spawn_workers_isolate_flag() {
     let entries = env.spawn_queue().peek(10).expect("peek");
     assert_eq!(entries.len(), 1);
     assert!(entries[0].isolate, "Should have isolate=true");
+}
+
+/// cas-6913 AC3: `task_id` on a single-worker spawn request must carry
+/// through to the queued `SpawnRequest`, ready for `finish_worker_spawn` to
+/// pick up once the daemon actually spawns the worker (unit-tested
+/// separately in epic_workers.rs — this test covers the MCP-to-queue leg).
+#[tokio::test]
+async fn test_spawn_workers_task_id_enqueues_for_single_worker() {
+    let env = FactoryTestEnv::new();
+    env.create_epic("Test Epic");
+    let task_store = env.task_store();
+    let task_id = task_store.generate_id().expect("generate_id");
+    task_store
+        .add(&Task::new(task_id.clone(), "Pre-assign me".to_string()))
+        .expect("add task");
+
+    let mut req = factory_req("spawn_workers");
+    req.count = Some(1);
+    req.task_id = Some(task_id.clone());
+
+    let result = env.service.factory(Parameters(req)).await;
+    assert!(result.is_ok(), "single-worker spawn with task_id should succeed: {result:?}");
+    let text = get_text(&result.unwrap());
+    assert!(
+        text.contains(&task_id),
+        "response should mention the pre-assigned task: {text}"
+    );
+
+    let entries = env.spawn_queue().peek(10).expect("peek");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].task_id.as_deref(), Some(task_id.as_str()));
+}
+
+/// cas-6913 AC3: task_id with a single explicit worker_names entry is also
+/// a valid "single worker" request (not just count=1).
+#[tokio::test]
+async fn test_spawn_workers_task_id_enqueues_for_single_named_worker() {
+    let env = FactoryTestEnv::new();
+    env.create_epic("Test Epic");
+    let task_store = env.task_store();
+    let task_id = task_store.generate_id().expect("generate_id");
+    task_store
+        .add(&Task::new(task_id.clone(), "Pre-assign me".to_string()))
+        .expect("add task");
+
+    let mut req = factory_req("spawn_workers");
+    req.worker_names = Some("swift-fox".to_string());
+    req.task_id = Some(task_id.clone());
+
+    let result = env.service.factory(Parameters(req)).await;
+    assert!(result.is_ok(), "single named-worker spawn with task_id should succeed: {result:?}");
+
+    let entries = env.spawn_queue().peek(10).expect("peek");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].task_id.as_deref(), Some(task_id.as_str()));
+}
+
+/// cas-6913: task_id must be rejected (not silently ignored or applied to
+/// only one of several) when the spawn request is ambiguous about which
+/// worker "the" spawned worker is.
+#[tokio::test]
+async fn test_spawn_workers_task_id_rejects_multi_worker_count() {
+    let env = FactoryTestEnv::new();
+    env.create_epic("Test Epic");
+    let task_store = env.task_store();
+    let task_id = task_store.generate_id().expect("generate_id");
+    task_store
+        .add(&Task::new(task_id.clone(), "Ambiguous".to_string()))
+        .expect("add task");
+
+    let mut req = factory_req("spawn_workers");
+    req.count = Some(3);
+    req.task_id = Some(task_id);
+
+    let result = env.service.factory(Parameters(req)).await;
+    assert!(result.is_err(), "task_id with count>1 must be rejected");
+    let err = result.unwrap_err();
+    assert!(
+        err.message.contains("single-worker"),
+        "error should explain the single-worker requirement: {}",
+        err.message
+    );
+
+    assert!(
+        env.spawn_queue().peek(10).expect("peek").is_empty(),
+        "rejected request must not enqueue anything"
+    );
+}
+
+/// cas-6913: same ambiguity guard, via worker_names listing more than one name.
+#[tokio::test]
+async fn test_spawn_workers_task_id_rejects_multi_worker_names() {
+    let env = FactoryTestEnv::new();
+    env.create_epic("Test Epic");
+    let task_store = env.task_store();
+    let task_id = task_store.generate_id().expect("generate_id");
+    task_store
+        .add(&Task::new(task_id.clone(), "Ambiguous".to_string()))
+        .expect("add task");
+
+    let mut req = factory_req("spawn_workers");
+    req.worker_names = Some("alpha,beta".to_string());
+    req.task_id = Some(task_id);
+
+    let result = env.service.factory(Parameters(req)).await;
+    assert!(result.is_err(), "task_id with 2 worker_names must be rejected");
+}
+
+/// cas-6913: task_id referencing a task that doesn't exist must fail fast
+/// with a clear error, not silently queue a spawn request that can never
+/// resolve the assignment.
+#[tokio::test]
+async fn test_spawn_workers_task_id_rejects_unknown_task() {
+    let env = FactoryTestEnv::new();
+    env.create_epic("Test Epic");
+
+    let mut req = factory_req("spawn_workers");
+    req.count = Some(1);
+    req.task_id = Some("cas-doesnotexist".to_string());
+
+    let result = env.service.factory(Parameters(req)).await;
+    assert!(result.is_err(), "unknown task_id must be rejected");
+    let err = result.unwrap_err();
+    assert!(
+        err.message.contains("not found"),
+        "error should say the task wasn't found: {}",
+        err.message
+    );
+}
+
+/// cas-6913: task_id referencing an already-closed task must be rejected —
+/// pre-assigning a spawned worker to dead work is never useful.
+#[tokio::test]
+async fn test_spawn_workers_task_id_rejects_closed_task() {
+    let env = FactoryTestEnv::new();
+    env.create_epic("Test Epic");
+    let task_store = env.task_store();
+    let task_id = task_store.generate_id().expect("generate_id");
+    let mut task = Task::new(task_id.clone(), "Already done".to_string());
+    task.status = TaskStatus::Closed;
+    task_store.add(&task).expect("add closed task");
+
+    let mut req = factory_req("spawn_workers");
+    req.count = Some(1);
+    req.task_id = Some(task_id);
+
+    let result = env.service.factory(Parameters(req)).await;
+    assert!(result.is_err(), "closed task_id must be rejected");
+    let err = result.unwrap_err();
+    assert!(
+        err.message.contains("closed"),
+        "error should say the task is closed: {}",
+        err.message
+    );
 }
 
 #[tokio::test]

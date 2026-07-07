@@ -955,6 +955,9 @@ fn handle_cloud_command(
                     isolate,
                     spec_json_owned.as_deref(),
                     factory_session,
+                    // cas-6913: task_id pre-assignment is MCP-only for now —
+                    // the cloud relay protocol has no task_id field yet.
+                    None,
                 ) {
                     Ok(id) => {
                         tracing::info!("Cloud spawn_workers queued (id={}): count={}", id, count)
