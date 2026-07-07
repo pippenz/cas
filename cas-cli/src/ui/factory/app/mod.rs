@@ -675,19 +675,6 @@ impl FactoryApp {
             .event_detector
             .detect_changes(&self.director_data, self.epic_state.epic_id());
 
-        // Update epic_state immediately from detected events so the filter below
-        // uses the correct epic_id (otherwise a new epic's tasks get filtered out)
-        for event in &events {
-            if let DirectorEvent::EpicStarted {
-                epic_id,
-                epic_title,
-            } = event
-                && inferred_epic_is_displayable(&self.director_data, epic_id)
-            {
-                self.set_active_epic(epic_id, epic_title);
-            }
-        }
-
         // Now filter to current session (agents + tasks scoped to active epic)
         if db_changed {
             self.filter_director_agents_to_current_session();
@@ -711,7 +698,12 @@ impl FactoryApp {
         Ok((prompts, events))
     }
 
-    fn set_active_epic(&mut self, epic_id: &str, epic_title: &str) -> EpicState {
+    fn set_active_epic(
+        &mut self,
+        epic_id: &str,
+        epic_title: &str,
+        source: EpicFocusSource,
+    ) -> EpicState {
         let previous = std::mem::replace(
             &mut self.epic_state,
             EpicState::Active {
@@ -720,9 +712,27 @@ impl FactoryApp {
             },
         );
         self.current_epic_id = Some(epic_id.to_string());
-        self.current_epic_source = Some(EpicFocusSource::SessionDefault);
-        self.persist_current_epic_id();
+        self.current_epic_source = Some(source);
+        if source == EpicFocusSource::SessionDefault {
+            self.persist_current_epic_id();
+        }
         previous
+    }
+
+    fn source_for_detected_epic_started(&self, epic_id: &str) -> EpicFocusSource {
+        let focus = preferred_epic_focus_from_session_metadata();
+        if focus.epic_id.as_deref() == Some(epic_id) {
+            focus.source.unwrap_or(EpicFocusSource::Inference)
+        } else {
+            EpicFocusSource::Inference
+        }
+    }
+
+    fn can_adopt_detected_epic_started(&self, epic_id: &str, source: EpicFocusSource) -> bool {
+        match source {
+            EpicFocusSource::Pinned | EpicFocusSource::SessionDefault => true,
+            EpicFocusSource::Inference => inferred_epic_is_displayable(&self.director_data, epic_id),
+        }
     }
 
     fn persist_current_epic_id(&self) {
@@ -759,7 +769,9 @@ impl FactoryApp {
 
     fn apply_session_metadata_focus(&mut self) {
         let focus = preferred_epic_focus_from_session_metadata();
-        if self.current_epic_id.as_deref() == focus.epic_id.as_deref() {
+        if self.current_epic_id.as_deref() == focus.epic_id.as_deref()
+            && (focus.epic_id.is_none() || self.current_epic_source == focus.source)
+        {
             return;
         }
 
@@ -1255,7 +1267,10 @@ pub(crate) fn inferred_epic_is_displayable(data: &DirectorData, epic_id: &str) -
     data.in_progress_tasks
         .iter()
         .chain(data.ready_tasks.iter())
-        .any(|task| task.epic.as_deref() == Some(epic_id))
+        .any(|task| {
+            task.epic.as_deref() == Some(epic_id)
+                && crate::ui::factory::director::tasks::task_assigned_to_session_agent(task, data)
+        })
 }
 
 #[cfg(test)]
@@ -1507,6 +1522,23 @@ mod tests {
                 let key = (*key).to_string();
                 let prev = std::env::var(&key).ok();
                 unsafe { std::env::set_var(&key, value) };
+                saved.push((key, prev));
+            }
+            Self { saved, _lock: lock }
+        }
+
+        fn set_optional(vars: &[(&str, Option<&str>)]) -> Self {
+            let lock = ENV_MUTEX
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut saved = Vec::with_capacity(vars.len());
+            for (key, value) in vars {
+                let key = (*key).to_string();
+                let prev = std::env::var(&key).ok();
+                match value {
+                    Some(value) => unsafe { std::env::set_var(&key, value) },
+                    None => unsafe { std::env::remove_var(&key) },
+                }
                 saved.push((key, prev));
             }
             Self { saved, _lock: lock }
@@ -2124,6 +2156,38 @@ mod tests {
     }
 
     #[test]
+    fn preferred_epic_focus_from_metadata_tags_sources() {
+        let mut metadata = crate::ui::factory::session::create_metadata(
+            "test-session",
+            12345,
+            "supervisor",
+            &[],
+            Some("cas-session"),
+            Some("/tmp/project"),
+            None,
+        );
+
+        let session_default = super::preferred_epic_focus_from_metadata(&metadata);
+        assert_eq!(session_default.epic_id.as_deref(), Some("cas-session"));
+        assert_eq!(
+            session_default.source,
+            Some(super::EpicFocusSource::SessionDefault)
+        );
+
+        metadata.pinned_epic_id = Some("cas-pinned".to_string());
+        let pinned = super::preferred_epic_focus_from_metadata(&metadata);
+        assert_eq!(pinned.epic_id.as_deref(), Some("cas-pinned"));
+        assert_eq!(pinned.source, Some(super::EpicFocusSource::Pinned));
+
+        metadata.pinned_epic_id = Some(" ".to_string());
+        metadata.epic_id = Some("\t".to_string());
+        assert_eq!(
+            super::preferred_epic_focus_from_metadata(&metadata),
+            super::SessionEpicFocus::default()
+        );
+    }
+
+    #[test]
     fn preferred_epic_id_from_session_metadata_named_filters_empty_missing_and_malformed() {
         let home = tempfile::tempdir().unwrap();
         let _guard = EnvGuard::set(&[("HOME", home.path().to_str().unwrap())]);
@@ -2231,6 +2295,48 @@ mod tests {
     }
 
     #[test]
+    fn inferred_epic_displayability_requires_session_agent_subtask() {
+        let epic_id = "cas-focused";
+        let mut data = DirectorData {
+            ready_tasks: vec![task_summary(
+                "cas-foreign",
+                "Foreign open subtask",
+                Some(epic_id),
+                Some("other-agent"),
+            )],
+            in_progress_tasks: Vec::new(),
+            epic_tasks: vec![epic_summary(epic_id, "Focused Epic", TaskStatus::Open)],
+            agents: Vec::new(),
+            activity: Vec::new(),
+            agent_id_to_name: HashMap::from([(
+                "session-agent".to_string(),
+                "worker-one".to_string(),
+            )]),
+            changes: Vec::new(),
+            git_loaded: false,
+            reminders: Vec::new(),
+            epic_closed_counts: HashMap::new(),
+        };
+
+        assert!(
+            !super::inferred_epic_is_displayable(&data, epic_id),
+            "foreign-assigned subtasks must not make an inferred epic displayable"
+        );
+
+        data.ready_tasks[0].assignee = Some("session-agent".to_string());
+        assert!(
+            super::inferred_epic_is_displayable(&data, epic_id),
+            "session-id assignee should make the inferred epic displayable"
+        );
+
+        data.ready_tasks[0].assignee = Some("worker-one".to_string());
+        assert!(
+            super::inferred_epic_is_displayable(&data, epic_id),
+            "session display-name assignee should make the inferred epic displayable"
+        );
+    }
+
+    #[test]
     fn epic_completed_clears_current_and_session_default_without_clearing_pin() {
         let home = tempfile::tempdir().unwrap();
         let _guard = EnvGuard::set(&[
@@ -2269,6 +2375,7 @@ mod tests {
         }]);
         assert_eq!(changes.len(), 1);
         assert_eq!(app.current_epic_id, None);
+        assert_eq!(app.current_epic_source, None);
 
         let updated: crate::ui::factory::protocol::SessionMetadata =
             serde_json::from_str(&std::fs::read_to_string(&metadata_path).unwrap()).unwrap();
@@ -2279,6 +2386,52 @@ mod tests {
             Some("cas-pin".to_string()),
             "reload should not resurrect the completed session-default epic"
         );
+    }
+
+    #[test]
+    fn reset_epic_state_clears_current_and_session_default_without_clearing_pin() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set(&[
+            ("HOME", home.path().to_str().unwrap()),
+            ("CAS_FACTORY_SESSION", "session-reset-clear"),
+        ]);
+        let metadata_path = crate::ui::factory::session::metadata_path("session-reset-clear");
+        std::fs::create_dir_all(metadata_path.parent().unwrap()).unwrap();
+        let mut metadata = crate::ui::factory::session::create_metadata(
+            "session-reset-clear",
+            12345,
+            "supervisor",
+            &[],
+            Some("cas-current"),
+            Some("/tmp/project"),
+            None,
+        );
+        metadata.pinned_epic_id = Some("cas-pin".to_string());
+        std::fs::write(
+            &metadata_path,
+            serde_json::to_string_pretty(&metadata).unwrap(),
+        )
+        .unwrap();
+
+        let mut app = super::FactoryApp::for_test();
+        app.factory_session = Some("session-reset-clear".to_string());
+        app.current_epic_id = Some("cas-current".to_string());
+        app.current_epic_source = Some(super::EpicFocusSource::SessionDefault);
+        app.epic_state = EpicState::Active {
+            epic_id: "cas-current".to_string(),
+            epic_title: "Current Epic".to_string(),
+        };
+
+        app.reset_epic_state();
+
+        assert_eq!(app.current_epic_id, None);
+        assert_eq!(app.current_epic_source, None);
+        assert!(matches!(app.epic_state, EpicState::Idle));
+
+        let updated: crate::ui::factory::protocol::SessionMetadata =
+            serde_json::from_str(&std::fs::read_to_string(&metadata_path).unwrap()).unwrap();
+        assert_eq!(updated.epic_id, None);
+        assert_eq!(updated.pinned_epic_id, Some("cas-pin".to_string()));
     }
 
     #[test]
@@ -2397,6 +2550,7 @@ mod tests {
 
         let mut app = super::FactoryApp::for_test();
         app.current_epic_id = Some("cas-session".to_string());
+        app.current_epic_source = Some(super::EpicFocusSource::SessionDefault);
         app.epic_state = EpicState::Active {
             epic_id: "cas-session".to_string(),
             epic_title: "Session Epic".to_string(),
@@ -2409,6 +2563,10 @@ mod tests {
         app.apply_session_metadata_focus();
 
         assert_eq!(app.current_epic_id, Some("cas-pinned".to_string()));
+        assert_eq!(
+            app.current_epic_source,
+            Some(super::EpicFocusSource::Pinned)
+        );
         match app.epic_state {
             EpicState::Active {
                 ref epic_id,
@@ -2448,6 +2606,7 @@ mod tests {
 
         let mut app = super::FactoryApp::for_test();
         app.current_epic_id = Some("cas-pinned".to_string());
+        app.current_epic_source = Some(super::EpicFocusSource::Pinned);
         app.epic_state = EpicState::Active {
             epic_id: "cas-pinned".to_string(),
             epic_title: "Preserved Existing State".to_string(),
@@ -2471,6 +2630,88 @@ mod tests {
             }
             ref other => panic!("expected preserved Active state, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn detector_driven_adoption_without_metadata_keeps_inference_source() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set(&[
+            ("HOME", home.path().to_str().unwrap()),
+            ("CAS_FACTORY_SESSION", "session-without-metadata"),
+        ]);
+        let epic_id = "cas-inferred";
+        let mut app = super::FactoryApp::for_test();
+        app.director_data = DirectorData {
+            ready_tasks: vec![task_summary(
+                "cas-session-task",
+                "Session-owned task",
+                Some(epic_id),
+                Some("session-agent"),
+            )],
+            in_progress_tasks: Vec::new(),
+            epic_tasks: vec![epic_summary(epic_id, "Inferred Epic", TaskStatus::Open)],
+            agents: Vec::new(),
+            activity: Vec::new(),
+            agent_id_to_name: HashMap::from([(
+                "session-agent".to_string(),
+                "worker-one".to_string(),
+            )]),
+            changes: Vec::new(),
+            git_loaded: false,
+            reminders: Vec::new(),
+            epic_closed_counts: HashMap::new(),
+        };
+
+        let changes = app.handle_epic_events(&[DirectorEvent::EpicStarted {
+            epic_id: epic_id.to_string(),
+            epic_title: "Inferred Epic".to_string(),
+        }]);
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(app.current_epic_id.as_deref(), Some(epic_id));
+        assert_eq!(
+            app.current_epic_source,
+            Some(super::EpicFocusSource::Inference),
+            "detector adoption absent metadata must not be laundered into SessionDefault"
+        );
+    }
+
+    #[test]
+    fn refresh_then_handle_same_foreign_epic_started_event_does_not_adopt_focus() {
+        let _guard = EnvGuard::set_optional(&[("CAS_FACTORY_SESSION", None)]);
+        let epic_id = "cas-foreign";
+        let mut app = super::FactoryApp::for_test();
+        app.director_data = DirectorData {
+            ready_tasks: vec![task_summary(
+                "cas-foreign-task",
+                "Foreign task",
+                Some(epic_id),
+                Some("other-agent"),
+            )],
+            in_progress_tasks: Vec::new(),
+            epic_tasks: vec![epic_summary(epic_id, "Foreign Epic", TaskStatus::Open)],
+            agents: Vec::new(),
+            activity: Vec::new(),
+            agent_id_to_name: HashMap::from([(
+                "session-agent".to_string(),
+                "worker-one".to_string(),
+            )]),
+            changes: Vec::new(),
+            git_loaded: false,
+            reminders: Vec::new(),
+            epic_closed_counts: HashMap::new(),
+        };
+
+        let events = vec![DirectorEvent::EpicStarted {
+            epic_id: epic_id.to_string(),
+            epic_title: "Foreign Epic".to_string(),
+        }];
+        let changes = app.handle_epic_events(&events);
+
+        assert!(changes.is_empty());
+        assert_eq!(app.current_epic_id, None);
+        assert_eq!(app.current_epic_source, None);
+        assert!(matches!(app.epic_state, EpicState::Idle));
     }
 
     #[test]

@@ -143,6 +143,11 @@ fn render_epic_progress(
         return;
     };
 
+    if !focused_epic_is_renderable_source_blind(data, focused_epic_id) {
+        render_unfocused_epic_placeholder(frame, area, theme);
+        return;
+    }
+
     let Some(epic) = data.epic_tasks.iter().find(|e| e.id == focused_epic_id) else {
         render_unfocused_epic_placeholder(frame, area, theme);
         return;
@@ -218,6 +223,17 @@ fn render_unfocused_epic_placeholder(frame: &mut Frame, area: Rect, theme: &Acti
         styles.text_muted,
     ));
     frame.render_widget(Paragraph::new(line), area);
+}
+
+fn focused_epic_is_renderable_source_blind(data: &DirectorData, epic_id: &str) -> bool {
+    data.in_progress_tasks
+        .iter()
+        .chain(data.ready_tasks.iter())
+        .filter(|task| task.epic.as_deref() == Some(epic_id))
+        .all(|task| {
+            task.assignee.is_none()
+                || crate::ui::factory::director::tasks::task_assigned_to_session_agent(task, data)
+        })
 }
 
 /// Render worker list with current tasks
@@ -499,8 +515,67 @@ mod tests {
     }
 
     #[test]
-    fn factory_radar_renders_resolved_focused_epic_source_blind() {
+    fn factory_radar_renders_unfocused_placeholder_instead_of_foreign_epic() {
         let data = data_with_unrelated_epic();
+        let backend = TestBackend::new(90, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = ActiveTheme::default();
+
+        terminal
+            .draw(|frame| {
+                render_with_focus(
+                    frame,
+                    frame.area(),
+                    &data,
+                    &theme,
+                    Some("cas-foreign"),
+                    false,
+                    None,
+                    "supervisor",
+                    false,
+                );
+            })
+            .unwrap();
+
+        let text = buffer_text(&terminal);
+        assert!(text.contains("No focused epic"));
+        assert!(text.contains("coordination action=focus_epic id=<epic>"));
+        assert!(!text.contains("EPIC: cas-foreign"));
+    }
+
+    #[test]
+    fn factory_radar_renders_session_owned_focused_epic_source_blind() {
+        let mut data = data_with_unrelated_epic();
+        data.ready_tasks[0].assignee = Some("session-agent".to_string());
+        let backend = TestBackend::new(90, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = ActiveTheme::default();
+
+        terminal
+            .draw(|frame| {
+                render_with_focus(
+                    frame,
+                    frame.area(),
+                    &data,
+                    &theme,
+                    Some("cas-foreign"),
+                    false,
+                    None,
+                    "supervisor",
+                    false,
+                );
+            })
+            .unwrap();
+
+        let text = buffer_text(&terminal);
+        assert!(text.contains("EPIC: cas-foreign"));
+        assert!(!text.contains("No focused epic"));
+    }
+
+    #[test]
+    fn factory_radar_renders_unassigned_focused_epic_source_blind() {
+        let mut data = data_with_unrelated_epic();
+        data.ready_tasks[0].assignee = None;
         let backend = TestBackend::new(90, 12);
         let mut terminal = Terminal::new(backend).unwrap();
         let theme = ActiveTheme::default();

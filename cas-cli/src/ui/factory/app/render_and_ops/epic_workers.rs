@@ -118,7 +118,11 @@ impl FactoryApp {
                     epic_id,
                     epic_title,
                 } => {
-                    let previous = self.set_active_epic(epic_id, epic_title);
+                    let source = self.source_for_detected_epic_started(epic_id);
+                    if !self.can_adopt_detected_epic_started(epic_id, source) {
+                        continue;
+                    }
+                    let previous = self.set_active_epic(epic_id, epic_title, source);
 
                     changes.push(EpicStateChange::Started {
                         epic_id: epic_id.clone(),
