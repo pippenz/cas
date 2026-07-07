@@ -26,8 +26,8 @@ verify on upgrade) · 🔧 fix shipped · 🏗 EPIC · ⏭ n/a
 
 - **CAS validated against:** Codex CLI **0.128.0** (the `crates/cas-pty/src/pty.rs` effort-approach
   comment pins to 0.128).
-- **Locally installed:** **0.142.4** (`codex-cli 0.142.4`, checked 2026-06-30).
-- **Latest stable:** **0.142.4** (2026-06-29). **0.143.0** in alpha.
+- **Locally installed:** **0.142.5** (`codex-cli 0.142.5`, checked 2026-07-07).
+- **Latest stable:** **0.142.5** (2026-07-01). **0.143.0** still in alpha (alpha.38 as of 2026-07-07).
 - **Gap:** ~14 minor versions between the validated pin (0.128) and what's installed/latest (0.142).
   The entries below are a *triage pass* against the touchpoints, not a per-item code audit —
   upgrade-time re-verification is the trigger for promoting any 👀 to a task. (Contrast the Claude
@@ -65,6 +65,7 @@ The load-bearing surface, all in `crates/cas-pty/src/pty.rs::PtyConfig::codex` u
 | Codex version | Headline | CAS verdict | Pointer |
 |---------------|----------|-------------|---------|
 | 0.143.0-alpha | (pre-release; not tracked until stable) | — | — |
+| 0.142.5 | Single backport: WebSocket request payloads no longer written to trace logs | ✅ no action | this doc |
 | 0.142.0–.4 | **Rollout token budgets (turns abort when exhausted)** · env-scoped command/network approvals · AGENTS.md from foreign envs · `SkillsManager→SkillsService` + skill-frontmatter repair | 👀 watch | this doc |
 | 0.141.0 | **Hook trust bypass persists through `codex exec`; blocking PostToolUse rejects code-mode** · per-thread plugin stdio MCP activation · MCP tool timeout→300s | 👀 watch | this doc |
 | 0.140.0 | **`/import` Claude Code setup/config/chats** · corrupted-SQLite auto-recover · encrypted MCP-OAuth secret storage · hooks.json unsupported-field warnings | 👀 watch | this doc |
@@ -77,6 +78,16 @@ The load-bearing surface, all in `crates/cas-pty/src/pty.rs::PtyConfig::codex` u
 ---
 
 ## Entries
+
+### 0.142.5 — trace-log payload redaction backport
+
+Reviewed 2026-07-07 (patient-condor-18 / supervisor). Locally installed at review time.
+
+- **"Prevented full Responses WebSocket request payloads from being written to trace logs"
+  (#30771, sole change).** → ✅ **no action.** Privacy/hygiene backport on Codex's own trace
+  logging; no CAS touchpoint (not `--yolo`, effort, MCP, skills, or AGENTS.md). Recorded so the
+  0.142.4 → 0.142.5 delta is known-empty for the pending 0.128 → 0.142 upgrade-validation
+  checklist — nothing new to verify beyond the 0.142.0–.4 items.
 
 ### 0.142.0–.4 — rollout token budgets · env-scoped approvals · AGENTS.md from foreign envs · SkillsService
 

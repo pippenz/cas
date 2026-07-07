@@ -39,6 +39,12 @@ When a new Claude Code version ships:
 
 | CC version | Headline | CAS verdict | Pointer |
 |------------|----------|-------------|---------|
+| 2.1.202 | Workflow script parse fixes · **re-invoked skill no longer duplicates instructions** · resume-picker slow with many worktrees fixed · `/review` back to single-pass | ✅ no action (wins ride free) | this doc |
+| 2.1.201 | Sonnet 5 sessions drop mid-conversation system role for harness reminders | ✅ no action | this doc |
+| 2.1.200 | **`AskUserQuestion` no longer auto-continues by default** · "default" mode renamed "Manual" · tmux 3.4+ flicker fix | 👀 watch | this doc |
+| 2.1.199 | **SessionStart/SubagentStart stderr no longer hidden on exit 2** · SendMessage respawn-name misroute fix · subagent API-error reporting | 🟢 already covered / ✅ | this doc |
+| 2.1.198 | **Subagents background by default** · **agent-teams: dead teammate reports "failed" to lead** · launcher messages = task direction | 👀 watch / 🟢 win | this doc |
+| 2.1.197 | **Claude Sonnet 5 GA — new CC default model, 1M context, $2/$10 promo to Aug 31** | 👀 opportunity | this doc |
 | 2.1.196 | MCP self-approval tightening · streaming idle watchdog **default-on** · `/code-review` −25% tokens | ✅ no action / 👀 watch | this doc |
 | 2.1.195 | **Hook matchers with hyphenated identifiers now exact-match** (CAS uses `matcher:"task-verifier"`) | 🟢 already aligned | this doc |
 | 2.1.193 | `autoMode.classifyAllShell` · OTEL `assistant_response` logging default | ✅ no action | — |
@@ -67,7 +73,139 @@ When a new Claude Code version ships:
 
 ## Entries
 
-### 2.1.196 — MCP self-approval tightening · streaming idle watchdog default-on · /code-review token cut
+### 2.1.202 — Workflow parse fixes · re-invoked skill dedup · worktree-heavy resume perf
+
+Reviewed 2026-07-07 (patient-condor-18 / supervisor). Sweep of 2.1.197–2.1.202. Local host is on
+**2.1.201** at review time, so everything through .201 is already live behavior here, not hypothetical.
+
+- **"Fixed re-invoking an already-loaded skill appending a duplicate copy of its instructions to
+  context."** → ✅ **no action — direct win.** Long supervisor sessions re-invoke CAS skills
+  (`cas-supervisor`, `verify-before-claim`, `cas-code-review`) repeatedly; each re-invoke was silently
+  duplicating the skill body in context. This fix is pure context-bloat relief for exactly our usage
+  pattern. Rides free on the bump.
+- **"Fixed resuming a session by name, or opening the resume picker, taking minutes and using a large
+  amount of memory in repositories with many git worktrees."** → ✅ **no action — direct win.** Factory
+  hosts accumulate `cas-worktrees-*` dirs by design; this was our exact slow-resume shape. Nothing to
+  change in CAS.
+- **"Fixed workflow scripts with unicode quote escapes in strings being corrupted before parsing;
+  workflow parse errors now show the offending line."** + `workflow.run_id`/`workflow.name` OTel
+  attributes. → ✅ no action; de-flakes + improves debuggability of the `cas-code-review` Workflow
+  scripts (Phase C, cas-b667). No CAS change.
+- **"Changed `/review <pr>` back to a fast single-pass review; use `/code-review <level> <pr#>` for
+  multi-agent."** → ✅ no action — CC's *built-in* review surfaces, distinct from `cas-code-review`
+  (same disambiguation as the 2.1.196 token-cut note). Logged so nobody mistakes it for a CAS change.
+- "Dynamic workflow size" `/config` setting (advisory agent-count guideline) → ✅ no action; could be
+  a host-side knob if `cas-code-review` fan-out ever feels over/under-sized, but it's advisory only.
+
+### 2.1.201 — Sonnet 5 drops mid-conversation system role for harness reminders
+
+Reviewed 2026-07-07.
+
+- **"Claude Sonnet 5 sessions no longer use the mid-conversation system role for harness reminders."**
+  → ✅ **no action, precision note.** CAS hooks inject guidance via `additionalContext` /
+  system-reminder-shaped payloads; this changes what *role* the harness wraps them in on Sonnet 5
+  sessions, not whether they're delivered. Local host has run .201 with CAS hooks active and
+  SessionStart context + supervisor reminders demonstrably still land (this very session). Nothing to
+  verify further.
+
+### 2.1.200 — AskUserQuestion no auto-continue · "default" → "Manual" · tmux 3.4+ flicker fix
+
+Reviewed 2026-07-07.
+
+- **"Changed `AskUserQuestion` dialogs to no longer auto-continue by default; opt into an idle timeout
+  via `/config`."** → 👀 **watch — unattended-pane hang class.** Previously an unanswered
+  `AskUserQuestion` eventually auto-continued; now it blocks until answered. CAS already steers this
+  surface: the cas-e603 PreToolUse reminder (`pre_tool.rs:197-210`) tells factory *supervisors*
+  AskUserQuestion routes to the human only, and `--yolo`-equivalent workers shouldn't be prompting at
+  all. But if a factory agent does call it in an unattended pane, the pane now hangs indefinitely
+  where it previously self-resolved — stall detection is the backstop, and the `/config` idle-timeout
+  opt-in is the lever if this ever bites. No code change; recorded as the failure shape to recognize.
+- **"default" permission mode renamed "Manual" (`--permission-mode manual` accepted alongside
+  `default`).** → ✅ no action. Factory workers spawn with `--dangerously-skip-permissions`
+  (bypassPermissions); CAS never passes `--permission-mode default`, and the old spelling stays
+  accepted anyway.
+- **"Fixed rendering flicker under tmux 3.4+ by enabling synchronized terminal output."** → ✅ no
+  action — direct win. Factory workers are CC instances inside tmux panes; less flicker in exactly our
+  render path. (Adjacent to, not overlapping, the Konsole AlternateScrolling scrollback issue —
+  that one is terminal config, memory `project_konsole_alternate_scrolling_breaks_factory`.)
+- Startup crash on non-array `disabledMcpServers`; background-session stall/daemon-lock/roster fixes
+  → ✅ no action / ⏭ n/a (CAS factory uses tmux workers, not CC background agents).
+
+### 2.1.199 — hook stderr visibility · SendMessage respawn-name misroute · subagent error reporting
+
+Reviewed 2026-07-07.
+
+- **"Fixed `SessionStart`, `Setup`, and `SubagentStart` hooks silently hiding stderr when exiting with
+  code 2 — the error is now shown in the transcript."** → 🟢 **already aligned — debuggability win.**
+  SessionStart (context injection) and SubagentStart (`matcher: "task-verifier"` unjail) are both
+  load-bearing CAS hook surfaces. A CAS hook bug that exits 2 was previously invisible; now the stderr
+  lands in the transcript. Pairs with the standing memory `feedback_verify_hook_runtime_via_jsonl` —
+  the JSONL grep is still the ground truth, but first-line triage just got easier.
+- **"Fixed `SendMessage` silently misrouting when a re-spawned agent reuses a previous agent's name —
+  the tool now detects the mismatch and asks the caller to retarget."** → 🟢 **mostly covered, residual
+  path helped.** In factory mode CAS *intercepts* native SendMessage in PreToolUse and reroutes onto
+  the CAS prompt queue (`auto_route_send_message`, returns deny), so worker-to-worker traffic never
+  rode the broken native path. The residual native surface (supervisor ↔ team-lead, non-factory
+  teams) does respawn agents under reused display names (memory
+  `feedback_reassign_collision_near_limit_worker`), so the mismatch detection is a genuine safety net
+  there. No CAS change.
+- **"Subagents cut off by a rate limit or server error now return partial work / report the error to
+  the parent instead of claiming success."** → ✅ no action — de-flakes `cas-code-review` Workflow
+  persona dispatch (an API-errored persona previously looked like an empty-but-successful review).
+  Same family as the 2.1.187 structured-output hardening.
+- **Retry hardening: transient 429s auto-retry with backoff for subscribers;
+  `CLAUDE_CODE_RETRY_WATCHDOG` raises retry ceilings.** → ✅ no action; strictly helpful for long
+  factory runs. The env var is a lever if a factory host sits on a flaky network.
+
+### 2.1.198 — subagents background by default · agent-teams failure reporting · launcher messages as direction
+
+Reviewed 2026-07-07. **Most factory-relevant release in this sweep.**
+
+- **"Subagents now run in the background by default, so Claude keeps working while they run" (was a
+  gradual rollout).** → 👀 **watch — verify the close-time verification flow.** The task-verifier agent
+  is spawned at task close; if that spawn is now backgrounded, a close flow could theoretically proceed
+  while verification is still running. Mitigating evidence: local host has been on ≥2.1.198 through
+  multiple shipped EPICs (2026-07-07 releases) with the verification jail + SubagentStart unjail
+  visibly working, so no categorical breakage exists. The hook surface (SubagentStart firing) is
+  unchanged by backgrounding. Recorded as the first thing to check if a task ever closes with a
+  verification verdict that arrives "late".
+- **"Agent teams: a teammate that dies on an API error now reports 'failed' to the lead, and messaging
+  a stuck teammate wakes it to retry immediately."** → 🟢 **direct factory win.** CAS factory rides CC
+  agent teams (memory `reference_cas_factory_uses_cc_agent_teams_cli_flags`), and silent worker death
+  is a documented pain class (memories `feedback_phantom_assignee_recovery`,
+  `feedback_reassign_collision_near_limit_worker`). "Failed" now propagating to the lead + message-to-
+  wake shrinks the zombie-worker window. No CAS change; supervisor playbooks (check activity/task/git
+  before respawning) still apply as defense in depth.
+- **"Subagents now treat messages from the agent that launched them as normal task direction; an
+  agent's message is still never treated as the user's approval."** → ✅ no action; matches how the CAS
+  supervisor already directs workers, and the approval carve-out is the same authority model as the
+  2.1.166 SendMessage hardening.
+- **Explore agent now inherits the main session's model (capped at opus) instead of haiku.** → ✅ no
+  action; quality win for any supervisor using Explore for repo sweeps.
+- Claude in Chrome GA, `/dataviz` skill, removed `/agents` wizard, background-agent draft-PR flow →
+  ⏭ n/a (host surfaces CAS doesn't ride).
+
+### 2.1.197 — Claude Sonnet 5 GA: new CC default model, 1M context, promo pricing
+
+Reviewed 2026-07-07.
+
+- **Claude Sonnet 5 ships as the new Claude Code default model, with a native 1M-token context window
+  and promotional pricing of $2/$10 per Mtok through 2026-08-31.** → 👀 **opportunity — model-selection
+  calculus changed, no forced action.** Current CAS posture: `STOCK_WORKER_MODEL = "gpt-5.5"`
+  (`cas-cli/src/config/settings.rs:557`, the v2.27.0 Codex-default decision), and standing guidance
+  "prefer high-effort Sonnet for long factory runs" (memory
+  `feedback_codex_budget_prefer_sonnet_long_runs`) — written against the previous Sonnet. What
+  changes:
+  1. **Claude-path workers that don't pin a model already inherit Sonnet 5** — CC's default moved
+     under us. That's a silent quality/context upgrade, not a break.
+  2. **1M native context** materially reduces compaction pressure on long worker turns — relevant to
+     the supervisor model-tier rubric (memory `project_supervisor_model_tier_rubric`), which should be
+     re-scored with Sonnet 5 in the "standard/heavy" tiers.
+  3. **Promo pricing ends 2026-08-31** — any cost comparison vs the gpt-5.5 default done before then
+     bakes in a 5× discount that expires. Don't re-litigate `STOCK_WORKER_MODEL` on promo numbers
+     alone.
+  No task filed; the tier-rubric refresh is the natural vehicle when it next gets touched. Backlogged
+  below.
 
 Reviewed 2026-06-30 (eager-leopard-33 / supervisor). Sweep of 2.1.171–2.1.196.
 
@@ -359,6 +497,9 @@ remaining .160 changelog lines with a CAS angle.)
 
 ## Backlog of opportunities (not required, tracked)
 
+- **Model-tier rubric refresh for Sonnet 5** (from 2.1.197) — re-score standard/heavy tiers
+  against Sonnet 5's 1M context; ignore promo pricing (ends 2026-08-31) in any
+  `STOCK_WORKER_MODEL` comparison. See 2.1.197 entry.
 - **session-learn / guidance via Stop-hook `additionalContext`** (from 2.1.163) — evaluate
   before next hook-surface EPIC. See 2.1.163 entry.
 - **Factory CC version floor** via `requiredMinimumVersion` (from 2.1.163) — ops/onboarding
