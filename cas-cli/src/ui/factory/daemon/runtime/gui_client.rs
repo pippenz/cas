@@ -344,8 +344,13 @@ impl FactoryDaemon {
                     self.app.spawning_count += count;
                     for i in 0..count {
                         let spec = specs.get(i).cloned().flatten();
-                        self.pending_spawns
-                            .push_back(PendingSpawn::Anonymous { isolate: false, spec });
+                        self.pending_spawns.push_back(PendingSpawn::Anonymous {
+                            isolate: false,
+                            spec,
+                            // cas-6913: task_id pre-assignment is MCP-only for
+                            // now — the GUI client protocol has no task_id field.
+                            task_id: None,
+                        });
                     }
                 } else {
                     self.app.spawning_count += names.len();
@@ -355,6 +360,7 @@ impl FactoryDaemon {
                             name,
                             isolate: false,
                             spec,
+                            task_id: None,
                         });
                     }
                 }

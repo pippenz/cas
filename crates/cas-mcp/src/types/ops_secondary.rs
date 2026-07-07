@@ -380,6 +380,13 @@ pub struct FactoryRequest {
     #[serde(default)]
     pub worker_names: Option<String>,
 
+    /// Task to pre-assign to the spawned worker (spawn_workers only).
+    #[schemars(
+        description = "spawn_workers only: task ID to pre-assign to the spawned worker once it boots (single-worker requests only — count must be 1 or worker_names must name exactly one worker). Eliminates the spawn-then-message race: the worker's first `task mine` already shows the task, no follow-up message required."
+    )]
+    #[serde(default)]
+    pub task_id: Option<String>,
+
     /// Target agent for clear_context or remind
     #[schemars(
         description = "Target agent name for clear_context/remind (or 'all_workers' for broadcast). For remind: agent who receives the reminder (defaults to self)"
@@ -507,8 +514,10 @@ pub struct CoordinationRequest {
     #[serde(default)]
     pub id: Option<String>,
 
-    /// Task ID (for loop_start, worktree_create)
-    #[schemars(description = "Task ID")]
+    /// Task ID (for loop_start, worktree_create, spawn_workers)
+    #[schemars(
+        description = "Task ID. For loop_start/worktree_create: the task the loop/worktree is scoped to. For spawn_workers: pre-assign this task to the spawned worker (single-worker requests only) — see spawn_workers-specific docs."
+    )]
     #[serde(default)]
     pub task_id: Option<String>,
 
@@ -805,6 +814,7 @@ impl CoordinationRequest {
             id: self.id.clone(),
             count: self.count,
             worker_names: self.worker_names.clone(),
+            task_id: self.task_id.clone(),
             target: self.target.clone(),
             message: self.message.clone(),
             force: self.force,

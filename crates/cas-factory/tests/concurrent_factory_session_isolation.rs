@@ -113,7 +113,7 @@ fn two_concurrent_factory_sessions_are_isolated_with_legacy_null_compatibility()
     // to B, then visible to A. Legacy NULL rows remain processable by either.
     stores
         .spawn_queue
-        .enqueue_spawn(1, &[], false, None, Some("session-a"))
+        .enqueue_spawn(1, &[], false, None, Some("session-a"), None)
         .expect("enqueue session-a spawn");
     assert!(
         stores
@@ -153,7 +153,7 @@ fn two_concurrent_factory_sessions_are_isolated_with_legacy_null_compatibility()
 
     stores
         .spawn_queue
-        .enqueue_spawn(2, &[], false, None, None)
+        .enqueue_spawn(2, &[], false, None, None, None)
         .expect("enqueue legacy spawn");
     let legacy_spawn = stores
         .spawn_queue

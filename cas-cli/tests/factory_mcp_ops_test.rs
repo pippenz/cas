@@ -255,6 +255,7 @@ fn factory_req(action: &str) -> FactoryRequest {
         id: None,
         count: None,
         worker_names: None,
+        task_id: None,
         target: None,
         message: None,
         force: None,
@@ -606,6 +607,160 @@ async fn test_spawn_workers_isolate_flag() {
     let entries = env.spawn_queue().peek(10).expect("peek");
     assert_eq!(entries.len(), 1);
     assert!(entries[0].isolate, "Should have isolate=true");
+}
+
+/// cas-6913 AC3: `task_id` on a single-worker spawn request must carry
+/// through to the queued `SpawnRequest`, ready for `finish_worker_spawn` to
+/// pick up once the daemon actually spawns the worker (unit-tested
+/// separately in epic_workers.rs — this test covers the MCP-to-queue leg).
+#[tokio::test]
+async fn test_spawn_workers_task_id_enqueues_for_single_worker() {
+    let env = FactoryTestEnv::new();
+    env.create_epic("Test Epic");
+    let task_store = env.task_store();
+    let task_id = task_store.generate_id().expect("generate_id");
+    task_store
+        .add(&Task::new(task_id.clone(), "Pre-assign me".to_string()))
+        .expect("add task");
+
+    let mut req = factory_req("spawn_workers");
+    req.count = Some(1);
+    req.task_id = Some(task_id.clone());
+
+    let result = env.service.factory(Parameters(req)).await;
+    assert!(result.is_ok(), "single-worker spawn with task_id should succeed: {result:?}");
+    let text = get_text(&result.unwrap());
+    assert!(
+        text.contains(&task_id),
+        "response should mention the pre-assigned task: {text}"
+    );
+
+    let entries = env.spawn_queue().peek(10).expect("peek");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].task_id.as_deref(), Some(task_id.as_str()));
+}
+
+/// cas-6913 AC3: task_id with a single explicit worker_names entry is also
+/// a valid "single worker" request (not just count=1).
+#[tokio::test]
+async fn test_spawn_workers_task_id_enqueues_for_single_named_worker() {
+    let env = FactoryTestEnv::new();
+    env.create_epic("Test Epic");
+    let task_store = env.task_store();
+    let task_id = task_store.generate_id().expect("generate_id");
+    task_store
+        .add(&Task::new(task_id.clone(), "Pre-assign me".to_string()))
+        .expect("add task");
+
+    let mut req = factory_req("spawn_workers");
+    req.worker_names = Some("swift-fox".to_string());
+    req.task_id = Some(task_id.clone());
+
+    let result = env.service.factory(Parameters(req)).await;
+    assert!(result.is_ok(), "single named-worker spawn with task_id should succeed: {result:?}");
+
+    let entries = env.spawn_queue().peek(10).expect("peek");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].task_id.as_deref(), Some(task_id.as_str()));
+}
+
+/// cas-6913: task_id must be rejected (not silently ignored or applied to
+/// only one of several) when the spawn request is ambiguous about which
+/// worker "the" spawned worker is.
+#[tokio::test]
+async fn test_spawn_workers_task_id_rejects_multi_worker_count() {
+    let env = FactoryTestEnv::new();
+    env.create_epic("Test Epic");
+    let task_store = env.task_store();
+    let task_id = task_store.generate_id().expect("generate_id");
+    task_store
+        .add(&Task::new(task_id.clone(), "Ambiguous".to_string()))
+        .expect("add task");
+
+    let mut req = factory_req("spawn_workers");
+    req.count = Some(3);
+    req.task_id = Some(task_id);
+
+    let result = env.service.factory(Parameters(req)).await;
+    assert!(result.is_err(), "task_id with count>1 must be rejected");
+    let err = result.unwrap_err();
+    assert!(
+        err.message.contains("single-worker"),
+        "error should explain the single-worker requirement: {}",
+        err.message
+    );
+
+    assert!(
+        env.spawn_queue().peek(10).expect("peek").is_empty(),
+        "rejected request must not enqueue anything"
+    );
+}
+
+/// cas-6913: same ambiguity guard, via worker_names listing more than one name.
+#[tokio::test]
+async fn test_spawn_workers_task_id_rejects_multi_worker_names() {
+    let env = FactoryTestEnv::new();
+    env.create_epic("Test Epic");
+    let task_store = env.task_store();
+    let task_id = task_store.generate_id().expect("generate_id");
+    task_store
+        .add(&Task::new(task_id.clone(), "Ambiguous".to_string()))
+        .expect("add task");
+
+    let mut req = factory_req("spawn_workers");
+    req.worker_names = Some("alpha,beta".to_string());
+    req.task_id = Some(task_id);
+
+    let result = env.service.factory(Parameters(req)).await;
+    assert!(result.is_err(), "task_id with 2 worker_names must be rejected");
+}
+
+/// cas-6913: task_id referencing a task that doesn't exist must fail fast
+/// with a clear error, not silently queue a spawn request that can never
+/// resolve the assignment.
+#[tokio::test]
+async fn test_spawn_workers_task_id_rejects_unknown_task() {
+    let env = FactoryTestEnv::new();
+    env.create_epic("Test Epic");
+
+    let mut req = factory_req("spawn_workers");
+    req.count = Some(1);
+    req.task_id = Some("cas-doesnotexist".to_string());
+
+    let result = env.service.factory(Parameters(req)).await;
+    assert!(result.is_err(), "unknown task_id must be rejected");
+    let err = result.unwrap_err();
+    assert!(
+        err.message.contains("not found"),
+        "error should say the task wasn't found: {}",
+        err.message
+    );
+}
+
+/// cas-6913: task_id referencing an already-closed task must be rejected —
+/// pre-assigning a spawned worker to dead work is never useful.
+#[tokio::test]
+async fn test_spawn_workers_task_id_rejects_closed_task() {
+    let env = FactoryTestEnv::new();
+    env.create_epic("Test Epic");
+    let task_store = env.task_store();
+    let task_id = task_store.generate_id().expect("generate_id");
+    let mut task = Task::new(task_id.clone(), "Already done".to_string());
+    task.status = TaskStatus::Closed;
+    task_store.add(&task).expect("add closed task");
+
+    let mut req = factory_req("spawn_workers");
+    req.count = Some(1);
+    req.task_id = Some(task_id);
+
+    let result = env.service.factory(Parameters(req)).await;
+    assert!(result.is_err(), "closed task_id must be rejected");
+    let err = result.unwrap_err();
+    assert!(
+        err.message.contains("closed"),
+        "error should say the task is closed: {}",
+        err.message
+    );
 }
 
 #[tokio::test]
@@ -1519,6 +1674,201 @@ async fn test_coordination_message_urgent_flag_enqueues_urgent() {
         prompts[0].priority,
         cas_store::NotificationPriority::Critical,
         "urgent with no explicit priority defaults to Critical so it jumps the queue"
+    );
+}
+
+/// cas-6913 AC2: a message to a target that IS registered must say so
+/// honestly — not just "queued", but "queued for next poll (target is
+/// registered)". Regression guard against re-collapsing the two cases.
+#[tokio::test]
+async fn test_coordination_message_to_registered_target_reports_delivery_status() {
+    let _guard = EnvGuard::set(&[
+        ("CAS_AGENT_ROLE", "supervisor"),
+        ("CAS_AGENT_NAME", "supervisor"),
+    ]);
+    let env = FactoryTestEnv::new();
+    env.register_worker("swift-fox");
+
+    let req = coord_msg("message", "swift-fox", "status update", None);
+    let result = env.service.coordination(Parameters(req)).await;
+    assert!(result.is_ok(), "message should succeed: {result:?}");
+    let text = get_text(&result.unwrap());
+    assert!(
+        text.contains("target is registered"),
+        "response should confirm the target is registered: {text}"
+    );
+    assert!(
+        !text.contains("not yet registered"),
+        "a registered target must not read as unregistered: {text}"
+    );
+}
+
+/// cas-6913 AC2: the defect this task exists to fix — "Message queued" reads
+/// as delivery confirmation even when the target name isn't in the agent
+/// store yet (the common spawn-then-immediately-assign race). The ack must
+/// say so honestly instead of implying success either way.
+#[tokio::test]
+async fn test_coordination_message_to_unregistered_target_reports_queued_pending_registration() {
+    let _guard = EnvGuard::set(&[
+        ("CAS_AGENT_ROLE", "supervisor"),
+        ("CAS_AGENT_NAME", "supervisor"),
+    ]);
+    let env = FactoryTestEnv::new();
+    // Deliberately do NOT register "not-born-yet" — simulates a message
+    // addressed to a worker name the supervisor already knows (e.g. from an
+    // explicit spawn_workers worker_names= request) before the daemon has
+    // finished spawning it.
+
+    let req = coord_msg("message", "not-born-yet", "start with task cas-abc1", None);
+    let result = env.service.coordination(Parameters(req)).await;
+    assert!(result.is_ok(), "message should still enqueue: {result:?}");
+    let text = get_text(&result.unwrap());
+    assert!(
+        text.contains("not yet registered"),
+        "response must honestly flag the target as not yet registered: {text}"
+    );
+    assert!(
+        !text.contains("target is registered"),
+        "an unregistered target must not read as registered: {text}"
+    );
+
+    // The message still lands in the queue — this is about honest
+    // reporting, not blocking the send. cas-7e20/daemon polling handles
+    // eventual delivery once the name is registered.
+    let prompts = env.prompt_queue().peek_all(10).expect("peek");
+    assert_eq!(prompts.len(), 1);
+    assert_eq!(prompts[0].target, "not-born-yet");
+}
+
+/// cas-6913 AC1: "queue-before-register -> register -> poll sees it".
+/// A message queued to a worker name before that worker exists in the
+/// agent store must be delivered into the worker's OWN prompt loop at
+/// registration time (surfaced directly in the register response text —
+/// no PTY-injection timing dependency), and must remain pollable
+/// afterward (at-least-once, matching this queue's existing philosophy).
+#[tokio::test]
+async fn test_agent_register_surfaces_pending_prompt_queue_mail() {
+    let env = FactoryTestEnv::new();
+
+    // Step 1: queue-before-register.
+    env.prompt_queue()
+        .enqueue_urgent(
+            "supervisor",
+            "not-born-yet",
+            "start with task cas-abc1",
+            None,
+            Some("assignment"),
+            None,
+            false,
+        )
+        .expect("enqueue pre-registration message");
+
+    // Step 2: register.
+    let mut req = coord_req("register");
+    req.name = Some("not-born-yet".to_string());
+    req.session_id = Some("session-not-born-yet".to_string());
+    let result = env.service.coordination(Parameters(req)).await;
+    assert!(result.is_ok(), "register should succeed: {result:?}");
+    let text = get_text(&result.unwrap());
+    assert!(
+        text.contains("start with task cas-abc1"),
+        "registration response should surface the pending message: {text}"
+    );
+    assert!(
+        text.contains("waiting for you"),
+        "response should explain why the message appears: {text}"
+    );
+
+    // Step 3: poll sees it — surfacing in the register response must not
+    // consume the message. The daemon's normal poll loop still delivers it.
+    let still_pending = env
+        .prompt_queue()
+        .poll_for_target("not-born-yet", 10)
+        .expect("poll");
+    assert_eq!(
+        still_pending.len(),
+        1,
+        "message must remain pollable after being surfaced at registration"
+    );
+}
+
+/// Codex workers register via `action=session_start`, not `action=register`
+/// (see cas-e7c8 / the ToolSearch two-step guidance) — this is the literal
+/// path the source bug doc's repro hit ("Worker zealous-hawk-40 (codex
+/// CLI)"). Must get the same treatment as the Claude `register` path.
+#[tokio::test]
+async fn test_agent_session_start_surfaces_pending_prompt_queue_mail() {
+    let env = FactoryTestEnv::new();
+
+    env.prompt_queue()
+        .enqueue_urgent(
+            "supervisor",
+            "codex-worker-1",
+            "branch base: epic/foo. proof command: cargo test.",
+            None,
+            Some("assignment"),
+            None,
+            false,
+        )
+        .expect("enqueue pre-registration message");
+
+    let mut req = coord_req("session_start");
+    req.name = Some("codex-worker-1".to_string());
+    req.session_id = Some("session-codex-worker-1".to_string());
+    let result = env.service.coordination(Parameters(req)).await;
+    assert!(result.is_ok(), "session_start should succeed: {result:?}");
+    let text = get_text(&result.unwrap());
+    assert!(
+        text.contains("branch base: epic/foo"),
+        "session_start response should surface the pending message: {text}"
+    );
+}
+
+/// No pending mail must add no noise — registration stays a clean,
+/// unchanged response for the overwhelmingly common case.
+#[tokio::test]
+async fn test_agent_register_with_no_pending_mail_stays_unchanged() {
+    let env = FactoryTestEnv::new();
+
+    let mut req = coord_req("register");
+    req.name = Some("fresh-worker".to_string());
+    req.session_id = Some("session-fresh-worker".to_string());
+    let result = env.service.coordination(Parameters(req)).await;
+    assert!(result.is_ok(), "register should succeed: {result:?}");
+    let text = get_text(&result.unwrap());
+    assert!(
+        !text.contains("waiting for you"),
+        "no pending mail should mean no pending-mail section: {text}"
+    );
+}
+
+/// A message queued for a DIFFERENT worker must never leak into this
+/// worker's registration response.
+#[tokio::test]
+async fn test_agent_register_does_not_leak_other_agents_mail() {
+    let env = FactoryTestEnv::new();
+
+    env.prompt_queue()
+        .enqueue_urgent(
+            "supervisor",
+            "someone-else",
+            "top secret instructions for someone-else",
+            None,
+            Some("assignment"),
+            None,
+            false,
+        )
+        .expect("enqueue message for a different worker");
+
+    let mut req = coord_req("register");
+    req.name = Some("fresh-worker".to_string());
+    req.session_id = Some("session-fresh-worker".to_string());
+    let result = env.service.coordination(Parameters(req)).await;
+    assert!(result.is_ok(), "register should succeed: {result:?}");
+    let text = get_text(&result.unwrap());
+    assert!(
+        !text.contains("top secret instructions"),
+        "another agent's queued message must not leak into this registration: {text}"
     );
 }
 
