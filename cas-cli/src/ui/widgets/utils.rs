@@ -42,7 +42,11 @@ fn prefix_at_char_boundary(s: &str, max_bytes: usize) -> &str {
 
 /// Format a datetime as relative time (e.g., "5m", "2h", "3d")
 pub fn format_relative(dt: DateTime<Utc>) -> String {
-    let now = Utc::now();
+    format_relative_at(dt, Utc::now())
+}
+
+/// Format a datetime as relative time against an explicit clock.
+pub fn format_relative_at(dt: DateTime<Utc>, now: DateTime<Utc>) -> String {
     let diff = now.signed_duration_since(dt);
     let secs = diff.num_seconds();
 
