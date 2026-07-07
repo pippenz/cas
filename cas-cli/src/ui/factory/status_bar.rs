@@ -49,35 +49,33 @@ impl StatusBar {
         let mode = match &app.input_mode {
             InputMode::Normal => Span::styled(
                 " NORMAL ",
-                Style::default()
-                    .fg(palette.text_primary)
-                    .bg(palette.status_info),
+                Style::default().fg(palette.chip_fg).bg(palette.status_info),
             ),
             InputMode::Inject => Span::styled(
                 " INJECT ",
                 Style::default()
-                    .fg(palette.text_primary)
+                    .fg(palette.chip_fg)
                     .bg(palette.status_warning),
             ),
             InputMode::PaneSelect => Span::styled(
                 " PANE ",
-                Style::default().fg(palette.text_primary).bg(palette.accent),
+                Style::default().fg(palette.chip_fg).bg(palette.accent),
             ),
             InputMode::Feedback => Span::styled(
                 " FEEDBACK ",
                 Style::default()
-                    .fg(palette.text_primary)
+                    .fg(palette.chip_fg)
                     .bg(palette.status_warning),
             ),
             InputMode::Resize => Span::styled(
                 " RESIZE ",
                 Style::default()
-                    .fg(palette.text_primary)
+                    .fg(palette.chip_fg)
                     .bg(palette.status_success),
             ),
             InputMode::Terminal => Span::styled(
                 " TERMINAL ",
-                Style::default().fg(palette.text_primary).bg(palette.accent),
+                Style::default().fg(palette.chip_fg).bg(palette.accent),
             ),
         };
         left_spans.push(mode);
@@ -88,7 +86,7 @@ impl StatusBar {
             left_spans.push(Span::styled(
                 " SELECT MODE — F10 to exit ",
                 Style::default()
-                    .fg(palette.text_primary)
+                    .fg(palette.chip_fg)
                     .bg(palette.status_warning)
                     .add_modifier(Modifier::BOLD),
             ));
@@ -146,7 +144,7 @@ impl StatusBar {
             left_spans.push(Span::styled(
                 " ● TERM ",
                 Style::default()
-                    .fg(palette.text_primary)
+                    .fg(palette.chip_fg)
                     .bg(palette.accent_dim)
                     .add_modifier(Modifier::BOLD),
             ));

@@ -52,7 +52,11 @@ impl ColorPalette {
             gray_100: Color::Rgb(228, 229, 235),
             gray_200: Color::Rgb(198, 200, 210),
             gray_300: Color::Rgb(160, 162, 175),
-            gray_400: Color::Rgb(120, 123, 138),
+            // cas-7bf4: lightened from (120,123,138) — text_muted/task_open/
+            // priority_low/status_neutral all read at <4.5:1 against
+            // bg_elevated (40,43,53); this hits ~4.6:1 while staying dimmer
+            // than gray_300.
+            gray_400: Color::Rgb(144, 147, 159),
             gray_500: Color::Rgb(90, 93, 107),
             gray_600: Color::Rgb(60, 63, 75),
             gray_700: Color::Rgb(40, 43, 53),
@@ -71,7 +75,10 @@ impl ColorPalette {
             success_dim: Color::Rgb(40, 100, 60),
             warning: Color::Rgb(240, 160, 60),
             warning_dim: Color::Rgb(120, 80, 30),
-            error: Color::Rgb(230, 90, 90),
+            // cas-7bf4: lightened from (230,90,90) — status_error/text_error
+            // read at 4.02:1 against bg_elevated (40,43,53), just under the
+            // 4.5:1 floor; this hits ~4.6:1.
+            error: Color::Rgb(233, 108, 108),
             error_dim: Color::Rgb(115, 45, 45),
             info: Color::Rgb(70, 170, 230),
             info_dim: Color::Rgb(35, 85, 115),
@@ -94,8 +101,13 @@ impl ColorPalette {
             gray_100: Color::Rgb(28, 30, 38),
             gray_200: Color::Rgb(40, 43, 53),
             gray_300: Color::Rgb(60, 63, 75),
-            gray_400: Color::Rgb(90, 93, 107),
-            gray_500: Color::Rgb(120, 123, 138),
+            // cas-7bf4: darkened from (90,93,107) — status_neutral/task_open/
+            // rule_draft read at <3:1 against bg_elevated (198,200,210);
+            // this hits ~4.6:1.
+            gray_400: Color::Rgb(80, 83, 95),
+            // cas-7bf4: darkened from (120,123,138) — text_muted read at
+            // 2.52:1 against bg_elevated (198,200,210); this hits ~4.7:1.
+            gray_500: Color::Rgb(80, 82, 92),
             gray_600: Color::Rgb(160, 162, 175),
             gray_700: Color::Rgb(198, 200, 210),
             gray_800: Color::Rgb(228, 229, 235),
