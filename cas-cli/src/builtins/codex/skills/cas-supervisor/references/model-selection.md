@@ -10,7 +10,7 @@ Pay for reasoning only where reasoning is the bottleneck. Every worker slot has 
 
 ## Tiers
 
-| Tier | Spawn overrides | Use for |
+| Tier | Spawn parameters | Use for |
 |---|---|---|
 | **light** | `cli=codex model=gpt-5.5 effort=low` | Chores, docs, mechanical renames, config bumps, `depth=light` tasks, test backfill that mirrors existing patterns |
 | **standard** | `cli=codex model=gpt-5.5 effort=medium` | Normal feature/bug work with a clear spec and bounded blast radius. The stock floor is codex / gpt-5.5 / medium. |
@@ -58,7 +58,7 @@ For Claude workers, `effort=high` is the ceiling. `xhigh`/`max` increase per-ste
 ## Workflow
 
 1. **Tag at breakdown** — tasks default to standard; tag deviations with a label: `labels="tier:light"` / `"tier:heavy"` / `"tier:frontier"`. Note non-obvious tier rationale in the task's `design` field.
-2. **Spawn the mix** — count tiers in the ready backlog, then issue one `spawn_workers` call per tier (a call's overrides apply to every worker in that call):
+2. **Spawn the mix** — count tiers in the ready backlog, then issue one `spawn_workers` call per tier (a call's parameters apply to every worker in that call):
    ```
    # two standard workers
    mcp__cas__coordination action=spawn_workers count=2 isolate=true cli=codex model=gpt-5.5 effort=medium
@@ -75,4 +75,4 @@ For Claude workers, `effort=high` is the ceiling. `xhigh`/`max` increase per-ste
 5. **Escalate on judgment** — the two-rejection rule is a floor, not a permission gate. If a cheaper worker's draft gathers facts but misses the quality bar, escalate before verification fails. Judge the output, not the price tag; use cheap tiers for information and drafts, then pay for what ships. Cost is a tiebreaker only.
 6. **De-escalate the tail** — when only light tasks remain, don't leave a heavy/frontier worker idle-burning; shut it down and let a cheaper worker sweep the tail.
 
-Per-spawn overrides beat `.cas/config.toml` `[factory.defaults]` / `[[factory.workers]]` for that spawn only — check the project config before assuming what the floor actually is.
+Explicit per-spawn parameters beat `.cas/config.toml` `[factory.defaults]` / `[[factory.workers]]` for that spawn only — check the project config before assuming what the floor actually is.

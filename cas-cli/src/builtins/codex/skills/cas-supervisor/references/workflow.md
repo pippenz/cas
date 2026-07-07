@@ -49,9 +49,9 @@ In shared mode, file-overlap analysis is even more critical — two workers edit
 
    **Hard rule:** every `spawn_workers` call MUST include explicit `model=` and
    `effort=`. Include `cli=` as well when spawning outside the stock Codex lane.
-   The spawn acknowledgement nags when either field is omitted because silent
-   session-default inheritance can put workers on the supervisor's expensive
-   model/effort.
+   Omitted fields fall back through the factory config cascade and stock floor;
+   the spawn acknowledgement nags because supervisors should make worker tier
+   selection intentional and visible.
 
    **Heterogeneous team example** — Claude supervisor spawning Codex workers:
    ```

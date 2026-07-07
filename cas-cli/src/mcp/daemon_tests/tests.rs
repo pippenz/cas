@@ -5,7 +5,44 @@ use tempfile::TempDir;
 use crate::cloud::SyncQueue;
 use crate::store::SqliteStore;
 use crate::store::init_cas_dir;
-use cas_types::Session;
+use cas_types::{Agent, AgentRole, Session};
+
+struct EnvVarGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    saved: Vec<(&'static str, Option<String>)>,
+}
+
+impl EnvVarGuard {
+    fn set(vars: &[(&'static str, Option<&str>)]) -> Self {
+        let lock = crate::hooks::test_env_lock();
+        let saved = vars
+            .iter()
+            .map(|(key, _)| (*key, std::env::var(key).ok()))
+            .collect();
+        for (key, value) in vars {
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+        Self { _lock: lock, saved }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        for (key, value) in &self.saved {
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+}
 
 #[test]
 fn test_activity_tracker() {
@@ -28,6 +65,56 @@ fn test_daemon_config_conversion() {
     let daemon_config = config.to_daemon_config();
     assert_eq!(daemon_config.interval_minutes, 30);
     assert_eq!(daemon_config.cas_root, PathBuf::from("/tmp/cas"));
+}
+
+#[test]
+fn apply_factory_worker_metadata_records_worker_model_effort_and_clone_path() {
+    let _env = EnvVarGuard::set(&[
+        ("CAS_AGENT_ROLE", Some("worker")),
+        ("CAS_CLONE_PATH", Some("/tmp/cas-worker-clone")),
+        ("CAS_FACTORY_WORKER_MODEL", Some("sonnet")),
+        ("CAS_FACTORY_WORKER_EFFORT", Some("high")),
+    ]);
+    let mut agent = Agent::new("agent-id".to_string(), "agent".to_string());
+
+    apply_factory_worker_metadata(&mut agent, None);
+
+    assert_eq!(
+        agent.metadata.get("clone_path").map(String::as_str),
+        Some("/tmp/cas-worker-clone")
+    );
+    assert_eq!(
+        agent.metadata.get("worker_model").map(String::as_str),
+        Some("sonnet")
+    );
+    assert_eq!(
+        agent.metadata.get("worker_effort").map(String::as_str),
+        Some("high")
+    );
+}
+
+#[test]
+fn apply_factory_worker_metadata_skips_model_effort_for_non_worker() {
+    let _env = EnvVarGuard::set(&[
+        ("CAS_AGENT_ROLE", None),
+        ("CAS_CLONE_PATH", None),
+        ("CAS_FACTORY_WORKER_MODEL", Some("sonnet")),
+        ("CAS_FACTORY_WORKER_EFFORT", Some("high")),
+    ]);
+    let mut agent = Agent::new_with_role(
+        "agent-id".to_string(),
+        "agent".to_string(),
+        AgentRole::Supervisor,
+    );
+
+    apply_factory_worker_metadata(&mut agent, Some("/tmp/explicit-clone"));
+
+    assert_eq!(
+        agent.metadata.get("clone_path").map(String::as_str),
+        Some("/tmp/explicit-clone")
+    );
+    assert!(!agent.metadata.contains_key("worker_model"));
+    assert!(!agent.metadata.contains_key("worker_effort"));
 }
 
 // =========================================================================
@@ -167,9 +254,12 @@ fn read_pid_starttime_self_is_stable() {
     let our_pid = std::process::id();
     let first = crate::mcp::daemon::read_pid_starttime(our_pid)
         .expect("read_pid_starttime must succeed on self");
-    assert!(first > 0, "starttime must be positive clock ticks since boot");
-    let second = crate::mcp::daemon::read_pid_starttime(our_pid)
-        .expect("second read must also succeed");
+    assert!(
+        first > 0,
+        "starttime must be positive clock ticks since boot"
+    );
+    let second =
+        crate::mcp::daemon::read_pid_starttime(our_pid).expect("second read must also succeed");
     assert_eq!(
         first, second,
         "starttime must be invariant for the lifetime of a process"
@@ -263,7 +353,8 @@ fn parse_starttime_from_stat_handles_comm_with_parens_and_spaces() {
     // stime=0, cutime=0, cstime=0, priority=20, nice=0, num_threads=1,
     // itrealvalue=0, starttime=9876543210. That's 19 fields after state,
     // matching field 22 = index 19 in the post-comm tail.
-    let synthetic = "1234 (weird )name with spaces) R 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 9876543210 1 2 3";
+    let synthetic =
+        "1234 (weird )name with spaces) R 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 9876543210 1 2 3";
     assert_eq!(
         crate::mcp::daemon::parse_starttime_from_stat(synthetic),
         Some(9876543210),
@@ -509,7 +600,11 @@ fn evaluate_liveness_prefers_typed_pid_starttime_over_metadata() {
         &agent,
         |_| panic!("pid_alive must not be consulted when a fingerprint is present"),
         |pid, st| {
-            assert_eq!((pid, st), (5555u32, 22222u64), "typed field must take precedence over metadata");
+            assert_eq!(
+                (pid, st),
+                (5555u32, 22222u64),
+                "typed field must take precedence over metadata"
+            );
             true
         },
     );
@@ -535,7 +630,11 @@ fn evaluate_liveness_falls_back_to_metadata_when_typed_is_none() {
         &agent,
         |_| panic!("pid_alive must not be consulted when metadata fingerprint parses"),
         |pid, st| {
-            assert_eq!((pid, st), (7777u32, 33333u64), "metadata fallback must drive fingerprint fn");
+            assert_eq!(
+                (pid, st),
+                (7777u32, 33333u64),
+                "metadata fallback must drive fingerprint fn"
+            );
             true
         },
     );
@@ -647,8 +746,14 @@ fn all_agent_registration_sites_stamp_pid_fingerprint() {
     // (See cas-389c for the real-fn-invocation follow-up that will make
     // this catch a real site that forgets to stamp, not just a mirror.)
     let sites: &[(&str, AgentBuilder)] = &[
-        ("daemon::register_agent (socket-driven)", socket_driven_register),
-        ("server::register_agent_with_hints (self)", self_register_hints),
+        (
+            "daemon::register_agent (socket-driven)",
+            socket_driven_register,
+        ),
+        (
+            "server::register_agent_with_hints (self)",
+            self_register_hints,
+        ),
         ("server::re-register-missing (self)", re_register_missing),
     ];
 

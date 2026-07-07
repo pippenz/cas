@@ -133,7 +133,9 @@ impl CasCore {
         // eliminate.
         use crate::hooks::HookSpecificOutput;
         let context = match output.hook_specific_output {
-            Some(HookSpecificOutput::SessionStart { additional_context, .. }) => Some(additional_context),
+            Some(HookSpecificOutput::SessionStart {
+                additional_context, ..
+            }) => Some(additional_context),
             // None variants below are unreachable in practice (handle_session_start
             // never emits these shapes), but pattern-matching them explicitly
             // makes the invariant load-bearing on the type system rather than on
@@ -146,10 +148,10 @@ impl CasCore {
             | None => None,
         }
         .filter(|c| !c.is_empty())
-            .unwrap_or_else(|| {
-                build_context(&input, req.limit.unwrap_or(5), &self.cas_root)
-                    .unwrap_or_else(|_| String::new())
-            });
+        .unwrap_or_else(|| {
+            build_context(&input, req.limit.unwrap_or(5), &self.cas_root)
+                .unwrap_or_else(|_| String::new())
+        });
 
         // Write current_session for CLI parity (best effort)
         let _ = std::fs::write(self.cas_root.join("current_session"), &session_id);
@@ -167,6 +169,7 @@ impl CasCore {
                 } else if requested_agent_type == Some(crate::types::AgentType::Worker) {
                     existing.role = crate::types::AgentRole::Worker;
                 }
+                crate::mcp::daemon::apply_factory_worker_metadata(&mut existing, None);
                 let _ = store.update(&existing);
 
                 let _ = self.agent_id.set(Some(session_id.clone()));
