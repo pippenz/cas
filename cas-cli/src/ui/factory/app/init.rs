@@ -190,6 +190,9 @@ impl FactoryApp {
         let mut event_detector =
             DirectorEventDetector::new(worker_names.clone(), supervisor_name.clone());
         event_detector.set_stall_threshold_secs(config.stall_threshold_secs);
+        // cas-728b: lets stall-candidate confirmation consult transcript
+        // mtime the same way `cas factory is-wedged` does.
+        event_detector.set_cas_root(cas_dir.clone());
         event_detector.initialize(&director_data);
 
         let notifier = Notifier::new(config.notify);
@@ -364,6 +367,9 @@ impl FactoryApp {
         // cas-9829: activity-based stall detection threshold, sourced from
         // `.cas/config.toml` `[factory] stall_threshold_secs`.
         event_detector.set_stall_threshold_secs(cas_config.factory().stall_threshold_secs);
+        // cas-728b: lets stall-candidate confirmation consult transcript
+        // mtime the same way `cas factory is-wedged` does.
+        event_detector.set_cas_root(cas_dir.clone());
 
         let app = Self {
             mux,

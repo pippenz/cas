@@ -298,6 +298,85 @@ fn test_worker_idle_payload_includes_close_rejected_task_state() {
     assert!(!idle.description().to_lowercase().contains("finished"));
 }
 
+/// cas-627f/cas-728b: a MERGE REQUIRED close parks the task as
+/// `AwaitingMerge` and releases the worker's lease (cas-8d5b). The worker
+/// then sits genuinely idle — `current_task` is `None` (parking doesn't set
+/// `InProgress`) for as long as the task stays parked. cas-627f made
+/// `active_lease` resolve the parked task again (fallback by assignee +
+/// status), so `WorkerIdle` carries the close-rejected payload once the
+/// idle streak crosses `IDLE_CONSECUTIVE_TICKS` — same as the InProgress
+/// case above. What this test adds: proving `idle_already_emitted` already
+/// debounces this to ONE notification per sustained idle streak, not one
+/// per 2s tick, WITHOUT any additional Blocked/AwaitingMerge-specific
+/// suppression. A prior version of cas-728b's Fix 5 unconditionally
+/// suppressed this notification for parked states — that re-hid the exact
+/// notification cas-627f fixed; this test locks in the debounce-without-
+/// silencing behavior that replaced it.
+#[test]
+fn test_worker_idle_awaiting_merge_close_rejected_debounces_after_first_fire() {
+    let mut detector =
+        DirectorEventDetector::new(vec!["swift-fox".to_string()], "supervisor".to_string());
+
+    let mut agent = make_agent("agent-1", "swift-fox", None);
+    agent.last_heartbeat = None;
+    agent.active_lease = Some(ActiveLeaseSummary {
+        task_id: "cas-1234".to_string(),
+        task_title: "Fix close gate".to_string(),
+        task_status: TaskStatus::AwaitingMerge,
+        close_rejected_reason: Some("MERGE REQUIRED".to_string()),
+    });
+
+    let data = DirectorData {
+        ready_tasks: vec![],
+        in_progress_tasks: vec![],
+        epic_tasks: vec![],
+        agents: vec![agent],
+        activity: vec![],
+        agent_id_to_name: [("agent-1".to_string(), "swift-fox".to_string())]
+            .into_iter()
+            .collect(),
+        changes: vec![],
+        git_loaded: true,
+        reminders: vec![],
+        epic_closed_counts: HashMap::new(),
+    };
+    detector.initialize(&data);
+
+    let tick1 = detector.detect_changes(&data, None);
+    assert!(
+        !tick1
+            .iter()
+            .any(|event| matches!(event, DirectorEvent::WorkerIdle { .. })),
+        "IDLE_CONSECUTIVE_TICKS == 2, so tick-1 must still be suppressed: {tick1:?}"
+    );
+
+    let tick2 = detector.detect_changes(&data, None);
+    let idle = tick2
+        .iter()
+        .find(|event| matches!(event, DirectorEvent::WorkerIdle { .. }))
+        .expect("sustained idle streak should emit WorkerIdle once threshold is crossed");
+    let payload = idle.to_json();
+    assert_eq!(payload["task_id"], "cas-1234");
+    assert_eq!(payload["task_state"], "awaiting_merge");
+    assert_eq!(payload["close_rejected_reason"], "MERGE REQUIRED");
+
+    // Same sustained idle streak, task still parked, nothing changed: ticks
+    // 3-5 must NOT re-emit WorkerIdle. This is the debounce-after-first-fire
+    // guarantee — `idle_already_emitted` stays set until `current_task`
+    // becomes `Some` again (worker picks up new work), not merely a
+    // few-tick cooldown.
+    for _ in 0..3 {
+        let repeat = detector.detect_changes(&data, None);
+        assert!(
+            !repeat
+                .iter()
+                .any(|event| matches!(event, DirectorEvent::WorkerIdle { .. })),
+            "repeated ticks within the same idle streak must not re-fire WorkerIdle \
+             for a still-parked task: {repeat:?}"
+        );
+    }
+}
+
 /// Regression test for cas-f9e8.
 ///
 /// Reproduces the close-X → start-Y race that caused spurious "Worker X is
@@ -1885,6 +1964,137 @@ fn test_9829_worker_stalled_streak_resets_when_activity_resumes() {
             }
         )),
         "a fresh stall after activity resumed must re-nudge, not escalate: {ev3:?}"
+    );
+}
+
+/// cas-728b: reproduces the exact 2026-07-07 false-positive class — two
+/// workers flagged stalled ~5m after a task started while still in a
+/// read-only investigation turn (zero checkpoint-class events by design).
+/// A genuine Open→InProgress transition must grant a grace period keyed to
+/// task-start, and that grace period must naturally elapse once the task
+/// has truly run past the threshold with zero activity since start.
+#[test]
+fn test_728b_worker_stalled_suppressed_within_grace_window_then_fires_once_elapsed() {
+    let t0 = std::time::Instant::now();
+    let base_utc = chrono::Utc::now();
+
+    let mut detector =
+        DirectorEventDetector::new(vec!["lively-crow".to_string()], "supervisor".to_string());
+    detector.set_stall_threshold_secs(300);
+
+    // Tick 1: task is still Open — nobody has started it yet. Establishes
+    // `last_state` so the next tick's Open→InProgress edge is detectable.
+    let open_data = DirectorData {
+        ready_tasks: vec![make_task(
+            "cas-6945",
+            "Dense investigation task",
+            TaskStatus::Open,
+            None,
+        )],
+        in_progress_tasks: vec![],
+        epic_tasks: vec![],
+        agents: vec![],
+        activity: vec![],
+        agent_id_to_name: [("agent-1".to_string(), "lively-crow".to_string())]
+            .into_iter()
+            .collect(),
+        changes: vec![],
+        git_loaded: true,
+        reminders: vec![],
+        epic_closed_counts: HashMap::new(),
+    };
+    detector.initialize(&open_data);
+
+    // Tick 2 (at base_utc): task just transitioned to InProgress. Worker is
+    // in its first read/plan turn — fresh heartbeat, but zero
+    // checkpoint-class activity ever recorded (`latest_activity: None`),
+    // exactly the repro's "explicitly instructed evidence-first, so zero
+    // file/git activity is the CORRECT behavior" shape.
+    let just_started = stalled_data_for(make_agent_working_stalled(
+        "agent-1",
+        "lively-crow",
+        "cas-6945",
+        5,    // fresh heartbeat
+        None, // no checkpoint activity ever recorded
+        base_utc,
+    ));
+    let ev_at_start = detector.detect_changes_at(&just_started, None, t0, base_utc);
+    assert!(
+        !ev_at_start
+            .iter()
+            .any(|e| matches!(e, DirectorEvent::WorkerStalled { .. })),
+        "must not fire immediately at task-start with zero checkpoint activity: {ev_at_start:?}"
+    );
+
+    // Tick 3: same task, still InProgress (no further status transition —
+    // just_transitioned_to_in_progress is now false), 310s later, STILL
+    // zero checkpoint activity. The grace period from tick 2 has now
+    // genuinely elapsed past the 300s threshold — must fire.
+    let later_utc = base_utc + chrono::Duration::seconds(310);
+    let still_quiet = stalled_data_for(make_agent_working_stalled(
+        "agent-1",
+        "lively-crow",
+        "cas-6945",
+        5,
+        None,
+        later_utc,
+    ));
+    let ev_later = detector.detect_changes_at(&still_quiet, None, t0, later_utc);
+    assert!(
+        ev_later.iter().any(|e| matches!(
+            e,
+            DirectorEvent::WorkerStalled {
+                escalate: false,
+                ..
+            }
+        )),
+        "grace period must naturally elapse once genuinely past the threshold: {ev_later:?}"
+    );
+}
+
+/// cas-728b: `transcript_confirms_stall_for_path` — the pure decision
+/// behind the transcript-mtime confirmation gate, split out for testing
+/// without a full `SqliteAgentStore` round-trip. Uses real temp files so
+/// this exercises the actual `std::fs::metadata` mtime read, not a mock.
+#[test]
+fn test_728b_transcript_confirms_stall_for_path_freshness_decision() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    // No path resolved at all (e.g. worker unresolvable, or is-wedged
+    // couldn't locate a transcript) — proceed with the checkpoint verdict.
+    assert!(
+        transcript_confirms_stall_for_path(None),
+        "missing transcript path must not block the checkpoint-age verdict"
+    );
+
+    // Path resolved but the file doesn't exist (mtime unreadable) — same
+    // fallback: proceed with the checkpoint verdict.
+    let missing = tmp.path().join("does-not-exist.jsonl");
+    assert!(
+        transcript_confirms_stall_for_path(Some(&missing)),
+        "unreadable transcript mtime must not block the checkpoint-age verdict"
+    );
+
+    // Just-written file: fresh mtime — the worker is evidently still
+    // producing output. Must suppress (return false).
+    let fresh = tmp.path().join("fresh.jsonl");
+    std::fs::write(&fresh, b"{}").unwrap();
+    assert!(
+        !transcript_confirms_stall_for_path(Some(&fresh)),
+        "a transcript written moments ago must suppress the stall verdict"
+    );
+
+    // File exists but its mtime is well past TRANSCRIPT_FRESH_WINDOW (60s)
+    // — the confirming signal agrees with the checkpoint-age verdict.
+    let stale = tmp.path().join("stale.jsonl");
+    std::fs::write(&stale, b"{}").unwrap();
+    let old_mtime = filetime::FileTime::from_system_time(
+        std::time::SystemTime::now() - std::time::Duration::from_secs(120),
+    );
+    filetime::set_file_mtime(&stale, old_mtime).unwrap();
+    assert!(
+        transcript_confirms_stall_for_path(Some(&stale)),
+        "a transcript stale past TRANSCRIPT_FRESH_WINDOW must not block the stall verdict"
     );
 }
 

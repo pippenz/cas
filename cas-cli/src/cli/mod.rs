@@ -19,7 +19,9 @@ mod config;
 mod config_tui;
 mod device;
 mod doctor;
-mod factory;
+// cas-728b: pub(crate) so ui::factory::director::events can reach
+// cli::factory::wedged's transcript-mtime liveness primitives.
+pub(crate) mod factory;
 mod factory_tooling;
 mod hook;
 mod init;
