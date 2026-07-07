@@ -29,6 +29,11 @@ pub enum TaskStatus {
     /// supervisor code-review dispatch. Only reachable when
     /// `[code_review] owner = "supervisor"` is set (cas-b51a).
     PendingSupervisorReview,
+    /// Worker close reached the merge-state guard and the worker's factory
+    /// branch is not on the target branch yet. The worker has no further
+    /// action until the supervisor merges the branch, but the task is still
+    /// open and closeable once the merge guard passes.
+    AwaitingMerge,
 }
 
 impl fmt::Display for TaskStatus {
@@ -39,6 +44,7 @@ impl fmt::Display for TaskStatus {
             TaskStatus::Blocked => write!(f, "blocked"),
             TaskStatus::Closed => write!(f, "closed"),
             TaskStatus::PendingSupervisorReview => write!(f, "pending_supervisor_review"),
+            TaskStatus::AwaitingMerge => write!(f, "awaiting_merge"),
         }
     }
 }
@@ -62,6 +68,10 @@ impl FromStr for TaskStatus {
             || s.eq_ignore_ascii_case("pending-supervisor-review")
         {
             Ok(TaskStatus::PendingSupervisorReview)
+        } else if s.eq_ignore_ascii_case("awaiting_merge")
+            || s.eq_ignore_ascii_case("awaiting-merge")
+        {
+            Ok(TaskStatus::AwaitingMerge)
         } else {
             Err(TypeError::InvalidTaskStatus(s.to_string()))
         }
@@ -400,11 +410,10 @@ impl Task {
         self.status != TaskStatus::Closed
     }
 
-    /// Check if the task is ready to work on (open, not blocked, not awaiting
-    /// supervisor review). PendingSupervisorReview is intentionally excluded
-    /// because the task cannot be picked up again by a worker until the
-    /// supervisor either approves (and closes) or rejects (and resets to
-    /// in_progress).
+    /// Check if the task is ready to work on. Waiting states like
+    /// PendingSupervisorReview and AwaitingMerge are intentionally excluded:
+    /// the task cannot be picked up again by a worker until the supervisor
+    /// resolves the waiting condition.
     pub fn is_ready(&self) -> bool {
         self.status == TaskStatus::Open
     }
@@ -485,6 +494,14 @@ mod tests {
             TaskStatus::from_str("pending-supervisor-review").unwrap(),
             TaskStatus::PendingSupervisorReview
         );
+        assert_eq!(
+            TaskStatus::from_str("awaiting_merge").unwrap(),
+            TaskStatus::AwaitingMerge
+        );
+        assert_eq!(
+            TaskStatus::from_str("awaiting-merge").unwrap(),
+            TaskStatus::AwaitingMerge
+        );
         assert!(TaskStatus::from_str("invalid").is_err());
     }
 
@@ -505,6 +522,21 @@ mod tests {
         // Still "open" (not closed) so dependents remain unblocked logic is sensible
         assert!(task.is_open());
         // But NOT ready — worker should not pick it up again until supervisor decides
+        assert!(!task.is_ready());
+    }
+
+    #[test]
+    fn test_awaiting_merge_display_roundtrip() {
+        let s = TaskStatus::AwaitingMerge.to_string();
+        assert_eq!(s, "awaiting_merge");
+        assert_eq!(TaskStatus::from_str(&s).unwrap(), TaskStatus::AwaitingMerge);
+    }
+
+    #[test]
+    fn test_awaiting_merge_is_open_not_ready() {
+        let mut task = Task::new("cas-test".to_string(), "Test".to_string());
+        task.status = TaskStatus::AwaitingMerge;
+        assert!(task.is_open());
         assert!(!task.is_ready());
     }
 

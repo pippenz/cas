@@ -179,6 +179,7 @@ impl CasCore {
                                 TaskStatus::Closed => "✓",
                                 // cas-b51a: awaiting supervisor code-review
                                 TaskStatus::PendingSupervisorReview => "⏳",
+                                TaskStatus::AwaitingMerge => "⇄",
                             };
                             output.push_str(&format!(
                                 "  {} {} [P{}] {}\n",
