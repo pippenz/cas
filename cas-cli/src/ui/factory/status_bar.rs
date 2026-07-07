@@ -49,35 +49,33 @@ impl StatusBar {
         let mode = match &app.input_mode {
             InputMode::Normal => Span::styled(
                 " NORMAL ",
-                Style::default()
-                    .fg(palette.text_primary)
-                    .bg(palette.status_info),
+                Style::default().fg(palette.chip_fg).bg(palette.status_info),
             ),
             InputMode::Inject => Span::styled(
                 " INJECT ",
                 Style::default()
-                    .fg(palette.text_primary)
+                    .fg(palette.chip_fg)
                     .bg(palette.status_warning),
             ),
             InputMode::PaneSelect => Span::styled(
                 " PANE ",
-                Style::default().fg(palette.text_primary).bg(palette.accent),
+                Style::default().fg(palette.chip_fg).bg(palette.accent),
             ),
             InputMode::Feedback => Span::styled(
                 " FEEDBACK ",
                 Style::default()
-                    .fg(palette.text_primary)
+                    .fg(palette.chip_fg)
                     .bg(palette.status_warning),
             ),
             InputMode::Resize => Span::styled(
                 " RESIZE ",
                 Style::default()
-                    .fg(palette.text_primary)
+                    .fg(palette.chip_fg)
                     .bg(palette.status_success),
             ),
             InputMode::Terminal => Span::styled(
                 " TERMINAL ",
-                Style::default().fg(palette.text_primary).bg(palette.accent),
+                Style::default().fg(palette.chip_fg).bg(palette.accent),
             ),
         };
         left_spans.push(mode);
@@ -88,7 +86,7 @@ impl StatusBar {
             left_spans.push(Span::styled(
                 " SELECT MODE — F10 to exit ",
                 Style::default()
-                    .fg(palette.text_primary)
+                    .fg(palette.chip_fg)
                     .bg(palette.status_warning)
                     .add_modifier(Modifier::BOLD),
             ));
@@ -146,7 +144,7 @@ impl StatusBar {
             left_spans.push(Span::styled(
                 " ● TERM ",
                 Style::default()
-                    .fg(palette.text_primary)
+                    .fg(palette.chip_fg)
                     .bg(palette.accent_dim)
                     .add_modifier(Modifier::BOLD),
             ));
@@ -230,17 +228,17 @@ impl StatusBar {
         if area.width >= 80 {
             if is_mc {
                 // Mission Control mode shortcuts
-                Self::add_shortcut(&mut right_spans, styles, "^W", " panes", styles.text_info);
+                Self::add_shortcut(&mut right_spans, styles, "^W", " panes", styles.hint_info);
                 right_spans.push(Span::raw(" │ "));
                 Self::add_shortcut(
                     &mut right_spans,
                     styles,
                     "Tab",
                     " focus",
-                    styles.text_accent,
+                    styles.hint_accent,
                 );
                 right_spans.push(Span::raw(" │ "));
-                right_spans.push(Span::styled("j/k", styles.text_info));
+                right_spans.push(Span::styled("j/k", styles.hint_info));
                 right_spans.push(Span::styled(" scroll", styles.text_muted));
                 right_spans.push(Span::raw(" │ "));
                 Self::add_shortcut(
@@ -248,10 +246,10 @@ impl StatusBar {
                     styles,
                     "Enter",
                     " detail",
-                    styles.text_success,
+                    styles.hint_success,
                 );
                 right_spans.push(Span::raw(" │ "));
-                right_spans.push(Span::styled("f/t/c/a", styles.text_warning));
+                right_spans.push(Span::styled("f/t/c/a", styles.hint_warning));
                 right_spans.push(Span::styled(" jump", styles.text_muted));
                 right_spans.push(Span::raw(" │ "));
                 Self::add_shortcut(
@@ -259,61 +257,61 @@ impl StatusBar {
                     styles,
                     "i",
                     " inject",
-                    styles.text_success,
+                    styles.hint_success,
                 );
                 right_spans.push(Span::raw(" │ "));
                 right_spans.push(Span::styled(
                     "q",
-                    styles.text_error.add_modifier(Modifier::BOLD),
+                    styles.hint_error.add_modifier(Modifier::BOLD),
                 ));
                 right_spans.push(Span::styled(" quit", styles.text_muted));
             } else if is_resize {
                 // Resize mode: show resize hints
                 right_spans.push(Span::styled(
                     "h/l",
-                    styles.text_accent.add_modifier(Modifier::BOLD),
+                    styles.hint_accent.add_modifier(Modifier::BOLD),
                 ));
                 right_spans.push(Span::styled(" workers", styles.text_muted));
                 right_spans.push(Span::raw(" │ "));
 
                 right_spans.push(Span::styled(
                     "j/k",
-                    styles.text_accent.add_modifier(Modifier::BOLD),
+                    styles.hint_accent.add_modifier(Modifier::BOLD),
                 ));
                 right_spans.push(Span::styled(" sidecar", styles.text_muted));
                 right_spans.push(Span::raw(" │ "));
 
                 right_spans.push(Span::styled(
                     "r",
-                    styles.text_warning.add_modifier(Modifier::BOLD),
+                    styles.hint_warning.add_modifier(Modifier::BOLD),
                 ));
                 right_spans.push(Span::styled(" reset", styles.text_muted));
                 right_spans.push(Span::raw(" │ "));
 
                 right_spans.push(Span::styled(
                     "Esc",
-                    styles.text_success.add_modifier(Modifier::BOLD),
+                    styles.hint_success.add_modifier(Modifier::BOLD),
                 ));
                 right_spans.push(Span::styled(" done", styles.text_muted));
             } else if is_pane_select {
                 // PaneSelect mode: show navigation hints
                 right_spans.push(Span::styled(
                     "hjkl",
-                    styles.text_accent.add_modifier(Modifier::BOLD),
+                    styles.hint_accent.add_modifier(Modifier::BOLD),
                 ));
                 right_spans.push(Span::styled(" move", styles.text_muted));
                 right_spans.push(Span::raw(" │ "));
 
                 right_spans.push(Span::styled(
                     "Enter",
-                    styles.text_success.add_modifier(Modifier::BOLD),
+                    styles.hint_success.add_modifier(Modifier::BOLD),
                 ));
                 right_spans.push(Span::styled(" copy", styles.text_muted));
                 right_spans.push(Span::raw(" │ "));
 
                 right_spans.push(Span::styled(
                     "Esc",
-                    styles.text_warning.add_modifier(Modifier::BOLD),
+                    styles.hint_warning.add_modifier(Modifier::BOLD),
                 ));
                 right_spans.push(Span::styled(" exit", styles.text_muted));
             } else if sidecar_focused {
@@ -326,76 +324,76 @@ impl StatusBar {
                     };
                     right_spans.push(Span::styled(
                         view_hint,
-                        styles.text_info.add_modifier(Modifier::BOLD),
+                        styles.hint_info.add_modifier(Modifier::BOLD),
                     ));
                     right_spans.push(Span::raw(" │ "));
                 }
                 right_spans.push(Span::styled(
                     "Enter",
-                    styles.text_success.add_modifier(Modifier::BOLD),
+                    styles.hint_success.add_modifier(Modifier::BOLD),
                 ));
                 right_spans.push(Span::styled(" detail", styles.text_muted));
                 right_spans.push(Span::raw(" │ "));
-                right_spans.push(Span::styled("j/k", styles.text_info));
+                right_spans.push(Span::styled("j/k", styles.hint_info));
                 right_spans.push(Span::styled(" scroll", styles.text_muted));
                 right_spans.push(Span::raw(" │ "));
-                right_spans.push(Span::styled("f", styles.text_warning));
+                right_spans.push(Span::styled("f", styles.hint_warning));
                 right_spans.push(Span::styled(" filter", styles.text_muted));
                 right_spans.push(Span::raw(" │ "));
-                right_spans.push(Span::styled("t/c/v", styles.text_accent));
+                right_spans.push(Span::styled("t/c/v", styles.hint_accent));
                 right_spans.push(Span::styled(" sections", styles.text_muted));
                 right_spans.push(Span::raw(" │ "));
-                right_spans.push(Span::styled("Esc", styles.text_warning));
+                right_spans.push(Span::styled("Esc", styles.hint_warning));
                 right_spans.push(Span::styled(" back", styles.text_muted));
                 right_spans.push(Span::raw(" │ "));
                 Self::add_shortcut(&mut right_spans, styles, "?", " help", styles.text_primary);
                 right_spans.push(Span::raw(" │ "));
                 right_spans.push(Span::styled(
                     "q",
-                    styles.text_error.add_modifier(Modifier::BOLD),
+                    styles.hint_error.add_modifier(Modifier::BOLD),
                 ));
                 right_spans.push(Span::styled(" quit", styles.text_muted));
             } else if input_focused {
                 // Input focused: keys go to pane, show Ctrl combos
                 right_spans.push(Span::styled(
                     "^P",
-                    styles.text_info.add_modifier(Modifier::BOLD),
+                    styles.hint_info.add_modifier(Modifier::BOLD),
                 ));
                 right_spans.push(Span::styled(" focus", styles.text_muted));
                 right_spans.push(Span::raw(" │ "));
 
-                right_spans.push(Span::styled("^N", styles.text_success));
+                right_spans.push(Span::styled("^N", styles.hint_success));
                 right_spans.push(Span::styled(" resize", styles.text_muted));
                 right_spans.push(Span::raw(" │ "));
 
-                right_spans.push(Span::styled("^R", styles.text_warning));
+                right_spans.push(Span::styled("^R", styles.hint_warning));
                 right_spans.push(Span::styled(" refresh", styles.text_muted));
                 right_spans.push(Span::raw(" │ "));
 
-                right_spans.push(Span::styled("^G", styles.text_accent));
+                right_spans.push(Span::styled("^G", styles.hint_accent));
                 right_spans.push(Span::styled(" term", styles.text_muted));
                 right_spans.push(Span::raw(" │ "));
-                Self::add_shortcut(&mut right_spans, styles, "^]", " sidecar", styles.text_info);
+                Self::add_shortcut(&mut right_spans, styles, "^]", " sidecar", styles.hint_info);
                 right_spans.push(Span::raw(" │ "));
                 Self::add_shortcut(
                     &mut right_spans,
                     styles,
                     "^W",
                     " dashboard",
-                    styles.text_accent,
+                    styles.hint_accent,
                 );
                 right_spans.push(Span::raw(" │ "));
 
-                right_spans.push(Span::styled("^Q", styles.text_error));
+                right_spans.push(Span::styled("^Q", styles.hint_error));
                 right_spans.push(Span::styled(" quit", styles.text_muted));
                 if app.error_message.is_some() {
                     right_spans.push(Span::raw(" │ "));
-                    right_spans.push(Span::styled("^E", styles.text_warning));
+                    right_spans.push(Span::styled("^E", styles.hint_warning));
                     right_spans.push(Span::styled(" dismiss err", styles.text_muted));
                 }
             } else {
                 // Worker focused: single-key shortcuts work
-                Self::add_shortcut(&mut right_spans, styles, "s", " sup", styles.text_info);
+                Self::add_shortcut(&mut right_spans, styles, "s", " sup", styles.hint_info);
                 right_spans.push(Span::raw(" │ "));
 
                 if has_workers {
@@ -404,7 +402,7 @@ impl StatusBar {
                         styles,
                         "1-9",
                         " workers",
-                        styles.text_accent,
+                        styles.hint_accent,
                     );
                     right_spans.push(Span::raw(" │ "));
                 }
@@ -414,109 +412,109 @@ impl StatusBar {
                     styles,
                     "i",
                     " inject",
-                    styles.text_success,
+                    styles.hint_success,
                 );
                 right_spans.push(Span::raw(" │ "));
-                Self::add_shortcut(&mut right_spans, styles, "^]", " sidecar", styles.text_info);
+                Self::add_shortcut(&mut right_spans, styles, "^]", " sidecar", styles.hint_info);
                 right_spans.push(Span::raw(" │ "));
                 Self::add_shortcut(
                     &mut right_spans,
                     styles,
                     "^W",
                     " dashboard",
-                    styles.text_accent,
+                    styles.hint_accent,
                 );
                 right_spans.push(Span::raw(" │ "));
                 Self::add_shortcut(&mut right_spans, styles, "?", " help", styles.text_primary);
                 right_spans.push(Span::raw(" │ "));
                 right_spans.push(Span::styled(
                     "q",
-                    styles.text_error.add_modifier(Modifier::BOLD),
+                    styles.hint_error.add_modifier(Modifier::BOLD),
                 ));
                 right_spans.push(Span::styled(" quit", styles.text_muted));
                 if app.error_message.is_some() {
                     right_spans.push(Span::raw(" │ "));
-                    right_spans.push(Span::styled("^E", styles.text_warning));
+                    right_spans.push(Span::styled("^E", styles.hint_warning));
                     right_spans.push(Span::styled(" dismiss err", styles.text_muted));
                 }
             }
         } else if area.width >= 50 {
             // Compact hints
             if is_mc {
-                right_spans.push(Span::styled("^W", styles.text_info));
+                right_spans.push(Span::styled("^W", styles.hint_info));
                 right_spans.push(Span::raw(" "));
-                right_spans.push(Span::styled("Tab", styles.text_accent));
+                right_spans.push(Span::styled("Tab", styles.hint_accent));
                 right_spans.push(Span::raw(" "));
-                right_spans.push(Span::styled("j/k", styles.text_info));
+                right_spans.push(Span::styled("j/k", styles.hint_info));
                 right_spans.push(Span::raw(" "));
-                right_spans.push(Span::styled("Enter", styles.text_success));
+                right_spans.push(Span::styled("Enter", styles.hint_success));
                 right_spans.push(Span::raw(" "));
-                right_spans.push(Span::styled("i", styles.text_success));
+                right_spans.push(Span::styled("i", styles.hint_success));
                 right_spans.push(Span::raw(" "));
-                right_spans.push(Span::styled("q", styles.text_error));
+                right_spans.push(Span::styled("q", styles.hint_error));
             } else if is_resize {
-                right_spans.push(Span::styled("h/l", styles.text_accent));
+                right_spans.push(Span::styled("h/l", styles.hint_accent));
                 right_spans.push(Span::raw(" "));
-                right_spans.push(Span::styled("j/k", styles.text_accent));
+                right_spans.push(Span::styled("j/k", styles.hint_accent));
                 right_spans.push(Span::raw(" "));
-                right_spans.push(Span::styled("r", styles.text_warning));
+                right_spans.push(Span::styled("r", styles.hint_warning));
                 right_spans.push(Span::raw(" "));
-                right_spans.push(Span::styled("Esc", styles.text_success));
+                right_spans.push(Span::styled("Esc", styles.hint_success));
             } else if is_pane_select {
-                right_spans.push(Span::styled("hjkl", styles.text_accent));
+                right_spans.push(Span::styled("hjkl", styles.hint_accent));
                 right_spans.push(Span::raw(" "));
-                right_spans.push(Span::styled("Enter", styles.text_success));
+                right_spans.push(Span::styled("Enter", styles.hint_success));
                 right_spans.push(Span::raw(" "));
-                right_spans.push(Span::styled("Esc", styles.text_warning));
+                right_spans.push(Span::styled("Esc", styles.hint_warning));
             } else if sidecar_focused {
-                right_spans.push(Span::styled("Enter", styles.text_success));
+                right_spans.push(Span::styled("Enter", styles.hint_success));
                 right_spans.push(Span::raw(" "));
-                right_spans.push(Span::styled("j/k", styles.text_info));
+                right_spans.push(Span::styled("j/k", styles.hint_info));
                 right_spans.push(Span::raw(" "));
-                right_spans.push(Span::styled("f", styles.text_warning));
+                right_spans.push(Span::styled("f", styles.hint_warning));
                 right_spans.push(Span::raw(" "));
-                right_spans.push(Span::styled("t/c/v", styles.text_accent));
+                right_spans.push(Span::styled("t/c/v", styles.hint_accent));
                 right_spans.push(Span::raw(" "));
                 Self::add_shortcut(&mut right_spans, styles, "?", "", styles.text_primary);
                 right_spans.push(Span::raw(" "));
-                right_spans.push(Span::styled("q", styles.text_error));
+                right_spans.push(Span::styled("q", styles.hint_error));
             } else if input_focused {
-                right_spans.push(Span::styled("^P", styles.text_info));
+                right_spans.push(Span::styled("^P", styles.hint_info));
                 right_spans.push(Span::raw(" "));
-                right_spans.push(Span::styled("^N", styles.text_success));
+                right_spans.push(Span::styled("^N", styles.hint_success));
                 right_spans.push(Span::raw(" "));
-                right_spans.push(Span::styled("^R", styles.text_warning));
+                right_spans.push(Span::styled("^R", styles.hint_warning));
                 right_spans.push(Span::raw(" "));
-                right_spans.push(Span::styled("^G", styles.text_accent));
+                right_spans.push(Span::styled("^G", styles.hint_accent));
                 right_spans.push(Span::raw(" "));
-                Self::add_shortcut(&mut right_spans, styles, "^]", "", styles.text_info);
+                Self::add_shortcut(&mut right_spans, styles, "^]", "", styles.hint_info);
                 right_spans.push(Span::raw(" "));
-                right_spans.push(Span::styled("^W", styles.text_accent));
+                right_spans.push(Span::styled("^W", styles.hint_accent));
                 right_spans.push(Span::raw(" "));
-                right_spans.push(Span::styled("^Q", styles.text_error));
+                right_spans.push(Span::styled("^Q", styles.hint_error));
                 if app.error_message.is_some() {
                     right_spans.push(Span::raw(" "));
-                    right_spans.push(Span::styled("^E", styles.text_warning));
+                    right_spans.push(Span::styled("^E", styles.hint_warning));
                 }
             } else {
-                Self::add_shortcut(&mut right_spans, styles, "s", "", styles.text_info);
+                Self::add_shortcut(&mut right_spans, styles, "s", "", styles.hint_info);
                 right_spans.push(Span::raw(" "));
                 if has_workers {
-                    right_spans.push(Span::styled("1-9", styles.text_accent));
+                    right_spans.push(Span::styled("1-9", styles.hint_accent));
                     right_spans.push(Span::raw(" "));
                 }
-                Self::add_shortcut(&mut right_spans, styles, "i", "", styles.text_success);
+                Self::add_shortcut(&mut right_spans, styles, "i", "", styles.hint_success);
                 right_spans.push(Span::raw(" "));
-                Self::add_shortcut(&mut right_spans, styles, "^]", "", styles.text_info);
+                Self::add_shortcut(&mut right_spans, styles, "^]", "", styles.hint_info);
                 right_spans.push(Span::raw(" "));
-                right_spans.push(Span::styled("^W", styles.text_accent));
+                right_spans.push(Span::styled("^W", styles.hint_accent));
                 right_spans.push(Span::raw(" "));
                 Self::add_shortcut(&mut right_spans, styles, "?", "", styles.text_primary);
                 right_spans.push(Span::raw(" "));
-                right_spans.push(Span::styled("q", styles.text_error));
+                right_spans.push(Span::styled("q", styles.hint_error));
                 if app.error_message.is_some() {
                     right_spans.push(Span::raw(" "));
-                    right_spans.push(Span::styled("^E", styles.text_warning));
+                    right_spans.push(Span::styled("^E", styles.hint_warning));
                 }
             }
         } else {
@@ -524,9 +522,9 @@ impl StatusBar {
             if is_mc {
                 right_spans.push(Span::styled("^W Tab jk Enter i q", styles.text_muted));
             } else if is_resize {
-                right_spans.push(Span::styled("hjkl r Esc", styles.text_accent));
+                right_spans.push(Span::styled("hjkl r Esc", styles.hint_accent));
             } else if is_pane_select {
-                right_spans.push(Span::styled("hjkl Esc", styles.text_accent));
+                right_spans.push(Span::styled("hjkl Esc", styles.hint_accent));
             } else if sidecar_focused {
                 right_spans.push(Span::styled("Enter jk Esc ? q", styles.text_muted));
             } else if input_focused {

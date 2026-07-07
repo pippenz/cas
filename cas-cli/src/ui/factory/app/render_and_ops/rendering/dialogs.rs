@@ -39,20 +39,20 @@ impl FactoryApp {
             Span::styled(
                 prefix,
                 Style::default()
-                    .fg(palette.text_primary)
+                    .fg(palette.chip_fg)
                     .bg(palette.status_error)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 format!(" {truncated}"),
                 Style::default()
-                    .fg(palette.text_primary)
+                    .fg(palette.chip_fg)
                     .bg(palette.status_error),
             ),
             Span::styled(
                 dismiss,
                 Style::default()
-                    .fg(palette.text_primary)
+                    .fg(palette.chip_fg)
                     .bg(palette.status_error)
                     .add_modifier(Modifier::DIM),
             ),
@@ -910,7 +910,7 @@ impl FactoryApp {
                 let is_selected = *cat == self.feedback_category;
                 let style = if is_selected {
                     Style::default()
-                        .fg(palette.text_primary)
+                        .fg(palette.chip_fg)
                         .bg(palette.status_warning)
                         .add_modifier(Modifier::BOLD)
                 } else {

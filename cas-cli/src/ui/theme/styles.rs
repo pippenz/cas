@@ -131,6 +131,16 @@ pub struct Styles {
     pub hint_key_primary: Style,
     pub hint_description: Style,
 
+    // Keybind hint-key colors (cas-7bf4) — status-bar right-side hint row
+    // (^P focus, ^Q quit, etc). Same semantic mapping as text_info/success/
+    // warning/error/accent but split so light mode can be darkened for
+    // legibility without touching the shared status/accent chip-bg colors.
+    pub hint_info: Style,
+    pub hint_success: Style,
+    pub hint_warning: Style,
+    pub hint_error: Style,
+    pub hint_accent: Style,
+
     // Markdown rendering
     pub md_h1: Style,
     pub md_h2: Style,
@@ -286,6 +296,13 @@ impl Styles {
                 .fg(p.hint_key_primary)
                 .add_modifier(Modifier::BOLD),
             hint_description: Style::default().fg(p.hint_description),
+
+            // Keybind hint-key colors (cas-7bf4)
+            hint_info: Style::default().fg(p.hint_info),
+            hint_success: Style::default().fg(p.hint_success),
+            hint_warning: Style::default().fg(p.hint_warning),
+            hint_error: Style::default().fg(p.hint_error),
+            hint_accent: Style::default().fg(p.hint_accent),
 
             // Markdown rendering
             md_h1: Style::default()
