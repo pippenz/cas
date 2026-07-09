@@ -1117,15 +1117,244 @@ async fn test_stale_local_epic_ref_falls_back_to_origin_cas_38e2() {
     );
 }
 
-/// cas-4b3f (AC c): reproduces BUG-close-guard-nonepic-task-targets-main.md.
-/// A standalone (non-epic) task whose worker has fully committed and merged
-/// their work onto an INTEGRATION branch that isn't `main` must not have its
-/// merge-gate target silently default to `main` — that produces a false
-/// MERGE REQUIRED that no worker action can resolve (the branch legitimately
-/// never touches `main`). Post-fix, a task with no resolvable parent epic
-/// branch skips the merge-state gate entirely instead of guessing "main".
+/// cas-cf64 (P2, anchor freshness — Scenario B): park → merge → close →
+/// REOPEN → rework → close again must NOT silently Proceed using the
+/// stale anchor from the FIRST close cycle. Before this fix,
+/// `park_task_awaiting_merge`'s `is_none()` guard meant the anchor (set to
+/// the tip at the first rejection) was NEVER cleared or updated once a
+/// task closed and was later reopened — so a second round of genuinely
+/// new, unmerged work would still check against the OLD (already-merged)
+/// anchor and false-Proceed. Post-fix, both `cas_task_reopen` and a
+/// successful close clear the anchor, so the reworked task's retry
+/// correctly re-evaluates from scratch.
 #[tokio::test]
-async fn test_nonepic_task_does_not_default_merge_target_to_main_cas_4b3f() {
+async fn test_reopened_task_does_not_reuse_stale_anchor_cas_cf64() {
+    use std::process::Command;
+
+    let (temp, service) = setup_cas();
+    let _env_lock = env_test_lock();
+    let cas_dir = temp.path().join(".cas");
+    let agent_store = open_agent_store(&cas_dir).expect("open agent store");
+    {
+        let mut agent = agent_store
+            .list(None)
+            .expect("list agents")
+            .into_iter()
+            .find(|agent| agent.name == "test-agent")
+            .expect("test agent exists");
+        agent.role = AgentRole::Worker;
+        agent_store.update(&agent).expect("mark test agent worker");
+    }
+
+    std::fs::write(
+        cas_dir.join("config.toml"),
+        "[verification]\nenabled = true\n",
+    )
+    .expect("write config");
+
+    let repo = temp.path();
+    let git = |args: &[&str]| {
+        let ok = Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .status()
+            .expect("git")
+            .success();
+        assert!(ok, "git {args:?} failed");
+    };
+    git(&["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("seed.txt"), "seed\n").unwrap();
+    git(&["add", "seed.txt"]);
+    git(&["commit", "-q", "-m", "seed"]);
+    git(&["checkout", "-q", "-b", "epic/cas-cf64-scenario-b"]);
+    git(&["checkout", "-q", "-b", "factory/test-agent"]);
+    std::fs::write(repo.join("v1.txt"), "first pass\n").unwrap();
+    git(&["add", "v1.txt"]);
+    git(&["commit", "-q", "-m", "feat: first pass"]);
+
+    let task_store = open_task_store(&cas_dir).expect("open task store");
+
+    let epic_id = extract_task_id(&extract_text(
+        service
+            .cas_task_create(Parameters(TaskCreateRequest {
+                depth: None,
+                title: "Anchor-freshness epic".to_string(),
+                description: None,
+                priority: 2,
+                task_type: "epic".to_string(),
+                labels: None,
+                notes: None,
+                blocked_by: None,
+                design: None,
+                acceptance_criteria: None,
+                external_ref: None,
+                assignee: None,
+                demo_statement: None,
+                execution_note: None,
+                epic: None,
+            }))
+            .await
+            .expect("create epic"),
+    ))
+    .expect("epic id")
+    .to_string();
+    {
+        let mut epic = task_store.get(&epic_id).expect("epic exists");
+        epic.branch = Some("epic/cas-cf64-scenario-b".to_string());
+        task_store.update(&epic).expect("update epic branch");
+    }
+
+    let id_a = extract_task_id(&extract_text(
+        service
+            .cas_task_create(Parameters(TaskCreateRequest {
+                epic: Some(epic_id.clone()),
+                ..simple_task_req("Task A")
+            }))
+            .await
+            .expect("create A"),
+    ))
+    .expect("id A")
+    .to_string();
+    service
+        .cas_task_start(Parameters(IdRequest { id: id_a.clone() }))
+        .await
+        .expect("start A");
+    {
+        let mut task_a = task_store.get(&id_a).expect("A exists after start");
+        task_a.assignee = Some("test-agent".to_string());
+        task_store.update(&task_a).expect("set A assignee");
+    }
+
+    // First close attempt: MERGE REQUIRED — parks and snapshots the anchor.
+    let first_close = extract_text(
+        service
+            .cas_task_close(Parameters(TaskCloseRequest {
+                id: id_a.clone(),
+                reason: Some("ready for merge".to_string()),
+                bypass_code_review: None,
+                code_review_findings: None,
+            }))
+            .await
+            .expect("first close returns"),
+    );
+    assert!(
+        first_close.contains("MERGE REQUIRED"),
+        "first close must reject on stranded factory branch: {first_close}"
+    );
+    let parked = task_store.get(&id_a).expect("A exists");
+    assert!(
+        parked.deliverables.factory_branch_anchor.is_some(),
+        "first rejection must snapshot the anchor"
+    );
+
+    // Supervisor merges the first-pass commit into the epic branch.
+    git(&["checkout", "-q", "epic/cas-cf64-scenario-b"]);
+    git(&["merge", "-q", "--no-ff", "factory/test-agent"]);
+    git(&["checkout", "-q", "factory/test-agent"]);
+
+    let verification_store = open_verification_store(&cas_dir).expect("open verification store");
+    verification_store
+        .add(&Verification::approved(
+            "ver-cas-cf64-first".to_string(),
+            id_a.clone(),
+            "Simulated approval after first merge".to_string(),
+        ))
+        .expect("record verification approval");
+
+    let second_close = extract_text(
+        service
+            .cas_task_close(Parameters(TaskCloseRequest {
+                id: id_a.clone(),
+                reason: Some("merged, closing".to_string()),
+                bypass_code_review: None,
+                code_review_findings: None,
+            }))
+            .await
+            .expect("second close returns"),
+    );
+    assert!(
+        second_close.contains("Closed task:"),
+        "close must succeed once the anchored commit is merged: {second_close}"
+    );
+    assert_eq!(
+        task_store.get(&id_a).expect("A exists").status,
+        TaskStatus::Closed
+    );
+
+    // Reopen the task — this must clear the stale anchor.
+    let reopen_text = extract_text(
+        service
+            .cas_task_reopen(Parameters(IdRequest { id: id_a.clone() }))
+            .await
+            .expect("reopen returns"),
+    );
+    assert!(
+        reopen_text.contains("Reopened task:"),
+        "reopen should succeed: {reopen_text}"
+    );
+    let reopened = task_store.get(&id_a).expect("A exists");
+    assert_eq!(reopened.status, TaskStatus::Open);
+    assert!(
+        reopened.deliverables.factory_branch_anchor.is_none(),
+        "reopen must clear the stale factory_branch_anchor"
+    );
+
+    // Worker reworks the SAME task on the SAME branch — a genuinely new,
+    // unmerged commit.
+    service
+        .cas_task_start(Parameters(IdRequest { id: id_a.clone() }))
+        .await
+        .expect("restart A after reopen");
+    {
+        let mut task_a = task_store.get(&id_a).expect("A exists after restart");
+        task_a.assignee = Some("test-agent".to_string());
+        task_store.update(&task_a).expect("set A assignee again");
+    }
+    std::fs::write(repo.join("v2.txt"), "reworked, NOT yet merged\n").unwrap();
+    git(&["add", "v2.txt"]);
+    git(&["commit", "-q", "-m", "feat: rework after reopen"]);
+
+    let third_close = extract_text(
+        service
+            .cas_task_close(Parameters(TaskCloseRequest {
+                id: id_a.clone(),
+                reason: Some("reworked, claiming done".to_string()),
+                bypass_code_review: None,
+                code_review_findings: None,
+            }))
+            .await
+            .expect("third close returns"),
+    );
+    assert!(
+        third_close.contains("MERGE REQUIRED"),
+        "the reworked commit must be caught as unmerged — a stale anchor \
+         from the FIRST close cycle must not let this silently Proceed: {third_close}"
+    );
+    assert_ne!(
+        task_store.get(&id_a).expect("A exists").status,
+        TaskStatus::Closed,
+        "rejected close must not transition task to Closed"
+    );
+}
+
+/// cas-4b3f (AC c): reproduces BUG-close-guard-nonepic-task-targets-main.md.
+/// A standalone (non-epic) task whose worker has fully committed AND
+/// MERGED their work onto the repo's real integration branch (resolved via
+/// `resolve_standalone_merge_target` — here git's detected default branch,
+/// `main`, since no `[factory] epic_base_branch` override is configured)
+/// must close cleanly. cas-cf64 replaced cas-4b3f's "skip the gate when no
+/// epic parent" behavior with "resolve the REAL target and actually check
+/// it" — this proves the positive (already-integrated) side of that still
+/// works, not just the negative (still-unmerged) side covered by the
+/// sibling test below.
+#[tokio::test]
+async fn test_nonepic_task_resolves_default_branch_and_proceeds_when_merged_cas_cf64() {
     use std::process::Command;
 
     let (temp, service) = setup_cas();
@@ -1158,22 +1387,21 @@ async fn test_nonepic_task_does_not_default_merge_target_to_main_cas_4b3f() {
     std::fs::write(repo.join("seed.txt"), "seed\n").unwrap();
     git(&["add", "seed.txt"]);
     git(&["commit", "-q", "-m", "seed"]);
-    // The worker's real integration branch — `main` never sees these
-    // commits, mirroring the bug doc's rows ("committed, merged onto epic
-    // cas-2abd" but the guard demanded main).
-    git(&["checkout", "-q", "-b", "epic/some-slug"]);
     git(&["checkout", "-q", "-b", "factory/standalone-worker"]);
     std::fs::write(repo.join("work.rs"), "// standalone work\n").unwrap();
     git(&["add", "work.rs"]);
     git(&["commit", "-q", "-m", "feat: standalone task work"]);
+    // Actually merge into the repo's real default branch — this is what
+    // "already integrated" genuinely means when there's no epic parent.
+    git(&["checkout", "-q", "main"]);
+    git(&["merge", "-q", "--no-ff", "factory/standalone-worker"]);
+    git(&["checkout", "-q", "factory/standalone-worker"]);
 
     let create_req = TaskCreateRequest {
         depth: None,
-        title: "cas-4b3f regression: no-epic close must not default to main".to_string(),
+        title: "cas-cf64: no-epic close resolves default branch, proceeds when merged".to_string(),
         description: None,
         priority: 2,
-        // Deliberately a code-expecting type (not chore/spike) to prove
-        // the fix is about the missing epic parent, not a type exemption.
         task_type: "task".to_string(),
         labels: None,
         notes: None,
@@ -1203,7 +1431,7 @@ async fn test_nonepic_task_does_not_default_merge_target_to_main_cas_4b3f() {
 
     let close_req = TaskCloseRequest {
         id: id.clone(),
-        reason: Some("done, merged onto the epic branch (not main)".to_string()),
+        reason: Some("done, merged onto main".to_string()),
         bypass_code_review: None,
         code_review_findings: None,
     };
@@ -1215,13 +1443,288 @@ async fn test_nonepic_task_does_not_default_merge_target_to_main_cas_4b3f() {
     );
     assert!(
         !resp.contains("MERGE REQUIRED"),
-        "a task with no parent epic must not default its merge target to \
-         `main` and false-reject — pre-fix this rejected even though the \
-         work is fully committed on the worker's real integration branch: {resp}"
+        "work already merged onto the resolved default branch must not \
+         false-reject: {resp}"
     );
     assert!(
         resp.contains("Closed task:"),
-        "close should otherwise succeed once the false merge-gate is skipped: {resp}"
+        "close should succeed once the resolved target genuinely contains the work: {resp}"
+    );
+}
+
+/// cas-cf64 (P2, standalone-task backstop gap): the negative side of the
+/// test above — a standalone (non-epic) task whose worker committed real
+/// code to `factory/<assignee>` but NEVER merged it anywhere must now be
+/// REJECTED at close. Before this fix, cas-4b3f's "skip the gate when no
+/// epic parent resolves" left exactly this hole: the code above proves the
+/// gate now runs against the REAL resolved target (git's detected default
+/// branch, `main`, absent a configured override) instead of skipping.
+#[tokio::test]
+async fn test_nonepic_task_with_unmerged_code_is_rejected_not_skipped_cas_cf64() {
+    use std::process::Command;
+
+    let (temp, service) = setup_cas();
+    let _env_lock = env_test_lock();
+    let cas_dir = temp.path().join(".cas");
+
+    std::fs::write(
+        cas_dir.join("config.toml"),
+        "[verification]\nenabled = false\n",
+    )
+    .expect("write config");
+
+    let repo = temp.path();
+    let git = |args: &[&str]| {
+        let ok = Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .status()
+            .expect("git")
+            .success();
+        assert!(ok, "git {args:?} failed");
+    };
+    git(&["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("seed.txt"), "seed\n").unwrap();
+    git(&["add", "seed.txt"]);
+    git(&["commit", "-q", "-m", "seed"]);
+    git(&["checkout", "-q", "-b", "factory/standalone-worker"]);
+    std::fs::write(repo.join("work.rs"), "// standalone work, never merged\n").unwrap();
+    git(&["add", "work.rs"]);
+    git(&["commit", "-q", "-m", "feat: standalone task work"]);
+    // Deliberately NOT merged into main or anywhere else.
+
+    let create_req = TaskCreateRequest {
+        depth: None,
+        title: "cas-cf64: no-epic close with unmerged code must reject".to_string(),
+        description: None,
+        priority: 2,
+        task_type: "task".to_string(),
+        labels: None,
+        notes: None,
+        blocked_by: None,
+        design: None,
+        acceptance_criteria: None,
+        external_ref: None,
+        assignee: None,
+        demo_statement: None,
+        execution_note: None,
+        epic: None, // <-- standalone, no epic parent recorded
+    };
+    let id = extract_task_id(&extract_text(
+        service
+            .cas_task_create(Parameters(create_req))
+            .await
+            .expect("task_create"),
+    ))
+    .expect("task id")
+    .to_string();
+
+    let task_store = open_task_store(&cas_dir).expect("open task store");
+    let mut task = task_store.get(&id).expect("task exists");
+    task.status = TaskStatus::InProgress;
+    task.assignee = Some("standalone-worker".to_string());
+    task_store.update(&task).expect("update task");
+
+    let close_req = TaskCloseRequest {
+        id: id.clone(),
+        reason: Some("claiming done but never merged".to_string()),
+        bypass_code_review: None,
+        code_review_findings: None,
+    };
+    let resp = extract_text(
+        service
+            .cas_task_close(Parameters(close_req))
+            .await
+            .expect("close returns result"),
+    );
+    assert!(
+        resp.contains("MERGE REQUIRED"),
+        "a standalone task with real committed-unmerged code on \
+         factory/<assignee> must be rejected, not silently skipped: {resp}"
+    );
+    assert!(
+        resp.contains("main"),
+        "rejection must name the resolved real target (git's detected \
+         default branch), not skip or say nothing: {resp}"
+    );
+    assert_ne!(
+        task_store.get(&id).expect("task exists").status,
+        TaskStatus::Closed,
+        "rejected close must not transition task to Closed"
+    );
+}
+
+/// cas-cf64 (Chore/Spike no longer exempt): a Chore-type standalone task
+/// that commits real code to `factory/<assignee>` and never merges it must
+/// ALSO be rejected — cas-4b3f's type-based exemption (Chore/Spike skip
+/// this gate outright) was the other half of the backstop gap.
+#[tokio::test]
+async fn test_chore_type_task_with_unmerged_code_is_no_longer_exempt_cas_cf64() {
+    use std::process::Command;
+
+    let (temp, service) = setup_cas();
+    let _env_lock = env_test_lock();
+    let cas_dir = temp.path().join(".cas");
+
+    std::fs::write(
+        cas_dir.join("config.toml"),
+        "[verification]\nenabled = false\n",
+    )
+    .expect("write config");
+
+    let repo = temp.path();
+    let git = |args: &[&str]| {
+        let ok = Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .status()
+            .expect("git")
+            .success();
+        assert!(ok, "git {args:?} failed");
+    };
+    git(&["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("seed.txt"), "seed\n").unwrap();
+    git(&["add", "seed.txt"]);
+    git(&["commit", "-q", "-m", "seed"]);
+    git(&["checkout", "-q", "-b", "factory/chore-worker"]);
+    std::fs::write(repo.join("cleanup.rs"), "// chore cleanup, never merged\n").unwrap();
+    git(&["add", "cleanup.rs"]);
+    git(&["commit", "-q", "-m", "chore: cleanup"]);
+
+    let create_req = TaskCreateRequest {
+        depth: None,
+        title: "cas-cf64: chore-type task with unmerged code must reject".to_string(),
+        description: None,
+        priority: 2,
+        task_type: "chore".to_string(),
+        labels: None,
+        notes: None,
+        blocked_by: None,
+        design: None,
+        acceptance_criteria: None,
+        external_ref: None,
+        assignee: None,
+        demo_statement: None,
+        execution_note: None,
+        epic: None,
+    };
+    let id = extract_task_id(&extract_text(
+        service
+            .cas_task_create(Parameters(create_req))
+            .await
+            .expect("task_create"),
+    ))
+    .expect("task id")
+    .to_string();
+
+    let task_store = open_task_store(&cas_dir).expect("open task store");
+    let mut task = task_store.get(&id).expect("task exists");
+    task.status = TaskStatus::InProgress;
+    task.assignee = Some("chore-worker".to_string());
+    task_store.update(&task).expect("update task");
+
+    let close_req = TaskCloseRequest {
+        id: id.clone(),
+        reason: Some("claiming done but never merged".to_string()),
+        bypass_code_review: None,
+        code_review_findings: None,
+    };
+    let resp = extract_text(
+        service
+            .cas_task_close(Parameters(close_req))
+            .await
+            .expect("close returns result"),
+    );
+    assert!(
+        resp.contains("MERGE REQUIRED"),
+        "a Chore-type task with real committed-unmerged code must no longer \
+         be exempt from the merge-state gate: {resp}"
+    );
+    assert_ne!(
+        task_store.get(&id).expect("task exists").status,
+        TaskStatus::Closed,
+        "rejected close must not transition task to Closed"
+    );
+}
+
+/// cas-cf64 negative control (preserve the original cas-4b3f intent): a
+/// Chore-type task with genuinely NO code (docs/notes-only, no factory
+/// branch at all) must still close on notes alone — dropping the type
+/// exemption must not turn every docs-only chore into a false reject.
+#[tokio::test]
+async fn test_chore_type_task_with_zero_commits_still_closes_on_notes_cas_cf64() {
+    let (temp, service) = setup_cas();
+    let _env_lock = env_test_lock();
+    let cas_dir = temp.path().join(".cas");
+
+    std::fs::write(
+        cas_dir.join("config.toml"),
+        "[verification]\nenabled = false\n",
+    )
+    .expect("write config");
+
+    let create_req = TaskCreateRequest {
+        depth: None,
+        title: "cas-cf64: docs-only chore, no factory branch at all".to_string(),
+        description: None,
+        priority: 2,
+        task_type: "chore".to_string(),
+        labels: None,
+        notes: None,
+        blocked_by: None,
+        design: None,
+        acceptance_criteria: None,
+        external_ref: None,
+        assignee: None,
+        demo_statement: None,
+        execution_note: None,
+        epic: None,
+    };
+    let id = extract_task_id(&extract_text(
+        service
+            .cas_task_create(Parameters(create_req))
+            .await
+            .expect("task_create"),
+    ))
+    .expect("task id")
+    .to_string();
+
+    // No factory/<assignee> branch is ever created for this assignee — the
+    // gate must gracefully treat "branch doesn't exist" as merged, same as
+    // every other gate in this file.
+    let task_store = open_task_store(&cas_dir).expect("open task store");
+    let mut task = task_store.get(&id).expect("task exists");
+    task.status = TaskStatus::InProgress;
+    task.assignee = Some("someone-with-no-branch".to_string());
+    task_store.update(&task).expect("update task");
+
+    let close_req = TaskCloseRequest {
+        id: id.clone(),
+        reason: Some("resolved via notes, no code needed".to_string()),
+        bypass_code_review: None,
+        code_review_findings: None,
+    };
+    let resp = extract_text(
+        service
+            .cas_task_close(Parameters(close_req))
+            .await
+            .expect("close returns result"),
+    );
+    assert!(
+        resp.contains("Closed task:"),
+        "a genuinely no-code chore must still close on notes alone: {resp}"
     );
 }
 
