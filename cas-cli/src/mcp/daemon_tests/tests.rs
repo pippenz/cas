@@ -93,6 +93,36 @@ fn apply_factory_worker_metadata_records_worker_model_effort_and_clone_path() {
     );
 }
 
+/// cas-921f (P1 fix-round): the real env→register→resolve chain for a
+/// worker's harness, end to end — from a REAL `CAS_FACTORY_WORKER_CLI` env
+/// var (not injected `Agent.metadata` directly, which is what the earlier
+/// factory_ops.rs `worker_cli_from_agent` tests do and why they missed the
+/// live bug: `PtyConfig::grok` never actually set this env var, so
+/// `apply_factory_worker_metadata` never had anything to read). Proves the
+/// full path: env var → `apply_factory_worker_metadata` → `agent.metadata`
+/// → `worker_cli_from_agent` → `SupervisorCli::Grok`.
+#[test]
+fn apply_factory_worker_metadata_real_env_persists_worker_cli_grok() {
+    let _env = EnvVarGuard::set(&[
+        ("CAS_AGENT_ROLE", Some("worker")),
+        ("CAS_FACTORY_WORKER_CLI", Some("grok")),
+    ]);
+    let mut agent = Agent::new("agent-id".to_string(), "grok-worker".to_string());
+
+    apply_factory_worker_metadata(&mut agent, None);
+
+    assert_eq!(
+        agent.metadata.get("worker_cli").map(String::as_str),
+        Some("grok")
+    );
+    assert_eq!(
+        crate::mcp::tools::service::factory_ops::worker_cli_from_agent(&agent),
+        cas_mux::SupervisorCli::Grok,
+        "the persisted metadata must round-trip through worker_cli_from_agent \
+         to the real Grok harness, not silently default to Claude"
+    );
+}
+
 #[test]
 fn apply_factory_worker_metadata_skips_model_effort_for_non_worker() {
     let _env = EnvVarGuard::set(&[
