@@ -1,8 +1,9 @@
-//! Integration + unit tests for the `cas claude` / `cas codex` / `cas default`
-//! provider-shortcut feature (cas-7f2c).
+//! Integration + unit tests for the `cas claude` / `cas codex` / `cas grok` /
+//! `cas default` provider-shortcut feature (cas-7f2c, extended by EPIC cas-8888
+//! Phase 3 / cas-964a for Grok).
 //!
 //! Coverage:
-//! - CLI parse: `cas claude --help`, `cas codex --help`, `cas default --help`
+//! - CLI parse: `cas claude --help`, `cas codex --help`, `cas grok --help`, `cas default --help`
 //! - `cas default <provider>` round-trip: persists to config, confirmation printed
 //! - `cas default <invalid>` → non-zero exit + useful error
 //! - Precedence regression: `cas claude` with persisted codex default uses Claude
@@ -42,6 +43,16 @@ fn test_codex_help_shows_shortcut_description() {
 }
 
 #[test]
+fn test_grok_help_shows_shortcut_description() {
+    cas_cmd()
+        .args(["grok", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("supervisor"))
+        .stdout(predicate::str::contains("--default"));
+}
+
+#[test]
 fn test_default_help() {
     cas_cmd()
         .args(["default", "--help"])
@@ -49,7 +60,8 @@ fn test_default_help() {
         .success()
         .stdout(predicate::str::contains("PROVIDER"))
         .stdout(predicate::str::contains("claude"))
-        .stdout(predicate::str::contains("codex"));
+        .stdout(predicate::str::contains("codex"))
+        .stdout(predicate::str::contains("grok"));
 }
 
 // `cas claude` and `cas codex` pass all factory flags through.
@@ -66,6 +78,14 @@ fn test_claude_accepts_factory_flags() {
 fn test_codex_accepts_factory_flags() {
     cas_cmd()
         .args(["codex", "--workers", "0", "--help"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn test_grok_accepts_factory_flags() {
+    cas_cmd()
+        .args(["grok", "--workers", "0", "--help"])
         .assert()
         .success();
 }
@@ -129,6 +149,23 @@ fn test_default_claude_persists_to_config() {
     assert!(
         content.contains(r#"harness = "claude""#),
         "harness = \"claude\" not found in config:\n{content}"
+    );
+}
+
+#[test]
+fn test_default_grok_persists_to_config() {
+    let (_temp, config_path, stdout) = run_default_in_temp("grok");
+
+    assert!(
+        stdout.contains("supervisor default set to grok"),
+        "Expected confirmation line, got: {stdout}"
+    );
+
+    assert!(config_path.exists(), "config.toml was not created");
+    let content = std::fs::read_to_string(&config_path).unwrap();
+    assert!(
+        content.contains(r#"harness = "grok""#),
+        "harness = \"grok\" not found in config:\n{content}"
     );
 }
 

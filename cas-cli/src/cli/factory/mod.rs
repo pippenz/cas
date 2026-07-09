@@ -1278,7 +1278,8 @@ fn resolve_cli_choice(
             "{role} 'codex' is not installed. Install from https://developers.openai.com/codex"
         ),
         cas_mux::SupervisorCli::Grok => bail!(
-            "{role} 'grok' is not installed. Install the xAI Grok Build CLI (see https://x.ai)"
+            "{role} 'grok' is not installed. Install the xAI Grok Build CLI: \
+             curl -fsSL https://x.ai/cli/install.sh | bash"
         ),
     }
 }
@@ -1525,6 +1526,58 @@ fn preflight_factory_launch(
 mod tests {
     use super::*;
     use crate::ui::factory::FactoryConfig;
+
+    // EPIC cas-8888 (cas-964a, Phase 3): resolve_cli_choice's Grok arm.
+    #[test]
+    fn resolve_cli_choice_grok_installed_passes_through() {
+        let mut notices = Vec::new();
+        let result = resolve_cli_choice(
+            "supervisor",
+            "grok",
+            true,  // allow_default_fallback
+            true,  // claude_installed
+            true,  // codex_installed
+            true,  // grok_installed
+            &mut notices,
+        );
+        assert_eq!(result.unwrap(), cas_mux::SupervisorCli::Grok);
+        assert!(notices.is_empty(), "no fallback notice expected: {notices:?}");
+    }
+
+    #[test]
+    fn resolve_cli_choice_grok_missing_bails_with_installer_command() {
+        let mut notices = Vec::new();
+        let err = resolve_cli_choice(
+            "supervisor",
+            "grok",
+            true, // allow_default_fallback — irrelevant: Grok has no 3-way fallback dance
+            true, // claude_installed
+            true, // codex_installed
+            false, // grok_installed
+            &mut notices,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("'grok' is not installed"), "got: {msg}");
+        assert!(
+            msg.contains("curl -fsSL https://x.ai/cli/install.sh | bash"),
+            "bail message should carry the exact installer command per cas-964a's AC, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_cli_choice_grok_missing_does_not_silently_fall_back() {
+        // Unlike Claude<->Codex, an explicit `--cli grok` request that's not
+        // installed must bail rather than silently swap to whatever else is
+        // on PATH — even with allow_default_fallback=true and both Claude and
+        // Codex installed.
+        let mut notices = Vec::new();
+        let result = resolve_cli_choice(
+            "supervisor", "grok", true, true, true, false, &mut notices,
+        );
+        assert!(result.is_err());
+        assert!(notices.is_empty(), "grok must not push a fallback notice: {notices:?}");
+    }
 
     #[test]
     fn test_factory_config_default() {
