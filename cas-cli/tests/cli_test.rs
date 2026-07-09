@@ -171,6 +171,43 @@ fn test_init_force_reinit() {
         .stdout(predicate::str::contains("CAS initialized"));
 }
 
+/// EPIC cas-8888 (cas-6f46, Phase 5): a pre-existing `.grok/` dir (the
+/// opt-in signal `detect_agent_defaults` looks for) must cause `cas init`
+/// to sync the Grok builtin skill twins, using the `cas__` tool prefix —
+/// end-to-end proof that the config.agents.grok wiring actually runs,
+/// not just that the underlying sync function works in isolation.
+#[test]
+fn test_init_json_syncs_grok_builtins_when_grok_dir_present() {
+    let temp = TempDir::new().unwrap();
+    std::fs::create_dir_all(temp.path().join(".grok")).unwrap();
+
+    cas_cmd()
+        .current_dir(&temp)
+        .args(["init", "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"grok\":true"));
+
+    let worker_skill = temp.path().join(".grok/skills/cas-worker/SKILL.md");
+    assert!(
+        worker_skill.exists(),
+        "cas init with .grok/ present must sync the Grok cas-worker skill twin"
+    );
+    let content = std::fs::read_to_string(&worker_skill).unwrap();
+    assert!(
+        content.contains("cas__task"),
+        "grok cas-worker skill must reference the cas__ tool prefix"
+    );
+    assert!(
+        !content.contains("mcp__"),
+        "grok cas-worker skill must not reference any mcp__ wrapped tool name"
+    );
+
+    // .mcp.json is reused (no separate Grok config writer) — confirm it
+    // was still created so Grok's own MCP doctor can find it.
+    assert!(temp.path().join(".mcp.json").exists());
+}
+
 #[test]
 fn test_init_json_already_initialized() {
     let temp = TempDir::new().unwrap();
