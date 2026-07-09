@@ -153,11 +153,18 @@ pub fn is_worker_without_subagents_from_env() -> bool {
 /// cas-8aaf: Codex MCP servers register under the `cs` alias; Claude MCP
 /// servers register under the `cas` alias. Hardcoding `mcp__cas__coordination`
 /// in guidance given to Codex workers produces an instruction they cannot follow.
+///
+/// EPIC cas-8888 (cas-9a31, Phase 1) SILENT SITE — audited: this was a
+/// boolean `== Codex` check, so Grok would have silently fallen into the
+/// Claude branch (`mcp__cas__coordination`) — wrong, since Grok namespaces
+/// MCP tools as `cas__<tool>` (neither Claude's `mcp__cas__` nor Codex's
+/// `mcp__cs__`). Switched to an exhaustive match so a future harness
+/// addition trips a compile error here too, instead of silently defaulting.
 pub fn worker_coordination_tool() -> &'static str {
-    if worker_harness_from_env() == SupervisorCli::Codex {
-        "mcp__cs__coordination"
-    } else {
-        "mcp__cas__coordination"
+    match worker_harness_from_env() {
+        SupervisorCli::Codex => "mcp__cs__coordination",
+        SupervisorCli::Grok => "cas__coordination",
+        SupervisorCli::Claude => "mcp__cas__coordination",
     }
 }
 
@@ -166,12 +173,16 @@ pub fn worker_coordination_tool() -> &'static str {
 /// to ask the supervisor to run).
 ///
 /// Claude supervisors use `mcp__cas__verification`, Codex supervisors use
-/// `mcp__cs__verification`.
+/// `mcp__cs__verification`, Grok supervisors use `cas__verification`.
+///
+/// EPIC cas-8888 (cas-9a31, Phase 1) SILENT SITE — audited, same fix as
+/// `worker_coordination_tool` above: was a boolean `== Codex` check that
+/// would have silently defaulted Grok to Claude's prefix.
 pub fn supervisor_verification_tool() -> &'static str {
-    if supervisor_harness_from_env() == SupervisorCli::Codex {
-        "mcp__cs__verification"
-    } else {
-        "mcp__cas__verification"
+    match supervisor_harness_from_env() {
+        SupervisorCli::Codex => "mcp__cs__verification",
+        SupervisorCli::Grok => "cas__verification",
+        SupervisorCli::Claude => "mcp__cas__verification",
     }
 }
 
@@ -415,6 +426,21 @@ mod tests {
         );
     }
 
+    /// EPIC cas-8888 (cas-9a31, Phase 1): the silent `== Codex` boolean check
+    /// this function used to be would have silently returned Claude's
+    /// `mcp__cas__coordination` for a Grok worker — wrong, since Grok
+    /// namespaces tools as `cas__<tool>`.
+    #[test]
+    fn worker_coordination_tool_returns_cas_double_underscore_for_grok_harness() {
+        let _g = env_lock();
+        let _c = set_worker_cli(Some("grok"));
+        assert_eq!(
+            super::worker_coordination_tool(),
+            "cas__coordination",
+            "CAS_FACTORY_WORKER_CLI=grok → cas__coordination"
+        );
+    }
+
     #[test]
     fn supervisor_verification_tool_returns_cas_when_supervisor_unset() {
         let _g = env_lock();
@@ -438,6 +464,19 @@ mod tests {
             super::supervisor_verification_tool(),
             "mcp__cs__verification",
             "CAS_FACTORY_SUPERVISOR_CLI=codex → mcp__cs__verification"
+        );
+    }
+
+    /// EPIC cas-8888 (cas-9a31, Phase 1): same rationale as
+    /// worker_coordination_tool_returns_cas_double_underscore_for_grok_harness.
+    #[test]
+    fn supervisor_verification_tool_returns_cas_double_underscore_for_grok_supervisor() {
+        let _g = env_lock();
+        let _s = set_supervisor_cli(Some("grok"));
+        assert_eq!(
+            super::supervisor_verification_tool(),
+            "cas__verification",
+            "CAS_FACTORY_SUPERVISOR_CLI=grok → cas__verification"
         );
     }
 

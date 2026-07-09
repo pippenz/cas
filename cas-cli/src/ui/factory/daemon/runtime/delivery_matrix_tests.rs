@@ -20,7 +20,7 @@
 //! happens to keep the primitives self-consistent but breaks a real factory
 //! shape still trips a red cell here.
 
-use cas_mux::SupervisorCli::{self, Claude, Codex};
+use cas_mux::SupervisorCli::{self, Claude, Codex, Grok};
 
 use super::delivery::{
     DeliveryChannel, choose_channel, pty_payload_needs_framing, requires_pty_readiness_gate,
@@ -62,8 +62,11 @@ impl FactoryShape {
     }
 }
 
-/// The full 4-combo matrix the EPIC enumerates.
-const SHAPES: [FactoryShape; 4] = [
+/// The full combo matrix the EPIC enumerates. EPIC cas-8888 (cas-9a31,
+/// Phase 1) appended the two Grok combos (indices 4-5) — existing
+/// index-based tests below (`SHAPES[0]`..`SHAPES[3]`) are unaffected
+/// since the original four keep their positions.
+const SHAPES: [FactoryShape; 6] = [
     // 1. claude-sup → codex-worker: the original bug (codex worker unreachable).
     FactoryShape { supervisor: Claude, worker: Codex, label: "claude-sup / codex-worker" },
     // 2. codex-sup → claude-worker: codex supervisor, claude worker.
@@ -72,15 +75,24 @@ const SHAPES: [FactoryShape; 4] = [
     FactoryShape { supervisor: Codex, worker: Codex, label: "codex-sup / codex-worker" },
     // 4. claude-sup → claude-worker: the all-Claude regression baseline.
     FactoryShape { supervisor: Claude, worker: Claude, label: "claude-sup / claude-worker" },
+    // 5. claude-sup → grok-worker: Grok has no CC Agent-Teams membership
+    //    (EPIC cas-8888 delta #4), so it must be PTY-delivered even though
+    //    the supervisor is in teams mode — the same shape of bug cas-b68a
+    //    fixed for Codex, now proven for Grok too.
+    FactoryShape { supervisor: Claude, worker: Grok, label: "claude-sup / grok-worker" },
+    // 6. grok-sup → grok-worker: grok-only factory (teams never active,
+    //    since teams_active() keys on supervisor == Claude).
+    FactoryShape { supervisor: Grok, worker: Grok, label: "grok-sup / grok-worker" },
 ];
 
 /// Expected routing for one cell, derived from the contract (NOT from the
-/// implementation): Codex recipients are always PTY + gated + framed; Claude
-/// recipients use the team inbox iff teams are active (no gate, no framing),
-/// else fall back to bare PTY (gated, unframed).
+/// implementation): Codex and Grok recipients are always PTY + gated +
+/// framed (EPIC cas-8888: Grok has no team-transport, coordinates the
+/// Codex way); Claude recipients use the team inbox iff teams are active
+/// (no gate, no framing), else fall back to bare PTY (gated, unframed).
 fn expected(recipient: SupervisorCli, teams_active: bool) -> (DeliveryChannel, bool, bool) {
     match recipient {
-        Codex => (DeliveryChannel::Pty, true, true),
+        Codex | Grok => (DeliveryChannel::Pty, true, true),
         Claude if teams_active => (DeliveryChannel::TeamsInbox, false, false),
         Claude => (DeliveryChannel::Pty, true, false),
     }

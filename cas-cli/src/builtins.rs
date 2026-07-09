@@ -834,6 +834,14 @@ pub fn sync_all_builtins_for_harness(
     match harness {
         SupervisorCli::Claude => sync_all_builtins(target_dir),
         SupervisorCli::Codex => sync_all_codex_builtins(target_dir),
+        // EPIC cas-8888 (cas-9a31, Phase 1): placeholder arm only — Phase 5
+        // (cas-6f46) authors dedicated GROK_BUILTIN_AGENTS/GROK_BUILTIN_SKILLS
+        // with the cas__ tool-prefix convention baked into skill bodies.
+        // Codex's set is the closer placeholder of the two existing sets
+        // (already non-Claude-prefixed) but is still WRONG for Grok's
+        // actual cas__ prefix — harmless today since cli=grok isn't
+        // spawnable yet, so nothing calls this with harness=Grok.
+        SupervisorCli::Grok => sync_all_codex_builtins(target_dir),
     }
 }
 
@@ -928,6 +936,10 @@ pub fn prune_stale_user_skills_for_harness(
     let builtins = match harness {
         SupervisorCli::Claude => BUILTIN_SKILLS,
         SupervisorCli::Codex => CODEX_BUILTIN_SKILLS,
+        // EPIC cas-8888 (cas-9a31, Phase 1): placeholder — see the same
+        // rationale in sync_all_builtins_for_harness above. Phase 5 owns
+        // the real GROK_BUILTIN_SKILLS set.
+        SupervisorCli::Grok => CODEX_BUILTIN_SKILLS,
     };
     let keep = builtin_skill_dir_names(builtins);
     prune_stale_cas_skill_dirs(&harness_dir.join("skills"), &keep)
@@ -1020,6 +1032,9 @@ pub fn preview_all_builtins_for_harness(
     match harness {
         SupervisorCli::Claude => preview_all_builtins(target_dir),
         SupervisorCli::Codex => preview_all_codex_builtins(target_dir),
+        // EPIC cas-8888 (cas-9a31, Phase 1): placeholder — see the same
+        // rationale in sync_all_builtins_for_harness above.
+        SupervisorCli::Grok => preview_all_codex_builtins(target_dir),
     }
 }
 

@@ -8,6 +8,14 @@ use serde::{Deserialize, Serialize};
 pub enum SupervisorCli {
     Claude,
     Codex,
+    /// xAI Grok Build (grok 0.2.93+). Namespaces MCP tools as
+    /// `<server>__<tool>` (e.g. `cas__task`) via its own search_tool/
+    /// use_tool dispatch — NOT `mcp__cas__` (Claude) or `mcp__cs__`
+    /// (Codex). Maps to the Claude capability tier (hooks + subagents +
+    /// textbox submit all work), but coordinates like Codex (no CC
+    /// agent-teams --team-name/--agent-id; MCP + prompt injection only).
+    /// See EPIC cas-8888.
+    Grok,
 }
 
 impl SupervisorCli {
@@ -15,6 +23,7 @@ impl SupervisorCli {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::Grok => "grok",
         }
     }
 
@@ -32,6 +41,12 @@ impl SupervisorCli {
                 supports_textbox_submit: false,
                 tool_prefix: "mcp__cs__",
             },
+            Self::Grok => HarnessCapabilities {
+                supports_hooks: true,
+                supports_subagents: true,
+                supports_textbox_submit: true,
+                tool_prefix: "cas__",
+            },
         }
     }
 }
@@ -43,6 +58,7 @@ impl FromStr for SupervisorCli {
         match s.trim().to_ascii_lowercase().as_str() {
             "claude" => Ok(Self::Claude),
             "codex" => Ok(Self::Codex),
+            "grok" => Ok(Self::Grok),
             _ => Err(format!("unsupported harness: {s}")),
         }
     }
@@ -54,4 +70,67 @@ pub struct HarnessCapabilities {
     pub supports_subagents: bool,
     pub supports_textbox_submit: bool,
     pub tool_prefix: &'static str,
+}
+
+#[cfg(test)]
+mod tests {
+    //! cas-9a31 (EPIC cas-8888, Phase 1): Grok harness-core coverage.
+    use super::*;
+
+    #[test]
+    fn grok_as_str_and_from_str_round_trip() {
+        assert_eq!(SupervisorCli::Grok.as_str(), "grok");
+        assert_eq!(SupervisorCli::from_str("grok"), Ok(SupervisorCli::Grok));
+        // Case/whitespace tolerance, matching Claude/Codex's existing contract.
+        assert_eq!(SupervisorCli::from_str("Grok"), Ok(SupervisorCli::Grok));
+        assert_eq!(SupervisorCli::from_str("  grok  "), Ok(SupervisorCli::Grok));
+    }
+
+    #[test]
+    fn grok_capabilities_match_claude_tier_with_its_own_tool_prefix() {
+        let caps = SupervisorCli::Grok.capabilities();
+        assert!(
+            caps.supports_hooks,
+            "Grok's SessionStart/PreToolUse/PostToolUse/Stop hooks are fully wired \
+             (verified live per EPIC cas-8888)"
+        );
+        assert!(
+            caps.supports_subagents,
+            "Grok supports the same subagent model as Claude"
+        );
+        assert!(
+            caps.supports_textbox_submit,
+            "Grok supports textbox-submit interaction like Claude"
+        );
+        assert_eq!(
+            caps.tool_prefix, "cas__",
+            "Grok namespaces MCP tools as <server>__<tool> (cas__task), \
+             distinct from Claude's mcp__cas__ and Codex's mcp__cs__"
+        );
+    }
+
+    #[test]
+    fn grok_serde_round_trips_as_lowercase_grok() {
+        let json = serde_json::to_string(&SupervisorCli::Grok).unwrap();
+        assert_eq!(json, "\"grok\"");
+        let back: SupervisorCli = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, SupervisorCli::Grok);
+    }
+
+    #[test]
+    fn from_str_rejects_unknown_harness() {
+        assert!(SupervisorCli::from_str("gemini").is_err());
+    }
+
+    #[test]
+    fn claude_and_codex_capabilities_unchanged_by_the_grok_addition() {
+        // Regression pin: adding Grok must not perturb the existing two.
+        let claude = SupervisorCli::Claude.capabilities();
+        assert!(claude.supports_hooks && claude.supports_subagents && claude.supports_textbox_submit);
+        assert_eq!(claude.tool_prefix, "mcp__cas__");
+
+        let codex = SupervisorCli::Codex.capabilities();
+        assert!(!codex.supports_hooks && !codex.supports_subagents && !codex.supports_textbox_submit);
+        assert_eq!(codex.tool_prefix, "mcp__cs__");
+    }
 }
