@@ -7,18 +7,29 @@ impl FactoryApp {
     }
 
     /// Create an epic branch based on the configured trunk (not supervisor HEAD)
+    ///
+    /// Base resolution order (cas-b082): `.cas/config.toml`
+    /// `[factory] epic_base_branch` if set, else the repo's detected
+    /// default branch. Either way, the base is fetched and resolved
+    /// against its remote tip before branching — a stale local base can
+    /// never silently seed a new epic branch (BUG-epic-branch-stale-local-base).
     pub fn create_epic_branch(&self, epic_title: &str) -> anyhow::Result<String> {
+        use crate::config::Config;
         use crate::worktree::GitOperations;
 
         let branch_name = epic_branch_name(epic_title);
         let git_ops = GitOperations::new(self.project_dir.clone());
-        let trunk = git_ops.detect_default_branch();
+        let trunk = Config::configured_epic_base_branch(&self.project_dir)
+            .unwrap_or_else(|| git_ops.detect_default_branch());
+        let resolved = git_ops.resolve_fresh_base(&trunk)?;
 
-        if git_ops.create_branch_from(&branch_name, &trunk)? {
+        if git_ops.create_branch_from(&branch_name, &resolved.branch_ref)? {
             tracing::info!(
-                "Created epic branch {} from trunk '{}'",
+                "Created epic branch {} from base '{}' (sha={}, behind={})",
                 branch_name,
-                trunk
+                resolved.branch_ref,
+                &resolved.sha[..resolved.sha.len().min(7)],
+                resolved.behind_count,
             );
         } else {
             tracing::info!("Epic branch already exists: {}", branch_name);
