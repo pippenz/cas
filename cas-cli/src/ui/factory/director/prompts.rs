@@ -175,6 +175,49 @@ pub fn revalidate_event_for_delivery(
                 },
                 worker: worker.clone(),
             }),
+        // cas-2ca9: `TaskAssigned` used to fall through to the `_` catch-all
+        // below with NO revalidation — unlike WorkerIdle/WorkerStalled/
+        // TaskBlocked/AgentRegistered, which all re-check current task state
+        // against this delivery-time `unfiltered_data` snapshot before
+        // generating a prompt. `detect_changes_at` (events.rs) snapshots the
+        // task as dispatchable+newly-assigned at *detection* time, but
+        // `revalidate_and_prompt_for_delivery` (app/mod.rs) loads a SEPARATE,
+        // later snapshot specifically to catch state that changed in the gap
+        // between detection and delivery (see its doc comment). Without this
+        // arm, a task that closed (or was reassigned to someone else) in that
+        // gap still got the "You have been assigned a new task" prompt
+        // delivered — the dedup guard in `detect_changes_at` only prevents
+        // the SAME (task, assignee) pair from firing more than once; it does
+        // nothing to stop a single already-emitted, now-stale event from
+        // being delivered. This is the root cause of cas-2ca9 (director
+        // re-dispatching already-Closed tasks): the terminal-status guard
+        // added in cas-177f covers event *generation* but this delivery-time
+        // gate was never extended to cover `TaskAssigned` when it was added
+        // later (cas-627f).
+        DirectorEvent::TaskAssigned {
+            task_id,
+            task_title,
+            worker,
+        } => unfiltered_data
+            .in_progress_tasks
+            .iter()
+            .chain(
+                unfiltered_data
+                    .ready_tasks
+                    .iter()
+                    .filter(|task| task.status == TaskStatus::Open),
+            )
+            .find(|task| task.id == *task_id)
+            .filter(|task| task_assigned_to_worker(unfiltered_data, task, worker))
+            .map(|task| DirectorEvent::TaskAssigned {
+                task_id: task.id.clone(),
+                task_title: if task.title.is_empty() {
+                    task_title.clone()
+                } else {
+                    task.title.clone()
+                },
+                worker: worker.clone(),
+            }),
         _ => Some(event.clone()),
     }
 }
@@ -831,6 +874,114 @@ mod tests {
                 Some(DirectorEvent::TaskBlocked { .. })
             ),
             "blocked notification should remain when delivery still sees the blocked task"
+        );
+    }
+
+    /// Regression test for cas-2ca9: a director re-dispatching an
+    /// already-Closed task. `detect_changes_at` legitimately emitted
+    /// `TaskAssigned` while `cas-9789` was still Open+assigned (dedup guard
+    /// means this fires at most once per detector lifetime), but the task
+    /// closed in the gap before `revalidate_and_prompt_for_delivery` loaded
+    /// its fresh delivery-time snapshot. Before the fix, `TaskAssigned` fell
+    /// through the `_` catch-all in `revalidate_event_for_delivery` with no
+    /// recheck, so the stale "You have been assigned a new task" prompt
+    /// still went out for a task the worker (or supervisor) already closed.
+    #[test]
+    fn test_delivery_recheck_drops_task_assigned_for_already_closed_task() {
+        let event = DirectorEvent::TaskAssigned {
+            task_id: "cas-9789".to_string(),
+            task_title: "Stale assignment".to_string(),
+            worker: "swift-fox".to_string(),
+        };
+        // Delivery-time snapshot: cas-9789 is Closed, so it's absent from
+        // both `ready_tasks` and `in_progress_tasks` (the only two buckets
+        // `DirectorData` uses for non-terminal tasks).
+        let data = make_data(0);
+
+        assert!(
+            revalidate_event_for_delivery(&event, &data, "supervisor").is_none(),
+            "TaskAssigned must be dropped when delivery sees the task is no longer active"
+        );
+    }
+
+    /// Companion regression: the task was reassigned to a DIFFERENT worker
+    /// by delivery time (e.g. supervisor force-transfer). The original
+    /// worker's stale `TaskAssigned` must not be delivered either — only a
+    /// fresh event carrying the new assignee would be correct, and that's a
+    /// different (task_id, assignee) key handled by `detect_changes_at`'s own
+    /// dedup guard, not this revalidation layer.
+    #[test]
+    fn test_delivery_recheck_drops_task_assigned_reassigned_to_other_worker() {
+        let event = DirectorEvent::TaskAssigned {
+            task_id: "cas-9789".to_string(),
+            task_title: "Reassigned elsewhere".to_string(),
+            worker: "swift-fox".to_string(),
+        };
+        let mut data = make_data(0);
+        data.ready_tasks = vec![open_task("cas-9789", Some("other-worker"))];
+
+        assert!(
+            revalidate_event_for_delivery(&event, &data, "supervisor").is_none(),
+            "TaskAssigned must be dropped when delivery sees a different assignee"
+        );
+    }
+
+    /// Positive control: a genuinely still-valid assignment (task still Open
+    /// and assigned to the same worker at delivery time) must survive
+    /// revalidation and deliver normally — the fix must not over-suppress.
+    #[test]
+    fn test_delivery_recheck_keeps_task_assigned_when_still_valid() {
+        let event = DirectorEvent::TaskAssigned {
+            task_id: "cas-9789".to_string(),
+            task_title: "Stale title from detection time".to_string(),
+            worker: "swift-fox".to_string(),
+        };
+        let mut data = make_data(0);
+        data.ready_tasks = vec![open_task("cas-9789", Some("swift-fox"))];
+
+        let rechecked = revalidate_event_for_delivery(&event, &data, "supervisor")
+            .expect("still-assigned task must survive revalidation");
+
+        match rechecked {
+            DirectorEvent::TaskAssigned {
+                task_id, worker, ..
+            } => {
+                assert_eq!(task_id, "cas-9789");
+                assert_eq!(worker, "swift-fox");
+            }
+            other => panic!("expected TaskAssigned to survive, got {other:?}"),
+        }
+    }
+
+    /// Positive control: an in-progress task (rather than ready/Open) must
+    /// also survive — `TaskAssigned` can be delivered slightly after the
+    /// worker already called `task start`, moving the task to InProgress.
+    #[test]
+    fn test_delivery_recheck_keeps_task_assigned_when_in_progress() {
+        let event = DirectorEvent::TaskAssigned {
+            task_id: "cas-4321".to_string(),
+            task_title: "Already started".to_string(),
+            worker: "swift-fox".to_string(),
+        };
+        let mut data = make_data(0);
+        data.in_progress_tasks = vec![TaskSummary {
+            id: "cas-4321".to_string(),
+            title: "Already started".to_string(),
+            status: TaskStatus::InProgress,
+            priority: Priority::MEDIUM,
+            assignee: Some("swift-fox".to_string()),
+            task_type: TaskType::Task,
+            epic: None,
+            branch: None,
+            updated_at: None,
+        }];
+
+        assert!(
+            matches!(
+                revalidate_event_for_delivery(&event, &data, "supervisor"),
+                Some(DirectorEvent::TaskAssigned { .. })
+            ),
+            "TaskAssigned must survive when delivery sees the task now InProgress"
         );
     }
 
