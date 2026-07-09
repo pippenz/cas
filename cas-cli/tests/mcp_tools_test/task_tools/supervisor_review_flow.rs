@@ -8,7 +8,7 @@
 /// - AC5: all 5 named test functions listed in spec
 use crate::support::*;
 use cas::config::{CodeReviewConfig, Config};
-use cas::mcp::{CasCore, CasService};
+use cas::mcp::CasService;
 use cas::store::{open_agent_store, open_task_store, open_verification_store};
 use cas::types::{TaskStatus, Verification, VerificationStatus};
 use rmcp::handler::server::wrapper::Parameters;
@@ -137,7 +137,7 @@ async fn test_worker_close_in_supervisor_mode_skips_cas_code_review() {
     init_git_repo_with_staged_changes(temp.path());
 
     // Rebuild CasCore so it reads from our config.toml.
-    let core = CasCore::with_daemon(cas_dir.clone(), None, None);
+    let core = core_with_test_agent(&cas_dir);
     let task_store = open_task_store(&cas_dir).unwrap();
     let service = CasService::new(core, None);
 
@@ -215,7 +215,7 @@ async fn test_worker_close_in_worker_mode_runs_cas_code_review_unchanged() {
     // Init git repo so has_reviewable_changes() = true.
     init_git_repo_with_staged_changes(temp.path());
 
-    let core = CasCore::with_daemon(cas_dir.clone(), None, None);
+    let core = core_with_test_agent(&cas_dir);
     let service = CasService::new(core, None);
 
     let _worker_guard = FactoryWorkerGuard::enter();
@@ -415,7 +415,7 @@ async fn test_lint_fail_close_blocked_before_pending_supervisor_review() {
     // Create a git repo whose staged diff includes a `todo!()` so the lint fires.
     init_git_repo_with_lint_violation(temp.path());
 
-    let core = CasCore::with_daemon(cas_dir.clone(), None, None);
+    let core = core_with_test_agent(&cas_dir);
     let task_store = open_task_store(&cas_dir).unwrap();
     let service = CasService::new(core, None);
 
@@ -509,7 +509,7 @@ async fn test_worker_close_absent_code_review_section_defaults_to_supervisor_mod
     // Init git repo at the project root so has_reviewable_changes() returns true.
     init_git_repo_with_staged_changes(temp.path());
 
-    let core = CasCore::with_daemon(cas_dir.clone(), None, None);
+    let core = core_with_test_agent(&cas_dir);
     let task_store = open_task_store(&cas_dir).unwrap();
     let service = CasService::new(core, None);
 
@@ -595,7 +595,7 @@ async fn test_start_on_pending_supervisor_review_task_is_rejected() {
     task.status = TaskStatus::PendingSupervisorReview;
     task_store.add(&task).expect("task.add should succeed");
 
-    let core = CasCore::with_daemon(cas_dir.clone(), None, None);
+    let core = core_with_test_agent(&cas_dir);
     let service = CasService::new(core, None);
 
     // Attempt to start the PSR task — must be rejected.
@@ -652,7 +652,7 @@ async fn test_release_orphan_recovery_does_not_reset_psr_to_open() {
     task.status = TaskStatus::PendingSupervisorReview;
     task_store.add(&task).expect("task.add should succeed");
 
-    let core = CasCore::with_daemon(cas_dir.clone(), None, None);
+    let core = core_with_test_agent(&cas_dir);
     let service = CasService::new(core, None);
 
     // Call action=release with no active lease — triggers the orphan-recovery
@@ -703,7 +703,7 @@ async fn test_psr_transition_releases_worker_lease() {
     write_supervisor_review_config(&cas_dir);
     init_git_repo_with_staged_changes(temp.path());
 
-    let core = CasCore::with_daemon(cas_dir.clone(), None, None);
+    let core = core_with_test_agent(&cas_dir);
     let task_store = open_task_store(&cas_dir).unwrap();
     let service = CasService::new(core, None);
 

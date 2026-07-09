@@ -10,7 +10,7 @@
 
 use crate::support::*;
 use cas::mcp::tools::*;
-use cas::mcp::{CasCore, CasService};
+use cas::mcp::CasService;
 use cas::store::open_task_store;
 use cas::types::TaskStatus;
 use rmcp::handler::server::wrapper::Parameters;
@@ -297,7 +297,7 @@ async fn test_light_depth_factory_close_skips_p0_gate_and_closes() {
     write_supervisor_review_config(&cas_dir);
     init_git_repo_with_staged_changes(temp.path());
 
-    let core = CasCore::with_daemon(cas_dir.clone(), None, None);
+    let core = core_with_test_agent(&cas_dir);
     let task_store = open_task_store(&cas_dir).unwrap();
     let service = CasService::new(core, None);
 
@@ -372,7 +372,7 @@ async fn test_deep_depth_factory_close_still_pends_supervisor_review() {
     write_supervisor_review_config(&cas_dir);
     init_git_repo_with_staged_changes(temp.path());
 
-    let core = CasCore::with_daemon(cas_dir.clone(), None, None);
+    let core = core_with_test_agent(&cas_dir);
     let task_store = open_task_store(&cas_dir).unwrap();
     let service = CasService::new(core, None);
 
