@@ -302,9 +302,27 @@ impl CasCore {
         })?;
 
         if task.status == TaskStatus::Closed {
+            // cas-3c23: this message used to tell EVERY caller "Use reopen
+            // first" — a factory worker follows that verbatim, reopens an
+            // already-merged task, re-verifies already-shipped code, and
+            // re-closes it (the cas-a7c8 thrash loop). Reopen is now a
+            // supervisor-only action (see `cas_task_reopen`), so the
+            // guidance must differ by role: a supervisor may still reopen,
+            // a worker must not.
             return Err(Self::error(
                 ErrorCode::INVALID_PARAMS,
-                "Cannot start a closed task. Use reopen first.",
+                if crate::harness_policy::is_supervisor_from_env() {
+                    "Cannot start a closed task. Use reopen first if this task \
+                     genuinely needs rework."
+                        .to_string()
+                } else {
+                    format!(
+                        "Cannot start a closed task. Task {} is closed — do not \
+                         reopen it; report to your supervisor if you believe \
+                         this task needs rework.",
+                        req.id
+                    )
+                },
             ));
         }
 

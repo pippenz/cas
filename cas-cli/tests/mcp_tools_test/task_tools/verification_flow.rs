@@ -1288,12 +1288,17 @@ async fn test_reopened_task_does_not_reuse_stale_anchor_cas_cf64() {
     );
 
     // Reopen the task — this must clear the stale anchor.
-    let reopen_text = extract_text(
-        service
-            .cas_task_reopen(Parameters(IdRequest { id: id_a.clone() }))
-            .await
-            .expect("reopen returns"),
-    );
+    // cas-3c23: reopen is now supervisor-gated, so this "supervisor decides
+    // rework is needed" scenario must run under CAS_AGENT_ROLE=supervisor.
+    let reopen_text = {
+        let _sup = ScopedSupervisorEnv::new();
+        extract_text(
+            service
+                .cas_task_reopen(Parameters(IdRequest { id: id_a.clone() }))
+                .await
+                .expect("reopen returns"),
+        )
+    };
     assert!(
         reopen_text.contains("Reopened task:"),
         "reopen should succeed: {reopen_text}"

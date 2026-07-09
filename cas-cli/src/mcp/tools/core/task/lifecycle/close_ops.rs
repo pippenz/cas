@@ -2126,10 +2126,29 @@ impl CasCore {
     }
 
     /// Reopen a closed task
+    ///
+    /// cas-3c23: reopening a Closed/merged task is a supervisor-only action.
+    /// A factory worker told (by a stale director re-dispatch or coordination
+    /// message) to work an already-Closed ticket must NOT be able to reopen
+    /// it unilaterally — that's exactly the thrash loop cas-a7c8 diagnosed
+    /// (reopen → re-verify already-shipped code → re-close, stomping main).
     pub async fn cas_task_reopen(
         &self,
         Parameters(req): Parameters<IdRequest>,
     ) -> Result<CallToolResult, McpError> {
+        if !is_supervisor_from_env() {
+            return Err(Self::error(
+                ErrorCode::INVALID_PARAMS,
+                format!(
+                    "task reopen rejected: only supervisors may reopen a closed task \
+                     (CAS_AGENT_ROLE=supervisor). Task {} stays Closed. Message your \
+                     supervisor if you believe this task needs rework — do not reopen \
+                     it yourself.",
+                    req.id
+                ),
+            ));
+        }
+
         let task_store = self.open_task_store()?;
 
         let mut task = task_store.get(&req.id).map_err(|e| McpError {
