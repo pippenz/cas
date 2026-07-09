@@ -302,9 +302,27 @@ impl CasCore {
         })?;
 
         if task.status == TaskStatus::Closed {
+            // cas-3c23: this message used to tell EVERY caller "Use reopen
+            // first" — a factory worker follows that verbatim, reopens an
+            // already-merged task, re-verifies already-shipped code, and
+            // re-closes it (the cas-a7c8 thrash loop). Reopen is now a
+            // supervisor-only action (see `cas_task_reopen`), so the
+            // guidance must differ by role: a supervisor may still reopen,
+            // a worker must not.
             return Err(Self::error(
                 ErrorCode::INVALID_PARAMS,
-                "Cannot start a closed task. Use reopen first.",
+                if crate::harness_policy::is_supervisor_from_env() {
+                    "Cannot start a closed task. Use reopen first if this task \
+                     genuinely needs rework."
+                        .to_string()
+                } else {
+                    format!(
+                        "Cannot start a closed task. Task {} is closed — do not \
+                         reopen it; report to your supervisor if you believe \
+                         this task needs rework.",
+                        req.id
+                    )
+                },
             ));
         }
 
@@ -374,6 +392,32 @@ impl CasCore {
             .get(&agent_id)
             .map(|a| a.role == cas_types::AgentRole::Worker)
             .unwrap_or(false);
+
+        // cas-3558: reject a worker starting a task explicitly assigned to
+        // someone else. This is the code-level half of the self-dispatch
+        // guard — the skill-level half tells an idle worker to wait for an
+        // explicit assignment instead of grabbing from `action=ready`. Only
+        // fires for factory workers with a *pre-existing, different*
+        // assignee: `assignee.is_none()` (the normal first-start case) and
+        // Standard/interactive sessions are both exempt, so this can't
+        // regress the auto-assign-on-start behavior above.
+        if is_worker {
+            if let (Ok(agent), Some(assignee)) =
+                (agent_store.get(&agent_id), task.assignee.as_deref())
+            {
+                if assignee != agent.name {
+                    return Err(Self::error(
+                        ErrorCode::INVALID_PARAMS,
+                        format!(
+                            "Task {} is assigned to {}, not you ({}). Do not self-dispatch — \
+                            wait for an explicit assignment, or ask the supervisor to \
+                            reassign it: mcp__cas__task action=transfer id={} to_agent=<your-agent-id>",
+                            req.id, assignee, agent.name, req.id
+                        ),
+                    ));
+                }
+            }
+        }
 
         // Check if supervisor is trying to start a non-epic task
         if let Ok(agent) = agent_store.get(&agent_id) {

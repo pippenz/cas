@@ -1398,6 +1398,126 @@ async fn test_task_start_preserves_existing_assignee() {
 }
 
 // ============================================================================
+// cas-3558: code-level half of the self-dispatch guard. A worker starting a
+// task that is explicitly assigned to a *different* agent must be rejected
+// — this is what should have stopped the grok factory run from grabbing
+// ready-but-unassigned-to-it tickets that already belonged to someone else.
+// Standard/interactive sessions are exempt (see next test).
+// ============================================================================
+
+#[tokio::test]
+async fn test_worker_cannot_start_task_assigned_to_other_worker() {
+    let (temp, service) = setup_cas();
+    let cas_dir = temp.path().join(".cas");
+
+    // Promote the test session to Worker role.
+    let agent_store = open_agent_store(&cas_dir).expect("open agent store");
+    {
+        let mut agent = agent_store
+            .list(None)
+            .expect("list agents")
+            .into_iter()
+            .find(|a| a.name == "test-agent")
+            .expect("test agent exists");
+        agent.role = cas::types::AgentRole::Worker;
+        agent_store.update(&agent).expect("mark test agent worker");
+    }
+
+    let create_req = TaskCreateRequest {
+        depth: None,
+        title: "Assigned to someone else".to_string(),
+        description: None,
+        priority: 2,
+        task_type: "task".to_string(),
+        labels: None,
+        notes: None,
+        blocked_by: None,
+        design: None,
+        acceptance_criteria: None,
+        external_ref: None,
+        assignee: Some("other-worker".to_string()),
+        demo_statement: None,
+        execution_note: None,
+        epic: None,
+    };
+    let result = service
+        .cas_task_create(Parameters(create_req))
+        .await
+        .expect("task create should succeed");
+    let create_text = extract_text(result);
+    let task_id = extract_task_id(&create_text)
+        .expect("should have task ID")
+        .to_string();
+
+    let err = service
+        .cas_task_start(Parameters(IdRequest {
+            id: task_id.to_string(),
+        }))
+        .await
+        .expect_err("worker starting another worker's assigned task must be rejected");
+
+    assert!(
+        err.message.contains("other-worker") && err.message.contains("not you"),
+        "error should name the real assignee and explain this agent isn't it: {}",
+        err.message
+    );
+
+    let task_store = cas::store::open_task_store(&cas_dir).expect("open task store");
+    let task = task_store.get(&task_id).expect("task should exist");
+    assert_eq!(
+        task.status,
+        cas::types::TaskStatus::Open,
+        "rejected start must not flip status to InProgress"
+    );
+}
+
+#[tokio::test]
+async fn test_standard_agent_can_start_task_assigned_to_other_worker() {
+    // Standard/interactive sessions (not factory workers) are exempt from
+    // the cas-3558 assignee guard — only `AgentRole::Worker` self-dispatch
+    // is the problem this guards against.
+    let (temp, service) = setup_cas();
+    let cas_dir = temp.path().join(".cas");
+
+    let create_req = TaskCreateRequest {
+        depth: None,
+        title: "Assigned to someone else, standard session".to_string(),
+        description: None,
+        priority: 2,
+        task_type: "task".to_string(),
+        labels: None,
+        notes: None,
+        blocked_by: None,
+        design: None,
+        acceptance_criteria: None,
+        external_ref: None,
+        assignee: Some("other-worker".to_string()),
+        demo_statement: None,
+        execution_note: None,
+        epic: None,
+    };
+    let result = service
+        .cas_task_create(Parameters(create_req))
+        .await
+        .expect("task create should succeed");
+    let create_text = extract_text(result);
+    let task_id = extract_task_id(&create_text)
+        .expect("should have task ID")
+        .to_string();
+
+    service
+        .cas_task_start(Parameters(IdRequest {
+            id: task_id.to_string(),
+        }))
+        .await
+        .expect("standard-role session should not be blocked by the worker-only guard");
+
+    let task_store = cas::store::open_task_store(&cas_dir).expect("open task store");
+    let task = task_store.get(&task_id).expect("task should exist");
+    assert_eq!(task.assignee.as_deref(), Some("other-worker"));
+}
+
+// ============================================================================
 // cas-5572 (EPIC cas-9508): Spawn-time `action=mine` race regression
 //
 // Reproduces the factory-session friction described in

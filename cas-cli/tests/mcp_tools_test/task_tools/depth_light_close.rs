@@ -10,7 +10,7 @@
 
 use crate::support::*;
 use cas::mcp::tools::*;
-use cas::mcp::CasService;
+use cas::mcp::{CasCore, CasService};
 use cas::store::open_task_store;
 use cas::types::TaskStatus;
 use rmcp::handler::server::wrapper::Parameters;
@@ -428,4 +428,199 @@ async fn test_deep_depth_factory_close_still_pends_supervisor_review() {
         "deep close must not write the light-skip decision note: {}",
         task.notes
     );
+}
+
+// =============================================================================
+// cas-3c23: reopen is supervisor-only; start-on-closed guidance is role-aware.
+//
+// Root cause of the cas-a7c8 grok thrash loop: an idle worker told (by a
+// stale re-dispatch) to work an already-Closed ticket would follow the
+// start-guard's literal instruction ("Use reopen first"), reopen the task
+// itself (no role check existed on `cas_task_reopen`), re-verify already-
+// shipped code, and re-close it — stomping main. These tests pin: (1) a
+// non-supervisor caller cannot reopen a Closed task, (2) a supervisor still
+// can, and (3) the start-on-closed error message no longer tells a worker
+// to reopen.
+// =============================================================================
+
+/// Close a light-depth task with no factory-role env set (the same "solo"
+/// path used above) and return its id so callers can drive further
+/// lifecycle calls against the now-Closed task.
+async fn create_started_and_closed_light_task(core: &CasCore, title: &str) -> String {
+    let created = core
+        .cas_task_create(Parameters(create_req(title, Some("light"))))
+        .await
+        .expect("task_create should succeed");
+    let id = extract_task_id(&extract_text(created))
+        .expect("should have task ID")
+        .to_string();
+
+    core.cas_task_start(Parameters(IdRequest { id: id.clone() }))
+        .await
+        .expect("task_start should succeed");
+
+    let close_text = extract_text(
+        core.cas_task_close(Parameters(TaskCloseRequest {
+            id: id.clone(),
+            reason: Some("Feel-driven pass complete.".to_string()),
+            bypass_code_review: None,
+            code_review_findings: None,
+        }))
+        .await
+        .expect("task_close should return a result"),
+    );
+    assert!(
+        close_text.contains("Closed"),
+        "setup close should succeed: {close_text}"
+    );
+    id
+}
+
+/// A non-supervisor caller (no CAS_AGENT_ROLE=supervisor) must NOT be able
+/// to reopen a Closed task — the task stays Closed and the rejection points
+/// the caller at the supervisor instead of performing the reopen.
+#[tokio::test]
+async fn test_worker_cannot_reopen_closed_task() {
+    let (temp, core) = setup_cas();
+    let _env_lock = env_test_lock();
+    let cas_dir = temp.path().join(".cas");
+    let task_store = open_task_store(&cas_dir).unwrap();
+
+    // Deliberately no CAS_AGENT_ROLE=supervisor — a plain/worker caller.
+    let id = create_started_and_closed_light_task(&core, "worker reopen rejection").await;
+
+    let result = core
+        .cas_task_reopen(Parameters(IdRequest { id: id.clone() }))
+        .await;
+
+    match result {
+        Err(e) => {
+            let msg = e.message.to_string();
+            assert!(
+                msg.contains("supervisor") || msg.contains("CAS_AGENT_ROLE"),
+                "rejection should point the worker at the supervisor: {msg}"
+            );
+        }
+        Ok(ok) => panic!(
+            "expected reopen to be rejected for a non-supervisor caller, got: {}",
+            extract_text(ok)
+        ),
+    }
+
+    let task = task_store.get(&id).expect("task should exist");
+    assert_eq!(
+        task.status,
+        TaskStatus::Closed,
+        "task must remain Closed after a rejected worker reopen attempt"
+    );
+}
+
+/// A supervisor caller (CAS_AGENT_ROLE=supervisor) can still reopen a
+/// Closed task — the guard is a role check, not a blanket ban.
+#[tokio::test]
+async fn test_supervisor_can_reopen_closed_task() {
+    let (temp, core) = setup_cas();
+    let _env_lock = env_test_lock();
+    let cas_dir = temp.path().join(".cas");
+    let task_store = open_task_store(&cas_dir).unwrap();
+
+    let id = create_started_and_closed_light_task(&core, "supervisor reopen happy path").await;
+
+    let reopen_text = {
+        // SAFETY: held under env_test_lock() for the whole scope.
+        unsafe {
+            std::env::set_var("CAS_AGENT_ROLE", "supervisor");
+        }
+        let text = extract_text(
+            core.cas_task_reopen(Parameters(IdRequest { id: id.clone() }))
+                .await
+                .expect("supervisor reopen should succeed"),
+        );
+        unsafe {
+            std::env::remove_var("CAS_AGENT_ROLE");
+        }
+        text
+    };
+
+    assert!(
+        reopen_text.contains("Reopened task:"),
+        "supervisor reopen should succeed: {reopen_text}"
+    );
+    let task = task_store.get(&id).expect("task should exist");
+    assert_eq!(
+        task.status,
+        TaskStatus::Open,
+        "supervisor reopen must transition the task back to Open"
+    );
+}
+
+/// The start-on-closed error message must no longer tell a worker to
+/// "Use reopen first" — that instruction is exactly what caused the
+/// cas-a7c8 thrash loop. A worker caller should instead be told to report
+/// to the supervisor without reopening.
+#[tokio::test]
+async fn test_start_on_closed_message_is_worker_appropriate() {
+    let (temp, core) = setup_cas();
+    let _env_lock = env_test_lock();
+
+    let id = create_started_and_closed_light_task(&core, "start-on-closed worker message").await;
+
+    // Deliberately no CAS_AGENT_ROLE=supervisor.
+    let result = core
+        .cas_task_start(Parameters(IdRequest { id: id.clone() }))
+        .await;
+
+    let _ = temp; // keep tempdir alive for the duration of the call above
+    match result {
+        Err(e) => {
+            let msg = e.message.to_string();
+            assert!(
+                !msg.contains("Use reopen first"),
+                "worker-facing start-on-closed message must not instruct reopen: {msg}"
+            );
+            assert!(
+                msg.contains("do not reopen") && msg.contains("supervisor"),
+                "worker-facing start-on-closed message should direct to the supervisor: {msg}"
+            );
+        }
+        Ok(ok) => panic!("expected start-on-closed to fail, got: {}", extract_text(ok)),
+    }
+}
+
+/// A supervisor caller starting a Closed task still gets an error (start
+/// does not silently reopen), but the message is the supervisor-appropriate
+/// variant that does not carry the worker refusal wording.
+#[tokio::test]
+async fn test_start_on_closed_message_is_supervisor_appropriate() {
+    let (temp, core) = setup_cas();
+    let _env_lock = env_test_lock();
+
+    let id =
+        create_started_and_closed_light_task(&core, "start-on-closed supervisor message").await;
+
+    let result = {
+        // SAFETY: held under env_test_lock() for the whole scope.
+        unsafe {
+            std::env::set_var("CAS_AGENT_ROLE", "supervisor");
+        }
+        let r = core
+            .cas_task_start(Parameters(IdRequest { id: id.clone() }))
+            .await;
+        unsafe {
+            std::env::remove_var("CAS_AGENT_ROLE");
+        }
+        r
+    };
+
+    let _ = temp; // keep tempdir alive for the duration of the call above
+    match result {
+        Err(e) => {
+            let msg = e.message.to_string();
+            assert!(
+                !msg.contains("do not reopen"),
+                "supervisor-facing message should not use the worker refusal wording: {msg}"
+            );
+        }
+        Ok(ok) => panic!("expected start-on-closed to fail, got: {}", extract_text(ok)),
+    }
 }

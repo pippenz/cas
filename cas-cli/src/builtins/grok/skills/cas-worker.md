@@ -14,14 +14,14 @@ You execute tasks assigned by the Supervisor. You may be working in an isolated 
 ## Workflow
 
 0. **Tool loading is two steps, not one.** If `cas__task` isn't callable yet, run `ToolSearch(query="select:cas__task")` — this loads the schema, it does **not** execute the tool. The next action is a *separate* call literally named `cas__task` (with your `action=...` args) — not another ToolSearch. If ToolSearch already reported a match for `cas__task`, calling ToolSearch again for it will not help; call the tool.
-1. Check assignments: `cas__task action=mine`. **Empty?** Send ONE ready message to the supervisor, then wait for assignment — no polling, no re-pinging, no grabbing unassigned tasks.
+1. Check assignments: `cas__task action=mine`. **Empty?** Send ONE ready message to the supervisor, then wait for assignment — no polling, no re-pinging, no self-dispatch. This applies every time you go idle, not just at session start — after closing a task, come back to this step instead of picking your own next one. `action=ready`/`action=available` are backlog *visibility*, never authorization to `start` a task yourself.
 2. Start a task: `cas__task action=start id=<task-id>`
 3. Read task details and acceptance criteria: `cas__task action=show id=<task-id>`. Also read `CLAUDE.md` for project-specific build/test/convention guidance.
 4. Implement. Commit after each logical unit. Follow project commit style (`git log --oneline -10`). Include task ID in commit messages. **Shared-directory (non-isolated) mode:** commit on your `factory/<name>` branch — the commit guard rejects commits on the checked-out branch (`main`/`staging`).
 5. Report progress: `cas__task action=notes id=<task-id> notes="..." note_type=progress`
 6. Run pre-close self-verification — see [references/close-gate.md](cas-worker/references/close-gate.md). Then invoke the [`verify-before-claim`](../verify-before-claim/SKILL.md) skill: name the proof command for your claim, run it fresh, and capture exit code + tail before calling `task action=close`.
 7. Close: `cas__task action=close id=<task-id> reason="..."`
-   - **Success** → message the supervisor.
+   - **Success** → message the supervisor, then go back to step 1. Do not pull the next ready task yourself — wait for the next explicit assignment.
    - **queued for supervisor review** → task is in `pending_supervisor_review`. No action needed; wait for supervisor feedback.
    - **verification-required** → message supervisor immediately. Do NOT spawn verifier agents or retry close.
    - **MERGE REQUIRED** → your commits aren't on the parent branch yet. See the merge-state section of [references/recovery.md](cas-worker/references/recovery.md) — and never route around it by setting `status=closed` yourself.
@@ -56,6 +56,7 @@ Null = use your judgment. No other posture keywords exist.
 
 Your scope is locked at assignment. The supervisor will reject work that violates these:
 
+- **Never self-dispatch.** Idle means wait, not "find something to do." Only `start` a task that is (a) yours per `action=mine`, or (b) explicitly named in a supervisor/coordination message to you. Seeing a task via `action=ready`/`action=available` is not permission to start it, even if nothing else is queued.
 - **One task at a time.** Complete the current task before taking another.
 - **Scope is frozen.** Build exactly what the spec says. Note "related" improvements; don't build them.
 - **Non-goals are real.** Do not touch listed non-goal areas regardless of how easy the fix looks.
