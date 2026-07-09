@@ -238,54 +238,102 @@ pub fn get_cc_pid_for_mcp() -> u32 {
     std::process::id()
 }
 
-/// Get Claude Code's PID from hook context
+/// Get the interactive harness PID from hook context (Claude / Codex / Grok).
 ///
 /// Hooks can run in two modes:
-/// 1. Direct: Claude Code → cas hook (PPID = Claude Code)
-/// 2. Via shell: Claude Code → shell → cas hook (grandparent = Claude Code)
+/// 1. Direct: harness → cas hook (PPID = harness)
+/// 2. Via shell: harness → shell → cas hook (grandparent = harness)
 ///
-/// We detect which mode by checking if our parent's name contains "claude".
+/// We detect which mode by checking whether the parent is a known harness
+/// process (`claude`, `codex`, or `grok`). Pre-cas-3e56 this only matched
+/// `"claude"`, so Grok SessionStart hooks walked up to the *grandparent*
+/// (often a short-lived factory wrapper) and stored the wrong PID. The
+/// daemon liveness gate then declared the agent dead while the real Grok
+/// process was mid-turn — worker_status showed "None active".
 #[cfg(unix)]
 pub fn get_cc_pid_for_hook() -> u32 {
     let ppid = std::os::unix::process::parent_id();
 
-    // Check if parent is Claude Code directly
-    if is_claude_code_process(ppid) {
+    // Parent is the harness itself (direct hook spawn).
+    if is_harness_process(ppid) {
         return ppid;
     }
 
-    // Otherwise assume we're in a shell, get grandparent
-    get_parent_of_pid(ppid).unwrap_or(ppid)
+    // Parent is a shell/wrapper — prefer grandparent when it is a harness.
+    if let Some(gpid) = get_parent_of_pid(ppid) {
+        if is_harness_process(gpid) {
+            return gpid;
+        }
+    }
+
+    // Fallback: parent if we cannot identify a harness (legacy behavior for
+    // unknown wrappers). Prefer ppid over grandparent so we at least track
+    // the immediate invoker rather than an unrelated ancestor.
+    ppid
 }
 
-/// Check if a process is Claude Code by examining its command name
+/// Whether `pid` looks like a supported interactive harness process.
+///
+/// Matches command names containing `claude`, `codex`, or `grok` (case-
+/// insensitive). Public for tests and for callers that need the same
+/// recognition as SessionStart PID stamping (cas-3e56).
 #[cfg(target_os = "macos")]
-fn is_claude_code_process(pid: u32) -> bool {
+pub fn is_harness_process(pid: u32) -> bool {
     use std::process::Command;
     if let Ok(output) = Command::new("ps")
         .args(["-o", "comm=", "-p", &pid.to_string()])
         .output()
     {
-        let comm = String::from_utf8_lossy(&output.stdout);
-        let comm_lower = comm.trim().to_lowercase();
-        return comm_lower.contains("claude");
+        return comm_looks_like_harness(String::from_utf8_lossy(&output.stdout).trim());
     }
     false
 }
 
 #[cfg(target_os = "linux")]
-fn is_claude_code_process(pid: u32) -> bool {
-    // Read /proc/{pid}/comm
-    if let Ok(comm) = std::fs::read_to_string(format!("/proc/{}/comm", pid)) {
-        let comm_lower = comm.trim().to_lowercase();
-        return comm_lower.contains("claude");
+pub fn is_harness_process(pid: u32) -> bool {
+    // Prefer /proc/{pid}/comm; also check cmdline basename so renamed
+    // binaries (e.g. `node` wrapping a harness) can still match argv0.
+    if let Ok(comm) = std::fs::read_to_string(format!("/proc/{pid}/comm")) {
+        if comm_looks_like_harness(comm.trim()) {
+            return true;
+        }
+    }
+    if let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) {
+        // First NUL-separated token is argv0.
+        let argv0 = cmdline
+            .split(|&b| b == 0)
+            .next()
+            .map(|b| String::from_utf8_lossy(b))
+            .unwrap_or_default();
+        let base = std::path::Path::new(argv0.as_ref())
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(argv0.as_ref());
+        if comm_looks_like_harness(base) {
+            return true;
+        }
     }
     false
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn is_claude_code_process(_pid: u32) -> bool {
+pub fn is_harness_process(_pid: u32) -> bool {
     false
+}
+
+/// Shared name matcher for harness process detection (cas-3e56).
+pub(crate) fn comm_looks_like_harness(comm: &str) -> bool {
+    let c = comm.to_ascii_lowercase();
+    // Substring match: covers `claude`, `claude-code`, `grok`, full paths
+    // already basenamed by callers, and `codex` / `codex-cli`.
+    c.contains("claude") || c.contains("codex") || c.contains("grok")
+}
+
+/// Back-compat alias used by older call sites / tests.
+#[cfg(any(test, unix))]
+#[allow(dead_code)]
+fn is_claude_code_process(pid: u32) -> bool {
+    is_harness_process(pid)
 }
 
 #[cfg(not(unix))]
@@ -303,6 +351,22 @@ mod tests {
         let hash2 = compute_machine_hash();
         assert_eq!(hash1, hash2);
         assert_eq!(hash1.len(), 8); // 8 hex chars
+    }
+
+    /// cas-3e56: harness recognition must cover Claude, Codex, and Grok so
+    /// SessionStart stores the real interactive PID (not grandparent).
+    #[test]
+    fn comm_looks_like_harness_matches_all_supported_clis() {
+        assert!(comm_looks_like_harness("claude"));
+        assert!(comm_looks_like_harness("Claude"));
+        assert!(comm_looks_like_harness("claude-code"));
+        assert!(comm_looks_like_harness("codex"));
+        assert!(comm_looks_like_harness("codex-cli"));
+        assert!(comm_looks_like_harness("grok"));
+        assert!(comm_looks_like_harness("Grok"));
+        assert!(!comm_looks_like_harness("bash"));
+        assert!(!comm_looks_like_harness("cargo"));
+        assert!(!comm_looks_like_harness("node"));
     }
 
     #[test]
@@ -332,14 +396,10 @@ mod tests {
         let pid: u32 = pid_str.parse().unwrap();
         #[cfg(unix)]
         {
+            // compute_agent_id_for_hook always uses grandparent (shell wrapper
+            // model). get_cc_pid_for_hook is the harness-aware path (cas-3e56).
             let ppid = std::os::unix::process::parent_id();
-            // In test, parent is cargo/test runner, not Claude Code
-            // So we use grandparent
-            let expected = if is_claude_code_process(ppid) {
-                ppid
-            } else {
-                get_parent_of_pid(ppid).unwrap_or(ppid)
-            };
+            let expected = get_parent_of_pid(ppid).unwrap_or(ppid);
             assert_eq!(pid, expected);
         }
         #[cfg(not(unix))]

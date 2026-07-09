@@ -1031,6 +1031,61 @@ async fn test_worker_status_scopes_agents_to_factory_session() {
     );
 }
 
+/// cas-3e56: heartbeat past WORKER_STALE_SECS but registered harness PID still
+/// alive → worker_status must keep the worker listed as active with the
+/// "[alive — heartbeat stale]" dual-signal, never omit as "None active".
+///
+/// This is the supervision-truth residual after Grok liveness work: false
+/// "None active" while a Grok worker is mid-turn nearly caused a re-spawn.
+#[tokio::test]
+async fn test_worker_status_keeps_heartbeat_stale_process_alive_worker() {
+    let _guard = EnvGuard::set(&[]);
+    let env = FactoryTestEnv::new();
+
+    let store = env.agent_store();
+    let id = Agent::generate_fallback_id();
+    let mut agent = Agent::new(id.clone(), "mid-turn-grok".to_string());
+    agent.role = AgentRole::Worker;
+    agent
+        .metadata
+        .insert("worker_cli".to_string(), "grok".to_string());
+    // Heartbeat is "stale" by the 30s prune threshold.
+    let staleness = chrono::Duration::seconds(40);
+    agent.last_heartbeat = chrono::Utc::now() - staleness;
+    agent.registered_at = chrono::Utc::now() - staleness;
+    // Registered PID = this test process (alive). No fingerprint → pid-only
+    // liveness (kill 0) still proves the process is up.
+    agent.pid = Some(std::process::id());
+    store
+        .register(&agent)
+        .expect("register heartbeat-stale process-alive worker");
+
+    let req = factory_req("worker_status");
+    let result = env
+        .service
+        .factory(Parameters(req))
+        .await
+        .expect("worker_status call should succeed");
+    let text = get_text(&result);
+
+    assert!(
+        text.contains("mid-turn-grok"),
+        "process-alive worker must stay in Active listing despite stale heartbeat. Got:\n{text}"
+    );
+    assert!(
+        !text.contains("Workers: None active"),
+        "must not report empty roster when a process-alive worker exists. Got:\n{text}"
+    );
+    assert!(
+        text.contains("alive") && text.contains("heartbeat stale"),
+        "must surface dual-signal '[alive — heartbeat stale]'. Got:\n{text}"
+    );
+    assert!(
+        !text.contains("Filtered stale agent record(s)"),
+        "process-alive worker must not be pruned. Got:\n{text}"
+    );
+}
+
 /// cas-5b1c integration coverage: a worker whose heartbeat is older than
 /// `WORKER_STALE_SECS` (30s) is pruned out of the Active listing on the
 /// next `factory_worker_status` call and reported in the "Filtered stale
