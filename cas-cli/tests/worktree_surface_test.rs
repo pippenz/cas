@@ -13,7 +13,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use cas::mcp::{CasCore, CasService};
-use cas::store::init_cas_dir;
+use cas::store::{init_cas_dir, open_task_store};
+use cas::types::{Task, TaskType};
 use cas_mcp::types::CoordinationRequest;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::RawContent;
@@ -385,5 +386,250 @@ async fn test_worktree_merge_reports_not_found_not_disabled_when_nothing_matches
     assert!(
         contains_not_found,
         "a missing worktree should be reported as not found. Got: {result:?}"
+    );
+}
+
+// =============================================================================
+// cas-0938: worktree_merge's System-B fallback must target the worker's
+// TASK'S EPIC branch, not the repo trunk — merging an epic worker's commits
+// to trunk (then deleting the branch via cleanup_on_close) is a silent
+// wrong-target class of bug: worse than cas-1d11's pre-fix refusal, because
+// the close-gate still rejects AND unreviewed code now sits on trunk with
+// the only copy of it gone.
+// =============================================================================
+
+fn create_epic_and_worker_task(cas_root: &Path, epic_branch: &str) -> (String, String) {
+    let task_store = open_task_store(cas_root).expect("open_task_store");
+
+    let mut epic = Task::new("epic-1".to_string(), "Test epic".to_string());
+    epic.task_type = TaskType::Epic;
+    epic.branch = Some(epic_branch.to_string());
+    task_store.add(&epic).expect("add epic task");
+
+    let worker_task = Task::new("worker-task-1".to_string(), "Worker task".to_string());
+    task_store
+        .create_atomic(&worker_task, &[], Some(&epic.id), None)
+        .expect("create worker task under epic");
+
+    (epic.id, worker_task.id)
+}
+
+#[tokio::test]
+async fn test_worktree_merge_targets_epic_branch_when_task_id_given() {
+    let repo = GitRepo::new();
+    let cas_root = init_cas_dir(&repo.root).expect("init_cas_dir");
+    disable_system_a(&cas_root);
+
+    // The epic branch is a real branch in this repo (created off main) so
+    // merge_and_cleanup can actually check it out.
+    Command::new("git")
+        .args(["branch", "epic/foo"])
+        .current_dir(&repo.root)
+        .output()
+        .unwrap();
+
+    let (_epic_id, worker_task_id) = create_epic_and_worker_task(&cas_root, "epic/foo");
+
+    let wt_path = cas_root.join("worktrees").join("alice");
+    repo.add_worktree(&wt_path, "factory/alice");
+    std::fs::write(wt_path.join("alice-work.txt"), "alice's work").unwrap();
+    run_git(&["add", "."], &wt_path);
+    run_git(&["commit", "-m", "alice work"], &wt_path);
+
+    let _lock = merge_cwd_lock().lock().unwrap_or_else(|p| p.into_inner());
+    let _cwd = CwdGuard::enter(&repo.root);
+
+    let svc = make_service(cas_root);
+    let mut req = coord_req("worktree_merge");
+    req.id = Some("factory/alice".to_string());
+    req.task_id = Some(worker_task_id);
+    let result = svc
+        .coordination(Parameters(req))
+        .await
+        .expect("coordination call should succeed");
+    let text = get_text(&result);
+
+    assert!(
+        text.contains("Merged worktree") && text.contains("epic/foo"),
+        "must merge into the task's epic branch (epic/foo), not trunk.\nGot:\n{text}"
+    );
+    assert!(
+        !text.contains("Merged worktree system-b-alice to main")
+            && !text.contains("Merged worktree system-b-alice to master"),
+        "must NOT merge to trunk when the task has a parent epic.\nGot:\n{text}"
+    );
+    assert!(
+        text.contains("[resolved via:"),
+        "the resolved target and why must be surfaced in the success message.\nGot:\n{text}"
+    );
+
+    // The epic branch itself must now contain the worker's content — proves
+    // the merge landed on the right branch, not just that the message says so.
+    let epic_tree = Command::new("git")
+        .args(["ls-tree", "-r", "--name-only", "epic/foo"])
+        .current_dir(&repo.root)
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&epic_tree.stdout).contains("alice-work.txt"),
+        "epic/foo must contain the merged worker content"
+    );
+}
+
+#[tokio::test]
+async fn test_worktree_merge_falls_back_to_trunk_when_task_has_no_parent_epic() {
+    let repo = GitRepo::new();
+    let cas_root = init_cas_dir(&repo.root).expect("init_cas_dir");
+    disable_system_a(&cas_root);
+
+    // A standalone (non-epic) task — legitimately "no epic in play".
+    let task_store = open_task_store(&cas_root).expect("open_task_store");
+    let standalone_task = Task::new("standalone-1".to_string(), "Standalone task".to_string());
+    task_store.add(&standalone_task).expect("add standalone task");
+
+    let wt_path = cas_root.join("worktrees").join("bob");
+    repo.add_worktree(&wt_path, "factory/bob");
+
+    let _lock = merge_cwd_lock().lock().unwrap_or_else(|p| p.into_inner());
+    let _cwd = CwdGuard::enter(&repo.root);
+
+    let svc = make_service(cas_root);
+    let mut req = coord_req("worktree_merge");
+    req.id = Some("factory/bob".to_string());
+    req.task_id = Some(standalone_task.id.clone());
+    let result = svc
+        .coordination(Parameters(req))
+        .await
+        .expect("coordination call should succeed");
+    let text = get_text(&result);
+
+    assert!(
+        text.contains("Merged worktree"),
+        "a task with no parent epic must still merge to trunk, not refuse.\nGot:\n{text}"
+    );
+    assert!(
+        text.contains("no parent epic"),
+        "the trunk fallback reason must explain why (no parent epic), not just say 'trunk'.\nGot:\n{text}"
+    );
+}
+
+#[tokio::test]
+async fn test_worktree_merge_refuses_when_task_id_does_not_exist() {
+    let repo = GitRepo::new();
+    let cas_root = init_cas_dir(&repo.root).expect("init_cas_dir");
+    disable_system_a(&cas_root);
+
+    let wt_path = cas_root.join("worktrees").join("carol");
+    repo.add_worktree(&wt_path, "factory/carol");
+
+    let _lock = merge_cwd_lock().lock().unwrap_or_else(|p| p.into_inner());
+    let _cwd = CwdGuard::enter(&repo.root);
+
+    let svc = make_service(cas_root);
+    let mut req = coord_req("worktree_merge");
+    req.id = Some("factory/carol".to_string());
+    req.task_id = Some("cas-does-not-exist".to_string());
+    let result = svc.coordination(Parameters(req)).await;
+
+    // A caller-asserted task_id we can't verify must refuse — never guess a
+    // merge target (that's exactly how the original wrong-target-to-trunk
+    // defect happened) and never silently merge to trunk instead.
+    assert!(
+        result.is_err(),
+        "an unresolvable task_id must be refused, not silently fall back to trunk"
+    );
+    let msg = format!("{:?}", result.unwrap_err());
+    assert!(
+        msg.contains("not found") || msg.to_lowercase().contains("not found"),
+        "the refusal should explain the task_id couldn't be resolved. Got: {msg}"
+    );
+
+    // The worktree must survive the refused merge — not silently deleted.
+    assert!(
+        wt_path.exists(),
+        "a refused merge must not clean up / delete the worktree"
+    );
+}
+
+#[tokio::test]
+async fn test_worktree_merge_falls_back_to_trunk_when_no_task_id_given() {
+    // Regression guard: the original cas-1d11 caller pattern (no task_id at
+    // all) must keep working exactly as before — trunk fallback, not a
+    // refusal, since "no task_id" is a legitimate "no epic context" case.
+    let repo = GitRepo::new();
+    let cas_root = init_cas_dir(&repo.root).expect("init_cas_dir");
+    disable_system_a(&cas_root);
+
+    let wt_path = cas_root.join("worktrees").join("dave");
+    repo.add_worktree(&wt_path, "factory/dave");
+
+    let _lock = merge_cwd_lock().lock().unwrap_or_else(|p| p.into_inner());
+    let _cwd = CwdGuard::enter(&repo.root);
+
+    let svc = make_service(cas_root);
+    let mut req = coord_req("worktree_merge");
+    req.id = Some("factory/dave".to_string());
+    let result = svc
+        .coordination(Parameters(req))
+        .await
+        .expect("coordination call should succeed");
+    let text = get_text(&result);
+
+    assert!(text.contains("Merged worktree"));
+    assert!(
+        text.contains("no task_id given"),
+        "the trunk-fallback reason must be explicit about why. Got:\n{text}"
+    );
+}
+
+/// cas-0938 P3: System-B path resolution must honor a customized
+/// `worktrees.base_path`, not the hardcoded `<cas_root>/worktrees/<assignee>`
+/// convention — `spawn_workers isolate=true` itself resolves paths via
+/// `WorktreeManager::worktree_path_for_worker`, which respects this config,
+/// so a hardcoded path in `worktree_merge` would false-not-found any worker
+/// spawned under a non-default layout.
+#[tokio::test]
+async fn test_worktree_merge_honors_configured_base_path_not_hardcoded_convention() {
+    let repo = GitRepo::new();
+    let cas_root = init_cas_dir(&repo.root).expect("init_cas_dir");
+    std::fs::write(
+        cas_root.join("config.toml"),
+        "[worktrees]\nenabled = false\nbase_path = \"custom-worktree-loc\"\n",
+    )
+    .unwrap();
+
+    // Mirrors WorktreeManager::worktree_root()'s resolution for a relative,
+    // non-{project} base_path: repo_root.parent().join(base_path).
+    let expected_root = repo
+        .root
+        .parent()
+        .unwrap()
+        .join("custom-worktree-loc")
+        .join("erin");
+    repo.add_worktree(&expected_root, "factory/erin");
+
+    // Sanity: this is NOT where the old hardcoded convention would look.
+    assert_ne!(expected_root, cas_root.join("worktrees").join("erin"));
+
+    let _lock = merge_cwd_lock().lock().unwrap_or_else(|p| p.into_inner());
+    let _cwd = CwdGuard::enter(&repo.root);
+
+    let svc = make_service(cas_root);
+    let mut req = coord_req("worktree_merge");
+    req.id = Some("factory/erin".to_string());
+    let result = svc
+        .coordination(Parameters(req))
+        .await
+        .expect("coordination call should succeed");
+    let text = get_text(&result);
+
+    assert!(
+        text.contains("Merged worktree"),
+        "must find and merge the worker worktree at its CONFIGURED location, \
+         not the hardcoded default.\nGot:\n{text}"
+    );
+    assert!(
+        !text.contains("Worktree not found"),
+        "must not false-not-found a worker under a customized base_path.\nGot:\n{text}"
     );
 }

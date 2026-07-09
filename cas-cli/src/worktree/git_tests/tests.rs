@@ -464,3 +464,175 @@ fn test_commits_behind_counts_one_sided_divergence() {
     // Local has nothing origin/main lacks — behind count the other way is 0.
     assert_eq!(git.commits_behind("origin/main", "main").unwrap(), 0);
 }
+
+// --- cas-0938: resolve_fresh_base must not silently drop local-ahead ------
+// commits by unconditionally preferring origin/<base> whenever it exists.
+
+#[test]
+fn test_resolve_fresh_base_prefers_local_when_strictly_ahead_of_origin() {
+    let (_temp, _origin_path, local_path) = create_repo_with_origin();
+
+    // Add a local-only commit that is never pushed — origin/main stays at
+    // the original tip while local main moves ahead.
+    std::fs::write(local_path.join("unpushed.txt"), "local work").unwrap();
+    Command::new("git")
+        .args(["add", "."])
+        .current_dir(&local_path)
+        .output()
+        .unwrap();
+    Command::new("git")
+        .args(["commit", "-m", "local-only commit"])
+        .current_dir(&local_path)
+        .output()
+        .unwrap();
+
+    let git = GitOperations::new(local_path.clone());
+    let local_ahead_sha = git.ref_sha("main").unwrap();
+
+    let resolved = git.resolve_fresh_base("main").unwrap();
+
+    assert!(
+        !resolved.used_remote,
+        "local is strictly ahead of origin/main — origin is the stale ref here, \
+         resolve_fresh_base must not take it and silently drop the local-only commit"
+    );
+    assert_eq!(resolved.branch_ref, "main");
+    assert_eq!(resolved.sha, local_ahead_sha);
+    assert_eq!(resolved.ahead_count, 1);
+    assert_eq!(resolved.behind_count, 0);
+
+    // Branching from the resolved ref must carry the local-only commit.
+    Command::new("git")
+        .args(["branch", "epic/test", &resolved.branch_ref])
+        .current_dir(&local_path)
+        .output()
+        .unwrap();
+    let tree = Command::new("git")
+        .args(["ls-tree", "-r", "--name-only", "epic/test"])
+        .current_dir(&local_path)
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&tree.stdout).contains("unpushed.txt"),
+        "epic branch must contain the local-only commit's file"
+    );
+}
+
+#[test]
+fn test_resolve_fresh_base_true_divergence_prefers_local_and_reports_both_counts() {
+    let (temp, origin_path, local_path) = create_repo_with_origin();
+    // origin/main gains 2 commits local never fetched...
+    advance_origin_main(&temp, &origin_path, 2);
+    // ...while local ALSO gains 1 commit of its own, never pushed. Local
+    // has not fetched yet, so at resolution time this is genuine two-way
+    // divergence once the fetch inside resolve_fresh_base runs.
+    std::fs::write(local_path.join("local-only.txt"), "local work").unwrap();
+    Command::new("git")
+        .args(["add", "."])
+        .current_dir(&local_path)
+        .output()
+        .unwrap();
+    Command::new("git")
+        .args(["commit", "-m", "local-only commit"])
+        .current_dir(&local_path)
+        .output()
+        .unwrap();
+
+    let git = GitOperations::new(local_path.clone());
+    let local_sha = git.ref_sha("main").unwrap();
+
+    let resolved = git.resolve_fresh_base("main").unwrap();
+
+    assert!(
+        !resolved.used_remote,
+        "on true divergence the local ref must be preferred — never silently \
+         drop the caller's own local-only commit by taking origin's tip"
+    );
+    assert_eq!(resolved.branch_ref, "main");
+    assert_eq!(resolved.sha, local_sha);
+    assert_eq!(resolved.ahead_count, 1, "local has exactly 1 commit origin lacks");
+    assert_eq!(
+        resolved.behind_count, 2,
+        "origin has exactly 2 commits local lacks — still reported even though \
+         local was preferred, so the caller can see what's missing"
+    );
+}
+
+#[test]
+fn test_resolve_fresh_base_no_divergence_still_prefers_remote_tip() {
+    // Regression guard: the ahead-count fix must not disturb the original
+    // cas-b082 behavior when local is ONLY behind (never ahead).
+    let (temp, origin_path, local_path) = create_repo_with_origin();
+    advance_origin_main(&temp, &origin_path, 1);
+
+    let git = GitOperations::new(local_path);
+    let resolved = git.resolve_fresh_base("main").unwrap();
+
+    assert!(resolved.used_remote);
+    assert_eq!(resolved.branch_ref, "origin/main");
+    assert_eq!(resolved.ahead_count, 0);
+    assert_eq!(resolved.behind_count, 1);
+}
+
+// --- cas-0938: fetch must be bounded, not block indefinitely on an -------
+// unreachable remote. Tested via the generic process-bounding mechanism
+// (not a real network hang, which would be slow/unreliable in CI) with a
+// `sleep` child standing in for a hung `git fetch`.
+
+#[test]
+fn test_run_command_bounded_kills_hung_process_and_returns_promptly() {
+    let mut cmd = Command::new("sleep");
+    cmd.arg("5");
+
+    let start = std::time::Instant::now();
+    let result = GitOperations::run_command_bounded(cmd, std::time::Duration::from_millis(100));
+    let elapsed = start.elapsed();
+
+    assert!(
+        result.is_err(),
+        "a process that outlives the timeout must be reported as an error"
+    );
+    assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "must return promptly after the timeout fires, not wait out the full 5s hang; took {elapsed:?}"
+    );
+}
+
+#[test]
+fn test_run_command_bounded_returns_output_for_fast_process() {
+    let mut cmd = Command::new("echo");
+    cmd.arg("hello");
+
+    let output =
+        GitOperations::run_command_bounded(cmd, std::time::Duration::from_secs(5)).unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "hello");
+}
+
+#[test]
+fn test_fetch_branch_bounded_times_out_fast_on_hung_remote() {
+    let (_temp, repo_path) = create_test_repo();
+    let git = GitOperations::new(repo_path.clone());
+
+    // Point origin at a non-routable, non-responding address so the fetch
+    // hangs rather than fails fast — this is the scenario the timeout must
+    // catch (a dead SSH host or a VPN that's down doesn't reject the
+    // connection, it just never answers).
+    Command::new("git")
+        .args(["remote", "add", "origin", "git://10.255.255.1/nowhere.git"])
+        .current_dir(&repo_path)
+        .output()
+        .unwrap();
+
+    let start = std::time::Instant::now();
+    let result = git.fetch_branch_bounded("main", std::time::Duration::from_millis(200));
+    let elapsed = start.elapsed();
+
+    assert!(result.is_err(), "an unreachable remote must not silently succeed");
+    assert!(
+        elapsed < std::time::Duration::from_secs(3),
+        "fetch_branch must not block for git's full TCP connect/retry window; took {elapsed:?}"
+    );
+}

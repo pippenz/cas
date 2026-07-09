@@ -1,22 +1,82 @@
 use crate::mcp::tools::core::imports::*;
 
-/// Resolve the on-disk path of a System B (`spawn_workers isolate=true`)
-/// worktree for `assignee`, if one exists.
+/// Check whether `path` looks like a live git worktree (has a `.git` entry
+/// — a file for linked worktrees, pointing back at the main repo's
+/// worktree admin dir).
 ///
-/// `spawn_workers isolate=true` places every worker at the fixed
-/// convention `<cas_root>/worktrees/<assignee>` on branch
-/// `factory/<assignee>` — never registered in the `WorktreeStore`
-/// (System A), so `worktree_merge` needs this as a fallback lookup
-/// (cas-1d11) when the System A store misses. Returns `None` when the
-/// path doesn't exist or isn't a git worktree (no `.git` entry) — an
-/// unknowable worktree is not treated as a false positive.
-fn system_b_worktree_path(cas_root: &std::path::Path, assignee: &str) -> Option<std::path::PathBuf> {
-    let path = cas_root.join("worktrees").join(assignee);
-    if path.join(".git").exists() {
-        Some(path)
-    } else {
-        None
+/// Used to confirm a System B (`spawn_workers isolate=true`) worktree
+/// actually exists at its resolved path before `worktree_merge` acts on
+/// it (cas-1d11). Returns `false` for a path that doesn't exist or isn't a
+/// git worktree — an unknowable worktree is not treated as a false
+/// positive.
+fn is_git_worktree(path: &std::path::Path) -> bool {
+    path.join(".git").exists()
+}
+
+/// Resolve the parent branch a System B worker's branch should merge into
+/// (cas-0938).
+///
+/// Before this fix, `worktree_merge`'s System-B fallback always merged
+/// into the configured/detected TRUNK — even for epic workers whose
+/// close-gate demands merging into the task's EPIC branch. That produced
+/// a wrong-target merge that also deleted the branch (`cleanup_on_close`),
+/// worse than cas-1d11's pre-fix refusal: unreviewed worker code silently
+/// landed on trunk with no way to recover it.
+///
+/// When `task_id` is supplied, resolves via the task's parent epic
+/// (`TaskStore::get_parent_epic` — the exact lookup the close-gate itself
+/// uses in `close_ops.rs`). Refuses when `task_id` is supplied but doesn't
+/// resolve to a real task: the caller asserted a specific epic context we
+/// can't verify, so silently falling back to trunk there would repeat the
+/// original defect under a different disguise. Falls back to the
+/// configured/detected trunk only when no `task_id` was given, or the
+/// given task genuinely has no parent epic — both are legitimately "no
+/// epic in play". Always returns a human-readable reason so the caller
+/// can see which branch (and why) without opening any other tool.
+fn resolve_system_b_merge_target(
+    task_store: &dyn cas_store::TaskStore,
+    task_id: Option<&str>,
+    trunk: impl FnOnce() -> String,
+) -> Result<(String, String), McpError> {
+    if let Some(task_id) = task_id {
+        task_store.get(task_id).map_err(|e| McpError {
+            code: ErrorCode::INVALID_PARAMS,
+            message: Cow::from(format!(
+                "task_id {task_id} not found — refusing to guess a merge target: {e}"
+            )),
+            data: None,
+        })?;
+        let epic_branch = task_store
+            .get_parent_epic(task_id)
+            .map_err(|e| McpError {
+                code: ErrorCode::INTERNAL_ERROR,
+                message: Cow::from(format!(
+                    "Failed to resolve parent epic for task {task_id}: {e}"
+                )),
+                data: None,
+            })?
+            .and_then(|epic| epic.branch);
+
+        if let Some(branch) = epic_branch {
+            return Ok((
+                branch.clone(),
+                format!("epic branch {branch} (task {task_id}'s parent epic)"),
+            ));
+        }
+
+        // Task exists but has no parent epic — legitimately "no epic in play".
+        let trunk = trunk();
+        return Ok((
+            trunk.clone(),
+            format!("trunk {trunk} (task {task_id} has no parent epic)"),
+        ));
     }
+
+    let trunk = trunk();
+    Ok((
+        trunk.clone(),
+        format!("trunk {trunk} (no task_id given — no epic context to resolve)"),
+    ))
 }
 
 impl CasCore {
@@ -440,14 +500,28 @@ impl CasCore {
     /// Resolves `id` against System A first (the `WorktreeStore`-tracked,
     /// `worktrees.enabled`-gated worktrees created by `worktree_create`).
     /// When that lookup misses, falls back to System B — the
-    /// `<cas_root>/worktrees/<assignee>` / `factory/<assignee>` convention
-    /// used by `spawn_workers isolate=true`, which is never registered in
-    /// the store and doesn't check `worktrees.enabled` at all (cas-1d11).
-    /// Without this fallback, spawn happily created isolated worktrees
-    /// while the only supervisor-callable merge action refused every one
-    /// of them — forcing a manual `git worktree add` + merge + push that
-    /// bypassed factory tracking/lease/cleanup entirely.
-    pub async fn worktree_merge(&self, id: &str, force: bool) -> Result<CallToolResult, McpError> {
+    /// `spawn_workers isolate=true` convention (branch `factory/<assignee>`,
+    /// path resolved via `WorktreeManager::worktree_path_for_worker` so a
+    /// customized `worktrees.base_path` still resolves correctly), which is
+    /// never registered in the store and doesn't check `worktrees.enabled`
+    /// at all (cas-1d11). Without this fallback, spawn happily created
+    /// isolated worktrees while the only supervisor-callable merge action
+    /// refused every one of them — forcing a manual `git worktree add` +
+    /// merge + push that bypassed factory tracking/lease/cleanup entirely.
+    ///
+    /// A System-B merge target is resolved via `task_id` (cas-0938): pass
+    /// the worker's task and this merges into that task's parent EPIC
+    /// branch, not the repo trunk — merging an epic worker's commits to
+    /// trunk instead of its epic branch is a silent-wrong-target class of
+    /// bug (the close-gate still rejects, and the branch is gone). Falls
+    /// back to trunk only when no `task_id` is given or the task has no
+    /// parent epic; the resolved target is always surfaced in the result.
+    pub async fn worktree_merge(
+        &self,
+        id: &str,
+        force: bool,
+        task_id: Option<&str>,
+    ) -> Result<CallToolResult, McpError> {
         use crate::config::Config;
         use crate::store::open_worktree_store;
         use crate::worktree::{WorktreeConfig, WorktreeManager};
@@ -466,11 +540,12 @@ impl CasCore {
             data: None,
         })?;
 
-        let cwd = std::env::current_dir().map_err(|e| McpError {
-            code: ErrorCode::INTERNAL_ERROR,
-            message: Cow::from(format!("Failed to get cwd: {e}")),
-            data: None,
-        })?;
+        // Repo root: `cas_root` is `<repo>/.cas`, so its parent is the repo
+        // — consistent with close_ops.rs's `close_project_root` and every
+        // other cas_root-anchored lookup in this handler. `cwd` is
+        // process-global on the long-lived MCP server and must not be
+        // trusted to match the intended repo (cas-0938).
+        let cwd = cas_root.parent().unwrap_or(&cas_root).to_path_buf();
 
         let manager_config = WorktreeConfig {
             enabled: wt_config.enabled,
@@ -496,21 +571,31 @@ impl CasCore {
             })?,
         };
 
-        let (mut worktree, is_system_b) = match system_a {
-            Some(wt) => (wt, false),
+        let (mut worktree, is_system_b, target_reason) = match system_a {
+            Some(wt) => (wt, false, String::new()),
             None => {
                 let assignee = id.strip_prefix("factory/").unwrap_or(id);
-                let path = system_b_worktree_path(&cas_root, assignee).ok_or_else(|| McpError {
-                    code: ErrorCode::INVALID_PARAMS,
-                    message: Cow::from(format!(
-                        "Worktree not found: {id} (checked System A worktree store and \
-                         the System B convention {}/worktrees/{assignee})",
-                        cas_root.display()
-                    )),
-                    data: None,
-                })?;
-                let parent_branch = Config::configured_epic_base_branch(&cwd)
-                    .unwrap_or_else(|| manager.git().detect_default_branch());
+                let path = manager.worktree_path_for_worker(assignee);
+                if !is_git_worktree(&path) {
+                    return Err(McpError {
+                        code: ErrorCode::INVALID_PARAMS,
+                        message: Cow::from(format!(
+                            "Worktree not found: {id} (checked System A worktree store and \
+                             the System B path {})",
+                            path.display()
+                        )),
+                        data: None,
+                    });
+                }
+                let task_store = self.open_task_store()?;
+                let (parent_branch, target_reason) = resolve_system_b_merge_target(
+                    task_store.as_ref(),
+                    task_id,
+                    || {
+                        Config::configured_epic_base_branch(&cwd)
+                            .unwrap_or_else(|| manager.git().detect_default_branch())
+                    },
+                )?;
                 (
                     crate::types::Worktree::new(
                         format!("system-b-{assignee}"),
@@ -519,6 +604,7 @@ impl CasCore {
                         path,
                     ),
                     true,
+                    target_reason,
                 )
             }
         };
@@ -542,14 +628,24 @@ impl CasCore {
             })?;
         }
 
+        // Always surface the resolved target for System-B merges — the
+        // wrong-target-to-trunk defect (cas-0938) was invisible precisely
+        // because the tool didn't say which branch it actually used.
+        let target_suffix = if is_system_b {
+            format!(" [resolved via: {target_reason}]")
+        } else {
+            String::new()
+        };
+
         // Promote entries if configured
         if wt_config.promote_entries_on_merge {
             if let Ok(count) = self.promote_branch_entries(&worktree.branch) {
                 if count > 0 {
                     return Ok(Self::success(format!(
-                        "Merged worktree {} to {}. Commit: {}\nPromoted {} entries from branch scope.",
+                        "Merged worktree {} to {}.{} Commit: {}\nPromoted {} entries from branch scope.",
                         worktree.id,
                         worktree.parent_branch,
+                        target_suffix,
                         merge_commit.as_deref().unwrap_or("none"),
                         count
                     )));
@@ -558,9 +654,10 @@ impl CasCore {
         }
 
         Ok(Self::success(format!(
-            "Merged worktree {} to {}. Commit: {}",
+            "Merged worktree {} to {}.{} Commit: {}",
             worktree.id,
             worktree.parent_branch,
+            target_suffix,
             merge_commit.as_deref().unwrap_or("none")
         )))
     }
@@ -667,38 +764,32 @@ impl CasCore {
 
 #[cfg(test)]
 mod tests {
-    use super::system_b_worktree_path;
+    use super::is_git_worktree;
     use tempfile::TempDir;
 
     #[test]
-    fn system_b_worktree_path_resolves_when_git_dir_present() {
+    fn is_git_worktree_true_when_git_entry_present() {
         let temp = TempDir::new().unwrap();
-        let cas_root = temp.path().to_path_buf();
-        let wt_path = cas_root.join("worktrees").join("alice");
+        let wt_path = temp.path().join("alice");
         std::fs::create_dir_all(wt_path.join(".git")).unwrap();
 
-        assert_eq!(
-            system_b_worktree_path(&cas_root, "alice"),
-            Some(wt_path)
-        );
+        assert!(is_git_worktree(&wt_path));
     }
 
     #[test]
-    fn system_b_worktree_path_none_when_directory_missing() {
+    fn is_git_worktree_false_when_path_missing() {
         let temp = TempDir::new().unwrap();
-        let cas_root = temp.path().to_path_buf();
-
-        assert_eq!(system_b_worktree_path(&cas_root, "ghost"), None);
+        assert!(!is_git_worktree(&temp.path().join("ghost")));
     }
 
     #[test]
-    fn system_b_worktree_path_none_when_directory_exists_but_not_a_git_worktree() {
-        // A stray non-git directory under worktrees/ (e.g. leftover cruft)
-        // must not be mistaken for a live factory worktree.
+    fn is_git_worktree_false_when_directory_exists_but_not_a_git_worktree() {
+        // A stray non-git directory (e.g. leftover cruft) must not be
+        // mistaken for a live factory worktree.
         let temp = TempDir::new().unwrap();
-        let cas_root = temp.path().to_path_buf();
-        std::fs::create_dir_all(cas_root.join("worktrees").join("bob")).unwrap();
+        let path = temp.path().join("bob");
+        std::fs::create_dir_all(&path).unwrap();
 
-        assert_eq!(system_b_worktree_path(&cas_root, "bob"), None);
+        assert!(!is_git_worktree(&path));
     }
 }
