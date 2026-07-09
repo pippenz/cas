@@ -936,6 +936,187 @@ async fn test_serial_second_task_on_same_branch_does_not_restrand_first_close_ca
     );
 }
 
+/// cas-38e2: reproduces the live incident found while merging cas-4b3f/
+/// cas-ac2e/cas-c093/cas-f781/cas-b082 in this same factory session — a
+/// worker's commit is merged into the epic branch and PUSHED to origin
+/// (so `origin/<epic>` genuinely contains it), but the closing worker's
+/// OWN local `<epic>` ref is still at the pre-merge tip. Every other
+/// worker this session hit MERGE REQUIRED on already-integrated work and
+/// had to be closed from the supervisor's own (fresh) checkout as a
+/// workaround. Post-fix, the gate falls back to `origin/<epic>` before
+/// rejecting, so the worker's own close succeeds directly.
+#[tokio::test]
+async fn test_stale_local_epic_ref_falls_back_to_origin_cas_38e2() {
+    use std::process::Command;
+
+    let (temp, service) = setup_cas();
+    let _env_lock = env_test_lock();
+    let cas_dir = temp.path().join(".cas");
+    let agent_store = open_agent_store(&cas_dir).expect("open agent store");
+    {
+        let mut agent = agent_store
+            .list(None)
+            .expect("list agents")
+            .into_iter()
+            .find(|agent| agent.name == "test-agent")
+            .expect("test agent exists");
+        agent.role = AgentRole::Worker;
+        agent_store.update(&agent).expect("mark test agent worker");
+    }
+
+    std::fs::write(
+        cas_dir.join("config.toml"),
+        "[verification]\nenabled = true\n",
+    )
+    .expect("write config");
+
+    let bare = tempfile::tempdir().expect("bare tempdir");
+    let bare_status = Command::new("git")
+        .args(["init", "-q", "--bare"])
+        .current_dir(bare.path())
+        .status()
+        .expect("git init --bare");
+    assert!(bare_status.success());
+
+    let repo = temp.path();
+    let git = |args: &[&str]| {
+        let ok = Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .status()
+            .expect("git")
+            .success();
+        assert!(ok, "git {args:?} failed");
+    };
+    let git_output = |args: &[&str]| -> String {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .expect("git");
+        assert!(out.status.success(), "git {args:?} failed");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    git(&["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("seed.txt"), "seed\n").unwrap();
+    git(&["add", "seed.txt"]);
+    git(&["commit", "-q", "-m", "seed"]);
+    git(&[
+        "remote",
+        "add",
+        "origin",
+        bare.path().to_str().unwrap(),
+    ]);
+    git(&["checkout", "-q", "-b", "epic/cas-38e2"]);
+    let old_epic_tip = git_output(&["rev-parse", "epic/cas-38e2"]);
+    git(&["checkout", "-q", "-b", "factory/test-agent"]);
+    std::fs::write(repo.join("worker.txt"), "worker\n").unwrap();
+    git(&["add", "worker.txt"]);
+    git(&["commit", "-q", "-m", "worker change"]);
+
+    let task_store = open_task_store(&cas_dir).expect("open task store");
+
+    let epic_id = extract_task_id(&extract_text(
+        service
+            .cas_task_create(Parameters(TaskCreateRequest {
+                depth: None,
+                title: "Stale-ref merge epic".to_string(),
+                description: None,
+                priority: 2,
+                task_type: "epic".to_string(),
+                labels: None,
+                notes: None,
+                blocked_by: None,
+                design: None,
+                acceptance_criteria: None,
+                external_ref: None,
+                assignee: None,
+                demo_statement: None,
+                execution_note: None,
+                epic: None,
+            }))
+            .await
+            .expect("create epic"),
+    ))
+    .expect("epic id")
+    .to_string();
+    {
+        let mut epic = task_store.get(&epic_id).expect("epic exists");
+        epic.branch = Some("epic/cas-38e2".to_string());
+        task_store.update(&epic).expect("update epic branch");
+    }
+
+    let id_a = extract_task_id(&extract_text(
+        service
+            .cas_task_create(Parameters(TaskCreateRequest {
+                epic: Some(epic_id.clone()),
+                ..simple_task_req("Task A")
+            }))
+            .await
+            .expect("create A"),
+    ))
+    .expect("id A")
+    .to_string();
+    service
+        .cas_task_start(Parameters(IdRequest { id: id_a.clone() }))
+        .await
+        .expect("start A");
+    {
+        let mut task_a = task_store.get(&id_a).expect("A exists after start");
+        task_a.assignee = Some("test-agent".to_string());
+        task_store.update(&task_a).expect("set A assignee");
+    }
+
+    // Supervisor (simulated in the same checkout): merge + push the epic
+    // branch to origin. This is what makes `origin/epic/cas-38e2` genuinely
+    // contain the worker's commit.
+    git(&["checkout", "-q", "epic/cas-38e2"]);
+    git(&["merge", "-q", "--no-ff", "factory/test-agent"]);
+    git(&["push", "-q", "origin", "epic/cas-38e2"]);
+
+    // Now force the local epic branch ref back to its pre-merge tip —
+    // simulating the closing worker's own view not having observed the
+    // merge yet, even though origin (and everyone else) has.
+    git(&["checkout", "-q", "factory/test-agent"]);
+    git(&["branch", "-f", "epic/cas-38e2", &old_epic_tip]);
+
+    let verification_store = open_verification_store(&cas_dir).expect("open verification store");
+    verification_store
+        .add(&Verification::approved(
+            "ver-cas-38e2".to_string(),
+            id_a.clone(),
+            "Simulated approval".to_string(),
+        ))
+        .expect("record verification approval");
+
+    let close_text = extract_text(
+        service
+            .cas_task_close(Parameters(TaskCloseRequest {
+                id: id_a.clone(),
+                reason: Some("merged and pushed to origin".to_string()),
+                bypass_code_review: None,
+                code_review_findings: None,
+            }))
+            .await
+            .expect("close returns"),
+    );
+    assert!(
+        close_text.contains("Closed task:"),
+        "a commit already reachable from origin/epic/cas-38e2 must not bounce \
+         off this repo's stale local epic branch ref: {close_text}"
+    );
+    assert_eq!(
+        task_store.get(&id_a).expect("A exists").status,
+        TaskStatus::Closed
+    );
+}
+
 /// cas-4b3f (AC c): reproduces BUG-close-guard-nonepic-task-targets-main.md.
 /// A standalone (non-epic) task whose worker has fully committed and merged
 /// their work onto an INTEGRATION branch that isn't `main` must not have its
