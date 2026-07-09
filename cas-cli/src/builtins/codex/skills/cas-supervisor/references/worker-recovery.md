@@ -4,26 +4,34 @@
 
 Before you run `shutdown_workers` on a pane that *looks* broken, spend 60 seconds on triage. The supervisor TUI is not ground truth for worker liveness — the most common false-positive failure mode is a worker that's mid-way through a long tool call or showing Claude Code's Bun/React-Ink crash screen (which leaves the process alive with an unresponsive UI). Destructive recovery on a live worker rips its worktree out from under itself and turns a recoverable hang into a real crash.
 
-**Step 1: classify.** `cas factory is-wedged <worker>` returns one of four states plus evidence and exits with a differentiated code:
+**Step 1: classify.** `cas factory is-wedged <worker>` returns one of five states plus evidence and exits with a differentiated code:
 
 | Exit | State | What it means | Recovery |
 |---|---|---|---|
 | 0 | `alive` | PID up, transcript fresh, no crash signature — worker is running. | Wait. |
 | 1 | `wedged` | PID up, transcript fresh, Bun/React-Ink crash signature matched. | `cas factory kill` + respawn. |
 | 2 | `starved` | PID up, transcript cold (>60s since last write). Likely scheduler-starved or hung on a tool call. | Wait another 2 minutes, then re-classify. |
-| 3 | `dead` | PID gone. | Cleanup only — no kill needed. |
+| 3 | `dead` | PID gone, AND a second signal corroborates it (transcript stale AND worktree not recently edited). | Cleanup only — no kill needed. |
+| 4 | `unverified` | PID probe says gone, but the transcript is still fresh or the worktree was recently edited — a contradiction. | **Do not treat as dead.** Run `cas factory debug <worker>` and check the worktree before doing anything destructive — this is what a stale/wrong tracked pid looks like while the real worker is still alive (cas-f781). |
 
 The Bun/React-Ink crash signature is the visual fingerprint captured in the cas-4513 discovery note 2026-04-23 15:11 UTC: the pane fills with minified source paths like `/$bunfs/root/src/entrypoints/cli.js`, React-Ink `createElement("ink-box", ...)` enumerations, and a JS stack trace. The Bun event loop does NOT exit on unhandled rejection, so the PID stays alive and a daemon-faked heartbeat stays fresh — without the transcript grep you cannot distinguish this from a live worker mid-call.
 
+**Why `dead` now requires two signals (cas-f781).** A live worker's tracked pid can end up pointing at the wrong process — e.g. an MCP-server child self-registering over the real `claude --agent-name <worker>` pid. When that happens, the pid probe alone reads "gone" while the real worker is still alive and writing. `is-wedged` now corroborates a pid-gone reading against transcript mtime and worktree edit recency before calling it `dead`; a single contradicted signal reports `unverified` instead. Never auto-reset a lease off `unverified` — investigate first.
+
 **Step 2: read the transcript tail.** `cas factory debug <worker> --tail 20` prints the last N JSONL entries from `~/.claude/projects/*/<session>.jsonl` without touching the TUI. This is the canonical "what did the worker just do" signal — use it to decide whether the wedged state has salvageable in-flight work before killing.
 
-**Step 3: recovery.** Only after `is-wedged` reports `wedged` or `dead`:
+**Step 3: recovery.** Only after `is-wedged` reports `wedged` or `dead` — never off `unverified`:
 
 - **Wedged:** `cas factory kill <worker>` — SIGKILL (SIGTERM is observed not to exit cleanly on the Bun wedge) and reset any leased tasks (release lease + status→Open + clear assignee, same semantics as `mcp__cas__task action=reset`). Idempotent on an already-dead process. Then respawn.
 - **Starved:** do not kill. Come back in 2 minutes; if it re-classifies as `wedged`, proceed to the kill path.
 - **Dead:** no kill needed. The `kill` verb is still safe to run (`skipping SIGKILL` + task reset runs); or manually `mcp__cas__task action=reset id=<task>`.
+- **Unverified:** do not kill and do not reset the lease. Run `cas factory debug <worker>` and inspect the worktree manually; re-run `is-wedged` once you've confirmed which process is actually the worker.
 
-**PID-recycling guard.** `cas factory kill` refuses to SIGKILL unless the `/proc/<pid>/stat` starttime fingerprint recorded at agent registration (cas-ea46 / cas-b157) still matches the process at that PID. On a busy host the kernel can recycle a PID between registration and kill, so without this guard we could SIGKILL an unrelated process. If the fingerprint mismatches, the summary says `pid N SKIPPED: starttime fingerprint mismatch (PID recycled). Pass --force to override.` — investigate before using `--force`. Legacy agents (registered before cas-ea46) have no fingerprint and also require `--force`.
+**Process resolution (cas-f781).** `cas factory kill` does not blindly trust the agent store's tracked pid — that value can be stale or wrong (the MCP-server-child self-registration bug above). Before killing, it scans the live process table for a process whose own argv (`--agent-name <worker>`) or environment (`CAS_AGENT_NAME=<worker>`, for Codex workers) identifies it as the target worker, and prefers that resolved pid over the tracked one. The summary line calls this out explicitly: `process-table scan resolved a live process for `<worker>` at pid N (agent-name match) — overriding stale tracked pid M`. The kill itself targets the process **group**, not a single pid, since workers are spawned as session leaders and may have forked children of their own.
+
+**Lease reset only fires after confirmed death (cas-f781).** The task lease is no longer released as an unconditional side effect of running `kill`. It resets only when death is independently confirmed: the pid was already gone before the attempt, or SIGKILL was delivered and a short post-kill poll confirms the process actually died. If the kill was refused (fingerprint mismatch / no fingerprint, see below) or the process demonstrably survived the signal, the summary says `skipping lease reset for `<worker>` — worker death not confirmed` and the lease is left alone — a still-alive worker never has its task yanked out from under it.
+
+**PID-recycling guard.** For the tracked-pid fallback path (no live process-table match), `cas factory kill` refuses to SIGKILL unless the `/proc/<pid>/stat` starttime fingerprint recorded at agent registration (cas-ea46 / cas-b157) still matches the process at that PID. On a busy host the kernel can recycle a PID between registration and kill, so without this guard we could SIGKILL an unrelated process. If the fingerprint mismatches, the summary says `pid N SKIPPED: starttime fingerprint mismatch (PID recycled). Pass --force to override.` — investigate before using `--force`. Legacy agents (registered before cas-ea46) have no fingerprint and also require `--force`. A process resolved via the live agent-name scan skips this gate — the argv/environ match is itself a direct identity proof.
 
 **Anti-pattern:** "pane looks broken → `shutdown_workers`". That pathway has destroyed in-progress work multiple times (silent-owl-56 2026-04-23 shipped cas-4181 through what looked like a crashed pane). The `is-wedged` / `debug` / `kill` triad replaces it.
 
