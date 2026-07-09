@@ -2432,6 +2432,37 @@ pub(crate) fn run_factory_branch_merge_gate(
         return MergeStateGateOutcome::Proceed;
     }
 
+    // cas-38e2: before rejecting, re-check reachability against
+    // `origin/<parent_branch>` — the closing worker's LOCAL view of
+    // `parent_branch` can be behind (a merge landed via a different
+    // checkout/session and was pushed to origin, but this repo's local
+    // ref for it hasn't caught up). A commit already reachable from
+    // `origin/<parent_branch>` is genuinely integrated and must not
+    // bounce off a stale local ref. See
+    // BUG (live repro): worker committed+pushed, supervisor merged into
+    // the epic branch and pushed it to origin, worker's close still
+    // bounced MERGE REQUIRED because ITS local `parent_branch` ref
+    // hadn't observed the merge.
+    //
+    // Best-effort `git fetch` first (refreshes `origin/<parent_branch>`
+    // if a remote is configured and reachable); any failure — no
+    // `origin` remote, offline, auth prompt suppressed via
+    // `GIT_TERMINAL_PROMPT=0` — is swallowed and we fall back to
+    // whatever `origin/<parent_branch>` already resolves to locally (or
+    // nothing, if it never existed). This mirrors the graceful-
+    // degradation posture of every other gate in this file: an
+    // unreachable/unconfigured origin is not treated as evidence of
+    // non-integration, just as "nothing extra to check."
+    fetch_parent_branch_best_effort(repo_path, parent_branch);
+    let origin_parent_branch = format!("origin/{parent_branch}");
+    if git_ref_exists(repo_path, &origin_parent_branch) {
+        let stranded_vs_origin =
+            count_unmerged_factory_commits(repo_path, commit_ish, &origin_parent_branch);
+        if stranded_vs_origin == 0 {
+            return MergeStateGateOutcome::Proceed;
+        }
+    }
+
     // cas-c631: `epic/<slug>` branches are created locally by the supervisor
     // (see cas-supervisor EPIC workflow) and are, by convention, never pushed
     // to origin — the epic ships to `main` as a single PR once complete, not
@@ -2537,6 +2568,32 @@ pub(crate) fn count_unmerged_factory_commits(
             .unwrap_or(u32::MAX),
         _ => 0,
     }
+}
+
+/// cas-38e2: best-effort `git fetch origin <parent_branch>` inside
+/// `repo_path`, refreshing the `origin/<parent_branch>` remote-tracking ref
+/// before [`run_factory_branch_merge_gate`] consults it as a fallback.
+///
+/// Deliberately fire-and-forget:
+/// - No `origin` remote configured (common for local-only dev repos, or the
+///   `epic/<slug>` local-only-branch convention) → the command fails fast
+///   and is ignored; the caller falls back to whatever `origin/<parent_branch>`
+///   already resolves to (nothing, if it never existed).
+/// - Offline / unreachable remote → same graceful ignore.
+/// - `GIT_TERMINAL_PROMPT=0` prevents a credential prompt from hanging the
+///   close call indefinitely on a private remote with no cached credentials.
+///
+/// No explicit process timeout is applied — matches this module's existing
+/// posture of not hard-bounding git shell-outs (all of which are local-only
+/// except this one); a genuinely hung network fetch is a pre-existing class
+/// of risk this task does not newly introduce a mitigation for.
+fn fetch_parent_branch_best_effort(repo_path: &std::path::Path, parent_branch: &str) {
+    use std::process::Command;
+    let _ = Command::new("git")
+        .args(["fetch", "--quiet", "origin", parent_branch])
+        .current_dir(repo_path)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output();
 }
 
 // ---------------------------------------------------------------------------
@@ -5619,6 +5676,141 @@ mod merge_state_gate_tests {
         assert!(
             matches!(out, MergeStateGateOutcome::Reject(_)),
             "no-anchor first attempt must still reject on the real stranded commit, got {out:?}"
+        );
+    }
+
+    // --- cas-38e2: stale local parent-branch ref vs. origin ----------------
+
+    fn rev_parse(dir: &std::path::Path, refname: &str) -> String {
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", refname])
+            .current_dir(dir)
+            .output()
+            .expect("git rev-parse");
+        assert!(out.status.success(), "rev-parse {refname} failed");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Reproduces the exact live incident (cas-38e2 AC): the worker's
+    /// commit was merged into the epic branch and PUSHED to origin (so
+    /// `origin/<parent_branch>` genuinely contains it), but this repo's
+    /// LOCAL `<parent_branch>` ref is still at the pre-merge tip — the gate
+    /// must not bounce off that stale local view when origin already has
+    /// the work.
+    #[test]
+    fn stale_local_parent_branch_falls_back_to_origin_and_proceeds() {
+        let bare = tempfile::tempdir().unwrap();
+        let bare_status = std::process::Command::new("git")
+            .args(["init", "-q", "--bare"])
+            .current_dir(bare.path())
+            .status()
+            .expect("git init --bare");
+        assert!(bare_status.success());
+
+        let dir = init_factory_repo_with_parent("worker", "epic/x");
+        let p = dir.path();
+        git(
+            p,
+            &["remote", "add", "origin", bare.path().to_str().unwrap()],
+        );
+
+        // Snapshot the epic branch's pre-merge tip before anything lands.
+        let old_epic_tip = rev_parse(p, "epic/x");
+
+        // Worker's commit on factory/worker.
+        std::fs::write(p.join("a.rs"), "// a\n").unwrap();
+        git(p, &["add", "a.rs"]);
+        git(p, &["commit", "-q", "-m", "feat: a"]);
+
+        // Supervisor (simulated in the same repo): merge + push epic/x to
+        // origin. This is what makes `origin/epic/x` genuinely contain the
+        // work.
+        git(p, &["checkout", "-q", "epic/x"]);
+        git(p, &["merge", "-q", "--no-ff", "factory/worker", "-m", "merge worker"]);
+        git(p, &["push", "-q", "origin", "epic/x"]);
+
+        // Now force the LOCAL epic/x ref back to the pre-merge tip —
+        // simulating the closing worker's own checkout not having observed
+        // the merge, while `origin/epic/x` (already fetched via the push
+        // above) still correctly reflects it.
+        git(p, &["checkout", "-q", "factory/worker"]);
+        git(p, &["branch", "-f", "epic/x", &old_epic_tip]);
+
+        // Precondition: the LOCAL epic/x view alone really would strand
+        // this close (proves the test exercises the origin-fallback path,
+        // not a no-op).
+        assert_eq!(
+            count_unmerged_factory_commits(p, "factory/worker", "epic/x"),
+            1,
+            "precondition: local epic/x must look stranded before the origin fallback kicks in"
+        );
+
+        let task = worker_task("worker");
+        let req = base_req(&task.id);
+        let out = run_factory_branch_merge_gate(&task, &req, "epic/x", p);
+        assert!(
+            matches!(out, MergeStateGateOutcome::Proceed),
+            "a commit already reachable from origin/epic/x must not bounce off \
+             a stale local epic/x ref, got {out:?}"
+        );
+    }
+
+    /// Negative control: `origin/<parent_branch>` exists but genuinely does
+    /// NOT contain the worker's commit either — the fallback must not
+    /// paper over a real integration gap.
+    #[test]
+    fn origin_parent_branch_without_the_commit_still_rejects() {
+        let bare = tempfile::tempdir().unwrap();
+        let bare_status = std::process::Command::new("git")
+            .args(["init", "-q", "--bare"])
+            .current_dir(bare.path())
+            .status()
+            .expect("git init --bare");
+        assert!(bare_status.success());
+
+        let dir = init_factory_repo_with_parent("worker", "epic/x");
+        let p = dir.path();
+        git(
+            p,
+            &["remote", "add", "origin", bare.path().to_str().unwrap()],
+        );
+        // Push epic/x to origin BEFORE the worker's commit exists — origin
+        // has a real ref for epic/x, but it's never seen this work.
+        git(p, &["push", "-q", "origin", "epic/x"]);
+
+        std::fs::write(p.join("a.rs"), "// a\n").unwrap();
+        git(p, &["add", "a.rs"]);
+        git(p, &["commit", "-q", "-m", "feat: a"]);
+
+        let task = worker_task("worker");
+        let req = base_req(&task.id);
+        let out = run_factory_branch_merge_gate(&task, &req, "epic/x", p);
+        match out {
+            MergeStateGateOutcome::Reject(msg) => {
+                assert!(msg.contains("1 commit"), "expected stranded count of 1: {msg}");
+            }
+            other => panic!(
+                "commit reachable from neither local nor origin epic/x must still reject, got {other:?}"
+            ),
+        }
+    }
+
+    /// No `origin` remote configured at all (the common local-only dev/test
+    /// case) — the best-effort fetch + origin lookup must no-op gracefully,
+    /// with behavior identical to before cas-38e2.
+    #[test]
+    fn no_origin_remote_configured_degrades_to_existing_behavior() {
+        let dir = init_factory_repo("worker");
+        std::fs::write(dir.path().join("a.rs"), "// a\n").unwrap();
+        git(dir.path(), &["add", "a.rs"]);
+        git(dir.path(), &["commit", "-q", "-m", "feat: a"]);
+
+        let task = worker_task("worker");
+        let req = base_req(&task.id);
+        let out = run_factory_branch_merge_gate(&task, &req, "main", dir.path());
+        assert!(
+            matches!(out, MergeStateGateOutcome::Reject(_)),
+            "no-origin-remote case must still reject on the real stranded commit, got {out:?}"
         );
     }
 }
