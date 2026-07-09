@@ -553,9 +553,12 @@ impl CasService {
                 .unwrap_or_default()
         };
 
-        // Agents suppressed from pruning due to recent I/O activity. Used in
-        // the render loop to show the dual-signal annotation.
+        // Agents suppressed from pruning due to recent I/O activity or a live
+        // harness PID. Used in the render loop to show the dual-signal
+        // annotation (cas-1ec7 I/O / cas-3e56 process-alive).
         let mut active_io_suppressed: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let mut process_alive_suppressed: std::collections::HashSet<String> =
             std::collections::HashSet::new();
         let mut stale_pruned = 0usize;
         let factory_session = current_factory_session();
@@ -570,6 +573,13 @@ impl CasService {
                 // cas-1ec7: suppress stale-prune when observable I/O is recent.
                 if has_recent_worker_io_activity(&recent_io_events, &agent.id) {
                     active_io_suppressed.insert(agent.id.clone());
+                    continue;
+                }
+                // cas-3e56: suppress when the registered harness process is
+                // still live. Never drop a mid-turn Grok/Claude/Codex worker
+                // as "None active" solely because heartbeat lagged.
+                if agent_process_is_alive(&agent) {
+                    process_alive_suppressed.insert(agent.id.clone());
                     continue;
                 }
                 if store.mark_stale(&agent.id).is_ok() {
@@ -644,8 +654,14 @@ impl CasService {
                 // recent WorkerFileEdited/WorkerGitCommit event confirms they are
                 // still making progress despite a heartbeat lapse (e.g. during a
                 // long cargo build/test run).
+                //
+                // cas-3e56: "[alive — heartbeat stale]" when the registered
+                // harness PID is still live. Honest dual-signal so supervisors
+                // never re-spawn solely on heartbeat age.
                 let liveness_label = if active_io_suppressed.contains(&agent.id) {
                     " [heartbeat stale, active I/O]"
+                } else if process_alive_suppressed.contains(&agent.id) {
+                    " [alive — heartbeat stale]"
                 } else {
                     liveness_label_for(elapsed)
                 };
@@ -1718,6 +1734,59 @@ pub(crate) fn has_recent_worker_io_activity(events: &[cas_types::Event], agent_i
             EventType::WorkerFileEdited | EventType::WorkerGitCommit
         ) && e.session_id.as_deref() == Some(agent_id)
     })
+}
+
+/// cas-3e56: whether this agent still has a live harness process.
+///
+/// Used by `factory_worker_status` to suppress the opportunistic stale prune
+/// when heartbeat age alone would drop a worker that is still mid-turn. The
+/// classic failure mode is a Grok worker whose SessionStart stored a wrong
+/// ancestor PID (pre-cas-3e56) OR whose heartbeat lapsed while the real
+/// process kept working — supervisors saw "Workers: None active" and nearly
+/// re-spawned.
+///
+/// Probe order:
+/// 1. Registered `agent.pid` (+ optional starttime fingerprint) via the
+///    daemon liveness helpers.
+/// 2. Live process-table scan by agent name (`find_worker_pid`) — recovers
+///    when the store pid is wrong/stale but the real harness is still up
+///    (Grok workers identity via `CAS_AGENT_NAME` environ).
+pub(crate) fn agent_process_is_alive(agent: &cas_types::Agent) -> bool {
+    if agent_process_is_alive_with(
+        agent,
+        crate::mcp::daemon::pid_alive,
+        crate::mcp::daemon::pid_matches_fingerprint,
+    ) {
+        return true;
+    }
+    // Fallback: scan /proc for a process that identifies as this worker.
+    // Cheap enough for a status poll (is-wedged already does this on kill).
+    crate::cli::factory::wedged::find_worker_pid(
+        &crate::cli::factory::wedged::RealProcessTable,
+        &agent.name,
+    )
+    .is_some()
+}
+
+/// Injected-probe variant of the registered-pid check for unit tests.
+pub(crate) fn agent_process_is_alive_with(
+    agent: &cas_types::Agent,
+    pid_alive_fn: impl Fn(u32) -> bool,
+    fingerprint_matches_fn: impl Fn(u32, u64) -> bool,
+) -> bool {
+    let Some(pid) = agent.pid else {
+        return false;
+    };
+    let expected_starttime = agent.pid_starttime.or_else(|| {
+        agent
+            .metadata
+            .get(crate::mcp::daemon::PID_STARTTIME_KEY)
+            .and_then(|s| s.parse::<u64>().ok())
+    });
+    match expected_starttime {
+        Some(st) => fingerprint_matches_fn(pid, st),
+        None => pid_alive_fn(pid),
+    }
 }
 
 /// Return the age (seconds) and a short phase label of the worker's most recent
@@ -3329,6 +3398,52 @@ effort = "high"
             !has_recent_worker_io_activity(&[e], "ses-abc-123"),
             "event without session_id must not match (matching is by session_id, not entity_id)"
         );
+    }
+
+    // ---- cas-3e56: process-alive prune suppress ---------------------------
+
+    #[test]
+    fn agent_process_is_alive_with_no_pid_is_false() {
+        let agent = cas_types::Agent::new("id-1".into(), "worker".into());
+        assert!(
+            !agent_process_is_alive_with(&agent, |_| true, |_, _| true),
+            "no registered pid → cannot prove process alive"
+        );
+    }
+
+    #[test]
+    fn agent_process_is_alive_with_pid_only_uses_pid_alive_probe() {
+        let mut agent = cas_types::Agent::new("id-1".into(), "worker".into());
+        agent.pid = Some(4242);
+        assert!(agent_process_is_alive_with(
+            &agent,
+            |p| p == 4242,
+            |_, _| false
+        ));
+        assert!(!agent_process_is_alive_with(
+            &agent,
+            |_| false,
+            |_, _| true
+        ));
+    }
+
+    #[test]
+    fn agent_process_is_alive_with_fingerprint_prefers_strict_check() {
+        let mut agent = cas_types::Agent::new("id-1".into(), "worker".into());
+        agent.pid = Some(7);
+        agent.pid_starttime = Some(99);
+        // Fingerprint says alive even if pid_alive would say dead.
+        assert!(agent_process_is_alive_with(
+            &agent,
+            |_| false,
+            |p, st| p == 7 && st == 99
+        ));
+        // Fingerprint says dead even if pid_alive would say alive.
+        assert!(!agent_process_is_alive_with(
+            &agent,
+            |_| true,
+            |_, _| false
+        ));
     }
 
     // ---- cas-573c: context-usage band + tail reader -----------------------

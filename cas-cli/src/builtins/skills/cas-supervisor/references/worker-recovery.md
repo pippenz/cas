@@ -53,7 +53,7 @@ Workers fail in production. These are recurring observed failure modes and their
 
 **Diagnosis:**
 1. Check worker status: `mcp__cas__coordination action=worker_status`
-2. Look for stale heartbeat (last activity timestamp far in the past) or missing entry
+2. Look for stale heartbeat (last activity timestamp far in the past) or missing entry — but **do not treat `Workers: None active` or `Filtered stale` as death alone** (cas-3e56: live Grok workers were omitted while mid-turn; prefer `[alive — heartbeat stale]` + OS/`ps`/worktree check before re-spawn)
 3. Check worker activity log: `mcp__cas__coordination action=worker_activity`
 
 **Recovery:**
