@@ -1,19 +1,26 @@
 use crate::error::CoreError;
 use crate::hooks::config::HooksConfig;
 use crate::hooks::context::{
-    ContextItem, ContextStats, ContextStores, estimate_tokens, merge_rules, rule_matches_path,
-    token_display, truncate,
+    ContextItem, ContextStats, ContextStores, estimate_tokens, merge_rules, remap_tool_prefix,
+    rule_matches_path, token_display, truncate,
 };
 use crate::hooks::types::HookInput;
 use cas_store::TaskStore;
 use cas_types::{Dependency, Rule, RuleStatus, Task, TaskStatus};
 use std::collections::HashSet;
 
+/// `tool_prefix` is the reader's own MCP tool-call prefix (`mcp__cas__` /
+/// `mcp__cs__` / `cas__` — see `harness_policy::own_tool_prefix` in
+/// `cas-cli`). The "Planning Tools" hints below are authored against the
+/// Claude `mcp__cas__` baseline and remapped once via `remap_tool_prefix`
+/// right before returning (cas-fd9f — this function previously had no remap
+/// at all, so a non-Claude reader always saw Claude's tool names here).
 pub fn build_plan_context_with_stores(
     input: &HookInput,
     stores: &ContextStores,
     config: &dyn HooksConfig,
     _limit: usize,
+    tool_prefix: &str,
 ) -> Result<(String, ContextStats), CoreError> {
     let plan_config = config.plan_mode();
     let token_budget = plan_config.token_budget;
@@ -273,7 +280,10 @@ pub fn build_plan_context_with_stores(
     ));
 
     stats.total_tokens = total_tokens;
-    Ok((context_parts.join("\n"), stats))
+    Ok((
+        remap_tool_prefix(&context_parts.join("\n"), tool_prefix),
+        stats,
+    ))
 }
 
 /// Format a task with dependency info for plan mode

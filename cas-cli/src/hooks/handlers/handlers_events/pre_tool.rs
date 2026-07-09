@@ -48,11 +48,17 @@ pub fn handle_pre_tool_use(
         // pending_verification if a future caller ever pairs it with isolation.
         let is_verifier_exempt = subagent_type == Some("task-verifier");
         if isolation == Some("worktree") && !is_verifier_exempt {
+            // EPIC cas-8888 (cas-fd9f): own_tool_prefix() — this reminder
+            // tells the supervisor what IT can call, so it needs the
+            // supervisor's own tool prefix, not a hardcoded mcp__cas__.
+            let prefix = crate::harness_policy::own_tool_prefix();
             return Ok(HookOutput::with_pre_tool_permission(
                 "deny",
-                "🚫 Supervisors must not spawn isolated-worktree subagents.\n\
-                Use mcp__cas__coordination action=spawn_workers — factory-managed worktrees get cleaned up; Agent(isolation=\"worktree\") ones leak.\n\
-                If you genuinely need a throwaway subagent, drop `isolation` or run as a worker via `cas factory`.",
+                &format!(
+                    "🚫 Supervisors must not spawn isolated-worktree subagents.\n\
+                    Use {prefix}coordination action=spawn_workers — factory-managed worktrees get cleaned up; Agent(isolation=\"worktree\") ones leak.\n\
+                    If you genuinely need a throwaway subagent, drop `isolation` or run as a worker via `cas factory`."
+                ),
             ));
         }
     }
@@ -207,11 +213,16 @@ pub fn handle_pre_tool_use(
     // guess intent — always remind regardless.
     // ========================================================================
     if is_factory_agent && is_supervisor && tool_name == "AskUserQuestion" {
-        const REMINDER: &str = "[role-routing reminder] AskUserQuestion routes to the human user ONLY.\n\
+        // EPIC cas-8888 (cas-fd9f): own_tool_prefix() — this tells the
+        // supervisor what IT should call instead.
+        let prefix = crate::harness_policy::own_tool_prefix();
+        let reminder = format!(
+            "[role-routing reminder] AskUserQuestion routes to the human user ONLY.\n\
             If you meant to ask a worker/teammate, cancel this call and use:\n  \
-            mcp__cas__coordination action=message target=<worker-name> message=\"...\"\n\
-            If you genuinely need the human's input, proceed.";
-        return Ok(HookOutput::with_pre_tool_permission("allow", REMINDER));
+            {prefix}coordination action=message target=<worker-name> message=\"...\"\n\
+            If you genuinely need the human's input, proceed."
+        );
+        return Ok(HookOutput::with_pre_tool_permission("allow", &reminder));
     }
 
     // ========================================================================
@@ -231,11 +242,10 @@ pub fn handle_pre_tool_use(
             .tool_input
             .as_ref()
             .and_then(|ti| ti.get("action").and_then(|v| v.as_str()));
-        let is_gated = matches!(
-            (tool_name, action),
-            ("mcp__cas__task", Some("create"))
-                | ("mcp__cas__coordination", Some("spawn_workers"))
-                | ("mcp__cas__coordination", Some("spawn_worker"))
+        let is_gated = is_codemap_gated_tool_call(
+            tool_name,
+            action,
+            crate::harness_policy::own_tool_prefix(),
         );
         if is_gated {
             if let Some(crate::hooks::handlers::handlers_events::CodemapStaleness::SignificantlyStale { total_changes, .. }) =
@@ -398,9 +408,11 @@ pub fn handle_pre_tool_use(
                         false
                     };
 
-                    // Allow verification tool for recording results (CAS + Codex alias)
-                    let is_verification_tool = tool_name == "mcp__cas__verification"
-                        || tool_name == "mcp__cs__verification";
+                    // Allow verification tool for recording results (any harness alias).
+                    let is_verification_tool = is_own_verification_tool_call(
+                        tool_name,
+                        crate::harness_policy::own_tool_prefix(),
+                    );
 
                     debug!(
                         is_verifier_agent = is_verifier_agent,
@@ -1085,6 +1097,35 @@ pub(crate) const FACTORY_AUTO_APPROVE_TOOLS: &[&str] = &[
     "NotebookEdit",
 ];
 
+/// Whether `tool_name`/`action` is one of the CODEMAP-freshness-gated calls
+/// (task creation, worker spawn) — keyed on the CALLER's own `tool_prefix`
+/// so this recognizes `mcp__cas__task`/`mcp__cs__task`/`cas__task` etc.
+/// correctly for whichever harness is actually running.
+///
+/// EPIC cas-8888 (cas-fd9f): extracted from `handle_pre_tool_use` (was
+/// inline, hardcoded to `mcp__cas__task`/`mcp__cas__coordination` — silently
+/// inert for every non-Claude supervisor, since `tool_name` is whatever the
+/// CALLING process's own harness actually named the tool).
+fn is_codemap_gated_tool_call(tool_name: &str, action: Option<&str>, tool_prefix: &str) -> bool {
+    let task_tool = format!("{tool_prefix}task");
+    let coordination_tool = format!("{tool_prefix}coordination");
+    (tool_name == task_tool && action == Some("create"))
+        || (tool_name == coordination_tool
+            && matches!(action, Some("spawn_workers") | Some("spawn_worker")))
+}
+
+/// Whether `tool_name` is the CALLER's own harness-namespaced `verification`
+/// tool (`mcp__cas__verification` / `mcp__cs__verification` /
+/// `cas__verification`) — used to let a verification-jailed agent record its
+/// own verification result without unjailing via task-verifier.
+///
+/// EPIC cas-8888 (cas-fd9f): was a 2-way OR (`mcp__cas__` + `mcp__cs__`) that
+/// silently never matched Grok's `cas__verification` — the jail would never
+/// unlock for a Grok agent recording its own result.
+fn is_own_verification_tool_call(tool_name: &str, tool_prefix: &str) -> bool {
+    tool_name == format!("{tool_prefix}verification")
+}
+
 /// Auto-route a factory-mode `SendMessage` tool call onto the CAS prompt
 /// queue so the message actually reaches its recipient, then return a
 /// `deny` receipt that tells the agent not to retry. See the `SendMessage`
@@ -1097,13 +1138,20 @@ fn auto_route_send_message(
     cas_root: &Path,
     current_agent_id: &str,
 ) -> HookOutput {
-    let fallback_guidance = || HookOutput::with_pre_tool_permission(
-        "deny",
-        "🚫 SendMessage is disabled in factory mode.\n\n\
-         Use CAS coordination instead:\n\
-         mcp__cas__coordination action=message target=<agent-name> message=\"...\" summary=\"<brief summary>\"\n\n\
-         This ensures messages are routed through the factory Director.",
-    );
+    // EPIC cas-8888 (cas-fd9f): own_tool_prefix() — reminder text describing
+    // what THIS agent should call instead of SendMessage.
+    let fallback_guidance = || {
+        let prefix = crate::harness_policy::own_tool_prefix();
+        HookOutput::with_pre_tool_permission(
+            "deny",
+            &format!(
+                "🚫 SendMessage is disabled in factory mode.\n\n\
+                 Use CAS coordination instead:\n\
+                 {prefix}coordination action=message target=<agent-name> message=\"...\" summary=\"<brief summary>\"\n\n\
+                 This ensures messages are routed through the factory Director."
+            ),
+        )
+    };
 
     let Some(ti) = tool_input else {
         return fallback_guidance();
@@ -1203,12 +1251,13 @@ fn auto_route_send_message(
         "SendMessage auto-routed onto CAS prompt queue"
     );
 
+    let prefix = crate::harness_policy::own_tool_prefix();
     HookOutput::with_pre_tool_permission(
         "deny",
         &format!(
             "✅ AUTO-ROUTED via CAS coordination (message id {message_id}).\n\n\
              Message delivered to `{target}`. DO NOT retry this SendMessage call.\n\n\
-             For future messages, call `mcp__cas__coordination action=message target=<name> message=\"...\" summary=\"...\"` directly — skip SendMessage."
+             For future messages, call `{prefix}coordination action=message target=<name> message=\"...\" summary=\"...\"` directly — skip SendMessage."
         ),
     )
 }
@@ -1731,6 +1780,131 @@ mod worker_commit_guard_tests {
         assert_eq!(
             decision, "deny",
             "non-isolated factory worker on main must be denied (cas-ba04), got: {val}"
+        );
+    }
+
+    // ========================================================================
+    // EPIC cas-8888 (cas-fd9f): harness-aware tool-name matcher guard tests.
+    // ========================================================================
+
+    #[test]
+    fn codemap_gate_recognizes_claude_task_create() {
+        assert!(is_codemap_gated_tool_call(
+            "mcp__cas__task",
+            Some("create"),
+            "mcp__cas__"
+        ));
+    }
+
+    #[test]
+    fn codemap_gate_recognizes_codex_spawn_workers() {
+        assert!(is_codemap_gated_tool_call(
+            "mcp__cs__coordination",
+            Some("spawn_workers"),
+            "mcp__cs__"
+        ));
+    }
+
+    /// The load-bearing regression: before cas-fd9f this matcher was
+    /// hardcoded to "mcp__cas__task"/"mcp__cas__coordination" and so NEVER
+    /// fired for a Grok supervisor (whose tool_name is "cas__task" etc.) —
+    /// the CODEMAP freshness gate was silently inert for every non-Claude
+    /// supervisor.
+    #[test]
+    fn codemap_gate_recognizes_grok_task_create_and_spawn_worker() {
+        assert!(is_codemap_gated_tool_call(
+            "cas__task",
+            Some("create"),
+            "cas__"
+        ));
+        assert!(is_codemap_gated_tool_call(
+            "cas__coordination",
+            Some("spawn_worker"),
+            "cas__"
+        ));
+        assert!(is_codemap_gated_tool_call(
+            "cas__coordination",
+            Some("spawn_workers"),
+            "cas__"
+        ));
+    }
+
+    #[test]
+    fn codemap_gate_does_not_match_wrong_prefix_or_action() {
+        // A Grok tool_name must not match under a stale/wrong prefix guess.
+        assert!(!is_codemap_gated_tool_call(
+            "cas__task",
+            Some("create"),
+            "mcp__cas__"
+        ));
+        // Right tool, wrong action.
+        assert!(!is_codemap_gated_tool_call("cas__task", Some("list"), "cas__"));
+        // Unrelated tool.
+        assert!(!is_codemap_gated_tool_call("Bash", Some("create"), "cas__"));
+    }
+
+    #[test]
+    fn verification_tool_call_recognizes_all_three_harness_prefixes() {
+        assert!(is_own_verification_tool_call(
+            "mcp__cas__verification",
+            "mcp__cas__"
+        ));
+        assert!(is_own_verification_tool_call(
+            "mcp__cs__verification",
+            "mcp__cs__"
+        ));
+        // The load-bearing regression: previously a 2-way OR that never
+        // matched Grok's "cas__verification" — a Grok agent could never
+        // unjail itself by recording its own verification result.
+        assert!(is_own_verification_tool_call(
+            "cas__verification",
+            "cas__"
+        ));
+    }
+
+    #[test]
+    fn verification_tool_call_rejects_mismatched_prefix() {
+        assert!(!is_own_verification_tool_call(
+            "mcp__cs__verification",
+            "cas__"
+        ));
+        assert!(!is_own_verification_tool_call("mcp__cas__task", "mcp__cas__"));
+    }
+
+    /// Sanity check that the full `handle_pre_tool_use` entrypoint reaches
+    /// the codemap-gate matcher for a Grok supervisor's `cas__coordination`
+    /// call at all (rather than short-circuiting on role/tool checks
+    /// upstream) and, with no CODEMAP.md present to be stale against,
+    /// doesn't false-positive deny. The matcher's actual gate/no-gate logic
+    /// is proven by the dedicated unit tests above — this only guards the
+    /// wiring between `own_tool_prefix()`, the env, and the real handler.
+    #[test]
+    fn grok_supervisor_codemap_gate_wiring_reaches_matcher_without_false_deny() {
+        let _lock = env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _env = EnvGuard::set(&[
+            ("CAS_AGENT_ROLE", Some("supervisor")),
+            ("CAS_FACTORY_MODE", Some("1")),
+            ("CAS_FACTORY_SUPERVISOR_CLI", Some("grok")),
+            ("CAS_FACTORY_WORKER_CLI", None),
+        ]);
+
+        let mut input = crate::hooks::handlers::HookInput::default();
+        input.hook_event_name = "PreToolUse".to_string();
+        input.tool_name = Some("cas__coordination".to_string());
+        input.cwd = tmp.path().to_string_lossy().to_string();
+        input.tool_input = Some(serde_json::json!({"action": "spawn_workers"}));
+
+        let out = handle_pre_tool_use(&input, Some(tmp.path())).expect("handler ok");
+        let val = serde_json::to_value(&out).unwrap();
+        let decision = val
+            .get("hookSpecificOutput")
+            .and_then(|h| h.get("permissionDecision"))
+            .and_then(|v| v.as_str());
+        assert_ne!(
+            decision,
+            Some("deny"),
+            "no CODEMAP.md present → nothing to gate on, must not deny: {val}"
         );
     }
 }

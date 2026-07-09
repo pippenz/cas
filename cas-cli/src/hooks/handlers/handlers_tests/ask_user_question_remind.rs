@@ -44,6 +44,37 @@ fn set_role_env(role: Option<&str>) -> RoleGuard {
     RoleGuard(prev)
 }
 
+/// EPIC cas-8888 (cas-fd9f): the reminder text now depends on
+/// `harness_policy::own_tool_prefix()`, which for a supervisor reads
+/// `CAS_FACTORY_SUPERVISOR_CLI`. Tests that assert a specific prefix must
+/// pin this var explicitly — leaving it to whatever the *ambient* process
+/// env happens to hold (this test binary may itself be running inside a
+/// real factory worker/supervisor session) would make the test's outcome
+/// depend on where it's run, not on the code under test.
+struct SupervisorCliGuard(Option<String>);
+
+impl Drop for SupervisorCliGuard {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.0 {
+                Some(v) => std::env::set_var("CAS_FACTORY_SUPERVISOR_CLI", v),
+                None => std::env::remove_var("CAS_FACTORY_SUPERVISOR_CLI"),
+            }
+        }
+    }
+}
+
+fn set_supervisor_cli_env(cli: Option<&str>) -> SupervisorCliGuard {
+    let prev = std::env::var("CAS_FACTORY_SUPERVISOR_CLI").ok();
+    unsafe {
+        match cli {
+            Some(v) => std::env::set_var("CAS_FACTORY_SUPERVISOR_CLI", v),
+            None => std::env::remove_var("CAS_FACTORY_SUPERVISOR_CLI"),
+        }
+    }
+    SupervisorCliGuard(prev)
+}
+
 // ============================================================================
 // Input builder
 // ============================================================================
@@ -93,6 +124,10 @@ fn reminder_reason(out: &HookOutput) -> Option<String> {
 fn supervisor_ask_user_question_gets_reminder() {
     let _g = super::env_lock();
     let _role = set_role_env(Some("supervisor"));
+    // Pin the supervisor's own harness explicitly (cas-fd9f) so this test's
+    // "mcp__cas__coordination" assertion is deterministic regardless of the
+    // ambient process env.
+    let _cli = set_supervisor_cli_env(Some("claude"));
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let out = handle_pre_tool_use(&hook_input("AskUserQuestion"), Some(tmp.path()))
@@ -122,6 +157,32 @@ fn supervisor_ask_user_question_gets_reminder() {
         reason.len() <= 500,
         "reminder must be ≤500 bytes, got {} bytes: {reason}",
         reason.len()
+    );
+}
+
+/// EPIC cas-8888 (cas-fd9f): the load-bearing regression test for this file
+/// — before the fix, this reminder was hardcoded to Claude's `mcp__cas__`
+/// prefix unconditionally, which a Grok supervisor cannot call at all.
+#[test]
+fn grok_supervisor_ask_user_question_gets_reminder_with_cas_prefix() {
+    let _g = super::env_lock();
+    let _role = set_role_env(Some("supervisor"));
+    let _cli = set_supervisor_cli_env(Some("grok"));
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let out = handle_pre_tool_use(&hook_input("AskUserQuestion"), Some(tmp.path()))
+        .expect("handler ok");
+
+    let reason = reminder_reason(&out)
+        .expect("grok supervisor AskUserQuestion must still get the role-routing reminder");
+
+    assert!(
+        reason.contains("cas__coordination"),
+        "grok supervisor reminder must use its own cas__ prefix: {reason}"
+    );
+    assert!(
+        !reason.contains("mcp__cas__coordination") && !reason.contains("mcp__cs__coordination"),
+        "grok supervisor reminder must NOT carry another harness's prefix: {reason}"
     );
 }
 

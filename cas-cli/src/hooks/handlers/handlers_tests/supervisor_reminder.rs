@@ -39,6 +39,34 @@ fn set_role_env(role: Option<&str>) -> RoleGuard {
     RoleGuard(prev)
 }
 
+/// EPIC cas-8888 (cas-fd9f): pins `CAS_FACTORY_SUPERVISOR_CLI` — the
+/// reminder's tool-prefix now comes from `harness_policy::own_tool_prefix()`,
+/// so tests asserting a specific prefix must control this var explicitly
+/// rather than depending on the ambient process env.
+struct SupervisorCliGuard(Option<String>);
+
+impl Drop for SupervisorCliGuard {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.0 {
+                Some(v) => std::env::set_var("CAS_FACTORY_SUPERVISOR_CLI", v),
+                None => std::env::remove_var("CAS_FACTORY_SUPERVISOR_CLI"),
+            }
+        }
+    }
+}
+
+fn set_supervisor_cli_env(cli: Option<&str>) -> SupervisorCliGuard {
+    let prev = std::env::var("CAS_FACTORY_SUPERVISOR_CLI").ok();
+    unsafe {
+        match cli {
+            Some(v) => std::env::set_var("CAS_FACTORY_SUPERVISOR_CLI", v),
+            None => std::env::remove_var("CAS_FACTORY_SUPERVISOR_CLI"),
+        }
+    }
+    SupervisorCliGuard(prev)
+}
+
 fn supervisor_input() -> HookInput {
     HookInput {
         session_id: "test-supervisor-session".to_string(),
@@ -101,6 +129,7 @@ fn supervisor_gets_reminder_within_512_bytes() {
 fn supervisor_reminder_contains_all_6_hard_rule_keywords() {
     let _g = super::env_lock();
     let _role = set_role_env(Some("supervisor"));
+    let _cli = set_supervisor_cli_env(Some("claude"));
     let input = supervisor_input();
     let output = handle_user_prompt_submit(&input, None).unwrap();
 
@@ -126,6 +155,32 @@ fn supervisor_reminder_contains_all_6_hard_rule_keywords() {
             "Supervisor reminder missing keyword '{kw}':\n---\n{context}\n---"
         );
     }
+}
+
+/// EPIC cas-8888 (cas-fd9f): the load-bearing regression test — this
+/// every-turn reminder was hardcoded to Claude's `mcp__cas__` prefix, so a
+/// Grok supervisor was told a tool call it cannot make on EVERY turn.
+#[test]
+fn grok_supervisor_reminder_uses_cas_prefix() {
+    let _g = super::env_lock();
+    let _role = set_role_env(Some("supervisor"));
+    let _cli = set_supervisor_cli_env(Some("grok"));
+    let input = supervisor_input();
+    let output = handle_user_prompt_submit(&input, None).unwrap();
+
+    let context = match &output.hook_specific_output {
+        Some(HookSpecificOutput::UserPromptSubmit { additional_context }) => additional_context,
+        other => panic!("Expected UserPromptSubmit hookSpecificOutput, got: {other:?}"),
+    };
+
+    assert!(
+        context.contains("cas__coordination"),
+        "grok supervisor reminder must use its own cas__ prefix:\n---\n{context}\n---"
+    );
+    assert!(
+        !context.contains("mcp__cas__coordination") && !context.contains("mcp__cs__coordination"),
+        "grok supervisor reminder must NOT carry another harness's prefix:\n---\n{context}\n---"
+    );
 }
 
 /// AC2: Worker sessions return empty (no reminder injected).

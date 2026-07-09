@@ -327,7 +327,10 @@ impl ExitBlockers {
             lines.push("To exit, complete all remaining tasks:".to_string());
 
             if open_count > 0 {
-                lines.push(format!("  {open_count} open task(s): Start with mcp__cas__task action: start, implement, then close"));
+                // EPIC cas-8888 (cas-fd9f): own_tool_prefix() — reminder
+                // text describing what THIS agent should call.
+                let prefix = crate::harness_policy::own_tool_prefix();
+                lines.push(format!("  {open_count} open task(s): Start with {prefix}task action: start, implement, then close"));
             }
             if in_progress_count > 0 {
                 lines.push(format!("  {in_progress_count} in_progress task(s): Verify before close (spawn 'task-verifier' directly, or ask supervisor if workers are Codex)"));
