@@ -221,8 +221,9 @@ pub fn detect_store_type(cas_dir: &Path) -> StoreType {
     StoreType::Sqlite
 }
 
-/// Open the appropriate store based on what exists
-pub fn open_store(cas_dir: &Path) -> Result<Arc<dyn Store>> {
+/// Open base entry store (sqlite/markdown + optional notifier).
+/// Never wraps with [`SyncingEntryStore`] — safe for pull/apply-remote.
+fn open_store_base(cas_dir: &Path) -> Result<Arc<dyn Store>> {
     let store_type = detect_store_type(cas_dir);
     let config = Config::load(cas_dir).unwrap_or_default();
 
@@ -240,11 +241,24 @@ pub fn open_store(cas_dir: &Path) -> Result<Arc<dyn Store>> {
     };
 
     // Wrap with notifying store if TUI notifier is active
-    let base_store: Arc<dyn Store> = if has_notifier() && config.notifications_enabled() {
-        Arc::new(NotifyingEntryStore::new(base_store, config.notifications()))
+    if has_notifier() && config.notifications_enabled() {
+        Ok(Arc::new(NotifyingEntryStore::new(
+            base_store,
+            config.notifications(),
+        )))
     } else {
-        base_store
-    };
+        Ok(base_store)
+    }
+}
+
+/// Open the appropriate store based on what exists.
+///
+/// When logged in, wraps writes with [`SyncingEntryStore`] so local edits
+/// enqueue to the cloud SyncQueue. For pull / apply-remote paths use
+/// [`open_store_local`] instead — otherwise every pulled row re-enters the
+/// queue and push↔pull never settles (cas-7fbb).
+pub fn open_store(cas_dir: &Path) -> Result<Arc<dyn Store>> {
+    let base_store = open_store_base(cas_dir)?;
 
     // Wrap with cloud sync if logged in
     if let Ok(cloud_config) = CloudConfig::load_from_cas_dir(cas_dir) {
@@ -262,20 +276,36 @@ pub fn open_store(cas_dir: &Path) -> Result<Arc<dyn Store>> {
     Ok(base_store)
 }
 
-/// Open the task store
-pub fn open_task_store(cas_dir: &Path) -> Result<Arc<dyn TaskStore>> {
+/// Open entry store without cloud SyncQueue wrappers.
+///
+/// Use on pull / team-pull / daemon cloud-sync apply paths so remote rows
+/// are written locally without re-enqueueing (cas-7fbb).
+pub fn open_store_local(cas_dir: &Path) -> Result<Arc<dyn Store>> {
+    open_store_base(cas_dir)
+}
+
+/// Open base task store (+ optional notifier). No SyncingTaskStore.
+fn open_task_store_base(cas_dir: &Path) -> Result<Arc<dyn TaskStore>> {
     let config = Config::load(cas_dir).unwrap_or_default();
 
     let store = SqliteTaskStore::open(cas_dir)?;
     store.init()?;
     let base_store: Arc<dyn TaskStore> = Arc::new(store);
 
-    // Wrap with notifying store if TUI notifier is active
-    let base_store: Arc<dyn TaskStore> = if has_notifier() && config.notifications_enabled() {
-        Arc::new(NotifyingTaskStore::new(base_store, config.notifications()))
+    if has_notifier() && config.notifications_enabled() {
+        Ok(Arc::new(NotifyingTaskStore::new(
+            base_store,
+            config.notifications(),
+        )))
     } else {
-        base_store
-    };
+        Ok(base_store)
+    }
+}
+
+/// Open the task store (cloud-sync wrap when logged in).
+/// Prefer [`open_task_store_local`] for pull/apply-remote paths.
+pub fn open_task_store(cas_dir: &Path) -> Result<Arc<dyn TaskStore>> {
+    let base_store = open_task_store_base(cas_dir)?;
 
     // Wrap with cloud sync if logged in
     if let Ok(cloud_config) = CloudConfig::load_from_cas_dir(cas_dir) {
@@ -293,20 +323,33 @@ pub fn open_task_store(cas_dir: &Path) -> Result<Arc<dyn TaskStore>> {
     Ok(base_store)
 }
 
-/// Open the skill store
-pub fn open_skill_store(cas_dir: &Path) -> Result<Arc<dyn SkillStore>> {
+/// Open task store without cloud SyncQueue wrappers (cas-7fbb).
+pub fn open_task_store_local(cas_dir: &Path) -> Result<Arc<dyn TaskStore>> {
+    open_task_store_base(cas_dir)
+}
+
+/// Open base skill store (+ optional notifier). No SyncingSkillStore.
+fn open_skill_store_base(cas_dir: &Path) -> Result<Arc<dyn SkillStore>> {
     let config = Config::load(cas_dir).unwrap_or_default();
 
     let store = SqliteSkillStore::open(cas_dir)?;
     store.init()?;
     let base_store: Arc<dyn SkillStore> = Arc::new(store);
 
-    // Wrap with notifying store if TUI notifier is active
-    let base_store: Arc<dyn SkillStore> = if has_notifier() && config.notifications_enabled() {
-        Arc::new(NotifyingSkillStore::new(base_store, config.notifications()))
+    if has_notifier() && config.notifications_enabled() {
+        Ok(Arc::new(NotifyingSkillStore::new(
+            base_store,
+            config.notifications(),
+        )))
     } else {
-        base_store
-    };
+        Ok(base_store)
+    }
+}
+
+/// Open the skill store (cloud-sync wrap when logged in).
+/// Prefer [`open_skill_store_local`] for pull/apply-remote paths.
+pub fn open_skill_store(cas_dir: &Path) -> Result<Arc<dyn SkillStore>> {
+    let base_store = open_skill_store_base(cas_dir)?;
 
     // Wrap with cloud sync if logged in
     if let Ok(cloud_config) = CloudConfig::load_from_cas_dir(cas_dir) {
@@ -322,6 +365,11 @@ pub fn open_skill_store(cas_dir: &Path) -> Result<Arc<dyn SkillStore>> {
     }
 
     Ok(base_store)
+}
+
+/// Open skill store without cloud SyncQueue wrappers (cas-7fbb).
+pub fn open_skill_store_local(cas_dir: &Path) -> Result<Arc<dyn SkillStore>> {
+    open_skill_store_base(cas_dir)
 }
 
 /// Open the entity store for knowledge graph
@@ -436,8 +484,8 @@ pub fn open_spec_store(cas_dir: &Path) -> Result<Arc<dyn SpecStore>> {
     Ok(Arc::new(store))
 }
 
-/// Open the appropriate rule store
-pub fn open_rule_store(cas_dir: &Path) -> Result<Arc<dyn RuleStore>> {
+/// Open base rule store (+ optional notifier). No SyncingRuleStore / SyncQueue.
+fn open_rule_store_base(cas_dir: &Path) -> Result<Arc<dyn RuleStore>> {
     let store_type = detect_store_type(cas_dir);
     let config = Config::load(cas_dir).unwrap_or_default();
 
@@ -454,12 +502,21 @@ pub fn open_rule_store(cas_dir: &Path) -> Result<Arc<dyn RuleStore>> {
         }
     };
 
-    // Wrap with notifying store if TUI notifier is active
-    let base_store: Arc<dyn RuleStore> = if has_notifier() && config.notifications_enabled() {
-        Arc::new(NotifyingRuleStore::new(base_store, config.notifications()))
+    if has_notifier() && config.notifications_enabled() {
+        Ok(Arc::new(NotifyingRuleStore::new(
+            base_store,
+            config.notifications(),
+        )))
     } else {
-        base_store
-    };
+        Ok(base_store)
+    }
+}
+
+/// Open the appropriate rule store (file + cloud sync wrappers when enabled).
+/// Prefer [`open_rule_store_local`] for pull/apply-remote paths.
+pub fn open_rule_store(cas_dir: &Path) -> Result<Arc<dyn RuleStore>> {
+    let config = Config::load(cas_dir).unwrap_or_default();
+    let base_store = open_rule_store_base(cas_dir)?;
 
     // Wrap with syncing store if sync is enabled
     if config.sync.enabled && !Config::is_sync_disabled() {
@@ -502,6 +559,15 @@ pub fn open_rule_store(cas_dir: &Path) -> Result<Arc<dyn RuleStore>> {
     }
 
     Ok(base_store)
+}
+
+/// Open rule store without SyncingRuleStore / SyncQueue wrappers (cas-7fbb).
+///
+/// Skips both cloud enqueue and local `.claude/rules` file sync so pull
+/// apply does not re-feed the queue. Local rule-file sync still runs on
+/// normal edit paths via [`open_rule_store`].
+pub fn open_rule_store_local(cas_dir: &Path) -> Result<Arc<dyn RuleStore>> {
+    open_rule_store_base(cas_dir)
 }
 
 /// Initialize a new .cas directory
