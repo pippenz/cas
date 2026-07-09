@@ -6352,6 +6352,94 @@ mod system_b_worktree_resolution_tests {
             Some(wt_path)
         );
     }
+
+    // --- cas-cf64 follow-up: cross-validate against
+    // WorktreeManager::worktree_path_for_worker() (hv-skill's cas-0938) ----
+    //
+    // cas-0938 (worktree_ops.rs, a different file/task) switched ITS
+    // System-B path resolution to call
+    // `WorktreeManager::worktree_path_for_worker()` directly rather than a
+    // parallel formula, and flagged this module's
+    // `resolve_system_b_worktree_path` as now-inconsistent. Reusing that
+    // method here directly is architecturally awkward: `WorktreeManager::new`
+    // requires a REAL git repository at the resolved root
+    // (`GitOperations::detect_repo_root`) and does a live
+    // `git --version`-style availability probe — both wrong for a "gate"
+    // helper that must degrade gracefully on arbitrary/test paths, and it
+    // would force every existing lightweight unit test in this module
+    // (which use a bare tempdir as `cas_root`, not a real nested repo) to
+    // grow a full fake repository. Per the supervisor's explicit fallback
+    // ("if a shared helper is awkward... match its base_path resolution
+    // exactly"), `system_b_worktree_base` re-derives the SAME formula
+    // (`{project}` substitution, absolute-vs-relative-to-repo-root's-
+    // parent) instead of calling the method. This test proves that
+    // decision empirically: constructs a REAL `WorktreeManager` against
+    // the same config and asserts both resolvers agree, for both the
+    // default and a configured override — not just by code inspection.
+    #[test]
+    fn agrees_with_worktree_manager_worktree_path_for_worker_default() {
+        let sandbox = tempfile::tempdir().unwrap();
+        let repo_root = sandbox.path().join("myrepo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        git(&repo_root, &["init", "-q", "-b", "main"]);
+        let cas_root = repo_root.join(".cas");
+        std::fs::create_dir_all(&cas_root).unwrap();
+
+        let wt_config = crate::worktree::WorktreeConfig {
+            enabled: true,
+            base_path: DEFAULT_WORKTREE_BASE_PATH_TEMPLATE.to_string(),
+            branch_prefix: "cas/".to_string(),
+            auto_merge: false,
+            cleanup_on_close: true,
+            promote_entries_on_merge: true,
+        };
+        let manager = crate::worktree::WorktreeManager::new(&repo_root, wt_config)
+            .expect("manager should construct against a real repo");
+
+        assert_eq!(
+            system_b_worktree_base(&cas_root),
+            manager.worktree_root(),
+            "default base_path must resolve to the SAME location as \
+             WorktreeManager::worktree_root() (which worktree_path_for_worker \
+             joins the assignee onto)"
+        );
+    }
+
+    #[test]
+    fn agrees_with_worktree_manager_worktree_path_for_worker_configured_override() {
+        let sandbox = tempfile::tempdir().unwrap();
+        let repo_root = sandbox.path().join("myrepo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        git(&repo_root, &["init", "-q", "-b", "main"]);
+        let cas_root = repo_root.join(".cas");
+        std::fs::create_dir_all(&cas_root).unwrap();
+
+        let override_template = "../{project}-worktrees".to_string();
+        std::fs::write(
+            cas_root.join("config.toml"),
+            format!("[worktrees]\nbase_path = \"{override_template}\"\n"),
+        )
+        .unwrap();
+
+        let wt_config = crate::worktree::WorktreeConfig {
+            enabled: true,
+            base_path: override_template,
+            branch_prefix: "cas/".to_string(),
+            auto_merge: false,
+            cleanup_on_close: true,
+            promote_entries_on_merge: true,
+        };
+        let manager = crate::worktree::WorktreeManager::new(&repo_root, wt_config)
+            .expect("manager should construct against a real repo");
+
+        assert_eq!(
+            system_b_worktree_base(&cas_root),
+            manager.worktree_root(),
+            "a configured base_path override must resolve to the SAME \
+             location via both resolvers — this is the exact drift \
+             hv-skill's cas-0938 flagged"
+        );
+    }
 }
 
 #[cfg(test)]
