@@ -196,7 +196,7 @@ The proposed refactor matches the shape that was tried in 1a2b3c4 and reverted. 
   - `.claude/`, `.claude/CODEMAP.md`
   - `.cas/`
 - **Build metadata in commits** — CAS embeds git hash and build date via `build.rs`. A commit that touches `build.rs` is usually not a functional change; don't flag it as significant.
-- **The cas-35c5 / cas-XXXX pattern** in commit messages is the CAS task-ID breadcrumb. Commits ending in `(cas-XXXX)` link back to tasks — fetching the task via `mcp__cas__task action=show id=cas-XXXX` is often the fastest way to understand "why."
+- **The cas-35c5 / cas-XXXX pattern** in commit messages is the CAS task-ID breadcrumb. Commits ending in `(cas-XXXX)` link back to tasks — fetching the task via `mcp__cs__task action=show id=cas-XXXX` is often the fastest way to understand "why."
 - **Worktree-aware**: if the caller is in a worktree, `.git` may be a file pointing at the main repo. Git commands still work; don't be confused if you see unfamiliar branches.
 
 ## Invocation Patterns

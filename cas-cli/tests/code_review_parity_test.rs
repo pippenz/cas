@@ -121,8 +121,11 @@ const LEGACY_PATTERNS: &[LegacyPattern] = &[
     },
     // ---- Project standards red flags ----
     LegacyPattern {
+        // cas-2c61: the codex mirror correctly uses mcp__cs__ (its own
+        // tool alias), not Claude's mcp__cas__ — both needles are the same
+        // pattern under each harness's prefix, not two different patterns.
         label: "mcp__cas__rule rule-compliance check",
-        needles: &["mcp__cas__rule"],
+        needles: &["mcp__cas__rule", "mcp__cs__rule"],
         expected_owner: "project-standards",
     },
     LegacyPattern {

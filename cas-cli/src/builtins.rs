@@ -2132,7 +2132,9 @@ This is the body content."#;
         // are sync-mirrored by `cas update`. Drift between them silently
         // produces a different classifier prompt on whichever harness
         // reads the stale copy — exactly the failure mode cas-ec8f traced
-        // in cas-code-review. Pin byte-identity at the source.
+        // in cas-code-review. Pin content-identity at the source, modulo
+        // the intentional per-harness tool prefix (cas-2c61: the codex
+        // copy correctly uses mcp__cs__, not Claude's mcp__cas__).
         let claude = BUILTIN_SKILLS
             .iter()
             .find(|b| b.path == "skills/session-learn/SKILL.md")
@@ -2142,9 +2144,11 @@ This is the body content."#;
             .find(|b| b.path == "skills/session-learn/SKILL.md")
             .expect("CODEX_BUILTIN_SKILLS missing session-learn SKILL.md");
         assert_eq!(
-            claude.content, codex.content,
-            "session-learn SKILL.md .claude and .codex copies must be byte-identical; \
-             drift here produces a divergent classifier prompt across harnesses",
+            claude.content.replace("mcp__cas__", "mcp__cs__"),
+            codex.content,
+            "session-learn SKILL.md .claude and .codex copies must be identical apart from \
+             the mcp__cas__/mcp__cs__ tool prefix; drift here produces a divergent \
+             classifier prompt across harnesses",
         );
     }
 
@@ -2153,7 +2157,9 @@ This is the body content."#;
         // The .claude and .codex builtin copies of cas-code-review/SKILL.md
         // are sync-mirrored by `cas update`. Drift between them
         // re-introduces the cas-ec8f regression on whichever harness reads
-        // the stale copy — guard against that at the source.
+        // the stale copy — guard against that at the source, modulo the
+        // intentional per-harness tool prefix (cas-2c61: the codex copy
+        // correctly uses mcp__cs__, not Claude's mcp__cas__).
         let claude = BUILTIN_SKILLS
             .iter()
             .find(|b| b.path == "skills/cas-code-review/SKILL.md")
@@ -2163,9 +2169,11 @@ This is the body content."#;
             .find(|b| b.path == "skills/cas-code-review/SKILL.md")
             .expect("CODEX_BUILTIN_SKILLS missing cas-code-review SKILL.md");
         assert_eq!(
-            claude.content, codex.content,
-            "cas-code-review SKILL.md .claude and .codex copies must be byte-identical; \
-             drift here re-opens cas-ec8f on the harness reading the stale copy",
+            claude.content.replace("mcp__cas__", "mcp__cs__"),
+            codex.content,
+            "cas-code-review SKILL.md .claude and .codex copies must be identical apart \
+             from the mcp__cas__/mcp__cs__ tool prefix; drift here re-opens cas-ec8f on \
+             the harness reading the stale copy",
         );
     }
 
@@ -2645,9 +2653,10 @@ This is the body content."#;
     }
 
     /// cas-6219: the supervisor's model-selection rubric must be registered on
-    /// both surfaces, stay byte-identical across mirrors (reference files carry
-    /// no alias divergence today — cas-62ab owns the eventual mcp__cs__ sweep),
-    /// and remain discoverable from the skill body that fits the 8 KB cap.
+    /// both surfaces, stay content-identical across mirrors modulo the
+    /// intentional per-harness tool prefix (cas-2c61/cas-62ab: the codex copy
+    /// correctly uses mcp__cs__, not Claude's mcp__cas__), and remain
+    /// discoverable from the skill body that fits the 8 KB cap.
     #[test]
     fn test_supervisor_model_selection_reference_registered_and_mirrored() {
         let claude = BUILTIN_SKILLS
@@ -2659,8 +2668,10 @@ This is the body content."#;
             .find(|b| b.path == "skills/cas-supervisor/references/model-selection.md")
             .expect("CODEX_BUILTIN_SKILLS missing cas-supervisor model-selection.md");
         assert_eq!(
-            claude.content, codex.content,
-            "model-selection.md .claude and .codex copies must be byte-identical",
+            claude.content.replace("mcp__cas__", "mcp__cs__"),
+            codex.content,
+            "model-selection.md .claude and .codex copies must be identical apart from \
+             the mcp__cas__/mcp__cs__ tool prefix",
         );
         // The four tiers and the escalation rule are the contract of the rubric.
         for required in [
@@ -2717,9 +2728,14 @@ This is the body content."#;
                 .iter()
                 .find(|b| b.path == path)
                 .unwrap_or_else(|| panic!("CODEX_BUILTIN_SKILLS missing {path}"));
+            // cas-2c61/cas-62ab: identical modulo the intentional per-harness
+            // tool prefix — the codex copy correctly uses mcp__cs__, not
+            // Claude's mcp__cas__.
             assert_eq!(
-                claude.content, codex.content,
-                "{path} .claude and .codex copies must be byte-identical",
+                claude.content.replace("mcp__cas__", "mcp__cs__"),
+                codex.content,
+                "{path} .claude and .codex copies must be identical apart from the \
+                 mcp__cas__/mcp__cs__ tool prefix",
             );
         }
 
@@ -3063,6 +3079,23 @@ This is the body content."#;
             task_verifier_path.exists(),
             "task-verifier.md should be created by sync_all_codex_builtins"
         );
+    }
+
+    /// cas-2c61: every Codex builtin (agent or skill) must reference the
+    /// codex-aliased tool prefix `mcp__cs__` (per
+    /// `SupervisorCli::Codex.capabilities().tool_prefix`), never `mcp__cas__`
+    /// (Claude's prefix). A codex worker/supervisor following a skill that
+    /// carries the wrong prefix calls a tool name that doesn't resolve.
+    /// Anti-drift guard mirroring the Grok corpus check (cas-6f46).
+    #[test]
+    fn test_codex_builtins_never_reference_claude_tool_prefix() {
+        for builtin in CODEX_BUILTIN_SKILLS.iter().chain(CODEX_BUILTIN_AGENTS.iter()) {
+            assert!(
+                !builtin.content.contains("mcp__cas__"),
+                "{} must not reference mcp__cas__ (Claude's prefix) — Codex uses mcp__cs__",
+                builtin.path
+            );
+        }
     }
 
     // =========================================================================

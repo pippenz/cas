@@ -71,7 +71,7 @@ ls docs/brainstorms/ 2>/dev/null
 Also check CAS for prior brainstorms or tasks:
 
 ```
-mcp__cas__search action=search query="<topic keywords>" doc_type=entry limit=5
+mcp__cs__search action=search query="<topic keywords>" doc_type=entry limit=5
 ```
 
 If a recent matching `*-requirements.md` file exists, or the user references prior work:
@@ -123,8 +123,8 @@ Match depth to scope:
 
 *Constraint Check* — Read project instruction files (`CLAUDE.md`, `AGENTS.md` if present) for workflow, product, or scope constraints that affect the brainstorm. Search CAS for prior decisions:
 ```
-mcp__cas__search action=search query="<topic>" doc_type=entry
-mcp__cas__task action=list status=closed
+mcp__cs__search action=search query="<topic>" doc_type=entry
+mcp__cs__task action=list status=closed
 ```
 
 *Topic Scan* — Search for relevant terms in the codebase. Read the most relevant existing artifact (prior brainstorm, plan, spec, skill, or feature doc). Skim adjacent examples covering similar behavior.
@@ -212,7 +212,7 @@ For **Lightweight** brainstorms, keep the document compact. Skip document creati
 After writing the document, also store the topic and key decisions in CAS memory so future brainstorms can find them:
 
 ```
-mcp__cas__memory action=remember title="Brainstorm: <topic>" content="<1-paragraph summary + decisions + path to doc>" tags=brainstorm,<topic>
+mcp__cs__memory action=remember title="Brainstorm: <topic>" content="<1-paragraph summary + decisions + path to doc>" tags=brainstorm,<topic>
 ```
 
 ### Phase 4: Handoff

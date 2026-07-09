@@ -110,7 +110,7 @@ The two bulleted lines and the `keep` markers survive re-runs.
 
 ### 1. Write a thin memory pointer
 
-Invoke `mcp__cas__memory` with `action=remember` to create/update a pointer memory.
+Invoke `mcp__cs__memory` with `action=remember` to create/update a pointer memory.
 
 - **Name / title:** `project_<slug>_domain.md` (slug = lowercase kebab-case of project name)
 - **Body:** ONE line only. A repo-relative link to the doc plus a single-sentence hook.

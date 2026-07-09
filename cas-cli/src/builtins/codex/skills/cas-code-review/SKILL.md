@@ -27,7 +27,7 @@ Return shape: `{"residual": [], "pre_existing": [], "mode": "<mode>", "skipped_r
    git diff --name-only <base_sha>..HEAD  # → file_list
    git log --format=%B <base_sha>..HEAD   # → commit_log
    ```
-   If `task_id` is known, also fetch task context: `mcp__cas__task action=show id=<task_id>` → `task_context` (title + description + acceptance criteria + notes).
+   If `task_id` is known, also fetch task context: `mcp__cs__task action=show id=<task_id>` → `task_context` (title + description + acceptance criteria + notes).
 
 3. **Call the Workflow:**
    ```

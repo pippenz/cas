@@ -119,7 +119,7 @@ Supervisor has rejection authority. Work is sent back with specific, actionable 
 
 - **Pattern consistency** — New work matches established conventions; deviations require explicit justification
 - **Debt tagging** — Log deliberate shortcuts with reason and remediation plan; unlogged shortcuts are violations
-- **Search before planning** — Use `mcp__cas__search` for semantic search across memories and tasks, `mcp__cas__memory` for storing learnings. Always search before creating new work to avoid duplicating prior solutions or contradicting past decisions.
+- **Search before planning** — Use `mcp__cs__search` for semantic search across memories and tasks, `mcp__cs__memory` for storing learnings. Always search before creating new work to avoid duplicating prior solutions or contradicting past decisions.
 
 ## EPIC Sizing
 
