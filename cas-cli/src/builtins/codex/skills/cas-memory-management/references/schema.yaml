@@ -191,7 +191,7 @@ validation_rules:
   - "Validators warn on violation but do not hard-fail (backward compat)"
 
 # --- Search indexing hints ---------------------------------------------------
-# mcp__cas__search should index these fields as filterable metadata so users
+# mcp__cs__search should index these fields as filterable metadata so users
 # can run queries like:
 #   - "show all runtime_error memories for cas-mcp"
 #   - "show critical/high severity memories from the last 30 days"

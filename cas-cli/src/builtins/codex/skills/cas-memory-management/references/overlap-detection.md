@@ -4,7 +4,7 @@ managed_by: cas
 
 # Memory Overlap Detection
 
-Run this workflow **before** creating a new memory via `mcp__cas__memory action=remember`. It catches the case where the agent is about to write a second memory about a problem CAS already has captured — the silent drift cause that the refresh workflow has to clean up later.
+Run this workflow **before** creating a new memory via `mcp__cs__memory action=remember`. It catches the case where the agent is about to write a second memory about a problem CAS already has captured — the silent drift cause that the refresh workflow has to clean up later.
 
 The cheapest fix is to never write the duplicate. The next cheapest is to write it with an explicit cross-reference. Both are this workflow's job.
 
@@ -32,7 +32,7 @@ Build a query string for BM25 search: prefer reference symbols (most discriminat
 
 ### 2. Search existing memories
 
-Call `mcp__cas__search` with the query string and `doc_type=entry` (memory entries). Take the top **3–5 candidates** by score. If the top result has a score below the search engine's "weak match" threshold, treat the candidate set as empty and skip to step 4 (create normally).
+Call `mcp__cs__search` with the query string and `doc_type=entry` (memory entries). Take the top **3–5 candidates** by score. If the top result has a score below the search engine's "weak match" threshold, treat the candidate set as empty and skip to step 4 (create normally).
 
 If the new memory has a `module` field, prefer candidates from the same module — they're far more likely to be true overlaps. Boost same-module candidates one rank.
 
@@ -159,14 +159,14 @@ The autofix path must always succeed in either creating or updating something �
 When this check moves into Rust (`cas-core::memory::overlap`), the steps map cleanly:
 
 1. **Term extraction** — pure Rust. Tokenize the new memory, drop stop words, extract symbol-shaped tokens (CamelCase, snake_case, paths, file extensions). Tokenizer already exists in the search index path.
-2. **BM25 search** — already implemented. Reuse `mcp__cas__search`'s underlying call. Pass the extracted terms as the query.
+2. **BM25 search** — already implemented. Reuse `mcp__cs__search`'s underlying call. Pass the extracted terms as the query.
 3. **Dimension scoring** — implementable as pure Rust heuristics. The structured frontmatter fields from cas-559d (`root_cause`, `module`, `tags`) make most dimensions cheap exact-match comparisons. Problem-statement and solution-shape comparisons need either token-overlap heuristics or a small embedding model — start with token overlap and upgrade only if precision suffers.
 4. **Decision** — table lookup based on score.
 5. **Side effects** — file edits for cross-reference / update flows. Use the existing memory write path; add a `mode: update | create-with-link | create` enum to the writer.
 
 Performance budget: total overlap check should run in <500ms for a memory store with 10k entries. The bottleneck is BM25 search; everything after the candidate set is small.
 
-Add a `--no-overlap-check` flag to `mcp__cas__memory action=remember` for bulk imports and tests that intentionally create overlapping memories.
+Add a `--no-overlap-check` flag to `mcp__cs__memory action=remember` for bulk imports and tests that intentionally create overlapping memories.
 
 ## Relationship to the refresh workflow
 

@@ -133,10 +133,13 @@ fn codex_mirror_skill_exists_and_is_structurally_complete() {
 fn both_mirrors_are_content_equivalent() {
     let a = read(&claude_skill_path());
     let b = read(&codex_skill_path());
+    // cas-2c61: identical modulo the intentional per-harness tool prefix —
+    // the codex mirror correctly uses mcp__cs__, not Claude's mcp__cas__.
     assert_eq!(
-        a, b,
-        "claude and codex SKILL.md mirrors must be byte-identical so \
-         `cas sync` doesn't oscillate between them"
+        a.replace("mcp__cas__", "mcp__cs__"),
+        b,
+        "claude and codex SKILL.md mirrors must be identical (apart from the \
+         mcp__cas__/mcp__cs__ tool prefix) so `cas sync` doesn't oscillate between them"
     );
 }
 

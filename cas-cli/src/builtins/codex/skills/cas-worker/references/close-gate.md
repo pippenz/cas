@@ -6,7 +6,7 @@ managed_by: cas
 
 # Close Gate — Self-Verification
 
-Run all 6 self-verification checks before `mcp__cas__task action=close`. The gate is the same regardless of task type. Skip and you eat a verifier rejection round-trip.
+Run all 6 self-verification checks before `mcp__cs__task action=close`. The gate is the same regardless of task type. Skip and you eat a verifier rejection round-trip.
 
 ## Depth: `light` tasks skip this gate
 
@@ -20,7 +20,7 @@ Close runs a merge-state guard before anything else: every commit on your `facto
 - **Parent is `main`/`master`/`staging`** — push and complete the project's PR/merge flow (or the merge flow the supervisor stated at assignment), then close.
 - **Guard still fires after a confirmed merge?** Squash-merges rewrite SHAs, so the guard can count already-merged commits as missing. Send the supervisor the exact guard text — they fix the stale branch ref. Do not retry-loop.
 
-**Never bypass the close path.** Setting `status=closed` via `action=update` and hand-writing a `mcp__cas__verification action=add` record forges the verification audit trail — the task looks verified when nobody verified it. If close keeps rejecting, that is a supervisor conversation, not a workaround opportunity.
+**Never bypass the close path.** Setting `status=closed` via `action=update` and hand-writing a `mcp__cs__verification action=add` record forges the verification audit trail — the task looks verified when nobody verified it. If close keeps rejecting, that is a supervisor conversation, not a workaround opportunity.
 
 **Code review is not your job at close** under the v2.13.0+ default `[code_review] owner = "supervisor"`. The supervisor runs a lightweight gate when merging each worker diff, then one full `/cas-code-review` pass when the epic is code-complete. Do not invoke the multi-persona review yourself unless your supervisor explicitly tells you to, or your project has opted in to legacy `owner = "worker"` in `.cas/config.toml` — the worker-inline path adds ~14 min and ~100K tokens per close, which is exactly what the v2.13.0 flip was designed to eliminate.
 
@@ -113,7 +113,7 @@ Only close after all checks pass. The verifier will catch what you miss — but 
 After closing your **third** task in the current EPIC — and again after the 6th, 9th, 12th, etc. — invoke the `simplify` skill on your own recent work in that EPIC before picking up the next task.
 
 - **Counter is per-worker-per-EPIC.** It resets when you move to a different EPIC.
-- **Counter is stateless** — derive it at close time by querying `mcp__cas__task action=list assignee=<self> epic=<current-epic> status=closed` and checking whether `(count + 1) % 3 == 0` (the `+1` is for the task you're about to close).
+- **Counter is stateless** — derive it at close time by querying `mcp__cs__task action=list assignee=<self> epic=<current-epic> status=closed` and checking whether `(count + 1) % 3 == 0` (the `+1` is for the task you're about to close).
 - **Scope of simplification** = your own committed and staged work within the current EPIC only. Not cross-worker. Not cross-EPIC. Not code you haven't touched.
 - **If the EPIC has fewer than 3 of your tasks total**, simplify-as-you-go never fires for you in that EPIC. That is intentional — the trigger exists to catch pattern accumulation, and <3 tasks is below the accumulation threshold.
 
