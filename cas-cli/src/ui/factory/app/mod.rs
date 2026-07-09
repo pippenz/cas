@@ -809,6 +809,14 @@ impl FactoryApp {
         self.sync_session_mappings();
         self.apply_session_metadata_focus();
 
+        // cas-e98e AC3: drop phantom worker panes when registry says the
+        // worker is no longer supervision-live (Shutdown, or Stale/dead with
+        // no live process). Keeps panes for still-registering names and for
+        // process-alive dual-signal workers.
+        if db_changed {
+            self.reconcile_phantom_worker_panes();
+        }
+
         // Detect state changes against the UNFILTERED snapshot (cas-dbbe) so new
         // epics are visible to the event detector, and so a second epic worked
         // concurrently in this session is never epic-scoped out of the
@@ -828,6 +836,47 @@ impl FactoryApp {
         }
 
         Ok(events)
+    }
+
+    /// Drop worker panes whose registry rows are all non-live (cas-e98e AC3).
+    ///
+    /// Uses the shared [`crate::mcp::tools::service::agent_liveness`] classifier
+    /// so pane grid, worker_status, and agent_list cannot disagree about dead
+    /// workers. Names with **no** registry row yet are kept (spawn race).
+    fn reconcile_phantom_worker_panes(&mut self) {
+        use crate::mcp::tools::service::agent_liveness::should_keep_worker_pane;
+        use crate::store::open_agent_store;
+
+        let Ok(agent_store) = open_agent_store(&self.cas_dir) else {
+            return;
+        };
+        let Ok(all_agents) = agent_store.list(None) else {
+            return;
+        };
+
+        let to_drop: Vec<String> = self
+            .worker_names
+            .iter()
+            .filter(|name| !should_keep_worker_pane(name, all_agents.iter()))
+            .cloned()
+            .collect();
+
+        if to_drop.is_empty() {
+            return;
+        }
+
+        for name in &to_drop {
+            tracing::info!(
+                worker = %name,
+                "cas-e98e: dropping phantom worker pane (registry non-live)"
+            );
+            self.worker_names.retain(|n| n != name);
+            self.event_detector.remove_worker(name);
+        }
+
+        self.pane_grid = PaneGrid::new(&self.worker_names, &self.supervisor_name, self.is_tabbed);
+        self.clamp_selected_worker_tab();
+        let _ = self.sync_pane_sizes();
     }
 
     fn set_active_epic(

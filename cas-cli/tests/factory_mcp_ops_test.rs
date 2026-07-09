@@ -1072,7 +1072,11 @@ async fn test_worker_status_and_agent_list_agree_on_live_workers() {
             .expect("agent_list"),
     );
 
-    // Live identities from worker_status (named bullets).
+    // Live identities from worker_status (named bullets) — AC2 count + identity.
+    assert!(
+        status_text.contains("Workers (2)"),
+        "worker_status operational count must be 2. Got:\n{status_text}"
+    );
     for name in ["live-fresh", "live-stale-hb"] {
         assert!(
             status_text.contains(name),
@@ -1084,8 +1088,12 @@ async fn test_worker_status_and_agent_list_agree_on_live_workers() {
         );
     }
     assert!(
+        list_text.contains("Live factory workers (authoritative): 2"),
+        "agent_list live footer must agree on count 2. Got:\n{list_text}"
+    );
+    assert!(
         list_text.contains("active,alive-heartbeat-stale")
-            || status_text.contains("alive") && status_text.contains("heartbeat stale"),
+            || (status_text.contains("alive") && status_text.contains("heartbeat stale")),
         "dual-signal must appear for process-alive stale-hb worker.\nstatus:\n{status_text}\nlist:\n{list_text}"
     );
     assert!(

@@ -124,6 +124,24 @@ pub fn is_live_factory_worker(agent: &Agent) -> bool {
     agent.role == AgentRole::Worker && evaluate_supervision_liveness(agent).is_live()
 }
 
+/// Whether a worker pane named `name` should remain given registry agents.
+///
+/// cas-e98e AC3 phantom-pane rule: keep when still registering (no rows) or
+/// any matching row is supervision-live; drop when every matching row is
+/// non-live (dead process + stale/shutdown registry).
+pub fn should_keep_worker_pane<'a>(
+    name: &str,
+    agents: impl IntoIterator<Item = &'a Agent>,
+) -> bool {
+    let matching: Vec<&Agent> = agents.into_iter().filter(|a| a.name == name).collect();
+    if matching.is_empty() {
+        return true;
+    }
+    matching
+        .iter()
+        .any(|a| evaluate_supervision_liveness(a).is_live())
+}
+
 /// `agent_list` status token using authoritative liveness.
 pub fn agent_list_status_label(agent: &Agent) -> String {
     match evaluate_supervision_liveness(agent) {
@@ -207,5 +225,20 @@ mod tests {
         a.pid = Some(9);
         assert!(agent_process_is_alive_with(&a, |p| p == 9, |_, _| false));
         assert!(!agent_process_is_alive_with(&a, |_| false, |_, _| true));
+    }
+
+    #[test]
+    fn pane_kept_when_unregistered_or_live() {
+        assert!(should_keep_worker_pane("spawning", std::iter::empty()));
+        let live = worker(AgentStatus::Active, 5);
+        assert!(should_keep_worker_pane("w1", std::iter::once(&live)));
+    }
+
+    #[test]
+    fn pane_dropped_when_all_matching_not_live() {
+        let dead = worker(AgentStatus::Stale, 120);
+        assert!(!should_keep_worker_pane("w1", std::iter::once(&dead)));
+        let shutdown = worker(AgentStatus::Shutdown, 0);
+        assert!(!should_keep_worker_pane("w1", std::iter::once(&shutdown)));
     }
 }
