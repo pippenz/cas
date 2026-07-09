@@ -67,8 +67,7 @@ pub(crate) fn requires_pty_readiness_gate(harness: SupervisorCli, teams_active: 
 }
 
 /// Whether a PTY-delivered payload must carry the literal `Message from <sender>: `
-/// framing. True iff the recipient is **Codex** or **Grok**, independent of teams
-/// mode.
+/// framing. True iff the recipient is **Codex**, independent of teams mode.
 ///
 /// The Codex worker/supervisor prompts (sibling task cas-83c8) key on EXACTLY this
 /// prefix to recognise an injected turn as an actionable instruction, and they do
@@ -78,16 +77,22 @@ pub(crate) fn requires_pty_readiness_gate(harness: SupervisorCli, teams_active: 
 /// reached via the PTY fallback (codex-supervised factory, teams=None) must NOT be
 /// framed — it isn't a codex prompt and stays byte-for-byte bare.
 ///
-/// EPIC cas-8888 (cas-9a31, Phase 1) SILENT SITE — audited: Grok is included
-/// here too. Reasoning: Grok has no CC Agent-Teams membership (delta #4) and
-/// is *always* PTY-delivered (see `choose_channel` above), coordinating "the
-/// Codex way" per the epic notes — so its own worker/supervisor prompts are
-/// expected to key on the same literal prefix for turn recognition, same as
-/// Codex's. This is a judgment call made without Grok's actual prompt content
-/// (that's Phase 2/3's job); revisit if Grok's real injected-turn recognition
-/// mechanism turns out to differ.
+/// EPIC cas-8888 (cas-9a31, Phase 1) SILENT SITE — audited: Grok is NOT
+/// included here (revised from an earlier version of this comment that did
+/// include it — see the task's coordination history). Checked the actual
+/// mechanism first: `CODEX_WORKER_INSTRUCTIONS`/`CODEX_SUPERVISOR_INSTRUCTIONS`
+/// (crates/cas-pty/src/pty.rs) EXPLICITLY tell Codex to "treat any injected
+/// turn framed 'Message from <sender>: …' as an instruction to act on" — the
+/// marker exists because it's baked into Codex's own prompt text, not because
+/// of any inherent PTY-delivery or hooks property. No such prompt convention
+/// exists for Grok yet (that's Phase 2/3's job to author), and Grok's design
+/// otherwise mirrors Claude's (native hooks incl. UserPromptSubmit, a real
+/// TUI textbox) — so absent a reason to invent an unbacked marker
+/// requirement, Grok should behave like Claude's PTY-fallback case: bare,
+/// unframed. Revisit once Phase 2/3 actually authors Grok's coordination
+/// prompt, if it turns out to need its own recognition convention.
 pub(crate) fn pty_payload_needs_framing(harness: SupervisorCli) -> bool {
-    matches!(harness, SupervisorCli::Codex | SupervisorCli::Grok)
+    matches!(harness, SupervisorCli::Codex)
 }
 
 /// Prefix PTY-delivered text with literal sender attribution.
@@ -224,6 +229,19 @@ mod tests {
         assert!(pty_payload_needs_framing(SupervisorCli::Codex));
         // Claude recipient via PTY fallback (codex-supervised, teams=None) → bare.
         assert!(!pty_payload_needs_framing(SupervisorCli::Claude));
+    }
+
+    /// EPIC cas-8888 (cas-9a31, Phase 1): Grok is always PTY-delivered (no
+    /// team-transport) but must NOT be framed like Codex — no such prompt
+    /// convention has been authored for Grok (unlike Codex's
+    /// CODEX_WORKER_INSTRUCTIONS, which explicitly keys on the literal
+    /// prefix), and Grok's design otherwise mirrors Claude's (native hooks,
+    /// real TUI textbox). See the doc comment on `pty_payload_needs_framing`
+    /// for the full reasoning trail (this was revised once already after
+    /// checking the actual mechanism — don't re-flip without re-checking).
+    #[test]
+    fn pty_framing_does_not_apply_to_grok() {
+        assert!(!pty_payload_needs_framing(SupervisorCli::Grok));
     }
 
     #[test]

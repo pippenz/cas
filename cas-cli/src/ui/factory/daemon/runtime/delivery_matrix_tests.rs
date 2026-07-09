@@ -86,13 +86,20 @@ const SHAPES: [FactoryShape; 6] = [
 ];
 
 /// Expected routing for one cell, derived from the contract (NOT from the
-/// implementation): Codex and Grok recipients are always PTY + gated +
-/// framed (EPIC cas-8888: Grok has no team-transport, coordinates the
-/// Codex way); Claude recipients use the team inbox iff teams are active
-/// (no gate, no framing), else fall back to bare PTY (gated, unframed).
+/// implementation): Codex recipients are always PTY + gated + framed
+/// (`CODEX_WORKER_INSTRUCTIONS`/`CODEX_SUPERVISOR_INSTRUCTIONS` explicitly
+/// key on the literal "Message from <sender>: " prefix — see
+/// `pty_payload_needs_framing`'s doc comment). Grok recipients are always
+/// PTY + gated (EPIC cas-8888: no team-transport) but NOT framed — no such
+/// prompt convention has been authored for Grok, and its design otherwise
+/// mirrors Claude's (native hooks, real TUI textbox), so it behaves like
+/// Claude's PTY-fallback case for framing purposes. Claude recipients use
+/// the team inbox iff teams are active (no gate, no framing), else fall
+/// back to bare PTY (gated, unframed).
 fn expected(recipient: SupervisorCli, teams_active: bool) -> (DeliveryChannel, bool, bool) {
     match recipient {
-        Codex | Grok => (DeliveryChannel::Pty, true, true),
+        Codex => (DeliveryChannel::Pty, true, true),
+        Grok => (DeliveryChannel::Pty, true, false),
         Claude if teams_active => (DeliveryChannel::TeamsInbox, false, false),
         Claude => (DeliveryChannel::Pty, true, false),
     }
