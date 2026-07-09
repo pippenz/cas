@@ -582,18 +582,49 @@ pub(crate) fn find_worker_pid<T: ProcessTable + ?Sized>(
     table: &T,
     worker_name: &str,
 ) -> Option<u32> {
-    table.pids().into_iter().find(|&pid| {
+    let pids = table.pids();
+    // cas-a91b: argv (`--agent-name`) is only ever present on the actual
+    // `claude`/leader process's OWN command line — unlike an env var, argv
+    // is never copied to child processes. `CAS_AGENT_NAME`, by contrast, is
+    // *inherited* by every descendant the worker spawns (its `cas serve`
+    // child, git, cargo, ...), so an environ-only match is ambiguous — it
+    // could be the leader or any of its children, and `ProcessTable::pids()`
+    // order is unspecified. Search cmdline across ALL pids first (a global
+    // pass, not interleaved per-pid); only fall back to the environ signal
+    // (needed for Codex, whose argv carries no identifying flag at all) when
+    // no process's own argv identifies it as this worker.
+    if let Some(pid) = pids.iter().copied().find(|&pid| {
         table
             .cmdline(pid)
             .and_then(|c| agent_name_from_cmdline(&c))
             .as_deref()
             == Some(worker_name)
-            || table
-                .environ(pid)
-                .and_then(|e| agent_name_from_environ(&e))
-                .as_deref()
-                == Some(worker_name)
+    }) {
+        return Some(pid);
+    }
+    pids.into_iter().find(|&pid| {
+        table
+            .environ(pid)
+            .and_then(|e| agent_name_from_environ(&e))
+            .as_deref()
+            == Some(worker_name)
     })
+}
+
+/// Convert `pid` to its process GROUP LEADER's pid via `getpgid()` (cas-a91b).
+/// `find_worker_pid`'s environ-based fallback (Codex workers) can still
+/// resolve a descendant rather than the actual session leader, since
+/// `CAS_AGENT_NAME` is inherited by every child process. Converting through
+/// the kernel's own process-group bookkeeping — rather than assuming the
+/// resolved pid IS the pgid — is what makes `killpg` safe to call on it:
+/// descendants stay in their parent's process group unless they explicitly
+/// detach (`setsid`/`setpgid`), so `getpgid(descendant_pid)` correctly
+/// returns the leader's pid. Returns `None` if the process is already gone
+/// (`getpgid` fails, e.g. ESRCH) — callers fall back to the original pid,
+/// which the subsequent liveness/kill checks handle as "already dead".
+fn resolve_group_leader_pid(pid: u32) -> Option<u32> {
+    let pgid = unsafe { libc::getpgid(pid as libc::pid_t) };
+    if pgid < 0 { None } else { Some(pgid as u32) }
 }
 
 /// Pick which pid [`execute_kill`] targets: a live process-table match (by
@@ -619,20 +650,58 @@ pub(crate) fn decide_post_kill_action(verdict: &KillVerdict, death_confirmed_aft
     }
 }
 
+/// Parse the process `state` (field 3) out of a raw `/proc/<pid>/stat` line,
+/// `true` iff it's `Z` (zombie). Same comm-parsing caveat as
+/// `daemon::parse_starttime_from_stat` (`comm` is parenthesized and may
+/// itself contain spaces/parens) — split on the LAST `)` before reading
+/// fields from the tail. Field 3 is the first field after the parens.
+fn is_zombie_state(raw: &str) -> bool {
+    let Some(last_paren) = raw.rfind(')') else {
+        return false;
+    };
+    let Some(tail) = raw.get(last_paren + 1..) else {
+        return false;
+    };
+    tail.trim_start().split_whitespace().next() == Some("Z")
+}
+
+/// Whether `pid` is currently a zombie (exited but not yet reaped by its
+/// parent). Linux-only (`/proc`); non-Linux always reports `false` — see
+/// `verify_death` doc for why that's the safe default there.
+#[cfg(target_os = "linux")]
+fn pid_is_zombie(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .is_some_and(|raw| is_zombie_state(&raw))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pid_is_zombie(_pid: u32) -> bool {
+    false
+}
+
 /// Poll pid liveness briefly after SIGKILL. The signal-delivery syscall
 /// returning success is not proof of death — the kernel needs a scheduling
 /// tick to actually reap the process — and cas-f781 AC b requires the lease
 /// reset to wait for genuinely-confirmed death rather than assume the kill
 /// worked. 10 x 20ms = 200ms ceiling: generous for an already-signalled
 /// process while keeping `cas factory kill` responsive.
+///
+/// cas-a91b: a killed process GROUP LEADER becomes a zombie under its
+/// original parent (typically the daemon that spawned it, not this `cas
+/// factory kill` invocation) — `pid_alive` (`kill(pid, 0)`) reports a zombie
+/// as alive, since its `/proc` entry still exists until reaped. Without the
+/// zombie check, `verify_death` would time out and return `false` for a
+/// worker that is, for all practical purposes, dead — leaving its task
+/// stuck InProgress with no way to reclaim it short of a manual reset.
 fn verify_death(pid: u32) -> bool {
     for _ in 0..10 {
-        if !crate::mcp::daemon::pid_alive(pid) {
+        if !crate::mcp::daemon::pid_alive(pid) || pid_is_zombie(pid) {
             return true;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    !crate::mcp::daemon::pid_alive(pid)
+    !crate::mcp::daemon::pid_alive(pid) || pid_is_zombie(pid)
 }
 
 /// `cas factory kill <worker>`: SIGKILL the worker process and release any
@@ -705,15 +774,33 @@ pub(crate) fn execute_kill(
                 };
                 let death_after_attempt = match &verdict {
                     KillVerdict::Go => {
-                        match send_sigkill(pid) {
+                        // cas-a91b: convert to the actual process GROUP
+                        // LEADER before signaling — `pid` may be a descendant
+                        // that inherited CAS_AGENT_NAME in its environ
+                        // (find_worker_pid's Codex fallback), not the leader
+                        // itself. `killpg`/`verify_death` only make sense
+                        // against the real pgid; falling back to the raw
+                        // `pid` when the process just vanished mid-resolve is
+                        // fine — the ESRCH/pid_alive checks downstream still
+                        // handle that safely.
+                        let group_pid = resolve_group_leader_pid(pid).unwrap_or(pid);
+                        match send_sigkill(group_pid) {
                             Ok(()) => {
-                                summary.push(format!("SIGKILL delivered to process group {pid}"))
+                                summary.push(format!(
+                                    "SIGKILL delivered to process group {group_pid}"
+                                ));
+                                verify_death(group_pid)
                             }
                             Err(e) => {
-                                summary.push(format!("SIGKILL failed for pid {pid}: {e}"))
+                                summary.push(format!(
+                                    "SIGKILL failed for pid {group_pid}: {e}"
+                                ));
+                                // cas-a91b: do NOT fall through to verify_death
+                                // on a failed/refused kill — a failure here
+                                // must never be treated as "confirmed dead".
+                                false
                             }
                         }
-                        verify_death(pid)
                     }
                     KillVerdict::AlreadyDead => {
                         summary.push(format!("pid {pid} already dead — skipping SIGKILL"));
@@ -814,22 +901,38 @@ fn kill_verdict(pid: u32, expected_starttime: Option<u64>, force: bool) -> KillV
     }
 }
 
-fn send_sigkill(pid: u32) -> Result<()> {
+fn send_sigkill(pgid: u32) -> Result<()> {
     // cas-f781: kill the process GROUP, not just the single recorded pid.
     // Workers are spawned as session leaders (portable_pty calls setsid()
-    // before exec), so pid == pgid for every worker process — killpg here
-    // also reaps any children the worker forked (e.g. an in-flight tool
+    // before exec), so pid == pgid for the actual leader — killpg here also
+    // reaps any children the worker forked (e.g. an in-flight tool
     // subprocess), where a bare `kill(pid)` would leave those running.
-    // SAFETY: libc::killpg with SIGKILL has no side effects on this
-    // process — `pid` always comes from a resolved worker record via
-    // `pick_kill_pid`, never from this process's own `getpgrp()`. ESRCH
-    // (group already gone) is treated as success by the caller.
-    let rc = unsafe { libc::killpg(pid as libc::pid_t, libc::SIGKILL) };
+    // `pgid` must already be a real process-group id by the time this is
+    // called — callers convert via `resolve_group_leader_pid` first
+    // (cas-a91b), since a raw resolved pid can be a descendant rather than
+    // the leader (see `find_worker_pid`'s environ-fallback ambiguity).
+    // SAFETY: libc::killpg with SIGKILL has no side effects on this process.
+    let rc = unsafe { libc::killpg(pgid as libc::pid_t, libc::SIGKILL) };
     if rc == 0 {
         return Ok(());
     }
     let errno = std::io::Error::last_os_error();
     if errno.raw_os_error() == Some(libc::ESRCH) {
+        // cas-a91b adversarial P1: ESRCH means "no process group with this
+        // id exists" — but that's only trustworthy as "the worker's group is
+        // dead" if `pgid` doesn't independently resolve to a still-alive
+        // process. If it does, we passed the wrong number (e.g. a
+        // descendant's raw pid that was never actually a valid pgid) and
+        // silently treating this as success would let a live worker's task
+        // lease get reset out from under it — the exact destructive bug this
+        // task exists to close. Refuse instead of guessing.
+        if crate::mcp::daemon::pid_alive(pgid) {
+            bail!(
+                "killpg({pgid}) returned ESRCH but pid {pgid} is still alive — refusing to \
+                 treat this as a successful kill (the resolved target was not a valid process \
+                 group; the worker may still be running)"
+            );
+        }
         return Ok(());
     }
     Err(errno.into())
@@ -1491,6 +1594,197 @@ mod tests {
         entries.insert(1, (Some(b"init\0".to_vec()), None));
         let table = FakeProcessTable { entries };
         assert_eq!(find_worker_pid(&table, "hv-live"), None);
+    }
+
+    /// A `ProcessTable` whose `pids()` returns entries in an EXPLICIT,
+    /// caller-controlled order — `FakeProcessTable`'s `HashMap`-backed
+    /// `pids()` has unspecified iteration order, which can't reliably
+    /// reproduce "the wrong candidate is scanned first" (cas-a91b).
+    struct OrderedFakeProcessTable {
+        order: Vec<u32>,
+        entries: std::collections::HashMap<u32, (Option<Vec<u8>>, Option<Vec<u8>>)>,
+    }
+
+    impl ProcessTable for OrderedFakeProcessTable {
+        fn pids(&self) -> Vec<u32> {
+            self.order.clone()
+        }
+        fn cmdline(&self, pid: u32) -> Option<Vec<u8>> {
+            self.entries.get(&pid).and_then(|e| e.0.clone())
+        }
+        fn environ(&self, pid: u32) -> Option<Vec<u8>> {
+            self.entries.get(&pid).and_then(|e| e.1.clone())
+        }
+    }
+
+    #[test]
+    fn find_worker_pid_prefers_cmdline_match_over_environ_match_regardless_of_scan_order() {
+        // cas-a91b P1: CAS_AGENT_NAME is inherited by EVERY descendant of the
+        // worker (its `cas serve` child, git, cargo, ...) — an environ-only
+        // match is not proof of being the actual leader, unlike argv, which
+        // is never copied to children. Simulate the exact failure mode: a
+        // descendant (environ match only) is enumerated BEFORE the real
+        // leader (cmdline match) — proving the two-pass priority fix picks
+        // the leader regardless of scan order, where the pre-fix single-pass
+        // `.find()` would have nondeterministically returned the descendant.
+        let mut entries = std::collections::HashMap::new();
+        entries.insert(
+            9999,
+            (
+                Some(b"cas\0serve\0".to_vec()),
+                Some(b"PATH=/usr/bin\0CAS_AGENT_NAME=hv-live\0".to_vec()),
+            ),
+        );
+        entries.insert(
+            4242,
+            (
+                Some(b"claude\0--dangerously-skip-permissions\0--agent-name\0hv-live\0".to_vec()),
+                None,
+            ),
+        );
+        let table = OrderedFakeProcessTable {
+            order: vec![9999, 4242], // descendant (environ match) scanned FIRST
+            entries,
+        };
+        assert_eq!(
+            find_worker_pid(&table, "hv-live"),
+            Some(4242),
+            "the cmdline (leader) match must win even though the environ-matching \
+             descendant was scanned first"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_group_leader_pid_converts_descendant_to_actual_leader() {
+        // cas-a91b: prove getpgid() correctly walks a descendant pid back to
+        // its real process-group leader — the fix that makes killpg safe to
+        // call on whatever find_worker_pid resolved, even when that's a
+        // descendant rather than the leader itself. Spawn a detached leader
+        // (own session/group, distinct from the `cargo test` process group)
+        // whose script backgrounds a child in the SAME group, then confirm
+        // resolve_group_leader_pid(child_pid) == leader_pid.
+        use std::os::unix::process::CommandExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let pidfile = tmp.path().join("child.pid");
+        let script = format!("sleep 5 & echo $! > {} ; wait", pidfile.display());
+
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c").arg(&script);
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut leader = cmd.spawn().expect("spawn detached leader");
+        let leader_pid = leader.id();
+
+        let mut child_pid: Option<u32> = None;
+        for _ in 0..50 {
+            if let Ok(s) = std::fs::read_to_string(&pidfile) {
+                if let Ok(p) = s.trim().parse::<u32>() {
+                    child_pid = Some(p);
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let child_pid = child_pid.expect("background child pid should appear");
+
+        assert_eq!(
+            resolve_group_leader_pid(child_pid),
+            Some(leader_pid),
+            "a descendant's group leader must resolve to the actual session leader"
+        );
+        assert_eq!(
+            resolve_group_leader_pid(leader_pid),
+            Some(leader_pid),
+            "the leader's own group leader is itself (pid == pgid via setsid())"
+        );
+
+        // Clean up: killpg the real group so nothing outlives the test.
+        let _ = send_sigkill(leader_pid);
+        let _ = leader.wait();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn send_sigkill_refuses_esrch_when_target_pid_still_alive() {
+        // cas-a91b P1: killpg() on an ordinary (non-leader) pid returns
+        // ESRCH because no process group has that id — but if the
+        // underlying process is still alive, blindly treating ESRCH as
+        // "already dead" silently no-ops the kill while the caller believes
+        // it succeeded. This is the exact destructive path: a live worker's
+        // task lease would then get reset out from under it. Use a plain
+        // child process (NOT a session/group leader — it stays in this
+        // test's own process group) as the "wrong pid resolved" stand-in.
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .expect("spawn plain child");
+        let pid = child.id();
+        assert!(crate::mcp::daemon::pid_alive(pid));
+
+        let result = send_sigkill(pid);
+        assert!(
+            result.is_err(),
+            "send_sigkill must refuse (return Err), not silently succeed, when killpg(pid) \
+             returns ESRCH but pid is still alive: {result:?}"
+        );
+
+        // This test process is the child's real parent — kill + reap directly
+        // rather than relying on the (deliberately refused) send_sigkill.
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGKILL);
+        }
+        let _ = child.wait();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verify_death_treats_zombie_as_confirmed_dead() {
+        // cas-a91b P3: a killed process GROUP LEADER becomes a zombie under
+        // its original parent (not `cas factory kill`) — pid_alive
+        // (kill(pid,0)) reports a zombie as alive, since its /proc entry
+        // persists until reaped. Without zombie detection, verify_death
+        // would time out (200ms) and return false for an effectively-dead
+        // worker, leaving its task stuck InProgress.
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn short-lived child");
+        let pid = child.id();
+        // Give it a moment to exit — a zombie exists once the process exits
+        // but before THIS process (its parent) reaps it via wait().
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            pid_is_zombie(pid),
+            "child should be a zombie by now (exited, not yet reaped)"
+        );
+        assert!(
+            verify_death(pid),
+            "a zombie must be treated as confirmed-dead, not timed-out-alive"
+        );
+        let _ = child.wait(); // reap so no zombie leaks past the test
+    }
+
+    #[test]
+    fn is_zombie_state_parses_z_state_from_stat_line() {
+        // Pure-function coverage independent of a real /proc round-trip.
+        // Synthetic stat line: "pid (comm) state ppid ...".
+        assert!(is_zombie_state("1234 (sh) Z 1 1234 1234 0 -1 ..."));
+        assert!(!is_zombie_state("1234 (sh) R 1 1234 1234 0 -1 ..."));
+        assert!(!is_zombie_state("1234 (sh) S 1 1234 1234 0 -1 ..."));
+    }
+
+    #[test]
+    fn is_zombie_state_handles_comm_with_parens_and_spaces() {
+        // comm can itself contain spaces/parens — must split on the LAST
+        // `)`, same caveat as daemon::parse_starttime_from_stat.
+        assert!(is_zombie_state("1234 (my (weird) proc) Z 1 1234 1234 0 -1 ..."));
     }
 
     #[test]
