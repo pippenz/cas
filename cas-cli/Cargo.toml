@@ -100,6 +100,7 @@ notify = { version = "8.0", default-features = false, features = ["macos_fsevent
 notify-debouncer-mini = "0.7"
 glob = "0.3"
 fs2 = "0.4"
+urlencoding = "2.1"
 
 # Text Processing
 regex = "1.11"

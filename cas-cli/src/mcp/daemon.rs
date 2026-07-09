@@ -60,6 +60,16 @@ pub(crate) fn apply_factory_worker_metadata(agent: &mut Agent, clone_path: Optio
     if let Ok(effort) = std::env::var("CAS_FACTORY_WORKER_EFFORT") {
         agent.metadata.insert("worker_effort".to_string(), effort);
     }
+    // cas-058f (EPIC cas-8888 Phase 4): persist which harness this worker
+    // runs so a separate process (`cas factory is-wedged`/`kill`, which only
+    // has the agent-store row to go on) can pick the right transcript
+    // resolver. Same env var `worker_harness_from_env` (harness_policy.rs)
+    // reads in-process for tool-prefix selection — this just also writes it
+    // to the durable agent record, mirroring the worker_model/worker_effort
+    // pattern above.
+    if let Ok(cli) = std::env::var("CAS_FACTORY_WORKER_CLI") {
+        agent.metadata.insert("worker_cli".to_string(), cli);
+    }
 }
 
 /// Extension trait for EmbeddedDaemonConfig to convert to DaemonConfig

@@ -27,6 +27,15 @@
 //!
 //! See `cas-cli/src/mcp/tools/service/factory_ops.rs::resolve_transcript`
 //! (cas-900b) for the transcript path resolver used by `is-wedged` / `debug`.
+//!
+//! Harness-awareness (cas-058f, EPIC cas-8888 Phase 4): the module doc above
+//! describes Claude's Bun/React-Ink failure mode specifically — Grok workers
+//! have a structurally different transcript layout (directory-per-session
+//! with a `signals.json` turn/token counter file, no known crash-screen
+//! signature) and are resolved/classified differently; see
+//! [`resolve_worker`]'s harness branch and [`effective_transcript_age`] /
+//! [`effective_crash_signature`]. Codex still has no dedicated transcript
+//! reader and resolves to `None` regardless of harness.
 
 use anyhow::{Context, Result, anyhow, bail};
 use std::io::{BufRead, BufReader, Read};
@@ -34,7 +43,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use crate::mcp::tools::service::factory_ops::{
-    TranscriptResolution, default_claude_projects_dir, resolve_transcript,
+    TranscriptResolution, default_claude_projects_dir, default_grok_sessions_dir,
+    resolve_transcript, worker_cli_from_agent,
 };
 
 /// Window in which a transcript mtime counts as "recent" — used to distinguish
@@ -285,17 +295,64 @@ pub(crate) fn transcript_has_crash_signature(path: &Path, tail_lines: usize) -> 
     }
 }
 
+/// Age of the freshest available Grok activity signal for a resolved
+/// transcript path (which points at `updates.jsonl`, the authoritative ACP
+/// log — see `factory_ops::resolve_grok_transcript`). Prefers the sibling
+/// `signals.json` file (rewritten on every turn/token-count change — a
+/// finer-grained activity signal than JSONL mtime, cas-058f AC) when it
+/// exists and is readable, falling back to `updates.jsonl`'s own mtime
+/// otherwise. Both files live in the same `<session-uuid>` directory, so
+/// `signals.json` is always a sibling of the resolved transcript path.
+fn grok_activity_age(updates_jsonl_path: &Path) -> Option<Duration> {
+    let signals_path = updates_jsonl_path.with_file_name("signals.json");
+    transcript_mtime_age(&signals_path).or_else(|| transcript_mtime_age(updates_jsonl_path))
+}
+
+/// Harness-aware transcript freshness: Grok prefers `signals.json` (see
+/// [`grok_activity_age`]); Claude and Codex use the transcript's own mtime
+/// (Codex has no dedicated transcript reader today and resolves to `None`
+/// upstream anyway — see `factory_ops::resolve_transcript` docs).
+fn effective_transcript_age(path: &Path, cli: cas_mux::SupervisorCli) -> Option<Duration> {
+    match cli {
+        cas_mux::SupervisorCli::Grok => grok_activity_age(path),
+        cas_mux::SupervisorCli::Claude | cas_mux::SupervisorCli::Codex => {
+            transcript_mtime_age(path)
+        }
+    }
+}
+
+/// Harness-aware crash-signature detection. [`CRASH_SIGNATURE_NEEDLES`] are
+/// Claude/Bun/React-Ink-specific — cas-058f audited whether they apply to
+/// Grok's UI stack and found no evidence they would (Grok isn't a Bun/Ink
+/// CLI), and no Grok-specific crash signature is known yet. Rather than
+/// silently no-op-matching Claude's needles against Grok transcripts (which
+/// would never fire but implies a false sense of coverage), skip the check
+/// explicitly for Grok — `Wedged` simply isn't a classification this
+/// harness supports today; a stalled/crashed Grok worker still correctly
+/// falls into `Starved`/`Dead`/`Unverified` via the other signals.
+fn effective_crash_signature(path: &Path, cli: cas_mux::SupervisorCli) -> bool {
+    match cli {
+        cas_mux::SupervisorCli::Grok => false,
+        cas_mux::SupervisorCli::Claude | cas_mux::SupervisorCli::Codex => {
+            transcript_has_crash_signature(path, CRASH_SIGNATURE_TAIL_LINES)
+        }
+    }
+}
+
 /// Orchestrator that combines PID liveness, transcript mtime, and signature
 /// grep. Called by all three verbs with the same inputs so a Wedged decision
 /// in one surfaces consistently in the others.
 ///
 /// `pid_alive_probe` is injectable so tests don't need to exercise the real
 /// `kill(pid, 0)` path (cas-2749's `pid_alive` helper covers production).
+/// `cli` (cas-058f) selects the harness-appropriate freshness/crash-signature
+/// logic — see [`effective_transcript_age`] / [`effective_crash_signature`].
 pub(crate) fn classify_worker<F, G>(
     pid: Option<u32>,
     transcript_path: Option<&Path>,
     clone_path: Option<&Path>,
     session_id: &str,
+    cli: cas_mux::SupervisorCli,
     pid_alive_probe: F,
     worktree_age_probe: G,
 ) -> (WorkerLivenessState, WorkerEvidence)
@@ -306,8 +363,8 @@ where
     let pid_alive = pid.map(pid_alive_probe).unwrap_or(false);
     let (age_opt, sig) = match transcript_path {
         Some(p) => (
-            transcript_mtime_age(p),
-            transcript_has_crash_signature(p, CRASH_SIGNATURE_TAIL_LINES),
+            effective_transcript_age(p, cli),
+            effective_crash_signature(p, cli),
         ),
         None => (None, false),
     };
@@ -361,11 +418,17 @@ pub(crate) fn resolve_worker(
         .cc_session_id
         .clone()
         .unwrap_or_else(|| agent.id.clone());
-    let transcript_path = match resolve_transcript(
-        default_claude_projects_dir().as_deref(),
-        clone_path.as_deref(),
-        &session_id,
-    ) {
+    // cas-058f: which harness this worker runs determines both the
+    // transcript layout (Claude's single JSONL vs. Grok's session
+    // directory) and the base dir to glob under.
+    let cli = worker_cli_from_agent(&agent);
+    let base_dir = match cli {
+        cas_mux::SupervisorCli::Grok => default_grok_sessions_dir(),
+        cas_mux::SupervisorCli::Claude | cas_mux::SupervisorCli::Codex => {
+            default_claude_projects_dir()
+        }
+    };
+    let transcript_path = match resolve_transcript(base_dir.as_deref(), clone_path.as_deref(), &session_id, cli) {
         TranscriptResolution::Resolved(p) => Some(p),
         TranscriptResolution::Ambiguous { mut matches, .. } => {
             // Deterministic: most-recently-modified first. Ambiguity is rare
@@ -405,6 +468,7 @@ pub(crate) fn resolve_worker(
         }),
         clone_path,
         session_id,
+        cli,
         transcript_path,
     })
 }
@@ -419,6 +483,9 @@ pub(crate) struct ResolvedWorker {
     pub pid_starttime: Option<u64>,
     pub clone_path: Option<String>,
     pub session_id: String,
+    /// The harness this worker runs (cas-058f) — determines transcript
+    /// layout and freshness/crash-signature semantics in `classify_worker`.
+    pub cli: cas_mux::SupervisorCli,
     pub transcript_path: Option<PathBuf>,
 }
 
@@ -444,6 +511,7 @@ pub(crate) fn execute_is_wedged(
             w.transcript_path.as_deref(),
             w.clone_path.as_deref().map(Path::new),
             &w.session_id,
+            w.cli,
             crate::mcp::daemon::pid_alive,
             worktree_recent_edit_age,
         );
@@ -1158,6 +1226,114 @@ mod tests {
         assert!(worktree_recent_edit_age(tmp.path()).is_none());
     }
 
+    // -------------------------------------------------------------------
+    // cas-058f (EPIC cas-8888 Phase 4): Grok-aware liveness signals.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn grok_activity_age_prefers_signals_json_over_updates_jsonl() {
+        let tmp = tempfile::tempdir().unwrap();
+        let updates = tmp.path().join("updates.jsonl");
+        let signals = tmp.path().join("signals.json");
+        // updates.jsonl written first (stale-ish), signals.json touched
+        // just now — signals.json's mtime must win.
+        std::fs::write(&updates, b"{}").unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        std::fs::write(&signals, b"{\"turn\":3}").unwrap();
+
+        let age = grok_activity_age(&updates).expect("signals.json should be found");
+        assert!(
+            age < Duration::from_millis(40),
+            "expected the fresher signals.json mtime to win, got {age:?}"
+        );
+    }
+
+    #[test]
+    fn grok_activity_age_falls_back_to_updates_jsonl_when_signals_json_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let updates = tmp.path().join("updates.jsonl");
+        std::fs::write(&updates, b"{}").unwrap();
+        // No signals.json written alongside it.
+        let age = grok_activity_age(&updates).expect("updates.jsonl mtime should be used");
+        assert!(age < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn effective_transcript_age_grok_uses_grok_activity_age() {
+        let tmp = tempfile::tempdir().unwrap();
+        let updates = tmp.path().join("updates.jsonl");
+        std::fs::write(&updates, b"{}").unwrap();
+        assert!(effective_transcript_age(&updates, cas_mux::SupervisorCli::Grok).is_some());
+    }
+
+    #[test]
+    fn effective_transcript_age_claude_and_codex_use_plain_mtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        std::fs::write(&path, b"{}").unwrap();
+        assert!(effective_transcript_age(&path, cas_mux::SupervisorCli::Claude).is_some());
+        assert!(effective_transcript_age(&path, cas_mux::SupervisorCli::Codex).is_some());
+    }
+
+    #[test]
+    fn effective_crash_signature_skips_for_grok_even_when_claude_needle_present() {
+        // cas-058f audit: Claude/Bun/React-Ink crash strings don't apply to
+        // Grok's UI stack — must never fire for a Grok worker, even if the
+        // literal needle text happens to appear in its transcript content.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("updates.jsonl");
+        std::fs::write(&path, b"<Box> can't be nested inside <Text>").unwrap();
+        assert!(
+            !effective_crash_signature(&path, cas_mux::SupervisorCli::Grok),
+            "crash-signature detection must be skipped entirely for Grok"
+        );
+        assert!(
+            effective_crash_signature(&path, cas_mux::SupervisorCli::Claude),
+            "the same content must still be detected for Claude (sanity check on the fixture)"
+        );
+    }
+
+    /// End-to-end through the full `classify_worker` orchestrator (not just
+    /// the isolated helpers above): a Grok worker whose `updates.jsonl` looks
+    /// stale (past `TRANSCRIPT_FRESH_WINDOW`) but whose sibling
+    /// `signals.json` was just touched — a mid-think turn updating token
+    /// counters without a new JSONL line yet — must classify `Alive`, not
+    /// `Starved`. This is the AC's concrete "a grok worker mid-think is not
+    /// false-flagged Dead"-adjacent scenario (Starved is the more precise
+    /// wrong verdict a stale-mtime-only read would produce here; pid_alive
+    /// is true throughout, so `Dead` was never in play — the risk this test
+    /// pins is the *next* rung down).
+    #[test]
+    fn classify_worker_grok_prefers_fresh_signals_json_over_stale_updates_jsonl() {
+        let tmp = tempfile::tempdir().unwrap();
+        let updates = tmp.path().join("updates.jsonl");
+        let signals = tmp.path().join("signals.json");
+        std::fs::write(&updates, b"{}").unwrap();
+        // Backdate updates.jsonl past the freshness window.
+        let stale_time = std::time::SystemTime::now() - Duration::from_secs(120);
+        let file = std::fs::File::open(&updates).unwrap();
+        file.set_modified(stale_time).unwrap();
+        // signals.json touched just now.
+        std::fs::write(&signals, b"{\"turn\":7}").unwrap();
+
+        let pid_probe = |_: u32| true;
+        let worktree_probe = |_: &Path| None::<Duration>;
+        let (state, ev) = classify_worker(
+            Some(4242),
+            Some(&updates),
+            None,
+            "grok-ses",
+            cas_mux::SupervisorCli::Grok,
+            pid_probe,
+            worktree_probe,
+        );
+        assert_eq!(
+            state,
+            WorkerLivenessState::Alive,
+            "signals.json freshness must win over stale updates.jsonl mtime: {ev:?}"
+        );
+    }
+
     #[test]
     fn crash_signature_matches_bun_root_path() {
         // Evidence from cas-4513 discovery note: `/$bunfs/root` prefix
@@ -1227,7 +1403,15 @@ mod tests {
             true
         };
         let worktree_probe = |_: &Path| None::<Duration>;
-        let (state, ev) = classify_worker(Some(1234), None, None, "ses", probe, worktree_probe);
+        let (state, ev) = classify_worker(
+            Some(1234),
+            None,
+            None,
+            "ses",
+            cas_mux::SupervisorCli::Claude,
+            probe,
+            worktree_probe,
+        );
         assert!(called.get(), "probe must be called when pid is Some");
         // no transcript → not fresh, crash=false, alive=true → Starved.
         assert_eq!(state, WorkerLivenessState::Starved);
@@ -1241,7 +1425,15 @@ mod tests {
     fn classify_worker_no_pid_short_circuits_to_dead() {
         let probe = |_: u32| panic!("probe must not be called when pid is None");
         let worktree_probe = |_: &Path| None::<Duration>;
-        let (state, ev) = classify_worker(None, None, None, "ses", probe, worktree_probe);
+        let (state, ev) = classify_worker(
+            None,
+            None,
+            None,
+            "ses",
+            cas_mux::SupervisorCli::Claude,
+            probe,
+            worktree_probe,
+        );
         assert_eq!(state, WorkerLivenessState::Dead);
         assert!(!ev.pid_alive);
     }
@@ -1258,6 +1450,7 @@ mod tests {
             None,
             None,
             "ses",
+            cas_mux::SupervisorCli::Claude,
             pid_probe,
             worktree_probe,
         );
@@ -1274,6 +1467,7 @@ mod tests {
             None,
             Some(Path::new("/some/clone/path")),
             "ses",
+            cas_mux::SupervisorCli::Claude,
             pid_probe,
             worktree_probe,
         );
