@@ -1,0 +1,769 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>CAS Factory Model Matrix — Leaderboard Recommendations</title>
+<style>
+  :root {
+    --bg: #f7f8fa;
+    --surface: #ffffff;
+    --text: #1a1d23;
+    --muted: #5c6570;
+    --border: #e2e6eb;
+    --accent: #0b5fff;
+    --accent-soft: #e8f0ff;
+    --good: #0d7a4f;
+    --good-bg: #e8f7f0;
+    --warn: #9a6700;
+    --warn-bg: #fff7e0;
+    --bad: #b42318;
+    --bad-bg: #fdeceb;
+    --code-bg: #f0f2f5;
+    --shadow: 0 1px 2px rgba(16, 24, 40, 0.06), 0 8px 24px rgba(16, 24, 40, 0.06);
+    --radius: 12px;
+    --max: 42rem;
+  }
+
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    font-family: "Segoe UI", system-ui, -apple-system, Roboto, "Helvetica Neue", Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.55;
+    font-size: 16px;
+  }
+
+  .wrap {
+    max-width: var(--max);
+    margin: 0 auto;
+    padding: 1.25rem 1rem 3rem;
+  }
+
+  header.hero {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    padding: 1.35rem 1.25rem;
+    margin-bottom: 1.25rem;
+  }
+
+  .eyebrow {
+    display: inline-block;
+    font-size: 0.75rem;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--accent);
+    background: var(--accent-soft);
+    padding: 0.28rem 0.55rem;
+    border-radius: 999px;
+    margin-bottom: 0.75rem;
+  }
+
+  h1 {
+    font-size: clamp(1.45rem, 4.5vw, 1.9rem);
+    line-height: 1.2;
+    margin: 0 0 0.6rem;
+    letter-spacing: -0.02em;
+  }
+
+  .meta {
+    color: var(--muted);
+    font-size: 0.92rem;
+    margin: 0;
+  }
+
+  .meta strong { color: var(--text); }
+
+  nav.toc {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 1rem 1.1rem;
+    margin-bottom: 1.25rem;
+  }
+
+  nav.toc h2 {
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--muted);
+    margin: 0 0 0.55rem;
+  }
+
+  nav.toc ol {
+    margin: 0;
+    padding-left: 1.15rem;
+  }
+
+  nav.toc a {
+    color: var(--accent);
+    text-decoration: none;
+  }
+
+  nav.toc a:hover { text-decoration: underline; }
+
+  section {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    padding: 1.2rem 1.15rem 1.35rem;
+    margin-bottom: 1rem;
+  }
+
+  h2 {
+    font-size: 1.15rem;
+    margin: 0 0 0.75rem;
+    letter-spacing: -0.01em;
+  }
+
+  h3 {
+    font-size: 1rem;
+    margin: 1.15rem 0 0.5rem;
+  }
+
+  p { margin: 0 0 0.75rem; }
+  p:last-child { margin-bottom: 0; }
+
+  ul, ol { margin: 0 0 0.75rem; padding-left: 1.2rem; }
+  li { margin-bottom: 0.35rem; }
+
+  .callout {
+    border-radius: 10px;
+    padding: 0.85rem 0.95rem;
+    margin: 0.85rem 0;
+    border: 1px solid var(--border);
+  }
+  .callout.good { background: var(--good-bg); border-color: #b7e4cc; }
+  .callout.warn { background: var(--warn-bg); border-color: #f0d78c; }
+  .callout.bad { background: var(--bad-bg); border-color: #f3b4ae; }
+  .callout strong { display: block; margin-bottom: 0.25rem; }
+  .callout.good strong { color: var(--good); }
+  .callout.warn strong { color: var(--warn); }
+  .callout.bad strong { color: var(--bad); }
+
+  .table-wrap {
+    width: 100%;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    margin: 0.75rem 0 1rem;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+  }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.88rem;
+    min-width: 28rem;
+  }
+
+  th, td {
+    text-align: left;
+    padding: 0.55rem 0.65rem;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+
+  th {
+    background: #f3f5f8;
+    font-weight: 650;
+    white-space: nowrap;
+  }
+
+  tr:last-child td { border-bottom: none; }
+
+  code, .mono {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.84em;
+    background: var(--code-bg);
+    padding: 0.1em 0.35em;
+    border-radius: 4px;
+  }
+
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 0.85rem 0.9rem;
+    overflow-x: auto;
+    font-size: 0.8rem;
+    line-height: 1.45;
+    margin: 0.75rem 0;
+  }
+
+  pre code {
+    background: none;
+    padding: 0;
+    font-size: inherit;
+  }
+
+  .tier-card {
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 0.85rem 0.95rem;
+    margin: 0.65rem 0;
+    background: #fbfcfe;
+  }
+
+  .tier-card h3 {
+    margin: 0 0 0.35rem;
+    font-size: 0.95rem;
+  }
+
+  .tier-card .spawn {
+    display: block;
+    margin: 0.35rem 0 0.55rem;
+    word-break: break-word;
+  }
+
+  .pill {
+    display: inline-block;
+    font-size: 0.72rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    padding: 0.15rem 0.45rem;
+    border-radius: 999px;
+    background: var(--accent-soft);
+    color: var(--accent);
+    margin-right: 0.35rem;
+  }
+
+  .cite-list {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+  }
+
+  .cite-list li {
+    padding: 0.75rem 0;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .cite-list li:last-child { border-bottom: none; }
+
+  .cite-id {
+    font-weight: 700;
+    color: var(--accent);
+    margin-right: 0.35rem;
+  }
+
+  .cite-list a {
+    color: var(--accent);
+    word-break: break-all;
+  }
+
+  .rev {
+    font-size: 0.85rem;
+    color: var(--muted);
+    border-left: 3px solid var(--accent);
+    padding-left: 0.75rem;
+    margin: 0.75rem 0 0;
+  }
+
+  footer {
+    color: var(--muted);
+    font-size: 0.85rem;
+    text-align: center;
+    padding: 1rem 0.5rem 0;
+  }
+
+  @media (max-width: 480px) {
+    body { font-size: 15px; }
+    .wrap { padding: 0.85rem 0.7rem 2.5rem; }
+    section, header.hero, nav.toc { padding: 1rem 0.85rem; }
+    table { min-width: 24rem; font-size: 0.82rem; }
+  }
+
+  @media print {
+    body { background: #fff; }
+    .wrap { max-width: none; padding: 0; }
+    section, header.hero, nav.toc {
+      box-shadow: none;
+      break-inside: avoid;
+      page-break-inside: avoid;
+    }
+    a { color: inherit; text-decoration: none; }
+    .table-wrap { overflow: visible; }
+    table { min-width: 0; font-size: 9.5pt; }
+  }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <header class="hero">
+      <div class="eyebrow">CAS Factory · Supervisor routing</div>
+      <h1>Model matrix recommendations</h1>
+      <p class="meta">
+        <strong>Date:</strong> 2026-07-09 &nbsp;·&nbsp;
+        <strong>Rev:</strong> 2 (Composer as Grok Build model) &nbsp;·&nbsp;
+        <strong>Scope:</strong> cas-supervisor model selection after first-class Grok harness (cas-8888)
+      </p>
+      <p class="meta" style="margin-top:0.55rem">
+        Leaderboard snapshot primarily from <strong>Artificial Analysis</strong> (Intelligence Index v4.1, Coding Agent Index, model pages) as of 8–9 July 2026, plus live <code>grok models</code> availability on this host.
+      </p>
+      <p class="rev">
+        <strong>Rev 2 correction:</strong> Composer 2.5 is <em>not</em> Cursor-only for factory use.
+        On Grok Build (<code>grok</code> 0.2.93), available models are exactly
+        <code>grok-4.5</code> (default) and <code>grok-composer-2.5-fast</code>.
+        CAS can already spawn it via <code>cli=grok model=grok-composer-2.5-fast</code>.
+      </p>
+    </header>
+
+    <nav class="toc" aria-label="Contents">
+      <h2>Contents</h2>
+      <ol>
+        <li><a href="#exec">Executive recommendation</a></li>
+        <li><a href="#availability">Live Grok model availability</a></li>
+        <li><a href="#boards">Leaderboard evidence</a></li>
+        <li><a href="#wrong">What the old matrix got wrong</a></li>
+        <li><a href="#matrix">Recommended matrix</a></li>
+        <li><a href="#escalation">Escalation &amp; routing rules</a></li>
+        <li><a href="#composer">Composer 2.5 vs Haiku (corrected)</a></li>
+        <li><a href="#ship">What to ship in CAS</a></li>
+        <li><a href="#caveats">Caveats</a></li>
+        <li><a href="#citations">Citations</a></li>
+      </ol>
+    </nav>
+
+    <section id="exec">
+      <h2>1. Executive recommendation</h2>
+      <div class="callout good">
+        <strong>Primary decision</strong>
+        Run most factory engineering on the <strong>Grok Build harness</strong> with two models:
+        <strong>Composer 2.5 Fast</strong> for light/fast work, <strong>Grok 4.5</strong> for standard and heavy.
+        Keep <strong>Claude Opus</strong> as scarce frontier insurance. Stop treating <strong>Claude Sonnet</strong> as default heavy.
+        Codex/Haiku become optional capacity backups, not the light default.
+      </div>
+      <ul>
+        <li><strong>Light / flash:</strong> <code>cli=grok model=grok-composer-2.5-fast</code></li>
+        <li><strong>Standard floor:</strong> <code>cli=grok model=grok-4.5 effort=medium</code></li>
+        <li><strong>Heavy default:</strong> <code>cli=grok model=grok-4.5 effort=high</code></li>
+        <li><strong>Frontier:</strong> <code>cli=claude model=opus effort=high</code> (architecture, taste-max, 2× bounce)</li>
+      </ul>
+      <p>
+        Artificial Analysis places Grok 4.5 (high) at Intelligence Index <strong>54</strong> (near frontier),
+        with Coding Agent Index performance <strong>on par with GPT-5.5 in Codex</strong> at roughly
+        <strong>half the $/task</strong> and far fewer tokens. Composer 2.5 sits on the CAI cost/speed
+        Pareto frontier (~$0.07–$0.44/task, ~6.7–9.3 min wall time in AA Cursor measurements) and is
+        <strong>already selectable in Grok Build</strong> as <code>grok-composer-2.5-fast</code>.
+      </p>
+    </section>
+
+    <section id="availability">
+      <h2>2. Live Grok model availability (this host)</h2>
+      <p>
+        Verified 2026-07-09 via <code>grok models</code> on Grok Build <code>0.2.93</code>:
+      </p>
+      <pre><code>Default model: grok-4.5
+
+Available models:
+  * grok-4.5 (default)
+  - grok-composer-2.5-fast</code></pre>
+      <p>
+        CAS factory already supports <code>cli=grok</code> and passes <code>-m &lt;MODEL&gt;</code> through
+        <code>PtyConfig::grok</code>. No new harness is required to use Composer — only an explicit
+        <code>model=</code> on <code>spawn_workers</code>.
+      </p>
+      <div class="callout warn">
+        <strong>Prior draft error (rev 1)</strong>
+        Rev 1 incorrectly stated Composer needed a Cursor harness. That conflated model origin
+        (Cursor/Anysphere training lineage; AA measured in Cursor CLI) with runtime availability
+        (Grok Build exposes it as a second model ID). Rev 2 corrects this.
+      </div>
+    </section>
+
+    <section id="boards">
+      <h2>3. Leaderboard evidence</h2>
+      <h3>3.1 Intelligence Index (quality ceiling)</h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Rank</th><th>Model</th><th>II score</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>1</td><td>Claude Fable 5 (max, Opus fallback)</td><td>60</td></tr>
+            <tr><td>2</td><td>Claude Opus 4.8 (max)</td><td>56</td></tr>
+            <tr><td>3</td><td>GPT-5.5 (xhigh)</td><td>55</td></tr>
+            <tr><td>4</td><td><strong>Grok 4.5 (high)</strong></td><td><strong>54</strong></td></tr>
+            <tr><td>~5</td><td>Claude Sonnet 5 (max)</td><td>53</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="meta">Sources: Artificial Analysis · [C1][C2][C3].</p>
+
+      <h3>3.2 Speed &amp; list pricing</h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Model</th><th>Output speed</th><th>List $/M in · out</th><th>Notes</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Grok 4.5 (high)</td>
+              <td><strong>91.3 tok/s</strong></td>
+              <td>$2 · $6</td>
+              <td>Cache hit $0.50 (−75%); TTFT ~16.5s (reasoning)</td>
+            </tr>
+            <tr>
+              <td>Composer 2.5 Fast</td>
+              <td>agent wall ~6.7 min/task (AA)</td>
+              <td>$3 · $15 (Fast token rates)</td>
+              <td>Fastest high-quality agent lane; Grok model id <code>grok-composer-2.5-fast</code></td>
+            </tr>
+            <tr>
+              <td>Composer 2.5 Standard</td>
+              <td>agent wall ~9.3 min/task (AA)</td>
+              <td>$0.50 · $2.50</td>
+              <td>~$0.07/task on CAI (AA Cursor measure); not listed as separate Grok model id here</td>
+            </tr>
+            <tr>
+              <td>Claude Sonnet 5 (max)</td>
+              <td>~85 tok/s</td>
+              <td>$3 · $15</td>
+              <td>Can exceed Opus $/task due to verbosity</td>
+            </tr>
+            <tr>
+              <td>Claude Haiku 4.5</td>
+              <td>~97–127 tok/s</td>
+              <td>$1 · $5</td>
+              <td>Fastest Claude decode; weaker agent Pareto vs Composer</td>
+            </tr>
+            <tr>
+              <td>Claude Opus 4.8 (max)</td>
+              <td>~61–66 tok/s</td>
+              <td>$5 · $25</td>
+              <td>~1.4× slower decode than Grok 4.5</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="meta">Sources: [C2][C4][C5][C6][C9].</p>
+
+      <h3>3.3 Cost efficiency ($/task beats $/token)</h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Metric</th><th>Grok 4.5 (high)</th><th>Peers (AA)</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>$ / Intelligence Index task</td>
+              <td><strong>~$0.31</strong></td>
+              <td>GPT-5.5 xhigh ~$0.99; Opus max ~$1.78; Sonnet 5 max ~$2.29</td>
+            </tr>
+            <tr>
+              <td>Output tokens / II task</td>
+              <td>~14k (~60%+ less than Opus)</td>
+              <td>Sonnet 5 max uses ~40% more output tokens than Sonnet 4.6</td>
+            </tr>
+            <tr>
+              <td>Coding Agent Index (harness)</td>
+              <td><strong>76</strong> in Grok Build</td>
+              <td>On par with GPT-5.5 xhigh in Codex; just under Fable 5 in Claude Code</td>
+            </tr>
+            <tr>
+              <td>$ / CAI task</td>
+              <td><strong>~$2.49–2.59</strong></td>
+              <td>GPT-5.5 Codex ~$5.07; Fable 5 Claude Code ~$11.80</td>
+            </tr>
+            <tr>
+              <td>Tokens / CAI task</td>
+              <td><strong>~1.9M</strong></td>
+              <td>GPT-5.5 Codex ~6.2M; Fable 5 ~7.2M (~3–4× more)</td>
+            </tr>
+            <tr>
+              <td>Composer 2.5 $/CAI task</td>
+              <td colspan="2"><strong>$0.07</strong> standard · <strong>$0.44</strong> Fast (AA Cursor CLI measure) — best cost Pareto above CAI 60 [C9]</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="meta">Sources: [C1][C7][C8][C9].</p>
+    </section>
+
+    <section id="wrong">
+      <h2>4. What the old matrix got wrong</h2>
+      <p>Current cas-supervisor rubric (<code>model-selection.md</code>):</p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Old tier</th><th>Old spawn</th><th>Board + availability verdict</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>light</td>
+              <td><code>codex / gpt-5.5 / low</code></td>
+              <td><strong>Replace with Composer on Grok.</strong> <code>grok-composer-2.5-fast</code> is the Haiku-shaped lane with better agent quality/$ [C9][C13].</td>
+            </tr>
+            <tr>
+              <td>standard (floor)</td>
+              <td><code>codex / gpt-5.5 / medium</code></td>
+              <td>Grok 4.5 matches GPT-5.5 CAI class at roughly half $/task and ~⅓ the tokens. New floor is Grok medium [C1].</td>
+            </tr>
+            <tr>
+              <td>heavy</td>
+              <td><code>claude / sonnet / high</code></td>
+              <td><strong>Economically obsolete as default.</strong> Sonnet 5 max can cost more per II task than Opus. Grok high is the rational heavy default [C1][C8].</td>
+            </tr>
+            <tr>
+              <td>frontier</td>
+              <td><code>claude / opus / high</code></td>
+              <td>Correct quality ceiling; wrong as frequent worker. CAI peers cost 2–5× Grok at similar coding-agent scores.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="callout warn">
+        <strong>Form issue, not just slugs</strong>
+        Four capability tiers still work. Binding light/standard to Codex and heavy/frontier to Claude is outdated now that Grok Build is first-class and exposes both Composer and Grok 4.5 as models on one CLI.
+      </div>
+    </section>
+
+    <section id="matrix">
+      <h2>5. Recommended matrix</h2>
+      <h3>5.1 Axes (include Speed)</h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Axis</th><th>Measure</th><th>Prefer</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Intelligence</td><td>II + CAI</td><td>Opus/Fable only when +2–6 II points matter</td></tr>
+            <tr><td>Cost</td><td><strong>$/task</strong>, not $/M tokens</td><td>Composer Fast, Grok 4.5, Codex subscription backup</td></tr>
+            <tr><td>Speed</td><td>TPS + agent wall time + tokens/task</td><td>Composer Fast first; then Grok 4.5</td></tr>
+            <tr><td>Taste</td><td>Supervisor judgment (unbenchmarked)</td><td>Claude for prose, skills, public APIs</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>5.2 Capability tiers (CAS-real spawns)</h3>
+
+      <div class="tier-card">
+        <span class="pill">light</span>
+        <h3>Flash / mechanical / small edits</h3>
+        <code class="spawn">cli=grok model=grok-composer-2.5-fast</code>
+        <p>
+          Chores, docs, renames, config bumps, <code>depth=light</code>, pattern-mirror tests,
+          “what Haiku would have done.” Same Grok harness as the rest of the Grok fleet — only the model id changes.
+          Fallback: <code>cli=codex model=gpt-5.5 effort=low</code> if Grok quota is exhausted.
+        </p>
+      </div>
+
+      <div class="tier-card">
+        <span class="pill">standard</span>
+        <h3>New engineering floor</h3>
+        <code class="spawn">cli=grok model=grok-4.5 effort=medium</code>
+        <p>
+          Clear AC, bounded blast radius. Fallback: <code>cli=codex model=gpt-5.5 effort=medium</code>
+          for bulk parallel when Grok capacity is tight.
+        </p>
+      </div>
+
+      <div class="tier-card">
+        <span class="pill">heavy</span>
+        <h3>Cross-cutting / critical path</h3>
+        <code class="spawn">cli=grok model=grok-4.5 effort=high</code>
+        <p>
+          Refactors, concurrency/lifecycle, P0/P1 path. Escalate to Sonnet only for taste or Claude-lifecycle thrash —
+          and watch Sonnet $/task.
+        </p>
+      </div>
+
+      <div class="tier-card">
+        <span class="pill">frontier</span>
+        <h3>Architecture &amp; rescue</h3>
+        <code class="spawn">cli=claude model=opus effort=high</code>
+        <p>
+          Architecture-defining units, high blast radius, twice-failed tasks, “would read the diff twice.”
+          Not volume engineering.
+        </p>
+      </div>
+
+      <h3>5.3 Why this mapping (evidence → action)</h3>
+      <ul>
+        <li><strong>Composer light:</strong> available on Grok Build as the only non-default model [C13]; AA cost/speed Pareto leader for agents above CAI 60 [C9]; replaces Haiku-shaped work.</li>
+        <li><strong>Grok standard/heavy:</strong> II 54 near frontier; CAI ≈ GPT-5.5 Codex; ~$2.5/CAI task vs ~$5–12 peers; ~1.9M tokens vs 6–7M; 91 tok/s [C1][C2].</li>
+        <li><strong>Opus frontier only:</strong> II 56 available best (Fable 60 if available); expensive agent loops [C1][C7][C8].</li>
+        <li><strong>Sonnet not default heavy:</strong> II 53; ~$2.29/II task can exceed Opus because of verbosity [C8].</li>
+      </ul>
+    </section>
+
+    <section id="escalation">
+      <h2>6. Escalation &amp; routing rules</h2>
+      <p>On a Grok-first factory, the first three steps share <code>cli=grok</code>:</p>
+      <pre><code>light    grok  model=grok-composer-2.5-fast
+  → standard  grok  model=grok-4.5 effort=medium
+    → heavy   grok  model=grok-4.5 effort=high
+      → heavy+  claude model=sonnet effort=high   # taste / Claude harness
+        → frontier  claude model=opus effort=high   # +II ceiling; rare</code></pre>
+      <ul>
+        <li>Escalate on <strong>judgment</strong> or <strong>two verification failures</strong> — not “prestige.”</li>
+        <li>Composer → Grok 4.5 when the task needs deeper reasoning or multi-module judgment, not just speed.</li>
+        <li>Do <strong>not</strong> auto-promote standard → heavy by switching to Sonnet; that often raises cost without a board-backed quality jump vs Grok high.</li>
+        <li>Taste-sensitive work (skills, supervisor guidance, public docs, API naming) starts on Claude even if the diff is small.</li>
+        <li>Prefer <strong>model switch</strong> over Claude effort above <code>high</code> (existing CAS rule; keep).</li>
+        <li>De-escalate the tail: shut down Opus/Sonnet workers when only light tasks remain; sweep with Composer workers.</li>
+      </ul>
+
+      <h3>Task-shape cheat sheet</h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Task shape</th><th>Route</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Mechanical edit, rename, small config, depth=light</td><td><strong>grok-composer-2.5-fast</strong></td></tr>
+            <tr><td>Bounded bug/feature, clear AC</td><td>grok-4.5 medium</td></tr>
+            <tr><td>Multi-module refactor, critical path</td><td>grok-4.5 high</td></tr>
+            <tr><td>Skill wording / public API / release prose</td><td>Sonnet → Opus</td></tr>
+            <tr><td>Architecture / ambiguous design</td><td>Opus (or Fable)</td></tr>
+            <tr><td>High-volume when Grok quota is tight</td><td>Codex low/medium backup</td></tr>
+            <tr><td>Failed twice on Grok 4.5</td><td>Sonnet then Opus</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="composer">
+      <h2>7. Composer 2.5 vs Haiku (corrected)</h2>
+      <div class="callout good">
+        <strong>Composer is a first-class Grok Build model — use it for light</strong>
+        Verified on this host: <code>grok models</code> lists only <code>grok-4.5</code> and
+        <code>grok-composer-2.5-fast</code> [C13]. Factory spawn is
+        <code>cli=grok model=grok-composer-2.5-fast</code>. No Cursor harness required.
+      </div>
+      <ul>
+        <li><strong>AA (Cursor CLI measure):</strong> Composer 2.5 scored CAI 62 (3rd then), at ~$0.07 (standard) / $0.44 (Fast) per task, Fast wall ~6.7 min [C9].</li>
+        <li><strong>Haiku:</strong> still the fastest Claude decode (~97–127 tok/s) [C6], but loses on agent quality/$ vs Composer. Prefer Haiku only if you must stay on Claude for a tiny task.</li>
+        <li><strong>Codex low:</strong> still useful as bulk backup when Grok subscription/rate limits are the bottleneck — not as the preferred light model when Composer is available.</li>
+        <li><strong>Note on AA harness:</strong> AA measured Composer under Cursor CLI; factory will run it under Grok Build. Quality should be directionally similar; wall-time/$ may differ — treat AA as orientation, not identical factory telemetry.</li>
+      </ul>
+    </section>
+
+    <section id="ship">
+      <h2>8. What to ship in CAS (docs-first)</h2>
+      <p>Routing is supervisor judgment today — no runtime model picker required for v1.</p>
+      <ol>
+        <li>Update source of truth: <code>cas-cli/src/builtins/skills/cas-supervisor/references/model-selection.md</code></li>
+        <li>Update hard-rule one-liner in <code>cas-supervisor/SKILL.md</code> (and Grok/Codex twins)</li>
+        <li>Mirror Grok twin under <code>cas-cli/src/builtins/grok/skills/cas-supervisor/</code></li>
+        <li>Keep skill body under SessionStart 8KB budget; put numbers + model ids in the reference</li>
+        <li>Document model ids: <code>grok-4.5</code>, <code>grok-composer-2.5-fast</code> (from <code>grok models</code>)</li>
+        <li>Optional follow-on: change <code>WorkerSpec</code> stock defaults (separate product decision)</li>
+      </ol>
+      <div class="callout warn">
+        <strong>Suggested skill table (v2)</strong>
+        light = <code>grok / grok-composer-2.5-fast</code> ·
+        standard = <code>grok / grok-4.5 / medium</code> ·
+        heavy = <code>grok / grok-4.5 / high</code> ·
+        frontier = <code>claude / opus / high</code> ·
+        axes include Speed · cite AA snapshot date + <code>grok models</code> date.
+      </div>
+      <p>Example spawns:</p>
+      <pre><code># light / flash workers
+cas__coordination action=spawn_workers count=2 isolate=true \
+  cli=grok model=grok-composer-2.5-fast
+
+# standard workers
+cas__coordination action=spawn_workers count=2 isolate=true \
+  cli=grok model=grok-4.5 effort=medium
+
+# heavy worker
+cas__coordination action=spawn_workers count=1 isolate=true \
+  cli=grok model=grok-4.5 effort=high worker_names="hv-ada"</code></pre>
+    </section>
+
+    <section id="caveats">
+      <h2>9. Caveats</h2>
+      <ul>
+        <li><strong>CAI scale drift:</strong> May Composer scores (~62) vs July Grok prose (~76) may not be on identical index versions — trust relatives and $/tokens.</li>
+        <li><strong>Harness effect:</strong> AA measured Composer under Cursor CLI and Grok 4.5 under Grok Build. Factory Composer runs under Grok Build — expect directional, not identical, economics.</li>
+        <li><strong>Only Fast listed here:</strong> this host’s <code>grok models</code> shows <code>grok-composer-2.5-fast</code>, not a separate standard Composer id. If xAI adds standard later, re-evaluate light pricing.</li>
+        <li><strong>Subscription ≠ API $:</strong> real factory burn often hits plan limits; token efficiency still matters either way.</li>
+        <li><strong>Grok 4.5 TTFT ~16.5s:</strong> weaker for single-shot chat; strong for multi-step agent loops [C2]. Composer Fast is the low-latency lane for small tasks.</li>
+        <li><strong>Taste unbenchmarked:</strong> keep Claude for human-facing writing.</li>
+      </ul>
+    </section>
+
+    <section id="citations">
+      <h2>10. Citations</h2>
+      <ol class="cite-list">
+        <li>
+          <span class="cite-id">[C1]</span>
+          Artificial Analysis, “Grok 4.5 brings SpaceXAI to the intelligence frontier” (8 July 2026). II 54; CAI 76 in Grok Build; ~$0.31/II task; ~$2.49–2.59/CAI task; ~1.9M tokens/CAI task; peer costs Fable 5 ~$11.80, GPT-5.5 Codex ~$5.07; ~14k output tokens/II task.
+          <br /><a href="https://artificialanalysis.ai/articles/grok-4-5-brings-spacexai-to-the-the-intelligence-frontier">https://artificialanalysis.ai/articles/grok-4-5-brings-spacexai-to-the-the-intelligence-frontier</a>
+        </li>
+        <li>
+          <span class="cite-id">[C2]</span>
+          Artificial Analysis, Grok 4.5 (high) model page. II #4 / 54; output speed 91.3 tok/s; $2/$6; cache hit $0.50; TTFT 16.49s; 500k context.
+          <br /><a href="https://artificialanalysis.ai/models/grok-4-5">https://artificialanalysis.ai/models/grok-4-5</a>
+        </li>
+        <li>
+          <span class="cite-id">[C3]</span>
+          Artificial Analysis models comparison / FAQ top ranks: Fable 5 (60), Opus 4.8 max (56), GPT-5.5 xhigh (55), Grok 4.5 high (54).
+          <br /><a href="https://artificialanalysis.ai/models">https://artificialanalysis.ai/models</a>
+        </li>
+        <li>
+          <span class="cite-id">[C4]</span>
+          Artificial Analysis, Claude Opus 4.8 (max) model page — list pricing $5/$25; speed band relative to peers.
+          <br /><a href="https://artificialanalysis.ai/models/claude-opus-4-8">https://artificialanalysis.ai/models/claude-opus-4-8</a>
+        </li>
+        <li>
+          <span class="cite-id">[C5]</span>
+          Artificial Analysis comparison: Claude Opus 4.8 (max) vs GPT-5.5 (medium) — II 56 vs 50; ~63 vs ~61 tok/s.
+          <br /><a href="https://artificialanalysis.ai/models/comparisons/claude-opus-4-8-vs-gpt-5-5-medium">https://artificialanalysis.ai/models/comparisons/claude-opus-4-8-vs-gpt-5-5-medium</a>
+        </li>
+        <li>
+          <span class="cite-id">[C6]</span>
+          Artificial Analysis Anthropic provider page — Haiku ~97–127 tok/s; Sonnet 5 max ~84 tok/s ranking among Anthropic speeds.
+          <br /><a href="https://artificialanalysis.ai/providers/anthropic">https://artificialanalysis.ai/providers/anthropic</a>
+        </li>
+        <li>
+          <span class="cite-id">[C7]</span>
+          Artificial Analysis Intelligence Index v4.1 announcement notes — Opus max ~$1.78/II task; GPT-5.5 xhigh ~$0.99; decode time Opus ~6.4 min vs GPT xhigh ~3.7 min.
+          <br /><a href="https://www.linkedin.com/pulse/announcing-artificial-analysis-intelligence-index-vzl8c">https://www.linkedin.com/pulse/announcing-artificial-analysis-intelligence-index-vzl8c</a>
+        </li>
+        <li>
+          <span class="cite-id">[C8]</span>
+          Artificial Analysis, “Claude Sonnet 5: strong agentic performance at a higher cost per task” (30 June 2026). II 53; ~$2.29/II task; ~15% more than Opus 4.8; ~40% more output tokens than Sonnet 4.6.
+          <br /><a href="https://artificialanalysis.ai/articles/claude-sonnet-5-agentic-cost">https://artificialanalysis.ai/articles/claude-sonnet-5-agentic-cost</a>
+        </li>
+        <li>
+          <span class="cite-id">[C9]</span>
+          Artificial Analysis, “Cursor’s Composer 2.5: third on the Coding Agent Index…” (20 May 2026). CAI 62; $0.07 / $0.44 per task; wall time ~9.3 / ~6.7 min. Measured under Cursor CLI; quality/economics directional for Grok Build model id.
+          <br /><a href="https://artificialanalysis.ai/articles/cursor-composer-2-5-coding-agent-index">https://artificialanalysis.ai/articles/cursor-composer-2-5-coding-agent-index</a>
+        </li>
+        <li>
+          <span class="cite-id">[C10]</span>
+          Artificial Analysis Coding Agent Index methodology page (DeepSWE + Terminal-Bench v2 + SWE-Atlas-QnA; cost, tokens, wall time).
+          <br /><a href="https://artificialanalysis.ai/agents/coding-agents">https://artificialanalysis.ai/agents/coding-agents</a>
+        </li>
+        <li>
+          <span class="cite-id">[C11]</span>
+          Anthropic, “Introducing Claude Opus 4.8” — list pricing $5/$25 standard; fast mode $10/$50.
+          <br /><a href="https://www.anthropic.com/news/claude-opus-4-8">https://www.anthropic.com/news/claude-opus-4-8</a>
+        </li>
+        <li>
+          <span class="cite-id">[C12]</span>
+          CAS in-repo: <code>cas-supervisor/references/model-selection.md</code> (current four-tier rubric); factory harnesses <code>claude|codex|grok</code> via cas-8888; <code>PtyConfig::grok</code> passes <code>-m</code> model through (<code>crates/cas-pty/src/pty.rs</code>); <code>WorkerSpec</code> grok-4.5 round-trip in <code>crates/cas-mux/src/spec.rs</code>.
+        </li>
+        <li>
+          <span class="cite-id">[C13]</span>
+          Live host verification, 2026-07-09: <code>grok models</code> on Grok Build <code>0.2.93 (f00f96316d)</code> reports available models <code>grok-4.5</code> (default) and <code>grok-composer-2.5-fast</code> only. Confirms Composer is a Grok Build model id, not a separate harness requirement.
+        </li>
+      </ol>
+    </section>
+
+    <footer>
+      Generated 2026-07-09 · Rev 2 · CAS factory supervisor routing · Self-contained HTML · Light mode · Print/PDF friendly
+    </footer>
+  </div>
+</body>
+</html>
