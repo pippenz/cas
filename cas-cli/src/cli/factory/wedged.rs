@@ -305,7 +305,22 @@ pub(crate) fn transcript_has_crash_signature(path: &Path, tail_lines: usize) -> 
 /// `signals.json` is always a sibling of the resolved transcript path.
 fn grok_activity_age(updates_jsonl_path: &Path) -> Option<Duration> {
     let signals_path = updates_jsonl_path.with_file_name("signals.json");
-    transcript_mtime_age(&signals_path).or_else(|| transcript_mtime_age(updates_jsonl_path))
+    let signals_age = transcript_mtime_age(&signals_path);
+    let updates_age = transcript_mtime_age(updates_jsonl_path);
+    // cas-921f P2: take the FRESHEST (minimum age) of the two, not a strict
+    // "prefer signals.json, only fall back when it's absent" preference.
+    // Grok appends to updates.jsonl continuously mid-turn but may only
+    // rewrite signals.json at turn boundaries — an actively-working worker
+    // can have a fresh updates.jsonl and a stale signals.json at the same
+    // instant. Strictly preferring signals.json would return the STALE age
+    // in that case and misclassify the worker Starved — exactly the
+    // mid-think false-flag this whole harness-aware path exists to prevent.
+    match (signals_age, updates_age) {
+        (Some(s), Some(u)) => Some(s.min(u)),
+        (Some(s), None) => Some(s),
+        (None, Some(u)) => Some(u),
+        (None, None) => None,
+    }
 }
 
 /// Harness-aware transcript freshness: Grok prefers `signals.json` (see
@@ -1231,12 +1246,12 @@ mod tests {
     // -------------------------------------------------------------------
 
     #[test]
-    fn grok_activity_age_prefers_signals_json_over_updates_jsonl() {
+    fn grok_activity_age_prefers_fresher_signals_json_when_updates_is_staler() {
         let tmp = tempfile::tempdir().unwrap();
         let updates = tmp.path().join("updates.jsonl");
         let signals = tmp.path().join("signals.json");
         // updates.jsonl written first (stale-ish), signals.json touched
-        // just now — signals.json's mtime must win.
+        // just now — the fresher signals.json age must win.
         std::fs::write(&updates, b"{}").unwrap();
         std::thread::sleep(Duration::from_millis(50));
         std::fs::write(&signals, b"{\"turn\":3}").unwrap();
@@ -1245,6 +1260,32 @@ mod tests {
         assert!(
             age < Duration::from_millis(40),
             "expected the fresher signals.json mtime to win, got {age:?}"
+        );
+    }
+
+    /// cas-921f P2: the inverse ordering. Grok appends to `updates.jsonl`
+    /// continuously mid-turn but may only rewrite `signals.json` at turn
+    /// boundaries — an actively-working worker can have a FRESH
+    /// updates.jsonl and a STALE signals.json at the same instant. A strict
+    /// "prefer signals.json, fall back only if absent" rule would return the
+    /// stale age here and misclassify the worker Starved; taking the min of
+    /// the two must return the fresher updates.jsonl age instead.
+    #[test]
+    fn grok_activity_age_prefers_fresher_updates_jsonl_when_signals_is_staler() {
+        let tmp = tempfile::tempdir().unwrap();
+        let updates = tmp.path().join("updates.jsonl");
+        let signals = tmp.path().join("signals.json");
+        // signals.json written first (stale-ish), updates.jsonl touched
+        // just now — the fresher updates.jsonl age must win.
+        std::fs::write(&signals, b"{\"turn\":3}").unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        std::fs::write(&updates, b"{}").unwrap();
+
+        let age = grok_activity_age(&updates).expect("updates.jsonl should be found");
+        assert!(
+            age < Duration::from_millis(40),
+            "expected the fresher updates.jsonl mtime to win over a staler \
+             signals.json, got {age:?}"
         );
     }
 

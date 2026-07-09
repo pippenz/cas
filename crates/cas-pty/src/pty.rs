@@ -506,6 +506,24 @@ impl PtyConfig {
                 cwd.to_string_lossy().to_string(),
             ),
             ("IS_DEMO".to_string(), "true".to_string()),
+            // cas-921f (P1 fix-round): a grok process is ALWAYS grok — set
+            // this unconditionally rather than relying on
+            // `factory_worker_cli`, which the worker spawn path leaves
+            // `None` (see `build_worker_config`, cas-mux/pane/mod.rs). Grok
+            // has no Codex-style `-c mcp_servers.*.env` override mechanism
+            // (Phase 2 finding: it discovers `cas serve` natively via
+            // `.mcp.json`/`~/.claude.json`, inheriting this process's own
+            // env like `claude()` does) — so this is the ONLY place the
+            // signal can originate. Without it, `apply_factory_worker_metadata`
+            // (mcp/daemon.rs) / the direct-registration fallback
+            // (hooks/handlers/handlers_session.rs) never see
+            // `CAS_FACTORY_WORKER_CLI`, `worker_cli_from_agent` silently
+            // defaults every grok worker to `Claude`, and Phase 4's entire
+            // harness-aware is-wedged/liveness path never engages for a
+            // real grok worker — it globs `~/.claude/projects/*` for a
+            // transcript that lives at `~/.grok/sessions/*` and always
+            // resolves `None`.
+            ("CAS_FACTORY_WORKER_CLI".to_string(), "grok".to_string()),
         ];
 
         if let Some(root) = cas_root {
@@ -3146,6 +3164,17 @@ mod tests {
     /// EPIC cas-8888 (cas-9a31, Phase 1 wiring): CAS_FACTORY_WORKER_CLI must
     /// be injected so downstream harness_policy resolution (cas__ tool
     /// prefix) works for a Grok worker, same as Claude/Codex.
+    ///
+    /// cas-921f P1 fix-round: this test originally passed `Some("grok")` for
+    /// `factory_worker_cli` — a shape that never actually occurs on the real
+    /// worker spawn path (`build_worker_config`, cas-mux/pane/mod.rs, always
+    /// passes `None` there), so it gave false confidence: it proved the
+    /// PASSTHROUGH worked, never that a real worker gets the env var at all.
+    /// Fixed to pass `None`, matching the real call shape, so this test
+    /// actually exercises the P1 bug (Phase 4 liveness was completely inert
+    /// for real grok workers — no `CAS_FACTORY_WORKER_CLI` ⇒ `is-wedged`
+    /// globs `~/.claude/projects/*` for a transcript that lives at
+    /// `~/.grok/sessions/*` and always resolves `None`).
     #[tokio::test]
     async fn test_pty_config_grok_worker_injects_factory_worker_cli() {
         let config = PtyConfig::grok(
@@ -3154,7 +3183,7 @@ mod tests {
             PathBuf::from("/tmp"),
             None,
             None,
-            Some("grok"),
+            None, // factory_worker_cli — always None on the real worker spawn path
             None,
             None,
             None,
@@ -3163,7 +3192,46 @@ mod tests {
             config
                 .env
                 .iter()
-                .any(|(k, v)| k == "CAS_FACTORY_WORKER_CLI" && v == "grok")
+                .any(|(k, v)| k == "CAS_FACTORY_WORKER_CLI" && v == "grok"),
+            "a grok process must set its own CAS_FACTORY_WORKER_CLI unconditionally — \
+             it cannot rely on the factory_worker_cli param, which the worker spawn path \
+             always leaves None: {:?}",
+            config.env
+        );
+    }
+
+    /// The supervisor path passes `factory_worker_cli = Some(<workers' cli>)`
+    /// — a DIFFERENT semantic meaning of the same env var ("what CLI do MY
+    /// WORKERS run", not "what CLI am I"). That value must still win over
+    /// the unconditional grok-self push above; `apply_factory_worker_metadata`
+    /// only ever reads this env var for worker-role agents anyway (cas-921f),
+    /// so a supervisor never persists bogus `worker_cli` metadata from it —
+    /// but pin the env-vec ordering contract directly too, since `Vec<(K,V)>`
+    /// → `Command::env` applies last-write-wins per key.
+    #[tokio::test]
+    async fn test_pty_config_grok_supervisor_factory_worker_cli_overrides_self_grok() {
+        let config = PtyConfig::grok(
+            "test-supervisor",
+            "supervisor",
+            PathBuf::from("/tmp"),
+            None,
+            None,
+            Some("codex"), // "my workers run codex"
+            None,
+            None,
+            None,
+        );
+        let values: Vec<&str> = config
+            .env
+            .iter()
+            .filter(|(k, _)| k == "CAS_FACTORY_WORKER_CLI")
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert_eq!(
+            values.last().copied(),
+            Some("codex"),
+            "the last CAS_FACTORY_WORKER_CLI entry (which Command::env applies last, \
+             winning) must be the supervisor's actual workers' cli, not grok's self-id: {values:?}"
         );
     }
 }
