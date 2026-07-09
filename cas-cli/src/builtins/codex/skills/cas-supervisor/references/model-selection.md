@@ -8,50 +8,117 @@ managed_by: cas
 
 Pay for reasoning only where reasoning is the bottleneck. Every worker slot has three knobs — `cli`, `model`, `effort` — and the supervisor owns them: decide per task at breakdown, spawn the mix the backlog needs, escalate deliberately. Spawning everything at the session default wastes budget on chores and starves hard tasks of capability.
 
+Evidence baseline (Jul 2026): Artificial Analysis leaderboards (II / CAI) plus live `grok models` on Grok Build justify Grok/Composer as the factory default lane. Optional full write-up: `docs/reports/2026-07-09-factory-model-matrix-recommendations.html` (rev 2).
+
 ## Tiers
 
 | Tier | Spawn parameters | Use for |
 |---|---|---|
-| **light** | `cli=codex model=gpt-5.5 effort=low` | Chores, docs, mechanical renames, config bumps, `depth=light` tasks, test backfill that mirrors existing patterns |
-| **standard** | `cli=codex model=gpt-5.5 effort=medium` | Normal feature/bug work with a clear spec and bounded blast radius. The stock floor is codex / gpt-5.5 / medium. |
-| **heavy** | `cli=claude model=sonnet effort=high` | Cross-cutting refactors, concurrency/lifecycle code, migrations, gnarly debugging, P0/P1 critical-path units |
+| **light** | `cli=grok model=grok-composer-2.5-fast` | Chores, docs, mechanical renames, config bumps, `depth=light` tasks, test backfill that mirrors existing patterns. Composer is a **Grok Build model id**, not a separate `cli=` harness — never invent `cli=cursor`. |
+| **standard** | `cli=grok model=grok-4.5 effort=medium` | Normal feature/bug work with a clear spec and bounded blast radius. The stock floor. |
+| **heavy** | `cli=grok model=grok-4.5 effort=high` | Cross-cutting refactors, concurrency/lifecycle code, migrations, gnarly debugging, P0/P1 critical-path units. Sonnet is escalate-for-taste, not default heavy. |
 | **frontier** | `cli=claude model=opus effort=high` | Architecture-defining units, high-blast-radius changes, tasks that already bounced twice. Sparingly — every frontier worker should map to named tasks. |
+
+Capacity backups (not preferred defaults): when Grok quota is tight, Codex works as bulk backup — `cli=codex model=gpt-5.5 effort=low|medium`. Haiku remains optional for Claude-only tiny tasks.
 
 Token-heavy read-only investigation belongs in a `cas-codex-exec` shell-out, not a worker and not your own context window.
 
-Model slugs: Claude accepts the `sonnet` / `opus` / `haiku` aliases. Codex subscription accounts must use plain `gpt-5.5` — `-codex`-suffixed slugs are rejected by the API.
+### Model slug table
+
+| `cli=` | Accepted `model=` slugs | Notes |
+|---|---|---|
+| `grok` | `grok-4.5`, `grok-composer-2.5-fast` | From live `grok models`. Composer is a **model id on the Grok harness** — never invent `cli=cursor`. |
+| `claude` | `sonnet`, `opus`, `haiku` (full Anthropic ids also ok) | Aliases preferred in factory docs. |
+| `codex` | `gpt-5.5` | Plain slug only — `-codex`-suffixed slugs are rejected by the API. |
+
+### Effort vocabulary (CAS-wide)
+
+Accepted values: `minimal` \| `low` \| `medium` \| `high` \| `xhigh` (alias `x-high`).
+
+How each backend receives them:
+
+| Backend | Flag / config |
+|---|---|
+| Claude | `--effort <level>` |
+| Codex | `--config model_reasoning_effort=<level>` |
+| Grok | `--reasoning-effort <level>` |
+
+For multi-step Claude workers, `effort=high` is the practical ceiling — do not reach for `xhigh`/`max` on long agent loops (overthink + cost). Grok 4.5 uses `medium` (standard) and `high` (heavy). Light Composer is model-id tiering; `effort=` optional.
+
+## Spawn cookbook (all three harnesses)
+
+Copy-paste `spawn_workers` recipes. Examples below use this harness's coordination tool prefix. Worker `cli=`/`model=`/`effort=` are independent of which harness the supervisor runs on — `cli=grok` works from Claude, Codex, or Grok supervisors alike.
+
+### Grok workers (stock floor + light Composer)
+
+```
+# standard floor
+mcp__cs__coordination action=spawn_workers count=2 isolate=true cli=grok model=grok-4.5 effort=medium
+
+# light / flash — Composer model id on cli=grok
+mcp__cs__coordination action=spawn_workers count=1 isolate=true cli=grok model=grok-composer-2.5-fast worker_names="lt-ada"
+
+# heavy
+mcp__cs__coordination action=spawn_workers count=1 isolate=true cli=grok model=grok-4.5 effort=high worker_names="hv-ada"
+```
+
+### Claude workers (taste / frontier / escalate)
+
+```
+# taste / judgment (not default heavy)
+mcp__cs__coordination action=spawn_workers count=1 isolate=true cli=claude model=sonnet effort=high worker_names="sn-ada"
+
+# frontier
+mcp__cs__coordination action=spawn_workers count=1 isolate=true cli=claude model=opus effort=high worker_names="fr-ada"
+
+# optional tiny Claude-only lane
+mcp__cs__coordination action=spawn_workers count=1 isolate=true cli=claude model=haiku effort=low worker_names="hk-ada"
+```
+
+### Codex workers (capacity backup when Grok quota is tight)
+
+```
+# bulk / light backup
+mcp__cs__coordination action=spawn_workers count=2 isolate=true cli=codex model=gpt-5.5 effort=low
+
+# standard backup
+mcp__cs__coordination action=spawn_workers count=2 isolate=true cli=codex model=gpt-5.5 effort=medium
+```
+
+Parameter table and field names: [reference.md](reference.md#spawn_workers-parameters).
 
 ## Routing Axes
 
-Use tier labels as defaults, then check three axes before spawning:
+Use tier labels as defaults, then check four axes before spawning:
 
-| Tier | Cost | Intelligence | Taste |
-|---|---|---|---|
-| **light** | Very low — Codex subscription capacity is effectively free for normal factory use | High: can solve hard problems when the task is well bounded | Low: often produces awkward public APIs, stiff prose, and code that works but does not feel native |
-| **standard** | Very low — same Codex budget, more reasoning effort | High: good default for bounded engineering work | Low-to-mid: fine for internal scaffolding; review anything user-facing before it ships |
-| **heavy** | Constrained — Claude subscription budget is the scarce pool | Mid-high: strong at messy codebases, lifecycle bugs, and tradeoff analysis | Mid-high: good default for public surfaces, docs, prompts, and naming |
-| **frontier** | Highest — reserve for work where quality or risk justifies it | High: best for ambiguous architecture and second-pass rescue work | High: best for taste-sensitive output that must land cleanly |
+| Tier | Cost | Intelligence | Speed | Taste |
+|---|---|---|---|---|
+| **light** | Lowest agent $/task in the Grok lane (Composer Fast) | Sufficient for well-bounded mechanical work | Highest — low wall time / flash lane | Low: fine for renames and internal scaffolding; review public surfaces |
+| **standard** | Low — Grok 4.5 medium is the cost-efficient floor | High for bounded engineering; default for most factory work | High throughput (TPS + tokens/task) vs Claude peers on similar agent scores | Low-to-mid: fine for internal code; review user-facing prose |
+| **heavy** | Still Grok-priced; escalate to Claude only when needed | High for messy codebases, lifecycle bugs, multi-module judgment | Strong multi-step agent loops; slower than Composer on tiny tasks | Mid: good default for critical-path code; escalate Claude for taste |
+| **frontier** | Highest — reserve for quality/risk that justifies it | Highest available ceiling (Opus / Fable-class when present) | Slowest / most expensive agent loops | High: taste-sensitive output that must land cleanly |
 
 Glossary:
 
-- **Cost** is the budget we actually spend. Codex subscription runs are cheap enough to use for drafts and investigation; Claude subscription workers are the constrained resource.
+- **Cost** is budget spent per task (prefer $/task and tokens/task over list $/M tokens alone). Grok/Composer is the efficient default lane; Claude subscription workers are the scarce pool.
 - **Intelligence** is how hard a problem the model can handle unsupervised: ambiguity, hidden coupling, long reasoning chains, and unfamiliar code.
+- **Speed** is wall-clock and throughput: decode TPS, agent task wall time, and tokens burned per task. Prefer Composer for flash work; Grok 4.5 for sustained agent loops.
 - **Taste** is the quality of what ships: UI/UX judgment, API and SDK shape, naming, code style, prompts, docs, release notes, and error-message wording.
 
-Taste-sensitive work routes to a high-taste tier even when the task is mechanically simple. Skill wording, supervisor guidance, release notes, public docs, API/SDK surfaces, and user-facing error text are not "light" just because the diff is small.
+Taste-sensitive work routes to a high-taste tier even when the task is mechanically simple. Skill wording, supervisor guidance, release notes, public docs, API/SDK surfaces, and user-facing error text are not "light" just because the diff is small — start those on Claude (Sonnet → Opus), not Composer.
 
 ## Reading the task signals
 
 Score each task while breaking down the EPIC:
 
 - `task_type=chore`, docs-only, or `depth=light` → **light**
-- Spike whose question is architectural ("which design holds at 10x?") → **heavy**; mechanical spikes ("does the API return X?") → **light** or **standard**
+- Spike whose question is architectural ("which design holds at 10x?") → **heavy** or **frontier**; mechanical spikes ("does the API return X?") → **light** or **standard**
 - Priority 0–1 AND on the critical path → at least **heavy**
 - Touches 3+ modules, shared traits/schemas, or unwind/panic/locking behavior → **heavy**
 - You would read the diff twice yourself before merging → **frontier**
 - Everything else → **standard** (the default is the default for a reason)
 
-Effort is the main cost lever on subscription-metered backends. For long-running heavy work, prefer switching model tier (`cli=claude model=sonnet effort=high`) over pinning codex at `high`/`xhigh` — sustained deep-effort runs on a metered subscription burn budget disproportionately fast.
+Effort is the main cost lever on reasoning-capable models. On a Grok-first factory, prefer raising **effort on Grok 4.5** (`medium` → `high`) before switching to Claude. Escalate to `cli=claude model=sonnet effort=high` only for taste, Claude-lifecycle thrash, or after Grok has already failed twice — watch Sonnet $/task (verbosity can make it more expensive than Opus).
 
 For Claude workers, `effort=high` is the ceiling. `xhigh`/`max` increase per-step reasoning, not step count or run length; on hard multi-step work they tend to overthink each move, produce heavier diffs, and multiply cost. Escalate the model tier or split the task before raising Claude effort above `high`.
 
@@ -60,19 +127,37 @@ For Claude workers, `effort=high` is the ceiling. `xhigh`/`max` increase per-ste
 1. **Tag at breakdown** — tasks default to standard; tag deviations with a label: `labels="tier:light"` / `"tier:heavy"` / `"tier:frontier"`. Note non-obvious tier rationale in the task's `design` field.
 2. **Spawn the mix** — count tiers in the ready backlog, then issue one `spawn_workers` call per tier (a call's parameters apply to every worker in that call):
    ```
-   # two standard workers
-   mcp__cs__coordination action=spawn_workers count=2 isolate=true cli=codex model=gpt-5.5 effort=medium
+   # two standard workers (floor)
+   mcp__cs__coordination action=spawn_workers count=2 isolate=true cli=grok model=grok-4.5 effort=medium
 
-   # one heavy worker for the tier:heavy tasks
-   mcp__cs__coordination action=spawn_workers count=1 isolate=true cli=claude model=sonnet effort=high worker_names="hv-ada"
+   # one light / flash worker for chores
+   mcp__cs__coordination action=spawn_workers count=1 isolate=true cli=grok model=grok-composer-2.5-fast worker_names="lt-ada"
+
+   # one heavy worker for tier:heavy tasks
+   mcp__cs__coordination action=spawn_workers count=1 isolate=true cli=grok model=grok-4.5 effort=high worker_names="hv-ada"
    ```
-   Every `spawn_workers` call MUST include explicit `model=` and `effort=`;
-   relying on omitted fields is a fallback path that emits an acknowledgement
+   Every `spawn_workers` call MUST include explicit `model=` (and `effort=` for standard/heavy/frontier and any Claude/Codex spawn).
+   Light Composer on Grok is model-id only — still pass `cli=grok model=grok-composer-2.5-fast` explicitly.
+   Relying on omitted fields is a fallback path that emits an acknowledgement
    warning, not an approved supervisor workflow.
    Tiers change the fleet's composition, not its size — worker-count strategy (3–4 max, sized by independent file groups) still applies.
 3. **Route by tier** — assign `tier:*`-labelled tasks to a matching worker; standard tasks go to anyone. Name heavier workers so routing stays legible (`hv-*`, `fr-*`).
 4. **Escalate on failure** — a task rejected or verification-failed twice moves up one tier: reassign to an existing heavier worker or spawn one. Don't re-run the same task on the same tier hoping for different output.
 5. **Escalate on judgment** — the two-rejection rule is a floor, not a permission gate. If a cheaper worker's draft gathers facts but misses the quality bar, escalate before verification fails. Judge the output, not the price tag; use cheap tiers for information and drafts, then pay for what ships. Cost is a tiebreaker only.
-6. **De-escalate the tail** — when only light tasks remain, don't leave a heavy/frontier worker idle-burning; shut it down and let a cheaper worker sweep the tail.
+
+### Escalation ladder (Grok-first)
+
+```
+light     grok  model=grok-composer-2.5-fast
+→ standard  grok  model=grok-4.5 effort=medium
+  → heavy     grok  model=grok-4.5 effort=high
+    → heavy+    claude model=sonnet effort=high   # taste / Claude harness
+      → frontier  claude model=opus effort=high     # +II ceiling; rare
+```
+
+- Composer → Grok 4.5 when the task needs deeper reasoning or multi-module judgment, not just speed.
+- Do **not** auto-promote standard → heavy by switching to Sonnet; prefer Grok high first.
+- Taste-sensitive work can jump straight to Claude even if the diff is small.
+6. **De-escalate the tail** — when only light tasks remain, don't leave a heavy/frontier worker idle-burning; shut it down and let Composer workers sweep the tail.
 
 Explicit per-spawn parameters beat `.cas/config.toml` `[factory.defaults]` / `[[factory.workers]]` for that spawn only — check the project config before assuming what the floor actually is.

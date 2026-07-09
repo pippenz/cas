@@ -3,18 +3,10 @@ use crate::mcp::tools::service::imports::*;
 /// Heartbeat age at which a worker is considered **stale** and becomes
 /// eligible for the opportunistic prune in `factory_worker_status`.
 ///
-/// A stale worker is dropped from the Active listing on the next status
-/// call (see the `list_stale` + `mark_stale` loop). If the prune succeeds
-/// — the overwhelmingly common path — the worker never reaches the
-/// render-time liveness-label branch at all.
-///
-/// Bumped from 120s to 30s by cas-2749 so a crashed CC client is
-/// detected within roughly one supervisor status poll. The 30s number is
-/// load-bearing: callers in tests assert the exact value via
-/// [`worker_stale_secs_is_pinned_at_30`] (cas-8240 AC anchor) so a drift
-/// fix in one place that forgets to update the other cannot silently
-/// regress the UX.
-pub(crate) const WORKER_STALE_SECS: i64 = 30;
+/// Re-exported from [`super::agent_liveness`] (cas-e98e single source of
+/// truth). Callers/tests that assert the 30s pin continue to use this
+/// name.
+pub(crate) use super::agent_liveness::WORKER_STALE_SECS;
 
 /// Heartbeat age at which a worker is escalated to **dead** in the
 /// supervisor-facing render: hard `[DEAD]` label + transcript-path
@@ -553,9 +545,12 @@ impl CasService {
                 .unwrap_or_default()
         };
 
-        // Agents suppressed from pruning due to recent I/O activity. Used in
-        // the render loop to show the dual-signal annotation.
+        // Agents suppressed from pruning due to recent I/O activity or a live
+        // harness PID. Used in the render loop to show the dual-signal
+        // annotation (cas-1ec7 I/O / cas-3e56 process-alive).
         let mut active_io_suppressed: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let mut process_alive_suppressed: std::collections::HashSet<String> =
             std::collections::HashSet::new();
         let mut stale_pruned = 0usize;
         let factory_session = current_factory_session();
@@ -570,6 +565,14 @@ impl CasService {
                 // cas-1ec7: suppress stale-prune when observable I/O is recent.
                 if has_recent_worker_io_activity(&recent_io_events, &agent.id) {
                     active_io_suppressed.insert(agent.id.clone());
+                    continue;
+                }
+                // cas-3e56 / cas-e98e: suppress when process proves mid-turn.
+                // Prefer revive of already-Stale rows so agent_list and
+                // worker_status agree on Active identity.
+                if agent_process_is_alive(&agent) {
+                    process_alive_suppressed.insert(agent.id.clone());
+                    let _ = store.revive(&agent.id);
                     continue;
                 }
                 if store.mark_stale(&agent.id).is_ok() {
@@ -644,8 +647,14 @@ impl CasService {
                 // recent WorkerFileEdited/WorkerGitCommit event confirms they are
                 // still making progress despite a heartbeat lapse (e.g. during a
                 // long cargo build/test run).
+                //
+                // cas-3e56: "[alive — heartbeat stale]" when the registered
+                // harness PID is still live. Honest dual-signal so supervisors
+                // never re-spawn solely on heartbeat age.
                 let liveness_label = if active_io_suppressed.contains(&agent.id) {
                     " [heartbeat stale, active I/O]"
+                } else if process_alive_suppressed.contains(&agent.id) {
+                    " [alive — heartbeat stale]"
                 } else {
                     liveness_label_for(elapsed)
                 };
@@ -1719,6 +1728,10 @@ pub(crate) fn has_recent_worker_io_activity(events: &[cas_types::Event], agent_i
         ) && e.session_id.as_deref() == Some(agent_id)
     })
 }
+
+// Process-alive probes live in `agent_liveness` (cas-e98e). Re-export so
+// existing call sites and tests keep compiling.
+pub(crate) use super::agent_liveness::agent_process_is_alive;
 
 /// Return the age (seconds) and a short phase label of the worker's most recent
 /// observable activity event (cas-86c5).
@@ -3330,6 +3343,8 @@ effort = "high"
             "event without session_id must not match (matching is by session_id, not entity_id)"
         );
     }
+
+    // Process-alive unit tests live in agent_liveness::tests (cas-e98e).
 
     // ---- cas-573c: context-usage band + tail reader -----------------------
 

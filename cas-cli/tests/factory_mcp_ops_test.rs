@@ -1031,6 +1031,132 @@ async fn test_worker_status_scopes_agents_to_factory_session() {
     );
 }
 
+/// cas-e98e AC2: for the same registry state, the set of live factory worker
+/// identities from `worker_status` must agree with `agent_list` effective
+/// liveness labels (active / active,alive-heartbeat-stale).
+#[tokio::test]
+async fn test_worker_status_and_agent_list_agree_on_live_workers() {
+    let _guard = EnvGuard::set(&[]);
+    let env = FactoryTestEnv::new();
+
+    env.register_worker("live-fresh");
+    let store = env.agent_store();
+
+    // Heartbeat-stale + process-alive (this test process).
+    let id_alive = Agent::generate_fallback_id();
+    let mut alive = Agent::new(id_alive.clone(), "live-stale-hb".to_string());
+    alive.role = AgentRole::Worker;
+    let staleness = chrono::Duration::seconds(40);
+    alive.last_heartbeat = chrono::Utc::now() - staleness;
+    alive.registered_at = chrono::Utc::now() - staleness;
+    alive.pid = Some(std::process::id());
+    store.register(&alive).expect("register process-alive stale-hb worker");
+
+    // Truly dead stale (no pid) — must not appear as live.
+    env.register_stale_worker_with_clone_path("dead-stale", "/tmp/cas-wt-dead", 40);
+
+    let status_text = get_text(
+        &env.service
+            .factory(Parameters(factory_req("worker_status")))
+            .await
+            .expect("worker_status"),
+    );
+    let list_req: CoordinationRequest = serde_json::from_value(serde_json::json!({
+        "action": "agent_list"
+    }))
+    .expect("CoordinationRequest");
+    let list_text = get_text(
+        &env.service
+            .coordination(Parameters(list_req))
+            .await
+            .expect("agent_list"),
+    );
+
+    // Live identities from worker_status (named bullets) — AC2 count + identity.
+    assert!(
+        status_text.contains("Workers (2)"),
+        "worker_status operational count must be 2. Got:\n{status_text}"
+    );
+    for name in ["live-fresh", "live-stale-hb"] {
+        assert!(
+            status_text.contains(name),
+            "worker_status must list {name}. Got:\n{status_text}"
+        );
+        assert!(
+            list_text.contains(name),
+            "agent_list must list {name}. Got:\n{list_text}"
+        );
+    }
+    assert!(
+        list_text.contains("Live factory workers (authoritative): 2"),
+        "agent_list live footer must agree on count 2. Got:\n{list_text}"
+    );
+    assert!(
+        list_text.contains("active,alive-heartbeat-stale")
+            || (status_text.contains("alive") && status_text.contains("heartbeat stale")),
+        "dual-signal must appear for process-alive stale-hb worker.\nstatus:\n{status_text}\nlist:\n{list_text}"
+    );
+    assert!(
+        !status_text.contains("dead-stale"),
+        "dead worker must not be in worker_status Active roster. Got:\n{status_text}"
+    );
+}
+
+/// cas-3e56: heartbeat past WORKER_STALE_SECS but registered harness PID still
+/// alive → worker_status must keep the worker listed as active with the
+/// "[alive — heartbeat stale]" dual-signal, never omit as "None active".
+///
+/// This is the supervision-truth residual after Grok liveness work: false
+/// "None active" while a Grok worker is mid-turn nearly caused a re-spawn.
+#[tokio::test]
+async fn test_worker_status_keeps_heartbeat_stale_process_alive_worker() {
+    let _guard = EnvGuard::set(&[]);
+    let env = FactoryTestEnv::new();
+
+    let store = env.agent_store();
+    let id = Agent::generate_fallback_id();
+    let mut agent = Agent::new(id.clone(), "mid-turn-grok".to_string());
+    agent.role = AgentRole::Worker;
+    agent
+        .metadata
+        .insert("worker_cli".to_string(), "grok".to_string());
+    // Heartbeat is "stale" by the 30s prune threshold.
+    let staleness = chrono::Duration::seconds(40);
+    agent.last_heartbeat = chrono::Utc::now() - staleness;
+    agent.registered_at = chrono::Utc::now() - staleness;
+    // Registered PID = this test process (alive). No fingerprint → pid-only
+    // liveness (kill 0) still proves the process is up.
+    agent.pid = Some(std::process::id());
+    store
+        .register(&agent)
+        .expect("register heartbeat-stale process-alive worker");
+
+    let req = factory_req("worker_status");
+    let result = env
+        .service
+        .factory(Parameters(req))
+        .await
+        .expect("worker_status call should succeed");
+    let text = get_text(&result);
+
+    assert!(
+        text.contains("mid-turn-grok"),
+        "process-alive worker must stay in Active listing despite stale heartbeat. Got:\n{text}"
+    );
+    assert!(
+        !text.contains("Workers: None active"),
+        "must not report empty roster when a process-alive worker exists. Got:\n{text}"
+    );
+    assert!(
+        text.contains("alive") && text.contains("heartbeat stale"),
+        "must surface dual-signal '[alive — heartbeat stale]'. Got:\n{text}"
+    );
+    assert!(
+        !text.contains("Filtered stale agent record(s)"),
+        "process-alive worker must not be pruned. Got:\n{text}"
+    );
+}
+
 /// cas-5b1c integration coverage: a worker whose heartbeat is older than
 /// `WORKER_STALE_SECS` (30s) is pruned out of the Active listing on the
 /// next `factory_worker_status` call and reported in the "Filtered stale

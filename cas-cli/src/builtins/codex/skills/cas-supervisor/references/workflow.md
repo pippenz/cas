@@ -43,23 +43,27 @@ In shared mode, file-overlap analysis is even more critical — two workers edit
 
 1. Spawn workers:
    ```
-   mcp__cs__coordination action=spawn_workers count=N isolate=true cli=codex model=gpt-5.5 effort=medium
+   mcp__cs__coordination action=spawn_workers count=N isolate=true cli=grok model=grok-4.5 effort=medium
    ```
    Omit `isolate` for shared mode.
 
-   **Hard rule:** every `spawn_workers` call MUST include explicit `model=` and
-   `effort=`. Include `cli=` as well when spawning outside the stock Codex lane.
+   **Hard rule:** every `spawn_workers` call MUST include explicit `model=` (and
+   `effort=` for standard/heavy/frontier and any Claude/Codex spawn). Include
+   `cli=` explicitly — Grok is the stock floor (`cli=grok model=grok-4.5`).
    Omitted fields fall back through the factory config cascade and stock floor;
    the spawn acknowledgement nags because supervisors should make worker tier
    selection intentional and visible.
 
-   **Heterogeneous team example** — Claude supervisor spawning Codex workers:
+   **Tiered mix example** — standard floor + light Composer + heavy Grok:
    ```
-   # All Codex workers
-   mcp__cs__coordination action=spawn_workers count=2 cli=codex model=gpt-5.5 effort=medium isolate=true
+   # Standard floor (Grok 4.5 medium)
+   mcp__cs__coordination action=spawn_workers count=2 cli=grok model=grok-4.5 effort=medium isolate=true
 
-   # Named workers with explicit Codex backend
-   mcp__cs__coordination action=spawn_workers count=1 cli=codex model=gpt-5.5 effort=low worker_names="alice" isolate=true
+   # Light / flash (Composer is a Grok model id — not cli=cursor)
+   mcp__cs__coordination action=spawn_workers count=1 cli=grok model=grok-composer-2.5-fast worker_names="lt-ada" isolate=true
+
+   # Heavy (Grok 4.5 high)
+   mcp__cs__coordination action=spawn_workers count=1 cli=grok model=grok-4.5 effort=high worker_names="hv-ada" isolate=true
    ```
    `cli`, `model`, and `effort` are per-spawn controls for the workers spawned
    by that call.

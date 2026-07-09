@@ -1,5 +1,18 @@
 # Worker Recovery — Triage and Failure Modes
 
+## Authoritative liveness (cas-e98e)
+
+`worker_status`, `agent_list`, and the FACTORY pane share one dual-signal classifier:
+
+> **Live = (Active/Idle + heartbeat &lt; 30s) OR live OS harness process for that agent.**
+
+**Authoritative for shutdown / re-spawn decisions:**
+
+1. **OS process** (highest) — if Grok/Claude/Codex is still running, the worker is alive even when heartbeat lagged (`[alive — heartbeat stale]` / `active,alive-heartbeat-stale`). Do **not** shut down, unregister, or re-spawn.
+2. **Heartbeat freshness** — within ~30s → live. Past that with no process → not live.
+3. **Supporting:** last activity / transcript age, worktree dirty, active leases, `is-wedged`.
+4. **Never** act on `Workers: None active` or `Filtered stale` alone — confirm `ps`/worktree/`is-wedged` first (cas-3e56 residual: false-empty roster nearly killed mid-turn Grok). Use `gc_cleanup` to purge dead registry rows.
+
 ## Is the worker actually dead? (cas-4513 triage)
 
 Before you run `shutdown_workers` on a pane that *looks* broken, spend 60 seconds on triage. The supervisor TUI is not ground truth for worker liveness — the most common false-positive failure mode is a worker that's mid-way through a long tool call or showing Claude Code's Bun/React-Ink crash screen (which leaves the process alive with an unresponsive UI). Destructive recovery on a live worker rips its worktree out from under itself and turns a recoverable hang into a real crash.
@@ -22,9 +35,9 @@ The Bun/React-Ink crash signature is the visual fingerprint captured in the cas-
 
 **Step 3: recovery.** Only after `is-wedged` reports `wedged` or `dead` — never off `unverified`:
 
-- **Wedged:** `cas factory kill <worker>` — SIGKILL (SIGTERM is observed not to exit cleanly on the Bun wedge) and reset any leased tasks (release lease + status→Open + clear assignee, same semantics as `cas__task action=reset`). Idempotent on an already-dead process. Then respawn.
+- **Wedged:** `cas factory kill <worker>` — SIGKILL (SIGTERM is observed not to exit cleanly on the Bun wedge) and reset any leased tasks (release lease + status→Open + clear assignee, same semantics as `mcp__cas__task action=reset`). Idempotent on an already-dead process. Then respawn.
 - **Starved:** do not kill. Come back in 2 minutes; if it re-classifies as `wedged`, proceed to the kill path.
-- **Dead:** no kill needed. The `kill` verb is still safe to run (`skipping SIGKILL` + task reset runs); or manually `cas__task action=reset id=<task>`.
+- **Dead:** no kill needed. The `kill` verb is still safe to run (`skipping SIGKILL` + task reset runs); or manually `mcp__cas__task action=reset id=<task>`.
 - **Unverified:** do not kill and do not reset the lease. Run `cas factory debug <worker>` and inspect the worktree manually; re-run `is-wedged` once you've confirmed which process is actually the worker.
 
 **Process resolution (cas-f781).** `cas factory kill` does not blindly trust the agent store's tracked pid — that value can be stale or wrong (the MCP-server-child self-registration bug above). Before killing, it scans the live process table for a process whose own argv (`--agent-name <worker>`) or environment (`CAS_AGENT_NAME=<worker>`, for Codex workers) identifies it as the target worker, and prefers that resolved pid over the tracked one. The summary line calls this out explicitly: `process-table scan resolved a live process for `<worker>` at pid N (agent-name match) — overriding stale tracked pid M`. The kill itself targets the process **group**, not a single pid, since workers are spawned as session leaders and may have forked children of their own.
@@ -39,9 +52,9 @@ The Bun/React-Ink crash signature is the visual fingerprint captured in the cas-
 
 Director and task-lifecycle notifications are hints, not ground truth. A known bug (tracking pointer `cas-dbbe`) produced false `task_completed` notifications around task start, including five false completions in one session. Before closing, reassigning, respawning, or merging because of a notification:
 
-- Run `cas__task action=show id=<task-id>` and trust the task status over the notification text.
+- Run `mcp__cas__task action=show id=<task-id>` and trust the task status over the notification text.
 - Check the worker branch tip or worktree commits before assuming work exists: `git -C .cas/worktrees/<worker> log --oneline -5`.
-- Check liveness with `cas__coordination action=worker_status` before declaring a worker idle or dead.
+- Check liveness with `mcp__cas__coordination action=worker_status` before declaring a worker idle or dead.
 
 ## Worker Failure Recovery
 
@@ -52,16 +65,16 @@ Workers fail in production. These are recurring observed failure modes and their
 **Signature:** Worker stops responding to messages. No progress notes, no commits, no heartbeat updates. Task stays `in_progress` indefinitely.
 
 **Diagnosis:**
-1. Check worker status: `cas__coordination action=worker_status`
-2. Look for stale heartbeat (last activity timestamp far in the past) or missing entry
-3. Check worker activity log: `cas__coordination action=worker_activity`
+1. Check worker status: `mcp__cas__coordination action=worker_status`
+2. Look for stale heartbeat (last activity timestamp far in the past) or missing entry — but **do not treat `Workers: None active` or `Filtered stale` as death alone** (cas-3e56: live Grok workers were omitted while mid-turn; prefer `[alive — heartbeat stale]` + OS/`ps`/worktree check before re-spawn)
+3. Check worker activity log: `mcp__cas__coordination action=worker_activity`
 
 **Recovery:**
 1. Check the worker's worktree for partial work: `git -C .cas/worktrees/<worker> log --oneline main..HEAD`
 2. If commits exist, cherry-pick salvageable work to the base branch before cleanup
-3. Release the dead worker's lease: `cas__task action=release id=<task-id>`
-4. Shut down the dead worker: `cas__coordination action=shutdown_workers count=0` (then respawn the count you need)
-5. Spawn a fresh worker: `cas__coordination action=spawn_workers count=1 isolate=true`
+3. Release the dead worker's lease: `mcp__cas__task action=release id=<task-id>`
+4. Shut down the dead worker: `mcp__cas__coordination action=shutdown_workers count=0` (then respawn the count you need)
+5. Spawn a fresh worker: `mcp__cas__coordination action=spawn_workers count=1 isolate=true`
 6. Reassign the task to the new worker. If partial work was cherry-picked, include that context in the assignment message so the new worker builds on it rather than redoing it.
 
 ### Injected but Unwoken Worker
@@ -69,7 +82,7 @@ Workers fail in production. These are recurring observed failure modes and their
 **Signature:** Heartbeat is fresh, worktree is clean, and there is zero activity for 10+ minutes after a supervisor message. The prompt was injected into the worker session, but the worker did not acknowledge or act. This is most often triggered by long multi-line payloads sent to Codex workers.
 
 **Diagnosis:**
-1. Confirm a fresh heartbeat with `cas__coordination action=worker_status`
+1. Confirm a fresh heartbeat with `mcp__cas__coordination action=worker_status`
 2. Confirm no work started: `git -C .cas/worktrees/<worker> status --short`
 3. Check prompt delivery state:
    ```bash
@@ -81,13 +94,13 @@ Workers fail in production. These are recurring observed failure modes and their
 1. Ensure the work exists as an assigned task with full spec and acceptance criteria.
 2. Send a short urgent wake that points only at the task:
    ```
-   cas__coordination action=message target=<worker> urgent=true summary="Task <id> assigned" message="Task <id> is assigned. Run cas__task action=show id=<id>."
+   mcp__cas__coordination action=message target=<worker> urgent=true summary="Task <id> assigned" message="Task <id> is assigned. Run mcp__cas__task action=show id=<id>."
    ```
 3. Do not kill or respawn. There is no evidence of a dead process or dirty worktree; the fix is a durable task plus a short wake.
 
 ### Pre-compaction Triage via worker_status context indicator (cas-573c)
 
-`cas__coordination action=worker_status` now includes a `context:` line per worker:
+`mcp__cas__coordination action=worker_status` now includes a `context:` line per worker:
 
 ```
   • bright-leopard-9 (heartbeat: 8s ago)
@@ -104,8 +117,8 @@ Workers fail in production. These are recurring observed failure modes and their
 | `near-limit` | ≥ 160k | Act immediately — see recovery steps below. |
 
 **Pre-compaction recovery (context: near-limit):**
-1. Send: `cas__coordination action=message target=<worker> message="Your context is near the limit. Commit any in-progress work immediately (git add / git commit), then report what you committed."`
-2. Wait for the commit confirmation (watch `cas__coordination action=worker_activity`).
+1. Send: `mcp__cas__coordination action=message target=<worker> message="Your context is near the limit. Commit any in-progress work immediately (git add / git commit), then report what you committed."`
+2. Wait for the commit confirmation (watch `mcp__cas__coordination action=worker_activity`).
 3. If the worker is mid-task and not responding: check the worktree manually: `git -C .cas/worktrees/<worker> log --oneline HEAD~5..HEAD`
 4. Once work is committed: shut down the worker cleanly and respawn with a fresh context.
 
@@ -140,7 +153,7 @@ Workers fail in production. These are recurring observed failure modes and their
 2. Respawn workers — they will pick up the new binary
 
 **Recovery (binary is outdated or rebuild is not feasible mid-session):**
-1. Close the jailed task with an audit trail: `cas__task action=close id=<task-id> reason="Supervisor close — verification jail deadlock. Work verified at <commit-sha>. Worker jailed, CAS binary predates bba6fbf exemption fix."`
+1. Close the jailed task with an audit trail: `mcp__cas__task action=close id=<task-id> reason="Supervisor close — verification jail deadlock. Work verified at <commit-sha>. Worker jailed, CAS binary predates bba6fbf exemption fix."`
 2. If `close` is also blocked, use direct sqlite as last resort:
    ```sql
    UPDATE tasks SET status='closed', pending_verification=0 WHERE id='cas-XXXX';

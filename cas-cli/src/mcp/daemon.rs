@@ -32,8 +32,8 @@ use crate::orchestration::names as friendly_names;
 use crate::store::open_agent_store;
 use crate::store::{
     SqliteStore, open_commit_link_store, open_event_store, open_file_change_store,
-    open_prompt_store, open_rule_store, open_skill_store, open_spec_store, open_store,
-    open_task_store,
+    open_prompt_store, open_rule_store_local, open_skill_store_local, open_spec_store,
+    open_store_local, open_task_store_local,
 };
 use crate::types::{Agent, AgentRole};
 
@@ -953,18 +953,46 @@ impl EmbeddedDaemon {
                             cc_pid,
                             fingerprint_checked,
                         } => {
-                            tracing::info!(
-                                agent_id = %short_id,
-                                cc_pid = cc_pid,
-                                fingerprint_checked = fingerprint_checked,
-                                "Claude Code client process is gone (or PID recycled to \
-                                 a different process) — marking agent stale and stopping \
-                                 heartbeat (cas-2749/cas-ea46 liveness gate)"
+                            // cas-3e56: registered pid may be wrong (pre-fix
+                            // SessionStart only matched "claude" and walked to
+                            // grandparent for Grok). Before mark_stale, scan the
+                            // live process table for this agent name — if the
+                            // real harness is mid-turn, keep heartbeating.
+                            let live_pid = crate::cli::factory::wedged::find_worker_pid(
+                                &crate::cli::factory::wedged::RealProcessTable,
+                                &agent.name,
                             );
-                            let _ = store.mark_stale(&id);
-                            let mut guard = self.agent_id.write().await;
-                            *guard = None;
-                            return;
+                            if let Some(resolved) = live_pid {
+                                tracing::warn!(
+                                    agent_id = %short_id,
+                                    registered_cc_pid = cc_pid,
+                                    resolved_pid = resolved,
+                                    fingerprint_checked = fingerprint_checked,
+                                    "Registered harness PID dead/recycled but live \
+                                     process found by agent name — continuing heartbeat \
+                                     (cas-3e56)"
+                                );
+                                // Best-effort: re-stamp the correct pid so
+                                // subsequent ticks use the strict path.
+                                if let Ok(mut refreshed) = store.get(&id) {
+                                    refreshed.pid = Some(resolved);
+                                    stamp_pid_fingerprint(&mut refreshed, resolved);
+                                    let _ = store.update(&refreshed);
+                                }
+                            } else {
+                                tracing::info!(
+                                    agent_id = %short_id,
+                                    cc_pid = cc_pid,
+                                    fingerprint_checked = fingerprint_checked,
+                                    "Harness client process is gone (or PID recycled to \
+                                     a different process) — marking agent stale and stopping \
+                                     heartbeat (cas-2749/cas-ea46/cas-3e56 liveness gate)"
+                                );
+                                let _ = store.mark_stale(&id);
+                                let mut guard = self.agent_id.write().await;
+                                *guard = None;
+                                return;
+                            }
                         }
                     }
                 }
@@ -1064,15 +1092,18 @@ impl EmbeddedDaemon {
                 }
             }
 
-            // Open stores without cloud sync wrappers (to avoid recursion)
-            // We use the base stores here since we're doing the sync ourselves
-            let store = open_store(&cas_root)?;
-            let task_store = open_task_store(&cas_root)?;
-            let rule_store = open_rule_store(&cas_root)?;
-            let skill_store = open_skill_store(&cas_root)?;
+            // cas-7fbb: open_*_local skips Syncing* / SyncQueue wrappers so
+            // pull apply does not re-enqueue remote rows (which would feed
+            // push → pull forever). Local edits still use open_store (etc.)
+            // and correctly enqueue.
+            let store = open_store_local(&cas_root)?;
+            let task_store = open_task_store_local(&cas_root)?;
+            let rule_store = open_rule_store_local(&cas_root)?;
+            let skill_store = open_skill_store_local(&cas_root)?;
             // cas-bba4: extra stores for the extended pull surface (specs +
             // events + prompts + file_changes + commit_links). The auto-sync
             // path now imports the full content set just like `cas cloud pull`.
+            // These kinds are not wrapped by Syncing* openers today.
             let spec_store = open_spec_store(&cas_root)?;
             let event_store = open_event_store(&cas_root)?;
             let prompt_store = open_prompt_store(&cas_root)?;

@@ -18,8 +18,9 @@ use crate::ui::theme::ActiveTheme;
 
 use crate::store::{
     SqliteStore, open_commit_link_store, open_event_store, open_file_change_store,
-    open_prompt_store, open_rule_store, open_skill_store, open_spec_store, open_store,
-    open_task_store, open_worktree_store,
+    open_prompt_store, open_rule_store, open_rule_store_local, open_skill_store,
+    open_skill_store_local, open_spec_store, open_store, open_store_local, open_task_store,
+    open_task_store_local, open_worktree_store,
 };
 
 #[derive(Subcommand)]
@@ -1916,10 +1917,13 @@ fn execute_pull(args: &CloudPullArgs, cli: &Cli, cas_root: &Path) -> anyhow::Res
     // cas-bba4 re-adds the remaining 5 entity kinds (specs/events/prompts/
     // file_changes/commit_links) — also scoped — so `cas cloud pull` once
     // again imports the full set without re-introducing the leak.
-    let store = open_store(cas_root)?;
-    let task_store = open_task_store(cas_root)?;
-    let rule_store = open_rule_store(cas_root)?;
-    let skill_store = open_skill_store(cas_root)?;
+    //
+    // cas-7fbb: use *_local openers so pull apply does not re-enqueue into
+    // SyncQueue (open_store wraps Syncing* when logged in → push↔pull loop).
+    let store = open_store_local(cas_root)?;
+    let task_store = open_task_store_local(cas_root)?;
+    let rule_store = open_rule_store_local(cas_root)?;
+    let skill_store = open_skill_store_local(cas_root)?;
     let spec_store = open_spec_store(cas_root)?;
     let event_store = open_event_store(cas_root)?;
     let prompt_store = open_prompt_store(cas_root)?;
@@ -2471,28 +2475,30 @@ pub fn execute_team_pull(
     // Per cas-6ec7 spec, this is intentional parity with the current
     // `pull_team` signature — adding the remaining 5 entity kinds is a
     // separate scope expansion.
-    let store = match open_store(cas_root) {
+    //
+    // cas-7fbb: *_local openers — pull must not re-enqueue pulled rows.
+    let store = match open_store_local(cas_root) {
         Ok(s) => s,
         Err(e) => {
             let _ = report_team_pull_error(cli, &format!("Could not open entry store: {e}"));
             return Ok(());
         }
     };
-    let task_store = match open_task_store(cas_root) {
+    let task_store = match open_task_store_local(cas_root) {
         Ok(s) => s,
         Err(e) => {
             let _ = report_team_pull_error(cli, &format!("Could not open task store: {e}"));
             return Ok(());
         }
     };
-    let rule_store = match open_rule_store(cas_root) {
+    let rule_store = match open_rule_store_local(cas_root) {
         Ok(s) => s,
         Err(e) => {
             let _ = report_team_pull_error(cli, &format!("Could not open rule store: {e}"));
             return Ok(());
         }
     };
-    let skill_store = match open_skill_store(cas_root) {
+    let skill_store = match open_skill_store_local(cas_root) {
         Ok(s) => s,
         Err(e) => {
             let _ = report_team_pull_error(cli, &format!("Could not open skill store: {e}"));
@@ -2979,10 +2985,11 @@ fn execute_team_memories(
         return Ok(());
     }
 
-    // Merge into local stores using LWW
-    let store = open_store(cas_root)?;
-    let rule_store = open_rule_store(cas_root)?;
-    let skill_store = open_skill_store(cas_root)?;
+    // Merge into local stores using LWW.
+    // cas-7fbb: apply remote team memories without re-enqueueing to SyncQueue.
+    let store = open_store_local(cas_root)?;
+    let rule_store = open_rule_store_local(cas_root)?;
+    let skill_store = open_skill_store_local(cas_root)?;
 
     let mut entries_merged = 0usize;
     let mut entries_skipped = 0usize;
@@ -3119,10 +3126,12 @@ fn execute_purge_foreign(
     let project_id = get_project_canonical_id()
         .ok_or_else(|| anyhow::anyhow!("Cannot determine project ID. Not inside a CAS project?"))?;
 
-    let store = open_store(cas_root)?;
-    let task_store = open_task_store(cas_root)?;
-    let rule_store = open_rule_store(cas_root)?;
-    let skill_store = open_skill_store(cas_root)?;
+    // cas-7fbb: delete + re-pull must use local openers so the re-pull does
+    // not re-feed SyncQueue.
+    let store = open_store_local(cas_root)?;
+    let task_store = open_task_store_local(cas_root)?;
+    let rule_store = open_rule_store_local(cas_root)?;
+    let skill_store = open_skill_store_local(cas_root)?;
     // cas-bba4: extra stores required by the extended `CloudSyncer::pull`
     // signature. purge-foreign only deletes content entities (entries/tasks/
     // rules/skills), so these are passed through purely to satisfy the

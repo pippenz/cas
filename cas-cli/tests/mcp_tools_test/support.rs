@@ -1,3 +1,5 @@
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use tempfile::TempDir;
 
@@ -81,17 +83,59 @@ pub(crate) fn setup_cas() -> (TempDir, CasCore) {
     let agent_store = open_agent_store(&cas_dir).expect("agent store should open");
     agent_store.init().expect("agent store should initialize");
 
-    // In production, daemon setup handles session registration.
+    // Stable id format `test-session-{pid}` — several tests hardcode this
+    // (e.g. operations force-transfer, verification cas-7998 self-assignee).
+    // Secondary/rebuilt cores must use `core_with_test_agent` instead of bare
+    // `CasCore::with_daemon` (cas-48e6).
     let session_id = format!("test-session-{}", std::process::id());
     let agent = Agent::new(session_id.clone(), "test-agent".to_string());
     agent_store
         .register(&agent)
         .expect("test agent should register");
 
-    let core = CasCore::with_daemon(cas_dir.clone(), None, None);
+    let core = CasCore::with_daemon(cas_dir, None, None);
     core.set_agent_id_for_testing(session_id);
 
     (temp, core)
+}
+
+/// Build a `CasCore` on an existing `.cas` directory with a **registered** test
+/// agent identity.
+///
+/// Use this whenever a test rebuilds a core after `setup_cas()` (e.g. after
+/// writing `config.toml` so `OnceLock` config reloads, or to model a second
+/// worker process). Bare `CasCore::with_daemon` has no `agent_id` and no
+/// SessionStart mapping file, so `task.start` fails with:
+///
+/// ```text
+/// Agent not registered. … Original error: No such file or directory (os error 2)
+/// ```
+///
+/// when `CAS_SESSION_ID` is unset (cas-48e6). The ENOENT is from
+/// `agent_id::read_session_for_mcp` — the production SessionStart hook path.
+/// Ambient `CAS_SESSION_ID` masks the bug via env auto-register, which is why
+/// the suite can stay green inside a factory session and red on a clean
+/// checkout.
+pub(crate) fn core_with_test_agent(cas_dir: impl AsRef<Path>) -> CasCore {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let cas_dir: PathBuf = cas_dir.as_ref().to_path_buf();
+    let session_id = format!(
+        "test-session-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    );
+
+    let agent_store = open_agent_store(&cas_dir).expect("agent store should open");
+    // Idempotent if setup_cas already initialized the store.
+    let _ = agent_store.init();
+    let agent = Agent::new(session_id.clone(), "test-agent".to_string());
+    agent_store
+        .register(&agent)
+        .expect("test agent should register");
+
+    let core = CasCore::with_daemon(cas_dir, None, None);
+    core.set_agent_id_for_testing(session_id);
+    core
 }
 
 /// Extract text from a tool result.

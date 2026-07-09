@@ -159,13 +159,19 @@ impl FactoryDaemon {
                                         self.app.diff_scroll_up();
                                     } else if self.app.handle_scroll_up() == ScrollAction::AltScreen
                                     {
-                                        // Focused pane is in alt-screen — forward as
-                                        // arrow-up keys so the inner TUI can scroll.
+                                        // Focused pane is in alt-screen — forward a
+                                        // harness-aware scroll payload so the inner
+                                        // TUI can scroll its own transcript.
+                                        // Claude/Codex: PgUp (cas-f93a).
+                                        // Grok: SGR mouse wheel (cas-d3b5) — PgUp is a
+                                        // no-op while the prompt is focused.
+                                        let payload = self.app.alt_screen_scroll_payload(true);
                                         tracing::debug!(
-                                            "alt-screen scroll up: forwarding {} arrow-up bytes to PTY",
-                                            SCROLL_LINES
+                                            harness = ?self.app.focused_harness(),
+                                            bytes = payload.len(),
+                                            "alt-screen scroll up: forwarding wheel payload to PTY"
                                         );
-                                        let _ = self.app.mux.send_input(SCROLL_UP_ARROWS).await;
+                                        let _ = self.app.mux.send_input(&payload).await;
                                     }
                                     // ScrollAction::Done: scroll was handled by handle_scroll_up.
                                 }
@@ -175,13 +181,13 @@ impl FactoryDaemon {
                                     } else if self.app.handle_scroll_down()
                                         == ScrollAction::AltScreen
                                     {
-                                        // Focused pane is in alt-screen — forward as
-                                        // arrow-down keys so the inner TUI can scroll.
+                                        let payload = self.app.alt_screen_scroll_payload(false);
                                         tracing::debug!(
-                                            "alt-screen scroll down: forwarding {} arrow-down bytes to PTY",
-                                            SCROLL_LINES
+                                            harness = ?self.app.focused_harness(),
+                                            bytes = payload.len(),
+                                            "alt-screen scroll down: forwarding wheel payload to PTY"
                                         );
-                                        let _ = self.app.mux.send_input(SCROLL_DOWN_ARROWS).await;
+                                        let _ = self.app.mux.send_input(&payload).await;
                                     }
                                     // ScrollAction::Done: scroll was handled by handle_scroll_down.
                                 }
