@@ -107,9 +107,15 @@ pub fn build_context(input: &HookInput, limit: usize, cas_root: &Path) -> Result
         };
 
     // Build context using cas-core
-    let (context, stats) =
-        build_context_with_stores(input, &stores, &config, limit, surfaced_callback.as_ref())
-            .map_err(|e| MemError::Other(e.to_string()))?;
+    let (context, stats) = build_context_with_stores(
+        input,
+        &stores,
+        &config,
+        limit,
+        surfaced_callback.as_ref(),
+        crate::harness_policy::own_tool_prefix(),
+    )
+    .map_err(|e| MemError::Other(e.to_string()))?;
 
     // Inject connected MCP proxy tools (from cached catalog)
     let context = {
@@ -295,11 +301,12 @@ pub fn build_context_ai(
     // Add hints
     if !context_parts.is_empty() {
         context_parts.push(String::new());
-        let hints = if input.source.as_deref() == Some("codex") {
-            "Fetch details: `mcp__cs__memory` | Search: `mcp__cs__search`"
-        } else {
-            "Fetch details: `mcp__cas__memory` | Search: `mcp__cas__search`"
-        };
+        // EPIC cas-8888 (cas-fd9f): was a 2-way `input.source == "codex"`
+        // guess (always wrong for Grok, and fragile even for Codex — see
+        // `harness_policy::own_tool_prefix`'s doc comment). This process's
+        // own env always correctly describes the actual reader.
+        let prefix = crate::harness_policy::own_tool_prefix();
+        let hints = format!("Fetch details: `{prefix}memory` | Search: `{prefix}search`");
         context_parts.push(format!(
             "**Context: {} (AI-selected)** | {}",
             token_display(total_tokens),
@@ -358,8 +365,14 @@ pub fn build_plan_context(
         recent_files,
     };
 
-    let (context, _stats) = build_plan_context_with_stores(input, &stores, &config, limit)
-        .map_err(|e| MemError::Other(e.to_string()))?;
+    let (context, _stats) = build_plan_context_with_stores(
+        input,
+        &stores,
+        &config,
+        limit,
+        crate::harness_policy::own_tool_prefix(),
+    )
+    .map_err(|e| MemError::Other(e.to_string()))?;
 
     Ok(context)
 }
@@ -645,8 +658,14 @@ fn fetch_personal_patterns_for_context() -> Result<String, MemError> {
     }
 
     if patterns.len() > 20 {
+        // EPIC cas-8888 (cas-fd9f): own_tool_prefix() — this section is
+        // appended in the cas-cli wrapper AFTER cas-core's
+        // build_context_with_stores returns, so it falls outside that
+        // function's centralized end-of-function remap and needs its own
+        // fix.
+        let prefix = crate::harness_policy::own_tool_prefix();
         section.push_str(&format!(
-            "\n... and {} more patterns (use `mcp__cas__pattern action=list` to see all)\n",
+            "\n... and {} more patterns (use `{prefix}pattern action=list` to see all)\n",
             patterns.len() - 20
         ));
     }
@@ -701,11 +720,15 @@ fn fetch_team_suggestions_for_context() -> Result<String, MemError> {
     };
 
     let team_name = cloud_config.team_slug.as_deref().unwrap_or("your team");
+    // EPIC cas-8888 (cas-fd9f): own_tool_prefix() — see the note on the
+    // patterns-section fix above; this section is likewise appended after
+    // cas-core's centralized remap has already run.
+    let prefix = crate::harness_policy::own_tool_prefix();
 
     let mut section = format!(
         "## Team Suggestions ({team_name})\n\n\
          Your team has shared pattern suggestions for you to review.\n\
-         Use `mcp__cas__pattern action=team_adopt team_id={team_id} suggestion_id=<id>` to adopt, \
+         Use `{prefix}pattern action=team_adopt team_id={team_id} suggestion_id=<id>` to adopt, \
          or `action=team_dismiss` to hide.\n\n"
     );
 
@@ -744,7 +767,7 @@ fn fetch_team_suggestions_for_context() -> Result<String, MemError> {
 
     if suggestions.len() > 10 {
         section.push_str(&format!(
-            "\n... and {} more suggestions (use `mcp__cas__pattern action=team_suggestions team_id={}` to see all)\n",
+            "\n... and {} more suggestions (use `{prefix}pattern action=team_suggestions team_id={}` to see all)\n",
             suggestions.len() - 10,
             team_id
         ));
@@ -783,10 +806,13 @@ fn build_mcp_tools_section(cas_root: &Path) -> String {
         total_tools
     ));
     parts.push(String::new());
-    parts.push(
-        "Use `mcp__cas__mcp_search` to discover tools, `mcp__cas__mcp_execute` to call them."
-            .to_string(),
-    );
+    // EPIC cas-8888 (cas-fd9f): own_tool_prefix() — appended after
+    // cas-core's centralized remap has already run, same as the two
+    // cloud-pattern sections above.
+    let prefix = crate::harness_policy::own_tool_prefix();
+    parts.push(format!(
+        "Use `{prefix}mcp_search` to discover tools, `{prefix}mcp_execute` to call them."
+    ));
     parts.push(String::new());
 
     for (server, tools) in &servers {
@@ -863,6 +889,71 @@ mod tests {
         assert!(section.contains("chrome-devtools"));
         assert!(section.contains("navigate_page"));
         assert!(section.contains("github"));
+
+        // EPIC cas-8888 (cas-fd9f): the tool-name prefix now comes from
+        // harness_policy::own_tool_prefix(), which is env-based. Pin the
+        // env explicitly so this assertion is deterministic regardless of
+        // the ambient process (this test binary may itself be running
+        // inside a real factory worker/supervisor session).
+        let _g = crate::hooks::test_env_lock();
+        let prev_role = std::env::var("CAS_AGENT_ROLE").ok();
+        let prev_worker_cli = std::env::var("CAS_FACTORY_WORKER_CLI").ok();
+        unsafe {
+            std::env::remove_var("CAS_AGENT_ROLE");
+            std::env::remove_var("CAS_FACTORY_WORKER_CLI");
+        }
+        let section = build_mcp_tools_section(dir.path());
+        unsafe {
+            match prev_role {
+                Some(v) => std::env::set_var("CAS_AGENT_ROLE", v),
+                None => std::env::remove_var("CAS_AGENT_ROLE"),
+            }
+            match prev_worker_cli {
+                Some(v) => std::env::set_var("CAS_FACTORY_WORKER_CLI", v),
+                None => std::env::remove_var("CAS_FACTORY_WORKER_CLI"),
+            }
+        }
         assert!(section.contains("mcp__cas__mcp_search"));
+    }
+
+    /// EPIC cas-8888 (cas-fd9f): the load-bearing regression test — before
+    /// the fix, `build_mcp_tools_section` hardcoded Claude's `mcp__cas__`
+    /// prefix unconditionally.
+    #[test]
+    fn test_build_mcp_tools_section_uses_grok_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_path = dir.path().join("proxy_catalog.json");
+        std::fs::write(
+            &cache_path,
+            serde_json::json!({"github": ["list_issues"]}).to_string(),
+        )
+        .unwrap();
+
+        let _g = crate::hooks::test_env_lock();
+        let prev_role = std::env::var("CAS_AGENT_ROLE").ok();
+        let prev_worker_cli = std::env::var("CAS_FACTORY_WORKER_CLI").ok();
+        unsafe {
+            std::env::set_var("CAS_AGENT_ROLE", "worker");
+            std::env::set_var("CAS_FACTORY_WORKER_CLI", "grok");
+        }
+        let section = build_mcp_tools_section(dir.path());
+        unsafe {
+            match prev_role {
+                Some(v) => std::env::set_var("CAS_AGENT_ROLE", v),
+                None => std::env::remove_var("CAS_AGENT_ROLE"),
+            }
+            match prev_worker_cli {
+                Some(v) => std::env::set_var("CAS_FACTORY_WORKER_CLI", v),
+                None => std::env::remove_var("CAS_FACTORY_WORKER_CLI"),
+            }
+        }
+        assert!(
+            section.contains("cas__mcp_search") && section.contains("cas__mcp_execute"),
+            "grok worker must see its own cas__ prefix: {section}"
+        );
+        assert!(
+            !section.contains("mcp__cas__mcp_search") && !section.contains("mcp__cs__mcp_search"),
+            "grok worker must NOT see another harness's prefix: {section}"
+        );
     }
 }

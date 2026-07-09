@@ -351,8 +351,11 @@ pub fn build_session_start_wip_banner(cas_root: &Path) -> Option<String> {
     }
     if total > shown {
         let extra = total - shown;
+        // EPIC cas-8888 (cas-fd9f): own_tool_prefix() — this banner is read
+        // by the supervisor telling itself what to run next.
+        let prefix = crate::harness_policy::own_tool_prefix();
         out.push_str(&format!(
-            "  ... and {extra} more — run `mcp__cas__coordination action=gc_report` for the full list.\n",
+            "  ... and {extra} more — run `{prefix}coordination action=gc_report` for the full list.\n",
         ));
     }
     out.push_str(

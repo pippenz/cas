@@ -227,7 +227,19 @@ fn inject_role_guidance(
         _ => return,
     };
 
-    // SessionStart context hint for Claude supervisors when workers are Codex.
+    // SessionStart context hint for supervisors when workers are Codex.
+    //
+    // EPIC cas-8888 (cas-fd9f): this note describes what the SUPERVISOR
+    // itself (not the Codex workers it's coordinating) may call — so it
+    // needs the supervisor's OWN tool prefix, which depends on the
+    // supervisor's OWN harness, not the workers' Codex harness. Previously
+    // hardcoded `mcp__cs__verification` unconditionally, which was already
+    // wrong for a Claude (or Grok) supervisor coordinating Codex workers —
+    // neither can call a `mcp__cs__`-namespaced tool from their own process.
+    // Authored here against the `mcp__cas__` baseline like every other
+    // contributor to this context buffer; `build_context_with_stores`
+    // remaps the whole assembled text to the reader's real prefix exactly
+    // once, at the end (see `remap_tool_prefix`'s doc comment).
     if role == AgentRole::Supervisor
         && std::env::var("CAS_FACTORY_WORKER_CLI")
             .map(|v| v.eq_ignore_ascii_case("codex"))
@@ -235,7 +247,7 @@ fn inject_role_guidance(
     {
         guidance.push_str(
             "\n\n## Codex Worker Coordination Note\n\
-Workers are running Codex. Be explicit in assignments: include task id, acceptance criteria, required checks, and update cadence. Require worker ACK + task start confirmation, and send corrective prompts if progress updates are missing. For task closure, Codex workers should ask you to verify and close on their behalf; you may use task-verifier or direct mcp__cs__verification.",
+Workers are running Codex. Be explicit in assignments: include task id, acceptance criteria, required checks, and update cadence. Require worker ACK + task start confirmation, and send corrective prompts if progress updates are missing. For task closure, Codex workers should ask you to verify and close on their behalf; you may use task-verifier or direct mcp__cas__verification.",
         );
     }
     *total_tokens += estimate_tokens(&guidance);
