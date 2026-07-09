@@ -16,8 +16,8 @@ pub enum ScrollAction {
     /// Control panel, or regular host-side scrollback.
     Done,
     /// The focused pane is in alt-screen mode and no overlay is suppressing
-    /// forwarding.  The caller must send the appropriate PTY escape sequence:
-    /// [`SCROLL_UP_ARROWS`] / [`SCROLL_DOWN_ARROWS`] (PgUp / PgDn) to the PTY.
+    /// forwarding.  The caller must send [`FactoryApp::alt_screen_scroll_payload`]
+    /// (harness-aware: SGR wheel for Grok, PgUp/PgDn for Claude/Codex).
     AltScreen,
 }
 
@@ -25,16 +25,53 @@ pub enum ScrollAction {
 pub const SCROLL_LINES: usize = 3;
 
 /// PgUp bytes forwarded to an alt-screen PTY on scroll-up (`\x1b[5~`).
+/// Used for Claude/Codex (cas-f93a). Grok ignores this when the prompt is
+/// focused — see [`alt_screen_wheel_bytes`].
 pub const SCROLL_UP_ARROWS: &[u8] = b"\x1b[5~";
 /// PgDn bytes forwarded to an alt-screen PTY on scroll-down (`\x1b[6~`).
 pub const SCROLL_DOWN_ARROWS: &[u8] = b"\x1b[6~";
 
+/// One SGR 1006 mouse-wheel-up event (`CSI < 64 ; col ; row M`).
+/// Button 64 = wheel up. Coordinates are 1-based; top-left content area is
+/// enough for Grok to treat the gesture as scrollback scroll (cas-d3b5).
+pub const SCROLL_UP_SGR: &[u8] = b"\x1b[<64;2;2M";
+/// One SGR 1006 mouse-wheel-down event (`CSI < 65 ; col ; row M`).
+pub const SCROLL_DOWN_SGR: &[u8] = b"\x1b[<65;2;2M";
+
 // Compile-time assertion: byte count must stay in sync with the sequences above.
 // PgUp (ESC [ 5 ~) and PgDn (ESC [ 6 ~) are each 4 bytes.
+// SGR wheel (ESC [ < 64 ; 2 ; 2 M) is 10 bytes.
 const _: () = {
     assert!(SCROLL_UP_ARROWS.len() == 4);
     assert!(SCROLL_DOWN_ARROWS.len() == 4);
+    assert!(SCROLL_UP_SGR.len() == 10);
+    assert!(SCROLL_DOWN_SGR.len() == 10);
 };
+
+/// Bytes to inject into an alt-screen PTY for one mouse-wheel tick.
+///
+/// Harness-aware (cas-d3b5):
+/// - **Grok**: SGR mouse wheel (`\x1b[<64;…M` / `\x1b[<65;…M`) × [`SCROLL_LINES`].
+///   Live PTY A/B on grok 0.2.93: when the **prompt** is focused (the default),
+///   PgUp/PgDn are no-ops, but SGR wheel scrolls the transcript. When scrollback
+///   is focused both work — SGR is therefore the safe universal Grok payload.
+/// - **Claude / Codex**: PgUp/PgDn (cas-f93a). Claude Code was verified to page
+///   its transcript on those sequences; keep that path for no-regression.
+pub fn alt_screen_wheel_bytes(cli: cas_mux::SupervisorCli, up: bool) -> Vec<u8> {
+    match cli {
+        cas_mux::SupervisorCli::Grok => {
+            let unit = if up { SCROLL_UP_SGR } else { SCROLL_DOWN_SGR };
+            unit.repeat(SCROLL_LINES)
+        }
+        cas_mux::SupervisorCli::Claude | cas_mux::SupervisorCli::Codex => {
+            if up {
+                SCROLL_UP_ARROWS.to_vec()
+            } else {
+                SCROLL_DOWN_ARROWS.to_vec()
+            }
+        }
+    }
+}
 
 impl FactoryApp {
     // ========================================================================
@@ -314,11 +351,32 @@ impl FactoryApp {
         names
     }
 
+    /// Harness of the currently focused PTY pane (supervisor or worker).
+    ///
+    /// Used by the alt-screen wheel forward path so Grok gets SGR mouse-wheel
+    /// bytes while Claude/Codex keep PgUp/PgDn (cas-d3b5).
+    pub fn focused_harness(&self) -> cas_mux::SupervisorCli {
+        match self.mux.focused_id() {
+            Some(id) => self.harness_for(id),
+            None => self.supervisor_cli,
+        }
+    }
+
+    /// PTY payload for one alt-screen wheel tick on the focused pane.
+    ///
+    /// See [`alt_screen_wheel_bytes`]. Call only after
+    /// [`handle_scroll_up`] / [`handle_scroll_down`] returned
+    /// [`ScrollAction::AltScreen`].
+    pub fn alt_screen_scroll_payload(&self, up: bool) -> Vec<u8> {
+        alt_screen_wheel_bytes(self.focused_harness(), up)
+    }
+
     /// Handle mouse scroll up.
     ///
     /// Returns [`ScrollAction::AltScreen`] when the focused pane is in
     /// alt-screen mode and no overlay suppresses forwarding — the caller must
-    /// send [`SCROLL_UP_ARROWS`] (`\x1b[5~`, PgUp) to the PTY.
+    /// send [`Self::alt_screen_scroll_payload`]`(true)` to the PTY (harness-
+    /// aware: SGR for Grok, PgUp for Claude/Codex).
     /// Returns [`ScrollAction::Done`] in all other cases (the scroll was
     /// handled internally by a dialog, sidecar, MC panel, or host scrollback).
     ///
@@ -357,8 +415,8 @@ impl FactoryApp {
     ///
     /// Mirror of [`handle_scroll_up`].  Returns [`ScrollAction::AltScreen`]
     /// when the focused pane is in alt-screen mode and no overlay suppresses
-    /// forwarding — the caller must send [`SCROLL_DOWN_ARROWS`] (`\x1b[6~`,
-    /// PgDn) to the PTY.
+    /// forwarding — the caller must send [`Self::alt_screen_scroll_payload`]
+    /// `(false)` to the PTY (harness-aware: SGR for Grok, PgDn for Claude/Codex).
     pub fn handle_scroll_down(&mut self) -> ScrollAction {
         if self.show_task_dialog {
             self.task_dialog_scroll =
@@ -1183,9 +1241,8 @@ mod tests {
 
     /// AC #3 (cas-72c3, point 1): the wheel byte constants must match the
     /// documented shape — PgUp (`\x1b[5~`) for up, PgDn (`\x1b[6~`) for
-    /// down.  The daemon forwards these literals verbatim via `mux.send_input`,
-    /// so a silent typo here would translate to a broken wheel-to-PTY forward
-    /// with no compile-time or runtime guard.
+    /// down.  The daemon forwards these literals via `alt_screen_wheel_bytes`
+    /// for Claude/Codex, so a silent typo would break wheel-to-PTY forward.
     #[test]
     fn scroll_arrow_consts_have_exact_byte_shape_cas_72c3() {
         assert_eq!(
@@ -1195,6 +1252,85 @@ mod tests {
         assert_eq!(
             SCROLL_DOWN_ARROWS, b"\x1b[6~",
             "SCROLL_DOWN_ARROWS must be the PgDn sequence (ESC [ 6 ~)"
+        );
+    }
+
+    /// cas-d3b5: SGR wheel constants + harness-aware payload selection.
+    ///
+    /// Grok prompt-focused no-ops on PgUp/PgDn but scrolls on SGR 1006 wheel
+    /// (button 64/65). Claude/Codex keep the cas-f93a PgUp/PgDn path.
+    #[test]
+    fn sgr_wheel_consts_and_harness_payloads_cas_d3b5() {
+        assert_eq!(
+            SCROLL_UP_SGR, b"\x1b[<64;2;2M",
+            "SCROLL_UP_SGR must be SGR 1006 wheel-up (button 64)"
+        );
+        assert_eq!(
+            SCROLL_DOWN_SGR, b"\x1b[<65;2;2M",
+            "SCROLL_DOWN_SGR must be SGR 1006 wheel-down (button 65)"
+        );
+
+        // Grok: SCROLL_LINES copies of the SGR unit.
+        let grok_up = alt_screen_wheel_bytes(cas_mux::SupervisorCli::Grok, true);
+        let grok_dn = alt_screen_wheel_bytes(cas_mux::SupervisorCli::Grok, false);
+        assert_eq!(grok_up, SCROLL_UP_SGR.repeat(SCROLL_LINES));
+        assert_eq!(grok_dn, SCROLL_DOWN_SGR.repeat(SCROLL_LINES));
+        assert_eq!(grok_up.len(), SCROLL_UP_SGR.len() * SCROLL_LINES);
+        assert!(
+            !grok_up.windows(4).any(|w| w == b"\x1b[5~"),
+            "Grok payload must not contain PgUp"
+        );
+
+        // Claude/Codex: single PgUp/PgDn (cas-f93a regression pin).
+        assert_eq!(
+            alt_screen_wheel_bytes(cas_mux::SupervisorCli::Claude, true),
+            SCROLL_UP_ARROWS
+        );
+        assert_eq!(
+            alt_screen_wheel_bytes(cas_mux::SupervisorCli::Claude, false),
+            SCROLL_DOWN_ARROWS
+        );
+        assert_eq!(
+            alt_screen_wheel_bytes(cas_mux::SupervisorCli::Codex, true),
+            SCROLL_UP_ARROWS
+        );
+        assert_eq!(
+            alt_screen_wheel_bytes(cas_mux::SupervisorCli::Codex, false),
+            SCROLL_DOWN_ARROWS
+        );
+    }
+
+    /// cas-d3b5: FactoryApp routes payload via focused pane harness.
+    /// `for_test` defaults supervisor_cli/worker_cli to Claude; setting
+    /// supervisor_cli=Grok and focusing the supervisor-named pane must
+    /// select the SGR payload.
+    #[test]
+    fn alt_screen_scroll_payload_follows_focused_harness_cas_d3b5() {
+        let mut app = app_with_alt_screen();
+        // Default test harness is Claude → PgUp.
+        assert_eq!(
+            app.alt_screen_scroll_payload(true),
+            SCROLL_UP_ARROWS,
+            "default Claude harness must keep PgUp"
+        );
+
+        // Point the focused pane at the supervisor name and switch harness.
+        app.supervisor_name = "test-pane".to_string();
+        app.supervisor_cli = cas_mux::SupervisorCli::Grok;
+        assert_eq!(
+            app.focused_harness(),
+            cas_mux::SupervisorCli::Grok,
+            "focused supervisor pane must resolve Grok harness"
+        );
+        assert_eq!(
+            app.alt_screen_scroll_payload(true),
+            SCROLL_UP_SGR.repeat(SCROLL_LINES),
+            "Grok focused pane must get SGR wheel-up × SCROLL_LINES"
+        );
+        assert_eq!(
+            app.alt_screen_scroll_payload(false),
+            SCROLL_DOWN_SGR.repeat(SCROLL_LINES),
+            "Grok focused pane must get SGR wheel-down × SCROLL_LINES"
         );
     }
 

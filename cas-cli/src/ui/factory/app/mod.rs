@@ -42,9 +42,12 @@ use branch_visibility::{
 // Re-export from cas-factory for backward compatibility
 pub use cas_factory::{AutoPromptConfig, EpicState, FactoryConfig};
 
-// Re-export scroll dispatch types so callers in sibling crates can use them
-// without reaching into the private `sidecar_and_selection` submodule.
-pub use sidecar_and_selection::{SCROLL_DOWN_ARROWS, SCROLL_LINES, SCROLL_UP_ARROWS, ScrollAction};
+// Re-export scroll dispatch types so callers can use them without reaching
+// into the private `sidecar_and_selection` submodule. Constants
+// (SCROLL_*_ARROWS / SCROLL_*_SGR / SCROLL_LINES) and
+// `alt_screen_wheel_bytes` remain reachable via this module's children for
+// tests; production daemon code uses `FactoryApp::alt_screen_scroll_payload`.
+pub use sidecar_and_selection::ScrollAction;
 
 /// Booting state for a worker that is being spawned (after prepare, before finish)
 #[derive(Debug, Clone)]
