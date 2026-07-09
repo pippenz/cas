@@ -1,5 +1,24 @@
 use crate::mcp::tools::core::imports::*;
 
+/// Resolve the on-disk path of a System B (`spawn_workers isolate=true`)
+/// worktree for `assignee`, if one exists.
+///
+/// `spawn_workers isolate=true` places every worker at the fixed
+/// convention `<cas_root>/worktrees/<assignee>` on branch
+/// `factory/<assignee>` — never registered in the `WorktreeStore`
+/// (System A), so `worktree_merge` needs this as a fallback lookup
+/// (cas-1d11) when the System A store misses. Returns `None` when the
+/// path doesn't exist or isn't a git worktree (no `.git` entry) — an
+/// unknowable worktree is not treated as a false positive.
+fn system_b_worktree_path(cas_root: &std::path::Path, assignee: &str) -> Option<std::path::PathBuf> {
+    let path = cas_root.join("worktrees").join(assignee);
+    if path.join(".git").exists() {
+        Some(path)
+    } else {
+        None
+    }
+}
+
 impl CasCore {
     pub async fn worktree_create(&self, epic_id: &str) -> Result<CallToolResult, McpError> {
         use crate::config::Config;
@@ -417,6 +436,17 @@ impl CasCore {
     }
 
     /// Merge worktree back to parent
+    ///
+    /// Resolves `id` against System A first (the `WorktreeStore`-tracked,
+    /// `worktrees.enabled`-gated worktrees created by `worktree_create`).
+    /// When that lookup misses, falls back to System B — the
+    /// `<cas_root>/worktrees/<assignee>` / `factory/<assignee>` convention
+    /// used by `spawn_workers isolate=true`, which is never registered in
+    /// the store and doesn't check `worktrees.enabled` at all (cas-1d11).
+    /// Without this fallback, spawn happily created isolated worktrees
+    /// while the only supervisor-callable merge action refused every one
+    /// of them — forcing a manual `git worktree add` + merge + push that
+    /// bypassed factory tracking/lease/cleanup entirely.
     pub async fn worktree_merge(&self, id: &str, force: bool) -> Result<CallToolResult, McpError> {
         use crate::config::Config;
         use crate::store::open_worktree_store;
@@ -435,22 +465,6 @@ impl CasCore {
             message: Cow::from(format!("Failed to open worktree store: {e}")),
             data: None,
         })?;
-
-        let mut worktree = match worktree_store.get(id) {
-            Ok(wt) => wt,
-            Err(_) => worktree_store
-                .get_by_branch(id)
-                .map_err(|e| McpError {
-                    code: ErrorCode::INTERNAL_ERROR,
-                    message: Cow::from(format!("Failed to get worktree: {e}")),
-                    data: None,
-                })?
-                .ok_or_else(|| McpError {
-                    code: ErrorCode::INVALID_PARAMS,
-                    message: Cow::from(format!("Worktree not found: {id}")),
-                    data: None,
-                })?,
-        };
 
         let cwd = std::env::current_dir().map_err(|e| McpError {
             code: ErrorCode::INTERNAL_ERROR,
@@ -473,6 +487,42 @@ impl CasCore {
             data: None,
         })?;
 
+        let system_a = match worktree_store.get(id) {
+            Ok(wt) => Some(wt),
+            Err(_) => worktree_store.get_by_branch(id).map_err(|e| McpError {
+                code: ErrorCode::INTERNAL_ERROR,
+                message: Cow::from(format!("Failed to get worktree: {e}")),
+                data: None,
+            })?,
+        };
+
+        let (mut worktree, is_system_b) = match system_a {
+            Some(wt) => (wt, false),
+            None => {
+                let assignee = id.strip_prefix("factory/").unwrap_or(id);
+                let path = system_b_worktree_path(&cas_root, assignee).ok_or_else(|| McpError {
+                    code: ErrorCode::INVALID_PARAMS,
+                    message: Cow::from(format!(
+                        "Worktree not found: {id} (checked System A worktree store and \
+                         the System B convention {}/worktrees/{assignee})",
+                        cas_root.display()
+                    )),
+                    data: None,
+                })?;
+                let parent_branch = Config::configured_epic_base_branch(&cwd)
+                    .unwrap_or_else(|| manager.git().detect_default_branch());
+                (
+                    crate::types::Worktree::new(
+                        format!("system-b-{assignee}"),
+                        format!("factory/{assignee}"),
+                        parent_branch,
+                        path,
+                    ),
+                    true,
+                )
+            }
+        };
+
         let merge_commit = manager
             .merge_and_cleanup(&mut worktree, force)
             .map_err(|e| McpError {
@@ -481,12 +531,16 @@ impl CasCore {
                 data: None,
             })?;
 
-        // Update store
-        worktree_store.update(&worktree).map_err(|e| McpError {
-            code: ErrorCode::INTERNAL_ERROR,
-            message: Cow::from(format!("Failed to update worktree: {e}")),
-            data: None,
-        })?;
+        // Update store — System B worktrees were never registered there, so
+        // there's no row to update (and nothing worth persisting: the
+        // git-level merge + cleanup above already happened).
+        if !is_system_b {
+            worktree_store.update(&worktree).map_err(|e| McpError {
+                code: ErrorCode::INTERNAL_ERROR,
+                message: Cow::from(format!("Failed to update worktree: {e}")),
+                data: None,
+            })?;
+        }
 
         // Promote entries if configured
         if wt_config.promote_entries_on_merge {
@@ -608,5 +662,43 @@ impl CasCore {
         }
 
         Ok(Self::success(output))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::system_b_worktree_path;
+    use tempfile::TempDir;
+
+    #[test]
+    fn system_b_worktree_path_resolves_when_git_dir_present() {
+        let temp = TempDir::new().unwrap();
+        let cas_root = temp.path().to_path_buf();
+        let wt_path = cas_root.join("worktrees").join("alice");
+        std::fs::create_dir_all(wt_path.join(".git")).unwrap();
+
+        assert_eq!(
+            system_b_worktree_path(&cas_root, "alice"),
+            Some(wt_path)
+        );
+    }
+
+    #[test]
+    fn system_b_worktree_path_none_when_directory_missing() {
+        let temp = TempDir::new().unwrap();
+        let cas_root = temp.path().to_path_buf();
+
+        assert_eq!(system_b_worktree_path(&cas_root, "ghost"), None);
+    }
+
+    #[test]
+    fn system_b_worktree_path_none_when_directory_exists_but_not_a_git_worktree() {
+        // A stray non-git directory under worktrees/ (e.g. leftover cruft)
+        // must not be mistaken for a live factory worktree.
+        let temp = TempDir::new().unwrap();
+        let cas_root = temp.path().to_path_buf();
+        std::fs::create_dir_all(cas_root.join("worktrees").join("bob")).unwrap();
+
+        assert_eq!(system_b_worktree_path(&cas_root, "bob"), None);
     }
 }
