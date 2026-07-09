@@ -162,15 +162,27 @@ impl CasCore {
             format!("Agents ({} total):\n\n", agents.len())
         };
 
+        // cas-e98e: status token comes from authoritative supervision
+        // liveness (heartbeat + OS process), not the raw registry row alone
+        // — so process-alive mid-turn workers agree with worker_status.
+        use crate::mcp::tools::service::agent_liveness::{
+            agent_list_status_label, is_live_factory_worker,
+        };
         for agent in agents.iter().take(limit) {
+            let status_label = agent_list_status_label(agent);
             output.push_str(&format!(
-                "[{}] {} - {} ({}/{}) - {} tasks\n",
-                agent.status,
+                "[{status_label}] {} - {} ({}/{}) - {} tasks\n",
                 agent.id,
                 agent.name,
                 agent.agent_type,
                 agent.role,
                 agent.active_tasks
+            ));
+        }
+        let live_worker_count = agents.iter().filter(|a| is_live_factory_worker(a)).count();
+        if live_worker_count > 0 {
+            output.push_str(&format!(
+                "\nLive factory workers (authoritative): {live_worker_count}\n"
             ));
         }
 

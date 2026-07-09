@@ -1031,6 +1031,69 @@ async fn test_worker_status_scopes_agents_to_factory_session() {
     );
 }
 
+/// cas-e98e AC2: for the same registry state, the set of live factory worker
+/// identities from `worker_status` must agree with `agent_list` effective
+/// liveness labels (active / active,alive-heartbeat-stale).
+#[tokio::test]
+async fn test_worker_status_and_agent_list_agree_on_live_workers() {
+    let _guard = EnvGuard::set(&[]);
+    let env = FactoryTestEnv::new();
+
+    env.register_worker("live-fresh");
+    let store = env.agent_store();
+
+    // Heartbeat-stale + process-alive (this test process).
+    let id_alive = Agent::generate_fallback_id();
+    let mut alive = Agent::new(id_alive.clone(), "live-stale-hb".to_string());
+    alive.role = AgentRole::Worker;
+    let staleness = chrono::Duration::seconds(40);
+    alive.last_heartbeat = chrono::Utc::now() - staleness;
+    alive.registered_at = chrono::Utc::now() - staleness;
+    alive.pid = Some(std::process::id());
+    store.register(&alive).expect("register process-alive stale-hb worker");
+
+    // Truly dead stale (no pid) — must not appear as live.
+    env.register_stale_worker_with_clone_path("dead-stale", "/tmp/cas-wt-dead", 40);
+
+    let status_text = get_text(
+        &env.service
+            .factory(Parameters(factory_req("worker_status")))
+            .await
+            .expect("worker_status"),
+    );
+    let list_req: CoordinationRequest = serde_json::from_value(serde_json::json!({
+        "action": "agent_list"
+    }))
+    .expect("CoordinationRequest");
+    let list_text = get_text(
+        &env.service
+            .coordination(Parameters(list_req))
+            .await
+            .expect("agent_list"),
+    );
+
+    // Live identities from worker_status (named bullets).
+    for name in ["live-fresh", "live-stale-hb"] {
+        assert!(
+            status_text.contains(name),
+            "worker_status must list {name}. Got:\n{status_text}"
+        );
+        assert!(
+            list_text.contains(name),
+            "agent_list must list {name}. Got:\n{list_text}"
+        );
+    }
+    assert!(
+        list_text.contains("active,alive-heartbeat-stale")
+            || status_text.contains("alive") && status_text.contains("heartbeat stale"),
+        "dual-signal must appear for process-alive stale-hb worker.\nstatus:\n{status_text}\nlist:\n{list_text}"
+    );
+    assert!(
+        !status_text.contains("dead-stale"),
+        "dead worker must not be in worker_status Active roster. Got:\n{status_text}"
+    );
+}
+
 /// cas-3e56: heartbeat past WORKER_STALE_SECS but registered harness PID still
 /// alive → worker_status must keep the worker listed as active with the
 /// "[alive — heartbeat stale]" dual-signal, never omit as "None active".

@@ -1102,6 +1102,7 @@ impl CasService {
 // ============================================================================
 
 mod agent_search_system;
+pub(crate) mod agent_liveness;
 mod core;
 pub(crate) mod factory_ops;
 mod factory_remind;
