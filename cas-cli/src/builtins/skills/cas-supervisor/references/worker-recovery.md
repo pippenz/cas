@@ -1,5 +1,18 @@
 # Worker Recovery — Triage and Failure Modes
 
+## Authoritative liveness (cas-e98e)
+
+`worker_status`, `agent_list`, and the FACTORY pane share one dual-signal classifier:
+
+> **Live = (Active/Idle + heartbeat &lt; 30s) OR live OS harness process for that agent.**
+
+**Authoritative for shutdown / re-spawn decisions:**
+
+1. **OS process** (highest) — if Grok/Claude/Codex is still running, the worker is alive even when heartbeat lagged (`[alive — heartbeat stale]` / `active,alive-heartbeat-stale`). Do **not** shut down, unregister, or re-spawn.
+2. **Heartbeat freshness** — within ~30s → live. Past that with no process → not live.
+3. **Supporting:** last activity / transcript age, worktree dirty, active leases, `is-wedged`.
+4. **Never** act on `Workers: None active` or `Filtered stale` alone — confirm `ps`/worktree/`is-wedged` first (cas-3e56 residual: false-empty roster nearly killed mid-turn Grok). Use `gc_cleanup` to purge dead registry rows.
+
 ## Is the worker actually dead? (cas-4513 triage)
 
 Before you run `shutdown_workers` on a pane that *looks* broken, spend 60 seconds on triage. The supervisor TUI is not ground truth for worker liveness — the most common false-positive failure mode is a worker that's mid-way through a long tool call or showing Claude Code's Bun/React-Ink crash screen (which leaves the process alive with an unresponsive UI). Destructive recovery on a live worker rips its worktree out from under itself and turns a recoverable hang into a real crash.
