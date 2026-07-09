@@ -113,10 +113,21 @@ pub struct ResolvedBase {
     /// could not be resolved, e.g. base branch doesn't exist locally yet).
     pub sha: String,
     /// Commits the local `<base>` branch was behind `origin/<base>` at
-    /// resolution time. Always 0 when `used_remote` is false.
+    /// resolution time. Can be nonzero even when `used_remote` is false —
+    /// on true divergence (local carries commits origin lacks AND origin
+    /// carries commits local lacks) the local ref is preferred to avoid
+    /// silently dropping the caller's own commits, but the origin-only
+    /// commits this represents are still worth surfacing (cas-0938).
     pub behind_count: u32,
+    /// Commits the local `<base>` branch was ahead of `origin/<base>` at
+    /// resolution time (unpushed local-only commits). Always 0 when
+    /// `used_remote` is true (cas-0938 — resolve_fresh_base previously took
+    /// `origin/<base>` unconditionally whenever it existed, silently
+    /// dropping these on a local-ahead or diverged base).
+    pub ahead_count: u32,
     /// Whether `branch_ref` points at the fetched remote tracking branch
-    /// (true) or fell back to the local branch (false).
+    /// (true) or fell back to the local branch (false — offline, no
+    /// remote, remote ref missing, OR local carries commits origin lacks).
     pub used_remote: bool,
 }
 

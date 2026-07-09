@@ -54,7 +54,7 @@ impl CasService {
             Self::error(ErrorCode::INVALID_PARAMS, "id is required for merge action")
         })?;
         self.inner
-            .worktree_merge(&id, req.force.unwrap_or(false))
+            .worktree_merge(&id, req.force.unwrap_or(false), req.task_id.as_deref())
             .await
     }
 
