@@ -10,7 +10,7 @@
 
 use crate::support::*;
 use cas::mcp::tools::*;
-use cas::mcp::CasService;
+use cas::mcp::{CasCore, CasService};
 use cas::store::open_task_store;
 use cas::types::TaskStatus;
 use rmcp::handler::server::wrapper::Parameters;
