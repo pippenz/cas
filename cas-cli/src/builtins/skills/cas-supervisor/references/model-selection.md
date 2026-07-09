@@ -23,11 +23,69 @@ Capacity backups (not preferred defaults): when Grok quota is tight, Codex works
 
 Token-heavy read-only investigation belongs in a `cas-codex-exec` shell-out, not a worker and not your own context window.
 
-Model slugs:
+### Model slug table
 
-- **Grok** (`cli=grok`): ids from `grok models` — currently `grok-4.5` (default) and `grok-composer-2.5-fast`. Pass Composer only as `model=grok-composer-2.5-fast` on `cli=grok`.
-- **Claude**: `sonnet` / `opus` / `haiku` aliases.
-- **Codex**: plain `gpt-5.5` — `-codex`-suffixed slugs are rejected by the API.
+| `cli=` | Accepted `model=` slugs | Notes |
+|---|---|---|
+| `grok` | `grok-4.5`, `grok-composer-2.5-fast` | From live `grok models`. Composer is a **model id on the Grok harness** — never invent `cli=cursor`. |
+| `claude` | `sonnet`, `opus`, `haiku` (full Anthropic ids also ok) | Aliases preferred in factory docs. |
+| `codex` | `gpt-5.5` | Plain slug only — `-codex`-suffixed slugs are rejected by the API. |
+
+### Effort vocabulary (CAS-wide)
+
+Accepted values: `minimal` \| `low` \| `medium` \| `high` \| `xhigh` (alias `x-high`).
+
+How each backend receives them:
+
+| Backend | Flag / config |
+|---|---|
+| Claude | `--effort <level>` |
+| Codex | `--config model_reasoning_effort=<level>` |
+| Grok | `--reasoning-effort <level>` |
+
+For multi-step Claude workers, `effort=high` is the practical ceiling — do not reach for `xhigh`/`max` on long agent loops (overthink + cost). Grok 4.5 uses `medium` (standard) and `high` (heavy). Light Composer is model-id tiering; `effort=` optional.
+
+## Spawn cookbook (all three harnesses)
+
+Copy-paste `spawn_workers` recipes. Examples below use this harness's coordination tool prefix. Worker `cli=`/`model=`/`effort=` are independent of which harness the supervisor runs on — `cli=grok` works from Claude, Codex, or Grok supervisors alike.
+
+### Grok workers (stock floor + light Composer)
+
+```
+# standard floor
+mcp__cas__coordination action=spawn_workers count=2 isolate=true cli=grok model=grok-4.5 effort=medium
+
+# light / flash — Composer model id on cli=grok
+mcp__cas__coordination action=spawn_workers count=1 isolate=true cli=grok model=grok-composer-2.5-fast worker_names="lt-ada"
+
+# heavy
+mcp__cas__coordination action=spawn_workers count=1 isolate=true cli=grok model=grok-4.5 effort=high worker_names="hv-ada"
+```
+
+### Claude workers (taste / frontier / escalate)
+
+```
+# taste / judgment (not default heavy)
+mcp__cas__coordination action=spawn_workers count=1 isolate=true cli=claude model=sonnet effort=high worker_names="sn-ada"
+
+# frontier
+mcp__cas__coordination action=spawn_workers count=1 isolate=true cli=claude model=opus effort=high worker_names="fr-ada"
+
+# optional tiny Claude-only lane
+mcp__cas__coordination action=spawn_workers count=1 isolate=true cli=claude model=haiku effort=low worker_names="hk-ada"
+```
+
+### Codex workers (capacity backup when Grok quota is tight)
+
+```
+# bulk / light backup
+mcp__cas__coordination action=spawn_workers count=2 isolate=true cli=codex model=gpt-5.5 effort=low
+
+# standard backup
+mcp__cas__coordination action=spawn_workers count=2 isolate=true cli=codex model=gpt-5.5 effort=medium
+```
+
+Parameter table and field names: [reference.md](reference.md#spawn_workers-parameters).
 
 ## Routing Axes
 
