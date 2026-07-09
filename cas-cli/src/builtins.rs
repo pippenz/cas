@@ -602,6 +602,220 @@ pub const CODEX_BUILTIN_SKILLS: &[BuiltinFile] = &[
     },
 ];
 
+/// All built-in agents managed by CAS for Grok (EPIC cas-8888, Phase 5 /
+/// cas-6f46). Derived from the Claude set (`BUILTIN_AGENTS`), not the Codex
+/// one: Grok's capability tier matches Claude's (hooks + subagents +
+/// textbox-submit all supported), so the Claude agent prompts are the
+/// correct behavioral starting point. Only the tool prefix changes
+/// (`mcp__cas__` → `cas__` — Grok namespaces MCP tools as `<server>__<tool>`
+/// via its own search_tool/use_tool dispatch, with no `mcp__` wrapper).
+pub const GROK_BUILTIN_AGENTS: &[BuiltinFile] = &[
+    BuiltinFile {
+        path: "agents/task-verifier.md",
+        content: include_str!("builtins/grok/agents/task-verifier.md"),
+    },
+    BuiltinFile {
+        path: "agents/learning-reviewer.md",
+        content: include_str!("builtins/grok/agents/learning-reviewer.md"),
+    },
+    BuiltinFile {
+        path: "agents/rule-reviewer.md",
+        content: include_str!("builtins/grok/agents/rule-reviewer.md"),
+    },
+    BuiltinFile {
+        path: "agents/duplicate-detector.md",
+        content: include_str!("builtins/grok/agents/duplicate-detector.md"),
+    },
+    BuiltinFile {
+        path: "agents/session-summarizer.md",
+        content: include_str!("builtins/grok/agents/session-summarizer.md"),
+    },
+    // DEPRECATED (Phase 1 subsystem A, EPIC cas-0750): see the note on the
+    // claude-mirror entry in BUILTIN_AGENTS. Kept only so `cas sync`
+    // overwrites stale downstream copies with the deprecation stub.
+    BuiltinFile {
+        path: "agents/code-reviewer.md",
+        content: include_str!("builtins/grok/agents/code-reviewer.md"),
+    },
+    BuiltinFile {
+        path: "agents/git-history-analyzer.md",
+        content: include_str!("builtins/grok/agents/git-history-analyzer.md"),
+    },
+    BuiltinFile {
+        path: "agents/issue-intelligence-analyst.md",
+        content: include_str!("builtins/grok/agents/issue-intelligence-analyst.md"),
+    },
+];
+
+/// All built-in skills managed by CAS for Grok (EPIC cas-8888, Phase 5 /
+/// cas-6f46).
+///
+/// Deliberately a SUBSET of the full Claude/Codex catalogs — the priority
+/// twins named in the task: cas-worker, cas-supervisor (+ its references
+/// and the cas-c093/cas-edf4 model-tiering rule), cas-supervisor-checklist,
+/// cas-code-review, cas-task-tracking, cas-memory-management, plus
+/// verify-before-claim (a hard dependency of cas-worker's close step).
+/// Grok reads `~/.claude` skills natively too, so the non-priority skills
+/// remain available there; this set only needs to cover what a Grok
+/// worker/supervisor session actually depends on to operate correctly.
+///
+/// Tool-prefix content is modeled on the Claude originals (matching
+/// capability tier — hooks/subagents/textbox-submit all supported, unlike
+/// Codex) with `mcp__cas__` swapped for `cas__`. The supervisor checklist
+/// specifically is built from the Claude version (not Codex's "no hooks"
+/// compensation variant), since Grok has real SessionStart hooks like
+/// Claude does.
+pub const GROK_BUILTIN_SKILLS: &[BuiltinFile] = &[
+    BuiltinFile {
+        path: "skills/cas-worker/SKILL.md",
+        content: include_str!("builtins/grok/skills/cas-worker.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-worker/references/close-gate.md",
+        content: include_str!("builtins/grok/skills/cas-worker/references/close-gate.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-worker/references/recovery.md",
+        content: include_str!("builtins/grok/skills/cas-worker/references/recovery.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-worker/references/details.md",
+        content: include_str!("builtins/grok/skills/cas-worker/references/details.md"),
+    },
+    BuiltinFile {
+        path: "skills/verify-before-claim/SKILL.md",
+        content: include_str!("builtins/grok/skills/verify-before-claim/SKILL.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-supervisor/SKILL.md",
+        content: include_str!("builtins/grok/skills/cas-supervisor.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-supervisor/references/preflight.md",
+        content: include_str!("builtins/grok/skills/cas-supervisor/references/preflight.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-supervisor/references/intake.md",
+        content: include_str!("builtins/grok/skills/cas-supervisor/references/intake.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-supervisor/references/planning.md",
+        content: include_str!("builtins/grok/skills/cas-supervisor/references/planning.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-supervisor/references/workflow.md",
+        content: include_str!("builtins/grok/skills/cas-supervisor/references/workflow.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-supervisor/references/model-selection.md",
+        content: include_str!("builtins/grok/skills/cas-supervisor/references/model-selection.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-supervisor/references/worker-recovery.md",
+        content: include_str!("builtins/grok/skills/cas-supervisor/references/worker-recovery.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-supervisor/references/reference.md",
+        content: include_str!("builtins/grok/skills/cas-supervisor/references/reference.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-supervisor/references/code-review-queue.md",
+        content: include_str!(
+            "builtins/grok/skills/cas-supervisor/references/code-review-queue.md"
+        ),
+    },
+    BuiltinFile {
+        path: "skills/cas-supervisor/references/filing-cas-bugs.md",
+        content: include_str!("builtins/grok/skills/cas-supervisor/references/filing-cas-bugs.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-supervisor-checklist/SKILL.md",
+        content: include_str!("builtins/grok/skills/cas-supervisor-checklist.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-task-tracking/SKILL.md",
+        content: include_str!("builtins/grok/skills/cas-task-tracking.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-memory-management/SKILL.md",
+        content: include_str!("builtins/grok/skills/cas-memory-management/SKILL.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-memory-management/references/schema.yaml",
+        content: include_str!("builtins/grok/skills/cas-memory-management/references/schema.yaml"),
+    },
+    BuiltinFile {
+        path: "skills/cas-memory-management/references/body-templates.md",
+        content: include_str!(
+            "builtins/grok/skills/cas-memory-management/references/body-templates.md"
+        ),
+    },
+    BuiltinFile {
+        path: "skills/cas-memory-management/references/overlap-detection.md",
+        content: include_str!(
+            "builtins/grok/skills/cas-memory-management/references/overlap-detection.md"
+        ),
+    },
+    BuiltinFile {
+        path: "skills/cas-code-review/SKILL.md",
+        content: include_str!("builtins/grok/skills/cas-code-review/SKILL.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-code-review/references/findings-schema.md",
+        content: include_str!("builtins/grok/skills/cas-code-review/references/findings-schema.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-code-review/references/fixer.md",
+        content: include_str!("builtins/grok/skills/cas-code-review/references/fixer.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-code-review/references/personas/adversarial.md",
+        content: include_str!(
+            "builtins/grok/skills/cas-code-review/references/personas/adversarial.md"
+        ),
+    },
+    BuiltinFile {
+        path: "skills/cas-code-review/references/personas/correctness.md",
+        content: include_str!(
+            "builtins/grok/skills/cas-code-review/references/personas/correctness.md"
+        ),
+    },
+    BuiltinFile {
+        path: "skills/cas-code-review/references/personas/fallow.md",
+        content: include_str!("builtins/grok/skills/cas-code-review/references/personas/fallow.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-code-review/references/personas/maintainability.md",
+        content: include_str!(
+            "builtins/grok/skills/cas-code-review/references/personas/maintainability.md"
+        ),
+    },
+    BuiltinFile {
+        path: "skills/cas-code-review/references/personas/performance.md",
+        content: include_str!(
+            "builtins/grok/skills/cas-code-review/references/personas/performance.md"
+        ),
+    },
+    BuiltinFile {
+        path: "skills/cas-code-review/references/personas/project-standards.md",
+        content: include_str!(
+            "builtins/grok/skills/cas-code-review/references/personas/project-standards.md"
+        ),
+    },
+    BuiltinFile {
+        path: "skills/cas-code-review/references/personas/security.md",
+        content: include_str!(
+            "builtins/grok/skills/cas-code-review/references/personas/security.md"
+        ),
+    },
+    BuiltinFile {
+        path: "skills/cas-code-review/references/personas/testing.md",
+        content: include_str!(
+            "builtins/grok/skills/cas-code-review/references/personas/testing.md"
+        ),
+    },
+];
+
 /// Check if a file is managed by CAS (has `managed_by: cas` in frontmatter)
 pub fn is_managed_by_cas(content: &str) -> bool {
     // Check frontmatter for managed_by: cas
@@ -826,6 +1040,11 @@ pub fn sync_all_codex_builtins(codex_dir: &Path) -> std::io::Result<SyncResult> 
     sync_all_builtins_inner(codex_dir, CODEX_BUILTIN_AGENTS, CODEX_BUILTIN_SKILLS)
 }
 
+/// Sync all built-in files to .grok/ directory (EPIC cas-8888, Phase 5).
+pub fn sync_all_grok_builtins(grok_dir: &Path) -> std::io::Result<SyncResult> {
+    sync_all_builtins_inner(grok_dir, GROK_BUILTIN_AGENTS, GROK_BUILTIN_SKILLS)
+}
+
 /// Sync all built-ins for a specific harness.
 pub fn sync_all_builtins_for_harness(
     harness: SupervisorCli,
@@ -834,6 +1053,9 @@ pub fn sync_all_builtins_for_harness(
     match harness {
         SupervisorCli::Claude => sync_all_builtins(target_dir),
         SupervisorCli::Codex => sync_all_codex_builtins(target_dir),
+        // EPIC cas-8888 (cas-6f46, Phase 5): dedicated GROK_BUILTIN_AGENTS/
+        // GROK_BUILTIN_SKILLS set, cas__-prefixed (no mcp__ wrapper).
+        SupervisorCli::Grok => sync_all_grok_builtins(target_dir),
     }
 }
 
@@ -928,6 +1150,7 @@ pub fn prune_stale_user_skills_for_harness(
     let builtins = match harness {
         SupervisorCli::Claude => BUILTIN_SKILLS,
         SupervisorCli::Codex => CODEX_BUILTIN_SKILLS,
+        SupervisorCli::Grok => GROK_BUILTIN_SKILLS,
     };
     let keep = builtin_skill_dir_names(builtins);
     prune_stale_cas_skill_dirs(&harness_dir.join("skills"), &keep)
@@ -1012,6 +1235,27 @@ pub fn preview_all_codex_builtins(codex_dir: &Path) -> std::io::Result<Vec<Built
     Ok(changes)
 }
 
+/// Preview all Grok built-in file changes (dry-run mode) (EPIC cas-8888,
+/// Phase 5).
+pub fn preview_all_grok_builtins(grok_dir: &Path) -> std::io::Result<Vec<BuiltinChange>> {
+    let mut changes = Vec::new();
+
+    let all_builtins = GROK_BUILTIN_AGENTS.iter().chain(GROK_BUILTIN_SKILLS.iter());
+
+    for builtin in all_builtins {
+        if let Some((old, new)) = preview_builtin(builtin, grok_dir)? {
+            changes.push(BuiltinChange {
+                path: builtin.path.to_string(),
+                old_content: old.clone(),
+                new_content: new,
+                is_new: old.is_empty(),
+            });
+        }
+    }
+
+    Ok(changes)
+}
+
 /// Preview all built-ins for a specific harness.
 pub fn preview_all_builtins_for_harness(
     harness: SupervisorCli,
@@ -1020,6 +1264,7 @@ pub fn preview_all_builtins_for_harness(
     match harness {
         SupervisorCli::Claude => preview_all_builtins(target_dir),
         SupervisorCli::Codex => preview_all_codex_builtins(target_dir),
+        SupervisorCli::Grok => preview_all_grok_builtins(target_dir),
     }
 }
 
@@ -1887,7 +2132,9 @@ This is the body content."#;
         // are sync-mirrored by `cas update`. Drift between them silently
         // produces a different classifier prompt on whichever harness
         // reads the stale copy — exactly the failure mode cas-ec8f traced
-        // in cas-code-review. Pin byte-identity at the source.
+        // in cas-code-review. Pin content-identity at the source, modulo
+        // the intentional per-harness tool prefix (cas-2c61: the codex
+        // copy correctly uses mcp__cs__, not Claude's mcp__cas__).
         let claude = BUILTIN_SKILLS
             .iter()
             .find(|b| b.path == "skills/session-learn/SKILL.md")
@@ -1897,9 +2144,11 @@ This is the body content."#;
             .find(|b| b.path == "skills/session-learn/SKILL.md")
             .expect("CODEX_BUILTIN_SKILLS missing session-learn SKILL.md");
         assert_eq!(
-            claude.content, codex.content,
-            "session-learn SKILL.md .claude and .codex copies must be byte-identical; \
-             drift here produces a divergent classifier prompt across harnesses",
+            claude.content.replace("mcp__cas__", "mcp__cs__"),
+            codex.content,
+            "session-learn SKILL.md .claude and .codex copies must be identical apart from \
+             the mcp__cas__/mcp__cs__ tool prefix; drift here produces a divergent \
+             classifier prompt across harnesses",
         );
     }
 
@@ -1908,7 +2157,9 @@ This is the body content."#;
         // The .claude and .codex builtin copies of cas-code-review/SKILL.md
         // are sync-mirrored by `cas update`. Drift between them
         // re-introduces the cas-ec8f regression on whichever harness reads
-        // the stale copy — guard against that at the source.
+        // the stale copy — guard against that at the source, modulo the
+        // intentional per-harness tool prefix (cas-2c61: the codex copy
+        // correctly uses mcp__cs__, not Claude's mcp__cas__).
         let claude = BUILTIN_SKILLS
             .iter()
             .find(|b| b.path == "skills/cas-code-review/SKILL.md")
@@ -1918,9 +2169,11 @@ This is the body content."#;
             .find(|b| b.path == "skills/cas-code-review/SKILL.md")
             .expect("CODEX_BUILTIN_SKILLS missing cas-code-review SKILL.md");
         assert_eq!(
-            claude.content, codex.content,
-            "cas-code-review SKILL.md .claude and .codex copies must be byte-identical; \
-             drift here re-opens cas-ec8f on the harness reading the stale copy",
+            claude.content.replace("mcp__cas__", "mcp__cs__"),
+            codex.content,
+            "cas-code-review SKILL.md .claude and .codex copies must be identical apart \
+             from the mcp__cas__/mcp__cs__ tool prefix; drift here re-opens cas-ec8f on \
+             the harness reading the stale copy",
         );
     }
 
@@ -2400,9 +2653,10 @@ This is the body content."#;
     }
 
     /// cas-6219: the supervisor's model-selection rubric must be registered on
-    /// both surfaces, stay byte-identical across mirrors (reference files carry
-    /// no alias divergence today — cas-62ab owns the eventual mcp__cs__ sweep),
-    /// and remain discoverable from the skill body that fits the 8 KB cap.
+    /// both surfaces, stay content-identical across mirrors modulo the
+    /// intentional per-harness tool prefix (cas-2c61/cas-62ab: the codex copy
+    /// correctly uses mcp__cs__, not Claude's mcp__cas__), and remain
+    /// discoverable from the skill body that fits the 8 KB cap.
     #[test]
     fn test_supervisor_model_selection_reference_registered_and_mirrored() {
         let claude = BUILTIN_SKILLS
@@ -2414,8 +2668,10 @@ This is the body content."#;
             .find(|b| b.path == "skills/cas-supervisor/references/model-selection.md")
             .expect("CODEX_BUILTIN_SKILLS missing cas-supervisor model-selection.md");
         assert_eq!(
-            claude.content, codex.content,
-            "model-selection.md .claude and .codex copies must be byte-identical",
+            claude.content.replace("mcp__cas__", "mcp__cs__"),
+            codex.content,
+            "model-selection.md .claude and .codex copies must be identical apart from \
+             the mcp__cas__/mcp__cs__ tool prefix",
         );
         // The four tiers and the escalation rule are the contract of the rubric.
         for required in [
@@ -2472,9 +2728,14 @@ This is the body content."#;
                 .iter()
                 .find(|b| b.path == path)
                 .unwrap_or_else(|| panic!("CODEX_BUILTIN_SKILLS missing {path}"));
+            // cas-2c61/cas-62ab: identical modulo the intentional per-harness
+            // tool prefix — the codex copy correctly uses mcp__cs__, not
+            // Claude's mcp__cas__.
             assert_eq!(
-                claude.content, codex.content,
-                "{path} .claude and .codex copies must be byte-identical",
+                claude.content.replace("mcp__cas__", "mcp__cs__"),
+                codex.content,
+                "{path} .claude and .codex copies must be identical apart from the \
+                 mcp__cas__/mcp__cs__ tool prefix",
             );
         }
 
@@ -2819,4 +3080,216 @@ This is the body content."#;
             "task-verifier.md should be created by sync_all_codex_builtins"
         );
     }
+
+    /// cas-2c61: every Codex builtin (agent or skill) must reference the
+    /// codex-aliased tool prefix `mcp__cs__` (per
+    /// `SupervisorCli::Codex.capabilities().tool_prefix`), never `mcp__cas__`
+    /// (Claude's prefix). A codex worker/supervisor following a skill that
+    /// carries the wrong prefix calls a tool name that doesn't resolve.
+    /// Anti-drift guard mirroring the Grok corpus check (cas-6f46).
+    #[test]
+    fn test_codex_builtins_never_reference_claude_tool_prefix() {
+        for builtin in CODEX_BUILTIN_SKILLS.iter().chain(CODEX_BUILTIN_AGENTS.iter()) {
+            assert!(
+                !builtin.content.contains("mcp__cas__"),
+                "{} must not reference mcp__cas__ (Claude's prefix) — Codex uses mcp__cs__",
+                builtin.path
+            );
+        }
+    }
+
+    // =========================================================================
+    // EPIC cas-8888 (cas-6f46, Phase 5): Grok config wiring + skill twins
+    // =========================================================================
+
+    #[test]
+    fn test_sync_all_grok_builtins_includes_agents_and_skills() {
+        use tempfile::tempdir;
+
+        let temp = tempdir().unwrap();
+        let grok_dir = temp.path().join(".grok");
+        std::fs::create_dir_all(&grok_dir).unwrap();
+
+        let result = sync_all_grok_builtins(&grok_dir).unwrap();
+
+        assert!(
+            result.agents_updated > 0,
+            "sync_all_grok_builtins should sync agents"
+        );
+        assert!(
+            result.skills_updated > 0,
+            "sync_all_grok_builtins should sync skills"
+        );
+
+        assert!(
+            grok_dir.join("agents/task-verifier.md").exists(),
+            "task-verifier.md should be created by sync_all_grok_builtins"
+        );
+        assert!(
+            grok_dir.join("skills/cas-worker/SKILL.md").exists(),
+            "cas-worker/SKILL.md should be created by sync_all_grok_builtins"
+        );
+        assert!(
+            grok_dir.join("skills/cas-supervisor/SKILL.md").exists(),
+            "cas-supervisor/SKILL.md should be created by sync_all_grok_builtins"
+        );
+        assert!(
+            grok_dir
+                .join("skills/cas-supervisor-checklist/SKILL.md")
+                .exists(),
+            "cas-supervisor-checklist/SKILL.md should be created by sync_all_grok_builtins"
+        );
+    }
+
+    #[test]
+    fn test_sync_all_builtins_for_harness_routes_grok_to_grok_set() {
+        use tempfile::tempdir;
+
+        let temp = tempdir().unwrap();
+        let target = temp.path().join(".grok");
+        std::fs::create_dir_all(&target).unwrap();
+
+        let result = sync_all_builtins_for_harness(SupervisorCli::Grok, &target).unwrap();
+
+        assert!(result.agents_updated > 0);
+        assert!(result.skills_updated > 0);
+        assert!(target.join("skills/cas-worker/SKILL.md").exists());
+    }
+
+    #[test]
+    fn test_preview_all_builtins_for_harness_routes_grok_to_grok_set() {
+        use tempfile::tempdir;
+
+        let temp = tempdir().unwrap();
+        let target = temp.path().join(".grok");
+        std::fs::create_dir_all(&target).unwrap();
+
+        // Target is empty, so every builtin is a "new" change.
+        let changes = preview_all_builtins_for_harness(SupervisorCli::Grok, &target).unwrap();
+
+        assert!(!changes.is_empty(), "expected preview changes on an empty target");
+        assert!(changes.iter().all(|c| c.is_new));
+        assert!(
+            changes
+                .iter()
+                .any(|c| c.path == "skills/cas-worker/SKILL.md")
+        );
+    }
+
+    #[test]
+    fn test_prune_stale_user_skills_for_harness_uses_grok_skill_set() {
+        use tempfile::tempdir;
+
+        let temp = tempdir().unwrap();
+        let grok_dir = temp.path().join(".grok");
+        std::fs::create_dir_all(&grok_dir).unwrap();
+
+        // Sync first so the real builtin dirs exist and are correctly kept...
+        sync_all_grok_builtins(&grok_dir).unwrap();
+
+        // ...then plant a stale, unmanaged cas-* orphan that isn't part of
+        // GROK_BUILTIN_SKILLS and confirm it gets pruned, while a real
+        // builtin dir (cas-worker) survives.
+        let orphan_dir = grok_dir.join("skills").join("cas-orphan-skill");
+        std::fs::create_dir_all(&orphan_dir).unwrap();
+        std::fs::write(orphan_dir.join("SKILL.md"), "not managed by cas").unwrap();
+
+        let removed =
+            prune_stale_user_skills_for_harness(SupervisorCli::Grok, &grok_dir).unwrap();
+
+        assert!(
+            removed.contains(&"cas-orphan-skill".to_string()),
+            "expected cas-orphan-skill to be pruned, got: {removed:?}"
+        );
+        assert!(
+            grok_dir.join("skills/cas-worker").exists(),
+            "a real Grok builtin skill dir must survive pruning"
+        );
+    }
+
+    /// cas-6f46: every Grok skill twin must use the `cas__` tool prefix —
+    /// never `mcp__cas__` (Claude) or `mcp__cs__` (Codex). A Grok worker
+    /// copying tool-call syntax from a skill with the wrong prefix gets a
+    /// tool-not-found error instead of a working call.
+    #[test]
+    fn test_grok_builtin_skills_never_reference_mcp_wrapped_tool_names() {
+        for builtin in GROK_BUILTIN_SKILLS.iter().chain(GROK_BUILTIN_AGENTS.iter()) {
+            assert!(
+                !builtin.content.contains("mcp__cas__"),
+                "{} must not reference mcp__cas__ (Claude's prefix) — Grok uses cas__",
+                builtin.path
+            );
+            assert!(
+                !builtin.content.contains("mcp__cs__"),
+                "{} must not reference mcp__cs__ (Codex's prefix) — Grok uses cas__",
+                builtin.path
+            );
+        }
+    }
+
+    /// cas-6f46 AC: "a grok worker following its cas-worker twin can call
+    /// cas__task successfully" — the twin must actually reference the
+    /// cas__ prefixed tool names a Grok worker needs for its core workflow.
+    #[test]
+    fn test_grok_worker_skill_references_cas_prefixed_tools() {
+        let worker = GROK_BUILTIN_SKILLS
+            .iter()
+            .find(|b| b.path == "skills/cas-worker/SKILL.md")
+            .expect("GROK_BUILTIN_SKILLS missing cas-worker/SKILL.md");
+
+        for required in ["cas__task", "cas__coordination"] {
+            assert!(
+                worker.content.contains(required),
+                "grok cas-worker skill missing required tool reference: {required:?}"
+            );
+        }
+    }
+
+    /// cas-6f46: the Grok supervisor twin must carry the same deliberate
+    /// model-tiering rule as the Claude (cas-c093) and Codex (cas-edf4)
+    /// copies — the whole point of mirroring it a third time is to close
+    /// this exact fleet-default footgun for every harness.
+    #[test]
+    fn test_grok_supervisor_skill_carries_model_tiering_rule() {
+        let supervisor = GROK_BUILTIN_SKILLS
+            .iter()
+            .find(|b| b.path == "skills/cas-supervisor/SKILL.md")
+            .expect("GROK_BUILTIN_SKILLS missing cas-supervisor/SKILL.md");
+
+        for keyword in [
+            "Tier every spawn",
+            "never fleet-default",
+            "light",
+            "standard",
+            "heavy",
+            "frontier",
+        ] {
+            assert!(
+                supervisor.content.contains(keyword),
+                "grok cas-supervisor skill missing tiering-rule keyword: {keyword:?}"
+            );
+        }
+    }
+
+    /// cas-6f46: the Grok supervisor checklist must be modeled on the
+    /// Claude version (real SessionStart hooks), not Codex's "no hooks"
+    /// compensation variant — Grok's capability tier matches Claude's.
+    #[test]
+    fn test_grok_supervisor_checklist_is_not_the_no_hooks_variant() {
+        let checklist = GROK_BUILTIN_SKILLS
+            .iter()
+            .find(|b| b.path == "skills/cas-supervisor-checklist/SKILL.md")
+            .expect("GROK_BUILTIN_SKILLS missing cas-supervisor-checklist/SKILL.md");
+
+        assert!(
+            !checklist.content.to_lowercase().contains("no hooks"),
+            "grok checklist must not carry Codex's no-hooks-compensation framing — \
+             Grok has real SessionStart hooks like Claude"
+        );
+        assert!(
+            !checklist.content.contains("Compensates for missing hooks"),
+            "grok checklist description must not claim to compensate for missing hooks"
+        );
+    }
+
 }

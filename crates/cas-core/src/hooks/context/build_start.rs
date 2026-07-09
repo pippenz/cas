@@ -3,8 +3,8 @@ use crate::hooks::config::HooksConfig;
 use crate::hooks::context::{
     BasicContextScorer, ContextItem, ContextQuery, ContextScorer, ContextStats, ContextStores,
     SurfacedItemCallback, USAGE_REMINDER, estimate_tokens, format_category_badge, merge_entries,
-    merge_rules, merge_skills, render_factory_coordination, render_normal_coordination,
-    rule_matches_path, token_display,
+    merge_rules, merge_skills, remap_tool_prefix, render_factory_coordination,
+    render_normal_coordination, rule_matches_path, token_display,
 };
 use crate::hooks::types::HookInput;
 use cas_types::{
@@ -18,12 +18,22 @@ use std::collections::HashSet;
 /// - Shows summaries with token estimates
 /// - Full content available via `cas show <id>`
 /// - Allows Claude to decide what to fetch based on relevance
+///
+/// `tool_prefix` is the READER's own MCP tool-call prefix (`mcp__cas__` for
+/// Claude, `mcp__cs__` for Codex, `cas__` for Grok — see
+/// `harness_policy::own_tool_prefix` in `cas-cli`, the canonical caller-side
+/// source of this value). Every `mcp__cas__`-prefixed tool mention this
+/// function assembles is remapped to `tool_prefix` exactly once, at the very
+/// end, via `remap_tool_prefix` — see that function's doc comment for why a
+/// single end-of-function pass replaced the old per-site `input.source ==
+/// "codex"` closure (cas-fd9f).
 pub fn build_context_with_stores(
     input: &HookInput,
     stores: &ContextStores,
     config: &dyn HooksConfig,
     limit: usize,
     on_surfaced: Option<&SurfacedItemCallback>,
+    tool_prefix: &str,
 ) -> Result<(String, ContextStats), CoreError> {
     let token_budget = config.token_budget();
     let mcp_enabled = config.mcp_enabled();
@@ -50,17 +60,9 @@ pub fn build_context_with_stores(
     let mut available_ready_tasks_tokens = 0usize;
     let mut available_memories = 0usize;
     let mut available_memories_tokens = 0usize;
-    let use_cs_alias = input.source.as_deref() == Some("codex");
-    let remap_aliases = |s: &str| {
-        if use_cs_alias {
-            s.replace("mcp__cas__", "mcp__cs__")
-        } else {
-            s.to_string()
-        }
-    };
 
     // Add CAS usage reminder at the top
-    let usage_reminder = remap_aliases(USAGE_REMINDER.trim());
+    let usage_reminder = USAGE_REMINDER.trim().to_string();
     total_tokens += estimate_tokens(&usage_reminder);
     context_parts.push(usage_reminder);
 
@@ -213,7 +215,10 @@ pub fn build_context_with_stores(
             "**Context: ~{total_tokens}tk (minimal mode)** | Use `cas context` for full context | Search: `cas search \"<query>\"`"
         ));
         stats.total_tokens = total_tokens;
-        return Ok((context_parts.join("\n"), stats));
+        return Ok((
+            remap_tool_prefix(&context_parts.join("\n"), tool_prefix),
+            stats,
+        ));
     }
 
     // Show ALL in-progress tasks
@@ -715,11 +720,7 @@ pub fn build_context_with_stores(
             context_parts.push("## 📦 More Context Available".to_string());
             context_parts.push(String::new());
 
-            let fetch_cmd = if use_cs_alias {
-                "`mcp__cs__search` or `mcp__cs__task`"
-            } else {
-                "`mcp__cas__search` or `mcp__cas__task`"
-            };
+            let fetch_cmd = "`mcp__cas__search` or `mcp__cas__task`";
 
             if available_ready_tasks > 0 {
                 context_parts.push(format!(
@@ -756,11 +757,7 @@ pub fn build_context_with_stores(
         } else {
             String::new()
         };
-        let hints = if use_cs_alias {
-            "Fetch details: `mcp__cs__memory` | Search: `mcp__cs__search`"
-        } else {
-            "Fetch details: `mcp__cas__memory` | Search: `mcp__cas__search`"
-        };
+        let hints = "Fetch details: `mcp__cas__memory` | Search: `mcp__cas__search`";
         context_parts.push(format!(
             "**Context: {}{}** | {}",
             token_display(total_tokens),
@@ -770,5 +767,8 @@ pub fn build_context_with_stores(
     }
 
     stats.total_tokens = total_tokens;
-    Ok((context_parts.join("\n"), stats))
+    Ok((
+        remap_tool_prefix(&context_parts.join("\n"), tool_prefix),
+        stats,
+    ))
 }

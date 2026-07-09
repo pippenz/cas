@@ -650,6 +650,7 @@ dependencies = [
  "tracing-subscriber",
  "unicode-normalization",
  "ureq",
+ "urlencoding",
  "uuid",
  "walkdir",
  "webbrowser",

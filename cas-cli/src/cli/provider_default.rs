@@ -12,7 +12,7 @@ use crate::store::known_repos::host_cas_dir;
 /// Arguments for `cas default`
 #[derive(Args, Debug, Clone)]
 pub struct DefaultArgs {
-    /// Provider to persist as the default supervisor harness (`claude` or `codex`)
+    /// Provider to persist as the default supervisor harness (`claude`, `codex`, or `grok`)
     pub provider: String,
 }
 
@@ -33,14 +33,15 @@ pub fn execute(args: &DefaultArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Validate that `s` is "claude" or "codex"; return the normalised lowercase
-/// string on success, or a descriptive error on failure.
+/// Validate that `s` is "claude", "codex", or "grok"; return the normalised
+/// lowercase string on success, or a descriptive error on failure.
 pub(crate) fn validate_provider(s: &str) -> anyhow::Result<&str> {
     match s.trim() {
         "claude" => Ok("claude"),
         "codex" => Ok("codex"),
+        "grok" => Ok("grok"),
         other => anyhow::bail!(
-            "Unknown provider '{other}'. Use 'claude' or 'codex'."
+            "Unknown provider '{other}'. Use 'claude', 'codex', or 'grok'."
         ),
     }
 }
@@ -51,4 +52,39 @@ pub(crate) fn set_supervisor_harness(config: &mut Config, provider: &str) {
     let llm = config.llm.get_or_insert_with(LlmConfig::default);
     let supervisor = llm.supervisor.get_or_insert_with(LlmRoleConfig::default);
     supervisor.harness = Some(provider.to_string());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_provider_accepts_claude_codex_grok() {
+        assert_eq!(validate_provider("claude").unwrap(), "claude");
+        assert_eq!(validate_provider("codex").unwrap(), "codex");
+        assert_eq!(validate_provider("grok").unwrap(), "grok");
+    }
+
+    #[test]
+    fn validate_provider_trims_whitespace() {
+        assert_eq!(validate_provider("  grok  ").unwrap(), "grok");
+    }
+
+    #[test]
+    fn validate_provider_rejects_unknown_and_mentions_grok_in_error() {
+        let err = validate_provider("openai").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Unknown provider 'openai'"), "got: {msg}");
+        assert!(msg.contains("grok"), "error should mention grok: {msg}");
+    }
+
+    #[test]
+    fn set_supervisor_harness_writes_grok() {
+        let mut config = Config::default();
+        set_supervisor_harness(&mut config, "grok");
+        assert_eq!(
+            config.llm.as_ref().unwrap().supervisor.as_ref().unwrap().harness.as_deref(),
+            Some("grok")
+        );
+    }
 }

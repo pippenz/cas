@@ -61,10 +61,10 @@ For Claude workers, `effort=high` is the ceiling. `xhigh`/`max` increase per-ste
 2. **Spawn the mix** — count tiers in the ready backlog, then issue one `spawn_workers` call per tier (a call's parameters apply to every worker in that call):
    ```
    # two standard workers
-   mcp__cas__coordination action=spawn_workers count=2 isolate=true cli=codex model=gpt-5.5 effort=medium
+   mcp__cs__coordination action=spawn_workers count=2 isolate=true cli=codex model=gpt-5.5 effort=medium
 
    # one heavy worker for the tier:heavy tasks
-   mcp__cas__coordination action=spawn_workers count=1 isolate=true cli=claude model=sonnet effort=high worker_names="hv-ada"
+   mcp__cs__coordination action=spawn_workers count=1 isolate=true cli=claude model=sonnet effort=high worker_names="hv-ada"
    ```
    Every `spawn_workers` call MUST include explicit `model=` and `effort=`;
    relying on omitted fields is a fallback path that emits an acknowledgement

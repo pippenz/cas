@@ -38,9 +38,14 @@ pub(crate) enum DeliveryChannel {
 ///   the load-bearing fix for cas-b68a.
 /// - **Claude** recipients use the team inbox when teams are active, and fall back
 ///   to PTY when they are not (codex-only / non-teams factories).
+/// - **Grok** recipients are *always* PTY-delivered, same as Codex: EPIC
+///   cas-8888 delta #4 — Grok has no CC Agent-Teams membership
+///   (`--team-name`/`--agent-id`/`--teammate-mode` don't exist for it), so
+///   it can never read a Claude team inbox regardless of the supervisor's
+///   teams mode.
 pub(crate) fn choose_channel(harness: SupervisorCli, teams_active: bool) -> DeliveryChannel {
     match harness {
-        SupervisorCli::Codex => DeliveryChannel::Pty,
+        SupervisorCli::Codex | SupervisorCli::Grok => DeliveryChannel::Pty,
         SupervisorCli::Claude => {
             if teams_active {
                 DeliveryChannel::TeamsInbox
@@ -71,6 +76,21 @@ pub(crate) fn requires_pty_readiness_gate(harness: SupervisorCli, teams_active: 
 /// property of the recipient's harness, not of teams mode. A Claude recipient
 /// reached via the PTY fallback (codex-supervised factory, teams=None) must NOT be
 /// framed — it isn't a codex prompt and stays byte-for-byte bare.
+///
+/// EPIC cas-8888 (cas-9a31, Phase 1) SILENT SITE — audited: Grok is NOT
+/// included here (revised from an earlier version of this comment that did
+/// include it — see the task's coordination history). Checked the actual
+/// mechanism first: `CODEX_WORKER_INSTRUCTIONS`/`CODEX_SUPERVISOR_INSTRUCTIONS`
+/// (crates/cas-pty/src/pty.rs) EXPLICITLY tell Codex to "treat any injected
+/// turn framed 'Message from <sender>: …' as an instruction to act on" — the
+/// marker exists because it's baked into Codex's own prompt text, not because
+/// of any inherent PTY-delivery or hooks property. No such prompt convention
+/// exists for Grok yet (that's Phase 2/3's job to author), and Grok's design
+/// otherwise mirrors Claude's (native hooks incl. UserPromptSubmit, a real
+/// TUI textbox) — so absent a reason to invent an unbacked marker
+/// requirement, Grok should behave like Claude's PTY-fallback case: bare,
+/// unframed. Revisit once Phase 2/3 actually authors Grok's coordination
+/// prompt, if it turns out to need its own recognition convention.
 pub(crate) fn pty_payload_needs_framing(harness: SupervisorCli) -> bool {
     matches!(harness, SupervisorCli::Codex)
 }
@@ -209,6 +229,19 @@ mod tests {
         assert!(pty_payload_needs_framing(SupervisorCli::Codex));
         // Claude recipient via PTY fallback (codex-supervised, teams=None) → bare.
         assert!(!pty_payload_needs_framing(SupervisorCli::Claude));
+    }
+
+    /// EPIC cas-8888 (cas-9a31, Phase 1): Grok is always PTY-delivered (no
+    /// team-transport) but must NOT be framed like Codex — no such prompt
+    /// convention has been authored for Grok (unlike Codex's
+    /// CODEX_WORKER_INSTRUCTIONS, which explicitly keys on the literal
+    /// prefix), and Grok's design otherwise mirrors Claude's (native hooks,
+    /// real TUI textbox). See the doc comment on `pty_payload_needs_framing`
+    /// for the full reasoning trail (this was revised once already after
+    /// checking the actual mechanism — don't re-flip without re-checking).
+    #[test]
+    fn pty_framing_does_not_apply_to_grok() {
+        assert!(!pty_payload_needs_framing(SupervisorCli::Grok));
     }
 
     #[test]

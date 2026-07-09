@@ -18,11 +18,11 @@ Store memories proactively — don't wait to be asked. Before creating a new mem
 
 ## Actions
 
-- **Store**: `mcp__cas__memory action=remember title="..." content="..." entry_type=learning` (types: learning, preference, context, observation)
-- **Find**: `mcp__cas__search action=search query="..." doc_type=entry`
-- **Promote**: `mcp__cas__memory action=helpful id=<id>` — increases priority for future retrieval
+- **Store**: `mcp__cs__memory action=remember title="..." content="..." entry_type=learning` (types: learning, preference, context, observation)
+- **Find**: `mcp__cs__search action=search query="..." doc_type=entry`
+- **Promote**: `mcp__cs__memory action=helpful id=<id>` — increases priority for future retrieval
 
-**Valid `mcp__cas__memory` actions** (exact list — do not invent others): `remember`, `get`, `list`, `update`, `delete`, `archive`, `unarchive`, `helpful`, `harmful`, `mark_reviewed`, `recent`, `set_tier`, `opinion_reinforce`, `opinion_weaken`, `opinion_contradict`. There is **no `recall` action** — use `get` (by id) or `mcp__cas__search action=search` (by query).
+**Valid `mcp__cs__memory` actions** (exact list — do not invent others): `remember`, `get`, `list`, `update`, `delete`, `archive`, `unarchive`, `helpful`, `harmful`, `mark_reviewed`, `recent`, `set_tier`, `opinion_reinforce`, `opinion_weaken`, `opinion_contradict`. There is **no `recall` action** — use `get` (by id) or `mcp__cs__search action=search` (by query).
 
 ## Two Modes: Legacy and Structured
 
@@ -76,7 +76,7 @@ Before you create a new memory, run the overlap check. The goal is to catch the 
 High-level workflow:
 
 1. **Extract key terms** from the new memory — prefer reference symbols (file paths, function names, commit SHAs), then symptom/error strings, then title tokens.
-2. **Search existing memories** via `mcp__cas__search action=search doc_type=entry` using those terms. Take the top 3–5 candidates. If the new memory has a `module` field, prefer same-module candidates.
+2. **Search existing memories** via `mcp__cs__search action=search doc_type=entry` using those terms. Take the top 3–5 candidates. If the new memory has a `module` field, prefer same-module candidates.
 3. **Score each candidate 0–5** across five dimensions: problem statement, root cause, solution approach, referenced files, tags. Subtract 1 for `module` mismatch and 1 for `track` mismatch (floor at 0).
 4. **Act on the highest score:**
    - **4–5 (high overlap)** — do not create. Update the existing memory in place (autofix/headless) or surface the match for user decision (interactive).

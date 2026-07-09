@@ -27,15 +27,15 @@ In shared mode, file-overlap analysis is even more critical — two workers edit
 1. Search before planning — check all three sources for prior art:
    ```
    # Similar past EPICs (patterns, sizing, what worked)
-   mcp__cas__task action=list task_type=epic status=closed
+   mcp__cs__task action=list task_type=epic status=closed
 
    # CAS memories for learnings, bugfixes, architectural decisions
-   mcp__cas__search action=search query="<keywords>" doc_type=entry limit=10
+   mcp__cs__search action=search query="<keywords>" doc_type=entry limit=10
 
    # Codebase for existing implementations you might duplicate or conflict with
-   Grep pattern="<feature-name>" or mcp__cas__search action=search query="<keywords>" scope=code
+   Grep pattern="<feature-name>" or mcp__cs__search action=search query="<keywords>" scope=code
    ```
-2. Create EPIC: `mcp__cas__task action=create task_type=epic title="..." description="..."`
+2. Create EPIC: `mcp__cs__task action=create task_type=epic title="..." description="..."`
 3. Gather spec with `/epic-spec`, break down with `/epic-breakdown`
 4. Review task scope and dependencies
 
@@ -43,7 +43,7 @@ In shared mode, file-overlap analysis is even more critical — two workers edit
 
 1. Spawn workers:
    ```
-   mcp__cas__coordination action=spawn_workers count=N isolate=true cli=codex model=gpt-5.5 effort=medium
+   mcp__cs__coordination action=spawn_workers count=N isolate=true cli=codex model=gpt-5.5 effort=medium
    ```
    Omit `isolate` for shared mode.
 
@@ -56,10 +56,10 @@ In shared mode, file-overlap analysis is even more critical — two workers edit
    **Heterogeneous team example** — Claude supervisor spawning Codex workers:
    ```
    # All Codex workers
-   mcp__cas__coordination action=spawn_workers count=2 cli=codex model=gpt-5.5 effort=medium isolate=true
+   mcp__cs__coordination action=spawn_workers count=2 cli=codex model=gpt-5.5 effort=medium isolate=true
 
    # Named workers with explicit Codex backend
-   mcp__cas__coordination action=spawn_workers count=1 cli=codex model=gpt-5.5 effort=low worker_names="alice" isolate=true
+   mcp__cs__coordination action=spawn_workers count=1 cli=codex model=gpt-5.5 effort=low worker_names="alice" isolate=true
    ```
    `cli`, `model`, and `effort` are per-spawn controls for the workers spawned
    by that call.
@@ -67,11 +67,11 @@ In shared mode, file-overlap analysis is even more critical — two workers edit
    and routing in [model-selection.md](model-selection.md).
    Full parameter table in [reference.md](reference.md#spawn_workers-parameters).
 2. Verify workers appear in TUI before assigning (stale DB records are not real workers)
-3. Assign tasks: `mcp__cas__task action=update id=<id> assignee=<worker>`
-4. Pin epic focus so the TUI shows it immediately: `mcp__cas__coordination action=focus_epic id=<epic-id>`. Without this, the TASKS/FACTORY panels stay empty until a worker's first `task action=start` on a subtask lets the panel infer the epic — and inference only fires once that subtask's `assignee` matches a live session agent (workers now get this for free: `task action=start` sets `assignee` automatically when unset, cas-6945). Clear with `action=focus_epic clear=true` when the epic wraps.
+3. Assign tasks: `mcp__cs__task action=update id=<id> assignee=<worker>`
+4. Pin epic focus so the TUI shows it immediately: `mcp__cs__coordination action=focus_epic id=<epic-id>`. Without this, the TASKS/FACTORY panels stay empty until a worker's first `task action=start` on a subtask lets the panel infer the epic — and inference only fires once that subtask's `assignee` matches a live session agent (workers now get this for free: `task action=start` sets `assignee` automatically when unset, cas-6945). Clear with `action=focus_epic clear=true` when the epic wraps.
 5. Search for relevant context and send assignment message:
    ```
-   mcp__cas__coordination action=message target=<worker> message="Task <id>: <description>. Context: <findings>. Run mcp__cas__task action=mine to see your tasks."
+   mcp__cs__coordination action=message target=<worker> message="Task <id>: <description>. Context: <findings>. Run mcp__cs__task action=mine to see your tasks."
    ```
 6. **End your turn immediately.** Stop here. Do not monitor, poll, or run any commands. Workers will push a message to you when done or blocked. Your next action is triggered by their message, not by checking.
 
@@ -111,15 +111,15 @@ base branch ────────────────────► (sta
      whether the worker proved the right command.
    - Run targeted mechanical verification only when warranted by the diff.
    - Record the audit trail:
-     `mcp__cas__verification action=add task_id=<task-id> status=approved summary="<per-merge gate: diff read + proof checked>"`.
+     `mcp__cs__verification action=add task_id=<task-id> status=approved summary="<per-merge gate: diff read + proof checked>"`.
    - If the single diff is exceptionally risky, you may run
      `/cas-code-review mode=interactive base_sha=<pre-cp-sha> task_id=<task-id>`
      by explicit judgment; this is an exception, not the default cadence.
 6. Message other active workers to sync onto the **local** branch (not `origin/`):
    ```
-   mcp__cas__coordination action=message target=<other-worker> message="Branch updated after cherry-pick. Sync: git stash && git rebase <base-branch> && git stash pop"
+   mcp__cs__coordination action=message target=<other-worker> message="Branch updated after cherry-pick. Sync: git stash && git rebase <base-branch> && git stash pop"
    ```
-7. Clear completed worker's context: `mcp__cas__coordination action=clear_context target=<worker>`
+7. Clear completed worker's context: `mcp__cs__coordination action=clear_context target=<worker>`
 8. Assign next task
 
 ## Phase 3: Review (Shared Mode)
@@ -136,7 +136,7 @@ When workers share the main directory, there's no branch merging — workers com
 - Workers set status to blocked and add a blocker note
 - Help resolve or reassign the task
 - **Race condition warning:** Task state updates are not atomic across supervisor and worker. After closing a task (especially via the escape hatch), verify it stayed closed before proceeding — a worker's stale `status=blocked` update can overwrite the close. If a worker resurrects a closed task, re-close with an audit trail noting the race.
-- **Stale outbox replays:** Workers may send duplicate stale messages due to outbox replay. Before acting on a blocker notification or status change, check the task's current state with `mcp__cas__task action=show` — the message may be outdated.
+- **Stale outbox replays:** Workers may send duplicate stale messages due to outbox replay. Before acting on a blocker notification or status change, check the task's current state with `mcp__cs__task action=show` — the message may be outdated.
 
 **Multiple workers complete simultaneously:**
 - Run verification calls in parallel (single response turn)
@@ -145,7 +145,7 @@ When workers share the main directory, there's no branch merging — workers com
 
 ## Phase 4: Complete
 
-1. Verify all tasks closed: `mcp__cas__task action=list status=open epic=<epic-id>`
+1. Verify all tasks closed: `mcp__cs__task action=list status=open epic=<epic-id>`
 2. Hold the main merge. The epic branch is not ready for base until the assembled diff has passed review and the final gate.
 3. Run the single required full multi-persona review against the assembled EPIC
    diff. The Phase 3 per-merge gate catches obvious per-task problems; this
@@ -168,9 +168,9 @@ When workers share the main directory, there's no branch merging — workers com
 6. **Isolated mode only**: Merge epic to base branch and cleanup worktrees (can be 10GB+ each) only after the review loop is clean and the full gate exits 0:
    ```bash
    git checkout <base-branch> && git merge epic/<slug>
-   mcp__cas__coordination action=shutdown_workers count=0
+   mcp__cs__coordination action=shutdown_workers count=0
    git worktree remove <path>  # for each worker worktree
    git branch -d epic/<slug>
    ```
 7. Close the epic and post release notes.
-8. Shutdown workers: `mcp__cas__coordination action=shutdown_workers count=0`
+8. Shutdown workers: `mcp__cs__coordination action=shutdown_workers count=0`

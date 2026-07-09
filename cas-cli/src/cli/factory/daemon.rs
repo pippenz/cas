@@ -71,6 +71,9 @@ pub(super) fn execute_daemon(
 
     // Resolve per-worker specs from the cascade (cas-2992).
     let resolved_worker_specs = {
+        // EPIC cas-8888 (cas-9a31, Phase 1) SILENT SITE — audited:
+        // harness-agnostic, Grok flows through as Some(Grok) correctly
+        // (same pattern as cli/factory/mod.rs).
         let sources = ConfigSources {
             cli_flag: if worker_cli != cas_mux::SupervisorCli::Claude {
                 Some(worker_cli)
@@ -93,6 +96,8 @@ pub(super) fn execute_daemon(
 
     // Resolve supervisor spec from the cascade (cas-1948).
     let resolved_supervisor_spec = {
+        // EPIC cas-8888 (cas-9a31, Phase 1) SILENT SITE — audited, same as
+        // resolved_worker_specs above.
         let sources = ConfigSources {
             cli_flag: if supervisor_cli != cas_mux::SupervisorCli::Claude {
                 Some(supervisor_cli)

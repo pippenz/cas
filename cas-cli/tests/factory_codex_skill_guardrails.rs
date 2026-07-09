@@ -166,6 +166,51 @@ fn supervisor_skill_mirrors_include_implementation_unit_template() {
     }
 }
 
+/// cas-2c61/cas-62ab: the ~25-file mcp__cas__ sweep beyond recovery.md
+/// (cas-5b4f fixed only that one file; this closes the rest of the list
+/// cas-62ab named — workflow.md, details.md, worker-recovery.md,
+/// reference.md, cas-worker.md, session-learn/SKILL.md,
+/// cas-memory-management/SKILL.md, and the remaining swept files). Every
+/// codex builtin skill/agent source must use mcp__cs__ for executable
+/// tool instructions, never Claude's mcp__cas__ — extends the
+/// `codex_worker_recovery_uses_cs_alias_not_cas` convention corpus-wide.
+#[test]
+fn codex_builtin_skills_and_agents_never_hardcode_claude_alias() {
+    let root = repo_root();
+
+    for base in [
+        root.join("cas-cli/src/builtins/codex/skills"),
+        root.join("cas-cli/src/builtins/codex/agents"),
+    ] {
+        let mut stack = vec![base];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+                    continue;
+                };
+                if ext != "md" && ext != "yaml" {
+                    continue;
+                }
+                let content = load(&path);
+                assert!(
+                    !content.contains("mcp__cas__"),
+                    "{} still hardcodes the Claude mcp__cas__ alias — codex agents only \
+                     surface CAS tools under mcp__cs__ (cas-2c61/cas-62ab)",
+                    path.display()
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn codex_worker_runtime_instruction_allows_close_then_escalate() {
     let root = repo_root();

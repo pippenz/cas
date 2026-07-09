@@ -4,7 +4,7 @@
 
 The canonical instance of this was 2026-04-22 (~8 min × 2 closes wasted) when `cas serve` predated commit `bba6fbf` (factory worker verification jail exemption). That fix is on `main` and has been for a while — but stale deploys keep re-discovering it.
 
-**30-second check before `mcp__cas__coordination action=spawn_workers`:**
+**30-second check before `mcp__cs__coordination action=spawn_workers`:**
 
 ```
 cas --version                                      # running binary's git hash

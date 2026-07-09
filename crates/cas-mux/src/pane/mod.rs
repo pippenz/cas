@@ -258,11 +258,37 @@ impl Pane {
                 effort,
                 teams,
             ),
+            // cas-6569 (EPIC cas-8888, Phase 2): real driver — see
+            // PtyConfig::grok's doc comment (crates/cas-pty/src/pty.rs) for
+            // the verified flag set and the MCP/context-injection design.
+            SupervisorCli::Grok => PtyConfig::grok(
+                name,
+                "worker",
+                cwd,
+                cas_root,
+                Some(supervisor_name),
+                None,
+                model,
+                effort,
+                teams,
+            ),
         };
         config.env.push((
             "CAS_FACTORY_SUPERVISOR_CLI".to_string(),
             supervisor_cli.as_str().to_string(),
         ));
+        // cas-6569 (EPIC cas-8888, Phase 2) SILENT SITE — audited and
+        // RESOLVED (was left open in Phase 1): confirmed against the real
+        // grok 0.2.93 binary that it has NO `-c`/config-override flag at
+        // all — `grok mcp add` only writes to persistent
+        // ~/.grok/config.toml, there's no per-launch equivalent. This `-c
+        // mcp_servers.cs.env.*` arg is Codex-specific syntax and stays
+        // `== Codex` intentionally: Grok gets CAS_FACTORY_SUPERVISOR_CLI
+        // the same way Claude already does — as a plain env var on the
+        // process itself (pushed just above), relying on ordinary
+        // child-process env inheritance when Grok spawns `cas serve` per
+        // its resolved MCP config. See PtyConfig::grok's doc comment
+        // (crates/cas-pty/src/pty.rs) for the full verification trail.
         if cli == SupervisorCli::Codex {
             config.args.push("-c".to_string());
             config.args.push(format!(
@@ -337,6 +363,23 @@ impl Pane {
                 teams,
             ),
             SupervisorCli::Codex => PtyConfig::codex(
+                name,
+                "supervisor",
+                cwd,
+                cas_root,
+                None,
+                Some(worker_cli_str),
+                model,
+                effort,
+                teams,
+            ),
+            // cas-6569 (EPIC cas-8888, Phase 2): real driver — see
+            // PtyConfig::grok's doc comment. `cas grok` (the standalone
+            // supervisor launcher CLI command) is still Phase 3's job
+            // (cas-964a); this only wires the underlying PtyConfig so a
+            // grok supervisor pane, however it gets spawned, launches
+            // correctly.
+            SupervisorCli::Grok => PtyConfig::grok(
                 name,
                 "supervisor",
                 cwd,
@@ -1221,6 +1264,11 @@ pub(crate) fn push_factory_session_env(
         config
             .env
             .push(("CAS_FACTORY_SESSION".to_string(), session.to_string()));
+        // cas-6569 (EPIC cas-8888, Phase 2) SILENT SITE — audited and
+        // RESOLVED, same rationale as build_worker_config above: Grok has
+        // no `-c`-style flag to mirror, and gets CAS_FACTORY_SESSION via
+        // the plain env var pushed just above (process env inheritance),
+        // same as Claude.
         if cli == SupervisorCli::Codex {
             let session = sanitize_factory_session_for_toml_arg(session);
             config.args.push("-c".to_string());

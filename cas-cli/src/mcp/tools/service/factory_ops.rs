@@ -33,10 +33,26 @@ pub(crate) const WORKER_STALE_SECS: i64 = 30;
 /// dead.
 pub(crate) const WORKER_DEAD_SECS: i64 = 75;
 
+/// The harness (`SupervisorCli`) a worker registered under, read from
+/// `Agent.metadata["worker_cli"]` (cas-058f: persisted at registration time
+/// from `CAS_FACTORY_WORKER_CLI`, mirroring the existing `worker_effort`
+/// pattern — see `apply_factory_worker_metadata` in `mcp/daemon.rs`).
+/// Defaults to `Claude` for legacy agents registered before this metadata
+/// key existed, or any unparseable value — the same "no signal ⇒ don't
+/// guess exotic" default the rest of the harness-detection code already
+/// uses (`worker_harness_from_env`).
+pub(crate) fn worker_cli_from_agent(agent: &cas_types::Agent) -> cas_mux::SupervisorCli {
+    agent
+        .metadata
+        .get("worker_cli")
+        .and_then(|s| s.parse::<cas_mux::SupervisorCli>().ok())
+        .unwrap_or(cas_mux::SupervisorCli::Claude)
+}
+
 fn parse_spawn_cli(cli: Option<&str>) -> Result<Option<cas_mux::SupervisorCli>, String> {
     cli.map(|s| {
         s.parse::<cas_mux::SupervisorCli>()
-            .map_err(|_| format!("invalid cli value {s:?}: expected 'claude' or 'codex'"))
+            .map_err(|_| format!("invalid cli value {s:?}: expected 'claude', 'codex', or 'grok'"))
     })
     .transpose()
 }
@@ -55,6 +71,8 @@ fn default_worker_model_for_cli(cli: cas_mux::SupervisorCli) -> &'static str {
     match cli {
         cas_mux::SupervisorCli::Claude => "sonnet",
         cas_mux::SupervisorCli::Codex => crate::config::STOCK_WORKER_MODEL,
+        // EPIC cas-8888 (cas-9a31, Phase 1): grok 0.2.93 default model.
+        cas_mux::SupervisorCli::Grok => "grok-4.5",
     }
 }
 
@@ -114,6 +132,11 @@ pub(crate) fn build_spawn_spec_json_with_project_config(
         .next()
         .ok_or_else(|| "failed to resolve worker spec: no worker slots returned".to_string())?;
 
+    // EPIC cas-8888 (cas-9a31, Phase 1) SILENT SITE — audited, left AS-IS
+    // per the task's own guidance: this default-cli auto-upgrade only ever
+    // fires when the resolved default happens to be Claude (never Grok, since
+    // nothing defaults TO Grok yet — it isn't a stock/default CLI at this
+    // phase), so no Grok arm is needed here.
     if cli.is_none() && !configured_cli && spec.cli == cas_mux::SupervisorCli::Claude {
         spec.cli = cas_mux::SupervisorCli::Codex;
     }
@@ -654,7 +677,11 @@ impl CasService {
                 // since cas-2749.
                 let transcript_info = if elapsed >= WORKER_DEAD_SECS {
                     let session_id = agent.cc_session_id.as_deref().unwrap_or(&agent.id);
-                    format_transcript_block(clone_path.as_deref(), session_id)
+                    format_transcript_block(
+                        clone_path.as_deref(),
+                        session_id,
+                        worker_cli_from_agent(agent),
+                    )
                 } else {
                     String::new()
                 };
@@ -1879,14 +1906,36 @@ fn glob_transcript_candidates(
     (out, truncated)
 }
 
-/// Resolve the transcript location for a worker. Uses `glob_transcript_candidates`
-/// against `~/.claude/projects/` by default; tests override `projects_dir`.
+/// Resolve the transcript location for a worker, dispatching by harness
+/// (cas-058f, EPIC cas-8888 Phase 4). Claude (and Codex, which has no
+/// dedicated transcript reader of its own and simply resolves to
+/// `Synthesized`/never-matches — see module docs) use
+/// `~/.claude/projects/*/<session-id>.jsonl`. Grok uses a structurally
+/// different, directory-based layout — see [`resolve_grok_transcript`].
+///
+/// `base_dir` is the harness-appropriate root (`~/.claude/projects` or
+/// `~/.grok/sessions`); callers pick it via [`default_claude_projects_dir`]
+/// / [`default_grok_sessions_dir`] (or inject a temp dir in tests).
 ///
 /// `clone_path == None` means the worker registered without cwd metadata;
 /// the `Synthesized` / `Ambiguous` fallback paths omit the reconstructed
 /// legacy escape in that case (there's nothing to reconstruct from), and
 /// the caller must label the output accordingly.
 pub(crate) fn resolve_transcript(
+    base_dir: Option<&std::path::Path>,
+    clone_path: Option<&str>,
+    session_id: &str,
+    cli: cas_mux::SupervisorCli,
+) -> TranscriptResolution {
+    match cli {
+        cas_mux::SupervisorCli::Grok => resolve_grok_transcript(base_dir, clone_path, session_id),
+        cas_mux::SupervisorCli::Claude | cas_mux::SupervisorCli::Codex => {
+            resolve_claude_transcript(base_dir, clone_path, session_id)
+        }
+    }
+}
+
+fn resolve_claude_transcript(
     projects_dir: Option<&std::path::Path>,
     clone_path: Option<&str>,
     session_id: &str,
@@ -1925,17 +1974,123 @@ fn synthesized_unknown_clone_path(session_id: &str) -> String {
     format!("~/.claude/projects/<cwd>/{session_id}.jsonl (clone path unknown)")
 }
 
+// ---------------------------------------------------------------------------
+// cas-058f (EPIC cas-8888 Phase 4): Grok transcript resolution.
+//
+// xAI Grok Build's on-disk layout is structurally different from Claude's —
+// this is net-new resolution logic, not a match-arm addition:
+//   Claude: ~/.claude/projects/<escaped-cwd '/'&'.'→'-'>/<session-id>.jsonl
+//   Grok:   ~/.grok/sessions/<URL-encoded-cwd>/<session-uuid>/{
+//             updates.jsonl   (authoritative ACP log — the "transcript"),
+//             chat_history.jsonl,
+//             signals.json    (token/turn counters — a better activity
+//                              signal than raw mtime, see classify_worker)
+//           }
+// `session_id` is a directory component here, not a filename stem, and the
+// cwd is URL-encoded rather than collapsed to `-`. `GROK_HOME` overrides the
+// base directory (mirrors Grok's own env-var convention). A cwd longer than
+// 255 bytes gets a slug+hash directory name instead (with the original cwd
+// stashed in a `.cwd` file) — that hash scheme isn't reverse-engineered, so
+// long cwds fall back to the un-truncated encoding for the *synthesized*
+// (best-guess) path and rely on the glob to find the real directory anyway.
+// ---------------------------------------------------------------------------
+
+/// `~/.grok/sessions` — xAI Grok Build's per-user transcript root.
+/// `GROK_HOME` overrides the base directory when set; falls back to the
+/// user's real home dir. Returns `None` if neither resolves.
+pub(crate) fn default_grok_sessions_dir() -> Option<std::path::PathBuf> {
+    if let Ok(grok_home) = std::env::var("GROK_HOME") {
+        return Some(std::path::PathBuf::from(grok_home).join("sessions"));
+    }
+    dirs::home_dir().map(|h| h.join(".grok").join("sessions"))
+}
+
+/// Reconstruct the legacy Grok transcript path:
+/// `~/.grok/sessions/<url-encoded-cwd>/<session-uuid>/updates.jsonl`.
+fn synthesized_grok_transcript_path(clone_path: &str, session_id: &str) -> String {
+    let encoded = urlencoding::encode(clone_path);
+    format!("~/.grok/sessions/{encoded}/{session_id}/updates.jsonl")
+}
+
+fn synthesized_unknown_grok_clone_path(session_id: &str) -> String {
+    format!("~/.grok/sessions/<cwd>/{session_id}/updates.jsonl (clone path unknown)")
+}
+
+/// Glob `<sessions_dir>/*/<session-uuid>/updates.jsonl` — Grok's session id
+/// is a directory component, not a filename stem (unlike Claude's
+/// `<session-id>.jsonl`). Same glob-escaping and candidate cap as
+/// [`glob_transcript_candidates`], for the same reasons.
+fn glob_grok_transcript_candidates(
+    sessions_dir: &std::path::Path,
+    session_id: &str,
+) -> (Vec<std::path::PathBuf>, bool) {
+    let escaped_session = glob::Pattern::escape(session_id);
+    let pattern = format!(
+        "{}/*/{}/updates.jsonl",
+        sessions_dir.to_string_lossy(),
+        escaped_session
+    );
+    let iter = match glob::glob(&pattern) {
+        Ok(it) => it,
+        Err(_) => return (Vec::new(), false),
+    };
+    let mut out = Vec::new();
+    let mut truncated = false;
+    for result in iter.flatten() {
+        if out.len() >= MAX_TRANSCRIPT_CANDIDATES {
+            truncated = true;
+            break;
+        }
+        out.push(result);
+    }
+    (out, truncated)
+}
+
+fn resolve_grok_transcript(
+    sessions_dir: Option<&std::path::Path>,
+    clone_path: Option<&str>,
+    session_id: &str,
+) -> TranscriptResolution {
+    let synthesized = clone_path.map(|p| synthesized_grok_transcript_path(p, session_id));
+    let Some(dir) = sessions_dir else {
+        return TranscriptResolution::Synthesized(
+            synthesized.unwrap_or_else(|| synthesized_unknown_grok_clone_path(session_id)),
+        );
+    };
+    let (mut matches, truncated) = glob_grok_transcript_candidates(dir, session_id);
+    match matches.len() {
+        0 => TranscriptResolution::Synthesized(
+            synthesized.unwrap_or_else(|| synthesized_unknown_grok_clone_path(session_id)),
+        ),
+        1 => TranscriptResolution::Resolved(matches.remove(0)),
+        _ => TranscriptResolution::Ambiguous {
+            matches,
+            synthesized: synthesized.unwrap_or_else(|| synthesized_unknown_grok_clone_path(session_id)),
+            truncated,
+        },
+    }
+}
+
 /// Render the transcript block for `worker_status` output. Always surfaces
 /// the raw `session_id` so a supervisor who doesn't trust our resolution
 /// can grep the projects tree themselves (cas-900b AC).
 ///
 /// `clone_path == None` is handled by the same resolver with a clearly
 /// labelled fallback — no duplicated glob+match dispatch (maintainability
-/// cas-900b P2).
-fn format_transcript_block(clone_path: Option<&str>, session_id: &str) -> String {
-    let projects = default_claude_projects_dir();
-    let resolution = resolve_transcript(projects.as_deref(), clone_path, session_id);
-    render_transcript_block(&resolution, session_id, projects.is_some())
+/// cas-900b P2). `cli` picks the harness-appropriate base dir (cas-058f).
+fn format_transcript_block(
+    clone_path: Option<&str>,
+    session_id: &str,
+    cli: cas_mux::SupervisorCli,
+) -> String {
+    let base_dir = match cli {
+        cas_mux::SupervisorCli::Grok => default_grok_sessions_dir(),
+        cas_mux::SupervisorCli::Claude | cas_mux::SupervisorCli::Codex => {
+            default_claude_projects_dir()
+        }
+    };
+    let resolution = resolve_transcript(base_dir.as_deref(), clone_path, session_id, cli);
+    render_transcript_block(&resolution, session_id, base_dir.is_some())
 }
 
 /// Pure string-rendering half of `format_transcript_block`, split out so
@@ -2639,8 +2794,7 @@ effort = "high"
         let got = resolve_transcript(
             Some(&projects),
             Some("/home/alice/workspace/one"),
-            TEST_SESSION,
-        );
+            TEST_SESSION, cas_mux::SupervisorCli::Claude);
         let expected_path = projects
             .join("-home-alice-workspace-one")
             .join(format!("{TEST_SESSION}.jsonl"));
@@ -2655,8 +2809,7 @@ effort = "high"
         let got = resolve_transcript(
             Some(&projects),
             Some("/home/alice/workspace/one"),
-            TEST_SESSION,
-        );
+            TEST_SESSION, cas_mux::SupervisorCli::Claude);
         let expected = synthesized_transcript_path("/home/alice/workspace/one", TEST_SESSION);
         assert_eq!(got, TranscriptResolution::Synthesized(expected));
     }
@@ -2672,8 +2825,7 @@ effort = "high"
         let got = resolve_transcript(
             Some(&projects),
             Some("/home/alice/workspace/one"),
-            TEST_SESSION,
-        );
+            TEST_SESSION, cas_mux::SupervisorCli::Claude);
         match got {
             TranscriptResolution::Ambiguous {
                 mut matches,
@@ -2714,8 +2866,7 @@ effort = "high"
         let got = resolve_transcript(
             Some(&projects),
             Some("/home/usér/projet/café"),
-            TEST_SESSION,
-        );
+            TEST_SESSION, cas_mux::SupervisorCli::Claude);
         let expected_path = projects
             .join("-home-usér-projet-café")
             .join(format!("{TEST_SESSION}.jsonl"));
@@ -2726,7 +2877,7 @@ effort = "high"
     fn resolve_transcript_no_projects_dir_is_synthesized() {
         // If we can't resolve the home dir (shouldn't happen in practice),
         // the function still returns a usable Synthesized fallback.
-        let got = resolve_transcript(None, Some("/home/alice/x"), TEST_SESSION);
+        let got = resolve_transcript(None, Some("/home/alice/x"), TEST_SESSION, cas_mux::SupervisorCli::Claude);
         let expected = synthesized_transcript_path("/home/alice/x", TEST_SESSION);
         assert_eq!(got, TranscriptResolution::Synthesized(expected));
     }
@@ -2737,9 +2888,184 @@ effort = "high"
         // the Synthesized arm carries the placeholder label instead of a
         // reconstructed path.
         let (_tmp, projects) = fake_projects_dir(&[]);
-        let got = resolve_transcript(Some(&projects), None, TEST_SESSION);
+        let got = resolve_transcript(Some(&projects), None, TEST_SESSION, cas_mux::SupervisorCli::Claude);
         let expected = synthesized_unknown_clone_path(TEST_SESSION);
         assert_eq!(got, TranscriptResolution::Synthesized(expected));
+    }
+
+    // --- cas-058f (EPIC cas-8888 Phase 4): Grok transcript resolution --------
+
+    /// Build `<tmp>/sessions/<cwd-dir-name>/<session-uuid>/{updates.jsonl,
+    /// chat_history.jsonl, signals.json}` — Grok's directory-per-session
+    /// layout, structurally different from `fake_projects_dir`'s flat
+    /// `<dir>/<session>.jsonl`. `cwd_dir_name` is whatever the caller wants
+    /// on disk (tests pin exact encoding separately); `sessions` is a list
+    /// of session-uuid directories to create under it, each populated with
+    /// all three Grok files (empty).
+    fn fake_grok_sessions_dir(
+        dirs: &[(&str, &[&str])],
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sessions = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        for (cwd_dir_name, session_uuids) in dirs {
+            let cwd_dir = sessions.join(cwd_dir_name);
+            for uuid in *session_uuids {
+                let session_dir = cwd_dir.join(uuid);
+                std::fs::create_dir_all(&session_dir).unwrap();
+                std::fs::write(session_dir.join("updates.jsonl"), b"").unwrap();
+                std::fs::write(session_dir.join("chat_history.jsonl"), b"").unwrap();
+                std::fs::write(session_dir.join("signals.json"), b"{}").unwrap();
+            }
+        }
+        (tmp, sessions)
+    }
+
+    #[test]
+    fn synthesized_grok_path_url_encodes_cwd() {
+        // Grok URL-encodes the cwd (task description, VERIFIED) — a
+        // structurally different escape scheme from Claude's '/'+'.'→'-'
+        // collapse. Pin the exact encoding contract.
+        let clone = "/home/alice/workspace one";
+        let session = "064e7b23-331d-4dae-9c6a-721cbbe9c024";
+        let got = synthesized_grok_transcript_path(clone, session);
+        assert_eq!(
+            got,
+            format!("~/.grok/sessions/%2Fhome%2Falice%2Fworkspace%20one/{session}/updates.jsonl")
+        );
+    }
+
+    #[test]
+    fn resolve_grok_transcript_returns_resolved_on_unique_match() {
+        let session = "grok-session-0000-0000-000000000000";
+        let (_tmp, sessions) =
+            fake_grok_sessions_dir(&[("%2Fhome%2Falice%2Fworkspace", &[session])]);
+        let got = resolve_transcript(
+            Some(&sessions),
+            Some("/home/alice/workspace"),
+            session,
+            cas_mux::SupervisorCli::Grok,
+        );
+        let expected_path = sessions
+            .join("%2Fhome%2Falice%2Fworkspace")
+            .join(session)
+            .join("updates.jsonl");
+        assert_eq!(got, TranscriptResolution::Resolved(expected_path));
+    }
+
+    #[test]
+    fn resolve_grok_transcript_returns_synthesized_on_no_match() {
+        let session = "grok-session-0000-0000-000000000000";
+        let (_tmp, sessions) = fake_grok_sessions_dir(&[("some-dir", &["unrelated-session"])]);
+        let got = resolve_transcript(
+            Some(&sessions),
+            Some("/home/alice/workspace"),
+            session,
+            cas_mux::SupervisorCli::Grok,
+        );
+        let expected = synthesized_grok_transcript_path("/home/alice/workspace", session);
+        assert_eq!(got, TranscriptResolution::Synthesized(expected));
+    }
+
+    #[test]
+    fn resolve_grok_transcript_returns_ambiguous_on_multiple_matches() {
+        let session = "grok-session-0000-0000-000000000000";
+        let (_tmp, sessions) =
+            fake_grok_sessions_dir(&[("dir-one", &[session]), ("dir-two", &[session])]);
+        let got = resolve_transcript(
+            Some(&sessions),
+            Some("/home/alice/workspace"),
+            session,
+            cas_mux::SupervisorCli::Grok,
+        );
+        match got {
+            TranscriptResolution::Ambiguous {
+                mut matches,
+                truncated,
+                ..
+            } => {
+                assert!(!truncated);
+                matches.sort();
+                let mut expected = vec![
+                    sessions.join("dir-one").join(session).join("updates.jsonl"),
+                    sessions.join("dir-two").join(session).join("updates.jsonl"),
+                ];
+                expected.sort();
+                assert_eq!(matches, expected);
+            }
+            other => panic!("expected Ambiguous, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_grok_transcript_no_sessions_dir_is_synthesized() {
+        let session = "grok-session-0000-0000-000000000000";
+        let got = resolve_transcript(
+            None,
+            Some("/home/alice/x"),
+            session,
+            cas_mux::SupervisorCli::Grok,
+        );
+        let expected = synthesized_grok_transcript_path("/home/alice/x", session);
+        assert_eq!(got, TranscriptResolution::Synthesized(expected));
+    }
+
+    #[test]
+    fn resolve_grok_transcript_no_clone_path_falls_back_to_placeholder() {
+        let session = "grok-session-0000-0000-000000000000";
+        let (_tmp, sessions) = fake_grok_sessions_dir(&[]);
+        let got = resolve_transcript(Some(&sessions), None, session, cas_mux::SupervisorCli::Grok);
+        let expected = synthesized_unknown_grok_clone_path(session);
+        assert_eq!(got, TranscriptResolution::Synthesized(expected));
+    }
+
+    #[test]
+    fn default_grok_sessions_dir_honors_grok_home_override() {
+        let _lock = crate::hooks::test_env_lock();
+        let old = std::env::var("GROK_HOME").ok();
+        unsafe {
+            std::env::set_var("GROK_HOME", "/custom/grok/home");
+        }
+        let got = default_grok_sessions_dir();
+        unsafe {
+            match &old {
+                Some(v) => std::env::set_var("GROK_HOME", v),
+                None => std::env::remove_var("GROK_HOME"),
+            }
+        }
+        assert_eq!(
+            got,
+            Some(std::path::PathBuf::from("/custom/grok/home/sessions"))
+        );
+    }
+
+    #[test]
+    fn worker_cli_from_agent_parses_grok_metadata() {
+        let mut agent = cas_types::Agent::new("sess-1".to_string(), "grok-worker".to_string());
+        agent
+            .metadata
+            .insert("worker_cli".to_string(), "grok".to_string());
+        assert_eq!(worker_cli_from_agent(&agent), cas_mux::SupervisorCli::Grok);
+    }
+
+    #[test]
+    fn worker_cli_from_agent_defaults_to_claude_when_missing_or_invalid() {
+        let agent = cas_types::Agent::new("sess-1".to_string(), "legacy-worker".to_string());
+        assert_eq!(
+            worker_cli_from_agent(&agent),
+            cas_mux::SupervisorCli::Claude,
+            "no worker_cli metadata (legacy agent) must default to Claude"
+        );
+
+        let mut bad_agent = cas_types::Agent::new("sess-2".to_string(), "bad-worker".to_string());
+        bad_agent
+            .metadata
+            .insert("worker_cli".to_string(), "not-a-real-cli".to_string());
+        assert_eq!(
+            worker_cli_from_agent(&bad_agent),
+            cas_mux::SupervisorCli::Claude,
+            "an unparseable worker_cli value must default to Claude, not panic"
+        );
     }
 
     #[test]

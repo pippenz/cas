@@ -156,6 +156,12 @@ const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦
 struct AgentSelection {
     claude: bool,
     codex: bool,
+    /// EPIC cas-8888 (cas-6f46, Phase 5): opt-in Grok Build support.
+    /// Unlike claude/codex, never auto-selected by `detect_agent_defaults`'s
+    /// fresh-project heuristic — Grok support is new enough that an
+    /// explicit choice (interactive prompt or `--grok`-equivalent flag)
+    /// is safer than silently enabling it just because `grok` is on PATH.
+    grok: bool,
 }
 
 /// Simplified wizard configuration
@@ -169,6 +175,7 @@ impl Default for WizardConfig {
             agents: AgentSelection {
                 claude: true,
                 codex: false,
+                grok: false,
             },
         }
     }
@@ -301,6 +308,7 @@ fn execute_json(cwd: &Path, args: &InitArgs) -> anyhow::Result<()> {
     let mut skill_generated = false;
     let mut builtins_count = 0;
     let mut codex_configured = false;
+    let mut grok_configured = false;
     let gitignore_updated = ensure_gitignore(cwd).is_ok();
     let _ = gitignore_updated;
 
@@ -330,6 +338,21 @@ fn execute_json(cwd: &Path, args: &InitArgs) -> anyhow::Result<()> {
             .unwrap_or(0);
     }
 
+    if config.agents.grok {
+        // Grok reads `.mcp.json` directly (verified via `grok mcp doctor`) —
+        // no separate config writer needed, just make sure it exists.
+        // Reuses the same idempotent writer Claude uses.
+        grok_configured = configure_mcp_server(cwd).unwrap_or(false);
+
+        let grok_dir = cwd.join(".grok");
+        let builtins_result =
+            sync_all_builtins_for_harness(cas_mux::SupervisorCli::Grok, &grok_dir).ok();
+        builtins_count += builtins_result
+            .as_ref()
+            .map(|r| r.agents_updated + r.skills_updated)
+            .unwrap_or(0);
+    }
+
     // Setup factory tooling
     let factory_tooling_result = factory_tooling::setup_factory_tooling(cwd).unwrap_or_default();
 
@@ -338,17 +361,19 @@ fn execute_json(cwd: &Path, args: &InitArgs) -> anyhow::Result<()> {
     let steps = next_steps_needed(cwd);
 
     println!(
-        r#"{{"status":"initialized","path":"{}","agents":{},"hooks_configured":{},"claude_md_updated":{},"skill_generated":{},"builtins_synced":{},"codex_configured":{},"factory_tooling":"{}","next_steps":{}}}"#,
+        r#"{{"status":"initialized","path":"{}","agents":{},"hooks_configured":{},"claude_md_updated":{},"skill_generated":{},"builtins_synced":{},"codex_configured":{},"grok_configured":{},"factory_tooling":"{}","next_steps":{}}}"#,
         cas_dir.display(),
         serde_json::json!({
             "claude": config.agents.claude,
             "codex": config.agents.codex,
+            "grok": config.agents.grok,
         }),
         hooks_configured,
         claude_md_updated,
         skill_generated,
         builtins_count,
         codex_configured,
+        grok_configured,
         factory_tooling_result,
         serde_json::json!(steps),
     );
@@ -519,6 +544,11 @@ fn is_codex_cli_installed() -> bool {
 fn detect_agent_defaults(cwd: &Path) -> AgentSelection {
     let claude = cwd.join(".claude").exists();
     let codex = cwd.join(".codex").exists();
+    // Grok is opt-in only (see the AgentSelection.grok doc comment) — an
+    // existing `.grok/` dir means a prior `cas init`/`cas update` already
+    // opted this project in, so honor that; a fresh project never defaults
+    // to grok=true regardless of whether the `grok` CLI is installed.
+    let grok = cwd.join(".grok").exists();
 
     if !claude && !codex {
         // Fresh project: pick defaults from installed CLIs first.
@@ -529,19 +559,26 @@ fn detect_agent_defaults(cwd: &Path) -> AgentSelection {
             (false, true) => AgentSelection {
                 claude: false,
                 codex: true,
+                grok,
             },
             (true, false) => AgentSelection {
                 claude: true,
                 codex: false,
+                grok,
             },
             // Keep existing preference when both are installed (or both absent).
             _ => AgentSelection {
                 claude: true,
                 codex: false,
+                grok,
             },
         }
     } else {
-        AgentSelection { claude, codex }
+        AgentSelection {
+            claude,
+            codex,
+            grok,
+        }
     }
 }
 
@@ -600,6 +637,14 @@ fn confirm_and_apply(
         print_file_item(".codex/commands/", "Built-in commands", colors::GREEN)?;
     }
 
+    if config.agents.grok {
+        if !mcp_exists {
+            print_file_item(".mcp.json", "MCP server config (shared with Grok)", colors::GREEN)?;
+        }
+        print_file_item(".grok/agents/", "Built-in agents", colors::GREEN)?;
+        print_file_item(".grok/skills/", "Built-in skills", colors::GREEN)?;
+    }
+
     // Factory tooling files
     let env_template_exists = cwd.join(".env.worktree.template").exists();
     let boot_script_exists = cwd.join("scripts/worktree-boot.sh").exists();
@@ -624,6 +669,7 @@ fn confirm_and_apply(
     let has_modifications = (config.agents.claude
         && (settings_exists || mcp_exists || claude_md_exists))
         || (config.agents.codex && codex_config_exists)
+        || (config.agents.grok && mcp_exists && !config.agents.claude)
         || gitignore_exists;
     if has_modifications {
         println!();
@@ -649,6 +695,12 @@ fn confirm_and_apply(
 
         if config.agents.codex && codex_config_exists {
             print_file_item(".codex/config.toml", "Add CAS server", colors::ORANGE)?;
+        }
+
+        // Only print .mcp.json's "Modify" row once — claude's clause above
+        // already covers it when claude is also enabled.
+        if config.agents.grok && mcp_exists && !config.agents.claude {
+            print_file_item(".mcp.json", "Add CAS server (shared with Grok)", colors::ORANGE)?;
         }
     }
 
@@ -743,6 +795,23 @@ fn apply_configuration(
         execute_step("Syncing Codex built-in files", animate, || {
             let codex_dir = cwd.join(".codex");
             let result = sync_all_builtins_for_harness(cas_mux::SupervisorCli::Codex, &codex_dir)?;
+            let total = result.agents_updated + result.skills_updated;
+            Ok(format!("{total} files"))
+        })?;
+    }
+
+    if config.agents.grok {
+        // Grok reads `.mcp.json` directly (verified via `grok mcp doctor`) —
+        // reuse the same idempotent writer Claude uses instead of a
+        // separate Grok-specific config file.
+        execute_step("Configuring MCP server for Grok", animate, || {
+            configure_mcp_server(cwd)?;
+            Ok(".mcp.json".to_string())
+        })?;
+
+        execute_step("Syncing Grok built-in files", animate, || {
+            let grok_dir = cwd.join(".grok");
+            let result = sync_all_builtins_for_harness(cas_mux::SupervisorCli::Grok, &grok_dir)?;
             let total = result.agents_updated + result.skills_updated;
             Ok(format!("{total} files"))
         })?;
@@ -1068,5 +1137,58 @@ mod integration_flag_tests {
         assert!(flags.vercel_project.is_none());
         assert!(flags.neon_project.is_none());
         assert!(flags.github_repo.is_none());
+    }
+}
+
+/// EPIC cas-8888 (cas-6f46, Phase 5): Grok config wiring — the
+/// `agents.grok` toggle and its detection.
+#[cfg(test)]
+mod grok_agent_selection_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn default_wizard_config_grok_is_false() {
+        let config = WizardConfig::default();
+        assert!(!config.agents.grok);
+        // Regression guard: adding grok must not perturb the existing
+        // claude/codex defaults.
+        assert!(config.agents.claude);
+        assert!(!config.agents.codex);
+    }
+
+    #[test]
+    fn detect_agent_defaults_grok_false_on_fresh_project() {
+        let temp = TempDir::new().unwrap();
+        let selection = detect_agent_defaults(temp.path());
+        assert!(
+            !selection.grok,
+            "grok is opt-in only — a fresh project must never default to grok=true"
+        );
+    }
+
+    #[test]
+    fn detect_agent_defaults_grok_true_when_grok_dir_exists() {
+        let temp = TempDir::new().unwrap();
+        std::fs::create_dir_all(temp.path().join(".grok")).unwrap();
+        // Need at least one of claude/.codex to exist too, or the fresh-project
+        // branch runs instead of the existing-project branch.
+        std::fs::create_dir_all(temp.path().join(".claude")).unwrap();
+
+        let selection = detect_agent_defaults(temp.path());
+        assert!(
+            selection.grok,
+            "an existing .grok/ dir means a prior init/update already opted in"
+        );
+    }
+
+    #[test]
+    fn detect_agent_defaults_grok_false_when_grok_dir_absent_but_claude_present() {
+        let temp = TempDir::new().unwrap();
+        std::fs::create_dir_all(temp.path().join(".claude")).unwrap();
+
+        let selection = detect_agent_defaults(temp.path());
+        assert!(!selection.grok);
+        assert!(selection.claude);
     }
 }

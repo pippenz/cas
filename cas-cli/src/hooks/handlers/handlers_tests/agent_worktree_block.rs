@@ -62,6 +62,21 @@ fn deny_reason(out: &cas_core::hooks::types::HookOutput) -> Option<String> {
 
 #[test]
 fn supervisor_agent_worktree_is_denied() {
+    // EPIC cas-8888 (cas-fd9f): the deny message's tool-prefix now comes from
+    // `harness_policy::own_tool_prefix()`, which is env-based (matching
+    // every other harness-alias helper in this codebase). In real usage
+    // `HookInput.agent_role` is always just a snapshot of `CAS_AGENT_ROLE`
+    // taken at dispatch time (see `cli/hook.rs`), so the two signals are
+    // never actually independent — but this test drives role purely via
+    // the HookInput field (by original design, to avoid env locking), so it
+    // must now also pin the env explicitly to keep both signals consistent
+    // the way production always does, rather than leaving the prefix to
+    // whatever CAS_AGENT_ROLE/CAS_FACTORY_SUPERVISOR_CLI the ambient process
+    // happens to have.
+    let _g = env_lock();
+    let _role = set_role_env(Some("supervisor"));
+    let _cli = set_supervisor_cli_env(Some("claude"));
+
     let input = agent_input_with_role(Some("supervisor"), Some("worktree"));
     let out = handle_pre_tool_use(&input, None).expect("handler ok");
     let reason = deny_reason(&out).expect("expected deny");
@@ -77,6 +92,28 @@ fn supervisor_agent_worktree_is_denied() {
     assert!(
         reason.contains("leak") || reason.contains("cleaned up"),
         "deny message should explain the leak reason: {reason}"
+    );
+}
+
+/// EPIC cas-8888 (cas-fd9f): the load-bearing regression test — before the
+/// fix, this deny message was hardcoded to Claude's `mcp__cas__` prefix
+/// unconditionally.
+#[test]
+fn grok_supervisor_agent_worktree_is_denied_with_cas_prefix() {
+    let _g = env_lock();
+    let _role = set_role_env(Some("supervisor"));
+    let _cli = set_supervisor_cli_env(Some("grok"));
+
+    let input = agent_input_with_role(Some("supervisor"), Some("worktree"));
+    let out = handle_pre_tool_use(&input, None).expect("handler ok");
+    let reason = deny_reason(&out).expect("expected deny");
+    assert!(
+        reason.contains("cas__coordination"),
+        "grok supervisor deny message must use its own cas__ prefix: {reason}"
+    );
+    assert!(
+        !reason.contains("mcp__cas__coordination") && !reason.contains("mcp__cs__coordination"),
+        "grok supervisor deny message must NOT carry another harness's prefix: {reason}"
     );
 }
 
@@ -259,6 +296,33 @@ fn set_role_env(role: Option<&str>) -> RoleGuard {
         }
     }
     RoleGuard(prev)
+}
+
+/// EPIC cas-8888 (cas-fd9f): pins `CAS_FACTORY_SUPERVISOR_CLI` for tests that
+/// assert a specific tool-prefix in the deny/reminder text (see
+/// `harness_policy::own_tool_prefix`).
+struct SupervisorCliGuard(Option<String>);
+
+impl Drop for SupervisorCliGuard {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.0 {
+                Some(v) => std::env::set_var("CAS_FACTORY_SUPERVISOR_CLI", v),
+                None => std::env::remove_var("CAS_FACTORY_SUPERVISOR_CLI"),
+            }
+        }
+    }
+}
+
+fn set_supervisor_cli_env(cli: Option<&str>) -> SupervisorCliGuard {
+    let prev = std::env::var("CAS_FACTORY_SUPERVISOR_CLI").ok();
+    unsafe {
+        match cli {
+            Some(v) => std::env::set_var("CAS_FACTORY_SUPERVISOR_CLI", v),
+            None => std::env::remove_var("CAS_FACTORY_SUPERVISOR_CLI"),
+        }
+    }
+    SupervisorCliGuard(prev)
 }
 
 #[test]

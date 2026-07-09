@@ -20,9 +20,11 @@
 //! let stores = ContextStores { ... };
 //! let config = DefaultHooksConfig::new().with_mcp();
 //!
-//! // Build context
+//! // Build context — `tool_prefix` is the reader's own MCP tool prefix
+//! // (`mcp__cas__` / `mcp__cs__` / `cas__`; see `harness_policy::own_tool_prefix`
+//! // in `cas-cli` for the canonical caller-side source of this value).
 //! let input = HookInput { cwd: "/project".to_string(), ..Default::default() };
-//! let (context, stats) = build_context_with_stores(&input, &stores, &config, 10, None)?;
+//! let (context, stats) = build_context_with_stores(&input, &stores, &config, 10, None, "mcp__cas__")?;
 //! ```
 //!
 //! # Supported Hooks

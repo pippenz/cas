@@ -155,6 +155,8 @@ fn sync_claude_files(cli: &Cli, cas_root_param: Option<&Path>) -> anyhow::Result
     let claude_dir = project_root.join(".claude");
     let codex_dir = project_root.join(".codex");
     let codex_enabled = codex_dir.exists();
+    let grok_dir = project_root.join(".grok");
+    let grok_enabled = grok_dir.exists();
 
     let theme = ActiveTheme::default();
 
@@ -338,6 +340,22 @@ fn sync_claude_files(cli: &Cli, cas_root_param: Option<&Path>) -> anyhow::Result
         0
     };
 
+    // Grok built-ins (EPIC cas-8888, Phase 5). No separate config writer:
+    // `.mcp.json` is already kept current by the unconditional
+    // configure_mcp_server call above, which Grok reads directly.
+    let grok_builtins_updated = if grok_enabled {
+        if !cli.json {
+            let mut out = io::stdout();
+            let mut fmt = Formatter::stdout(&mut out, theme.clone());
+            fmt.subheading("Syncing .grok files")?;
+        }
+
+        let grok_result = sync_all_builtins_for_harness(cas_mux::SupervisorCli::Grok, &grok_dir)?;
+        grok_result.total_updated()
+    } else {
+        0
+    };
+
     if cli.json {
         let config_json: Vec<String> = config_updated.iter().map(|s| format!("\"{s}\"")).collect();
         let codex_config_json: Vec<String> = codex_config_updated
@@ -345,11 +363,12 @@ fn sync_claude_files(cli: &Cli, cas_root_param: Option<&Path>) -> anyhow::Result
             .map(|s| format!("\"{s}\""))
             .collect();
         println!(
-            r#"{{"config_updated":[{}],"builtins_updated":{},"codex_config_updated":[{}],"codex_builtins_updated":{},"rules_synced":{},"rules_removed":{},"skills_synced":{},"skills_removed":{},"factory_tooling":"{}"}}"#,
+            r#"{{"config_updated":[{}],"builtins_updated":{},"codex_config_updated":[{}],"codex_builtins_updated":{},"grok_builtins_updated":{},"rules_synced":{},"rules_removed":{},"skills_synced":{},"skills_removed":{},"factory_tooling":"{}"}}"#,
             config_json.join(","),
             builtin_result.total_updated(),
             codex_config_json.join(","),
             codex_builtins_updated,
+            grok_builtins_updated,
             rule_report.synced,
             rule_report.removed,
             skill_report.synced,
@@ -446,6 +465,7 @@ fn sync_user_builtins(cli: &Cli) -> anyhow::Result<()> {
     })?;
     let claude_dir = home.join(".claude");
     let codex_dir = home.join(".codex");
+    let grok_dir = home.join(".grok");
 
     let theme = ActiveTheme::default();
 
@@ -460,6 +480,7 @@ fn sync_user_builtins(cli: &Cli) -> anyhow::Result<()> {
     // empty dir for them.
     let mut claude_pruned: Vec<String> = Vec::new();
     let mut codex_pruned: Vec<String> = Vec::new();
+    let mut grok_pruned: Vec<String> = Vec::new();
 
     let claude_result = if claude_dir.exists() {
         let r = sync_all_builtins_for_harness(cas_mux::SupervisorCli::Claude, &claude_dir)?;
@@ -532,15 +553,47 @@ fn sync_user_builtins(cli: &Cli) -> anyhow::Result<()> {
         None
     };
 
+    let grok_result = if grok_dir.exists() {
+        let r = sync_all_builtins_for_harness(cas_mux::SupervisorCli::Grok, &grok_dir)?;
+        grok_pruned = prune_stale_user_skills_for_harness(cas_mux::SupervisorCli::Grok, &grok_dir)?;
+        if !cli.json {
+            let mut out = io::stdout();
+            let mut fmt = Formatter::stdout(&mut out, theme.clone());
+            fmt.write_raw("  ")?;
+            if r.total_updated() > 0 {
+                fmt.success(&format!(
+                    "~/.grok: updated {} files ({} agents, {} skills)",
+                    r.total_updated(),
+                    r.agents_updated,
+                    r.skills_updated
+                ))?;
+            } else {
+                fmt.success("~/.grok: built-ins up to date")?;
+            }
+            for name in &grok_pruned {
+                fmt.write_raw(&format!("    - skills/{name} (removed stale orphan)"))?;
+                fmt.newline()?;
+            }
+        }
+        Some(r)
+    } else {
+        // No nag for absent ~/.grok — Grok is opt-in and most users won't
+        // have it. Silent skip.
+        None
+    };
+
     if cli.json {
         let claude_total = claude_result.as_ref().map(|r| r.total_updated()).unwrap_or(0);
         let codex_total = codex_result.as_ref().map(|r| r.total_updated()).unwrap_or(0);
+        let grok_total = grok_result.as_ref().map(|r| r.total_updated()).unwrap_or(0);
         let claude_present = claude_dir.exists();
         let codex_present = codex_dir.exists();
+        let grok_present = grok_dir.exists();
         let claude_pruned_n = claude_pruned.len();
         let codex_pruned_n = codex_pruned.len();
+        let grok_pruned_n = grok_pruned.len();
         println!(
-            r#"{{"claude_present":{claude_present},"claude_builtins_updated":{claude_total},"claude_skills_pruned":{claude_pruned_n},"codex_present":{codex_present},"codex_builtins_updated":{codex_total},"codex_skills_pruned":{codex_pruned_n}}}"#
+            r#"{{"claude_present":{claude_present},"claude_builtins_updated":{claude_total},"claude_skills_pruned":{claude_pruned_n},"codex_present":{codex_present},"codex_builtins_updated":{codex_total},"codex_skills_pruned":{codex_pruned_n},"grok_present":{grok_present},"grok_builtins_updated":{grok_total},"grok_skills_pruned":{grok_pruned_n}}}"#
         );
     }
 

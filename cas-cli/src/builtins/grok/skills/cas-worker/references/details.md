@@ -1,0 +1,81 @@
+# Details — Tools, Sync, Schema
+
+## Tool Selection Guide
+
+Pick the right tool for the job:
+
+| Need | Tool | Example |
+|------|------|---------|
+| Conceptual/exploratory query | `cas__search action=search` | "how does auth work?", "where is X handled?" |
+| Exact symbol or string match | `Grep` | find all callers of `process_task()` |
+| Complex codebase investigation | `Agent` with `subagent_type=Explore` | tracing a data flow across multiple modules |
+| Record a learning or bugfix | `cas__memory action=remember` | root cause found, pattern discovered |
+| Find files by name/pattern | `Glob` | `**/*.rs`, `src/**/mod.rs` |
+
+See the `cas-search` skill for detailed search guidance including code symbol search and hybrid queries.
+
+## Report / Evidence Tasks
+
+Start with sources that cannot mutate the live CAS DB:
+
+- MCP task/search/coordination surfaces for task records, notes, already-surfaced messages, and searchable project context
+- `.cas/logs/*.log` for daemon and lifecycle timelines
+- Local git/worktree status and exported report artifacts already present in the repo or worktree
+
+If those still do not answer the question:
+
+1. Add a progress or decision note explaining why task/log artifacts were insufficient.
+2. Prefer inspecting a copied snapshot of `.cas/cas.db`.
+3. If you must inspect the live DB, open it with a read-only SQLite URI such as `file:/abs/path/to/.cas/cas.db?mode=ro`. Do **not** use unrestricted `sqlite3 /path/to/.cas/cas.db` for routine report/evidence work.
+
+## Syncing (Isolated Mode)
+
+If the supervisor asks you to sync, safely rebase without losing WIP:
+
+```bash
+git stash                   # save uncommitted work
+git rebase <branch>         # use the branch name the supervisor gives you (e.g. master, epic/<slug>)
+git stash pop               # restore WIP
+```
+
+**Important:** Use the **local** branch name the supervisor specifies (e.g. `master`, `epic/<slug>`), NOT `origin/master`. In factory mode, the supervisor merges into the local branch directly, so `origin/master` is stale.
+
+If the rebase has conflicts, resolve them before popping the stash. Message the supervisor if you're stuck.
+
+## Schema Cheat Sheet (exact field names and valid actions)
+
+Wrong field names are rejected. These are the **exact** names for the calls workers make most often.
+
+**`cas__task`** — the task ID field is always `id` (NOT `task_id`, `taskId`, `_id`). Notes parameter is `notes` (plural, NOT `note`).
+
+```
+# Start / show / close
+cas__task action=start id=cas-abc1
+cas__task action=show id=cas-abc1
+cas__task action=close id=cas-abc1 reason="Implemented X, tests pass"
+
+# Progress notes (note_type ∈ progress|blocker|decision|discovery|question)
+cas__task action=notes id=cas-abc1 notes="Found root cause in Y" note_type=progress
+
+# Mark blocked
+cas__task action=update id=cas-abc1 status=blocked
+cas__task action=notes id=cas-abc1 notes="Blocked: <reason>" note_type=blocker
+```
+
+**Priority** accepts numeric (0–4) OR named alias: `critical`/`high`/`medium`/`low`/`backlog`. `priority="high"` is the same as `priority=1`.
+
+**Booleans** on `with_deps`, etc. accept `true`/`false`, `"true"`/`"false"`, or `1`/`0`.
+
+**`cas__coordination action=message`** requires BOTH `message` and `summary`:
+
+```
+cas__coordination action=message target=supervisor \
+  summary="task blocked on verification" \
+  message="cas-abc1 needs schema review before I can proceed"
+```
+
+Sending `message` alone without `summary` is rejected. `summary` is the one-line preview shown in the UI.
+
+**Valid `cas__task` actions** (do not invent others): `create`, `show`, `update`, `start`, `close`, `reopen`, `delete`, `list`, `ready`, `blocked`, `notes`, `dep_add`, `dep_remove`, `dep_list`, `claim`, `release`, `transfer`, `available`, `mine`.
+
+**Valid `cas__coordination` actions for workers**: `message`, `message_ack`, `message_status`, `whoami`, `heartbeat`, `queue_poll`, `queue_ack`. Factory/worktree/spawn actions are supervisor-only.

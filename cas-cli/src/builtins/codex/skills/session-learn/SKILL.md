@@ -1,12 +1,12 @@
 ---
 name: session-learn
-description: Classify the just-ended session into 7 knowledge signals (concept / entity / correction / pattern / idea / decision / gap) and emit structured memory entries via `mcp__cas__memory remember`. Used either via auto-trigger (Stop hook when `[memory] session_learn_auto = true` in `.cas/config.toml`) or manual invocation ("extract this session", "save what we learned"). Skips trivial sessions (<5 tool calls) and routes findings through the existing overlap-detection gate so duplicates never reach the store.
+description: Classify the just-ended session into 7 knowledge signals (concept / entity / correction / pattern / idea / decision / gap) and emit structured memory entries via `mcp__cs__memory remember`. Used either via auto-trigger (Stop hook when `[memory] session_learn_auto = true` in `.cas/config.toml`) or manual invocation ("extract this session", "save what we learned"). Skips trivial sessions (<5 tool calls) and routes findings through the existing overlap-detection gate so duplicates never reach the store.
 managed_by: cas
 ---
 
 # session-learn — 7-signal session classifier
 
-Borrowed from `third-brain-v5-skills/skills/session-learn` (MIT, reference_third_brain_v5_skills_borrow_source) and adapted to the CAS memory schema. The third-brain version writes to a wiki tree; this version writes to the CAS memory + rule stores via `mcp__cas__memory remember` so findings benefit from CAS's existing dedup, embedding, and recall pipeline.
+Borrowed from `third-brain-v5-skills/skills/session-learn` (MIT, reference_third_brain_v5_skills_borrow_source) and adapted to the CAS memory schema. The third-brain version writes to a wiki tree; this version writes to the CAS memory + rule stores via `mcp__cs__memory remember` so findings benefit from CAS's existing dedup, embedding, and recall pipeline.
 
 ## When to use
 
@@ -16,7 +16,7 @@ Borrowed from `third-brain-v5-skills/skills/session-learn` (MIT, reference_third
 
 ## What you produce
 
-Exactly one batched output: a JSON array of memory drafts, each with the 7-signal classification, the proposed CAS entry_type / tags / scope, and a confidence score. The caller (Rust handler or interactive user) routes them through `mcp__cas__memory action=remember` so the standard overlap-detection gate decides whether each draft lands.
+Exactly one batched output: a JSON array of memory drafts, each with the 7-signal classification, the proposed CAS entry_type / tags / scope, and a confidence score. The caller (Rust handler or interactive user) routes them through `mcp__cs__memory action=remember` so the standard overlap-detection gate decides whether each draft lands.
 
 **You do NOT write to the store directly.** Return drafts only; the caller writes. This separation lets the user preview drafts in interactive mode and lets the hook handler apply the overlap gate.
 
@@ -41,7 +41,7 @@ Exactly one batched output: a JSON array of memory drafts, each with the 7-signa
 ## Quality rules
 
 - **Skip floor.** If the session has < 5 tool calls, return `[]`. Trivial sessions produce noisy memories. (The Rust hook handler enforces this same floor before invoking the classifier so we never spend a Haiku call on noise.)
-- **Dedupe at the source.** Before drafting, scan the existing memory store via `mcp__cas__search` for each candidate finding. If a near-duplicate exists, do not draft a new one — instead include the existing memory's ID in your output's `dedup_hits` field so the caller can record the corroboration without creating a duplicate. The overlap-detection gate downstream is a second backstop, not the first one.
+- **Dedupe at the source.** Before drafting, scan the existing memory store via `mcp__cs__search` for each candidate finding. If a near-duplicate exists, do not draft a new one — instead include the existing memory's ID in your output's `dedup_hits` field so the caller can record the corroboration without creating a duplicate. The overlap-detection gate downstream is a second backstop, not the first one.
 - **Confidence honesty.** Each draft must carry `confidence ∈ [0.0, 1.0]`. The Rust handler suppresses drafts with `confidence < 0.6` unless they're tagged `correction` (corrections fire at `≥ 0.5` because user pushbacks are high-signal even when terse).
 - **One signal per draft.** A finding that arguably fits two signal types is two drafts, not one merged "mixed" draft — the downstream entry_type routing depends on the signal being unambiguous.
 - **No general programming knowledge.** Only emit what was project-, user-, or session-specific. "Always close file handles" is not a memory; "this codebase uses `tracing::warn!` in cloud/syncer/pull.rs but `eprintln!` in cloud/syncer/push.rs" is.
@@ -138,4 +138,4 @@ Session-end transcript shows: user corrected me twice on scope discipline, I dis
 
 - `cas-cli/src/builtins/skills/cas-memory-management/SKILL.md` — how memories are stored, recalled, and pruned in CAS.
 - `cas-cli/src/hooks/handlers/handlers_middle/session_stop/stop_flow.rs` — the existing single-bucket `extract_learnings_sync` path that session-learn complements. session-learn is the richer multi-signal successor; the old path remains for legacy `[hooks] generate_summaries = true` users until session_learn_auto becomes the default.
-- `third-brain-v5-skills/skills/session-learn/SKILL.md` — upstream pattern. Diffs: third-brain writes to a wiki tree; this skill writes via `mcp__cas__memory remember` so findings inherit CAS dedup and recall.
+- `third-brain-v5-skills/skills/session-learn/SKILL.md` — upstream pattern. Diffs: third-brain writes to a wiki tree; this skill writes via `mcp__cs__memory remember` so findings inherit CAS dedup and recall.

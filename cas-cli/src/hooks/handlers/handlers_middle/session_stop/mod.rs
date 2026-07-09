@@ -497,12 +497,24 @@ pub fn build_session_summary_context(
     context.push_str(
         "1. Use the Task tool to spawn a `session-summarizer` subagent with this prompt:\n",
     );
+    // EPIC cas-8888 (cas-fd9f): own_tool_prefix() — the summarizer subagent
+    // inherits the same process's MCP registration as its parent, so it
+    // needs the parent's own tool prefix here.
+    let prefix = crate::harness_policy::own_tool_prefix();
     context.push_str("   \"Generate a session summary. Steps:\n");
-    context.push_str("   - Get session context using mcp__cas__search action=context\n");
-    context.push_str("   - List tasks worked on using mcp__cas__task action=mine\n");
-    context.push_str("   - Get recent memories using mcp__cas__memory action=recent limit=20\n");
+    context.push_str(&format!(
+        "   - Get session context using {prefix}search action=context\n"
+    ));
+    context.push_str(&format!(
+        "   - List tasks worked on using {prefix}task action=mine\n"
+    ));
+    context.push_str(&format!(
+        "   - Get recent memories using {prefix}memory action=recent limit=20\n"
+    ));
     context.push_str("   - Create a structured summary covering: completed work, decisions, files changed, learnings, blockers, next steps\n");
-    context.push_str("   - Store the summary using mcp__cas__memory action=remember with tags session,summary\"\n");
+    context.push_str(&format!(
+        "   - Store the summary using {prefix}memory action=remember with tags session,summary\"\n"
+    ));
     context.push_str("2. After the subagent completes, you may stop.\n");
     context.push_str("</session-summary>\n");
 

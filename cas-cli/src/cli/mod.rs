@@ -135,12 +135,19 @@ pub enum Commands {
     /// Codex as the default supervisor for future sessions.
     Codex(FactoryArgs),
 
+    /// Launch factory with Grok as the supervisor (shortcut for `cas factory --supervisor-cli=grok`)
+    ///
+    /// All `cas factory` flags pass through. Use `--default` to also persist
+    /// Grok as the default supervisor for future sessions. Requires the xAI
+    /// Grok Build CLI (see https://x.ai) to be installed.
+    Grok(FactoryArgs),
+
     /// Set the default supervisor provider without launching (persist only)
     ///
     /// `cas default codex` — persists `[llm.supervisor] harness = "codex"` to
     /// `~/.cas/config.toml` and exits.  `cas default claude` is symmetric.
-    /// To launch immediately AND persist, use `cas codex --default` or
-    /// `cas claude --default`.
+    /// `cas default grok` is symmetric. To launch immediately AND persist,
+    /// use `cas codex --default`, `cas claude --default`, or `cas grok --default`.
     #[command(name = "default")]
     Default(DefaultArgs),
 
@@ -266,6 +273,7 @@ fn auth_requirement(command: &Option<Commands>) -> AuthRequirement {
         | Commands::Factory(_)
         | Commands::Claude(_)
         | Commands::Codex(_)
+        | Commands::Grok(_)
         | Commands::Default(_)
         | Commands::Attach(_)
         | Commands::List(_)
@@ -318,7 +326,11 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
     // process. Only mutates env for the factory command path.
     if matches!(
         cli.command,
-        Some(Commands::Factory(_)) | Some(Commands::Claude(_)) | Some(Commands::Codex(_)) | None
+        Some(Commands::Factory(_))
+            | Some(Commands::Claude(_))
+            | Some(Commands::Codex(_))
+            | Some(Commands::Grok(_))
+            | None
     ) {
         let early_cas_root = find_cas_root().ok();
         factory::apply_resource_contention_env(early_cas_root.as_deref());
@@ -425,6 +437,7 @@ fn get_command_name(cmd: &Option<Commands>) -> String {
         Commands::Factory(_) => "factory".to_string(),
         Commands::Claude(_) => "claude".to_string(),
         Commands::Codex(_) => "codex".to_string(),
+        Commands::Grok(_) => "grok".to_string(),
         Commands::Default(_) => "default".to_string(),
         Commands::Bridge(_) => "bridge".to_string(),
         #[cfg(feature = "mcp-server")]
@@ -491,6 +504,12 @@ fn run_command(cli: &Cli, cas_root: Option<&Path>) -> anyhow::Result<()> {
         Commands::Codex(args) => {
             let mut a = args.clone();
             a.supervisor_cli = "codex".to_string();
+            a.supervisor_cli_explicit = true;
+            factory::execute(&a, cli, cas_root)
+        }
+        Commands::Grok(args) => {
+            let mut a = args.clone();
+            a.supervisor_cli = "grok".to_string();
             a.supervisor_cli_explicit = true;
             factory::execute(&a, cli, cas_root)
         }

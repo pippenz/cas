@@ -217,6 +217,30 @@ pub fn token_display(tokens: usize) -> String {
     }
 }
 
+/// Rewrite every `mcp__cas__<tool>` reference in `text` to use `tool_prefix`
+/// instead (`mcp__cs__` for Codex, `cas__` for Grok; a no-op for Claude,
+/// whose prefix already IS `mcp__cas__`).
+///
+/// Context/reminder builders in this module author their guidance text
+/// against Claude's `mcp__cas__` prefix as the canonical baseline — it's
+/// correct as-is for a Claude reader — and call this exactly once, on the
+/// fully-assembled text, right before returning it. Centralizing the remap
+/// here (rather than scattering per-string closures across every call site
+/// that contributes to the assembled context) is deliberate: EPIC cas-8888
+/// (cas-fd9f) found that the old per-site approach silently missed several
+/// contributors (`coordination::render_factory_coordination`'s Codex-worker
+/// note, `plan_mode`'s planning-tools hints) that fed into the same
+/// `context_parts` buffer without ever passing through the local remap
+/// closure. A single end-of-function pass can't be skipped by a new
+/// contributor the way a per-site convention can.
+pub(crate) fn remap_tool_prefix(text: &str, tool_prefix: &str) -> String {
+    if tool_prefix == "mcp__cas__" {
+        text.to_string()
+    } else {
+        text.replace("mcp__cas__", tool_prefix)
+    }
+}
+
 /// Truncate a string to a maximum length
 pub fn truncate(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {

@@ -22,6 +22,24 @@ const CODEX_WORKER_INSTRUCTIONS: &str = "You are a CAS Factory Worker. Always us
 /// Prefix for the Codex worker startup prompt. The worker name is appended at runtime.
 const CODEX_WORKER_STARTUP_PREFIX: &str = "I'm initiating CAS worker startup now: confirm identity, check assigned tasks, then start any assigned task with a progress note. My CAS session is already registered automatically (do NOT call session_start).\n1) Run mcp__cs__coordination action=whoami";
 
+/// Instructions injected into Grok Build supervisor agents via `--rules`
+/// (EPIC cas-8888, cas-6569 Phase 2).
+///
+/// Grok's SessionStart hook fires but its stdout is ignored, so the
+/// SessionStart-additionalContext bundle Claude relies on for context
+/// injection never reaches a Grok agent (delta #2) — `--rules` (confirmed
+/// via `grok --help`: "Extra rules to append to the system prompt")
+/// substitutes for that at launch time. Unlike Claude/Codex, Grok
+/// namespaces MCP tools as `cas__<tool>` (its own `search_tool`/`use_tool`
+/// dispatch, NOT `mcp__cas__`/`mcp__cs__`), so every tool reference here
+/// uses that prefix.
+const GROK_SUPERVISOR_INSTRUCTIONS: &str = "You are the CAS Factory Supervisor, running on Grok Build. Coordinate only: plan epics, assign tasks, monitor progress, review/merge. Never implement tasks. Use skills cas-supervisor and cas-supervisor-checklist. MCP tools are namespaced cas__<tool> (e.g. cas__task, cas__coordination) — not mcp__cas__ or mcp__cs__. Worker messages (status/blocker/ready) arrive asynchronously as new injected turns; each is a triage trigger, not a fresh startup — read it, then assign/answer/redirect/merge as appropriate and reply via `cas__coordination action=message target=<worker>`. Finishing one round does not mean you are done — remain available to coordinate the next message.";
+
+/// Instructions injected into Grok Build worker agents via `--rules`
+/// (EPIC cas-8888, cas-6569 Phase 2). See `GROK_SUPERVISOR_INSTRUCTIONS`
+/// for the context-injection rationale.
+const GROK_WORKER_INSTRUCTIONS: &str = "You are a CAS Factory Worker, running on Grok Build. Always use CAS MCP tools for task lifecycle and coordination — they are namespaced cas__<tool> (e.g. cas__task, cas__coordination), not mcp__cas__ or mcp__cs__. On startup your CAS session is already registered automatically. Run `cas__coordination action=whoami` then `cas__task action=mine`. Work exactly ONE task at a time: choose a single assigned task, run `cas__task action=show id=<task-id>` then `cas__task action=start id=<task-id>` before coding, implement it, commit and push your changes, then close it with `cas__task action=close id=<task-id> reason=\"...\"` (or hand it to the supervisor if close returns verification-required guidance) BEFORE starting any other task. Never start a second task while one is still in progress. Add progress notes frequently using `cas__task action=notes id=<task-id> note_type=progress notes=\"...\"`. For blockers, add a blocker note, set status=blocked, and message supervisor via `cas__coordination action=message target=supervisor message=\"...\"`. After closing or handing off a task, stay available — the supervisor will send you more work as new messages; treat any injected turn as an instruction to act on, not noise. Stay within assigned task scope.";
+
 /// Configuration for spawning a PTY
 #[derive(Debug, Clone)]
 pub struct PtyConfig {
@@ -391,6 +409,165 @@ impl PtyConfig {
 
         // cas-0bf4: see equivalent comment in `claude()`.
         let (command, args) = maybe_wrap_with_nice("codex", args, role);
+
+        Self {
+            command,
+            args,
+            cwd: Some(cwd),
+            env,
+            rows: 24,
+            cols: 80,
+        }
+    }
+
+    /// Create config for a Grok Build CLI instance (EPIC cas-8888, cas-6569
+    /// Phase 2).
+    ///
+    /// # Verified against the installed grok 0.2.93 binary (2026-07-09,
+    /// `grok --help` / `grok inspect` / `grok mcp doctor` run live in this
+    /// repo — see task notes for the full transcript)
+    /// - `-s/--session-id <uuid>`: "Use a specific session UUID for a NEW
+    ///   conversation" — same anti-overwrite model as Claude, so (like
+    ///   `claude()`) we always generate a fresh uuid rather than Codex's
+    ///   `codex-<name>-<uuid>` prefixed style. Phase 4's transcript
+    ///   resolver keys on this exact value.
+    /// - `-m/--model <MODEL>`, `--reasoning-effort <EFFORT>` (aliased
+    ///   `--effort`; same minimal/low/medium/high/xhigh vocabulary as
+    ///   Claude/Codex — reused via the caller's existing
+    ///   `Effort::as_claude_arg()`, no separate `as_grok_arg` needed),
+    ///   `--cwd <CWD>`, `--permission-mode <MODE>` (accepts
+    ///   `bypassPermissions`) all confirmed present.
+    /// - `--rules <RULES>`: "Extra rules to append to the system prompt" —
+    ///   used to deliver GROK_WORKER_INSTRUCTIONS/GROK_SUPERVISOR_INSTRUCTIONS
+    ///   in place of the hook-based context bundle Claude uses (Grok's
+    ///   SessionStart hook fires but its stdout is ignored — delta #2).
+    ///
+    /// # MCP registration — deliberately NOT mirroring `push_codex_mcp_server_args`
+    ///
+    /// The task description asked for a `push_grok_mcp_server_args` mirroring
+    /// Codex's `-c mcp_servers.*` spawn-time override. Checked the real binary
+    /// before writing one: `grok --help` has NO ephemeral per-launch
+    /// config-override flag at all (no `-c`/`--config key=value`). The only
+    /// way to register an MCP server is `grok mcp add` — which writes to
+    /// PERSISTENT `~/.grok/config.toml` / `./.grok/config.toml`, not a
+    /// per-spawn flag. So there is no flag to emit here.
+    ///
+    /// Verified live (this session) that `cas` is ALREADY discoverable
+    /// without any Grok-specific setup: `grok mcp doctor` in this repo shows
+    /// `cas (stdio: cas serve) ✓ handshake OK, ✓ 11 tools discovered`, and
+    /// `grok inspect` resolves it from `~/.claude.json` (with a fallback
+    /// tested live: removing `~/.grok/config.toml`'s own `cas` entry, Grok
+    /// still found `cas` via `~/.claude.json`). Every CAS-integrated project
+    /// already has one of `.mcp.json`/`~/.claude.json` from Claude support —
+    /// unlike Codex, which has an entirely separate `.codex/config.toml`
+    /// surface that many Claude-first projects never set up (the actual
+    /// cas-bbc2 problem), there's no equivalent "never integrated" gap for
+    /// Grok to defend against.
+    ///
+    /// Identity/factory env (CAS_SESSION_ID, CAS_AGENT_NAME, etc.) is set as
+    /// plain process env vars on the grok process itself — exactly like
+    /// `claude()` — relying on ordinary child-process environment
+    /// inheritance when Grok spawns `cas serve` per its resolved MCP config.
+    /// This is the same mechanism Claude Code already relies on for
+    /// CAS_SESSION_ID delivery in production (`.mcp.json`'s own `cas` entry
+    /// has no `env` block either), and Grok is explicitly "Claude-Code-shaped"
+    /// (delta description). Revisit with a live end-to-end spawn if a real
+    /// worker fails to auto-register.
+    #[allow(clippy::too_many_arguments)]
+    pub fn grok(
+        name: &str,
+        role: &str,
+        cwd: PathBuf,
+        cas_root: Option<&PathBuf>,
+        supervisor_name: Option<&str>,
+        factory_worker_cli: Option<&str>,
+        model: Option<&str>,
+        effort: Option<&str>,
+        _teams: Option<&TeamsSpawnConfig>,
+    ) -> Self {
+        // Grok uses Claude's anti-overwrite session model (a fresh uuid per
+        // NEW conversation) — no Codex-style name-prefixed session id, so
+        // Phase 4's transcript resolver can key on this value directly.
+        let session_id = uuid::Uuid::new_v4().to_string();
+
+        let mut env = vec![
+            ("CAS_AGENT_NAME".to_string(), name.to_string()),
+            ("CAS_AGENT_ROLE".to_string(), role.to_string()),
+            // See equivalent comment in `claude()` — without this the
+            // pre_tool verification-jail exemption for factory workers
+            // does not fire.
+            ("CAS_FACTORY_MODE".to_string(), "1".to_string()),
+            // Provide session ID so CAS MCP server can self-register
+            // without hooks (Grok's SessionStart hook output is ignored —
+            // this env var is the load-bearing identity signal instead).
+            ("CAS_SESSION_ID".to_string(), session_id.clone()),
+            (
+                "CAS_CLONE_PATH".to_string(),
+                cwd.to_string_lossy().to_string(),
+            ),
+            ("IS_DEMO".to_string(), "true".to_string()),
+            // cas-921f (P1 fix-round): a grok process is ALWAYS grok — set
+            // this unconditionally rather than relying on
+            // `factory_worker_cli`, which the worker spawn path leaves
+            // `None` (see `build_worker_config`, cas-mux/pane/mod.rs). Grok
+            // has no Codex-style `-c mcp_servers.*.env` override mechanism
+            // (Phase 2 finding: it discovers `cas serve` natively via
+            // `.mcp.json`/`~/.claude.json`, inheriting this process's own
+            // env like `claude()` does) — so this is the ONLY place the
+            // signal can originate. Without it, `apply_factory_worker_metadata`
+            // (mcp/daemon.rs) / the direct-registration fallback
+            // (hooks/handlers/handlers_session.rs) never see
+            // `CAS_FACTORY_WORKER_CLI`, `worker_cli_from_agent` silently
+            // defaults every grok worker to `Claude`, and Phase 4's entire
+            // harness-aware is-wedged/liveness path never engages for a
+            // real grok worker — it globs `~/.claude/projects/*` for a
+            // transcript that lives at `~/.grok/sessions/*` and always
+            // resolves `None`.
+            ("CAS_FACTORY_WORKER_CLI".to_string(), "grok".to_string()),
+        ];
+
+        if let Some(root) = cas_root {
+            env.push(("CAS_ROOT".to_string(), root.to_string_lossy().to_string()));
+        }
+        if let Some(sup) = supervisor_name {
+            env.push(("CAS_SUPERVISOR_NAME".to_string(), sup.to_string()));
+        }
+        push_factory_worker_metadata_env(&mut env, role, factory_worker_cli, model, effort);
+
+        // cas-0bf4: see equivalent comment in `claude()`.
+        push_worker_cargo_env(&mut env, role);
+        // cas-3522 follow-on: see equivalent comment in `claude()`.
+        push_worker_zig_env(&mut env, role, cas_root);
+
+        let mut args = vec![
+            "--permission-mode".to_string(),
+            "bypassPermissions".to_string(),
+            "--session-id".to_string(),
+            session_id,
+            "--cwd".to_string(),
+            cwd.to_string_lossy().to_string(),
+        ];
+        if let Some(m) = model {
+            args.push("-m".to_string());
+            args.push(m.to_string());
+        }
+        if let Some(e) = effort {
+            args.push("--reasoning-effort".to_string());
+            args.push(e.to_string());
+        }
+
+        // Context-bundle substitute for the ignored-SessionStart-hook gap
+        // (delta #2): append role-appropriate instructions via --rules.
+        let instructions = if role == "supervisor" {
+            GROK_SUPERVISOR_INSTRUCTIONS
+        } else {
+            GROK_WORKER_INSTRUCTIONS
+        };
+        args.push("--rules".to_string());
+        args.push(instructions.to_string());
+
+        // cas-0bf4: see equivalent comment in `claude()`.
+        let (command, args) = maybe_wrap_with_nice("grok", args, role);
 
         Self {
             command,
@@ -2720,6 +2897,341 @@ mod tests {
         assert!(
             exited,
             "Ctrl+C (0x03) from interrupt() must terminate cat (INTR signal)"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // cas-6569 (EPIC cas-8888, Phase 2): PtyConfig::grok
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_pty_config_grok_basic() {
+        // ScopedEnv clears CAS_FACTORY_NICE_WORKER etc. for the duration of
+        // this test — this suite runs inside a real factory worker session
+        // that sets CAS_FACTORY_NICE_WORKER=1 in its own ambient env, which
+        // would otherwise wrap `config.command` in `nice` and break the
+        // exact-match assertion below (same reason `test_pty_config_claude`
+        // uses it).
+        let _e = ScopedEnv::new();
+        let config = PtyConfig::grok(
+            "test-agent",
+            "worker",
+            PathBuf::from("/tmp"),
+            None,
+            None,
+            None,
+            None, // model
+            None, // effort
+            None, // teams
+        );
+        assert_eq!(config.command, "grok");
+        assert!(
+            config
+                .args
+                .contains(&"--permission-mode".to_string())
+        );
+        assert!(config.args.contains(&"bypassPermissions".to_string()));
+        assert!(
+            config
+                .env
+                .iter()
+                .any(|(k, v)| k == "CAS_AGENT_NAME" && v == "test-agent")
+        );
+        assert!(
+            config
+                .env
+                .iter()
+                .any(|(k, v)| k == "CAS_AGENT_ROLE" && v == "worker")
+        );
+        assert!(
+            config
+                .env
+                .iter()
+                .any(|(k, v)| k == "CAS_FACTORY_MODE" && v == "1"),
+            "worker verification-jail exemption depends on this"
+        );
+        // No CAS_ROOT when not provided.
+        assert!(!config.env.iter().any(|(k, _)| k == "CAS_ROOT"));
+    }
+
+    #[tokio::test]
+    async fn test_pty_config_grok_with_cas_root() {
+        let cas_root = PathBuf::from("/home/user/project/.cas");
+        let config = PtyConfig::grok(
+            "test-agent",
+            "worker",
+            PathBuf::from("/tmp"),
+            Some(&cas_root),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(
+            config
+                .env
+                .iter()
+                .any(|(k, v)| k == "CAS_ROOT" && v == "/home/user/project/.cas")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pty_config_grok_with_supervisor() {
+        let config = PtyConfig::grok(
+            "test-agent",
+            "worker",
+            PathBuf::from("/tmp"),
+            None,
+            Some("sup-1"),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(
+            config
+                .env
+                .iter()
+                .any(|(k, v)| k == "CAS_SUPERVISOR_NAME" && v == "sup-1")
+        );
+    }
+
+    /// EPIC cas-8888: Grok uses Claude's anti-overwrite session model — a
+    /// fresh uuid, not Codex's name-prefixed style — because Phase 4's
+    /// transcript resolver keys on this exact value.
+    #[tokio::test]
+    async fn test_pty_config_grok_injects_session_id_as_bare_uuid() {
+        let config = PtyConfig::grok(
+            "test-agent",
+            "worker",
+            PathBuf::from("/tmp"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let session_id = config
+            .env
+            .iter()
+            .find(|(k, _)| k == "CAS_SESSION_ID")
+            .map(|(_, v)| v.clone())
+            .expect("CAS_SESSION_ID must be set");
+        assert!(
+            uuid::Uuid::parse_str(&session_id).is_ok(),
+            "grok session id must be a bare uuid (anti-overwrite model), got: {session_id}"
+        );
+        // The --session-id arg must carry the SAME value as the env var.
+        let idx = config
+            .args
+            .iter()
+            .position(|a| a == "--session-id")
+            .expect("--session-id flag must be present");
+        assert_eq!(config.args[idx + 1], session_id);
+    }
+
+    #[tokio::test]
+    async fn test_pty_config_grok_with_model_and_effort() {
+        let config = PtyConfig::grok(
+            "test-agent",
+            "worker",
+            PathBuf::from("/tmp"),
+            None,
+            None,
+            None,
+            Some("grok-4.5"),
+            Some("high"),
+            None,
+        );
+        let all_args = config.args.join(" ");
+        assert!(
+            all_args.contains("-m grok-4.5"),
+            "expected -m <model>; got: {all_args}"
+        );
+        assert!(
+            all_args.contains("--reasoning-effort high"),
+            "expected --reasoning-effort <effort>; got: {all_args}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pty_config_grok_without_model_or_effort_omits_flags() {
+        let config = PtyConfig::grok(
+            "test-agent",
+            "worker",
+            PathBuf::from("/tmp"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(!config.args.contains(&"-m".to_string()));
+        assert!(!config.args.contains(&"--reasoning-effort".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_pty_config_grok_injects_cwd_flag() {
+        let cwd = PathBuf::from("/home/user/myproject");
+        let config = PtyConfig::grok(
+            "test-agent",
+            "worker",
+            cwd.clone(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let idx = config
+            .args
+            .iter()
+            .position(|a| a == "--cwd")
+            .expect("--cwd flag must be present");
+        assert_eq!(config.args[idx + 1], cwd.to_string_lossy().to_string());
+        // The actual process working directory must ALSO be set (the
+        // `--cwd` flag and the spawned process's real cwd are independent
+        // — both are set for correctness).
+        assert_eq!(config.cwd, Some(cwd));
+    }
+
+    /// EPIC cas-8888 delta #2: Grok's SessionStart hook output is ignored,
+    /// so the context bundle is delivered via `--rules` instead. Worker and
+    /// supervisor get role-appropriate instructions.
+    #[tokio::test]
+    async fn test_pty_config_grok_worker_injects_rules_with_cas_prefix() {
+        let config = PtyConfig::grok(
+            "test-worker",
+            "worker",
+            PathBuf::from("/tmp"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let idx = config
+            .args
+            .iter()
+            .position(|a| a == "--rules")
+            .expect("--rules flag must be present");
+        let rules = &config.args[idx + 1];
+        assert!(
+            rules.contains("cas__task") && rules.contains("cas__coordination"),
+            "grok worker rules must reference the cas__ tool prefix, not mcp__cas__/mcp__cs__: {rules}"
+        );
+        // No actual TOOL-CALL-shaped usage of Claude's/Codex's prefix (e.g.
+        // "mcp__cas__task action=..." or "mcp__cs__task action=..."). The
+        // text is allowed to mention those prefixes in passing (as a "not
+        // this" clarification) — only real call-shaped occurrences would
+        // be a bug.
+        assert!(
+            !rules.contains("mcp__cas__task") && !rules.contains("mcp__cs__task"),
+            "grok rules must not use Claude's or Codex's tool-call syntax: {rules}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pty_config_grok_supervisor_injects_rules_with_cas_prefix() {
+        let config = PtyConfig::grok(
+            "test-supervisor",
+            "supervisor",
+            PathBuf::from("/tmp"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let idx = config
+            .args
+            .iter()
+            .position(|a| a == "--rules")
+            .expect("--rules flag must be present");
+        let rules = &config.args[idx + 1];
+        assert!(
+            rules.contains("cas__coordination") && rules.contains("Supervisor"),
+            "grok supervisor rules must reference the cas__ prefix and supervisor role: {rules}"
+        );
+    }
+
+    /// EPIC cas-8888 (cas-9a31, Phase 1 wiring): CAS_FACTORY_WORKER_CLI must
+    /// be injected so downstream harness_policy resolution (cas__ tool
+    /// prefix) works for a Grok worker, same as Claude/Codex.
+    ///
+    /// cas-921f P1 fix-round: this test originally passed `Some("grok")` for
+    /// `factory_worker_cli` — a shape that never actually occurs on the real
+    /// worker spawn path (`build_worker_config`, cas-mux/pane/mod.rs, always
+    /// passes `None` there), so it gave false confidence: it proved the
+    /// PASSTHROUGH worked, never that a real worker gets the env var at all.
+    /// Fixed to pass `None`, matching the real call shape, so this test
+    /// actually exercises the P1 bug (Phase 4 liveness was completely inert
+    /// for real grok workers — no `CAS_FACTORY_WORKER_CLI` ⇒ `is-wedged`
+    /// globs `~/.claude/projects/*` for a transcript that lives at
+    /// `~/.grok/sessions/*` and always resolves `None`).
+    #[tokio::test]
+    async fn test_pty_config_grok_worker_injects_factory_worker_cli() {
+        let config = PtyConfig::grok(
+            "test-agent",
+            "worker",
+            PathBuf::from("/tmp"),
+            None,
+            None,
+            None, // factory_worker_cli — always None on the real worker spawn path
+            None,
+            None,
+            None,
+        );
+        assert!(
+            config
+                .env
+                .iter()
+                .any(|(k, v)| k == "CAS_FACTORY_WORKER_CLI" && v == "grok"),
+            "a grok process must set its own CAS_FACTORY_WORKER_CLI unconditionally — \
+             it cannot rely on the factory_worker_cli param, which the worker spawn path \
+             always leaves None: {:?}",
+            config.env
+        );
+    }
+
+    /// The supervisor path passes `factory_worker_cli = Some(<workers' cli>)`
+    /// — a DIFFERENT semantic meaning of the same env var ("what CLI do MY
+    /// WORKERS run", not "what CLI am I"). That value must still win over
+    /// the unconditional grok-self push above; `apply_factory_worker_metadata`
+    /// only ever reads this env var for worker-role agents anyway (cas-921f),
+    /// so a supervisor never persists bogus `worker_cli` metadata from it —
+    /// but pin the env-vec ordering contract directly too, since `Vec<(K,V)>`
+    /// → `Command::env` applies last-write-wins per key.
+    #[tokio::test]
+    async fn test_pty_config_grok_supervisor_factory_worker_cli_overrides_self_grok() {
+        let config = PtyConfig::grok(
+            "test-supervisor",
+            "supervisor",
+            PathBuf::from("/tmp"),
+            None,
+            None,
+            Some("codex"), // "my workers run codex"
+            None,
+            None,
+            None,
+        );
+        let values: Vec<&str> = config
+            .env
+            .iter()
+            .filter(|(k, _)| k == "CAS_FACTORY_WORKER_CLI")
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert_eq!(
+            values.last().copied(),
+            Some("codex"),
+            "the last CAS_FACTORY_WORKER_CLI entry (which Command::env applies last, \
+             winning) must be the supervisor's actual workers' cli, not grok's self-id: {values:?}"
         );
     }
 }

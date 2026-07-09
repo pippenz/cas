@@ -74,6 +74,13 @@ pub fn handle_session_start(
                 if let Ok(effort) = std::env::var("CAS_FACTORY_WORKER_EFFORT") {
                     agent.metadata.insert("worker_effort".to_string(), effort);
                 }
+                // cas-058f: mirror apply_factory_worker_metadata's worker_cli
+                // write for this direct-registration fallback path (both
+                // registration paths must agree, or is-wedged/kill would see
+                // the harness only sometimes).
+                if let Ok(cli) = std::env::var("CAS_FACTORY_WORKER_CLI") {
+                    agent.metadata.insert("worker_cli".to_string(), cli);
+                }
 
                 if let Err(reg_err) = agent_store.register(&agent) {
                     eprintln!("cas: Failed to register agent: {reg_err}");
