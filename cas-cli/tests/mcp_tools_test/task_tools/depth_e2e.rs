@@ -21,7 +21,7 @@
 //! the single-session per-layer tests cannot catch.
 
 use crate::support::*;
-use cas::mcp::{CasCore, CasService};
+use cas::mcp::CasService;
 use cas::store::open_task_store;
 use cas::types::{TaskDepth, TaskStatus};
 use rmcp::handler::server::wrapper::Parameters;
@@ -96,7 +96,7 @@ fn init_git_repo_with_staged_changes(project_root: &std::path::Path) {
 /// Session-1 create: returns the new task id. Built on its own core/service so
 /// the close runs on a freshly-opened one (session 2).
 async fn create_task(cas_dir: &std::path::Path, title: &str, depth: Option<&str>) -> String {
-    let core = CasCore::with_daemon(cas_dir.to_path_buf(), None, None);
+    let core = core_with_test_agent(cas_dir);
     let service = CasService::new(core, None);
     let mut body = serde_json::json!({
         "action": "create",
@@ -118,7 +118,9 @@ async fn create_task(cas_dir: &std::path::Path, title: &str, depth: Option<&str>
 
 /// Session-2 start+close on a fresh core/service; returns the close output text.
 async fn start_and_close(cas_dir: &std::path::Path, id: &str) -> String {
-    let core = CasCore::with_daemon(cas_dir.to_path_buf(), None, None);
+    // Fresh session (second worker process) — must seed agent identity itself
+    // (cas-48e6); bare with_daemon has no SessionStart mapping / agent_id.
+    let core = core_with_test_agent(cas_dir);
     let service = CasService::new(core, None);
     service
         .task(Parameters(task_req(
