@@ -18,6 +18,24 @@ use cas_types::{
 
 use crate::changes::{FileChangeInfo, GitFileStatus, SourceChangesInfo};
 
+/// cas-e98e: lightweight PID liveness for FACTORY pane reconciliation.
+/// Linux: `/proc/<pid>` exists. Other platforms: conservatively false
+/// (no false "live" without a real probe).
+fn agent_pid_looks_alive(pid: Option<u32>) -> bool {
+    let Some(pid) = pid else {
+        return false;
+    };
+    #[cfg(target_os = "linux")]
+    {
+        std::path::Path::new(&format!("/proc/{pid}")).exists()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
 /// Cached store handles to avoid re-opening on every refresh cycle.
 ///
 /// Each `open()` call does path canonicalization + global hashmap lookup.
@@ -394,12 +412,22 @@ impl DirectorData {
         let mut agent_id_to_name = HashMap::new();
         let agents: Vec<AgentSummary> = agents_list
             .into_iter()
-            // Only show factory-relevant agents (not CLI agents with Standard role)
+            // Factory-relevant agents only. cas-e98e: also keep Stale rows
+            // whose registered PID is still live so FACTORY does not show
+            // "not registered" for a mid-turn agent that lost its heartbeat
+            // (same dual-signal as worker_status process-alive suppress).
             .filter(|a| {
-                (a.status == AgentStatus::Active || a.status == AgentStatus::Idle)
-                    && (a.role == AgentRole::Supervisor
-                        || a.role == AgentRole::Worker
-                        || a.role == AgentRole::Director)
+                let role_ok = a.role == AgentRole::Supervisor
+                    || a.role == AgentRole::Worker
+                    || a.role == AgentRole::Director;
+                if !role_ok {
+                    return false;
+                }
+                match a.status {
+                    AgentStatus::Active | AgentStatus::Idle => true,
+                    AgentStatus::Stale => agent_pid_looks_alive(a.pid),
+                    _ => false,
+                }
             })
             .map(|a| {
                 agent_id_to_name.insert(a.id.clone(), a.name.clone());
@@ -448,10 +476,19 @@ impl DirectorData {
                             .get(&(a.id.clone(), task.id.clone()))
                             .cloned(),
                     });
+                // Surface process-alive Stale rows as Active so icons/counts
+                // match worker_status dual-signal (cas-e98e).
+                let display_status = if a.status == AgentStatus::Stale
+                    && agent_pid_looks_alive(a.pid)
+                {
+                    AgentStatus::Active
+                } else {
+                    a.status
+                };
                 AgentSummary {
                     id: a.id,
                     name: a.name,
-                    status: a.status,
+                    status: display_status,
                     current_task,
                     latest_activity,
                     last_heartbeat: Some(a.last_heartbeat),

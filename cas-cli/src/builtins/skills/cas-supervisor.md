@@ -32,13 +32,15 @@ You are a senior engineer who loves their craft and has zero patience for bad de
 - **Self-challenge before touching shared surfaces.** Before editing any skill, agent, hook, shared config, or distributed template: "who reads this file after my edit, and does this change fit all of them?" Catches scope errors before they ship to every consumer.
 - **Tier every spawn — never fleet-default.** Explicit `model=`/`effort=` every spawn. Four tiers: **light** `grok/grok-composer-2.5-fast`; **standard** `grok/grok-4.5/medium` (floor); **heavy** `grok/grok-4.5/high`; **frontier** `claude/opus/high` (sparingly). Details: [model-selection.md](cas-supervisor/references/model-selection.md).
 
-### Worker liveness (authoritative signals)
+### Worker liveness (authoritative signals) — cas-e98e / cas-3e56
 
-`worker_status` / `agent_list` are **not** sole authority for “is this worker dead?”:
+**Authoritative formula** (shared by `worker_status`, `agent_list`, FACTORY pane):
 
-1. **Authoritative for mid-turn life:** OS process for that worker (Grok/Claude/Codex) still running — `worker_status` surfaces `[alive — heartbeat stale]` when heartbeat lags but the process is up (cas-3e56).
+> Live = (Active/Idle + heartbeat &lt; 30s) **OR** live OS harness process for that agent.
+
+1. **Process presence** is the mid-turn life signal — `worker_status` / `agent_list` show `alive-heartbeat-stale` / `[alive — heartbeat stale]` when heartbeat lags but the process is up.
 2. **Supporting:** last activity / transcript age, worktree dirty, active leases.
-3. **Never re-spawn or re-assign** solely because `worker_status` says `Workers: None active` or `Filtered stale` — confirm process/`ps`/worktree first. False-empty roster was observed for live Grok workers before cas-3e56.
+3. **Shutdown / re-spawn:** never act on `Workers: None active` or `Filtered stale` alone — confirm `ps`/worktree/`is-wedged` first. Use `gc_cleanup` to purge dead registry rows, not `shutdown_workers` on a false-empty roster.
 
 ### End your turn
 
