@@ -37,10 +37,15 @@ pub(super) fn resolve_live_worker_harness(cas_dir: &std::path::Path) -> cas_mux:
 /// worktree. The daemon reaper (Unit 3) reads this to drive TTL-based salvage.
 const DIRTY_ON_SHUTDOWN_KEY: &str = "dirty_on_shutdown";
 
+/// Resolve the branch a dynamically-spawned worker should be cut from: the
+/// active epic branch when pinned, else the configured epic base
+/// (`.cas/config.toml` `[factory] epic_base_branch`, cas-b082), else the
+/// repo's detected default branch.
 fn worker_base_for_spawn(epic_branch: Option<&str>, manager: &WorktreeManager) -> String {
-    epic_branch
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| manager.git().detect_default_branch())
+    epic_branch.map(ToOwned::to_owned).unwrap_or_else(|| {
+        Config::configured_epic_base_branch(manager.repo_root())
+            .unwrap_or_else(|| manager.git().detect_default_branch())
+    })
 }
 
 /// Stamp `dirty_on_shutdown=true` (plus path + file count) onto the agent

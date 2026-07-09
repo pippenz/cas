@@ -235,3 +235,155 @@ async fn test_worktree_list_no_disabled_message_when_no_factory_worktrees() {
         "worktree_list should say 'No worktrees' when none exist.\nGot:\n{text}"
     );
 }
+
+// =============================================================================
+// cas-1d11: worktree_merge must agree with spawn isolate=true on
+// worktrees.enabled — a factory (System B) worktree must be mergeable
+// even when System A is off, since spawn never checked that flag either.
+// =============================================================================
+
+/// `worktree_merge`'s handler resolves the repo root from the *process*
+/// current directory (`std::env::current_dir()`), not from `cas_root` —
+/// a pre-existing quirk shared by `worktree_create` too, unrelated to this
+/// fix. Since cwd is process-global, tests that exercise `worktree_merge`
+/// must serialize around changing it. All such tests live in this file and
+/// take this lock for their full duration; no other test file is affected
+/// (`cargo test` runs each integration-test file as its own process).
+fn merge_cwd_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+/// RAII guard: switches the process cwd to `dir` on construction, restores
+/// the original cwd on drop (including on panic/early return).
+struct CwdGuard {
+    original: PathBuf,
+}
+
+impl CwdGuard {
+    fn enter(dir: &Path) -> Self {
+        let original = std::env::current_dir().expect("current_dir");
+        std::env::set_current_dir(dir).expect("set_current_dir");
+        Self { original }
+    }
+}
+
+impl Drop for CwdGuard {
+    fn drop(&mut self) {
+        let _ = std::env::set_current_dir(&self.original);
+    }
+}
+
+fn run_git(args: &[&str], dir: &Path) {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("git");
+    assert!(
+        out.status.success(),
+        "git {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// AC: spawn isolate=true creates a real factory worktree regardless of
+/// `worktrees.enabled`; `worktree_merge` must actually merge it instead of
+/// refusing with the "disabled by default" message.
+#[tokio::test]
+async fn test_worktree_merge_succeeds_for_factory_worktree_when_system_a_disabled() {
+    let repo = GitRepo::new();
+    let cas_root = init_cas_dir(&repo.root).expect("init_cas_dir");
+    disable_system_a(&cas_root);
+
+    let wt_path = cas_root.join("worktrees").join("alice");
+    repo.add_worktree(&wt_path, "factory/alice");
+
+    // Give the worker branch real content to merge, not just an empty commit.
+    std::fs::write(wt_path.join("alice-work.txt"), "alice's work").unwrap();
+    run_git(&["add", "."], &wt_path);
+    run_git(&["commit", "-m", "alice work"], &wt_path);
+
+    let _lock = merge_cwd_lock().lock().unwrap_or_else(|p| p.into_inner());
+    let _cwd = CwdGuard::enter(&repo.root);
+
+    let svc = make_service(cas_root);
+    let mut req = coord_req("worktree_merge");
+    req.id = Some("factory/alice".to_string());
+    let result = svc
+        .coordination(Parameters(req))
+        .await
+        .expect("coordination call should succeed");
+
+    let text = get_text(&result);
+
+    assert!(
+        !text.contains("experimental and disabled"),
+        "worktree_merge must not refuse a real factory (System B) worktree just \
+         because System A's flag is off — spawn never checked that flag either.\nGot:\n{text}"
+    );
+    assert!(
+        text.contains("Merged worktree"),
+        "worktree_merge should report a successful merge.\nGot:\n{text}"
+    );
+
+    // The merge actually landed: content reachable from the checked-out repo.
+    assert!(
+        repo.root.join("alice-work.txt").exists(),
+        "merged content must land on the parent branch's working tree"
+    );
+    // cleanup_on_close defaults true: the worktree directory is reclaimed.
+    assert!(
+        !wt_path.exists(),
+        "worktree directory should be cleaned up after a successful merge"
+    );
+}
+
+/// Negative case: when neither System A nor System B has a matching
+/// worktree, `worktree_merge` must report an accurate "not found" — never
+/// silently succeed, and never fall back to the misleading "disabled"
+/// message (that message implies the feature is off, not that the target
+/// doesn't exist).
+#[tokio::test]
+async fn test_worktree_merge_reports_not_found_not_disabled_when_nothing_matches() {
+    let repo = GitRepo::new();
+    let cas_root = init_cas_dir(&repo.root).expect("init_cas_dir");
+    disable_system_a(&cas_root);
+    // No worktree created for "bob" in either system.
+
+    let _lock = merge_cwd_lock().lock().unwrap_or_else(|p| p.into_inner());
+    let _cwd = CwdGuard::enter(&repo.root);
+
+    let svc = make_service(cas_root);
+    let mut req = coord_req("worktree_merge");
+    req.id = Some("factory/bob".to_string());
+    let result = svc.coordination(Parameters(req)).await;
+
+    let (not_disabled, contains_not_found) = match &result {
+        Ok(r) => {
+            let text = get_text(r);
+            (
+                !text.contains("experimental and disabled"),
+                text.to_lowercase().contains("not found"),
+            )
+        }
+        Err(e) => {
+            let msg = format!("{e:?}");
+            (
+                !msg.contains("experimental and disabled"),
+                msg.to_lowercase().contains("not found"),
+            )
+        }
+    };
+
+    assert!(
+        not_disabled,
+        "a missing worktree must never be reported as 'disabled' — that implies \
+         the feature is off, not that the target doesn't exist. Got: {result:?}"
+    );
+    assert!(
+        contains_not_found,
+        "a missing worktree should be reported as not found. Got: {result:?}"
+    );
+}

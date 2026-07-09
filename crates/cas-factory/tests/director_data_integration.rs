@@ -809,6 +809,7 @@ fn test_agent_summary_fields() {
         last_heartbeat: Some(now),
         pending_messages: 0,
         active_lease: None,
+        effort: None,
     };
 
     assert_eq!(summary.id, "agent-123");

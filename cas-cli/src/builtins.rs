@@ -1176,6 +1176,34 @@ This is the body content."#;
         }
     }
 
+    /// cas-edf4: the codex-flavored supervisor guide carries the same
+    /// deliberate-tiering hard rule as the Claude copy (cas-c093) — the
+    /// codex copy has no byte-cap test gating it, so this is the guard
+    /// against the two surfaces silently drifting back apart.
+    #[test]
+    fn test_codex_supervisor_guidance_mirrors_tiering_rule() {
+        let codex_guide = include_str!("builtins/codex/skills/cas-supervisor.md");
+        for keyword in [
+            "Tier every spawn",
+            "never fleet-default",
+            "light",
+            "standard",
+            "heavy",
+            "frontier",
+            "model-selection.md",
+        ] {
+            assert!(
+                codex_guide.contains(keyword),
+                "codex cas-supervisor.md missing tiering-rule keyword: {keyword:?}"
+            );
+        }
+        // Quick Start step 6 must show a tiered mix, not a single default line.
+        assert!(
+            codex_guide.contains("tiered mix"),
+            "codex cas-supervisor.md Quick Start must not read as a single default spawn recipe"
+        );
+    }
+
     /// The checklist is a separate skill invocable via /cas-supervisor-checklist.
     /// Bundling it into supervisor_guidance() would push the SessionStart
     /// payload over the ~10KB harness cap (cas-ecd5, 2026-06-01).

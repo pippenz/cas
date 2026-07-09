@@ -99,6 +99,27 @@ impl WorktreeDirtyStatus {
     }
 }
 
+/// Result of resolving a branch-creation base against its remote tip
+/// (cas-b082). `create_branch_from`-style callers should branch from
+/// `branch_ref`, not the raw base name, so a stale local base never
+/// silently anchors a new epic/worker branch.
+#[derive(Debug, Clone)]
+pub struct ResolvedBase {
+    /// The ref actually used as the branch-creation start point — either
+    /// `origin/<base>` (remote tip, when reachable) or the bare local
+    /// `<base>` (offline / no remote / remote ref missing).
+    pub branch_ref: String,
+    /// Resolved SHA of `branch_ref` at resolution time (empty string if it
+    /// could not be resolved, e.g. base branch doesn't exist locally yet).
+    pub sha: String,
+    /// Commits the local `<base>` branch was behind `origin/<base>` at
+    /// resolution time. Always 0 when `used_remote` is false.
+    pub behind_count: u32,
+    /// Whether `branch_ref` points at the fetched remote tracking branch
+    /// (true) or fell back to the local branch (false).
+    pub used_remote: bool,
+}
+
 /// Git operations wrapper
 pub struct GitOperations {
     /// Path to the main repository root

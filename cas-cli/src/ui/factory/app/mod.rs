@@ -694,6 +694,23 @@ impl FactoryApp {
             })
             .collect();
 
+        // cas-09d0: tasks that are Open but have an unmet `Blocks` dependency
+        // must not be counted as "dispatchable" — see `compute_gated_task_ids`.
+        let non_closed_ids = non_closed_task_ids(&unfiltered_data);
+        let blocks_deps = self
+            .director_stores
+            .as_ref()
+            .and_then(|s| {
+                cas_store::TaskStore::list_dependencies(
+                    &s.task_store,
+                    Some(cas_types::DependencyType::Blocks),
+                )
+                .ok()
+            })
+            .unwrap_or_default();
+        let gated_task_ids =
+            crate::ui::factory::director::compute_gated_task_ids(&non_closed_ids, &blocks_deps);
+
         let prompts: Vec<Prompt> = delivery_events
             .iter()
             .filter_map(|event| {
@@ -705,6 +722,7 @@ impl FactoryApp {
                     &self.auto_prompt,
                     self.supervisor_cli,
                     self.worker_cli,
+                    &gated_task_ids,
                 )
             })
             .collect();
@@ -1326,6 +1344,31 @@ impl FactoryApp {
     }
 }
 
+/// Task ids from `data` that are NOT in a Closed state — the "still open"
+/// universe `compute_gated_task_ids` checks a Blocks-dependency's blocker
+/// against (cas-09d0). `ready_tasks`/`in_progress_tasks` only ever contain
+/// non-closed statuses already (see `director.rs::load_with_stores`'s
+/// bucketing switch), but `epic_tasks` is populated unconditionally — EVERY
+/// epic lands there regardless of status, including `Closed` (cas-a91b
+/// review finding). Without filtering epic_tasks here, a task blocked by an
+/// already-CLOSED epic was incorrectly still counted as "non-closed" and
+/// stayed gated forever — over-excluding a task that `TaskStore::list_ready()`
+/// (`blocker.status != 'closed'`) would correctly treat as ready. Split out
+/// as a standalone function so it's testable against a plain `DirectorData`
+/// literal, without needing real stores.
+fn non_closed_task_ids(data: &DirectorData) -> HashSet<&str> {
+    data.ready_tasks
+        .iter()
+        .chain(data.in_progress_tasks.iter())
+        .chain(
+            data.epic_tasks
+                .iter()
+                .filter(|e| e.status != cas_types::TaskStatus::Closed),
+        )
+        .map(|t| t.id.as_str())
+        .collect()
+}
+
 fn merge_director_data_preserving_git(
     previous: &DirectorData,
     mut loaded: DirectorData,
@@ -1700,7 +1743,8 @@ mod tests {
     use cas_types::{Priority, TaskStatus, TaskType};
 
     use super::{
-        DirectorData, DirectorEvent, merge_director_data_preserving_git, unfiltered_snapshot_from,
+        DirectorData, DirectorEvent, merge_director_data_preserving_git, non_closed_task_ids,
+        unfiltered_snapshot_from,
     };
 
     fn data_with_changes(git_loaded: bool, changes: Vec<SourceChangesInfo>) -> DirectorData {
@@ -1778,6 +1822,40 @@ mod tests {
             branch: Some(format!("epic/{id}")),
             updated_at: None,
         }
+    }
+
+    /// cas-a91b review finding: `director.rs::load_with_stores` pushes EVERY
+    /// epic into `epic_tasks` regardless of status, including `Closed` —
+    /// unlike `ready_tasks`/`in_progress_tasks`, which the bucketing switch
+    /// already excludes Closed from. `non_closed_task_ids` must filter
+    /// `epic_tasks` itself rather than trusting it's already non-closed, or
+    /// a task blocked by an already-closed epic stays gated forever (over-
+    /// excluding a task `TaskStore::list_ready()` would correctly show ready).
+    #[test]
+    fn test_a91b_non_closed_task_ids_excludes_closed_epics() {
+        let data = DirectorData {
+            ready_tasks: vec![],
+            in_progress_tasks: vec![],
+            epic_tasks: vec![
+                epic_summary("epic-open", "Open Epic", TaskStatus::Open),
+                epic_summary("epic-closed", "Closed Epic", TaskStatus::Closed),
+            ],
+            agents: vec![],
+            activity: vec![],
+            agent_id_to_name: HashMap::new(),
+            changes: vec![],
+            git_loaded: true,
+            reminders: vec![],
+            epic_closed_counts: HashMap::new(),
+        };
+
+        let ids = non_closed_task_ids(&data);
+        assert!(ids.contains("epic-open"), "an Open epic must count as non-closed");
+        assert!(
+            !ids.contains("epic-closed"),
+            "a Closed epic must NOT count as non-closed — its blockees should be treated \
+             as ready, matching TaskStore::list_ready()'s blocker.status != 'closed' check"
+        );
     }
 
     fn task_summary(
@@ -2689,6 +2767,7 @@ mod tests {
             last_heartbeat: None,
             pending_messages: 0,
             active_lease: None,
+            effort: None,
         }];
         source
             .agent_id_to_name

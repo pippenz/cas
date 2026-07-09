@@ -99,6 +99,15 @@ pub struct AgentSummary {
     /// separate from `current_task` because an agent can appear idle while a
     /// task row remains InProgress after a rejected close.
     pub active_lease: Option<ActiveLeaseSummary>,
+    /// Configured reasoning effort, parsed from `Agent.metadata["worker_effort"]`
+    /// (written at registration time from `CAS_FACTORY_WORKER_EFFORT`, see
+    /// `apply_factory_worker_metadata` in `cas-cli/src/mcp/daemon.rs`). `None`
+    /// when unset (legacy agent, or a role that doesn't carry an effort tier).
+    /// Used by the director's stall detector to scale its threshold —
+    /// a high/xhigh-effort worker's read-and-think phase routinely runs
+    /// longer before producing a checkpoint-class activity event than a
+    /// low-effort worker's (cas-09d0).
+    pub effort: Option<cas_mux::Effort>,
 }
 
 /// A group of tasks under an epic
@@ -398,6 +407,10 @@ impl DirectorData {
                 let current_task = assignee_tasks.get(&a.name).cloned();
                 let latest_activity = agent_latest_activity.get(&a.id).cloned();
                 let pending_messages = pending_counts.get(&a.name).copied().unwrap_or(0);
+                let effort = a
+                    .metadata
+                    .get("worker_effort")
+                    .and_then(|s| s.parse::<cas_mux::Effort>().ok());
                 // cas-627f: `list_agent_leases` returns only status='active'
                 // rows, but `park_task_awaiting_merge` (cas-8d5b) deliberately
                 // RELEASES the worker's lease as part of parking — so the
@@ -444,6 +457,7 @@ impl DirectorData {
                     last_heartbeat: Some(a.last_heartbeat),
                     pending_messages,
                     active_lease,
+                    effort,
                 }
             })
             .collect();
