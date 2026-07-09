@@ -96,4 +96,17 @@ impl Config {
             .map(|v| v == "1" || v.to_lowercase() == "true")
             .unwrap_or(false)
     }
+
+    /// Resolve `.cas/config.toml` `[factory] epic_base_branch` for the repo
+    /// at `repo_root`, or `None` when unset / the config can't be read.
+    ///
+    /// Shared by epic-branch auto-creation and worker-spawn base resolution
+    /// (cas-b082) so both paths agree on the configured trunk before
+    /// falling back to `GitOperations::detect_default_branch()`.
+    pub fn configured_epic_base_branch(repo_root: &std::path::Path) -> Option<String> {
+        Self::load(&repo_root.join(".cas"))
+            .ok()?
+            .factory()
+            .epic_base_branch
+    }
 }

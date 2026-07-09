@@ -292,3 +292,175 @@ fn test_fix_symlinked_submodules() {
     // Symlink should be gone (submodule init may or may not succeed, but symlink is removed)
     assert!(!symlink_path.is_symlink());
 }
+
+// --- cas-b082: resolve_fresh_base / fetch_branch / commits_behind ---------
+
+/// Bare "origin" repo plus a local clone tracking it — a real git remote
+/// setup (`create_test_repo` above is local-only). Returns
+/// (tempdir, origin bare path, local clone path); both branches are named
+/// "main" explicitly so tests don't depend on this system's
+/// `init.defaultBranch`.
+fn create_repo_with_origin() -> (TempDir, PathBuf, PathBuf) {
+    let temp = TempDir::new().unwrap();
+    let origin_path = temp.path().join("origin.git");
+    let local_path = temp.path().join("local");
+
+    Command::new("git")
+        .args(["init", "--bare", "-b", "main"])
+        .arg(&origin_path)
+        .output()
+        .unwrap();
+
+    Command::new("git")
+        .args([
+            "clone",
+            origin_path.to_str().unwrap(),
+            local_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    for (key, value) in [("user.email", "test@test.com"), ("user.name", "Test")] {
+        Command::new("git")
+            .args(["config", key, value])
+            .current_dir(&local_path)
+            .output()
+            .unwrap();
+    }
+
+    std::fs::write(local_path.join("README.md"), "# Test").unwrap();
+    Command::new("git")
+        .args(["add", "."])
+        .current_dir(&local_path)
+        .output()
+        .unwrap();
+    Command::new("git")
+        .args(["commit", "-m", "Initial commit"])
+        .current_dir(&local_path)
+        .output()
+        .unwrap();
+    Command::new("git")
+        .args(["push", "-u", "origin", "main"])
+        .current_dir(&local_path)
+        .output()
+        .unwrap();
+
+    (temp, origin_path, local_path)
+}
+
+/// Push `count` extra commits to `origin_path`'s `main` from a fresh clone,
+/// simulating upstream moving ahead while a different clone never fetches.
+fn advance_origin_main(temp: &TempDir, origin_path: &Path, count: usize) {
+    let advancer_path = temp.path().join("advancer");
+    Command::new("git")
+        .args([
+            "clone",
+            origin_path.to_str().unwrap(),
+            advancer_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    for (key, value) in [("user.email", "test@test.com"), ("user.name", "Test")] {
+        Command::new("git")
+            .args(["config", key, value])
+            .current_dir(&advancer_path)
+            .output()
+            .unwrap();
+    }
+    for i in 0..count {
+        std::fs::write(advancer_path.join(format!("upstream-{i}.txt")), "x").unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(&advancer_path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", &format!("upstream commit {i}")])
+            .current_dir(&advancer_path)
+            .output()
+            .unwrap();
+    }
+    Command::new("git")
+        .args(["push", "origin", "main"])
+        .current_dir(&advancer_path)
+        .output()
+        .unwrap();
+}
+
+#[test]
+fn test_resolve_fresh_base_no_remote_falls_back_to_local() {
+    let (_temp, repo_path) = create_test_repo();
+    let git = GitOperations::new(repo_path);
+    let trunk = git.detect_default_branch();
+
+    let resolved = git.resolve_fresh_base(&trunk).unwrap();
+
+    assert!(
+        !resolved.used_remote,
+        "local-only repo (no origin) must fall back to the local base"
+    );
+    assert_eq!(resolved.branch_ref, trunk);
+    assert_eq!(resolved.behind_count, 0);
+}
+
+#[test]
+fn test_resolve_fresh_base_up_to_date_remote() {
+    let (_temp, _origin_path, local_path) = create_repo_with_origin();
+    let git = GitOperations::new(local_path);
+
+    let resolved = git.resolve_fresh_base("main").unwrap();
+
+    assert!(resolved.used_remote);
+    assert_eq!(resolved.branch_ref, "origin/main");
+    assert_eq!(resolved.behind_count, 0);
+    assert!(!resolved.sha.is_empty());
+}
+
+#[test]
+fn test_resolve_fresh_base_reports_behind_count_and_uses_remote_tip() {
+    let (temp, origin_path, local_path) = create_repo_with_origin();
+    // origin/main gains 3 commits that local_path has never fetched — the
+    // live BUG-epic-branch-stale-local-base-2026-07-08 scenario.
+    advance_origin_main(&temp, &origin_path, 3);
+
+    let git = GitOperations::new(local_path.clone());
+    let stale_local_sha = git.ref_sha("main").unwrap();
+
+    let resolved = git.resolve_fresh_base("main").unwrap();
+
+    assert!(
+        resolved.used_remote,
+        "should resolve against the freshly fetched remote tracking branch"
+    );
+    assert_eq!(resolved.branch_ref, "origin/main");
+    assert_eq!(
+        resolved.behind_count, 3,
+        "local base was exactly 3 commits behind origin/main"
+    );
+    assert_ne!(
+        resolved.sha, stale_local_sha,
+        "resolved sha must be the fetched remote tip, not the stale local head"
+    );
+
+    // Branching from the resolved ref must actually carry the 3 commits the
+    // stale local `main` was missing — proves the fix, not just the report.
+    Command::new("git")
+        .args(["branch", "epic/test", &resolved.branch_ref])
+        .current_dir(&local_path)
+        .output()
+        .unwrap();
+    assert_eq!(git.ref_sha("epic/test").unwrap(), resolved.sha);
+}
+
+#[test]
+fn test_commits_behind_counts_one_sided_divergence() {
+    let (temp, origin_path, local_path) = create_repo_with_origin();
+    advance_origin_main(&temp, &origin_path, 2);
+
+    let git = GitOperations::new(local_path);
+    git.fetch_branch("main").unwrap();
+
+    assert_eq!(git.commits_behind("main", "origin/main").unwrap(), 2);
+    // Local has nothing origin/main lacks — behind count the other way is 0.
+    assert_eq!(git.commits_behind("origin/main", "main").unwrap(), 0);
+}

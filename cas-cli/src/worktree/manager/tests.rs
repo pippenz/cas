@@ -618,3 +618,213 @@ fn test_cleanup_workers_non_force_reports_dirty_deferred() {
     assert!(!clean_path.exists());
     assert!(dirty_path.exists(), "dirty tree must survive non-force cleanup");
 }
+
+// --- cas-b082: epic-branch base resolution (fetch-before-branch + config) --
+
+/// Write `.cas/config.toml` with `[factory] epic_base_branch = "<branch>"`
+/// under `repo_root`, creating the `.cas` dir if needed.
+fn write_epic_base_branch_config(repo_root: &std::path::Path, branch: &str) {
+    let cas_dir = repo_root.join(".cas");
+    std::fs::create_dir_all(&cas_dir).unwrap();
+    std::fs::write(
+        cas_dir.join("config.toml"),
+        format!("[factory]\nepic_base_branch = \"{branch}\"\n"),
+    )
+    .unwrap();
+}
+
+/// Bare "origin" repo plus a local clone tracking it — a real git remote
+/// setup (unlike `create_test_repo`'s local-only repo), so fetch-before-branch
+/// behavior can be exercised. Returns (tempdir, origin bare path, local clone path).
+fn create_repo_with_origin() -> (TempDir, PathBuf, PathBuf) {
+    let temp = TempDir::new().unwrap();
+    let origin_path = temp.path().join("origin.git");
+    let local_path = temp.path().join("local");
+
+    Command::new("git")
+        .args(["init", "--bare", "-b", "main"])
+        .arg(&origin_path)
+        .output()
+        .unwrap();
+
+    Command::new("git")
+        .args([
+            "clone",
+            origin_path.to_str().unwrap(),
+            local_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    for (key, value) in [("user.email", "test@test.com"), ("user.name", "Test")] {
+        Command::new("git")
+            .args(["config", key, value])
+            .current_dir(&local_path)
+            .output()
+            .unwrap();
+    }
+
+    std::fs::write(local_path.join("README.md"), "# Test").unwrap();
+    Command::new("git")
+        .args(["add", "."])
+        .current_dir(&local_path)
+        .output()
+        .unwrap();
+    Command::new("git")
+        .args(["commit", "-m", "Initial commit"])
+        .current_dir(&local_path)
+        .output()
+        .unwrap();
+    Command::new("git")
+        .args(["push", "-u", "origin", "main"])
+        .current_dir(&local_path)
+        .output()
+        .unwrap();
+
+    (temp, origin_path, local_path)
+}
+
+/// Push `count` extra commits to `origin_path`'s `main` from a fresh clone,
+/// simulating upstream moving ahead while `local_path` never fetches —
+/// the exact BUG-epic-branch-stale-local-base-2026-07-08 scenario.
+fn advance_origin_main(temp: &TempDir, origin_path: &std::path::Path, count: usize) {
+    let advancer_path = temp.path().join("advancer");
+    Command::new("git")
+        .args([
+            "clone",
+            origin_path.to_str().unwrap(),
+            advancer_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    for (key, value) in [("user.email", "test@test.com"), ("user.name", "Test")] {
+        Command::new("git")
+            .args(["config", key, value])
+            .current_dir(&advancer_path)
+            .output()
+            .unwrap();
+    }
+    for i in 0..count {
+        std::fs::write(advancer_path.join(format!("upstream-{i}.txt")), "x").unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(&advancer_path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", &format!("upstream commit {i}")])
+            .current_dir(&advancer_path)
+            .output()
+            .unwrap();
+    }
+    Command::new("git")
+        .args(["push", "origin", "main"])
+        .current_dir(&advancer_path)
+        .output()
+        .unwrap();
+}
+
+#[test]
+fn test_create_epic_branch_fetches_and_uses_remote_tip_when_local_base_stale() {
+    let (temp, origin_path, local_path) = create_repo_with_origin();
+    // origin/main moves 3 commits ahead; local_path's tracking ref is stale
+    // because it never fetches before create_epic_branch runs.
+    advance_origin_main(&temp, &origin_path, 3);
+
+    let config = WorktreeConfig::default();
+    let manager = WorktreeManager::new(&local_path, config).unwrap();
+
+    let stale_local_main_sha = manager.git().ref_sha("main").unwrap();
+    let branch = manager
+        .create_epic_branch("Stale Base Regression")
+        .unwrap();
+    let epic_sha = manager.git().ref_sha(&branch).unwrap();
+
+    assert_ne!(
+        epic_sha, stale_local_main_sha,
+        "epic branch must not be cut from the stale local base — it must include \
+         the 3 commits origin/main gained after clone"
+    );
+
+    // The 3 upstream-only commits must be reachable from the epic branch.
+    let epic_has_upstream_files = Command::new("git")
+        .args(["ls-tree", "-r", "--name-only", &branch])
+        .current_dir(&local_path)
+        .output()
+        .unwrap();
+    let epic_tree = String::from_utf8_lossy(&epic_has_upstream_files.stdout);
+    for i in 0..3 {
+        assert!(
+            epic_tree.contains(&format!("upstream-{i}.txt")),
+            "epic branch tree must contain upstream-only file {i} fetched from origin/main"
+        );
+    }
+}
+
+#[test]
+fn test_create_epic_branch_honors_configured_epic_base_branch() {
+    let (_temp, repo_path) = create_test_repo();
+    let config = WorktreeConfig::default();
+    // Capture the manager's own view of the trunk (whatever this system's
+    // git default-branch happens to be — "main" or "master") before adding
+    // a divergent branch, so the test doesn't hardcode either name.
+    let detected_trunk = WorktreeManager::new(&repo_path, config)
+        .unwrap()
+        .git()
+        .detect_default_branch();
+
+    // Create a "staging" branch one commit ahead of the detected default
+    // branch, and point [factory] epic_base_branch at it.
+    Command::new("git")
+        .args(["checkout", "-q", "-b", "staging"])
+        .current_dir(&repo_path)
+        .output()
+        .unwrap();
+    std::fs::write(repo_path.join("staging-only.txt"), "staging").unwrap();
+    Command::new("git")
+        .args(["add", "staging-only.txt"])
+        .current_dir(&repo_path)
+        .output()
+        .unwrap();
+    Command::new("git")
+        .args(["commit", "-m", "staging-only commit"])
+        .current_dir(&repo_path)
+        .output()
+        .unwrap();
+    Command::new("git")
+        .args(["checkout", "-q", &detected_trunk])
+        .current_dir(&repo_path)
+        .output()
+        .unwrap();
+
+    write_epic_base_branch_config(&repo_path, "staging");
+
+    let config = WorktreeConfig::default();
+    let manager = WorktreeManager::new(&repo_path, config).unwrap();
+
+    let staging_sha = manager.git().ref_sha("staging").unwrap();
+    let branch = manager.create_epic_branch("Configured Base").unwrap();
+    let epic_sha = manager.git().ref_sha(&branch).unwrap();
+
+    assert_eq!(
+        epic_sha, staging_sha,
+        "epic branch must be cut from the configured epic_base_branch (staging), \
+         not the repo-detected default branch ({detected_trunk})"
+    );
+}
+
+#[test]
+fn test_create_epic_branch_without_config_still_defaults_to_detected_trunk() {
+    // No .cas/config.toml at all — epic_base_branch must default to None,
+    // falling back to detect_default_branch() exactly as before cas-b082.
+    let (_temp, repo_path) = create_test_repo();
+    let config = WorktreeConfig::default();
+    let manager = WorktreeManager::new(&repo_path, config).unwrap();
+
+    let detected_trunk = manager.git().detect_default_branch();
+    let trunk_sha = manager.git().ref_sha(&detected_trunk).unwrap();
+    let branch = manager.create_epic_branch("Default Base").unwrap();
+    let epic_sha = manager.git().ref_sha(&branch).unwrap();
+
+    assert_eq!(epic_sha, trunk_sha);
+}

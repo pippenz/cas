@@ -1,19 +1,42 @@
+use crate::config::Config;
 use crate::worktree::git::GitError;
 use crate::worktree::manager::{WorktreeError, WorktreeManager, WorktreeResult, slugify_title};
 
+/// First 7 chars of a SHA for log/echo output, or the whole string if shorter
+/// (e.g. the empty string when a ref couldn't be resolved).
+fn short_sha(sha: &str) -> &str {
+    &sha[..sha.len().min(7)]
+}
+
 impl WorktreeManager {
     /// Create an epic branch from the configured trunk (not the current HEAD)
+    ///
+    /// Base resolution order (cas-b082): `.cas/config.toml`
+    /// `[factory] epic_base_branch` if set, else the repo's detected
+    /// default branch. Either way, the base is fetched and resolved
+    /// against its remote tip before branching — a stale local base can
+    /// never silently seed a new epic branch (BUG-epic-branch-stale-local-base).
     pub fn create_epic_branch(&self, epic_title: &str) -> WorktreeResult<String> {
         let slug = slugify_title(epic_title);
         let branch_name = format!("epic/{slug}");
-        let trunk = self.git.detect_default_branch();
+        let trunk = Config::configured_epic_base_branch(&self.repo_root)
+            .unwrap_or_else(|| self.git.detect_default_branch());
+        let resolved = self
+            .git
+            .resolve_fresh_base(&trunk)
+            .map_err(WorktreeError::Git)?;
 
-        let newly_created = match self.git.create_branch_from(&branch_name, &trunk) {
+        let newly_created = match self
+            .git
+            .create_branch_from(&branch_name, &resolved.branch_ref)
+        {
             Ok(true) => {
                 tracing::info!(
-                    "Created epic branch {} from trunk '{}'",
+                    "Created epic branch {} from base '{}' (sha={}, behind={})",
                     branch_name,
-                    trunk
+                    resolved.branch_ref,
+                    short_sha(&resolved.sha),
+                    resolved.behind_count,
                 );
                 true
             }

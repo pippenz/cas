@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use crate::worktree::git::{GitError, GitOperations, Result};
+use crate::worktree::git::{GitError, GitOperations, ResolvedBase, Result};
 
 impl GitOperations {
     /// Create a branch from HEAD if it doesn't exist
@@ -50,6 +50,98 @@ impl GitOperations {
         }
 
         Ok(true)
+    }
+
+    /// Fetch a single branch from `origin`.
+    ///
+    /// Best-effort by design: callers should treat an `Err` as "could not
+    /// verify freshness" (offline, no remote configured, remote branch
+    /// doesn't exist yet) rather than a hard failure — local-only repos
+    /// must keep working.
+    pub fn fetch_branch(&self, branch: &str) -> Result<()> {
+        let output = Command::new("git")
+            .args(["fetch", "origin", branch])
+            .current_dir(&self.repo_root)
+            .output()?;
+
+        if !output.status.success() {
+            return Err(GitError::CommandFailed(
+                String::from_utf8_lossy(&output.stderr).to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Count commits reachable from `to` but not from `from`
+    /// (`git rev-list --count from..to`) — i.e. how far `from` is behind `to`.
+    pub fn commits_behind(&self, from: &str, to: &str) -> Result<u32> {
+        let output = Command::new("git")
+            .args(["rev-list", "--count", &format!("{from}..{to}")])
+            .current_dir(&self.repo_root)
+            .output()?;
+
+        if !output.status.success() {
+            return Err(GitError::CommandFailed(
+                String::from_utf8_lossy(&output.stderr).to_string(),
+            ));
+        }
+
+        String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse::<u32>()
+            .map_err(|e| GitError::CommandFailed(format!("Failed to parse rev-list count: {e}")))
+    }
+
+    /// Resolve a branch-creation base against its remote tip (cas-b082 —
+    /// BUG-epic-branch-stale-local-base).
+    ///
+    /// Fetches `origin/<base>` and, when reachable, always branches from
+    /// the fetched remote tip rather than the local `<base>` ref — so a
+    /// stale local base (the observed failure: local 30 commits behind
+    /// origin) can never silently seed a new epic/worker branch. When the
+    /// local base was behind, logs a loud warning with the exact
+    /// behind-count before returning. Falls back to the local `<base>`
+    /// ref when there is no remote, the fetch fails (offline), or
+    /// `origin/<base>` doesn't exist — local-only repos keep working
+    /// unchanged.
+    pub fn resolve_fresh_base(&self, base: &str) -> Result<ResolvedBase> {
+        let remote_ref = format!("origin/{base}");
+        let fetch_ok = self.fetch_branch(base).is_ok();
+
+        if fetch_ok && self.branch_exists(&remote_ref).unwrap_or(false) {
+            let behind_count = if self.branch_exists(base).unwrap_or(false) {
+                self.commits_behind(base, &remote_ref).unwrap_or(0)
+            } else {
+                0
+            };
+
+            if behind_count > 0 {
+                tracing::warn!(
+                    "Local '{}' is {} commit(s) behind 'origin/{}' — basing the new branch \
+                     on the fetched remote tip instead of the stale local ref",
+                    base,
+                    behind_count,
+                    base
+                );
+            }
+
+            let sha = self.ref_sha(&remote_ref).unwrap_or_default();
+            return Ok(ResolvedBase {
+                branch_ref: remote_ref,
+                sha,
+                behind_count,
+                used_remote: true,
+            });
+        }
+
+        let sha = self.ref_sha(base).unwrap_or_default();
+        Ok(ResolvedBase {
+            branch_ref: base.to_string(),
+            sha,
+            behind_count: 0,
+            used_remote: false,
+        })
     }
 
     /// Resolve the full SHA of a ref (branch name, "HEAD", etc.).
