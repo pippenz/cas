@@ -851,7 +851,7 @@ async fn test_task_show_dependency_direction_labels() {
         .expect("task_show should succeed");
     let text = extract_text(show);
     assert!(
-        text.contains("BlockedBy:") && text.contains(&blocker_id),
+        text.contains("Blocked by:") && text.contains(&blocker_id),
         "Blocked task should display inbound blockers clearly: {text}"
     );
 
@@ -2279,7 +2279,7 @@ async fn test_dep_remove_type_mismatch_does_not_delete_existing_dep() {
             .expect("dep_list before"),
     );
     assert!(
-        deps_before.contains("ParentChild") || deps_before.contains("parent"),
+        deps_before.to_lowercase().contains("parent"),
         "parent-child dep should exist: {deps_before}"
     );
 
@@ -2318,7 +2318,7 @@ async fn test_dep_remove_type_mismatch_does_not_delete_existing_dep() {
             .expect("dep_list after"),
     );
     assert!(
-        deps_after.contains("ParentChild") || deps_after.contains("parent"),
+        deps_after.to_lowercase().contains("parent"),
         "parent-child dep must survive type-mismatched dep_remove: {deps_after}"
     );
 }
