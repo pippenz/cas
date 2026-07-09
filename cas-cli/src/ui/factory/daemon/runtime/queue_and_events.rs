@@ -1338,6 +1338,7 @@ mod tests {
             last_heartbeat: None,
             pending_messages: 0,
             active_lease: None,
+            effort: None,
         };
 
         assert!(

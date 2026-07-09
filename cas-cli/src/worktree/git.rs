@@ -99,6 +99,38 @@ impl WorktreeDirtyStatus {
     }
 }
 
+/// Result of resolving a branch-creation base against its remote tip
+/// (cas-b082). `create_branch_from`-style callers should branch from
+/// `branch_ref`, not the raw base name, so a stale local base never
+/// silently anchors a new epic/worker branch.
+#[derive(Debug, Clone)]
+pub struct ResolvedBase {
+    /// The ref actually used as the branch-creation start point — either
+    /// `origin/<base>` (remote tip, when reachable) or the bare local
+    /// `<base>` (offline / no remote / remote ref missing).
+    pub branch_ref: String,
+    /// Resolved SHA of `branch_ref` at resolution time (empty string if it
+    /// could not be resolved, e.g. base branch doesn't exist locally yet).
+    pub sha: String,
+    /// Commits the local `<base>` branch was behind `origin/<base>` at
+    /// resolution time. Can be nonzero even when `used_remote` is false —
+    /// on true divergence (local carries commits origin lacks AND origin
+    /// carries commits local lacks) the local ref is preferred to avoid
+    /// silently dropping the caller's own commits, but the origin-only
+    /// commits this represents are still worth surfacing (cas-0938).
+    pub behind_count: u32,
+    /// Commits the local `<base>` branch was ahead of `origin/<base>` at
+    /// resolution time (unpushed local-only commits). Always 0 when
+    /// `used_remote` is true (cas-0938 — resolve_fresh_base previously took
+    /// `origin/<base>` unconditionally whenever it existed, silently
+    /// dropping these on a local-ahead or diverged base).
+    pub ahead_count: u32,
+    /// Whether `branch_ref` points at the fetched remote tracking branch
+    /// (true) or fell back to the local branch (false — offline, no
+    /// remote, remote ref missing, OR local carries commits origin lacks).
+    pub used_remote: bool,
+}
+
 /// Git operations wrapper
 pub struct GitOperations {
     /// Path to the main repository root

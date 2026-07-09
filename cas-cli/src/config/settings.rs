@@ -139,6 +139,18 @@ pub struct FactoryConfig {
     /// "a few minutes" per the bug report).
     #[serde(default = "default_stall_threshold_secs")]
     pub stall_threshold_secs: u64,
+
+    /// Base branch for epic auto-branch creation, and the default
+    /// `sync_all_workers` / worker-spawn base when no epic is pinned.
+    ///
+    /// `None` (default) falls back to the repo's detected default branch
+    /// (`detect_default_branch()` — origin/HEAD, then `init.defaultBranch`,
+    /// then common names). Staging-first shops set
+    /// `epic_base_branch = "staging"` so epic/worker branches are cut from
+    /// staging without a manual `git branch -f epic/... origin/staging`
+    /// correction after the fact (BUG/FEATURE 2026-07-08, cas-b082).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epic_base_branch: Option<String>,
 }
 
 fn default_stale_threshold() -> u32 {
@@ -162,6 +174,7 @@ impl Default for FactoryConfig {
             cargo_build_jobs: default_auto(),
             nice_cargo: true,
             stall_threshold_secs: default_stall_threshold_secs(),
+            epic_base_branch: None,
         }
     }
 }
@@ -863,6 +876,8 @@ mod tests {
             fc.stall_threshold_secs,
             FactoryConfig::default().stall_threshold_secs
         );
+        assert_eq!(fc.epic_base_branch, FactoryConfig::default().epic_base_branch);
+        assert_eq!(fc.epic_base_branch, None);
     }
 
     /// cas-9829: `stall_threshold_secs` defaults to a few minutes
@@ -880,6 +895,53 @@ mod tests {
         assert_eq!(
             FactoryConfig::default().stall_threshold_secs,
             cas_factory::DEFAULT_STALL_THRESHOLD_SECS
+        );
+    }
+
+    /// cas-b082: `epic_base_branch` defaults to `None` (repo default branch)
+    /// and is overridable via `.cas/config.toml` — staging-first shops set
+    /// `epic_base_branch = "staging"` so epic auto-branch creation and
+    /// worker-spawn base resolution stop needing a manual
+    /// `git branch -f epic/... origin/staging` correction after the fact.
+    #[test]
+    fn factory_config_epic_base_branch_configurable() {
+        let toml_str = "[factory]\nepic_base_branch = \"staging\"\n";
+        let parsed: std::collections::HashMap<String, FactoryConfig> =
+            toml::from_str(toml_str).expect("valid toml");
+        let fc = parsed.get("factory").expect("section present");
+        assert_eq!(fc.epic_base_branch.as_deref(), Some("staging"));
+        assert_eq!(FactoryConfig::default().epic_base_branch, None);
+    }
+
+    /// `Config::configured_epic_base_branch` is the shared read path used by
+    /// both epic-branch creation and worker-spawn base resolution — assert
+    /// it actually reads the TOML-persisted value end to end (not just that
+    /// `FactoryConfig` deserializes correctly in isolation).
+    #[test]
+    fn configured_epic_base_branch_reads_persisted_toml_value() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let cas_dir = temp.path().join(".cas");
+        std::fs::create_dir_all(&cas_dir).unwrap();
+        std::fs::write(
+            cas_dir.join("config.toml"),
+            "[factory]\nepic_base_branch = \"staging\"\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            crate::config::Config::configured_epic_base_branch(temp.path()),
+            Some("staging".to_string())
+        );
+    }
+
+    /// No `.cas/config.toml` at all (fresh repo) must resolve to `None`, not
+    /// error — callers fall back to `detect_default_branch()`.
+    #[test]
+    fn configured_epic_base_branch_none_when_config_absent() {
+        let temp = tempfile::TempDir::new().unwrap();
+        assert_eq!(
+            crate::config::Config::configured_epic_base_branch(temp.path()),
+            None
         );
     }
 

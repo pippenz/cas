@@ -3,11 +3,41 @@
 //! Generates prompts based on detected CAS state changes and injects them
 //! into the appropriate agent's terminal.
 
+use std::collections::HashSet;
+
 use crate::config::AutoPromptConfig;
 use crate::ui::factory::director::data::{DirectorData, TaskSummary};
 use crate::ui::factory::director::events::DirectorEvent;
 use cas_mux::SupervisorCli;
 use cas_types::TaskStatus;
+
+/// Task ids that are Open but have at least one unmet `Blocks` dependency (a
+/// blocker task whose status isn't Closed). Mirrors the exact semantics of
+/// `TaskStore::list_ready()`'s SQL predicate (`crates/cas-store`), which
+/// `DirectorData.ready_tasks` does NOT apply — that bucket only splits on
+/// `task.status` (see `crates/cas-factory/src/director.rs`), so a
+/// discussion-gated/dependency-blocked task can otherwise leak into
+/// `dispatchable_ready_count` and get surfaced as "ready tasks exist —
+/// assign" even though the live `task action=ready` query would correctly
+/// exclude it (cas-09d0 bug report point 3).
+///
+/// `non_closed_task_ids` should be every task id NOT in a Closed state —
+/// derivable from `ready_tasks ∪ in_progress_tasks ∪ epic_tasks`, since
+/// together those three buckets exhaustively cover every non-closed
+/// `TaskStatus` (see the bucketing switch in `director.rs::load_with_stores`).
+/// A blocker id absent from that set is therefore closed (or no longer
+/// exists), matching `list_ready()`'s `blocker.status != 'closed'` check.
+pub fn compute_gated_task_ids(
+    non_closed_task_ids: &HashSet<&str>,
+    blocks_deps: &[cas_types::Dependency],
+) -> HashSet<String> {
+    blocks_deps
+        .iter()
+        .filter(|d| d.dep_type == cas_types::DependencyType::Blocks)
+        .filter(|d| non_closed_task_ids.contains(d.to_id.as_str()))
+        .map(|d| d.from_id.clone())
+        .collect()
+}
 
 /// Count tasks that are actually dispatchable to an idle worker.
 ///
@@ -15,12 +45,14 @@ use cas_types::TaskStatus;
 /// `crates/cas-factory/src/director.rs`). Blocked tasks cannot be started, and
 /// Closed tasks never appear in `ready_tasks` at all, but this count decides
 /// whether the `WorkerIdle` / `AgentRegistered` prompts should offer an assign
-/// command. Count only `Open` and only tasks without an assignee already set.
-/// See cas-177f.
-fn dispatchable_ready_count(data: &DirectorData) -> usize {
+/// command. Count only `Open`, unassigned, and not dependency-gated (cas-09d0)
+/// tasks. See cas-177f.
+fn dispatchable_ready_count(data: &DirectorData, gated_task_ids: &HashSet<String>) -> usize {
     data.ready_tasks
         .iter()
-        .filter(|t| t.status == TaskStatus::Open && t.assignee.is_none())
+        .filter(|t| {
+            t.status == TaskStatus::Open && t.assignee.is_none() && !gated_task_ids.contains(&t.id)
+        })
         .count()
 }
 
@@ -202,6 +234,7 @@ pub fn generate_prompt(
     config: &AutoPromptConfig,
     supervisor_cli: SupervisorCli,
     worker_cli: SupervisorCli,
+    gated_task_ids: &HashSet<String>,
 ) -> Option<Prompt> {
     // Check global enable flag first
     if !config.enabled {
@@ -432,7 +465,7 @@ pub fn generate_prompt(
 
             // Count only truly-dispatchable tasks (Open + unassigned). See
             // `dispatchable_ready_count` for why `ready_tasks.len()` is wrong.
-            let ready_count = dispatchable_ready_count(data);
+            let ready_count = dispatchable_ready_count(data, gated_task_ids);
 
             let text = if ready_count > 0 {
                 // D-3 (cas-405f): do NOT embed the snapshot count here.
@@ -575,7 +608,7 @@ pub fn generate_prompt(
                 return None;
             }
 
-            let ready_count = dispatchable_ready_count(data);
+            let ready_count = dispatchable_ready_count(data, gated_task_ids);
             let text = if ready_count > 0 {
                 format!(
                     "Worker {agent_name} is ready and waiting for tasks.\n\
@@ -667,6 +700,7 @@ mod tests {
                 last_heartbeat: Some(chrono::Utc::now()),
                 pending_messages: 0,
                 active_lease: None,
+                effort: None,
             }],
             activity: vec![],
             agent_id_to_name: [("sess-id-abc123".to_string(), "swift-fox".to_string())]
@@ -818,6 +852,7 @@ mod tests {
             &config,
             codex(),
             codex(),
+            &HashSet::new(),
         )
         .unwrap();
 
@@ -852,6 +887,7 @@ mod tests {
             &config,
             codex(),
             codex(),
+            &HashSet::new(),
         )
         .unwrap();
 
@@ -922,6 +958,7 @@ mod tests {
             &config,
             codex(),
             codex(),
+            &HashSet::new(),
         )
         .unwrap();
 
@@ -981,6 +1018,7 @@ mod tests {
             &config,
             codex(),
             codex(),
+            &HashSet::new(),
         );
         assert!(
             prompt.is_none(),
@@ -1006,6 +1044,7 @@ mod tests {
             &config,
             codex(),
             codex(),
+            &HashSet::new(),
         )
         .unwrap();
 
@@ -1045,6 +1084,7 @@ mod tests {
             &config,
             codex(),
             codex(),
+            &HashSet::new(),
         )
         .unwrap();
 
@@ -1079,6 +1119,7 @@ mod tests {
             &config,
             codex(),
             codex(),
+            &HashSet::new(),
         )
         .unwrap();
         let lower = prompt.text.to_lowercase();
@@ -1146,6 +1187,7 @@ mod tests {
             &config,
             codex(),
             codex(),
+            &HashSet::new(),
         )
         .expect("close-rejected WorkerIdle must produce an operator notification");
 
@@ -1185,6 +1227,7 @@ mod tests {
             &config,
             codex(),
             codex(),
+            &HashSet::new(),
         )
         .unwrap();
 
@@ -1215,6 +1258,7 @@ mod tests {
             &config,
             codex(),
             codex(),
+            &HashSet::new(),
         );
 
         assert!(
@@ -1240,6 +1284,7 @@ mod tests {
             &config,
             codex(),
             codex(),
+            &HashSet::new(),
         );
 
         assert!(
@@ -1265,6 +1310,7 @@ mod tests {
             &config,
             codex(),
             codex(),
+            &HashSet::new(),
         )
         .unwrap();
         let lower = prompt.text.to_lowercase();
@@ -1294,6 +1340,7 @@ mod tests {
             &config,
             codex(),
             codex(),
+            &HashSet::new(),
         )
         .unwrap();
 
@@ -1322,6 +1369,7 @@ mod tests {
             &config,
             codex(),
             codex(),
+            &HashSet::new(),
         )
         .unwrap();
 
@@ -1352,6 +1400,7 @@ mod tests {
             &config,
             codex(),
             codex(),
+            &HashSet::new(),
         );
         assert!(prompt.is_none());
     }
@@ -1374,6 +1423,7 @@ mod tests {
             &config,
             codex(),
             codex(),
+            &HashSet::new(),
         );
         assert!(prompt.is_none());
     }
@@ -1399,6 +1449,7 @@ mod tests {
             &config,
             codex(),
             codex(),
+            &HashSet::new(),
         );
         assert!(prompt.is_none());
     }
@@ -1424,6 +1475,7 @@ mod tests {
             &config,
             codex(),
             codex(),
+            &HashSet::new(),
         );
         assert!(prompt.is_none());
     }
@@ -1459,6 +1511,7 @@ mod tests {
             &config,
             claude(),
             claude(),
+            &HashSet::new(),
         )
         .unwrap();
         assert!(prompt.text.contains("mcp__cas__task action=start"));
@@ -1524,6 +1577,7 @@ mod tests {
             &config,
             codex(),
             codex(),
+            &HashSet::new(),
         )
         .unwrap();
 
@@ -1563,6 +1617,7 @@ mod tests {
             &config,
             codex(),
             codex(),
+            &HashSet::new(),
         );
 
         assert!(
@@ -1592,6 +1647,7 @@ mod tests {
             &config,
             codex(),
             codex(),
+            &HashSet::new(),
         );
 
         assert!(
@@ -1622,6 +1678,7 @@ mod tests {
             &config,
             codex(),
             codex(),
+            &HashSet::new(),
         )
         .unwrap();
 
@@ -1657,6 +1714,7 @@ mod tests {
             &config,
             codex(),
             codex(),
+            &HashSet::new(),
         );
 
         assert!(
@@ -1712,6 +1770,7 @@ mod tests {
             &config,
             codex(),
             codex(),
+            &HashSet::new(),
         );
         assert!(
             prompt.is_none(),
@@ -1733,6 +1792,7 @@ mod tests {
             &config,
             codex(),
             codex(),
+            &HashSet::new(),
         );
         assert!(
             prompt2.is_none(),
@@ -1774,6 +1834,7 @@ mod tests {
                 last_heartbeat: Some(chrono::Utc::now()),
                 pending_messages: 0,
                 active_lease: None,
+                effort: None,
             }],
             activity: vec![],
             agent_id_to_name: [("sess-id-abc123".to_string(), "swift-fox".to_string())]
@@ -1798,6 +1859,7 @@ mod tests {
             &config,
             codex(),
             codex(),
+            &HashSet::new(),
         );
         assert!(
             prompt.is_some(),
@@ -1852,6 +1914,7 @@ mod tests {
             &config,
             codex(),
             codex(),
+            &HashSet::new(),
         );
         assert!(
             prompt.is_none(),
@@ -1904,6 +1967,7 @@ mod tests {
             &config,
             codex(),
             codex(),
+            &HashSet::new(),
         );
         assert!(
             prompt.is_none(),
@@ -1939,6 +2003,7 @@ mod tests {
             &config,
             codex(),
             codex(),
+            &HashSet::new(),
         );
 
         assert!(
@@ -1970,6 +2035,7 @@ mod tests {
             &config,
             codex(),
             codex(),
+            &HashSet::new(),
         );
 
         assert!(
@@ -2012,6 +2078,7 @@ mod tests {
             &config,
             claude(),
             codex(),
+            &HashSet::new(),
         )
         .expect("TaskAssigned must produce a prompt");
 
@@ -2064,6 +2131,7 @@ mod tests {
             &config,
             codex(),
             claude(),
+            &HashSet::new(),
         )
         .expect("TaskAssigned must produce a prompt");
 
@@ -2128,6 +2196,7 @@ mod tests {
             &config,
             claude(),
             codex(),
+            &HashSet::new(),
         )
         .expect("TaskCompleted (closed path) must produce a prompt");
 
@@ -2195,6 +2264,7 @@ mod tests {
             &config,
             claude(),
             codex(),
+            &HashSet::new(),
         )
         .expect("TaskCompleted (regressed) must produce a prompt");
 
@@ -2250,6 +2320,7 @@ mod tests {
             last_heartbeat: Some(chrono::Utc::now()),
             pending_messages: 0,
             active_lease: None,
+            effort: None,
         }];
         data.agent_id_to_name = [(
             "sess-id-codex-worker".to_string(),
@@ -2268,6 +2339,7 @@ mod tests {
             &config,
             claude(),
             codex(),
+            &HashSet::new(),
         )
         .expect("WorkerIdle must produce a prompt");
 
@@ -2342,6 +2414,7 @@ mod tests {
             &config,
             codex(),
             codex(),
+            &HashSet::new(),
         )
         .unwrap();
 
@@ -2374,6 +2447,7 @@ mod tests {
             &config,
             codex(),
             codex(),
+            &HashSet::new(),
         )
         .unwrap();
 
@@ -2390,7 +2464,7 @@ mod tests {
     /// `is-wedged` triage triad instead.
     #[test]
     fn test_728b_worker_stalled_escalation_points_at_is_wedged_triage_not_clean_worktree_shutdown()
-     {
+    {
         let event = DirectorEvent::WorkerStalled {
             worker: "swift-fox".to_string(),
             task_id: "cas-0b7d".to_string(),
@@ -2408,6 +2482,7 @@ mod tests {
             &config,
             codex(),
             codex(),
+            &HashSet::new(),
         )
         .unwrap();
 
@@ -2456,7 +2531,8 @@ mod tests {
                     "supervisor",
                     &config,
                     codex(),
-                    codex()
+                    codex(),
+                    &HashSet::new(),
                 )
                 .is_none(),
                 "on_worker_stalled=false must suppress WorkerStalled (escalate={escalate})"
@@ -2486,10 +2562,168 @@ mod tests {
                 "supervisor",
                 &config,
                 codex(),
-                codex()
+                codex(),
+                &HashSet::new(),
             )
             .is_none(),
             "WorkerStalled must not fire for a worker absent from the live snapshot"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // cas-09d0: dependency-gated tasks excluded from assignable counts
+    // -----------------------------------------------------------------
+
+    fn dep(
+        from_id: &str,
+        to_id: &str,
+        dep_type: cas_types::DependencyType,
+    ) -> cas_types::Dependency {
+        cas_types::Dependency {
+            from_id: from_id.to_string(),
+            to_id: to_id.to_string(),
+            dep_type,
+            created_at: chrono::Utc::now(),
+            created_by: None,
+        }
+    }
+
+    #[test]
+    fn test_09d0_compute_gated_task_ids_flags_task_with_open_blocker() {
+        let non_closed: HashSet<&str> = ["cas-1", "cas-2"].into_iter().collect();
+        let deps = vec![dep("cas-1", "cas-2", cas_types::DependencyType::Blocks)];
+        let gated = compute_gated_task_ids(&non_closed, &deps);
+        assert!(gated.contains("cas-1"), "cas-1 is blocked by open cas-2");
+    }
+
+    #[test]
+    fn test_09d0_compute_gated_task_ids_ignores_closed_blocker() {
+        // "cas-2" (the blocker) is NOT in non_closed_task_ids, meaning it's
+        // closed — matches list_ready()'s `blocker.status != 'closed'` check.
+        let non_closed: HashSet<&str> = ["cas-1"].into_iter().collect();
+        let deps = vec![dep("cas-1", "cas-2", cas_types::DependencyType::Blocks)];
+        let gated = compute_gated_task_ids(&non_closed, &deps);
+        assert!(
+            !gated.contains("cas-1"),
+            "a closed blocker must not gate the dependent task"
+        );
+    }
+
+    #[test]
+    fn test_09d0_compute_gated_task_ids_ignores_non_blocks_dep_types() {
+        let non_closed: HashSet<&str> = ["cas-1", "cas-2"].into_iter().collect();
+        let deps = vec![dep("cas-1", "cas-2", cas_types::DependencyType::Related)];
+        let gated = compute_gated_task_ids(&non_closed, &deps);
+        assert!(
+            gated.is_empty(),
+            "a Related (non-Blocks) dependency must not gate the task"
+        );
+    }
+
+    #[test]
+    fn test_09d0_worker_idle_no_ready_tasks_when_only_task_is_gated() {
+        // Regression for the exact bug report point 3: a single Open task
+        // exists in the snapshot, but it has an unmet Blocks dependency — the
+        // "ready tasks exist — assign" message must NOT fire.
+        let event = DirectorEvent::WorkerIdle {
+            worker: "swift-fox".to_string(),
+            active_task: None,
+        };
+        let data = make_data(1); // one Open, unassigned task: "task-0"
+        let config = default_config();
+        let gated: HashSet<String> = ["task-0".to_string()].into_iter().collect();
+
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+            &gated,
+        )
+        .unwrap();
+
+        let lower = prompt.text.to_lowercase();
+        assert!(
+            lower.contains("no dispatchable"),
+            "the only ready task is gated — must fall through to the \
+             no-dispatchable-work message, not 'ready tasks exist': {}",
+            prompt.text
+        );
+    }
+
+    #[test]
+    fn test_09d0_agent_registered_no_ready_tasks_when_only_task_is_gated() {
+        let event = DirectorEvent::AgentRegistered {
+            agent_id: "sess-id-abc123".to_string(),
+            agent_name: "swift-fox".to_string(),
+        };
+        let data = make_data(1);
+        let config = default_config();
+        let gated: HashSet<String> = ["task-0".to_string()].into_iter().collect();
+
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+            &gated,
+        )
+        .unwrap();
+
+        let lower = prompt.text.to_lowercase();
+        assert!(
+            lower.contains("no dispatchable"),
+            "a gated-only snapshot must not advertise ready tasks on \
+             registration either: {}",
+            prompt.text
+        );
+    }
+
+    /// AC (c) hardening: an idle worker parked on an `AwaitingMerge` task must
+    /// get the informational framing, never the "please assign" wording —
+    /// this is the concrete "not idle-needing-work" requirement.
+    #[test]
+    fn test_09d0_worker_idle_awaiting_merge_is_not_worded_as_assignable() {
+        let event = DirectorEvent::WorkerIdle {
+            worker: "swift-fox".to_string(),
+            active_task: Some(ActiveLeaseSummary {
+                task_id: "cas-1234".to_string(),
+                task_title: "Fix close gate".to_string(),
+                task_status: TaskStatus::AwaitingMerge,
+                close_rejected_reason: None,
+            }),
+        };
+        // Ready tasks ALSO exist in the snapshot — proves the informational
+        // branch takes priority over the ready-count branch entirely,
+        // regardless of what else is dispatchable.
+        let data = make_data(2);
+        let config = default_config();
+
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+            &HashSet::new(),
+        )
+        .unwrap();
+
+        let lower = prompt.text.to_lowercase();
+        assert!(
+            !lower.contains("assign"),
+            "an AwaitingMerge-parked worker must never be worded as \
+             assignable/idle-needing-work: {}",
+            prompt.text
+        );
+        assert!(prompt.text.contains("not a task completion"));
     }
 }

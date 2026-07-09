@@ -535,7 +535,8 @@ impl CasService {
                     let wt_action = action.strip_prefix("worktree_").unwrap();
 
                     // Gate: require System A (`worktrees.enabled`) for mutating or
-                    // detail operations, but let `status` and `list` through always.
+                    // detail operations, but let `status`, `list`, and `merge`
+                    // through always.
                     //
                     // `status` reports configuration — must work regardless.
                     // `list` must reflect reality: factory (System B) worktrees are
@@ -545,8 +546,24 @@ impl CasService {
                     // it returned a misleading "disabled" message even when workers
                     // were actively running in real git worktrees.
                     //
-                    // create / show / cleanup / merge genuinely require System A.
-                    if wt_action != "status" && wt_action != "list" {
+                    // `merge` is exempt for the same reason (cas-1d11): spawn's
+                    // `isolate=true` never checks this flag (it gates on the
+                    // separate `--worktrees` factory CLI flag instead, default
+                    // on), so System-B worker worktrees exist and need merging
+                    // regardless of `worktrees.enabled`. Blocking `merge` here
+                    // left supervisors with no CAS-tracked way to fold a spawned
+                    // worker's branch back in — the reported fallback was manual
+                    // `git worktree add` + merge + push, bypassing factory
+                    // tracking/lease/cleanup entirely. `worktree_merge`'s own
+                    // handler resolves System A first, then falls back to the
+                    // System B `<cas_root>/worktrees/<assignee>` convention, and
+                    // returns an accurate "not found" for neither — so removing
+                    // this gate never masks a genuine absence, only the false
+                    // "disabled" refusal for worktrees that demonstrably exist.
+                    //
+                    // create / show / cleanup still genuinely require System A —
+                    // they're pure WorktreeStore CRUD with no System-B analogue.
+                    if wt_action != "status" && wt_action != "list" && wt_action != "merge" {
                         let config = crate::config::Config::load(&this.inner.cas_root)
                             .map_err(|e| {
                                 Self::error(

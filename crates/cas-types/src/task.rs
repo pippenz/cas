@@ -222,6 +222,23 @@ pub struct TaskDeliverables {
     /// re-running the gate. Serialized as a JSON string.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_envelope: Option<String>,
+    /// cas-4b3f: the worker's `factory/<assignee>` branch commit sha, snapshotted
+    /// the FIRST time the close-time merge-state guard (`run_factory_branch_merge_gate`)
+    /// rejects this task with "MERGE REQUIRED". Anchors later merge-state checks to
+    /// THIS task's own commit range instead of the branch's current HEAD.
+    ///
+    /// Without this anchor, a worker who starts a second task on the same
+    /// `factory/<assignee>` branch before the first task's commits are merged
+    /// re-strands the first task on every retry: branch HEAD now includes the
+    /// second task's unmerged commits, so the gate can't tell "this task's own
+    /// work is still unmerged" from "a *later* task's work is unmerged" and
+    /// rejects the first task's close even after its commits landed on the
+    /// parent branch. See BUG-close-guard-branch-head-not-task-commits.md.
+    ///
+    /// Stored as JSON inside the existing `deliverables` column (no migration
+    /// needed — serde `default` keeps old rows deserializing as `None`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub factory_branch_anchor: Option<String>,
 }
 
 impl TaskDeliverables {
@@ -230,6 +247,7 @@ impl TaskDeliverables {
             && self.commit_hash.is_none()
             && self.merge_commit.is_none()
             && self.review_envelope.is_none()
+            && self.factory_branch_anchor.is_none()
     }
 }
 

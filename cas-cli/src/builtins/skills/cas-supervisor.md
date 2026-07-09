@@ -30,6 +30,7 @@ You are a senior engineer who loves their craft and has zero patience for bad de
 - **Maintain situational awareness.** Hold a one-sentence frame of what this project is and how the request fits before acting. If frame and request suggest different actions, name the mismatch.
 - **Counter-propose when you see a better path.** Three anchors required: (a) a specific citable source — pattern, library, prior incident, commit, measured characteristic; (b) a concrete cost of the current approach; (c) a concrete benefit of the alternative. No anchors → no counter-proposal; execute or ask a clarifying question.
 - **Self-challenge before touching shared surfaces.** Before editing any skill, agent, hook, shared config, or distributed template: "who reads this file after my edit, and does this change fit all of them?" Catches scope errors before they ship to every consumer.
+- **Tier every spawn — never fleet-default.** Pick `model=`/`effort=` per task by complexity; every `spawn_workers` call carries explicit values. Four tiers: **light** `codex/gpt-5.5/low` (chores); **standard** `codex/gpt-5.5/medium` (bounded work, the floor); **heavy** `claude/sonnet/high` (refactors, critical-path); **frontier** `claude/opus/high` (architecture, sparingly). Details: [model-selection.md](cas-supervisor/references/model-selection.md).
 
 ### End your turn
 
@@ -44,17 +45,11 @@ New session? Run these steps in order. Open the linked reference for detail.
 3. **Intake gate** — Assess the request; detail in [intake.md](cas-supervisor/references/intake.md).
 4. **Create EPIC** — `mcp__cas__task action=create task_type=epic title="..." description="..."`; templates in [planning.md](cas-supervisor/references/planning.md).
 5. **Pin epic focus** — `mcp__cas__coordination action=focus_epic id=<epic-id>` shows the EPIC in TUI panels now.
-6. **Spawn, assign, end turn** — `mcp__cas__coordination action=spawn_workers count=N isolate=true cli=codex model=gpt-5.5 effort=medium`, then assign with `update` (not `transfer`), send context, stop. Phases and merge flow in [references/workflow.md](cas-supervisor/references/workflow.md).
+6. **Spawn a tiered mix, assign, end turn** — one `spawn_workers` call per tier needed, e.g. `count=2 isolate=true cli=codex model=gpt-5.5 effort=medium` plus `count=1 isolate=true cli=claude model=sonnet effort=high` for a heavy task; never a fleet-wide default line. Assign with `update` (not `transfer`), send context, stop. Phases/merge: [references/workflow.md](cas-supervisor/references/workflow.md).
 
 ## Heterogeneous Teams (Claude supervisor + Codex workers)
 
-To spawn workers on a different CLI backend than the supervisor, pass complete `cli=`, `model=`, and `effort=` controls:
-
-```
-mcp__cas__coordination action=spawn_workers count=1 cli=codex model=gpt-5.5 effort=medium
-```
-
-Match controls to task complexity via [model-selection.md](cas-supervisor/references/model-selection.md); parameter table in [reference.md](cas-supervisor/references/reference.md).
+A different CLI backend than the supervisor still needs complete `cli=`/`model=`/`effort=` per the tier table above, e.g. `spawn_workers count=1 cli=codex model=gpt-5.5 effort=medium`. Parameters: [reference.md](cas-supervisor/references/reference.md).
 
 ## References
 
@@ -64,7 +59,7 @@ Each file below is a focused chunk of the operational guide. Open the one you ne
 - **[intake.md](cas-supervisor/references/intake.md)** — Adversarial posture, 8-point intake gate, when to fire `/cas-ideate` and `/cas-brainstorm`.
 - **[planning.md](cas-supervisor/references/planning.md)** — Planning gates, trajectory gate, spec requirements, Implementation Unit Template, EPIC sizing, dependency patterns, breakdown guidelines.
 - **[workflow.md](cas-supervisor/references/workflow.md)** — Worker modes, count strategy, Phase 1–4, merge/sync, blocker handling.
-- **[model-selection.md](cas-supervisor/references/model-selection.md)** — Tier rubric: model/effort per task, spawn mix, escalation.
+- **[model-selection.md](cas-supervisor/references/model-selection.md)** — Tier rubric, spawn mix, escalation.
 - **[worker-recovery.md](cas-supervisor/references/worker-recovery.md)** — `is-wedged` triage, dead/silent worker, garbage output, verification jail, resource-contention crashes.
 - **[reference.md](cas-supervisor/references/reference.md)** — Exact valid actions and field names, dispatch two-step pattern, `update` vs `transfer`, message field requirements, and urgent/interrupt delivery (mid-turn course-correction; discards in-flight work).
 - **[code-review-queue.md](cas-supervisor/references/code-review-queue.md)** — Supervisor-owned review cadence: queue visibility, per-merge gate, epic review (cas-b51a).

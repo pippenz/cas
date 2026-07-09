@@ -31,6 +31,27 @@ const FRESH_HEARTBEAT_SECS: i64 = 60;
 /// rate without masking a genuinely stalled worker.
 const RECENT_ACTIVITY_SECS: i64 = 120;
 
+/// Scale the base stall threshold by a worker's configured reasoning effort
+/// (cas-09d0). A high/xhigh-effort worker's read-and-think phase routinely
+/// runs longer before producing a checkpoint-class event (file edit, commit,
+/// subagent spawn) than a low/minimal-effort worker's — using one flat
+/// threshold for every worker means the workers most likely to have a long,
+/// legitimate silent-reasoning phase are also the ones most likely to trip a
+/// false stall. `None` (effort unknown/unset) scales as 1.0x, the pre-cas-09d0
+/// behavior.
+pub(crate) fn effective_stall_threshold_secs(
+    base_secs: u64,
+    effort: Option<cas_mux::Effort>,
+) -> u64 {
+    let multiplier = match effort {
+        None | Some(cas_mux::Effort::Minimal) | Some(cas_mux::Effort::Low) => 1.0,
+        Some(cas_mux::Effort::Medium) => 1.5,
+        Some(cas_mux::Effort::High) => 2.0,
+        Some(cas_mux::Effort::XHigh) => 3.0,
+    };
+    ((base_secs as f64) * multiplier).round() as u64
+}
+
 /// Number of consecutive refresh ticks an agent must appear idle before
 /// WorkerIdle is emitted.
 ///
@@ -497,6 +518,25 @@ pub struct DirectorEventDetector {
     /// preserves old behavior rather than going silent when the stronger
     /// signal is unavailable.
     cas_root: Option<std::path::PathBuf>,
+    /// (cas-09d0) Test-only override for transcript-age resolution, keyed by
+    /// resolved worker name. When `Some`, `transcript_confirms_stall` uses
+    /// this map directly instead of doing real `/proc` + filesystem I/O via
+    /// `cas_root` + `resolve_worker` — lets tests exercise the
+    /// transcript-confirms-stall suppression path (AC a: "transcript mtime
+    /// < 60s suppresses stall alert") without a full `SqliteAgentStore` +
+    /// real transcript file round-trip. `None` (production default) leaves
+    /// the existing `cas_root`-based path untouched.
+    transcript_age_override: Option<HashMap<String, Option<Duration>>>,
+    /// (cas-09d0) Workers explicitly put on hold by the supervisor — a
+    /// first-class primitive for "deliberately paused, not idle-needing-work"
+    /// that doesn't require a task-status transition (unlike `AwaitingMerge`,
+    /// which already gets informational-only `WorkerIdle` framing via
+    /// `active_lease`, see `prompts.rs`). While a worker's name is in this
+    /// set, the idle-tick counter never accumulates for them and no
+    /// `WorkerIdle` is emitted, mirroring the existing `pending_messages > 0`
+    /// short-circuit below. Set/cleared via [`Self::mark_worker_hold`] /
+    /// [`Self::clear_worker_hold`].
+    held_workers: HashSet<String>,
 }
 
 impl DirectorEventDetector {
@@ -517,7 +557,39 @@ impl DirectorEventDetector {
             stall_threshold_secs: cas_factory::DEFAULT_STALL_THRESHOLD_SECS,
             task_start_observed: HashMap::new(),
             cas_root: None,
+            transcript_age_override: None,
+            held_workers: HashSet::new(),
         }
+    }
+
+    /// (cas-09d0) Put a worker on hold: suppress `WorkerIdle` for them
+    /// entirely until [`Self::clear_worker_hold`] is called, regardless of
+    /// how long they appear idle. Use for a deliberate supervisor pause that
+    /// doesn't correspond to a task-status transition (e.g. "stand by while
+    /// I sort out the merge base") — the task-level equivalent
+    /// (`AwaitingMerge`) is already handled via `active_lease` informational
+    /// framing in `prompts.rs` and doesn't need this.
+    pub fn mark_worker_hold(&mut self, worker_name: &str) {
+        self.held_workers.insert(worker_name.to_string());
+    }
+
+    /// Release a worker from hold — idle detection resumes normally on the
+    /// next tick.
+    pub fn clear_worker_hold(&mut self, worker_name: &str) {
+        self.held_workers.remove(worker_name);
+    }
+
+    /// Whether `worker_name` is currently held (test/inspection helper).
+    pub fn is_worker_held(&self, worker_name: &str) -> bool {
+        self.held_workers.contains(worker_name)
+    }
+
+    /// (cas-09d0) Test-only seam: inject synthetic transcript ages instead of
+    /// resolving them via real `/proc` + filesystem I/O. See
+    /// `transcript_age_override` field doc.
+    #[cfg(test)]
+    pub(crate) fn set_transcript_age_override(&mut self, ages: HashMap<String, Option<Duration>>) {
+        self.transcript_age_override = Some(ages);
     }
 
     /// Initialize with current state (call after first data load)
@@ -560,6 +632,10 @@ impl DirectorEventDetector {
     /// must not let a *missing* confirmation signal silently suppress every
     /// stall alert.
     fn transcript_confirms_stall(&self, worker_name: &str) -> bool {
+        if let Some(overrides) = &self.transcript_age_override {
+            let age = overrides.get(worker_name).copied().flatten();
+            return transcript_confirms_stall_for_age(age);
+        }
         let Some(cas_root) = &self.cas_root else {
             return true;
         };
@@ -806,6 +882,18 @@ impl DirectorEventDetector {
 
             seen_factory_agents.insert(agent.id.clone());
 
+            if self.held_workers.contains(&resolved_name) {
+                // cas-09d0: a deliberately held worker is never
+                // idle-needing-work and shouldn't stall-nudge either. Reset
+                // any partially-accumulated state so a fresh streak starts
+                // once released — mirrors the `pending_messages` gate below.
+                self.consecutive_idle_ticks.remove(&agent.id);
+                self.idle_already_emitted.remove(&agent.id);
+                self.stall_nudged.remove(&agent.id);
+                self.stall_escalated.remove(&agent.id);
+                continue;
+            }
+
             if let Some(task_id) = &agent.current_task {
                 // Agent is working — reset the idle streak. The next time this
                 // agent's `current_task` goes to `None`, the counter starts
@@ -883,9 +971,14 @@ impl DirectorEventDetector {
                     (None, Some(start_ts)) => Some(start_ts),
                     (None, None) => None,
                 };
+                // cas-09d0: scale the threshold by this worker's configured
+                // effort before comparing — a high/xhigh worker gets a longer
+                // grace window before the same elapsed time counts as stalled.
+                let effective_threshold =
+                    effective_stall_threshold_secs(self.stall_threshold_secs, agent.effort);
                 let stalled_elapsed_secs = effective_activity_ts.and_then(|ts| {
                     let age_secs = (now_utc - ts).num_seconds();
-                    (age_secs >= self.stall_threshold_secs as i64).then_some(age_secs)
+                    (age_secs >= effective_threshold as i64).then_some(age_secs)
                 });
 
                 if has_fresh_heartbeat {
@@ -1280,7 +1373,15 @@ fn transcript_confirms_stall_for_path(transcript_path: Option<&std::path::Path>)
     let Some(path) = transcript_path else {
         return true;
     };
-    match crate::cli::factory::wedged::transcript_mtime_age(path) {
+    transcript_confirms_stall_for_age(crate::cli::factory::wedged::transcript_mtime_age(path))
+}
+
+/// (cas-09d0) Pure core of the confirmation decision, split out one layer
+/// further than `transcript_confirms_stall_for_path` so tests (and the
+/// `transcript_age_override` seam) can drive it from a plain `Option<Duration>`
+/// without touching the filesystem at all.
+fn transcript_confirms_stall_for_age(age: Option<Duration>) -> bool {
+    match age {
         Some(age) if age < crate::cli::factory::wedged::TRANSCRIPT_FRESH_WINDOW => false,
         _ => true,
     }

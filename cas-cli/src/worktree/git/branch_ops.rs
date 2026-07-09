@@ -1,9 +1,63 @@
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
-use crate::worktree::git::{GitError, GitOperations, Result};
+use crate::worktree::git::{GitError, GitOperations, ResolvedBase, Result};
+
+/// Wall-clock bound for `fetch_branch` (cas-0938). Protects a synchronous
+/// supervisor/UI action (`create_epic_branch` calls `resolve_fresh_base` calls
+/// `fetch_branch`) from blocking indefinitely on a configured-but-unreachable
+/// remote (VPN down, dead SSH host) — those hang rather than fail fast, and
+/// git has no single config knob that bounds connect time across both
+/// http(s) and ssh transports, so this is enforced at the process level.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl GitOperations {
+    /// Run `cmd` to completion, killing it and returning
+    /// `io::ErrorKind::TimedOut` if it hasn't finished within `timeout`.
+    ///
+    /// Generic and git-agnostic on purpose so it's directly unit-testable
+    /// against a deterministic child (e.g. `sleep`) instead of relying on a
+    /// real network hang, which would be slow and unreliable in CI.
+    pub(crate) fn run_command_bounded(
+        mut cmd: Command,
+        timeout: Duration,
+    ) -> std::io::Result<Output> {
+        use std::io::Read;
+
+        let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+        let deadline = Instant::now() + timeout;
+
+        loop {
+            if let Some(status) = child.try_wait()? {
+                let mut stdout = Vec::new();
+                let mut stderr = Vec::new();
+                if let Some(mut s) = child.stdout.take() {
+                    let _ = s.read_to_end(&mut stdout);
+                }
+                if let Some(mut s) = child.stderr.take() {
+                    let _ = s.read_to_end(&mut stderr);
+                }
+                return Ok(Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
+            }
+
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("command timed out after {timeout:?}"),
+                ));
+            }
+
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// Create a branch from HEAD if it doesn't exist
     ///
     /// Returns true if the branch was created, false if it already existed.
@@ -50,6 +104,164 @@ impl GitOperations {
         }
 
         Ok(true)
+    }
+
+    /// Fetch a single branch from `origin`, bounded by [`FETCH_TIMEOUT`].
+    ///
+    /// Best-effort by design: callers should treat an `Err` as "could not
+    /// verify freshness" (offline, no remote configured, remote branch
+    /// doesn't exist yet, OR the remote didn't answer within the timeout)
+    /// rather than a hard failure — local-only repos must keep working, and
+    /// an unreachable-but-configured remote must degrade fast to the local
+    /// fallback instead of hanging a synchronous caller (cas-0938).
+    pub fn fetch_branch(&self, branch: &str) -> Result<()> {
+        self.fetch_branch_bounded(branch, FETCH_TIMEOUT)
+    }
+
+    /// Same as [`Self::fetch_branch`] with an injectable timeout — the test
+    /// seam that lets tests prove the bound actually fires without waiting
+    /// out the default 10s.
+    pub(crate) fn fetch_branch_bounded(&self, branch: &str, timeout: Duration) -> Result<()> {
+        let mut cmd = Command::new("git");
+        cmd.args(["fetch", "origin", branch])
+            // Never block on an interactive credential prompt — fail fast
+            // instead of hanging (mirrors cas-38e2's fetch_parent_branch_best_effort).
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .current_dir(&self.repo_root);
+
+        let output = Self::run_command_bounded(cmd, timeout).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::TimedOut {
+                GitError::CommandFailed(format!(
+                    "git fetch origin {branch} timed out after {timeout:?} — remote unreachable?"
+                ))
+            } else {
+                GitError::Io(e)
+            }
+        })?;
+
+        if !output.status.success() {
+            return Err(GitError::CommandFailed(
+                String::from_utf8_lossy(&output.stderr).to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Count commits reachable from `to` but not from `from`
+    /// (`git rev-list --count from..to`) — i.e. how far `from` is behind `to`.
+    pub fn commits_behind(&self, from: &str, to: &str) -> Result<u32> {
+        let output = Command::new("git")
+            .args(["rev-list", "--count", &format!("{from}..{to}")])
+            .current_dir(&self.repo_root)
+            .output()?;
+
+        if !output.status.success() {
+            return Err(GitError::CommandFailed(
+                String::from_utf8_lossy(&output.stderr).to_string(),
+            ));
+        }
+
+        String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse::<u32>()
+            .map_err(|e| GitError::CommandFailed(format!("Failed to parse rev-list count: {e}")))
+    }
+
+    /// Resolve a branch-creation base against its remote tip (cas-b082 —
+    /// BUG-epic-branch-stale-local-base; ahead/divergence handling cas-0938).
+    ///
+    /// Fetches `origin/<base>` and, when reachable AND local is not ahead
+    /// of it, branches from the fetched remote tip rather than the local
+    /// `<base>` ref — so a stale local base (the observed failure: local
+    /// 30 commits behind origin) can never silently seed a new
+    /// epic/worker branch. Logs a loud warning with the exact behind-count
+    /// before returning in that case.
+    ///
+    /// When local carries commits `origin/<base>` lacks (ahead, or truly
+    /// diverged — both ahead AND behind), prefers the LOCAL ref instead:
+    /// taking `origin/<base>` unconditionally would silently drop the
+    /// caller's own unpushed commits, which is worse than the staleness
+    /// bug this function originally fixed. On true divergence this still
+    /// reports `behind_count` so the caller can see what origin has that
+    /// local doesn't, even though local was the one used.
+    ///
+    /// Falls back to the local `<base>` ref when there is no remote, the
+    /// fetch fails (offline), or `origin/<base>` doesn't exist —
+    /// local-only repos keep working unchanged.
+    pub fn resolve_fresh_base(&self, base: &str) -> Result<ResolvedBase> {
+        let remote_ref = format!("origin/{base}");
+        let fetch_ok = self.fetch_branch(base).is_ok();
+
+        if fetch_ok && self.branch_exists(&remote_ref).unwrap_or(false) {
+            let local_exists = self.branch_exists(base).unwrap_or(false);
+            let behind_count = if local_exists {
+                self.commits_behind(base, &remote_ref).unwrap_or(0)
+            } else {
+                0
+            };
+            let ahead_count = if local_exists {
+                self.commits_behind(&remote_ref, base).unwrap_or(0)
+            } else {
+                0
+            };
+
+            if ahead_count > 0 {
+                if behind_count > 0 {
+                    tracing::warn!(
+                        "'{}' and 'origin/{}' have diverged ({} commit(s) local-only, {} \
+                         commit(s) origin-only) — basing the new branch on the LOCAL ref to \
+                         avoid silently dropping local-only commits. The {} origin-only \
+                         commit(s) are NOT included; reconcile manually before relying on \
+                         this branch if you need them.",
+                        base, base, ahead_count, behind_count, behind_count
+                    );
+                } else {
+                    tracing::info!(
+                        "Local '{}' is {} commit(s) ahead of 'origin/{}' (unpushed) — basing \
+                         the new branch on the local ref instead of the stale origin tip",
+                        base, ahead_count, base
+                    );
+                }
+
+                let sha = self.ref_sha(base).unwrap_or_default();
+                return Ok(ResolvedBase {
+                    branch_ref: base.to_string(),
+                    sha,
+                    behind_count,
+                    ahead_count,
+                    used_remote: false,
+                });
+            }
+
+            if behind_count > 0 {
+                tracing::warn!(
+                    "Local '{}' is {} commit(s) behind 'origin/{}' — basing the new branch \
+                     on the fetched remote tip instead of the stale local ref",
+                    base,
+                    behind_count,
+                    base
+                );
+            }
+
+            let sha = self.ref_sha(&remote_ref).unwrap_or_default();
+            return Ok(ResolvedBase {
+                branch_ref: remote_ref,
+                sha,
+                behind_count,
+                ahead_count: 0,
+                used_remote: true,
+            });
+        }
+
+        let sha = self.ref_sha(base).unwrap_or_default();
+        Ok(ResolvedBase {
+            branch_ref: base.to_string(),
+            sha,
+            behind_count: 0,
+            ahead_count: 0,
+            used_remote: false,
+        })
     }
 
     /// Resolve the full SHA of a ref (branch name, "HEAD", etc.).

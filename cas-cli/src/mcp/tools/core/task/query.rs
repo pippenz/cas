@@ -136,7 +136,7 @@ impl CasCore {
                     output.push_str("\n\nDependencies:\n");
                 }
                 if !blocked_by.is_empty() {
-                    output.push_str(&format!("  - BlockedBy: {}\n", blocked_by.join(", ")));
+                    output.push_str(&format!("  - Blocked by: {}\n", blocked_by.join(", ")));
                 }
                 if !blocking.is_empty() {
                     output.push_str(&format!("  - Blocks: {}\n", blocking.join(", ")));
