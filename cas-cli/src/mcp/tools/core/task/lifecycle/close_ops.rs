@@ -344,80 +344,82 @@ impl CasCore {
             }
         }
 
-        // cas-95ce / cas-4b3f: per-task close-time merge-state guard. Mirrors
-        // the shape of the epic check above, but at the worker scope: when
-        // a non-epic, code-expecting task with an assignee is being closed,
-        // reject if `factory/<assignee>` carries commits that haven't landed
-        // on the parent epic branch. Runs BEFORE the verification policy
-        // and the cas-code-review bypass — `bypass_code_review=true`
-        // cannot skip this guard because it is a data-state check, not
-        // a review gate. See `run_factory_branch_merge_gate` for the
-        // full skip matrix and EPIC cas-754b for context.
+        // cas-95ce / cas-4b3f / cas-cf64: per-task close-time merge-state
+        // guard. Mirrors the shape of the epic check above, but at the
+        // worker scope: when a non-epic task with an assignee is being
+        // closed, reject if `factory/<assignee>` carries commits that
+        // haven't landed on the real integration target. Runs BEFORE the
+        // verification policy and the cas-code-review bypass —
+        // `bypass_code_review=true` cannot skip this guard because it is a
+        // data-state check, not a review gate. See
+        // `run_factory_branch_merge_gate` for the full skip matrix and EPIC
+        // cas-754b for context.
         //
-        // cas-4b3f fix (BUG-close-guard-nonepic-task-targets-main): a task
-        // with NO parent epic must NOT default its merge target to `main`.
-        // Every observed instance was a standalone chore/bug/review task
-        // created mid-run with no ParentChild epic edge recorded — demanding
-        // a merge to `main` violates staging-first and is impossible for a
-        // read-only review task with zero commits. When no parent epic
-        // branch resolves, SKIP the gate entirely (treat the target as
-        // unset) instead of guessing "main". Non-code-expecting task types
-        // (Chore/Spike — the same classification `check_zero_commit_close`
-        // already uses below) are exempt from this gate outright: they have
-        // no reviewable diff to merge-gate in the first place, matching
-        // "review/docs tasks close on notes alone" from the bug doc.
-        let is_code_expecting_type = matches!(
-            task.task_type,
-            TaskType::Bug | TaskType::Feature | TaskType::Task
-        );
-        if is_code_expecting_type && task.assignee.is_some() {
+        // cas-cf64 fix (standalone-task backstop gap): cas-4b3f's fix for
+        // BUG-close-guard-nonepic-task-targets-main over-corrected in two
+        // ways: (a) it exempted Chore/Spike task types from this gate
+        // outright, and (b) it skipped the gate entirely whenever no
+        // parent-epic branch resolved. Both left a real hole: a standalone
+        // Bug/Chore/Spike task that commits real code to
+        // `factory/<assignee>` and never merges it closed cleanly — this
+        // gate never ran, and the B2 "merge-reality" gate
+        // (`check_factory_branch_merge_reality`) only refuses the
+        // zero-commit case, so N>0 committed-unmerged commits sailed
+        // through untouched.
+        //
+        // Fix: run this DATA-STATE check unconditionally for every
+        // non-epic task with an assignee — dropping the type exemption.
+        // Genuine review/docs/zero-commit tasks of ANY type are still
+        // unaffected: `count_unmerged_factory_commits` naturally returns 0
+        // when `factory/<assignee>` has nothing to strand, so
+        // `run_factory_branch_merge_gate` still Proceeds for them exactly
+        // as before — "review/docs tasks close on notes alone" holds
+        // without needing a type-based carve-out. When no parent epic
+        // branch resolves, resolve the REAL integration target
+        // (`resolve_standalone_merge_target`: configured
+        // `epic_base_branch`, falling back to git's detected default
+        // branch) instead of skipping the gate or guessing `"main"`.
+        let close_project_root = self.cas_root.parent().unwrap_or(&self.cas_root);
+        if task.task_type != TaskType::Epic && task.assignee.is_some() {
             let parent_branch = task_store
                 .get_parent_epic(&req.id)
                 .ok()
                 .flatten()
-                .and_then(|p| p.branch);
-            if let Some(parent_branch) = parent_branch {
-                let close_project_root = self.cas_root.parent().unwrap_or(&self.cas_root);
-                match run_factory_branch_merge_gate(&task, &req, &parent_branch, close_project_root)
-                {
-                    MergeStateGateOutcome::Proceed => {}
-                    MergeStateGateOutcome::Reject(msg) => {
-                        // cas-627f: a worker looping `close` before the
-                        // supervisor merges (the documented #1 worker failure
-                        // mode) used to re-run `park_task_awaiting_merge` on
-                        // EVERY retry — appending a duplicate audit note to
-                        // `task.notes` and emitting a duplicate
-                        // `WorkerVerificationBlocked` close-rejection activity
-                        // event each time, unboundedly. Park (and record the
-                        // rejection activity) only the first time a task
-                        // transitions into `AwaitingMerge`; once it's already
-                        // parked, a retry gets the same rejection message with
-                        // no further state mutation.
-                        if task.status != TaskStatus::AwaitingMerge {
-                            // cas-4b3f: snapshot the factory branch's current
-                            // tip so later retries anchor to THIS task's own
-                            // commit range, not whatever HEAD drifts to if a
-                            // second task starts on the same branch.
-                            let anchor = task.assignee.as_deref().and_then(|assignee| {
-                                resolve_branch_sha(
-                                    close_project_root,
-                                    &format!("factory/{assignee}"),
-                                )
-                            });
-                            self.park_task_awaiting_merge(
-                                task_store.as_ref(),
-                                &task,
-                                "MERGE REQUIRED",
-                                &msg,
-                                anchor,
-                            );
-                        }
-                        return Ok(Self::tool_error(msg));
+                .and_then(|p| p.branch)
+                .unwrap_or_else(|| resolve_standalone_merge_target(close_project_root));
+            match run_factory_branch_merge_gate(&task, &req, &parent_branch, close_project_root) {
+                MergeStateGateOutcome::Proceed => {}
+                MergeStateGateOutcome::Reject(msg) => {
+                    // cas-627f: a worker looping `close` before the
+                    // supervisor merges (the documented #1 worker failure
+                    // mode) used to re-run `park_task_awaiting_merge` on
+                    // EVERY retry — appending a duplicate audit note to
+                    // `task.notes` and emitting a duplicate
+                    // `WorkerVerificationBlocked` close-rejection activity
+                    // event each time, unboundedly. Park (and record the
+                    // rejection activity) only the first time a task
+                    // transitions into `AwaitingMerge`; once it's already
+                    // parked, a retry gets the same rejection message with
+                    // no further state mutation.
+                    if task.status != TaskStatus::AwaitingMerge {
+                        // cas-4b3f: snapshot the factory branch's current
+                        // tip so later retries anchor to THIS task's own
+                        // commit range, not whatever HEAD drifts to if a
+                        // second task starts on the same branch.
+                        let anchor = task.assignee.as_deref().and_then(|assignee| {
+                            resolve_branch_sha(close_project_root, &format!("factory/{assignee}"))
+                        });
+                        self.park_task_awaiting_merge(
+                            task_store.as_ref(),
+                            &task,
+                            "MERGE REQUIRED",
+                            &msg,
+                            anchor,
+                        );
                     }
+                    return Ok(Self::tool_error(msg));
                 }
             }
-            // else: no parent epic branch resolvable — skip the gate
-            // (cas-4b3f fix) rather than defaulting to `main`.
         }
 
         // Check verification status if enabled
@@ -1618,6 +1620,14 @@ impl CasCore {
         task.status = TaskStatus::Closed;
         task.closed_at = Some(now);
         task.updated_at = now;
+        // cas-cf64 (P2, anchor freshness — defense in depth): clear the
+        // merge-gate anchor on every successful close, not just on reopen.
+        // The anchor has no further purpose once a task is genuinely
+        // Closed, and clearing it here means a stale value can never
+        // survive into some future state transition that doesn't route
+        // through `cas_task_reopen` (belt-and-suspenders alongside the
+        // reopen-time clear).
+        task.deliverables.factory_branch_anchor = None;
 
         // cas-778a: apply worker-owned verification fields to the now-mutable
         // `task` so the final task_store.update(&task) below carries them.
@@ -2141,6 +2151,15 @@ impl CasCore {
         task.status = TaskStatus::Open;
         task.closed_at = None;
         task.updated_at = chrono::Utc::now();
+        // cas-cf64 (P2, anchor freshness — Scenario B): a stale
+        // `factory_branch_anchor` from a PRIOR close/park cycle must not
+        // survive a reopen. Without this, `run_factory_branch_merge_gate`
+        // would keep trusting the OLD anchor sha (already merged, from
+        // before the reopen) forever — `park_task_awaiting_merge`'s
+        // `is_none()` guard never overwrites an existing anchor, so any
+        // NEW commits made after rework would be invisible to the gate and
+        // the task would false-Proceed on reworked-but-unmerged code.
+        task.deliverables.factory_branch_anchor = None;
 
         task_store.update(&task).map_err(|e| McpError {
             code: ErrorCode::INTERNAL_ERROR,
@@ -2410,6 +2429,17 @@ pub(crate) enum MergeStateGateOutcome {
 /// unmerged commits ride along on branch HEAD and the gate can't tell
 /// them apart from the first task's own (already-merged) work. See
 /// BUG-close-guard-branch-head-not-task-commits.md.
+///
+/// ## cas-cf64: the anchor is trusted ONLY while `status == AwaitingMerge`
+///
+/// An anchor is written exactly once, by `park_task_awaiting_merge`, which
+/// sets `status = AwaitingMerge` in the SAME update — so in the intended
+/// lifecycle an anchor is never present without that status. This is a
+/// defense-in-depth guard against a data anomaly (a stale anchor surviving
+/// some state transition that isn't `cas_task_reopen` or a normal close,
+/// both of which now clear it): if `status` isn't `AwaitingMerge`, an
+/// existing anchor value is ignored and the gate falls back to the live
+/// branch name, matching first-attempt behavior.
 pub(crate) fn run_factory_branch_merge_gate(
     task: &Task,
     _req: &TaskCloseRequest,
@@ -2422,9 +2452,26 @@ pub(crate) fn run_factory_branch_merge_gate(
     let Some(assignee) = task.assignee.as_deref() else {
         return MergeStateGateOutcome::Proceed;
     };
+    // cas-cf64 (P3, option-injection hardening): reject leading-`-`
+    // assignee/parent-branch names before they ever reach a git shell-out.
+    // `count_unmerged_factory_commits`/`fetch_parent_branch_best_effort`
+    // also fail closed on this independently (defense in depth for other
+    // callers), but doing it here first gives a clear, actionable error
+    // instead of a confusing "u32::MAX commits not merged" message.
+    if !is_safe_git_refname(assignee) || !is_safe_git_refname(parent_branch) {
+        return MergeStateGateOutcome::Reject(format!(
+            "⚠️ INVALID BRANCH NAME\n\n\
+             task close rejected: the assignee ({assignee:?}) or resolved parent \
+             branch ({parent_branch:?}) is not a safe git ref name (empty, or \
+             starts with '-'). This looks like corrupted task data or a malformed \
+             call — fix the task's assignee/epic-branch fields and retry."
+        ));
+    }
     let factory_branch = format!("factory/{assignee}");
     let commit_ish = match task.deliverables.factory_branch_anchor.as_deref() {
-        Some(tip) if git_ref_exists(repo_path, tip) => tip,
+        Some(tip) if task.status == TaskStatus::AwaitingMerge && git_ref_exists(repo_path, tip) => {
+            tip
+        }
         _ => factory_branch.as_str(),
     };
     let stranded = count_unmerged_factory_commits(repo_path, commit_ish, parent_branch);
@@ -2527,12 +2574,26 @@ pub(crate) fn run_factory_branch_merge_gate(
 ///
 /// Mirrors the shell-out style of
 /// [`check_additive_only_branch_violations`] — no external git crate.
+///
+/// cas-cf64 (P3, option-injection hardening): returns `u32::MAX`
+/// ("maximally stranded", forcing the caller to Reject) instead of the
+/// usual graceful-degradation `0` when either ref fails
+/// [`is_safe_git_refname`] — a ref starting with `-` reaching
+/// `git merge-base`/`git rev-list` would be parsed as an option, not a ref
+/// name. This is a deliberate departure from this function's normal
+/// fail-open-to-0 posture: an invalid ref here means corrupted task data
+/// or a malformed call, and the safe direction for a close-integrity gate
+/// is to refuse, not to silently treat unparseable input as "merged".
 pub(crate) fn count_unmerged_factory_commits(
     repo_path: &std::path::Path,
     factory_branch: &str,
     parent_branch: &str,
 ) -> u32 {
     use std::process::Command;
+
+    if !is_safe_git_refname(factory_branch) || !is_safe_git_refname(parent_branch) {
+        return u32::MAX;
+    }
 
     // Resolve merge-base explicitly so we get a clean failure signal
     // when either ref can't be resolved (vs. silently comparing
@@ -2570,9 +2631,10 @@ pub(crate) fn count_unmerged_factory_commits(
     }
 }
 
-/// cas-38e2: best-effort `git fetch origin <parent_branch>` inside
-/// `repo_path`, refreshing the `origin/<parent_branch>` remote-tracking ref
-/// before [`run_factory_branch_merge_gate`] consults it as a fallback.
+/// cas-38e2 / cas-cf64 (P3, bounded + validated): best-effort
+/// `git fetch origin <parent_branch>` inside `repo_path`, refreshing the
+/// `origin/<parent_branch>` remote-tracking ref before
+/// [`run_factory_branch_merge_gate`] consults it as a fallback.
 ///
 /// Deliberately fire-and-forget:
 /// - No `origin` remote configured (common for local-only dev repos, or the
@@ -2583,17 +2645,72 @@ pub(crate) fn count_unmerged_factory_commits(
 /// - `GIT_TERMINAL_PROMPT=0` prevents a credential prompt from hanging the
 ///   close call indefinitely on a private remote with no cached credentials.
 ///
-/// No explicit process timeout is applied — matches this module's existing
-/// posture of not hard-bounding git shell-outs (all of which are local-only
-/// except this one); a genuinely hung network fetch is a pre-existing class
-/// of risk this task does not newly introduce a mitigation for.
+/// cas-cf64 (P3) hardening on top of the original cas-38e2 version:
+/// - **Bounded**: this fires on the reject path on EVERY retry (there is no
+///   fetch-once-per-park cache), so a worker looping `close` on a parked
+///   task against a slow/blackholed `origin` would otherwise re-hang the
+///   synchronous MCP handler each attempt. The child process is killed if
+///   it hasn't finished within [`FETCH_TIMEOUT`], bounding worst-case
+///   added latency per close attempt regardless of transport (SSH/HTTP/
+///   filesystem) or how the remote fails.
+/// - **Validated**: `parent_branch` is checked with [`is_safe_git_refname`]
+///   before ever reaching the shell-out. `git fetch <remote> <refspec>` has
+///   no safe `--` end-of-options marker, so a `parent_branch` value
+///   starting with `-` would otherwise be parsed as a git option instead of
+///   a ref name.
+const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 fn fetch_parent_branch_best_effort(repo_path: &std::path::Path, parent_branch: &str) {
-    use std::process::Command;
-    let _ = Command::new("git")
+    use std::process::{Command, Stdio};
+    use std::time::Instant;
+
+    if !is_safe_git_refname(parent_branch) {
+        return;
+    }
+
+    let mut child = match Command::new("git")
         .args(["fetch", "--quiet", "origin", parent_branch])
         .current_dir(repo_path)
         .env("GIT_TERMINAL_PROMPT", "0")
-        .output();
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return,
+    };
+
+    let deadline = Instant::now() + FETCH_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => return, // finished (success or failure — don't care)
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(_) => return,
+        }
+    }
+}
+
+/// cas-cf64 (P3, option-injection hardening): `true` when `name` is safe to
+/// pass as a git ref/branch-name argument to a git subcommand.
+///
+/// None of the git subcommands this module shells out to
+/// (`fetch`, `merge-base`, `rev-list`, `rev-parse --verify`) offer a safe
+/// `--` end-of-options marker at every position a branch name is passed —
+/// `git fetch <remote> <refspec>` in particular has none — so callers
+/// validate at the source instead of trying to escape per call site. A
+/// name starting with `-` would otherwise be parsed as a command-line
+/// option (by git itself, or by ssh/git's transport helpers) rather than a
+/// ref name.
+fn is_safe_git_refname(name: &str) -> bool {
+    !name.is_empty() && !name.starts_with('-')
 }
 
 // ---------------------------------------------------------------------------
@@ -2739,6 +2856,32 @@ pub(crate) fn resolve_branch_sha(repo_path: &std::path::Path, refname: &str) -> 
     if sha.is_empty() { None } else { Some(sha) }
 }
 
+/// cas-cf64: resolve the real integration target for a non-epic task with
+/// no parent-epic branch recorded.
+///
+/// cas-4b3f's original fix for BUG-close-guard-nonepic-task-targets-main
+/// skipped the merge-state gate ENTIRELY in this case (treating the target
+/// as unset) rather than guess `"main"`. That over-corrected: a standalone
+/// task that commits real code to `factory/<assignee>` and never merges it
+/// now closed cleanly with no backstop at all. The right target isn't
+/// "skip" or "main" — it's whatever this repo's actual configured/detected
+/// trunk is, exactly what epic-branch creation and worker-spawn base
+/// resolution already agree on (cas-b082):
+///
+/// 1. `[factory] epic_base_branch` from `.cas/config.toml`, if configured.
+/// 2. Otherwise git's own detected default branch (remote HEAD →
+///    `init.defaultBranch` → common names → HEAD symref → `"main"` as
+///    absolute last resort) — see `GitOperations::detect_default_branch`.
+///
+/// Genuine review/docs/zero-commit standalone tasks are unaffected: when
+/// `factory/<assignee>` has no commits beyond whatever this resolves to,
+/// `count_unmerged_factory_commits` still naturally returns 0 → Proceed.
+fn resolve_standalone_merge_target(repo_path: &std::path::Path) -> String {
+    crate::config::Config::configured_epic_base_branch(repo_path).unwrap_or_else(|| {
+        crate::worktree::git::GitOperations::new(repo_path.to_path_buf()).detect_default_branch()
+    })
+}
+
 // ---------------------------------------------------------------------------
 // cas-4b3f: System B (factory-isolation) worktree resolution
 // ---------------------------------------------------------------------------
@@ -2760,15 +2903,95 @@ pub(crate) fn resolve_branch_sha(repo_path: &std::path::Path, refname: &str) -> 
 /// (no `.git` entry) — the same graceful-pass posture as every other
 /// git-backed check in this module: an unknowable worktree is not
 /// treated as a false positive.
+///
+/// cas-cf64 (P3, path-traversal hardening): `assignee` is validated as a
+/// single, safe path COMPONENT before ever being joined onto a filesystem
+/// path. Without this, an `assignee` like `"../.."` would let
+/// `cas_root.join("worktrees").join(assignee)` escape `worktrees/` entirely
+/// — e.g. resolving all the way back up to the MAIN repo checkout (which
+/// has its own `.git`), reintroducing the exact cas-895d "reject every
+/// close on unrelated dirty state" bug this whole System-B resolution path
+/// exists to fix.
+///
+/// cas-cf64 (P3, configurable layout): the base directory is resolved via
+/// [`system_b_worktree_base`], which honors a configured
+/// `[worktrees] base_path` override instead of always hardcoding
+/// `<cas_root>/worktrees`.
 pub(crate) fn resolve_system_b_worktree_path(
     cas_root: &std::path::Path,
     assignee: &str,
 ) -> Option<std::path::PathBuf> {
-    let path = cas_root.join("worktrees").join(assignee);
+    if !is_safe_path_component(assignee) {
+        return None;
+    }
+    let path = system_b_worktree_base(cas_root).join(assignee);
     if path.join(".git").exists() {
         Some(path)
     } else {
         None
+    }
+}
+
+/// cas-cf64 (P3, path-traversal hardening): `true` when `name` is safe to
+/// use as a single filesystem path COMPONENT (not a full path) — i.e. it
+/// cannot escape the directory it's joined onto. Rejects empty strings,
+/// `.`/`..`, and any path separator (`/` or `\`, so this is safe on both
+/// Unix and Windows layouts regardless of which platform actually runs
+/// the check).
+fn is_safe_path_component(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains('/') && !name.contains('\\')
+}
+
+/// Default `[worktrees] base_path` template, mirrored from
+/// `WorktreeConfig`/`WorktreesConfig`'s own default
+/// (`cas-cli/src/worktree/manager/mod.rs`, `cas-cli/src/config/runtime.rs`).
+/// Used to detect "no override configured" so the common case resolves via
+/// the simple, unchanged `<cas_root>/worktrees` convention rather than
+/// re-deriving an equivalent (but not test-fixture-friendly) path through
+/// the full `{project}` + repo-root-parent formula.
+const DEFAULT_WORKTREE_BASE_PATH_TEMPLATE: &str = "{project}/.cas/worktrees";
+
+/// cas-cf64 (P3, configurable worktree layout): resolve the System-B
+/// worktree base directory, honoring a configured `[worktrees] base_path`
+/// override.
+///
+/// `resolve_system_b_worktree_path` previously hardcoded
+/// `<cas_root>/worktrees` unconditionally — but that's only ONE of the two
+/// places `base_path` is allowed to point. `WorktreeManager::worktree_root()`
+/// (the code that actually CREATES these directories for
+/// `spawn_workers isolate=true`) resolves the same config-driven
+/// `[worktrees] base_path` (`{project}` placeholder, absolute-or-relative-
+/// to-the-repo-root's-parent) — a customized base path (e.g. a sibling
+/// directory outside `.cas` entirely) would silently no-op every close
+/// gate that depends on finding the worker's real worktree, exactly like
+/// the original System-A/System-B gap cas-4b3f fixed, just triggered by a
+/// config choice instead of a code path.
+///
+/// When no override is configured (the overwhelmingly common case —
+/// `[worktrees]` absent, or `base_path` left at its default), this
+/// resolves to the SAME `<cas_root>/worktrees` path as before — zero
+/// behavior change and no dependency on `cas_root` looking like a real
+/// `<repo>/.cas` directory (existing tests construct `cas_root` as an
+/// arbitrary tempdir with no real repo structure above it).
+fn system_b_worktree_base(cas_root: &std::path::Path) -> std::path::PathBuf {
+    let configured_base_path = crate::config::Config::load(cas_root)
+        .ok()
+        .map(|c| c.worktrees().base_path);
+    match configured_base_path {
+        Some(base_path_template) if base_path_template != DEFAULT_WORKTREE_BASE_PATH_TEMPLATE => {
+            let repo_root = cas_root.parent().unwrap_or(cas_root);
+            let project_name = repo_root
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("project");
+            let base = base_path_template.replace("{project}", project_name);
+            if base.starts_with('/') {
+                std::path::PathBuf::from(base)
+            } else {
+                repo_root.parent().unwrap_or(repo_root).join(base)
+            }
+        }
+        _ => cas_root.join("worktrees"),
     }
 }
 
@@ -5568,6 +5791,73 @@ mod merge_state_gate_tests {
         );
     }
 
+    // --- cas-cf64 (P3): option-injection hardening --------------------------
+
+    #[test]
+    fn is_safe_git_refname_rejects_leading_dash_and_empty() {
+        assert!(!is_safe_git_refname("-oProxyCommand=evil"));
+        assert!(!is_safe_git_refname("--upload-pack=evil"));
+        assert!(!is_safe_git_refname("-"));
+        assert!(!is_safe_git_refname(""));
+        assert!(is_safe_git_refname("factory/worker"));
+        assert!(is_safe_git_refname("epic/some-slug"));
+        assert!(is_safe_git_refname("main"));
+    }
+
+    #[test]
+    fn count_unmerged_factory_commits_fails_closed_on_unsafe_refname() {
+        let dir = init_factory_repo("worker");
+        // A leading-dash "branch name" must never reach the git shell-out —
+        // fails CLOSED (u32::MAX, forcing Reject upstream), the opposite of
+        // this function's normal graceful-degrade-to-0 posture, because an
+        // invalid ref here signals corrupted data or an injection attempt,
+        // not an ordinary unresolvable ref.
+        assert_eq!(
+            count_unmerged_factory_commits(dir.path(), "-oProxyCommand=evil", "main"),
+            u32::MAX,
+            "unsafe factory_branch must fail closed, not silently degrade to 0"
+        );
+        assert_eq!(
+            count_unmerged_factory_commits(dir.path(), "factory/worker", "-oProxyCommand=evil"),
+            u32::MAX,
+            "unsafe parent_branch must fail closed, not silently degrade to 0"
+        );
+    }
+
+    #[test]
+    fn merge_gate_rejects_unsafe_assignee_or_parent_branch_with_clear_message() {
+        let dir = init_factory_repo("worker");
+        std::fs::write(dir.path().join("a.rs"), "// a\n").unwrap();
+        git(dir.path(), &["add", "a.rs"]);
+        git(dir.path(), &["commit", "-q", "-m", "feat: a"]);
+
+        // Unsafe parent_branch (as would be produced by a corrupted epic
+        // `branch` field or a malformed API call).
+        let task = worker_task("worker");
+        let req = base_req(&task.id);
+        let out = run_factory_branch_merge_gate(&task, &req, "-oProxyCommand=evil", dir.path());
+        match out {
+            MergeStateGateOutcome::Reject(msg) => {
+                assert!(
+                    msg.contains("INVALID BRANCH NAME"),
+                    "must give a clear, actionable error, not a confusing \
+                     huge-stranded-count message: {msg}"
+                );
+            }
+            other => panic!("unsafe parent_branch must Reject, got {other:?}"),
+        }
+
+        // Unsafe assignee.
+        let mut task = worker_task("-oProxyCommand=evil");
+        task.assignee = Some("-oProxyCommand=evil".to_string());
+        let req = base_req(&task.id);
+        let out = run_factory_branch_merge_gate(&task, &req, "main", dir.path());
+        match out {
+            MergeStateGateOutcome::Reject(ref msg) if msg.contains("INVALID BRANCH NAME") => {}
+            other => panic!("unsafe assignee must Reject with a clear message, got {other:?}"),
+        }
+    }
+
     // --- cas-4b3f (AC b): anchor to the task's own commits, not HEAD -------
 
     /// Reproduces BUG-close-guard-branch-head-not-task-commits.md exactly:
@@ -5623,7 +5913,11 @@ mod merge_state_gate_tests {
 
         // Task A's close, anchored to the tip captured at its first
         // rejection (simulating what `park_task_awaiting_merge` recorded).
+        // Status must be AwaitingMerge too — cas-cf64 only trusts the
+        // anchor in that status, matching what park_task_awaiting_merge
+        // actually persists (both fields together, in the same update).
         let mut task_a = worker_task("worker");
+        task_a.status = TaskStatus::AwaitingMerge;
         task_a.deliverables.factory_branch_anchor = Some(task_a_tip);
         let req = base_req(&task_a.id);
         let out = run_factory_branch_merge_gate(&task_a, &req, "main", p);
@@ -5676,6 +5970,58 @@ mod merge_state_gate_tests {
         assert!(
             matches!(out, MergeStateGateOutcome::Reject(_)),
             "no-anchor first attempt must still reject on the real stranded commit, got {out:?}"
+        );
+    }
+
+    /// cas-cf64 (P2, anchor freshness): an anchor present on a task whose
+    /// `status` is NOT `AwaitingMerge` must be ignored — this is a defense-
+    /// in-depth guard against a stale anchor surviving some state
+    /// transition that isn't `cas_task_reopen` or a normal close (both of
+    /// which now clear it). The gate must fall back to the live branch
+    /// name (first-attempt behavior) rather than trusting a sha that no
+    /// longer corresponds to "this task is genuinely parked awaiting merge."
+    #[test]
+    fn anchor_present_but_status_not_awaiting_merge_is_ignored() {
+        let dir = init_factory_repo("worker");
+        let p = dir.path();
+
+        // Commit + merge into main (this WOULD make the anchor-based check
+        // Proceed if the anchor were trusted).
+        std::fs::write(p.join("a.rs"), "// a\n").unwrap();
+        git(p, &["add", "a.rs"]);
+        git(p, &["commit", "-q", "-m", "feat: a"]);
+        let merged_tip = String::from_utf8(
+            std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(p)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        git(p, &["checkout", "-q", "main"]);
+        git(p, &["merge", "-q", "--no-ff", "factory/worker"]);
+        git(p, &["checkout", "-q", "factory/worker"]);
+
+        // Now add a NEW, genuinely unmerged commit — simulating reworked
+        // code after some state transition that left a stale anchor
+        // pointing at the OLD (already-merged) tip.
+        std::fs::write(p.join("b.rs"), "// b, reworked, unmerged\n").unwrap();
+        git(p, &["add", "b.rs"]);
+        git(p, &["commit", "-q", "-m", "feat: b (reworked, unmerged)"]);
+
+        let mut task = worker_task("worker");
+        task.status = TaskStatus::InProgress; // NOT AwaitingMerge
+        task.deliverables.factory_branch_anchor = Some(merged_tip);
+        let req = base_req(&task.id);
+        let out = run_factory_branch_merge_gate(&task, &req, "main", p);
+        assert!(
+            matches!(out, MergeStateGateOutcome::Reject(_)),
+            "a stale anchor on a non-AwaitingMerge task must be ignored, \
+             falling back to the live branch (which has 1 genuinely \
+             unmerged commit), got {out:?}"
         );
     }
 
@@ -5875,6 +6221,135 @@ mod system_b_worktree_resolution_tests {
         assert_eq!(
             resolve_system_b_worktree_path(cas_root.path(), "not-a-worktree"),
             None
+        );
+    }
+
+    // --- cas-cf64 (P3): path-traversal hardening ----------------------------
+
+    #[test]
+    fn path_traversal_assignee_does_not_escape_worktrees_dir() {
+        // Without sanitization, `cas_root.join("worktrees").join("../..")`
+        // resolves to `cas_root`'s PARENT — in production that's the MAIN
+        // repo checkout root (cas_root = <repo>/.cas), which has its own
+        // `.git`. Reintroduces the cas-895d "reject every close on
+        // unrelated dirty state" bug (`resolve_system_b_worktree_path`
+        // would return the main worktree instead of `None`).
+        let sandbox = tempfile::tempdir().unwrap();
+        let fake_repo_root = sandbox.path().join("myrepo");
+        let cas_root = fake_repo_root.join(".cas");
+        // The intermediate `worktrees/` directory must actually exist on
+        // disk for `..` traversal through it to resolve at all (the OS
+        // resolves `..` against the real directory tree, not lexically) —
+        // without this the malicious path would ENOENT regardless of
+        // sanitization, silently defeating the test.
+        std::fs::create_dir_all(cas_root.join("worktrees")).unwrap();
+        // The "main repo checkout" decoy: `.git` at `cas_root`'s parent —
+        // exactly where `worktrees/../..` would land.
+        std::fs::create_dir_all(fake_repo_root.join(".git")).unwrap();
+
+        // The realistic attack shape: exactly 2 levels up from
+        // `<cas_root>/worktrees` lands on `<cas_root>`'s parent — the main
+        // repo root in production. This is the one that would actually
+        // reach the planted decoy `.git` above if unsanitized.
+        assert_eq!(
+            resolve_system_b_worktree_path(&cas_root, "../.."),
+            None,
+            "\"../..\" must not escape to the main repo checkout"
+        );
+
+        // Other traversal/separator shapes must also be rejected outright
+        // (none of these coincidentally land on a `.git`-bearing directory
+        // in this fixture, but they must still be refused at the
+        // validation layer, not merely "happen to fail" the existence check).
+        for malicious in ["..", "../victim", "a/../../escape"] {
+            assert_eq!(
+                resolve_system_b_worktree_path(&cas_root, malicious),
+                None,
+                "traversal-shaped assignee {malicious:?} must not resolve"
+            );
+        }
+    }
+
+    #[test]
+    fn plain_assignee_names_with_hyphens_and_digits_still_resolve() {
+        // Sanity: the sanitization must not be so strict it breaks normal
+        // agent-name conventions (e.g. "adjective-noun-42").
+        let cas_root = tempfile::tempdir().unwrap();
+        let wt_path = cas_root.path().join("worktrees").join("quiet-tiger-24");
+        std::fs::create_dir_all(&wt_path).unwrap();
+        git(&wt_path, &["init", "-q", "-b", "factory/quiet-tiger-24"]);
+
+        assert_eq!(
+            resolve_system_b_worktree_path(cas_root.path(), "quiet-tiger-24"),
+            Some(wt_path)
+        );
+    }
+
+    // --- cas-cf64 (P3): configurable worktree_base_path ---------------------
+
+    #[test]
+    fn honors_configured_worktree_base_path_override() {
+        // Use an ABSOLUTE base_path override (the code's `base.starts_with('/')`
+        // branch) so the expected resolved location is unambiguous — the
+        // relative form additionally resolves `{project}` against the repo
+        // root's PARENT, which is exercised separately by
+        // `WorktreeManager`'s own tests; here we're only proving that a
+        // configured override is consulted at all instead of being
+        // silently ignored.
+        let sandbox = tempfile::tempdir().unwrap();
+        let repo_root = sandbox.path().join("myrepo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        let cas_root = repo_root.join(".cas");
+        std::fs::create_dir_all(&cas_root).unwrap();
+
+        let override_base = sandbox.path().join("elsewhere-worktrees");
+        std::fs::write(
+            cas_root.join("config.toml"),
+            format!(
+                "[worktrees]\nbase_path = \"{}\"\n",
+                override_base.to_str().unwrap().replace('\\', "\\\\")
+            ),
+        )
+        .unwrap();
+
+        // The configured location: NOT under `.cas/worktrees` at all.
+        let configured_wt_path = override_base.join("worker-1");
+        std::fs::create_dir_all(&configured_wt_path).unwrap();
+        git(&configured_wt_path, &["init", "-q", "-b", "factory/worker-1"]);
+
+        assert_eq!(
+            resolve_system_b_worktree_path(&cas_root, "worker-1"),
+            Some(configured_wt_path.clone()),
+            "a configured base_path override must be honored, not silently \
+             ignored in favor of the hardcoded <cas_root>/worktrees default"
+        );
+
+        // The OLD hardcoded default location must NOT be preferred, proving
+        // the override actually took effect rather than the check passing
+        // by coincidence.
+        let default_wt_path = cas_root.join("worktrees").join("worker-1");
+        std::fs::create_dir_all(&default_wt_path).unwrap();
+        git(&default_wt_path, &["init", "-q", "-b", "factory/worker-1"]);
+        assert_eq!(
+            resolve_system_b_worktree_path(&cas_root, "worker-1"),
+            Some(configured_wt_path),
+            "with an override configured, the default path must be ignored \
+             even when something happens to exist there too"
+        );
+    }
+
+    #[test]
+    fn no_config_falls_back_to_default_worktrees_path_unchanged() {
+        // No `.cas/config.toml` at all — must behave exactly as before
+        // cas-cf64 (simple `<cas_root>/worktrees/<assignee>`).
+        let cas_root = tempfile::tempdir().unwrap();
+        let wt_path = cas_root.path().join("worktrees").join("worker-1");
+        std::fs::create_dir_all(&wt_path).unwrap();
+        git(&wt_path, &["init", "-q", "-b", "factory/worker-1"]);
+
+        assert_eq!(
+            resolve_system_b_worktree_path(cas_root.path(), "worker-1"),
+            Some(wt_path)
         );
     }
 }
