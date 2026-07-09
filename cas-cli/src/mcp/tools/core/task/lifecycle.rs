@@ -375,6 +375,32 @@ impl CasCore {
             .map(|a| a.role == cas_types::AgentRole::Worker)
             .unwrap_or(false);
 
+        // cas-3558: reject a worker starting a task explicitly assigned to
+        // someone else. This is the code-level half of the self-dispatch
+        // guard — the skill-level half tells an idle worker to wait for an
+        // explicit assignment instead of grabbing from `action=ready`. Only
+        // fires for factory workers with a *pre-existing, different*
+        // assignee: `assignee.is_none()` (the normal first-start case) and
+        // Standard/interactive sessions are both exempt, so this can't
+        // regress the auto-assign-on-start behavior above.
+        if is_worker {
+            if let (Ok(agent), Some(assignee)) =
+                (agent_store.get(&agent_id), task.assignee.as_deref())
+            {
+                if assignee != agent.name {
+                    return Err(Self::error(
+                        ErrorCode::INVALID_PARAMS,
+                        format!(
+                            "Task {} is assigned to {}, not you ({}). Do not self-dispatch — \
+                            wait for an explicit assignment, or ask the supervisor to \
+                            reassign it: mcp__cas__task action=transfer id={} to_agent=<your-agent-id>",
+                            req.id, assignee, agent.name, req.id
+                        ),
+                    ));
+                }
+            }
+        }
+
         // Check if supervisor is trying to start a non-epic task
         if let Ok(agent) = agent_store.get(&agent_id) {
             if agent.role == cas_types::AgentRole::Supervisor

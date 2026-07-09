@@ -2950,6 +2950,60 @@ This is the body content."#;
         );
     }
 
+    /// cas-3558: the 2026-07-09 grok run had an idle worker self-dispatch
+    /// through the entire ready backlog ("session can exit. Starting
+    /// cas-48e6…") with no supervisor assignment — the skill said "no
+    /// grabbing unassigned tasks" but never spelled out that `action=ready`
+    /// / `action=available` are visibility-only, and step 7 (close) never
+    /// looped back to "go wait", so an idle worker filled the gap by
+    /// self-serving. Pins the strengthened guidance across all three
+    /// harness mirrors (Claude, Codex, Grok) so it can't silently erode.
+    #[test]
+    fn test_worker_never_self_dispatch_guidance_present_and_mirrored() {
+        for (label, guide) in [
+            ("claude cas-worker.md", WORKER_GUIDE),
+            (
+                "codex cas-worker.md",
+                include_str!("builtins/codex/skills/cas-worker.md"),
+            ),
+            (
+                "grok cas-worker.md",
+                include_str!("builtins/grok/skills/cas-worker.md"),
+            ),
+        ] {
+            for required in [
+                "no self-dispatch",
+                "This applies every time you go idle, not just at session start",
+                "backlog *visibility*, never authorization to `start` a task yourself",
+                "Never self-dispatch.",
+                "Do not pull the next ready task yourself",
+            ] {
+                assert!(
+                    guide.contains(required),
+                    "{label} missing self-dispatch guard marker: {required:?}"
+                );
+            }
+        }
+
+        for (label, set) in [
+            ("BUILTIN_SKILLS", BUILTIN_SKILLS),
+            ("CODEX_BUILTIN_SKILLS", CODEX_BUILTIN_SKILLS),
+            ("GROK_BUILTIN_SKILLS", GROK_BUILTIN_SKILLS),
+        ] {
+            let path = "skills/cas-worker/references/details.md";
+            let entry = set
+                .iter()
+                .find(|b| b.path == path)
+                .unwrap_or_else(|| panic!("{label} missing {path}"));
+            assert!(
+                entry
+                    .content
+                    .contains("read-only backlog visibility — not self-dispatch"),
+                "{label} {path} missing the ready/available visibility-only caveat"
+            );
+        }
+    }
+
     // cas-e0d1: pin the opt-in description so a future sync or hand-edit can't
     // silently re-introduce auto-trigger phrasing into either mirror — that
     // would resurrect the wall-clock regression the rewrite fixed.

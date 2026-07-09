@@ -78,4 +78,6 @@ Sending `message` alone without `summary` is rejected. `summary` is the one-line
 
 **Valid `cas__task` actions** (do not invent others): `create`, `show`, `update`, `start`, `close`, `reopen`, `delete`, `list`, `ready`, `blocked`, `notes`, `dep_add`, `dep_remove`, `dep_list`, `claim`, `release`, `transfer`, `available`, `mine`.
 
+**`ready` and `available` are read-only backlog visibility — not self-dispatch.** They exist for supervisors planning work and for you to sanity-check task state after an explicit assignment. Seeing a task there is never grounds to `start` it yourself; see "Never self-dispatch" in the main skill.
+
 **Valid `cas__coordination` actions for workers**: `message`, `message_ack`, `message_status`, `whoami`, `heartbeat`, `queue_poll`, `queue_ack`. Factory/worktree/spawn actions are supervisor-only.
