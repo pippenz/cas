@@ -54,6 +54,7 @@ fn make_agent(id: &str, name: &str, current_task: Option<&str>) -> AgentSummary 
         last_heartbeat: Some(chrono::Utc::now()),
         pending_messages: 0,
         active_lease: None,
+        effort: None,
     }
 }
 
@@ -1237,6 +1238,7 @@ fn test_no_worker_idle_while_pending_messages_in_queue() {
             last_heartbeat: Some(chrono::Utc::now()),
             pending_messages: 1,
             active_lease: None,
+            effort: None,
         }],
         activity: vec![],
         agent_id_to_name: [("agent-1".to_string(), "swift-fox".to_string())]
@@ -1536,6 +1538,7 @@ fn make_agent_active(
         last_heartbeat: Some(base_utc - CDuration::seconds(heartbeat_ago_secs)),
         pending_messages: 0,
         active_lease: None,
+        effort: None,
     }
 }
 
@@ -1775,7 +1778,16 @@ fn make_agent_working_stalled(
         last_heartbeat: Some(base_utc - CDuration::seconds(heartbeat_ago_secs)),
         pending_messages: 0,
         active_lease: None,
+        effort: None,
     }
+}
+
+/// Set `effort` on an already-built agent summary (cas-09d0). Kept as a
+/// small wrapper rather than adding a parameter to `make_agent_working_stalled`
+/// so the 9 existing call sites of that helper don't need touching.
+fn with_effort(mut agent: AgentSummary, effort: cas_mux::Effort) -> AgentSummary {
+    agent.effort = Some(effort);
+    agent
 }
 
 fn stalled_data_for(agent: AgentSummary) -> DirectorData {
@@ -2161,5 +2173,253 @@ fn test_9829_worker_stalled_threshold_is_configurable() {
             }
         )),
         "a lowered stall_threshold_secs must be honored: {events:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// cas-09d0: transcript-mtime activity, effort-aware thresholds, holds
+// ---------------------------------------------------------------------------
+
+/// AC (a): a fresh transcript (< TRANSCRIPT_FRESH_WINDOW) must suppress the
+/// stall alert even though the checkpoint-class `latest_activity` signal is
+/// long past the threshold — this is the exact false-positive class from the
+/// live repro (worker actively producing tokens, zero file-edit/commit/
+/// subagent events). Uses `set_transcript_age_override` so the suppression
+/// path is exercised end-to-end through `detect_changes_at` without a real
+/// SqliteAgentStore + filesystem round-trip.
+#[test]
+fn test_09d0_fresh_transcript_suppresses_stall_alert() {
+    let base_utc = chrono::Utc::now();
+    let t0 = std::time::Instant::now();
+
+    let mut detector =
+        DirectorEventDetector::new(vec!["lively-crow".to_string()], "supervisor".to_string());
+    detector.set_stall_threshold_secs(300);
+    detector.set_transcript_age_override(HashMap::from([(
+        "lively-crow".to_string(),
+        Some(std::time::Duration::from_secs(3)), // transcript written 3s ago
+    )]));
+
+    let data = stalled_data_for(make_agent_working_stalled(
+        "agent-1",
+        "lively-crow",
+        "cas-0b7d",
+        5,         // fresh heartbeat
+        Some(310), // checkpoint-class activity 310s ago — past the threshold
+        base_utc,
+    ));
+    detector.initialize(&data);
+
+    let events = detector.detect_changes_at(&data, None, t0, base_utc);
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, DirectorEvent::WorkerStalled { .. })),
+        "a transcript written 3s ago must suppress the stall alert regardless \
+         of stale checkpoint-class activity: {events:?}"
+    );
+}
+
+/// Inverse of the above: a stale transcript (>= TRANSCRIPT_FRESH_WINDOW) does
+/// NOT suppress — the checkpoint-age verdict stands.
+#[test]
+fn test_09d0_stale_transcript_does_not_suppress_stall_alert() {
+    let base_utc = chrono::Utc::now();
+    let t0 = std::time::Instant::now();
+
+    let mut detector =
+        DirectorEventDetector::new(vec!["lively-crow".to_string()], "supervisor".to_string());
+    detector.set_stall_threshold_secs(300);
+    detector.set_transcript_age_override(HashMap::from([(
+        "lively-crow".to_string(),
+        Some(std::time::Duration::from_secs(600)), // transcript stale too
+    )]));
+
+    let data = stalled_data_for(make_agent_working_stalled(
+        "agent-1",
+        "lively-crow",
+        "cas-0b7d",
+        5,
+        Some(310),
+        base_utc,
+    ));
+    detector.initialize(&data);
+
+    let events = detector.detect_changes_at(&data, None, t0, base_utc);
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            DirectorEvent::WorkerStalled {
+                escalate: false,
+                ..
+            }
+        )),
+        "a stale transcript must NOT suppress a genuine stall: {events:?}"
+    );
+}
+
+/// Pure-function coverage for the transcript age → confirm decision,
+/// independent of the DirectorEventDetector plumbing above.
+#[test]
+fn test_09d0_transcript_confirms_stall_for_age_pure_cases() {
+    assert!(
+        !transcript_confirms_stall_for_age(Some(std::time::Duration::from_secs(5))),
+        "fresh age must NOT confirm the stall (i.e. suppress it)"
+    );
+    assert!(
+        transcript_confirms_stall_for_age(Some(std::time::Duration::from_secs(120))),
+        "stale age must confirm (proceed with) the stall verdict"
+    );
+    assert!(
+        transcript_confirms_stall_for_age(None),
+        "unknown age (no signal) must confirm — preserves pre-existing behavior \
+         when the stronger signal is unavailable"
+    );
+}
+
+/// AC (b): effort scales the stall threshold. A base threshold of 300s with
+/// an XHigh-effort worker (3x) must NOT fire at 310s elapsed — that's well
+/// under the effective 900s threshold — while the same elapsed time on a
+/// worker with no configured effort (1x, the pre-cas-09d0 default) DOES fire.
+#[test]
+fn test_09d0_xhigh_effort_worker_gets_longer_grace_before_stalling() {
+    let base_utc = chrono::Utc::now();
+    let t0 = std::time::Instant::now();
+
+    let mut detector =
+        DirectorEventDetector::new(vec!["lively-crow".to_string()], "supervisor".to_string());
+    detector.set_stall_threshold_secs(300);
+
+    let agent = with_effort(
+        make_agent_working_stalled("agent-1", "lively-crow", "cas-0b7d", 5, Some(310), base_utc),
+        cas_mux::Effort::XHigh,
+    );
+    let data = stalled_data_for(agent);
+    detector.initialize(&data);
+
+    let events = detector.detect_changes_at(&data, None, t0, base_utc);
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, DirectorEvent::WorkerStalled { .. })),
+        "an XHigh-effort worker at 310s elapsed (under the scaled 900s \
+         threshold) must not be flagged stalled: {events:?}"
+    );
+}
+
+/// Same elapsed time (310s) with no configured effort must still fire at the
+/// unscaled base threshold — proves the scaling is additive, not a blanket
+/// suppression, and that `None` effort preserves pre-cas-09d0 behavior.
+#[test]
+fn test_09d0_no_effort_worker_uses_unscaled_threshold() {
+    let base_utc = chrono::Utc::now();
+    let t0 = std::time::Instant::now();
+
+    let mut detector =
+        DirectorEventDetector::new(vec!["lively-crow".to_string()], "supervisor".to_string());
+    detector.set_stall_threshold_secs(300);
+
+    let data = stalled_data_for(make_agent_working_stalled(
+        "agent-1",
+        "lively-crow",
+        "cas-0b7d",
+        5,
+        Some(310),
+        base_utc,
+    ));
+    detector.initialize(&data);
+
+    let events = detector.detect_changes_at(&data, None, t0, base_utc);
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            DirectorEvent::WorkerStalled {
+                escalate: false,
+                ..
+            }
+        )),
+        "no configured effort must use the unscaled base threshold: {events:?}"
+    );
+}
+
+/// Pure-function coverage for the effort → multiplier table.
+#[test]
+fn test_09d0_effective_stall_threshold_secs_scaling_table() {
+    assert_eq!(effective_stall_threshold_secs(300, None), 300);
+    assert_eq!(
+        effective_stall_threshold_secs(300, Some(cas_mux::Effort::Minimal)),
+        300
+    );
+    assert_eq!(
+        effective_stall_threshold_secs(300, Some(cas_mux::Effort::Low)),
+        300
+    );
+    assert_eq!(
+        effective_stall_threshold_secs(300, Some(cas_mux::Effort::Medium)),
+        450
+    );
+    assert_eq!(
+        effective_stall_threshold_secs(300, Some(cas_mux::Effort::High)),
+        600
+    );
+    assert_eq!(
+        effective_stall_threshold_secs(300, Some(cas_mux::Effort::XHigh)),
+        900
+    );
+}
+
+/// AC (c): a worker explicitly put on hold must never be flagged
+/// `WorkerIdle`, no matter how many ticks it sits idle — the hold is a
+/// deliberate supervisor pause, not idle-needing-work.
+#[test]
+fn test_09d0_held_worker_never_flags_idle() {
+    let mut detector =
+        DirectorEventDetector::new(vec!["lively-crow".to_string()], "supervisor".to_string());
+    detector.mark_worker_hold("lively-crow");
+    assert!(detector.is_worker_held("lively-crow"));
+
+    let data = idle_data_for("agent-1", "lively-crow");
+    detector.initialize(&data);
+
+    // Drive several ticks past IDLE_CONSECUTIVE_TICKS — a non-held worker
+    // would have fired WorkerIdle by now (see the idle-detection tests
+    // above using the same `idle_data_for` fixture).
+    let mut saw_idle = false;
+    for _ in 0..5 {
+        let events = detector.detect_changes(&data, None);
+        if events
+            .iter()
+            .any(|e| matches!(e, DirectorEvent::WorkerIdle { .. }))
+        {
+            saw_idle = true;
+        }
+    }
+    assert!(!saw_idle, "a held worker must never emit WorkerIdle");
+}
+
+/// Clearing a hold resumes normal idle detection on subsequent ticks.
+#[test]
+fn test_09d0_clearing_hold_resumes_idle_detection() {
+    let mut detector =
+        DirectorEventDetector::new(vec!["lively-crow".to_string()], "supervisor".to_string());
+    detector.mark_worker_hold("lively-crow");
+
+    let data = idle_data_for("agent-1", "lively-crow");
+    detector.initialize(&data);
+    for _ in 0..3 {
+        detector.detect_changes(&data, None);
+    }
+
+    detector.clear_worker_hold("lively-crow");
+    assert!(!detector.is_worker_held("lively-crow"));
+
+    // IDLE_CONSECUTIVE_TICKS is 2 — two ticks after release must emit.
+    detector.detect_changes(&data, None);
+    let events = detector.detect_changes(&data, None);
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, DirectorEvent::WorkerIdle { .. })),
+        "idle detection must resume once the hold is cleared: {events:?}"
     );
 }

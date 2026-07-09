@@ -694,6 +694,33 @@ impl FactoryApp {
             })
             .collect();
 
+        // cas-09d0: tasks that are Open but have an unmet `Blocks` dependency
+        // must not be counted as "dispatchable" — see `compute_gated_task_ids`.
+        // `non_closed_ids` = every task id visible in the unfiltered snapshot;
+        // together `ready_tasks`/`in_progress_tasks`/`epic_tasks` exhaustively
+        // cover every non-closed status (see `director.rs::load_with_stores`),
+        // so a blocker id absent from this set is closed (or gone).
+        let non_closed_ids: HashSet<&str> = unfiltered_data
+            .ready_tasks
+            .iter()
+            .chain(unfiltered_data.in_progress_tasks.iter())
+            .chain(unfiltered_data.epic_tasks.iter())
+            .map(|t| t.id.as_str())
+            .collect();
+        let blocks_deps = self
+            .director_stores
+            .as_ref()
+            .and_then(|s| {
+                cas_store::TaskStore::list_dependencies(
+                    &s.task_store,
+                    Some(cas_types::DependencyType::Blocks),
+                )
+                .ok()
+            })
+            .unwrap_or_default();
+        let gated_task_ids =
+            crate::ui::factory::director::compute_gated_task_ids(&non_closed_ids, &blocks_deps);
+
         let prompts: Vec<Prompt> = delivery_events
             .iter()
             .filter_map(|event| {
@@ -705,6 +732,7 @@ impl FactoryApp {
                     &self.auto_prompt,
                     self.supervisor_cli,
                     self.worker_cli,
+                    &gated_task_ids,
                 )
             })
             .collect();
@@ -2689,6 +2717,7 @@ mod tests {
             last_heartbeat: None,
             pending_messages: 0,
             active_lease: None,
+            effort: None,
         }];
         source
             .agent_id_to_name
