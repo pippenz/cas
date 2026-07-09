@@ -16,11 +16,11 @@ Wrong field names and invalid actions waste dispatch cycles. This section covers
 | `count` | int | Number of workers to spawn |
 | `isolate` | bool | Each worker gets its own git worktree and branch (default false) |
 | `worker_names` | string | Comma-separated names for the spawned workers |
-| `cli` | string | Explicit CLI backend for this spawn: `claude` or `codex`. If omitted, resolves through factory config, then stock fallback. |
-| `model` | string | Explicit model name (e.g. `claude-opus-4-5`). Passed as `--model`. If omitted, resolves through factory config, then backend stock fallback. |
-| `effort` | string | Explicit reasoning effort: `minimal`, `low`, `medium`, `high`, `xhigh`. Passed as `--effort` (Claude) or `--config model_reasoning_effort=<v>` (Codex). If omitted, resolves through factory config, then stock fallback. |
+| `cli` | string | Explicit CLI backend for this spawn: `claude`, `codex`, or `grok`. If omitted, resolves through factory config, then stock fallback. |
+| `model` | string | Explicit model name. Claude: aliases `sonnet`/`opus`/`haiku` (or full id). Codex: plain `gpt-5.5` (no `-codex` suffix). Grok: `grok-4.5` or `grok-composer-2.5-fast` (from `grok models`). Passed as `-m`/`--model`. If omitted, resolves through factory config, then backend stock fallback. |
+| `effort` | string | Explicit reasoning effort. CAS vocabulary: `minimal` \| `low` \| `medium` \| `high` \| `xhigh` (alias `x-high`). Mapping: Claude `--effort`; Codex `--config model_reasoning_effort=<v>`; Grok `--reasoning-effort`. If omitted, resolves through factory config, then stock fallback. For multi-step Claude workers prefer `high` as the ceiling — see [model-selection.md](model-selection.md). |
 
-`cli`, `model`, and `effort` are per-spawn controls — they apply to the workers spawned by this call only. Supervisors MUST pass explicit `model=` and `effort=` on every `spawn_workers` call; omitted fields resolve through the config cascade as a fallback and produce an acknowledgement warning.
+`cli`, `model`, and `effort` are per-spawn controls — they apply to the workers spawned by this call only. Supervisors MUST pass explicit `model=` and `effort=` on every `spawn_workers` call (light Grok Composer may omit `effort=` because the model id is the tier); omitted fields resolve through the config cascade as a fallback and produce an acknowledgement warning. Copy-paste recipes for all three backends: [model-selection.md](model-selection.md#spawn-cookbook-all-three-harnesses).
 
 **Task ID is always `id`** — not `task_id`, `taskId`, or `_id`.
 
