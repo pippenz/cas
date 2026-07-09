@@ -38,9 +38,14 @@ pub(crate) enum DeliveryChannel {
 ///   the load-bearing fix for cas-b68a.
 /// - **Claude** recipients use the team inbox when teams are active, and fall back
 ///   to PTY when they are not (codex-only / non-teams factories).
+/// - **Grok** recipients are *always* PTY-delivered, same as Codex: EPIC
+///   cas-8888 delta #4 — Grok has no CC Agent-Teams membership
+///   (`--team-name`/`--agent-id`/`--teammate-mode` don't exist for it), so
+///   it can never read a Claude team inbox regardless of the supervisor's
+///   teams mode.
 pub(crate) fn choose_channel(harness: SupervisorCli, teams_active: bool) -> DeliveryChannel {
     match harness {
-        SupervisorCli::Codex => DeliveryChannel::Pty,
+        SupervisorCli::Codex | SupervisorCli::Grok => DeliveryChannel::Pty,
         SupervisorCli::Claude => {
             if teams_active {
                 DeliveryChannel::TeamsInbox
@@ -62,7 +67,8 @@ pub(crate) fn requires_pty_readiness_gate(harness: SupervisorCli, teams_active: 
 }
 
 /// Whether a PTY-delivered payload must carry the literal `Message from <sender>: `
-/// framing. True iff the recipient is **Codex**, independent of teams mode.
+/// framing. True iff the recipient is **Codex** or **Grok**, independent of teams
+/// mode.
 ///
 /// The Codex worker/supervisor prompts (sibling task cas-83c8) key on EXACTLY this
 /// prefix to recognise an injected turn as an actionable instruction, and they do
@@ -71,8 +77,17 @@ pub(crate) fn requires_pty_readiness_gate(harness: SupervisorCli, teams_active: 
 /// property of the recipient's harness, not of teams mode. A Claude recipient
 /// reached via the PTY fallback (codex-supervised factory, teams=None) must NOT be
 /// framed — it isn't a codex prompt and stays byte-for-byte bare.
+///
+/// EPIC cas-8888 (cas-9a31, Phase 1) SILENT SITE — audited: Grok is included
+/// here too. Reasoning: Grok has no CC Agent-Teams membership (delta #4) and
+/// is *always* PTY-delivered (see `choose_channel` above), coordinating "the
+/// Codex way" per the epic notes — so its own worker/supervisor prompts are
+/// expected to key on the same literal prefix for turn recognition, same as
+/// Codex's. This is a judgment call made without Grok's actual prompt content
+/// (that's Phase 2/3's job); revisit if Grok's real injected-turn recognition
+/// mechanism turns out to differ.
 pub(crate) fn pty_payload_needs_framing(harness: SupervisorCli) -> bool {
-    matches!(harness, SupervisorCli::Codex)
+    matches!(harness, SupervisorCli::Codex | SupervisorCli::Grok)
 }
 
 /// Prefix PTY-delivered text with literal sender attribution.

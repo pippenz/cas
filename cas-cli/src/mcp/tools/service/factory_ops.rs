@@ -36,7 +36,7 @@ pub(crate) const WORKER_DEAD_SECS: i64 = 75;
 fn parse_spawn_cli(cli: Option<&str>) -> Result<Option<cas_mux::SupervisorCli>, String> {
     cli.map(|s| {
         s.parse::<cas_mux::SupervisorCli>()
-            .map_err(|_| format!("invalid cli value {s:?}: expected 'claude' or 'codex'"))
+            .map_err(|_| format!("invalid cli value {s:?}: expected 'claude', 'codex', or 'grok'"))
     })
     .transpose()
 }
@@ -55,6 +55,8 @@ fn default_worker_model_for_cli(cli: cas_mux::SupervisorCli) -> &'static str {
     match cli {
         cas_mux::SupervisorCli::Claude => "sonnet",
         cas_mux::SupervisorCli::Codex => crate::config::STOCK_WORKER_MODEL,
+        // EPIC cas-8888 (cas-9a31, Phase 1): grok 0.2.93 default model.
+        cas_mux::SupervisorCli::Grok => "grok-4.5",
     }
 }
 
@@ -114,6 +116,11 @@ pub(crate) fn build_spawn_spec_json_with_project_config(
         .next()
         .ok_or_else(|| "failed to resolve worker spec: no worker slots returned".to_string())?;
 
+    // EPIC cas-8888 (cas-9a31, Phase 1) SILENT SITE — audited, left AS-IS
+    // per the task's own guidance: this default-cli auto-upgrade only ever
+    // fires when the resolved default happens to be Claude (never Grok, since
+    // nothing defaults TO Grok yet — it isn't a stock/default CLI at this
+    // phase), so no Grok arm is needed here.
     if cli.is_none() && !configured_cli && spec.cli == cas_mux::SupervisorCli::Claude {
         spec.cli = cas_mux::SupervisorCli::Codex;
     }

@@ -975,6 +975,11 @@ pub fn execute(args: &FactoryArgs, cli: &Cli, cas_root: Option<&std::path::Path>
     // Resolve per-worker specs from the cascade (cas-2992): config files,
     // CLI flags, and per-worker JSON overrides in priority order.
     let resolved_worker_specs = {
+        // EPIC cas-8888 (cas-9a31, Phase 1) SILENT SITE — audited: this
+        // `!= Claude` check is harness-agnostic by construction ("only pass
+        // an explicit override when it's not the Claude default"), so Grok
+        // already flows through correctly as `Some(Grok)` — no code change
+        // needed here.
         let sources = ConfigSources {
             cli_flag: if preflight.worker_cli != cas_mux::SupervisorCli::Claude {
                 Some(preflight.worker_cli)
@@ -998,6 +1003,9 @@ pub fn execute(args: &FactoryArgs, cli: &Cli, cas_root: Option<&std::path::Path>
     // Resolve supervisor spec from the cascade (cas-1948): [factory.supervisor] TOML
     // + --supervisor-cli/model/effort CLI flags + --supervisor-spec JSON override.
     let resolved_supervisor_spec = {
+        // EPIC cas-8888 (cas-9a31, Phase 1) SILENT SITE — audited, same as
+        // resolved_worker_specs above: harness-agnostic, Grok flows through
+        // as Some(Grok) correctly.
         let sources = ConfigSources {
             cli_flag: if preflight.supervisor_cli != cas_mux::SupervisorCli::Claude {
                 Some(preflight.supervisor_cli)
@@ -1195,10 +1203,22 @@ fn is_codex_installed() -> bool {
         .is_ok()
 }
 
+/// EPIC cas-8888 (cas-9a31, Phase 1): mirrors is_claude_installed/
+/// is_codex_installed. Grok isn't yet a stock/default CLI (no auto-upgrade
+/// or Claude<->Codex-style fallback swap targets it — see
+/// resolve_cli_choice below), but an explicit `--cli grok`/`--worker-cli
+/// grok` request needs a real, non-placeholder installed check.
+fn is_grok_installed() -> bool {
+    std::process::Command::new("grok")
+        .arg("--version")
+        .output()
+        .is_ok()
+}
+
 fn parse_supervisor_cli(value: &str) -> Result<cas_mux::SupervisorCli> {
     value
         .parse::<cas_mux::SupervisorCli>()
-        .map_err(|_| anyhow::anyhow!("Invalid CLI '{value}'. Use 'claude' or 'codex'."))
+        .map_err(|_| anyhow::anyhow!("Invalid CLI '{value}'. Use 'claude', 'codex', or 'grok'."))
 }
 
 struct FactoryPreflight {
@@ -1215,6 +1235,7 @@ fn resolve_cli_choice(
     allow_default_fallback: bool,
     claude_installed: bool,
     codex_installed: bool,
+    grok_installed: bool,
     notices: &mut Vec<String>,
 ) -> Result<cas_mux::SupervisorCli> {
     let parsed = parse_supervisor_cli(requested)?;
@@ -1224,6 +1245,7 @@ fn resolve_cli_choice(
         match cli {
             cas_mux::SupervisorCli::Claude => claude_installed,
             cas_mux::SupervisorCli::Codex => codex_installed,
+            cas_mux::SupervisorCli::Grok => grok_installed,
         }
     };
 
@@ -1231,7 +1253,11 @@ fn resolve_cli_choice(
         return Ok(parsed);
     }
 
-    // Fallback logic for Claude <-> Codex (existing behavior)
+    // Fallback logic for Claude <-> Codex (existing behavior). EPIC cas-8888
+    // (cas-9a31): deliberately NOT extended to a 3-way dance for Grok — it
+    // isn't a stock/default CLI yet, so an explicit `--cli grok` request
+    // that isn't installed just bails with a clear message rather than
+    // silently swapping to a harness the caller didn't ask for.
     match parsed {
         cas_mux::SupervisorCli::Claude if allow_default_fallback && codex_installed => {
             notices.push(format!(
@@ -1250,6 +1276,9 @@ fn resolve_cli_choice(
         ),
         cas_mux::SupervisorCli::Codex => bail!(
             "{role} 'codex' is not installed. Install from https://developers.openai.com/codex"
+        ),
+        cas_mux::SupervisorCli::Grok => bail!(
+            "{role} 'grok' is not installed. Install the xAI Grok Build CLI (see https://x.ai)"
         ),
     }
 }
@@ -1278,6 +1307,7 @@ fn preflight_factory_launch(
 
     let claude_installed = is_claude_installed();
     let codex_installed = is_codex_installed();
+    let grok_installed = is_grok_installed();
 
     // cas-7f2c: `allow_default_fallback` controls whether an absent CLI binary
     // is silently swapped for the other one (e.g. claude→codex).  We allow
@@ -1292,6 +1322,7 @@ fn preflight_factory_launch(
         !args.supervisor_cli_explicit,
         claude_installed,
         codex_installed,
+        grok_installed,
         &mut notices,
     ) {
         Ok(cli) => Some(cli),
@@ -1307,6 +1338,7 @@ fn preflight_factory_launch(
             args.worker_cli == "claude",
             claude_installed,
             codex_installed,
+            grok_installed,
             &mut notices,
         ) {
             Ok(cli) => Some(cli),
@@ -1322,6 +1354,7 @@ fn preflight_factory_launch(
             args.worker_cli == "claude",
             claude_installed,
             codex_installed,
+            grok_installed,
             &mut notices,
         )
         .ok()

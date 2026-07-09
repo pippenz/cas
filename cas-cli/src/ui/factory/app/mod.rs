@@ -1432,6 +1432,24 @@ pub(crate) fn queue_supervisor_intro_prompt(
 - First steps: mcp__cs__coordination action=whoami; mcp__cs__task action=list task_type=epic; mcp__cs__task action=ready"
         ),
         cas_mux::SupervisorCli::Claude => return,
+        // EPIC cas-8888 (cas-9a31, Phase 1): Grok's SessionStart hook fires
+        // but its stdout is ignored, so the SessionStart-additionalContext
+        // bundle injection Claude relies on does NOT reach a Grok
+        // supervisor (see EPIC cas-8888 delta #2) — the real fix (injecting
+        // the CAS context bundle at launch via --agents/--rules/
+        // --system-prompt-override) is Phase 2's job (PtyConfig::grok).
+        // Until then, queue an explicit startup prompt the same shape as
+        // Codex's (no-hooks-context-injection posture) but naming Grok's
+        // OWN cas__ tool prefix rather than Codex's mcp__cs__.
+        cas_mux::SupervisorCli::Grok => format!(
+            "Grok supervisor startup:\n\
+- Use skills: cas-supervisor (context bundle injection via hooks is NOT \
+  active for Grok yet — SessionStart's stdout is ignored on this harness)\n\
+- Tools are namespaced cas__<tool> (e.g. cas__task, cas__coordination), \
+  not mcp__cas__ or mcp__cs__\n\
+- Canonical current workers for this session: {worker_list}\n\
+- First steps: cas__coordination action=whoami; cas__task action=list task_type=epic; cas__task action=ready"
+        ),
     };
 
     if let Ok(queue) = open_prompt_queue_store(cas_dir) {
@@ -1460,6 +1478,28 @@ pub(crate) fn queue_codex_worker_intro_prompt(
                  Check your assigned tasks: `mcp__cas__task action=mine`\n\
                  \n\
                  See the cas-worker skill for detailed workflow guidance."
+            );
+            if let Ok(queue) = open_prompt_queue_store(cas_dir) {
+                let _ = queue.enqueue("cas", worker_name, &prompt);
+            }
+        }
+        // EPIC cas-8888 (cas-9a31, Phase 1): placeholder arm — the real
+        // decision (initial-prompt-at-spawn like Codex, vs. queued like
+        // Claude, vs. something new given the passive-SessionStart-hook
+        // caveat) belongs with Phase 2's PtyConfig::grok, which controls
+        // how Grok is actually launched. Queuing here (Claude-shaped, with
+        // Grok's own tool prefix) is a safe default in the meantime: it
+        // degrades to "one extra queued prompt" rather than "worker never
+        // told its task", not a correctness bug — cli=grok isn't
+        // spawnable yet.
+        cas_mux::SupervisorCli::Grok => {
+            let prompt = format!(
+                "You are a CAS factory worker ({worker_name}).\n\
+                 \n\
+                 Check your assigned tasks: `cas__task action=mine`\n\
+                 \n\
+                 See the cas-worker skill for detailed workflow guidance. \
+                 Tools are namespaced cas__<tool>, not mcp__cas__/mcp__cs__."
             );
             if let Ok(queue) = open_prompt_queue_store(cas_dir) {
                 let _ = queue.enqueue("cas", worker_name, &prompt);

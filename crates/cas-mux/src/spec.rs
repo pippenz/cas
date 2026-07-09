@@ -88,7 +88,7 @@ pub struct WorkerSpec {
     /// Optional name for this worker slot (e.g. `"alice"`).
     /// `None` means the factory assigns a generated name at spawn time.
     pub name: Option<String>,
-    /// CLI backend (Claude or Codex).
+    /// CLI backend (Claude, Codex, or Grok).
     pub cli: SupervisorCli,
     /// Model name (e.g. `"claude-opus-4-5"` or `"gpt-5.5"`).
     /// `None` = use the backend's own default.
@@ -191,5 +191,27 @@ mod tests {
         assert_eq!(spec.model, None);
         assert_eq!(spec.effort, None);
         assert_eq!(spec.name.as_deref(), Some("alice"));
+    }
+
+    /// EPIC cas-8888 (cas-9a31, Phase 1): `WorkerSpec.cli` derives its
+    /// Serialize/Deserialize straight from `SupervisorCli`, which carries
+    /// `#[serde(rename_all = "lowercase")]` — so `"grok"` round-trips with
+    /// zero extra wiring here. This is the concrete proof cited in the
+    /// task description (crates/cas-mux/src/spec.rs:87-98).
+    #[test]
+    fn worker_spec_grok_round_trips_through_json() {
+        let spec = WorkerSpec {
+            name: Some("bob".to_string()),
+            cli: SupervisorCli::Grok,
+            model: Some("grok-4.5".to_string()),
+            effort: Some(Effort::Medium),
+        };
+        let json = serde_json::to_string(&spec).unwrap();
+        assert!(
+            json.contains("\"cli\":\"grok\""),
+            "expected lowercase 'grok' in serialized WorkerSpec: {json}"
+        );
+        let back: WorkerSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, spec);
     }
 }
