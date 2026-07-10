@@ -1436,6 +1436,12 @@ This is the body content."#;
             "heavy",
             "frontier",
             "model-selection.md",
+            // cas-b342: Codex-first tier table + fit/capacity lanes in the body.
+            "Codex-first tiers",
+            "codex/gpt-5.5/low",
+            "codex/gpt-5.6-sol/high",
+            "Claude Max",
+            "capacity route",
         ] {
             assert!(
                 codex_guide.contains(keyword),
@@ -1447,6 +1453,55 @@ This is the body content."#;
             codex_guide.contains("tiered mix"),
             "codex cas-supervisor.md Quick Start must not read as a single default spawn recipe"
         );
+    }
+
+    /// cas-b342: the three supervisor bodies must be semantically identical
+    /// apart from the intentional per-harness tool prefix (mcp__cas__ /
+    /// mcp__cs__ / cas__) and the Grok Heterogeneous-Teams section title. This
+    /// pins routing examples (tier table, Quick Start spawn recipes, the
+    /// heterogeneous complete-call) to full explicit controls across all three
+    /// harnesses — a condensed or drifted example on one twin now fails CI.
+    #[test]
+    fn test_supervisor_bodies_normalized_consistent_across_harnesses() {
+        let claude = SUPERVISOR_GUIDE;
+        let codex = include_str!("builtins/codex/skills/cas-supervisor.md");
+        let grok = include_str!("builtins/grok/skills/cas-supervisor.md");
+
+        // Claude -> Codex is a pure tool-prefix mirror.
+        assert_eq!(
+            claude.replace("mcp__cas__", "mcp__cs__"),
+            codex,
+            "codex cas-supervisor.md must equal the Claude body apart from the \
+             mcp__cas__/mcp__cs__ tool prefix"
+        );
+
+        // Claude -> Grok differs only by the cas__ prefix and the intentional
+        // Heterogeneous-Teams section title (Grok supervisors lead a different
+        // fleet). Normalize both, then require exact equality.
+        let claude_as_grok = claude
+            .replace("mcp__cas__", "cas__")
+            .replace(
+                "## Heterogeneous Teams (Claude supervisor + Codex workers)",
+                "## Heterogeneous Teams (Grok supervisor + Claude/Codex workers)",
+            );
+        assert_eq!(
+            claude_as_grok, grok,
+            "grok cas-supervisor.md must equal the Claude body apart from the cas__ \
+             tool prefix and the intentional Heterogeneous-Teams section title"
+        );
+
+        // The shared body must carry the full explicit spawn recipes (not a
+        // condensed `effort=high`-only heavy example) on every twin.
+        for (label, body) in [("claude", claude), ("codex", codex), ("grok", grok)] {
+            assert!(
+                body.contains("model=gpt-5.5 effort=high` for a heavy one"),
+                "{label} cas-supervisor.md must give the heavy spawn as a complete recipe"
+            );
+            assert!(
+                body.contains("pass complete `cli=`, `model=`, and `effort=` controls"),
+                "{label} cas-supervisor.md heterogeneous example must be a complete call"
+            );
+        }
     }
 
     /// The checklist is a separate skill invocable via /cas-supervisor-checklist.
@@ -1470,18 +1525,32 @@ This is the body content."#;
 
     /// SessionStart additionalContext gets truncated by the Claude Code harness
     /// once the payload exceeds its ~10KB threshold (measured empirically by
-    /// cas-ecd5, 2026-06-01). 8KB leaves ~2KB headroom for SessionStart banners
-    /// (codemap freshness, agent identity, WIP banner) to fit alongside without
-    /// tripping truncation. See memory `project_session_start_truncation.md`.
+    /// cas-ecd5, 2026-06-01). The hard ceiling is 8192 bytes (~2KB headroom for
+    /// SessionStart banners: codemap freshness, agent identity, WIP banner). We
+    /// assert a slightly tighter 8000-byte soft cap (cas-b342) so a routine
+    /// punctuation/wording edit can't silently detonate the 8192 ceiling in CI —
+    /// ~192 bytes of guaranteed slack. Over the soft cap: move content into
+    /// cas-supervisor/references/ rather than inlining it in cas-supervisor.md.
+    /// See memory `project_session_start_truncation.md`.
     #[test]
     fn test_supervisor_guidance_under_8kb() {
+        const HARD_CEILING: usize = 8_192; // Claude Code harness truncation point.
+        const SOFT_CAP: usize = 8_000; // early-warning margin below the ceiling.
         let guide = supervisor_guidance();
         assert!(
-            guide.len() < 8_192,
-            "supervisor_guidance is {} bytes — over the 8KB ceiling. \
+            guide.len() < HARD_CEILING,
+            "supervisor_guidance is {} bytes — over the {HARD_CEILING}B SessionStart ceiling. \
              Move content into cas-supervisor/references/ instead of \
              inlining it in cas-supervisor.md.",
             guide.len()
+        );
+        assert!(
+            guide.len() <= SOFT_CAP,
+            "supervisor_guidance is {} bytes — over the {SOFT_CAP}B soft cap (only \
+             {}B from the {HARD_CEILING}B hard ceiling). Trim body prose or move it \
+             into cas-supervisor/references/ to keep CI headroom.",
+            guide.len(),
+            HARD_CEILING - guide.len()
         );
     }
 
@@ -2667,14 +2736,50 @@ This is the body content."#;
             .iter()
             .find(|b| b.path == "skills/cas-supervisor/references/model-selection.md")
             .expect("CODEX_BUILTIN_SKILLS missing cas-supervisor model-selection.md");
+        let grok = GROK_BUILTIN_SKILLS
+            .iter()
+            .find(|b| b.path == "skills/cas-supervisor/references/model-selection.md")
+            .expect("GROK_BUILTIN_SKILLS missing cas-supervisor model-selection.md");
         assert_eq!(
             claude.content.replace("mcp__cas__", "mcp__cs__"),
             codex.content,
             "model-selection.md .claude and .codex copies must be identical apart from \
              the mcp__cas__/mcp__cs__ tool prefix",
         );
-        // The four tiers and the escalation rule are the contract of the rubric.
+        // cas-b342: the Grok twin is a third normalized mirror — identical to
+        // the Claude copy apart from the cas__ tool prefix.
+        assert_eq!(
+            claude.content.replace("mcp__cas__", "cas__"),
+            grok.content,
+            "model-selection.md .claude and .grok copies must be identical apart from \
+             the mcp__cas__/cas__ tool prefix",
+        );
+        // cas-b342: the Codex-first tier table is the contract of the rubric.
+        // The four rungs must be exactly codex/gpt-5.5 low|medium|high and
+        // codex/gpt-5.6-sol high, with Claude Max as a fit overlay and Grok as
+        // a health-gated capacity overlay.
         for required in [
+            // Codex-first tier table (AC2)
+            "Codex-first",
+            "cli=codex model=gpt-5.5 effort=low",
+            "cli=codex model=gpt-5.5 effort=medium",
+            "cli=codex model=gpt-5.5 effort=high",
+            "cli=codex model=gpt-5.6-sol effort=high",
+            // Claude Max fit lane (AC3)
+            "Claude Max",
+            "cli=claude model=sonnet effort=high",
+            "cli=claude model=opus effort=high",
+            "architecture",
+            "rescue",
+            "independent",
+            // Grok capacity lane (AC4). The light Grok recipe is pinned with
+            // explicit effort=low — every spawn recipe must carry cli/model/effort.
+            "capacity",
+            "cli=grok model=grok-composer-2.5-fast effort=low",
+            "grok model=grok-4.5",
+            "same-tier Codex fallback",
+            "health",
+            // Rubric contract carried over
             "light",
             "standard",
             "heavy",
@@ -2695,12 +2800,36 @@ This is the body content."#;
                 "model-selection.md missing required tier-rubric marker: {required:?}"
             );
         }
-        // Discoverable from the SessionStart-injected body on both surfaces.
+        // cas-b342 edge case: the exact frontier slug is `gpt-5.6-sol`; a bare
+        // `gpt-5.6` must never appear as a spawn recipe (`model=gpt-5.6` or the
+        // `codex/gpt-5.6` tier shorthand). Documentation may still mention the
+        // bare slug to warn against it, so we only forbid the recipe forms.
+        let stripped = claude.content.replace("gpt-5.6-sol", "SOLSLUG");
+        assert!(
+            !stripped.contains("model=gpt-5.6") && !stripped.contains("codex/gpt-5.6"),
+            "model-selection.md must not use a bare gpt-5.6 spawn recipe — exact slug is gpt-5.6-sol"
+        );
+        // cas-b342: the hard rule requires explicit cli/model/effort on EVERY
+        // spawn, so every `spawn_workers` recipe line in the rubric — including
+        // the light Grok Composer lane — must carry an explicit `effort=`.
+        for line in claude.content.lines() {
+            if line.contains("action=spawn_workers") {
+                assert!(
+                    line.contains("effort="),
+                    "spawn_workers recipe omits explicit effort=: {line:?}"
+                );
+            }
+        }
+        // Discoverable from the SessionStart-injected body on all three surfaces.
         for (label, guide) in [
             ("claude cas-supervisor.md", SUPERVISOR_GUIDE),
             (
                 "codex cas-supervisor.md",
                 include_str!("builtins/codex/skills/cas-supervisor.md"),
+            ),
+            (
+                "grok cas-supervisor.md",
+                include_str!("builtins/grok/skills/cas-supervisor.md"),
             ),
         ] {
             assert!(
@@ -3317,6 +3446,12 @@ This is the body content."#;
             "standard",
             "heavy",
             "frontier",
+            // cas-b342: Codex-first tier table + fit/capacity lanes in the body.
+            "Codex-first tiers",
+            "codex/gpt-5.5/low",
+            "codex/gpt-5.6-sol/high",
+            "Claude Max",
+            "capacity route",
         ] {
             assert!(
                 supervisor.content.contains(keyword),
