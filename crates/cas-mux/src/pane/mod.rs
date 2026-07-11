@@ -102,11 +102,16 @@ pub struct Pane {
     created_at: std::time::Instant,
     /// Authoritative in-flight turn flag (cas-7f6f).
     ///
-    /// Set at control points that start a turn (prompt submit / inject);
-    /// cleared when cancel is issued (`break_turn` / `interrupt`). Not inferred
-    /// from PTY output timing — quiet mid-turn stays true; idle redraws do not
-    /// flip it.
+    /// Set at control points that start a turn (true prompt submit / inject);
+    /// cleared on cancel (`break_turn` / `interrupt`), Stop-forward, or
+    /// normal completion ([`Self::mark_turn_completed`]). Not set by output
+    /// redraws or paste/drop payloads.
     turn_in_flight: std::sync::atomic::AtomicBool,
+    /// Whether the current in-flight turn has emitted any PTY output (for
+    /// normal-completion detection after the model has actually started).
+    turn_saw_output: std::sync::atomic::AtomicBool,
+    /// Last output time while a turn is in-flight (completion quiet window).
+    turn_last_output_at: std::sync::Mutex<Option<std::time::Instant>>,
     /// Whether the inner process is currently in alt-screen mode.
     ///
     /// Tracked by watching for DEC private mode set/reset sequences in `feed()`:
@@ -173,6 +178,8 @@ impl Pane {
             total_bytes_received: 0,
             created_at: std::time::Instant::now(),
             turn_in_flight: std::sync::atomic::AtomicBool::new(false),
+            turn_saw_output: std::sync::atomic::AtomicBool::new(false),
+            turn_last_output_at: std::sync::Mutex::new(None),
             in_alt_screen: false,
             has_hyperlinks: false,
             partial_esc: Vec::new(),
@@ -1004,6 +1011,13 @@ impl Pane {
 
         if !coalesced.is_empty() {
             self.total_bytes_received += coalesced.len() as u64;
+            if self.is_turn_in_flight() {
+                self.turn_saw_output
+                    .store(true, std::sync::atomic::Ordering::Release);
+                if let Ok(mut guard) = self.turn_last_output_at.lock() {
+                    *guard = Some(std::time::Instant::now());
+                }
+            }
             let feed_data = Self::strip_literal_cursor_reports(&coalesced);
             if let Err(e) = self.feed(feed_data.as_ref()) {
                 tracing::warn!(
@@ -1012,6 +1026,9 @@ impl Pane {
                     e
                 );
             }
+        } else {
+            // No new bytes this poll — maybe the in-flight turn finished.
+            self.maybe_complete_turn_after_quiet();
         }
 
         // Return the coalesced data directly — no clone needed since take()
@@ -1057,16 +1074,71 @@ impl Pane {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// Mark that a turn has started (user submit or inject).
+    /// Quiet window after the last in-flight output before we treat the turn
+    /// as normally completed (cas-7f6f). Longer than mid-tool blips (>2s quiet
+    /// still cancelable) but finite so Esc returns to idle after a finished turn.
+    pub const TURN_COMPLETE_QUIET: std::time::Duration =
+        std::time::Duration::from_secs(8);
+
+    /// Mark that a turn has started (true prompt submit or inject).
     pub fn mark_turn_in_flight(&self) {
         self.turn_in_flight
             .store(true, std::sync::atomic::Ordering::Release);
+        self.turn_saw_output
+            .store(false, std::sync::atomic::Ordering::Release);
+        if let Ok(mut guard) = self.turn_last_output_at.lock() {
+            *guard = None;
+        }
     }
 
     /// Mark that the in-flight turn has ended (cancel issued or explicit idle).
     pub fn clear_turn_in_flight(&self) {
         self.turn_in_flight
             .store(false, std::sync::atomic::Ordering::Release);
+        self.turn_saw_output
+            .store(false, std::sync::atomic::Ordering::Release);
+        if let Ok(mut guard) = self.turn_last_output_at.lock() {
+            *guard = None;
+        }
+    }
+
+    /// Authoritative normal completion (turn finished without cancel).
+    pub fn mark_turn_completed(&self) {
+        self.clear_turn_in_flight();
+    }
+
+    /// If an in-flight turn has produced output and then gone quiet for
+    /// [`Self::TURN_COMPLETE_QUIET`], mark it completed.
+    ///
+    /// Quiet mid-turn *before* any response (or tool gaps shorter than the
+    /// window) stays in-flight so Esc still cancels. Idle redraws never set
+    /// in-flight on their own.
+    pub fn maybe_complete_turn_after_quiet(&self) {
+        if !self.is_turn_in_flight() {
+            return;
+        }
+        if !self
+            .turn_saw_output
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
+        let Some(last) = self.turn_last_output_at.lock().ok().and_then(|g| *g) else {
+            return;
+        };
+        if last.elapsed() >= Self::TURN_COMPLETE_QUIET {
+            self.mark_turn_completed();
+        }
+    }
+
+    /// Test helper: simulate that an in-flight turn produced output `ago` ago
+    /// (for quiet-active vs completion tests without sleeping).
+    pub fn test_set_turn_last_output_ago(&self, ago: std::time::Duration) {
+        self.turn_saw_output
+            .store(true, std::sync::atomic::Ordering::Release);
+        if let Ok(mut guard) = self.turn_last_output_at.lock() {
+            *guard = Some(std::time::Instant::now() - ago);
+        }
     }
 
     /// Whether this pane is ready to accept prompt injection.
@@ -1101,11 +1173,10 @@ impl Pane {
         }
     }
 
-    /// Note a user prompt submit (trailing CR/LF on input) as turn start.
-    pub fn note_user_submit(&self, data: &[u8]) {
-        if data.contains(&b'\r') || data.contains(&b'\n') {
-            self.mark_turn_in_flight();
-        }
+    /// Whether `data` is a true keyboard prompt submit (lone CR/LF), not a
+    /// multi-byte paste/drop payload that happens to embed newlines.
+    pub fn is_true_prompt_submit(data: &[u8]) -> bool {
+        matches!(data, b"\r" | b"\n" | b"\r\n")
     }
 
     /// Break the current turn with a harness-aware cancel payload (cas-7f6f).

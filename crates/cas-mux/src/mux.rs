@@ -900,24 +900,49 @@ impl Mux {
         pane.inject_prompt(prompt).await
     }
 
-    /// Send input to the focused pane
+    /// Send input to the focused pane.
+    ///
+    /// Does **not** mark turn-in-flight: bracketed paste / image-drop payloads
+    /// may embed CR/LF as literals (cas-7f6f). Callers that mean a real
+    /// prompt submit must call [`Pane::mark_turn_in_flight`] (or
+    /// [`Mux::note_prompt_submit`]) separately.
     pub async fn send_input(&self, data: &[u8]) -> Result<()> {
         let pane = self
             .focused()
             .ok_or_else(|| Error::pty("No focused pane"))?;
-        // CR/LF submit starts a turn (cas-7f6f authoritative in-flight flag).
-        pane.note_user_submit(data);
         pane.write(data).await
     }
 
-    /// Send input to a specific pane.
+    /// Send input to a specific pane (no turn-in-flight side effects; see
+    /// [`Mux::send_input`]).
     pub async fn send_input_to(&self, pane_id: &str, data: &[u8]) -> Result<()> {
         let pane = self
             .panes
             .get(pane_id)
             .ok_or_else(|| Error::pane_not_found(pane_id))?;
-        pane.note_user_submit(data);
         pane.write(data).await
+    }
+
+    /// Record that the focused pane received a real prompt submit (Enter).
+    pub fn note_prompt_submit_focused(&self) {
+        if let Some(pane) = self.focused() {
+            pane.mark_turn_in_flight();
+        }
+    }
+
+    /// Record normal turn completion on a pane (not cancel — cancel clears
+    /// via [`Pane::break_turn`] / [`Pane::interrupt`]).
+    pub fn note_turn_completed(&self, pane_id: &str) {
+        if let Some(pane) = self.panes.get(pane_id) {
+            pane.mark_turn_completed();
+        }
+    }
+
+    /// Record normal turn completion on the focused pane.
+    pub fn note_turn_completed_focused(&self) {
+        if let Some(pane) = self.focused() {
+            pane.mark_turn_completed();
+        }
     }
 
     /// Poll all panes for events (non-blocking)

@@ -1623,10 +1623,9 @@ mod tests {
         );
     }
 
-    /// Grok Esc uses authoritative turn_in_flight — quiet active still cancels;
-    /// idle redraw/output does not.
+    /// submit → quiet active → complete → idle (authoritative completion clear).
     #[test]
-    fn grok_esc_quiet_active_vs_idle_redraw_cas_7f6f() {
+    fn grok_esc_submit_quiet_complete_idle_cas_7f6f() {
         assert_eq!(grok_esc_action(true), GrokEscAction::CancelTurn);
         assert_eq!(grok_esc_action(false), GrokEscAction::ForwardRaw);
 
@@ -1638,38 +1637,106 @@ mod tests {
         app.supervisor_name = "g".to_string();
         app.supervisor_cli = cas_mux::SupervisorCli::Grok;
 
-        // Idle (no turn marked) → ForwardRaw even if we feed redraw-like output.
+        // Idle redraw alone never starts a turn.
         app.mux
             .get_mut("g")
             .unwrap()
             .feed(b"\x1b[2Jidle-redraw")
             .unwrap();
-        assert!(
-            !app.focused_turn_in_flight(),
-            "output/redraw alone must not mark turn in-flight"
-        );
+        assert!(!app.focused_turn_in_flight());
         assert_eq!(app.focused_grok_esc_action(), GrokEscAction::ForwardRaw);
 
-        // Active turn (authoritative flag) → CancelTurn even when quiet (no feed).
+        // Submit starts in-flight.
+        assert!(cas_mux::Pane::is_true_prompt_submit(b"\r"));
+        assert!(!cas_mux::Pane::is_true_prompt_submit(
+            b"\x1b[200~line1\nline2\r\x1b[201~"
+        ));
         app.mux.get("g").unwrap().mark_turn_in_flight();
         assert!(app.focused_turn_in_flight());
         assert_eq!(app.focused_grok_esc_action(), GrokEscAction::CancelTurn);
-        // Simulate quiet mid-turn (>2s is not modeled with sleep; flag alone is
-        // the signal — still cancelable without further output).
+
+        // Quiet active (>2s, no further output) still cancelable.
+        app.mux
+            .get("g")
+            .unwrap()
+            .test_set_turn_last_output_ago(std::time::Duration::from_secs(3));
+        assert!(app.focused_turn_in_flight());
         assert_eq!(
-            grok_esc_action(true),
+            app.focused_grok_esc_action(),
             GrokEscAction::CancelTurn,
             "quiet active turn remains cancelable"
         );
 
-        // Cancel clears the flag.
-        app.mux.get("g").unwrap().clear_turn_in_flight();
+        // Normal completion → idle Esc is raw.
+        app.mux.get("g").unwrap().mark_turn_completed();
+        assert!(!app.focused_turn_in_flight());
         assert_eq!(app.focused_grok_esc_action(), GrokEscAction::ForwardRaw);
 
-        // User submit (CR) marks in-flight.
-        app.mux.get("g").unwrap().note_user_submit(b"do work\r");
-        assert!(app.focused_turn_in_flight());
-        assert_eq!(app.focused_grok_esc_action(), GrokEscAction::CancelTurn);
+        // Completion quiet window also clears after saw-output + long quiet.
+        app.mux.get("g").unwrap().mark_turn_in_flight();
+        app.mux
+            .get("g")
+            .unwrap()
+            .test_set_turn_last_output_ago(cas_mux::Pane::TURN_COMPLETE_QUIET);
+        app.mux.get("g").unwrap().maybe_complete_turn_after_quiet();
+        assert!(
+            !app.focused_turn_in_flight(),
+            "normal completion quiet window must clear in-flight"
+        );
+    }
+
+    /// Bracketed paste / multi-byte payloads with embedded CR must not mark submit.
+    #[test]
+    fn true_prompt_submit_not_paste_payload_cas_7f6f() {
+        assert!(cas_mux::Pane::is_true_prompt_submit(b"\r"));
+        assert!(cas_mux::Pane::is_true_prompt_submit(b"\n"));
+        assert!(cas_mux::Pane::is_true_prompt_submit(b"\r\n"));
+        assert!(!cas_mux::Pane::is_true_prompt_submit(b"hello\r"));
+        assert!(!cas_mux::Pane::is_true_prompt_submit(
+            b"\x1b[200~path/with\nnewline\r\x1b[201~"
+        ));
+        assert!(!cas_mux::Pane::is_true_prompt_submit(b"\x1b[200~\x1b[201~"));
+    }
+
+    /// Drop hit-testing is mode-aware so compact and full coexist.
+    #[test]
+    fn drop_target_geometry_mode_aware_cas_7f6f() {
+        let mut app = FactoryApp::for_test();
+        app.supervisor_name = "sup".to_string();
+        app.worker_names = vec!["w1".to_string()];
+        // Full: supervisor at left, worker at right (stale full layout).
+        app.supervisor_area = Some(Rect::new(0, 0, 40, 20));
+        app.worker_areas = vec![Rect::new(40, 0, 40, 20)];
+        app.full_pty_content_areas
+            .insert("sup".to_string(), full_mode_pty_content(Rect::new(0, 0, 40, 20)));
+        app.full_pty_content_areas
+            .insert("w1".to_string(), full_mode_pty_content(Rect::new(40, 0, 40, 20)));
+        // Compact paints only supervisor borderless in a different rect.
+        app.compact_pty_content_areas
+            .insert("sup".to_string(), Rect::new(0, 1, 40, 18));
+
+        // Full hit at worker content maps to w1.
+        assert_eq!(
+            app.pane_at_screen_for(50, 10, ClientGeometryMode::Full),
+            Some("w1".to_string())
+        );
+        // Compact ignores full worker areas — only supervisor content.
+        assert_eq!(
+            app.pane_at_screen_for(50, 10, ClientGeometryMode::Compact),
+            None,
+            "compact must not use full-layout worker hit tests"
+        );
+        assert_eq!(
+            app.pane_at_screen_for(5, 5, ClientGeometryMode::Compact),
+            Some("sup".to_string())
+        );
+        // Updating compact map must not change full hit tests.
+        app.compact_pty_content_areas
+            .insert("sup".to_string(), Rect::new(0, 1, 10, 5));
+        assert_eq!(
+            app.pane_at_screen_for(50, 10, ClientGeometryMode::Full),
+            Some("w1".to_string())
+        );
     }
 
     /// Claude focused alt-screen must NOT forward SGR clicks (Stop path is

@@ -226,6 +226,8 @@ impl FactoryDaemon {
                                             );
                                             let _ =
                                                 self.app.mux.send_input_to(&pane, &payload).await;
+                                            // Stop click ends the turn authoritatively.
+                                            self.app.mux.note_turn_completed(&pane);
                                         }
                                     }
                                 }
@@ -233,9 +235,22 @@ impl FactoryDaemon {
                                     self.app.select_mode = on;
                                 }
                                 ControlEvent::DropImage { col, row, path } => {
-                                    let target = self.resolve_drop_target(col, row);
+                                    // Mode-aware drop target (cas-7f6f): compact
+                                    // clients must not use full-layout hit tests.
+                                    let geometry = match self
+                                        .clients
+                                        .get(&client_id)
+                                        .map(|c| c.view_mode)
+                                    {
+                                        Some(ClientViewMode::Compact) => {
+                                            crate::ui::factory::app::ClientGeometryMode::Compact
+                                        }
+                                        _ => crate::ui::factory::app::ClientGeometryMode::Full,
+                                    };
+                                    let target = self.resolve_drop_target(col, row, geometry);
                                     if let Some(target_pane) = target {
                                         let _ = self.app.mux.focus(&target_pane);
+                                        // Bracketed paste only — never marks turn-in-flight.
                                         let payload = bracketed_paste_bytes(&path);
                                         if let Err(e) =
                                             self.app.mux.send_input_to(&target_pane, &payload).await
@@ -265,6 +280,7 @@ impl FactoryDaemon {
                                     // walks one byte at a time) keeps embedded
                                     // newlines/control bytes literal, so the inner
                                     // CLI stops submitting mid-paste (cas-5702).
+                                    // Must not mark turn-in-flight (embedded CR/LF).
                                     if self.app.focused_accepts_input() {
                                         let bytes = bracketed_paste_bytes(&payload);
                                         if let Err(e) = self.app.mux.send_input(&bytes).await {
@@ -923,6 +939,13 @@ impl FactoryDaemon {
                     continue;
                 }
 
+                // True keyboard Enter/Return is a prompt submit (cas-7f6f).
+                // Bracketed paste/image-drop go through a different path with
+                // multi-byte payloads — they must not mark turn-in-flight.
+                if byte == b'\r' || byte == b'\n' {
+                    self.app.mux.note_prompt_submit_focused();
+                }
+
                 // Forward all other input (including Tab) to the focused pane
                 let _ = self.app.mux.send_input(&[byte]).await;
                 i += 1;
@@ -962,15 +985,25 @@ impl FactoryDaemon {
         Ok(())
     }
 
-    fn resolve_drop_target(&self, col: u16, row: u16) -> Option<String> {
+    fn resolve_drop_target(
+        &self,
+        col: u16,
+        row: u16,
+        geometry: crate::ui::factory::app::ClientGeometryMode,
+    ) -> Option<String> {
         if col != u16::MAX && row != u16::MAX {
-            if let Some(pane_name) = self.app.pane_at_screen(col, row) {
+            if let Some(pane_name) = self.app.pane_at_screen_for(col, row, geometry) {
                 if pane_name == self.app.supervisor_name()
                     || self.app.worker_names().iter().any(|w| w == &pane_name)
                 {
                     return Some(pane_name);
                 }
             }
+        }
+
+        // Compact clients only show the supervisor content area.
+        if geometry == crate::ui::factory::app::ClientGeometryMode::Compact {
+            return Some(self.app.supervisor_name().to_string());
         }
 
         if self.app.focused_is_supervisor() {

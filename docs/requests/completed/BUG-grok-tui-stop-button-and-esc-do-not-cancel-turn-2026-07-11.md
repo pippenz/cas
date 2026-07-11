@@ -194,3 +194,8 @@ Exit 0 on both.
 ### Review follow-up 2 (cas-7f6f P2)
 1. Authoritative `Pane.turn_in_flight` (set on inject/CR submit; cleared on break_turn/interrupt) — not output-timing. Quiet active stays cancelable; idle redraws do not mark in-flight.
 2. Separate `full_pty_content_areas` / `compact_pty_content_areas`; mouse routing uses client view mode so concurrent full+compact clients keep independent Stop geometry.
+
+### Review follow-up 3 (cas-7f6f)
+1. Normal completion: mark_turn_completed + quiet-after-saw-output window (TURN_COMPLETE_QUIET); submit→quiet→complete→idle test.
+2. Only true keyboard Enter/inject marks turn_in_flight; bracketed paste/drop never do.
+3. Image drop uses pane_at_screen_for(geometry) so compact/full maps stay independent.
