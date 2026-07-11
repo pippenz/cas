@@ -1754,6 +1754,7 @@ mod tests {
             epic: Some("cas-4c77".to_string()),
             branch: None,
             updated_at: None,
+            epic_verification_owner: None,
         }];
         data.epic_tasks = vec![TaskSummary {
             id: "cas-4c77".to_string(),
@@ -1767,6 +1768,7 @@ mod tests {
                 "epic/general-dosha-recipes-dual-mode-generation-standal-cas-4c77".to_string(),
             ),
             updated_at: None,
+            epic_verification_owner: None,
         }];
         let config = default_config();
 
@@ -1871,6 +1873,7 @@ mod tests {
             epic: Some("cas-epic1".to_string()),
             branch: None,
             updated_at: None,
+            epic_verification_owner: None,
         }];
         data.epic_tasks = vec![TaskSummary {
             id: "cas-epic1".to_string(),
@@ -1882,6 +1885,7 @@ mod tests {
             epic: None,
             branch: Some("epic/mixed-cas-epic1".to_string()),
             updated_at: None,
+            epic_verification_owner: None,
         }];
         let config = default_config();
 

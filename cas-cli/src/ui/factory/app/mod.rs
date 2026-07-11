@@ -2744,7 +2744,7 @@ mod tests {
             cols: 80,
         };
         let pty = cas_mux::Pty::spawn(pty_id, pty_config).ok()?;
-        cas_mux::Pane::with_pty(pane_id, cas_mux::PaneKind::Worker, pty, 24, 80).ok()
+        cas_mux::Pane::with_pty(pane_id, cas_mux::PaneKind::Worker, pty, 24, 80, cas_mux::SupervisorCli::Claude).ok()
     }
 
     /// cas-eb7f (review finding, cas-ebc1 final): `sync_worker_pane_branch_titles`
