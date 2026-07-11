@@ -467,7 +467,14 @@ impl FactoryApp {
         };
 
         match Pty::spawn(pane_name, config) {
-            Ok(pty) => match Pane::with_pty(pane_name, PaneKind::Shell, pty, 24, 80) {
+            Ok(pty) => match Pane::with_pty(
+                pane_name,
+                PaneKind::Shell,
+                pty,
+                24,
+                80,
+                cas_mux::SupervisorCli::Claude,
+            ) {
                 Ok(pane) => {
                     self.mux.add_pane(pane);
                     self.terminal_pane_name = Some(pane_name.to_string());
