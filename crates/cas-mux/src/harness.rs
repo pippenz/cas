@@ -49,6 +49,22 @@ impl SupervisorCli {
             },
         }
     }
+
+    /// Bytes that cancel the current in-flight turn for this harness.
+    ///
+    /// Used by factory turn-break (`Pane::break_turn`, Escape routing, and the
+    /// urgent interrupt-and-redirect path) so Stop / Esc / programmatic cancel
+    /// share one harness-aware payload (cas-7f6f):
+    ///
+    /// - **Claude / Codex**: Esc (`0x1b`) — Claude Code's cancel-turn key.
+    /// - **Grok**: Ctrl+C (`0x03`) — since 0.2.93 Esc is a mid-turn no-op and
+    ///   cancel is Ctrl+C (empty prompt; non-empty draft clears first).
+    pub fn turn_cancel_bytes(self) -> &'static [u8] {
+        match self {
+            Self::Claude | Self::Codex => &[0x1b],
+            Self::Grok => &[0x03],
+        }
+    }
 }
 
 impl FromStr for SupervisorCli {
@@ -132,5 +148,13 @@ mod tests {
         let codex = SupervisorCli::Codex.capabilities();
         assert!(!codex.supports_hooks && !codex.supports_subagents && !codex.supports_textbox_submit);
         assert_eq!(codex.tool_prefix, "mcp__cs__");
+    }
+
+    /// cas-7f6f: Grok cancels with Ctrl+C; Claude/Codex keep Esc.
+    #[test]
+    fn turn_cancel_bytes_are_harness_aware() {
+        assert_eq!(SupervisorCli::Claude.turn_cancel_bytes(), &[0x1b]);
+        assert_eq!(SupervisorCli::Codex.turn_cancel_bytes(), &[0x1b]);
+        assert_eq!(SupervisorCli::Grok.turn_cancel_bytes(), &[0x03]);
     }
 }

@@ -836,11 +836,12 @@ impl Mux {
         self.panes.get(pane_id).map(|p| p.bytes_received())
     }
 
-    /// Break a specific worker's current turn by name by sending a single
-    /// Esc (0x1b) — the canonical Claude Code "stop this turn" key.
+    /// Break a specific worker's current turn by name with a harness-aware
+    /// cancel payload (cas-7f6f): Esc for Claude/Codex, Ctrl+C for Grok.
     ///
-    /// Distinct from [`Mux::interrupt`], which sends Ctrl+C (0x03). Targets a
-    /// pane by name independent of TUI focus.
+    /// Distinct from [`Mux::interrupt`] only in intent (turn cancel vs generic
+    /// interrupt); for Grok both currently send Ctrl+C. Targets a pane by name
+    /// independent of TUI focus.
     pub async fn break_turn(&self, pane_id: &str) -> Result<()> {
         let pane = self
             .panes
@@ -850,9 +851,9 @@ impl Mux {
     }
 
     /// Urgent interrupt-and-redirect: break the target worker's in-flight turn
-    /// (Esc), wait a bounded settle window for the turn to actually break, then
-    /// inject the correction as the worker's next prompt — by name, independent
-    /// of TUI focus.
+    /// (harness-aware cancel), wait a bounded settle window for the turn to
+    /// actually break, then inject the correction as the worker's next prompt
+    /// — by name, independent of TUI focus.
     ///
     /// `settle` is the bounded fallback delay between the turn-break and the
     /// inject. It exists because Claude Code (like the 2.1.183 tmux fix) drops
