@@ -1673,20 +1673,22 @@ mod tests {
             "Claude+Grok supervisor body show must be exact Claude command: {}",
             grok_body
         );
-        // Negative: worker (Grok) prefix must not appear on supervisor actions.
+        // Negative: bare Grok `cas__` tool calls on supervisor actions.
+        // Match the leading backtick so Claude's `mcp__cas__` (which
+        // contains the substring `cas__`) does not false-fail the check.
         assert!(
-            !grok_body.contains("cas__coordination action=epic_status"),
-            "supervisor epic_status must not use worker (Grok) prefix: {}",
+            !grok_body.contains("`cas__coordination action=epic_status"),
+            "supervisor epic_status must not use bare worker (Grok) prefix: {}",
             grok_body
         );
         assert!(
-            !grok_body.contains("cas__task action=list status=awaiting_merge"),
-            "supervisor list must not use worker (Grok) prefix: {}",
+            !grok_body.contains("`cas__task action=list status=awaiting_merge"),
+            "supervisor list must not use bare worker (Grok) prefix: {}",
             grok_body
         );
         assert!(
-            !grok_body.contains("cas__task action=show id=cas-mix2"),
-            "supervisor show must not use worker (Grok) prefix: {}",
+            !grok_body.contains("`cas__task action=show id=cas-mix2"),
+            "supervisor show must not use bare worker (Grok) prefix: {}",
             grok_body
         );
         // Worker re-close: Grok alias only
