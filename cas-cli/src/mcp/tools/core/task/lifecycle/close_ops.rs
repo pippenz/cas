@@ -256,6 +256,38 @@ impl CasCore {
             data: None,
         })?;
 
+        // cas-9fff: refuse silent cross-session epic close when
+        // epic_verification_owner is set to a different agent. Callers who
+        // need to take over must update epic_verification_owner first (or
+        // act as the owner). Prevents a mis-routed director completion
+        // prompt from racing the owning supervisor on `task close`.
+        if task.task_type == TaskType::Epic {
+            if let Some(ref owner) = task.epic_verification_owner {
+                let caller_id = self.get_agent_id().ok();
+                let caller_name = std::env::var("CAS_AGENT_NAME").ok();
+                let caller_session = std::env::var("CAS_SESSION_ID").ok();
+                let matches_owner = [caller_id.as_deref(), caller_name.as_deref(), caller_session.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .any(|id| id == owner.as_str());
+                let has_identity = caller_id.is_some()
+                    || caller_name.is_some()
+                    || caller_session.is_some();
+                if has_identity && !matches_owner {
+                    return Err(McpError {
+                        code: ErrorCode::INVALID_PARAMS,
+                        message: Cow::from(format!(
+                            "Epic {id} is owned by epic_verification_owner={owner}; \
+                             this session cannot close it. Update epic_verification_owner \
+                             if ownership has transferred (cas-9fff).",
+                            id = req.id
+                        )),
+                        data: None,
+                    });
+                }
+            }
+        }
+
         // cas-6538 (EPIC cas-1255 — per-task depth speed mode): a `depth=light`
         // task is the feel-driven, fast-iteration path. The close gate skips
         // the two *rigor* gates — the verification jail (no `task-verifier`

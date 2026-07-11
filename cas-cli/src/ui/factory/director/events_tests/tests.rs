@@ -13,6 +13,7 @@ fn make_task(id: &str, title: &str, status: TaskStatus, assignee: Option<&str>) 
         epic: None,
         branch: None,
         updated_at: None,
+        epic_verification_owner: None,
     }
 }
 
@@ -27,6 +28,7 @@ fn make_epic(id: &str, title: &str, status: TaskStatus) -> TaskSummary {
         epic: None,
         branch: None,
         updated_at: None,
+        epic_verification_owner: None,
     }
 }
 
@@ -41,6 +43,7 @@ fn make_epic_with_branch(id: &str, title: &str, status: TaskStatus, branch: &str
         epic: None,
         branch: Some(branch.to_string()),
         updated_at: None,
+        epic_verification_owner: None,
     }
 }
 

@@ -580,8 +580,9 @@ fn summary_at(
             None
         },
         updated_at: Some(updated_at),
+        epic_verification_owner: None,
     }
-}
+    }
 
 /// Assemble a minimal `DirectorData` from explicit task summaries. Tasks are
 /// partitioned into ready/in_progress/epic buckets the same way `load_with_stores`
@@ -781,7 +782,8 @@ fn test_task_summary_fields() {
         epic: Some("cas-epic".to_string()),
         branch: Some("feature/test".to_string()),
         updated_at: None,
-    };
+            epic_verification_owner: None,
+        };
 
     assert_eq!(summary.id, "cas-1234");
     assert_eq!(summary.title, "Test Task");
@@ -836,7 +838,8 @@ fn test_epic_group_fields() {
         epic: None,
         branch: Some("epic/test".to_string()),
         updated_at: None,
-    };
+            epic_verification_owner: None,
+        };
 
     let subtask = TaskSummary {
         id: "cas-0001".to_string(),
@@ -848,7 +851,8 @@ fn test_epic_group_fields() {
         epic: Some("cas-epic".to_string()),
         branch: None,
         updated_at: None,
-    };
+            epic_verification_owner: None,
+        };
 
     let group = EpicGroup {
         epic,

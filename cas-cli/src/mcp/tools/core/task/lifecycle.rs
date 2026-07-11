@@ -82,6 +82,20 @@ impl CasCore {
             .unwrap_or_default();
 
         let now = chrono::Utc::now();
+        // cas-9fff: in factory mode, stamp the creating agent as
+        // epic_verification_owner on new epics so director completion
+        // notifications route to the owning session (not every concurrent
+        // supervisor). Outside factory mode leave unset (legacy solo flow).
+        let in_factory = std::env::var("CAS_FACTORY_MODE").is_ok()
+            || std::env::var("CAS_FACTORY_SESSION").is_ok();
+        let epic_verification_owner = if task_type == TaskType::Epic && in_factory {
+            self.get_agent_id()
+                .ok()
+                .or_else(|| std::env::var("CAS_AGENT_NAME").ok())
+                .or_else(|| std::env::var("CAS_SESSION_ID").ok())
+        } else {
+            None
+        };
         let task = Task {
             id: id.clone(),
             scope: crate::types::Scope::Project, // MCP tasks are project-scoped
@@ -109,7 +123,7 @@ impl CasCore {
             worktree_id: None,
             pending_verification: false,
             pending_worktree_merge: false,
-            epic_verification_owner: None,
+            epic_verification_owner,
             share: None,
             depth,
         };
