@@ -293,6 +293,33 @@ impl CasCore {
             data: None,
         })?;
 
+        // cas-b269: already-Closed → idempotent success. Do not re-enter
+        // verification / merge / re-close work from stale guidance.
+        if super::stale_close_guard::is_terminal_closed(task.status) {
+            return Ok(Self::success(
+                super::stale_close_guard::already_closed_close_message(&req.id),
+            ));
+        }
+
+        // cas-b269: urgent stop sets halt_task_work; block close until new start.
+        if let Ok(agent_id) = self.get_agent_id() {
+            if let Ok(agent_store) = self.open_agent_store() {
+                if let Ok(agent) = agent_store.get(&agent_id) {
+                    if super::stale_close_guard::agent_task_work_halted(&agent.metadata) {
+                        return Err(McpError {
+                            code: ErrorCode::INVALID_PARAMS,
+                            message: Cow::from(
+                                super::stale_close_guard::halt_blocks_task_work_message(
+                                    "task action=close",
+                                ),
+                            ),
+                            data: None,
+                        });
+                    }
+                }
+            }
+        }
+
         // cas-9fff: refuse silent cross-session epic close when
         // epic_verification_owner is set. Fail closed: unknown caller
         // identity is a rejection (not a fall-through). Callers who need

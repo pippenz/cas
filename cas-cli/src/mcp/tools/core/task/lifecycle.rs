@@ -2,6 +2,7 @@ use crate::harness_policy::is_worker_without_subagents_from_env;
 use crate::mcp::tools::core::imports::*;
 
 pub(crate) mod close_ops;
+pub(crate) mod stale_close_guard;
 
 /// Resolve `epic_verification_owner` for a factory-mode epic create (cas-9fff).
 ///
@@ -372,6 +373,22 @@ impl CasCore {
                     )
                 },
             ));
+        }
+
+        // cas-b269: a successful start clears urgent-stop halt so legitimate
+        // new assignments can close/verify again.
+        if let Ok(agent_id) = self.get_agent_id() {
+            if let Ok(agent_store) = self.open_agent_store() {
+                if let Ok(mut agent) = agent_store.get(&agent_id) {
+                    if agent
+                        .metadata
+                        .remove(stale_close_guard::HALT_TASK_WORK_META)
+                        .is_some()
+                    {
+                        let _ = agent_store.update(&agent);
+                    }
+                }
+            }
         }
 
         // cas-9684: PSR tasks are "work complete, awaiting supervisor review".

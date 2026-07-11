@@ -311,6 +311,34 @@ impl CasService {
                     format!("Failed to queue message: {error}"),
                 )
             })?;
+
+        // cas-b269: urgent supervisor→worker messages set an authoritative
+        // halt flag so post-interrupt MCP cannot re-run close/verify without
+        // a new task start (transcript interpretation alone is insufficient).
+        if urgent && resolved_target != "supervisor" && resolved_target != "all_workers" {
+            use crate::mcp::tools::core::task::lifecycle::stale_close_guard::HALT_TASK_WORK_META;
+            use crate::store::open_agent_store;
+            if let Ok(agent_store) = open_agent_store(&self.inner.cas_root) {
+                if let Ok(agents) = agent_store.list(None) {
+                    if let Some(mut agent) = agents
+                        .into_iter()
+                        .find(|a| a.name.eq_ignore_ascii_case(&resolved_target))
+                    {
+                        agent
+                            .metadata
+                            .insert(HALT_TASK_WORK_META.to_string(), "1".to_string());
+                        if let Err(e) = agent_store.update(&agent) {
+                            tracing::warn!(
+                                target = %resolved_target,
+                                error = %e,
+                                "cas-b269: failed to set halt_task_work after urgent message"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         let persist_latency_ms = enqueue_started.elapsed().as_secs_f64() * 1000.0;
         tracing::debug!(
             target: "cas::coordination",

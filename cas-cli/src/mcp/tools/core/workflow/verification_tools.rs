@@ -17,6 +17,41 @@ impl CasCore {
             data: None,
         })?;
 
+        // cas-b269: refuse verification against an already-closed task so
+        // stale post-close guidance cannot restart the verify/re-close loop.
+        if crate::mcp::tools::core::task::lifecycle::stale_close_guard::is_terminal_closed(
+            task.status,
+        ) {
+            return Err(McpError {
+                code: ErrorCode::INVALID_PARAMS,
+                message: Cow::from(
+                    crate::mcp::tools::core::task::lifecycle::stale_close_guard::verification_on_closed_message(
+                        &req.task_id,
+                    ),
+                ),
+                data: None,
+            });
+        }
+
+        // cas-b269: urgent stop halt blocks verification MCP.
+        if let Ok(agent_id) = self.get_agent_id() {
+            if let Ok(agent) = agent_store.get(&agent_id) {
+                if crate::mcp::tools::core::task::lifecycle::stale_close_guard::agent_task_work_halted(
+                    &agent.metadata,
+                ) {
+                    return Err(McpError {
+                        code: ErrorCode::INVALID_PARAMS,
+                        message: Cow::from(
+                            crate::mcp::tools::core::task::lifecycle::stale_close_guard::halt_blocks_task_work_message(
+                                "verification action=add",
+                            ),
+                        ),
+                        data: None,
+                    });
+                }
+            }
+        }
+
         // Supervisors can usually only verify epics.
         // Exceptions:
         // 1. Factory sessions with Codex workers (no subagent support)
