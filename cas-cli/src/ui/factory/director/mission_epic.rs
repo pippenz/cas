@@ -187,9 +187,8 @@ mod tests {
             epic: epic.map(str::to_string),
             branch: Some(format!("epic/{id}")).filter(|_| task_type == TaskType::Epic),
             updated_at: None,
-        epic_verification_owner: None,
         }
-        }
+    }
 
     fn data_with_unassigned_subtask() -> DirectorData {
         DirectorData {

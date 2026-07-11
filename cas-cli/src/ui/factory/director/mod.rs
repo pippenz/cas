@@ -22,7 +22,7 @@ pub(crate) use events::pick_best_open_branch_epic;
 pub use events::{DirectorEvent, DirectorEventDetector};
 pub use panel::PanelRegistry;
 pub use prompts::{
-    Prompt, compute_gated_task_ids, generate_prompt, revalidate_event_for_delivery_with_focus,
+    Prompt, compute_gated_task_ids, generate_prompt, revalidate_event_for_delivery,
     with_response_instructions,
 };
 // PanelAreas, SidecarFocus, SidecarState, ViewMode, DiffLine, DiffLineType, render, render_with_state are already public in this module
@@ -388,9 +388,8 @@ mod tests {
             epic: epic.map(str::to_string),
             branch: Some(format!("epic/{id}")).filter(|_| task_type == TaskType::Epic),
             updated_at: None,
-        epic_verification_owner: None,
         }
-        }
+    }
 
     fn data_with_two_epics() -> DirectorData {
         DirectorData {
@@ -578,8 +577,7 @@ mod tests {
                 epic: Some("cas-live".to_string()),
                 branch: None,
                 updated_at: None,
-            epic_verification_owner: None,
-        }],
+            }],
             in_progress_tasks: Vec::new(),
             epic_tasks: vec![task("cas-live", TaskType::Epic, None)],
             agents: Vec::new(),

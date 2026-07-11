@@ -1057,9 +1057,8 @@ mod tests {
             epic: epic.map(str::to_string),
             branch: Some(format!("epic/{id}")).filter(|_| task_type == TaskType::Epic),
             updated_at: None,
-        epic_verification_owner: None,
         }
-        }
+    }
 
     #[test]
     fn get_epic_at_display_index_uses_current_epic_scoped_mapping() {

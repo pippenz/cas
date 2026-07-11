@@ -1209,9 +1209,8 @@ mod tests {
             epic: None,
             branch: Some(branch.to_string()),
             updated_at: None,
-        epic_verification_owner: None,
         }
-        }
+    }
 
     fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
         terminal

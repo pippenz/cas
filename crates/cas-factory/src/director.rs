@@ -86,10 +86,6 @@ pub struct TaskSummary {
     /// stale, high-subtask-count epic (cas-2fb6). `None` when the source is a
     /// hand-built summary that does not carry timing (e.g. some tests).
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
-    /// Agent id/name responsible for epic verification (epics only; cas-9fff).
-    /// Used to route epic-completion prompts to the owning supervisor instead
-    /// of every concurrent factory session's supervisor.
-    pub epic_verification_owner: Option<String>,
 }
 
 /// Task state carried by an active lease even when the agent currently appears
@@ -272,7 +268,6 @@ impl DirectorData {
                 epic: child_to_epic.get(&t.id).cloned(),
                 branch: t.branch.clone(),
                 updated_at: Some(t.updated_at),
-                epic_verification_owner: t.epic_verification_owner.clone(),
             }
         };
 

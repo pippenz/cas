@@ -5,43 +5,6 @@ use crate::harness_policy::{
 };
 use crate::mcp::tools::core::imports::*;
 
-/// cas-9fff: gate epic close when `epic_verification_owner` is set.
-///
-/// Fail closed: the caller must present an identity that matches `owner`.
-/// An unknown / absent identity is a rejection (not a silent fall-through),
-/// so a mis-routed completion prompt cannot close an owned epic without
-/// credentials.
-pub(crate) fn epic_close_owner_gate(
-    epic_id: &str,
-    owner: &str,
-    caller_id: Option<&str>,
-    caller_name: Option<&str>,
-    caller_session: Option<&str>,
-) -> Result<(), String> {
-    let matches_owner = [caller_id, caller_name, caller_session]
-        .into_iter()
-        .flatten()
-        .any(|id| id == owner);
-    if matches_owner {
-        return Ok(());
-    }
-    let has_identity =
-        caller_id.is_some() || caller_name.is_some() || caller_session.is_some();
-    if !has_identity {
-        return Err(format!(
-            "Epic {epic_id} is owned by epic_verification_owner={owner}; \
-             caller identity is unknown — refusing close (fail closed, cas-9fff). \
-             Present CAS agent id / CAS_AGENT_NAME / CAS_SESSION_ID matching the owner, \
-             or transfer epic_verification_owner first."
-        ));
-    }
-    Err(format!(
-        "Epic {epic_id} is owned by epic_verification_owner={owner}; \
-         this session cannot close it. Update epic_verification_owner \
-         if ownership has transferred (cas-9fff)."
-    ))
-}
-
 /// Maximum time a task may sit in `pending_verification` before the close path
 /// treats the task-verifier subagent as dead, auto-escalates, and releases the
 /// jail. Addresses cas-c29a (within-task verification deadlock): if the
@@ -292,33 +255,6 @@ impl CasCore {
             message: Cow::from(format!("Task not found: {e}")),
             data: None,
         })?;
-
-        // cas-9fff: refuse silent cross-session epic close when
-        // epic_verification_owner is set. Fail closed: unknown caller
-        // identity is a rejection (not a fall-through). Callers who need
-        // to take over must update epic_verification_owner first (or act
-        // as the owner). Prevents a mis-routed director completion prompt
-        // from racing the owning supervisor on `task close`.
-        if task.task_type == TaskType::Epic {
-            if let Some(ref owner) = task.epic_verification_owner {
-                let caller_id = self.get_agent_id().ok();
-                let caller_name = std::env::var("CAS_AGENT_NAME").ok();
-                let caller_session = std::env::var("CAS_SESSION_ID").ok();
-                if let Err(msg) = epic_close_owner_gate(
-                    &req.id,
-                    owner,
-                    caller_id.as_deref(),
-                    caller_name.as_deref(),
-                    caller_session.as_deref(),
-                ) {
-                    return Err(McpError {
-                        code: ErrorCode::INVALID_PARAMS,
-                        message: Cow::from(msg),
-                        data: None,
-                    });
-                }
-            }
-        }
 
         // cas-6538 (EPIC cas-1255 — per-task depth speed mode): a `depth=light`
         // task is the feel-driven, fast-iteration path. The close gate skips
@@ -7526,58 +7462,6 @@ mod merge_reality_tests {
         assert!(
             matches!(outcome, MergeRealityOutcome::Proceed),
             "absent factory branch (push+merge+prune) must PROCEED"
-        );
-    }
-}
-
-#[cfg(test)]
-mod epic_close_owner_gate_tests {
-    use super::epic_close_owner_gate;
-
-    #[test]
-    fn test_9fff_owner_match_by_id_or_name_allows_close() {
-        assert!(epic_close_owner_gate(
-            "cas-epic",
-            "owner-id",
-            Some("owner-id"),
-            None,
-            None
-        )
-        .is_ok());
-        assert!(epic_close_owner_gate(
-            "cas-epic",
-            "owner-sup",
-            None,
-            Some("owner-sup"),
-            None
-        )
-        .is_ok());
-    }
-
-    #[test]
-    fn test_9fff_wrong_identity_rejects_close() {
-        let err = epic_close_owner_gate(
-            "cas-epic",
-            "owner-id",
-            Some("other-id"),
-            Some("other-sup"),
-            None,
-        )
-        .unwrap_err();
-        assert!(
-            err.contains("cannot close") && err.contains("owner-id"),
-            "wrong identity must reject: {err}"
-        );
-    }
-
-    /// Review P1: unknown caller must fail closed — never fall through when
-    /// epic_verification_owner is set.
-    #[test]
-    fn test_9fff_unknown_caller_identity_fail_closed() {
-        let err = epic_close_owner_gate("cas-epic", "owner-id", None, None, None).unwrap_err();
-        assert!(
-            err.contains("identity is unknown") && err.contains("fail closed"),
-            "unknown identity must fail closed, got: {err}"
         );
     }
 }

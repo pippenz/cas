@@ -196,9 +196,8 @@ mod tests {
             epic: None,
             branch: None,
             updated_at: None,
-        epic_verification_owner: None,
         }
-        }
+    }
 
     fn data(in_progress_tasks: Vec<cas_factory::TaskSummary>) -> DirectorData {
         DirectorData {

@@ -471,9 +471,8 @@ mod tests {
             epic: epic.map(str::to_string),
             branch: None,
             updated_at: None,
-        epic_verification_owner: None,
         }
-        }
+    }
 
     fn data_for_scoping() -> DirectorData {
         DirectorData {

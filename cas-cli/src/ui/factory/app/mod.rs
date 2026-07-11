@@ -12,7 +12,7 @@ use ratatui::layout::Rect;
 
 use super::director::{
     DiffLine, DirectorData, DirectorEvent, DirectorEventDetector, DirectorStores, PanelAreas,
-    Prompt, SidecarFocus, ViewMode, generate_prompt, revalidate_event_for_delivery_with_focus,
+    Prompt, SidecarFocus, ViewMode, generate_prompt, revalidate_event_for_delivery,
 };
 use crate::store::open_prompt_queue_store;
 use crate::types::Worktree;
@@ -690,18 +690,10 @@ impl FactoryApp {
 
         let unfiltered_data = self.load_unfiltered_director_data_for_delivery();
 
-        // cas-9fff: pass session-focused epic so EpicAllSubtasksClosed can
-        // use session-affinity routing (not just epic_verification_owner).
-        let focused_epic_id = self.current_epic_id.as_deref();
         let delivery_events: Vec<DirectorEvent> = events
             .iter()
             .filter_map(|event| {
-                revalidate_event_for_delivery_with_focus(
-                    event,
-                    &unfiltered_data,
-                    &self.supervisor_name,
-                    focused_epic_id,
-                )
+                revalidate_event_for_delivery(event, &unfiltered_data, &self.supervisor_name)
             })
             .collect();
 
@@ -1891,9 +1883,8 @@ mod tests {
             epic: Some(epic.to_string()),
             branch: None,
             updated_at: None,
-        epic_verification_owner: None,
         }
-        }
+    }
 
     /// Epic-kind `TaskSummary` fixture, branch-focused (see `epic_summary`
     /// above for the title/status-focused variant used elsewhere).
@@ -1908,9 +1899,8 @@ mod tests {
             epic: None,
             branch: branch.map(str::to_string),
             updated_at: None,
-        epic_verification_owner: None,
         }
-        }
+    }
 
     fn epic_summary(id: &str, title: &str, status: TaskStatus) -> TaskSummary {
         TaskSummary {
@@ -1923,9 +1913,8 @@ mod tests {
             epic: None,
             branch: Some(format!("epic/{id}")),
             updated_at: None,
-        epic_verification_owner: None,
         }
-        }
+    }
 
     /// cas-a91b review finding: `director.rs::load_with_stores` pushes EVERY
     /// epic into `epic_tasks` regardless of status, including `Closed` —
@@ -1977,9 +1966,8 @@ mod tests {
             epic: epic.map(str::to_string),
             branch: None,
             updated_at: None,
-        epic_verification_owner: None,
         }
-        }
+    }
 
     static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -2087,9 +2075,8 @@ mod tests {
                 epic: epic.map(str::to_string),
                 branch: None,
                 updated_at: None,
-            epic_verification_owner: None,
             }
-            }
+        }
 
         fn set(items: &[&str]) -> HashSet<String> {
             items.iter().map(|s| s.to_string()).collect()
@@ -2207,8 +2194,7 @@ mod tests {
                 epic: Some(new_epic_id.to_string()),
                 branch: None,
                 updated_at: None,
-            epic_verification_owner: None,
-        }],
+            }],
             in_progress_tasks: vec![TaskSummary {
                 id: "task-2".to_string(),
                 title: "In-progress subtask".to_string(),
@@ -2219,8 +2205,7 @@ mod tests {
                 epic: Some(new_epic_id.to_string()),
                 branch: None,
                 updated_at: None,
-            epic_verification_owner: None,
-        }],
+            }],
             epic_tasks: vec![TaskSummary {
                 id: new_epic_id.to_string(),
                 title: new_epic_title.to_string(),
@@ -2231,8 +2216,7 @@ mod tests {
                 epic: None,
                 branch: Some("epic/new-feature".to_string()),
                 updated_at: None,
-            epic_verification_owner: None,
-        }],
+            }],
             agents: Vec::new(),
             activity: Vec::new(),
             agent_id_to_name: HashMap::new(),
@@ -2493,9 +2477,8 @@ mod tests {
                 epic: Some(epic_id.to_string()),
                 branch: None,
                 updated_at: None,
-            epic_verification_owner: None,
             }
-            }
+        }
 
         let mut app = super::FactoryApp::for_test();
         app.current_epic_id = Some("epic-current".to_string());
@@ -2576,8 +2559,7 @@ mod tests {
                 epic: Some("epic-shared".to_string()),
                 branch: None,
                 updated_at: None,
-            epic_verification_owner: None,
-        }],
+            }],
             in_progress_tasks: Vec::new(),
             epic_tasks: vec![TaskSummary {
                 id: "epic-shared".to_string(),
@@ -2589,8 +2571,7 @@ mod tests {
                 epic: None,
                 branch: Some("epic/shared".to_string()),
                 updated_at: None,
-            epic_verification_owner: None,
-        }],
+            }],
             agents: Vec::new(),
             activity: Vec::new(),
             agent_id_to_name: HashMap::new(),
@@ -2983,8 +2964,7 @@ mod tests {
                 epic: Some(active_epic_id.to_string()),
                 branch: None,
                 updated_at: None,
-            epic_verification_owner: None,
-        }],
+            }],
             in_progress_tasks: vec![TaskSummary {
                 id: "task-ip".to_string(),
                 title: "In-progress subtask".to_string(),
@@ -2995,8 +2975,7 @@ mod tests {
                 epic: Some(active_epic_id.to_string()),
                 branch: None,
                 updated_at: None,
-            epic_verification_owner: None,
-        }],
+            }],
             epic_tasks: vec![
                 TaskSummary {
                     id: stale_epic_id.to_string(),
@@ -3008,8 +2987,7 @@ mod tests {
                     epic: None,
                     branch: Some("epic/stale".to_string()),
                     updated_at: None,
-            epic_verification_owner: None,
-        },
+                },
                 TaskSummary {
                     id: active_epic_id.to_string(),
                     title: "Active Epic".to_string(),
@@ -3020,8 +2998,7 @@ mod tests {
                     epic: None,
                     branch: Some("epic/active".to_string()),
                     updated_at: None,
-            epic_verification_owner: None,
-        },
+                },
             ],
             agents: Vec::new(),
             activity: Vec::new(),
@@ -3063,8 +3040,7 @@ mod tests {
                 epic: Some(active_epic_id.to_string()),
                 branch: None,
                 updated_at: None,
-            epic_verification_owner: None,
-        }],
+            }],
             in_progress_tasks: Vec::new(),
             epic_tasks: vec![
                 TaskSummary {
@@ -3077,8 +3053,7 @@ mod tests {
                     epic: None,
                     branch: Some("epic/stale".to_string()),
                     updated_at: None,
-            epic_verification_owner: None,
-        },
+                },
                 TaskSummary {
                     id: active_epic_id.to_string(),
                     title: "Active Epic".to_string(),
@@ -3089,8 +3064,7 @@ mod tests {
                     epic: None,
                     branch: Some("epic/active".to_string()),
                     updated_at: None,
-            epic_verification_owner: None,
-        },
+                },
             ],
             agents: Vec::new(),
             activity: Vec::new(),
@@ -3135,8 +3109,7 @@ mod tests {
                     epic: None,
                     branch: Some("epic/preferred".to_string()),
                     updated_at: None,
-            epic_verification_owner: None,
-        },
+                },
                 TaskSummary {
                     id: unrelated_id.to_string(),
                     title: "Unrelated InProgress Epic".to_string(),
@@ -3147,8 +3120,7 @@ mod tests {
                     epic: None,
                     branch: Some("epic/unrelated".to_string()),
                     updated_at: None,
-            epic_verification_owner: None,
-        },
+                },
             ],
             agents: Vec::new(),
             activity: Vec::new(),
@@ -3186,7 +3158,6 @@ mod tests {
             )],
             in_progress_tasks: vec![TaskSummary {
                 status: TaskStatus::InProgress,
-                epic_verification_owner: None,
                 ..task_summary(
                     "cas-ip",
                     "Active heuristic subtask",
@@ -3952,8 +3923,7 @@ mod tests {
                 epic: Some(active_id.to_string()),
                 branch: None,
                 updated_at: None,
-            epic_verification_owner: None,
-        }],
+            }],
             in_progress_tasks: vec![TaskSummary {
                 id: "task-ip".to_string(),
                 title: "In-progress subtask of active epic".to_string(),
@@ -3964,8 +3934,7 @@ mod tests {
                 epic: Some(active_id.to_string()),
                 branch: None,
                 updated_at: None,
-            epic_verification_owner: None,
-        }],
+            }],
             epic_tasks: vec![
                 TaskSummary {
                     id: active_id.to_string(),
@@ -3977,8 +3946,7 @@ mod tests {
                     epic: None,
                     branch: Some("epic/active".to_string()),
                     updated_at: None,
-            epic_verification_owner: None,
-        },
+                },
                 TaskSummary {
                     id: hijacker_id.to_string(),
                     title: "Stray zero-subtask epic".to_string(),
@@ -3989,8 +3957,7 @@ mod tests {
                     epic: None,
                     branch: Some("epic/hijacker".to_string()),
                     updated_at: None,
-            epic_verification_owner: None,
-        },
+                },
             ],
             agents: Vec::new(),
             activity: Vec::new(),
@@ -4085,8 +4052,7 @@ mod tests {
                 epic: Some(new_id.to_string()),
                 branch: None,
                 updated_at: None,
-            epic_verification_owner: None,
-        }],
+            }],
             in_progress_tasks: Vec::new(),
             epic_tasks: vec![TaskSummary {
                 id: new_id.to_string(),
@@ -4098,8 +4064,7 @@ mod tests {
                 epic: None,
                 branch: Some("epic/new".to_string()),
                 updated_at: None,
-            epic_verification_owner: None,
-        }],
+            }],
             agents: Vec::new(),
             activity: Vec::new(),
             agent_id_to_name: HashMap::new(),
@@ -4164,8 +4129,7 @@ mod tests {
                 epic: Some(active_id.to_string()),
                 branch: None,
                 updated_at: None,
-            epic_verification_owner: None,
-        }],
+            }],
             in_progress_tasks: Vec::new(),
             epic_tasks: vec![
                 TaskSummary {
@@ -4178,8 +4142,7 @@ mod tests {
                     epic: None,
                     branch: Some("epic/active".to_string()),
                     updated_at: None,
-            epic_verification_owner: None,
-        },
+                },
                 TaskSummary {
                     id: hijacker_id.to_string(),
                     title: "Stray epic".to_string(),
@@ -4190,8 +4153,7 @@ mod tests {
                     epic: None,
                     branch: Some("epic/hijacker".to_string()),
                     updated_at: None,
-            epic_verification_owner: None,
-        },
+                },
             ],
             agents: Vec::new(),
             activity: Vec::new(),
