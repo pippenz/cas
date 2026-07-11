@@ -98,10 +98,15 @@ pub struct Pane {
     drain_buf: Vec<u8>,
     /// Total bytes of output received from the process (for readiness detection)
     total_bytes_received: u64,
-    /// Last time this pane received PTY output (cas-7f6f turn-active signal).
-    last_output_at: Option<std::time::Instant>,
     /// When this pane was created (for startup grace period)
     created_at: std::time::Instant,
+    /// Authoritative in-flight turn flag (cas-7f6f).
+    ///
+    /// Set at control points that start a turn (prompt submit / inject);
+    /// cleared when cancel is issued (`break_turn` / `interrupt`). Not inferred
+    /// from PTY output timing — quiet mid-turn stays true; idle redraws do not
+    /// flip it.
+    turn_in_flight: std::sync::atomic::AtomicBool,
     /// Whether the inner process is currently in alt-screen mode.
     ///
     /// Tracked by watching for DEC private mode set/reset sequences in `feed()`:
@@ -166,8 +171,8 @@ impl Pane {
             new_lines_below: 0,
             drain_buf: Vec::with_capacity(65536),
             total_bytes_received: 0,
-            last_output_at: None,
             created_at: std::time::Instant::now(),
+            turn_in_flight: std::sync::atomic::AtomicBool::new(false),
             in_alt_screen: false,
             has_hyperlinks: false,
             partial_esc: Vec::new(),
@@ -999,7 +1004,6 @@ impl Pane {
 
         if !coalesced.is_empty() {
             self.total_bytes_received += coalesced.len() as u64;
-            self.last_output_at = Some(std::time::Instant::now());
             let feed_data = Self::strip_literal_cursor_reports(&coalesced);
             if let Err(e) = self.feed(feed_data.as_ref()) {
                 tracing::warn!(
@@ -1047,25 +1051,22 @@ impl Pane {
         self.total_bytes_received
     }
 
-    /// Whether this pane emitted PTY output within `window`.
-    ///
-    /// Used as a best-effort "turn active" signal for Grok Esc→cancel routing
-    /// (cas-7f6f): recent stream/redraw activity means a turn is likely running;
-    /// quiet panes keep raw Esc for idle clear/rewind.
-    pub fn had_output_within(&self, window: std::time::Duration) -> bool {
-        self.last_output_at
-            .is_some_and(|t| t.elapsed() <= window)
+    /// Whether a turn is currently in-flight on this pane (cas-7f6f).
+    pub fn is_turn_in_flight(&self) -> bool {
+        self.turn_in_flight
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// Mark the pane as having just produced output (tests / feed paths).
-    pub fn mark_output_now(&mut self) {
-        self.last_output_at = Some(std::time::Instant::now());
-        self.total_bytes_received = self.total_bytes_received.saturating_add(1);
+    /// Mark that a turn has started (user submit or inject).
+    pub fn mark_turn_in_flight(&self) {
+        self.turn_in_flight
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
-    /// Clear recent-output state (tests: simulate idle prompt).
-    pub fn clear_recent_output(&mut self) {
-        self.last_output_at = None;
+    /// Mark that the in-flight turn has ended (cancel issued or explicit idle).
+    pub fn clear_turn_in_flight(&self) {
+        self.turn_in_flight
+            .store(false, std::sync::atomic::Ordering::Release);
     }
 
     /// Whether this pane is ready to accept prompt injection.
@@ -1092,9 +1093,18 @@ impl Pane {
                     let _ = guard.write_all(b"\r");
                     let _ = guard.flush();
                 });
+                // Inject submits a prompt → turn is in flight (cas-7f6f).
+                self.mark_turn_in_flight();
                 Ok(())
             }
             PaneBackend::None => Err(Error::pty("Pane has no backend")),
+        }
+    }
+
+    /// Note a user prompt submit (trailing CR/LF on input) as turn start.
+    pub fn note_user_submit(&self, data: &[u8]) {
+        if data.contains(&b'\r') || data.contains(&b'\n') {
+            self.mark_turn_in_flight();
         }
     }
 
@@ -1107,10 +1117,25 @@ impl Pane {
     ///
     /// Used by the urgent interrupt-and-redirect path and by factory Escape
     /// routing so UI cancel and programmatic cancel share one tested path.
+    /// Clears [`Self::is_turn_in_flight`] after issuing cancel (Grok re-cancel
+    /// while cancelling uses raw Esc, which is correct for that state).
     pub async fn break_turn(&self) -> Result<()> {
         match &self.backend {
             PaneBackend::Pty(pty) => {
                 pty.write(self.harness.turn_cancel_bytes()).await?;
+                self.clear_turn_in_flight();
+                Ok(())
+            }
+            PaneBackend::None => Err(Error::pty("Pane has no backend")),
+        }
+    }
+
+    pub async fn interrupt(&self) -> Result<()> {
+        match &self.backend {
+            PaneBackend::Pty(pty) => {
+                pty.interrupt().await?;
+                // Ctrl+C is also a cancel path for Grok mid-turn.
+                self.clear_turn_in_flight();
                 Ok(())
             }
             PaneBackend::None => Err(Error::pty("Pane has no backend")),
@@ -1125,16 +1150,6 @@ impl Pane {
     /// Override the harness (tests and late-bound config only).
     pub fn set_harness(&mut self, harness: SupervisorCli) {
         self.harness = harness;
-    }
-
-    pub async fn interrupt(&self) -> Result<()> {
-        match &self.backend {
-            PaneBackend::Pty(pty) => {
-                pty.interrupt().await?;
-                Ok(())
-            }
-            PaneBackend::None => Err(Error::pty("Pane has no backend")),
-        }
     }
 
     pub fn scroll(&mut self, delta: i32) -> Result<()> {

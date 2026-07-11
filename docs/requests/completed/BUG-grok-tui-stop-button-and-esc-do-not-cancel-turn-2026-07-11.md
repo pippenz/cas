@@ -190,3 +190,7 @@ Exit 0 on both.
 ### Review follow-up (cas-7f6f P2)
 1. Grok Esc only rewrites to cancel when the pane has recent PTY output (turn-active); idle forwards raw Esc.
 2. Stop click geometry uses per-render `pty_content_areas` (full=bordered inner, compact=borderless content).
+
+### Review follow-up 2 (cas-7f6f P2)
+1. Authoritative `Pane.turn_in_flight` (set on inject/CR submit; cleared on break_turn/interrupt) — not output-timing. Quiet active stays cancelable; idle redraws do not mark in-flight.
+2. Separate `full_pty_content_areas` / `compact_pty_content_areas`; mouse routing uses client view mode so concurrent full+compact clients keep independent Stop geometry.

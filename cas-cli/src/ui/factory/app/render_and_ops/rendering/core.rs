@@ -117,23 +117,24 @@ impl FactoryApp {
         self.supervisor_area = Some(layout.supervisor_area);
         self.sidecar_area = Some(layout.sidecar_area);
         // Full-mode panes always render with Borders::ALL — PTY content is the
-        // bordered inner rect (cas-7f6f Stop click geometry).
-        self.pty_content_areas.clear();
-        self.pty_content_areas.insert(
+        // bordered inner rect. Written only to full_pty_content_areas so a later
+        // compact render does not overwrite full-client Stop geometry (cas-7f6f).
+        self.full_pty_content_areas.clear();
+        self.full_pty_content_areas.insert(
             self.supervisor_name.clone(),
             bordered_pty_content(layout.supervisor_area),
         );
         if layout.is_tabbed {
             if let Some(content) = layout.worker_content {
                 if let Some(name) = all_names.get(self.selected_worker_tab) {
-                    self.pty_content_areas
+                    self.full_pty_content_areas
                         .insert(name.clone(), bordered_pty_content(content));
                 }
             }
         } else {
             for (i, name) in all_names.iter().enumerate() {
                 if let Some(area) = layout.worker_areas.get(i) {
-                    self.pty_content_areas
+                    self.full_pty_content_areas
                         .insert(name.clone(), bordered_pty_content(*area));
                 }
             }
@@ -384,14 +385,10 @@ impl FactoryApp {
         let supervisor_area = chunks[1];
 
         // Compact paints the supervisor borderless into the full content area
-        // (see render body below). Keep click/Stop geometry in sync (cas-7f6f).
-        self.supervisor_area = Some(supervisor_area);
-        self.worker_tab_bar_area = None;
-        self.worker_content_area = None;
-        self.worker_areas.clear();
-        self.sidecar_area = None;
-        self.pty_content_areas.clear();
-        self.pty_content_areas
+        // (see render body below). Update compact geometry only — do not touch
+        // full_pty_content_areas (simultaneous full+compact clients, cas-7f6f).
+        self.compact_pty_content_areas.clear();
+        self.compact_pty_content_areas
             .insert(self.supervisor_name.clone(), supervisor_area);
 
         // === Compact status bar ===

@@ -905,6 +905,8 @@ impl Mux {
         let pane = self
             .focused()
             .ok_or_else(|| Error::pty("No focused pane"))?;
+        // CR/LF submit starts a turn (cas-7f6f authoritative in-flight flag).
+        pane.note_user_submit(data);
         pane.write(data).await
     }
 
@@ -914,6 +916,7 @@ impl Mux {
             .panes
             .get(pane_id)
             .ok_or_else(|| Error::pane_not_found(pane_id))?;
+        pane.note_user_submit(data);
         pane.write(data).await
     }
 

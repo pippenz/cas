@@ -193,9 +193,21 @@ impl FactoryDaemon {
                                 }
                                 ControlEvent::MouseClick { col, row } => {
                                     use crate::ui::factory::app::{
-                                        ClickAction, sgr_left_click_bytes,
+                                        ClickAction, ClientGeometryMode, sgr_left_click_bytes,
                                     };
-                                    match self.app.handle_mouse_click(col, row) {
+                                    // Use this client's view mode so full/compact
+                                    // geometry maps stay independent (cas-7f6f).
+                                    let geometry = match self
+                                        .clients
+                                        .get(&client_id)
+                                        .map(|c| c.view_mode)
+                                    {
+                                        Some(ClientViewMode::Compact) => {
+                                            ClientGeometryMode::Compact
+                                        }
+                                        _ => ClientGeometryMode::Full,
+                                    };
+                                    match self.app.handle_mouse_click(col, row, geometry) {
                                         ClickAction::Handled => {}
                                         ClickAction::ForwardSgr {
                                             pane,
@@ -209,6 +221,7 @@ impl FactoryDaemon {
                                                 %pane,
                                                 pty_col,
                                                 pty_row,
+                                                ?geometry,
                                                 "forwarding SGR click to focused Grok pane"
                                             );
                                             let _ =
