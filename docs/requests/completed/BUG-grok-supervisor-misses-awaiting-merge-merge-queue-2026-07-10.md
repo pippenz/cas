@@ -1,8 +1,8 @@
 # Resolution (cas-c145)
 
-**Status:** Fixed on `factory/hv-grok-merge`  
-**Commit:** `e1b33f4992eb430582ab329e710a1314cd965573`  
-**Date:** 2026-07-11  
+**Status:** Fixed on `factory/hv-grok-merge`
+**Commit:** `e1b33f4992eb430582ab329e710a1314cd965573`
+**Date:** 2026-07-11
 **Epic:** cas-0e22
 
 ## Characterization (pre-fix stall)
@@ -23,6 +23,10 @@ Verified against parent of the fix (`e1b33f4992eb430582ab329e710a1314cd965573^`)
 | Supervisor skill twins (Claude/Grok/Codex) | Push-based merge drain in hard rules; Phase 3 workflow documents AwaitingMerge steps |
 
 **Non-goals honored:** close-gate / `close_ops` merge semantics **not** modified (owned by hv-close / sibling tasks). No polling loop introduced.
+
+### Review fix (P1, mixed harness)
+
+`merge_required_idle_prompt_text` now takes both `supervisor_prefix` and `worker_prefix`. Supervisor tools (`epic_status`, list, show) keep the supervisor alias; the worker re-close command uses the **worker** harness prefix so Claude→Codex/Grok factories do not relay an unusable alias. Regression: `test_c145_mixed_harness_awaiting_merge_uses_worker_prefix_for_reclose`.
 
 ## Proof (fresh, exit 0)
 

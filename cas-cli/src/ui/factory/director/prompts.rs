@@ -296,6 +296,12 @@ fn resolve_merge_target_for_task(
 /// signals (cas-c145). Carries task, source factory branch, merge target,
 /// and next action. Explicitly push-based (no polling loop).
 ///
+/// `supervisor_prefix` is used for tools the **supervisor** runs
+/// (epic_status, list awaiting_merge, show). `worker_prefix` is used only
+/// for the worker re-close command the supervisor is told to relay — mixed
+/// factories (e.g. Claude supervisor + Codex/Grok worker) must not leak the
+/// supervisor's MCP alias into worker-facing tool strings (review P1).
+///
 /// Wording constraint: must not contain "assign" — the AwaitingMerge idle
 /// path is not "idle needing work" (cas-09d0 / cas-728b).
 fn merge_required_idle_prompt_text(
@@ -303,6 +309,7 @@ fn merge_required_idle_prompt_text(
     task: &ActiveLeaseSummary,
     data: &DirectorData,
     supervisor_prefix: &str,
+    worker_prefix: &str,
 ) -> String {
     let factory_branch = format!("factory/{worker}");
     let (epic_id, epic_branch) = resolve_merge_target_for_task(data, &task.task_id);
@@ -318,10 +325,9 @@ fn merge_required_idle_prompt_text(
     let list_awaiting =
         format!("`{supervisor_prefix}task action=list status=awaiting_merge`");
     let show = format!("`{supervisor_prefix}task action=show id={}`", task.task_id);
-    let reclose = format!(
-        "`{supervisor_prefix}task action=close id={}`",
-        task.task_id
-    );
+    // Worker re-close uses the *worker's* harness prefix so the supervisor
+    // relays a callable alias (cas-c145 review P1).
+    let reclose = format!("`{worker_prefix}task action=close id={}`", task.task_id);
     let rejection = task
         .close_rejected_reason
         .as_deref()
@@ -581,7 +587,13 @@ pub fn generate_prompt(
                 // epic target, next steps). Other close-rejection reasons
                 // keep the informational wording.
                 let text = if is_merge_required_idle(task) {
-                    merge_required_idle_prompt_text(worker, task, data, supervisor_prefix)
+                    merge_required_idle_prompt_text(
+                        worker,
+                        task,
+                        data,
+                        supervisor_prefix,
+                        worker_prefix,
+                    )
                 } else {
                     let rejection = task
                         .close_rejected_reason
@@ -1481,8 +1493,13 @@ mod tests {
             prompt.text
         );
         assert!(
-            prompt.text.contains("re-close") || prompt.text.contains("action=close id=cas-8eff"),
-            "must resume normal close flow after merge: {}",
+            prompt.text.contains("cas__task action=close id=cas-8eff"),
+            "homogeneous Grok: worker re-close must use cas__ prefix: {}",
+            prompt.text
+        );
+        assert!(
+            prompt.text.contains("cas__task action=show id=cas-8eff"),
+            "homogeneous Grok: supervisor show must use cas__ prefix: {}",
             prompt.text
         );
         let lower = prompt.text.to_lowercase();
@@ -1500,6 +1517,150 @@ mod tests {
             !prompt.text.contains("resolve the rejection before acting"),
             "must not keep the pre-cas-c145 vague wording: {}",
             prompt.text
+        );
+    }
+
+    /// cas-c145 review P1: mixed harness — Claude supervisor + Codex worker.
+    /// Supervisor actions use `mcp__cas__`; the worker re-close command the
+    /// supervisor is told to relay must use `mcp__cs__` (never the supervisor
+    /// alias). Same shape for Grok workers (`cas__`).
+    #[test]
+    fn test_c145_mixed_harness_awaiting_merge_uses_worker_prefix_for_reclose() {
+        let event = DirectorEvent::WorkerIdle {
+            worker: "codex-worker".to_string(),
+            active_task: Some(ActiveLeaseSummary {
+                task_id: "cas-mix1".to_string(),
+                task_title: "Mixed factory merge park".to_string(),
+                task_status: TaskStatus::AwaitingMerge,
+                close_rejected_reason: Some("MERGE REQUIRED".to_string()),
+            }),
+        };
+        let mut data = make_data(0);
+        data.agents[0].name = "codex-worker".to_string();
+        data.agent_id_to_name
+            .insert("sess-id-abc123".to_string(), "codex-worker".to_string());
+        data.in_progress_tasks = vec![TaskSummary {
+            id: "cas-mix1".to_string(),
+            title: "Mixed factory merge park".to_string(),
+            status: TaskStatus::AwaitingMerge,
+            priority: Priority::MEDIUM,
+            assignee: Some("codex-worker".to_string()),
+            task_type: TaskType::Task,
+            epic: Some("cas-epic1".to_string()),
+            branch: None,
+            updated_at: None,
+        }];
+        data.epic_tasks = vec![TaskSummary {
+            id: "cas-epic1".to_string(),
+            title: "Epic".to_string(),
+            status: TaskStatus::InProgress,
+            priority: Priority::HIGH,
+            assignee: None,
+            task_type: TaskType::Epic,
+            epic: None,
+            branch: Some("epic/mixed-cas-epic1".to_string()),
+            updated_at: None,
+        }];
+        let config = default_config();
+
+        // Claude supervisor, Codex worker
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            claude(),
+            codex(),
+            &HashSet::new(),
+        )
+        .expect("mixed-harness AwaitingMerge must produce a supervisor prompt");
+
+        // Supervisor-facing tools: Claude alias
+        assert!(
+            prompt
+                .text
+                .contains("mcp__cas__coordination action=epic_status id=cas-epic1"),
+            "supervisor epic_status must use Claude prefix: {}",
+            prompt.text
+        );
+        assert!(
+            prompt
+                .text
+                .contains("mcp__cas__task action=list status=awaiting_merge"),
+            "supervisor list must use Claude prefix: {}",
+            prompt.text
+        );
+        assert!(
+            prompt
+                .text
+                .contains("mcp__cas__task action=show id=cas-mix1"),
+            "supervisor show must use Claude prefix: {}",
+            prompt.text
+        );
+        // Worker re-close: Codex alias only
+        assert!(
+            prompt
+                .text
+                .contains("mcp__cs__task action=close id=cas-mix1"),
+            "worker re-close must use Codex prefix mcp__cs__: {}",
+            prompt.text
+        );
+        assert!(
+            !prompt
+                .text
+                .contains("mcp__cas__task action=close id=cas-mix1"),
+            "worker re-close must NOT use Claude supervisor prefix: {}",
+            prompt.text
+        );
+
+        // Claude supervisor + Grok worker: re-close uses cas__
+        let grok_worker_event = DirectorEvent::WorkerIdle {
+            worker: "grok-worker".to_string(),
+            active_task: Some(ActiveLeaseSummary {
+                task_id: "cas-mix2".to_string(),
+                task_title: "Grok worker merge park".to_string(),
+                task_status: TaskStatus::AwaitingMerge,
+                close_rejected_reason: Some("MERGE REQUIRED".to_string()),
+            }),
+        };
+        let mut grok_data = make_data(0);
+        grok_data.agents[0].name = "grok-worker".to_string();
+        grok_data
+            .agent_id_to_name
+            .insert("sess-id-abc123".to_string(), "grok-worker".to_string());
+        let grok_prompt = generate_prompt(
+            &grok_worker_event,
+            &grok_data,
+            &grok_data,
+            "supervisor",
+            &config,
+            claude(),
+            SupervisorCli::Grok,
+            &HashSet::new(),
+        )
+        .expect("Claude+Grok AwaitingMerge must produce a prompt");
+        assert!(
+            grok_prompt
+                .text
+                .contains("cas__task action=close id=cas-mix2"),
+            "Grok worker re-close must use cas__ prefix: {}",
+            grok_prompt.text
+        );
+        assert!(
+            !grok_prompt
+                .text
+                .contains("mcp__cas__task action=close id=cas-mix2"),
+            "Grok worker re-close must NOT use Claude supervisor prefix: {}",
+            grok_prompt.text
+        );
+        assert!(
+            grok_prompt
+                .text
+                .contains("mcp__cas__task action=show id=cas-mix2")
+                || grok_prompt.text.contains("mcp__cas__"),
+            "supervisor actions still use Claude prefix: {}",
+            grok_prompt.text
         );
     }
 
