@@ -42,14 +42,12 @@ use branch_visibility::{
 // Re-export from cas-factory for backward compatibility
 pub use cas_factory::{AutoPromptConfig, EpicState, FactoryConfig};
 
-// Re-export scroll / click dispatch types so callers can use them without
-// reaching into the private `sidecar_and_selection` submodule. Constants
+// Re-export scroll dispatch types so callers can use them without reaching
+// into the private `sidecar_and_selection` submodule. Constants
 // (SCROLL_*_ARROWS / SCROLL_*_SGR / SCROLL_LINES) and
-// `alt_screen_wheel_bytes` / `sgr_left_click_bytes` remain reachable via this
-// module's children for tests; production daemon code uses
-// `FactoryApp::alt_screen_scroll_payload` and `ClickAction` +
-// `sgr_left_click_bytes` for cas-7f6f Stop-click forwarding.
-pub use sidecar_and_selection::{ClickAction, ScrollAction, sgr_left_click_bytes};
+// `alt_screen_wheel_bytes` remain reachable via this module's children for
+// tests; production daemon code uses `FactoryApp::alt_screen_scroll_payload`.
+pub use sidecar_and_selection::ScrollAction;
 
 /// Booting state for a worker that is being spawned (after prepare, before finish)
 #[derive(Debug, Clone)]
@@ -2716,15 +2714,7 @@ mod tests {
             cols: 80,
         };
         let pty = cas_mux::Pty::spawn(pty_id, pty_config).ok()?;
-        cas_mux::Pane::with_pty(
-            pane_id,
-            cas_mux::PaneKind::Worker,
-            pty,
-            24,
-            80,
-            cas_mux::SupervisorCli::Claude,
-        )
-        .ok()
+        cas_mux::Pane::with_pty(pane_id, cas_mux::PaneKind::Worker, pty, 24, 80).ok()
     }
 
     /// cas-eb7f (review finding, cas-ebc1 final): `sync_worker_pane_branch_titles`

@@ -121,12 +121,6 @@ pub struct Pane {
     partial_esc: Vec<u8>,
     /// Partial OSC 8 introducer carried over from the previous `feed()` chunk.
     partial_osc8: Vec<u8>,
-    /// Interactive harness for this pane (Claude / Codex / Grok).
-    ///
-    /// Drives harness-aware turn cancel via [`Pane::break_turn`] (cas-7f6f).
-    /// Shell and director panes default to [`SupervisorCli::Claude`] (Esc is a
-    /// harmless no-op on bare shells).
-    harness: SupervisorCli,
 }
 
 impl Pane {
@@ -138,7 +132,6 @@ impl Pane {
         backend: PaneBackend,
         rows: u16,
         cols: u16,
-        harness: SupervisorCli,
     ) -> Result<Self> {
         let id = id.into();
         let mut terminal = Terminal::new(rows, cols).map_err(|e| Error::terminal(e.to_string()))?;
@@ -169,7 +162,6 @@ impl Pane {
             has_hyperlinks: false,
             partial_esc: Vec::new(),
             partial_osc8: Vec::new(),
-            harness,
         })
     }
 
@@ -180,7 +172,6 @@ impl Pane {
         pty: Pty,
         rows: u16,
         cols: u16,
-        harness: SupervisorCli,
     ) -> Result<Self> {
         let id_str: String = id.into();
         Self::new_with_backend(
@@ -190,7 +181,6 @@ impl Pane {
             PaneBackend::Pty(pty),
             rows,
             cols,
-            harness,
         )
     }
 
@@ -204,7 +194,6 @@ impl Pane {
             PaneBackend::None,
             rows,
             cols,
-            SupervisorCli::Claude,
         )
     }
 
@@ -229,8 +218,7 @@ impl Pane {
             cols,
         };
         let pty = Pty::spawn(name, config)?;
-        // Shell has no agent harness; Claude cancel-key (Esc) is a no-op on shells.
-        Self::with_pty(name, PaneKind::Shell, pty, rows, cols, SupervisorCli::Claude)
+        Self::with_pty(name, PaneKind::Shell, pty, rows, cols)
     }
 
     /// Build the `PtyConfig` that `worker()` would spawn, without actually
@@ -339,7 +327,7 @@ impl Pane {
         );
         push_factory_session_env(&mut config, cli, factory_session);
         let pty = Pty::spawn(name, config)?;
-        Self::with_pty(name, PaneKind::Worker, pty, rows, cols, cli)
+        Self::with_pty(name, PaneKind::Worker, pty, rows, cols)
     }
 
     /// Build the `PtyConfig` that `supervisor()` would spawn, without actually
@@ -435,7 +423,7 @@ impl Pane {
         );
         push_factory_session_env(&mut config, cli, factory_session);
         let pty = Pty::spawn(name, config)?;
-        Self::with_pty(name, PaneKind::Supervisor, pty, rows, cols, cli)
+        Self::with_pty(name, PaneKind::Supervisor, pty, rows, cols)
     }
 
     fn push_supervisor_env(
@@ -1073,33 +1061,22 @@ impl Pane {
         }
     }
 
-    /// Break the current turn with a harness-aware cancel payload (cas-7f6f).
+    /// Break the current turn by sending a single Esc (0x1b).
     ///
-    /// - **Claude / Codex**: Esc (`0x1b`) — Claude Code's cancel-turn key
-    ///   (Ctrl+C is the double-press quit signal).
-    /// - **Grok**: Ctrl+C (`0x03`) — since 0.2.93 Esc is a mid-turn no-op;
-    ///   cancel is Ctrl+C (see [`SupervisorCli::turn_cancel_bytes`]).
-    ///
-    /// Used by the urgent interrupt-and-redirect path and by factory Escape
-    /// routing so UI cancel and programmatic cancel share one tested path.
+    /// This is distinct from [`Pane::interrupt`], which sends Ctrl+C (0x03).
+    /// For Claude Code, Esc is the canonical "stop the current turn / cancel"
+    /// key, whereas Ctrl+C is the (double-press) quit signal. The urgent
+    /// interrupt-and-redirect path uses Esc so it breaks the worker's in-flight
+    /// turn without risking a process exit — matching exactly what a human
+    /// presses (`KeyCode::Esc => vec![0x1b]` in the factory TUI client).
     pub async fn break_turn(&self) -> Result<()> {
         match &self.backend {
             PaneBackend::Pty(pty) => {
-                pty.write(self.harness.turn_cancel_bytes()).await?;
+                pty.write(&[0x1b]).await?;
                 Ok(())
             }
             PaneBackend::None => Err(Error::pty("Pane has no backend")),
         }
-    }
-
-    /// Interactive harness for this pane (Claude / Codex / Grok).
-    pub fn harness(&self) -> SupervisorCli {
-        self.harness
-    }
-
-    /// Override the harness (tests and late-bound config only).
-    pub fn set_harness(&mut self, harness: SupervisorCli) {
-        self.harness = harness;
     }
 
     pub async fn interrupt(&self) -> Result<()> {

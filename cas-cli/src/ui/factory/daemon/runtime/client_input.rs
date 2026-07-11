@@ -192,29 +192,7 @@ impl FactoryDaemon {
                                     // ScrollAction::Done: scroll was handled by handle_scroll_down.
                                 }
                                 ControlEvent::MouseClick { col, row } => {
-                                    use crate::ui::factory::app::{
-                                        ClickAction, sgr_left_click_bytes,
-                                    };
-                                    match self.app.handle_mouse_click(col, row) {
-                                        ClickAction::Handled => {}
-                                        ClickAction::ForwardSgr {
-                                            pane,
-                                            col: pty_col,
-                                            row: pty_row,
-                                        } => {
-                                            // cas-7f6f: deliver SGR click so Grok's
-                                            // on-screen Stop control can cancel.
-                                            let payload = sgr_left_click_bytes(pty_col, pty_row);
-                                            tracing::debug!(
-                                                %pane,
-                                                pty_col,
-                                                pty_row,
-                                                "forwarding SGR click to focused Grok pane"
-                                            );
-                                            let _ =
-                                                self.app.mux.send_input_to(&pane, &payload).await;
-                                        }
-                                    }
+                                    self.app.handle_mouse_click(col, row);
                                 }
                                 ControlEvent::SetSelectMode(on) => {
                                     self.app.select_mode = on;
@@ -747,21 +725,8 @@ impl FactoryDaemon {
                     i += 1;
                     continue;
                 } else if is_standalone_esc && self.app.focused_accepts_input() {
-                    // cas-7f6f: Grok mid-turn Esc is a no-op (0.2.93); route
-                    // through harness-aware break_turn (Ctrl+C for Grok, Esc
-                    // for Claude/Codex) so keyboard cancel matches Stop.
-                    if self.app.focused_harness() == cas_mux::SupervisorCli::Grok {
-                        if let Some(id) = self.app.mux.focused_id().map(|s| s.to_string()) {
-                            tracing::debug!(
-                                pane = %id,
-                                "Grok Esc → turn cancel (Ctrl+C) via break_turn"
-                            );
-                            let _ = self.app.mux.break_turn(&id).await;
-                        }
-                    } else {
-                        // Claude/Codex: Esc is the native cancel key — forward raw.
-                        let _ = self.app.mux.send_input(&[byte]).await;
-                    }
+                    // Forward ESC to focused pane
+                    let _ = self.app.mux.send_input(&[byte]).await;
                     i += 1;
                     continue;
                 } else if !is_standalone_esc {
