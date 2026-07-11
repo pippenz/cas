@@ -87,12 +87,238 @@ fn worker_has_open_or_in_progress_assignment(data: &DirectorData, worker: &str) 
         .any(|task| task_assigned_to_worker(data, task, worker))
 }
 
+/// How epic-completion ownership was resolved (cas-9fff).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EpicCompletionOwnershipSource {
+    /// `Task.epic_verification_owner` matched this supervisor.
+    VerificationOwner,
+    /// Inferred: this session's agents worked the epic (assignees) or the
+    /// session is focused on it.
+    SessionAffinity,
+    /// Owner is known but not live here; deliver only as an explicit
+    /// last-resort fallback (never silent).
+    UnreachableOwnerFallback,
+    /// No ownership signal at all — legacy single-session path.
+    Unresolved,
+}
+
+/// Routing decision for `EpicAllSubtasksClosed` prompts (cas-9fff).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EpicCompletionRoute {
+    /// Deliver to this session's supervisor.
+    Deliver {
+        owner: String,
+        source: EpicCompletionOwnershipSource,
+        owner_session: Option<String>,
+    },
+    /// Suppress — another supervisor owns this epic.
+    Suppress { reason: &'static str },
+}
+
+/// Decide whether this factory session's supervisor should receive an
+/// epic-completion notification.
+///
+/// Preference order (per cas-9fff design):
+/// 1. `epic_verification_owner` (exact agent id or display name)
+/// 2. Session affinity (subtask assignees visible as agents in this session,
+///    or `focused_epic_id` matches)
+/// 3. Unreachable-owner fallback only when explicitly requested by the caller
+///    (`allow_unreachable_fallback`) and this session has affinity
+/// 4. Epic present but no affinity → suppress (foreign concurrent session)
+/// 5. Epic absent from snapshot → deliver unresolved (legacy/tests)
+///
+/// Concurrent supervisors: a non-owning session always gets `Suppress`.
+pub fn route_epic_completion(
+    supervisor_name: &str,
+    supervisor_id: Option<&str>,
+    factory_session: Option<&str>,
+    epic_verification_owner: Option<&str>,
+    focused_on_epic: bool,
+    session_has_epic_workers: bool,
+    owner_live_in_this_session: bool,
+    allow_unreachable_fallback: bool,
+    epic_present_in_snapshot: bool,
+) -> EpicCompletionRoute {
+    let self_ids: Vec<&str> = std::iter::once(supervisor_name)
+        .chain(supervisor_id)
+        .collect();
+
+    if let Some(owner) = epic_verification_owner.map(str::trim).filter(|s| !s.is_empty()) {
+        let is_owner = self_ids.iter().any(|id| *id == owner);
+        if is_owner {
+            return EpicCompletionRoute::Deliver {
+                owner: owner.to_string(),
+                source: EpicCompletionOwnershipSource::VerificationOwner,
+                owner_session: factory_session.map(str::to_string),
+            };
+        }
+        // Owner is someone else. Only fall back if they are unreachable *and*
+        // this session has affinity (worked the epic / focused it).
+        if !owner_live_in_this_session
+            && allow_unreachable_fallback
+            && (session_has_epic_workers || focused_on_epic)
+        {
+            return EpicCompletionRoute::Deliver {
+                owner: owner.to_string(),
+                source: EpicCompletionOwnershipSource::UnreachableOwnerFallback,
+                owner_session: None,
+            };
+        }
+        return EpicCompletionRoute::Suppress {
+            reason: "epic_verification_owner is a different supervisor",
+        };
+    }
+
+    // No explicit owner — infer from this session's affinity.
+    if session_has_epic_workers || focused_on_epic {
+        return EpicCompletionRoute::Deliver {
+            owner: supervisor_name.to_string(),
+            source: EpicCompletionOwnershipSource::SessionAffinity,
+            owner_session: factory_session.map(str::to_string),
+        };
+    }
+
+    // Epic is visible but this session has no claim — concurrent foreign epic.
+    if epic_present_in_snapshot {
+        return EpicCompletionRoute::Suppress {
+            reason: "no ownership affinity for epic in this session",
+        };
+    }
+
+    // Epic not in snapshot (unit tests / degraded load): deliver with explicit
+    // unresolved stamp so the recipient can still self-filter.
+    EpicCompletionRoute::Deliver {
+        owner: supervisor_name.to_string(),
+        source: EpicCompletionOwnershipSource::Unresolved,
+        owner_session: factory_session.map(str::to_string),
+    }
+}
+
+/// Ownership inputs for an epic from a director snapshot.
+#[derive(Debug, Clone)]
+pub struct EpicCompletionContext {
+    pub owner: Option<String>,
+    pub session_has_epic_workers: bool,
+    pub focused_on_epic: bool,
+    pub supervisor_id: Option<String>,
+    pub owner_live_in_this_session: bool,
+    pub epic_present: bool,
+}
+
+/// Collect ownership inputs for an epic from a director snapshot.
+pub fn epic_completion_context(
+    data: &DirectorData,
+    epic_id: &str,
+    supervisor_name: &str,
+    focused_epic_id: Option<&str>,
+) -> EpicCompletionContext {
+    let epic = data.epic_tasks.iter().find(|e| e.id == epic_id);
+    let owner = epic
+        .and_then(|e| e.epic_verification_owner.clone())
+        .or_else(|| epic.and_then(|e| e.assignee.clone()));
+
+    let session_agent_keys: HashSet<&str> = data
+        .agents
+        .iter()
+        .flat_map(|a| [a.id.as_str(), a.name.as_str()])
+        .chain(
+            data.agent_id_to_name
+                .iter()
+                .flat_map(|(id, name)| [id.as_str(), name.as_str()]),
+        )
+        .chain(std::iter::once(supervisor_name))
+        .collect();
+
+    let session_has_epic_workers = data
+        .ready_tasks
+        .iter()
+        .chain(data.in_progress_tasks.iter())
+        .filter(|t| t.epic.as_deref() == Some(epic_id))
+        .filter_map(|t| t.assignee.as_deref())
+        .any(|assignee| session_agent_keys.contains(assignee));
+
+    let owner_live_in_this_session = owner
+        .as_deref()
+        .map(|o| session_agent_keys.contains(o))
+        .unwrap_or(false);
+
+    let supervisor_id = data
+        .agents
+        .iter()
+        .find(|a| a.name == supervisor_name)
+        .map(|a| a.id.clone())
+        .or_else(|| {
+            data.agent_id_to_name
+                .iter()
+                .find_map(|(id, name)| (name == supervisor_name).then(|| id.clone()))
+        });
+
+    EpicCompletionContext {
+        owner,
+        session_has_epic_workers,
+        focused_on_epic: focused_epic_id == Some(epic_id),
+        supervisor_id,
+        owner_live_in_this_session,
+        epic_present: epic.is_some(),
+    }
+}
+
 pub fn revalidate_event_for_delivery(
     event: &DirectorEvent,
     unfiltered_data: &DirectorData,
     supervisor_name: &str,
 ) -> Option<DirectorEvent> {
+    revalidate_event_for_delivery_with_focus(
+        event,
+        unfiltered_data,
+        supervisor_name,
+        None,
+    )
+}
+
+/// Like [`revalidate_event_for_delivery`], but accepts the session's focused
+/// epic so session-affinity routing for epic completion can use it (cas-9fff).
+pub fn revalidate_event_for_delivery_with_focus(
+    event: &DirectorEvent,
+    unfiltered_data: &DirectorData,
+    supervisor_name: &str,
+    focused_epic_id: Option<&str>,
+) -> Option<DirectorEvent> {
     match event {
+        DirectorEvent::EpicAllSubtasksClosed { epic_id, .. } => {
+            let factory_session = std::env::var("CAS_FACTORY_SESSION").ok();
+            let ctx = epic_completion_context(
+                unfiltered_data,
+                epic_id,
+                supervisor_name,
+                focused_epic_id,
+            );
+            match route_epic_completion(
+                supervisor_name,
+                ctx.supervisor_id.as_deref(),
+                factory_session.as_deref(),
+                ctx.owner.as_deref(),
+                ctx.focused_on_epic,
+                ctx.session_has_epic_workers,
+                ctx.owner_live_in_this_session,
+                // Never auto-fallback at revalidation — wrong-session must
+                // suppress; owner session (or explicit ops) owns recovery.
+                false,
+                ctx.epic_present,
+            ) {
+                EpicCompletionRoute::Deliver { .. } => Some(event.clone()),
+                EpicCompletionRoute::Suppress { reason } => {
+                    tracing::info!(
+                        target: "cas::coordination",
+                        epic_id = %epic_id,
+                        supervisor = %supervisor_name,
+                        reason,
+                        "suppressing EpicAllSubtasksClosed for non-owning supervisor"
+                    );
+                    None
+                }
+            }
+        }
         DirectorEvent::AgentRegistered {
             agent_id,
             agent_name,
@@ -691,8 +917,98 @@ pub fn generate_prompt(
                 return None;
             }
 
+            // cas-9fff: stamp ownership in the payload. Hard suppress only when
+            // epic_verification_owner is an explicit other agent — full
+            // session-affinity / focus routing lives in
+            // `revalidate_event_for_delivery_with_focus` (which has focus
+            // context). generate_prompt may be called without focus, so it
+            // must not re-suppress session-affinity deliveries that already
+            // passed revalidation.
+            let factory_session = std::env::var("CAS_FACTORY_SESSION").ok();
+            let ctx = epic_completion_context(unfiltered_data, epic_id, supervisor_name, None);
+            if let Some(ref owner) = ctx.owner {
+                let self_ids: Vec<&str> = std::iter::once(supervisor_name)
+                    .chain(ctx.supervisor_id.as_deref())
+                    .collect();
+                if !self_ids.iter().any(|id| *id == owner.as_str()) {
+                    tracing::info!(
+                        target: "cas::coordination",
+                        epic_id = %epic_id,
+                        supervisor = %supervisor_name,
+                        owner = %owner,
+                        "generate_prompt suppressed EpicAllSubtasksClosed for non-owner"
+                    );
+                    return None;
+                }
+            }
+            let route = route_epic_completion(
+                supervisor_name,
+                ctx.supervisor_id.as_deref(),
+                factory_session.as_deref(),
+                ctx.owner.as_deref(),
+                // Prefer delivering a stamped prompt once revalidation (or a
+                // direct test) admitted the event — force affinity so we get
+                // a Deliver route for stamping rather than Suppress.
+                true,
+                true,
+                ctx.owner_live_in_this_session,
+                false,
+                ctx.epic_present,
+            );
+            let (owner_label, source, owner_session) = match route {
+                EpicCompletionRoute::Suppress { .. } => {
+                    // Should be unreachable given the force-affinity flags
+                    // above; keep a safe unresolved stamp if it happens.
+                    (
+                        supervisor_name.to_string(),
+                        EpicCompletionOwnershipSource::Unresolved,
+                        factory_session.clone(),
+                    )
+                }
+                EpicCompletionRoute::Deliver {
+                    owner,
+                    source,
+                    owner_session,
+                } => (owner, source, owner_session),
+            };
+
+            let source_label = match source {
+                EpicCompletionOwnershipSource::VerificationOwner => "epic_verification_owner",
+                EpicCompletionOwnershipSource::SessionAffinity => "session_affinity",
+                EpicCompletionOwnershipSource::UnreachableOwnerFallback => {
+                    "unreachable_owner_fallback"
+                }
+                EpicCompletionOwnershipSource::Unresolved => "unresolved",
+            };
+            let session_label = owner_session
+                .as_deref()
+                .or(factory_session.as_deref())
+                .unwrap_or("(unknown session)");
+
+            let ownership_banner = match source {
+                EpicCompletionOwnershipSource::UnreachableOwnerFallback => {
+                    format!(
+                        "OWNERSHIP: owner={owner_label} (UNREACHABLE — fallback delivery) \
+                         session={session_label} source={source_label}\n\
+                         Do NOT close this epic or shutdown_workers unless you confirm you own it.\n\n"
+                    )
+                }
+                EpicCompletionOwnershipSource::Unresolved => {
+                    format!(
+                        "OWNERSHIP: owner={owner_label} session={session_label} source={source_label}\n\
+                         Owner could not be verified — decline if this is not your epic.\n\n"
+                    )
+                }
+                _ => {
+                    format!(
+                        "OWNERSHIP: owner={owner_label} session={session_label} source={source_label}\n\n"
+                    )
+                }
+            };
+
             let text = format!(
-                "All subtasks of epic '{epic_title}' ({epic_id}) are now closed.\n\n\
+                "{ownership_banner}\
+                 All subtasks of epic '{epic_title}' ({epic_id}) are now closed.\n\n\
                  Next steps:\n\
                  - Verify the integrated result\n\
                  - Close the epic: {supervisor_prefix}task action=close id={epic_id} reason=\"All subtasks complete\"\n\
@@ -727,7 +1043,8 @@ mod tests {
                 epic: None,
                 branch: None,
                 updated_at: None,
-            })
+            epic_verification_owner: None,
+        })
             .collect();
 
         DirectorData {
@@ -767,12 +1084,14 @@ mod tests {
             epic: None,
             branch: None,
             updated_at: None,
+            epic_verification_owner: None,
         }
     }
 
     fn blocked_task(id: &str, assignee: Option<&str>) -> TaskSummary {
         TaskSummary {
             status: TaskStatus::Blocked,
+            epic_verification_owner: None,
             ..open_task(id, assignee)
         }
     }
@@ -974,6 +1293,7 @@ mod tests {
             epic: None,
             branch: None,
             updated_at: None,
+            epic_verification_owner: None,
         }];
 
         assert!(
@@ -1086,6 +1406,7 @@ mod tests {
             epic: None,
             branch: None,
             updated_at: None,
+            epic_verification_owner: None,
         };
         let data = DirectorData {
             ready_tasks: vec![task],
@@ -1146,6 +1467,7 @@ mod tests {
             epic: None,
             branch: None,
             updated_at: None,
+            epic_verification_owner: None,
         };
         let data = DirectorData {
             ready_tasks: vec![],
@@ -1318,6 +1640,7 @@ mod tests {
             epic: None,
             branch: None,
             updated_at: None,
+            epic_verification_owner: None,
         }];
         data.agents[0].active_lease = Some(ActiveLeaseSummary {
             task_id: "cas-1234".to_string(),
@@ -1687,6 +2010,7 @@ mod tests {
             epic: None,
             branch: None,
             updated_at: None,
+            epic_verification_owner: None,
         };
         DirectorData {
             ready_tasks: vec![],
@@ -1893,6 +2217,7 @@ mod tests {
             epic: None,
             branch: None,
             updated_at: None,
+            epic_verification_owner: None,
         };
         let data = DirectorData {
             ready_tasks: vec![task],
@@ -1970,6 +2295,7 @@ mod tests {
             epic: None,
             branch: None,
             updated_at: None,
+            epic_verification_owner: None,
         };
         let data = DirectorData {
             // Blocked task is in ready_tasks (Open|Blocked both land here).
@@ -2035,6 +2361,7 @@ mod tests {
             epic: None,
             branch: None,
             updated_at: None,
+            epic_verification_owner: None,
         };
         let mut data = DirectorData {
             ready_tasks: vec![open_task],
@@ -2091,6 +2418,7 @@ mod tests {
             epic: None,
             branch: None,
             updated_at: None,
+            epic_verification_owner: None,
         };
         let data = DirectorData {
             ready_tasks: vec![open_task],
@@ -2404,6 +2732,7 @@ mod tests {
             epic: None,
             branch: None,
             updated_at: None,
+            epic_verification_owner: None,
         });
         let config = default_config();
 
@@ -2876,5 +3205,229 @@ mod tests {
             prompt.text
         );
         assert!(prompt.text.contains("not a task completion"));
+    }
+
+    // --- cas-9fff: epic-completion ownership routing ---
+
+    #[test]
+    fn test_9fff_route_prefers_epic_verification_owner() {
+        let owner_route = route_epic_completion(
+            "owner-sup",
+            Some("owner-id"),
+            Some("session-owner"),
+            Some("owner-id"),
+            false,
+            false,
+            true,
+            false,
+            true,
+        );
+        assert!(matches!(
+            owner_route,
+            EpicCompletionRoute::Deliver {
+                source: EpicCompletionOwnershipSource::VerificationOwner,
+                ..
+            }
+        ));
+
+        let foreign = route_epic_completion(
+            "other-sup",
+            Some("other-id"),
+            Some("session-other"),
+            Some("owner-id"),
+            false,
+            false,
+            false,
+            false,
+            true,
+        );
+        assert!(matches!(foreign, EpicCompletionRoute::Suppress { .. }));
+    }
+
+    #[test]
+    fn test_9fff_route_session_affinity_without_owner() {
+        let route = route_epic_completion(
+            "owner-sup",
+            None,
+            Some("session-a"),
+            None,
+            true, // focused
+            false,
+            false,
+            false,
+            true,
+        );
+        assert!(matches!(
+            route,
+            EpicCompletionRoute::Deliver {
+                source: EpicCompletionOwnershipSource::SessionAffinity,
+                ..
+            }
+        ));
+
+        let foreign = route_epic_completion(
+            "other-sup",
+            None,
+            Some("session-b"),
+            None,
+            false,
+            false,
+            false,
+            false,
+            true,
+        );
+        assert!(matches!(foreign, EpicCompletionRoute::Suppress { .. }));
+    }
+
+    #[test]
+    fn test_9fff_unreachable_owner_fallback_is_explicit() {
+        let route = route_epic_completion(
+            "fallback-sup",
+            None,
+            Some("session-fallback"),
+            Some("dead-owner"),
+            true,
+            true,
+            false, // owner not live
+            true,  // allow fallback
+            true,
+        );
+        match route {
+            EpicCompletionRoute::Deliver {
+                source: EpicCompletionOwnershipSource::UnreachableOwnerFallback,
+                owner,
+                ..
+            } => assert_eq!(owner, "dead-owner"),
+            other => panic!("expected unreachable fallback, got {other:?}"),
+        }
+
+        // Without allow_unreachable_fallback → suppress
+        let suppressed = route_epic_completion(
+            "fallback-sup",
+            None,
+            Some("session-fallback"),
+            Some("dead-owner"),
+            true,
+            true,
+            false,
+            false,
+            true,
+        );
+        assert!(matches!(suppressed, EpicCompletionRoute::Suppress { .. }));
+    }
+
+    #[test]
+    fn test_9fff_two_supervisors_only_owner_gets_epic_complete_prompt() {
+        let event = DirectorEvent::EpicAllSubtasksClosed {
+            epic_id: "cas-f4ef".to_string(),
+            epic_title: "EPIC: food visual remediation".to_string(),
+        };
+
+        // Owner session snapshot: epic owned by owner-sup (by name)
+        let mut owner_data = make_data(0);
+        owner_data.epic_tasks = vec![TaskSummary {
+            id: "cas-f4ef".to_string(),
+            title: "EPIC: food visual remediation".to_string(),
+            status: TaskStatus::Open,
+            priority: Priority::HIGH,
+            assignee: None,
+            task_type: TaskType::Epic,
+            epic: None,
+            branch: Some("epic/food".to_string()),
+            updated_at: None,
+            epic_verification_owner: Some("owner-sup".to_string()),
+        }];
+        owner_data.agents.push(AgentSummary {
+            id: "owner-session-id".to_string(),
+            name: "owner-sup".to_string(),
+            status: AgentStatus::Active,
+            current_task: None,
+            latest_activity: None,
+            last_heartbeat: Some(chrono::Utc::now()),
+            pending_messages: 0,
+            active_lease: None,
+            effort: None,
+        });
+
+        // Foreign session sees the same epic (shared DB) but different supervisor
+        let foreign_data = owner_data.clone();
+        let config = default_config();
+
+        // Revalidation: only owner delivers
+        let owner_event = revalidate_event_for_delivery(&event, &owner_data, "owner-sup");
+        assert!(
+            owner_event.is_some(),
+            "owning supervisor must receive EpicAllSubtasksClosed"
+        );
+        let foreign_event = revalidate_event_for_delivery(&event, &foreign_data, "other-sup");
+        assert!(
+            foreign_event.is_none(),
+            "non-owning concurrent supervisor must NOT receive EpicAllSubtasksClosed"
+        );
+
+        // Prompt for owner includes ownership stamp + next steps
+        let owner_prompt = generate_prompt(
+            &event,
+            &owner_data,
+            &owner_data,
+            "owner-sup",
+            &config,
+            codex(),
+            codex(),
+            &HashSet::new(),
+        )
+        .expect("owner should get a prompt");
+        assert_eq!(owner_prompt.target, "owner-sup");
+        assert!(
+            owner_prompt.text.contains("OWNERSHIP: owner=owner-sup"),
+            "payload must stamp owner for self-filter: {}",
+            owner_prompt.text
+        );
+        assert!(owner_prompt.text.contains("source=epic_verification_owner"));
+        assert!(owner_prompt.text.contains("task action=close id=cas-f4ef"));
+
+        // Prompt for foreign supervisor is suppressed
+        let foreign_prompt = generate_prompt(
+            &event,
+            &foreign_data,
+            &foreign_data,
+            "other-sup",
+            &config,
+            codex(),
+            codex(),
+            &HashSet::new(),
+        );
+        assert!(
+            foreign_prompt.is_none(),
+            "foreign supervisor must not get epic-complete prompt"
+        );
+    }
+
+    #[test]
+    fn test_9fff_epic_complete_prompt_stamps_session_context() {
+        let event = DirectorEvent::EpicAllSubtasksClosed {
+            epic_id: "epic-456".to_string(),
+            epic_title: "Test Epic".to_string(),
+        };
+        // No epic in data → unresolved deliver path (legacy/single-session)
+        let data = make_data(0);
+        let config = default_config();
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert!(
+            prompt.text.contains("OWNERSHIP:"),
+            "must stamp ownership even when unresolved: {}",
+            prompt.text
+        );
+        assert!(prompt.text.contains("task action=close id=epic-456"));
     }
 }

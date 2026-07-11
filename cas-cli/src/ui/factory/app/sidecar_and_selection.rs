@@ -964,8 +964,9 @@ mod tests {
             epic: epic.map(str::to_string),
             branch: Some(format!("epic/{id}")).filter(|_| task_type == TaskType::Epic),
             updated_at: None,
+        epic_verification_owner: None,
         }
-    }
+        }
 
     fn app_with_scoped_tasks() -> FactoryApp {
         let mut app = FactoryApp::for_test();
