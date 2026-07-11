@@ -1348,20 +1348,24 @@ impl CasCore {
         // non-isolated tasks, fall through to the existing main-repo check —
         // those workers share the main worktree so its state IS the task diff.
         //
-        // Also capture `worker_review_parent_branch` for the case-3 ambiguity
-        // check below (avoids a second open_worktree_store call).
+        // Also capture `worker_review_parent_branch` for lint / merge-reality /
+        // case-3 ambiguity (avoids a second parent lookup).
+        //
+        // cas-dc5d P1: System-B isolated workers (`spawn_workers isolate=true`)
+        // almost never set `task.worktree_id` (that's System A). The previous
+        // worktree_id → parent_branch lookup therefore fell through to a
+        // hard-coded `"main"`, so lightweight lint's merge-base..HEAD range
+        // was wrong whenever the real integration target was `epic/<slug>`.
+        // Reuse the same authoritative resolution as the merge-state gate:
+        // `get_parent_epic(...).branch`, else `resolve_standalone_merge_target`.
         let (effective_has_reviewable, worker_review_parent_branch) =
             if let Some(worker_wt) = worker_worktree_path.as_ref() {
-                let parent_branch = task
-                    .worktree_id
-                    .as_deref()
-                    .and_then(|wt_id| {
-                        self.open_worktree_store()
-                            .ok()
-                            .and_then(|store| store.get(wt_id).ok())
-                            .map(|wt| wt.parent_branch.clone())
-                    })
-                    .unwrap_or_else(|| "main".to_string());
+                let parent_branch = task_store
+                    .get_parent_epic(&req.id)
+                    .ok()
+                    .flatten()
+                    .and_then(|p| p.branch)
+                    .unwrap_or_else(|| resolve_standalone_merge_target(close_project_root));
                 let reviewable = has_worker_committed_reviewable_changes(worker_wt, &parent_branch);
                 (reviewable, Some(parent_branch))
             } else {
@@ -4648,12 +4652,13 @@ pub(crate) fn run_lightweight_structural_lint(
 /// - `committed_range_parent = Some(parent)` — diff
 ///   `merge-base(HEAD, parent)..HEAD` inside `project_root`. Used for
 ///   isolated worker worktrees so only task commits are linted; unrelated
-///   dirty files in the main checkout are never visible.
+///   dirty files in the main checkout are never visible. **Fail-closed**
+///   (cas-dc5d P2): unsafe/missing parent, failed merge-base, or failed
+///   `git diff` returns [`LightweightLintOutcome::Fail`] with an actionable
+///   message — never silent Pass.
 /// - `committed_range_parent = None` — legacy working-tree `git diff HEAD`
-///   (then `--cached`) in `project_root`, for non-isolated closes.
-///
-/// If git is unavailable or the diff is empty, the lint passes (graceful
-/// degradation — same rule as `has_reviewable_changes`).
+///   (then `--cached`) in `project_root`, for non-isolated closes. Empty
+///   diff still Passes (graceful degradation).
 pub(crate) fn run_lightweight_structural_lint_with_scope(
     project_root: &std::path::Path,
     committed_range_parent: Option<&str>,
@@ -4670,8 +4675,21 @@ pub(crate) fn run_lightweight_structural_lint_with_scope(
     // `--cached`. `--unified=0` keeps the consecutive-comment heuristic
     // free of context lines. Only one diff source is used.
     let diff_text = if let Some(parent) = committed_range_parent {
+        // cas-dc5d P2: committed-range proof must fail closed. Passing on
+        // unsafe/missing parent or failed merge-base/diff would silently
+        // skip lint for isolated workers (worse than scanning wrong root).
         if !is_safe_git_refname(parent) {
-            return LightweightLintOutcome::Pass;
+            return LightweightLintOutcome::Fail(format!(
+                "Cannot scope structural lint: parent branch name {parent:?} is not a safe git \
+                 ref (empty or starts with '-'). Fix the task's parent epic branch and retry."
+            ));
+        }
+        if !git_ref_exists(project_root, parent) {
+            return LightweightLintOutcome::Fail(format!(
+                "Cannot scope structural lint: parent branch `{parent}` does not resolve in the \
+                 worker worktree. Ensure the epic/integration branch is available locally \
+                 (fetch or merge base) and retry close."
+            ));
         }
         let merge_base_out = Command::new("git")
             .args(["merge-base", "HEAD", parent])
@@ -4681,11 +4699,20 @@ pub(crate) fn run_lightweight_structural_lint_with_scope(
             Ok(o) if o.status.success() => {
                 let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
                 if s.is_empty() {
-                    return LightweightLintOutcome::Pass;
+                    return LightweightLintOutcome::Fail(format!(
+                        "Cannot scope structural lint: empty merge-base between HEAD and \
+                         `{parent}`. Check that the worker branch shares history with the \
+                         integration branch."
+                    ));
                 }
                 s
             }
-            _ => return LightweightLintOutcome::Pass,
+            _ => {
+                return LightweightLintOutcome::Fail(format!(
+                    "Cannot scope structural lint: failed to compute merge-base(HEAD, `{parent}`). \
+                     Ensure both refs exist in the worker worktree and share history."
+                ));
+            }
         };
         match Command::new("git")
             .args(["diff", "--unified=0", &format!("{merge_base}..HEAD")])
@@ -4693,7 +4720,23 @@ pub(crate) fn run_lightweight_structural_lint_with_scope(
             .output()
         {
             Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
-            _ => String::new(),
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                return LightweightLintOutcome::Fail(format!(
+                    "Cannot scope structural lint: `git diff {merge_base}..HEAD` failed \
+                     against parent `{parent}`.{maybe_stderr}",
+                    maybe_stderr = if stderr.trim().is_empty() {
+                        String::new()
+                    } else {
+                        format!(" stderr: {}", stderr.trim())
+                    }
+                ));
+            }
+            Err(e) => {
+                return LightweightLintOutcome::Fail(format!(
+                    "Cannot scope structural lint: failed to spawn git diff ({e})."
+                ));
+            }
         }
     } else {
         let mut text = String::new();
@@ -5222,6 +5265,131 @@ fn leftover() {}\n";
             matches!(scoped, LightweightLintOutcome::Fail(_)),
             "committed todo!() in worker range must Fail scoped lint, got {scoped:?}"
         );
+    }
+
+    /// cas-dc5d P1: when the real integration parent is `epic/x` (diverged
+    /// from `main`), scoping against `main` falsely includes epic-branch
+    /// comment blocks in the lint range; scoping against `epic/x` does not.
+    #[test]
+    fn lint_scoped_parent_must_be_epic_not_main_when_they_diverge() {
+        let main = TempDir::new().unwrap();
+        let p = main.path();
+        git_dc5d(p, &["init", "-q", "-b", "main"]);
+        std::fs::write(p.join("base.rs"), "fn main() {}\n").unwrap();
+        git_dc5d(p, &["add", "base.rs"]);
+        git_dc5d(p, &["commit", "-q", "-m", "init"]);
+
+        // Epic diverges from main with a large // comment block (would Fail
+        // lint if incorrectly included in the worker's range vs main).
+        git_dc5d(p, &["checkout", "-q", "-b", "epic/x"]);
+        let epic_comments = "\
+// epic line 1
+// epic line 2
+// epic line 3
+// epic line 4
+// epic line 5
+// epic line 6
+// epic line 7
+pub fn epic_only() {}\n";
+        std::fs::write(p.join("epic.rs"), epic_comments).unwrap();
+        git_dc5d(p, &["add", "epic.rs"]);
+        git_dc5d(p, &["commit", "-q", "-m", "epic clean-ish but comment-heavy"]);
+
+        // Worker branches from epic with a clean feature.
+        let worker = p.join("worktrees").join("worker");
+        std::fs::create_dir_all(worker.parent().unwrap()).unwrap();
+        git_dc5d(
+            p,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "factory/worker",
+                worker.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(worker.join("feature.rs"), "pub fn feature() -> u32 { 1 }\n").unwrap();
+        git_dc5d(&worker, &["add", "feature.rs"]);
+        git_dc5d(&worker, &["commit", "-q", "-m", "feat: worker task"]);
+
+        // Wrong parent (main): range includes epic comment block → Fail.
+        let vs_main = run_lightweight_structural_lint_with_scope(&worker, Some("main"));
+        assert!(
+            matches!(vs_main, LightweightLintOutcome::Fail(_)),
+            "wrong parent=main must include epic comments and Fail, got {vs_main:?}"
+        );
+
+        // Correct parent (epic/x): only clean feature → Pass.
+        let vs_epic = run_lightweight_structural_lint_with_scope(&worker, Some("epic/x"));
+        assert!(
+            matches!(vs_epic, LightweightLintOutcome::Pass),
+            "parent=epic/x must Pass for clean worker feature, got {vs_epic:?}"
+        );
+    }
+
+    /// cas-dc5d P2: missing parent ref must Fail with actionable text.
+    #[test]
+    fn lint_scoped_fails_closed_on_missing_parent() {
+        let dir = init_repo_with_diff("fn ok() {}\n");
+        let out = run_lightweight_structural_lint_with_scope(dir.path(), Some("epic/does-not-exist"));
+        match out {
+            LightweightLintOutcome::Fail(msg) => {
+                assert!(
+                    msg.contains("does not resolve") || msg.contains("Cannot scope"),
+                    "must be actionable, got: {msg}"
+                );
+            }
+            other => panic!("missing parent must Fail closed, got {other:?}"),
+        }
+    }
+
+    /// cas-dc5d P2: unsafe parent refname must Fail closed (not Pass).
+    #[test]
+    fn lint_scoped_fails_closed_on_unsafe_parent() {
+        let dir = init_repo_with_diff("fn ok() {}\n");
+        let out = run_lightweight_structural_lint_with_scope(dir.path(), Some("-oProxyCommand=evil"));
+        match out {
+            LightweightLintOutcome::Fail(msg) => {
+                assert!(
+                    msg.contains("not a safe git") || msg.contains("Cannot scope"),
+                    "must mention unsafe ref, got: {msg}"
+                );
+            }
+            other => panic!("unsafe parent must Fail closed, got {other:?}"),
+        }
+    }
+
+    /// cas-dc5d P2: unrelated histories (merge-base fails) must Fail closed.
+    #[test]
+    fn lint_scoped_fails_closed_on_merge_base_failure() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path();
+        git_dc5d(p, &["init", "-q", "-b", "main"]);
+        std::fs::write(p.join("seed.txt"), "seed\n").unwrap();
+        git_dc5d(p, &["add", "seed.txt"]);
+        git_dc5d(p, &["commit", "-q", "-m", "seed"]);
+
+        // Orphan factory tip — no merge-base with main.
+        git_dc5d(p, &["checkout", "-q", "--orphan", "factory/worker"]);
+        let _ = Command::new("git")
+            .args(["rm", "-rf", "--cached", "."])
+            .current_dir(p)
+            .output();
+        std::fs::write(p.join("orphan.txt"), "orphan\n").unwrap();
+        git_dc5d(p, &["add", "orphan.txt"]);
+        git_dc5d(p, &["commit", "-q", "-m", "orphan"]);
+
+        let out = run_lightweight_structural_lint_with_scope(p, Some("main"));
+        match out {
+            LightweightLintOutcome::Fail(msg) => {
+                assert!(
+                    msg.contains("merge-base") || msg.contains("Cannot scope"),
+                    "must mention merge-base failure, got: {msg}"
+                );
+            }
+            other => panic!("failed merge-base must Fail closed, got {other:?}"),
+        }
     }
 }
 

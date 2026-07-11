@@ -174,7 +174,17 @@ scoped to the isolated worker worktree; lint did not.
    visible.
 3. Non-isolated closes keep legacy working-tree `git diff HEAD` via
    `run_lightweight_structural_lint(close_project_root)`.
+4. **P1 parent authority:** `worker_review_parent_branch` uses the same
+   `get_parent_epic(...).branch` → `resolve_standalone_merge_target` path as
+   the merge-state gate (not `task.worktree_id` / hard-coded `main`). System-B
+   workers rarely have `worktree_id`.
+5. **P2 fail-closed range proof:** unsafe/missing parent, failed merge-base,
+   or failed `git diff` → `LightweightLintOutcome::Fail` with actionable text
+   (never silent Pass).
 
 **Regression (`lightweight_lint_tests`):**
 - `lint_scoped_to_worker_range_ignores_main_checkout_wip`
 - `lint_scoped_to_worker_range_fails_on_committed_todo`
+- `lint_scoped_parent_must_be_epic_not_main_when_they_diverge` (P1)
+- `lint_scoped_fails_closed_on_missing_parent` / `_unsafe_parent` /
+  `_merge_base_failure` (P2)
