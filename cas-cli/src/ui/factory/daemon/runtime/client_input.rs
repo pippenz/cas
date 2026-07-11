@@ -747,16 +747,26 @@ impl FactoryDaemon {
                     i += 1;
                     continue;
                 } else if is_standalone_esc && self.app.focused_accepts_input() {
-                    // cas-7f6f: Grok mid-turn Esc is a no-op (0.2.93); route
-                    // through harness-aware break_turn (Ctrl+C for Grok, Esc
-                    // for Claude/Codex) so keyboard cancel matches Stop.
+                    // cas-7f6f: Grok mid-turn Esc is a no-op (0.2.93). Only
+                    // rewrite Esc→cancel when the pane has recent output
+                    // (turn likely active). Idle keeps raw Esc for clear/rewind.
+                    use crate::ui::factory::app::GrokEscAction;
                     if self.app.focused_harness() == cas_mux::SupervisorCli::Grok {
-                        if let Some(id) = self.app.mux.focused_id().map(|s| s.to_string()) {
-                            tracing::debug!(
-                                pane = %id,
-                                "Grok Esc → turn cancel (Ctrl+C) via break_turn"
-                            );
-                            let _ = self.app.mux.break_turn(&id).await;
+                        match self.app.focused_grok_esc_action() {
+                            GrokEscAction::CancelTurn => {
+                                if let Some(id) = self.app.mux.focused_id().map(|s| s.to_string())
+                                {
+                                    tracing::debug!(
+                                        pane = %id,
+                                        "Grok Esc (turn active) → cancel via break_turn"
+                                    );
+                                    let _ = self.app.mux.break_turn(&id).await;
+                                }
+                            }
+                            GrokEscAction::ForwardRaw => {
+                                tracing::debug!("Grok Esc (idle) → raw Esc");
+                                let _ = self.app.mux.send_input(&[byte]).await;
+                            }
                         }
                     } else {
                         // Claude/Codex: Esc is the native cancel key — forward raw.

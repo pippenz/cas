@@ -98,6 +98,8 @@ pub struct Pane {
     drain_buf: Vec<u8>,
     /// Total bytes of output received from the process (for readiness detection)
     total_bytes_received: u64,
+    /// Last time this pane received PTY output (cas-7f6f turn-active signal).
+    last_output_at: Option<std::time::Instant>,
     /// When this pane was created (for startup grace period)
     created_at: std::time::Instant,
     /// Whether the inner process is currently in alt-screen mode.
@@ -164,6 +166,7 @@ impl Pane {
             new_lines_below: 0,
             drain_buf: Vec::with_capacity(65536),
             total_bytes_received: 0,
+            last_output_at: None,
             created_at: std::time::Instant::now(),
             in_alt_screen: false,
             has_hyperlinks: false,
@@ -996,6 +999,7 @@ impl Pane {
 
         if !coalesced.is_empty() {
             self.total_bytes_received += coalesced.len() as u64;
+            self.last_output_at = Some(std::time::Instant::now());
             let feed_data = Self::strip_literal_cursor_reports(&coalesced);
             if let Err(e) = self.feed(feed_data.as_ref()) {
                 tracing::warn!(
@@ -1041,6 +1045,27 @@ impl Pane {
     /// to its prompt and is safe to inject into.
     pub fn bytes_received(&self) -> u64 {
         self.total_bytes_received
+    }
+
+    /// Whether this pane emitted PTY output within `window`.
+    ///
+    /// Used as a best-effort "turn active" signal for Grok Esc→cancel routing
+    /// (cas-7f6f): recent stream/redraw activity means a turn is likely running;
+    /// quiet panes keep raw Esc for idle clear/rewind.
+    pub fn had_output_within(&self, window: std::time::Duration) -> bool {
+        self.last_output_at
+            .is_some_and(|t| t.elapsed() <= window)
+    }
+
+    /// Mark the pane as having just produced output (tests / feed paths).
+    pub fn mark_output_now(&mut self) {
+        self.last_output_at = Some(std::time::Instant::now());
+        self.total_bytes_received = self.total_bytes_received.saturating_add(1);
+    }
+
+    /// Clear recent-output state (tests: simulate idle prompt).
+    pub fn clear_recent_output(&mut self) {
+        self.last_output_at = None;
     }
 
     /// Whether this pane is ready to accept prompt injection.

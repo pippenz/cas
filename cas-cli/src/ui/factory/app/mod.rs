@@ -49,7 +49,9 @@ pub use cas_factory::{AutoPromptConfig, EpicState, FactoryConfig};
 // module's children for tests; production daemon code uses
 // `FactoryApp::alt_screen_scroll_payload` and `ClickAction` +
 // `sgr_left_click_bytes` for cas-7f6f Stop-click forwarding.
-pub use sidecar_and_selection::{ClickAction, ScrollAction, sgr_left_click_bytes};
+pub use sidecar_and_selection::{
+    ClickAction, GrokEscAction, ScrollAction, sgr_left_click_bytes,
+};
 
 /// Booting state for a worker that is being spawned (after prepare, before finish)
 #[derive(Debug, Clone)]
@@ -477,6 +479,12 @@ pub struct FactoryApp {
     worker_areas: Vec<Rect>,
     supervisor_area: Option<Rect>,
     sidecar_area: Option<Rect>,
+    /// Authoritative PTY content rects per pane name (updated each render).
+    ///
+    /// These are the on-screen cells where the inner TUI is painted — **not**
+    /// the outer border box. Full mode uses bordered inners; compact mode
+    /// paints the supervisor borderless into the full content area (cas-7f6f).
+    pty_content_areas: HashMap<String, Rect>,
     /// Stored terminal dimensions (for daemon mode where crossterm::terminal::size() doesn't work)
     terminal_cols: u16,
     terminal_rows: u16,

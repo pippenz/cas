@@ -71,7 +71,7 @@ Operator observation (verbatim intent): *"I can't stop a Grok turn — clicking 
 
 Factory supervisors and workers routinely run multi-minute turns (merge, verification, code review). When the director misroutes epic-completion to the wrong supervisor, or a turn is about to do the wrong destructive action (`shutdown_workers count=0`, wrong epic close), the operator **must** be able to stop the turn in seconds.
 
-Related same-day incident (different bug, same need for stop):  
+Related same-day incident (different bug, same need for stop):
 `docs/requests/BUG-director-epic-complete-misrouted-supervisor-2026-07-11.md` — operator interrupt was the only thing that prevented a non-owning supervisor from racing close/shutdown. If Stop is dead, that safety valve is gone.
 
 ---
@@ -186,3 +186,7 @@ Exit 0 on both.
 3. Focus the pane (click once if needed), click Stop → turn should cancel.
 4. Or press Esc while focused → same cancel path (Ctrl+C into Grok).
 5. Factory session remains alive; Claude panes keep Esc-cancel and no SGR click forward.
+
+### Review follow-up (cas-7f6f P2)
+1. Grok Esc only rewrites to cancel when the pane has recent PTY output (turn-active); idle forwards raw Esc.
+2. Stop click geometry uses per-render `pty_content_areas` (full=bordered inner, compact=borderless content).

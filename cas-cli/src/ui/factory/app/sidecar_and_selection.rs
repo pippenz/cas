@@ -100,6 +100,42 @@ pub enum ClickAction {
     },
 }
 
+/// How the factory should handle a standalone Esc on a focused Grok pane (cas-7f6f).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrokEscAction {
+    /// Mid-turn: rewrite Esc to harness cancel (Ctrl+C via `break_turn`).
+    CancelTurn,
+    /// Idle: forward raw Esc so clear/rewind semantics stay intact.
+    ForwardRaw,
+}
+
+/// Pure decision for Grok Esc routing (unit-tested active-vs-idle).
+///
+/// `turn_active` is true when the focused pane has recent PTY output (streaming /
+/// redraw). Idle quiet panes keep raw Esc.
+pub fn grok_esc_action(turn_active: bool) -> GrokEscAction {
+    if turn_active {
+        GrokEscAction::CancelTurn
+    } else {
+        GrokEscAction::ForwardRaw
+    }
+}
+
+/// Window for "recent PTY output ⇒ turn likely active" (cas-7f6f Esc guard).
+pub const GROK_TURN_ACTIVE_OUTPUT_WINDOW: std::time::Duration =
+    std::time::Duration::from_secs(2);
+
+/// Full-mode bordered content inset (1 cell each side). Kept next to click
+/// geometry so tests don't reach into private render modules.
+pub fn full_mode_pty_content(outer: Rect) -> Rect {
+    Rect {
+        x: outer.x.saturating_add(1),
+        y: outer.y.saturating_add(1),
+        width: outer.width.saturating_sub(2),
+        height: outer.height.saturating_sub(2),
+    }
+}
+
 impl FactoryApp {
     // ========================================================================
     // Sidecar navigation
@@ -344,47 +380,51 @@ impl FactoryApp {
 
     /// Map factory screen coordinates to 1-based PTY cell coordinates for a pane.
     ///
-    /// Assumes a 1-cell border around the pane content (ratatui Block). Returns
-    /// `None` when the click lands on the border or the pane area is unknown.
+    /// Uses the authoritative content rect recorded at the last full/compact
+    /// render ([`FactoryApp::pty_content_areas`]) — full mode is border-inset,
+    /// compact mode is borderless. Returns `None` when the click is outside
+    /// that content rect or geometry is unknown.
     pub fn screen_to_pty_coords(
         &self,
         pane_name: &str,
         screen_col: u16,
         screen_row: u16,
     ) -> Option<(u16, u16)> {
-        let area = self.pane_content_area(pane_name)?;
-        let inner_x = area.x.saturating_add(1);
-        let inner_y = area.y.saturating_add(1);
-        let inner_w = area.width.saturating_sub(2);
-        let inner_h = area.height.saturating_sub(2);
-        if inner_w == 0 || inner_h == 0 {
+        let content = self.pty_content_area(pane_name)?;
+        if content.width == 0 || content.height == 0 {
             return None;
         }
-        if screen_col < inner_x
-            || screen_row < inner_y
-            || screen_col >= inner_x + inner_w
-            || screen_row >= inner_y + inner_h
+        if screen_col < content.x
+            || screen_row < content.y
+            || screen_col >= content.x + content.width
+            || screen_row >= content.y + content.height
         {
             return None;
         }
-        // 1-based terminal coordinates.
-        let pty_col = screen_col - inner_x + 1;
-        let pty_row = screen_row - inner_y + 1;
+        // 1-based terminal coordinates relative to painted content origin.
+        let pty_col = screen_col - content.x + 1;
+        let pty_row = screen_row - content.y + 1;
         Some((pty_col, pty_row))
     }
 
-    /// Outer screen rect for a named supervisor/worker pane (includes border).
-    fn pane_content_area(&self, pane_name: &str) -> Option<Rect> {
-        if pane_name == self.supervisor_name {
-            return self.supervisor_area;
-        }
-        if self.is_tabbed {
-            return self.worker_content_area;
-        }
-        self.worker_names
-            .iter()
-            .position(|n| n == pane_name)
-            .and_then(|i| self.worker_areas.get(i).copied())
+    /// Authoritative PTY content rect for a pane (from last render).
+    pub fn pty_content_area(&self, pane_name: &str) -> Option<Rect> {
+        self.pty_content_areas.get(pane_name).copied()
+    }
+
+    /// Whether the focused pane looks mid-turn (recent PTY output).
+    pub fn focused_turn_likely_active(&self) -> bool {
+        let Some(id) = self.mux.focused_id() else {
+            return false;
+        };
+        self.mux
+            .get(id)
+            .is_some_and(|p| p.had_output_within(GROK_TURN_ACTIVE_OUTPUT_WINDOW))
+    }
+
+    /// Esc routing for the focused pane when the harness is Grok.
+    pub fn focused_grok_esc_action(&self) -> GrokEscAction {
+        grok_esc_action(self.focused_turn_likely_active())
     }
 
     /// Focus the next PTY pane (cycles through supervisor + worker panes only)
@@ -1462,8 +1502,11 @@ mod tests {
         app.mux.add_pane(pane);
         app.supervisor_name = "test-supervisor".to_string();
         app.supervisor_cli = cas_mux::SupervisorCli::Grok;
-        // Outer rect: x=0 y=0 w=40 h=20 (border 1 → content 1..38 × 1..18)
-        app.supervisor_area = Some(Rect::new(0, 0, 40, 20));
+        // Outer rect for focus hit-test; full-mode content is border-inset.
+        let outer = Rect::new(0, 0, 40, 20);
+        app.supervisor_area = Some(outer);
+        app.pty_content_areas
+            .insert("test-supervisor".to_string(), full_mode_pty_content(outer));
 
         // Focus is on "other" — first click on Grok pane focuses only.
         assert_eq!(app.mux.focused_id(), Some("other"));
@@ -1478,18 +1521,101 @@ mod tests {
         match app.handle_mouse_click(10, 10) {
             ClickAction::ForwardSgr { pane, col, row } => {
                 assert_eq!(pane, "test-supervisor");
-                // screen (10,10) → inner origin (1,1) → pty (10,10)
+                // screen (10,10) → content origin (1,1) → pty (10,10)
                 assert_eq!((col, row), (10, 10));
             }
             other => panic!("expected ForwardSgr, got {other:?}"),
         }
 
-        // Border click (col 0) stays Handled — no forward into chrome.
+        // Border click (col 0) stays Handled — outside content rect.
         assert_eq!(
             app.handle_mouse_click(0, 10),
             ClickAction::Handled,
             "border click must not forward SGR"
         );
+    }
+
+    /// Full-mode Stop coords use bordered content (inset 1); compact is borderless.
+    #[test]
+    fn screen_to_pty_coords_full_vs_compact_cas_7f6f() {
+        let mut app = FactoryApp::for_test();
+        app.supervisor_name = "sup".to_string();
+        let outer = Rect::new(2, 4, 30, 12);
+
+        // Full mode: Borders::ALL → content starts at (3,5)
+        app.pty_content_areas
+            .insert("sup".to_string(), full_mode_pty_content(outer));
+        assert_eq!(
+            app.screen_to_pty_coords("sup", 3, 5),
+            Some((1, 1)),
+            "full-mode top-left content cell is pty (1,1)"
+        );
+        assert_eq!(
+            app.screen_to_pty_coords("sup", 2, 5),
+            None,
+            "full-mode left border is not content"
+        );
+        assert_eq!(
+            app.screen_to_pty_coords("sup", 10, 8),
+            Some((8, 4)),
+            "full-mode relative coords"
+        );
+
+        // Compact mode: borderless — outer IS content
+        app.pty_content_areas
+            .insert("sup".to_string(), outer);
+        assert_eq!(
+            app.screen_to_pty_coords("sup", 2, 4),
+            Some((1, 1)),
+            "compact top-left of content area is pty (1,1)"
+        );
+        assert_eq!(
+            app.screen_to_pty_coords("sup", 10, 8),
+            Some((9, 5)),
+            "compact relative coords without border inset"
+        );
+        // Same absolute screen point must differ full vs compact relative mapping
+        app.pty_content_areas
+            .insert("sup".to_string(), full_mode_pty_content(outer));
+        let full = app.screen_to_pty_coords("sup", 10, 8).unwrap();
+        app.pty_content_areas
+            .insert("sup".to_string(), outer);
+        let compact = app.screen_to_pty_coords("sup", 10, 8).unwrap();
+        assert_ne!(
+            full, compact,
+            "full bordered vs compact borderless must map screen clicks differently"
+        );
+    }
+
+    /// Grok Esc: active turn → cancel; idle → raw (preserve clear/rewind).
+    #[test]
+    fn grok_esc_active_vs_idle_cas_7f6f() {
+        assert_eq!(grok_esc_action(true), GrokEscAction::CancelTurn);
+        assert_eq!(grok_esc_action(false), GrokEscAction::ForwardRaw);
+
+        let mut app = FactoryApp::for_test();
+        let mut pane = Pane::director("g", 10, 20).unwrap();
+        pane.set_harness(cas_mux::SupervisorCli::Grok);
+        app.mux.add_pane(pane);
+        app.mux.focus("g");
+        app.supervisor_name = "g".to_string();
+        app.supervisor_cli = cas_mux::SupervisorCli::Grok;
+
+        // Idle (no recent output) → ForwardRaw
+        assert!(
+            !app.focused_turn_likely_active(),
+            "fresh pane has no recent output"
+        );
+        assert_eq!(app.focused_grok_esc_action(), GrokEscAction::ForwardRaw);
+
+        // Active (recent output) → CancelTurn
+        app.mux.get_mut("g").unwrap().mark_output_now();
+        assert!(app.focused_turn_likely_active());
+        assert_eq!(app.focused_grok_esc_action(), GrokEscAction::CancelTurn);
+
+        // Quiet again → idle
+        app.mux.get_mut("g").unwrap().clear_recent_output();
+        assert_eq!(app.focused_grok_esc_action(), GrokEscAction::ForwardRaw);
     }
 
     /// Claude focused alt-screen must NOT forward SGR clicks (Stop path is
