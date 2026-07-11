@@ -2476,12 +2476,14 @@ pub(crate) enum MergeStateGateOutcome {
 ///    pre-squash factory tip; this also preserves cas-4b3f serial-task
 ///    protection after squash (task A can close while task B's later
 ///    unmerged commits ride on the live factory HEAD).
-/// 2. **Live-ref convergence** — the live `factory/<assignee>` tip has
-///    zero commits not on the parent. Covers conflict-resolved squashes
-///    whose tip tree differs from A after the worker force-aligns the
-///    factory ref to the integration tip. Cannot mask later unmerged
-///    serial work (those leave live stranded > 0); when content check
-///    already cleared, live-ref is not required.
+/// 2. **Live-ref convergence** — the live `factory/<assignee>` tip is
+///    **known** to have zero commits not on the parent, via
+///    [`known_unmerged_factory_commits`] → [`KnownUnmergedCount::KnownZero`]
+///    (never the fail-open `count_unmerged_factory_commits == 0`). Covers
+///    conflict-resolved squashes whose tip tree differs from A after the
+///    worker force-aligns the factory ref to the integration tip. Missing
+///    refs / merge-base / rev-list failure are `Unknown` and do not clear
+///    the gate. Cannot mask later unmerged serial work (KnownPositive).
 pub(crate) fn run_factory_branch_merge_gate(
     task: &Task,
     _req: &TaskCloseRequest,
@@ -2572,20 +2574,27 @@ pub(crate) fn run_factory_branch_merge_gate(
             return MergeStateGateOutcome::Proceed;
         }
 
-        let live_stranded =
-            count_unmerged_factory_commits(repo_path, factory_branch.as_str(), parent_branch);
-        if live_stranded == 0 {
+        // cas-2938 P0 integrity: live-ref acceptance MUST NOT treat the
+        // fail-open `count_unmerged_factory_commits(...) == 0` as proof of
+        // convergence — that helper returns 0 when refs/merge-base/rev-list
+        // are unknowable. Only an explicit KnownZero authorizes close.
+        if matches!(
+            known_unmerged_factory_commits(repo_path, factory_branch.as_str(), parent_branch),
+            KnownUnmergedCount::KnownZero
+        ) {
             return MergeStateGateOutcome::Proceed;
         }
-        if git_ref_exists(repo_path, &origin_parent_branch) {
-            let live_vs_origin = count_unmerged_factory_commits(
-                repo_path,
-                factory_branch.as_str(),
-                &origin_parent_branch,
-            );
-            if live_vs_origin == 0 {
-                return MergeStateGateOutcome::Proceed;
-            }
+        if git_ref_exists(repo_path, &origin_parent_branch)
+            && matches!(
+                known_unmerged_factory_commits(
+                    repo_path,
+                    factory_branch.as_str(),
+                    &origin_parent_branch,
+                ),
+                KnownUnmergedCount::KnownZero
+            )
+        {
+            return MergeStateGateOutcome::Proceed;
         }
     }
 
@@ -2707,6 +2716,87 @@ pub(crate) fn count_unmerged_factory_commits(
             // direction for an unparseable count.
             .unwrap_or(u32::MAX),
         _ => 0,
+    }
+}
+
+/// Success-bearing unmerged-count for close-integrity **acceptance** paths
+/// (cas-2938 live-ref convergence).
+///
+/// Unlike [`count_unmerged_factory_commits`], which deliberately fail-opens
+/// to `0` when Git history is unknowable (legacy Proceed-friendly posture
+/// for the primary ancestry path), this tri-state never maps unknown state
+/// to zero. Callers that authorize close must match on [`KnownZero`] only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KnownUnmergedCount {
+    /// Refs resolved, merge-base computed, rev-list succeeded with count 0.
+    KnownZero,
+    /// Refs resolved and rev-list reported a positive stranded count.
+    KnownPositive(u32),
+    /// Missing ref, failed merge-base, failed/unparseable rev-list, or
+    /// unsafe refname — Git state is not evidence of convergence.
+    Unknown,
+}
+
+/// Explicit success-bearing counterpart to [`count_unmerged_factory_commits`].
+///
+/// Returns:
+/// - [`KnownUnmergedCount::KnownZero`] only when both refs resolve, merge-base
+///   succeeds, and `rev-list --count` parses as `0`.
+/// - [`KnownUnmergedCount::KnownPositive`] when the count is a known `> 0`
+///   (or the cas-cf64 unsafe-refname fail-closed `u32::MAX` case).
+/// - [`KnownUnmergedCount::Unknown`] on any resolution/computation failure —
+///   never treats "couldn't tell" as "zero ahead".
+fn known_unmerged_factory_commits(
+    repo_path: &std::path::Path,
+    factory_branch: &str,
+    parent_branch: &str,
+) -> KnownUnmergedCount {
+    use std::process::Command;
+
+    if !is_safe_git_refname(factory_branch) || !is_safe_git_refname(parent_branch) {
+        // Corrupted/injection input: not KnownZero. Surface as positive so
+        // any caller that only checks `== KnownZero` still refuses, and
+        // callers that inspect magnitude still see "stranded".
+        return KnownUnmergedCount::KnownPositive(u32::MAX);
+    }
+
+    // Both tips must resolve — missing factory or parent is Unknown, not zero.
+    if !git_ref_exists(repo_path, factory_branch) || !git_ref_exists(repo_path, parent_branch) {
+        return KnownUnmergedCount::Unknown;
+    }
+
+    let merge_base_out = Command::new("git")
+        .args(["merge-base", parent_branch, factory_branch])
+        .current_dir(repo_path)
+        .output();
+    let merge_base = match merge_base_out {
+        Ok(o) if o.status.success() => {
+            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if s.is_empty() {
+                return KnownUnmergedCount::Unknown;
+            }
+            s
+        }
+        _ => return KnownUnmergedCount::Unknown,
+    };
+
+    let count_out = Command::new("git")
+        .args([
+            "rev-list",
+            "--count",
+            &format!("{merge_base}..{factory_branch}"),
+        ])
+        .current_dir(repo_path)
+        .output();
+    match count_out {
+        Ok(o) if o.status.success() => match String::from_utf8_lossy(&o.stdout).trim().parse::<u32>()
+        {
+            Ok(0) => KnownUnmergedCount::KnownZero,
+            Ok(n) => KnownUnmergedCount::KnownPositive(n),
+            // Unparseable count is not evidence of zero.
+            Err(_) => KnownUnmergedCount::Unknown,
+        },
+        _ => KnownUnmergedCount::Unknown,
     }
 }
 
@@ -6356,6 +6446,168 @@ mod merge_state_gate_tests {
         assert!(
             matches!(out, MergeStateGateOutcome::Reject(_)),
             "genuinely unmerged parked work must still Reject, got {out:?}"
+        );
+    }
+
+    /// cas-2938 P0 integrity: missing live factory ref must not authorize
+    /// close. Legacy `count_unmerged_factory_commits` returns 0 for a missing
+    /// factory ref; the live-ref path must use KnownZero-only and Reject.
+    #[test]
+    fn live_ref_fallback_rejects_when_live_factory_ref_missing() {
+        let dir = init_factory_repo("worker");
+        let p = dir.path();
+
+        std::fs::write(p.join("a.rs"), "// a unmerged\n").unwrap();
+        git(p, &["add", "a.rs"]);
+        git(p, &["commit", "-q", "-m", "feat: task A (never integrated)"]);
+        let anchor_a = rev_parse_local(p, "HEAD");
+
+        // Drop the live factory branch while keeping the parked anchor sha
+        // resolvable as a dangling commit object.
+        git(p, &["checkout", "-q", "main"]);
+        git(p, &["branch", "-D", "factory/worker"]);
+
+        assert!(
+            git_ref_exists(p, &anchor_a),
+            "precondition: parked anchor commit object still resolves"
+        );
+        assert!(
+            !git_ref_exists(p, "factory/worker"),
+            "precondition: live factory ref is gone"
+        );
+        // Legacy helper fail-opens to 0 — pins the bug class under test.
+        assert_eq!(
+            count_unmerged_factory_commits(p, "factory/worker", "main"),
+            0,
+            "precondition: legacy count treats missing factory ref as 0"
+        );
+        assert!(
+            matches!(
+                known_unmerged_factory_commits(p, "factory/worker", "main"),
+                KnownUnmergedCount::Unknown
+            ),
+            "success-bearing helper must report Unknown for missing factory ref"
+        );
+        assert!(
+            !commit_tip_tree_reachable_from(p, &anchor_a, "main"),
+            "precondition: content path must not clear (A never integrated)"
+        );
+
+        let mut task = worker_task("worker");
+        task.status = TaskStatus::AwaitingMerge;
+        task.deliverables.factory_branch_anchor = Some(anchor_a);
+        let req = base_req(&task.id);
+        let out = run_factory_branch_merge_gate(&task, &req, "main", p);
+        assert!(
+            matches!(out, MergeStateGateOutcome::Reject(_)),
+            "missing live factory ref must not authorize close via live-ref \
+             fallback (unknown Git state ≠ KnownZero), got {out:?}"
+        );
+    }
+
+    /// cas-2938 P0 integrity: when live factory merge-base cannot be computed
+    /// (unrelated histories), live-ref must not treat fail-open count==0 as
+    /// convergence. Primary path still uses the historical anchor (known
+    /// stranded); live-ref must not clear on Unknown.
+    #[test]
+    fn live_ref_fallback_rejects_when_merge_base_unknowable() {
+        let dir = init_factory_repo("worker");
+        let p = dir.path();
+
+        // Parked anchor A: related history, genuinely unmerged (KnownPositive).
+        std::fs::write(p.join("a.rs"), "// a unmerged\n").unwrap();
+        git(p, &["add", "a.rs"]);
+        git(p, &["commit", "-q", "-m", "feat: task A (never integrated)"]);
+        let anchor_a = rev_parse_local(p, "HEAD");
+        assert_eq!(
+            count_unmerged_factory_commits(p, &anchor_a, "main"),
+            1,
+            "precondition: primary anchor ancestry must still see 1 stranded"
+        );
+
+        // Rewrite live factory/worker onto an orphan history so merge-base
+        // with main fails — legacy count fail-opens to 0; Known* is Unknown.
+        git(p, &["checkout", "-q", "--orphan", "factory-orphan"]);
+        let _ = std::process::Command::new("git")
+            .args(["rm", "-rf", "--cached", "."])
+            .current_dir(p)
+            .output();
+        std::fs::write(p.join("orphan.txt"), "orphan\n").unwrap();
+        git(p, &["add", "orphan.txt"]);
+        git(p, &["commit", "-q", "-m", "orphan factory tip"]);
+        git(p, &["branch", "-f", "factory/worker", "HEAD"]);
+        git(p, &["checkout", "-q", "factory/worker"]);
+
+        let mb = std::process::Command::new("git")
+            .args(["merge-base", "main", "factory/worker"])
+            .current_dir(p)
+            .status()
+            .expect("merge-base");
+        assert!(
+            !mb.success(),
+            "precondition: live factory must have no merge-base with main"
+        );
+        assert_eq!(
+            count_unmerged_factory_commits(p, "factory/worker", "main"),
+            0,
+            "precondition: legacy count fail-opens to 0 on merge-base failure"
+        );
+        assert!(
+            matches!(
+                known_unmerged_factory_commits(p, "factory/worker", "main"),
+                KnownUnmergedCount::Unknown
+            ),
+            "success-bearing helper must report Unknown when merge-base fails"
+        );
+        assert!(
+            !commit_tip_tree_reachable_from(p, &anchor_a, "main"),
+            "precondition: content path must not clear"
+        );
+
+        let mut task = worker_task("worker");
+        task.status = TaskStatus::AwaitingMerge;
+        task.deliverables.factory_branch_anchor = Some(anchor_a);
+        let req = base_req(&task.id);
+        let out = run_factory_branch_merge_gate(&task, &req, "main", p);
+        assert!(
+            matches!(out, MergeStateGateOutcome::Reject(_)),
+            "unknowable live merge-base must not authorize close via live-ref \
+             fallback, got {out:?}"
+        );
+    }
+
+    /// Unit coverage: known_unmerged_factory_commits is KnownZero only for a
+    /// real zero-ahead tip, not for missing refs.
+    #[test]
+    fn known_unmerged_count_distinguishes_known_zero_from_unknown() {
+        let dir = init_factory_repo("worker");
+        let p = dir.path();
+        // factory tip == main tip after init (no extra commits) → KnownZero.
+        assert!(
+            matches!(
+                known_unmerged_factory_commits(p, "factory/worker", "main"),
+                KnownUnmergedCount::KnownZero
+            ),
+            "fully-merged live factory must be KnownZero"
+        );
+
+        std::fs::write(p.join("a.rs"), "// a\n").unwrap();
+        git(p, &["add", "a.rs"]);
+        git(p, &["commit", "-q", "-m", "feat: a"]);
+        assert!(
+            matches!(
+                known_unmerged_factory_commits(p, "factory/worker", "main"),
+                KnownUnmergedCount::KnownPositive(1)
+            ),
+            "one stranded commit must be KnownPositive(1)"
+        );
+
+        assert!(
+            matches!(
+                known_unmerged_factory_commits(p, "factory/ghost", "main"),
+                KnownUnmergedCount::Unknown
+            ),
+            "missing factory ref must be Unknown, not KnownZero"
         );
     }
 
