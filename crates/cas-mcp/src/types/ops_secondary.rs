@@ -550,9 +550,20 @@ pub struct CoordinationRequest {
     pub urgent: Option<bool>,
 
     /// Force operation (shutdown, worktree cleanup/merge, gc_cleanup)
-    #[schemars(description = "Force operation even with uncommitted changes")]
+    #[schemars(
+        description = "Force operation even with uncommitted changes (dirty worktree cleanup/merge). Does NOT authorize trunk as a merge target — use allow_trunk for that (cas-0b32)."
+    )]
     #[serde(default)]
     pub force: Option<bool>,
+
+    /// Explicit intent to merge a System-B factory worker into trunk when no
+    /// epic target can be resolved (cas-0b32). Independent of `force` so
+    /// authorizing trunk never bypasses dirty-worktree protection.
+    #[schemars(
+        description = "worktree_merge only: authorize merge to trunk/main when no epic target is resolvable. Separate from force= (dirty worktree override)."
+    )]
+    #[serde(default)]
+    pub allow_trunk: Option<bool>,
 
     /// Clear the pinned epic focus for focus_epic
     #[schemars(description = "Clear the pinned epic focus (focus_epic only)")]
