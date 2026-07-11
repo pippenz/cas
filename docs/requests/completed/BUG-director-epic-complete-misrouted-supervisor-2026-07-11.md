@@ -62,23 +62,24 @@ Any multi-supervisor host (multiple concurrent factory sessions on one machine �
 
 3. **Payload stamp:** completion prompt always includes `OWNERSHIP: owner=… session=… source=…` so a mis-delivery is self-identifying.
 
-4. **Sticky owner:** factory-mode epic create auto-sets `epic_verification_owner` from caller identity.
+4. **Sticky owner (fail closed):** factory-mode epic create resolves `epic_verification_owner` from caller identity; if identity cannot be resolved, create is **rejected** (no silent `None` that would disable routing/guard).
 
-5. **Defense-in-depth close guard:** `task action=close` on an epic with `epic_verification_owner` set rejects non-owner callers (must transfer ownership first).
+5. **Defense-in-depth close guard (fail closed):** `task action=close` on an epic with `epic_verification_owner` set requires a matching caller identity. **Unknown identity is a rejection**, not a fall-through.
 
 6. **Shutdown:** existing `factory_shutdown_workers` already scopes by `CAS_FACTORY_SESSION` + `supervisor_owned_workers` — documented, not redesigned.
+
+7. **Out of scope (tracked separately):** unguarded `epic_verification_owner` mutation surface on task update — not absorbed into this fix.
 
 ### Proof
 
 ```text
-cargo test -p cas --lib -- \
-  ui::factory::director::prompts::tests::test_9fff \
-  ui::factory::director::prompts::tests::test_epic_all_subtasks
-# 6 passed
+cargo test -p cas --lib -- test_9fff
+# routing + close-gate + factory-create owner tests
 ```
 
 Key tests: `test_9fff_two_supervisors_only_owner_gets_epic_complete_prompt`,
 `test_9fff_route_prefers_epic_verification_owner`,
 `test_9fff_unreachable_owner_fallback_is_explicit`,
-`test_9fff_epic_complete_prompt_stamps_session_context`.
-
+`test_9fff_epic_complete_prompt_stamps_session_context`,
+`test_9fff_unknown_caller_identity_fail_closed`,
+`test_9fff_factory_epic_create_rejects_when_identity_unresolvable`.
