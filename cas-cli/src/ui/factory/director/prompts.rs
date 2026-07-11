@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 
 use crate::config::AutoPromptConfig;
-use crate::ui::factory::director::data::{DirectorData, TaskSummary};
+use crate::ui::factory::director::data::{ActiveLeaseSummary, DirectorData, TaskSummary};
 use crate::ui::factory::director::events::DirectorEvent;
 use cas_mux::SupervisorCli;
 use cas_types::TaskStatus;
@@ -256,6 +256,94 @@ pub fn with_response_instructions(
     )
 }
 
+/// True when a WorkerIdle active-task payload is the merge-gate park path
+/// (cas-c145): either the task is already `AwaitingMerge`, or the close
+/// rejection reason names MERGE REQUIRED. Other close rejections stay on the
+/// generic informational wording.
+fn is_merge_required_idle(task: &ActiveLeaseSummary) -> bool {
+    task.task_status == TaskStatus::AwaitingMerge
+        || task
+            .close_rejected_reason
+            .as_deref()
+            .is_some_and(|reason| reason.to_ascii_uppercase().contains("MERGE REQUIRED"))
+}
+
+/// Resolve the focused epic id + branch for a parked task from the current
+/// director snapshot (best-effort; falls back to placeholders when the epic
+/// link is not in this refresh).
+fn resolve_merge_target_for_task(
+    data: &DirectorData,
+    task_id: &str,
+) -> (Option<String>, Option<String>) {
+    // AwaitingMerge tasks live in `in_progress_tasks` (DirectorData
+    // waiting/active bucket). Ready/open rows are chained as a fallback.
+    let epic_id = data
+        .in_progress_tasks
+        .iter()
+        .chain(data.ready_tasks.iter())
+        .find(|t| t.id == task_id)
+        .and_then(|t| t.epic.clone());
+    let epic_branch = epic_id.as_ref().and_then(|eid| {
+        data.epic_tasks
+            .iter()
+            .find(|e| e.id == *eid)
+            .and_then(|e| e.branch.clone())
+    });
+    (epic_id, epic_branch)
+}
+
+/// Actionable merge-queue prompt for MERGE REQUIRED / AwaitingMerge idle
+/// signals (cas-c145). Carries task, source factory branch, merge target,
+/// and next action. Explicitly push-based (no polling loop).
+///
+/// Wording constraint: must not contain "assign" — the AwaitingMerge idle
+/// path is not "idle needing work" (cas-09d0 / cas-728b).
+fn merge_required_idle_prompt_text(
+    worker: &str,
+    task: &ActiveLeaseSummary,
+    data: &DirectorData,
+    supervisor_prefix: &str,
+) -> String {
+    let factory_branch = format!("factory/{worker}");
+    let (epic_id, epic_branch) = resolve_merge_target_for_task(data, &task.task_id);
+    let target = epic_branch
+        .as_deref()
+        .unwrap_or("the focused epic branch");
+    let epic_status = match epic_id.as_deref() {
+        Some(id) => format!("`{supervisor_prefix}coordination action=epic_status id={id}`"),
+        None => format!(
+            "`{supervisor_prefix}coordination action=epic_status id=<focused-epic>`"
+        ),
+    };
+    let list_awaiting =
+        format!("`{supervisor_prefix}task action=list status=awaiting_merge`");
+    let show = format!("`{supervisor_prefix}task action=show id={}`", task.task_id);
+    let reclose = format!(
+        "`{supervisor_prefix}task action=close id={}`",
+        task.task_id
+    );
+    let rejection = task
+        .close_rejected_reason
+        .as_deref()
+        .unwrap_or("MERGE REQUIRED");
+
+    format!(
+        "⚠️ MERGE REQUIRED — supervisor action needed (not a task completion).\n\
+         Worker {worker} is idle while task {} ({}) is {} (close rejected: {rejection}).\n\
+         Source branch: {factory_branch}\n\
+         Merge target: {target}\n\
+         Next action — drain the merge queue before free-form user chat:\n\
+         1. Confirm: {epic_status} and/or {list_awaiting}\n\
+         2. Merge {factory_branch} into {target} (FF preferred; else `git merge --no-ff {factory_branch}` on the epic branch)\n\
+         3. Push the epic branch if remote tracking applies\n\
+         4. Tell {worker} to re-close with {reclose} (or use the supervisor escape-hatch close after merge if the worker is unresponsive)\n\
+         5. Then clear context / hand the worker their next task if more work is ready\n\
+         Live task state: {show}\n\
+         This is a push-based WorkerIdle close-rejected signal — do not poll or sleep.",
+        task.task_id, task.task_title, task.task_status
+    )
+}
+
 /// Generate a prompt for a detected event
 ///
 /// Returns `Some(Prompt)` if a prompt should be sent for this event,
@@ -471,9 +559,8 @@ pub fn generate_prompt(
 
             if let Some(task) = active_task {
                 // cas-728b/cas-627f: Blocked and AwaitingMerge are
-                // supervisor-parked states, but this branch is already an
-                // INFORMATIONAL status update ("task X is still {status}"),
-                // not the worker-assistance "please assign this idle worker
+                // supervisor-parked states. This arm is NOT the
+                // worker-assistance "please assign this idle worker
                 // something" ping (that's the `ready_count` branch below,
                 // reached only when `active_task` is `None`). An earlier
                 // version of this fix unconditionally suppressed this arm
@@ -487,18 +574,28 @@ pub fn generate_prompt(
                 // once per sustained idle streak, not every 2s tick, and
                 // `IDLE_RATE_LIMIT` floors any streak-reset repeat to once
                 // per 5 minutes. No additional suppression needed here.
-                let rejection = task
-                    .close_rejected_reason
-                    .as_deref()
-                    .map(|reason| format!(", close rejected ({reason})"))
-                    .unwrap_or_default();
-                let text = format!(
-                    "Worker {worker} is idle while task {} ({}) is still {}{}.\n\
-                     This is a worker-lifecycle idle signal, not a task completion.\n\
-                     Check live state: `{supervisor_prefix}task action=show id={}`\n\
-                     If close was rejected, resolve the rejection before acting on the task as closed.",
-                    task.task_id, task.task_title, task.task_status, rejection, task.task_id
-                );
+                //
+                // cas-c145: when the park is specifically MERGE REQUIRED /
+                // AwaitingMerge, upgrade from vague "resolve the rejection"
+                // to an actionable merge-queue prompt (task, factory branch,
+                // epic target, next steps). Other close-rejection reasons
+                // keep the informational wording.
+                let text = if is_merge_required_idle(task) {
+                    merge_required_idle_prompt_text(worker, task, data, supervisor_prefix)
+                } else {
+                    let rejection = task
+                        .close_rejected_reason
+                        .as_deref()
+                        .map(|reason| format!(", close rejected ({reason})"))
+                        .unwrap_or_default();
+                    format!(
+                        "Worker {worker} is idle while task {} ({}) is still {}{}.\n\
+                         This is a worker-lifecycle idle signal, not a task completion.\n\
+                         Check live state: `{supervisor_prefix}task action=show id={}`\n\
+                         If close was rejected, resolve the rejection before acting on the task as closed.",
+                        task.task_id, task.task_title, task.task_status, rejection, task.task_id
+                    )
+                };
 
                 return Some(Prompt {
                     target: supervisor_name.to_string(),
@@ -1283,6 +1380,166 @@ mod tests {
         assert!(
             !lower.contains("done") && !lower.contains("finished"),
             "idle close-rejection prompt must not use completion-flavored wording: {}",
+            prompt.text
+        );
+        // cas-c145: MERGE REQUIRED upgrades to an actionable merge-queue prompt.
+        assert!(
+            prompt.text.contains("factory/swift-fox"),
+            "merge-required idle must name the factory source branch: {}",
+            prompt.text
+        );
+    }
+
+    /// cas-c145: AwaitingMerge idle must be an actionable merge-queue event
+    /// (task + factory branch + epic target + next action), not a vague
+    /// "resolve the rejection" hint. Push-based — no polling loop wording.
+    #[test]
+    fn test_c145_awaiting_merge_idle_is_actionable_merge_queue_prompt() {
+        let event = DirectorEvent::WorkerIdle {
+            worker: "recipe-be".to_string(),
+            active_task: Some(ActiveLeaseSummary {
+                task_id: "cas-8eff".to_string(),
+                task_title: "Backend recipes API".to_string(),
+                task_status: TaskStatus::AwaitingMerge,
+                close_rejected_reason: Some("MERGE REQUIRED".to_string()),
+            }),
+        };
+        let mut data = make_data(0);
+        // make_data seeds a single agent named swift-fox; re-point it so the
+        // live-worker session-id guard accepts recipe-be.
+        data.agents[0].name = "recipe-be".to_string();
+        data.agent_id_to_name
+            .insert("sess-id-abc123".to_string(), "recipe-be".to_string());
+        data.in_progress_tasks = vec![TaskSummary {
+            id: "cas-8eff".to_string(),
+            title: "Backend recipes API".to_string(),
+            status: TaskStatus::AwaitingMerge,
+            priority: Priority::MEDIUM,
+            assignee: Some("recipe-be".to_string()),
+            task_type: TaskType::Task,
+            epic: Some("cas-4c77".to_string()),
+            branch: None,
+            updated_at: None,
+        }];
+        data.epic_tasks = vec![TaskSummary {
+            id: "cas-4c77".to_string(),
+            title: "Dosha recipes epic".to_string(),
+            status: TaskStatus::InProgress,
+            priority: Priority::HIGH,
+            assignee: None,
+            task_type: TaskType::Epic,
+            epic: None,
+            branch: Some(
+                "epic/general-dosha-recipes-dual-mode-generation-standal-cas-4c77".to_string(),
+            ),
+            updated_at: None,
+        }];
+        let config = default_config();
+
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            SupervisorCli::Grok,
+            SupervisorCli::Grok,
+            &HashSet::new(),
+        )
+        .expect("AwaitingMerge idle must produce a supervisor prompt");
+
+        assert_eq!(prompt.target, "supervisor");
+        assert!(prompt.text.contains("cas-8eff"), "{}", prompt.text);
+        assert!(
+            prompt.text.contains("factory/recipe-be"),
+            "must name source factory branch: {}",
+            prompt.text
+        );
+        assert!(
+            prompt
+                .text
+                .contains("epic/general-dosha-recipes-dual-mode-generation-standal-cas-4c77"),
+            "must name merge target epic branch: {}",
+            prompt.text
+        );
+        assert!(
+            prompt.text.contains("cas__coordination action=epic_status id=cas-4c77")
+                || prompt.text.contains("epic_status"),
+            "must direct supervisor to epic_status with cas__ prefix for Grok: {}",
+            prompt.text
+        );
+        assert!(
+            prompt.text.contains("cas__task action=list status=awaiting_merge")
+                || prompt.text.contains("status=awaiting_merge"),
+            "must surface awaiting_merge list: {}",
+            prompt.text
+        );
+        assert!(
+            prompt.text.contains("git merge --no-ff factory/recipe-be")
+                || prompt.text.to_lowercase().contains("merge factory/recipe-be"),
+            "must include merge next action: {}",
+            prompt.text
+        );
+        assert!(
+            prompt.text.contains("re-close") || prompt.text.contains("action=close id=cas-8eff"),
+            "must resume normal close flow after merge: {}",
+            prompt.text
+        );
+        let lower = prompt.text.to_lowercase();
+        assert!(
+            !lower.contains("poll") || lower.contains("do not poll"),
+            "must not introduce a polling loop: {}",
+            prompt.text
+        );
+        assert!(
+            !lower.contains("assign"),
+            "AwaitingMerge must not be worded as idle-needing-assign: {}",
+            prompt.text
+        );
+        assert!(
+            !prompt.text.contains("resolve the rejection before acting"),
+            "must not keep the pre-cas-c145 vague wording: {}",
+            prompt.text
+        );
+    }
+
+    /// cas-c145 characterization: non-merge close rejections keep the
+    /// informational wording (not the merge-queue template).
+    #[test]
+    fn test_c145_non_merge_close_rejection_stays_informational() {
+        let event = DirectorEvent::WorkerIdle {
+            worker: "swift-fox".to_string(),
+            active_task: Some(ActiveLeaseSummary {
+                task_id: "cas-9999".to_string(),
+                task_title: "Lint gate".to_string(),
+                task_status: TaskStatus::InProgress,
+                close_rejected_reason: Some("CODE REVIEW REQUIRED".to_string()),
+            }),
+        };
+        let data = make_data(0);
+        let config = default_config();
+
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+            &HashSet::new(),
+        )
+        .unwrap();
+
+        assert!(prompt.text.contains("CODE REVIEW REQUIRED"));
+        assert!(
+            prompt.text.contains("resolve the rejection before acting"),
+            "non-merge rejections keep informational wording: {}",
+            prompt.text
+        );
+        assert!(
+            !prompt.text.contains("factory/swift-fox"),
+            "non-merge rejection must not use the merge-queue template: {}",
             prompt.text
         );
     }
