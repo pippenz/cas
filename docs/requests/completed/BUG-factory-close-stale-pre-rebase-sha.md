@@ -161,10 +161,16 @@ anchor is still ancestry-stranded, accept close via:
    `known_unmerged_factory_commits` → **KnownZero** on the live `factory/<assignee>`
    tip (or vs `origin/<parent>`). Unknown refs/merge-base/rev-list never authorize.
    This is not a blanket zero-ahead bypass of the fail-open legacy counter.
+3. **Cherry-equivalent patches of the parked anchor** (cas-5485 P2) —
+   `commit_patches_cherry_equivalent_on_parent` (`git cherry` all `-`, at least
+   one equivalent commit as positive evidence). Covers: park A → rebase A' →
+   integrate A' → later unmerged B on live HEAD. Does not require live
+   zero-ahead; evaluates the **task anchor**, so B cannot satisfy A. Fail-closed
+   on missing refs / failed cherry / empty / any `+`.
 
-Genuinely unmerged rebased work still Rejects (live tip KnownPositive; content
-absent). Serial-task protection (cas-4b3f) retained: later unmerged commits keep
-live KnownPositive so only the historical/content paths can clear task A.
+Genuinely unmerged rebased work still Rejects. Serial-task protection (cas-4b3f)
+retained for non-rebased anchors; after rebase, cherry-equivalence of A clears
+task A while B remains unmerged on the factory branch.
 
 The second repro in this report (docs-only task vs wrong repo/parent) is **out of
 scope** for cas-5485 (no code changes for non-epic default parent / zero-diff skip).
@@ -174,3 +180,6 @@ Regression coverage (`merge_state_gate_tests`):
 - `rebased_awaiting_merge_anchor_proceeds_after_post_rebase_tip_integrated`
 - `stale_pre_rebase_anchor_alone_is_stranded_after_rebase_integrate` (precondition)
 - `rebased_but_unmerged_work_still_rejects`
+- `rebased_integrated_a_with_later_unmerged_b_still_closes_a` (P2)
+- `later_unmerged_b_does_not_satisfy_unintegrated_anchor_a` (P2 safety)
+- `cherry_equivalent_fails_closed_on_missing_ref`

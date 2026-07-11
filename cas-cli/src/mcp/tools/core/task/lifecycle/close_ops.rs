@@ -2487,17 +2487,18 @@ pub(crate) enum MergeStateGateOutcome {
 ///
 /// ## cas-5485: stale pre-rebase factory SHA
 ///
-/// A normal `git rebase` rewrites parked tip A → A' (new SHA, same or
-/// conflict-resolved content). The first park still stores A. After A' is
-/// integrated into the parent, ancestry against A never clears, but the
-/// cas-2938 secondary paths accept when either the tip tree of A is on the
-/// parent (clean rewrite) or the live factory tip is KnownZero on the
-/// parent (post-rebase head fully integrated). In addition, when the
-/// historical anchor is **not** an ancestor of the live factory tip
-/// (history was rewritten) and the live tip is KnownZero on parent/origin,
-/// the gate treats the live tip as the authoritative refreshed SHA —
-/// auditable supersession of the pre-rebase identity without a blanket
-/// zero-ahead bypass (Unknown never clears).
+/// A normal `git rebase` rewrites parked tip A → A' (new SHA). The first
+/// park still stores A. After A' is integrated, ancestry against A never
+/// clears. Secondary acceptance (fail-closed):
+///
+/// 1. **Tip-tree reachability** of A on parent (identical tip tree).
+/// 2. **Live tip KnownZero** — factory HEAD fully integrated (no later
+///    unmerged work). Does not help when serial task B advanced HEAD.
+/// 3. **Cherry-equivalent patches of A on parent** — `git cherry` reports
+///    every commit unique to A as equivalent (`-`) on parent/origin. This
+///    is the task-specific proof for the rebased form A': it does **not**
+///    require live HEAD to be zero-ahead, so serial B cannot mask or
+///    satisfy task A. Unknown/failed cherry → not integrated (fail closed).
 pub(crate) fn run_factory_branch_merge_gate(
     task: &Task,
     _req: &TaskCloseRequest,
@@ -2570,13 +2571,11 @@ pub(crate) fn run_factory_branch_merge_gate(
 
     // cas-2938 / cas-5485: when a trusted historical anchor still looks
     // stranded by ancestry (squash A→B, or rebase A→A'), accept close if
-    // either the anchor tip's *tree* is already on the parent (clean
-    // rewrite) or the live factory tip is KnownZero on parent/origin
-    // (post-rewrite head fully integrated — authoritative SHA refresh).
-    // Neither path deletes the historical anchor; later serial-task
-    // commits leave live stranded > 0 (KnownPositive), and content check
-    // only clears when A's tree is genuinely present on the integration
-    // branch. Unknown Git state never authorizes close.
+    // tip-tree, live KnownZero, or cherry-equivalent patches of the
+    // *parked anchor* are on parent. Live KnownZero alone cannot cover
+    // serial task B on the same factory branch; cherry-equivalence is
+    // task-specific to A and cannot be satisfied by B's unmerged commits.
+    // Unknown Git state never authorizes close.
     if task.status == TaskStatus::AwaitingMerge
         && task.deliverables.factory_branch_anchor.is_some()
         && commit_ish != factory_branch.as_str()
@@ -2590,15 +2589,29 @@ pub(crate) fn run_factory_branch_merge_gate(
             return MergeStateGateOutcome::Proceed;
         }
 
-        // cas-2938 P0 / cas-5485: live factory tip is the refreshed SHA
-        // after rebase/force-push. Accept ONLY on KnownZero — never the
-        // fail-open `count_unmerged_factory_commits(...) == 0`.
+        // cas-2938 P0 / cas-5485: live factory tip KnownZero after rewrite.
         if live_factory_tip_known_fully_merged(
             repo_path,
             factory_branch.as_str(),
             parent_branch,
             &origin_parent_branch,
         ) {
+            return MergeStateGateOutcome::Proceed;
+        }
+
+        // cas-5485 P2: rebased A' integrated while live HEAD carries later
+        // unmerged B — prove parked anchor A via patch-id equivalence on
+        // parent (not live HEAD zero-ahead). B cannot satisfy this check.
+        if commit_patches_cherry_equivalent_on_parent(repo_path, commit_ish, parent_branch) {
+            return MergeStateGateOutcome::Proceed;
+        }
+        if git_ref_exists(repo_path, &origin_parent_branch)
+            && commit_patches_cherry_equivalent_on_parent(
+                repo_path,
+                commit_ish,
+                &origin_parent_branch,
+            )
+        {
             return MergeStateGateOutcome::Proceed;
         }
     }
@@ -2765,6 +2778,69 @@ fn live_factory_tip_known_fully_merged(
             known_unmerged_factory_commits(repo_path, factory_branch, origin_parent_branch),
             KnownUnmergedCount::KnownZero
         )
+}
+
+/// cas-5485 P2: true when every commit unique to `commit_ish` (vs
+/// `parent_ref`) has a patch-id-equivalent commit on `parent_ref`
+/// (`git cherry` marks them `-`).
+///
+/// Used when a parked pre-rebase tip A was rewritten to A' and A' is
+/// integrated, but the live factory HEAD carries later unmerged work B
+/// (so live KnownZero cannot clear). Equivalence is evaluated against
+/// the **parked task anchor**, never against live HEAD — so B cannot
+/// satisfy task A.
+///
+/// Fail-closed: missing refs, unsafe names, failed `git cherry`, empty
+/// output (no positive evidence), or any `+` (non-equivalent) line →
+/// false.
+fn commit_patches_cherry_equivalent_on_parent(
+    repo_path: &std::path::Path,
+    commit_ish: &str,
+    parent_ref: &str,
+) -> bool {
+    use std::process::Command;
+
+    if !is_safe_git_refname(commit_ish) || !is_safe_git_refname(parent_ref) {
+        return false;
+    }
+    if !git_ref_exists(repo_path, commit_ish) || !git_ref_exists(repo_path, parent_ref) {
+        return false;
+    }
+
+    // `git cherry <upstream> <head>` lists commits reachable from head but
+    // not upstream; prefix `-` = equivalent patch on upstream, `+` = not.
+    let cherry_out = Command::new("git")
+        .args(["cherry", parent_ref, commit_ish])
+        .current_dir(repo_path)
+        .output();
+    let Ok(o) = cherry_out else {
+        return false;
+    };
+    if !o.status.success() {
+        return false;
+    }
+
+    let stdout = String::from_utf8_lossy(&o.stdout);
+    let mut saw_equivalent = false;
+    for line in stdout.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        // Lines look like "+ <sha>" or "- <sha>".
+        if t.starts_with('+') {
+            return false;
+        }
+        if t.starts_with('-') {
+            saw_equivalent = true;
+            continue;
+        }
+        // Unrecognized cherry output is not evidence of equivalence.
+        return false;
+    }
+    // Empty output is not positive proof (already-ancestor cases are
+    // handled by the primary ancestry path; fail closed here).
+    saw_equivalent
 }
 
 /// Explicit success-bearing counterpart to [`count_unmerged_factory_commits`].
@@ -6790,6 +6866,122 @@ mod merge_state_gate_tests {
         assert!(
             matches!(out, MergeStateGateOutcome::Reject(_)),
             "rebased but unmerged work must still Reject, got {out:?}"
+        );
+    }
+
+    /// cas-5485 P2: park A → rebase A' → integrate A' → unmerged serial B
+    /// on the same factory branch. Live KnownZero fails (B ahead); tip-tree
+    /// of pre-rebase A differs from A' after rebase onto parent files.
+    /// Cherry-equivalence of parked A must still clear task A without
+    /// letting B satisfy the gate.
+    #[test]
+    fn rebased_integrated_a_with_later_unmerged_b_still_closes_a() {
+        let dir = init_factory_repo("worker");
+        let p = dir.path();
+
+        std::fs::write(p.join("a.rs"), "// a\n").unwrap();
+        git(p, &["add", "a.rs"]);
+        git(p, &["commit", "-q", "-m", "feat: task A"]);
+        let anchor_a = rev_parse_local(p, "HEAD");
+
+        // Parent advances; rebase A→A'; integrate A'.
+        git(p, &["checkout", "-q", "main"]);
+        std::fs::write(p.join("other.rs"), "// other\n").unwrap();
+        git(p, &["add", "other.rs"]);
+        git(p, &["commit", "-q", "-m", "feat: other worker"]);
+        git(p, &["checkout", "-q", "factory/worker"]);
+        git(p, &["rebase", "-q", "main"]);
+        let tip_a_prime = rev_parse_local(p, "HEAD");
+        assert_ne!(anchor_a, tip_a_prime, "precondition: rebase rewrites SHA");
+        git(p, &["checkout", "-q", "main"]);
+        git(p, &["merge", "-q", "--no-ff", "factory/worker", "-m", "merge A'"]);
+        git(p, &["checkout", "-q", "factory/worker"]);
+
+        // Serial task B unmerged on the same factory branch.
+        std::fs::write(p.join("b.rs"), "// b task B unmerged\n").unwrap();
+        git(p, &["add", "b.rs"]);
+        git(p, &["commit", "-q", "-m", "feat: task B (unmerged)"]);
+
+        assert!(
+            matches!(
+                known_unmerged_factory_commits(p, "factory/worker", "main"),
+                KnownUnmergedCount::KnownPositive(_)
+            ),
+            "precondition: live tip carries B — KnownZero path must not apply"
+        );
+        assert_eq!(
+            count_unmerged_factory_commits(p, &anchor_a, "main"),
+            1,
+            "precondition: pre-rebase A still ancestry-stranded"
+        );
+        assert!(
+            !commit_tip_tree_reachable_from(p, &anchor_a, "main"),
+            "precondition: tip-tree of pre-rebase A is not on main after \
+             rebase onto parent-with-other (trees differ)"
+        );
+        assert!(
+            commit_patches_cherry_equivalent_on_parent(p, &anchor_a, "main"),
+            "precondition: patch of A must be cherry-equivalent on main via A'"
+        );
+
+        let mut task_a = worker_task("worker");
+        task_a.status = TaskStatus::AwaitingMerge;
+        task_a.deliverables.factory_branch_anchor = Some(anchor_a);
+        let req = base_req(&task_a.id);
+        let out = run_factory_branch_merge_gate(&task_a, &req, "main", p);
+        assert!(
+            matches!(out, MergeStateGateOutcome::Proceed),
+            "task A must close after A' integrated even with later unmerged \
+             B on live factory HEAD (cas-5485 P2), got {out:?}"
+        );
+    }
+
+    /// cas-5485 P2 safety: later unmerged B must not clear close for an
+    /// anchor whose patches are still absent from the parent.
+    #[test]
+    fn later_unmerged_b_does_not_satisfy_unintegrated_anchor_a() {
+        let dir = init_factory_repo("worker");
+        let p = dir.path();
+
+        // Anchor A — never integrated (no rebase, no merge).
+        std::fs::write(p.join("a.rs"), "// a only on factory\n").unwrap();
+        git(p, &["add", "a.rs"]);
+        git(p, &["commit", "-q", "-m", "feat: task A never integrated"]);
+        let anchor_a = rev_parse_local(p, "HEAD");
+
+        // Task B on same branch — also unmerged.
+        std::fs::write(p.join("b.rs"), "// b\n").unwrap();
+        git(p, &["add", "b.rs"]);
+        git(p, &["commit", "-q", "-m", "feat: task B"]);
+
+        assert!(
+            !commit_patches_cherry_equivalent_on_parent(p, &anchor_a, "main"),
+            "precondition: A's patch is not on main"
+        );
+
+        let mut task_a = worker_task("worker");
+        task_a.status = TaskStatus::AwaitingMerge;
+        task_a.deliverables.factory_branch_anchor = Some(anchor_a);
+        let req = base_req(&task_a.id);
+        let out = run_factory_branch_merge_gate(&task_a, &req, "main", p);
+        assert!(
+            matches!(out, MergeStateGateOutcome::Reject(_)),
+            "unintegrated A must still Reject even when live HEAD has later \
+             commits (B must not satisfy A), got {out:?}"
+        );
+    }
+
+    #[test]
+    fn cherry_equivalent_fails_closed_on_missing_ref() {
+        let dir = init_factory_repo("worker");
+        let p = dir.path();
+        assert!(
+            !commit_patches_cherry_equivalent_on_parent(p, "factory/ghost", "main"),
+            "missing commit-ish must fail closed"
+        );
+        assert!(
+            !commit_patches_cherry_equivalent_on_parent(p, "factory/worker", "no-such-parent"),
+            "missing parent must fail closed"
         );
     }
 
