@@ -23,6 +23,20 @@ use tokio::sync::Mutex;
 
 use cas_recording::{RecordingWriter, WriterConfig};
 
+/// How user input is classified for turn-submit side effects (cas-7f6f).
+///
+/// One explicit submit API across terminal, GUI, WebSocket, and relay surfaces.
+/// Structured paste/drop never marks turn-in-flight even when CR/LF is embedded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserInputKind {
+    /// Keyboard / keystroke stream. Lone CR/LF (or a multi-byte keystream
+    /// chunk ending in CR/LF) marks a true prompt submit.
+    KeyStream,
+    /// Bracketed paste, image drop, or other structured non-keyboard input.
+    /// Never marks turn-in-flight.
+    StructuredPaste,
+}
+
 /// Unique identifier for a pane
 pub type PaneId = String;
 
@@ -102,16 +116,21 @@ pub struct Pane {
     created_at: std::time::Instant,
     /// Authoritative in-flight turn flag (cas-7f6f).
     ///
-    /// Set at control points that start a turn (true prompt submit / inject);
-    /// cleared on cancel (`break_turn` / `interrupt`), Stop-forward, or
-    /// normal completion ([`Self::mark_turn_completed`]). Not set by output
-    /// redraws or paste/drop payloads.
+    /// Set at control points that start a turn (true prompt submit / inject via
+    /// [`UserInputKind::KeyStream`]); cleared on cancel (`break_turn` /
+    /// `interrupt`) or authoritative harness completion
+    /// ([`Self::mark_turn_completed`] from Grok `events.jsonl` `turn_ended`).
+    /// Not set by output redraws, paste/drop, or generic SGR clicks.
+    /// Not cleared by PTY quiet timers (long tool waits stay in-flight).
     turn_in_flight: std::sync::atomic::AtomicBool,
-    /// Whether the current in-flight turn has emitted any PTY output (for
-    /// normal-completion detection after the model has actually started).
-    turn_saw_output: std::sync::atomic::AtomicBool,
-    /// Last output time while a turn is in-flight (completion quiet window).
-    turn_last_output_at: std::sync::Mutex<Option<std::time::Instant>>,
+    /// Harness session id (`CAS_SESSION_ID` / Grok `--session-id`).
+    /// Used to locate `~/.grok/sessions/*/<id>/events.jsonl` for turn completion.
+    harness_session_id: std::sync::Mutex<Option<String>>,
+    /// Byte offset into the harness events file when the current turn started.
+    /// Only events after this offset can complete the turn.
+    turn_events_byte_offset: std::sync::Mutex<Option<u64>>,
+    /// Test/override path for harness events (skips session-id lookup).
+    harness_events_path_override: std::sync::Mutex<Option<PathBuf>>,
     /// Whether the inner process is currently in alt-screen mode.
     ///
     /// Tracked by watching for DEC private mode set/reset sequences in `feed()`:
@@ -178,8 +197,9 @@ impl Pane {
             total_bytes_received: 0,
             created_at: std::time::Instant::now(),
             turn_in_flight: std::sync::atomic::AtomicBool::new(false),
-            turn_saw_output: std::sync::atomic::AtomicBool::new(false),
-            turn_last_output_at: std::sync::Mutex::new(None),
+            harness_session_id: std::sync::Mutex::new(None),
+            turn_events_byte_offset: std::sync::Mutex::new(None),
+            harness_events_path_override: std::sync::Mutex::new(None),
             in_alt_screen: false,
             has_hyperlinks: false,
             partial_esc: Vec::new(),
@@ -353,8 +373,13 @@ impl Pane {
             teams,
         );
         push_factory_session_env(&mut config, cli, factory_session);
+        let session_id = cas_session_id_from_config(&config);
         let pty = Pty::spawn(name, config)?;
-        Self::with_pty(name, PaneKind::Worker, pty, rows, cols, cli)
+        let pane = Self::with_pty(name, PaneKind::Worker, pty, rows, cols, cli)?;
+        if let Some(sid) = session_id {
+            pane.set_harness_session_id(sid);
+        }
+        Ok(pane)
     }
 
     /// Build the `PtyConfig` that `supervisor()` would spawn, without actually
@@ -449,8 +474,13 @@ impl Pane {
             teams,
         );
         push_factory_session_env(&mut config, cli, factory_session);
+        let session_id = cas_session_id_from_config(&config);
         let pty = Pty::spawn(name, config)?;
-        Self::with_pty(name, PaneKind::Supervisor, pty, rows, cols, cli)
+        let pane = Self::with_pty(name, PaneKind::Supervisor, pty, rows, cols, cli)?;
+        if let Some(sid) = session_id {
+            pane.set_harness_session_id(sid);
+        }
+        Ok(pane)
     }
 
     fn push_supervisor_env(
@@ -1011,13 +1041,6 @@ impl Pane {
 
         if !coalesced.is_empty() {
             self.total_bytes_received += coalesced.len() as u64;
-            if self.is_turn_in_flight() {
-                self.turn_saw_output
-                    .store(true, std::sync::atomic::Ordering::Release);
-                if let Ok(mut guard) = self.turn_last_output_at.lock() {
-                    *guard = Some(std::time::Instant::now());
-                }
-            }
             let feed_data = Self::strip_literal_cursor_reports(&coalesced);
             if let Err(e) = self.feed(feed_data.as_ref()) {
                 tracing::warn!(
@@ -1026,9 +1049,12 @@ impl Pane {
                     e
                 );
             }
-        } else {
-            // No new bytes this poll — maybe the in-flight turn finished.
-            self.maybe_complete_turn_after_quiet();
+        }
+
+        // Authoritative harness completion (Grok events.jsonl turn_ended).
+        // Never use PTY quiet timers — long MCP/tool waits stay in-flight.
+        if self.is_turn_in_flight() {
+            self.refresh_harness_turn_state();
         }
 
         // Return the coalesced data directly — no clone needed since take()
@@ -1074,20 +1100,38 @@ impl Pane {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// Quiet window after the last in-flight output before we treat the turn
-    /// as normally completed (cas-7f6f). Longer than mid-tool blips (>2s quiet
-    /// still cancelable) but finite so Esc returns to idle after a finished turn.
-    pub const TURN_COMPLETE_QUIET: std::time::Duration =
-        std::time::Duration::from_secs(8);
+    /// Set the harness session id (from `CAS_SESSION_ID` at spawn).
+    pub fn set_harness_session_id(&self, session_id: impl Into<String>) {
+        if let Ok(mut guard) = self.harness_session_id.lock() {
+            *guard = Some(session_id.into());
+        }
+    }
+
+    /// Harness session id, if known.
+    pub fn harness_session_id(&self) -> Option<String> {
+        self.harness_session_id
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+    }
+
+    /// Override the harness events path (tests only).
+    pub fn set_harness_events_path_for_test(&self, path: impl Into<PathBuf>) {
+        if let Ok(mut guard) = self.harness_events_path_override.lock() {
+            *guard = Some(path.into());
+        }
+    }
 
     /// Mark that a turn has started (true prompt submit or inject).
+    ///
+    /// Snapshots the harness events file length so only later `turn_ended`
+    /// events can complete this turn.
     pub fn mark_turn_in_flight(&self) {
         self.turn_in_flight
             .store(true, std::sync::atomic::Ordering::Release);
-        self.turn_saw_output
-            .store(false, std::sync::atomic::Ordering::Release);
-        if let Ok(mut guard) = self.turn_last_output_at.lock() {
-            *guard = None;
+        let offset = self.harness_events_len().unwrap_or(0);
+        if let Ok(mut guard) = self.turn_events_byte_offset.lock() {
+            *guard = Some(offset);
         }
     }
 
@@ -1095,9 +1139,7 @@ impl Pane {
     pub fn clear_turn_in_flight(&self) {
         self.turn_in_flight
             .store(false, std::sync::atomic::Ordering::Release);
-        self.turn_saw_output
-            .store(false, std::sync::atomic::Ordering::Release);
-        if let Ok(mut guard) = self.turn_last_output_at.lock() {
+        if let Ok(mut guard) = self.turn_events_byte_offset.lock() {
             *guard = None;
         }
     }
@@ -1107,38 +1149,61 @@ impl Pane {
         self.clear_turn_in_flight();
     }
 
-    /// If an in-flight turn has produced output and then gone quiet for
-    /// [`Self::TURN_COMPLETE_QUIET`], mark it completed.
+    /// Refresh in-flight state from the harness's authoritative turn signal.
     ///
-    /// Quiet mid-turn *before* any response (or tool gaps shorter than the
-    /// window) stays in-flight so Esc still cancels. Idle redraws never set
-    /// in-flight on their own.
-    pub fn maybe_complete_turn_after_quiet(&self) {
+    /// For Grok: reads `events.jsonl` after the offset captured at submit and
+    /// clears on any `turn_ended` (outcomes completed|error|cancelled).
+    /// Quiet PTY output alone never clears — long MCP/tool waits stay active.
+    pub fn refresh_harness_turn_state(&self) {
         if !self.is_turn_in_flight() {
             return;
         }
-        if !self
-            .turn_saw_output
-            .load(std::sync::atomic::Ordering::Acquire)
+        // Only Grok has an on-disk turn_ended signal we consume here.
+        // Claude/Codex clear via break_turn/interrupt or explicit completion.
+        if self.harness != SupervisorCli::Grok
+            && self
+                .harness_events_path_override
+                .lock()
+                .ok()
+                .and_then(|g| g.clone())
+                .is_none()
         {
             return;
         }
-        let Some(last) = self.turn_last_output_at.lock().ok().and_then(|g| *g) else {
+        let Some(path) = self.resolve_harness_events_path() else {
             return;
         };
-        if last.elapsed() >= Self::TURN_COMPLETE_QUIET {
+        let start = self
+            .turn_events_byte_offset
+            .lock()
+            .ok()
+            .and_then(|g| *g)
+            .unwrap_or(0);
+        let Ok(data) = std::fs::read(&path) else {
+            return;
+        };
+        if (data.len() as u64) <= start {
+            return;
+        }
+        let suffix = &data[start as usize..];
+        if harness_events_suffix_has_turn_ended(suffix) {
             self.mark_turn_completed();
         }
     }
 
-    /// Test helper: simulate that an in-flight turn produced output `ago` ago
-    /// (for quiet-active vs completion tests without sleeping).
-    pub fn test_set_turn_last_output_ago(&self, ago: std::time::Duration) {
-        self.turn_saw_output
-            .store(true, std::sync::atomic::Ordering::Release);
-        if let Ok(mut guard) = self.turn_last_output_at.lock() {
-            *guard = Some(std::time::Instant::now() - ago);
+    fn resolve_harness_events_path(&self) -> Option<PathBuf> {
+        if let Ok(guard) = self.harness_events_path_override.lock() {
+            if let Some(ref p) = *guard {
+                return Some(p.clone());
+            }
         }
+        let sid = self.harness_session_id()?;
+        find_grok_events_jsonl(&sid)
+    }
+
+    fn harness_events_len(&self) -> Option<u64> {
+        let path = self.resolve_harness_events_path()?;
+        std::fs::metadata(path).ok().map(|m| m.len())
     }
 
     /// Whether this pane is ready to accept prompt injection.
@@ -1177,6 +1242,33 @@ impl Pane {
     /// multi-byte paste/drop payload that happens to embed newlines.
     pub fn is_true_prompt_submit(data: &[u8]) -> bool {
         matches!(data, b"\r" | b"\n" | b"\r\n")
+    }
+
+    /// Whether a [`UserInputKind::KeyStream`] chunk should mark turn-in-flight.
+    ///
+    /// Lone CR/LF (terminal per-key Enter) or a multi-byte keystream ending in
+    /// CR/LF (GUI/WS line + Enter). Bracketed paste must use
+    /// [`UserInputKind::StructuredPaste`] instead — it never marks submit.
+    pub fn key_stream_is_submit(data: &[u8]) -> bool {
+        if data.is_empty() {
+            return false;
+        }
+        if Self::is_true_prompt_submit(data) {
+            return true;
+        }
+        // Multi-byte keystream chunks may be "typed text + Enter".
+        data.ends_with(b"\r") || data.ends_with(b"\n")
+    }
+
+    /// Deliver user input with explicit submit semantics (cas-7f6f).
+    ///
+    /// - [`UserInputKind::KeyStream`]: marks turn-in-flight on true submit
+    /// - [`UserInputKind::StructuredPaste`]: never marks (paste/drop)
+    pub async fn deliver_user_input(&self, data: &[u8], kind: UserInputKind) -> Result<()> {
+        if matches!(kind, UserInputKind::KeyStream) && Self::key_stream_is_submit(data) {
+            self.mark_turn_in_flight();
+        }
+        self.write(data).await
     }
 
     /// Break the current turn with a harness-aware cancel payload (cas-7f6f).
@@ -1387,6 +1479,52 @@ impl Pane {
     pub fn is_recording(&self) -> bool {
         self.recorder.is_some()
     }
+}
+
+fn cas_session_id_from_config(config: &PtyConfig) -> Option<String> {
+    config
+        .env
+        .iter()
+        .find(|(k, _)| k == "CAS_SESSION_ID")
+        .map(|(_, v)| v.clone())
+}
+
+/// Grok sessions root: `$GROK_HOME/sessions` or `~/.grok/sessions`.
+fn grok_sessions_dir() -> Option<PathBuf> {
+    if let Ok(home) = std::env::var("GROK_HOME") {
+        return Some(PathBuf::from(home).join("sessions"));
+    }
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join(".grok").join("sessions"))
+}
+
+/// Locate `~/.grok/sessions/*/<session_id>/events.jsonl`.
+fn find_grok_events_jsonl(session_id: &str) -> Option<PathBuf> {
+    let sessions = grok_sessions_dir()?;
+    let entries = std::fs::read_dir(sessions).ok()?;
+    for entry in entries.flatten() {
+        let candidate = entry.path().join(session_id).join("events.jsonl");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Whether a suffix of `events.jsonl` contains a `turn_ended` event.
+fn harness_events_suffix_has_turn_ended(suffix: &[u8]) -> bool {
+    for line in suffix.split(|&b| b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v.get("type").and_then(|t| t.as_str()) == Some("turn_ended") {
+            return true;
+        }
+    }
+    false
 }
 
 pub(crate) fn push_factory_session_env(

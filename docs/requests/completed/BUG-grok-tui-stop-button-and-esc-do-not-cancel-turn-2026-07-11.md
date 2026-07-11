@@ -199,3 +199,9 @@ Exit 0 on both.
 1. Normal completion: mark_turn_completed + quiet-after-saw-output window (TURN_COMPLETE_QUIET); submit→quiet→complete→idle test.
 2. Only true keyboard Enter/inject marks turn_in_flight; bracketed paste/drop never do.
 3. Image drop uses pane_at_screen_for(geometry) so compact/full maps stay independent.
+
+### Review follow-up 4 (cas-7f6f)
+1. Removed 8s/output quiet completion — long MCP/tool waits false-completed active turns.
+2. Authoritative Grok completion: `events.jsonl` `turn_ended` (offset after submit); quiet >8s stays cancelable.
+3. Unified `Mux::deliver_user_input(data, UserInputKind::{KeyStream,StructuredPaste})` across terminal, GUI, WebSocket, relay; paste/drop are StructuredPaste only.
+4. Generic SGR click never clears `turn_in_flight`; Stop completion via harness `turn_ended` / Esc via `break_turn`.

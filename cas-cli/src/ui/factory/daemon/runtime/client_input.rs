@@ -171,6 +171,7 @@ impl FactoryDaemon {
                                             bytes = payload.len(),
                                             "alt-screen scroll up: forwarding wheel payload to PTY"
                                         );
+                                        // Scroll is not a prompt submit.
                                         let _ = self.app.mux.send_input(&payload).await;
                                     }
                                     // ScrollAction::Done: scroll was handled by handle_scroll_up.
@@ -214,8 +215,11 @@ impl FactoryDaemon {
                                             col: pty_col,
                                             row: pty_row,
                                         } => {
-                                            // cas-7f6f: deliver SGR click so Grok's
-                                            // on-screen Stop control can cancel.
+                                            // cas-7f6f: forward SGR so Grok's on-screen
+                                            // Stop can cancel inside the harness. Do NOT
+                                            // clear turn_in_flight here — generic clicks
+                                            // (non-Stop) must preserve active; Stop
+                                            // completion comes from Grok turn_ended.
                                             let payload = sgr_left_click_bytes(pty_col, pty_row);
                                             tracing::debug!(
                                                 %pane,
@@ -226,8 +230,6 @@ impl FactoryDaemon {
                                             );
                                             let _ =
                                                 self.app.mux.send_input_to(&pane, &payload).await;
-                                            // Stop click ends the turn authoritatively.
-                                            self.app.mux.note_turn_completed(&pane);
                                         }
                                     }
                                 }
@@ -250,10 +252,17 @@ impl FactoryDaemon {
                                     let target = self.resolve_drop_target(col, row, geometry);
                                     if let Some(target_pane) = target {
                                         let _ = self.app.mux.focus(&target_pane);
-                                        // Bracketed paste only — never marks turn-in-flight.
+                                        // StructuredPaste — never marks turn-in-flight.
                                         let payload = bracketed_paste_bytes(&path);
-                                        if let Err(e) =
-                                            self.app.mux.send_input_to(&target_pane, &payload).await
+                                        if let Err(e) = self
+                                            .app
+                                            .mux
+                                            .deliver_user_input_to(
+                                                &target_pane,
+                                                &payload,
+                                                cas_mux::UserInputKind::StructuredPaste,
+                                            )
+                                            .await
                                         {
                                             tracing::warn!(
                                                 "Failed to deliver dropped image payload to {}: {}",
@@ -280,10 +289,18 @@ impl FactoryDaemon {
                                     // walks one byte at a time) keeps embedded
                                     // newlines/control bytes literal, so the inner
                                     // CLI stops submitting mid-paste (cas-5702).
-                                    // Must not mark turn-in-flight (embedded CR/LF).
+                                    // StructuredPaste — never marks turn-in-flight.
                                     if self.app.focused_accepts_input() {
                                         let bytes = bracketed_paste_bytes(&payload);
-                                        if let Err(e) = self.app.mux.send_input(&bytes).await {
+                                        if let Err(e) = self
+                                            .app
+                                            .mux
+                                            .deliver_user_input(
+                                                &bytes,
+                                                cas_mux::UserInputKind::StructuredPaste,
+                                            )
+                                            .await
+                                        {
                                             tracing::warn!(
                                                 "Failed to deliver paste payload: {}",
                                                 e
@@ -777,8 +794,9 @@ impl FactoryDaemon {
                     continue;
                 } else if is_standalone_esc && self.app.focused_accepts_input() {
                     // cas-7f6f: Grok mid-turn Esc is a no-op (0.2.93). Only
-                    // rewrite Esc→cancel when the pane has recent output
-                    // (turn likely active). Idle keeps raw Esc for clear/rewind.
+                    // rewrite Esc→cancel when turn_in_flight is set (submit/
+                    // inject; cleared by break_turn or Grok turn_ended).
+                    // Idle keeps raw Esc for clear/rewind.
                     use crate::ui::factory::app::GrokEscAction;
                     if self.app.focused_harness() == cas_mux::SupervisorCli::Grok {
                         match self.app.focused_grok_esc_action() {
@@ -939,15 +957,13 @@ impl FactoryDaemon {
                     continue;
                 }
 
-                // True keyboard Enter/Return is a prompt submit (cas-7f6f).
-                // Bracketed paste/image-drop go through a different path with
-                // multi-byte payloads — they must not mark turn-in-flight.
-                if byte == b'\r' || byte == b'\n' {
-                    self.app.mux.note_prompt_submit_focused();
-                }
-
-                // Forward all other input (including Tab) to the focused pane
-                let _ = self.app.mux.send_input(&[byte]).await;
+                // Unified submit API (cas-7f6f): KeyStream marks on true Enter;
+                // paste/drop use StructuredPaste elsewhere and never mark here.
+                let _ = self
+                    .app
+                    .mux
+                    .deliver_user_input(&[byte], cas_mux::UserInputKind::KeyStream)
+                    .await;
                 i += 1;
                 continue;
             }

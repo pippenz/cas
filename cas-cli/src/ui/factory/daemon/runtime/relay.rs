@@ -385,8 +385,12 @@ impl FactoryDaemon {
             return;
         }
 
-        // Forward input to the focused pane (same as local client input)
-        let _ = self.app.mux.send_input(data).await;
+        // Unified KeyStream submit API (cas-7f6f) — same as terminal/GUI/WS.
+        let _ = self
+            .app
+            .mux
+            .deliver_user_input(data, cas_mux::UserInputKind::KeyStream)
+            .await;
     }
 
     fn handle_relay_resize(&mut self, client_id: &str, cols: u16, rows: u16) {
@@ -604,7 +608,11 @@ impl FactoryDaemon {
         } else {
             pane.to_string()
         };
-        let _ = self.app.mux.send_input_to(&actual_pane, data).await;
+        let _ = self
+            .app
+            .mux
+            .deliver_user_input_to(&actual_pane, data, cas_mux::UserInputKind::KeyStream)
+            .await;
     }
 
     /// Forward per-pane PTY output to web watchers.

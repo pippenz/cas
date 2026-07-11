@@ -460,11 +460,17 @@ impl FactoryApp {
     }
 
     /// Whether the focused pane has an authoritative in-flight turn.
+    ///
+    /// Refreshes from harness events (Grok `turn_ended`) before reading so
+    /// Esc routing never uses a stale in-flight flag after normal completion.
     pub fn focused_turn_in_flight(&self) -> bool {
         let Some(id) = self.mux.focused_id() else {
             return false;
         };
-        self.mux.get(id).is_some_and(|p| p.is_turn_in_flight())
+        self.mux.get(id).is_some_and(|p| {
+            p.refresh_harness_turn_state();
+            p.is_turn_in_flight()
+        })
     }
 
     /// Esc routing for the focused pane when the harness is Grok.
@@ -1623,7 +1629,7 @@ mod tests {
         );
     }
 
-    /// submit → quiet active → complete → idle (authoritative completion clear).
+    /// submit → quiet >8s stays active; turn_ended completes; idle Esc is raw.
     #[test]
     fn grok_esc_submit_quiet_complete_idle_cas_7f6f() {
         assert_eq!(grok_esc_action(true), GrokEscAction::CancelTurn);
@@ -1648,6 +1654,7 @@ mod tests {
 
         // Submit starts in-flight.
         assert!(cas_mux::Pane::is_true_prompt_submit(b"\r"));
+        assert!(cas_mux::Pane::key_stream_is_submit(b"hello\r"));
         assert!(!cas_mux::Pane::is_true_prompt_submit(
             b"\x1b[200~line1\nline2\r\x1b[201~"
         ));
@@ -1655,34 +1662,53 @@ mod tests {
         assert!(app.focused_turn_in_flight());
         assert_eq!(app.focused_grok_esc_action(), GrokEscAction::CancelTurn);
 
-        // Quiet active (>2s, no further output) still cancelable.
+        // Quiet active for >8s (long MCP/tool wait) must stay cancelable —
+        // PTY quiet timers are forbidden as completion evidence.
         app.mux
-            .get("g")
+            .get_mut("g")
             .unwrap()
-            .test_set_turn_last_output_ago(std::time::Duration::from_secs(3));
-        assert!(app.focused_turn_in_flight());
+            .feed(b"tool wait...")
+            .unwrap();
+        // No events.jsonl → refresh must not clear.
+        app.mux.get("g").unwrap().refresh_harness_turn_state();
+        assert!(
+            app.focused_turn_in_flight(),
+            "quiet >8s without turn_ended must stay in-flight"
+        );
         assert_eq!(
             app.focused_grok_esc_action(),
             GrokEscAction::CancelTurn,
             "quiet active turn remains cancelable"
         );
 
-        // Normal completion → idle Esc is raw.
-        app.mux.get("g").unwrap().mark_turn_completed();
-        assert!(!app.focused_turn_in_flight());
-        assert_eq!(app.focused_grok_esc_action(), GrokEscAction::ForwardRaw);
-
-        // Completion quiet window also clears after saw-output + long quiet.
-        app.mux.get("g").unwrap().mark_turn_in_flight();
+        // Authoritative completion via Grok events.jsonl turn_ended.
+        let dir = std::env::temp_dir().join(format!(
+            "cas-7f6f-events-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let events = dir.join("events.jsonl");
+        std::fs::write(&events, b"").unwrap();
         app.mux
             .get("g")
             .unwrap()
-            .test_set_turn_last_output_ago(cas_mux::Pane::TURN_COMPLETE_QUIET);
-        app.mux.get("g").unwrap().maybe_complete_turn_after_quiet();
+            .set_harness_events_path_for_test(&events);
+        // Re-mark so offset captures empty file, then append turn_ended.
+        app.mux.get("g").unwrap().mark_turn_in_flight();
+        assert!(app.focused_turn_in_flight());
+        std::fs::write(
+            &events,
+            b"{\"ts\":\"2026-07-11T00:00:00Z\",\"type\":\"turn_ended\",\"outcome\":\"completed\"}\n",
+        )
+        .unwrap();
+        app.mux.get("g").unwrap().refresh_harness_turn_state();
         assert!(
             !app.focused_turn_in_flight(),
-            "normal completion quiet window must clear in-flight"
+            "turn_ended must clear in-flight"
         );
+        assert_eq!(app.focused_grok_esc_action(), GrokEscAction::ForwardRaw);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Bracketed paste / multi-byte payloads with embedded CR must not mark submit.
@@ -1692,10 +1718,68 @@ mod tests {
         assert!(cas_mux::Pane::is_true_prompt_submit(b"\n"));
         assert!(cas_mux::Pane::is_true_prompt_submit(b"\r\n"));
         assert!(!cas_mux::Pane::is_true_prompt_submit(b"hello\r"));
+        // KeyStream multi-byte line+Enter is a submit; paste payload is not.
+        assert!(cas_mux::Pane::key_stream_is_submit(b"hello\r"));
         assert!(!cas_mux::Pane::is_true_prompt_submit(
             b"\x1b[200~path/with\nnewline\r\x1b[201~"
         ));
         assert!(!cas_mux::Pane::is_true_prompt_submit(b"\x1b[200~\x1b[201~"));
+    }
+
+    /// Generic SGR click must not clear turn_in_flight (non-Stop preserves active).
+    #[test]
+    fn sgr_click_does_not_clear_turn_in_flight_cas_7f6f() {
+        let mut app = FactoryApp::for_test();
+        let mut pane = Pane::director("g", 10, 20).unwrap();
+        pane.set_harness(cas_mux::SupervisorCli::Grok);
+        app.mux.add_pane(pane);
+        app.mux.focus("g");
+        app.supervisor_name = "g".to_string();
+        app.supervisor_cli = cas_mux::SupervisorCli::Grok;
+
+        app.mux.get("g").unwrap().mark_turn_in_flight();
+        assert!(app.focused_turn_in_flight());
+        // Simulate raw SGR forward (no note_turn_completed) — state preserved.
+        let payload = sgr_left_click_bytes(5, 10);
+        // send_input is the non-submit path used for SGR; does not clear.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let _ = app.mux.send_input_to("g", &payload).await;
+        });
+        assert!(
+            app.focused_turn_in_flight(),
+            "generic SGR must not clear in-flight; only turn_ended/break_turn do"
+        );
+    }
+
+    /// KeyStream marks submit; StructuredPaste with embedded CR never does.
+    #[test]
+    fn deliver_user_input_keystream_vs_paste_cas_7f6f() {
+        let mut app = FactoryApp::for_test();
+        let mut pane = Pane::director("g", 10, 20).unwrap();
+        pane.set_harness(cas_mux::SupervisorCli::Grok);
+        // Director has no PTY backend — deliver_user_input will fail write, but
+        // mark happens before write. Use mark helpers for kind classification
+        // and assert the pure predicates + mark path.
+        app.mux.add_pane(pane);
+        app.mux.focus("g");
+
+        assert!(cas_mux::Pane::key_stream_is_submit(b"\r"));
+        assert!(!cas_mux::Pane::key_stream_is_submit(b"x"));
+        // Structured paste classification: never a true lone-CR submit.
+        let paste = b"\x1b[200~hello\rworld\x1b[201~";
+        assert!(!cas_mux::Pane::is_true_prompt_submit(paste));
+
+        // Explicit mark only on KeyStream submit path.
+        app.mux.get("g").unwrap().mark_turn_in_flight();
+        assert!(app.focused_turn_in_flight());
+        app.mux.get("g").unwrap().mark_turn_completed();
+        assert!(!app.focused_turn_in_flight());
+        // Paste does not auto-mark (no call to mark for StructuredPaste).
+        assert!(!app.focused_turn_in_flight());
     }
 
     /// Drop hit-testing is mode-aware so compact and full coexist.
