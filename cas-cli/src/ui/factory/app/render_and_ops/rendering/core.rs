@@ -4,6 +4,15 @@ use std::sync::Arc;
 
 const IDENTITY_HEADER_MIN_HEIGHT: u16 = 20;
 
+/// Content rect for a full-mode pane with `Borders::ALL` (1-cell border inset).
+///
+/// Matches `ratatui::widgets::Block::inner` for a default all-sides border so
+/// Stop-click / PTY coordinates align with painted cells (cas-7f6f).
+pub(crate) fn bordered_pty_content(outer: Rect) -> Rect {
+    // Keep identical to `full_mode_pty_content` in sidecar_and_selection.
+    crate::ui::factory::app::sidecar_and_selection::full_mode_pty_content(outer)
+}
+
 impl FactoryApp {
     pub(crate) fn full_pane_hyperlink_map(&self) -> HyperlinkMap {
         self.full_pane_hyperlinks.clone()
@@ -107,6 +116,29 @@ impl FactoryApp {
         self.worker_areas = layout.worker_areas.clone();
         self.supervisor_area = Some(layout.supervisor_area);
         self.sidecar_area = Some(layout.sidecar_area);
+        // Full-mode panes always render with Borders::ALL — PTY content is the
+        // bordered inner rect. Written only to full_pty_content_areas so a later
+        // compact render does not overwrite full-client Stop geometry (cas-7f6f).
+        self.full_pty_content_areas.clear();
+        self.full_pty_content_areas.insert(
+            self.supervisor_name.clone(),
+            bordered_pty_content(layout.supervisor_area),
+        );
+        if layout.is_tabbed {
+            if let Some(content) = layout.worker_content {
+                if let Some(name) = all_names.get(self.selected_worker_tab) {
+                    self.full_pty_content_areas
+                        .insert(name.clone(), bordered_pty_content(content));
+                }
+            }
+        } else {
+            for (i, name) in all_names.iter().enumerate() {
+                if let Some(area) = layout.worker_areas.get(i) {
+                    self.full_pty_content_areas
+                        .insert(name.clone(), bordered_pty_content(*area));
+                }
+            }
+        }
 
         // Update pane grid if tabbed mode changed
         if self.is_tabbed != layout.is_tabbed {
@@ -351,6 +383,13 @@ impl FactoryApp {
 
         let status_area = chunks[0];
         let supervisor_area = chunks[1];
+
+        // Compact paints the supervisor borderless into the full content area
+        // (see render body below). Update compact geometry only — do not touch
+        // full_pty_content_areas (simultaneous full+compact clients, cas-7f6f).
+        self.compact_pty_content_areas.clear();
+        self.compact_pty_content_areas
+            .insert(self.supervisor_name.clone(), supervisor_area);
 
         // === Compact status bar ===
         let palette = &self.theme().palette;

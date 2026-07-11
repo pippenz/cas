@@ -42,12 +42,16 @@ use branch_visibility::{
 // Re-export from cas-factory for backward compatibility
 pub use cas_factory::{AutoPromptConfig, EpicState, FactoryConfig};
 
-// Re-export scroll dispatch types so callers can use them without reaching
-// into the private `sidecar_and_selection` submodule. Constants
+// Re-export scroll / click dispatch types so callers can use them without
+// reaching into the private `sidecar_and_selection` submodule. Constants
 // (SCROLL_*_ARROWS / SCROLL_*_SGR / SCROLL_LINES) and
-// `alt_screen_wheel_bytes` remain reachable via this module's children for
-// tests; production daemon code uses `FactoryApp::alt_screen_scroll_payload`.
-pub use sidecar_and_selection::ScrollAction;
+// `alt_screen_wheel_bytes` / `sgr_left_click_bytes` remain reachable via this
+// module's children for tests; production daemon code uses
+// `FactoryApp::alt_screen_scroll_payload` and `ClickAction` +
+// `sgr_left_click_bytes` for cas-7f6f Stop-click forwarding.
+pub use sidecar_and_selection::{
+    ClickAction, ClientGeometryMode, GrokEscAction, ScrollAction, sgr_left_click_bytes,
+};
 
 /// Booting state for a worker that is being spawned (after prepare, before finish)
 #[derive(Debug, Clone)]
@@ -475,6 +479,13 @@ pub struct FactoryApp {
     worker_areas: Vec<Rect>,
     supervisor_area: Option<Rect>,
     sidecar_area: Option<Rect>,
+    /// Full-mode PTY content rects (bordered inners), updated by `render`.
+    /// Kept separate from compact so simultaneous full+compact clients do not
+    /// clobber each other (cas-7f6f).
+    full_pty_content_areas: HashMap<String, Rect>,
+    /// Compact-mode PTY content rects (borderless supervisor content), updated
+    /// by `render_compact` only.
+    compact_pty_content_areas: HashMap<String, Rect>,
     /// Stored terminal dimensions (for daemon mode where crossterm::terminal::size() doesn't work)
     terminal_cols: u16,
     terminal_rows: u16,

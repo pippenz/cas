@@ -23,6 +23,20 @@ use tokio::sync::Mutex;
 
 use cas_recording::{RecordingWriter, WriterConfig};
 
+/// How user input is classified for turn-submit side effects (cas-7f6f).
+///
+/// One explicit submit API across terminal, GUI, WebSocket, and relay surfaces.
+/// Structured paste/drop never marks turn-in-flight even when CR/LF is embedded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserInputKind {
+    /// Keyboard / keystroke stream. Lone CR/LF (or a multi-byte keystream
+    /// chunk ending in CR/LF) marks a true prompt submit.
+    KeyStream,
+    /// Bracketed paste, image drop, or other structured non-keyboard input.
+    /// Never marks turn-in-flight.
+    StructuredPaste,
+}
+
 /// Unique identifier for a pane
 pub type PaneId = String;
 
@@ -100,6 +114,23 @@ pub struct Pane {
     total_bytes_received: u64,
     /// When this pane was created (for startup grace period)
     created_at: std::time::Instant,
+    /// Authoritative in-flight turn flag (cas-7f6f).
+    ///
+    /// Set at control points that start a turn (true prompt submit / inject via
+    /// [`UserInputKind::KeyStream`]); cleared on cancel (`break_turn` /
+    /// `interrupt`) or authoritative harness completion
+    /// ([`Self::mark_turn_completed`] from Grok `events.jsonl` `turn_ended`).
+    /// Not set by output redraws, paste/drop, or generic SGR clicks.
+    /// Not cleared by PTY quiet timers (long tool waits stay in-flight).
+    turn_in_flight: std::sync::atomic::AtomicBool,
+    /// Harness session id (`CAS_SESSION_ID` / Grok `--session-id`).
+    /// Used to locate `~/.grok/sessions/*/<id>/events.jsonl` for turn completion.
+    harness_session_id: std::sync::Mutex<Option<String>>,
+    /// Byte offset into the harness events file when the current turn started.
+    /// Only events after this offset can complete the turn.
+    turn_events_byte_offset: std::sync::Mutex<Option<u64>>,
+    /// Test/override path for harness events (skips session-id lookup).
+    harness_events_path_override: std::sync::Mutex<Option<PathBuf>>,
     /// Whether the inner process is currently in alt-screen mode.
     ///
     /// Tracked by watching for DEC private mode set/reset sequences in `feed()`:
@@ -121,6 +152,12 @@ pub struct Pane {
     partial_esc: Vec<u8>,
     /// Partial OSC 8 introducer carried over from the previous `feed()` chunk.
     partial_osc8: Vec<u8>,
+    /// Interactive harness for this pane (Claude / Codex / Grok).
+    ///
+    /// Drives harness-aware turn cancel via [`Pane::break_turn`] (cas-7f6f).
+    /// Shell and director panes default to [`SupervisorCli::Claude`] (Esc is a
+    /// harmless no-op on bare shells).
+    harness: SupervisorCli,
 }
 
 impl Pane {
@@ -132,6 +169,7 @@ impl Pane {
         backend: PaneBackend,
         rows: u16,
         cols: u16,
+        harness: SupervisorCli,
     ) -> Result<Self> {
         let id = id.into();
         let mut terminal = Terminal::new(rows, cols).map_err(|e| Error::terminal(e.to_string()))?;
@@ -158,10 +196,15 @@ impl Pane {
             drain_buf: Vec::with_capacity(65536),
             total_bytes_received: 0,
             created_at: std::time::Instant::now(),
+            turn_in_flight: std::sync::atomic::AtomicBool::new(false),
+            harness_session_id: std::sync::Mutex::new(None),
+            turn_events_byte_offset: std::sync::Mutex::new(None),
+            harness_events_path_override: std::sync::Mutex::new(None),
             in_alt_screen: false,
             has_hyperlinks: false,
             partial_esc: Vec::new(),
             partial_osc8: Vec::new(),
+            harness,
         })
     }
 
@@ -172,6 +215,7 @@ impl Pane {
         pty: Pty,
         rows: u16,
         cols: u16,
+        harness: SupervisorCli,
     ) -> Result<Self> {
         let id_str: String = id.into();
         Self::new_with_backend(
@@ -181,6 +225,7 @@ impl Pane {
             PaneBackend::Pty(pty),
             rows,
             cols,
+            harness,
         )
     }
 
@@ -194,6 +239,7 @@ impl Pane {
             PaneBackend::None,
             rows,
             cols,
+            SupervisorCli::Claude,
         )
     }
 
@@ -218,7 +264,8 @@ impl Pane {
             cols,
         };
         let pty = Pty::spawn(name, config)?;
-        Self::with_pty(name, PaneKind::Shell, pty, rows, cols)
+        // Shell has no agent harness; Claude cancel-key (Esc) is a no-op on shells.
+        Self::with_pty(name, PaneKind::Shell, pty, rows, cols, SupervisorCli::Claude)
     }
 
     /// Build the `PtyConfig` that `worker()` would spawn, without actually
@@ -326,8 +373,13 @@ impl Pane {
             teams,
         );
         push_factory_session_env(&mut config, cli, factory_session);
+        let session_id = cas_session_id_from_config(&config);
         let pty = Pty::spawn(name, config)?;
-        Self::with_pty(name, PaneKind::Worker, pty, rows, cols)
+        let pane = Self::with_pty(name, PaneKind::Worker, pty, rows, cols, cli)?;
+        if let Some(sid) = session_id {
+            pane.set_harness_session_id(sid);
+        }
+        Ok(pane)
     }
 
     /// Build the `PtyConfig` that `supervisor()` would spawn, without actually
@@ -422,8 +474,13 @@ impl Pane {
             teams,
         );
         push_factory_session_env(&mut config, cli, factory_session);
+        let session_id = cas_session_id_from_config(&config);
         let pty = Pty::spawn(name, config)?;
-        Self::with_pty(name, PaneKind::Supervisor, pty, rows, cols)
+        let pane = Self::with_pty(name, PaneKind::Supervisor, pty, rows, cols, cli)?;
+        if let Some(sid) = session_id {
+            pane.set_harness_session_id(sid);
+        }
+        Ok(pane)
     }
 
     fn push_supervisor_env(
@@ -994,6 +1051,12 @@ impl Pane {
             }
         }
 
+        // Authoritative harness completion (Grok events.jsonl turn_ended).
+        // Never use PTY quiet timers — long MCP/tool waits stay in-flight.
+        if self.is_turn_in_flight() {
+            self.refresh_harness_turn_state();
+        }
+
         // Return the coalesced data directly — no clone needed since take()
         // already moved ownership out. drain_buf capacity is donated to the
         // caller but re-grows cheaply on the next cycle.
@@ -1031,6 +1094,118 @@ impl Pane {
         self.total_bytes_received
     }
 
+    /// Whether a turn is currently in-flight on this pane (cas-7f6f).
+    pub fn is_turn_in_flight(&self) -> bool {
+        self.turn_in_flight
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Set the harness session id (from `CAS_SESSION_ID` at spawn).
+    pub fn set_harness_session_id(&self, session_id: impl Into<String>) {
+        if let Ok(mut guard) = self.harness_session_id.lock() {
+            *guard = Some(session_id.into());
+        }
+    }
+
+    /// Harness session id, if known.
+    pub fn harness_session_id(&self) -> Option<String> {
+        self.harness_session_id
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+    }
+
+    /// Override the harness events path (tests only).
+    pub fn set_harness_events_path_for_test(&self, path: impl Into<PathBuf>) {
+        if let Ok(mut guard) = self.harness_events_path_override.lock() {
+            *guard = Some(path.into());
+        }
+    }
+
+    /// Mark that a turn has started (true prompt submit or inject).
+    ///
+    /// Snapshots the harness events file length so only later `turn_ended`
+    /// events can complete this turn.
+    pub fn mark_turn_in_flight(&self) {
+        self.turn_in_flight
+            .store(true, std::sync::atomic::Ordering::Release);
+        let offset = self.harness_events_len().unwrap_or(0);
+        if let Ok(mut guard) = self.turn_events_byte_offset.lock() {
+            *guard = Some(offset);
+        }
+    }
+
+    /// Mark that the in-flight turn has ended (cancel issued or explicit idle).
+    pub fn clear_turn_in_flight(&self) {
+        self.turn_in_flight
+            .store(false, std::sync::atomic::Ordering::Release);
+        if let Ok(mut guard) = self.turn_events_byte_offset.lock() {
+            *guard = None;
+        }
+    }
+
+    /// Authoritative normal completion (turn finished without cancel).
+    pub fn mark_turn_completed(&self) {
+        self.clear_turn_in_flight();
+    }
+
+    /// Refresh in-flight state from the harness's authoritative turn signal.
+    ///
+    /// For Grok: reads `events.jsonl` after the offset captured at submit and
+    /// clears on any `turn_ended` (outcomes completed|error|cancelled).
+    /// Quiet PTY output alone never clears — long MCP/tool waits stay active.
+    pub fn refresh_harness_turn_state(&self) {
+        if !self.is_turn_in_flight() {
+            return;
+        }
+        // Only Grok has an on-disk turn_ended signal we consume here.
+        // Claude/Codex clear via break_turn/interrupt or explicit completion.
+        if self.harness != SupervisorCli::Grok
+            && self
+                .harness_events_path_override
+                .lock()
+                .ok()
+                .and_then(|g| g.clone())
+                .is_none()
+        {
+            return;
+        }
+        let Some(path) = self.resolve_harness_events_path() else {
+            return;
+        };
+        let start = self
+            .turn_events_byte_offset
+            .lock()
+            .ok()
+            .and_then(|g| *g)
+            .unwrap_or(0);
+        let Ok(data) = std::fs::read(&path) else {
+            return;
+        };
+        if (data.len() as u64) <= start {
+            return;
+        }
+        let suffix = &data[start as usize..];
+        if harness_events_suffix_has_turn_ended(suffix) {
+            self.mark_turn_completed();
+        }
+    }
+
+    fn resolve_harness_events_path(&self) -> Option<PathBuf> {
+        if let Ok(guard) = self.harness_events_path_override.lock() {
+            if let Some(ref p) = *guard {
+                return Some(p.clone());
+            }
+        }
+        let sid = self.harness_session_id()?;
+        find_grok_events_jsonl(&sid)
+    }
+
+    fn harness_events_len(&self) -> Option<u64> {
+        let path = self.resolve_harness_events_path()?;
+        std::fs::metadata(path).ok().map(|m| m.len())
+    }
+
     /// Whether this pane is ready to accept prompt injection.
     /// Claude Code flushes the PTY input buffer during startup, so text
     /// written before readline initialization is silently lost. We require
@@ -1055,24 +1230,63 @@ impl Pane {
                     let _ = guard.write_all(b"\r");
                     let _ = guard.flush();
                 });
+                // Inject submits a prompt → turn is in flight (cas-7f6f).
+                self.mark_turn_in_flight();
                 Ok(())
             }
             PaneBackend::None => Err(Error::pty("Pane has no backend")),
         }
     }
 
-    /// Break the current turn by sending a single Esc (0x1b).
+    /// Whether `data` is a true keyboard prompt submit (lone CR/LF), not a
+    /// multi-byte paste/drop payload that happens to embed newlines.
+    pub fn is_true_prompt_submit(data: &[u8]) -> bool {
+        matches!(data, b"\r" | b"\n" | b"\r\n")
+    }
+
+    /// Whether a [`UserInputKind::KeyStream`] chunk should mark turn-in-flight.
     ///
-    /// This is distinct from [`Pane::interrupt`], which sends Ctrl+C (0x03).
-    /// For Claude Code, Esc is the canonical "stop the current turn / cancel"
-    /// key, whereas Ctrl+C is the (double-press) quit signal. The urgent
-    /// interrupt-and-redirect path uses Esc so it breaks the worker's in-flight
-    /// turn without risking a process exit — matching exactly what a human
-    /// presses (`KeyCode::Esc => vec![0x1b]` in the factory TUI client).
+    /// Lone CR/LF (terminal per-key Enter) or a multi-byte keystream ending in
+    /// CR/LF (GUI/WS line + Enter). Bracketed paste must use
+    /// [`UserInputKind::StructuredPaste`] instead — it never marks submit.
+    pub fn key_stream_is_submit(data: &[u8]) -> bool {
+        if data.is_empty() {
+            return false;
+        }
+        if Self::is_true_prompt_submit(data) {
+            return true;
+        }
+        // Multi-byte keystream chunks may be "typed text + Enter".
+        data.ends_with(b"\r") || data.ends_with(b"\n")
+    }
+
+    /// Deliver user input with explicit submit semantics (cas-7f6f).
+    ///
+    /// - [`UserInputKind::KeyStream`]: marks turn-in-flight on true submit
+    /// - [`UserInputKind::StructuredPaste`]: never marks (paste/drop)
+    pub async fn deliver_user_input(&self, data: &[u8], kind: UserInputKind) -> Result<()> {
+        if matches!(kind, UserInputKind::KeyStream) && Self::key_stream_is_submit(data) {
+            self.mark_turn_in_flight();
+        }
+        self.write(data).await
+    }
+
+    /// Break the current turn with a harness-aware cancel payload (cas-7f6f).
+    ///
+    /// - **Claude / Codex**: Esc (`0x1b`) — Claude Code's cancel-turn key
+    ///   (Ctrl+C is the double-press quit signal).
+    /// - **Grok**: Ctrl+C (`0x03`) — since 0.2.93 Esc is a mid-turn no-op;
+    ///   cancel is Ctrl+C (see [`SupervisorCli::turn_cancel_bytes`]).
+    ///
+    /// Used by the urgent interrupt-and-redirect path and by factory Escape
+    /// routing so UI cancel and programmatic cancel share one tested path.
+    /// Clears [`Self::is_turn_in_flight`] after issuing cancel (Grok re-cancel
+    /// while cancelling uses raw Esc, which is correct for that state).
     pub async fn break_turn(&self) -> Result<()> {
         match &self.backend {
             PaneBackend::Pty(pty) => {
-                pty.write(&[0x1b]).await?;
+                pty.write(self.harness.turn_cancel_bytes()).await?;
+                self.clear_turn_in_flight();
                 Ok(())
             }
             PaneBackend::None => Err(Error::pty("Pane has no backend")),
@@ -1083,10 +1297,22 @@ impl Pane {
         match &self.backend {
             PaneBackend::Pty(pty) => {
                 pty.interrupt().await?;
+                // Ctrl+C is also a cancel path for Grok mid-turn.
+                self.clear_turn_in_flight();
                 Ok(())
             }
             PaneBackend::None => Err(Error::pty("Pane has no backend")),
         }
+    }
+
+    /// Interactive harness for this pane (Claude / Codex / Grok).
+    pub fn harness(&self) -> SupervisorCli {
+        self.harness
+    }
+
+    /// Override the harness (tests and late-bound config only).
+    pub fn set_harness(&mut self, harness: SupervisorCli) {
+        self.harness = harness;
     }
 
     pub fn scroll(&mut self, delta: i32) -> Result<()> {
@@ -1253,6 +1479,52 @@ impl Pane {
     pub fn is_recording(&self) -> bool {
         self.recorder.is_some()
     }
+}
+
+fn cas_session_id_from_config(config: &PtyConfig) -> Option<String> {
+    config
+        .env
+        .iter()
+        .find(|(k, _)| k == "CAS_SESSION_ID")
+        .map(|(_, v)| v.clone())
+}
+
+/// Grok sessions root: `$GROK_HOME/sessions` or `~/.grok/sessions`.
+fn grok_sessions_dir() -> Option<PathBuf> {
+    if let Ok(home) = std::env::var("GROK_HOME") {
+        return Some(PathBuf::from(home).join("sessions"));
+    }
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join(".grok").join("sessions"))
+}
+
+/// Locate `~/.grok/sessions/*/<session_id>/events.jsonl`.
+fn find_grok_events_jsonl(session_id: &str) -> Option<PathBuf> {
+    let sessions = grok_sessions_dir()?;
+    let entries = std::fs::read_dir(sessions).ok()?;
+    for entry in entries.flatten() {
+        let candidate = entry.path().join(session_id).join("events.jsonl");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Whether a suffix of `events.jsonl` contains a `turn_ended` event.
+fn harness_events_suffix_has_turn_ended(suffix: &[u8]) -> bool {
+    for line in suffix.split(|&b| b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v.get("type").and_then(|t| t.as_str()) == Some("turn_ended") {
+            return true;
+        }
+    }
+    false
 }
 
 pub(crate) fn push_factory_session_env(
