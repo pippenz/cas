@@ -171,12 +171,28 @@ fn resolve_system_b_merge_target(
         }
     }
 
-    if !branchless_parent_epics.is_empty() && assignee_epic_branches.is_empty() {
+    // Any branchless active parent is a hard reject — even when another
+    // parent has a branch (mixed case must not silently pick the branchful
+    // one; cas-0b32 second-review residual AC).
+    if !branchless_parent_epics.is_empty() {
+        let branchful = if assignee_epic_branches.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " Also has branchful parent(s): {}.",
+                assignee_epic_branches
+                    .iter()
+                    .map(|(id, b)| format!("{id}→{b}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
         return Err(McpError {
             code: ErrorCode::INVALID_PARAMS,
             message: Cow::from(format!(
-                "assignee {assignee} has parent epic(s) without a branch field ({}) — \
-                 set epic.branch before worktree_merge.\n\n{}",
+                "assignee {assignee} has active parent epic(s) without a branch field ({}) — \
+                 set epic.branch (or pass task_id= for a branchful epic) before \
+                 worktree_merge.{branchful}\n\n{}",
                 branchless_parent_epics.join(", "),
                 merge_target_remediation(assignee)
             )),

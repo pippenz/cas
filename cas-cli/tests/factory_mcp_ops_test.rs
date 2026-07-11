@@ -259,7 +259,7 @@ fn factory_req(action: &str) -> FactoryRequest {
         target: None,
         message: None,
         force: None,
-        allow_trunk: None,
+        // allow_trunk is CoordinationRequest/worktree_merge only — not FactoryRequest
         clear: None,
         branch: None,
         older_than_secs: None,

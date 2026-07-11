@@ -909,6 +909,68 @@ async fn test_worktree_merge_rejects_focused_epic_for_non_member_worker_cas_0b32
     );
 }
 
+/// cas-0b32 second review: one branchful + one branchless active parent must
+/// reject (must not silently pick the branchful epic).
+#[tokio::test]
+async fn test_worktree_merge_rejects_mixed_branchful_and_branchless_parent_epics_cas_0b32() {
+    let repo = GitRepo::new();
+    let cas_root = init_cas_dir(&repo.root).expect("init_cas_dir");
+    disable_system_a(&cas_root);
+
+    Command::new("git")
+        .args(["branch", "epic/with-branch"])
+        .current_dir(&repo.root)
+        .output()
+        .unwrap();
+
+    let task_store = open_task_store(&cas_root).expect("open_task_store");
+    let mut epic_ok = Task::new("epic-ok".to_string(), "Has branch".to_string());
+    epic_ok.task_type = TaskType::Epic;
+    epic_ok.branch = Some("epic/with-branch".to_string());
+    task_store.add(&epic_ok).unwrap();
+    let mut epic_nb = Task::new("epic-nb".to_string(), "No branch".to_string());
+    epic_nb.task_type = TaskType::Epic;
+    epic_nb.branch = None;
+    task_store.add(&epic_nb).unwrap();
+
+    let mut t1 = Task::new("t-ok".to_string(), "Under branchful".to_string());
+    t1.assignee = Some("mixed".to_string());
+    t1.status = cas::types::TaskStatus::InProgress;
+    task_store
+        .create_atomic(&t1, &[], Some("epic-ok"), None)
+        .unwrap();
+    let mut t2 = Task::new("t-nb".to_string(), "Under branchless".to_string());
+    t2.assignee = Some("mixed".to_string());
+    t2.status = cas::types::TaskStatus::InProgress;
+    task_store
+        .create_atomic(&t2, &[], Some("epic-nb"), None)
+        .unwrap();
+
+    let wt_path = cas_root.join("worktrees").join("mixed");
+    repo.add_worktree(&wt_path, "factory/mixed");
+
+    let _lock = merge_cwd_lock().lock().unwrap_or_else(|p| p.into_inner());
+    let _cwd = CwdGuard::enter(&repo.root);
+    let svc = make_service(cas_root);
+    let mut req = coord_req("worktree_merge");
+    req.id = Some("factory/mixed".to_string());
+    let result = svc.coordination(Parameters(req)).await;
+    assert!(
+        result.is_err(),
+        "mixed branchful+branchless parent epics must reject, not pick branchful"
+    );
+    let msg = format!("{:?}", result.unwrap_err());
+    assert!(
+        (msg.contains("no branch") || msg.contains("branch field"))
+            && (msg.contains("epic-nb") || msg.contains("branchless") || msg.contains("epic-ok")),
+        "must cite branchless parent and not silently merge. Got: {msg}"
+    );
+    assert!(
+        !msg.contains("Merged worktree"),
+        "must not have merged. Got: {msg}"
+    );
+}
+
 /// cas-0b32 review P2: branchless parent epic rejects (no fall-through).
 #[tokio::test]
 async fn test_worktree_merge_rejects_branchless_assignee_parent_epic_cas_0b32() {
