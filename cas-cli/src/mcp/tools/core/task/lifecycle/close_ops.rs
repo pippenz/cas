@@ -2459,6 +2459,29 @@ pub(crate) enum MergeStateGateOutcome {
 /// both of which now clear it): if `status` isn't `AwaitingMerge`, an
 /// existing anchor value is ignored and the gate falls back to the live
 /// branch name, matching first-attempt behavior.
+///
+/// ## cas-2938: squash-equivalent convergence (content + live-ref)
+///
+/// The parked anchor is a *historical* commit-ish. GitHub squash-merge
+/// rewrites the factory tip A into a new integration tip B that does not
+/// have A as an ancestor, so raw ancestry against A never clears.
+///
+/// When the gate is evaluating a trusted AwaitingMerge anchor and that
+/// anchor still looks stranded by rev-list ancestry, two secondary
+/// signals may clear the gate without deleting the historical anchor:
+///
+/// 1. **Content / tip-tree reachability** — the anchor tip's tree object
+///    is reachable from the parent (or `origin/<parent>`). Clean squash
+///    of one or many commits produces a tip tree identical to the
+///    pre-squash factory tip; this also preserves cas-4b3f serial-task
+///    protection after squash (task A can close while task B's later
+///    unmerged commits ride on the live factory HEAD).
+/// 2. **Live-ref convergence** — the live `factory/<assignee>` tip has
+///    zero commits not on the parent. Covers conflict-resolved squashes
+///    whose tip tree differs from A after the worker force-aligns the
+///    factory ref to the integration tip. Cannot mask later unmerged
+///    serial work (those leave live stranded > 0); when content check
+///    already cleared, live-ref is not required.
 pub(crate) fn run_factory_branch_merge_gate(
     task: &Task,
     _req: &TaskCloseRequest,
@@ -2526,6 +2549,43 @@ pub(crate) fn run_factory_branch_merge_gate(
             count_unmerged_factory_commits(repo_path, commit_ish, &origin_parent_branch);
         if stranded_vs_origin == 0 {
             return MergeStateGateOutcome::Proceed;
+        }
+    }
+
+    // cas-2938: when a trusted historical anchor still looks stranded by
+    // ancestry (typical after squash rewrote A→B), accept close if either
+    // the anchor tip's *tree* is already on the parent (clean squash) or
+    // the live factory tip has fully converged (0 commits ahead). Neither
+    // path deletes the historical anchor; later serial-task commits leave
+    // live stranded > 0, and content check only clears when A's tree is
+    // genuinely present on the integration branch.
+    if task.status == TaskStatus::AwaitingMerge
+        && task.deliverables.factory_branch_anchor.is_some()
+        && commit_ish != factory_branch.as_str()
+    {
+        if commit_tip_tree_reachable_from(repo_path, commit_ish, parent_branch) {
+            return MergeStateGateOutcome::Proceed;
+        }
+        if git_ref_exists(repo_path, &origin_parent_branch)
+            && commit_tip_tree_reachable_from(repo_path, commit_ish, &origin_parent_branch)
+        {
+            return MergeStateGateOutcome::Proceed;
+        }
+
+        let live_stranded =
+            count_unmerged_factory_commits(repo_path, factory_branch.as_str(), parent_branch);
+        if live_stranded == 0 {
+            return MergeStateGateOutcome::Proceed;
+        }
+        if git_ref_exists(repo_path, &origin_parent_branch) {
+            let live_vs_origin = count_unmerged_factory_commits(
+                repo_path,
+                factory_branch.as_str(),
+                &origin_parent_branch,
+            );
+            if live_vs_origin == 0 {
+                return MergeStateGateOutcome::Proceed;
+            }
         }
     }
 
@@ -2647,6 +2707,58 @@ pub(crate) fn count_unmerged_factory_commits(
             // direction for an unparseable count.
             .unwrap_or(u32::MAX),
         _ => 0,
+    }
+}
+
+/// cas-2938: true when the tip tree of `commit_ish` appears on `parent_ref`.
+///
+/// Clean GitHub squash-merges rewrite the commit SHA (so ancestry fails)
+/// but preserve the factory tip tree as the squash commit's tree. Scanning
+/// parent history for that tree object is the content-level equivalence
+/// check that lets an AwaitingMerge task clear after squash without
+/// requiring the pre-squash SHA to be an ancestor.
+///
+/// Returns false on any resolution failure (missing ref, unsafe name,
+/// empty tree sha) — fail closed toward "not integrated" so the live-ref
+/// path / Reject can still decide.
+fn commit_tip_tree_reachable_from(
+    repo_path: &std::path::Path,
+    commit_ish: &str,
+    parent_ref: &str,
+) -> bool {
+    use std::process::Command;
+
+    if !is_safe_git_refname(commit_ish) || !is_safe_git_refname(parent_ref) {
+        return false;
+    }
+    if !git_ref_exists(repo_path, commit_ish) || !git_ref_exists(repo_path, parent_ref) {
+        return false;
+    }
+
+    let tree_out = Command::new("git")
+        .args(["rev-parse", &format!("{commit_ish}^{{tree}}")])
+        .current_dir(repo_path)
+        .output();
+    let tree = match tree_out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        _ => return false,
+    };
+    if tree.is_empty() || !tree.chars().all(|c| c.is_ascii_hexdigit()) {
+        return false;
+    }
+
+    // Walk parent history for any commit whose tree matches the anchor tip.
+    // `--pretty=%T` emits one tree SHA per commit; exact-line match avoids
+    // substring false positives from longer hashes (full SHA is fixed length).
+    let log_out = Command::new("git")
+        .args(["log", "--pretty=%T", parent_ref])
+        .current_dir(repo_path)
+        .output();
+    match log_out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .any(|line| line.trim() == tree),
+        _ => false,
     }
 }
 
@@ -6041,6 +6153,209 @@ mod merge_state_gate_tests {
             "a stale anchor on a non-AwaitingMerge task must be ignored, \
              falling back to the live branch (which has 1 genuinely \
              unmerged commit), got {out:?}"
+        );
+    }
+
+    // --- cas-2938: squash-equivalent live-ref convergence -------------------
+
+    fn rev_parse_local(dir: &std::path::Path, refname: &str) -> String {
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", refname])
+            .current_dir(dir)
+            .output()
+            .expect("git rev-parse");
+        assert!(out.status.success(), "rev-parse {refname} failed");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Reproduces BUG-awaitingmerge-anchor-squash-merge-2026-07-09.md:
+    /// park with tip A, squash-merge into parent as B (A is not an ancestor
+    /// of B), force-align factory tip to B. Historical anchor A still looks
+    /// stranded; live factory has 0 commits ahead → must Proceed.
+    #[test]
+    fn squash_merged_awaiting_merge_with_live_ref_aligned_to_integration_proceeds() {
+        let dir = init_factory_repo("worker");
+        let p = dir.path();
+
+        // Task work as commit A on factory/worker.
+        std::fs::write(p.join("a.rs"), "// a\n").unwrap();
+        git(p, &["add", "a.rs"]);
+        git(p, &["commit", "-q", "-m", "feat: task A"]);
+        let anchor_a = rev_parse_local(p, "HEAD");
+
+        // GitHub-style squash: apply factory tip as a NEW commit B on main
+        // that does not have A as an ancestor.
+        git(p, &["checkout", "-q", "main"]);
+        git(p, &["merge", "-q", "--squash", "factory/worker"]);
+        git(p, &["commit", "-q", "-m", "feat: task A (#683)"]);
+        let integration_b = rev_parse_local(p, "HEAD");
+        assert_ne!(
+            anchor_a, integration_b,
+            "precondition: squash must rewrite SHA (A ≠ B)"
+        );
+        // A is not an ancestor of B after squash.
+        let is_ancestor = std::process::Command::new("git")
+            .args(["merge-base", "--is-ancestor", &anchor_a, &integration_b])
+            .current_dir(p)
+            .status()
+            .expect("merge-base --is-ancestor");
+        assert!(
+            !is_ancestor.success(),
+            "precondition: A must NOT be an ancestor of squash tip B"
+        );
+
+        // Worker force-aligns factory/<name> to the integration tip B.
+        git(p, &["checkout", "-q", "factory/worker"]);
+        git(p, &["reset", "-q", "--hard", &integration_b]);
+        assert_eq!(
+            rev_parse_local(p, "factory/worker"),
+            integration_b,
+            "precondition: live factory ref must equal integration tip B"
+        );
+        assert_eq!(
+            count_unmerged_factory_commits(p, "factory/worker", "main"),
+            0,
+            "precondition: live factory must have 0 commits ahead of main"
+        );
+        assert_eq!(
+            count_unmerged_factory_commits(p, &anchor_a, "main"),
+            1,
+            "precondition: historical anchor A still looks stranded vs main"
+        );
+
+        // Task still AwaitingMerge with park-time anchor A.
+        let mut task = worker_task("worker");
+        task.status = TaskStatus::AwaitingMerge;
+        task.deliverables.factory_branch_anchor = Some(anchor_a);
+        let req = base_req(&task.id);
+        let out = run_factory_branch_merge_gate(&task, &req, "main", p);
+        assert!(
+            matches!(out, MergeStateGateOutcome::Proceed),
+            "squash-integrated + live-ref-aligned AwaitingMerge close must \
+             Proceed (cas-2938), got {out:?}"
+        );
+    }
+
+    /// Clean squash preserves tip tree: even without force-aligning the
+    /// factory ref to B, content reachability of A's tree on main must
+    /// clear the gate (better UX than requiring a manual reset).
+    #[test]
+    fn squash_merged_content_equivalent_without_live_ref_align_proceeds() {
+        let dir = init_factory_repo("worker");
+        let p = dir.path();
+
+        std::fs::write(p.join("a.rs"), "// a\n").unwrap();
+        git(p, &["add", "a.rs"]);
+        git(p, &["commit", "-q", "-m", "feat: task A"]);
+        let anchor_a = rev_parse_local(p, "HEAD");
+
+        // Squash onto main as B, leave factory/worker at A.
+        git(p, &["checkout", "-q", "main"]);
+        git(p, &["merge", "-q", "--squash", "factory/worker"]);
+        git(p, &["commit", "-q", "-m", "feat: task A (#683)"]);
+        git(p, &["checkout", "-q", "factory/worker"]);
+        assert_eq!(
+            rev_parse_local(p, "factory/worker"),
+            anchor_a,
+            "precondition: factory tip still at historical A"
+        );
+        assert_eq!(
+            count_unmerged_factory_commits(p, &anchor_a, "main"),
+            1,
+            "precondition: ancestry still counts A as stranded"
+        );
+        assert!(
+            commit_tip_tree_reachable_from(p, &anchor_a, "main"),
+            "precondition: tip tree of A must be on main after clean squash"
+        );
+
+        let mut task = worker_task("worker");
+        task.status = TaskStatus::AwaitingMerge;
+        task.deliverables.factory_branch_anchor = Some(anchor_a);
+        let req = base_req(&task.id);
+        let out = run_factory_branch_merge_gate(&task, &req, "main", p);
+        assert!(
+            matches!(out, MergeStateGateOutcome::Proceed),
+            "clean squash must clear via tip-tree reachability even without \
+             live-ref alignment, got {out:?}"
+        );
+    }
+
+    /// cas-2938 + cas-4b3f: after squash of A, a later unmerged task B on the
+    /// same factory branch must NOT re-strand task A's close — content of A
+    /// is on main even though live HEAD is ahead with B.
+    #[test]
+    fn squash_then_serial_second_task_does_not_restrand_first_close() {
+        let dir = init_factory_repo("worker");
+        let p = dir.path();
+
+        // Task A tip.
+        std::fs::write(p.join("a.rs"), "// a\n").unwrap();
+        git(p, &["add", "a.rs"]);
+        git(p, &["commit", "-q", "-m", "feat: task A"]);
+        let anchor_a = rev_parse_local(p, "HEAD");
+
+        // Squash A onto main as B (A not ancestor of main).
+        git(p, &["checkout", "-q", "main"]);
+        git(p, &["merge", "-q", "--squash", "factory/worker"]);
+        git(p, &["commit", "-q", "-m", "feat: task A (#683)"]);
+
+        // Align factory to B, then start task B with a new unmerged commit.
+        git(p, &["checkout", "-q", "factory/worker"]);
+        git(p, &["reset", "-q", "--hard", "main"]);
+        std::fs::write(p.join("b.rs"), "// b (task B, unmerged)\n").unwrap();
+        git(p, &["add", "b.rs"]);
+        git(p, &["commit", "-q", "-m", "feat: task B (unmerged)"]);
+
+        assert_eq!(
+            count_unmerged_factory_commits(p, "factory/worker", "main"),
+            1,
+            "precondition: live factory carries task B's unmerged commit"
+        );
+
+        let mut task_a = worker_task("worker");
+        task_a.status = TaskStatus::AwaitingMerge;
+        task_a.deliverables.factory_branch_anchor = Some(anchor_a);
+        let req = base_req(&task_a.id);
+        let out = run_factory_branch_merge_gate(&task_a, &req, "main", p);
+        assert!(
+            matches!(out, MergeStateGateOutcome::Proceed),
+            "task A's squash-integrated content must clear close even while \
+             task B's later unmerged commits ride on the live factory HEAD, \
+             got {out:?}"
+        );
+    }
+
+    /// Genuinely unmerged parked work still rejects: anchor A not on main
+    /// by ancestry or tip tree, live factory still carries A.
+    #[test]
+    fn genuinely_unmerged_awaiting_merge_anchor_still_rejects() {
+        let dir = init_factory_repo("worker");
+        let p = dir.path();
+
+        std::fs::write(p.join("a.rs"), "// a unmerged\n").unwrap();
+        git(p, &["add", "a.rs"]);
+        git(p, &["commit", "-q", "-m", "feat: task A (never integrated)"]);
+        let anchor_a = rev_parse_local(p, "HEAD");
+
+        assert_eq!(
+            count_unmerged_factory_commits(p, &anchor_a, "main"),
+            1,
+            "precondition: A is stranded vs main"
+        );
+        assert!(
+            !commit_tip_tree_reachable_from(p, &anchor_a, "main"),
+            "precondition: A's tree must not be on main"
+        );
+
+        let mut task = worker_task("worker");
+        task.status = TaskStatus::AwaitingMerge;
+        task.deliverables.factory_branch_anchor = Some(anchor_a);
+        let req = base_req(&task.id);
+        let out = run_factory_branch_merge_gate(&task, &req, "main", p);
+        assert!(
+            matches!(out, MergeStateGateOutcome::Reject(_)),
+            "genuinely unmerged parked work must still Reject, got {out:?}"
         );
     }
 
