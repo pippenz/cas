@@ -1576,42 +1576,53 @@ mod tests {
         )
         .expect("mixed-harness AwaitingMerge must produce a supervisor prompt");
 
-        // Supervisor-facing tools: Claude alias
+        // Split body from with_response_instructions footer so a Claude
+        // footer `mcp__cas__coordination action=message` cannot false-pass
+        // supervisor body-command assertions (cas-c145 review follow-up).
+        let body = prompt.text.split("\n---\n").next().unwrap_or(&prompt.text);
+
+        // Supervisor-facing body tools: exact Claude alias (not footer-only).
         assert!(
-            prompt
-                .text
-                .contains("mcp__cas__coordination action=epic_status id=cas-epic1"),
-            "supervisor epic_status must use Claude prefix: {}",
-            prompt.text
+            body.contains("mcp__cas__coordination action=epic_status id=cas-epic1"),
+            "supervisor body epic_status must use exact Claude command: {}",
+            body
         );
         assert!(
-            prompt
-                .text
-                .contains("mcp__cas__task action=list status=awaiting_merge"),
-            "supervisor list must use Claude prefix: {}",
-            prompt.text
+            body.contains("mcp__cas__task action=list status=awaiting_merge"),
+            "supervisor body list must use exact Claude command: {}",
+            body
         );
         assert!(
-            prompt
-                .text
-                .contains("mcp__cas__task action=show id=cas-mix1"),
-            "supervisor show must use Claude prefix: {}",
-            prompt.text
+            body.contains("mcp__cas__task action=show id=cas-mix1"),
+            "supervisor body show must use exact Claude command: {}",
+            body
+        );
+        // Worker prefix must not appear on supervisor body actions.
+        assert!(
+            !body.contains("mcp__cs__coordination action=epic_status"),
+            "supervisor epic_status must not use worker (Codex) prefix: {}",
+            body
+        );
+        assert!(
+            !body.contains("mcp__cs__task action=list status=awaiting_merge"),
+            "supervisor list must not use worker (Codex) prefix: {}",
+            body
+        );
+        assert!(
+            !body.contains("mcp__cs__task action=show id=cas-mix1"),
+            "supervisor show must not use worker (Codex) prefix: {}",
+            body
         );
         // Worker re-close: Codex alias only
         assert!(
-            prompt
-                .text
-                .contains("mcp__cs__task action=close id=cas-mix1"),
+            body.contains("mcp__cs__task action=close id=cas-mix1"),
             "worker re-close must use Codex prefix mcp__cs__: {}",
-            prompt.text
+            body
         );
         assert!(
-            !prompt
-                .text
-                .contains("mcp__cas__task action=close id=cas-mix1"),
+            !body.contains("mcp__cas__task action=close id=cas-mix1"),
             "worker re-close must NOT use Claude supervisor prefix: {}",
-            prompt.text
+            body
         );
 
         // Claude supervisor + Grok worker: re-close uses cas__
@@ -1640,27 +1651,54 @@ mod tests {
             &HashSet::new(),
         )
         .expect("Claude+Grok AwaitingMerge must produce a prompt");
+        let grok_body = grok_prompt
+            .text
+            .split("\n---\n")
+            .next()
+            .unwrap_or(&grok_prompt.text);
+
+        // Supervisor body commands: exact Claude prefix (not footer `mcp__cas__`).
         assert!(
-            grok_prompt
-                .text
-                .contains("cas__task action=close id=cas-mix2"),
+            grok_body.contains("mcp__cas__coordination action=epic_status id=<focused-epic>"),
+            "Claude+Grok supervisor body epic_status must be exact Claude command: {}",
+            grok_body
+        );
+        assert!(
+            grok_body.contains("mcp__cas__task action=list status=awaiting_merge"),
+            "Claude+Grok supervisor body list must be exact Claude command: {}",
+            grok_body
+        );
+        assert!(
+            grok_body.contains("mcp__cas__task action=show id=cas-mix2"),
+            "Claude+Grok supervisor body show must be exact Claude command: {}",
+            grok_body
+        );
+        // Negative: worker (Grok) prefix must not appear on supervisor actions.
+        assert!(
+            !grok_body.contains("cas__coordination action=epic_status"),
+            "supervisor epic_status must not use worker (Grok) prefix: {}",
+            grok_body
+        );
+        assert!(
+            !grok_body.contains("cas__task action=list status=awaiting_merge"),
+            "supervisor list must not use worker (Grok) prefix: {}",
+            grok_body
+        );
+        assert!(
+            !grok_body.contains("cas__task action=show id=cas-mix2"),
+            "supervisor show must not use worker (Grok) prefix: {}",
+            grok_body
+        );
+        // Worker re-close: Grok alias only
+        assert!(
+            grok_body.contains("cas__task action=close id=cas-mix2"),
             "Grok worker re-close must use cas__ prefix: {}",
-            grok_prompt.text
+            grok_body
         );
         assert!(
-            !grok_prompt
-                .text
-                .contains("mcp__cas__task action=close id=cas-mix2"),
+            !grok_body.contains("mcp__cas__task action=close id=cas-mix2"),
             "Grok worker re-close must NOT use Claude supervisor prefix: {}",
-            grok_prompt.text
-        );
-        assert!(
-            grok_prompt
-                .text
-                .contains("mcp__cas__task action=show id=cas-mix2")
-                || grok_prompt.text.contains("mcp__cas__"),
-            "supervisor actions still use Claude prefix: {}",
-            grok_prompt.text
+            grok_body
         );
     }
 
