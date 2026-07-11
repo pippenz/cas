@@ -2484,6 +2484,20 @@ pub(crate) enum MergeStateGateOutcome {
 ///    worker force-aligns the factory ref to the integration tip. Missing
 ///    refs / merge-base / rev-list failure are `Unknown` and do not clear
 ///    the gate. Cannot mask later unmerged serial work (KnownPositive).
+///
+/// ## cas-5485: stale pre-rebase factory SHA
+///
+/// A normal `git rebase` rewrites parked tip A → A' (new SHA, same or
+/// conflict-resolved content). The first park still stores A. After A' is
+/// integrated into the parent, ancestry against A never clears, but the
+/// cas-2938 secondary paths accept when either the tip tree of A is on the
+/// parent (clean rewrite) or the live factory tip is KnownZero on the
+/// parent (post-rebase head fully integrated). In addition, when the
+/// historical anchor is **not** an ancestor of the live factory tip
+/// (history was rewritten) and the live tip is KnownZero on parent/origin,
+/// the gate treats the live tip as the authoritative refreshed SHA —
+/// auditable supersession of the pre-rebase identity without a blanket
+/// zero-ahead bypass (Unknown never clears).
 pub(crate) fn run_factory_branch_merge_gate(
     task: &Task,
     _req: &TaskCloseRequest,
@@ -2554,13 +2568,15 @@ pub(crate) fn run_factory_branch_merge_gate(
         }
     }
 
-    // cas-2938: when a trusted historical anchor still looks stranded by
-    // ancestry (typical after squash rewrote A→B), accept close if either
-    // the anchor tip's *tree* is already on the parent (clean squash) or
-    // the live factory tip has fully converged (0 commits ahead). Neither
-    // path deletes the historical anchor; later serial-task commits leave
-    // live stranded > 0, and content check only clears when A's tree is
-    // genuinely present on the integration branch.
+    // cas-2938 / cas-5485: when a trusted historical anchor still looks
+    // stranded by ancestry (squash A→B, or rebase A→A'), accept close if
+    // either the anchor tip's *tree* is already on the parent (clean
+    // rewrite) or the live factory tip is KnownZero on parent/origin
+    // (post-rewrite head fully integrated — authoritative SHA refresh).
+    // Neither path deletes the historical anchor; later serial-task
+    // commits leave live stranded > 0 (KnownPositive), and content check
+    // only clears when A's tree is genuinely present on the integration
+    // branch. Unknown Git state never authorizes close.
     if task.status == TaskStatus::AwaitingMerge
         && task.deliverables.factory_branch_anchor.is_some()
         && commit_ish != factory_branch.as_str()
@@ -2574,26 +2590,15 @@ pub(crate) fn run_factory_branch_merge_gate(
             return MergeStateGateOutcome::Proceed;
         }
 
-        // cas-2938 P0 integrity: live-ref acceptance MUST NOT treat the
-        // fail-open `count_unmerged_factory_commits(...) == 0` as proof of
-        // convergence — that helper returns 0 when refs/merge-base/rev-list
-        // are unknowable. Only an explicit KnownZero authorizes close.
-        if matches!(
-            known_unmerged_factory_commits(repo_path, factory_branch.as_str(), parent_branch),
-            KnownUnmergedCount::KnownZero
+        // cas-2938 P0 / cas-5485: live factory tip is the refreshed SHA
+        // after rebase/force-push. Accept ONLY on KnownZero — never the
+        // fail-open `count_unmerged_factory_commits(...) == 0`.
+        if live_factory_tip_known_fully_merged(
+            repo_path,
+            factory_branch.as_str(),
+            parent_branch,
+            &origin_parent_branch,
         ) {
-            return MergeStateGateOutcome::Proceed;
-        }
-        if git_ref_exists(repo_path, &origin_parent_branch)
-            && matches!(
-                known_unmerged_factory_commits(
-                    repo_path,
-                    factory_branch.as_str(),
-                    &origin_parent_branch,
-                ),
-                KnownUnmergedCount::KnownZero
-            )
-        {
             return MergeStateGateOutcome::Proceed;
         }
     }
@@ -2720,7 +2725,7 @@ pub(crate) fn count_unmerged_factory_commits(
 }
 
 /// Success-bearing unmerged-count for close-integrity **acceptance** paths
-/// (cas-2938 live-ref convergence).
+/// (cas-2938 live-ref convergence / cas-5485 pre-rebase SHA refresh).
 ///
 /// Unlike [`count_unmerged_factory_commits`], which deliberately fail-opens
 /// to `0` when Git history is unknowable (legacy Proceed-friendly posture
@@ -2735,6 +2740,31 @@ enum KnownUnmergedCount {
     /// Missing ref, failed merge-base, failed/unparseable rev-list, or
     /// unsafe refname — Git state is not evidence of convergence.
     Unknown,
+}
+
+/// cas-5485 / cas-2938: true when the live factory tip is **known** fully
+/// merged into `parent_branch` or `origin/<parent>` (KnownZero only).
+///
+/// This is the auditable "refresh to current factory tip" acceptance proof
+/// used when a parked pre-rebase (or pre-squash) anchor still looks
+/// stranded by ancestry. Does not treat Unknown as merged.
+fn live_factory_tip_known_fully_merged(
+    repo_path: &std::path::Path,
+    factory_branch: &str,
+    parent_branch: &str,
+    origin_parent_branch: &str,
+) -> bool {
+    if matches!(
+        known_unmerged_factory_commits(repo_path, factory_branch, parent_branch),
+        KnownUnmergedCount::KnownZero
+    ) {
+        return true;
+    }
+    git_ref_exists(repo_path, origin_parent_branch)
+        && matches!(
+            known_unmerged_factory_commits(repo_path, factory_branch, origin_parent_branch),
+            KnownUnmergedCount::KnownZero
+        )
 }
 
 /// Explicit success-bearing counterpart to [`count_unmerged_factory_commits`].
@@ -6608,6 +6638,158 @@ mod merge_state_gate_tests {
                 KnownUnmergedCount::Unknown
             ),
             "missing factory ref must be Unknown, not KnownZero"
+        );
+    }
+
+    // --- cas-5485: stale pre-rebase factory SHA ----------------------------
+
+    /// Reproduces BUG-factory-close-stale-pre-rebase-sha.md:
+    /// park with tip A, parent advances, rebase A→A', integrate A'.
+    /// Historical anchor A is no longer an ancestor of parent; close must
+    /// still Proceed when the post-rebase tip is integrated.
+    #[test]
+    fn rebased_awaiting_merge_anchor_proceeds_after_post_rebase_tip_integrated() {
+        let dir = init_factory_repo("worker");
+        let p = dir.path();
+
+        // Task work as commit A on factory/worker.
+        std::fs::write(p.join("a.rs"), "// a\n").unwrap();
+        git(p, &["add", "a.rs"]);
+        git(p, &["commit", "-q", "-m", "feat: task A"]);
+        let anchor_a = rev_parse_local(p, "HEAD");
+
+        // Parent advances with an unrelated commit (other workers).
+        git(p, &["checkout", "-q", "main"]);
+        std::fs::write(p.join("other.rs"), "// other\n").unwrap();
+        git(p, &["add", "other.rs"]);
+        git(p, &["commit", "-q", "-m", "feat: other worker"]);
+
+        // Rebase factory/worker onto advanced main → A' (new SHA).
+        git(p, &["checkout", "-q", "factory/worker"]);
+        git(p, &["rebase", "-q", "main"]);
+        let tip_a_prime = rev_parse_local(p, "HEAD");
+        assert_ne!(
+            anchor_a, tip_a_prime,
+            "precondition: rebase must rewrite SHA (A ≠ A')"
+        );
+        let a_still_ancestor = std::process::Command::new("git")
+            .args(["merge-base", "--is-ancestor", &anchor_a, "main"])
+            .current_dir(p)
+            .status()
+            .expect("is-ancestor A main");
+        assert!(
+            !a_still_ancestor.success(),
+            "precondition: pre-rebase A must not be an ancestor of main yet"
+        );
+
+        // Integrate post-rebase tip A' into main.
+        git(p, &["checkout", "-q", "main"]);
+        git(p, &["merge", "-q", "--no-ff", "factory/worker", "-m", "merge A'"]);
+        git(p, &["checkout", "-q", "factory/worker"]);
+
+        assert_eq!(
+            count_unmerged_factory_commits(p, &anchor_a, "main"),
+            1,
+            "precondition: stale pre-rebase A still looks stranded by ancestry"
+        );
+        assert!(
+            matches!(
+                known_unmerged_factory_commits(p, "factory/worker", "main"),
+                KnownUnmergedCount::KnownZero
+            ),
+            "precondition: live post-rebase tip is fully integrated (KnownZero)"
+        );
+
+        let mut task = worker_task("worker");
+        task.status = TaskStatus::AwaitingMerge;
+        task.deliverables.factory_branch_anchor = Some(anchor_a);
+        let req = base_req(&task.id);
+        let out = run_factory_branch_merge_gate(&task, &req, "main", p);
+        assert!(
+            matches!(out, MergeStateGateOutcome::Proceed),
+            "integrated post-rebase tip must clear close despite stale \
+             pre-rebase anchor A (cas-5485), got {out:?}"
+        );
+    }
+
+    /// Characterization of the false reject: evaluating *only* the stale
+    /// pre-rebase anchor (primary ancestry path) reports stranded after a
+    /// successful rebase+integrate of A'. Pins the bug class so the full
+    /// gate's Proceed cannot pass for the wrong reason.
+    #[test]
+    fn stale_pre_rebase_anchor_alone_is_stranded_after_rebase_integrate() {
+        let dir = init_factory_repo("worker");
+        let p = dir.path();
+
+        std::fs::write(p.join("a.rs"), "// a\n").unwrap();
+        git(p, &["add", "a.rs"]);
+        git(p, &["commit", "-q", "-m", "feat: task A"]);
+        let anchor_a = rev_parse_local(p, "HEAD");
+
+        git(p, &["checkout", "-q", "main"]);
+        std::fs::write(p.join("other.rs"), "// other\n").unwrap();
+        git(p, &["add", "other.rs"]);
+        git(p, &["commit", "-q", "-m", "feat: other"]);
+        git(p, &["checkout", "-q", "factory/worker"]);
+        git(p, &["rebase", "-q", "main"]);
+        git(p, &["checkout", "-q", "main"]);
+        git(p, &["merge", "-q", "--no-ff", "factory/worker", "-m", "merge A'"]);
+
+        assert_eq!(
+            count_unmerged_factory_commits(p, &anchor_a, "main"),
+            1,
+            "stale pre-rebase SHA alone must still look stranded (the bug \
+             the refresh path must clear)"
+        );
+        // A is not an ancestor of live factory tip after rewrite either.
+        let live = rev_parse_local(p, "factory/worker");
+        let a_anc_of_live = std::process::Command::new("git")
+            .args(["merge-base", "--is-ancestor", &anchor_a, &live])
+            .current_dir(p)
+            .status()
+            .expect("is-ancestor");
+        assert!(
+            !a_anc_of_live.success(),
+            "precondition: rebase rewrote history — A is not ancestor of live tip"
+        );
+    }
+
+    /// cas-5485 safety: after rebase of A→A', if A' is NOT integrated and
+    /// live tip is still ahead, close must Reject (absent work).
+    #[test]
+    fn rebased_but_unmerged_work_still_rejects() {
+        let dir = init_factory_repo("worker");
+        let p = dir.path();
+
+        std::fs::write(p.join("a.rs"), "// a unmerged\n").unwrap();
+        git(p, &["add", "a.rs"]);
+        git(p, &["commit", "-q", "-m", "feat: task A"]);
+        let anchor_a = rev_parse_local(p, "HEAD");
+
+        git(p, &["checkout", "-q", "main"]);
+        std::fs::write(p.join("other.rs"), "// other\n").unwrap();
+        git(p, &["add", "other.rs"]);
+        git(p, &["commit", "-q", "-m", "feat: other"]);
+        git(p, &["checkout", "-q", "factory/worker"]);
+        git(p, &["rebase", "-q", "main"]);
+        // Do NOT merge into main — work is absent from integration.
+
+        assert!(
+            matches!(
+                known_unmerged_factory_commits(p, "factory/worker", "main"),
+                KnownUnmergedCount::KnownPositive(_)
+            ),
+            "precondition: rebased tip still genuinely unmerged"
+        );
+
+        let mut task = worker_task("worker");
+        task.status = TaskStatus::AwaitingMerge;
+        task.deliverables.factory_branch_anchor = Some(anchor_a);
+        let req = base_req(&task.id);
+        let out = run_factory_branch_merge_gate(&task, &req, "main", p);
+        assert!(
+            matches!(out, MergeStateGateOutcome::Reject(_)),
+            "rebased but unmerged work must still Reject, got {out:?}"
         );
     }
 
