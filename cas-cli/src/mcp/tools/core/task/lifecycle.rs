@@ -358,6 +358,8 @@ impl CasCore {
             // supervisor-only action (see `cas_task_reopen`), so the
             // guidance must differ by role: a supervisor may still reopen,
             // a worker must not.
+            // cas-b269 review: do NOT clear halt_task_work here — failed
+            // starts must preserve the urgent-stop halt.
             return Err(Self::error(
                 ErrorCode::INVALID_PARAMS,
                 if crate::harness_policy::is_supervisor_from_env() {
@@ -373,22 +375,6 @@ impl CasCore {
                     )
                 },
             ));
-        }
-
-        // cas-b269: a successful start clears urgent-stop halt so legitimate
-        // new assignments can close/verify again.
-        if let Ok(agent_id) = self.get_agent_id() {
-            if let Ok(agent_store) = self.open_agent_store() {
-                if let Ok(mut agent) = agent_store.get(&agent_id) {
-                    if agent
-                        .metadata
-                        .remove(stale_close_guard::HALT_TASK_WORK_META)
-                        .is_some()
-                    {
-                        let _ = agent_store.update(&agent);
-                    }
-                }
-            }
         }
 
         // cas-9684: PSR tasks are "work complete, awaiting supervisor review".
@@ -727,6 +713,20 @@ impl CasCore {
             message: Cow::from(format!("Failed to update: {e}")),
             data: None,
         })?;
+
+        // cas-b269 review: clear urgent-stop halt ONLY after start fully
+        // succeeds (task row is InProgress). Failed starts above preserve halt.
+        if let Ok(agent_store) = self.open_agent_store() {
+            if let Ok(mut agent) = agent_store.get(&agent_id) {
+                if agent
+                    .metadata
+                    .remove(stale_close_guard::HALT_TASK_WORK_META)
+                    .is_some()
+                {
+                    let _ = agent_store.update(&agent);
+                }
+            }
+        }
 
         // For subtasks, show parent epic's worktree; for epics, show newly created worktree
         let wt_info = parent_worktree_info.or(worktree_info).unwrap_or_default();

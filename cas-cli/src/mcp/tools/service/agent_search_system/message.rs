@@ -288,6 +288,74 @@ impl CasService {
         } else {
             priority
         };
+
+        // cas-b269 review: persist halt_task_work BEFORE enqueue so delivery
+        // cannot race ahead of the durable stop flag. Only authorized
+        // supervisor/director sources may set halt; all_workers expands to
+        // every worker; never halt the supervisor. Fail closed if halt
+        // cannot be persisted for an authorized urgent stop.
+        {
+            use crate::mcp::tools::core::task::lifecycle::stale_close_guard::{
+                halt_targets_for_urgent, may_source_set_halt, should_persist_urgent_halt,
+                HALT_TASK_WORK_META,
+            };
+            use crate::store::open_agent_store;
+            use cas_types::AgentRole;
+
+            if let Ok(agent_store) = open_agent_store(&self.inner.cas_root) {
+                let agents = agent_store.list(None).unwrap_or_default();
+                let worker_names: Vec<String> = agents
+                    .iter()
+                    .filter(|a| a.role == AgentRole::Worker)
+                    .map(|a| a.name.clone())
+                    .collect();
+
+                if should_persist_urgent_halt(
+                    urgent,
+                    &display_name,
+                    &role,
+                    &resolved_target,
+                    &worker_names,
+                ) {
+                    let targets = halt_targets_for_urgent(&resolved_target, &worker_names);
+                    for target_name in &targets {
+                        let Some(mut agent) = agents
+                            .iter()
+                            .find(|a| a.name.eq_ignore_ascii_case(target_name))
+                            .cloned()
+                        else {
+                            continue;
+                        };
+                        // Never halt a supervisor agent even if misnamed in the list.
+                        if agent.role == AgentRole::Supervisor {
+                            continue;
+                        }
+                        agent
+                            .metadata
+                            .insert(HALT_TASK_WORK_META.to_string(), "1".to_string());
+                        agent_store.update(&agent).map_err(|e| {
+                            Self::error(
+                                ErrorCode::INTERNAL_ERROR,
+                                format!(
+                                    "Failed to persist halt_task_work for {target_name} \
+                                     before urgent enqueue (cas-b269): {e}"
+                                ),
+                            )
+                        })?;
+                    }
+                } else if urgent
+                    && !may_source_set_halt(&display_name, &role)
+                    && resolved_target.eq_ignore_ascii_case("supervisor")
+                {
+                    // Worker→supervisor urgent: explicit no-op on halt (policy).
+                    tracing::debug!(
+                        source = %display_name,
+                        "cas-b269: ignoring halt for unauthorized source or supervisor target"
+                    );
+                }
+            }
+        }
+
         // cas-f9e8 telemetry: measure the wall-clock spent inside the DB
         // insert and log it alongside the caller-visible message id, so a
         // future investigator can bisect whether stalls live in send-side
@@ -311,33 +379,6 @@ impl CasService {
                     format!("Failed to queue message: {error}"),
                 )
             })?;
-
-        // cas-b269: urgent supervisor→worker messages set an authoritative
-        // halt flag so post-interrupt MCP cannot re-run close/verify without
-        // a new task start (transcript interpretation alone is insufficient).
-        if urgent && resolved_target != "supervisor" && resolved_target != "all_workers" {
-            use crate::mcp::tools::core::task::lifecycle::stale_close_guard::HALT_TASK_WORK_META;
-            use crate::store::open_agent_store;
-            if let Ok(agent_store) = open_agent_store(&self.inner.cas_root) {
-                if let Ok(agents) = agent_store.list(None) {
-                    if let Some(mut agent) = agents
-                        .into_iter()
-                        .find(|a| a.name.eq_ignore_ascii_case(&resolved_target))
-                    {
-                        agent
-                            .metadata
-                            .insert(HALT_TASK_WORK_META.to_string(), "1".to_string());
-                        if let Err(e) = agent_store.update(&agent) {
-                            tracing::warn!(
-                                target = %resolved_target,
-                                error = %e,
-                                "cas-b269: failed to set halt_task_work after urgent message"
-                            );
-                        }
-                    }
-                }
-            }
-        }
 
         let persist_latency_ms = enqueue_started.elapsed().as_secs_f64() * 1000.0;
         tracing::debug!(

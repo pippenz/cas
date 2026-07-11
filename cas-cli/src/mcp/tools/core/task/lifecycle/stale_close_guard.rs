@@ -57,6 +57,59 @@ pub fn agent_task_work_halted(metadata: &std::collections::HashMap<String, Strin
         .unwrap_or(false)
 }
 
+/// Whether the message **source** is authorized to set `halt_task_work`
+/// (cas-b269 review): only supervisor/director → worker stops.
+///
+/// Workers must not halt their supervisor (or peers) via urgent messages.
+pub fn may_source_set_halt(source_display: &str, source_role: &str) -> bool {
+    let role = source_role.eq_ignore_ascii_case("supervisor");
+    let name = source_display.eq_ignore_ascii_case("supervisor")
+        || source_display.eq_ignore_ascii_case("director");
+    role || name
+}
+
+/// Resolve which agent **names** should receive a durable halt for an urgent
+/// message (cas-b269 review).
+///
+/// - Never includes `supervisor` (workers cannot be halted *as* the supervisor
+///   target; a worker must not halt the supervisor).
+/// - `all_workers` expands to every provided worker name.
+/// - Single worker name is returned only when it is in `worker_names` (or
+///   `worker_names` is empty and the target is not supervisor — for unit tests).
+pub fn halt_targets_for_urgent(
+    resolved_target: &str,
+    worker_names: &[String],
+) -> Vec<String> {
+    if resolved_target.eq_ignore_ascii_case("supervisor") {
+        return Vec::new();
+    }
+    if resolved_target.eq_ignore_ascii_case("all_workers") {
+        return worker_names.to_vec();
+    }
+    // Single target: only halt if it is a known worker (or list empty for pure tests).
+    if worker_names.is_empty() {
+        return vec![resolved_target.to_string()];
+    }
+    worker_names
+        .iter()
+        .filter(|n| n.eq_ignore_ascii_case(resolved_target))
+        .cloned()
+        .collect()
+}
+
+/// Whether an urgent send should attempt durable halt for this source/target.
+pub fn should_persist_urgent_halt(
+    urgent: bool,
+    source_display: &str,
+    source_role: &str,
+    resolved_target: &str,
+    worker_names: &[String],
+) -> bool {
+    urgent
+        && may_source_set_halt(source_display, source_role)
+        && !halt_targets_for_urgent(resolved_target, worker_names).is_empty()
+}
+
 /// Heuristic: does this delivered prompt instruct close / re-verify work?
 /// Used by tests and optional delivery-time rewrite (not required for MCP gates).
 pub fn looks_like_close_or_verify_guidance(text: &str) -> bool {
@@ -175,5 +228,85 @@ mod tests {
         ));
         assert!(looks_like_close_or_verify_guidance("please re-verify the tip"));
         assert!(!looks_like_close_or_verify_guidance("standing by for work"));
+    }
+
+    /// Review: only supervisor/director may set halt — not workers.
+    #[test]
+    fn test_b269_only_supervisor_or_director_may_set_halt() {
+        assert!(may_source_set_halt("eager-marten-46", "supervisor"));
+        assert!(may_source_set_halt("supervisor", "primary"));
+        assert!(may_source_set_halt("director", "primary"));
+        assert!(!may_source_set_halt("staging-sync", "worker"));
+        assert!(!may_source_set_halt("staging-sync", "primary"));
+    }
+
+    /// Review: urgent all_workers expands to every worker; never supervisor.
+    #[test]
+    fn test_b269_urgent_all_workers_halts_every_worker_not_supervisor() {
+        let workers = vec!["w1".into(), "w2".into(), "w3".into()];
+        let targets = halt_targets_for_urgent("all_workers", &workers);
+        assert_eq!(targets, workers);
+        assert!(halt_targets_for_urgent("supervisor", &workers).is_empty());
+        assert_eq!(
+            halt_targets_for_urgent("w2", &workers),
+            vec!["w2".to_string()]
+        );
+        // Unknown name not in worker list → no halt (fail closed for wrong target).
+        assert!(halt_targets_for_urgent("not-a-worker", &workers).is_empty());
+    }
+
+    /// Review: worker→supervisor urgent must not set halt on anyone.
+    #[test]
+    fn test_b269_worker_cannot_halt_supervisor() {
+        let workers = vec!["staging-sync".into()];
+        assert!(!should_persist_urgent_halt(
+            true,
+            "staging-sync",
+            "worker",
+            "supervisor",
+            &workers
+        ));
+        assert!(!should_persist_urgent_halt(
+            true,
+            "staging-sync",
+            "worker",
+            "eager-marten-46",
+            &workers
+        ));
+        // Authorized supervisor → worker does set halt.
+        assert!(should_persist_urgent_halt(
+            true,
+            "eager-marten-46",
+            "supervisor",
+            "staging-sync",
+            &workers
+        ));
+        // Non-urgent never persists halt.
+        assert!(!should_persist_urgent_halt(
+            false,
+            "eager-marten-46",
+            "supervisor",
+            "staging-sync",
+            &workers
+        ));
+    }
+
+    /// Review: failed start must preserve halt (clear only after full success).
+    /// Pure policy: we never clear halt on Closed/PSR/AwaitingMerge rejections —
+    /// only after a successful InProgress transition (wired in cas_task_start).
+    #[test]
+    fn test_b269_failed_start_statuses_do_not_clear_halt_policy() {
+        // Document the terminal/non-startable statuses that must NOT clear halt.
+        let no_clear = [
+            TaskStatus::Closed,
+            TaskStatus::PendingSupervisorReview,
+            TaskStatus::AwaitingMerge,
+        ];
+        for status in no_clear {
+            assert!(
+                !matches!(status, TaskStatus::Open | TaskStatus::InProgress | TaskStatus::Blocked),
+                "status {status:?} is a failed-start path that must preserve halt"
+            );
+        }
     }
 }

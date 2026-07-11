@@ -136,3 +136,10 @@ Close-merge semantics unchanged. Unguarded product/Ozer code out of scope.
 ```text
 cargo test -p cas --lib -- test_b269
 ```
+
+### Review follow-up (halt durability)
+
+1. Halt cleared only after `task start` fully succeeds (InProgress persisted); failed starts preserve halt.
+2. Urgent `all_workers` expands halt to every Worker-role agent.
+3. Only supervisor/director sources may set halt; worker→supervisor never halts.
+4. Halt persisted before queue enqueue (fail closed if persist fails).
