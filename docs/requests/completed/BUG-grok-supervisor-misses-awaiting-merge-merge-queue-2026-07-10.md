@@ -1,37 +1,52 @@
-# Resolution (cas-c145, 2026-07-11)
+# Resolution (cas-c145)
 
-**Status:** Fixed in this branch (`factory/hv-grok-merge`).
+**Status:** Fixed on `factory/hv-grok-merge`  
+**Commit:** `e1b33f4992eb430582ab329e710a1314cd965573`  
+**Date:** 2026-07-11  
+**Epic:** cas-0e22
 
-## Characterization (pre-fix)
+## Characterization (pre-fix stall)
 
-1. WorkerIdle + AwaitingMerge/MERGE REQUIRED director prompt only said "resolve the rejection" — no factory branch, epic target, or merge next-action (`cas-cli/src/ui/factory/director/prompts.rs`).
-2. Event reachability already worked (cas-627f); the **content** of the supervisor nudge was the gap, not delivery.
-3. `GROK_SUPERVISOR_INSTRUCTIONS` (`crates/cas-pty/src/pty.rs`) mentioned review/merge generically with no merge-queue-before-user-chat priority (Grok lacks SessionStart additionalContext, so `--rules` is the boot surface).
-4. Supervisor skill "never poll / end turn" lacked a complementary push-based merge-drain rule, so free-form user chat could outrank a non-empty merge queue.
+Verified against parent of the fix (`e1b33f4992eb430582ab329e710a1314cd965573^`):
 
-## Fix
+1. **Director WorkerIdle prompt** for MERGE REQUIRED / AwaitingMerge only said “resolve the rejection before acting on the task as closed” — no factory branch, epic target, or merge next-action (`cas-cli/src/ui/factory/director/prompts.rs`).
+2. **Event reachability was not the bug** (cas-627f already restored park → idle notification). The **content** of the supervisor nudge was insufficient for Grok to treat merge as top priority.
+3. **`GROK_SUPERVISOR_INSTRUCTIONS`** (`crates/cas-pty/src/pty.rs`) mentioned review/merge generically; Grok has no SessionStart additionalContext, so `--rules` is the boot surface and lacked merge-queue-before-user-chat guidance.
+4. **Supervisor skill** emphasized never poll / end turn without a complementary push-based merge-drain rule, so free-form user chat could outrank a non-empty merge queue.
+
+## Fix (scope-bounded)
 
 | Layer | Change |
 |-------|--------|
-| Director auto-prompt | MERGE REQUIRED / AwaitingMerge idle → actionable merge-queue prompt: task id, `factory/<worker>`, epic target branch, `epic_status` + list awaiting_merge, merge steps, re-close, explicit no-poll |
-| Grok `--rules` | `GROK_SUPERVISOR_INSTRUCTIONS` now prioritizes merge-queue drain before free-form chat |
-| Supervisor skill twins | Push-based merge drain folded into "Never monitor, poll" hard rule; Phase 3 workflow documents AwaitingMerge steps (Claude/Grok/Codex prefixes) |
+| Director auto-prompt | MERGE REQUIRED / AwaitingMerge idle → actionable merge-queue event: task id/title, `factory/<worker>`, epic target branch, `epic_status` + `list status=awaiting_merge`, merge steps, worker re-close, explicit **do not poll** |
+| Grok `--rules` | `GROK_SUPERVISOR_INSTRUCTIONS` prioritizes merge-queue drain before free-form chat |
+| Supervisor skill twins (Claude/Grok/Codex) | Push-based merge drain in hard rules; Phase 3 workflow documents AwaitingMerge steps |
 
-Close-gate merge semantics were **not** modified (owned by sibling tasks).
+**Non-goals honored:** close-gate / `close_ops` merge semantics **not** modified (owned by hv-close / sibling tasks). No polling loop introduced.
 
-## Proof
+## Proof (fresh, exit 0)
 
 ```
 cargo test -p cas --lib ui::factory::director::prompts::tests::test_c145
-cargo test -p cas --lib ui::factory::director::prompts::tests::test_worker_idle
-cargo test -p cas --lib ui::factory::director::prompts::tests::test_09d0_worker_idle_awaiting_merge
-cargo test -p cas-pty --lib test_pty_config_grok_supervisor
-cargo test -p cas --lib test_supervisor_guidance
+# → test_c145_awaiting_merge_idle_is_actionable_merge_queue_prompt
+# → test_c145_non_merge_close_rejection_stays_informational
+
+cargo test -p cas-pty --lib test_pty_config_grok_supervisor_injects_rules
+# → test_pty_config_grok_supervisor_injects_rules_with_cas_prefix (MERGE REQUIRED / awaiting_merge / factory/<worker> / do not poll)
+
+cargo test -p cas --lib test_supervisor_guidance_under_8kb
 ```
 
-All focused tests above pass. After supervisor merge, workers re-close as before (existing verification_flow coverage for post-merge close).
+Post-merge, workers re-close via the existing close path (unchanged); verification_flow coverage for post-merge close remains valid.
 
-## Original report
+## Files
+
+- `cas-cli/src/ui/factory/director/prompts.rs`
+- `crates/cas-pty/src/pty.rs`
+- `cas-cli/src/builtins/{,grok/,codex/}skills/cas-supervisor.md`
+- `cas-cli/src/builtins/{,grok/,codex/}skills/cas-supervisor/references/workflow.md`
+
+## Original report (imported from supervisor checkout)
 
 ---
 from: Ozer Health factory (operator + Grok Build supervisor)
