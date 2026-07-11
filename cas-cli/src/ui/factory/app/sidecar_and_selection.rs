@@ -73,6 +73,33 @@ pub fn alt_screen_wheel_bytes(cli: cas_mux::SupervisorCli, up: bool) -> Vec<u8> 
     }
 }
 
+/// SGR 1006 left-button press+release at 1-based terminal coordinates.
+///
+/// Used to forward factory mouse clicks into an already-focused Grok alt-screen
+/// pane so the on-screen **Stop** control receives the click (cas-7f6f). Factory
+/// mouse capture otherwise steals clicks for pane-focus only.
+pub fn sgr_left_click_bytes(col: u16, row: u16) -> Vec<u8> {
+    let col = col.max(1);
+    let row = row.max(1);
+    // Press: CSI < 0 ; col ; row M   Release: CSI < 0 ; col ; row m
+    format!("\x1b[<0;{col};{row}M\x1b[<0;{col};{row}m").into_bytes()
+}
+
+/// Outcome of [`FactoryApp::handle_mouse_click`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum ClickAction {
+    /// Click was handled by factory chrome (tabs, focus change, dialogs).
+    Handled,
+    /// Forward an SGR click into the named pane (already focused, alt-screen Grok).
+    ForwardSgr {
+        pane: String,
+        /// 1-based PTY column
+        col: u16,
+        /// 1-based PTY row
+        row: u16,
+    },
+}
+
 impl FactoryApp {
     // ========================================================================
     // Sidecar navigation
@@ -207,11 +234,18 @@ impl FactoryApp {
         }
     }
 
-    /// Handle mouse click at screen coordinates
+    /// Handle mouse click at screen coordinates.
     ///
     /// Resolves which pane was clicked and focuses it. Also handles clicks
     /// on the worker tab bar to switch worker tabs.
-    pub fn handle_mouse_click(&mut self, col: u16, row: u16) {
+    ///
+    /// When the click is inside an **already-focused** Grok alt-screen pane,
+    /// returns [`ClickAction::ForwardSgr`] so the caller can inject an SGR
+    /// click into the PTY — this is what makes Grok's on-screen **Stop**
+    /// control work under factory mouse capture (cas-7f6f). First click on an
+    /// unfocused pane still only focuses (no forward), so idle clicks stay
+    /// harmless.
+    pub fn handle_mouse_click(&mut self, col: u16, row: u16) -> ClickAction {
         // Don't handle clicks while modal dialogs are open
         if self.show_task_dialog
             || self.show_changes_dialog
@@ -219,7 +253,7 @@ impl FactoryApp {
             || self.show_help
             || self.show_terminal_dialog
         {
-            return;
+            return ClickAction::Handled;
         }
 
         // Check worker tab bar clicks (switches tab without focusing)
@@ -262,7 +296,7 @@ impl FactoryApp {
                             }
                         }
                     }
-                    return;
+                    return ClickAction::Handled;
                 }
             }
         }
@@ -273,12 +307,13 @@ impl FactoryApp {
                 if self.sidecar_focus == SidecarFocus::None {
                     self.toggle_sidecar_focus();
                 }
-                return;
+                return ClickAction::Handled;
             }
         }
 
         // Check pane clicks (supervisor + workers)
         if let Some(pane_name) = self.pane_at_screen(col, row) {
+            let already_focused = self.mux.focused_id() == Some(pane_name.as_str());
             let _ = self.mux.focus(&pane_name);
             self.sidecar_focus = SidecarFocus::None;
 
@@ -288,7 +323,68 @@ impl FactoryApp {
                     self.selected_worker_tab = idx;
                 }
             }
+
+            // cas-7f6f: forward click into already-focused Grok alt-screen so
+            // Stop (and other in-TUI controls) receive the event.
+            if already_focused
+                && self.harness_for(&pane_name) == cas_mux::SupervisorCli::Grok
+                && self.mux.get(&pane_name).is_some_and(|p| p.is_in_alt_screen())
+            {
+                if let Some((pty_col, pty_row)) = self.screen_to_pty_coords(&pane_name, col, row) {
+                    return ClickAction::ForwardSgr {
+                        pane: pane_name,
+                        col: pty_col,
+                        row: pty_row,
+                    };
+                }
+            }
         }
+        ClickAction::Handled
+    }
+
+    /// Map factory screen coordinates to 1-based PTY cell coordinates for a pane.
+    ///
+    /// Assumes a 1-cell border around the pane content (ratatui Block). Returns
+    /// `None` when the click lands on the border or the pane area is unknown.
+    pub fn screen_to_pty_coords(
+        &self,
+        pane_name: &str,
+        screen_col: u16,
+        screen_row: u16,
+    ) -> Option<(u16, u16)> {
+        let area = self.pane_content_area(pane_name)?;
+        let inner_x = area.x.saturating_add(1);
+        let inner_y = area.y.saturating_add(1);
+        let inner_w = area.width.saturating_sub(2);
+        let inner_h = area.height.saturating_sub(2);
+        if inner_w == 0 || inner_h == 0 {
+            return None;
+        }
+        if screen_col < inner_x
+            || screen_row < inner_y
+            || screen_col >= inner_x + inner_w
+            || screen_row >= inner_y + inner_h
+        {
+            return None;
+        }
+        // 1-based terminal coordinates.
+        let pty_col = screen_col - inner_x + 1;
+        let pty_row = screen_row - inner_y + 1;
+        Some((pty_col, pty_row))
+    }
+
+    /// Outer screen rect for a named supervisor/worker pane (includes border).
+    fn pane_content_area(&self, pane_name: &str) -> Option<Rect> {
+        if pane_name == self.supervisor_name {
+            return self.supervisor_area;
+        }
+        if self.is_tabbed {
+            return self.worker_content_area;
+        }
+        self.worker_names
+            .iter()
+            .position(|n| n == pane_name)
+            .and_then(|i| self.worker_areas.get(i).copied())
     }
 
     /// Focus the next PTY pane (cycles through supervisor + worker panes only)
@@ -927,6 +1023,7 @@ mod tests {
     use cas_factory::TaskSummary;
     use cas_mux::Pane;
     use cas_types::{Priority, TaskStatus, TaskType};
+    use ratatui::layout::Rect;
     use std::collections::HashMap;
 
     /// Helper: create a FactoryApp with a single director pane that has been
@@ -1331,6 +1428,118 @@ mod tests {
             app.alt_screen_scroll_payload(false),
             SCROLL_DOWN_SGR.repeat(SCROLL_LINES),
             "Grok focused pane must get SGR wheel-down × SCROLL_LINES"
+        );
+    }
+
+    // =========================================================================
+    // cas-7f6f: Grok Stop click + Esc cancel path
+    // =========================================================================
+
+    /// SGR left-click is press (M) + release (m) at the given 1-based cell.
+    #[test]
+    fn sgr_left_click_bytes_shape_cas_7f6f() {
+        assert_eq!(
+            sgr_left_click_bytes(12, 7),
+            b"\x1b[<0;12;7M\x1b[<0;12;7m",
+            "SGR 1006 left click = press then release"
+        );
+        // Coordinates are clamped to ≥1 (terminals are 1-based).
+        assert_eq!(sgr_left_click_bytes(0, 0), b"\x1b[<0;1;1M\x1b[<0;1;1m");
+    }
+
+    /// Click on an unfocused Grok pane only focuses (no SGR forward).
+    /// Click on an already-focused Grok alt-screen pane forwards SGR so the
+    /// on-screen Stop control can receive the event.
+    #[test]
+    fn mouse_click_forwards_sgr_only_when_already_focused_grok_alt_cas_7f6f() {
+        let mut app = FactoryApp::for_test();
+        // Placeholder first so the Grok pane is not auto-focused on add.
+        app.mux
+            .add_pane(Pane::director("other", 20, 40).unwrap());
+        let mut pane = Pane::director("test-supervisor", 20, 40).unwrap();
+        pane.set_harness(cas_mux::SupervisorCli::Grok);
+        pane.feed(b"\x1b[?1049h").unwrap();
+        app.mux.add_pane(pane);
+        app.supervisor_name = "test-supervisor".to_string();
+        app.supervisor_cli = cas_mux::SupervisorCli::Grok;
+        // Outer rect: x=0 y=0 w=40 h=20 (border 1 → content 1..38 × 1..18)
+        app.supervisor_area = Some(Rect::new(0, 0, 40, 20));
+
+        // Focus is on "other" — first click on Grok pane focuses only.
+        assert_eq!(app.mux.focused_id(), Some("other"));
+        assert_eq!(
+            app.handle_mouse_click(10, 10),
+            ClickAction::Handled,
+            "first click on unfocused pane must only focus"
+        );
+        assert_eq!(app.mux.focused_id(), Some("test-supervisor"));
+
+        // Already focused + Grok + alt-screen → ForwardSgr.
+        match app.handle_mouse_click(10, 10) {
+            ClickAction::ForwardSgr { pane, col, row } => {
+                assert_eq!(pane, "test-supervisor");
+                // screen (10,10) → inner origin (1,1) → pty (10,10)
+                assert_eq!((col, row), (10, 10));
+            }
+            other => panic!("expected ForwardSgr, got {other:?}"),
+        }
+
+        // Border click (col 0) stays Handled — no forward into chrome.
+        assert_eq!(
+            app.handle_mouse_click(0, 10),
+            ClickAction::Handled,
+            "border click must not forward SGR"
+        );
+    }
+
+    /// Claude focused alt-screen must NOT forward SGR clicks (Stop path is
+    /// Grok-only; Claude keeps Esc cancel).
+    #[test]
+    fn mouse_click_does_not_forward_sgr_for_claude_cas_7f6f() {
+        let mut app = FactoryApp::for_test();
+        let pane = Pane::director("test-supervisor", 20, 40).unwrap();
+        app.mux.add_pane(pane);
+        app.mux.focus("test-supervisor");
+        app.mux
+            .get_mut("test-supervisor")
+            .unwrap()
+            .feed(b"\x1b[?1049h")
+            .unwrap();
+        app.supervisor_name = "test-supervisor".to_string();
+        app.supervisor_cli = cas_mux::SupervisorCli::Claude;
+        app.supervisor_area = Some(Rect::new(0, 0, 40, 20));
+
+        assert_eq!(
+            app.handle_mouse_click(10, 10),
+            ClickAction::Handled,
+            "Claude must not receive factory-forwarded SGR clicks"
+        );
+    }
+
+    /// Idle / no-pane click is harmless.
+    #[test]
+    fn mouse_click_idle_is_harmless_cas_7f6f() {
+        let mut app = FactoryApp::for_test();
+        assert_eq!(app.handle_mouse_click(5, 5), ClickAction::Handled);
+    }
+
+    /// Harness-aware turn cancel bytes (pin for Esc routing + break_turn).
+    #[test]
+    fn turn_cancel_bytes_follow_harness_cas_7f6f() {
+        assert_eq!(
+            cas_mux::SupervisorCli::Claude.turn_cancel_bytes(),
+            &[0x1b],
+            "Claude cancel = Esc"
+        );
+        assert_eq!(
+            cas_mux::SupervisorCli::Codex.turn_cancel_bytes(),
+            &[0x1b],
+            "Codex cancel = Esc"
+        );
+        assert_eq!(
+            cas_mux::SupervisorCli::Grok.turn_cancel_bytes(),
+            &[0x03],
+            "Grok cancel = Ctrl+C (Esc is mid-turn no-op since 0.2.93)"
         );
     }
 
