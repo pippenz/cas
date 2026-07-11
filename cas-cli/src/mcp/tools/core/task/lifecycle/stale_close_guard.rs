@@ -7,15 +7,28 @@
 //!
 //! - close of an already-closed task is a no-op success (no re-verify)
 //! - verification against a closed task is rejected
-//! - urgent supervisor halt blocks further close/verify until a new start
+//! - urgent supervisor/director halt blocks further close/verify until a
+//!   successful new start that does not race a newer halt generation
 //!
 //! Close-merge semantics and product code are out of scope.
 
 use cas_types::TaskStatus;
+use std::collections::HashMap;
 
-/// Agent metadata key: when `"1"`, the worker must not run task close or
-/// verification MCP until a new `task start` clears it (urgent stop).
+/// Agent metadata key: when truthy, the worker must not run task close or
+/// verification MCP until a successful `task start` clears it (urgent stop).
 pub const HALT_TASK_WORK_META: &str = "halt_task_work";
+
+/// Monotonic generation (unix millis) for the halt flag. A concurrent urgent
+/// stop during `task start` writes a newer gen; start must not clear it.
+pub const HALT_TASK_WORK_GEN_META: &str = "halt_task_work_gen";
+
+/// Snapshot of one worker candidate for halt fan-out (pure tests + production).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HaltWorkerCandidate {
+    pub name: String,
+    pub factory_session: Option<String>,
+}
 
 /// Whether the task is in the terminal closed state for close/verify suppression.
 pub fn is_terminal_closed(status: TaskStatus) -> bool {
@@ -50,47 +63,98 @@ pub fn halt_blocks_task_work_message(tool: &str) -> String {
 }
 
 /// True when agent metadata marks task work as halted after urgent stop.
-pub fn agent_task_work_halted(metadata: &std::collections::HashMap<String, String>) -> bool {
+pub fn agent_task_work_halted(metadata: &HashMap<String, String>) -> bool {
     metadata
         .get(HALT_TASK_WORK_META)
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
 }
 
-/// Whether the message **source** is authorized to set `halt_task_work`
-/// (cas-b269 review): only supervisor/director → worker stops.
+/// Parse halt generation from metadata (unix millis). Missing/invalid → 0.
+pub fn halt_generation(metadata: &HashMap<String, String>) -> u64 {
+    metadata
+        .get(HALT_TASK_WORK_GEN_META)
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+/// Whether `task start` may clear halt given the generation present at clear
+/// time and the ceiling captured after a successful start (unix millis).
 ///
-/// Workers must not halt their supervisor (or peers) via urgent messages.
+/// Clears only when `stored_gen <= clear_ceiling`. A concurrent urgent halt
+/// that wrote a *newer* gen must be preserved.
+pub fn should_clear_halt_at_generation(stored_gen: u64, clear_ceiling: u64) -> bool {
+    stored_gen <= clear_ceiling
+}
+
+/// Apply a new halt generation to metadata (sets flag + gen).
+pub fn apply_halt_metadata(metadata: &mut HashMap<String, String>, generation: u64) {
+    metadata.insert(HALT_TASK_WORK_META.to_string(), "1".to_string());
+    metadata.insert(
+        HALT_TASK_WORK_GEN_META.to_string(),
+        generation.to_string(),
+    );
+}
+
+/// Clear halt metadata keys.
+pub fn clear_halt_metadata(metadata: &mut HashMap<String, String>) {
+    metadata.remove(HALT_TASK_WORK_META);
+    metadata.remove(HALT_TASK_WORK_GEN_META);
+}
+
+/// Whether the message **source** is authorized to set `halt_task_work`.
+///
+/// Authorize by role string (`supervisor` / `director` via `AgentRole`) and
+/// by known display names (`supervisor`, `director`). Workers must not halt.
 pub fn may_source_set_halt(source_display: &str, source_role: &str) -> bool {
-    let role = source_role.eq_ignore_ascii_case("supervisor");
+    let role = source_role.eq_ignore_ascii_case("supervisor")
+        || source_role.eq_ignore_ascii_case("director");
     let name = source_display.eq_ignore_ascii_case("supervisor")
         || source_display.eq_ignore_ascii_case("director");
     role || name
 }
 
+/// Same as [`may_source_set_halt`] but with typed `AgentRole` when known.
+pub fn may_source_role_set_halt(role: cas_types::AgentRole) -> bool {
+    matches!(
+        role,
+        cas_types::AgentRole::Supervisor | cas_types::AgentRole::Director
+    )
+}
+
+/// Session-scope worker names visible to `factory_session` (strict match when
+/// `Some`; unfiltered when `None` for pure tests / non-factory).
+pub fn session_scoped_worker_names(
+    workers: &[HaltWorkerCandidate],
+    factory_session: Option<&str>,
+) -> Vec<String> {
+    workers
+        .iter()
+        .filter(|w| match factory_session {
+            Some(session) => w.factory_session.as_deref() == Some(session),
+            None => true,
+        })
+        .map(|w| w.name.clone())
+        .collect()
+}
+
 /// Resolve which agent **names** should receive a durable halt for an urgent
-/// message (cas-b269 review).
+/// message, scoped to the provided session-filtered worker name list.
 ///
-/// - Never includes `supervisor` (workers cannot be halted *as* the supervisor
-///   target; a worker must not halt the supervisor).
-/// - `all_workers` expands to every provided worker name.
-/// - Single worker name is returned only when it is in `worker_names` (or
-///   `worker_names` is empty and the target is not supervisor — for unit tests).
+/// - Never includes `supervisor`.
+/// - `all_workers` expands to every provided (session-scoped) worker name.
+/// - Single worker name only when present in the session-scoped list.
 pub fn halt_targets_for_urgent(
     resolved_target: &str,
-    worker_names: &[String],
+    session_worker_names: &[String],
 ) -> Vec<String> {
     if resolved_target.eq_ignore_ascii_case("supervisor") {
         return Vec::new();
     }
     if resolved_target.eq_ignore_ascii_case("all_workers") {
-        return worker_names.to_vec();
+        return session_worker_names.to_vec();
     }
-    // Single target: only halt if it is a known worker (or list empty for pure tests).
-    if worker_names.is_empty() {
-        return vec![resolved_target.to_string()];
-    }
-    worker_names
+    session_worker_names
         .iter()
         .filter(|n| n.eq_ignore_ascii_case(resolved_target))
         .cloned()
@@ -103,15 +167,14 @@ pub fn should_persist_urgent_halt(
     source_display: &str,
     source_role: &str,
     resolved_target: &str,
-    worker_names: &[String],
+    session_worker_names: &[String],
 ) -> bool {
     urgent
         && may_source_set_halt(source_display, source_role)
-        && !halt_targets_for_urgent(resolved_target, worker_names).is_empty()
+        && !halt_targets_for_urgent(resolved_target, session_worker_names).is_empty()
 }
 
 /// Heuristic: does this delivered prompt instruct close / re-verify work?
-/// Used by tests and optional delivery-time rewrite (not required for MCP gates).
 pub fn looks_like_close_or_verify_guidance(text: &str) -> bool {
     let lower = text.to_lowercase();
     const MARKERS: &[&str] = &[
@@ -138,9 +201,7 @@ pub fn rewrite_stale_close_guidance(
     if closed_task_ids.is_empty() || !looks_like_close_or_verify_guidance(text) {
         return None;
     }
-    let mentions_closed = closed_task_ids
-        .iter()
-        .any(|id| text.contains(id));
+    let mentions_closed = closed_task_ids.iter().any(|id| text.contains(id));
     if !mentions_closed {
         return None;
     }
@@ -156,8 +217,7 @@ pub fn rewrite_stale_close_guidance(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cas_types::TaskStatus;
-    use std::collections::HashMap;
+    use cas_types::{AgentRole, TaskStatus};
 
     #[test]
     fn test_b269_terminal_closed_only_for_closed() {
@@ -213,7 +273,6 @@ mod tests {
         let original = "task action=close id=cas-open reason=x";
         assert!(rewrite_stale_close_guidance(original, &[]).is_none());
         assert!(rewrite_stale_close_guidance("hello idle", &["cas-a651"]).is_none());
-        // Closed id not mentioned in text
         assert!(rewrite_stale_close_guidance(
             "task action=close id=cas-other",
             &["cas-a651"]
@@ -230,19 +289,58 @@ mod tests {
         assert!(!looks_like_close_or_verify_guidance("standing by for work"));
     }
 
-    /// Review: only supervisor/director may set halt — not workers.
+    /// Review 2: authorize AgentRole::Director explicitly (role string), not
+    /// display-name-only.
     #[test]
-    fn test_b269_only_supervisor_or_director_may_set_halt() {
+    fn test_b269_director_role_authorized_explicitly() {
+        assert!(may_source_set_halt("any-name", "director"));
+        assert!(may_source_role_set_halt(AgentRole::Director));
+        assert!(may_source_role_set_halt(AgentRole::Supervisor));
+        assert!(!may_source_role_set_halt(AgentRole::Worker));
+        assert!(!may_source_role_set_halt(AgentRole::Standard));
         assert!(may_source_set_halt("eager-marten-46", "supervisor"));
-        assert!(may_source_set_halt("supervisor", "primary"));
-        assert!(may_source_set_halt("director", "primary"));
+        assert!(may_source_set_halt("director", "primary")); // display fallback
         assert!(!may_source_set_halt("staging-sync", "worker"));
-        assert!(!may_source_set_halt("staging-sync", "primary"));
     }
 
-    /// Review: urgent all_workers expands to every worker; never supervisor.
+    /// Review 2: session scope — same worker name in another factory session
+    /// must not receive halt.
     #[test]
-    fn test_b269_urgent_all_workers_halts_every_worker_not_supervisor() {
+    fn test_b269_halt_scoped_to_factory_session_same_name_cross_session() {
+        let workers = vec![
+            HaltWorkerCandidate {
+                name: "staging-sync".into(),
+                factory_session: Some("session-a".into()),
+            },
+            HaltWorkerCandidate {
+                name: "staging-sync".into(), // same name, other session
+                factory_session: Some("session-b".into()),
+            },
+            HaltWorkerCandidate {
+                name: "other-worker".into(),
+                factory_session: Some("session-a".into()),
+            },
+        ];
+        let scoped = session_scoped_worker_names(&workers, Some("session-a"));
+        assert_eq!(
+            scoped,
+            vec!["staging-sync".to_string(), "other-worker".to_string()]
+        );
+        // all_workers only session-a workers
+        let targets = halt_targets_for_urgent("all_workers", &scoped);
+        assert_eq!(targets.len(), 2);
+        assert!(targets.contains(&"staging-sync".to_string()));
+        assert!(targets.contains(&"other-worker".to_string()));
+        // direct target: only session-scoped list (one staging-sync)
+        let direct = halt_targets_for_urgent("staging-sync", &scoped);
+        assert_eq!(direct, vec!["staging-sync".to_string()]);
+        // session-b scoped list would not include session-a other-worker
+        let scoped_b = session_scoped_worker_names(&workers, Some("session-b"));
+        assert_eq!(scoped_b, vec!["staging-sync".to_string()]);
+    }
+
+    #[test]
+    fn test_b269_urgent_all_workers_halts_every_session_worker_not_supervisor() {
         let workers = vec!["w1".into(), "w2".into(), "w3".into()];
         let targets = halt_targets_for_urgent("all_workers", &workers);
         assert_eq!(targets, workers);
@@ -251,11 +349,9 @@ mod tests {
             halt_targets_for_urgent("w2", &workers),
             vec!["w2".to_string()]
         );
-        // Unknown name not in worker list → no halt (fail closed for wrong target).
         assert!(halt_targets_for_urgent("not-a-worker", &workers).is_empty());
     }
 
-    /// Review: worker→supervisor urgent must not set halt on anyone.
     #[test]
     fn test_b269_worker_cannot_halt_supervisor() {
         let workers = vec!["staging-sync".into()];
@@ -266,14 +362,6 @@ mod tests {
             "supervisor",
             &workers
         ));
-        assert!(!should_persist_urgent_halt(
-            true,
-            "staging-sync",
-            "worker",
-            "eager-marten-46",
-            &workers
-        ));
-        // Authorized supervisor → worker does set halt.
         assert!(should_persist_urgent_halt(
             true,
             "eager-marten-46",
@@ -281,7 +369,13 @@ mod tests {
             "staging-sync",
             &workers
         ));
-        // Non-urgent never persists halt.
+        assert!(should_persist_urgent_halt(
+            true,
+            "factory-director",
+            "director",
+            "staging-sync",
+            &workers
+        ));
         assert!(!should_persist_urgent_halt(
             false,
             "eager-marten-46",
@@ -291,12 +385,30 @@ mod tests {
         ));
     }
 
-    /// Review: failed start must preserve halt (clear only after full success).
-    /// Pure policy: we never clear halt on Closed/PSR/AwaitingMerge rejections —
-    /// only after a successful InProgress transition (wired in cas_task_start).
+    /// Review 2: start must not clear a newer concurrent urgent halt gen.
+    #[test]
+    fn test_b269_start_does_not_clear_newer_halt_generation() {
+        let clear_ceiling = 1_000u64;
+        assert!(should_clear_halt_at_generation(500, clear_ceiling));
+        assert!(should_clear_halt_at_generation(1_000, clear_ceiling));
+        assert!(!should_clear_halt_at_generation(1_001, clear_ceiling));
+        // Legacy halt with no gen (0) is clearable.
+        assert!(should_clear_halt_at_generation(0, clear_ceiling));
+    }
+
+    #[test]
+    fn test_b269_apply_and_clear_halt_metadata() {
+        let mut meta = HashMap::new();
+        apply_halt_metadata(&mut meta, 42);
+        assert!(agent_task_work_halted(&meta));
+        assert_eq!(halt_generation(&meta), 42);
+        clear_halt_metadata(&mut meta);
+        assert!(!agent_task_work_halted(&meta));
+        assert_eq!(halt_generation(&meta), 0);
+    }
+
     #[test]
     fn test_b269_failed_start_statuses_do_not_clear_halt_policy() {
-        // Document the terminal/non-startable statuses that must NOT clear halt.
         let no_clear = [
             TaskStatus::Closed,
             TaskStatus::PendingSupervisorReview,
@@ -304,7 +416,10 @@ mod tests {
         ];
         for status in no_clear {
             assert!(
-                !matches!(status, TaskStatus::Open | TaskStatus::InProgress | TaskStatus::Blocked),
+                !matches!(
+                    status,
+                    TaskStatus::Open | TaskStatus::InProgress | TaskStatus::Blocked
+                ),
                 "status {status:?} is a failed-start path that must preserve halt"
             );
         }

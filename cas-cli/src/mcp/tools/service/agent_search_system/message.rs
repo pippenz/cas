@@ -289,70 +289,114 @@ impl CasService {
             priority
         };
 
-        // cas-b269 review: persist halt_task_work BEFORE enqueue so delivery
-        // cannot race ahead of the durable stop flag. Only authorized
-        // supervisor/director sources may set halt; all_workers expands to
-        // every worker; never halt the supervisor. Fail closed if halt
-        // cannot be persisted for an authorized urgent stop.
+        // cas-b269 review 2: halt fan-out is session-scoped, authorized by
+        // AgentRole::Supervisor|Director (and display fallback), fail-closed
+        // on store errors, generation-stamped, and all-or-none with enqueue
+        // (compensate halt writes if enqueue fails).
+        let mut halt_compensation: Vec<(String, std::collections::HashMap<String, String>)> =
+            Vec::new();
         {
             use crate::mcp::tools::core::task::lifecycle::stale_close_guard::{
-                halt_targets_for_urgent, may_source_set_halt, should_persist_urgent_halt,
-                HALT_TASK_WORK_META,
+                apply_halt_metadata, halt_targets_for_urgent, may_source_role_set_halt,
+                may_source_set_halt, session_scoped_worker_names, should_persist_urgent_halt,
+                HaltWorkerCandidate,
             };
             use crate::store::open_agent_store;
             use cas_types::AgentRole;
 
-            if let Ok(agent_store) = open_agent_store(&self.inner.cas_root) {
-                let agents = agent_store.list(None).unwrap_or_default();
-                let worker_names: Vec<String> = agents
+            // Prefer typed role from agent store when available.
+            let source_role_for_halt = agent_from_store
+                .as_ref()
+                .map(|a| a.role.to_string())
+                .unwrap_or_else(|| role.clone());
+            let source_authorized = agent_from_store
+                .as_ref()
+                .map(|a| may_source_role_set_halt(a.role))
+                .unwrap_or_else(|| may_source_set_halt(&display_name, &source_role_for_halt));
+
+            if urgent && (source_authorized || may_source_set_halt(&display_name, &source_role_for_halt))
+            {
+                let agent_store = open_agent_store(&self.inner.cas_root).map_err(|e| {
+                    Self::error(
+                        ErrorCode::INTERNAL_ERROR,
+                        format!(
+                            "Failed to open agent store for urgent halt (cas-b269, fail closed): {e}"
+                        ),
+                    )
+                })?;
+                let agents = agent_store.list(None).map_err(|e| {
+                    Self::error(
+                        ErrorCode::INTERNAL_ERROR,
+                        format!(
+                            "Failed to list agents for urgent halt (cas-b269, fail closed): {e}"
+                        ),
+                    )
+                })?;
+
+                let worker_candidates: Vec<HaltWorkerCandidate> = agents
                     .iter()
                     .filter(|a| a.role == AgentRole::Worker)
-                    .map(|a| a.name.clone())
+                    .map(|a| HaltWorkerCandidate {
+                        name: a.name.clone(),
+                        factory_session: a.factory_session.clone(),
+                    })
                     .collect();
+                let session_workers =
+                    session_scoped_worker_names(&worker_candidates, factory_session.as_deref());
 
                 if should_persist_urgent_halt(
                     urgent,
                     &display_name,
-                    &role,
+                    &source_role_for_halt,
                     &resolved_target,
-                    &worker_names,
+                    &session_workers,
                 ) {
-                    let targets = halt_targets_for_urgent(&resolved_target, &worker_names);
+                    let targets = halt_targets_for_urgent(&resolved_target, &session_workers);
+                    let halt_generation =
+                        chrono::Utc::now().timestamp_millis().max(0) as u64;
                     for target_name in &targets {
+                        // Match by name + session so same-name cross-session
+                        // peers are not halted.
                         let Some(mut agent) = agents
                             .iter()
-                            .find(|a| a.name.eq_ignore_ascii_case(target_name))
+                            .find(|a| {
+                                a.role == AgentRole::Worker
+                                    && a.name.eq_ignore_ascii_case(target_name)
+                                    && a.visible_to_factory_session(factory_session.as_deref())
+                            })
                             .cloned()
                         else {
                             continue;
                         };
-                        // Never halt a supervisor agent even if misnamed in the list.
-                        if agent.role == AgentRole::Supervisor {
-                            continue;
-                        }
-                        agent
-                            .metadata
-                            .insert(HALT_TASK_WORK_META.to_string(), "1".to_string());
-                        agent_store.update(&agent).map_err(|e| {
-                            Self::error(
+                        halt_compensation.push((agent.id.clone(), agent.metadata.clone()));
+                        apply_halt_metadata(&mut agent.metadata, halt_generation);
+                        if let Err(e) = agent_store.update(&agent) {
+                            // Compensate any prior successful writes.
+                            for (id, prev) in halt_compensation.drain(..) {
+                                if let Ok(mut a) = agent_store.get(&id) {
+                                    a.metadata = prev;
+                                    let _ = agent_store.update(&a);
+                                }
+                            }
+                            return Err(Self::error(
                                 ErrorCode::INTERNAL_ERROR,
                                 format!(
                                     "Failed to persist halt_task_work for {target_name} \
                                      before urgent enqueue (cas-b269): {e}"
                                 ),
-                            )
-                        })?;
+                            ));
+                        }
                     }
-                } else if urgent
-                    && !may_source_set_halt(&display_name, &role)
-                    && resolved_target.eq_ignore_ascii_case("supervisor")
-                {
-                    // Worker→supervisor urgent: explicit no-op on halt (policy).
-                    tracing::debug!(
-                        source = %display_name,
-                        "cas-b269: ignoring halt for unauthorized source or supervisor target"
-                    );
                 }
+            } else if urgent
+                && !source_authorized
+                && !may_source_set_halt(&display_name, &source_role_for_halt)
+            {
+                tracing::debug!(
+                    source = %display_name,
+                    role = %source_role_for_halt,
+                    "cas-b269: ignoring halt for unauthorized source"
+                );
             }
         }
 
@@ -363,22 +407,36 @@ impl CasService {
         // at debug so normal sessions stay quiet; enable via
         // `RUST_LOG=cas::coordination=debug`.
         let enqueue_started = std::time::Instant::now();
-        let message_id = queue
-            .enqueue_urgent(
-                &display_name,
-                &resolved_target,
-                &message,
-                factory_session.as_deref(),
-                Some(summary.as_str()),
-                priority,
-                urgent,
-            )
-            .map_err(|error| {
-                Self::error(
+        let message_id = match queue.enqueue_urgent(
+            &display_name,
+            &resolved_target,
+            &message,
+            factory_session.as_deref(),
+            Some(summary.as_str()),
+            priority,
+            urgent,
+        ) {
+            Ok(id) => id,
+            Err(error) => {
+                // Compensate halt fan-out so we never leave halt without the
+                // corresponding urgent message (all-or-none).
+                if !halt_compensation.is_empty() {
+                    use crate::store::open_agent_store;
+                    if let Ok(agent_store) = open_agent_store(&self.inner.cas_root) {
+                        for (id, prev) in halt_compensation.drain(..) {
+                            if let Ok(mut a) = agent_store.get(&id) {
+                                a.metadata = prev;
+                                let _ = agent_store.update(&a);
+                            }
+                        }
+                    }
+                }
+                return Err(Self::error(
                     ErrorCode::INTERNAL_ERROR,
                     format!("Failed to queue message: {error}"),
-                )
-            })?;
+                ));
+            }
+        };
 
         let persist_latency_ms = enqueue_started.elapsed().as_secs_f64() * 1000.0;
         tracing::debug!(

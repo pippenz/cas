@@ -143,3 +143,11 @@ cargo test -p cas --lib -- test_b269
 2. Urgent `all_workers` expands halt to every Worker-role agent.
 3. Only supervisor/director sources may set halt; worker→supervisor never halts.
 4. Halt persisted before queue enqueue (fail closed if persist fails).
+
+### Review 2 (session scope + atomicity + generation)
+
+1. Halt recipients scoped to `CAS_FACTORY_SESSION` (same-name cross-session excluded).
+2. Agent-store open/list errors fail closed on urgent authorized halt.
+3. Halt fan-out + enqueue all-or-none with compensating rollback on enqueue failure.
+4. `halt_task_work_gen` generation; start clears only if gen <= start ceiling.
+5. `AgentRole::Director` authorized explicitly via role.

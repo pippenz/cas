@@ -714,16 +714,21 @@ impl CasCore {
             data: None,
         })?;
 
-        // cas-b269 review: clear urgent-stop halt ONLY after start fully
-        // succeeds (task row is InProgress). Failed starts above preserve halt.
+        // cas-b269 review 2: clear urgent-stop halt ONLY after start fully
+        // succeeds, and only if halt gen is not newer than this start's
+        // ceiling (concurrent urgent stop must win).
         if let Ok(agent_store) = self.open_agent_store() {
             if let Ok(mut agent) = agent_store.get(&agent_id) {
-                if agent
-                    .metadata
-                    .remove(stale_close_guard::HALT_TASK_WORK_META)
-                    .is_some()
-                {
-                    let _ = agent_store.update(&agent);
+                if stale_close_guard::agent_task_work_halted(&agent.metadata) {
+                    let clear_ceiling = chrono::Utc::now().timestamp_millis().max(0) as u64;
+                    let stored_gen = stale_close_guard::halt_generation(&agent.metadata);
+                    if stale_close_guard::should_clear_halt_at_generation(
+                        stored_gen,
+                        clear_ceiling,
+                    ) {
+                        stale_close_guard::clear_halt_metadata(&mut agent.metadata);
+                        let _ = agent_store.update(&agent);
+                    }
                 }
             }
         }
