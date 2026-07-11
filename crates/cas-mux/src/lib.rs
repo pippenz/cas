@@ -39,7 +39,7 @@ pub use error::{Error, Result};
 pub use harness::{HarnessCapabilities, SupervisorCli};
 pub use mux::{Mux, MuxConfig, MuxEvent};
 pub use pane::TerminalSnapshot;
-pub use pane::{Pane, PaneBackend, PaneId, PaneKind};
+pub use pane::{Pane, PaneBackend, PaneId, PaneKind, UserInputKind};
 pub use pty::{Pty, PtyConfig, PtyEvent, TeamsSpawnConfig};
 pub use render::{LayoutDirection, Renderer};
 pub use spec::{Effort, WorkerSpec};

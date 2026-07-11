@@ -231,10 +231,20 @@ impl FactoryDaemon {
             }
             ClientMessage::Input { pane_id, data } => {
                 let actual = self.resolve_pane_name(&pane_id);
-                let _ = self.app.mux.send_input_to(&actual, &data).await;
+                // Unified KeyStream submit API (cas-7f6f). Paste/drop are not
+                // delivered on this message path.
+                let _ = self
+                    .app
+                    .mux
+                    .deliver_user_input_to(&actual, &data, cas_mux::UserInputKind::KeyStream)
+                    .await;
             }
             ClientMessage::InputFocused { data } => {
-                let _ = self.app.mux.send_input(&data).await;
+                let _ = self
+                    .app
+                    .mux
+                    .deliver_user_input(&data, cas_mux::UserInputKind::KeyStream)
+                    .await;
             }
             ClientMessage::Focus { pane_id } => {
                 let actual = self.resolve_pane_name(&pane_id);

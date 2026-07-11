@@ -836,11 +836,12 @@ impl Mux {
         self.panes.get(pane_id).map(|p| p.bytes_received())
     }
 
-    /// Break a specific worker's current turn by name by sending a single
-    /// Esc (0x1b) — the canonical Claude Code "stop this turn" key.
+    /// Break a specific worker's current turn by name with a harness-aware
+    /// cancel payload (cas-7f6f): Esc for Claude/Codex, Ctrl+C for Grok.
     ///
-    /// Distinct from [`Mux::interrupt`], which sends Ctrl+C (0x03). Targets a
-    /// pane by name independent of TUI focus.
+    /// Distinct from [`Mux::interrupt`] only in intent (turn cancel vs generic
+    /// interrupt); for Grok both currently send Ctrl+C. Targets a pane by name
+    /// independent of TUI focus.
     pub async fn break_turn(&self, pane_id: &str) -> Result<()> {
         let pane = self
             .panes
@@ -850,9 +851,9 @@ impl Mux {
     }
 
     /// Urgent interrupt-and-redirect: break the target worker's in-flight turn
-    /// (Esc), wait a bounded settle window for the turn to actually break, then
-    /// inject the correction as the worker's next prompt — by name, independent
-    /// of TUI focus.
+    /// (harness-aware cancel), wait a bounded settle window for the turn to
+    /// actually break, then inject the correction as the worker's next prompt
+    /// — by name, independent of TUI focus.
     ///
     /// `settle` is the bounded fallback delay between the turn-break and the
     /// inject. It exists because Claude Code (like the 2.1.183 tmux fix) drops
@@ -899,7 +900,11 @@ impl Mux {
         pane.inject_prompt(prompt).await
     }
 
-    /// Send input to the focused pane
+    /// Raw write to the focused pane (no turn-in-flight side effects).
+    ///
+    /// Prefer [`Mux::deliver_user_input`] for keyboard/paste so submit
+    /// semantics stay unified across surfaces (cas-7f6f). Keep this for
+    /// non-submit control bytes (SGR, scroll, raw Esc).
     pub async fn send_input(&self, data: &[u8]) -> Result<()> {
         let pane = self
             .focused()
@@ -907,13 +912,73 @@ impl Mux {
         pane.write(data).await
     }
 
-    /// Send input to a specific pane.
+    /// Raw write to a specific pane (no turn-in-flight side effects).
     pub async fn send_input_to(&self, pane_id: &str, data: &[u8]) -> Result<()> {
         let pane = self
             .panes
             .get(pane_id)
             .ok_or_else(|| Error::pane_not_found(pane_id))?;
         pane.write(data).await
+    }
+
+    /// Deliver user input to the focused pane with explicit submit kind.
+    ///
+    /// Unified API for terminal, GUI, WebSocket, and relay (cas-7f6f):
+    /// - [`UserInputKind::KeyStream`]: Enter marks turn-in-flight
+    /// - [`UserInputKind::StructuredPaste`]: never marks (paste/drop)
+    pub async fn deliver_user_input(
+        &self,
+        data: &[u8],
+        kind: crate::pane::UserInputKind,
+    ) -> Result<()> {
+        let pane = self
+            .focused()
+            .ok_or_else(|| Error::pty("No focused pane"))?;
+        pane.deliver_user_input(data, kind).await
+    }
+
+    /// Deliver user input to a specific pane with explicit submit kind.
+    pub async fn deliver_user_input_to(
+        &self,
+        pane_id: &str,
+        data: &[u8],
+        kind: crate::pane::UserInputKind,
+    ) -> Result<()> {
+        let pane = self
+            .panes
+            .get(pane_id)
+            .ok_or_else(|| Error::pane_not_found(pane_id))?;
+        pane.deliver_user_input(data, kind).await
+    }
+
+    /// Refresh harness turn state on the focused pane (Grok `turn_ended`).
+    pub fn refresh_focused_harness_turn_state(&self) {
+        if let Some(pane) = self.focused() {
+            pane.refresh_harness_turn_state();
+        }
+    }
+
+    /// Refresh harness turn state on a pane.
+    pub fn refresh_harness_turn_state(&self, pane_id: &str) {
+        if let Some(pane) = self.panes.get(pane_id) {
+            pane.refresh_harness_turn_state();
+        }
+    }
+
+    /// Record normal turn completion on a pane (not cancel — cancel clears
+    /// via [`Pane::break_turn`] / [`Pane::interrupt`]). Prefer harness
+    /// `turn_ended` via [`Pane::refresh_harness_turn_state`] for Grok.
+    pub fn note_turn_completed(&self, pane_id: &str) {
+        if let Some(pane) = self.panes.get(pane_id) {
+            pane.mark_turn_completed();
+        }
+    }
+
+    /// Record normal turn completion on the focused pane.
+    pub fn note_turn_completed_focused(&self) {
+        if let Some(pane) = self.focused() {
+            pane.mark_turn_completed();
+        }
     }
 
     /// Poll all panes for events (non-blocking)
