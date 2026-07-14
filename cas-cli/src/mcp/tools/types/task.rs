@@ -264,7 +264,11 @@ pub struct TaskUpdateRequest {
     #[serde(default)]
     pub epic: Option<String>,
 
-    /// Set epic verification owner (for epics in factory mode)
+    /// Set epic verification owner (for epics in factory mode).
+    ///
+    /// cas-cc74: this is an authorized transfer — only the current owner or a
+    /// supervisor may change it, and the target must be a live
+    /// supervisor/director identity. Unauthorized rewrites are rejected.
     #[schemars(
         description = "Agent ID responsible for epic verification (supervisor in factory mode)"
     )]

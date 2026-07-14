@@ -14,10 +14,21 @@ pub(crate) fn resolve_factory_epic_owner(
     agent_name: Option<String>,
     session_id: Option<String>,
 ) -> Result<String, String> {
-    agent_id
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| agent_name.filter(|s| !s.trim().is_empty()))
-        .or_else(|| session_id.filter(|s| !s.trim().is_empty()))
+    // cas-cc74: normalize/trim at the create write boundary so close gating
+    // and owner-routed compares never see padded owner strings.
+    let trim_nonempty = |s: Option<String>| {
+        s.and_then(|v| {
+            let t = v.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            }
+        })
+    };
+    trim_nonempty(agent_id)
+        .or_else(|| trim_nonempty(agent_name))
+        .or_else(|| trim_nonempty(session_id))
         .ok_or_else(|| {
             "Factory epic create requires a resolvable agent identity for \
              epic_verification_owner (CAS agent id / CAS_AGENT_NAME / CAS_SESSION_ID). \
@@ -788,5 +799,17 @@ mod factory_epic_owner_tests {
         let err_empty =
             resolve_factory_epic_owner(Some("  ".into()), Some("".into()), None).unwrap_err();
         assert!(err_empty.contains("Refusing ownerless factory epic"));
+    }
+
+    /// cas-cc74: create write boundary trims owner identity before store.
+    #[test]
+    fn test_cc74_factory_epic_owner_trims_whitespace() {
+        let owner = resolve_factory_epic_owner(
+            Some("  agent-uuid  ".into()),
+            Some("display".into()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(owner, "agent-uuid");
     }
 }
