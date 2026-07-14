@@ -179,6 +179,7 @@ fn authorize_explicit_task_for_system_b_worker(
             data: None,
         }),
     }
+}
 
 /// Path prefix match with canonicalize fallback (symlinks / relative forms).
 fn path_is_under(path: &Path, base: &Path) -> bool {
