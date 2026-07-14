@@ -60,8 +60,10 @@ pub use agent::{
     DEFAULT_HEARTBEAT_TIMEOUT_SECS, DEFAULT_LEASE_DURATION_SECS, DEFAULT_MAX_CONCURRENT_TASKS,
 };
 pub use code_review::{
-    AutofixClass, Finding, FindingValidationError, MAX_TITLE_LEN, Owner, ReviewOutcome,
-    ReviewerOutput, Severity as FindingSeverity, parse_reviewer_output,
+    AutofixClass, FINDING_OPTIONAL_FIELDS, FINDING_REQUIRED_FIELDS, Finding,
+    FindingValidationError, MAX_TITLE_LEN, Owner, ReviewOutcome, ReviewOutcomeParseError,
+    ReviewerOutput, Severity as FindingSeverity, parse_review_outcome, parse_reviewer_output,
+    review_outcome_shape_hint,
 };
 pub use commit_link::CommitLink;
 pub use dependency::{Dependency, DependencyType};

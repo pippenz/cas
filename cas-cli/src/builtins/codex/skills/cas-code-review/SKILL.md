@@ -71,6 +71,14 @@ With the Workflow result in hand, branch on `mode`:
 
 In every mode, the output envelope includes `activation` (which personas ran and why) and `intent_summary` from the Workflow return value.
 
+When the caller must pass the result into `task.close` via `code_review_findings`, the wire envelope is:
+
+```
+{ "residual": Finding[], "pre_existing": Finding[], "mode": string }
+```
+
+Each **Finding** requires: `title`, `severity`, `file`, `line`, `why_it_matters`, `autofix_class`, `owner`, `confidence`, `evidence`, `pre_existing`. Optional: `suggested_fix`, `requires_verification`. Full field rules live in [references/findings-schema.md](references/findings-schema.md). A malformed envelope is rejected with **all** missing Finding fields listed in one response — do not invent a partial shape by hand.
+
 ## Review ownership model
 
 `[code_review] owner` in `.cas/config.toml`:
