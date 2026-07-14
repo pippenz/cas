@@ -2,6 +2,7 @@ use crate::harness_policy::is_worker_without_subagents_from_env;
 use crate::mcp::tools::core::imports::*;
 
 pub(crate) mod close_ops;
+pub(crate) mod stale_close_guard;
 
 /// Resolve `epic_verification_owner` for a factory-mode epic create (cas-9fff).
 ///
@@ -357,6 +358,8 @@ impl CasCore {
             // supervisor-only action (see `cas_task_reopen`), so the
             // guidance must differ by role: a supervisor may still reopen,
             // a worker must not.
+            // cas-b269 review: do NOT clear halt_task_work here — failed
+            // starts must preserve the urgent-stop halt.
             return Err(Self::error(
                 ErrorCode::INVALID_PARAMS,
                 if crate::harness_policy::is_supervisor_from_env() {
@@ -710,6 +713,25 @@ impl CasCore {
             message: Cow::from(format!("Failed to update: {e}")),
             data: None,
         })?;
+
+        // cas-b269 review 2: clear urgent-stop halt ONLY after start fully
+        // succeeds, and only if halt gen is not newer than this start's
+        // ceiling (concurrent urgent stop must win).
+        if let Ok(agent_store) = self.open_agent_store() {
+            if let Ok(mut agent) = agent_store.get(&agent_id) {
+                if stale_close_guard::agent_task_work_halted(&agent.metadata) {
+                    let clear_ceiling = chrono::Utc::now().timestamp_millis().max(0) as u64;
+                    let stored_gen = stale_close_guard::halt_generation(&agent.metadata);
+                    if stale_close_guard::should_clear_halt_at_generation(
+                        stored_gen,
+                        clear_ceiling,
+                    ) {
+                        stale_close_guard::clear_halt_metadata(&mut agent.metadata);
+                        let _ = agent_store.update(&agent);
+                    }
+                }
+            }
+        }
 
         // For subtasks, show parent epic's worktree; for epics, show newly created worktree
         let wt_info = parent_worktree_info.or(worktree_info).unwrap_or_default();
