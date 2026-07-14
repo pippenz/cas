@@ -38,8 +38,148 @@ fn merge_target_remediation(assignee: &str) -> String {
     )
 }
 
+/// True when `token` is the System-B worker name (bare or `factory/<name>`).
+fn worker_name_token_matches(token: &str, worker: &str) -> bool {
+    token == worker || token.strip_prefix("factory/") == Some(worker)
+}
+
+/// Resolve whether an identity token (assignee field or agent id/name) belongs
+/// to the System-B worker being merged (cas-bd5f).
+fn identity_belongs_to_worker(
+    token: &str,
+    worker: &str,
+    agent_store: &dyn cas_store::AgentStore,
+) -> bool {
+    if worker_name_token_matches(token, worker) {
+        return true;
+    }
+    // Assignee may be an agent id — resolve and match on name.
+    if let Ok(agent) = agent_store.get(token) {
+        return worker_name_token_matches(&agent.name, worker) || agent.id == worker;
+    }
+    // Or a name that maps to a registered agent whose id equals worker
+    // (rare; worker is almost always a display name).
+    if let Ok(agents) = agent_store.list(None) {
+        return agents.iter().any(|a| {
+            (a.name == token || a.id == token)
+                && (worker_name_token_matches(&a.name, worker) || a.id == worker)
+        });
+    }
+    false
+}
+
+/// Authorize that an explicit `task_id` belongs to the System-B worker whose
+/// branch is being merged (cas-bd5f).
+///
+/// Pre-cas-bd5f gap: `resolve_system_b_merge_target` used the task's parent
+/// epic whenever `task_id` was supplied, without checking that the task's
+/// assignee / active lease matched the worktree worker. A caller could pair
+/// worker A with task B and redirect A's branch into B's epic.
+///
+/// Binding rules:
+/// 1. Active valid lease held by the worker → authorize (lease is authoritative).
+/// 2. Else task.assignee matches the worker (name, factory/name, or agent id) → ok.
+/// 3. Active valid lease held by a *different* agent → reject (incl. cross-session).
+/// 4. Assignee set to a different worker → reject.
+/// 5. No assignee and no matching valid lease → **conservative reject**.
+///
+/// Diagnostics are audit-ready: include worker, task id, and the mismatched
+/// identity token.
+fn authorize_explicit_task_for_system_b_worker(
+    task: &cas_types::Task,
+    worker: &str,
+    agent_store: &dyn cas_store::AgentStore,
+) -> Result<(), McpError> {
+    let task_id = task.id.as_str();
+
+    // Active lease is authoritative when present and valid.
+    let active_lease = match agent_store.get_lease(task_id) {
+        Ok(lease) => lease.filter(|l| l.is_valid()),
+        Err(e) => {
+            return Err(McpError {
+                code: ErrorCode::INTERNAL_ERROR,
+                message: Cow::from(format!(
+                    "Failed to read lease for task {task_id} while authorizing \
+                     worktree_merge for worker {worker}: {e} — refusing (fail-closed)."
+                )),
+                data: None,
+            });
+        }
+    };
+
+    if let Some(lease) = active_lease.as_ref() {
+        let holder_matches = identity_belongs_to_worker(&lease.agent_id, worker, agent_store);
+        if !holder_matches {
+            let holder_desc = agent_store
+                .get(&lease.agent_id)
+                .map(|a| {
+                    format!(
+                        "agent id={} name={} session={}",
+                        a.id,
+                        a.name,
+                        a.factory_session.as_deref().unwrap_or("-")
+                    )
+                })
+                .unwrap_or_else(|_| format!("agent id={}", lease.agent_id));
+            return Err(McpError {
+                code: ErrorCode::INVALID_PARAMS,
+                message: Cow::from(format!(
+                    "worktree_merge authorization failed (cas-bd5f): task {task_id} has an \
+                     active lease held by {holder_desc}, which does not match worker \
+                     '{worker}'. Refusing to redirect worker '{worker}'s branch into a \
+                     foreign task's epic.\n\n{}",
+                    merge_target_remediation(worker)
+                )),
+                data: None,
+            });
+        }
+        // Lease matches worker. If assignee is also set, it must not contradict.
+        if let Some(ref assignee) = task.assignee {
+            if !identity_belongs_to_worker(assignee, worker, agent_store) {
+                return Err(McpError {
+                    code: ErrorCode::INVALID_PARAMS,
+                    message: Cow::from(format!(
+                        "worktree_merge authorization failed (cas-bd5f): task {task_id} \
+                         lease matches worker '{worker}', but assignee '{assignee}' does \
+                         not — refusing contradictory ownership.\n\n{}",
+                        merge_target_remediation(worker)
+                    )),
+                    data: None,
+                });
+            }
+        }
+        return Ok(());
+    }
+
+    // No valid lease — require assignee match.
+    match task.assignee.as_deref() {
+        Some(assignee) if identity_belongs_to_worker(assignee, worker, agent_store) => Ok(()),
+        Some(assignee) => Err(McpError {
+            code: ErrorCode::INVALID_PARAMS,
+            message: Cow::from(format!(
+                "worktree_merge authorization failed (cas-bd5f): task {task_id} is assigned \
+                 to '{assignee}', not worker '{worker}'. Refusing to redirect worker \
+                 '{worker}'s branch into a foreign task's epic.\n\n{}",
+                merge_target_remediation(worker)
+            )),
+            data: None,
+        }),
+        None => Err(McpError {
+            code: ErrorCode::INVALID_PARAMS,
+            message: Cow::from(format!(
+                "worktree_merge authorization failed (cas-bd5f): task {task_id} has no \
+                 assignee and no active lease belonging to worker '{worker}' — refusing \
+                 (conservative rule). Assign the task to '{worker}' or claim a lease \
+                 before merging with task_id=.\n\n{}",
+                merge_target_remediation(worker)
+            )),
+            data: None,
+        }),
+    }
+}
+
 /// Resolve the parent branch a System B worker's branch should merge into
-/// (cas-0938, tightened cas-0b32).
+/// (cas-0938, tightened cas-0b32, authorized cas-bd5f).
 ///
 /// History:
 /// - Pre-cas-0938: System-B always merged to trunk → silent wrong-target.
@@ -48,10 +188,13 @@ fn merge_target_remediation(assignee: &str) -> String {
 ///   reason "no task_id given". Live incident 2026-07-11: supervisor merged
 ///   `hv-director` to main while epic cas-0e22 was focused and the worker's
 ///   task belonged to that epic.
+/// - Pre-cas-bd5f residual: explicit `task_id` resolved parent epic without
+///   verifying the task belongs to the worker being merged — a caller could
+///   pair worker A with task B and redirect A's branch into B's epic.
 ///
-/// Resolution order (cas-0b32):
-/// 1. Explicit `task_id` → parent epic branch; if none, **reject** unless
-///    `allow_trunk` — standalone trunk needs explicit intent (NOT `force`).
+/// Resolution order (cas-0b32 + cas-bd5f):
+/// 1. Explicit `task_id` → **authorize worker ownership** (assignee/lease), then
+///    parent epic branch; if none, **reject** unless `allow_trunk`.
 /// 2. Else unique parent-epic branch among the assignee's non-closed tasks
 ///    (get_parent_epic errors and branchless parents reject — no fall-through).
 /// 3. Else focused epic when session project_dir matches cas_root and the
@@ -62,6 +205,7 @@ fn merge_target_remediation(assignee: &str) -> String {
 /// Always returns a human-readable reason on success.
 fn resolve_system_b_merge_target(
     task_store: &dyn cas_store::TaskStore,
+    agent_store: &dyn cas_store::AgentStore,
     task_id: Option<&str>,
     assignee: &str,
     focused: Option<&ValidatedFocusedEpic>,
@@ -69,13 +213,15 @@ fn resolve_system_b_merge_target(
     trunk: impl FnOnce() -> String,
 ) -> Result<(String, String), McpError> {
     if let Some(task_id) = task_id {
-        task_store.get(task_id).map_err(|e| McpError {
+        let task = task_store.get(task_id).map_err(|e| McpError {
             code: ErrorCode::INVALID_PARAMS,
             message: Cow::from(format!(
                 "task_id {task_id} not found — refusing to guess a merge target: {e}"
             )),
             data: None,
         })?;
+        // cas-bd5f: bind explicit task context to the worker identity.
+        authorize_explicit_task_for_system_b_worker(&task, assignee, agent_store)?;
         let epic = task_store.get_parent_epic(task_id).map_err(|e| McpError {
             code: ErrorCode::INTERNAL_ERROR,
             message: Cow::from(format!(
@@ -88,7 +234,8 @@ fn resolve_system_b_merge_target(
                 return Ok((
                     branch.clone(),
                     format!(
-                        "epic branch {branch} (task {task_id}'s parent epic {})",
+                        "epic branch {branch} (task {task_id}'s parent epic {}; \
+                         authorized for worker {assignee})",
                         epic.id
                     ),
                 ));
@@ -111,7 +258,8 @@ fn resolve_system_b_merge_target(
             return Ok((
                 trunk.clone(),
                 format!(
-                    "trunk {trunk} (explicit allow_trunk=true; task {task_id} has no parent epic)"
+                    "trunk {trunk} (explicit allow_trunk=true; task {task_id} has no parent epic; \
+                     authorized for worker {assignee})"
                 ),
             ));
         }
@@ -889,9 +1037,21 @@ impl CasCore {
                     });
                 }
                 let task_store = self.open_task_store()?;
+                // cas-bd5f: agent store needed to bind explicit task_id to the
+                // System-B worker (assignee name and/or active lease holder).
+                let agent_store = crate::store::open_agent_store(&cas_root).map_err(|e| {
+                    McpError {
+                        code: ErrorCode::INTERNAL_ERROR,
+                        message: Cow::from(format!(
+                            "Failed to open agent store for worktree_merge authorization: {e}"
+                        )),
+                        data: None,
+                    }
+                })?;
                 let focused = load_validated_focused_epic(&cas_root, assignee);
                 let (parent_branch, target_reason) = resolve_system_b_merge_target(
                     task_store.as_ref(),
+                    agent_store.as_ref(),
                     task_id,
                     assignee,
                     focused.as_ref(),
