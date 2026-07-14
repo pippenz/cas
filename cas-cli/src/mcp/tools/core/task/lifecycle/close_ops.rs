@@ -256,6 +256,25 @@ impl CasCore {
             data: None,
         })?;
 
+        // cas-6d0b: short-circuit already-Closed before merge/review/verification
+        // gates. A second close must not:
+        //   - return "Closed task:" (implying this call performed the close),
+        //   - overwrite `closed_at` / `close_reason` / append another Closed note,
+        //   - demand CODE_REVIEW_REQUIRED (or any other gate) for a terminal state.
+        // Racing supervisors both got success and corrupted the audit trail;
+        // return a distinct non-destructive already-closed result instead.
+        if task.status == TaskStatus::Closed {
+            let closed_at_msg = task
+                .closed_at
+                .map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string())
+                .unwrap_or_else(|| "unknown time".to_string());
+            return Ok(Self::success(format!(
+                "Already closed: {} - {} (closed at {}). This call did not re-close \
+                 the task; closed_at and notes were left unchanged.",
+                req.id, task.title, closed_at_msg
+            )));
+        }
+
         // cas-6538 (EPIC cas-1255 — per-task depth speed mode): a `depth=light`
         // task is the feel-driven, fast-iteration path. The close gate skips
         // the two *rigor* gates — the verification jail (no `task-verifier`

@@ -2,6 +2,7 @@ mod create_and_epic;
 mod dependencies;
 mod depth_e2e;
 mod depth_light_close;
+mod double_close;
 mod operations;
 mod supervisor_review_flow;
 mod verification_flow;
