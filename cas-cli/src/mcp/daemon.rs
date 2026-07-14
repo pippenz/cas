@@ -610,24 +610,53 @@ impl EmbeddedDaemon {
             }
         }
 
-        // Agent cleanup: mark stale agents dead and reclaim expired leases
+        // Agent cleanup: mark stale agents dead, reclaim expired leases,
+        // and (cas-2e81) park orphaned InProgress tasks + emit worker_died.
         if let Ok(agent_store) = open_agent_store(&cas_root) {
             // Mark agents with no heartbeat in 600s (10 min) as stale
             // This is only for crash detection - normal cleanup via SessionEnd hook
             if let Ok(stale_agents) = agent_store.list_stale(600) {
                 for agent in stale_agents {
+                    let held: Vec<String> = agent_store
+                        .list_agent_leases(&agent.id)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|l| l.task_id)
+                        .collect();
                     if let Err(e) = agent_store.mark_stale(&agent.id) {
                         let msg = format!("Failed to mark stale agent {}: {}", agent.id, e);
                         eprintln!("[CAS] {msg}");
                         result.errors.push(msg);
+                    } else {
+                        let _ = crate::mcp::tools::service::orphan_recovery::recover_worker_vanished(
+                            &cas_root,
+                            agent_store.as_ref(),
+                            &agent,
+                            &held,
+                            "embedded daemon maintenance: heartbeat stale",
+                        );
                     }
                 }
             }
-            // Reclaim expired leases
+            // Reclaim expired leases (+ orphan recovery for dead holders)
+            let expired: Vec<(String, String)> = agent_store
+                .list_active_leases()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|l| l.is_expired())
+                .map(|l| (l.task_id, l.agent_id))
+                .collect();
             if let Err(e) = agent_store.reclaim_expired_leases() {
                 let msg = format!("Failed to reclaim expired leases: {e}");
                 eprintln!("[CAS] {msg}");
                 result.errors.push(msg);
+            } else if !expired.is_empty() {
+                let _ = crate::mcp::tools::service::orphan_recovery::recover_expired_leases_for_dead_holders(
+                    &cas_root,
+                    agent_store.as_ref(),
+                    &expired,
+                    600,
+                );
             }
         }
 
