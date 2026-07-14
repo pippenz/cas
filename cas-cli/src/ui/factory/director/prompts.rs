@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 
 use crate::config::AutoPromptConfig;
-use crate::ui::factory::director::data::{DirectorData, TaskSummary};
+use crate::ui::factory::director::data::{ActiveLeaseSummary, DirectorData, TaskSummary};
 use crate::ui::factory::director::events::DirectorEvent;
 use cas_mux::SupervisorCli;
 use cas_types::TaskStatus;
@@ -87,12 +87,238 @@ fn worker_has_open_or_in_progress_assignment(data: &DirectorData, worker: &str) 
         .any(|task| task_assigned_to_worker(data, task, worker))
 }
 
+/// How epic-completion ownership was resolved (cas-9fff).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EpicCompletionOwnershipSource {
+    /// `Task.epic_verification_owner` matched this supervisor.
+    VerificationOwner,
+    /// Inferred: this session's agents worked the epic (assignees) or the
+    /// session is focused on it.
+    SessionAffinity,
+    /// Owner is known but not live here; deliver only as an explicit
+    /// last-resort fallback (never silent).
+    UnreachableOwnerFallback,
+    /// No ownership signal at all — legacy single-session path.
+    Unresolved,
+}
+
+/// Routing decision for `EpicAllSubtasksClosed` prompts (cas-9fff).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EpicCompletionRoute {
+    /// Deliver to this session's supervisor.
+    Deliver {
+        owner: String,
+        source: EpicCompletionOwnershipSource,
+        owner_session: Option<String>,
+    },
+    /// Suppress — another supervisor owns this epic.
+    Suppress { reason: &'static str },
+}
+
+/// Decide whether this factory session's supervisor should receive an
+/// epic-completion notification.
+///
+/// Preference order (per cas-9fff design):
+/// 1. `epic_verification_owner` (exact agent id or display name)
+/// 2. Session affinity (subtask assignees visible as agents in this session,
+///    or `focused_epic_id` matches)
+/// 3. Unreachable-owner fallback only when explicitly requested by the caller
+///    (`allow_unreachable_fallback`) and this session has affinity
+/// 4. Epic present but no affinity → suppress (foreign concurrent session)
+/// 5. Epic absent from snapshot → deliver unresolved (legacy/tests)
+///
+/// Concurrent supervisors: a non-owning session always gets `Suppress`.
+pub fn route_epic_completion(
+    supervisor_name: &str,
+    supervisor_id: Option<&str>,
+    factory_session: Option<&str>,
+    epic_verification_owner: Option<&str>,
+    focused_on_epic: bool,
+    session_has_epic_workers: bool,
+    owner_live_in_this_session: bool,
+    allow_unreachable_fallback: bool,
+    epic_present_in_snapshot: bool,
+) -> EpicCompletionRoute {
+    let self_ids: Vec<&str> = std::iter::once(supervisor_name)
+        .chain(supervisor_id)
+        .collect();
+
+    if let Some(owner) = epic_verification_owner.map(str::trim).filter(|s| !s.is_empty()) {
+        let is_owner = self_ids.iter().any(|id| *id == owner);
+        if is_owner {
+            return EpicCompletionRoute::Deliver {
+                owner: owner.to_string(),
+                source: EpicCompletionOwnershipSource::VerificationOwner,
+                owner_session: factory_session.map(str::to_string),
+            };
+        }
+        // Owner is someone else. Only fall back if they are unreachable *and*
+        // this session has affinity (worked the epic / focused it).
+        if !owner_live_in_this_session
+            && allow_unreachable_fallback
+            && (session_has_epic_workers || focused_on_epic)
+        {
+            return EpicCompletionRoute::Deliver {
+                owner: owner.to_string(),
+                source: EpicCompletionOwnershipSource::UnreachableOwnerFallback,
+                owner_session: None,
+            };
+        }
+        return EpicCompletionRoute::Suppress {
+            reason: "epic_verification_owner is a different supervisor",
+        };
+    }
+
+    // No explicit owner — infer from this session's affinity.
+    if session_has_epic_workers || focused_on_epic {
+        return EpicCompletionRoute::Deliver {
+            owner: supervisor_name.to_string(),
+            source: EpicCompletionOwnershipSource::SessionAffinity,
+            owner_session: factory_session.map(str::to_string),
+        };
+    }
+
+    // Epic is visible but this session has no claim — concurrent foreign epic.
+    if epic_present_in_snapshot {
+        return EpicCompletionRoute::Suppress {
+            reason: "no ownership affinity for epic in this session",
+        };
+    }
+
+    // Epic not in snapshot (unit tests / degraded load): deliver with explicit
+    // unresolved stamp so the recipient can still self-filter.
+    EpicCompletionRoute::Deliver {
+        owner: supervisor_name.to_string(),
+        source: EpicCompletionOwnershipSource::Unresolved,
+        owner_session: factory_session.map(str::to_string),
+    }
+}
+
+/// Ownership inputs for an epic from a director snapshot.
+#[derive(Debug, Clone)]
+pub struct EpicCompletionContext {
+    pub owner: Option<String>,
+    pub session_has_epic_workers: bool,
+    pub focused_on_epic: bool,
+    pub supervisor_id: Option<String>,
+    pub owner_live_in_this_session: bool,
+    pub epic_present: bool,
+}
+
+/// Collect ownership inputs for an epic from a director snapshot.
+pub fn epic_completion_context(
+    data: &DirectorData,
+    epic_id: &str,
+    supervisor_name: &str,
+    focused_epic_id: Option<&str>,
+) -> EpicCompletionContext {
+    let epic = data.epic_tasks.iter().find(|e| e.id == epic_id);
+    let owner = epic
+        .and_then(|e| e.epic_verification_owner.clone())
+        .or_else(|| epic.and_then(|e| e.assignee.clone()));
+
+    let session_agent_keys: HashSet<&str> = data
+        .agents
+        .iter()
+        .flat_map(|a| [a.id.as_str(), a.name.as_str()])
+        .chain(
+            data.agent_id_to_name
+                .iter()
+                .flat_map(|(id, name)| [id.as_str(), name.as_str()]),
+        )
+        .chain(std::iter::once(supervisor_name))
+        .collect();
+
+    let session_has_epic_workers = data
+        .ready_tasks
+        .iter()
+        .chain(data.in_progress_tasks.iter())
+        .filter(|t| t.epic.as_deref() == Some(epic_id))
+        .filter_map(|t| t.assignee.as_deref())
+        .any(|assignee| session_agent_keys.contains(assignee));
+
+    let owner_live_in_this_session = owner
+        .as_deref()
+        .map(|o| session_agent_keys.contains(o))
+        .unwrap_or(false);
+
+    let supervisor_id = data
+        .agents
+        .iter()
+        .find(|a| a.name == supervisor_name)
+        .map(|a| a.id.clone())
+        .or_else(|| {
+            data.agent_id_to_name
+                .iter()
+                .find_map(|(id, name)| (name == supervisor_name).then(|| id.clone()))
+        });
+
+    EpicCompletionContext {
+        owner,
+        session_has_epic_workers,
+        focused_on_epic: focused_epic_id == Some(epic_id),
+        supervisor_id,
+        owner_live_in_this_session,
+        epic_present: epic.is_some(),
+    }
+}
+
 pub fn revalidate_event_for_delivery(
     event: &DirectorEvent,
     unfiltered_data: &DirectorData,
     supervisor_name: &str,
 ) -> Option<DirectorEvent> {
+    revalidate_event_for_delivery_with_focus(
+        event,
+        unfiltered_data,
+        supervisor_name,
+        None,
+    )
+}
+
+/// Like [`revalidate_event_for_delivery`], but accepts the session's focused
+/// epic so session-affinity routing for epic completion can use it (cas-9fff).
+pub fn revalidate_event_for_delivery_with_focus(
+    event: &DirectorEvent,
+    unfiltered_data: &DirectorData,
+    supervisor_name: &str,
+    focused_epic_id: Option<&str>,
+) -> Option<DirectorEvent> {
     match event {
+        DirectorEvent::EpicAllSubtasksClosed { epic_id, .. } => {
+            let factory_session = std::env::var("CAS_FACTORY_SESSION").ok();
+            let ctx = epic_completion_context(
+                unfiltered_data,
+                epic_id,
+                supervisor_name,
+                focused_epic_id,
+            );
+            match route_epic_completion(
+                supervisor_name,
+                ctx.supervisor_id.as_deref(),
+                factory_session.as_deref(),
+                ctx.owner.as_deref(),
+                ctx.focused_on_epic,
+                ctx.session_has_epic_workers,
+                ctx.owner_live_in_this_session,
+                // Never auto-fallback at revalidation — wrong-session must
+                // suppress; owner session (or explicit ops) owns recovery.
+                false,
+                ctx.epic_present,
+            ) {
+                EpicCompletionRoute::Deliver { .. } => Some(event.clone()),
+                EpicCompletionRoute::Suppress { reason } => {
+                    tracing::info!(
+                        target: "cas::coordination",
+                        epic_id = %epic_id,
+                        supervisor = %supervisor_name,
+                        reason,
+                        "suppressing EpicAllSubtasksClosed for non-owning supervisor"
+                    );
+                    None
+                }
+            }
+        }
         DirectorEvent::AgentRegistered {
             agent_id,
             agent_name,
@@ -253,6 +479,100 @@ pub fn with_response_instructions(
     let prefix = receiver_cli.capabilities().tool_prefix;
     format!(
         "{message}\n\n---\nTo respond to this message, use: `{prefix}coordination action=message target={respond_to} message=\"...\"`"
+    )
+}
+
+/// True when a WorkerIdle active-task payload is the merge-gate park path
+/// (cas-c145): either the task is already `AwaitingMerge`, or the close
+/// rejection reason names MERGE REQUIRED. Other close rejections stay on the
+/// generic informational wording.
+fn is_merge_required_idle(task: &ActiveLeaseSummary) -> bool {
+    task.task_status == TaskStatus::AwaitingMerge
+        || task
+            .close_rejected_reason
+            .as_deref()
+            .is_some_and(|reason| reason.to_ascii_uppercase().contains("MERGE REQUIRED"))
+}
+
+/// Resolve the focused epic id + branch for a parked task from the current
+/// director snapshot (best-effort; falls back to placeholders when the epic
+/// link is not in this refresh).
+fn resolve_merge_target_for_task(
+    data: &DirectorData,
+    task_id: &str,
+) -> (Option<String>, Option<String>) {
+    // AwaitingMerge tasks live in `in_progress_tasks` (DirectorData
+    // waiting/active bucket). Ready/open rows are chained as a fallback.
+    let epic_id = data
+        .in_progress_tasks
+        .iter()
+        .chain(data.ready_tasks.iter())
+        .find(|t| t.id == task_id)
+        .and_then(|t| t.epic.clone());
+    let epic_branch = epic_id.as_ref().and_then(|eid| {
+        data.epic_tasks
+            .iter()
+            .find(|e| e.id == *eid)
+            .and_then(|e| e.branch.clone())
+    });
+    (epic_id, epic_branch)
+}
+
+/// Actionable merge-queue prompt for MERGE REQUIRED / AwaitingMerge idle
+/// signals (cas-c145). Carries task, source factory branch, merge target,
+/// and next action. Explicitly push-based (no polling loop).
+///
+/// `supervisor_prefix` is used for tools the **supervisor** runs
+/// (epic_status, list awaiting_merge, show). `worker_prefix` is used only
+/// for the worker re-close command the supervisor is told to relay — mixed
+/// factories (e.g. Claude supervisor + Codex/Grok worker) must not leak the
+/// supervisor's MCP alias into worker-facing tool strings (review P1).
+///
+/// Wording constraint: must not contain "assign" — the AwaitingMerge idle
+/// path is not "idle needing work" (cas-09d0 / cas-728b).
+fn merge_required_idle_prompt_text(
+    worker: &str,
+    task: &ActiveLeaseSummary,
+    data: &DirectorData,
+    supervisor_prefix: &str,
+    worker_prefix: &str,
+) -> String {
+    let factory_branch = format!("factory/{worker}");
+    let (epic_id, epic_branch) = resolve_merge_target_for_task(data, &task.task_id);
+    let target = epic_branch
+        .as_deref()
+        .unwrap_or("the focused epic branch");
+    let epic_status = match epic_id.as_deref() {
+        Some(id) => format!("`{supervisor_prefix}coordination action=epic_status id={id}`"),
+        None => format!(
+            "`{supervisor_prefix}coordination action=epic_status id=<focused-epic>`"
+        ),
+    };
+    let list_awaiting =
+        format!("`{supervisor_prefix}task action=list status=awaiting_merge`");
+    let show = format!("`{supervisor_prefix}task action=show id={}`", task.task_id);
+    // Worker re-close uses the *worker's* harness prefix so the supervisor
+    // relays a callable alias (cas-c145 review P1).
+    let reclose = format!("`{worker_prefix}task action=close id={}`", task.task_id);
+    let rejection = task
+        .close_rejected_reason
+        .as_deref()
+        .unwrap_or("MERGE REQUIRED");
+
+    format!(
+        "⚠️ MERGE REQUIRED — supervisor action needed (not a task completion).\n\
+         Worker {worker} is idle while task {} ({}) is {} (close rejected: {rejection}).\n\
+         Source branch: {factory_branch}\n\
+         Merge target: {target}\n\
+         Next action — drain the merge queue before free-form user chat:\n\
+         1. Confirm: {epic_status} and/or {list_awaiting}\n\
+         2. Merge {factory_branch} into {target} (FF preferred; else `git merge --no-ff {factory_branch}` on the epic branch)\n\
+         3. Push the epic branch if remote tracking applies\n\
+         4. Tell {worker} to re-close with {reclose} (or use the supervisor escape-hatch close after merge if the worker is unresponsive)\n\
+         5. Then clear context / hand the worker their next task if more work is ready\n\
+         Live task state: {show}\n\
+         This is a push-based WorkerIdle close-rejected signal — do not poll or sleep.",
+        task.task_id, task.task_title, task.task_status
     )
 }
 
@@ -471,9 +791,8 @@ pub fn generate_prompt(
 
             if let Some(task) = active_task {
                 // cas-728b/cas-627f: Blocked and AwaitingMerge are
-                // supervisor-parked states, but this branch is already an
-                // INFORMATIONAL status update ("task X is still {status}"),
-                // not the worker-assistance "please assign this idle worker
+                // supervisor-parked states. This arm is NOT the
+                // worker-assistance "please assign this idle worker
                 // something" ping (that's the `ready_count` branch below,
                 // reached only when `active_task` is `None`). An earlier
                 // version of this fix unconditionally suppressed this arm
@@ -487,18 +806,34 @@ pub fn generate_prompt(
                 // once per sustained idle streak, not every 2s tick, and
                 // `IDLE_RATE_LIMIT` floors any streak-reset repeat to once
                 // per 5 minutes. No additional suppression needed here.
-                let rejection = task
-                    .close_rejected_reason
-                    .as_deref()
-                    .map(|reason| format!(", close rejected ({reason})"))
-                    .unwrap_or_default();
-                let text = format!(
-                    "Worker {worker} is idle while task {} ({}) is still {}{}.\n\
-                     This is a worker-lifecycle idle signal, not a task completion.\n\
-                     Check live state: `{supervisor_prefix}task action=show id={}`\n\
-                     If close was rejected, resolve the rejection before acting on the task as closed.",
-                    task.task_id, task.task_title, task.task_status, rejection, task.task_id
-                );
+                //
+                // cas-c145: when the park is specifically MERGE REQUIRED /
+                // AwaitingMerge, upgrade from vague "resolve the rejection"
+                // to an actionable merge-queue prompt (task, factory branch,
+                // epic target, next steps). Other close-rejection reasons
+                // keep the informational wording.
+                let text = if is_merge_required_idle(task) {
+                    merge_required_idle_prompt_text(
+                        worker,
+                        task,
+                        data,
+                        supervisor_prefix,
+                        worker_prefix,
+                    )
+                } else {
+                    let rejection = task
+                        .close_rejected_reason
+                        .as_deref()
+                        .map(|reason| format!(", close rejected ({reason})"))
+                        .unwrap_or_default();
+                    format!(
+                        "Worker {worker} is idle while task {} ({}) is still {}{}.\n\
+                         This is a worker-lifecycle idle signal, not a task completion.\n\
+                         Check live state: `{supervisor_prefix}task action=show id={}`\n\
+                         If close was rejected, resolve the rejection before acting on the task as closed.",
+                        task.task_id, task.task_title, task.task_status, rejection, task.task_id
+                    )
+                };
 
                 return Some(Prompt {
                     target: supervisor_name.to_string(),
@@ -691,8 +1026,98 @@ pub fn generate_prompt(
                 return None;
             }
 
+            // cas-9fff: stamp ownership in the payload. Hard suppress only when
+            // epic_verification_owner is an explicit other agent — full
+            // session-affinity / focus routing lives in
+            // `revalidate_event_for_delivery_with_focus` (which has focus
+            // context). generate_prompt may be called without focus, so it
+            // must not re-suppress session-affinity deliveries that already
+            // passed revalidation.
+            let factory_session = std::env::var("CAS_FACTORY_SESSION").ok();
+            let ctx = epic_completion_context(unfiltered_data, epic_id, supervisor_name, None);
+            if let Some(ref owner) = ctx.owner {
+                let self_ids: Vec<&str> = std::iter::once(supervisor_name)
+                    .chain(ctx.supervisor_id.as_deref())
+                    .collect();
+                if !self_ids.iter().any(|id| *id == owner.as_str()) {
+                    tracing::info!(
+                        target: "cas::coordination",
+                        epic_id = %epic_id,
+                        supervisor = %supervisor_name,
+                        owner = %owner,
+                        "generate_prompt suppressed EpicAllSubtasksClosed for non-owner"
+                    );
+                    return None;
+                }
+            }
+            let route = route_epic_completion(
+                supervisor_name,
+                ctx.supervisor_id.as_deref(),
+                factory_session.as_deref(),
+                ctx.owner.as_deref(),
+                // Prefer delivering a stamped prompt once revalidation (or a
+                // direct test) admitted the event — force affinity so we get
+                // a Deliver route for stamping rather than Suppress.
+                true,
+                true,
+                ctx.owner_live_in_this_session,
+                false,
+                ctx.epic_present,
+            );
+            let (owner_label, source, owner_session) = match route {
+                EpicCompletionRoute::Suppress { .. } => {
+                    // Should be unreachable given the force-affinity flags
+                    // above; keep a safe unresolved stamp if it happens.
+                    (
+                        supervisor_name.to_string(),
+                        EpicCompletionOwnershipSource::Unresolved,
+                        factory_session.clone(),
+                    )
+                }
+                EpicCompletionRoute::Deliver {
+                    owner,
+                    source,
+                    owner_session,
+                } => (owner, source, owner_session),
+            };
+
+            let source_label = match source {
+                EpicCompletionOwnershipSource::VerificationOwner => "epic_verification_owner",
+                EpicCompletionOwnershipSource::SessionAffinity => "session_affinity",
+                EpicCompletionOwnershipSource::UnreachableOwnerFallback => {
+                    "unreachable_owner_fallback"
+                }
+                EpicCompletionOwnershipSource::Unresolved => "unresolved",
+            };
+            let session_label = owner_session
+                .as_deref()
+                .or(factory_session.as_deref())
+                .unwrap_or("(unknown session)");
+
+            let ownership_banner = match source {
+                EpicCompletionOwnershipSource::UnreachableOwnerFallback => {
+                    format!(
+                        "OWNERSHIP: owner={owner_label} (UNREACHABLE — fallback delivery) \
+                         session={session_label} source={source_label}\n\
+                         Do NOT close this epic or shutdown_workers unless you confirm you own it.\n\n"
+                    )
+                }
+                EpicCompletionOwnershipSource::Unresolved => {
+                    format!(
+                        "OWNERSHIP: owner={owner_label} session={session_label} source={source_label}\n\
+                         Owner could not be verified — decline if this is not your epic.\n\n"
+                    )
+                }
+                _ => {
+                    format!(
+                        "OWNERSHIP: owner={owner_label} session={session_label} source={source_label}\n\n"
+                    )
+                }
+            };
+
             let text = format!(
-                "All subtasks of epic '{epic_title}' ({epic_id}) are now closed.\n\n\
+                "{ownership_banner}\
+                 All subtasks of epic '{epic_title}' ({epic_id}) are now closed.\n\n\
                  Next steps:\n\
                  - Verify the integrated result\n\
                  - Close the epic: {supervisor_prefix}task action=close id={epic_id} reason=\"All subtasks complete\"\n\
@@ -727,7 +1152,8 @@ mod tests {
                 epic: None,
                 branch: None,
                 updated_at: None,
-            })
+            epic_verification_owner: None,
+        })
             .collect();
 
         DirectorData {
@@ -767,12 +1193,14 @@ mod tests {
             epic: None,
             branch: None,
             updated_at: None,
+            epic_verification_owner: None,
         }
     }
 
     fn blocked_task(id: &str, assignee: Option<&str>) -> TaskSummary {
         TaskSummary {
             status: TaskStatus::Blocked,
+            epic_verification_owner: None,
             ..open_task(id, assignee)
         }
     }
@@ -974,6 +1402,7 @@ mod tests {
             epic: None,
             branch: None,
             updated_at: None,
+            epic_verification_owner: None,
         }];
 
         assert!(
@@ -1086,6 +1515,7 @@ mod tests {
             epic: None,
             branch: None,
             updated_at: None,
+            epic_verification_owner: None,
         };
         let data = DirectorData {
             ready_tasks: vec![task],
@@ -1146,6 +1576,7 @@ mod tests {
             epic: None,
             branch: None,
             updated_at: None,
+            epic_verification_owner: None,
         };
         let data = DirectorData {
             ready_tasks: vec![],
@@ -1285,6 +1716,359 @@ mod tests {
             "idle close-rejection prompt must not use completion-flavored wording: {}",
             prompt.text
         );
+        // cas-c145: MERGE REQUIRED upgrades to an actionable merge-queue prompt.
+        assert!(
+            prompt.text.contains("factory/swift-fox"),
+            "merge-required idle must name the factory source branch: {}",
+            prompt.text
+        );
+    }
+
+    /// cas-c145: AwaitingMerge idle must be an actionable merge-queue event
+    /// (task + factory branch + epic target + next action), not a vague
+    /// "resolve the rejection" hint. Push-based — no polling loop wording.
+    #[test]
+    fn test_c145_awaiting_merge_idle_is_actionable_merge_queue_prompt() {
+        let event = DirectorEvent::WorkerIdle {
+            worker: "recipe-be".to_string(),
+            active_task: Some(ActiveLeaseSummary {
+                task_id: "cas-8eff".to_string(),
+                task_title: "Backend recipes API".to_string(),
+                task_status: TaskStatus::AwaitingMerge,
+                close_rejected_reason: Some("MERGE REQUIRED".to_string()),
+            }),
+        };
+        let mut data = make_data(0);
+        // make_data seeds a single agent named swift-fox; re-point it so the
+        // live-worker session-id guard accepts recipe-be.
+        data.agents[0].name = "recipe-be".to_string();
+        data.agent_id_to_name
+            .insert("sess-id-abc123".to_string(), "recipe-be".to_string());
+        data.in_progress_tasks = vec![TaskSummary {
+            id: "cas-8eff".to_string(),
+            title: "Backend recipes API".to_string(),
+            status: TaskStatus::AwaitingMerge,
+            priority: Priority::MEDIUM,
+            assignee: Some("recipe-be".to_string()),
+            task_type: TaskType::Task,
+            epic: Some("cas-4c77".to_string()),
+            branch: None,
+            updated_at: None,
+            epic_verification_owner: None,
+        }];
+        data.epic_tasks = vec![TaskSummary {
+            id: "cas-4c77".to_string(),
+            title: "Dosha recipes epic".to_string(),
+            status: TaskStatus::InProgress,
+            priority: Priority::HIGH,
+            assignee: None,
+            task_type: TaskType::Epic,
+            epic: None,
+            branch: Some(
+                "epic/general-dosha-recipes-dual-mode-generation-standal-cas-4c77".to_string(),
+            ),
+            updated_at: None,
+            epic_verification_owner: None,
+        }];
+        let config = default_config();
+
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            SupervisorCli::Grok,
+            SupervisorCli::Grok,
+            &HashSet::new(),
+        )
+        .expect("AwaitingMerge idle must produce a supervisor prompt");
+
+        assert_eq!(prompt.target, "supervisor");
+        assert!(prompt.text.contains("cas-8eff"), "{}", prompt.text);
+        assert!(
+            prompt.text.contains("factory/recipe-be"),
+            "must name source factory branch: {}",
+            prompt.text
+        );
+        assert!(
+            prompt
+                .text
+                .contains("epic/general-dosha-recipes-dual-mode-generation-standal-cas-4c77"),
+            "must name merge target epic branch: {}",
+            prompt.text
+        );
+        assert!(
+            prompt.text.contains("cas__coordination action=epic_status id=cas-4c77")
+                || prompt.text.contains("epic_status"),
+            "must direct supervisor to epic_status with cas__ prefix for Grok: {}",
+            prompt.text
+        );
+        assert!(
+            prompt.text.contains("cas__task action=list status=awaiting_merge")
+                || prompt.text.contains("status=awaiting_merge"),
+            "must surface awaiting_merge list: {}",
+            prompt.text
+        );
+        assert!(
+            prompt.text.contains("git merge --no-ff factory/recipe-be")
+                || prompt.text.to_lowercase().contains("merge factory/recipe-be"),
+            "must include merge next action: {}",
+            prompt.text
+        );
+        assert!(
+            prompt.text.contains("cas__task action=close id=cas-8eff"),
+            "homogeneous Grok: worker re-close must use cas__ prefix: {}",
+            prompt.text
+        );
+        assert!(
+            prompt.text.contains("cas__task action=show id=cas-8eff"),
+            "homogeneous Grok: supervisor show must use cas__ prefix: {}",
+            prompt.text
+        );
+        let lower = prompt.text.to_lowercase();
+        assert!(
+            !lower.contains("poll") || lower.contains("do not poll"),
+            "must not introduce a polling loop: {}",
+            prompt.text
+        );
+        assert!(
+            !lower.contains("assign"),
+            "AwaitingMerge must not be worded as idle-needing-assign: {}",
+            prompt.text
+        );
+        assert!(
+            !prompt.text.contains("resolve the rejection before acting"),
+            "must not keep the pre-cas-c145 vague wording: {}",
+            prompt.text
+        );
+    }
+
+    /// cas-c145 review P1: mixed harness — Claude supervisor + Codex worker.
+    /// Supervisor actions use `mcp__cas__`; the worker re-close command the
+    /// supervisor is told to relay must use `mcp__cs__` (never the supervisor
+    /// alias). Same shape for Grok workers (`cas__`).
+    #[test]
+    fn test_c145_mixed_harness_awaiting_merge_uses_worker_prefix_for_reclose() {
+        let event = DirectorEvent::WorkerIdle {
+            worker: "codex-worker".to_string(),
+            active_task: Some(ActiveLeaseSummary {
+                task_id: "cas-mix1".to_string(),
+                task_title: "Mixed factory merge park".to_string(),
+                task_status: TaskStatus::AwaitingMerge,
+                close_rejected_reason: Some("MERGE REQUIRED".to_string()),
+            }),
+        };
+        let mut data = make_data(0);
+        data.agents[0].name = "codex-worker".to_string();
+        data.agent_id_to_name
+            .insert("sess-id-abc123".to_string(), "codex-worker".to_string());
+        data.in_progress_tasks = vec![TaskSummary {
+            id: "cas-mix1".to_string(),
+            title: "Mixed factory merge park".to_string(),
+            status: TaskStatus::AwaitingMerge,
+            priority: Priority::MEDIUM,
+            assignee: Some("codex-worker".to_string()),
+            task_type: TaskType::Task,
+            epic: Some("cas-epic1".to_string()),
+            branch: None,
+            updated_at: None,
+            epic_verification_owner: None,
+        }];
+        data.epic_tasks = vec![TaskSummary {
+            id: "cas-epic1".to_string(),
+            title: "Epic".to_string(),
+            status: TaskStatus::InProgress,
+            priority: Priority::HIGH,
+            assignee: None,
+            task_type: TaskType::Epic,
+            epic: None,
+            branch: Some("epic/mixed-cas-epic1".to_string()),
+            updated_at: None,
+            epic_verification_owner: None,
+        }];
+        let config = default_config();
+
+        // Claude supervisor, Codex worker
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            claude(),
+            codex(),
+            &HashSet::new(),
+        )
+        .expect("mixed-harness AwaitingMerge must produce a supervisor prompt");
+
+        // Split body from with_response_instructions footer so a Claude
+        // footer `mcp__cas__coordination action=message` cannot false-pass
+        // supervisor body-command assertions (cas-c145 review follow-up).
+        let body = prompt.text.split("\n---\n").next().unwrap_or(&prompt.text);
+
+        // Supervisor-facing body tools: exact Claude alias (not footer-only).
+        assert!(
+            body.contains("mcp__cas__coordination action=epic_status id=cas-epic1"),
+            "supervisor body epic_status must use exact Claude command: {}",
+            body
+        );
+        assert!(
+            body.contains("mcp__cas__task action=list status=awaiting_merge"),
+            "supervisor body list must use exact Claude command: {}",
+            body
+        );
+        assert!(
+            body.contains("mcp__cas__task action=show id=cas-mix1"),
+            "supervisor body show must use exact Claude command: {}",
+            body
+        );
+        // Worker prefix must not appear on supervisor body actions.
+        assert!(
+            !body.contains("mcp__cs__coordination action=epic_status"),
+            "supervisor epic_status must not use worker (Codex) prefix: {}",
+            body
+        );
+        assert!(
+            !body.contains("mcp__cs__task action=list status=awaiting_merge"),
+            "supervisor list must not use worker (Codex) prefix: {}",
+            body
+        );
+        assert!(
+            !body.contains("mcp__cs__task action=show id=cas-mix1"),
+            "supervisor show must not use worker (Codex) prefix: {}",
+            body
+        );
+        // Worker re-close: Codex alias only
+        assert!(
+            body.contains("mcp__cs__task action=close id=cas-mix1"),
+            "worker re-close must use Codex prefix mcp__cs__: {}",
+            body
+        );
+        assert!(
+            !body.contains("mcp__cas__task action=close id=cas-mix1"),
+            "worker re-close must NOT use Claude supervisor prefix: {}",
+            body
+        );
+
+        // Claude supervisor + Grok worker: re-close uses cas__
+        let grok_worker_event = DirectorEvent::WorkerIdle {
+            worker: "grok-worker".to_string(),
+            active_task: Some(ActiveLeaseSummary {
+                task_id: "cas-mix2".to_string(),
+                task_title: "Grok worker merge park".to_string(),
+                task_status: TaskStatus::AwaitingMerge,
+                close_rejected_reason: Some("MERGE REQUIRED".to_string()),
+            }),
+        };
+        let mut grok_data = make_data(0);
+        grok_data.agents[0].name = "grok-worker".to_string();
+        grok_data
+            .agent_id_to_name
+            .insert("sess-id-abc123".to_string(), "grok-worker".to_string());
+        let grok_prompt = generate_prompt(
+            &grok_worker_event,
+            &grok_data,
+            &grok_data,
+            "supervisor",
+            &config,
+            claude(),
+            SupervisorCli::Grok,
+            &HashSet::new(),
+        )
+        .expect("Claude+Grok AwaitingMerge must produce a prompt");
+        let grok_body = grok_prompt
+            .text
+            .split("\n---\n")
+            .next()
+            .unwrap_or(&grok_prompt.text);
+
+        // Supervisor body commands: exact Claude prefix (not footer `mcp__cas__`).
+        assert!(
+            grok_body.contains("mcp__cas__coordination action=epic_status id=<focused-epic>"),
+            "Claude+Grok supervisor body epic_status must be exact Claude command: {}",
+            grok_body
+        );
+        assert!(
+            grok_body.contains("mcp__cas__task action=list status=awaiting_merge"),
+            "Claude+Grok supervisor body list must be exact Claude command: {}",
+            grok_body
+        );
+        assert!(
+            grok_body.contains("mcp__cas__task action=show id=cas-mix2"),
+            "Claude+Grok supervisor body show must be exact Claude command: {}",
+            grok_body
+        );
+        // Negative: bare Grok `cas__` tool calls on supervisor actions.
+        // Match the leading backtick so Claude's `mcp__cas__` (which
+        // contains the substring `cas__`) does not false-fail the check.
+        assert!(
+            !grok_body.contains("`cas__coordination action=epic_status"),
+            "supervisor epic_status must not use bare worker (Grok) prefix: {}",
+            grok_body
+        );
+        assert!(
+            !grok_body.contains("`cas__task action=list status=awaiting_merge"),
+            "supervisor list must not use bare worker (Grok) prefix: {}",
+            grok_body
+        );
+        assert!(
+            !grok_body.contains("`cas__task action=show id=cas-mix2"),
+            "supervisor show must not use bare worker (Grok) prefix: {}",
+            grok_body
+        );
+        // Worker re-close: Grok alias only
+        assert!(
+            grok_body.contains("cas__task action=close id=cas-mix2"),
+            "Grok worker re-close must use cas__ prefix: {}",
+            grok_body
+        );
+        assert!(
+            !grok_body.contains("mcp__cas__task action=close id=cas-mix2"),
+            "Grok worker re-close must NOT use Claude supervisor prefix: {}",
+            grok_body
+        );
+    }
+
+    /// cas-c145 characterization: non-merge close rejections keep the
+    /// informational wording (not the merge-queue template).
+    #[test]
+    fn test_c145_non_merge_close_rejection_stays_informational() {
+        let event = DirectorEvent::WorkerIdle {
+            worker: "swift-fox".to_string(),
+            active_task: Some(ActiveLeaseSummary {
+                task_id: "cas-9999".to_string(),
+                task_title: "Lint gate".to_string(),
+                task_status: TaskStatus::InProgress,
+                close_rejected_reason: Some("CODE REVIEW REQUIRED".to_string()),
+            }),
+        };
+        let data = make_data(0);
+        let config = default_config();
+
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+            &HashSet::new(),
+        )
+        .unwrap();
+
+        assert!(prompt.text.contains("CODE REVIEW REQUIRED"));
+        assert!(
+            prompt.text.contains("resolve the rejection before acting"),
+            "non-merge rejections keep informational wording: {}",
+            prompt.text
+        );
+        assert!(
+            !prompt.text.contains("factory/swift-fox"),
+            "non-merge rejection must not use the merge-queue template: {}",
+            prompt.text
+        );
     }
 
     /// cas-627f: the flagship close-rejected notification, exercised end to
@@ -1318,6 +2102,7 @@ mod tests {
             epic: None,
             branch: None,
             updated_at: None,
+            epic_verification_owner: None,
         }];
         data.agents[0].active_lease = Some(ActiveLeaseSummary {
             task_id: "cas-1234".to_string(),
@@ -1687,6 +2472,7 @@ mod tests {
             epic: None,
             branch: None,
             updated_at: None,
+            epic_verification_owner: None,
         };
         DirectorData {
             ready_tasks: vec![],
@@ -1893,6 +2679,7 @@ mod tests {
             epic: None,
             branch: None,
             updated_at: None,
+            epic_verification_owner: None,
         };
         let data = DirectorData {
             ready_tasks: vec![task],
@@ -1970,6 +2757,7 @@ mod tests {
             epic: None,
             branch: None,
             updated_at: None,
+            epic_verification_owner: None,
         };
         let data = DirectorData {
             // Blocked task is in ready_tasks (Open|Blocked both land here).
@@ -2035,6 +2823,7 @@ mod tests {
             epic: None,
             branch: None,
             updated_at: None,
+            epic_verification_owner: None,
         };
         let mut data = DirectorData {
             ready_tasks: vec![open_task],
@@ -2091,6 +2880,7 @@ mod tests {
             epic: None,
             branch: None,
             updated_at: None,
+            epic_verification_owner: None,
         };
         let data = DirectorData {
             ready_tasks: vec![open_task],
@@ -2404,6 +3194,7 @@ mod tests {
             epic: None,
             branch: None,
             updated_at: None,
+            epic_verification_owner: None,
         });
         let config = default_config();
 
@@ -2876,5 +3667,229 @@ mod tests {
             prompt.text
         );
         assert!(prompt.text.contains("not a task completion"));
+    }
+
+    // --- cas-9fff: epic-completion ownership routing ---
+
+    #[test]
+    fn test_9fff_route_prefers_epic_verification_owner() {
+        let owner_route = route_epic_completion(
+            "owner-sup",
+            Some("owner-id"),
+            Some("session-owner"),
+            Some("owner-id"),
+            false,
+            false,
+            true,
+            false,
+            true,
+        );
+        assert!(matches!(
+            owner_route,
+            EpicCompletionRoute::Deliver {
+                source: EpicCompletionOwnershipSource::VerificationOwner,
+                ..
+            }
+        ));
+
+        let foreign = route_epic_completion(
+            "other-sup",
+            Some("other-id"),
+            Some("session-other"),
+            Some("owner-id"),
+            false,
+            false,
+            false,
+            false,
+            true,
+        );
+        assert!(matches!(foreign, EpicCompletionRoute::Suppress { .. }));
+    }
+
+    #[test]
+    fn test_9fff_route_session_affinity_without_owner() {
+        let route = route_epic_completion(
+            "owner-sup",
+            None,
+            Some("session-a"),
+            None,
+            true, // focused
+            false,
+            false,
+            false,
+            true,
+        );
+        assert!(matches!(
+            route,
+            EpicCompletionRoute::Deliver {
+                source: EpicCompletionOwnershipSource::SessionAffinity,
+                ..
+            }
+        ));
+
+        let foreign = route_epic_completion(
+            "other-sup",
+            None,
+            Some("session-b"),
+            None,
+            false,
+            false,
+            false,
+            false,
+            true,
+        );
+        assert!(matches!(foreign, EpicCompletionRoute::Suppress { .. }));
+    }
+
+    #[test]
+    fn test_9fff_unreachable_owner_fallback_is_explicit() {
+        let route = route_epic_completion(
+            "fallback-sup",
+            None,
+            Some("session-fallback"),
+            Some("dead-owner"),
+            true,
+            true,
+            false, // owner not live
+            true,  // allow fallback
+            true,
+        );
+        match route {
+            EpicCompletionRoute::Deliver {
+                source: EpicCompletionOwnershipSource::UnreachableOwnerFallback,
+                owner,
+                ..
+            } => assert_eq!(owner, "dead-owner"),
+            other => panic!("expected unreachable fallback, got {other:?}"),
+        }
+
+        // Without allow_unreachable_fallback → suppress
+        let suppressed = route_epic_completion(
+            "fallback-sup",
+            None,
+            Some("session-fallback"),
+            Some("dead-owner"),
+            true,
+            true,
+            false,
+            false,
+            true,
+        );
+        assert!(matches!(suppressed, EpicCompletionRoute::Suppress { .. }));
+    }
+
+    #[test]
+    fn test_9fff_two_supervisors_only_owner_gets_epic_complete_prompt() {
+        let event = DirectorEvent::EpicAllSubtasksClosed {
+            epic_id: "cas-f4ef".to_string(),
+            epic_title: "EPIC: food visual remediation".to_string(),
+        };
+
+        // Owner session snapshot: epic owned by owner-sup (by name)
+        let mut owner_data = make_data(0);
+        owner_data.epic_tasks = vec![TaskSummary {
+            id: "cas-f4ef".to_string(),
+            title: "EPIC: food visual remediation".to_string(),
+            status: TaskStatus::Open,
+            priority: Priority::HIGH,
+            assignee: None,
+            task_type: TaskType::Epic,
+            epic: None,
+            branch: Some("epic/food".to_string()),
+            updated_at: None,
+            epic_verification_owner: Some("owner-sup".to_string()),
+        }];
+        owner_data.agents.push(AgentSummary {
+            id: "owner-session-id".to_string(),
+            name: "owner-sup".to_string(),
+            status: AgentStatus::Active,
+            current_task: None,
+            latest_activity: None,
+            last_heartbeat: Some(chrono::Utc::now()),
+            pending_messages: 0,
+            active_lease: None,
+            effort: None,
+        });
+
+        // Foreign session sees the same epic (shared DB) but different supervisor
+        let foreign_data = owner_data.clone();
+        let config = default_config();
+
+        // Revalidation: only owner delivers
+        let owner_event = revalidate_event_for_delivery(&event, &owner_data, "owner-sup");
+        assert!(
+            owner_event.is_some(),
+            "owning supervisor must receive EpicAllSubtasksClosed"
+        );
+        let foreign_event = revalidate_event_for_delivery(&event, &foreign_data, "other-sup");
+        assert!(
+            foreign_event.is_none(),
+            "non-owning concurrent supervisor must NOT receive EpicAllSubtasksClosed"
+        );
+
+        // Prompt for owner includes ownership stamp + next steps
+        let owner_prompt = generate_prompt(
+            &event,
+            &owner_data,
+            &owner_data,
+            "owner-sup",
+            &config,
+            codex(),
+            codex(),
+            &HashSet::new(),
+        )
+        .expect("owner should get a prompt");
+        assert_eq!(owner_prompt.target, "owner-sup");
+        assert!(
+            owner_prompt.text.contains("OWNERSHIP: owner=owner-sup"),
+            "payload must stamp owner for self-filter: {}",
+            owner_prompt.text
+        );
+        assert!(owner_prompt.text.contains("source=epic_verification_owner"));
+        assert!(owner_prompt.text.contains("task action=close id=cas-f4ef"));
+
+        // Prompt for foreign supervisor is suppressed
+        let foreign_prompt = generate_prompt(
+            &event,
+            &foreign_data,
+            &foreign_data,
+            "other-sup",
+            &config,
+            codex(),
+            codex(),
+            &HashSet::new(),
+        );
+        assert!(
+            foreign_prompt.is_none(),
+            "foreign supervisor must not get epic-complete prompt"
+        );
+    }
+
+    #[test]
+    fn test_9fff_epic_complete_prompt_stamps_session_context() {
+        let event = DirectorEvent::EpicAllSubtasksClosed {
+            epic_id: "epic-456".to_string(),
+            epic_title: "Test Epic".to_string(),
+        };
+        // No epic in data → unresolved deliver path (legacy/single-session)
+        let data = make_data(0);
+        let config = default_config();
+        let prompt = generate_prompt(
+            &event,
+            &data,
+            &data,
+            "supervisor",
+            &config,
+            codex(),
+            codex(),
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert!(
+            prompt.text.contains("OWNERSHIP:"),
+            "must stamp ownership even when unresolved: {}",
+            prompt.text
+        );
+        assert!(prompt.text.contains("task action=close id=epic-456"));
     }
 }

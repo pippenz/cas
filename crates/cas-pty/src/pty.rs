@@ -33,7 +33,7 @@ const CODEX_WORKER_STARTUP_PREFIX: &str = "I'm initiating CAS worker startup now
 /// namespaces MCP tools as `cas__<tool>` (its own `search_tool`/`use_tool`
 /// dispatch, NOT `mcp__cas__`/`mcp__cs__`), so every tool reference here
 /// uses that prefix.
-const GROK_SUPERVISOR_INSTRUCTIONS: &str = "You are the CAS Factory Supervisor, running on Grok Build. Coordinate only: plan epics, assign tasks, monitor progress, review/merge. Never implement tasks. Use skills cas-supervisor and cas-supervisor-checklist. MCP tools are namespaced cas__<tool> (e.g. cas__task, cas__coordination) — not mcp__cas__ or mcp__cs__. Worker messages (status/blocker/ready) arrive asynchronously as new injected turns; each is a triage trigger, not a fresh startup — read it, then assign/answer/redirect/merge as appropriate and reply via `cas__coordination action=message target=<worker>`. Finishing one round does not mean you are done — remain available to coordinate the next message.";
+const GROK_SUPERVISOR_INSTRUCTIONS: &str = "You are the CAS Factory Supervisor, running on Grok Build. Coordinate only: plan epics, assign tasks, monitor progress, review/merge. Never implement tasks. Use skills cas-supervisor and cas-supervisor-checklist. MCP tools are namespaced cas__<tool> (e.g. cas__task, cas__coordination) — not mcp__cas__ or mcp__cs__. Worker messages (status/blocker/ready) arrive asynchronously as new injected turns; each is a triage trigger, not a fresh startup — read it, then assign/answer/redirect/merge as appropriate and reply via `cas__coordination action=message target=<worker>`. MERGE REQUIRED / awaiting_merge / idle-with-close-rejected is always top priority: run `cas__coordination action=epic_status` (and/or `cas__task action=list status=awaiting_merge`), merge `factory/<worker>` into the epic branch, tell the worker to re-close — before free-form user chat. Act on the injected signal; do not poll. Finishing one round does not mean you are done — remain available to coordinate the next message.";
 
 /// Instructions injected into Grok Build worker agents via `--rules`
 /// (EPIC cas-8888, cas-6569 Phase 2). See `GROK_SUPERVISOR_INSTRUCTIONS`
@@ -3158,6 +3158,21 @@ mod tests {
         assert!(
             rules.contains("cas__coordination") && rules.contains("Supervisor"),
             "grok supervisor rules must reference the cas__ prefix and supervisor role: {rules}"
+        );
+        // cas-c145: Grok supervisors must get merge-queue-first lifecycle
+        // guidance equivalent to other harnesses (no SessionStart bundle).
+        assert!(
+            rules.contains("MERGE REQUIRED")
+                && rules.contains("awaiting_merge")
+                && rules.contains("factory/<worker>")
+                && rules.contains("do not poll"),
+            "grok supervisor rules must surface AwaitingMerge merge-queue priority \
+             (task/branch/next action, no polling): {rules}"
+        );
+        assert!(
+            rules.contains("cas__task action=list status=awaiting_merge")
+                || rules.contains("status=awaiting_merge"),
+            "grok supervisor rules must name the awaiting_merge list command: {rules}"
         );
     }
 

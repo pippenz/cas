@@ -104,6 +104,8 @@ pub struct WorktreeRequest {
     pub orphans: Option<bool>,
     pub dry_run: Option<bool>,
     pub force: Option<bool>,
+    /// Explicit trunk merge intent (cas-0b32) — independent of force.
+    pub allow_trunk: Option<bool>,
 }
 
 // ============================================================================
@@ -591,6 +593,7 @@ impl CasService {
                         orphans: req.orphans,
                         dry_run: req.dry_run,
                         force: req.force,
+                        allow_trunk: req.allow_trunk,
                     };
                     match wt_action {
                         "create" => this.worktree_create(wt_req).await,
