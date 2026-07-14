@@ -298,12 +298,21 @@ impl CasCore {
             data: None,
         })?;
 
-        // cas-b269: already-Closed → idempotent success. Do not re-enter
-        // verification / merge / re-close work from stale guidance.
-        if super::stale_close_guard::is_terminal_closed(task.status) {
-            return Ok(Self::success(
-                super::stale_close_guard::already_closed_close_message(&req.id),
-            ));
+        // cas-6d0b / cas-b269: short-circuit already-Closed before
+        // merge/review/verification gates. Do not re-success, overwrite
+        // closed_at, or demand CODE_REVIEW_REQUIRED.
+        if super::stale_close_guard::is_terminal_closed(task.status)
+            || task.status == TaskStatus::Closed
+        {
+            let closed_at_msg = task
+                .closed_at
+                .map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string())
+                .unwrap_or_else(|| "unknown time".to_string());
+            return Ok(Self::success(format!(
+                "Already closed: {} - {} (closed at {}). This call did not re-close \
+                 the task; closed_at and notes were left unchanged.",
+                req.id, task.title, closed_at_msg
+            )));
         }
 
         // cas-b269: urgent stop sets halt_task_work; block close until new start.
