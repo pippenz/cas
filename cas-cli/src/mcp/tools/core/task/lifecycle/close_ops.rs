@@ -2664,14 +2664,24 @@ pub(crate) fn run_factory_branch_merge_gate(
     // degradation posture of every other gate in this file: an
     // unreachable/unconfigured origin is not treated as evidence of
     // non-integration, just as "nothing extra to check."
+    //
+    // cas-f522: origin-parent *acceptance* must use the success-bearing
+    // [`known_unmerged_factory_commits`] helper — only
+    // [`KnownUnmergedCount::KnownZero`] authorizes close. The legacy
+    // `count_unmerged_factory_commits == 0` fail-open treats missing
+    // merge-base / failed rev-list as "merged" and would let unknowable
+    // origin Git state masquerade as integration. Missing origin ref
+    // simply skips this block (no rescue); KnownPositive and Unknown
+    // fall through to Reject.
     fetch_parent_branch_best_effort(repo_path, parent_branch);
     let origin_parent_branch = format!("origin/{parent_branch}");
-    if git_ref_exists(repo_path, &origin_parent_branch) {
-        let stranded_vs_origin =
-            count_unmerged_factory_commits(repo_path, commit_ish, &origin_parent_branch);
-        if stranded_vs_origin == 0 {
-            return MergeStateGateOutcome::Proceed;
-        }
+    if git_ref_exists(repo_path, &origin_parent_branch)
+        && matches!(
+            known_unmerged_factory_commits(repo_path, commit_ish, &origin_parent_branch),
+            KnownUnmergedCount::KnownZero
+        )
+    {
+        return MergeStateGateOutcome::Proceed;
     }
 
     // cas-2938 / cas-5485: when a trusted historical anchor still looks
@@ -7561,6 +7571,239 @@ mod merge_state_gate_tests {
         assert!(
             matches!(out, MergeStateGateOutcome::Reject(_)),
             "no-origin-remote case must still reject on the real stranded commit, got {out:?}"
+        );
+    }
+
+    // --- cas-f522: origin-parent ancestry fallback fail-closed on Unknown ---
+
+    /// AC1: origin/<parent> KnownZero is the only origin-ancestry signal that
+    /// may authorize close when local parent still looks stranded. Pins the
+    /// success-bearing helper (not fail-open count==0) for the happy path.
+    #[test]
+    fn origin_parent_known_zero_authorizes_close_cas_f522() {
+        let bare = tempfile::tempdir().unwrap();
+        let bare_status = std::process::Command::new("git")
+            .args(["init", "-q", "--bare"])
+            .current_dir(bare.path())
+            .status()
+            .expect("git init --bare");
+        assert!(bare_status.success());
+
+        let dir = init_factory_repo_with_parent("worker", "epic/x");
+        let p = dir.path();
+        git(
+            p,
+            &["remote", "add", "origin", bare.path().to_str().unwrap()],
+        );
+
+        let old_epic_tip = rev_parse(p, "epic/x");
+
+        std::fs::write(p.join("a.rs"), "// a\n").unwrap();
+        git(p, &["add", "a.rs"]);
+        git(p, &["commit", "-q", "-m", "feat: a"]);
+
+        git(p, &["checkout", "-q", "epic/x"]);
+        git(
+            p,
+            &["merge", "-q", "--no-ff", "factory/worker", "-m", "merge worker"],
+        );
+        git(p, &["push", "-q", "origin", "epic/x"]);
+
+        git(p, &["checkout", "-q", "factory/worker"]);
+        git(p, &["branch", "-f", "epic/x", &old_epic_tip]);
+
+        assert_eq!(
+            count_unmerged_factory_commits(p, "factory/worker", "epic/x"),
+            1,
+            "precondition: local epic/x still looks stranded"
+        );
+        assert!(
+            matches!(
+                known_unmerged_factory_commits(p, "factory/worker", "origin/epic/x"),
+                KnownUnmergedCount::KnownZero
+            ),
+            "precondition: origin/epic/x must be KnownZero vs factory tip"
+        );
+
+        let task = worker_task("worker");
+        let req = base_req(&task.id);
+        let out = run_factory_branch_merge_gate(&task, &req, "epic/x", p);
+        assert!(
+            matches!(out, MergeStateGateOutcome::Proceed),
+            "origin/<parent> KnownZero must authorize close despite stale local parent, got {out:?}"
+        );
+    }
+
+    /// AC2: when origin/<parent> exists but merge-base is unknowable
+    /// (unrelated histories), legacy count fail-opens to 0 — that must NOT
+    /// authorize close. Unknown never masquerades as integration.
+    #[test]
+    fn origin_parent_unknown_merge_base_rejects_cas_f522() {
+        let bare = tempfile::tempdir().unwrap();
+        let bare_status = std::process::Command::new("git")
+            .args(["init", "-q", "--bare"])
+            .current_dir(bare.path())
+            .status()
+            .expect("git init --bare");
+        assert!(bare_status.success());
+
+        let dir = init_factory_repo_with_parent("worker", "epic/x");
+        let p = dir.path();
+        git(
+            p,
+            &["remote", "add", "origin", bare.path().to_str().unwrap()],
+        );
+
+        // Unmerged factory work so local parent ancestry is KnownPositive.
+        std::fs::write(p.join("a.rs"), "// a unmerged\n").unwrap();
+        git(p, &["add", "a.rs"]);
+        git(p, &["commit", "-q", "-m", "feat: a (never integrated)"]);
+
+        // Push an UNRELATED orphan tip as origin/epic/x so the origin ref
+        // exists but cannot compute merge-base with factory/worker.
+        git(p, &["checkout", "-q", "--orphan", "origin-orphan"]);
+        let _ = std::process::Command::new("git")
+            .args(["rm", "-rf", "--cached", "."])
+            .current_dir(p)
+            .output();
+        // Clear the worktree so the orphan commit is pure.
+        for entry in std::fs::read_dir(p).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name();
+            if name == ".git" {
+                continue;
+            }
+            let path = entry.path();
+            if path.is_dir() {
+                let _ = std::fs::remove_dir_all(&path);
+            } else {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+        std::fs::write(p.join("orphan.txt"), "unrelated origin tip\n").unwrap();
+        git(p, &["add", "orphan.txt"]);
+        git(p, &["commit", "-q", "-m", "orphan origin epic tip"]);
+        // Publish orphan as epic/x on origin (creates origin/epic/x tracking).
+        git(p, &["push", "-q", "origin", "HEAD:epic/x"]);
+        git(p, &["checkout", "-q", "factory/worker"]);
+        // Ensure remote-tracking ref is present without re-fetching local epic.
+        git(p, &["fetch", "-q", "origin", "epic/x:refs/remotes/origin/epic/x"]);
+
+        assert!(
+            git_ref_exists(p, "origin/epic/x"),
+            "precondition: origin/epic/x must resolve"
+        );
+        assert_eq!(
+            count_unmerged_factory_commits(p, "factory/worker", "epic/x"),
+            1,
+            "precondition: local epic/x must still strand the factory tip"
+        );
+        // Pin the fail-open hole under test.
+        assert_eq!(
+            count_unmerged_factory_commits(p, "factory/worker", "origin/epic/x"),
+            0,
+            "precondition: legacy count fail-opens to 0 on unknowable origin merge-base"
+        );
+        assert!(
+            matches!(
+                known_unmerged_factory_commits(p, "factory/worker", "origin/epic/x"),
+                KnownUnmergedCount::Unknown
+            ),
+            "success-bearing helper must report Unknown for origin merge-base failure"
+        );
+
+        let task = worker_task("worker");
+        let req = base_req(&task.id);
+        let out = run_factory_branch_merge_gate(&task, &req, "epic/x", p);
+        assert!(
+            matches!(out, MergeStateGateOutcome::Reject(_)),
+            "origin-parent Unknown (failed merge-base) must not authorize close, got {out:?}"
+        );
+    }
+
+    /// AC2 variant: origin/<parent> ref missing entirely — no origin rescue;
+    /// gate must still Reject on the real local stranded work (not treat
+    /// absence as KnownZero).
+    #[test]
+    fn origin_parent_missing_ref_does_not_authorize_close_cas_f522() {
+        let dir = init_factory_repo_with_parent("worker", "epic/x");
+        let p = dir.path();
+        // Remote present but never pushed — origin/epic/x does not resolve.
+        let bare = tempfile::tempdir().unwrap();
+        let bare_status = std::process::Command::new("git")
+            .args(["init", "-q", "--bare"])
+            .current_dir(bare.path())
+            .status()
+            .expect("git init --bare");
+        assert!(bare_status.success());
+        git(
+            p,
+            &["remote", "add", "origin", bare.path().to_str().unwrap()],
+        );
+
+        std::fs::write(p.join("a.rs"), "// a\n").unwrap();
+        git(p, &["add", "a.rs"]);
+        git(p, &["commit", "-q", "-m", "feat: a"]);
+
+        assert!(
+            !git_ref_exists(p, "origin/epic/x"),
+            "precondition: origin/epic/x must be missing"
+        );
+        assert!(
+            matches!(
+                known_unmerged_factory_commits(p, "factory/worker", "origin/epic/x"),
+                KnownUnmergedCount::Unknown
+            ),
+            "missing origin ref must be Unknown, not zero"
+        );
+
+        let task = worker_task("worker");
+        let req = base_req(&task.id);
+        let out = run_factory_branch_merge_gate(&task, &req, "epic/x", p);
+        assert!(
+            matches!(out, MergeStateGateOutcome::Reject(_)),
+            "missing origin/<parent> must not authorize close, got {out:?}"
+        );
+    }
+
+    /// AC3: origin/<parent> KnownPositive (genuinely unmerged vs origin) rejects.
+    /// Strengthens the existing negative control with the success-bearing helper.
+    #[test]
+    fn origin_parent_known_positive_rejects_cas_f522() {
+        let bare = tempfile::tempdir().unwrap();
+        let bare_status = std::process::Command::new("git")
+            .args(["init", "-q", "--bare"])
+            .current_dir(bare.path())
+            .status()
+            .expect("git init --bare");
+        assert!(bare_status.success());
+
+        let dir = init_factory_repo_with_parent("worker", "epic/x");
+        let p = dir.path();
+        git(
+            p,
+            &["remote", "add", "origin", bare.path().to_str().unwrap()],
+        );
+        git(p, &["push", "-q", "origin", "epic/x"]);
+
+        std::fs::write(p.join("a.rs"), "// a\n").unwrap();
+        git(p, &["add", "a.rs"]);
+        git(p, &["commit", "-q", "-m", "feat: a"]);
+
+        assert!(
+            matches!(
+                known_unmerged_factory_commits(p, "factory/worker", "origin/epic/x"),
+                KnownUnmergedCount::KnownPositive(1)
+            ),
+            "precondition: origin must report KnownPositive(1)"
+        );
+
+        let task = worker_task("worker");
+        let req = base_req(&task.id);
+        let out = run_factory_branch_merge_gate(&task, &req, "epic/x", p);
+        assert!(
+            matches!(out, MergeStateGateOutcome::Reject(_)),
+            "origin KnownPositive must reject, got {out:?}"
         );
     }
 }
