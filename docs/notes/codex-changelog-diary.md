@@ -1,8 +1,8 @@
 # Codex CLI Changelog Diary — CAS Response Ledger
 
 A living, **newest-first** ledger of OpenAI Codex CLI releases and how CAS responded to
-each. Sibling to `claude-code-changelog-diary.md` — CAS supports both harnesses
-(`--worker-cli codex` / `--supervisor-cli codex`), so we track Codex drift too.
+each. Sibling to `claude-code-changelog-diary.md` and `grok-changelog-diary.md` —
+CAS supports three harnesses (`cli=claude` / `cli=codex` / `cli=grok`), so we track Codex drift too.
 
 Codex has no `CHANGELOG.md`; release notes live on the GitHub **releases page**.
 
