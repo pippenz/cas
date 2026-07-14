@@ -1,5 +1,8 @@
 use crate::mcp::tools::core::imports::*;
 
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+
 /// Check whether `path` looks like a live git worktree (has a `.git` entry
 /// — a file for linked worktrees, pointing back at the main repo's
 /// worktree admin dir).
@@ -9,7 +12,7 @@ use crate::mcp::tools::core::imports::*;
 /// it (cas-1d11). Returns `false` for a path that doesn't exist or isn't a
 /// git worktree — an unknowable worktree is not treated as a false
 /// positive.
-fn is_git_worktree(path: &std::path::Path) -> bool {
+fn is_git_worktree(path: &Path) -> bool {
     path.join(".git").exists()
 }
 
@@ -176,6 +179,154 @@ fn authorize_explicit_task_for_system_b_worker(
             data: None,
         }),
     }
+
+/// Path prefix match with canonicalize fallback (symlinks / relative forms).
+fn path_is_under(path: &Path, base: &Path) -> bool {
+    if path.starts_with(base) {
+        return true;
+    }
+    match (std::fs::canonicalize(path), std::fs::canonicalize(base)) {
+        (Ok(p), Ok(b)) => p.starts_with(b),
+        _ => false,
+    }
+}
+
+fn paths_equal(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => false,
+    }
+}
+
+/// Resolve the configured factory worktree base for this project.
+///
+/// Matches `spawn_workers isolate=true` / `WorktreeManager` resolution so
+/// `worktree_list` does not hardcode `<cas_root>/worktrees` (cas-d1a0).
+fn resolve_factory_worktree_base(cas_root: &Path) -> PathBuf {
+    use crate::config::Config;
+
+    let Some(project_dir) = cas_root.parent() else {
+        return cas_root.join("worktrees");
+    };
+    let config = Config::load(cas_root).unwrap_or_default();
+    config.worktrees().resolve_base_path(project_dir)
+}
+
+/// Whether a live git worktree looks CAS-managed (factory, epic, cas/*, or
+/// under known CAS worktree roots) and should appear in worktree_list even
+/// without a WorktreeStore row (sibling/predecessor sessions).
+fn is_cas_pattern_worktree(
+    path: &Path,
+    branch: Option<&str>,
+    cas_root: &Path,
+    factory_base: &Path,
+    repo_root: &Path,
+) -> bool {
+    // Main checkout is never listed as a managed worktree entry.
+    if paths_equal(path, repo_root) {
+        return false;
+    }
+
+    if path_is_under(path, factory_base) {
+        return true;
+    }
+    // Default System B layout — still scanned when base_path is customized.
+    if path_is_under(path, &cas_root.join("worktrees")) {
+        return true;
+    }
+    // Claude Code agent isolation dirs (also swept by factory cleanup).
+    if path_is_under(path, &repo_root.join(".claude").join("worktrees")) {
+        return true;
+    }
+
+    if let Some(b) = branch {
+        if b.starts_with("factory/") || b.starts_with("epic/") || b.starts_with("cas/") {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn is_factory_style_worktree(
+    path: &Path,
+    branch: &str,
+    cas_root: &Path,
+    factory_base: &Path,
+) -> bool {
+    branch.starts_with("factory/")
+        || path_is_under(path, factory_base)
+        || path_is_under(path, &cas_root.join("worktrees"))
+}
+
+/// Reconcile live git worktrees that match CAS patterns but are missing from
+/// the SQLite WorktreeStore (System B never registers; System A rows are
+/// project-scoped but may be absent for sibling-session worktrees).
+///
+/// Returns transient `Worktree` rows with `git:` id prefix for display.
+fn collect_untracked_git_worktrees(
+    cas_root: &Path,
+    factory_base: &Path,
+    tracked_branches: &HashSet<String>,
+    tracked_paths: &HashSet<PathBuf>,
+) -> Vec<crate::types::Worktree> {
+    use crate::types::Worktree;
+    use crate::worktree::GitOperations;
+
+    let mut out = Vec::new();
+    let Some(project_dir) = cas_root.parent() else {
+        return out;
+    };
+    let Ok(repo_root) = GitOperations::detect_repo_root(project_dir) else {
+        return out;
+    };
+    let git_ops = GitOperations::new(repo_root.clone());
+    let Ok(git_worktrees) = git_ops.list_worktrees() else {
+        return out;
+    };
+
+    for git_wt in git_worktrees {
+        if !is_cas_pattern_worktree(
+            &git_wt.path,
+            git_wt.branch.as_deref(),
+            cas_root,
+            factory_base,
+            &repo_root,
+        ) {
+            continue;
+        }
+
+        let branch = git_wt.branch.clone().unwrap_or_default();
+        if !branch.is_empty() && tracked_branches.contains(&branch) {
+            continue;
+        }
+        if tracked_paths.iter().any(|p| paths_equal(p, &git_wt.path)) {
+            continue;
+        }
+
+        let id_key = if !branch.is_empty() {
+            branch.clone()
+        } else {
+            git_wt.path.display().to_string()
+        };
+        let display_branch = if branch.is_empty() {
+            "(detached)".to_string()
+        } else {
+            branch
+        };
+
+        out.push(Worktree::new(
+            format!("git:{id_key}"),
+            display_branch,
+            "unknown".to_string(),
+            git_wt.path,
+        ));
+    }
+
+    out
 }
 
 /// Resolve the parent branch a System B worker's branch should merge into
@@ -616,6 +767,13 @@ impl CasCore {
     }
 
     /// List worktrees
+    ///
+    /// Combines the project-scoped WorktreeStore (System A) with a live
+    /// `git worktree list` reconcile for CAS-pattern paths/branches that were
+    /// never registered (System B factory workers, sibling-session epic
+    /// worktrees). Registry rows live in `.cas/cas.db` — shared by every
+    /// session in the project; git is the second source of truth when a
+    /// session never wrote a row (cas-d1a0).
     pub async fn worktree_list(
         &self,
         all: bool,
@@ -623,9 +781,7 @@ impl CasCore {
         orphans_only: bool,
     ) -> Result<CallToolResult, McpError> {
         use crate::store::{open_agent_store, open_task_store, open_worktree_store};
-        use crate::types::{AgentStatus, TaskStatus, Worktree, WorktreeStatus};
-        use crate::worktree::GitOperations;
-        use std::collections::HashSet;
+        use crate::types::{AgentStatus, TaskStatus, WorktreeStatus};
 
         let cas_root = self.cas_root.clone();
         let worktree_store = open_worktree_store(&cas_root).map_err(|e| McpError {
@@ -644,12 +800,17 @@ impl CasCore {
             data: None,
         })?;
 
-        let mut worktrees = if let Some(status_str) = status_filter {
-            let status: WorktreeStatus = status_str.parse().map_err(|_| McpError {
+        let parsed_status: Option<WorktreeStatus> = if let Some(status_str) = status_filter {
+            Some(status_str.parse().map_err(|_| McpError {
                 code: ErrorCode::INVALID_PARAMS,
                 message: Cow::from(format!("Invalid status: {status_str}")),
                 data: None,
-            })?;
+            })?)
+        } else {
+            None
+        };
+
+        let mut worktrees = if let Some(status) = parsed_status {
             worktree_store
                 .list_by_status(status)
                 .map_err(|e| McpError {
@@ -671,43 +832,27 @@ impl CasCore {
             })?
         };
 
-        // Get branches already in SQLite for deduplication
-        let tracked_branches: HashSet<String> =
-            worktrees.iter().map(|wt| wt.branch.clone()).collect();
+        // Live git reconcile only for views that include active worktrees.
+        // Non-active status filters (merged/abandoned/…) must not gain
+        // transient Active git rows.
+        let should_reconcile_git = match parsed_status {
+            None => true,
+            Some(WorktreeStatus::Active) => true,
+            Some(_) => false,
+        };
 
-        // Also include factory (System B) worktrees from git that are not yet
-        // tracked in the SQLite store.
-        //
-        // We scope the scan to paths under `<cas_root>/worktrees/` so that
-        // the main checkout (and any unrelated user worktrees) are excluded.
-        // Factory workers are always placed at `.cas/worktrees/<name>` by
-        // `spawn_workers isolate=true`, so this filter is both safe and precise.
-        let factory_worktrees_base = cas_root.join("worktrees");
-        if let Some(repo_root) = cas_root.parent() {
-            if let Ok(git_ops) = GitOperations::detect_repo_root(repo_root).map(GitOperations::new)
-            {
-                if let Ok(git_worktrees) = git_ops.list_worktrees() {
-                    for git_wt in git_worktrees {
-                        // Only include worktrees that live under .cas/worktrees/
-                        // (factory / System B) and are not already in the store.
-                        if !git_wt.path.starts_with(&factory_worktrees_base) {
-                            continue;
-                        }
-                        let branch = git_wt.branch.clone().unwrap_or_default();
-                        if !branch.is_empty() && !tracked_branches.contains(&branch) {
-                            // Create a transient Worktree entry for display.
-                            // The `git:` id prefix is used downstream to identify
-                            // factory worktrees and render the `[factory]` label.
-                            worktrees.push(Worktree::new(
-                                format!("git:{branch}"),
-                                branch,
-                                "unknown".to_string(),
-                                git_wt.path.clone(),
-                            ));
-                        }
-                    }
-                }
-            }
+        let factory_base = resolve_factory_worktree_base(&cas_root);
+        if should_reconcile_git {
+            let tracked_branches: HashSet<String> =
+                worktrees.iter().map(|wt| wt.branch.clone()).collect();
+            let tracked_paths: HashSet<PathBuf> =
+                worktrees.iter().map(|wt| wt.path.clone()).collect();
+            worktrees.extend(collect_untracked_git_worktrees(
+                &cas_root,
+                &factory_base,
+                &tracked_branches,
+                &tracked_paths,
+            ));
         }
 
         // Filter orphans if requested
@@ -756,21 +901,28 @@ impl CasCore {
                 WorktreeStatus::Removed => "🗑️",
             };
             let path_status = if wt.path.exists() { "" } else { " (missing)" };
-            // Factory worktrees have IDs starting with "git:"
+            // git: prefix = reconciled from live git (not in WorktreeStore).
+            // Factory-style vs other CAS patterns get distinct labels so
+            // supervisors can tell spawn workers from untracked epic trees.
             let type_indicator = if wt.id.starts_with("git:") {
-                " [factory]"
+                if is_factory_style_worktree(&wt.path, &wt.branch, &cas_root, &factory_base) {
+                    " [factory]"
+                } else {
+                    " [untracked]"
+                }
             } else {
                 ""
             };
             output.push_str(&format!(
-                "{} {} - {} {}{}{}\n   Epic: {}\n\n",
+                "{} {} - {} {}{}{}\n   Epic: {}\n   Path: {}\n\n",
                 status_icon,
                 wt.id,
                 wt.branch,
                 wt.status,
                 path_status,
                 type_indicator,
-                wt.epic_id.as_deref().unwrap_or("-")
+                wt.epic_id.as_deref().unwrap_or("-"),
+                wt.path.display()
             ));
         }
 
@@ -1132,7 +1284,6 @@ impl CasCore {
         use crate::config::Config;
         use crate::store::open_worktree_store;
         use crate::worktree::GitOperations;
-        use std::collections::HashSet;
 
         let cas_root = self.cas_root.clone();
         let config = Config::load(&cas_root).map_err(|e| McpError {
@@ -1167,6 +1318,7 @@ impl CasCore {
 
         // Query worktree store for active worktrees
         let mut stored_branches: HashSet<String> = HashSet::new();
+        let mut stored_paths: HashSet<PathBuf> = HashSet::new();
         let mut active_count = 0usize;
         let mut branch_names: Vec<String> = Vec::new();
 
@@ -1175,29 +1327,27 @@ impl CasCore {
                 active_count = active_worktrees.len();
                 for wt in &active_worktrees {
                     stored_branches.insert(wt.branch.clone());
+                    stored_paths.insert(wt.path.clone());
                     branch_names.push(wt.branch.clone());
                 }
             }
         }
 
-        // System B — factory (isolate=true) worktrees.
-        // Scoped to `<cas_root>/worktrees/` so the main checkout is excluded.
-        let factory_worktrees_base = cas_root.join("worktrees");
-        let mut factory_entries: Vec<(String, std::path::PathBuf)> = Vec::new();
-        if let Some(repo_root) = cas_root.parent() {
-            if let Ok(git_ops) = GitOperations::detect_repo_root(repo_root).map(GitOperations::new)
-            {
-                if let Ok(git_worktrees) = git_ops.list_worktrees() {
-                    for git_wt in git_worktrees {
-                        if !git_wt.path.starts_with(&factory_worktrees_base) {
-                            continue;
-                        }
-                        let branch = git_wt.branch.clone().unwrap_or_default();
-                        if !branch.is_empty() && !stored_branches.contains(&branch) {
-                            factory_entries.push((branch, git_wt.path.clone()));
-                        }
-                    }
-                }
+        // Live git reconcile — same CAS-pattern rules as worktree_list (cas-d1a0).
+        let factory_base = resolve_factory_worktree_base(&cas_root);
+        let untracked = collect_untracked_git_worktrees(
+            &cas_root,
+            &factory_base,
+            &stored_branches,
+            &stored_paths,
+        );
+        let mut factory_entries: Vec<(String, PathBuf)> = Vec::new();
+        let mut other_untracked: Vec<(String, PathBuf)> = Vec::new();
+        for wt in untracked {
+            if is_factory_style_worktree(&wt.path, &wt.branch, &cas_root, &factory_base) {
+                factory_entries.push((wt.branch, wt.path));
+            } else {
+                other_untracked.push((wt.branch, wt.path));
             }
         }
 
@@ -1210,6 +1360,15 @@ impl CasCore {
         } else {
             output.push_str(&format!("  Active: {b_active}\n"));
             for (branch, path) in &factory_entries {
+                output.push_str(&format!("    {} ({})\n", branch, path.display()));
+            }
+        }
+
+        // Untracked CAS-pattern worktrees (e.g. epic/* outside factory base)
+        // from sibling sessions — visible for management without a store row.
+        if !other_untracked.is_empty() {
+            output.push_str("\nUntracked CAS-pattern worktrees:\n");
+            for (branch, path) in &other_untracked {
                 output.push_str(&format!("    {} ({})\n", branch, path.display()));
             }
         }
@@ -1229,7 +1388,10 @@ impl CasCore {
 
 #[cfg(test)]
 mod tests {
-    use super::is_git_worktree;
+    use super::{
+        is_cas_pattern_worktree, is_factory_style_worktree, is_git_worktree, path_is_under,
+    };
+    use std::path::Path;
     use tempfile::TempDir;
 
     #[test]
@@ -1256,5 +1418,72 @@ mod tests {
         std::fs::create_dir_all(&path).unwrap();
 
         assert!(!is_git_worktree(&path));
+    }
+
+    #[test]
+    fn cas_pattern_matches_factory_branch_outside_cas_dir() {
+        let repo = Path::new("/repo");
+        let cas = Path::new("/repo/.cas");
+        let factory_base = Path::new("/repo/.cas/worktrees");
+        let path = Path::new("/tmp/elsewhere/worker");
+        assert!(is_cas_pattern_worktree(
+            path,
+            Some("factory/hv-food-qa"),
+            cas,
+            factory_base,
+            repo,
+        ));
+    }
+
+    #[test]
+    fn cas_pattern_matches_epic_branch_outside_cas_dir() {
+        let repo = Path::new("/repo");
+        let cas = Path::new("/repo/.cas");
+        let factory_base = Path::new("/repo/.cas/worktrees");
+        let path = Path::new("/tmp/ozer-epic-ea3e-hv");
+        assert!(is_cas_pattern_worktree(
+            path,
+            Some("epic/integrate-cas-ea3e"),
+            cas,
+            factory_base,
+            repo,
+        ));
+        assert!(!is_factory_style_worktree(
+            path,
+            "epic/integrate-cas-ea3e",
+            cas,
+            factory_base,
+        ));
+    }
+
+    #[test]
+    fn cas_pattern_rejects_main_checkout_and_unrelated_branches() {
+        let repo = Path::new("/repo");
+        let cas = Path::new("/repo/.cas");
+        let factory_base = Path::new("/repo/.cas/worktrees");
+        assert!(!is_cas_pattern_worktree(
+            repo,
+            Some("staging"),
+            cas,
+            factory_base,
+            repo,
+        ));
+        assert!(!is_cas_pattern_worktree(
+            Path::new("/tmp/hand-made"),
+            Some("feature/hand-made"),
+            cas,
+            factory_base,
+            repo,
+        ));
+    }
+
+    #[test]
+    fn path_is_under_matches_prefix() {
+        let base = Path::new("/proj/.cas/worktrees");
+        assert!(path_is_under(
+            Path::new("/proj/.cas/worktrees/alice"),
+            base
+        ));
+        assert!(!path_is_under(Path::new("/proj/other"), base));
     }
 }

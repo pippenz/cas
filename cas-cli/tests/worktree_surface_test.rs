@@ -239,6 +239,159 @@ async fn test_worktree_list_no_disabled_message_when_no_factory_worktrees() {
 }
 
 // =============================================================================
+// cas-d1a0: project-scoped git reconcile — sibling-session worktrees must
+// appear in worktree_list even with no WorktreeStore row (System B never
+// registers; epic worktrees often live outside .cas/worktrees).
+// =============================================================================
+
+/// Factory worktree under a *customized* `worktrees.base_path` (not the
+/// hardcoded `<cas_root>/worktrees` layout) must still appear in
+/// `worktree_list` — same path resolution spawn / worktree_merge use.
+#[tokio::test]
+async fn test_worktree_list_honors_configured_base_path() {
+    let repo = GitRepo::new();
+    let cas_root = init_cas_dir(&repo.root).expect("init_cas_dir");
+    // Unique name: relative base_path resolves under the project parent
+    // (often /tmp), so a fixed name collides across tests/processes.
+    let base_name = format!(
+        "cas-d1a0-list-base-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    std::fs::write(
+        cas_root.join("config.toml"),
+        format!("[worktrees]\nenabled = false\nbase_path = \"{base_name}\"\n"),
+    )
+    .unwrap();
+
+    // Mirrors WorktreeManager::worktree_root for relative non-{project} base_path:
+    // repo_root.parent().join(base_path)/<worker>
+    let base_root = repo.root.parent().unwrap().join(&base_name);
+    let wt_path = base_root.join("erin");
+    repo.add_worktree(&wt_path, "factory/erin");
+    assert_ne!(wt_path, cas_root.join("worktrees").join("erin"));
+
+    let svc = make_service(cas_root);
+    let result = svc
+        .coordination(Parameters(coord_req("worktree_list")))
+        .await
+        .expect("coordination call should succeed");
+    let text = get_text(&result);
+
+    // Reclaim external worktree before asserts so a failure still cleans up.
+    let _ = Command::new("git")
+        .args(["worktree", "remove", "--force", wt_path.to_str().unwrap()])
+        .current_dir(&repo.root)
+        .output();
+    let _ = std::fs::remove_dir_all(&base_root);
+
+    assert!(
+        text.contains("factory/erin"),
+        "worktree_list must surface factory worktrees under configured base_path.\nGot:\n{text}"
+    );
+    assert!(
+        text.contains("[factory]"),
+        "custom-base factory worktree must be labeled [factory].\nGot:\n{text}"
+    );
+}
+/// Epic worktree outside `.cas/worktrees` (e.g. director `/tmp/…-epic-…`)
+/// with an `epic/*` branch must appear as untracked so a sibling session
+/// can see it for merge/cleanup (BUG report cas-d1a0).
+#[tokio::test]
+async fn test_worktree_list_surfaces_unregistered_epic_worktree_outside_cas_dir() {
+    let repo = GitRepo::new();
+    let cas_root = init_cas_dir(&repo.root).expect("init_cas_dir");
+    disable_system_a(&cas_root);
+
+    // No SQLite WorktreeStore row — simulates a worktree created by a
+    // sibling/predecessor session that never registered System A.
+    let tmp = TempDir::new().expect("TempDir for epic worktree");
+    let epic_path = tmp.path().join("ozer-epic-ea3e-hv");
+    repo.add_worktree(&epic_path, "epic/integrate-cas-ea3e");
+
+    let svc = make_service(cas_root);
+    let result = svc
+        .coordination(Parameters(coord_req("worktree_list")))
+        .await
+        .expect("coordination call should succeed");
+    let text = get_text(&result);
+
+    assert!(
+        text.contains("epic/integrate-cas-ea3e"),
+        "unregistered epic/* worktree outside .cas/worktrees must appear in list.\nGot:\n{text}"
+    );
+    assert!(
+        text.contains("[untracked]"),
+        "CAS-pattern worktree with no store row must be labeled [untracked].\nGot:\n{text}"
+    );
+    // Keep the temp dir alive until after the list call (git worktree still present).
+    drop(tmp);
+}
+
+/// Non-CAS user worktrees (arbitrary branch outside CAS layouts) must NOT
+/// pollute worktree_list — only CAS-pattern paths/branches are reconciled.
+#[tokio::test]
+async fn test_worktree_list_ignores_unrelated_git_worktrees() {
+    let repo = GitRepo::new();
+    let cas_root = init_cas_dir(&repo.root).expect("init_cas_dir");
+    disable_system_a(&cas_root);
+
+    let tmp = TempDir::new().expect("TempDir for unrelated worktree");
+    let other_path = tmp.path().join("hand-made-wt");
+    repo.add_worktree(&other_path, "feature/hand-made");
+
+    let svc = make_service(cas_root);
+    let result = svc
+        .coordination(Parameters(coord_req("worktree_list")))
+        .await
+        .expect("coordination call should succeed");
+    let text = get_text(&result);
+
+    assert!(
+        !text.contains("feature/hand-made"),
+        "unrelated user worktrees must not appear in worktree_list.\nGot:\n{text}"
+    );
+    assert!(
+        text.contains("No worktrees"),
+        "only non-CAS worktrees present → empty list message.\nGot:\n{text}"
+    );
+    drop(tmp);
+}
+
+/// Sibling-session factory worker under the default `.cas/worktrees/<name>`
+/// path with no store row must still list (git reconcile is the project-
+/// scoped source of truth for System B).
+#[tokio::test]
+async fn test_worktree_list_shows_sibling_session_factory_worktree_without_store_row() {
+    let repo = GitRepo::new();
+    let cas_root = init_cas_dir(&repo.root).expect("init_cas_dir");
+    disable_system_a(&cas_root);
+
+    // Session A created this; session B only has the git worktree + shared .cas.
+    let wt_path = cas_root.join("worktrees").join("hv-food-qa");
+    repo.add_worktree(&wt_path, "factory/hv-food-qa");
+
+    let svc = make_service(cas_root);
+    let result = svc
+        .coordination(Parameters(coord_req("worktree_list")))
+        .await
+        .expect("coordination call should succeed");
+    let text = get_text(&result);
+
+    assert!(
+        text.contains("factory/hv-food-qa"),
+        "director-spawned factory worktree must be visible to another session's worktree_list.\nGot:\n{text}"
+    );
+    assert!(
+        text.contains("[factory]"),
+        "expected [factory] label for System B reconcile entry.\nGot:\n{text}"
+    );
+}
+
+// =============================================================================
 // cas-1d11: worktree_merge must agree with spawn isolate=true on
 // worktrees.enabled — a factory (System B) worktree must be mergeable
 // even when System A is off, since spawn never checked that flag either.
