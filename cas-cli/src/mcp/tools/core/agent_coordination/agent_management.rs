@@ -230,11 +230,37 @@ impl CasCore {
         })?;
 
         let mut marked_stale = 0;
+        let mut tasks_recovered = 0usize;
+        // cas-2e81: before mark_stale revokes leases, capture held task IDs and
+        // park orphaned InProgress work + emit worker_died to supervisors.
         for agent in &stale_agents {
+            let held: Vec<String> = store
+                .list_agent_leases(&agent.id)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|l| l.task_id)
+                .collect();
             if store.mark_stale(&agent.id).is_ok() {
                 marked_stale += 1;
+                let summary = crate::mcp::tools::service::orphan_recovery::recover_worker_vanished(
+                    &self.cas_root,
+                    store.as_ref(),
+                    agent,
+                    &held,
+                    "agent_cleanup stale mark",
+                );
+                tasks_recovered += summary.recovered_task_ids.len();
             }
         }
+
+        // Capture expired leases before reclaim so we can recover dead holders.
+        let expired: Vec<(String, String)> = store
+            .list_active_leases()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|l| l.is_expired())
+            .map(|l| (l.task_id, l.agent_id))
+            .collect();
 
         // Reclaim expired leases
         let reclaimed = store.reclaim_expired_leases().map_err(|e| McpError {
@@ -243,10 +269,24 @@ impl CasCore {
             data: None,
         })?;
 
+        if !expired.is_empty() {
+            let summaries =
+                crate::mcp::tools::service::orphan_recovery::recover_expired_leases_for_dead_holders(
+                    &self.cas_root,
+                    store.as_ref(),
+                    &expired,
+                    threshold_secs,
+                );
+            for s in summaries {
+                tasks_recovered += s.recovered_task_ids.len();
+            }
+        }
+
         Ok(Self::success(format!(
             "Cleanup complete:\n\
              - Stale agents marked: {marked_stale}\n\
-             - Expired leases reclaimed: {reclaimed}"
+             - Expired leases reclaimed: {reclaimed}\n\
+             - Orphaned tasks parked Open: {tasks_recovered}"
         )))
     }
 

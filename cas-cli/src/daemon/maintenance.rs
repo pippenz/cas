@@ -10,10 +10,7 @@ use crate::error::CasError;
 
 /// Run a single maintenance cycle.
 pub fn run_maintenance(config: &DaemonConfig) -> Result<DaemonRunResult, CasError> {
-    use crate::store::{
-        open_agent_store, open_event_store, open_recording_store, open_store, open_task_store,
-    };
-    use crate::types::TaskStatus;
+    use crate::store::{open_agent_store, open_event_store, open_recording_store, open_store};
 
     let started_at = Utc::now();
     let mut errors = Vec::new();
@@ -98,36 +95,21 @@ pub fn run_maintenance(config: &DaemonConfig) -> Result<DaemonRunResult, CasErro
                     }
                 }
 
+                // Capture leases before mark_stale revokes them (cas-2e81).
+                let held_tasks = agent_store.list_agent_leases(&agent_id).unwrap_or_default();
+                let held_ids: Vec<String> = held_tasks.iter().map(|l| l.task_id.clone()).collect();
                 if agent_store.mark_stale(&agent_id).is_ok() {
                     agents_cleaned += 1;
-
-                    // Release any tasks that were assigned but never worked on
-                    let held_tasks = agent_store.list_agent_leases(&agent_id).unwrap_or_default();
-                    if !held_tasks.is_empty() {
-                        if let Ok(task_store) = open_task_store(&config.cas_root) {
-                            for lease in &held_tasks {
-                                if let Ok(mut task) = task_store.get(&lease.task_id) {
-                                    if task.status == TaskStatus::InProgress {
-                                        let timestamp = Utc::now().format("%Y-%m-%d %H:%M");
-                                        let note = format!(
-                                            "[{}] ⚠️ FAILED_STARTUP Agent {} registered but never confirmed startup — marking stale",
-                                            timestamp,
-                                            &agent_id[..12.min(agent_id.len())]
-                                        );
-                                        if task.notes.is_empty() {
-                                            task.notes = note;
-                                        } else {
-                                            task.notes = format!("{}\n\n{}", task.notes, note);
-                                        }
-                                        task.updated_at = Utc::now();
-                                        if task_store.update(&task).is_ok() {
-                                            tasks_interrupted += 1;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    // cas-2e81: park orphaned InProgress + emit worker_died.
+                    let summary =
+                        crate::mcp::tools::service::orphan_recovery::recover_worker_vanished(
+                            &config.cas_root,
+                            agent_store.as_ref(),
+                            agent,
+                            &held_ids,
+                            "daemon maintenance: failed startup",
+                        );
+                    tasks_interrupted += summary.recovered_task_ids.len();
                 }
             }
         }
@@ -135,41 +117,47 @@ pub fn run_maintenance(config: &DaemonConfig) -> Result<DaemonRunResult, CasErro
         if let Ok(stale_agents) = agent_store.list_stale(600) {
             for agent in &stale_agents {
                 let held_tasks = agent_store.list_agent_leases(&agent.id).unwrap_or_default();
+                let held_ids: Vec<String> = held_tasks.iter().map(|l| l.task_id.clone()).collect();
                 let agent_id = agent.id.clone();
 
                 if agent_store.mark_stale(&agent_id).is_ok() {
                     agents_cleaned += 1;
-
-                    if !held_tasks.is_empty() {
-                        if let Ok(task_store) = open_task_store(&config.cas_root) {
-                            for lease in &held_tasks {
-                                if let Ok(mut task) = task_store.get(&lease.task_id) {
-                                    if task.status == TaskStatus::InProgress {
-                                        let timestamp = Utc::now().format("%Y-%m-%d %H:%M");
-                                        let note = format!(
-                                            "[{}] ⚠️ INTERRUPTED Agent {} timed out while task was in progress",
-                                            timestamp,
-                                            &agent_id[..12.min(agent_id.len())]
-                                        );
-                                        if task.notes.is_empty() {
-                                            task.notes = note;
-                                        } else {
-                                            task.notes = format!("{}\n\n{}", task.notes, note);
-                                        }
-                                        task.updated_at = Utc::now();
-                                        if task_store.update(&task).is_ok() {
-                                            tasks_interrupted += 1;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    // cas-2e81: park orphaned InProgress + emit worker_died
+                    // (replaces note-only annotation that left status stuck).
+                    let summary =
+                        crate::mcp::tools::service::orphan_recovery::recover_worker_vanished(
+                            &config.cas_root,
+                            agent_store.as_ref(),
+                            agent,
+                            &held_ids,
+                            "daemon maintenance: heartbeat stale",
+                        );
+                    tasks_interrupted += summary.recovered_task_ids.len();
                 }
             }
         }
 
+        // Reclaim expired leases; park tasks when holder is already dead.
+        let expired: Vec<(String, String)> = agent_store
+            .list_active_leases()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|l| l.is_expired())
+            .map(|l| (l.task_id, l.agent_id))
+            .collect();
         let _ = agent_store.reclaim_expired_leases();
+        if !expired.is_empty() {
+            let summaries =
+                crate::mcp::tools::service::orphan_recovery::recover_expired_leases_for_dead_holders(
+                    &config.cas_root,
+                    agent_store.as_ref(),
+                    &expired,
+                    600,
+                );
+            for s in summaries {
+                tasks_interrupted += s.recovered_task_ids.len();
+            }
+        }
 
         if config.agent_purge_age_hours > 0 {
             let purge_cutoff =

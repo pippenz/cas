@@ -1106,6 +1106,7 @@ pub(crate) mod agent_liveness;
 mod core;
 pub(crate) mod factory_ops;
 mod factory_remind;
+pub(crate) mod orphan_recovery;
 mod panic_catch;
 #[cfg(test)]
 mod panic_regression_test;

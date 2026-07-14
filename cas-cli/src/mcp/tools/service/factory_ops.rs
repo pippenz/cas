@@ -575,9 +575,44 @@ impl CasService {
                     let _ = store.revive(&agent.id);
                     continue;
                 }
+                // cas-2e81: capture held leases BEFORE mark_stale revokes them,
+                // then park orphaned InProgress tasks + emit worker_died.
+                let held: Vec<String> = store
+                    .list_agent_leases(&agent.id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|l| l.task_id)
+                    .collect();
                 if store.mark_stale(&agent.id).is_ok() {
                     stale_pruned += 1;
+                    let _ = super::orphan_recovery::recover_worker_vanished(
+                        &self.inner.cas_root,
+                        store.as_ref(),
+                        &agent,
+                        &held,
+                        "worker_status stale prune (heartbeat gone, process not alive)",
+                    );
                 }
+            }
+        }
+
+        // cas-2e81: reclaim expired leases and park tasks when the holder is
+        // already dead/stale (lease expiry alone must not silence orphans).
+        if let Ok(active_leases) = store.list_active_leases() {
+            let now = chrono::Utc::now();
+            let expired: Vec<(String, String)> = active_leases
+                .into_iter()
+                .filter(|l| l.expires_at < now)
+                .map(|l| (l.task_id, l.agent_id))
+                .collect();
+            if !expired.is_empty() {
+                let _ = store.reclaim_expired_leases();
+                let _ = super::orphan_recovery::recover_expired_leases_for_dead_holders(
+                    &self.inner.cas_root,
+                    store.as_ref(),
+                    &expired,
+                    worker_stale_threshold_secs,
+                );
             }
         }
 
@@ -593,10 +628,26 @@ impl CasService {
             .filter(|a| a.visible_to_factory_session(factory_session.as_deref()))
             .collect();
 
+        // cas-2e81: always surface recently-died-while-leased even when the
+        // Active roster is empty — "None active" must not hide a mid-P0 crash.
+        let died_section = super::orphan_recovery::format_recently_died_while_leased(
+            &self.inner.cas_root,
+            store.as_ref(),
+            factory_session.as_deref(),
+            3600, // 1h window
+        );
+
         if agents.is_empty() {
-            return Ok(Self::success(
+            let mut msg = String::from(
                 "No active agents registered.\n\nNote: Factory TUI must be running for agents to be registered.",
-            ));
+            );
+            msg.push_str(&died_section);
+            if stale_pruned > 0 {
+                msg.push_str(&format!(
+                    "\nFiltered stale agent record(s): {stale_pruned} (>{worker_stale_threshold_secs}s heartbeat age)\n"
+                ));
+            }
+            return Ok(Self::success(msg));
         }
 
         let owned = supervisor_owned_workers();
@@ -777,6 +828,9 @@ impl CasService {
                 ));
             }
         }
+
+        // cas-2e81: died-while-leased section (empty-fleet vs crash distinction).
+        output.push_str(&died_section);
 
         if stale_pruned > 0 {
             output.push_str(&format!(
