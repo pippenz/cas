@@ -137,10 +137,10 @@ fn pretooluse_permission_decision_output_schema() {
         hso.get("permissionDecisionReason").and_then(Value::as_str),
         Some("auto-approved")
     );
-    // additionalContext has no place on PreToolUse permission-decision output.
+    // Default permission builder omits additionalContext (optional field).
     assert!(
         hso.get("additionalContext").is_none(),
-        "PreToolUse permission output must not carry additionalContext"
+        "default with_pre_tool_permission must not emit additionalContext"
     );
     assert_hook_specific_keys_subset(
         hso,
@@ -149,8 +149,30 @@ fn pretooluse_permission_decision_output_schema() {
             "permissionDecision",
             "permissionDecisionReason",
             "updatedInput",
+            "additionalContext",
         ],
         "PreToolUse.permission",
+    );
+}
+
+#[test]
+fn pretooluse_permission_with_context_emits_additional_context() {
+    // cas-73c8: successful SendMessage auto-route uses allow + additionalContext
+    // so Claude sees a success receipt instead of a deny/`<error>` envelope.
+    let output = HookOutput::with_pre_tool_permission_and_context(
+        "allow",
+        "auto-routed",
+        "✅ AUTO-ROUTED via CAS coordination",
+    );
+    let value = to_value(&output);
+    let hso = hook_specific(&value, "PreToolUse.permission+context");
+    assert_eq!(
+        hso.get("permissionDecision").and_then(Value::as_str),
+        Some("allow")
+    );
+    assert_eq!(
+        hso.get("additionalContext").and_then(Value::as_str),
+        Some("✅ AUTO-ROUTED via CAS coordination")
     );
 }
 

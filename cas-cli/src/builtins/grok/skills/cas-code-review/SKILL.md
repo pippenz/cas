@@ -27,7 +27,7 @@ Return shape: `{"residual": [], "pre_existing": [], "mode": "<mode>", "skipped_r
    git diff --name-only <base_sha>..HEAD  # → file_list
    git log --format=%B <base_sha>..HEAD   # → commit_log
    ```
-   If `task_id` is known, also fetch task context: `cas__task action=show id=<task_id>` → `task_context` (title + description + acceptance criteria + notes).
+   If `task_id` is known, also fetch task context: `mcp__cas__task action=show id=<task_id>` → `task_context` (title + description + acceptance criteria + notes).
 
 3. **Call the Workflow:**
    ```
@@ -70,6 +70,14 @@ With the Workflow result in hand, branch on `mode`:
 - **`headless`** — return merged envelope as structured text to the caller. No side effects.
 
 In every mode, the output envelope includes `activation` (which personas ran and why) and `intent_summary` from the Workflow return value.
+
+When the caller must pass the result into `task.close` via `code_review_findings`, the wire envelope is:
+
+```
+{ "residual": Finding[], "pre_existing": Finding[], "mode": string }
+```
+
+Each **Finding** requires: `title`, `severity`, `file`, `line`, `why_it_matters`, `autofix_class`, `owner`, `confidence`, `evidence`, `pre_existing`. Optional: `suggested_fix`, `requires_verification`. Full field rules live in [references/findings-schema.md](references/findings-schema.md). A malformed envelope is rejected with **all** missing Finding fields listed in one response — do not invent a partial shape by hand.
 
 ## Review ownership model
 

@@ -197,9 +197,15 @@ impl FactoryDaemon {
         // session running in the same project directory.
         let supervisor_name = self.app.supervisor_name().to_string();
         let worker_names = self.app.worker_names().to_vec();
-        let mut targets: Vec<&str> = Vec::with_capacity(worker_names.len() + 2);
+        // cas-73c8: include `director` so outbound replies to the permanent
+        // team director member are delivered (write_to_inbox / PTY), matching
+        // inbound director → agent delivery. Without this, messages queued
+        // to target=director sat forever while registration reported them
+        // as "not yet registered".
+        let mut targets: Vec<&str> = Vec::with_capacity(worker_names.len() + 3);
         targets.push(&supervisor_name);
         targets.push("all_workers");
+        targets.push(super::teams::DIRECTOR_AGENT_NAME);
         for w in &worker_names {
             targets.push(w.as_str());
         }

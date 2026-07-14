@@ -167,8 +167,9 @@ pub fn handle_pre_tool_use(
     //
     // New behaviour: parse the SendMessage call, enqueue the message on the
     // CAS prompt queue directly (same path `mcp__cas__coordination
-    // action=message` uses), notify the daemon, then return `deny` with an
-    // explicit "already delivered — do not retry" receipt so agents stop.
+    // action=message` uses), notify the daemon, then return `allow` with an
+    // `additionalContext` success receipt (cas-73c8) so agents see tool
+    // success — not a deny/`<error>` envelope — and stop retrying.
     //
     // On any failure (missing fields, queue open error, enqueue error) we
     // fall back to the original deny-with-guidance path — never silently drop.
@@ -1127,9 +1128,10 @@ fn is_own_verification_tool_call(tool_name: &str, tool_prefix: &str) -> bool {
 }
 
 /// Auto-route a factory-mode `SendMessage` tool call onto the CAS prompt
-/// queue so the message actually reaches its recipient, then return a
-/// `deny` receipt that tells the agent not to retry. See the `SendMessage`
-/// block in `handle_pre_tool_use` for the why.
+/// queue so the message actually reaches its recipient, then return an
+/// `allow` + `additionalContext` success receipt (cas-73c8). Returning
+/// `deny` wrapped the ✅ receipt in Claude Code's `<error>` envelope, which
+/// agents and tooling treated as failure even though delivery succeeded.
 ///
 /// On any parse / queue failure, falls back to the original deny-with-
 /// guidance path — we never silently drop the agent's message.
@@ -1252,14 +1254,19 @@ fn auto_route_send_message(
     );
 
     let prefix = crate::harness_policy::own_tool_prefix();
-    HookOutput::with_pre_tool_permission(
-        "deny",
-        &format!(
-            "✅ AUTO-ROUTED via CAS coordination (message id {message_id}).\n\n\
-             Message delivered to `{target}`. DO NOT retry this SendMessage call.\n\n\
-             For future messages, call `{prefix}coordination action=message target=<name> message=\"...\" summary=\"...\"` directly — skip SendMessage."
-        ),
-    )
+    // cas-73c8: success-shaped receipt. `permissionDecision=allow` so Claude
+    // Code does not wrap the receipt in `<error>`; the guidance lives in
+    // `additionalContext` (visible to the model next to the tool result).
+    // `permissionDecisionReason` is user-facing only on allow.
+    //
+    // Native SendMessage may also run after allow; inbox content-dedupe
+    // (teams write_to_inbox) suppresses an identical second write.
+    let receipt = format!(
+        "✅ AUTO-ROUTED via CAS coordination (message id {message_id}).\n\n\
+         Message delivered to `{target}`. DO NOT retry this SendMessage call.\n\n\
+         For future messages, call `{prefix}coordination action=message target=<name> message=\"...\" summary=\"...\"` directly — skip SendMessage."
+    );
+    HookOutput::with_pre_tool_permission_and_context("allow", "CAS auto-routed SendMessage", &receipt)
 }
 
 #[cfg(test)]

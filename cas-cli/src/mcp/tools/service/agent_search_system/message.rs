@@ -258,8 +258,15 @@ impl CasService {
         // signal this happened. Check registration state up front so the
         // response can say so honestly. `all_workers` is a broadcast, not a
         // single-target claim, so it's always reported as delivered framing.
+        //
+        // cas-73c8: `director` is a permanent team member (TeamsManager
+        // init_team_config) and the source of inbound teammate messages, but
+        // is not an agent_store registration. Treat it as always registered
+        // so outbound replies after an inbound director message are not
+        // reported as "not yet registered".
         let target_is_registered = resolved_target == "all_workers"
             || resolved_target == "supervisor"
+            || resolved_target.eq_ignore_ascii_case("director")
             || {
                 use crate::store::open_agent_store;
                 open_agent_store(&self.inner.cas_root)

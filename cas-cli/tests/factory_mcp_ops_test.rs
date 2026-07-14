@@ -1194,18 +1194,22 @@ async fn test_worker_status_prunes_stale_worker_and_keeps_live_one() {
         .expect("worker_status call should succeed");
     let text = get_text(&result);
 
-    // Live worker must appear; stale must not.
+    // Live worker must appear; stale must not appear as an Active bullet.
+    // cas-2e81: stale workers that held no lease may be absent entirely;
+    // those that held a lease can appear under "Recently died while leased".
     assert!(
         text.contains("live-fox"),
         "live worker must appear in Active listing. Got:\n{text}"
     );
+    let active_section = text
+        .split("Recently died while leased")
+        .next()
+        .unwrap_or(&text);
     assert!(
-        !text.contains("dead-wolf"),
+        !active_section
+            .lines()
+            .any(|l| l.contains("• dead-wolf") || l.contains(&format!("• {stale_id}"))),
         "stale worker must be pruned out of the Active listing. Got:\n{text}"
-    );
-    assert!(
-        !text.contains(&stale_id),
-        "stale worker's id must not appear in render. Got:\n{text}"
     );
 
     // The footer must account for the prune so operators can see the
@@ -1334,6 +1338,216 @@ async fn test_9829_worker_status_marks_stalled_worker_with_in_progress_task() {
     assert!(
         !ibis_block.contains("⚠ STALLED"),
         "a worker with no claimed task must never be marked STALLED. Got:\n{ibis_block}"
+    );
+}
+
+// =============================================================================
+// cas-2e81: orphan InProgress + death/lease-expiry signal
+// =============================================================================
+
+/// Simulated kill of a lease holder after start: worker_status prune must
+/// park the InProgress task Open with an audit note (non-silent recovery).
+#[tokio::test]
+async fn test_2e81_worker_status_parks_orphaned_inprogress_on_stale_prune() {
+    let _guard = EnvGuard::set(&[]);
+    let env = FactoryTestEnv::new();
+    let sup_id = env.register_supervisor("sup-orphan");
+
+    let worker_id =
+        env.register_stale_worker_with_clone_path("gone-worker", "/tmp/cas-worktrees/gone", 40);
+    let task_store = env.task_store();
+    let mut task = Task::new("cas-orphan1".to_string(), "Orphan mid-task".to_string());
+    task.status = TaskStatus::InProgress;
+    task.assignee = Some("gone-worker".to_string());
+    task_store.add(&task).expect("add task");
+    env.agent_store()
+        .try_claim("cas-orphan1", &worker_id, 600, Some("started"))
+        .expect("claim")
+        .is_success();
+
+    let req = factory_req("worker_status");
+    let result = env
+        .service
+        .factory(Parameters(req))
+        .await
+        .expect("worker_status");
+    let text = get_text(&result);
+
+    let recovered = task_store.get("cas-orphan1").expect("task still exists");
+    assert_eq!(
+        recovered.status,
+        TaskStatus::Open,
+        "orphaned InProgress must park to Open. Got notes: {}",
+        recovered.notes
+    );
+    assert!(
+        recovered.assignee.is_none(),
+        "assignee must clear on orphan recovery"
+    );
+    assert!(
+        recovered.notes.contains("orphaned")
+            || recovered.notes.contains("worker vanished")
+            || recovered.notes.contains("lease"),
+        "audit note required. notes={}",
+        recovered.notes
+    );
+
+    // Recovery signal also visible on worker_status (died-while-leased section).
+    assert!(
+        text.contains("Recently died while leased") || text.contains("gone-worker"),
+        "worker_status must surface death/orphan signal. Got:\n{text}"
+    );
+    assert!(
+        text.contains("cas-orphan1"),
+        "held task id must appear in death signal. Got:\n{text}"
+    );
+
+    // worker_died queue notification for the supervising session.
+    let queue = cas::store::open_supervisor_queue_store(&env.cas_root).expect("queue");
+    let pending = queue.peek(&sup_id, 20).expect("peek");
+    assert!(
+        pending.iter().any(|n| n.event_type == "worker_died"),
+        "worker_died must be queued for supervisor. pending={pending:?}"
+    );
+    let _ = sup_id;
+}
+
+/// Empty fleet with no deaths vs died-while-leased must read differently.
+#[tokio::test]
+async fn test_2e81_worker_status_distinguishes_empty_fleet_vs_died_while_leased() {
+    let _guard = EnvGuard::set(&[]);
+    let env = FactoryTestEnv::new();
+    env.register_supervisor("sup-empty");
+
+    // Empty fleet (only supervisor) — no died-while-leased section.
+    let empty_text = get_text(
+        &env.service
+            .factory(Parameters(factory_req("worker_status")))
+            .await
+            .expect("worker_status empty"),
+    );
+    assert!(
+        empty_text.contains("None active") || empty_text.contains("No active"),
+        "empty fleet must say no active workers. Got:\n{empty_text}"
+    );
+    assert!(
+        !empty_text.contains("Recently died while leased"),
+        "empty fleet must NOT claim died-while-leased. Got:\n{empty_text}"
+    );
+
+    // Kill a lease holder mid-task.
+    let worker_id =
+        env.register_stale_worker_with_clone_path("crash-worker", "/tmp/cas-worktrees/crash", 45);
+    let task_store = env.task_store();
+    let mut task = Task::new("cas-crash1".to_string(), "Crash mid-task".to_string());
+    task.status = TaskStatus::InProgress;
+    task.assignee = Some("crash-worker".to_string());
+    task_store.add(&task).expect("add");
+    env.agent_store()
+        .try_claim("cas-crash1", &worker_id, 600, None)
+        .expect("claim")
+        .is_success();
+
+    let died_text = get_text(
+        &env.service
+            .factory(Parameters(factory_req("worker_status")))
+            .await
+            .expect("worker_status after death"),
+    );
+    assert!(
+        died_text.contains("Recently died while leased"),
+        "died-while-leased must be explicit. Got:\n{died_text}"
+    );
+    assert!(
+        died_text.contains("crash-worker") && died_text.contains("cas-crash1"),
+        "must name dead worker + held task. Got:\n{died_text}"
+    );
+}
+
+/// agent_cleanup path: lease reclaim + stale mark also parks orphaned tasks
+/// and emits worker_died (not only worker_status).
+#[tokio::test]
+async fn test_2e81_agent_cleanup_parks_orphan_and_emits_worker_died() {
+    let _guard = EnvGuard::set(&[]);
+    let env = FactoryTestEnv::new();
+    let sup_id = env.register_supervisor("sup-cleanup");
+
+    let worker_id =
+        env.register_stale_worker_with_clone_path("cleanup-dead", "/tmp/cas-worktrees/cd", 200);
+    let task_store = env.task_store();
+    let mut task = Task::new("cas-clean1".to_string(), "Cleanup orphan".to_string());
+    task.status = TaskStatus::InProgress;
+    task.assignee = Some("cleanup-dead".to_string());
+    task_store.add(&task).expect("add");
+    env.agent_store()
+        .try_claim("cas-clean1", &worker_id, 600, None)
+        .expect("claim")
+        .is_success();
+
+    let mut req = coord_req("agent_cleanup");
+    req.stale_threshold_secs = Some(30);
+    let result = env
+        .service
+        .coordination(Parameters(req))
+        .await
+        .expect("agent_cleanup");
+    let text = get_text(&result);
+    assert!(
+        text.contains("Cleanup complete") || text.contains("Stale"),
+        "cleanup should succeed: {text}"
+    );
+
+    let recovered = task_store.get("cas-clean1").expect("task");
+    assert_eq!(
+        recovered.status,
+        TaskStatus::Open,
+        "agent_cleanup must park orphaned InProgress. notes={}",
+        recovered.notes
+    );
+
+    let queue = cas::store::open_supervisor_queue_store(&env.cas_root).expect("queue");
+    let pending = queue.peek(&sup_id, 20).expect("peek");
+    assert!(
+        pending.iter().any(|n| n.event_type == "worker_died"),
+        "agent_cleanup must queue worker_died. pending={pending:?}"
+    );
+}
+
+/// PSR tasks must not be reset to Open by orphan recovery (cas-6e4c invariant).
+#[tokio::test]
+async fn test_2e81_orphan_recovery_skips_psr_tasks() {
+    let _guard = EnvGuard::set(&[]);
+    let env = FactoryTestEnv::new();
+    env.register_supervisor("sup-psr");
+
+    let worker_id =
+        env.register_stale_worker_with_clone_path("psr-worker", "/tmp/cas-worktrees/psr", 40);
+    let task_store = env.task_store();
+    let mut task = Task::new("cas-psr1".to_string(), "PSR task".to_string());
+    task.status = TaskStatus::PendingSupervisorReview;
+    task.assignee = Some("psr-worker".to_string());
+    task_store.add(&task).expect("add");
+    // Still hold a lease so mark_stale revokes something — recovery must skip status flip.
+    env.agent_store()
+        .try_claim("cas-psr1", &worker_id, 600, None)
+        .expect("claim")
+        .is_success();
+    // Force PSR again in case claim path rewrote status.
+    let mut t = task_store.get("cas-psr1").unwrap();
+    t.status = TaskStatus::PendingSupervisorReview;
+    task_store.update(&t).unwrap();
+
+    let _ = env
+        .service
+        .factory(Parameters(factory_req("worker_status")))
+        .await
+        .expect("worker_status");
+
+    let after = task_store.get("cas-psr1").unwrap();
+    assert_eq!(
+        after.status,
+        TaskStatus::PendingSupervisorReview,
+        "PSR must not be auto-reset to Open by orphan recovery"
     );
 }
 
@@ -1829,6 +2043,32 @@ async fn test_coordination_message_to_registered_target_reports_delivery_status(
     assert!(
         !text.contains("not yet registered"),
         "a registered target must not read as unregistered: {text}"
+    );
+}
+
+/// cas-73c8 AC3: `director` is a permanent team member and the source of
+/// inbound teammate messages, but is not an agent_store registration.
+/// Outbound `target=director` must report registered (symmetric with inbound).
+#[tokio::test]
+async fn test_coordination_message_to_director_reports_registered() {
+    let _guard = EnvGuard::set(&[
+        ("CAS_AGENT_ROLE", "supervisor"),
+        ("CAS_AGENT_NAME", "supervisor"),
+    ]);
+    let env = FactoryTestEnv::new();
+    // Deliberately do NOT register "director" in agent_store.
+
+    let req = coord_msg("message", "director", "ack director nudge", None);
+    let result = env.service.coordination(Parameters(req)).await;
+    assert!(result.is_ok(), "message to director should succeed: {result:?}");
+    let text = get_text(&result.unwrap());
+    assert!(
+        text.contains("target is registered"),
+        "director must resolve as registered: {text}"
+    );
+    assert!(
+        !text.contains("not yet registered"),
+        "director must not read as unregistered after inbound teammate traffic: {text}"
     );
 }
 
