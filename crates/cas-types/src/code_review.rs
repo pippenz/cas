@@ -393,6 +393,157 @@ impl ReviewOutcome {
     }
 }
 
+/// Required `Finding` JSON keys (semantic rules still enforced by
+/// [`Finding::validate`] after successful deserialization).
+pub const FINDING_REQUIRED_FIELDS: &[&str] = &[
+    "title",
+    "severity",
+    "file",
+    "line",
+    "why_it_matters",
+    "autofix_class",
+    "owner",
+    "confidence",
+    "evidence",
+    "pre_existing",
+];
+
+/// Optional `Finding` JSON keys.
+pub const FINDING_OPTIONAL_FIELDS: &[&str] = &["suggested_fix", "requires_verification"];
+
+/// Compact shape + Finding field list for close-gate / tool error text.
+///
+/// Used when `code_review_findings` fails to parse so callers see the full
+/// `Finding` contract in one response instead of discovering it field-by-field
+/// across serial close attempts (cas-297e).
+pub fn review_outcome_shape_hint() -> String {
+    format!(
+        "Expected shape: {{residual: Finding[], pre_existing: Finding[], mode: string}}.\n\
+         Each Finding requires: {}.\n\
+         Optional Finding fields: {}.",
+        FINDING_REQUIRED_FIELDS.join(", "),
+        FINDING_OPTIONAL_FIELDS.join(", "),
+    )
+}
+
+/// Multi-error parse failure for a `ReviewOutcome` JSON envelope.
+///
+/// Unlike bare `serde_json::from_str`, this collects **all** missing
+/// required Finding fields (and other structural issues) into a single
+/// message so callers can fix the envelope in one round trip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewOutcomeParseError {
+    /// Human-readable multi-line diagnostic.
+    pub message: String,
+}
+
+impl fmt::Display for ReviewOutcomeParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ReviewOutcomeParseError {}
+
+/// Parse + structurally multi-validate + semantically validate a
+/// [`ReviewOutcome`] JSON string.
+///
+/// Structural missing-field checks run over every Finding in `residual[]`
+/// and `pre_existing[]` **before** serde type conversion, so a single bad
+/// envelope reports every missing key at once.
+pub fn parse_review_outcome(json: &str) -> Result<ReviewOutcome, ReviewOutcomeParseError> {
+    let value: serde_json::Value = serde_json::from_str(json).map_err(|e| {
+        ReviewOutcomeParseError {
+            message: format!("invalid JSON: {e}"),
+        }
+    })?;
+
+    let obj = value.as_object().ok_or_else(|| ReviewOutcomeParseError {
+        message: "ReviewOutcome must be a JSON object".to_string(),
+    })?;
+
+    let mut errors: Vec<String> = Vec::new();
+
+    match obj.get("mode") {
+        None => errors.push("missing field `mode`".to_string()),
+        Some(v) if !v.is_string() => {
+            errors.push("`mode` must be a string".to_string());
+        }
+        Some(v) if v.as_str().map(|s| s.trim().is_empty()).unwrap_or(true) => {
+            errors.push("`mode` must be a non-empty string".to_string());
+        }
+        Some(_) => {}
+    }
+
+    for key in ["residual", "pre_existing"] {
+        match obj.get(key) {
+            None | Some(serde_json::Value::Null) => {}
+            Some(v) => {
+                if let Some(arr) = v.as_array() {
+                    for (i, item) in arr.iter().enumerate() {
+                        errors.extend(collect_finding_field_errors(
+                            item,
+                            &format!("{key}[{i}]"),
+                        ));
+                    }
+                } else {
+                    errors.push(format!("`{key}` must be an array of Finding objects"));
+                }
+            }
+        }
+    }
+
+    for k in obj.keys() {
+        if !matches!(k.as_str(), "residual" | "pre_existing" | "mode") {
+            errors.push(format!("unknown field `{k}`"));
+        }
+    }
+
+    if !errors.is_empty() {
+        return Err(ReviewOutcomeParseError {
+            message: errors.join("\n"),
+        });
+    }
+
+    let outcome: ReviewOutcome = serde_json::from_value(value).map_err(|e| {
+        ReviewOutcomeParseError {
+            message: format!("type/shape error: {e}"),
+        }
+    })?;
+
+    outcome.validate().map_err(|e| ReviewOutcomeParseError {
+        message: e.to_string(),
+    })?;
+
+    Ok(outcome)
+}
+
+fn collect_finding_field_errors(value: &serde_json::Value, path: &str) -> Vec<String> {
+    let mut errs = Vec::new();
+    let Some(obj) = value.as_object() else {
+        errs.push(format!("{path}: expected a Finding object"));
+        return errs;
+    };
+
+    for field in FINDING_REQUIRED_FIELDS {
+        if !obj.contains_key(*field) {
+            errs.push(format!("{path}: missing field `{field}`"));
+        }
+    }
+
+    let known: std::collections::HashSet<&str> = FINDING_REQUIRED_FIELDS
+        .iter()
+        .chain(FINDING_OPTIONAL_FIELDS.iter())
+        .copied()
+        .collect();
+    for k in obj.keys() {
+        if !known.contains(k.as_str()) {
+            errs.push(format!("{path}: unknown field `{k}`"));
+        }
+    }
+    errs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -755,5 +906,110 @@ mod tests {
         let s = out.to_string();
         assert!(s.contains("== reviewer: gpt-5.5:independent (0 findings) =="));
         assert!(s.contains("skipped_reason: codex CLI not installed"));
+    }
+
+    // --- parse_review_outcome multi-field diagnostics (cas-297e) -----------
+
+    #[test]
+    fn parse_review_outcome_happy_path() {
+        let env = ReviewOutcome {
+            residual: vec![valid_finding()],
+            pre_existing: vec![],
+            mode: "autofix".to_string(),
+        };
+        let json = serde_json::to_string(&env).unwrap();
+        let parsed = parse_review_outcome(&json).unwrap();
+        assert_eq!(parsed, env);
+    }
+
+    #[test]
+    fn parse_review_outcome_reports_all_missing_finding_fields_at_once() {
+        // Minimal Finding-shaped object missing several required keys
+        // (the piecemeal failure mode reported in the Ozer bug).
+        let json = r#"{
+            "mode": "interactive",
+            "residual": [{
+                "title": "partial finding",
+                "severity": "P2",
+                "file": "src/a.rs",
+                "line": 1
+            }],
+            "pre_existing": []
+        }"#;
+        let err = parse_review_outcome(json).unwrap_err();
+        let msg = err.message;
+        // All missing required fields must appear in ONE response.
+        for field in [
+            "why_it_matters",
+            "autofix_class",
+            "owner",
+            "confidence",
+            "evidence",
+            "pre_existing",
+        ] {
+            assert!(
+                msg.contains(&format!("missing field `{field}`")),
+                "expected missing field `{field}` in multi-error message, got:\n{msg}"
+            );
+        }
+        // Present fields must not be reported as missing.
+        assert!(!msg.contains("missing field `title`"), "{msg}");
+        assert!(!msg.contains("missing field `severity`"), "{msg}");
+        assert!(!msg.contains("missing field `file`"), "{msg}");
+        assert!(!msg.contains("missing field `line`"), "{msg}");
+        // Path prefix points at the residual entry.
+        assert!(msg.contains("residual[0]"), "{msg}");
+    }
+
+    #[test]
+    fn parse_review_outcome_aggregates_errors_across_findings() {
+        let json = r#"{
+            "mode": "autofix",
+            "residual": [
+                { "title": "a", "severity": "P1", "file": "a.rs", "line": 1 },
+                { "title": "b", "severity": "P2", "file": "b.rs", "line": 2 }
+            ],
+            "pre_existing": [
+                { "title": "c", "severity": "P3", "file": "c.rs", "line": 3 }
+            ]
+        }"#;
+        let err = parse_review_outcome(json).unwrap_err();
+        let msg = err.message;
+        assert!(msg.contains("residual[0]"), "{msg}");
+        assert!(msg.contains("residual[1]"), "{msg}");
+        assert!(msg.contains("pre_existing[0]"), "{msg}");
+        // Each finding should report why_it_matters among the missing set.
+        assert_eq!(
+            msg.matches("missing field `why_it_matters`").count(),
+            3,
+            "expected 3 findings missing why_it_matters, got:\n{msg}"
+        );
+    }
+
+    #[test]
+    fn review_outcome_shape_hint_documents_finding_fields() {
+        let hint = review_outcome_shape_hint();
+        assert!(hint.contains("residual: Finding[]"));
+        assert!(hint.contains("pre_existing: Finding[]"));
+        assert!(hint.contains("mode: string"));
+        for field in FINDING_REQUIRED_FIELDS {
+            assert!(
+                hint.contains(field),
+                "shape hint must document required field `{field}`: {hint}"
+            );
+        }
+        assert!(hint.contains("suggested_fix"));
+        assert!(hint.contains("requires_verification"));
+    }
+
+    #[test]
+    fn parse_review_outcome_rejects_empty_mode() {
+        let json = r#"{"residual":[],"pre_existing":[],"mode":"   "}"#;
+        let err = parse_review_outcome(json).unwrap_err();
+        assert!(
+            err.message.contains("mode"),
+            "expected mode error, got: {}",
+            err.message
+        );
     }
 }

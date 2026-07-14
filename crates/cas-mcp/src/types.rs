@@ -212,7 +212,11 @@ pub struct TaskRequest {
                        Required for tasks with reviewable code changes \
                        unless bypass_code_review is set or the task is \
                        additive-only. Shape: \
-                       {residual: Finding[], pre_existing: Finding[], mode: string}."
+                       {residual: Finding[], pre_existing: Finding[], mode: string}. \
+                       Each Finding requires: title, severity, file, line, \
+                       why_it_matters, autofix_class, owner, confidence, \
+                       evidence, pre_existing (optional: suggested_fix, \
+                       requires_verification)."
     )]
     #[serde(default)]
     pub code_review_findings: Option<String>,

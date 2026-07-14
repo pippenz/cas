@@ -1593,7 +1593,12 @@ impl CasCore {
             // no-code (spike, chore, execution_note set, bypass).
             CodeReviewGateOutcome::Proceed
         } else {
-            run_code_review_gate(&task, &req, close_project_root)
+            run_code_review_gate(
+                &task,
+                &req,
+                close_project_root,
+                supervisor_review_mode,
+            )
         };
         match gate_outcome {
             CodeReviewGateOutcome::Proceed => {}
@@ -3673,10 +3678,50 @@ pub(crate) enum CodeReviewGateOutcome {
 ///   `pre_existing` flag; Check B rejects any P0 in `pre_existing[]`.
 ///   Then [`evaluate_gate`] is called as a safety net. Any rejection
 ///   returns a formatted block message; all checks pass → [`Proceed`].
+/// Build the `CODE_REVIEW_REQUIRED` rejection message with mode guidance
+/// that matches the configured `[code_review] owner` (cas-297e).
+///
+/// - `supervisor_owned = true` (default since v2.13.0): recommend
+///   `mode=interactive` / `mode=headless`.
+/// - `supervisor_owned = false` (`owner = "worker"`): recommend the
+///   legacy `mode=autofix` path.
+fn format_code_review_required(supervisor_owned: bool) -> String {
+    let step1 = if supervisor_owned {
+        "1. Invoke the cas-code-review skill via the Skill or Task tool with \
+         mode=interactive (or mode=headless for skill-to-skill) and the \
+         current diff.\n\
+         Note: mode=autofix is the legacy path for projects that pin \
+         [code_review] owner = \"worker\"."
+    } else {
+        "1. Invoke the cas-code-review skill via the Skill or Task tool with \
+         mode=autofix and the current diff."
+    };
+    format!(
+        "⚠️ CODE_REVIEW_REQUIRED\n\n\
+         task close rejected: this task has reviewable code changes \
+         and no code_review_findings envelope was provided.\n\n\
+         To resolve:\n\
+         {step1}\n\
+         2. Collect the returned ReviewOutcome envelope (residual, \
+            pre_existing, mode).\n\
+         3. Re-call task.close with the envelope JSON-stringified \
+            in code_review_findings.\n\n\
+         {}\n\n\
+         Supervisors may bypass this gate with \
+         bypass_code_review=true (logged as a decision note).",
+        cas_types::review_outcome_shape_hint(),
+    )
+}
+
+/// Run the cas-code-review P0 close gate.
+///
+/// `supervisor_owned` selects owner-aware mode guidance in
+/// `CODE_REVIEW_REQUIRED` (interactive/headless vs legacy autofix).
 pub(crate) fn run_code_review_gate(
     task: &Task,
     req: &TaskCloseRequest,
     project_root: &std::path::Path,
+    supervisor_owned: bool,
 ) -> CodeReviewGateOutcome {
     // Skip 1: additive-only tasks bypass the gate entirely.
     if task.execution_note.as_deref() == Some("additive-only") {
@@ -3734,45 +3779,31 @@ pub(crate) fn run_code_review_gate(
         _ => match persisted_envelope {
             Some(s) => s,
             None => {
-                return CodeReviewGateOutcome::Reject(
-                    "⚠️ CODE_REVIEW_REQUIRED\n\n\
-                     task close rejected: this task has reviewable code changes \
-                     and no code_review_findings envelope was provided.\n\n\
-                     To resolve:\n\
-                     1. Invoke the cas-code-review skill via the Skill or Task \
-                        tool with mode=autofix and the current diff.\n\
-                     2. Collect the returned ReviewOutcome envelope (residual, \
-                        pre_existing, mode).\n\
-                     3. Re-call task.close with the envelope JSON-stringified \
-                        in code_review_findings.\n\n\
-                     Supervisors may bypass this gate with \
-                     bypass_code_review=true (logged as a decision note)."
-                        .to_string(),
-                );
+                return CodeReviewGateOutcome::Reject(format_code_review_required(
+                    supervisor_owned,
+                ));
             }
         },
     };
 
-    let envelope: cas_types::ReviewOutcome = match serde_json::from_str(envelope_json) {
-        Ok(e) => e,
-        Err(e) => {
-            return CodeReviewGateOutcome::Reject(format!(
-                "⚠️ MALFORMED REVIEW ENVELOPE\n\n\
-                 task close rejected: code_review_findings failed to parse \
-                 as ReviewOutcome JSON: {e}\n\n\
-                 Expected shape: {{residual: Finding[], pre_existing: Finding[], mode: string}}."
-            ));
-        }
-    };
-
-    if let Err(e) = envelope.validate() {
-        return CodeReviewGateOutcome::Reject(format!(
-            "⚠️ MALFORMED REVIEW ENVELOPE\n\n\
-             task close rejected: code_review_findings failed validation: {e}\n\n\
-             The worker-side cas-code-review skill returned a structurally \
-             invalid envelope. Re-run the review and retry close."
-        ));
-    }
+    // cas-297e: multi-field parse via parse_review_outcome so a single
+    // bad envelope lists every missing Finding field (and documents the
+    // full Finding schema in the reject text).
+    let envelope: cas_types::ReviewOutcome =
+        match cas_types::parse_review_outcome(envelope_json) {
+            Ok(e) => e,
+            Err(e) => {
+                return CodeReviewGateOutcome::Reject(format!(
+                    "⚠️ MALFORMED REVIEW ENVELOPE\n\n\
+                     task close rejected: code_review_findings failed to parse \
+                     as ReviewOutcome JSON:\n{}\n\n\
+                     {}\n\n\
+                     Fix every listed field (or re-run cas-code-review) and retry close.",
+                    e.message,
+                    cas_types::review_outcome_shape_hint(),
+                ));
+            }
+        };
 
     use cas_store::code_review::close_gate::{GateDecision, evaluate_gate, format_block_message};
     use cas_types::FindingSeverity;
@@ -4968,7 +4999,7 @@ mod code_review_gate_tests {
         t.execution_note = Some("additive-only".to_string());
         let mut req = base_req(&t.id);
         req.code_review_findings = Some(autofix_envelope(vec![p0_finding()]));
-        let out = run_code_review_gate(&t, &req, dir.path());
+        let out = run_code_review_gate(&t, &req, dir.path(), true);
         assert!(matches!(out, CodeReviewGateOutcome::Proceed));
     }
 
@@ -4978,7 +5009,7 @@ mod code_review_gate_tests {
         let dir = repo_with_staged(&[("README.md", "new content\n"), ("docs/x.md", "x\n")]);
         let t = base_task();
         let req = base_req(&t.id); // no findings
-        let out = run_code_review_gate(&t, &req, dir.path());
+        let out = run_code_review_gate(&t, &req, dir.path(), true);
         assert!(
             matches!(out, CodeReviewGateOutcome::Proceed),
             "pure-docs diff must skip the review gate"
@@ -4991,14 +5022,106 @@ mod code_review_gate_tests {
         let dir = repo_with_staged(&[("src/foo.rs", "fn new() {}\n")]);
         let t = base_task();
         let req = base_req(&t.id);
-        let out = run_code_review_gate(&t, &req, dir.path());
+        // supervisor_owned=true is the config default (cas-865b).
+        let out = run_code_review_gate(&t, &req, dir.path(), true);
         match out {
             CodeReviewGateOutcome::Reject(msg) => {
                 assert!(msg.contains("CODE_REVIEW_REQUIRED"));
                 assert!(msg.contains("cas-code-review"));
                 assert!(msg.contains("code_review_findings"));
+                // cas-297e: supervisor-owned mode recommends interactive/headless.
+                assert!(
+                    msg.contains("mode=interactive"),
+                    "supervisor-owned guidance must recommend interactive: {msg}"
+                );
+                assert!(
+                    msg.contains("mode=headless"),
+                    "supervisor-owned guidance must mention headless: {msg}"
+                );
+                assert!(
+                    !msg.contains("mode=autofix and the current diff"),
+                    "supervisor-owned guidance must not primary-recommend autofix: {msg}"
+                );
+                // Finding schema documented at the point of failure.
+                assert!(
+                    msg.contains("why_it_matters"),
+                    "CODE_REVIEW_REQUIRED must document Finding fields: {msg}"
+                );
             }
             other => panic!("expected CODE_REVIEW_REQUIRED reject, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn code_review_required_worker_owned_recommends_autofix() {
+        // cas-297e AC3: owner=worker keeps the legacy autofix guidance.
+        let _g = env_lock();
+        let dir = repo_with_staged(&[("src/foo.rs", "fn new() {}\n")]);
+        let t = base_task();
+        let req = base_req(&t.id);
+        let out = run_code_review_gate(&t, &req, dir.path(), false);
+        match out {
+            CodeReviewGateOutcome::Reject(msg) => {
+                assert!(msg.contains("CODE_REVIEW_REQUIRED"));
+                assert!(
+                    msg.contains("mode=autofix"),
+                    "worker-owned guidance must recommend autofix: {msg}"
+                );
+                assert!(
+                    !msg.contains("mode=interactive"),
+                    "worker-owned guidance must not recommend interactive: {msg}"
+                );
+            }
+            other => panic!("expected CODE_REVIEW_REQUIRED reject, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn partial_finding_envelope_lists_all_missing_fields_once() {
+        // cas-297e AC1+AC2: one response lists every missing Finding field
+        // and documents the Finding schema.
+        let _g = env_lock();
+        let dir = repo_with_staged(&[("src/foo.rs", "fn new() {}\n")]);
+        let t = base_task();
+        let mut req = base_req(&t.id);
+        req.code_review_findings = Some(
+            r#"{
+                "mode": "interactive",
+                "residual": [{
+                    "title": "partial finding",
+                    "severity": "P2",
+                    "file": "src/foo.rs",
+                    "line": 1
+                }],
+                "pre_existing": []
+            }"#
+            .to_string(),
+        );
+        let out = run_code_review_gate(&t, &req, dir.path(), true);
+        match out {
+            CodeReviewGateOutcome::Reject(msg) => {
+                assert!(msg.contains("MALFORMED REVIEW ENVELOPE"), "{msg}");
+                for field in [
+                    "why_it_matters",
+                    "autofix_class",
+                    "owner",
+                    "confidence",
+                    "evidence",
+                    "pre_existing",
+                ] {
+                    assert!(
+                        msg.contains(&format!("missing field `{field}`")),
+                        "expected all-fields list to include `{field}`:\n{msg}"
+                    );
+                }
+                // Schema hint documents required Finding keys.
+                assert!(
+                    msg.contains("Each Finding requires:"),
+                    "error must document Finding required fields:\n{msg}"
+                );
+                assert!(msg.contains("residual[0]"), "{msg}");
+            }
+            other => panic!("expected MALFORMED reject, got {other:?}"),
         }
     }
 
@@ -5009,7 +5132,7 @@ mod code_review_gate_tests {
         let t = base_task();
         let mut req = base_req(&t.id);
         req.code_review_findings = Some(autofix_envelope(vec![p0_finding()]));
-        let out = run_code_review_gate(&t, &req, dir.path());
+        let out = run_code_review_gate(&t, &req, dir.path(), true);
         match out {
             CodeReviewGateOutcome::Reject(msg) => {
                 assert!(msg.contains("P0 BLOCK"));
@@ -5027,7 +5150,7 @@ mod code_review_gate_tests {
         let t = base_task();
         let mut req = base_req(&t.id);
         req.code_review_findings = Some(autofix_envelope(vec![p2_finding()]));
-        let out = run_code_review_gate(&t, &req, dir.path());
+        let out = run_code_review_gate(&t, &req, dir.path(), true);
         assert!(
             matches!(out, CodeReviewGateOutcome::Proceed),
             "P2 residual must route to Unit 8, not block close"
@@ -5041,7 +5164,7 @@ mod code_review_gate_tests {
         let t = base_task();
         let mut req = base_req(&t.id);
         req.code_review_findings = Some(autofix_envelope(Vec::new()));
-        let out = run_code_review_gate(&t, &req, dir.path());
+        let out = run_code_review_gate(&t, &req, dir.path(), true);
         assert!(matches!(out, CodeReviewGateOutcome::Proceed));
     }
 
@@ -5054,7 +5177,7 @@ mod code_review_gate_tests {
         // Whitespace-only mode passes serde but fails validate().
         req.code_review_findings =
             Some(r#"{"residual":[],"pre_existing":[],"mode":"   "}"#.to_string());
-        let out = run_code_review_gate(&t, &req, dir.path());
+        let out = run_code_review_gate(&t, &req, dir.path(), true);
         match out {
             CodeReviewGateOutcome::Reject(msg) => {
                 assert!(msg.contains("MALFORMED REVIEW ENVELOPE"));
@@ -5070,11 +5193,16 @@ mod code_review_gate_tests {
         let t = base_task();
         let mut req = base_req(&t.id);
         req.code_review_findings = Some("not json at all".to_string());
-        let out = run_code_review_gate(&t, &req, dir.path());
+        let out = run_code_review_gate(&t, &req, dir.path(), true);
         match out {
             CodeReviewGateOutcome::Reject(msg) => {
                 assert!(msg.contains("MALFORMED REVIEW ENVELOPE"));
                 assert!(msg.contains("failed to parse"));
+                // cas-297e AC2: even parse failures document the Finding schema.
+                assert!(
+                    msg.contains("Each Finding requires:"),
+                    "parse error must document Finding schema:\n{msg}"
+                );
             }
             other => panic!("expected parse reject, got {other:?}"),
         }
@@ -5094,7 +5222,7 @@ mod code_review_gate_tests {
         req.bypass_code_review = Some(true);
         req.reason = Some("P0 is a false positive, tracked in cas-xyz".to_string());
 
-        let out = run_code_review_gate(&t, &req, dir.path());
+        let out = run_code_review_gate(&t, &req, dir.path(), true);
 
         unsafe {
             match prev {
@@ -5126,7 +5254,7 @@ mod code_review_gate_tests {
         let mut req = base_req(&t.id);
         req.bypass_code_review = Some(true);
 
-        let out = run_code_review_gate(&t, &req, dir.path());
+        let out = run_code_review_gate(&t, &req, dir.path(), true);
 
         unsafe {
             match prev {
@@ -5151,7 +5279,7 @@ mod code_review_gate_tests {
         t.execution_note = Some("additive-only".to_string());
         let req = base_req(&t.id); // no findings, no override
         // additive-only short-circuits before the findings check.
-        let out = run_code_review_gate(&t, &req, dir.path());
+        let out = run_code_review_gate(&t, &req, dir.path(), true);
         assert!(matches!(out, CodeReviewGateOutcome::Proceed));
     }
 
@@ -5162,7 +5290,7 @@ mod code_review_gate_tests {
         let t = base_task();
         let req = base_req(&t.id);
         // Non-git dir → has_reviewable_changes returns false → skip.
-        let out = run_code_review_gate(&t, &req, dir.path());
+        let out = run_code_review_gate(&t, &req, dir.path(), true);
         assert!(matches!(out, CodeReviewGateOutcome::Proceed));
     }
 
@@ -5179,7 +5307,7 @@ mod code_review_gate_tests {
         let mut t = base_task();
         t.deliverables.review_envelope = Some(autofix_envelope(Vec::new()));
         let req = base_req(&t.id); // no findings in request
-        let out = run_code_review_gate(&t, &req, dir.path());
+        let out = run_code_review_gate(&t, &req, dir.path(), true);
         assert!(
             matches!(out, CodeReviewGateOutcome::Proceed),
             "persisted clean envelope must let supervisor-close proceed without bypass"
@@ -5194,7 +5322,7 @@ mod code_review_gate_tests {
         let mut t = base_task();
         t.deliverables.review_envelope = Some(autofix_envelope(vec![p0_finding()]));
         let req = base_req(&t.id);
-        let out = run_code_review_gate(&t, &req, dir.path());
+        let out = run_code_review_gate(&t, &req, dir.path(), true);
         match out {
             CodeReviewGateOutcome::Reject(msg) => {
                 assert!(msg.contains("P0 BLOCK"), "P0 must still block: {msg}");
@@ -5215,7 +5343,7 @@ mod code_review_gate_tests {
         let mut req = base_req(&t.id);
         // Request envelope is clean — should let the close proceed.
         req.code_review_findings = Some(autofix_envelope(Vec::new()));
-        let out = run_code_review_gate(&t, &req, dir.path());
+        let out = run_code_review_gate(&t, &req, dir.path(), true);
         assert!(
             matches!(out, CodeReviewGateOutcome::Proceed),
             "explicit request envelope must win over persisted fallback"
@@ -5229,7 +5357,7 @@ mod code_review_gate_tests {
         let mut t = base_task();
         t.deliverables.review_envelope = Some("not-json".to_string());
         let req = base_req(&t.id);
-        let out = run_code_review_gate(&t, &req, dir.path());
+        let out = run_code_review_gate(&t, &req, dir.path(), true);
         assert!(
             matches!(out, CodeReviewGateOutcome::Reject(_)),
             "malformed persisted envelope must be rejected, not silently bypassed"
@@ -5394,7 +5522,7 @@ mod code_review_gate_tests {
         let forged = envelope_with_pre_existing(vec![p0_finding_pre_existing_true()], Vec::new());
         t.deliverables.review_envelope = Some(forged);
         let req = base_req(&t.id); // no findings in request — reads persisted
-        let out = run_code_review_gate(&t, &req, dir.path());
+        let out = run_code_review_gate(&t, &req, dir.path(), true);
         match out {
             CodeReviewGateOutcome::Reject(msg) => {
                 assert!(
@@ -5421,7 +5549,7 @@ mod code_review_gate_tests {
         let forged = envelope_with_pre_existing(Vec::new(), vec![p0_finding()]);
         t.deliverables.review_envelope = Some(forged);
         let req = base_req(&t.id);
-        let out = run_code_review_gate(&t, &req, dir.path());
+        let out = run_code_review_gate(&t, &req, dir.path(), true);
         match out {
             CodeReviewGateOutcome::Reject(msg) => {
                 assert!(
@@ -5466,7 +5594,7 @@ mod code_review_gate_tests {
         t.deliverables.review_envelope = Some(forged);
         // Step 3: worker retries without providing code_review_findings.
         let req = base_req(&t.id);
-        let out = run_code_review_gate(&t, &req, dir.path());
+        let out = run_code_review_gate(&t, &req, dir.path(), true);
         match out {
             CodeReviewGateOutcome::Reject(msg) => {
                 // Must block with P0 — not CODE_REVIEW_REQUIRED (which would
