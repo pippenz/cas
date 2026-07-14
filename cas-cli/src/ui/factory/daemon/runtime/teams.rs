@@ -29,20 +29,19 @@ pub const DIRECTOR_AGENT_NAME: &str = "director";
 /// record (cas-405f D-4).
 pub const DIRECTOR_AGENT_COLOR: &str = "white";
 
-/// Dedup window for identical (from, text) inbox writes (task cas-7f57).
+/// Content-dedupe for identical (from, text) inbox writes (cas-7f57, cas-73c8).
 ///
 /// The daemon can re-fire the same auto-prompt (e.g. "You have been assigned
-/// cas-X") in a number of documented-but-unintended paths — event-detector
-/// last_state resets across refresh ticks, prompt_queue retry loops on pane
-/// busy, teams-inbox outbox replays on client reconnect. Workers live-reported
-/// receiving dozens of identical assignment messages minutes apart for tasks
-/// that were already Closed, each costing ~100–500 tokens of context per
-/// repeat. This is the coordination-layer guard: if the target's inbox
-/// already contains a message with identical `from` + `text` within the last
-/// `INBOX_DEDUP_WINDOW`, we skip the append and no-op the write. The deeper
-/// causes are left as follow-ups; this stops the bleeding at the delivery
-/// boundary.
-const INBOX_DEDUP_WINDOW: chrono::Duration = chrono::Duration::minutes(10);
+/// cas-X") via event-detector resets, prompt_queue retries, outbox replays,
+/// or SendMessage auto-route + native dual-write. A time-bounded window
+/// (previously 10 minutes) still re-delivered handled messages after the
+/// window expired with no redelivery marker (cas-73c8).
+///
+/// Guard: if the target's inbox already contains an identical `from` + `text`
+/// entry (any age, still present in the file), skip the append. Intentional
+/// redelivery must change the payload or include an explicit redelivery
+/// marker so the text is no longer identical. Retention pruning eventually
+/// drops old entries and allows a fresh identical send after cleanup.
 
 /// Retention window for messages in the inbox file (task cas-7f57).
 ///
@@ -664,31 +663,23 @@ impl TeamsManager {
         });
         let retention_pruned = messages.len() != messages_before_retain;
 
-        // Dedup guard: if an identical (from, text) message exists within
-        // the dedup window, skip the append. This is the coordination
-        // message-dedupe layer called out in the cas-7f57 acceptance
-        // criteria — prevents the director/prompt_queue/outbox replay
-        // paths from writing the same "You have been assigned cas-X"
-        // message to the same worker repeatedly.
-        let dedup_cutoff = now_utc - INBOX_DEDUP_WINDOW;
-        let is_recent_duplicate = messages.iter().rev().any(|m| {
-            if m.from != from || m.text != message {
-                return false;
-            }
-            match chrono::DateTime::parse_from_rfc3339(&m.timestamp) {
-                Ok(ts) => ts.with_timezone(&chrono::Utc) >= dedup_cutoff,
-                Err(_) => false,
-            }
-        });
+        // Dedup guard (cas-7f57 / cas-73c8): if an identical (from, text)
+        // message is still present in the inbox, skip the append — no
+        // time window. Prevents director/prompt_queue/outbox replay and
+        // post-handle redelivery without an intentional redelivery marker.
+        let is_content_duplicate = messages
+            .iter()
+            .rev()
+            .any(|m| m.from == from && m.text == message);
 
-        if is_recent_duplicate {
+        if is_content_duplicate {
             tracing::debug!(
                 target: "cas::coordination",
                 stage = "dedup_skip",
                 channel = "teams_inbox",
                 from = from,
                 target_agent = target,
-                "inbox write skipped — identical message within dedup window"
+                "inbox write skipped — identical message already present"
             );
             // Only re-serialize+write if the retention sweep actually
             // removed anything; otherwise this is a pure no-op and we
@@ -1300,11 +1291,10 @@ mod tests {
         }
     }
 
-    /// Cross-refresh replay: identical (from, text) writes within
-    /// `INBOX_DEDUP_WINDOW` must no-op, dropping the duplicate before it
-    /// reaches the worker. This is the core regression guard for cas-7f57
-    /// — workers observed "You have been assigned cas-X" messages replayed
-    /// minutes apart for tasks that were already Closed.
+    /// Cross-refresh replay: identical (from, text) writes must no-op while
+    /// the original remains in the inbox. Core regression guard for
+    /// cas-7f57 / cas-73c8 — workers observed "You have been assigned cas-X"
+    /// messages replayed for tasks that were already Closed.
     #[test]
     fn write_to_inbox_dedups_identical_messages_within_window() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1327,7 +1317,7 @@ mod tests {
         assert_eq!(
             inbox.len(),
             1,
-            "identical within-window writes must dedupe down to one entry; inbox={inbox:?}"
+            "identical writes must dedupe down to one entry; inbox={inbox:?}"
         );
 
         // A genuinely different payload still gets through.
@@ -1344,6 +1334,25 @@ mod tests {
         )
         .unwrap();
         assert_eq!(inbox.len(), 2, "distinct payload must not be deduped");
+
+        // Intentional redelivery marker changes text → allowed through.
+        mgr.write_to_inbox(
+            "swift-fox",
+            DIRECTOR_AGENT_NAME,
+            "[redelivery] You have been assigned cas-7f57\nTask: dup guard",
+            None,
+            None,
+        )
+        .unwrap();
+        let inbox: Vec<InboxMessage> = serde_json::from_str(
+            &std::fs::read_to_string(mgr.inboxes_dir.join("swift-fox.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            inbox.len(),
+            3,
+            "redelivery-marked payload must not be content-deduped"
+        );
     }
 
     /// Writes from different senders with the same text are independent —
@@ -1372,16 +1381,17 @@ mod tests {
         );
     }
 
-    /// A duplicate write beyond `INBOX_DEDUP_WINDOW` must pass through
-    /// and append — dedup is time-bounded, not permanent. Guards against
-    /// off-by-one sign flips on the cutoff comparison.
+    /// cas-73c8: identical (from, text) still present in the inbox is
+    /// suppressed regardless of age. A time-bounded window re-delivered
+    /// handled messages after 10+ minutes with no redelivery marker.
     #[test]
-    fn write_to_inbox_does_not_dedup_past_window() {
+    fn write_to_inbox_dedups_identical_messages_regardless_of_age() {
         let tmp = tempfile::tempdir().unwrap();
         let mgr = manager_in(tmp.path(), "t_expire");
         std::fs::create_dir_all(&mgr.inboxes_dir).unwrap();
 
-        // Seed inbox with a 15-minute-old duplicate (beyond 10-min window).
+        // Seed inbox with a 15-minute-old identical message (formerly
+        // beyond the 10-min window — must still suppress).
         let old_ts = (chrono::Utc::now() - chrono::Duration::minutes(15))
             .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         let seeded = vec![InboxMessage {
@@ -1390,15 +1400,14 @@ mod tests {
             summary: Some("ping".to_string()),
             timestamp: old_ts,
             color: "green".to_string(),
-            // Must be marked read or retention will keep it for
-            // unrelated reasons; we want dedup to be the only variable.
+            // Marked read so retention is not the reason it stays —
+            // dedup alone must suppress the re-write.
             read: true,
         }];
         let inbox_path = mgr.inboxes_dir.join("swift-fox.json");
         std::fs::write(&inbox_path, serde_json::to_string_pretty(&seeded).unwrap())
             .unwrap();
 
-        // Fresh write with identical (from, text). Must pass through.
         mgr.write_to_inbox("swift-fox", DIRECTOR_AGENT_NAME, "ping", None, None)
             .unwrap();
 
@@ -1408,8 +1417,8 @@ mod tests {
         .unwrap();
         assert_eq!(
             inbox.len(),
-            2,
-            "15-minute-old duplicate is beyond dedup window and must not suppress a fresh write"
+            1,
+            "identical content still in inbox must be suppressed even when older than 10 minutes"
         );
     }
 
