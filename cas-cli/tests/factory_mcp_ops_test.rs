@@ -2046,6 +2046,32 @@ async fn test_coordination_message_to_registered_target_reports_delivery_status(
     );
 }
 
+/// cas-73c8 AC3: `director` is a permanent team member and the source of
+/// inbound teammate messages, but is not an agent_store registration.
+/// Outbound `target=director` must report registered (symmetric with inbound).
+#[tokio::test]
+async fn test_coordination_message_to_director_reports_registered() {
+    let _guard = EnvGuard::set(&[
+        ("CAS_AGENT_ROLE", "supervisor"),
+        ("CAS_AGENT_NAME", "supervisor"),
+    ]);
+    let env = FactoryTestEnv::new();
+    // Deliberately do NOT register "director" in agent_store.
+
+    let req = coord_msg("message", "director", "ack director nudge", None);
+    let result = env.service.coordination(Parameters(req)).await;
+    assert!(result.is_ok(), "message to director should succeed: {result:?}");
+    let text = get_text(&result.unwrap());
+    assert!(
+        text.contains("target is registered"),
+        "director must resolve as registered: {text}"
+    );
+    assert!(
+        !text.contains("not yet registered"),
+        "director must not read as unregistered after inbound teammate traffic: {text}"
+    );
+}
+
 /// cas-6913 AC2: the defect this task exists to fix — "Message queued" reads
 /// as delivery confirmation even when the target name isn't in the agent
 /// store yet (the common spawn-then-immediately-assign race). The ack must
