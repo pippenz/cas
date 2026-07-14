@@ -18,15 +18,20 @@ pub(crate) fn epic_close_owner_gate(
     caller_name: Option<&str>,
     caller_session: Option<&str>,
 ) -> Result<(), String> {
+    // cas-cc74: trim owner + identity facets so write-boundary normalize and
+    // close compare stay consistent (exact match after trim).
+    let owner = owner.trim();
     let matches_owner = [caller_id, caller_name, caller_session]
         .into_iter()
         .flatten()
-        .any(|id| id == owner);
+        .any(|id| id.trim() == owner);
     if matches_owner {
         return Ok(());
     }
-    let has_identity =
-        caller_id.is_some() || caller_name.is_some() || caller_session.is_some();
+    let has_identity = [caller_id, caller_name, caller_session]
+        .into_iter()
+        .flatten()
+        .any(|s| !s.trim().is_empty());
     if !has_identity {
         return Err(format!(
             "Epic {epic_id} is owned by epic_verification_owner={owner}; \
@@ -9143,5 +9148,26 @@ mod epic_close_owner_gate_tests {
             err.contains("identity is unknown") && err.contains("fail closed"),
             "unknown identity must fail closed, got: {err}"
         );
+    }
+
+    /// cas-cc74: close compare trims owner + identity facets.
+    #[test]
+    fn test_cc74_close_owner_gate_trims_whitespace() {
+        assert!(epic_close_owner_gate(
+            "cas-epic",
+            "  owner-id  ",
+            Some("owner-id"),
+            None,
+            None
+        )
+        .is_ok());
+        assert!(epic_close_owner_gate(
+            "cas-epic",
+            "owner-id",
+            Some("  owner-id  "),
+            None,
+            None
+        )
+        .is_ok());
     }
 }

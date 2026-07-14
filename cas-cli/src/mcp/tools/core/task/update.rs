@@ -1,5 +1,170 @@
 use crate::mcp::tools::core::imports::*;
 
+/// Heartbeat staleness window for epic_verification_owner transfer targets
+/// (cas-cc74). Aligned with claim/close assignee liveness (~5 min).
+const EPIC_OWNER_TARGET_STALE_SECS: i64 = 300;
+
+/// Normalize `epic_verification_owner` at write boundaries (cas-cc74 discovery).
+/// Trims whitespace; empty/whitespace-only becomes `None` (unset / invalid).
+pub(crate) fn normalize_epic_verification_owner(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// True when any caller identity facet matches the stored owner (after trim).
+pub(crate) fn caller_matches_epic_owner(
+    owner: &str,
+    caller_id: Option<&str>,
+    caller_name: Option<&str>,
+    caller_session: Option<&str>,
+) -> bool {
+    let owner = owner.trim();
+    if owner.is_empty() {
+        return false;
+    }
+    [caller_id, caller_name, caller_session]
+        .into_iter()
+        .flatten()
+        .any(|id| id.trim() == owner)
+}
+
+/// Authorize the *caller* for an `epic_verification_owner` mutation (cas-cc74).
+///
+/// - Unknown / absent caller identity → fail closed.
+/// - Current owner (id/name/session match) may transfer.
+/// - Supervisor (`caller_is_supervisor`) may transfer or set when unset.
+/// - Non-owner non-supervisor cannot rewrite or claim ownership.
+pub(crate) fn authorize_epic_owner_transfer_caller(
+    current_owner: Option<&str>,
+    caller_id: Option<&str>,
+    caller_name: Option<&str>,
+    caller_session: Option<&str>,
+    caller_is_supervisor: bool,
+) -> Result<(), String> {
+    let has_identity = [caller_id, caller_name, caller_session]
+        .into_iter()
+        .flatten()
+        .any(|s| !s.trim().is_empty());
+    if !has_identity {
+        return Err(
+            "epic_verification_owner transfer refused: caller identity is unknown \
+             (fail closed, cas-cc74). Present CAS agent id / CAS_AGENT_NAME / \
+             CAS_SESSION_ID, or act as the current owner / a supervisor."
+                .to_string(),
+        );
+    }
+
+    let current = current_owner
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    if let Some(owner) = current {
+        if caller_matches_epic_owner(owner, caller_id, caller_name, caller_session) {
+            return Ok(());
+        }
+        if caller_is_supervisor {
+            return Ok(());
+        }
+        return Err(format!(
+            "epic_verification_owner transfer refused: epic is owned by '{owner}'; \
+             this session is not the owner and is not a supervisor (cas-cc74). \
+             Only the current owner or a supervisor may reassign ownership."
+        ));
+    }
+
+    // Unset owner: only a supervisor may claim/set (no silent worker takeover).
+    if caller_is_supervisor {
+        return Ok(());
+    }
+    Err(
+        "epic_verification_owner transfer refused: no current owner is set and \
+         the caller is not a supervisor — refusing silent claim (cas-cc74)."
+            .to_string(),
+    )
+}
+
+/// Role eligible as `epic_verification_owner` transfer target (cas-cc74).
+pub(crate) fn is_valid_epic_owner_role(role: cas_types::AgentRole) -> bool {
+    matches!(
+        role,
+        cas_types::AgentRole::Supervisor | cas_types::AgentRole::Director
+    )
+}
+
+/// Validate a resolved agent as a live epic-verification owner target (cas-cc74).
+///
+/// Fail closed: wrong role, dead/stale status, or expired heartbeat.
+pub(crate) fn validate_epic_owner_target_agent(
+    agent: &cas_types::Agent,
+    stale_secs: i64,
+) -> Result<(), String> {
+    if !is_valid_epic_owner_role(agent.role) {
+        return Err(format!(
+            "epic_verification_owner transfer refused: target '{}' (role={}) is \
+             not a supervisor/director identity (cas-cc74).",
+            agent.name, agent.role
+        ));
+    }
+    if !agent.is_alive() {
+        return Err(format!(
+            "epic_verification_owner transfer refused: target '{}' is not live \
+             (status={}, cas-cc74).",
+            agent.name, agent.status
+        ));
+    }
+    if agent.is_heartbeat_expired(stale_secs) {
+        return Err(format!(
+            "epic_verification_owner transfer refused: target '{}' heartbeat is \
+             stale (>{stale_secs}s, cas-cc74).",
+            agent.name
+        ));
+    }
+    Ok(())
+}
+
+/// Find a registered agent by id (exact, case-insensitive) or display name
+/// (case-insensitive). Used to resolve transfer targets.
+pub(crate) fn find_agent_for_epic_owner<'a>(
+    agents: &'a [cas_types::Agent],
+    requested: &str,
+) -> Option<&'a cas_types::Agent> {
+    let requested = requested.trim();
+    if requested.is_empty() {
+        return None;
+    }
+    agents
+        .iter()
+        .find(|a| a.id.eq_ignore_ascii_case(requested))
+        .or_else(|| {
+            agents
+                .iter()
+                .find(|a| a.name.eq_ignore_ascii_case(requested))
+        })
+}
+
+/// Build the DECISION audit note for a successful ownership transfer.
+pub(crate) fn epic_owner_transfer_audit_note(
+    previous: Option<&str>,
+    new_owner: &str,
+    by_caller: &str,
+) -> String {
+    let prev = previous
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("<unset>");
+    format!(
+        "[{}] DECISION: epic_verification_owner transferred {} → {} by {} (cas-cc74)",
+        chrono::Utc::now().format("%Y-%m-%d %H:%M"),
+        prev,
+        new_owner,
+        by_caller
+    )
+}
+
 impl CasCore {
     pub async fn cas_task_update(
         &self,
@@ -238,9 +403,114 @@ impl CasCore {
             changes.push("assignee");
         }
 
-        if let Some(owner) = req.epic_verification_owner {
-            task.epic_verification_owner = Some(owner);
-            changes.push("epic_verification_owner");
+        // cas-cc74: epic_verification_owner is an authorized transfer, not a
+        // free-form field. Unauthorized callers must not silently take over
+        // owner-routed notifications / epic-close authorization.
+        if let Some(owner_raw) = req.epic_verification_owner {
+            let new_owner = match normalize_epic_verification_owner(&owner_raw) {
+                Some(o) => o,
+                None => {
+                    return Err(McpError {
+                        code: ErrorCode::INVALID_PARAMS,
+                        message: Cow::from(
+                            "epic_verification_owner transfer refused: target identity \
+                             is empty/unknown after normalize (fail closed, cas-cc74). \
+                             Pass a registered supervisor agent id or display name.",
+                        ),
+                        data: None,
+                    });
+                }
+            };
+
+            let current_norm = task
+                .epic_verification_owner
+                .as_deref()
+                .and_then(normalize_epic_verification_owner);
+
+            // Idempotent re-set of the same owner (after trim) is a no-op.
+            if current_norm.as_deref() != Some(new_owner.as_str()) {
+                let caller_id = self.get_agent_id().ok();
+                let caller_name = std::env::var("CAS_AGENT_NAME").ok();
+                let caller_session = std::env::var("CAS_SESSION_ID").ok();
+                let caller_is_supervisor =
+                    crate::harness_policy::is_supervisor_from_env();
+
+                if let Err(msg) = authorize_epic_owner_transfer_caller(
+                    current_norm.as_deref(),
+                    caller_id.as_deref(),
+                    caller_name.as_deref(),
+                    caller_session.as_deref(),
+                    caller_is_supervisor,
+                ) {
+                    return Err(McpError {
+                        code: ErrorCode::INVALID_PARAMS,
+                        message: Cow::from(msg),
+                        data: None,
+                    });
+                }
+
+                // Target must resolve to a live supervisor/director identity.
+                let agent_store = self.open_agent_store().map_err(|e| McpError {
+                    code: ErrorCode::INTERNAL_ERROR,
+                    message: Cow::from(format!(
+                        "epic_verification_owner transfer refused: cannot open agent \
+                         store to validate target (fail closed, cas-cc74): {e}"
+                    )),
+                    data: None,
+                })?;
+                let agents = agent_store.list(None).map_err(|e| McpError {
+                    code: ErrorCode::INTERNAL_ERROR,
+                    message: Cow::from(format!(
+                        "epic_verification_owner transfer refused: cannot list agents \
+                         to validate target (fail closed, cas-cc74): {e}"
+                    )),
+                    data: None,
+                })?;
+                let target = match find_agent_for_epic_owner(&agents, &new_owner) {
+                    Some(a) => a,
+                    None => {
+                        return Err(McpError {
+                            code: ErrorCode::INVALID_PARAMS,
+                            message: Cow::from(format!(
+                                "epic_verification_owner transfer refused: target \
+                                 '{new_owner}' is not a registered agent identity \
+                                 (fail closed, cas-cc74)."
+                            )),
+                            data: None,
+                        });
+                    }
+                };
+                if let Err(msg) =
+                    validate_epic_owner_target_agent(target, EPIC_OWNER_TARGET_STALE_SECS)
+                {
+                    return Err(McpError {
+                        code: ErrorCode::INVALID_PARAMS,
+                        message: Cow::from(msg),
+                        data: None,
+                    });
+                }
+
+                // Prefer agent id (stable) — matches factory create preference.
+                let canonical_owner = target.id.clone();
+                let by_caller = caller_id
+                    .as_deref()
+                    .or(caller_name.as_deref())
+                    .or(caller_session.as_deref())
+                    .unwrap_or("<unknown>");
+                let audit = epic_owner_transfer_audit_note(
+                    current_norm.as_deref(),
+                    &canonical_owner,
+                    by_caller,
+                );
+                if task.notes.is_empty() {
+                    task.notes = audit;
+                } else {
+                    task.notes = format!("{}\n\n{}", task.notes, audit);
+                }
+
+                task.epic_verification_owner = Some(canonical_owner);
+                changes.push("epic_verification_owner");
+            }
         }
 
         if let Some(status_str) = req.status {
@@ -346,5 +616,231 @@ impl CasCore {
         }
 
         Ok(Self::success(response))
+    }
+}
+
+#[cfg(test)]
+mod epic_owner_transfer_auth_tests {
+    use super::*;
+    use cas_types::{Agent, AgentRole, AgentStatus};
+
+    fn agent(id: &str, name: &str, role: AgentRole, status: AgentStatus) -> Agent {
+        let mut a = Agent::new(id.to_string(), name.to_string());
+        a.role = role;
+        a.status = status;
+        a.last_heartbeat = chrono::Utc::now();
+        a
+    }
+
+    #[test]
+    fn test_cc74_normalize_trims_and_rejects_empty() {
+        assert_eq!(
+            normalize_epic_verification_owner("  owner-id  ").as_deref(),
+            Some("owner-id")
+        );
+        assert_eq!(normalize_epic_verification_owner(""), None);
+        assert_eq!(normalize_epic_verification_owner("   \t  "), None);
+    }
+
+    #[test]
+    fn test_cc74_unauthorized_caller_cannot_rewrite_owner() {
+        let err = authorize_epic_owner_transfer_caller(
+            Some("owner-id"),
+            Some("other-id"),
+            Some("other-name"),
+            None,
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("not the owner") && err.contains("cas-cc74"),
+            "unauthorized rewrite must fail: {err}"
+        );
+    }
+
+    #[test]
+    fn test_cc74_unknown_caller_identity_fail_closed() {
+        let err =
+            authorize_epic_owner_transfer_caller(Some("owner-id"), None, None, None, false)
+                .unwrap_err();
+        assert!(
+            err.contains("identity is unknown") && err.contains("fail closed"),
+            "unknown caller must fail closed: {err}"
+        );
+        // Whitespace-only identity facets also count as unknown.
+        let err_ws = authorize_epic_owner_transfer_caller(
+            Some("owner-id"),
+            Some("  "),
+            Some(""),
+            None,
+            true, // even supervisor role without real identity fails
+        )
+        .unwrap_err();
+        assert!(
+            err_ws.contains("identity is unknown"),
+            "whitespace identity must fail closed: {err_ws}"
+        );
+    }
+
+    #[test]
+    fn test_cc74_current_owner_may_transfer() {
+        assert!(authorize_epic_owner_transfer_caller(
+            Some("owner-id"),
+            Some("owner-id"),
+            None,
+            None,
+            false,
+        )
+        .is_ok());
+        // Match by display name
+        assert!(authorize_epic_owner_transfer_caller(
+            Some("owner-sup"),
+            None,
+            Some("owner-sup"),
+            None,
+            false,
+        )
+        .is_ok());
+        // Match ignores surrounding whitespace on facets
+        assert!(authorize_epic_owner_transfer_caller(
+            Some("owner-id"),
+            Some("  owner-id  "),
+            None,
+            None,
+            false,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn test_cc74_supervisor_may_transfer_or_claim_unset() {
+        assert!(authorize_epic_owner_transfer_caller(
+            Some("owner-id"),
+            Some("other-sup"),
+            None,
+            None,
+            true,
+        )
+        .is_ok());
+        assert!(authorize_epic_owner_transfer_caller(
+            None,
+            Some("sup-id"),
+            None,
+            None,
+            true,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn test_cc74_non_supervisor_cannot_claim_unset_owner() {
+        let err = authorize_epic_owner_transfer_caller(
+            None,
+            Some("worker-id"),
+            Some("worker-1"),
+            None,
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("no current owner") && err.contains("cas-cc74"),
+            "worker claim of unset owner must fail: {err}"
+        );
+    }
+
+    #[test]
+    fn test_cc74_target_must_be_live_supervisor_identity() {
+        let sup = agent(
+            "sup-1",
+            "bold-merlin",
+            AgentRole::Supervisor,
+            AgentStatus::Active,
+        );
+        assert!(validate_epic_owner_target_agent(&sup, EPIC_OWNER_TARGET_STALE_SECS).is_ok());
+
+        let director = agent(
+            "dir-1",
+            "director",
+            AgentRole::Director,
+            AgentStatus::Active,
+        );
+        assert!(
+            validate_epic_owner_target_agent(&director, EPIC_OWNER_TARGET_STALE_SECS).is_ok()
+        );
+
+        let worker = agent(
+            "w-1",
+            "worker-1",
+            AgentRole::Worker,
+            AgentStatus::Active,
+        );
+        let err = validate_epic_owner_target_agent(&worker, EPIC_OWNER_TARGET_STALE_SECS)
+            .unwrap_err();
+        assert!(
+            err.contains("not a supervisor") && err.contains("cas-cc74"),
+            "worker target must fail: {err}"
+        );
+
+        let mut dead = agent(
+            "sup-dead",
+            "dead-sup",
+            AgentRole::Supervisor,
+            AgentStatus::Shutdown,
+        );
+        let err = validate_epic_owner_target_agent(&dead, EPIC_OWNER_TARGET_STALE_SECS)
+            .unwrap_err();
+        assert!(err.contains("not live"), "dead supervisor must fail: {err}");
+
+        dead.status = AgentStatus::Active;
+        dead.last_heartbeat = chrono::Utc::now() - chrono::Duration::seconds(10_000);
+        let err = validate_epic_owner_target_agent(&dead, EPIC_OWNER_TARGET_STALE_SECS)
+            .unwrap_err();
+        assert!(err.contains("stale"), "stale heartbeat must fail: {err}");
+    }
+
+    #[test]
+    fn test_cc74_find_agent_by_id_or_name_unknown_fail_closed() {
+        let agents = vec![
+            agent(
+                "sup-uuid",
+                "OwnerSup",
+                AgentRole::Supervisor,
+                AgentStatus::Active,
+            ),
+            agent(
+                "w-uuid",
+                "worker-1",
+                AgentRole::Worker,
+                AgentStatus::Active,
+            ),
+        ];
+        assert_eq!(
+            find_agent_for_epic_owner(&agents, "sup-uuid").map(|a| a.id.as_str()),
+            Some("sup-uuid")
+        );
+        assert_eq!(
+            find_agent_for_epic_owner(&agents, "ownersup").map(|a| a.id.as_str()),
+            Some("sup-uuid")
+        );
+        assert!(find_agent_for_epic_owner(&agents, "missing").is_none());
+        assert!(find_agent_for_epic_owner(&agents, "  ").is_none());
+    }
+
+    #[test]
+    fn test_cc74_audit_note_records_transfer() {
+        let note = epic_owner_transfer_audit_note(Some("old-owner"), "new-owner", "caller-1");
+        assert!(
+            note.contains("DECISION")
+                && note.contains("old-owner")
+                && note.contains("new-owner")
+                && note.contains("caller-1")
+                && note.contains("cas-cc74"),
+            "audit note shape wrong: {note}"
+        );
+        let note_unset = epic_owner_transfer_audit_note(None, "new-owner", "sup");
+        assert!(
+            note_unset.contains("<unset>") && note_unset.contains("new-owner"),
+            "unset previous must be explicit: {note_unset}"
+        );
     }
 }
