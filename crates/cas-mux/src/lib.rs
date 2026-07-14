@@ -29,6 +29,7 @@
 
 mod error;
 mod harness;
+mod input_stream;
 mod mux;
 mod pane;
 mod pty;
@@ -37,6 +38,7 @@ mod spec;
 
 pub use error::{Error, Result};
 pub use harness::{HarnessCapabilities, SupervisorCli};
+pub use input_stream::{key_stream_marks_submit, BracketedPasteTracker, StreamByteClass};
 pub use mux::{Mux, MuxConfig, MuxEvent};
 pub use pane::TerminalSnapshot;
 pub use pane::{Pane, PaneBackend, PaneId, PaneKind, UserInputKind};
