@@ -158,6 +158,11 @@ pub struct Pane {
     /// Shell and director panes default to [`SupervisorCli::Claude`] (Esc is a
     /// harmless no-op on bare shells).
     harness: SupervisorCli,
+    /// Streaming bracketed-paste tracker for KeyStream submit detection (cas-4b99).
+    ///
+    /// Survives split `\x1b[200~` / `\x1b[201~` packets so embedded CR/LF inside
+    /// a paste never marks turn-in-flight. StructuredPaste does not advance this.
+    paste_tracker: std::sync::Mutex<crate::input_stream::BracketedPasteTracker>,
 }
 
 impl Pane {
@@ -205,6 +210,9 @@ impl Pane {
             partial_esc: Vec::new(),
             partial_osc8: Vec::new(),
             harness,
+            paste_tracker: std::sync::Mutex::new(
+                crate::input_stream::BracketedPasteTracker::new(),
+            ),
         })
     }
 
@@ -1246,27 +1254,32 @@ impl Pane {
 
     /// Whether a [`UserInputKind::KeyStream`] chunk should mark turn-in-flight.
     ///
-    /// Lone CR/LF (terminal per-key Enter) or a multi-byte keystream ending in
-    /// CR/LF (GUI/WS line + Enter). Bracketed paste must use
-    /// [`UserInputKind::StructuredPaste`] instead — it never marks submit.
+    /// Uses a **fresh** bracketed-paste tracker over the whole chunk (cas-4b99):
+    /// embedded CR/LF inside `\x1b[200~`…`\x1b[201~` do not mark submit; CR/LF
+    /// outside paste delimiters do. For streaming / split packets prefer
+    /// [`Self::deliver_user_input`], which keeps pane-local tracker state.
+    ///
+    /// Structured paste/drop should still use [`UserInputKind::StructuredPaste`]
+    /// — that path never marks submit and does not advance the stream tracker.
     pub fn key_stream_is_submit(data: &[u8]) -> bool {
-        if data.is_empty() {
-            return false;
-        }
-        if Self::is_true_prompt_submit(data) {
-            return true;
-        }
-        // Multi-byte keystream chunks may be "typed text + Enter".
-        data.ends_with(b"\r") || data.ends_with(b"\n")
+        crate::input_stream::key_stream_marks_submit(data)
     }
 
-    /// Deliver user input with explicit submit semantics (cas-7f6f).
+    /// Deliver user input with explicit submit semantics (cas-7f6f / cas-4b99).
     ///
-    /// - [`UserInputKind::KeyStream`]: marks turn-in-flight on true submit
-    /// - [`UserInputKind::StructuredPaste`]: never marks (paste/drop)
+    /// - [`UserInputKind::KeyStream`]: advances the pane's bracketed-paste
+    ///   tracker and marks turn-in-flight only on CR/LF outside paste.
+    /// - [`UserInputKind::StructuredPaste`]: never marks (paste/drop); does not
+    ///   advance the KeyStream paste tracker (payload is already framed).
     pub async fn deliver_user_input(&self, data: &[u8], kind: UserInputKind) -> Result<()> {
-        if matches!(kind, UserInputKind::KeyStream) && Self::key_stream_is_submit(data) {
-            self.mark_turn_in_flight();
+        if matches!(kind, UserInputKind::KeyStream) {
+            let marks = match self.paste_tracker.lock() {
+                Ok(mut t) => t.feed_chunk_marks_submit(data),
+                Err(poisoned) => poisoned.into_inner().feed_chunk_marks_submit(data),
+            };
+            if marks {
+                self.mark_turn_in_flight();
+            }
         }
         self.write(data).await
     }

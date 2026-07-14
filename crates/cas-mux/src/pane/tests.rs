@@ -330,6 +330,66 @@ mod cases {
         );
     }
 
+    /// cas-4b99: per-byte KeyStream paste must not mark turn_in_flight; Enter after
+    /// terminator must. Pane-local tracker survives split packets across delivers.
+    #[test]
+    fn deliver_user_input_bracketed_paste_stream_cas_4b99() {
+        use crate::pane::UserInputKind;
+
+        let pane = Pane::director("paste-stream", 10, 40).expect("create pane");
+        assert!(!pane.is_turn_in_flight());
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        // Split start + body with CR/LF + split end — director has no PTY so write
+        // fails, but submit marking runs before write.
+        let chunks: &[&[u8]] = &[
+            b"\x1b[20",
+            b"0~line1\nline2\r",
+            b"\x1b[201",
+            b"~",
+        ];
+        rt.block_on(async {
+            for chunk in chunks {
+                let _ = pane
+                    .deliver_user_input(chunk, UserInputKind::KeyStream)
+                    .await;
+            }
+        });
+        assert!(
+            !pane.is_turn_in_flight(),
+            "embedded CR/LF inside bracketed paste must not mark submit"
+        );
+
+        rt.block_on(async {
+            let _ = pane
+                .deliver_user_input(b"\r", UserInputKind::KeyStream)
+                .await;
+        });
+        assert!(
+            pane.is_turn_in_flight(),
+            "Enter after paste terminator must mark submit"
+        );
+
+        // StructuredPaste never marks even with embedded CR (independent of tracker).
+        pane.clear_turn_in_flight();
+        let paste = b"\x1b[200~x\ny\r\x1b[201~";
+        rt.block_on(async {
+            let _ = pane
+                .deliver_user_input(paste, UserInputKind::StructuredPaste)
+                .await;
+        });
+        assert!(!pane.is_turn_in_flight());
+
+        // Pure predicates (fresh tracker).
+        assert!(Pane::key_stream_is_submit(b"\r"));
+        assert!(!Pane::key_stream_is_submit(paste));
+        assert!(Pane::key_stream_is_submit(b"\x1b[200~a\nb\x1b[201~\r"));
+    }
+
     /// Regression (cas-ebc1 final review): the OSC 8 feed-time gate must detect
     /// a hyperlink introducer split across 3+ tiny feed chunks. The old carry
     /// logic kept the tail of the NEW chunk only, dropping earlier carried
