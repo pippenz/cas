@@ -3,6 +3,7 @@ use crate::mcp::tools::core::imports::*;
 
 pub(crate) mod close_ops;
 pub(crate) mod stale_close_guard;
+pub(crate) mod supervisor_push;
 
 /// Resolve `epic_verification_owner` for a factory-mode epic create (cas-9fff).
 ///
@@ -716,6 +717,8 @@ impl CasCore {
             }
         }
 
+        // Capture old status before mutation for lifecycle push (cas-062d).
+        let old_status = task.status;
         task.status = TaskStatus::InProgress;
         task.updated_at = chrono::Utc::now();
 
@@ -733,10 +736,8 @@ impl CasCore {
                 if stale_close_guard::agent_task_work_halted(&agent.metadata) {
                     let clear_ceiling = chrono::Utc::now().timestamp_millis().max(0) as u64;
                     let stored_gen = stale_close_guard::halt_generation(&agent.metadata);
-                    if stale_close_guard::should_clear_halt_at_generation(
-                        stored_gen,
-                        clear_ceiling,
-                    ) {
+                    if stale_close_guard::should_clear_halt_at_generation(stored_gen, clear_ceiling)
+                    {
                         stale_close_guard::clear_halt_metadata(&mut agent.metadata);
                         let _ = agent_store.update(&agent);
                     }
@@ -744,18 +745,65 @@ impl CasCore {
             }
         }
 
+        // cas-062d / cas-17e4: durable outbox push after successful start.
+        let actor = agent_store
+            .get(&agent_id)
+            .map(|a| a.name)
+            .unwrap_or_else(|_| agent_id.clone());
+        let occurrence = supervisor_push::occurrence_from_updated_at(task.updated_at);
+        let push_note = match self.push_task_lifecycle(
+            &req.id,
+            &task.title,
+            old_status,
+            TaskStatus::InProgress,
+            &actor,
+            None,
+            supervisor_push::LifecycleTransition::Started,
+            &occurrence,
+        ) {
+            Ok(supervisor_push::LifecyclePushResult::Enqueued { notification_id })
+            | Ok(supervisor_push::LifecyclePushResult::Recovered { notification_id }) => {
+                format!("\n\n📡 Supervisor notified (lifecycle event id={notification_id})")
+            }
+            Ok(supervisor_push::LifecyclePushResult::AlreadyComplete { .. }) => {
+                "\n\n📡 Supervisor lifecycle event already complete (outbox)".to_string()
+            }
+            Ok(supervisor_push::LifecyclePushResult::NoSupervisor) => String::new(),
+            Err(e) => {
+                let key = supervisor_push::transition_key(
+                    &req.id,
+                    old_status,
+                    TaskStatus::InProgress,
+                    std::env::var("CAS_FACTORY_SESSION").ok().as_deref(),
+                    supervisor_push::LifecycleTransition::Started,
+                    &occurrence,
+                );
+                return Err(Self::error(
+                    ErrorCode::INTERNAL_ERROR,
+                    supervisor_push::lifecycle_push_failure_message(
+                        &req.id,
+                        TaskStatus::InProgress,
+                        supervisor_push::LifecycleTransition::Started,
+                        &key,
+                        &e,
+                    ),
+                ));
+            }
+        };
+
         // For subtasks, show parent epic's worktree; for epics, show newly created worktree
         let wt_info = parent_worktree_info.or(worktree_info).unwrap_or_default();
 
         Ok(Self::success(format!(
-            "Started task: {} - {}{}{}{}{}{}",
+            "Started task: {} - {}{}{}{}{}{}{}",
             req.id,
             task.title,
             claim_info.unwrap_or_default(),
             epic_ownership_info.unwrap_or_default(),
             wt_info,
             sibling_notes_info.unwrap_or_default(),
-            Self::workflow_guidance()
+            Self::workflow_guidance(),
+            push_note,
         )))
     }
 }
@@ -804,12 +852,9 @@ mod factory_epic_owner_tests {
     /// cas-cc74: create write boundary trims owner identity before store.
     #[test]
     fn test_cc74_factory_epic_owner_trims_whitespace() {
-        let owner = resolve_factory_epic_owner(
-            Some("  agent-uuid  ".into()),
-            Some("display".into()),
-            None,
-        )
-        .unwrap();
+        let owner =
+            resolve_factory_epic_owner(Some("  agent-uuid  ".into()), Some("display".into()), None)
+                .unwrap();
         assert_eq!(owner, "agent-uuid");
     }
 }

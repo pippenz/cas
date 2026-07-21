@@ -658,7 +658,10 @@ async fn test_spawn_workers_task_id_enqueues_for_single_worker() {
     req.task_id = Some(task_id.clone());
 
     let result = env.service.factory(Parameters(req)).await;
-    assert!(result.is_ok(), "single-worker spawn with task_id should succeed: {result:?}");
+    assert!(
+        result.is_ok(),
+        "single-worker spawn with task_id should succeed: {result:?}"
+    );
     let text = get_text(&result.unwrap());
     assert!(
         text.contains(&task_id),
@@ -687,7 +690,10 @@ async fn test_spawn_workers_task_id_enqueues_for_single_named_worker() {
     req.task_id = Some(task_id.clone());
 
     let result = env.service.factory(Parameters(req)).await;
-    assert!(result.is_ok(), "single named-worker spawn with task_id should succeed: {result:?}");
+    assert!(
+        result.is_ok(),
+        "single named-worker spawn with task_id should succeed: {result:?}"
+    );
 
     let entries = env.spawn_queue().peek(10).expect("peek");
     assert_eq!(entries.len(), 1);
@@ -742,7 +748,10 @@ async fn test_spawn_workers_task_id_rejects_multi_worker_names() {
     req.task_id = Some(task_id);
 
     let result = env.service.factory(Parameters(req)).await;
-    assert!(result.is_err(), "task_id with 2 worker_names must be rejected");
+    assert!(
+        result.is_err(),
+        "task_id with 2 worker_names must be rejected"
+    );
 }
 
 /// cas-6913: task_id referencing a task that doesn't exist must fail fast
@@ -1080,7 +1089,9 @@ async fn test_worker_status_and_agent_list_agree_on_live_workers() {
     alive.last_heartbeat = chrono::Utc::now() - staleness;
     alive.registered_at = chrono::Utc::now() - staleness;
     alive.pid = Some(std::process::id());
-    store.register(&alive).expect("register process-alive stale-hb worker");
+    store
+        .register(&alive)
+        .expect("register process-alive stale-hb worker");
 
     // Truly dead stale (no pid) — must not appear as live.
     env.register_stale_worker_with_clone_path("dead-stale", "/tmp/cas-wt-dead", 40);
@@ -2075,7 +2086,10 @@ async fn test_126b_target_awaiting_merge_reclose_urgent_does_not_halt() {
     // Still enqueued as an urgent so the worker wakes.
     let prompts = env.prompt_queue().peek_all(10).expect("peek");
     assert_eq!(prompts.len(), 1);
-    assert!(prompts[0].urgent, "merge re-close must still enqueue urgent");
+    assert!(
+        prompts[0].urgent,
+        "merge re-close must still enqueue urgent"
+    );
     // But halt must NOT be armed on the owning worker.
     assert!(
         !env.worker_halted("swift-fox"),
@@ -2124,7 +2138,12 @@ async fn test_126b_ordinary_urgent_still_halts_even_with_parked_task() {
     env.register_worker("swift-fox");
     let _parked = env.create_awaiting_merge_task("parked work", "swift-fox");
 
-    let req = coord_msg("message", "swift-fox", "STOP — you are on the wrong file", Some(true));
+    let req = coord_msg(
+        "message",
+        "swift-fox",
+        "STOP — you are on the wrong file",
+        Some(true),
+    );
     let result = env.service.coordination(Parameters(req)).await;
     assert!(result.is_ok(), "urgent stop should succeed: {result:?}");
 
@@ -2206,7 +2225,10 @@ async fn test_coordination_message_to_director_reports_registered() {
 
     let req = coord_msg("message", "director", "ack director nudge", None);
     let result = env.service.coordination(Parameters(req)).await;
-    assert!(result.is_ok(), "message to director should succeed: {result:?}");
+    assert!(
+        result.is_ok(),
+        "message to director should succeed: {result:?}"
+    );
     let text = get_text(&result.unwrap());
     assert!(
         text.contains("target is registered"),
@@ -2623,5 +2645,235 @@ async fn test_efc4_worker_status_shows_clone_path_for_both_harnesses() {
     assert!(
         text.contains("/tmp/cas-worktrees/codex-worker"),
         "cas-efc4 AC4: Codex worker clone_path must be rendered: {text}"
+    );
+}
+
+// =============================================================================
+// cas-062d: task lifecycle → owning supervisor push
+// =============================================================================
+
+/// Happy path + isolation: start + blocked create durable `task_lifecycle`
+/// events only for the owning factory session's supervisor. Replay of the
+/// same transition identity does not create a second row.
+#[tokio::test]
+async fn test_062d_lifecycle_start_and_blocked_push_session_isolated() {
+    let _guard = EnvGuard::set(&[("CAS_FACTORY_SESSION", "sess-062d-a")]);
+    let env = FactoryTestEnv::with_agent_id("worker-062d");
+
+    // Owning supervisor (session A) vs foreign supervisor (session B).
+    let sup_a = env.register_supervisor_in_session("sup-a", "sess-062d-a");
+    let sup_b = env.register_supervisor_in_session("sup-b", "sess-062d-b");
+
+    // Register the starting agent so assignee/actor resolve cleanly.
+    {
+        let store = env.agent_store();
+        let mut worker = Agent::new("worker-062d".to_string(), "worker-062d".to_string());
+        worker.role = AgentRole::Worker;
+        worker.factory_session = Some("sess-062d-a".to_string());
+        store.register(&worker).expect("register worker");
+    }
+
+    let task_store = env.task_store();
+    let mut task = Task::new(
+        "cas-062d-start".to_string(),
+        "Lifecycle start push".to_string(),
+    );
+    task.status = TaskStatus::Open;
+    task_store.add(&task).expect("add task");
+
+    let start = env
+        .service
+        .inner
+        .cas_task_start(Parameters(cas::mcp::tools::IdRequest {
+            id: "cas-062d-start".to_string(),
+        }))
+        .await
+        .expect("start should succeed");
+    let start_text = get_text(&start);
+    assert!(
+        start_text.contains("Started task") || start_text.contains("cas-062d-start"),
+        "start response: {start_text}"
+    );
+
+    let queue = cas::store::open_supervisor_queue_store(&env.cas_root).expect("queue");
+    let pending_a = queue.peek(&sup_a, 20).expect("peek a");
+    assert!(
+        pending_a.iter().any(|n| {
+            n.event_type == "task_lifecycle"
+                && n.payload.contains("task_started")
+                && n.payload.contains("cas-062d-start")
+        }),
+        "session-A supervisor must receive task_started. pending={pending_a:?}"
+    );
+    let pending_b = queue.peek(&sup_b, 20).expect("peek b");
+    assert!(
+        !pending_b
+            .iter()
+            .any(|n| n.payload.contains("cas-062d-start")),
+        "session-B supervisor must NOT receive session-A lifecycle events. pending={pending_b:?}"
+    );
+    assert_eq!(
+        queue.pending_count(&sup_a).unwrap(),
+        1,
+        "exactly one start event before blocked"
+    );
+
+    // Blocked transition via task update.
+    let update = env
+        .service
+        .inner
+        .cas_task_update(Parameters(cas::mcp::tools::TaskUpdateRequest {
+            id: "cas-062d-start".to_string(),
+            title: None,
+            notes: None,
+            priority: None,
+            labels: None,
+            description: None,
+            design: None,
+            acceptance_criteria: None,
+            demo_statement: None,
+            execution_note: None,
+            external_ref: None,
+            assignee: None,
+            status: Some("blocked".to_string()),
+            epic: None,
+            epic_verification_owner: None,
+            depth: None,
+        }))
+        .await
+        .expect("update blocked");
+    let _ = get_text(&update);
+
+    let pending_a2 = queue.peek(&sup_a, 20).expect("peek a after blocked");
+    assert!(
+        pending_a2.iter().any(|n| {
+            n.event_type == "task_lifecycle"
+                && n.payload.contains("task_blocked")
+                && n.payload.contains("cas-062d-start")
+        }),
+        "blocked transition must enqueue task_blocked. pending={pending_a2:?}"
+    );
+    assert_eq!(
+        queue.pending_count(&sup_a).unwrap(),
+        2,
+        "start + blocked = 2 durable events"
+    );
+    assert_eq!(
+        queue.pending_count(&sup_b).unwrap(),
+        0,
+        "foreign session still empty"
+    );
+}
+
+/// Reopen (supervisor) emits ReadyReopened / task_ready for the owning session.
+#[tokio::test]
+async fn test_062d_lifecycle_reopen_pushes_ready() {
+    let _guard = EnvGuard::set(&[
+        ("CAS_FACTORY_SESSION", "sess-062d-reopen"),
+        ("CAS_AGENT_ROLE", "supervisor"),
+    ]);
+    let env = FactoryTestEnv::with_agent_id("sup-reopen-agent");
+
+    let sup_id = env.register_supervisor_in_session("sup-reopen", "sess-062d-reopen");
+    {
+        let store = env.agent_store();
+        let mut sup = Agent::new("sup-reopen-agent".to_string(), "sup-reopen".to_string());
+        sup.role = AgentRole::Supervisor;
+        sup.factory_session = Some("sess-062d-reopen".to_string());
+        store.register(&sup).expect("register calling supervisor");
+    }
+
+    let task_store = env.task_store();
+    let mut task = Task::new(
+        "cas-062d-reopen".to_string(),
+        "Reopen lifecycle".to_string(),
+    );
+    task.status = TaskStatus::Closed;
+    task.closed_at = Some(chrono::Utc::now());
+    task_store.add(&task).expect("add closed task");
+
+    let result = env
+        .service
+        .inner
+        .cas_task_reopen(Parameters(cas::mcp::tools::IdRequest {
+            id: "cas-062d-reopen".to_string(),
+        }))
+        .await
+        .expect("reopen should succeed");
+    let text = get_text(&result);
+    assert!(
+        text.contains("Reopened") || text.contains("cas-062d-reopen"),
+        "reopen response: {text}"
+    );
+
+    let after = task_store.get("cas-062d-reopen").expect("task");
+    assert_eq!(after.status, TaskStatus::Open);
+
+    let queue = cas::store::open_supervisor_queue_store(&env.cas_root).expect("queue");
+    let pending = queue.peek(&sup_id, 20).expect("peek");
+    assert!(
+        pending.iter().any(|n| {
+            n.event_type == "task_lifecycle"
+                && n.payload.contains("task_ready")
+                && n.payload.contains("cas-062d-reopen")
+        }),
+        "reopen must push task_ready. pending={pending:?}"
+    );
+}
+
+/// Supervisor close of an orphaned task pushes task_closed (Closed transition).
+#[tokio::test]
+async fn test_062d_lifecycle_close_pushes_closed() {
+    let _guard = EnvGuard::set(&[
+        ("CAS_FACTORY_SESSION", "sess-062d-close"),
+        ("CAS_AGENT_ROLE", "supervisor"),
+    ]);
+    let env = FactoryTestEnv::with_agent_id("sup-close-agent");
+
+    let sup_id = env.register_supervisor_in_session("sup-close", "sess-062d-close");
+    {
+        let store = env.agent_store();
+        let mut sup = Agent::new("sup-close-agent".to_string(), "sup-close".to_string());
+        sup.role = AgentRole::Supervisor;
+        sup.factory_session = Some("sess-062d-close".to_string());
+        store.register(&sup).expect("register calling supervisor");
+    }
+
+    let task_store = env.task_store();
+    let mut task = Task::new("cas-062d-close".to_string(), "Close lifecycle".to_string());
+    // Orphaned InProgress → supervisor bypass skips verification.
+    task.status = TaskStatus::InProgress;
+    task.assignee = None;
+    task_store.add(&task).expect("add task");
+
+    let result = env
+        .service
+        .inner
+        .cas_task_close(Parameters(cas::mcp::tools::TaskCloseRequest {
+            id: "cas-062d-close".to_string(),
+            reason: Some("lifecycle close proof".to_string()),
+            code_review_findings: None,
+            bypass_code_review: Some(true),
+        }))
+        .await
+        .expect("close should succeed");
+    let text = get_text(&result);
+    assert!(
+        text.contains("Closed") || text.contains("cas-062d-close"),
+        "close response: {text}"
+    );
+
+    let after = task_store.get("cas-062d-close").expect("task");
+    assert_eq!(after.status, TaskStatus::Closed, "notes={}", after.notes);
+
+    let queue = cas::store::open_supervisor_queue_store(&env.cas_root).expect("queue");
+    let pending = queue.peek(&sup_id, 20).expect("peek");
+    assert!(
+        pending.iter().any(|n| {
+            n.event_type == "task_lifecycle"
+                && n.payload.contains("task_closed")
+                && n.payload.contains("cas-062d-close")
+        }),
+        "close must push task_closed. pending={pending:?}"
     );
 }
