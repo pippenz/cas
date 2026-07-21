@@ -55,8 +55,8 @@ impl AgentStore for SqliteAgentStore {
     fn release_lease(&self, task_id: &str, agent_id: &str) -> Result<()> {
         self.lease_release_lease(task_id, agent_id)
     }
-    fn release_lease_for_task(&self, task_id: &str) -> Result<bool> {
-        self.lease_release_lease_for_task(task_id)
+    fn release_lease_for_task(&self, task_id: &str, reason: &str) -> Result<bool> {
+        self.lease_release_lease_for_task(task_id, reason)
     }
     fn renew_lease(&self, task_id: &str, agent_id: &str, duration_secs: i64) -> Result<()> {
         self.lease_renew_lease(task_id, agent_id, duration_secs)

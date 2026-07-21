@@ -215,8 +215,8 @@ pub trait AgentStore: Send + Sync {
     /// Release a task lease
     fn release_lease(&self, task_id: &str, agent_id: &str) -> Result<()>;
 
-    /// Release any lease on a task (regardless of owner) - used when closing tasks
-    fn release_lease_for_task(&self, task_id: &str) -> Result<bool>;
+    /// Release any lease on a task (regardless of owner), recording why it was released.
+    fn release_lease_for_task(&self, task_id: &str, reason: &str) -> Result<bool>;
 
     /// Renew a task lease
     fn renew_lease(&self, task_id: &str, agent_id: &str, duration_secs: i64) -> Result<()>;
