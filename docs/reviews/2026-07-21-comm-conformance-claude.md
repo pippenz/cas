@@ -136,5 +136,3 @@ Supervisor fired the scripted set as a burst at **14:59:18Z** (after two nudges)
 - Sibling transport-confirmed (~1.2 s, for contrast): 3631, 3632, 3648, 3650, 3651, 3652, 3656, 3658.
 - daemon `director_events` deliveries to comm-claude (the only channel that reached the worker): 14:46:16.465Z (34 ms), 14:58:25.137Z (19 ms), 15:02:59.844Z (22 ms), 15:04:14.358Z (34 ms).
 - Note on delivery irony: the supervisor's own completion instructions (3681/3682) telling this worker to finalize were themselves undelivered via the coordination channel and had to be read out of `prompt_queue` — a live demonstration of the reported gap.
-</content>
-</invoke>
