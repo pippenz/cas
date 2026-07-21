@@ -2072,18 +2072,19 @@ fn test_728b_worker_stalled_suppressed_within_grace_window_then_fires_once_elaps
 /// must **not** confirm a stall (false auto-nudge root cause).
 #[test]
 fn test_728b_transcript_confirms_stall_for_path_freshness_decision() {
+    use cas_mux::SupervisorCli;
     let tmp = tempfile::tempdir().unwrap();
 
     // cas-de95: unresolved path is missing evidence — do not confirm stall.
     assert!(
-        !transcript_confirms_stall_for_path(None),
+        !transcript_confirms_stall_for_path(None, SupervisorCli::Claude),
         "missing transcript path must NOT confirm stall (telemetry absence ≠ starvation)"
     );
 
     // Path claimed but file missing → mtime unreadable → same: no confirm.
     let missing = tmp.path().join("does-not-exist.jsonl");
     assert!(
-        !transcript_confirms_stall_for_path(Some(&missing)),
+        !transcript_confirms_stall_for_path(Some(&missing), SupervisorCli::Claude),
         "unreadable transcript mtime must NOT confirm stall"
     );
 
@@ -2091,11 +2092,13 @@ fn test_728b_transcript_confirms_stall_for_path_freshness_decision() {
     let fresh = tmp.path().join("fresh.jsonl");
     std::fs::write(&fresh, b"{}").unwrap();
     assert!(
-        !transcript_confirms_stall_for_path(Some(&fresh)),
+        !transcript_confirms_stall_for_path(Some(&fresh), SupervisorCli::Claude),
         "a transcript written moments ago must suppress the stall verdict"
     );
 
     // Resolved cold transcript — positive evidence of inactivity; confirm.
+    // 120s is past Claude's 60s window (and still within Codex's 5m — covered
+    // by the cas-ab80 harness-window tests below).
     let stale = tmp.path().join("stale.jsonl");
     std::fs::write(&stale, b"{}").unwrap();
     let old_mtime = filetime::FileTime::from_system_time(
@@ -2103,8 +2106,8 @@ fn test_728b_transcript_confirms_stall_for_path_freshness_decision() {
     );
     filetime::set_file_mtime(&stale, old_mtime).unwrap();
     assert!(
-        transcript_confirms_stall_for_path(Some(&stale)),
-        "a transcript stale past TRANSCRIPT_FRESH_WINDOW must confirm the stall verdict"
+        transcript_confirms_stall_for_path(Some(&stale), SupervisorCli::Claude),
+        "a transcript stale past Claude TRANSCRIPT_FRESH_WINDOW must confirm the stall verdict"
     );
 }
 
@@ -2260,18 +2263,114 @@ fn test_09d0_stale_transcript_does_not_suppress_stall_alert() {
 /// independent of the DirectorEventDetector plumbing above.
 #[test]
 fn test_09d0_transcript_confirms_stall_for_age_pure_cases() {
+    use crate::cli::factory::wedged::TRANSCRIPT_FRESH_WINDOW;
     assert!(
-        !transcript_confirms_stall_for_age(Some(std::time::Duration::from_secs(5))),
+        !transcript_confirms_stall_for_age(
+            Some(std::time::Duration::from_secs(5)),
+            TRANSCRIPT_FRESH_WINDOW
+        ),
         "fresh age must NOT confirm the stall (i.e. suppress it)"
     );
     assert!(
-        transcript_confirms_stall_for_age(Some(std::time::Duration::from_secs(120))),
+        transcript_confirms_stall_for_age(
+            Some(std::time::Duration::from_secs(120)),
+            TRANSCRIPT_FRESH_WINDOW
+        ),
         "stale age must confirm (proceed with) the stall verdict"
     );
     // cas-de95: unknown age is missing evidence, not a stall confirmation.
     assert!(
-        !transcript_confirms_stall_for_age(None),
+        !transcript_confirms_stall_for_age(None, TRANSCRIPT_FRESH_WINDOW),
         "unknown age (no telemetry) must NOT confirm stall — absence ≠ starvation"
+    );
+}
+
+/// cas-ab80: director must use the same harness-specific fresh window as
+/// `is-wedged` (`activity_fresh_window`). A Codex transcript at 120s is still
+/// "fresh" under the 5m Codex window and must not confirm stall; under the
+/// Claude 60s window the same age confirms.
+#[test]
+fn test_ab80_harness_specific_transcript_window_matches_is_wedged() {
+    use crate::cli::factory::wedged::{
+        CODEX_TRANSCRIPT_FRESH_WINDOW, TRANSCRIPT_FRESH_WINDOW, activity_fresh_window,
+    };
+    use cas_mux::SupervisorCli;
+
+    // Pin the shared helper the production path uses.
+    assert_eq!(
+        activity_fresh_window(SupervisorCli::Codex),
+        CODEX_TRANSCRIPT_FRESH_WINDOW
+    );
+    assert_eq!(
+        activity_fresh_window(SupervisorCli::Claude),
+        TRANSCRIPT_FRESH_WINDOW
+    );
+    assert_eq!(
+        activity_fresh_window(SupervisorCli::Grok),
+        TRANSCRIPT_FRESH_WINDOW
+    );
+
+    let mid_codex_window = std::time::Duration::from_secs(120); // past 60s, under 5m
+    assert!(
+        !transcript_confirms_stall_for_age(
+            Some(mid_codex_window),
+            activity_fresh_window(SupervisorCli::Codex)
+        ),
+        "Codex transcript active within 5m window must NOT confirm stall"
+    );
+    assert!(
+        transcript_confirms_stall_for_age(
+            Some(mid_codex_window),
+            activity_fresh_window(SupervisorCli::Claude)
+        ),
+        "Claude transcript at 120s (past 60s) must confirm stall"
+    );
+    assert!(
+        transcript_confirms_stall_for_age(
+            Some(std::time::Duration::from_secs(6 * 60)),
+            activity_fresh_window(SupervisorCli::Codex)
+        ),
+        "Codex transcript past 5m window must confirm stall"
+    );
+}
+
+/// cas-ab80 end-to-end: a Codex-window transcript age of 120s suppresses the
+/// director stall nudge even when checkpoint activity is long past threshold.
+#[test]
+fn test_ab80_codex_mid_window_transcript_suppresses_stall_alert() {
+    use crate::cli::factory::wedged::CODEX_TRANSCRIPT_FRESH_WINDOW;
+
+    let base_utc = chrono::Utc::now();
+    let t0 = std::time::Instant::now();
+
+    let mut detector =
+        DirectorEventDetector::new(vec!["lively-crow".to_string()], "supervisor".to_string());
+    detector.set_stall_threshold_secs(300);
+    detector.set_transcript_age_override(HashMap::from([(
+        "lively-crow".to_string(),
+        Some(std::time::Duration::from_secs(120)), // past Claude 60s, under Codex 5m
+    )]));
+    detector.set_transcript_window_override(HashMap::from([(
+        "lively-crow".to_string(),
+        CODEX_TRANSCRIPT_FRESH_WINDOW,
+    )]));
+
+    let data = stalled_data_for(make_agent_working_stalled(
+        "agent-1",
+        "lively-crow",
+        "cas-0b7d",
+        5,
+        Some(310),
+        base_utc,
+    ));
+    detector.initialize(&data);
+
+    let events = detector.detect_changes_at(&data, None, t0, base_utc);
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, DirectorEvent::WorkerStalled { .. })),
+        "Codex-window transcript at 120s must suppress stall nudge (director/is-wedged agreement): {events:?}"
     );
 }
 
@@ -2286,10 +2385,7 @@ fn test_de95_missing_transcript_does_not_auto_nudge() {
         DirectorEventDetector::new(vec!["codex-worker".to_string()], "supervisor".to_string());
     detector.set_stall_threshold_secs(300);
     // Explicit None age = unresolved telemetry (same as no path).
-    detector.set_transcript_age_override(HashMap::from([(
-        "codex-worker".to_string(),
-        None,
-    )]));
+    detector.set_transcript_age_override(HashMap::from([("codex-worker".to_string(), None)]));
 
     let data = stalled_data_for(make_agent_working_stalled(
         "agent-1",

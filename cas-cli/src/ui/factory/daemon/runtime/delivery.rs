@@ -156,8 +156,23 @@ pub(crate) fn pty_payload_needs_framing(harness: SupervisorCli) -> bool {
 /// Emits exactly `Message from <sender>: <text>` — no summary interpolation before
 /// the colon — because the Codex prompt (cas-83c8) matches on that literal prefix.
 /// `source` is the human-readable sender name ("supervisor" or a worker name).
-fn attribute_for_pty(source: &str, text: &str) -> String {
+pub(crate) fn attribute_for_pty(source: &str, text: &str) -> String {
     format!("Message from {source}: {text}")
+}
+
+/// Apply the shared Codex sender framing when the recipient needs it.
+///
+/// Used by both normal `deliver_to_worker` PTY injection and the urgent
+/// interrupt-and-inject paths (direct + `all_workers` + ClientMessage::Inject).
+/// Urgent delivery previously skipped this helper, so Codex recipients saw bare
+/// text that their prompt contract does not recognise as an actionable message
+/// (cas-ab80). Claude/Grok payloads stay byte-for-byte unchanged.
+pub(crate) fn frame_pty_payload(harness: SupervisorCli, source: &str, text: &str) -> String {
+    if pty_payload_needs_framing(harness) {
+        attribute_for_pty(source, text)
+    } else {
+        text.to_string()
+    }
 }
 
 impl FactoryDaemon {
@@ -215,20 +230,13 @@ impl FactoryDaemon {
                 // recipient always gets the literal `Message from <sender>: ` prefix
                 // its prompt keys on (even codex-only, teams=None); a Claude
                 // recipient reached via the PTY fallback stays byte-for-byte bare.
-                if pty_payload_needs_framing(harness) {
-                    let framed = attribute_for_pty(source, text);
-                    self.app
-                        .mux
-                        .inject(pane_target, &framed)
-                        .await
-                        .map_err(Into::into)
-                } else {
-                    self.app
-                        .mux
-                        .inject(pane_target, text)
-                        .await
-                        .map_err(Into::into)
-                }
+                // Shared helper also used by urgent interrupt-and-inject (cas-ab80).
+                let payload = frame_pty_payload(harness, source, text);
+                self.app
+                    .mux
+                    .inject(pane_target, &payload)
+                    .await
+                    .map_err(Into::into)
             }
         }
     }
@@ -358,6 +366,34 @@ mod tests {
         assert_eq!(
             attribute_for_pty("worker-3", "start cas-1234"),
             "Message from worker-3: start cas-1234"
+        );
+    }
+
+    /// cas-ab80: urgent Codex delivery must use the same framing contract as
+    /// normal PTY delivery. The shared helper is what both paths call.
+    #[test]
+    fn frame_pty_payload_frames_codex_with_sender_prefix() {
+        assert_eq!(
+            frame_pty_payload(SupervisorCli::Codex, "supervisor", "stop and re-close"),
+            "Message from supervisor: stop and re-close"
+        );
+        assert_eq!(
+            frame_pty_payload(SupervisorCli::Codex, "worker-2", "blocker: need merge"),
+            "Message from worker-2: blocker: need merge"
+        );
+    }
+
+    /// cas-ab80: Claude and Grok stay bare under urgent and normal paths alike.
+    #[test]
+    fn frame_pty_payload_leaves_claude_and_grok_unframed() {
+        let text = "urgent: drop what you are doing";
+        assert_eq!(
+            frame_pty_payload(SupervisorCli::Claude, "supervisor", text),
+            text
+        );
+        assert_eq!(
+            frame_pty_payload(SupervisorCli::Grok, "supervisor", text),
+            text
         );
     }
 }

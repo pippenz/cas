@@ -452,10 +452,19 @@ impl FactoryDaemon {
                         continue;
                     }
                     let inject_result: anyhow::Result<()> = if queued.urgent {
+                        // cas-ab80: urgent Codex recipients still need the shared
+                        // `Message from <sender>:` framing (same contract as
+                        // normal `deliver_to_worker`); Claude/Grok stay bare.
+                        let harness = self.app.harness_for(name);
+                        let payload = super::delivery::frame_pty_payload(
+                            harness,
+                            &inbox_source,
+                            &prompt_with_instructions,
+                        );
                         let settle = self.urgent_settle_duration(name);
                         self.app
                             .mux
-                            .interrupt_and_inject(name, &prompt_with_instructions, settle)
+                            .interrupt_and_inject(name, &payload, settle)
                             .await
                             .map_err(Into::into)
                     } else {
@@ -540,6 +549,14 @@ impl FactoryDaemon {
                     // bypassing the inbox even in teams mode. Break the turn
                     // (Esc), wait the bounded settle window for the turn to
                     // actually break, then inject.
+                    // cas-ab80: apply shared Codex framing before inject so
+                    // urgent direct delivery matches normal PTY framing.
+                    let harness = self.app.harness_for(pane_target);
+                    let payload = super::delivery::frame_pty_payload(
+                        harness,
+                        &inbox_source,
+                        &prompt_with_instructions,
+                    );
                     let settle = self.urgent_settle_duration(pane_target);
                     tracing::info!(
                         target: "cas::coordination",
@@ -551,7 +568,7 @@ impl FactoryDaemon {
                     );
                     self.app
                         .mux
-                        .interrupt_and_inject(pane_target, &prompt_with_instructions, settle)
+                        .interrupt_and_inject(pane_target, &payload, settle)
                         .await
                         .map_err(Into::into)
                 } else {
