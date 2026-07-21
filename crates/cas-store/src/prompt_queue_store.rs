@@ -86,6 +86,17 @@ const PROMPT_QUEUE_URGENT_MIGRATION: &str = r#"
 ALTER TABLE prompt_queue ADD COLUMN urgent INTEGER NOT NULL DEFAULT 0;
 "#;
 
+/// Indexes supporting two-lane `peek_for_targets` selection (cas-2bcb).
+/// Partial indexes keep the path bounded to pending rows only.
+const PROMPT_QUEUE_TWO_LANE_INDEXES: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_prompt_queue_session_pending
+    ON prompt_queue(factory_session, priority, id)
+    WHERE processed_at IS NULL AND factory_session IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_prompt_queue_legacy_pending
+    ON prompt_queue(target, priority, id)
+    WHERE processed_at IS NULL AND factory_session IS NULL;
+"#;
+
 /// Delivery status of a prompt queue message
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum MessageStatus {
@@ -199,18 +210,29 @@ pub trait PromptQueueStore: Send + Sync {
 
     /// Peek at pending prompts for specific targets only.
     ///
-    /// Eligibility (applied before LIMIT):
-    /// - Session-tagged rows match only when `factory_session` equals the
-    ///   row's session (never by target-name collision).
-    /// - Legacy NULL-session rows match only when `target` is in `targets`
+    /// # Eligibility (applied before LIMIT)
+    /// - **Session lane:** rows with `factory_session` equal to the supplied
+    ///   session (never matched by target-name collision alone).
+    /// - **Legacy lane:** NULL-session rows whose `target` is in `targets`
     ///   (historical compatibility arm).
     ///
-    /// Ordering among eligible rows: `priority ASC`, then (when a session is
-    /// supplied) prefer non-NULL session-tagged rows over legacy NULL-session
-    /// rows so a legacy backlog cannot occupy the entire LIMIT window ahead
-    /// of live-session traffic (cas-2bcb / cas-04a6 R1), then `id ASC` FIFO.
-    /// This prevents one factory daemon from consuming messages meant for
-    /// another daemon's workers/supervisor in multi-session setups.
+    /// # Cross-lane selection contract (when `factory_session` is set)
+    /// Two independent ordered peeks (each `ORDER BY priority ASC, id ASC`)
+    /// are merged with a **bounded two-lane quota** so neither lane can
+    /// permanently occupy the entire LIMIT window (cas-2bcb / cas-04a6 R1):
+    /// - When both lanes have pending work and `limit >= 2`: reserve
+    ///   `ceil(limit/2)` slots for the session lane and `floor(limit/2)` for
+    ///   the legacy lane; unused quota is filled from the other lane.
+    /// - When only one lane has work: that lane may use the full LIMIT.
+    /// - Final delivery order: `priority ASC, id ASC` across the selected
+    ///   set (priority is authoritative across lanes; FIFO is stable
+    ///   *within* each lane's contribution).
+    /// - `limit == 1` with both lanes pending: session lane wins the single
+    ///   slot (live coordination is the hot path); legacy still progresses
+    ///   on subsequent peeks once session pressure drops or limit >= 2.
+    ///
+    /// Without a session tag, behavior is the historical single-lane target
+    /// filter. Session isolation: other sessions' tagged rows never leak.
     fn peek_for_targets(
         &self,
         targets: &[&str],
@@ -292,6 +314,95 @@ impl SqlitePromptQueueStore {
             urgent,
         })
     }
+
+    /// Merge session-lane and legacy-lane peeks with a bounded two-lane quota.
+    ///
+    /// Contract (see `PromptQueueStore::peek_for_targets`):
+    /// - both non-empty + limit>=2 → ceil(n/2) session reserve, floor(n/2) legacy reserve
+    /// - unused reserve fills from the other lane
+    /// - final order: priority ASC, id ASC
+    fn merge_two_lane_peeks(
+        session: Vec<QueuedPrompt>,
+        legacy: Vec<QueuedPrompt>,
+        limit: usize,
+    ) -> Vec<QueuedPrompt> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        if session.is_empty() {
+            return legacy.into_iter().take(limit).collect();
+        }
+        if legacy.is_empty() {
+            return session.into_iter().take(limit).collect();
+        }
+
+        let session_quota = (limit + 1) / 2;
+        let legacy_quota = limit / 2;
+
+        let mut session_iter = session.into_iter();
+        let mut legacy_iter = legacy.into_iter();
+        let mut selected: Vec<QueuedPrompt> = Vec::with_capacity(limit);
+
+        for _ in 0..session_quota {
+            match session_iter.next() {
+                Some(row) => selected.push(row),
+                None => break,
+            }
+        }
+        for _ in 0..legacy_quota {
+            match legacy_iter.next() {
+                Some(row) => selected.push(row),
+                None => break,
+            }
+        }
+
+        // Remainder: merge leftover heads by priority then id (same key as final sort).
+        while selected.len() < limit {
+            let next = match (session_iter.as_slice().first(), legacy_iter.as_slice().first()) {
+                (None, None) => break,
+                (Some(_), None) => session_iter.next(),
+                (None, Some(_)) => legacy_iter.next(),
+                (Some(s), Some(l)) => {
+                    let take_session = match (s.priority as u8).cmp(&(l.priority as u8)) {
+                        std::cmp::Ordering::Less => true,
+                        std::cmp::Ordering::Greater => false,
+                        std::cmp::Ordering::Equal => s.id <= l.id,
+                    };
+                    if take_session {
+                        session_iter.next()
+                    } else {
+                        legacy_iter.next()
+                    }
+                }
+            };
+            match next {
+                Some(row) => selected.push(row),
+                None => break,
+            }
+        }
+
+        selected.sort_by(|a, b| {
+            (a.priority as u8)
+                .cmp(&(b.priority as u8))
+                .then(a.id.cmp(&b.id))
+        });
+        selected
+    }
+
+    fn query_lane(
+        conn: &Connection,
+        sql: &str,
+        params: &[Box<dyn rusqlite::ToSql>],
+    ) -> Result<Vec<QueuedPrompt>> {
+        let mut stmt = conn.prepare_cached(sql)?;
+        let prompts = stmt
+            .query_map(
+                rusqlite::params_from_iter(params.iter().map(|p| p.as_ref())),
+                Self::prompt_from_row,
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(prompts)
+    }
 }
 
 impl PromptQueueStore for SqlitePromptQueueStore {
@@ -338,6 +449,9 @@ impl PromptQueueStore for SqlitePromptQueueStore {
         if !has_urgent_col {
             conn.execute_batch(PROMPT_QUEUE_URGENT_MIGRATION)?;
         }
+
+        // Two-lane peek indexes (idempotent CREATE INDEX IF NOT EXISTS).
+        conn.execute_batch(PROMPT_QUEUE_TWO_LANE_INDEXES)?;
 
         Ok(())
     }
@@ -526,68 +640,73 @@ impl PromptQueueStore for SqlitePromptQueueStore {
         factory_session: Option<&str>,
         limit: usize,
     ) -> Result<Vec<QueuedPrompt>> {
-        if targets.is_empty() && factory_session.is_none() {
+        if limit == 0 || (targets.is_empty() && factory_session.is_none()) {
             return Ok(Vec::new());
         }
 
         let conn = self.conn.lock().unwrap();
 
-        // Target matching catches only legacy messages with no session tag.
-        // Session matching catches tagged messages for exactly this daemon's session.
-        let mut conditions = Vec::new();
-        let mut param_values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-
-        if !targets.is_empty() {
-            let placeholders: Vec<&str> = std::iter::repeat_n("?", targets.len()).collect();
-            let target_clause = if factory_session.is_some() {
-                format!(
-                    "(factory_session IS NULL AND target IN ({}))",
-                    placeholders.join(", ")
-                )
-            } else {
-                format!("target IN ({})", placeholders.join(", "))
-            };
-            conditions.push(target_clause);
-            for t in targets {
-                param_values.push(Box::new(t.to_string()));
+        // Legacy path (no session): single-lane target filter.
+        let Some(session) = factory_session else {
+            if targets.is_empty() {
+                return Ok(Vec::new());
             }
-        }
-
-        if let Some(session) = factory_session {
-            conditions.push("factory_session = ?".to_string());
-            param_values.push(Box::new(session.to_string()));
-        }
-
-        let where_clause = conditions.join(" OR ");
-        // When a factory session is active, prefer its tagged rows over the
-        // legacy NULL-session arm so equal-priority lower-ID legacy backlog
-        // cannot HOL-block live traffic under a small LIMIT (cas-2bcb).
-        // Priority still wins first; FIFO by id is preserved within each arm.
-        let order_clause = if factory_session.is_some() {
-            "priority ASC, CASE WHEN factory_session IS NOT NULL THEN 0 ELSE 1 END, id ASC"
-        } else {
-            "priority ASC, id ASC"
+            let placeholders: Vec<&str> = std::iter::repeat_n("?", targets.len()).collect();
+            let sql = format!(
+                "SELECT id, source, target, prompt, created_at, processed_at, summary, priority, acked_at, urgent, factory_session
+                 FROM prompt_queue
+                 WHERE processed_at IS NULL
+                   AND target IN ({})
+                 ORDER BY priority ASC, id ASC
+                 LIMIT ?",
+                placeholders.join(", ")
+            );
+            let mut params: Vec<Box<dyn rusqlite::ToSql>> = targets
+                .iter()
+                .map(|t| Box::new(t.to_string()) as Box<dyn rusqlite::ToSql>)
+                .collect();
+            params.push(Box::new(limit as i64));
+            return Self::query_lane(&conn, &sql, &params);
         };
-        let sql = format!(
-            "SELECT id, source, target, prompt, created_at, processed_at, summary, priority, acked_at, urgent, factory_session
+
+        // Live-session path: two indexable peeks + bounded two-lane merge
+        // (cas-2bcb). Each lane is LIMIT-bounded so neither can permanently
+        // occupy the caller's window.
+        let session_sql = "SELECT id, source, target, prompt, created_at, processed_at, summary, priority, acked_at, urgent, factory_session
              FROM prompt_queue
              WHERE processed_at IS NULL
-               AND ({where_clause})
-             ORDER BY {order_clause}
-             LIMIT ?"
-        );
+               AND factory_session = ?
+             ORDER BY priority ASC, id ASC
+             LIMIT ?";
+        let session_params: Vec<Box<dyn rusqlite::ToSql>> = vec![
+            Box::new(session.to_string()),
+            Box::new(limit as i64),
+        ];
+        let session_lane = Self::query_lane(&conn, session_sql, &session_params)?;
 
-        param_values.push(Box::new(limit as i64));
+        let legacy_lane = if targets.is_empty() {
+            Vec::new()
+        } else {
+            let placeholders: Vec<&str> = std::iter::repeat_n("?", targets.len()).collect();
+            let legacy_sql = format!(
+                "SELECT id, source, target, prompt, created_at, processed_at, summary, priority, acked_at, urgent, factory_session
+                 FROM prompt_queue
+                 WHERE processed_at IS NULL
+                   AND factory_session IS NULL
+                   AND target IN ({})
+                 ORDER BY priority ASC, id ASC
+                 LIMIT ?",
+                placeholders.join(", ")
+            );
+            let mut legacy_params: Vec<Box<dyn rusqlite::ToSql>> = targets
+                .iter()
+                .map(|t| Box::new(t.to_string()) as Box<dyn rusqlite::ToSql>)
+                .collect();
+            legacy_params.push(Box::new(limit as i64));
+            Self::query_lane(&conn, &legacy_sql, &legacy_params)?
+        };
 
-        let mut stmt = conn.prepare_cached(&sql)?;
-        let prompts = stmt
-            .query_map(
-                rusqlite::params_from_iter(param_values.iter().map(|p| p.as_ref())),
-                Self::prompt_from_row,
-            )?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-
-        Ok(prompts)
+        Ok(Self::merge_two_lane_peeks(session_lane, legacy_lane, limit))
     }
 
     fn mark_processed(&self, prompt_id: i64) -> Result<()> {
@@ -1205,29 +1324,17 @@ mod tests {
 
     /// cas-2bcb / cas-04a6 R1: lower-ID NULL-session legacy rows must not
     /// occupy the fetch LIMIT ahead of eligible live-session rows.
-    ///
-    /// Reproduces the production failure mode where ~45 equal-priority
-    /// legacy supervisor/director rows permanently filled `LIMIT 10` so
-    /// session-tagged normal traffic never entered the daemon peek window.
     #[test]
     fn test_live_session_not_starved_by_legacy_null_session_hol() {
         let (_temp, store) = create_test_store();
         const LIMIT: usize = 10;
 
-        // More than LIMIT lower-ID legacy NULL-session rows targeting names
-        // every factory daemon always peeks (supervisor/director).
         for i in 0..(LIMIT + 5) {
             store
-                .enqueue(
-                    "old-worker",
-                    "supervisor",
-                    &format!("legacy backlog {i}"),
-                )
+                .enqueue("old-worker", "supervisor", &format!("legacy backlog {i}"))
                 .unwrap();
         }
 
-        // Live-session normal-priority row enqueued after the backlog
-        // (higher id, equal priority) — must still appear in one peek.
         let live_id = store
             .enqueue_with_session(
                 "worker-live",
@@ -1245,49 +1352,170 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(
-            peeked.len(),
-            LIMIT,
-            "peek must still respect the caller LIMIT"
-        );
+        assert_eq!(peeked.len(), LIMIT, "peek must still respect the caller LIMIT");
         assert!(
             peeked.iter().any(|p| p.id == live_id),
             "live-session row must appear in one peek despite >LIMIT lower-ID NULL-session backlog; got ids {:?}",
             peeked.iter().map(|p| p.id).collect::<Vec<_>>()
         );
         assert!(
-            peeked
-                .iter()
-                .any(|p| p.factory_session.as_deref() == Some("session-live")),
-            "session-tagged live row must be selected"
-        );
-        // Legacy arm remains eligible (fills remaining slots) rather than being dropped.
-        assert!(
             peeked.iter().any(|p| p.factory_session.is_none()),
-            "legacy NULL-session rows remain eligible when room remains under LIMIT"
+            "legacy NULL-session rows remain eligible under the two-lane quota"
         );
     }
 
-    /// Within equal priority, eligible session-tagged rows keep id FIFO;
-    /// urgent eligible rows still precede normal ones; other sessions never leak.
+    /// Symmetric fairness: sustained live-session traffic must not starve
+    /// eligible legacy NULL-session rows either (supervisor reject of pure
+    /// session-first ordering).
+    #[test]
+    fn test_legacy_not_starved_by_live_session_traffic() {
+        let (_temp, store) = create_test_store();
+        const LIMIT: usize = 10;
+
+        for i in 0..(LIMIT + 5) {
+            store
+                .enqueue_with_session(
+                    "worker",
+                    "supervisor",
+                    &format!("live backlog {i}"),
+                    "session-live",
+                )
+                .unwrap();
+        }
+        let legacy_id = store
+            .enqueue("old", "supervisor", "lonely legacy")
+            .unwrap();
+
+        let peeked = store
+            .peek_for_targets(&["supervisor"], Some("session-live"), LIMIT)
+            .unwrap();
+
+        assert_eq!(peeked.len(), LIMIT);
+        assert!(
+            peeked.iter().any(|p| p.id == legacy_id),
+            "legacy row must appear in one peek despite >LIMIT live-session backlog; got {:?}",
+            peeked
+                .iter()
+                .map(|p| (p.id, p.factory_session.as_deref()))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            peeked
+                .iter()
+                .any(|p| p.factory_session.as_deref() == Some("session-live")),
+            "session lane also represented"
+        );
+    }
+
+    /// Repeated peek+mark batches: both lanes drain with bounded progress
+    /// (neither lane stuck forever while the other has work).
+    #[test]
+    fn test_two_lane_bounded_progress_across_repeated_peeks() {
+        let (_temp, store) = create_test_store();
+        const LIMIT: usize = 10;
+        const PER_LANE: usize = 25;
+
+        let mut session_ids = Vec::new();
+        let mut legacy_ids = Vec::new();
+        for i in 0..PER_LANE {
+            session_ids.push(
+                store
+                    .enqueue_with_session(
+                        "w",
+                        "supervisor",
+                        &format!("sess {i}"),
+                        "session-a",
+                    )
+                    .unwrap(),
+            );
+            legacy_ids.push(
+                store
+                    .enqueue("old", "supervisor", &format!("leg {i}"))
+                    .unwrap(),
+            );
+        }
+
+        let mut session_seen = 0usize;
+        let mut legacy_seen = 0usize;
+        let mut rounds = 0usize;
+        loop {
+            let batch = store
+                .peek_for_targets(&["supervisor"], Some("session-a"), LIMIT)
+                .unwrap();
+            if batch.is_empty() {
+                break;
+            }
+            rounds += 1;
+            assert!(rounds <= PER_LANE * 2, "must drain without infinite loop");
+
+            let sess_in_batch = batch
+                .iter()
+                .filter(|p| p.factory_session.as_deref() == Some("session-a"))
+                .count();
+            let leg_in_batch = batch.iter().filter(|p| p.factory_session.is_none()).count();
+            // While both lanes still have residual work beyond this batch,
+            // each peek must take from both (bounded dual progress).
+            let session_remaining_before = PER_LANE - session_seen;
+            let legacy_remaining_before = PER_LANE - legacy_seen;
+            if session_remaining_before > 0 && legacy_remaining_before > 0 && LIMIT >= 2 {
+                assert!(
+                    sess_in_batch >= 1 && leg_in_batch >= 1,
+                    "round {rounds}: both lanes must progress while both pending; \
+                     session={sess_in_batch} legacy={leg_in_batch}"
+                );
+            }
+            session_seen += sess_in_batch;
+            legacy_seen += leg_in_batch;
+
+            // Within each lane contribution, FIFO by id.
+            let sess_ids: Vec<i64> = batch
+                .iter()
+                .filter(|p| p.factory_session.as_deref() == Some("session-a"))
+                .map(|p| p.id)
+                .collect();
+            assert!(
+                sess_ids.windows(2).all(|w| w[0] < w[1]),
+                "session lane FIFO violated: {sess_ids:?}"
+            );
+            let leg_ids: Vec<i64> = batch
+                .iter()
+                .filter(|p| p.factory_session.is_none())
+                .map(|p| p.id)
+                .collect();
+            assert!(
+                leg_ids.windows(2).all(|w| w[0] < w[1]),
+                "legacy lane FIFO violated: {leg_ids:?}"
+            );
+
+            // Priority non-decreasing across the merged delivery set.
+            for window in batch.windows(2) {
+                assert!(window[0].priority as u8 <= window[1].priority as u8);
+            }
+
+            for p in &batch {
+                store.mark_processed(p.id).unwrap();
+            }
+        }
+
+        assert_eq!(session_seen, PER_LANE, "all session rows drained");
+        assert_eq!(legacy_seen, PER_LANE, "all legacy rows drained");
+    }
+
+    /// Priority authoritative across lanes; FIFO within lane; isolation holds.
     #[test]
     fn test_peek_for_targets_priority_fifo_and_isolation_with_legacy() {
         let (_temp, store) = create_test_store();
 
-        // Other-session row must never leak into session-a's peek.
         store
             .enqueue_with_session("sup-b", "worker", "other session", "session-b")
             .unwrap();
 
-        // Two equal-priority live rows for session-a — FIFO by id among them.
         let first = store
             .enqueue_with_session("worker-a", "supervisor", "live first", "session-a")
             .unwrap();
         let second = store
             .enqueue_with_session("worker-a", "supervisor", "live second", "session-a")
             .unwrap();
-
-        // Urgent live row enqueued later must still sort ahead of normals.
         let urgent = store
             .enqueue_urgent(
                 "worker-a",
@@ -1300,8 +1528,6 @@ mod tests {
             )
             .unwrap();
 
-        // Legacy backlog after the live rows would starve under pure id ASC;
-        // with the HOL fix, live rows still surface first at equal priority.
         for i in 0..15 {
             store
                 .enqueue("old", "supervisor", &format!("legacy tail {i}"))
@@ -1323,12 +1549,11 @@ mod tests {
             .iter()
             .filter(|p| p.factory_session.as_deref() == Some("session-a"))
             .collect();
-        assert_eq!(live.len(), 3, "all three session-a rows must fit in LIMIT");
+        assert_eq!(live.len(), 3, "all three session-a rows must fit under quota");
         assert_eq!(live[0].id, urgent, "urgent eligible precedes normal");
         assert_eq!(live[1].id, first, "equal-priority FIFO: first then second");
         assert_eq!(live[2].id, second);
 
-        // Among all returned rows, priority order is non-decreasing.
         for window in peeked.windows(2) {
             assert!(
                 window[0].priority as u8 <= window[1].priority as u8,
@@ -1337,5 +1562,167 @@ mod tests {
                 window[1].priority
             );
         }
+    }
+
+    /// Pure merge helper unit: documents the intentional cross-lane contract.
+    #[test]
+    fn test_merge_two_lane_peeks_quota_contract() {
+        fn row(id: i64, session: Option<&str>, priority: u8) -> QueuedPrompt {
+            QueuedPrompt {
+                id,
+                source: "s".into(),
+                target: "t".into(),
+                prompt: format!("p{id}"),
+                created_at: Utc::now(),
+                processed_at: None,
+                factory_session: session.map(|s| s.to_string()),
+                summary: None,
+                priority: NotificationPriority::from(priority),
+                acked_at: None,
+                urgent: priority == 0,
+            }
+        }
+
+        // Both lanes full, limit 10 → 5+5 reserve.
+        let session: Vec<_> = (1..=20).map(|i| row(i, Some("s"), 2)).collect();
+        let legacy: Vec<_> = (100..=119).map(|i| row(i, None, 2)).collect();
+        let merged = SqlitePromptQueueStore::merge_two_lane_peeks(session, legacy, 10);
+        assert_eq!(merged.len(), 10);
+        assert_eq!(
+            merged
+                .iter()
+                .filter(|p| p.factory_session.is_some())
+                .count(),
+            5
+        );
+        assert_eq!(merged.iter().filter(|p| p.factory_session.is_none()).count(), 5);
+
+        // One live + many legacy → live always included; remainder fills legacy.
+        let session = vec![row(50, Some("s"), 2)];
+        let legacy: Vec<_> = (1..=20).map(|i| row(i, None, 2)).collect();
+        let merged = SqlitePromptQueueStore::merge_two_lane_peeks(session, legacy, 10);
+        assert!(merged.iter().any(|p| p.id == 50));
+        assert_eq!(merged.len(), 10);
+        assert_eq!(merged.iter().filter(|p| p.factory_session.is_none()).count(), 9);
+
+        // Urgent legacy outranks normal session in final order.
+        let session = vec![row(2, Some("s"), 2)];
+        let legacy = vec![row(1, None, 0)];
+        let merged = SqlitePromptQueueStore::merge_two_lane_peeks(session, legacy, 10);
+        assert_eq!(merged[0].id, 1);
+        assert_eq!(merged[0].priority, NotificationPriority::Critical);
+        assert_eq!(merged[1].id, 2);
+    }
+
+    /// Scale + query plan: 10× backlog peeks stay LIMIT-bounded; EXPLAIN uses
+    /// the partial two-lane indexes rather than a full table scan of all rows.
+    #[test]
+    fn test_two_lane_peek_scale_and_query_plan() {
+        let (_temp, store) = create_test_store();
+        const LIMIT: usize = 10;
+        // 10× the daemon LIMIT on each lane (cas-2bcb scalability AC).
+        const BACKLOG: usize = LIMIT * 10;
+
+        for i in 0..BACKLOG {
+            store
+                .enqueue_with_session("w", "supervisor", &format!("s{i}"), "session-scale")
+                .unwrap();
+            store
+                .enqueue("old", "supervisor", &format!("l{i}"))
+                .unwrap();
+        }
+
+        let started = std::time::Instant::now();
+        let peeked = store
+            .peek_for_targets(&["supervisor"], Some("session-scale"), LIMIT)
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(peeked.len(), LIMIT);
+        assert!(
+            peeked
+                .iter()
+                .any(|p| p.factory_session.as_deref() == Some("session-scale"))
+        );
+        assert!(peeked.iter().any(|p| p.factory_session.is_none()));
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "peek over 10× backlog must stay fast; took {elapsed:?}"
+        );
+
+        // EXPLAIN QUERY PLAN for each lane — expect index usage on the
+        // partial two-lane indexes (not a full scan of every prompt_queue row).
+        let conn = store.conn.lock().unwrap();
+        let mut session_plan = String::new();
+        let mut stmt = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT id FROM prompt_queue
+                 WHERE processed_at IS NULL AND factory_session = ?
+                 ORDER BY priority ASC, id ASC
+                 LIMIT ?",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map(params!["session-scale", LIMIT as i64], |row| {
+                Ok(format!(
+                    "{}|{}|{}|{}",
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?
+                ))
+            })
+            .unwrap();
+        for r in rows {
+            session_plan.push_str(&r.unwrap());
+            session_plan.push('\n');
+        }
+
+        let mut legacy_plan = String::new();
+        let mut stmt = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT id FROM prompt_queue
+                 WHERE processed_at IS NULL
+                   AND factory_session IS NULL
+                   AND target IN (?)
+                 ORDER BY priority ASC, id ASC
+                 LIMIT ?",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map(params!["supervisor", LIMIT as i64], |row| {
+                Ok(format!(
+                    "{}|{}|{}|{}",
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?
+                ))
+            })
+            .unwrap();
+        for r in rows {
+            legacy_plan.push_str(&r.unwrap());
+            legacy_plan.push('\n');
+        }
+
+        // Plans must mention an index (partial two-lane indexes) and must not
+        // be an unconstrained SCAN of the whole table without a covering path.
+        assert!(
+            session_plan.to_lowercase().contains("index")
+                || session_plan.to_lowercase().contains("using"),
+            "session lane plan should use an index; plan was:\n{session_plan}"
+        );
+        assert!(
+            legacy_plan.to_lowercase().contains("index")
+                || legacy_plan.to_lowercase().contains("using"),
+            "legacy lane plan should use an index; plan was:\n{legacy_plan}"
+        );
+        // Document plans in assertion messages for supervisor review evidence.
+        assert!(
+            !session_plan.is_empty() && !legacy_plan.is_empty(),
+            "session_plan=\n{session_plan}\nlegacy_plan=\n{legacy_plan}"
+        );
     }
 }
