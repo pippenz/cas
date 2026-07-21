@@ -309,11 +309,35 @@ mod tests {
 
         assert_eq!(got.message_id, "claude-1");
         assert_eq!(got.target, "worker-a");
-        assert_eq!(got.delivered_at_ms, Some(1_000));
-        assert_eq!(got.wake_at_ms, Some(1_000));
-        assert_eq!(got.first_reaction_at_ms, Some(4_000));
+        let got_json = serde_json::to_value(&got).unwrap();
+        assert!(
+            got_json["enqueued_at_ms"].is_null(),
+            "recorded adapters must not fabricate enqueue timestamps: {got_json}"
+        );
+        assert!(
+            got_json["selected_at_ms"].is_null(),
+            "recorded adapters must not fabricate selection timestamps: {got_json}"
+        );
+        assert_eq!(got.delivered_at_ms, Some(1_184_957_201_000));
+        assert_eq!(
+            got.wake_at_ms, None,
+            "Claude inbox persistence is delivery evidence, not worker wake evidence"
+        );
+        assert_eq!(got.first_reaction_at_ms, Some(1_184_957_204_000));
         assert_eq!(got.reaction_status.as_deref(), Some("OBSERVED"));
         assert_eq!(got.terminal, "delivered");
+    }
+
+    #[test]
+    fn timestamp_ms_preserves_full_rfc3339_epoch_across_day_boundary() {
+        assert_eq!(
+            timestamp_ms("2026-07-21T23:59:59.999Z"),
+            Some(1_184_982_399_999)
+        );
+        assert_eq!(
+            timestamp_ms("2026-07-22T00:00:00.001Z"),
+            Some(1_184_982_400_001)
+        );
     }
 
     #[test]
@@ -337,9 +361,9 @@ mod tests {
         })
         .expect("codex fixture should parse");
 
-        assert_eq!(got.delivered_at_ms, Some(2_000));
-        assert_eq!(got.wake_at_ms, Some(3_000));
-        assert_eq!(got.first_reaction_at_ms, Some(6_000));
+        assert_eq!(got.delivered_at_ms, Some(1_184_957_202_000));
+        assert_eq!(got.wake_at_ms, Some(1_184_957_203_000));
+        assert_eq!(got.first_reaction_at_ms, Some(1_184_957_206_000));
         assert_eq!(got.reaction_status.as_deref(), Some("OBSERVED"));
     }
 
