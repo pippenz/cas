@@ -272,7 +272,7 @@ impl CasCore {
                 "failed to park task awaiting merge after close rejection"
             );
         } else {
-            // cas-062d: durable lifecycle push for AwaitingMerge + close-rejected.
+            // cas-062d / cas-17e4: durable outbox for AwaitingMerge + close-rejected.
             let actor = self.get_agent_id().unwrap_or_else(|_| "unknown".into());
             let actor_name = self
                 .open_agent_store()
@@ -280,6 +280,8 @@ impl CasCore {
                 .and_then(|s| s.get(&actor).ok())
                 .map(|a| a.name)
                 .unwrap_or_else(|| actor.clone());
+            let occurrence =
+                super::supervisor_push::occurrence_from_updated_at(parked.updated_at);
             if let Err(e) = self.push_task_lifecycle(
                 &task.id,
                 &task.title,
@@ -288,11 +290,12 @@ impl CasCore {
                 &actor_name,
                 Some(reason),
                 super::supervisor_push::LifecycleTransition::AwaitingMerge,
+                &occurrence,
             ) {
                 tracing::error!(
                     task_id = %task.id,
                     error = %e,
-                    "supervisor lifecycle push failed after AwaitingMerge park"
+                    "supervisor lifecycle push failed after AwaitingMerge park (task remains AwaitingMerge; replay outbox)"
                 );
             }
             if let Err(e) = self.push_task_lifecycle(
@@ -303,11 +306,12 @@ impl CasCore {
                 &actor_name,
                 Some(reason),
                 super::supervisor_push::LifecycleTransition::CloseRejected,
+                &occurrence,
             ) {
                 tracing::error!(
                     task_id = %task.id,
                     error = %e,
-                    "supervisor lifecycle push failed after close rejection"
+                    "supervisor lifecycle push failed after close rejection (task remains AwaitingMerge; replay outbox)"
                 );
             }
         }
@@ -1904,7 +1908,7 @@ impl CasCore {
             data: None,
         })?;
 
-        // cas-062d: durable Closed lifecycle push after successful close.
+        // cas-062d / cas-17e4: durable Closed outbox push after successful close.
         {
             let actor = self
                 .get_agent_id()
@@ -1916,6 +1920,8 @@ impl CasCore {
                         .map(|a| a.name)
                 })
                 .unwrap_or_else(|| "unknown".into());
+            let occurrence =
+                super::supervisor_push::occurrence_from_updated_at(task.updated_at);
             if let Err(e) = self.push_task_lifecycle(
                 &req.id,
                 &task.title,
@@ -1924,15 +1930,24 @@ impl CasCore {
                 &actor,
                 req.reason.as_deref(),
                 super::supervisor_push::LifecycleTransition::Closed,
+                &occurrence,
             ) {
-                // Task is already Closed — surface push failure without
-                // rolling back task state. Retry is idempotent by transition_key.
+                let key = super::supervisor_push::transition_key(
+                    &req.id,
+                    old_status_for_lifecycle,
+                    TaskStatus::Closed,
+                    std::env::var("CAS_FACTORY_SESSION").ok().as_deref(),
+                    super::supervisor_push::LifecycleTransition::Closed,
+                    &occurrence,
+                );
                 return Err(Self::error(
                     ErrorCode::INTERNAL_ERROR,
-                    format!(
-                        "Task {} closed, but supervisor lifecycle push failed: {e}. \
-                         Task state is Closed; retry is safe (idempotent).",
-                        req.id
+                    super::supervisor_push::lifecycle_push_failure_message(
+                        &req.id,
+                        TaskStatus::Closed,
+                        super::supervisor_push::LifecycleTransition::Closed,
+                        &key,
+                        &e,
                     ),
                 ));
             }
@@ -1971,9 +1986,12 @@ impl CasCore {
                             format!("{}\n\n{}", dependent_task.notes, unblock_note);
                     }
                     if task_store.update(&dependent_task).is_ok() {
-                        // cas-062d: ready/reopened push for auto-unblocked dependents.
+                        // cas-062d / cas-17e4: ready/reopened outbox for auto-unblocked dependents.
                         let dep_id = dependent_task.id.clone();
                         let dep_title = dependent_task.title.clone();
+                        let occurrence = super::supervisor_push::occurrence_from_updated_at(
+                            dependent_task.updated_at,
+                        );
                         let actor = self
                             .get_agent_id()
                             .ok()
@@ -1992,11 +2010,12 @@ impl CasCore {
                             &actor,
                             Some("auto-unblocked"),
                             super::supervisor_push::LifecycleTransition::ReadyReopened,
+                            &occurrence,
                         ) {
                             tracing::error!(
                                 task_id = %dep_id,
                                 error = %e,
-                                "supervisor lifecycle push failed after auto-unblock"
+                                "supervisor lifecycle push failed after auto-unblock (task remains Open; replay outbox)"
                             );
                         }
                         auto_unblocked_tasks.push(dep_id);
@@ -2417,7 +2436,7 @@ impl CasCore {
             data: None,
         })?;
 
-        // cas-062d: ready/reopened lifecycle push after successful reopen.
+        // cas-062d / cas-17e4: ready/reopened outbox after successful reopen.
         let actor = self
             .get_agent_id()
             .ok()
@@ -2428,6 +2447,7 @@ impl CasCore {
                     .map(|a| a.name)
             })
             .unwrap_or_else(|| "unknown".into());
+        let occurrence = super::supervisor_push::occurrence_from_updated_at(task.updated_at);
         if let Err(e) = self.push_task_lifecycle(
             &req.id,
             &task.title,
@@ -2436,13 +2456,24 @@ impl CasCore {
             &actor,
             Some("reopen"),
             super::supervisor_push::LifecycleTransition::ReadyReopened,
+            &occurrence,
         ) {
+            let key = super::supervisor_push::transition_key(
+                &req.id,
+                old_status,
+                TaskStatus::Open,
+                std::env::var("CAS_FACTORY_SESSION").ok().as_deref(),
+                super::supervisor_push::LifecycleTransition::ReadyReopened,
+                &occurrence,
+            );
             return Err(Self::error(
                 ErrorCode::INTERNAL_ERROR,
-                format!(
-                    "Task {} reopened, but supervisor lifecycle push failed: {e}. \
-                     Task state is Open; retry is safe (idempotent).",
-                    req.id
+                super::supervisor_push::lifecycle_push_failure_message(
+                    &req.id,
+                    TaskStatus::Open,
+                    super::supervisor_push::LifecycleTransition::ReadyReopened,
+                    &key,
+                    &e,
                 ),
             ));
         }

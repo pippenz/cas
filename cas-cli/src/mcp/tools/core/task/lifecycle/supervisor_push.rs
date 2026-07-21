@@ -1,11 +1,12 @@
-//! Centralized task lifecycle → owning-supervisor push (cas-062d).
+//! Centralized task lifecycle → owning-supervisor push (cas-062d / cas-17e4).
 //!
 //! Single transition-to-event seam so start / blocked / ready / close-rejected /
 //! awaiting-merge / closed cannot drift. Events are durable in
-//! `supervisor_queue` (idempotent by transition identity) and also enqueued to
-//! `prompt_queue` for factory-session delivery to the supervisor pane.
+//! `supervisor_queue` (idempotent by **occurrence** identity) and delivered via
+//! `prompt_queue` as an outbox step: replaying an existing durable row retries
+//! missing prompt delivery rather than suppressing it.
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde_json::json;
 
 use cas_store::{
@@ -51,28 +52,63 @@ impl LifecycleTransition {
 /// Result of a lifecycle push attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LifecyclePushResult {
-    /// New durable event enqueued (supervisor_queue id).
+    /// New durable event enqueued and prompt delivery completed (or no prompt path).
     Enqueued { notification_id: i64 },
-    /// Same transition_key already present — no duplicate row.
-    DuplicateSuppressed { notification_id: i64 },
+    /// Durable row already present; prompt delivery was completed (or re-stamped) without
+    /// inserting a second durable event.
+    Recovered { notification_id: i64 },
+    /// Same occurrence fully complete (durable + prompt) — no new side effects.
+    AlreadyComplete { notification_id: i64 },
     /// No owning supervisor found for the factory session (non-factory or empty).
     NoSupervisor,
 }
 
-/// Build stable transition identity for idempotency.
+/// Build occurrence-scoped transition identity for idempotency (cas-17e4).
 ///
-/// Includes factory_session so the same task transition in two concurrent
-/// factories never collides or leaks.
+/// Includes:
+/// - factory_session so concurrent factories never collide/leak
+/// - occurrence_id (typically post-mutation `task.updated_at`) so two legitimate
+///   Open→InProgress cycles (start → block → ready → start) produce distinct events,
+///   while retrying the *same* occurrence still dedupes
 pub fn transition_key(
     task_id: &str,
     old_status: TaskStatus,
     new_status: TaskStatus,
     factory_session: Option<&str>,
     kind: LifecycleTransition,
+    occurrence_id: &str,
 ) -> String {
     format!(
-        "{task_id}:{old_status}:{new_status}:{}:{}",
+        "{task_id}:{old_status}:{new_status}:{}:{}:{occurrence_id}",
         factory_session.unwrap_or(""),
+        kind.as_event_type()
+    )
+}
+
+/// Format occurrence id from a post-mutation timestamp (stable for that write).
+pub fn occurrence_from_updated_at(updated_at: DateTime<Utc>) -> String {
+    updated_at.to_rfc3339()
+}
+
+/// Truthful repair guidance after task mutation succeeded but lifecycle push failed.
+///
+/// Never claims that re-running the task operation is safe — status may already
+/// make that operation illegal/no-op. Names current state and the outbox replay path.
+pub fn lifecycle_push_failure_message(
+    task_id: &str,
+    current_status: TaskStatus,
+    kind: LifecycleTransition,
+    transition_key: &str,
+    error: &str,
+) -> String {
+    format!(
+        "Task {task_id} is already {current_status}; supervisor lifecycle push \
+         for {} failed: {error}. \
+         Task state was NOT rolled back. \
+         Repair: replay lifecycle outbox for transition_key={transition_key} \
+         (durable event may already exist — prompt delivery will retry). \
+         Do NOT re-run the original task operation solely to recover the event; \
+         that operation may now be illegal or a no-op for status={current_status}.",
         kind.as_event_type()
     )
 }
@@ -129,14 +165,51 @@ pub fn resolve_owning_supervisor(
     })
 }
 
-/// Emit one lifecycle transition to the owning supervisor.
+fn build_prompt_body(
+    kind: LifecycleTransition,
+    task_id: &str,
+    task_title: &str,
+    old_status: TaskStatus,
+    new_status: TaskStatus,
+    actor: &str,
+    reason: Option<&str>,
+    notification_id: i64,
+    factory_session: Option<&str>,
+    occurrence_id: &str,
+) -> String {
+    format!(
+        "<task-lifecycle transition=\"{}\" task_id=\"{}\" old=\"{}\" new=\"{}\" actor=\"{}\" \
+         notification_id=\"{}\" occurrence=\"{}\">\n\
+         Task {} — {}\n\
+         {}{}\
+         </task-lifecycle>",
+        kind.as_event_type(),
+        task_id,
+        old_status,
+        new_status,
+        actor,
+        notification_id,
+        occurrence_id,
+        task_id,
+        task_title,
+        reason.map(|r| format!("Reason: {r}\n")).unwrap_or_default(),
+        factory_session
+            .map(|s| format!("Session: {s}\n"))
+            .unwrap_or_default(),
+    )
+}
+
+/// Emit one lifecycle transition to the owning supervisor (outbox workflow).
 ///
-/// - **Durable:** `supervisor_queue.notify_idempotent` (fails hard if queue write fails)
-/// - **Deliverable:** best-effort `prompt_queue` enqueue to supervisor (session-tagged)
-///   so the factory daemon can inject without free-form worker prose.
+/// 1. **Durable:** `supervisor_queue.notify_idempotent` keyed by occurrence identity
+/// 2. **Prompt:** if not yet marked `prompt_delivered`, enqueue to prompt_queue then stamp
 ///
-/// Task mutation must already have succeeded. Callers must surface queue-write
-/// errors and must not claim a successful push when this returns `Err`.
+/// Replaying the same occurrence after a prompt failure retries prompt delivery and
+/// stamps delivery exactly once. Distinct occurrences (different `occurrence_id`) always
+/// create distinct durable rows.
+///
+/// Task mutation must already have succeeded. Callers must surface errors with
+/// [`lifecycle_push_failure_message`] — never claim the original task op retry is safe.
 #[allow(clippy::too_many_arguments)]
 pub fn emit_task_lifecycle_transition(
     supervisor_queue: &dyn SupervisorQueueStore,
@@ -149,6 +222,7 @@ pub fn emit_task_lifecycle_transition(
     actor: &str,
     reason: Option<&str>,
     kind: LifecycleTransition,
+    occurrence_id: &str,
 ) -> Result<LifecyclePushResult, String> {
     let factory_session = std::env::var("CAS_FACTORY_SESSION").ok();
     let Some(supervisor) = resolve_owning_supervisor(agent_store, factory_session.as_deref())
@@ -162,6 +236,7 @@ pub fn emit_task_lifecycle_transition(
         new_status,
         factory_session.as_deref(),
         kind,
+        occurrence_id,
     );
     let now = Utc::now();
     let payload = json!({
@@ -175,6 +250,8 @@ pub fn emit_task_lifecycle_transition(
         "factory_session": factory_session,
         "supervisor_id": supervisor.agent_id,
         "supervisor_name": supervisor.name,
+        "occurrence_id": occurrence_id,
+        "transition_key": key,
         "timestamp": now.to_rfc3339(),
     })
     .to_string();
@@ -190,61 +267,77 @@ pub fn emit_task_lifecycle_transition(
         )
         .map_err(|e| format!("supervisor_queue write failed: {e}"))?;
 
-    let notification_id = match result {
-        NotifyIdempotentResult::Created(id) => id,
-        NotifyIdempotentResult::AlreadyExists(id) => {
-            return Ok(LifecyclePushResult::DuplicateSuppressed {
-                notification_id: id,
-            });
-        }
+    let (notification_id, already_existed, prompt_already_delivered) = match result {
+        NotifyIdempotentResult::Created(id) => (id, false, false),
+        NotifyIdempotentResult::AlreadyExists {
+            id,
+            prompt_delivered,
+        } => (id, true, prompt_delivered),
     };
 
-    // Delivery path: structured coordination message to supervisor pane.
+    // Fully complete occurrence — no side effects.
+    if prompt_already_delivered {
+        return Ok(LifecyclePushResult::AlreadyComplete { notification_id });
+    }
+
+    // Outbox step: deliver real-time prompt (retry-safe when durable already exists).
     if let Some(pq) = prompt_queue {
-        let body = format!(
-            "<task-lifecycle transition=\"{}\" task_id=\"{}\" old=\"{}\" new=\"{}\" actor=\"{}\" notification_id=\"{}\">\n\
-             Task {} — {}\n\
-             {}{}\
-             </task-lifecycle>",
-            kind.as_event_type(),
+        let body = build_prompt_body(
+            kind,
             task_id,
+            task_title,
             old_status,
             new_status,
             actor,
+            reason,
             notification_id,
-            task_id,
-            task_title,
-            reason.map(|r| format!("Reason: {r}\n")).unwrap_or_default(),
-            factory_session
-                .as_deref()
-                .map(|s| format!("Session: {s}\n"))
-                .unwrap_or_default(),
+            factory_session.as_deref(),
+            occurrence_id,
         );
-        let summary = format!("{}: {}", kind.as_event_type(), task_id);
-        if let Some(ref sess) = factory_session {
-            pq.enqueue_with_summary(
-                actor,
-                "supervisor",
-                &body,
-                Some(sess.as_str()),
-                Some(&summary),
+        let summary = format!("{}: {} ({})", kind.as_event_type(), task_id, occurrence_id);
+        // Include notification_id in source tag so duplicate retries are diagnosable;
+        // body carries notification_id so consumers can dedupe if a race double-enqueues.
+        let source = format!("lifecycle:{notification_id}");
+        pq.enqueue_with_summary(
+            &source,
+            "supervisor",
+            &body,
+            factory_session.as_deref(),
+            Some(&summary),
+        )
+        .map_err(|e| {
+            format!(
+                "prompt_queue write failed after durable enqueue \
+                 (notification_id={notification_id}, transition_key={key}): {e}"
             )
-            .map_err(|e| format!("prompt_queue write failed after durable enqueue: {e}"))?;
-        } else {
-            pq.enqueue_with_summary(actor, "supervisor", &body, None, Some(&summary))
-                .map_err(|e| format!("prompt_queue write failed after durable enqueue: {e}"))?;
-        }
+        })?;
     }
 
-    Ok(LifecyclePushResult::Enqueued { notification_id })
+    supervisor_queue
+        .mark_prompt_delivered(notification_id)
+        .map_err(|e| {
+            format!(
+                "failed to stamp prompt_delivered_at for notification_id={notification_id}: {e}"
+            )
+        })?;
+
+    if already_existed {
+        Ok(LifecyclePushResult::Recovered { notification_id })
+    } else {
+        Ok(LifecyclePushResult::Enqueued { notification_id })
+    }
 }
 
 impl CasCore {
-    /// Push a lifecycle transition after a successful task mutation (cas-062d).
+    /// Push a lifecycle transition after a successful task mutation (cas-062d / cas-17e4).
     ///
-    /// Returns `Ok(None)` when no factory supervisor is present. Returns `Err`
-    /// when the durable supervisor_queue write fails — callers must surface it
-    /// and must not claim the push succeeded.
+    /// `occurrence_id` must identify this mutation (typically
+    /// [`occurrence_from_updated_at`] of the post-write `updated_at`).
+    ///
+    /// Returns `Ok(None)` only when wrapping returns None internally (always Some result).
+    /// Returns `Err` when durable write or prompt outbox step fails — callers must surface
+    /// via [`lifecycle_push_failure_message`].
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn push_task_lifecycle(
         &self,
         task_id: &str,
@@ -254,14 +347,15 @@ impl CasCore {
         actor: &str,
         reason: Option<&str>,
         kind: LifecycleTransition,
-    ) -> Result<Option<LifecyclePushResult>, String> {
+        occurrence_id: &str,
+    ) -> Result<LifecyclePushResult, String> {
         let agent_store = self
             .open_agent_store()
             .map_err(|e| format!("agent store: {e}"))?;
         let sq = open_supervisor_queue_store(&self.cas_root)
             .map_err(|e| format!("supervisor_queue open: {e}"))?;
         let pq = open_prompt_queue_store(&self.cas_root).ok();
-        let result = emit_task_lifecycle_transition(
+        emit_task_lifecycle_transition(
             sq.as_ref(),
             pq.as_ref().map(|a| a.as_ref() as &dyn PromptQueueStore),
             agent_store.as_ref(),
@@ -272,15 +366,18 @@ impl CasCore {
             actor,
             reason,
             kind,
-        )?;
-        Ok(Some(result))
+            occurrence_id,
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cas_store::{SqliteAgentStore, SqliteSupervisorQueueStore, SupervisorQueueStore};
+    use cas_store::{
+        PromptQueueStore, SqliteAgentStore, SqlitePromptQueueStore, SqliteSupervisorQueueStore,
+        SupervisorQueueStore,
+    };
     use cas_types::{Agent, AgentRole, AgentStatus};
     use std::sync::Mutex;
     use tempfile::TempDir;
@@ -289,13 +386,14 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
-    fn transition_key_includes_session_for_isolation() {
+    fn transition_key_includes_session_and_occurrence() {
         let a = transition_key(
             "cas-1",
             TaskStatus::InProgress,
             TaskStatus::Closed,
             Some("sess-a"),
             LifecycleTransition::Closed,
+            "occ-1",
         );
         let b = transition_key(
             "cas-1",
@@ -303,20 +401,31 @@ mod tests {
             TaskStatus::Closed,
             Some("sess-b"),
             LifecycleTransition::Closed,
+            "occ-1",
+        );
+        let c = transition_key(
+            "cas-1",
+            TaskStatus::InProgress,
+            TaskStatus::Closed,
+            Some("sess-a"),
+            LifecycleTransition::Closed,
+            "occ-2",
         );
         assert_ne!(a, b);
+        assert_ne!(a, c);
         assert!(a.contains("sess-a"));
-        assert!(b.contains("sess-b"));
+        assert!(a.contains("occ-1"));
     }
 
     #[test]
-    fn transition_key_stable_for_same_identity() {
+    fn transition_key_stable_for_same_occurrence() {
         let a = transition_key(
             "cas-1",
             TaskStatus::Open,
             TaskStatus::InProgress,
             Some("s"),
             LifecycleTransition::Started,
+            "t1",
         );
         let b = transition_key(
             "cas-1",
@@ -324,8 +433,30 @@ mod tests {
             TaskStatus::InProgress,
             Some("s"),
             LifecycleTransition::Started,
+            "t1",
         );
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn two_start_cycles_get_distinct_keys() {
+        let start1 = transition_key(
+            "cas-1",
+            TaskStatus::Open,
+            TaskStatus::InProgress,
+            Some("s"),
+            LifecycleTransition::Started,
+            "t-start-1",
+        );
+        let start2 = transition_key(
+            "cas-1",
+            TaskStatus::Open,
+            TaskStatus::InProgress,
+            Some("s"),
+            LifecycleTransition::Started,
+            "t-start-2",
+        );
+        assert_ne!(start1, start2);
     }
 
     #[test]
@@ -345,6 +476,21 @@ mod tests {
             "task_awaiting_merge"
         );
         assert_eq!(LifecycleTransition::Closed.as_event_type(), "task_closed");
+    }
+
+    #[test]
+    fn failure_message_never_claims_task_op_retry_is_safe() {
+        let msg = lifecycle_push_failure_message(
+            "cas-x",
+            TaskStatus::InProgress,
+            LifecycleTransition::Started,
+            "key",
+            "prompt failed",
+        );
+        assert!(msg.contains("already in_progress"));
+        assert!(msg.contains("Do NOT re-run"));
+        assert!(!msg.to_lowercase().contains("retry is safe"));
+        assert!(msg.contains("transition_key=key"));
     }
 
     fn agent_in_session(id: &str, name: &str, role: AgentRole, session: &str) -> Agent {
@@ -396,7 +542,7 @@ mod tests {
     }
 
     #[test]
-    fn emit_enqueues_once_and_suppresses_duplicate() {
+    fn emit_enqueues_once_and_suppresses_same_occurrence() {
         let _lock = ENV_LOCK.lock().unwrap();
         let prior = std::env::var("CAS_FACTORY_SESSION").ok();
         // SAFETY: ENV_LOCK held for this test body.
@@ -429,6 +575,7 @@ mod tests {
             "worker-1",
             None,
             LifecycleTransition::Started,
+            "occ-1",
         )
         .unwrap();
         let r2 = emit_task_lifecycle_transition(
@@ -442,6 +589,7 @@ mod tests {
             "worker-1",
             None,
             LifecycleTransition::Started,
+            "occ-1",
         )
         .unwrap();
 
@@ -450,11 +598,11 @@ mod tests {
                 LifecyclePushResult::Enqueued {
                     notification_id: id1,
                 },
-                LifecyclePushResult::DuplicateSuppressed {
+                LifecyclePushResult::AlreadyComplete {
                     notification_id: id2,
                 },
             ) => assert_eq!(id1, id2),
-            other => panic!("expected Enqueued then DuplicateSuppressed, got {other:?}"),
+            other => panic!("expected Enqueued then AlreadyComplete, got {other:?}"),
         }
         assert_eq!(sq.pending_count("sup-emit").unwrap(), 1);
         let pending = sq.peek("sup-emit", 10).unwrap();
@@ -463,10 +611,110 @@ mod tests {
         assert!(pending[0].payload.contains("task_started"));
         assert_eq!(
             pending[0].transition_key.as_deref(),
-            Some("cas-t1:open:in_progress:sess-emit:task_started")
+            Some("cas-t1:open:in_progress:sess-emit:task_started:occ-1")
         );
+        assert!(pending[0].prompt_delivered_at.is_some());
 
         // SAFETY: restore env under ENV_LOCK.
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("CAS_FACTORY_SESSION", v),
+                None => std::env::remove_var("CAS_FACTORY_SESSION"),
+            }
+        }
+    }
+
+    #[test]
+    fn emit_two_start_cycles_create_two_events() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let prior = std::env::var("CAS_FACTORY_SESSION").ok();
+        unsafe {
+            std::env::set_var("CAS_FACTORY_SESSION", "sess-cycle");
+        }
+
+        let temp = TempDir::new().unwrap();
+        let agents = SqliteAgentStore::open(temp.path()).unwrap();
+        agents.init().unwrap();
+        agents
+            .register(&agent_in_session(
+                "sup-c",
+                "sup-c",
+                AgentRole::Supervisor,
+                "sess-cycle",
+            ))
+            .unwrap();
+        let sq = SqliteSupervisorQueueStore::open(temp.path()).unwrap();
+        sq.init().unwrap();
+
+        // start₁
+        emit_task_lifecycle_transition(
+            &sq,
+            None,
+            &agents,
+            "cas-c",
+            "C",
+            TaskStatus::Open,
+            TaskStatus::InProgress,
+            "w",
+            None,
+            LifecycleTransition::Started,
+            "t1",
+        )
+        .unwrap();
+        // block
+        emit_task_lifecycle_transition(
+            &sq,
+            None,
+            &agents,
+            "cas-c",
+            "C",
+            TaskStatus::InProgress,
+            TaskStatus::Blocked,
+            "w",
+            None,
+            LifecycleTransition::Blocked,
+            "t2",
+        )
+        .unwrap();
+        // ready
+        emit_task_lifecycle_transition(
+            &sq,
+            None,
+            &agents,
+            "cas-c",
+            "C",
+            TaskStatus::Blocked,
+            TaskStatus::Open,
+            "w",
+            None,
+            LifecycleTransition::ReadyReopened,
+            "t3",
+        )
+        .unwrap();
+        // start₂ — same old/new/kind as start₁ but different occurrence
+        emit_task_lifecycle_transition(
+            &sq,
+            None,
+            &agents,
+            "cas-c",
+            "C",
+            TaskStatus::Open,
+            TaskStatus::InProgress,
+            "w",
+            None,
+            LifecycleTransition::Started,
+            "t4",
+        )
+        .unwrap();
+
+        assert_eq!(sq.pending_count("sup-c").unwrap(), 4);
+        let pending = sq.peek("sup-c", 20).unwrap();
+        let started: Vec<_> = pending
+            .iter()
+            .filter(|n| n.payload.contains("task_started"))
+            .collect();
+        assert_eq!(started.len(), 2, "two legitimate starts must both emit");
+
         unsafe {
             match prior {
                 Some(v) => std::env::set_var("CAS_FACTORY_SESSION", v),
@@ -516,11 +764,103 @@ mod tests {
             "worker",
             Some("waiting"),
             LifecycleTransition::Blocked,
+            "occ-x",
         )
         .unwrap();
 
         assert_eq!(sq.pending_count("sup-a").unwrap(), 1);
         assert_eq!(sq.pending_count("sup-b").unwrap(), 0);
+
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("CAS_FACTORY_SESSION", v),
+                None => std::env::remove_var("CAS_FACTORY_SESSION"),
+            }
+        }
+    }
+
+    /// Simulate partial failure: durable insert without prompt stamp, then recover.
+    #[test]
+    fn durable_without_prompt_recovers_exactly_once_on_replay() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let prior = std::env::var("CAS_FACTORY_SESSION").ok();
+        unsafe {
+            std::env::set_var("CAS_FACTORY_SESSION", "sess-outbox");
+        }
+
+        let temp = TempDir::new().unwrap();
+        let agents = SqliteAgentStore::open(temp.path()).unwrap();
+        agents.init().unwrap();
+        agents
+            .register(&agent_in_session(
+                "sup-o",
+                "sup-o",
+                AgentRole::Supervisor,
+                "sess-outbox",
+            ))
+            .unwrap();
+        let sq = SqliteSupervisorQueueStore::open(temp.path()).unwrap();
+        sq.init().unwrap();
+        let pq = SqlitePromptQueueStore::open(temp.path()).unwrap();
+        pq.init().unwrap();
+
+        let key = "cas-o:open:in_progress:sess-outbox:task_started:occ-outbox";
+        // Inject partial failure: durable row exists, prompt not stamped.
+        let created = sq
+            .notify_idempotent(
+                "sup-o",
+                "task_lifecycle",
+                r#"{"task_id":"cas-o"}"#,
+                NotificationPriority::Normal,
+                key,
+            )
+            .unwrap();
+        let id = match created {
+            NotifyIdempotentResult::Created(id) => id,
+            other => panic!("expected Created, got {other:?}"),
+        };
+        assert!(sq.get_by_transition_key(key).unwrap().unwrap().prompt_delivered_at.is_none());
+
+        // Replay via emit: must deliver prompt + stamp, not insert second durable row.
+        let r2 = emit_task_lifecycle_transition(
+            &sq,
+            Some(&pq as &dyn PromptQueueStore),
+            &agents,
+            "cas-o",
+            "O",
+            TaskStatus::Open,
+            TaskStatus::InProgress,
+            "w",
+            None,
+            LifecycleTransition::Started,
+            "occ-outbox",
+        )
+        .expect("replay must succeed");
+        assert!(
+            matches!(r2, LifecyclePushResult::Recovered { notification_id } if notification_id == id),
+            "got {r2:?}"
+        );
+        assert_eq!(sq.pending_count("sup-o").unwrap(), 1);
+        assert!(sq.get_by_transition_key(key).unwrap().unwrap().prompt_delivered_at.is_some());
+        assert_eq!(pq.pending_count().unwrap(), 1);
+
+        // Third call: fully complete — no additional prompt row.
+        let r3 = emit_task_lifecycle_transition(
+            &sq,
+            Some(&pq as &dyn PromptQueueStore),
+            &agents,
+            "cas-o",
+            "O",
+            TaskStatus::Open,
+            TaskStatus::InProgress,
+            "w",
+            None,
+            LifecycleTransition::Started,
+            "occ-outbox",
+        )
+        .unwrap();
+        assert!(matches!(r3, LifecyclePushResult::AlreadyComplete { .. }));
+        assert_eq!(pq.pending_count().unwrap(), 1, "exactly-once prompt delivery");
 
         unsafe {
             match prior {

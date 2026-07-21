@@ -748,6 +748,10 @@ impl CasCore {
                             .map(|a| a.name)
                     })
                     .unwrap_or_else(|| "unknown".into());
+                let occurrence =
+                    crate::mcp::tools::core::task::lifecycle::supervisor_push::occurrence_from_updated_at(
+                        task.updated_at,
+                    );
                 if let Err(e) = self.push_task_lifecycle(
                     &req.id,
                     &task.title,
@@ -756,14 +760,22 @@ impl CasCore {
                     &actor,
                     None,
                     kind,
+                    &occurrence,
                 ) {
+                    use crate::mcp::tools::core::task::lifecycle::supervisor_push::{
+                        lifecycle_push_failure_message, transition_key,
+                    };
+                    let key = transition_key(
+                        &req.id,
+                        old_st,
+                        new_st,
+                        std::env::var("CAS_FACTORY_SESSION").ok().as_deref(),
+                        kind,
+                        &occurrence,
+                    );
                     return Err(Self::error(
                         ErrorCode::INTERNAL_ERROR,
-                        format!(
-                            "Task {} updated, but supervisor lifecycle push failed: {e}. \
-                             Task state is {new_st}; retry is safe (idempotent).",
-                            req.id
-                        ),
+                        lifecycle_push_failure_message(&req.id, new_st, kind, &key, &e),
                     ));
                 }
             }

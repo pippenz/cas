@@ -58,18 +58,26 @@ pub struct SupervisorNotification {
     pub created_at: DateTime<Utc>,
     /// When the notification was processed (None if pending)
     pub processed_at: Option<DateTime<Utc>>,
-    /// Optional idempotency key (cas-062d lifecycle transitions).
+    /// Optional idempotency key (cas-062d / cas-17e4 lifecycle transitions).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transition_key: Option<String>,
+    /// When prompt_queue delivery for this row succeeded (cas-17e4 outbox).
+    /// None means durable event may exist without real-time prompt delivery yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_delivered_at: Option<DateTime<Utc>>,
 }
 
-/// Result of an idempotent notify (cas-062d).
+/// Result of an idempotent notify (cas-062d / cas-17e4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotifyIdempotentResult {
-    /// New row inserted.
+    /// New row inserted (prompt not yet delivered).
     Created(i64),
     /// Existing row for the same transition_key (no duplicate insert).
-    AlreadyExists(i64),
+    /// `prompt_delivered` is true when outbox prompt handoff already completed.
+    AlreadyExists {
+        id: i64,
+        prompt_delivered: bool,
+    },
 }
 
 /// Schema for supervisor queue table
@@ -97,6 +105,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_supervisor_queue_transition_key
     ON supervisor_queue(transition_key)
     WHERE transition_key IS NOT NULL;
 "#;
+/// Outbox marker: real-time prompt delivery completed (cas-17e4).
+const SUPERVISOR_QUEUE_PROMPT_DELIVERED_MIGRATION: &str = r#"
+ALTER TABLE supervisor_queue ADD COLUMN prompt_delivered_at TEXT;
+"#;
 
 /// Trait for supervisor queue operations
 pub trait SupervisorQueueStore: Send + Sync {
@@ -112,10 +124,11 @@ pub trait SupervisorQueueStore: Send + Sync {
         priority: NotificationPriority,
     ) -> Result<i64>;
 
-    /// Idempotent notify keyed by `transition_key` (cas-062d).
+    /// Idempotent notify keyed by `transition_key` (cas-062d / cas-17e4).
     ///
     /// Replaying the same transition identity returns [`NotifyIdempotentResult::AlreadyExists`]
-    /// without inserting a second row — no duplicate supervisor reactions.
+    /// without inserting a second row. Callers must still attempt prompt delivery when
+    /// `prompt_delivered` is false (outbox recovery).
     fn notify_idempotent(
         &self,
         supervisor_id: &str,
@@ -124,6 +137,13 @@ pub trait SupervisorQueueStore: Send + Sync {
         priority: NotificationPriority,
         transition_key: &str,
     ) -> Result<NotifyIdempotentResult>;
+
+    /// Mark prompt_queue delivery complete for a durable notification (cas-17e4 outbox).
+    /// Idempotent: safe to call again after success.
+    fn mark_prompt_delivered(&self, notification_id: i64) -> Result<()>;
+
+    /// Look up a notification by transition_key (repair / tests).
+    fn get_by_transition_key(&self, transition_key: &str) -> Result<Option<SupervisorNotification>>;
 
     /// Poll for pending notifications (ordered by priority, then created_at)
     /// Returns up to `limit` notifications and marks them as processed
@@ -180,6 +200,10 @@ impl SqliteSupervisorQueueStore {
         let processed_at = processed_at_str.and_then(|s| Self::parse_datetime(&s));
         // Column 7 = transition_key (cas-062d); tolerate pre-migration tables.
         let transition_key: Option<String> = row.get(7).unwrap_or(None);
+        // Column 8 = prompt_delivered_at (cas-17e4); tolerate pre-migration.
+        let prompt_delivered_at_str: Option<String> = row.get(8).unwrap_or(None);
+        let prompt_delivered_at =
+            prompt_delivered_at_str.and_then(|s| Self::parse_datetime(&s));
 
         Ok(SupervisorNotification {
             id: row.get(0)?,
@@ -190,6 +214,7 @@ impl SqliteSupervisorQueueStore {
             created_at: Self::parse_datetime(&row.get::<_, String>(5)?).unwrap_or_else(Utc::now),
             processed_at,
             transition_key,
+            prompt_delivered_at,
         })
     }
 }
@@ -206,6 +231,13 @@ impl SupervisorQueueStore for SqliteSupervisorQueueStore {
             conn.execute_batch(SUPERVISOR_QUEUE_TRANSITION_KEY_MIGRATION)?;
         }
         conn.execute_batch(SUPERVISOR_QUEUE_TRANSITION_KEY_INDEX)?;
+        // cas-17e4: outbox prompt-delivery marker
+        if conn
+            .prepare_cached("SELECT prompt_delivered_at FROM supervisor_queue LIMIT 0")
+            .is_err()
+        {
+            conn.execute_batch(SUPERVISOR_QUEUE_PROMPT_DELIVERED_MIGRATION)?;
+        }
         Ok(())
     }
 
@@ -262,13 +294,50 @@ impl SupervisorQueueStore for SqliteSupervisorQueueStore {
                 return Ok(NotifyIdempotentResult::Created(conn.last_insert_rowid()));
             }
 
-            let existing_id: i64 = conn.query_row(
-                "SELECT id FROM supervisor_queue WHERE transition_key = ?",
+            let (existing_id, prompt_delivered_at): (i64, Option<String>) = conn.query_row(
+                "SELECT id, prompt_delivered_at FROM supervisor_queue WHERE transition_key = ?",
                 params![transition_key],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
-            Ok(NotifyIdempotentResult::AlreadyExists(existing_id))
+            Ok(NotifyIdempotentResult::AlreadyExists {
+                id: existing_id,
+                prompt_delivered: prompt_delivered_at.is_some(),
+            })
         })
+    }
+
+    fn mark_prompt_delivered(&self, notification_id: i64) -> Result<()> {
+        crate::shared_db::with_write_retry(|| {
+            let conn = self.conn.lock().unwrap();
+            let now = Utc::now().to_rfc3339();
+            // Only stamp once — preserve original delivery time on replay.
+            conn.execute(
+                "UPDATE supervisor_queue
+                 SET prompt_delivered_at = ?
+                 WHERE id = ? AND prompt_delivered_at IS NULL",
+                params![now, notification_id],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn get_by_transition_key(
+        &self,
+        transition_key: &str,
+    ) -> Result<Option<SupervisorNotification>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, supervisor_id, event_type, payload, priority, created_at, processed_at,
+                    transition_key, prompt_delivered_at
+             FROM supervisor_queue
+             WHERE transition_key = ?
+             LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![transition_key])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(Self::notification_from_row(row)?)),
+            None => Ok(None),
+        }
     }
 
     fn poll(&self, supervisor_id: &str, limit: usize) -> Result<Vec<SupervisorNotification>> {
@@ -278,7 +347,7 @@ impl SupervisorQueueStore for SqliteSupervisorQueueStore {
 
             // Get pending notifications ordered by priority (ascending = critical first), then created_at
             let mut stmt = conn.prepare_cached(
-            "SELECT id, supervisor_id, event_type, payload, priority, created_at, processed_at, transition_key
+            "SELECT id, supervisor_id, event_type, payload, priority, created_at, processed_at, transition_key, prompt_delivered_at
              FROM supervisor_queue
              WHERE supervisor_id = ? AND processed_at IS NULL
              ORDER BY priority ASC, created_at ASC
@@ -320,7 +389,7 @@ impl SupervisorQueueStore for SqliteSupervisorQueueStore {
         let conn = self.conn.lock().unwrap();
 
         let mut stmt = conn.prepare_cached(
-            "SELECT id, supervisor_id, event_type, payload, priority, created_at, processed_at, transition_key
+            "SELECT id, supervisor_id, event_type, payload, priority, created_at, processed_at, transition_key, prompt_delivered_at
              FROM supervisor_queue
              WHERE supervisor_id = ? AND processed_at IS NULL
              ORDER BY priority ASC, created_at ASC
@@ -373,7 +442,7 @@ impl SupervisorQueueStore for SqliteSupervisorQueueStore {
         let conn = self.conn.lock().unwrap();
 
         let mut stmt = conn.prepare_cached(
-            "SELECT id, supervisor_id, event_type, payload, priority, created_at, processed_at, transition_key
+            "SELECT id, supervisor_id, event_type, payload, priority, created_at, processed_at, transition_key, prompt_delivered_at
              FROM supervisor_queue
              WHERE supervisor_id = ? AND processed_at IS NULL
              ORDER BY priority ASC, created_at ASC",
@@ -452,11 +521,36 @@ mod tests {
                 key,
             )
             .unwrap();
-        match (r1, r2) {
-            (NotifyIdempotentResult::Created(id1), NotifyIdempotentResult::AlreadyExists(id2)) => {
-                assert_eq!(id1, id2)
+        let id = match (r1, r2) {
+            (
+                NotifyIdempotentResult::Created(id1),
+                NotifyIdempotentResult::AlreadyExists {
+                    id: id2,
+                    prompt_delivered,
+                },
+            ) => {
+                assert_eq!(id1, id2);
+                assert!(!prompt_delivered, "fresh insert has no prompt delivery yet");
+                id1
             }
             other => panic!("expected Created then AlreadyExists, got {other:?}"),
+        };
+        store.mark_prompt_delivered(id).unwrap();
+        let r3 = store
+            .notify_idempotent(
+                "sup-a",
+                "task_lifecycle",
+                r#"{"task_id":"cas-x"}"#,
+                NotificationPriority::High,
+                key,
+            )
+            .unwrap();
+        match r3 {
+            NotifyIdempotentResult::AlreadyExists {
+                prompt_delivered: true,
+                ..
+            } => {}
+            other => panic!("expected AlreadyExists prompt_delivered=true, got {other:?}"),
         }
         assert_eq!(store.pending_count("sup-a").unwrap(), 1);
         // Different session key is a separate event (isolation).

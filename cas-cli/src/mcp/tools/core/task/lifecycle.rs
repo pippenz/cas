@@ -745,11 +745,12 @@ impl CasCore {
             }
         }
 
-        // cas-062d: durable push to owning supervisor after successful start.
+        // cas-062d / cas-17e4: durable outbox push after successful start.
         let actor = agent_store
             .get(&agent_id)
             .map(|a| a.name)
             .unwrap_or_else(|_| agent_id.clone());
+        let occurrence = supervisor_push::occurrence_from_updated_at(task.updated_at);
         let push_note = match self.push_task_lifecycle(
             &req.id,
             &task.title,
@@ -758,25 +759,33 @@ impl CasCore {
             &actor,
             None,
             supervisor_push::LifecycleTransition::Started,
+            &occurrence,
         ) {
-            Ok(Some(supervisor_push::LifecyclePushResult::Enqueued { notification_id })) => {
+            Ok(supervisor_push::LifecyclePushResult::Enqueued { notification_id })
+            | Ok(supervisor_push::LifecyclePushResult::Recovered { notification_id }) => {
                 format!("\n\n📡 Supervisor notified (lifecycle event id={notification_id})")
             }
-            Ok(Some(supervisor_push::LifecyclePushResult::DuplicateSuppressed { .. })) => {
-                "\n\n📡 Supervisor lifecycle event already recorded (idempotent)".to_string()
+            Ok(supervisor_push::LifecyclePushResult::AlreadyComplete { .. }) => {
+                "\n\n📡 Supervisor lifecycle event already complete (outbox)".to_string()
             }
-            Ok(Some(supervisor_push::LifecyclePushResult::NoSupervisor)) | Ok(None) => {
-                String::new()
-            }
+            Ok(supervisor_push::LifecyclePushResult::NoSupervisor) => String::new(),
             Err(e) => {
-                // Task state already mutated — surface push failure without
-                // claiming the notification was delivered.
+                let key = supervisor_push::transition_key(
+                    &req.id,
+                    old_status,
+                    TaskStatus::InProgress,
+                    std::env::var("CAS_FACTORY_SESSION").ok().as_deref(),
+                    supervisor_push::LifecycleTransition::Started,
+                    &occurrence,
+                );
                 return Err(Self::error(
                     ErrorCode::INTERNAL_ERROR,
-                    format!(
-                        "Task {} started, but supervisor lifecycle push failed: {e}. \
-                         Task state is InProgress; retry is safe (idempotent).",
-                        req.id
+                    supervisor_push::lifecycle_push_failure_message(
+                        &req.id,
+                        TaskStatus::InProgress,
+                        supervisor_push::LifecycleTransition::Started,
+                        &key,
+                        &e,
                     ),
                 ));
             }
