@@ -97,6 +97,25 @@ CREATE INDEX IF NOT EXISTS idx_prompt_queue_legacy_pending
     WHERE processed_at IS NULL AND factory_session IS NULL;
 "#;
 
+/// Idempotent lifecycle outbox enqueue key (cas-ecff).
+const PROMPT_QUEUE_DEDUPE_KEY_MIGRATION: &str = r#"
+ALTER TABLE prompt_queue ADD COLUMN dedupe_key TEXT;
+"#;
+const PROMPT_QUEUE_DEDUPE_KEY_INDEX: &str = r#"
+CREATE UNIQUE INDEX IF NOT EXISTS idx_prompt_queue_dedupe_key
+    ON prompt_queue(dedupe_key)
+    WHERE dedupe_key IS NOT NULL;
+"#;
+
+/// Result of an idempotent prompt enqueue (cas-ecff).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnqueueIdempotentResult {
+    /// New row inserted.
+    Created(i64),
+    /// Existing row for the same dedupe_key (no second insert).
+    AlreadyExists(i64),
+}
+
 /// Delivery status of a prompt queue message (legacy three-value ladder).
 ///
 /// Preserved for existing MCP/clients. Prefer [`MessageDeliveryReport`] for
@@ -459,6 +478,21 @@ pub trait PromptQueueStore: Send + Sync {
         priority: Option<NotificationPriority>,
         urgent: bool,
     ) -> Result<i64>;
+
+    /// Idempotent enqueue keyed by `dedupe_key` (cas-ecff lifecycle outbox).
+    ///
+    /// Replaying the same key returns [`EnqueueIdempotentResult::AlreadyExists`]
+    /// without inserting a second row — stamp-failure recovery cannot duplicate.
+    fn enqueue_idempotent(
+        &self,
+        source: &str,
+        target: &str,
+        prompt: &str,
+        factory_session: Option<&str>,
+        summary: Option<&str>,
+        priority: Option<NotificationPriority>,
+        dedupe_key: &str,
+    ) -> Result<EnqueueIdempotentResult>;
 
     /// Poll for pending prompts for a specific target (marks as processed)
     fn poll_for_target(&self, target: &str, limit: usize) -> Result<Vec<QueuedPrompt>>;
@@ -1015,6 +1049,15 @@ impl PromptQueueStore for SqlitePromptQueueStore {
         // Two-lane peek indexes (idempotent CREATE INDEX IF NOT EXISTS).
         conn.execute_batch(PROMPT_QUEUE_TWO_LANE_INDEXES)?;
 
+        // cas-ecff: lifecycle outbox dedupe_key
+        if conn
+            .prepare_cached("SELECT dedupe_key FROM prompt_queue LIMIT 0")
+            .is_err()
+        {
+            conn.execute_batch(PROMPT_QUEUE_DEDUPE_KEY_MIGRATION)?;
+        }
+        conn.execute_batch(PROMPT_QUEUE_DEDUPE_KEY_INDEX)?;
+
         Ok(())
     }
 
@@ -1057,6 +1100,52 @@ impl PromptQueueStore for SqlitePromptQueueStore {
             let _ = capture_message_event(&conn, source, target);
             Ok(id)
         }) // with_write_retry
+    }
+
+    fn enqueue_idempotent(
+        &self,
+        source: &str,
+        target: &str,
+        prompt: &str,
+        factory_session: Option<&str>,
+        summary: Option<&str>,
+        priority: Option<NotificationPriority>,
+        dedupe_key: &str,
+    ) -> Result<EnqueueIdempotentResult> {
+        crate::shared_db::with_write_retry(|| {
+            let conn = self.conn.lock().unwrap();
+            let now = Utc::now().to_rfc3339();
+            let prio: i32 = priority.unwrap_or(NotificationPriority::Normal).into();
+
+            let changed = conn.execute(
+                "INSERT OR IGNORE INTO prompt_queue
+                    (source, target, prompt, created_at, factory_session, summary, priority, urgent, dedupe_key)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)",
+                params![
+                    source,
+                    target,
+                    prompt,
+                    now,
+                    factory_session,
+                    summary,
+                    prio,
+                    dedupe_key
+                ],
+            )?;
+
+            if changed > 0 {
+                let id = conn.last_insert_rowid();
+                let _ = capture_message_event(&conn, source, target);
+                return Ok(EnqueueIdempotentResult::Created(id));
+            }
+
+            let existing_id: i64 = conn.query_row(
+                "SELECT id FROM prompt_queue WHERE dedupe_key = ?",
+                params![dedupe_key],
+                |row| row.get(0),
+            )?;
+            Ok(EnqueueIdempotentResult::AlreadyExists(existing_id))
+        })
     }
 
     fn poll_for_target(&self, target: &str, limit: usize) -> Result<Vec<QueuedPrompt>> {

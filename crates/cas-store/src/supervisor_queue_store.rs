@@ -145,6 +145,13 @@ pub trait SupervisorQueueStore: Send + Sync {
     /// Look up a notification by transition_key (repair / tests).
     fn get_by_transition_key(&self, transition_key: &str) -> Result<Option<SupervisorNotification>>;
 
+    /// List lifecycle outbox rows awaiting prompt delivery (cas-ecff).
+    ///
+    /// Returns `task_lifecycle` notifications with a transition_key and
+    /// `prompt_delivered_at IS NULL`, oldest first. Used by
+    /// `drain_lifecycle_outbox` after process restart.
+    fn list_pending_lifecycle_outbox(&self, limit: usize) -> Result<Vec<SupervisorNotification>>;
+
     /// Poll for pending notifications (ordered by priority, then created_at)
     /// Returns up to `limit` notifications and marks them as processed
     fn poll(&self, supervisor_id: &str, limit: usize) -> Result<Vec<SupervisorNotification>>;
@@ -338,6 +345,24 @@ impl SupervisorQueueStore for SqliteSupervisorQueueStore {
             Some(row) => Ok(Some(Self::notification_from_row(row)?)),
             None => Ok(None),
         }
+    }
+
+    fn list_pending_lifecycle_outbox(&self, limit: usize) -> Result<Vec<SupervisorNotification>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, supervisor_id, event_type, payload, priority, created_at, processed_at,
+                    transition_key, prompt_delivered_at
+             FROM supervisor_queue
+             WHERE event_type = 'task_lifecycle'
+               AND transition_key IS NOT NULL
+               AND prompt_delivered_at IS NULL
+             ORDER BY id ASC
+             LIMIT ?",
+        )?;
+        let rows = stmt
+            .query_map(params![limit as i64], Self::notification_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     fn poll(&self, supervisor_id: &str, limit: usize) -> Result<Vec<SupervisorNotification>> {

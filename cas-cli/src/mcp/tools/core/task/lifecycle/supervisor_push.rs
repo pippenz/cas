@@ -1,17 +1,20 @@
-//! Centralized task lifecycle → owning-supervisor push (cas-062d / cas-17e4).
+//! Centralized task lifecycle → owning-supervisor push (cas-062d / cas-17e4 / cas-ecff).
 //!
 //! Single transition-to-event seam so start / blocked / ready / close-rejected /
 //! awaiting-merge / closed cannot drift. Events are durable in
 //! `supervisor_queue` (idempotent by **occurrence** identity) and delivered via
-//! `prompt_queue` as an outbox step: replaying an existing durable row retries
-//! missing prompt delivery rather than suppressing it.
+//! `prompt_queue` as an outbox step:
+//! - prompt enqueue is **required** when an owning supervisor exists (open failure
+//!   leaves durable pending, never stamps delivered)
+//! - prompt rows use a unique `dedupe_key` so stamp-failure replay cannot duplicate
+//! - [`drain_lifecycle_outbox`] repairs pending rows without re-running task mutations
 
 use chrono::{DateTime, Utc};
 use serde_json::json;
 
 use cas_store::{
     AgentStore, NotificationPriority, NotifyIdempotentResult, PromptQueueStore,
-    SupervisorQueueStore,
+    SupervisorNotification, SupervisorQueueStore,
 };
 use cas_types::{AgentRole, TaskStatus};
 
@@ -90,10 +93,15 @@ pub fn occurrence_from_updated_at(updated_at: DateTime<Utc>) -> String {
     updated_at.to_rfc3339()
 }
 
+/// Stable prompt_queue dedupe key for one durable lifecycle notification (cas-ecff).
+pub fn lifecycle_prompt_dedupe_key(notification_id: i64) -> String {
+    format!("lifecycle-outbox:{notification_id}")
+}
+
 /// Truthful repair guidance after task mutation succeeded but lifecycle push failed.
 ///
 /// Never claims that re-running the task operation is safe — status may already
-/// make that operation illegal/no-op. Names current state and the outbox replay path.
+/// make that operation illegal/no-op. Names the **callable** outbox drain path.
 pub fn lifecycle_push_failure_message(
     task_id: &str,
     current_status: TaskStatus,
@@ -105,12 +113,24 @@ pub fn lifecycle_push_failure_message(
         "Task {task_id} is already {current_status}; supervisor lifecycle push \
          for {} failed: {error}. \
          Task state was NOT rolled back. \
-         Repair: replay lifecycle outbox for transition_key={transition_key} \
-         (durable event may already exist — prompt delivery will retry). \
+         Repair: call drain_lifecycle_outbox (CasCore / factory daemon auto-drain) \
+         for transition_key={transition_key} — durable event may already exist with \
+         prompt_delivered_at unmarked; drain re-delivers via idempotent prompt \
+         dedupe_key and stamps delivery exactly once. \
          Do NOT re-run the original task operation solely to recover the event; \
          that operation may now be illegal or a no-op for status={current_status}.",
         kind.as_event_type()
     )
+}
+
+/// Result of draining pending lifecycle outbox rows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LifecycleOutboxDrainReport {
+    pub attempted: usize,
+    pub recovered: usize,
+    pub already_complete: usize,
+    pub failed: usize,
+    pub errors: Vec<String>,
 }
 
 /// Owning supervisor identity for lifecycle push.
@@ -280,46 +300,32 @@ pub fn emit_task_lifecycle_transition(
         return Ok(LifecyclePushResult::AlreadyComplete { notification_id });
     }
 
-    // Outbox step: deliver real-time prompt (retry-safe when durable already exists).
-    if let Some(pq) = prompt_queue {
-        let body = build_prompt_body(
-            kind,
-            task_id,
-            task_title,
-            old_status,
-            new_status,
-            actor,
-            reason,
-            notification_id,
-            factory_session.as_deref(),
-            occurrence_id,
-        );
-        let summary = format!("{}: {} ({})", kind.as_event_type(), task_id, occurrence_id);
-        // Include notification_id in source tag so duplicate retries are diagnosable;
-        // body carries notification_id so consumers can dedupe if a race double-enqueues.
-        let source = format!("lifecycle:{notification_id}");
-        pq.enqueue_with_summary(
-            &source,
-            "supervisor",
-            &body,
-            factory_session.as_deref(),
-            Some(&summary),
-        )
-        .map_err(|e| {
-            format!(
-                "prompt_queue write failed after durable enqueue \
-                 (notification_id={notification_id}, transition_key={key}): {e}"
-            )
-        })?;
-    }
+    // cas-ecff: with an owning supervisor, prompt delivery store is required.
+    // Missing/failed open must leave durable pending (no stamp) and surface repair.
+    let Some(pq) = prompt_queue else {
+        return Err(format!(
+            "prompt_queue unavailable after durable enqueue \
+             (notification_id={notification_id}, transition_key={key}); \
+             durable event left pending (prompt_delivered_at unmarked). \
+             Repair: drain_lifecycle_outbox once prompt_queue is available"
+        ));
+    };
 
-    supervisor_queue
-        .mark_prompt_delivered(notification_id)
-        .map_err(|e| {
-            format!(
-                "failed to stamp prompt_delivered_at for notification_id={notification_id}: {e}"
-            )
-        })?;
+    deliver_prompt_for_notification(
+        supervisor_queue,
+        pq,
+        notification_id,
+        &key,
+        kind,
+        task_id,
+        task_title,
+        old_status,
+        new_status,
+        actor,
+        reason,
+        factory_session.as_deref(),
+        occurrence_id,
+    )?;
 
     if already_existed {
         Ok(LifecyclePushResult::Recovered { notification_id })
@@ -328,15 +334,215 @@ pub fn emit_task_lifecycle_transition(
     }
 }
 
+/// Idempotent prompt handoff + stamp for one durable notification (cas-ecff).
+///
+/// Uses `lifecycle-outbox:{notification_id}` as prompt_queue dedupe_key so a
+/// successful enqueue followed by stamp failure cannot produce a second prompt
+/// row on replay.
+#[allow(clippy::too_many_arguments)]
+fn deliver_prompt_for_notification(
+    supervisor_queue: &dyn SupervisorQueueStore,
+    prompt_queue: &dyn PromptQueueStore,
+    notification_id: i64,
+    transition_key: &str,
+    kind: LifecycleTransition,
+    task_id: &str,
+    task_title: &str,
+    old_status: TaskStatus,
+    new_status: TaskStatus,
+    actor: &str,
+    reason: Option<&str>,
+    factory_session: Option<&str>,
+    occurrence_id: &str,
+) -> Result<(), String> {
+    let body = build_prompt_body(
+        kind,
+        task_id,
+        task_title,
+        old_status,
+        new_status,
+        actor,
+        reason,
+        notification_id,
+        factory_session,
+        occurrence_id,
+    );
+    let summary = format!("{}: {} ({})", kind.as_event_type(), task_id, occurrence_id);
+    let source = format!("lifecycle:{notification_id}");
+    let dedupe = lifecycle_prompt_dedupe_key(notification_id);
+
+    prompt_queue
+        .enqueue_idempotent(
+            &source,
+            "supervisor",
+            &body,
+            factory_session,
+            Some(&summary),
+            Some(kind.priority()),
+            &dedupe,
+        )
+        .map_err(|e| {
+            format!(
+                "prompt_queue write failed after durable enqueue \
+                 (notification_id={notification_id}, transition_key={transition_key}): {e}"
+            )
+        })?;
+
+    supervisor_queue
+        .mark_prompt_delivered(notification_id)
+        .map_err(|e| {
+            format!(
+                "failed to stamp prompt_delivered_at for notification_id={notification_id} \
+                 (prompt may already be enqueued under dedupe_key={dedupe}; \
+                 drain_lifecycle_outbox is safe): {e}"
+            )
+        })?;
+    Ok(())
+}
+
+/// Deliver prompt for a persisted durable outbox row (drain / restart recovery).
+pub fn deliver_lifecycle_outbox_row(
+    supervisor_queue: &dyn SupervisorQueueStore,
+    prompt_queue: &dyn PromptQueueStore,
+    notification: &SupervisorNotification,
+) -> Result<LifecyclePushResult, String> {
+    if notification.event_type != "task_lifecycle" {
+        return Err(format!(
+            "not a task_lifecycle row: event_type={}",
+            notification.event_type
+        ));
+    }
+    if notification.prompt_delivered_at.is_some() {
+        return Ok(LifecyclePushResult::AlreadyComplete {
+            notification_id: notification.id,
+        });
+    }
+
+    let payload: serde_json::Value = serde_json::from_str(&notification.payload)
+        .map_err(|e| format!("corrupt lifecycle payload id={}: {e}", notification.id))?;
+
+    let task_id = payload
+        .get("task_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let task_title = payload
+        .get("title")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let actor = payload
+        .get("actor")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let occurrence_id = payload
+        .get("occurrence_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let key = payload
+        .get("transition_key")
+        .and_then(|v| v.as_str())
+        .or(notification.transition_key.as_deref())
+        .unwrap_or("");
+    let factory_session = payload
+        .get("factory_session")
+        .and_then(|v| v.as_str());
+    let reason = payload.get("reason").and_then(|v| v.as_str());
+    let transition = payload
+        .get("transition")
+        .and_then(|v| v.as_str())
+        .unwrap_or("task_started");
+    let kind = match transition {
+        "task_blocked" => LifecycleTransition::Blocked,
+        "task_ready" => LifecycleTransition::ReadyReopened,
+        "task_close_rejected" => LifecycleTransition::CloseRejected,
+        "task_awaiting_merge" => LifecycleTransition::AwaitingMerge,
+        "task_closed" => LifecycleTransition::Closed,
+        _ => LifecycleTransition::Started,
+    };
+    let old_status = payload
+        .get("old_status")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(TaskStatus::Open);
+    let new_status = payload
+        .get("new_status")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(TaskStatus::InProgress);
+
+    deliver_prompt_for_notification(
+        supervisor_queue,
+        prompt_queue,
+        notification.id,
+        key,
+        kind,
+        task_id,
+        task_title,
+        old_status,
+        new_status,
+        actor,
+        reason,
+        factory_session,
+        occurrence_id,
+    )?;
+
+    Ok(LifecyclePushResult::Recovered {
+        notification_id: notification.id,
+    })
+}
+
+/// Drain all pending lifecycle outbox rows (callable repair + daemon auto-drain).
+///
+/// Does **not** re-run task mutations. Safe after process restart.
+pub fn drain_lifecycle_outbox(
+    supervisor_queue: &dyn SupervisorQueueStore,
+    prompt_queue: &dyn PromptQueueStore,
+    limit: usize,
+) -> Result<LifecycleOutboxDrainReport, String> {
+    let pending = supervisor_queue
+        .list_pending_lifecycle_outbox(limit)
+        .map_err(|e| format!("list pending lifecycle outbox: {e}"))?;
+
+    let mut report = LifecycleOutboxDrainReport {
+        attempted: pending.len(),
+        ..Default::default()
+    };
+
+    for n in pending {
+        match deliver_lifecycle_outbox_row(supervisor_queue, prompt_queue, &n) {
+            Ok(LifecyclePushResult::Recovered { .. })
+            | Ok(LifecyclePushResult::Enqueued { .. }) => {
+                report.recovered += 1;
+            }
+            Ok(LifecyclePushResult::AlreadyComplete { .. }) => {
+                report.already_complete += 1;
+            }
+            Ok(LifecyclePushResult::NoSupervisor) => {
+                report.failed += 1;
+                report.errors.push(format!(
+                    "id={}: unexpected NoSupervisor during drain",
+                    n.id
+                ));
+            }
+            Err(e) => {
+                report.failed += 1;
+                report.errors.push(format!("id={}: {e}", n.id));
+            }
+        }
+    }
+    Ok(report)
+}
+
 impl CasCore {
-    /// Push a lifecycle transition after a successful task mutation (cas-062d / cas-17e4).
+    /// Push a lifecycle transition after a successful task mutation
+    /// (cas-062d / cas-17e4 / cas-ecff).
     ///
     /// `occurrence_id` must identify this mutation (typically
     /// [`occurrence_from_updated_at`] of the post-write `updated_at`).
     ///
-    /// Returns `Ok(None)` only when wrapping returns None internally (always Some result).
-    /// Returns `Err` when durable write or prompt outbox step fails — callers must surface
-    /// via [`lifecycle_push_failure_message`].
+    /// When an owning supervisor exists, prompt_queue **must** open successfully;
+    /// open failure surfaces after durable insert without stamping delivered.
+    /// Returns `Err` when durable write or prompt outbox step fails — callers must
+    /// surface via [`lifecycle_push_failure_message`].
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn push_task_lifecycle(
         &self,
@@ -354,10 +560,17 @@ impl CasCore {
             .map_err(|e| format!("agent store: {e}"))?;
         let sq = open_supervisor_queue_store(&self.cas_root)
             .map_err(|e| format!("supervisor_queue open: {e}"))?;
-        let pq = open_prompt_queue_store(&self.cas_root).ok();
-        emit_task_lifecycle_transition(
+        // Open is fallible: pass None so emit leaves durable pending when a
+        // supervisor exists. Never map open-fail to "skip prompt and stamp success".
+        let pq_open = open_prompt_queue_store(&self.cas_root);
+        let open_err = pq_open.as_ref().err().map(|e| e.to_string());
+        let pq_store = pq_open.ok();
+        let pq = pq_store
+            .as_ref()
+            .map(|a| a.as_ref() as &dyn PromptQueueStore);
+        match emit_task_lifecycle_transition(
             sq.as_ref(),
-            pq.as_ref().map(|a| a.as_ref() as &dyn PromptQueueStore),
+            pq,
             agent_store.as_ref(),
             task_id,
             task_title,
@@ -367,7 +580,27 @@ impl CasCore {
             reason,
             kind,
             occurrence_id,
-        )
+        ) {
+            Err(e) if e.contains("prompt_queue unavailable") => {
+                if let Some(open_err) = open_err {
+                    Err(format!("{e}; open error: {open_err}"))
+                } else {
+                    Err(e)
+                }
+            }
+            other => other,
+        }
+    }
+
+    /// Callable repair: drain pending lifecycle outbox to exactly-once prompt delivery.
+    ///
+    /// Safe after process restart. Factory daemon also invokes this automatically.
+    pub fn drain_lifecycle_outbox(&self) -> Result<LifecycleOutboxDrainReport, String> {
+        let sq = open_supervisor_queue_store(&self.cas_root)
+            .map_err(|e| format!("supervisor_queue open: {e}"))?;
+        let pq = open_prompt_queue_store(&self.cas_root)
+            .map_err(|e| format!("prompt_queue open: {e}"))?;
+        drain_lifecycle_outbox(sq.as_ref(), pq.as_ref(), 100)
     }
 }
 
@@ -491,6 +724,166 @@ mod tests {
         assert!(msg.contains("Do NOT re-run"));
         assert!(!msg.to_lowercase().contains("retry is safe"));
         assert!(msg.contains("transition_key=key"));
+        assert!(
+            msg.contains("drain_lifecycle_outbox"),
+            "must name callable repair path: {msg}"
+        );
+    }
+
+    #[test]
+    fn missing_prompt_queue_leaves_durable_unmarked() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let prior = std::env::var("CAS_FACTORY_SESSION").ok();
+        unsafe {
+            std::env::set_var("CAS_FACTORY_SESSION", "sess-no-pq");
+        }
+
+        let temp = TempDir::new().unwrap();
+        let agents = SqliteAgentStore::open(temp.path()).unwrap();
+        agents.init().unwrap();
+        agents
+            .register(&agent_in_session(
+                "sup-np",
+                "sup-np",
+                AgentRole::Supervisor,
+                "sess-no-pq",
+            ))
+            .unwrap();
+        let sq = SqliteSupervisorQueueStore::open(temp.path()).unwrap();
+        sq.init().unwrap();
+
+        let err = emit_task_lifecycle_transition(
+            &sq,
+            None, // prompt store open failed / unavailable
+            &agents,
+            "cas-np",
+            "NP",
+            TaskStatus::Open,
+            TaskStatus::InProgress,
+            "w",
+            None,
+            LifecycleTransition::Started,
+            "occ-np",
+        )
+        .expect_err("must fail when prompt_queue missing with supervisor");
+        assert!(err.contains("prompt_queue unavailable"), "{err}");
+        assert!(err.contains("drain_lifecycle_outbox"), "{err}");
+
+        let key = "cas-np:open:in_progress:sess-no-pq:task_started:occ-np";
+        let row = sq.get_by_transition_key(key).unwrap().expect("durable row");
+        assert!(
+            row.prompt_delivered_at.is_none(),
+            "must NOT stamp success when prompt path missing"
+        );
+
+        // Drain with real prompt store repairs exactly once.
+        let pq = SqlitePromptQueueStore::open(temp.path()).unwrap();
+        pq.init().unwrap();
+        let report = drain_lifecycle_outbox(&sq, &pq, 10).unwrap();
+        assert_eq!(report.recovered, 1);
+        assert_eq!(report.failed, 0);
+        assert!(sq.get_by_transition_key(key).unwrap().unwrap().prompt_delivered_at.is_some());
+        assert_eq!(pq.pending_count().unwrap(), 1);
+
+        // Second drain: no duplicate prompt.
+        let report2 = drain_lifecycle_outbox(&sq, &pq, 10).unwrap();
+        assert_eq!(report2.attempted, 0);
+        assert_eq!(pq.pending_count().unwrap(), 1);
+
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("CAS_FACTORY_SESSION", v),
+                None => std::env::remove_var("CAS_FACTORY_SESSION"),
+            }
+        }
+    }
+
+    /// Stamp fails after enqueue: replay must not create a second prompt row.
+    #[test]
+    fn stamp_failure_replay_does_not_duplicate_prompt() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let prior = std::env::var("CAS_FACTORY_SESSION").ok();
+        unsafe {
+            std::env::set_var("CAS_FACTORY_SESSION", "sess-stamp");
+        }
+
+        let temp = TempDir::new().unwrap();
+        let agents = SqliteAgentStore::open(temp.path()).unwrap();
+        agents.init().unwrap();
+        agents
+            .register(&agent_in_session(
+                "sup-st",
+                "sup-st",
+                AgentRole::Supervisor,
+                "sess-stamp",
+            ))
+            .unwrap();
+        let sq = SqliteSupervisorQueueStore::open(temp.path()).unwrap();
+        sq.init().unwrap();
+        let pq = SqlitePromptQueueStore::open(temp.path()).unwrap();
+        pq.init().unwrap();
+
+        // Durable insert only (simulate after enqueue-before-stamp crash by
+        // enqueue_idempotent then leaving stamp unset).
+        let key = "cas-st:open:in_progress:sess-stamp:task_started:occ-st";
+        let id = match sq
+            .notify_idempotent(
+                "sup-st",
+                "task_lifecycle",
+                r#"{"task_id":"cas-st","title":"ST","old_status":"open","new_status":"in_progress","actor":"w","transition":"task_started","factory_session":"sess-stamp","occurrence_id":"occ-st","transition_key":"cas-st:open:in_progress:sess-stamp:task_started:occ-st"}"#,
+                NotificationPriority::Normal,
+                key,
+            )
+            .unwrap()
+        {
+            NotifyIdempotentResult::Created(id) => id,
+            other => panic!("expected Created: {other:?}"),
+        };
+
+        // First enqueue succeeds; stamp intentionally skipped (partial failure).
+        pq.enqueue_idempotent(
+            &format!("lifecycle:{id}"),
+            "supervisor",
+            "body",
+            Some("sess-stamp"),
+            Some("sum"),
+            None,
+            &lifecycle_prompt_dedupe_key(id),
+        )
+        .unwrap();
+        assert_eq!(pq.pending_count().unwrap(), 1);
+        assert!(sq.get_by_transition_key(key).unwrap().unwrap().prompt_delivered_at.is_none());
+
+        // Drain/replay: must stamp without second prompt row.
+        let report = drain_lifecycle_outbox(&sq, &pq, 10).unwrap();
+        assert_eq!(report.recovered, 1, "errors={:?}", report.errors);
+        assert_eq!(pq.pending_count().unwrap(), 1, "exactly-once prompt");
+        assert!(sq.get_by_transition_key(key).unwrap().unwrap().prompt_delivered_at.is_some());
+
+        // emit same occurrence: AlreadyComplete, still one prompt.
+        let r = emit_task_lifecycle_transition(
+            &sq,
+            Some(&pq as &dyn PromptQueueStore),
+            &agents,
+            "cas-st",
+            "ST",
+            TaskStatus::Open,
+            TaskStatus::InProgress,
+            "w",
+            None,
+            LifecycleTransition::Started,
+            "occ-st",
+        )
+        .unwrap();
+        assert!(matches!(r, LifecyclePushResult::AlreadyComplete { .. }));
+        assert_eq!(pq.pending_count().unwrap(), 1);
+
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("CAS_FACTORY_SESSION", v),
+                None => std::env::remove_var("CAS_FACTORY_SESSION"),
+            }
+        }
     }
 
     fn agent_in_session(id: &str, name: &str, role: AgentRole, session: &str) -> Agent {
@@ -563,10 +956,12 @@ mod tests {
             .unwrap();
         let sq = SqliteSupervisorQueueStore::open(temp.path()).unwrap();
         sq.init().unwrap();
+        let pq = SqlitePromptQueueStore::open(temp.path()).unwrap();
+        pq.init().unwrap();
 
         let r1 = emit_task_lifecycle_transition(
             &sq,
-            None,
+            Some(&pq as &dyn PromptQueueStore),
             &agents,
             "cas-t1",
             "Title",
@@ -580,7 +975,7 @@ mod tests {
         .unwrap();
         let r2 = emit_task_lifecycle_transition(
             &sq,
-            None,
+            Some(&pq as &dyn PromptQueueStore),
             &agents,
             "cas-t1",
             "Title",
@@ -614,6 +1009,7 @@ mod tests {
             Some("cas-t1:open:in_progress:sess-emit:task_started:occ-1")
         );
         assert!(pending[0].prompt_delivered_at.is_some());
+        assert_eq!(pq.pending_count().unwrap(), 1);
 
         // SAFETY: restore env under ENV_LOCK.
         unsafe {
@@ -645,11 +1041,13 @@ mod tests {
             .unwrap();
         let sq = SqliteSupervisorQueueStore::open(temp.path()).unwrap();
         sq.init().unwrap();
+        let pq = SqlitePromptQueueStore::open(temp.path()).unwrap();
+        pq.init().unwrap();
 
         // start₁
         emit_task_lifecycle_transition(
             &sq,
-            None,
+            Some(&pq as &dyn PromptQueueStore),
             &agents,
             "cas-c",
             "C",
@@ -664,7 +1062,7 @@ mod tests {
         // block
         emit_task_lifecycle_transition(
             &sq,
-            None,
+            Some(&pq as &dyn PromptQueueStore),
             &agents,
             "cas-c",
             "C",
@@ -679,7 +1077,7 @@ mod tests {
         // ready
         emit_task_lifecycle_transition(
             &sq,
-            None,
+            Some(&pq as &dyn PromptQueueStore),
             &agents,
             "cas-c",
             "C",
@@ -694,7 +1092,7 @@ mod tests {
         // start₂ — same old/new/kind as start₁ but different occurrence
         emit_task_lifecycle_transition(
             &sq,
-            None,
+            Some(&pq as &dyn PromptQueueStore),
             &agents,
             "cas-c",
             "C",
@@ -714,6 +1112,7 @@ mod tests {
             .filter(|n| n.payload.contains("task_started"))
             .collect();
         assert_eq!(started.len(), 2, "two legitimate starts must both emit");
+        assert_eq!(pq.pending_count().unwrap(), 4);
 
         unsafe {
             match prior {
@@ -752,10 +1151,12 @@ mod tests {
             .unwrap();
         let sq = SqliteSupervisorQueueStore::open(temp.path()).unwrap();
         sq.init().unwrap();
+        let pq = SqlitePromptQueueStore::open(temp.path()).unwrap();
+        pq.init().unwrap();
 
         emit_task_lifecycle_transition(
             &sq,
-            None,
+            Some(&pq as &dyn PromptQueueStore),
             &agents,
             "cas-x",
             "X",
