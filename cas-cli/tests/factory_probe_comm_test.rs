@@ -421,6 +421,57 @@ fn probe_comm_cli_malformed_receipt_is_stage_failure() {
 }
 
 #[test]
+fn probe_comm_cli_slo_aggregate_uses_nearest_rank_p95_for_five_samples() {
+    let temp = tempfile::tempdir().unwrap();
+    let jsonl = temp.path().join("probe.jsonl");
+    let artifacts = temp.path().join("artifacts");
+    write_adapter_artifacts(&artifacts);
+    write_composed_receipts(&artifacts);
+    write_slo_samples(
+        &artifacts,
+        &[100, 300, 500, 800, 2500],
+        &[100, 300, 500, 800, 1200],
+        &[100, 800, 1500, 2500, 4000],
+        &[100, 2000, 4000, 7000, 12000],
+    );
+
+    cas_cmd()
+        .args([
+            "factory",
+            "probe-comm",
+            "--jsonl",
+            jsonl.to_str().unwrap(),
+            "--adapter",
+            "all",
+            "--artifact-root",
+            artifacts.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("normal_transport_p95"));
+
+    let lines = read_jsonl(&jsonl);
+    let slo = lines
+        .iter()
+        .find(|line| line["scenario"] == "slo_aggregate_evidence")
+        .unwrap();
+    assert_eq!(slo["failed_stage"], "normal_transport_p95");
+    let aggregates = slo["aggregate_slos"].as_array().unwrap();
+    let p95 = aggregates
+        .iter()
+        .find(|agg| agg["metric"] == "normal_transport" && agg["gate"] == "p95")
+        .unwrap();
+    assert_eq!(p95["observed_ms"], 2500);
+    assert_eq!(p95["passed"], false);
+    let max = aggregates
+        .iter()
+        .find(|agg| agg["metric"] == "normal_transport" && agg["gate"] == "max")
+        .unwrap();
+    assert_eq!(max["observed_ms"], 2500);
+    assert_eq!(max["passed"], true);
+}
+
+#[test]
 fn probe_comm_cli_slo_aggregate_receipt_enforces_epic_boundaries() {
     let temp = tempfile::tempdir().unwrap();
     let artifacts = temp.path().join("artifacts");
@@ -437,7 +488,11 @@ fn probe_comm_cli_slo_aggregate_receipt_enforces_epic_boundaries() {
         ),
         (
             "normal_transport_max",
-            vec![100, 300, 500, 800, 12000],
+            {
+                let mut samples = vec![800; 19];
+                samples.push(12000);
+                samples
+            },
             vec![100, 300, 500, 800, 1200],
             vec![100, 800, 1500, 2500, 4000],
             vec![100, 2000, 4000, 7000, 12000],
@@ -452,7 +507,11 @@ fn probe_comm_cli_slo_aggregate_receipt_enforces_epic_boundaries() {
         (
             "urgent_transport_max",
             vec![100, 300, 500, 800, 1200],
-            vec![100, 300, 500, 800, 6000],
+            {
+                let mut samples = vec![800; 19];
+                samples.push(6000);
+                samples
+            },
             vec![100, 800, 1500, 2500, 4000],
             vec![100, 2000, 4000, 7000, 12000],
         ),
