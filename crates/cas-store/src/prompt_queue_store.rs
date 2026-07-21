@@ -809,15 +809,31 @@ impl SqlitePromptQueueStore {
         )))
     }
 
-    /// Atomic stage stamp: single UPDATE for stage + timestamps + reason/outcome.
-    /// Safe across connections when used under the store write lock + write_retry.
+    /// Cross-process atomic stage stamp (cas-2c5f review 3).
+    ///
+    /// Uses `BEGIN IMMEDIATE` so read_highest_stage + legal-transition check +
+    /// stage/timestamp/reason write are one SQLite write transaction — safe
+    /// across independent connections/processes (not just process-local Mutex).
     fn atomic_stage_stamp(
         conn: &Connection,
         prompt_id: i64,
         proposed: DeliveryStage,
         opts: AtomicStampOpts<'_>,
     ) -> Result<()> {
-        let current = Self::read_highest_stage(conn, prompt_id)?;
+        let tx = crate::shared_db::ImmediateTx::new(conn)?;
+        Self::atomic_stage_stamp_in_tx(&tx, prompt_id, proposed, opts)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Read + resolve + write inside an already-open IMMEDIATE transaction.
+    fn atomic_stage_stamp_in_tx(
+        tx: &Connection,
+        prompt_id: i64,
+        proposed: DeliveryStage,
+        opts: AtomicStampOpts<'_>,
+    ) -> Result<()> {
+        let current = Self::read_highest_stage(tx, prompt_id)?;
         let next = Self::resolve_stage_transition(current, proposed, prompt_id)?;
         let now = Utc::now().to_rfc3339();
 
@@ -828,7 +844,9 @@ impl SqlitePromptQueueStore {
             || next.is_terminal_non_delivery()
             || next == DeliveryStage::PartiallyDelivered;
 
-        conn.execute(
+        // reason=None clears pending reason fields (Delivered success path).
+        // No follow-up UPDATE — keeps the atomic contract intact.
+        tx.execute(
             "UPDATE prompt_queue SET
                 highest_stage = ?,
                 selected_at = COALESCE(selected_at, ?),
@@ -1523,6 +1541,7 @@ impl PromptQueueStore for SqlitePromptQueueStore {
     fn mark_transport_delivered(&self, prompt_id: i64) -> Result<()> {
         crate::shared_db::with_write_retry(|| {
             let conn = self.conn.lock().unwrap();
+            // reason=None clears last_pending_* inside the same ImmediateTx UPDATE.
             Self::atomic_stage_stamp(
                 &conn,
                 prompt_id,
@@ -1535,14 +1554,7 @@ impl PromptQueueStore for SqlitePromptQueueStore {
                     broadcast_succeeded: None,
                     broadcast_failed: None,
                 },
-            )?;
-            conn.execute(
-                "UPDATE prompt_queue
-                 SET last_pending_reason = NULL, last_pending_detail = NULL
-                 WHERE id = ?",
-                params![prompt_id],
-            )?;
-            Ok(())
+            )
         })
     }
 
@@ -1572,7 +1584,8 @@ impl PromptQueueStore for SqlitePromptQueueStore {
                 );
             }
             if succeeded == attempted {
-                Self::atomic_stage_stamp(
+                // Full success: reason=None clears pending fields atomically.
+                return Self::atomic_stage_stamp(
                     &conn,
                     prompt_id,
                     DeliveryStage::Delivered,
@@ -1584,14 +1597,7 @@ impl PromptQueueStore for SqlitePromptQueueStore {
                         broadcast_succeeded: Some(succeeded),
                         broadcast_failed: Some(failed),
                     },
-                )?;
-                conn.execute(
-                    "UPDATE prompt_queue
-                     SET last_pending_reason = NULL, last_pending_detail = NULL
-                     WHERE id = ?",
-                    params![prompt_id],
-                )?;
-                return Ok(());
+                );
             }
             if succeeded == 0 {
                 return Self::atomic_stage_stamp(
@@ -3090,6 +3096,101 @@ mod tests {
         store.mark_transport_delivered(id).unwrap();
         let r = store.message_delivery_report(id).unwrap().unwrap();
         assert_eq!(r.stage, DeliveryStage::Delivered);
+        assert!(r.delivered_at.is_some());
+        assert_eq!(r.wake, ObservationStatus::Unobserved);
+    }
+
+    /// cas-2c5f review 3: two independent SQLite connections to the same DB.
+    /// A holds BEGIN IMMEDIATE while stamping Delivered; B waits then attempts
+    /// Dropped. B must not overwrite — final stage is Delivered.
+    #[test]
+    fn test_cross_connection_immediate_tx_prevents_stale_overwrite() {
+        use crate::shared_db::ImmediateTx;
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+        use std::time::Duration;
+
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().to_path_buf();
+        let db_path = path.join("cas.db");
+
+        let id = {
+            let store = SqlitePromptQueueStore::open(&path).unwrap();
+            store.init().unwrap();
+            store.enqueue("s", "w", "race").unwrap()
+        };
+
+        let barrier = Arc::new(Barrier::new(2));
+        let db_a = db_path.clone();
+        let db_b = db_path.clone();
+        let barrier_a = Arc::clone(&barrier);
+        let barrier_b = Arc::clone(&barrier);
+
+        // Connection A: hold IMMEDIATE lock, stamp Delivered, then commit.
+        let t_a = thread::spawn(move || {
+            let conn = rusqlite::Connection::open(&db_a).unwrap();
+            conn.busy_timeout(Duration::from_secs(10)).unwrap();
+            let tx = ImmediateTx::new(&conn).unwrap();
+            // Hold the write lock before B starts.
+            barrier_a.wait();
+            thread::sleep(Duration::from_millis(80));
+            SqlitePromptQueueStore::atomic_stage_stamp_in_tx(
+                &tx,
+                id,
+                DeliveryStage::Delivered,
+                AtomicStampOpts {
+                    reason: None,
+                    detail: None,
+                    set_processed: true,
+                    broadcast_attempted: None,
+                    broadcast_succeeded: None,
+                    broadcast_failed: None,
+                },
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        });
+
+        // Connection B: waits for A's IMMEDIATE, then tries illegal Dropped.
+        let t_b = thread::spawn(move || {
+            let conn = rusqlite::Connection::open(&db_b).unwrap();
+            conn.busy_timeout(Duration::from_secs(10)).unwrap();
+            barrier_b.wait();
+            // Blocks until A commits, then reads Delivered and rejects Dropped.
+            SqlitePromptQueueStore::atomic_stage_stamp(
+                &conn,
+                id,
+                DeliveryStage::Dropped,
+                AtomicStampOpts {
+                    reason: Some(PendingReason::DroppedDeadSource),
+                    detail: Some("stale writer"),
+                    set_processed: true,
+                    broadcast_attempted: None,
+                    broadcast_succeeded: None,
+                    broadcast_failed: None,
+                },
+            )
+        });
+
+        t_a.join().expect("writer A panicked");
+        let b_result = t_b.join().expect("writer B panicked");
+        assert!(
+            b_result.is_err(),
+            "stale Dropped after Delivered must fail; got {b_result:?}"
+        );
+        let err = b_result.unwrap_err().to_string();
+        assert!(
+            err.contains("illegal stage transition"),
+            "expected illegal transition, got {err}"
+        );
+
+        let store = SqlitePromptQueueStore::open(&path).unwrap();
+        let r = store.message_delivery_report(id).unwrap().unwrap();
+        assert_eq!(
+            r.stage,
+            DeliveryStage::Delivered,
+            "Delivered must survive interleaved Dropped attempt"
+        );
         assert!(r.delivered_at.is_some());
         assert_eq!(r.wake, ObservationStatus::Unobserved);
     }
