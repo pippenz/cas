@@ -552,6 +552,41 @@ pub enum FactoryCommands {
         cas_root: Option<std::path::PathBuf>,
     },
 
+    /// Run the isolated supervisor/worker communication conformance probe
+    ProbeComm {
+        /// JSONL output path for per-scenario stage evidence
+        #[arg(long)]
+        jsonl: std::path::PathBuf,
+
+        /// Disposable CAS root to use for the probe; defaults to a temp root
+        #[arg(long)]
+        cas_root: Option<std::path::PathBuf>,
+
+        /// Explicitly permit using the active parent CAS root
+        #[arg(long)]
+        allow_active_cas_root: bool,
+
+        /// Probe adapter. Unit 6 ships only the deterministic fake adapter.
+        #[arg(long, value_enum, default_value = "fake")]
+        adapter: probe_comm::ProbeAdapterKind,
+
+        /// Delivery SLO threshold in milliseconds
+        #[arg(long, default_value = "500")]
+        delivery_slo_ms: u64,
+
+        /// Selection SLO threshold in milliseconds
+        #[arg(long, default_value = "250")]
+        selection_slo_ms: u64,
+
+        /// Inject a transport failure as SCENARIO:MESSAGE_ID
+        #[arg(long, value_name = "SCENARIO:MESSAGE_ID")]
+        inject_transport_failure: Option<String>,
+
+        /// Inject an SLO failure as SCENARIO:MESSAGE_ID:DELIVERED_AFTER_MS
+        #[arg(long, value_name = "SCENARIO:MESSAGE_ID:MS")]
+        inject_slo_failure: Option<String>,
+    },
+
     /// Classify a worker as alive / wedged / starved / dead (cas-4513).
     ///
     /// Exit codes (differentiated so supervisor scripts can branch without
@@ -720,6 +755,28 @@ pub fn execute(args: &FactoryArgs, cli: &Cli, cas_root: Option<&std::path::Path>
                 *wait_ack,
                 *timeout_ms,
                 cas_root.as_deref(),
+            ),
+            FactoryCommands::ProbeComm {
+                jsonl,
+                cas_root: sub_cas_root,
+                allow_active_cas_root,
+                adapter,
+                delivery_slo_ms,
+                selection_slo_ms,
+                inject_transport_failure,
+                inject_slo_failure,
+            } => probe_comm::execute_probe_comm(
+                jsonl.clone(),
+                sub_cas_root.clone(),
+                cas_root,
+                *allow_active_cas_root,
+                *adapter,
+                *delivery_slo_ms,
+                *selection_slo_ms,
+                probe_comm::parse_probe_failure(
+                    inject_transport_failure.as_deref(),
+                    inject_slo_failure.as_deref(),
+                )?,
             ),
             FactoryCommands::IsWedged {
                 worker,
