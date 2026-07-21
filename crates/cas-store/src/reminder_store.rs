@@ -117,6 +117,11 @@ pub struct Reminder {
     /// JSON snapshot of the DirectorEvent that triggered this reminder
     /// (only set for event-based reminders after firing)
     pub fired_event: Option<serde_json::Value>,
+    /// Factory session that registered this reminder (`CAS_FACTORY_SESSION`).
+    /// Event-based fires only match in this session (cas-fcd4 multi-factory).
+    /// `None` = legacy / non-factory registration (any session may fire).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 /// Schema for reminders table
@@ -148,6 +153,9 @@ const MIGRATION_TARGET_ID: &str = "ALTER TABLE reminders ADD COLUMN target_id TE
 /// Migration to add fired_event column (stores triggering event JSON)
 const MIGRATION_FIRED_EVENT: &str = "ALTER TABLE reminders ADD COLUMN fired_event TEXT";
 
+/// Migration: factory session scope for event-based multi-session isolation (cas-fcd4)
+const MIGRATION_SESSION_ID: &str = "ALTER TABLE reminders ADD COLUMN session_id TEXT";
+
 /// Trait for reminder storage operations
 #[allow(clippy::too_many_arguments)]
 pub trait ReminderStore: Send + Sync {
@@ -157,6 +165,8 @@ pub trait ReminderStore: Send + Sync {
     /// Create a new reminder, returns its ID.
     /// `target_id` is the agent who should receive the reminder. If `None`,
     /// defaults to `owner_id` (self-reminder).
+    /// `session_id` is the registering factory session (`CAS_FACTORY_SESSION`);
+    /// event-based delivery is scoped to that session (cas-fcd4).
     fn create(
         &self,
         owner_id: &str,
@@ -167,6 +177,7 @@ pub trait ReminderStore: Send + Sync {
         trigger_event: Option<&str>,
         trigger_filter: Option<&serde_json::Value>,
         ttl_secs: i64,
+        session_id: Option<&str>,
     ) -> Result<i64>;
 
     /// List pending reminders owned by a specific agent
@@ -258,6 +269,17 @@ impl SqliteReminderStore {
         let fired_event_str: Option<String> = row.get(13)?;
         let fired_event = fired_event_str.and_then(|s| serde_json::from_str(&s).ok());
 
+        // Column 14 is session_id (may be NULL for pre-cas-fcd4 rows)
+        let session_id: Option<String> = row.get(14)?;
+        let session_id = session_id.and_then(|s| {
+            let t = s.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            }
+        });
+
         Ok(Reminder {
             id: row.get(0)?,
             target_id: target_id.unwrap_or_else(|| owner_id.clone()),
@@ -273,6 +295,7 @@ impl SqliteReminderStore {
             fired_at,
             cancelled_at,
             fired_event,
+            session_id,
         })
     }
 
@@ -292,10 +315,17 @@ impl SqliteReminderStore {
             conn.execute_batch(MIGRATION_FIRED_EVENT)?;
         }
 
+        if conn
+            .prepare_cached("SELECT session_id FROM reminders LIMIT 0")
+            .is_err()
+        {
+            conn.execute_batch(MIGRATION_SESSION_ID)?;
+        }
+
         Ok(())
     }
 
-    const SELECT_COLUMNS: &str = "id, supervisor_id, message, trigger_type, trigger_at, trigger_event, trigger_filter, status, ttl_secs, created_at, fired_at, cancelled_at, target_id, fired_event";
+    const SELECT_COLUMNS: &str = "id, supervisor_id, message, trigger_type, trigger_at, trigger_event, trigger_filter, status, ttl_secs, created_at, fired_at, cancelled_at, target_id, fired_event, session_id";
 }
 
 impl ReminderStore for SqliteReminderStore {
@@ -316,16 +346,21 @@ impl ReminderStore for SqliteReminderStore {
         trigger_event: Option<&str>,
         trigger_filter: Option<&serde_json::Value>,
         ttl_secs: i64,
+        session_id: Option<&str>,
     ) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
         let now = Utc::now().to_rfc3339();
         let trigger_at_str = trigger_at.map(|dt| dt.to_rfc3339());
         let trigger_filter_str = trigger_filter.map(|f| f.to_string());
         let resolved_target = target_id.unwrap_or(owner_id);
+        let session_id = session_id
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
 
         conn.execute(
-            "INSERT INTO reminders (supervisor_id, message, trigger_type, trigger_at, trigger_event, trigger_filter, ttl_secs, created_at, target_id)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO reminders (supervisor_id, message, trigger_type, trigger_at, trigger_event, trigger_filter, ttl_secs, created_at, target_id, session_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 owner_id,
                 message,
@@ -336,6 +371,7 @@ impl ReminderStore for SqliteReminderStore {
                 ttl_secs,
                 now,
                 resolved_target,
+                session_id,
             ],
         )?;
 
@@ -534,6 +570,7 @@ mod tests {
                 None,
                 None,
                 3600,
+                None, // session_id cas-fcd4
             )
             .unwrap();
 
@@ -564,6 +601,7 @@ mod tests {
                 None,
                 None,
                 3600,
+                None, // session_id cas-fcd4
             )
             .unwrap();
 
@@ -591,6 +629,7 @@ mod tests {
                 Some("task_completed"),
                 Some(&filter),
                 3600,
+                None, // session_id cas-fcd4
             )
             .unwrap();
 
@@ -621,6 +660,7 @@ mod tests {
                 None,
                 None,
                 3600,
+                None, // session_id cas-fcd4
             )
             .unwrap();
 
@@ -636,6 +676,7 @@ mod tests {
                 None,
                 None,
                 3600,
+                None, // session_id cas-fcd4
             )
             .unwrap();
 
@@ -658,6 +699,7 @@ mod tests {
                 Some("task_completed"),
                 None,
                 3600,
+                None, // session_id cas-fcd4
             )
             .unwrap();
 
@@ -671,6 +713,7 @@ mod tests {
                 Some("worker_idle"),
                 None,
                 3600,
+                None, // session_id cas-fcd4
             )
             .unwrap();
 
@@ -701,6 +744,7 @@ mod tests {
                 None,
                 None,
                 3600,
+                None, // session_id cas-fcd4
             )
             .unwrap();
 
@@ -745,6 +789,7 @@ mod tests {
                 Some("task_completed"),
                 None,
                 3600,
+                None, // session_id cas-fcd4
             )
             .unwrap();
 
@@ -777,6 +822,7 @@ mod tests {
                 None,
                 None,
                 1, // 1 second TTL
+                None, // session_id cas-fcd4
             )
             .unwrap();
 
@@ -791,6 +837,7 @@ mod tests {
                 None,
                 None,
                 99999,
+                None, // session_id cas-fcd4
             )
             .unwrap();
 
@@ -819,6 +866,7 @@ mod tests {
                 Some("task_completed"),
                 None,
                 3600,
+                None, // session_id cas-fcd4
             )
             .unwrap();
 
@@ -832,6 +880,7 @@ mod tests {
                 Some("task_completed"),
                 None,
                 3600,
+                None, // session_id cas-fcd4
             )
             .unwrap();
 
@@ -846,5 +895,87 @@ mod tests {
         // get_event_reminders returns all owners (daemon processes all)
         let all = store.get_event_reminders("task_completed").unwrap();
         assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn test_session_id_persisted_on_create() {
+        let (_temp, store) = create_test_store();
+        let id = store
+            .create(
+                "sup-a",
+                None,
+                "session scoped",
+                ReminderTriggerType::Event,
+                None,
+                Some("task_completed"),
+                None,
+                3600,
+                Some("factory-session-a"),
+            )
+            .unwrap();
+        assert!(id > 0);
+        let pending = store.list_pending("sup-a").unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].session_id.as_deref(),
+            Some("factory-session-a")
+        );
+    }
+
+    #[test]
+    fn test_session_id_empty_stored_as_none() {
+        let (_temp, store) = create_test_store();
+        store
+            .create(
+                "sup-a",
+                None,
+                "blank session",
+                ReminderTriggerType::Event,
+                None,
+                Some("task_completed"),
+                None,
+                3600,
+                Some("   "),
+            )
+            .unwrap();
+        let pending = store.list_pending("sup-a").unwrap();
+        assert_eq!(pending[0].session_id, None);
+    }
+
+    #[test]
+    fn test_event_reminders_from_two_sessions_both_listed() {
+        // Store returns both; session filter is applied at fire time (daemon).
+        let (_temp, store) = create_test_store();
+        store
+            .create(
+                "sup-a",
+                None,
+                "from A",
+                ReminderTriggerType::Event,
+                None,
+                Some("task_completed"),
+                None,
+                3600,
+                Some("session-a"),
+            )
+            .unwrap();
+        store
+            .create(
+                "sup-b",
+                None,
+                "from B",
+                ReminderTriggerType::Event,
+                None,
+                Some("task_completed"),
+                None,
+                3600,
+                Some("session-b"),
+            )
+            .unwrap();
+        let all = store.get_event_reminders("task_completed").unwrap();
+        assert_eq!(all.len(), 2);
+        let sessions: Vec<_> = all.iter().filter_map(|r| r.session_id.as_deref()).collect();
+        assert!(sessions.contains(&"session-a"));
+        assert!(sessions.contains(&"session-b"));
     }
 }

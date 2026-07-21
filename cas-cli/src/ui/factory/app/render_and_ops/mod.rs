@@ -1,4 +1,4 @@
-mod epic_workers;
+pub(crate) mod epic_workers;
 mod recording;
 mod rendering;
 mod worktree;

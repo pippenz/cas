@@ -41,6 +41,30 @@ fn merge_target_remediation(assignee: &str) -> String {
     )
 }
 
+/// cas-369f: decide whether `worktree_merge` should remove the worktree after
+/// merging. Pure — unit-tested.
+///
+/// Rules:
+/// - Explicit `cleanup` request always wins (end-of-lane consume vs preserve).
+/// - `force` is **not** consulted here (dirty-tree only; cas-0b32 / cas-369f).
+/// - System B (`spawn_workers isolate=true` factory workers): default **preserve**
+///   so mid-epic merges do not ENOENT the live worker cwd.
+/// - System A: fall back to config `cleanup_on_close`.
+pub(crate) fn resolve_worktree_merge_cleanup(
+    requested_cleanup: Option<bool>,
+    is_system_b: bool,
+    config_cleanup_on_close: bool,
+) -> bool {
+    if let Some(c) = requested_cleanup {
+        return c;
+    }
+    if is_system_b {
+        false
+    } else {
+        config_cleanup_on_close
+    }
+}
+
 /// True when `token` is the System-B worker name (bare or `factory/<name>`).
 fn worker_name_token_matches(token: &str, worker: &str) -> bool {
     token == worker || token.strip_prefix("factory/") == Some(worker)
@@ -1117,12 +1141,19 @@ impl CasCore {
     /// defaults a factory worker merge to trunk — trunk requires explicit
     /// `allow_trunk=true` (independent of `force`, which only bypasses dirty
     /// worktree protection). The resolved target is always surfaced.
+    ///
+    /// `cleanup` (cas-369f) is independent of `force`:
+    /// - `force` only allows merging a dirty worktree
+    /// - `cleanup=true` removes the worktree + deletes the branch after merge
+    /// - System-B default is **preserve** (mid-session merges leave the
+    ///   worker cwd intact); System-A uses `worktrees.cleanup_on_close`
     pub async fn worktree_merge(
         &self,
         id: &str,
         force: bool,
         task_id: Option<&str>,
         allow_trunk: bool,
+        cleanup: Option<bool>,
     ) -> Result<CallToolResult, McpError> {
         use crate::config::Config;
         use crate::store::open_worktree_store;
@@ -1227,8 +1258,16 @@ impl CasCore {
             }
         };
 
+        // cas-369f: force (dirty) ≠ cleanup (remove). System-B factory
+        // workers default to preserving the worktree mid-session.
+        let do_cleanup = resolve_worktree_merge_cleanup(
+            cleanup,
+            is_system_b,
+            wt_config.cleanup_on_close,
+        );
+
         let merge_commit = manager
-            .merge_and_cleanup(&mut worktree, force)
+            .merge_and_cleanup(&mut worktree, force, do_cleanup)
             .map_err(|e| McpError {
                 code: ErrorCode::INTERNAL_ERROR,
                 message: Cow::from(format!("Failed to merge worktree: {e}")),
@@ -1237,7 +1276,7 @@ impl CasCore {
 
         // Update store — System B worktrees were never registered there, so
         // there's no row to update (and nothing worth persisting: the
-        // git-level merge + cleanup above already happened).
+        // git-level merge + optional cleanup above already happened).
         if !is_system_b {
             worktree_store.update(&worktree).map_err(|e| McpError {
                 code: ErrorCode::INTERNAL_ERROR,
@@ -1255,16 +1294,23 @@ impl CasCore {
             String::new()
         };
 
+        let cleanup_note = if do_cleanup {
+            " Worktree removed (cleanup=true)."
+        } else {
+            " Worktree preserved (mid-session merge; pass cleanup=true to remove)."
+        };
+
         // Promote entries if configured
         if wt_config.promote_entries_on_merge {
             if let Ok(count) = self.promote_branch_entries(&worktree.branch) {
                 if count > 0 {
                     return Ok(Self::success(format!(
-                        "Merged worktree {} to {}.{} Commit: {}\nPromoted {} entries from branch scope.",
+                        "Merged worktree {} to {}.{} Commit: {}{}\nPromoted {} entries from branch scope.",
                         worktree.id,
                         worktree.parent_branch,
                         target_suffix,
                         merge_commit.as_deref().unwrap_or("none"),
+                        cleanup_note,
                         count
                     )));
                 }
@@ -1272,11 +1318,12 @@ impl CasCore {
         }
 
         Ok(Self::success(format!(
-            "Merged worktree {} to {}.{} Commit: {}",
+            "Merged worktree {} to {}.{} Commit: {}{}",
             worktree.id,
             worktree.parent_branch,
             target_suffix,
-            merge_commit.as_deref().unwrap_or("none")
+            merge_commit.as_deref().unwrap_or("none"),
+            cleanup_note
         )))
     }
 
@@ -1391,6 +1438,7 @@ impl CasCore {
 mod tests {
     use super::{
         is_cas_pattern_worktree, is_factory_style_worktree, is_git_worktree, path_is_under,
+        resolve_worktree_merge_cleanup,
     };
     use std::path::Path;
     use tempfile::TempDir;
@@ -1486,5 +1534,34 @@ mod tests {
             base
         ));
         assert!(!path_is_under(Path::new("/proj/other"), base));
+    }
+
+    // --- cas-369f: force ≠ cleanup; System-B default preserve -------------
+
+    #[test]
+    fn resolve_merge_cleanup_system_b_defaults_to_preserve() {
+        assert!(
+            !resolve_worktree_merge_cleanup(None, true, true),
+            "System-B mid-session default must preserve even if config cleanup_on_close=true"
+        );
+        assert!(!resolve_worktree_merge_cleanup(None, true, false));
+    }
+
+    #[test]
+    fn resolve_merge_cleanup_explicit_true_wins() {
+        assert!(resolve_worktree_merge_cleanup(Some(true), true, false));
+        assert!(resolve_worktree_merge_cleanup(Some(true), false, false));
+    }
+
+    #[test]
+    fn resolve_merge_cleanup_explicit_false_wins() {
+        assert!(!resolve_worktree_merge_cleanup(Some(false), true, true));
+        assert!(!resolve_worktree_merge_cleanup(Some(false), false, true));
+    }
+
+    #[test]
+    fn resolve_merge_cleanup_system_a_uses_config() {
+        assert!(resolve_worktree_merge_cleanup(None, false, true));
+        assert!(!resolve_worktree_merge_cleanup(None, false, false));
     }
 }

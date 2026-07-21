@@ -726,7 +726,31 @@ impl FactoryDaemon {
                 self.spawn_task.take().unwrap();
             // Remove from pending workers (boot pane transitions to real pane or disappears)
             self.app.remove_pending_worker(&pending_name);
+            // cas-7a94: if this worker was cancelled via shutdown while the
+            // isolate worktree was still building, drop the result and release
+            // any early pre-assign so the task is not stuck on a never-started
+            // worker.
+            let cancelled = self.dead_workers.contains(&pending_name);
             match handle.await {
+                Ok(Ok(_result)) if cancelled => {
+                    tracing::info!(
+                        worker = %pending_name,
+                        "cas-7a94: spawn finished after shutdown cancel — discarding pane, releasing pre-assign"
+                    );
+                    if let Some(ref task_id) = pending_task_id {
+                        crate::ui::factory::app::render_and_ops::epic_workers::release_preassign_if_bound(
+                            self.app.cas_dir(),
+                            task_id,
+                            &pending_name,
+                        );
+                    }
+                    crate::ui::factory::app::render_and_ops::epic_workers::release_worker_task_bindings(
+                        self.app.cas_dir(),
+                        &pending_name,
+                    );
+                    // Do not call finish_worker_spawn — the worktree (if any) is
+                    // left for the reaper; no PTY pane is registered.
+                }
                 Ok(Ok(result)) => {
                     // Build per-worker Teams config before finish_worker_spawn adds to worker list
                     let worker_name_for_teams = result.worker_name.clone();
@@ -744,10 +768,13 @@ impl FactoryDaemon {
                     if let Some(ref tc) = teams_config {
                         crate::ui::theme::register_agent_color(&tc.agent_name, &tc.agent_color);
                     }
-                    match self
-                        .app
-                        .finish_worker_spawn(result, teams_config, pending_spec, pending_task_id)
-                    {
+                    let task_id_for_finish = pending_task_id.clone();
+                    match self.app.finish_worker_spawn(
+                        result,
+                        teams_config,
+                        pending_spec,
+                        task_id_for_finish,
+                    ) {
                         Ok(name) => {
                             tracing::info!("Spawned worker (async): {}", name);
                             // A worker may reuse a retired name (e.g. a Codex worker
@@ -796,6 +823,15 @@ impl FactoryDaemon {
                                     ("reason", "finish_worker_spawn_failed"),
                                 ],
                             );
+                            // cas-7a94: early pre-assign may have bound the task —
+                            // release so a failed finish cannot leave a ghost assignee.
+                            if let Some(ref task_id) = pending_task_id {
+                                crate::ui::factory::app::render_and_ops::epic_workers::release_preassign_if_bound(
+                                    self.app.cas_dir(),
+                                    task_id,
+                                    &pending_name,
+                                );
+                            }
                             self.app.set_error(format!("Failed to finish spawn: {e}"));
                         }
                     }
@@ -805,6 +841,14 @@ impl FactoryDaemon {
                         "factory_worker_spawn_result",
                         vec![("success", "false"), ("reason", "background_spawn_failed")],
                     );
+                    // cas-7a94: isolate worktree failed after early pre-assign.
+                    if let Some(ref task_id) = pending_task_id {
+                        crate::ui::factory::app::render_and_ops::epic_workers::release_preassign_if_bound(
+                            self.app.cas_dir(),
+                            task_id,
+                            &pending_name,
+                        );
+                    }
                     self.app.set_error(format!("Failed to spawn worker: {e}"));
                 }
                 Err(e) => {
@@ -812,6 +856,13 @@ impl FactoryDaemon {
                         "factory_worker_spawn_result",
                         vec![("success", "false"), ("reason", "spawn_task_panicked")],
                     );
+                    if let Some(ref task_id) = pending_task_id {
+                        crate::ui::factory::app::render_and_ops::epic_workers::release_preassign_if_bound(
+                            self.app.cas_dir(),
+                            task_id,
+                            &pending_name,
+                        );
+                    }
                     self.app.set_error(format!("Spawn task panicked: {e}"));
                 }
             }
@@ -834,6 +885,18 @@ impl FactoryDaemon {
                 match self.app.prepare_worker_spawn(None, isolate) {
                     Ok(prep) => {
                         let worker_name = prep.worker_name.clone();
+                        // cas-7a94: bind task_id as soon as the worker name is
+                        // known — before the isolate worktree finishes — so
+                        // codex+isolate async gaps cannot skip pre-assign.
+                        // finish_worker_spawn confirms; failure/cancel paths
+                        // release via release_preassign_if_bound.
+                        if let Some(ref tid) = task_id {
+                            let _ = crate::ui::factory::app::render_and_ops::epic_workers::assign_task_to_new_worker(
+                                self.app.cas_dir(),
+                                tid,
+                                &worker_name,
+                            );
+                        }
                         self.app.add_pending_worker(worker_name.clone(), isolate);
                         self.spawn_task = Some((
                             worker_name,
@@ -864,6 +927,14 @@ impl FactoryDaemon {
                 match self.app.prepare_worker_spawn(Some(&name), isolate) {
                     Ok(prep) => {
                         let worker_name = prep.worker_name.clone();
+                        // cas-7a94: early pre-assign once name is final (see Anonymous).
+                        if let Some(ref tid) = task_id {
+                            let _ = crate::ui::factory::app::render_and_ops::epic_workers::assign_task_to_new_worker(
+                                self.app.cas_dir(),
+                                tid,
+                                &worker_name,
+                            );
+                        }
                         self.app.add_pending_worker(worker_name.clone(), isolate);
                         self.spawn_task = Some((
                             worker_name,
@@ -903,14 +974,75 @@ impl FactoryDaemon {
                         self.app.worker_names().iter().take(c).cloned().collect()
                     }
                 };
+
+                // cas-7a94: drop still-queued spawns for these names and release
+                // any early pre-assigns so "shutdown before boot finishes" cannot
+                // leave Open/InProgress ghosts on never-started workers.
+                {
+                    let stop_set: std::collections::HashSet<&str> =
+                        workers_to_stop.iter().map(String::as_str).collect();
+                    let cancel_all = names.is_empty() && count.unwrap_or(0) == 0;
+                    let mut kept = std::collections::VecDeque::new();
+                    while let Some(pending) = self.pending_spawns.pop_front() {
+                        match pending {
+                            PendingSpawn::Named {
+                                name,
+                                isolate,
+                                spec,
+                                task_id,
+                            } if cancel_all || stop_set.contains(name.as_str()) => {
+                                if let Some(ref tid) = task_id {
+                                    crate::ui::factory::app::render_and_ops::epic_workers::release_preassign_if_bound(
+                                        self.app.cas_dir(),
+                                        tid,
+                                        &name,
+                                    );
+                                }
+                                crate::ui::factory::app::render_and_ops::epic_workers::release_worker_task_bindings(
+                                    self.app.cas_dir(),
+                                    &name,
+                                );
+                                self.app.spawning_count =
+                                    self.app.spawning_count.saturating_sub(1);
+                                tracing::info!(
+                                    worker = %name,
+                                    "cas-7a94: cancelled pending spawn on shutdown — released pre-assign"
+                                );
+                                let _ = (isolate, spec); // consumed
+                            }
+                            PendingSpawn::Anonymous {
+                                isolate,
+                                spec,
+                                task_id,
+                            } if cancel_all => {
+                                // Anonymous names are only known once prepare runs;
+                                // if still in the queue, no early assign has fired yet.
+                                let _ = (isolate, spec, task_id);
+                                self.app.spawning_count =
+                                    self.app.spawning_count.saturating_sub(1);
+                            }
+                            other => kept.push_back(other),
+                        }
+                    }
+                    self.pending_spawns = kept;
+                }
+
                 if self.app.record_enabled() {
                     for name in &workers_to_stop {
                         let _ = self.app.stop_recording_for_pane(name).await;
                     }
                 }
                 // Track shut-down workers so their queued messages are dropped
+                // and any in-flight isolate spawn is discarded on completion.
                 for name in &workers_to_stop {
                     self.dead_workers.insert(name.clone());
+                    // Also release bindings for workers that never made it into
+                    // worker_names (early pre-assign only) — shutdown_worker
+                    // only runs for live workers.
+                    crate::ui::factory::app::render_and_ops::epic_workers::release_worker_task_bindings(
+                        self.app.cas_dir(),
+                        name,
+                    );
                 }
                 if let Err(e) = self.app.shutdown_workers(count, &names, force) {
                     let target = if !names.is_empty() {
@@ -1076,6 +1208,14 @@ impl FactoryDaemon {
             };
 
             for reminder in &candidates {
+                // cas-fcd4: only fire reminds registered in this factory session
+                // (shared cas.db otherwise cross-fires concurrent sessions).
+                if !reminder_matches_factory_session(
+                    reminder.session_id.as_deref(),
+                    &self.session_name,
+                ) {
+                    continue;
+                }
                 if matches_event_filter(reminder, event) {
                     fire_reminder(
                         reminder,
@@ -1292,11 +1432,28 @@ fn fire_reminder(
     }
 }
 
+/// Whether this factory daemon session may fire the reminder (cas-fcd4).
+///
+/// Reminders registered with a non-empty `session_id` only fire when the
+/// processing daemon's session name matches. Legacy / non-factory reminds
+/// (`session_id` unset) still fire in any session so single-session behavior
+/// is unchanged.
+pub(crate) fn reminder_matches_factory_session(
+    reminder_session_id: Option<&str>,
+    current_session: &str,
+) -> bool {
+    match reminder_session_id.map(str::trim).filter(|s| !s.is_empty()) {
+        None => true,
+        Some(sid) => sid == current_session,
+    }
+}
+
 /// Check if a reminder's event filter matches a detected DirectorEvent.
 ///
 /// Uses JSON subset matching: every key-value in the filter must appear
 /// in the event's JSON representation. An empty or missing filter matches
-/// any event of the correct type.
+/// any event of the correct type (after session scoping — see
+/// [`reminder_matches_factory_session`]).
 fn matches_event_filter(
     reminder: &cas_store::Reminder,
     event: &crate::ui::factory::director::DirectorEvent,
@@ -1328,10 +1485,79 @@ fn is_exact_agent_name_match(agent: &AgentSummary, worker_name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_exact_agent_name_match;
+    use super::{
+        is_exact_agent_name_match, matches_event_filter, reminder_matches_factory_session,
+    };
     use crate::ui::factory::daemon::FactoryDaemon;
-    use crate::ui::factory::director::AgentSummary;
+    use crate::ui::factory::director::{AgentSummary, DirectorEvent};
     use cas_types::AgentStatus;
+
+    // -----------------------------------------------------------------------
+    // cas-fcd4: event remind session scoping
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn reminder_session_scope_blocks_foreign_factory_session() {
+        assert!(
+            !reminder_matches_factory_session(Some("session-a"), "session-b"),
+            "session A remind must not fire in session B"
+        );
+        assert!(
+            reminder_matches_factory_session(Some("session-a"), "session-a"),
+            "same-session must match"
+        );
+    }
+
+    #[test]
+    fn reminder_session_scope_legacy_none_matches_any_session() {
+        // Single-session / pre-cas-fcd4 rows keep working.
+        assert!(reminder_matches_factory_session(None, "session-a"));
+        assert!(reminder_matches_factory_session(None, "session-b"));
+        assert!(reminder_matches_factory_session(Some(""), "session-a"));
+        assert!(reminder_matches_factory_session(Some("  "), "session-b"));
+    }
+
+    #[test]
+    fn matches_event_filter_task_id_still_works() {
+        let reminder = cas_store::Reminder {
+            id: 1,
+            owner_id: "owner".into(),
+            target_id: "owner".into(),
+            message: "review".into(),
+            trigger_type: cas_store::ReminderTriggerType::Event,
+            trigger_at: None,
+            trigger_event: Some("task_completed".into()),
+            trigger_filter: Some(serde_json::json!({"task_id": "cas-keep"})),
+            status: cas_store::ReminderStatus::Pending,
+            ttl_secs: 3600,
+            created_at: chrono::Utc::now(),
+            fired_at: None,
+            cancelled_at: None,
+            fired_event: None,
+            session_id: Some("session-a".into()),
+        };
+        let match_event = DirectorEvent::TaskCompleted {
+            task_id: "cas-keep".into(),
+            task_title: "Keep".into(),
+            worker: "worker-1".into(),
+        };
+        let other_event = DirectorEvent::TaskCompleted {
+            task_id: "cas-other".into(),
+            task_title: "Other".into(),
+            worker: "worker-2".into(),
+        };
+        assert!(matches_event_filter(&reminder, &match_event));
+        assert!(!matches_event_filter(&reminder, &other_event));
+        // Session gate is separate: filter alone still matches; session blocks foreign.
+        assert!(reminder_matches_factory_session(
+            reminder.session_id.as_deref(),
+            "session-a"
+        ));
+        assert!(!reminder_matches_factory_session(
+            reminder.session_id.as_deref(),
+            "session-b"
+        ));
+    }
 
     #[test]
     fn test_agent_match_is_exact_not_substring() {
