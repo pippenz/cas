@@ -24,7 +24,7 @@ With the **user**: technically precise, sassy/direct, and constructive. **Scope:
 - **Maintain situational awareness.** Hold a one-sentence frame of what this project is and how the request fits before acting. If frame and request suggest different actions, name the mismatch.
 - **Counter-propose when you see a better path.** Required anchors: citable source, concrete cost of current approach, concrete benefit of alternative. No anchors → execute or ask.
 - **Self-challenge before touching shared surfaces.** Before editing skills, agents, hooks, shared config, or templates: "who reads this, and does it fit all of them?"
-- **Tier every spawn — never fleet-default.** Explicit `cli=`/`model=`/`effort=` every spawn; `high` is the multi-step ceiling. Codex-first tiers: **light** `codex/gpt-5.5/low`, **standard** `codex/gpt-5.5/medium`, **heavy** `codex/gpt-5.5/high`, **frontier** `codex/gpt-5.6-sol/high`; taste/judgment uses `codex/gpt-5.6-sol/medium`. **Opus** = exceptional route, **Grok** = capacity route; [model-selection.md](cas-supervisor/references/model-selection.md).
+- **Tier every spawn — never fleet-default.** Explicit `cli=`/`model=`/`effort=` every spawn; `high` is the multi-step ceiling. Codex-first tiers: **light** `codex/gpt-5.6-sol/low`, **standard** `codex/gpt-5.6-sol/medium`, **heavy** `codex/gpt-5.6-sol/high`, **frontier** `codex/gpt-5.6-sol/high`; taste/judgment uses `codex/gpt-5.6-sol/medium`. **Opus** = exceptional route, **Grok** = capacity route; [model-selection.md](cas-supervisor/references/model-selection.md).
 - **Worker liveness (cas-e98e):** live = fresh heartbeat **or** live OS process. Never shut down on `None active` alone — see [worker-recovery.md](cas-supervisor/references/worker-recovery.md#authoritative-liveness-cas-e98e).
 
 ### End your turn
@@ -40,14 +40,14 @@ New session? Run these steps in order. Open the linked reference for detail.
 3. **Intake gate** — Assess the request; detail in [intake.md](cas-supervisor/references/intake.md).
 4. **Create EPIC** — `mcp__cs__task action=create task_type=epic title="..." description="..."`; templates in [planning.md](cas-supervisor/references/planning.md).
 5. **Pin epic focus** — `mcp__cs__coordination action=focus_epic id=<epic-id>` shows the EPIC in TUI panels now.
-6. **Spawn a tiered mix, assign, end turn** — one `spawn_workers` call per tier needed, e.g. `count=2 isolate=true cli=codex model=gpt-5.5 effort=medium` for standard tasks plus `count=1 isolate=true cli=codex model=gpt-5.5 effort=high` for a heavy one; never one default line for the fleet. Assign with `update` (not `transfer`), send context, stop. Phases/merge flow: [workflow.md](cas-supervisor/references/workflow.md).
+6. **Spawn a tiered mix, assign, end turn** — one `spawn_workers` call per tier needed, e.g. `count=2 isolate=true cli=codex model=gpt-5.6-sol effort=medium` for standard tasks plus `count=1 isolate=true cli=codex model=gpt-5.6-sol effort=high` for a heavy one; never one default line for the fleet. Assign with `update` (not `transfer`), send context, stop. Phases/merge flow: [workflow.md](cas-supervisor/references/workflow.md).
 
 ## Heterogeneous Teams (Claude supervisor + Codex workers)
 
 To spawn workers on a different CLI backend than the supervisor, pass complete `cli=`, `model=`, and `effort=` controls:
 
 ```
-mcp__cs__coordination action=spawn_workers count=1 cli=codex model=gpt-5.5 effort=medium
+mcp__cs__coordination action=spawn_workers count=1 cli=codex model=gpt-5.6-sol effort=medium
 ```
 
 Match controls to task complexity via [model-selection.md](cas-supervisor/references/model-selection.md); parameter table in [reference.md](cas-supervisor/references/reference.md).

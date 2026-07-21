@@ -10,7 +10,7 @@ Pay for reasoning only where reasoning is the bottleneck. Every worker slot has 
 
 Routing is two stages. **Stage 1 — tier the task** by complexity; the tier is a stable property of the work. **Stage 2 — pick the lane** that fills that tier:
 
-- **Codex is the default matrix** — every tier resolves to a Codex `gpt-5.5`/`gpt-5.6-sol` spawn.
+- **Codex is the default matrix** — every tier resolves to exact `cli=codex model=gpt-5.6-sol effort=<tier effort>`.
 - **GPT-5.6 Sol medium is the taste/judgment overlay** — route routine taste, public-surface, and general-judgment work to `cli=codex model=gpt-5.6-sol effort=medium`.
 - **Claude Opus is exceptional-only** — use it for architecture, safety, rescue, or independent challenge. Sonnet is not a normal worker lane.
 - **Grok is a capacity overlay** — route to it while its credits/auth/throughput are healthy; fall back to the same Codex tier when they are not.
@@ -21,9 +21,9 @@ Evidence rule: change routing guidance only on independent, cross-vendor evidenc
 
 | Tier | Spawn parameters | Use for |
 |---|---|---|
-| **light** | `cli=codex model=gpt-5.5 effort=low` | Chores, docs, mechanical renames, config bumps, `depth=light` tasks, test backfill that mirrors existing patterns. |
-| **standard** | `cli=codex model=gpt-5.5 effort=medium` | Normal feature/bug work with a clear spec and bounded blast radius. The stock floor. |
-| **heavy** | `cli=codex model=gpt-5.5 effort=high` | Cross-cutting refactors, concurrency/lifecycle code, migrations, gnarly debugging, P0/P1 critical-path units. |
+| **light** | `cli=codex model=gpt-5.6-sol effort=low` | Chores, docs, mechanical renames, config bumps, `depth=light` tasks, test backfill that mirrors existing patterns. |
+| **standard** | `cli=codex model=gpt-5.6-sol effort=medium` | Normal feature/bug work with a clear spec and bounded blast radius. The stock floor. |
+| **heavy** | `cli=codex model=gpt-5.6-sol effort=high` | Cross-cutting refactors, concurrency/lifecycle code, migrations, gnarly debugging, P0/P1 critical-path units. |
 | **frontier** | `cli=codex model=gpt-5.6-sol effort=high` | Architecture-defining units, high-blast-radius changes, tasks that already bounced twice. Sparingly — every frontier worker should map to named tasks. The exact slug is `gpt-5.6-sol`; a bare `gpt-5.6` is **not** a valid spawn recipe. |
 
 Token-heavy read-only investigation belongs in a `cas-codex-exec` shell-out, not a worker and not your own context window.
@@ -46,8 +46,8 @@ Max is still quota-limited capacity: keep `effort=high` as the ceiling on long w
 
 Grok is an optional credit/capacity route, not a required rung. Use it while healthy; fall back to the same-tier Codex rung when not.
 
-- **`cli=grok model=grok-composer-2.5-fast effort=low`** — light / flash lane (Composer is a Grok model id, never `cli=cursor`); same-tier Codex fallback is `gpt-5.5 effort=low`.
-- **`cli=grok model=grok-4.5 effort=medium|high`** — standard / heavy capacity; same-tier Codex fallback is `gpt-5.5 effort=medium|high`.
+- **`cli=grok model=grok-composer-2.5-fast effort=low`** — light / flash lane (Composer is a Grok model id, never `cli=cursor`); same-tier Codex fallback is `gpt-5.6-sol effort=low`.
+- **`cli=grok model=grok-4.5 effort=medium|high`** — standard / heavy capacity; same-tier Codex fallback is `gpt-5.6-sol effort=medium|high`.
 
 Health check before routing to Grok: credits/quota available, auth valid, throughput healthy (`grok models` responds). If any is red, take the same-tier Codex rung instead.
 
@@ -55,7 +55,7 @@ Health check before routing to Grok: credits/quota available, auth valid, throug
 
 | `cli=` | Accepted `model=` slugs | Notes |
 |---|---|---|
-| `codex` | `gpt-5.5`, `gpt-5.6-sol` | Plain slugs only — `-codex`-suffixed slugs are rejected by the API. Frontier is the exact slug `gpt-5.6-sol`; bare `gpt-5.6` is invalid. |
+| `codex` | `gpt-5.6-sol` | Plain slug only — `-codex`-suffixed slugs are rejected by the API. Frontier is the exact slug `gpt-5.6-sol`; bare `gpt-5.6` is invalid. |
 | `claude` | `opus` (full Anthropic ids also ok) | Supervisor docs only expose Opus for exceptional architecture/safety/rescue/challenge; Sonnet is not a normal worker lane. |
 | `grok` | `grok-4.5`, `grok-composer-2.5-fast` | From live `grok models`. Composer is a **model id on the Grok harness** — never invent `cli=cursor`. |
 
@@ -71,7 +71,7 @@ How each backend receives them:
 | Codex | `--config model_reasoning_effort=<level>` |
 | Grok | `--reasoning-effort <level>` |
 
-For multi-step workers, `effort=high` is the ceiling — do not reach for `xhigh`/`max` on long agent loops (overthink + cost). Codex tiers move on effort (`low` → `medium` → `high`) then on model (`gpt-5.5` → `gpt-5.6-sol`).
+For multi-step workers, `effort=high` is the ceiling — do not reach for `xhigh`/`max` on long agent loops (overthink + cost). Codex tiers move on effort (`low` → `medium` → `high`) on the exact `gpt-5.6-sol` model.
 
 ## Spawn cookbook (all three harnesses)
 
@@ -81,13 +81,13 @@ Copy-paste `spawn_workers` recipes. Examples below use this harness's coordinati
 
 ```
 # light / bulk
-mcp__cas__coordination action=spawn_workers count=2 isolate=true cli=codex model=gpt-5.5 effort=low
+mcp__cas__coordination action=spawn_workers count=2 isolate=true cli=codex model=gpt-5.6-sol effort=low
 
 # standard floor
-mcp__cas__coordination action=spawn_workers count=2 isolate=true cli=codex model=gpt-5.5 effort=medium
+mcp__cas__coordination action=spawn_workers count=2 isolate=true cli=codex model=gpt-5.6-sol effort=medium
 
 # heavy
-mcp__cas__coordination action=spawn_workers count=1 isolate=true cli=codex model=gpt-5.5 effort=high worker_names="hv-ada"
+mcp__cas__coordination action=spawn_workers count=1 isolate=true cli=codex model=gpt-5.6-sol effort=high worker_names="hv-ada"
 
 # frontier — exact slug gpt-5.6-sol
 mcp__cas__coordination action=spawn_workers count=1 isolate=true cli=codex model=gpt-5.6-sol effort=high worker_names="fr-ada"
@@ -126,9 +126,9 @@ Use tier labels as defaults, then check four axes before spawning:
 
 | Tier | Cost | Intelligence | Speed | Taste |
 |---|---|---|---|---|
-| **light** | Lowest agent $/task (Codex gpt-5.5 low; Grok Composer when capacity-routed) | Sufficient for well-bounded mechanical work | Highest — low wall time / flash lane | Low: fine for renames and internal scaffolding; review public surfaces |
-| **standard** | Low — Codex gpt-5.5 medium is the cost-efficient floor | High for bounded engineering; default for most factory work | High throughput on sustained agent loops | Low-to-mid: fine for internal code; review user-facing prose |
-| **heavy** | Codex gpt-5.5 high; Opus/Grok only when exception/capacity says so | High for messy codebases, lifecycle bugs, multi-module judgment | Strong multi-step agent loops; slower than light on tiny tasks | Mid: good default for critical-path code; use GPT-5.6 Sol medium for taste |
+| **light** | Lowest agent $/task (Codex gpt-5.6-sol low; Grok Composer when capacity-routed) | Sufficient for well-bounded mechanical work | Highest — low wall time / flash lane | Low: fine for renames and internal scaffolding; review public surfaces |
+| **standard** | Low — Codex gpt-5.6-sol medium is the cost-efficient floor | High for bounded engineering; default for most factory work | High throughput on sustained agent loops | Low-to-mid: fine for internal code; review user-facing prose |
+| **heavy** | Codex gpt-5.6-sol high; Opus/Grok only when exception/capacity says so | High for messy codebases, lifecycle bugs, multi-module judgment | Strong multi-step agent loops; slower than light on tiny tasks | Mid: good default for critical-path code; use GPT-5.6 Sol medium for taste |
 | **frontier** | Highest — reserve for quality/risk that justifies it | Highest ceiling (Codex gpt-5.6-sol; Claude Opus only for exceptional architecture / challenge) | Slowest / most expensive agent loops | High: taste-sensitive output that must land cleanly |
 
 Glossary:
@@ -153,7 +153,7 @@ Score each task while breaking down the EPIC:
 - Architecture, safety, rescue, or independent challenge in play → the **Claude Opus exceptional lane**
 - Everything else → **standard** (the default is the default for a reason)
 
-Effort is the main cost lever on reasoning-capable models. Prefer raising **effort on Codex gpt-5.5** (`low` → `medium` → `high`) before changing lane or model. Move to `gpt-5.6-sol effort=medium` for taste/general judgment, `gpt-5.6-sol effort=high` for frontier reasoning, Claude Opus for exceptional architecture/safety/rescue/challenge, and Grok for capacity relief.
+Effort is the main cost lever on reasoning-capable models. Prefer raising **effort on Codex gpt-5.6-sol** (`low` → `medium` → `high`) before changing lane or model. Move to `gpt-5.6-sol effort=medium` for taste/general judgment, `gpt-5.6-sol effort=high` for frontier reasoning, Claude Opus for exceptional architecture/safety/rescue/challenge, and Grok for capacity relief.
 
 For every worker, `effort=high` is the ceiling. `xhigh`/`max` increase per-step reasoning, not step count or run length; on hard multi-step work they tend to overthink each move, produce heavier diffs, and multiply cost. Escalate the model tier or split the task before raising effort above `high`.
 
@@ -163,35 +163,35 @@ For every worker, `effort=high` is the ceiling. `xhigh`/`max` increase per-step 
 2. **Spawn the mix** — count tiers in the ready backlog, then issue one `spawn_workers` call per tier (a call's parameters apply to every worker in that call):
    ```
    # two standard workers (floor)
-   mcp__cas__coordination action=spawn_workers count=2 isolate=true cli=codex model=gpt-5.5 effort=medium
+   mcp__cas__coordination action=spawn_workers count=2 isolate=true cli=codex model=gpt-5.6-sol effort=medium
 
    # one light worker for chores
-   mcp__cas__coordination action=spawn_workers count=1 isolate=true cli=codex model=gpt-5.5 effort=low worker_names="lt-ada"
+   mcp__cas__coordination action=spawn_workers count=1 isolate=true cli=codex model=gpt-5.6-sol effort=low worker_names="lt-ada"
 
    # one heavy worker for tier:heavy tasks
-   mcp__cas__coordination action=spawn_workers count=1 isolate=true cli=codex model=gpt-5.5 effort=high worker_names="hv-ada"
+   mcp__cas__coordination action=spawn_workers count=1 isolate=true cli=codex model=gpt-5.6-sol effort=high worker_names="hv-ada"
    ```
    Every `spawn_workers` call MUST include explicit `cli=`, `model=`, and `effort=`.
    Relying on omitted fields is a fallback path that emits an acknowledgement
    warning, not an approved supervisor workflow.
    Tiers change the fleet's composition, not its size — worker-count strategy (3–4 max, sized by independent file groups) still applies.
 3. **Route by tier and lane** — assign `tier:*`-labelled tasks to a matching worker; standard tasks go to anyone at that tier. Send taste/general judgment to `gpt-5.6-sol effort=medium`, exceptional architecture/safety/rescue/challenge to Opus, and capacity overflow to Grok while healthy. Name heavier workers so routing stays legible (`hv-*`, `fr-*`, `tj-*`, `op-*`).
-4. **Escalate on failure** — a task rejected or verification-failed twice moves up one tier: raise Codex effort, then Codex model (`gpt-5.5` → `gpt-5.6-sol`), or use Opus for an exceptional architecture/safety/rescue/challenge case. Don't re-run the same task on the same tier hoping for different output.
+4. **Escalate on failure** — a task rejected or verification-failed twice moves up one tier: raise Codex effort on `gpt-5.6-sol`, or use Opus for an exceptional architecture/safety/rescue/challenge case. Don't re-run the same task on the same tier hoping for different output.
 5. **Escalate on judgment** — the two-rejection rule is a floor, not a permission gate. If a cheaper worker's draft gathers facts but misses the quality bar, escalate before verification fails. Judge the output, not the price tag; use cheap tiers for information and drafts, then pay for what ships. Cost is a tiebreaker only.
 
 ### Escalation ladder (Codex-first, with fit/capacity overlays)
 
 ```
-light     codex  model=gpt-5.5 effort=low
-→ standard  codex  model=gpt-5.5 effort=medium
-  → heavy     codex  model=gpt-5.5 effort=high
+light     codex  model=gpt-5.6-sol effort=low
+→ standard  codex  model=gpt-5.6-sol effort=medium
+  → heavy     codex  model=gpt-5.6-sol effort=high
     → frontier  codex  model=gpt-5.6-sol effort=high   # exact slug; +reasoning ceiling
   taste lane:   codex  model=gpt-5.6-sol effort=medium # taste / public surface / judgment
   exception:    claude model=opus effort=high           # architecture / safety / rescue / challenge
   capacity:     grok   model=grok-composer-2.5-fast effort=low | grok-4.5 effort=medium|high (health-gated)
 ```
 
-- Raise Codex effort before switching model; raise Codex model before assuming you need another vendor.
+- Raise Codex effort on `gpt-5.6-sol` before assuming you need another vendor.
 - Taste, public-surface, and general-judgment work can jump straight to `cli=codex model=gpt-5.6-sol effort=medium` even if the diff is small.
 - Claude Sonnet is not a normal spawn lane; Opus is reserved for architecture, safety, rescue, and independent challenge.
 - Route to Grok only while its credits/auth/throughput are healthy; otherwise take the same-tier Codex rung.

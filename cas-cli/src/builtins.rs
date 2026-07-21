@@ -1732,7 +1732,7 @@ This is the body content."#;
             "model-selection.md",
             // cas-b342/cas-96ea: Codex-first tier table + exception/capacity lanes in the body.
             "Codex-first tiers",
-            "codex/gpt-5.5/low",
+            "codex/gpt-5.6-sol/low",
             "codex/gpt-5.6-sol/high",
             "codex/gpt-5.6-sol/medium",
             "Opus",
@@ -1789,7 +1789,7 @@ This is the body content."#;
         // condensed `effort=high`-only heavy example) on every twin.
         for (label, body) in [("claude", claude), ("codex", codex), ("grok", grok)] {
             assert!(
-                body.contains("model=gpt-5.5 effort=high` for a heavy one"),
+                body.contains("model=gpt-5.6-sol effort=high` for a heavy one"),
                 "{label} cas-supervisor.md must give the heavy spawn as a complete recipe"
             );
             assert!(
@@ -3049,17 +3049,14 @@ This is the body content."#;
             "model-selection.md .claude and .grok copies must be identical apart from \
              the mcp__cas__/cas__ tool prefix",
         );
-        // cas-b342: the Codex-first tier table is the contract of the rubric.
-        // The four rungs must be exactly codex/gpt-5.5 low|medium|high and
-        // codex/gpt-5.6-sol high. Taste/general judgment routes to
-        // gpt-5.6-sol medium; Opus is exceptional-only; Grok remains a
-        // health-gated capacity overlay.
+        // cas-b342/cas-b4ea: the Codex-first tier table is the contract of the
+        // rubric. Every positive Codex worker rung uses the exact gpt-5.6-sol
+        // slug; effort selects light/standard/heavy/frontier capability.
         for required in [
             // Codex-first tier table (AC2)
             "Codex-first",
-            "cli=codex model=gpt-5.5 effort=low",
-            "cli=codex model=gpt-5.5 effort=medium",
-            "cli=codex model=gpt-5.5 effort=high",
+            "cli=codex model=gpt-5.6-sol effort=low",
+            "cli=codex model=gpt-5.6-sol effort=medium",
             "cli=codex model=gpt-5.6-sol effort=high",
             // cas-96ea: routine taste/general judgment uses Sol medium.
             "cli=codex model=gpt-5.6-sol effort=medium",
@@ -3109,6 +3106,62 @@ This is the body content."#;
             !stripped.contains("model=gpt-5.6") && !stripped.contains("codex/gpt-5.6"),
             "model-selection.md must not use a bare gpt-5.6 spawn recipe — exact slug is gpt-5.6-sol"
         );
+        // cas-b4ea: GPT-5.5 is no longer a positive supervisor worker route.
+        // Keep this scoped to the supervisor rubric files so unrelated
+        // code-review/cas-codex-exec persona tests may continue documenting
+        // their own model choices.
+        for (label, content) in [
+            ("claude body", SUPERVISOR_GUIDE),
+            (
+                "claude model-selection",
+                include_str!("builtins/skills/cas-supervisor/references/model-selection.md"),
+            ),
+            (
+                "claude workflow",
+                include_str!("builtins/skills/cas-supervisor/references/workflow.md"),
+            ),
+            (
+                "claude reference",
+                include_str!("builtins/skills/cas-supervisor/references/reference.md"),
+            ),
+            (
+                "codex body",
+                include_str!("builtins/codex/skills/cas-supervisor.md"),
+            ),
+            (
+                "codex model-selection",
+                include_str!("builtins/codex/skills/cas-supervisor/references/model-selection.md"),
+            ),
+            (
+                "codex workflow",
+                include_str!("builtins/codex/skills/cas-supervisor/references/workflow.md"),
+            ),
+            (
+                "codex reference",
+                include_str!("builtins/codex/skills/cas-supervisor/references/reference.md"),
+            ),
+            (
+                "grok body",
+                include_str!("builtins/grok/skills/cas-supervisor.md"),
+            ),
+            (
+                "grok model-selection",
+                include_str!("builtins/grok/skills/cas-supervisor/references/model-selection.md"),
+            ),
+            (
+                "grok workflow",
+                include_str!("builtins/grok/skills/cas-supervisor/references/workflow.md"),
+            ),
+            (
+                "grok reference",
+                include_str!("builtins/grok/skills/cas-supervisor/references/reference.md"),
+            ),
+        ] {
+            assert!(
+                !content.contains("model=gpt-5.5") && !content.contains("codex/gpt-5.5"),
+                "{label} must not contain a GPT-5.5 supervisor worker recipe"
+            );
+        }
         // cas-b342/cas-96ea: the hard rule requires explicit cli/model/effort on EVERY
         // spawn, so every `spawn_workers` recipe line in the rubric — including
         // the light Grok Composer lane — must carry an explicit `effort=`, and
@@ -3758,7 +3811,7 @@ This is the body content."#;
             "frontier",
             // cas-b342/cas-96ea: Codex-first tier table + exception/capacity lanes in the body.
             "Codex-first tiers",
-            "codex/gpt-5.5/low",
+            "codex/gpt-5.6-sol/low",
             "codex/gpt-5.6-sol/high",
             "codex/gpt-5.6-sol/medium",
             "Opus",
