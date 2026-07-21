@@ -57,11 +57,13 @@ impl ClaudeAdapter {
         let first_reaction_at_ms = fixture
             .transcript_path
             .as_ref()
-            .and_then(|path| {
+            .filter(|path| path.exists())
+            .map(|path| {
                 first_correlated_jsonl_timestamp(path, &fixture.message_id)
-                    .ok()
-                    .flatten()
+                    .with_context(|| format!("transcript_parse_failed: {}", path.display()))
             })
+            .transpose()?
+            .flatten()
             .filter(|ts| *ts >= delivered_at_ms);
 
         Ok(stage_from_parts(
@@ -139,14 +141,27 @@ impl GrokAdapter {
             wake_at_ms,
             first_reaction_at_ms,
         );
-        if stage.first_reaction_at_ms.is_none()
-            && fixture
-                .events_path
-                .as_ref()
-                .and_then(|path| first_grok_turn_ended_timestamp(path).ok().flatten())
-                .is_some()
+        if let Some(turn_ended_at_ms) = fixture
+            .events_path
+            .as_ref()
+            .filter(|path| path.exists())
+            .map(|path| {
+                first_grok_turn_ended_timestamp(path)
+                    .with_context(|| format!("events_parse_failed: {}", path.display()))
+            })
+            .transpose()?
+            .flatten()
         {
-            stage.reaction_status = Some("UNKNOWN".to_string());
+            stage.stage_statuses.push(StageStatusEvidence {
+                stage: "turn_end".to_string(),
+                status: "OBSERVED".to_string(),
+                provenance: format!(
+                    "Grok events artifact contains turn_ended at {turn_ended_at_ms}ms"
+                ),
+            });
+            if stage.first_reaction_at_ms.is_none() {
+                stage.reaction_status = Some("UNKNOWN".to_string());
+            }
         }
         Ok(stage)
     }
@@ -195,20 +210,20 @@ fn recorded_stage_statuses(
 ) -> Vec<StageStatusEvidence> {
     let mut statuses = vec![
         StageStatusEvidence {
-            stage: "enqueued",
-            status: "UNKNOWN",
+            stage: "enqueued".to_string(),
+            status: "UNKNOWN".to_string(),
             provenance: "recorded adapter artifacts do not contain CAS enqueue evidence"
                 .to_string(),
         },
         StageStatusEvidence {
-            stage: "selected",
-            status: "UNKNOWN",
+            stage: "selected".to_string(),
+            status: "UNKNOWN".to_string(),
             provenance: "recorded adapter artifacts do not contain queue selection evidence"
                 .to_string(),
         },
         StageStatusEvidence {
-            stage: "delivered",
-            status: "OBSERVED",
+            stage: "delivered".to_string(),
+            status: "OBSERVED".to_string(),
             provenance: format!(
                 "recorded adapter artifact contains correlated delivery at {delivered_at_ms}ms"
             ),
@@ -216,27 +231,27 @@ fn recorded_stage_statuses(
     ];
     statuses.push(match wake_at_ms {
         Some(ts) => StageStatusEvidence {
-            stage: "wake",
-            status: "OBSERVED",
+            stage: "wake".to_string(),
+            status: "OBSERVED".to_string(),
             provenance: format!("recorded adapter artifact contains correlated wake at {ts}ms"),
         },
         None => StageStatusEvidence {
-            stage: "wake",
-            status: "UNKNOWN",
+            stage: "wake".to_string(),
+            status: "UNKNOWN".to_string(),
             provenance: "recorded adapter artifact does not prove worker wake".to_string(),
         },
     });
     statuses.push(match first_reaction_at_ms {
         Some(ts) => StageStatusEvidence {
-            stage: "reaction",
-            status: "OBSERVED",
+            stage: "reaction".to_string(),
+            status: "OBSERVED".to_string(),
             provenance: format!(
                 "recorded adapter artifact contains correlated first reaction at {ts}ms"
             ),
         },
         None => StageStatusEvidence {
-            stage: "reaction",
-            status: "UNKNOWN",
+            stage: "reaction".to_string(),
+            status: "UNKNOWN".to_string(),
             provenance: "recorded adapter artifact does not contain a correlated reaction"
                 .to_string(),
         },

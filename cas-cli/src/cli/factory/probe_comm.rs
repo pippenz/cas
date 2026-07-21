@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -20,6 +20,8 @@ pub enum ProbeAdapterKind {
 pub(crate) struct ProbeThresholds {
     pub delivery_ms: u64,
     pub selection_ms: u64,
+    pub wake_ms: u64,
+    pub reaction_ms: u64,
 }
 
 impl ProbeThresholds {
@@ -28,6 +30,8 @@ impl ProbeThresholds {
         Self {
             delivery_ms: 500,
             selection_ms: 250,
+            wake_ms: 250,
+            reaction_ms: 500,
         }
     }
 }
@@ -97,8 +101,8 @@ pub(crate) struct MessageStageEvidence {
 
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct StageStatusEvidence {
-    pub stage: &'static str,
-    pub status: &'static str,
+    pub stage: String,
+    pub status: String,
     pub provenance: String,
 }
 
@@ -167,6 +171,8 @@ pub(crate) fn execute_probe_comm(
     adapter: ProbeAdapterKind,
     delivery_slo_ms: u64,
     selection_slo_ms: u64,
+    wake_slo_ms: u64,
+    reaction_slo_ms: u64,
     failure: Option<ProbeFailure>,
 ) -> Result<()> {
     let report = run_probe_comm_with_parent(
@@ -179,6 +185,8 @@ pub(crate) fn execute_probe_comm(
             thresholds: ProbeThresholds {
                 delivery_ms: delivery_slo_ms,
                 selection_ms: selection_slo_ms,
+                wake_ms: wake_slo_ms,
+                reaction_ms: reaction_slo_ms,
             },
             failure,
         },
@@ -394,8 +402,8 @@ fn run_recorded_adapter_scenarios(
         ));
     }
     if matches!(adapter, ProbeAdapterKind::All) {
-        scenarios.push(routing_matrix_evidence_scenario());
-        scenarios.push(merge_reclose_lifecycle_evidence_scenario());
+        scenarios.push(routing_matrix_evidence_scenario(artifact_root));
+        scenarios.push(merge_reclose_lifecycle_evidence_scenario(artifact_root));
     }
     scenarios
 }
@@ -437,36 +445,36 @@ fn adapter_scenario(
     let mut failed_stage = None;
     if stage.terminal == "delivered" {
         if let (Some(delivered), Some(wake)) = (stage.delivered_at_ms, stage.wake_at_ms)
-            && wake.saturating_sub(delivered) > thresholds.selection_ms
+            && wake.saturating_sub(delivered) > thresholds.wake_ms
         {
             stage.terminal = "wake_slo_failed";
             failed_stage = Some("wake_slo");
             stage.wake_status = "FAILED";
             stage.stage_statuses.push(StageStatusEvidence {
-                stage: "wake",
-                status: "FAILED",
+                stage: "wake".to_string(),
+                status: "FAILED".to_string(),
                 provenance: format!(
-                    "wake observed {}ms after delivery; selection_slo_ms={}",
+                    "wake observed {}ms after delivery; wake_slo_ms={}",
                     wake.saturating_sub(delivered),
-                    thresholds.selection_ms
+                    thresholds.wake_ms
                 ),
             });
         }
         if failed_stage.is_none()
             && let (Some(delivered), Some(reaction)) =
                 (stage.delivered_at_ms, stage.first_reaction_at_ms)
-            && reaction.saturating_sub(delivered) > thresholds.delivery_ms
+            && reaction.saturating_sub(delivered) > thresholds.reaction_ms
         {
             stage.terminal = "reaction_slo_failed";
             failed_stage = Some("reaction_slo");
             stage.reaction_status = Some("FAILED".to_string());
             stage.stage_statuses.push(StageStatusEvidence {
-                stage: "reaction",
-                status: "FAILED",
+                stage: "reaction".to_string(),
+                status: "FAILED".to_string(),
                 provenance: format!(
-                    "reaction observed {}ms after delivery; delivery_slo_ms={}",
+                    "reaction observed {}ms after delivery; reaction_slo_ms={}",
                     reaction.saturating_sub(delivered),
-                    thresholds.delivery_ms
+                    thresholds.reaction_ms
                 ),
             });
         }
@@ -493,7 +501,11 @@ fn adapter_scenario(
 
 fn classify_artifact_error(error: &str) -> &'static str {
     let lower = error.to_ascii_lowercase();
-    if lower.contains("no such file")
+    if lower.contains("transcript_parse_failed") {
+        "transcript_parse_failed"
+    } else if lower.contains("events_parse_failed") {
+        "events_parse_failed"
+    } else if lower.contains("no such file")
         || lower.contains("not found")
         || lower.contains("os error 2")
         || lower.contains("requires --artifact-root")
@@ -540,12 +552,13 @@ fn adapter_failure_scenario(
             wake_status: "UNKNOWN",
             reaction_status: Some("UNKNOWN".to_string()),
             stage_statuses: vec![StageStatusEvidence {
-                stage: "artifact",
+                stage: "artifact".to_string(),
                 status: if failed_stage == "correlation_unknown" {
                     "UNKNOWN"
                 } else {
                     "FAILED"
-                },
+                }
+                .to_string(),
                 provenance: detail,
             }],
             terminal: failed_stage,
@@ -553,37 +566,185 @@ fn adapter_failure_scenario(
     }
 }
 
-fn routing_matrix_evidence_scenario() -> ScenarioReport {
+#[derive(Debug, Deserialize)]
+struct ReceiptDocument {
+    receipt_type: String,
+    #[serde(default)]
+    contracts: Vec<ReceiptEntry>,
+    #[serde(default)]
+    receipts: Vec<ReceiptEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReceiptEntry {
+    message_id: String,
+    target: String,
+    stage: String,
+    status: String,
+    provenance: String,
+}
+
+fn routing_matrix_evidence_scenario(artifact_root: Option<&Path>) -> ScenarioReport {
+    let expected = expected_routing_contracts();
+    receipt_backed_scenario(
+        "routing_matrix_evidence",
+        artifact_root,
+        "receipts/routing_matrix.json",
+        "routing_matrix",
+        "contracts",
+        &expected,
+        "routing_receipt_missing",
+        "routing_receipt_malformed",
+        "routing_receipt_incomplete",
+    )
+}
+
+fn merge_reclose_lifecycle_evidence_scenario(artifact_root: Option<&Path>) -> ScenarioReport {
+    let expected = vec![
+        (
+            "cas-126b-merge-reclose-halt-exemption".to_string(),
+            "awaiting-merge-worker".to_string(),
+            "merge_reclose".to_string(),
+        ),
+        (
+            "cas-062d-owner-lifecycle-transitions".to_string(),
+            "owning-supervisor".to_string(),
+            "lifecycle_transition".to_string(),
+        ),
+        (
+            "cas-ecff-lifecycle-outbox-recovery".to_string(),
+            "owning-supervisor".to_string(),
+            "lifecycle_outbox_recovery".to_string(),
+        ),
+    ];
+    receipt_backed_scenario(
+        "merge_reclose_lifecycle_evidence",
+        artifact_root,
+        "receipts/lifecycle.json",
+        "merge_reclose_lifecycle",
+        "receipts",
+        &expected,
+        "lifecycle_receipt_missing",
+        "lifecycle_receipt_malformed",
+        "lifecycle_receipt_incomplete",
+    )
+}
+
+fn expected_routing_contracts() -> Vec<(String, String, String)> {
     let harnesses = ["claude", "codex", "grok"];
-    let mut stages = Vec::new();
+    let mut expected = Vec::new();
     for supervisor in harnesses {
         for worker in harnesses {
-            stages.push(composed_evidence_stage(
-                &format!("{supervisor}-supervisor-to-{worker}-worker"),
-                &format!("{worker}-worker"),
-                "routing_matrix",
-                "OBSERVED",
-                "cas-4484 delivery_matrix_all_combos_both_directions covers this supervisor->worker contract",
+            expected.push((
+                format!("{supervisor}-supervisor-to-{worker}-worker"),
+                format!("{worker}-worker"),
+                "routing_matrix".to_string(),
             ));
-            stages.push(composed_evidence_stage(
-                &format!("{worker}-worker-to-{supervisor}-supervisor"),
-                &format!("{supervisor}-supervisor"),
-                "routing_matrix",
-                "OBSERVED",
-                "cas-4484 delivery_matrix_all_combos_both_directions covers this worker->supervisor contract",
+            expected.push((
+                format!("{worker}-worker-to-{supervisor}-supervisor"),
+                format!("{supervisor}-supervisor"),
+                "routing_matrix".to_string(),
             ));
         }
     }
-    stages.push(composed_evidence_stage(
-        "live-disposable-model-observation",
-        "live-model",
-        "live_observation",
-        "BLOCKED",
-        "live disposable model probes are not launched by recorded conformance; no PASS is emitted without live evidence",
-    ));
+    expected
+}
+
+fn receipt_backed_scenario(
+    name: &'static str,
+    artifact_root: Option<&Path>,
+    receipt_relpath: &str,
+    receipt_type: &str,
+    entry_field: &str,
+    expected: &[(String, String, String)],
+    missing_stage: &'static str,
+    malformed_stage: &'static str,
+    incomplete_stage: &'static str,
+) -> ScenarioReport {
+    let Some(root) = artifact_root else {
+        return receipt_failure_scenario(name, missing_stage, "no artifact root for receipts");
+    };
+    let path = root.join(receipt_relpath);
+    if !path.exists() {
+        return receipt_failure_scenario(
+            name,
+            missing_stage,
+            &format!("missing receipt {}", path.display()),
+        );
+    }
+    let data = match fs::read_to_string(&path) {
+        Ok(data) => data,
+        Err(error) => {
+            return receipt_failure_scenario(
+                name,
+                missing_stage,
+                &format!("read receipt {}: {error}", path.display()),
+            );
+        }
+    };
+    let document: ReceiptDocument = match serde_json::from_str(&data) {
+        Ok(document) => document,
+        Err(error) => {
+            return receipt_failure_scenario(
+                name,
+                malformed_stage,
+                &format!("parse receipt {}: {error}", path.display()),
+            );
+        }
+    };
+    if document.receipt_type != receipt_type {
+        return receipt_failure_scenario(
+            name,
+            malformed_stage,
+            &format!(
+                "receipt {} type '{}' did not match expected '{}'",
+                path.display(),
+                document.receipt_type,
+                receipt_type
+            ),
+        );
+    }
+    let entries = if entry_field == "contracts" {
+        document.contracts
+    } else {
+        document.receipts
+    };
+    let mut stages = Vec::new();
+    for (message_id, target, stage) in expected {
+        let Some(entry) = entries
+            .iter()
+            .find(|entry| entry.message_id == *message_id && entry.target == *target)
+        else {
+            return receipt_failure_scenario(
+                name,
+                incomplete_stage,
+                &format!(
+                    "receipt {} missing expected message_id={message_id}",
+                    path.display()
+                ),
+            );
+        };
+        if entry.stage != *stage || entry.status != "OBSERVED" || entry.provenance.is_empty() {
+            return receipt_failure_scenario(
+                name,
+                malformed_stage,
+                &format!(
+                    "receipt {} has invalid entry for {message_id}",
+                    path.display()
+                ),
+            );
+        }
+        stages.push(composed_evidence_stage(
+            &entry.message_id,
+            &entry.target,
+            stage,
+            "OBSERVED",
+            &entry.provenance,
+        ));
+    }
 
     ScenarioReport {
-        name: "routing_matrix_evidence",
+        name,
         passed: true,
         failed_stage: None,
         message_ids: stages
@@ -596,42 +757,36 @@ fn routing_matrix_evidence_scenario() -> ScenarioReport {
     }
 }
 
-fn merge_reclose_lifecycle_evidence_scenario() -> ScenarioReport {
-    let stages = vec![
-        composed_evidence_stage(
-            "cas-126b-merge-reclose-halt-exemption",
-            "awaiting-merge-worker",
-            "merge_reclose",
-            "OBSERVED",
-            "cas-126b evidence: merge-complete re-close urgent remains delivery/wake guidance without arming halt",
-        ),
-        composed_evidence_stage(
-            "cas-062d-owner-lifecycle-transitions",
-            "owning-supervisor",
-            "lifecycle_transition",
-            "OBSERVED",
-            "cas-062d evidence: task lifecycle transitions are pushed by the owning supervisor path",
-        ),
-    ];
-
+fn receipt_failure_scenario(
+    name: &'static str,
+    failed_stage: &'static str,
+    provenance: &str,
+) -> ScenarioReport {
     ScenarioReport {
-        name: "merge_reclose_lifecycle_evidence",
-        passed: true,
-        failed_stage: None,
-        message_ids: stages
-            .iter()
-            .map(|stage| stage.message_id.clone())
-            .collect(),
+        name,
+        passed: false,
+        failed_stage: Some(failed_stage),
+        message_ids: Vec::new(),
         duplicates_suppressed: 0,
         malformed_targets_rejected: 0,
-        stages,
+        stages: vec![composed_evidence_stage(
+            failed_stage,
+            "receipt",
+            failed_stage,
+            if failed_stage.ends_with("_malformed") {
+                "FAILED"
+            } else {
+                "BLOCKED"
+            },
+            provenance,
+        )],
     }
 }
 
 fn composed_evidence_stage(
     message_id: &str,
     target: &str,
-    stage: &'static str,
+    stage: &str,
     status: &'static str,
     provenance: &str,
 ) -> MessageStageEvidence {
@@ -649,8 +804,8 @@ fn composed_evidence_stage(
         wake_status: "UNKNOWN",
         reaction_status: Some(status.to_string()),
         stage_statuses: vec![StageStatusEvidence {
-            stage,
-            status,
+            stage: stage.to_string(),
+            status: status.to_string(),
             provenance: provenance.to_string(),
         }],
         terminal: "evidence_composed",
@@ -741,7 +896,7 @@ fn run_message(
     clock: &mut FakeClock,
 ) -> MessageStageEvidence {
     let enqueued_at_ms = clock.tick(1);
-    let selected_at_ms = clock.tick(0);
+    let selected_at_ms = clock.tick(1);
     let target = if scenario.malformed_target {
         "missing-worker"
     } else {
@@ -850,29 +1005,30 @@ fn fake_stage_statuses(
 ) -> Vec<StageStatusEvidence> {
     let mut statuses = vec![
         StageStatusEvidence {
-            stage: "enqueued",
-            status: "OBSERVED",
+            stage: "enqueued".to_string(),
+            status: "OBSERVED".to_string(),
             provenance: format!("fake adapter clock observed enqueue at {enqueued_at_ms}ms"),
         },
         StageStatusEvidence {
-            stage: "selected",
-            status: "OBSERVED",
+            stage: "selected".to_string(),
+            status: "OBSERVED".to_string(),
             provenance: format!("fake adapter clock observed selection at {selected_at_ms}ms"),
         },
     ];
     statuses.push(match delivered_at_ms {
         Some(ts) => StageStatusEvidence {
-            stage: "delivered",
+            stage: "delivered".to_string(),
             status: if terminal == "delivered" {
                 "OBSERVED"
             } else {
                 "FAILED"
-            },
+            }
+            .to_string(),
             provenance: format!("fake adapter clock observed delivery at {ts}ms"),
         },
         None => StageStatusEvidence {
-            stage: "delivered",
-            status: "FAILED",
+            stage: "delivered".to_string(),
+            status: "FAILED".to_string(),
             provenance: format!("fake adapter terminal outcome {terminal}"),
         },
     });

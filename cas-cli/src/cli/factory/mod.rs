@@ -582,6 +582,14 @@ pub enum FactoryCommands {
         #[arg(long, default_value = "250")]
         selection_slo_ms: u64,
 
+        /// Worker wake SLO threshold in milliseconds
+        #[arg(long, default_value = "250")]
+        wake_slo_ms: u64,
+
+        /// First reaction SLO threshold in milliseconds
+        #[arg(long, default_value = "500")]
+        reaction_slo_ms: u64,
+
         /// Inject a transport failure as SCENARIO:MESSAGE_ID
         #[arg(long, value_name = "SCENARIO:MESSAGE_ID")]
         inject_transport_failure: Option<String>,
@@ -768,6 +776,8 @@ pub fn execute(args: &FactoryArgs, cli: &Cli, cas_root: Option<&std::path::Path>
                 adapter,
                 delivery_slo_ms,
                 selection_slo_ms,
+                wake_slo_ms,
+                reaction_slo_ms,
                 inject_transport_failure,
                 inject_slo_failure,
             } => probe_comm::execute_probe_comm(
@@ -779,6 +789,8 @@ pub fn execute(args: &FactoryArgs, cli: &Cli, cas_root: Option<&std::path::Path>
                 *adapter,
                 *delivery_slo_ms,
                 *selection_slo_ms,
+                *wake_slo_ms,
+                *reaction_slo_ms,
                 probe_comm::parse_probe_failure(
                     inject_transport_failure.as_deref(),
                     inject_slo_failure.as_deref(),

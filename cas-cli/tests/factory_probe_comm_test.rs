@@ -252,14 +252,12 @@ fn probe_comm_cli_all_adapters_writes_recorded_fixture_report() {
     );
     assert!(routing["passed"].as_bool().unwrap());
     assert!(
-        routing["stages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|stage| stage["stage_statuses"][0]["provenance"]
+        routing["stages"].as_array().unwrap().iter().all(|stage| {
+            stage["stage_statuses"][0]["provenance"]
                 .as_str()
                 .unwrap()
-                .starts_with("receipt:")),
+                .starts_with("receipt:")
+        }),
         "routing observations must be receipt-backed: {routing}"
     );
     let lifecycle = lines
@@ -345,7 +343,10 @@ fn probe_comm_cli_malformed_receipt_is_stage_failure() {
         .find(|line| line["scenario"] == "routing_matrix_evidence")
         .unwrap();
     assert_eq!(routing["failed_stage"], "routing_receipt_malformed");
-    assert_eq!(routing["stages"][0]["stage_statuses"][0]["status"], "FAILED");
+    assert_eq!(
+        routing["stages"][0]["stage_statuses"][0]["status"],
+        "FAILED"
+    );
 }
 
 #[test]

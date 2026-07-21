@@ -82,12 +82,78 @@ fn write_adapter_artifacts(root: &std::path::Path) {
     );
 }
 
+fn write_composed_receipts(root: &std::path::Path) {
+    let receipts = root.join("receipts");
+    std::fs::create_dir_all(&receipts).unwrap();
+    let harnesses = ["claude", "codex", "grok"];
+    let mut contracts = Vec::new();
+    for supervisor in harnesses {
+        for worker in harnesses {
+            contracts.push(serde_json::json!({
+                "message_id": format!("{supervisor}-supervisor-to-{worker}-worker"),
+                "target": format!("{worker}-worker"),
+                "stage": "routing_matrix",
+                "status": "OBSERVED",
+                "provenance": "receipt:delivery_matrix_all_combos_both_directions"
+            }));
+            contracts.push(serde_json::json!({
+                "message_id": format!("{worker}-worker-to-{supervisor}-supervisor"),
+                "target": format!("{supervisor}-supervisor"),
+                "stage": "routing_matrix",
+                "status": "OBSERVED",
+                "provenance": "receipt:delivery_matrix_all_combos_both_directions"
+            }));
+        }
+    }
+    std::fs::write(
+        receipts.join("routing_matrix.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "receipt_type": "routing_matrix",
+            "contracts": contracts
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        receipts.join("lifecycle.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "receipt_type": "merge_reclose_lifecycle",
+            "receipts": [
+                {
+                    "message_id": "cas-126b-merge-reclose-halt-exemption",
+                    "target": "awaiting-merge-worker",
+                    "stage": "merge_reclose",
+                    "status": "OBSERVED",
+                    "provenance": "receipt:bounded re-close urgent halt exemption"
+                },
+                {
+                    "message_id": "cas-062d-owner-lifecycle-transitions",
+                    "target": "owning-supervisor",
+                    "stage": "lifecycle_transition",
+                    "status": "OBSERVED",
+                    "provenance": "receipt:owner lifecycle transition push"
+                },
+                {
+                    "message_id": "cas-ecff-lifecycle-outbox-recovery",
+                    "target": "owning-supervisor",
+                    "stage": "lifecycle_outbox_recovery",
+                    "status": "OBSERVED",
+                    "provenance": "receipt:exactly-once lifecycle outbox recovery"
+                }
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
 #[test]
 fn recorded_probe_comm_all_adapters_emit_stage_evidence() {
     let temp = tempfile::tempdir().unwrap();
     let jsonl = temp.path().join("probe.jsonl");
     let artifacts = temp.path().join("artifacts");
     write_adapter_artifacts(&artifacts);
+    write_composed_receipts(&artifacts);
 
     cas_cmd()
         .args([
