@@ -753,4 +753,57 @@ mod tests {
         assert_eq!(notifications.len(), 1);
         assert_eq!(notifications[0].event_type, "event2");
     }
+
+    /// cas-3a47: open a pre-transition_key / pre-prompt_delivered schema, upgrade, keep data.
+    #[test]
+    fn test_upgrade_from_legacy_supervisor_queue_schema() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("cas.db");
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            // Minimal pre-cas-062d schema (no transition_key, no prompt_delivered_at).
+            conn.execute_batch(
+                r#"
+                CREATE TABLE supervisor_queue (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    supervisor_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    priority INTEGER NOT NULL DEFAULT 2,
+                    created_at TEXT NOT NULL,
+                    processed_at TEXT
+                );
+                INSERT INTO supervisor_queue (supervisor_id, event_type, payload, priority, created_at)
+                VALUES ('sup-legacy', 'worker_died', '{"worker":"w1"}', 0, '2026-01-01T00:00:00Z');
+                "#,
+            )
+            .unwrap();
+        }
+
+        let store = SqliteSupervisorQueueStore::open(temp.path()).unwrap();
+        store.init().unwrap();
+        // Idempotent second init.
+        store.init().unwrap();
+
+        let pending = store.list_pending("sup-legacy").unwrap();
+        assert_eq!(pending.len(), 1, "legacy row preserved");
+        assert_eq!(pending[0].event_type, "worker_died");
+        assert!(pending[0].transition_key.is_none());
+        assert!(pending[0].prompt_delivered_at.is_none());
+
+        // New lifecycle outbox APIs work on upgraded schema.
+        let key = "cas-u:open:in_progress:s:task_started:occ";
+        store
+            .notify_idempotent(
+                "sup-legacy",
+                "task_lifecycle",
+                r#"{"task_id":"cas-u"}"#,
+                NotificationPriority::Normal,
+                key,
+            )
+            .unwrap();
+        let outbox = store.list_pending_lifecycle_outbox(10).unwrap();
+        assert_eq!(outbox.len(), 1);
+        assert_eq!(outbox[0].transition_key.as_deref(), Some(key));
+    }
 }
