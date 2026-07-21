@@ -304,9 +304,9 @@ impl CasService {
             Vec::new();
         {
             use crate::mcp::tools::core::task::lifecycle::stale_close_guard::{
-                apply_halt_metadata, halt_targets_for_urgent, is_merge_reclose_exempt_urgent,
-                may_source_role_set_halt, may_source_set_halt, session_scoped_worker_names,
-                should_persist_urgent_halt, HaltWorkerCandidate,
+                HaltWorkerCandidate, apply_halt_metadata, halt_targets_for_urgent,
+                is_merge_reclose_exempt_urgent, may_source_role_set_halt, may_source_set_halt,
+                session_scoped_worker_names, should_persist_urgent_halt,
             };
             use crate::store::{open_agent_store, open_task_store};
             use cas_types::{AgentRole, TaskStatus};
@@ -321,7 +321,8 @@ impl CasService {
                 .map(|a| may_source_role_set_halt(a.role))
                 .unwrap_or_else(|| may_source_set_halt(&display_name, &source_role_for_halt));
 
-            if urgent && (source_authorized || may_source_set_halt(&display_name, &source_role_for_halt))
+            if urgent
+                && (source_authorized || may_source_set_halt(&display_name, &source_role_for_halt))
             {
                 let agent_store = open_agent_store(&self.inner.cas_root).map_err(|e| {
                     Self::error(
@@ -399,8 +400,7 @@ impl CasService {
                     &session_workers,
                 ) {
                     let targets = halt_targets_for_urgent(&resolved_target, &session_workers);
-                    let halt_generation =
-                        chrono::Utc::now().timestamp_millis().max(0) as u64;
+                    let halt_generation = chrono::Utc::now().timestamp_millis().max(0) as u64;
                     for target_name in &targets {
                         // Match by name + session so same-name cross-session
                         // peers are not halted.
@@ -605,17 +605,36 @@ impl CasService {
             )
         })?;
 
-        let status = queue.message_status(notification_id).map_err(|error| {
-            Self::error(
-                ErrorCode::INTERNAL_ERROR,
-                format!("Failed to query message status: {error}"),
-            )
-        })?;
+        // cas-2c5f: stage-based report is additive; legacy status string is
+        // preserved on the first line for older clients/scripts.
+        let report = queue
+            .message_delivery_report(notification_id)
+            .map_err(|error| {
+                Self::error(
+                    ErrorCode::INTERNAL_ERROR,
+                    format!("Failed to query message status: {error}"),
+                )
+            })?;
 
-        match status {
-            Some(s) => Ok(Self::success(format!(
-                "Message {notification_id} status: {s}"
-            ))),
+        match report {
+            Some(r) => {
+                let json = serde_json::to_string_pretty(&r).unwrap_or_else(|_| {
+                    format!(
+                        "{{\"id\":{},\"legacy_status\":\"{}\",\"stage\":\"{}\"}}",
+                        r.id, r.legacy_status, r.stage
+                    )
+                });
+                let reason = r
+                    .pending_reason
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "none".into());
+                Ok(Self::success(format!(
+                    "Message {notification_id} status: {}\n\
+                     stage: {}  pending_reason: {}  wake: {}  reaction: {}\n\
+                     {json}",
+                    r.legacy_status, r.stage, reason, r.wake, r.reaction
+                )))
+            }
             None => Ok(Self::success(format!(
                 "Message {notification_id} not found"
             ))),

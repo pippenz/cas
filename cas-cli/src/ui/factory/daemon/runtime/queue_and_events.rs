@@ -222,8 +222,11 @@ impl FactoryDaemon {
             // and `queued.created_at` is the queue→deliver latency, which
             // is what the P99 SLO targets. Logged at debug; enable via
             // `RUST_LOG=cas::coordination=debug`.
+            // cas-2c5f: stamp selected_at so message_status can report the
+            // Selected stage (authoritative daemon observation).
             let now = chrono::Utc::now();
             for queued in &prompts {
+                let _ = queue.record_selected(queued.id);
                 let wait_ms = (now - queued.created_at).num_milliseconds();
                 tracing::debug!(
                     target: "cas::coordination",
@@ -275,7 +278,8 @@ impl FactoryDaemon {
                     target = %queued.target,
                     "Dropping message from dead worker"
                 );
-                let _ = queue.mark_processed(queued.id);
+                // cas-2c5f: not transport delivery — structured stage=dropped.
+                let _ = queue.mark_dropped(queued.id, Some("source worker is dead/shut down"));
                 continue;
             }
 
@@ -289,17 +293,24 @@ impl FactoryDaemon {
                 let dominated = self
                     .last_idle_message_times
                     .get(&queued.source)
-                    .is_some_and(|last| now.duration_since(*last) < std::time::Duration::from_secs(300));
+                    .is_some_and(|last| {
+                        now.duration_since(*last) < std::time::Duration::from_secs(300)
+                    });
                 if dominated {
                     tracing::debug!(
                         prompt_id = queued.id,
                         source = %queued.source,
                         "Suppressing duplicate idle message (rate-limited to 5min)"
                     );
-                    let _ = queue.mark_processed(queued.id);
+                    // cas-2c5f: not transport delivery — structured stage=suppressed.
+                    let _ = queue.mark_suppressed(
+                        queued.id,
+                        Some("duplicate idle message rate-limited (5min)"),
+                    );
                     continue;
                 }
-                self.last_idle_message_times.insert(queued.source.clone(), now);
+                self.last_idle_message_times
+                    .insert(queued.source.clone(), now);
             }
 
             // Skip PTY injection for native extension agents that use plain PTY mode —
@@ -339,6 +350,12 @@ impl FactoryDaemon {
                             )));
                 if pty_delivered && !self.app.mux.pane_ready_for_injection(pane_target) {
                     // Don't ack — the prompt stays in the queue for the next tick.
+                    // cas-2c5f: durable pending reason for message_status.
+                    let _ = queue.record_pending_reason(
+                        queued.id,
+                        cas_store::PendingReason::GatedNotReady,
+                        Some("pane not ready for injection"),
+                    );
                     continue;
                 }
             }
@@ -399,6 +416,8 @@ impl FactoryDaemon {
 
             let mut success = false;
             if target == "all_workers" {
+                // cas-2c5f: truthful broadcast outcomes — never stamp full
+                // Delivered on any_success. Count intended/succeeded/failed.
                 let workers: Vec<String> = self
                     .app
                     .worker_names()
@@ -410,21 +429,33 @@ impl FactoryDaemon {
                     .cloned()
                     .collect();
                 tracing::info!("all_workers target, workers: {:?}", workers);
-                if workers.is_empty() {
+                let attempted = workers.len() as u32;
+                if attempted == 0 {
+                    let _ = queue.mark_broadcast_outcome(
+                        queued.id,
+                        0,
+                        0,
+                        0,
+                        Some("no non-native workers for all_workers broadcast"),
+                    );
                     continue;
                 }
-                let mut any_success = false;
-                for name in workers {
+                let mut succeeded: u32 = 0;
+                let mut failed: u32 = 0;
+                let mut fail_notes: Vec<String> = Vec::new();
+                for name in &workers {
                     // For urgent broadcasts, skip workers whose pane isn't ready
-                    // yet (don't ack the row — it stays queued for retry).
-                    if queued.urgent && !self.app.mux.pane_ready_for_injection(&name) {
+                    // yet — count as failed for this tick (not full delivery).
+                    if queued.urgent && !self.app.mux.pane_ready_for_injection(name) {
+                        failed += 1;
+                        fail_notes.push(format!("{name}: pane not ready"));
                         continue;
                     }
                     let inject_result: anyhow::Result<()> = if queued.urgent {
-                        let settle = self.urgent_settle_duration(&name);
+                        let settle = self.urgent_settle_duration(name);
                         self.app
                             .mux
-                            .interrupt_and_inject(&name, &prompt_with_instructions, settle)
+                            .interrupt_and_inject(name, &prompt_with_instructions, settle)
                             .await
                             .map_err(Into::into)
                     } else {
@@ -433,7 +464,7 @@ impl FactoryDaemon {
                         // color=None: peer/supervisor senders; team manager resolves
                         // configured color from the sender's team record.
                         self.deliver_to_worker(
-                            &name,
+                            name,
                             &inbox_source,
                             &prompt_with_instructions,
                             queued.summary.as_deref(),
@@ -443,7 +474,7 @@ impl FactoryDaemon {
                     };
                     match inject_result {
                         Ok(_) => {
-                            any_success = true;
+                            succeeded += 1;
                             tracing::info!("Injected to worker '{}'", name);
                             if let Some(ref store) = event_store {
                                 record_injection(
@@ -451,13 +482,15 @@ impl FactoryDaemon {
                                     queued.id,
                                     &queued.source,
                                     &queued.target,
-                                    &name,
+                                    name,
                                     "ok",
                                     None,
                                 );
                             }
                         }
                         Err(e) => {
+                            failed += 1;
+                            fail_notes.push(format!("{name}: {e}"));
                             tracing::error!("Failed to inject to '{}': {}", name, e);
                             if let Some(ref store) = event_store {
                                 record_injection(
@@ -465,7 +498,7 @@ impl FactoryDaemon {
                                     queued.id,
                                     &queued.source,
                                     &queued.target,
-                                    &name,
+                                    name,
                                     "error",
                                     Some(e.to_string()),
                                 );
@@ -473,7 +506,26 @@ impl FactoryDaemon {
                         }
                     }
                 }
-                success = any_success;
+                let detail = if fail_notes.is_empty() {
+                    None
+                } else {
+                    Some(fail_notes.join("; "))
+                };
+                if let Err(e) = queue.mark_broadcast_outcome(
+                    queued.id,
+                    attempted,
+                    succeeded,
+                    failed,
+                    detail.as_deref(),
+                ) {
+                    tracing::error!(
+                        "Failed to stamp broadcast outcome for prompt {}: {}",
+                        queued.id,
+                        e
+                    );
+                }
+                // Do not fall through to mark_transport_delivered — outcome already stamped.
+                continue;
             } else {
                 // Resolve the pane name for diagnostics / event records. Delivery
                 // itself (channel selection + name normalisation) is handled by the
@@ -523,8 +575,8 @@ impl FactoryDaemon {
                         // measured from the sender-assigned `created_at` to
                         // the moment the daemon completed the inbox write.
                         // This is the number the P99 SLO tracks.
-                        let deliver_ms = (chrono::Utc::now() - queued.created_at)
-                            .num_milliseconds();
+                        let deliver_ms =
+                            (chrono::Utc::now() - queued.created_at).num_milliseconds();
                         tracing::info!(
                             target: "cas::coordination",
                             stage = "delivered",
@@ -557,6 +609,12 @@ impl FactoryDaemon {
                                 self.app.worker_names().contains(&pane_target.to_string())
                                     || pane_target == self.app.supervisor_name();
                             if is_current {
+                                // cas-2c5f: known target still spawning — retryable unavail.
+                                let _ = queue.record_pending_reason(
+                                    queued.id,
+                                    cas_store::PendingReason::TargetUnavailable,
+                                    Some("pane missing; target is current session member"),
+                                );
                                 continue;
                             }
                             tracing::warn!(
@@ -566,7 +624,13 @@ impl FactoryDaemon {
                                 "Abandoning queued prompt for unknown target — \
                                  message will not be delivered"
                             );
-                            let _ = queue.mark_processed(queued.id);
+                            // cas-2c5f: not transport delivery — structured stage=abandoned.
+                            let _ = queue.mark_abandoned(
+                                queued.id,
+                                Some(&format!(
+                                    "target '{pane_target}' not found in current session"
+                                )),
+                            );
 
                             // Record the drop and notify the supervisor so the
                             // message isn't silently lost.
@@ -592,9 +656,7 @@ impl FactoryDaemon {
                                  Undelivered message from '{}' to '{}' (target not in session):\n\n\
                                  {}\n\
                                  </system-notice>",
-                                queued.source,
-                                pane_target,
-                                &queued.prompt
+                                queued.source, pane_target, &queued.prompt
                             );
                             let _ = queue.enqueue_with_session(
                                 super::teams::DIRECTOR_AGENT_NAME,
@@ -606,6 +668,12 @@ impl FactoryDaemon {
                             continue;
                         }
                         tracing::error!("Failed to inject to '{}': {}", pane_target, e);
+                        // cas-2c5f: adapter failure leaves row pending for retry.
+                        let _ = queue.record_pending_reason(
+                            queued.id,
+                            cas_store::PendingReason::AdapterRetryable,
+                            Some(&e.to_string()),
+                        );
                         if let Some(ref store) = event_store {
                             record_injection(
                                 store,
@@ -622,8 +690,13 @@ impl FactoryDaemon {
             }
 
             if success {
-                if let Err(e) = queue.mark_processed(queued.id) {
-                    tracing::error!("Failed to mark prompt {} as processed: {}", queued.id, e);
+                // cas-2c5f: authoritative transport handoff only.
+                if let Err(e) = queue.mark_transport_delivered(queued.id) {
+                    tracing::error!(
+                        "Failed to mark prompt {} as transport-delivered: {}",
+                        queued.id,
+                        e
+                    );
                 }
             }
         }
@@ -1002,8 +1075,7 @@ impl FactoryDaemon {
                                     self.app.cas_dir(),
                                     &name,
                                 );
-                                self.app.spawning_count =
-                                    self.app.spawning_count.saturating_sub(1);
+                                self.app.spawning_count = self.app.spawning_count.saturating_sub(1);
                                 tracing::info!(
                                     worker = %name,
                                     "cas-7a94: cancelled pending spawn on shutdown — released pre-assign"
@@ -1018,8 +1090,7 @@ impl FactoryDaemon {
                                 // Anonymous names are only known once prepare runs;
                                 // if still in the queue, no early assign has fired yet.
                                 let _ = (isolate, spec, task_id);
-                                self.app.spawning_count =
-                                    self.app.spawning_count.saturating_sub(1);
+                                self.app.spawning_count = self.app.spawning_count.saturating_sub(1);
                             }
                             other => kept.push_back(other),
                         }
@@ -1599,7 +1670,11 @@ mod tests {
 
         // A live worker was respawned into the same name → NOT dead, must deliver.
         let live = vec!["backend-admin".to_string(), "frontend-dry".to_string()];
-        assert!(!FactoryDaemon::source_is_dead(&dead, &live, "backend-admin"));
+        assert!(!FactoryDaemon::source_is_dead(
+            &dead,
+            &live,
+            "backend-admin"
+        ));
         assert!(!FactoryDaemon::source_is_dead(&dead, &live, "frontend-dry"));
 
         // A source never in the dead set (external sender / fresh worker) passes.
@@ -1619,7 +1694,9 @@ mod tests {
         assert!(FactoryDaemon::is_idle_message("No task assigned."));
         // Case-insensitive and leading whitespace tolerant.
         assert!(FactoryDaemon::is_idle_message("  STANDING BY."));
-        assert!(FactoryDaemon::is_idle_message("standing by for further direction"));
+        assert!(FactoryDaemon::is_idle_message(
+            "standing by for further direction"
+        ));
     }
 
     /// Regression for cas-f9e8: the old unanchored substring filter silently
