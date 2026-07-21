@@ -147,6 +147,24 @@ fn write_composed_receipts(root: &std::path::Path) {
     .unwrap();
 }
 
+fn write_slo_samples(root: &std::path::Path) {
+    let receipts = root.join("receipts");
+    std::fs::create_dir_all(&receipts).unwrap();
+    std::fs::write(
+        receipts.join("slo_samples.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "receipt_type": "probe_comm_slo_samples",
+            "provenance": "receipt:multi-sample conformance run",
+            "normal_transport_ms": [100, 300, 500, 800, 1200],
+            "urgent_transport_ms": [100, 300, 500, 800, 1200],
+            "wake_ms": [100, 800, 1500, 2500, 4000],
+            "reaction_ms": [100, 2000, 4000, 7000, 12000]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
 #[test]
 fn recorded_probe_comm_all_adapters_emit_stage_evidence() {
     let temp = tempfile::tempdir().unwrap();
@@ -154,6 +172,7 @@ fn recorded_probe_comm_all_adapters_emit_stage_evidence() {
     let artifacts = temp.path().join("artifacts");
     write_adapter_artifacts(&artifacts);
     write_composed_receipts(&artifacts);
+    write_slo_samples(&artifacts);
 
     cas_cmd()
         .args([
@@ -170,7 +189,7 @@ fn recorded_probe_comm_all_adapters_emit_stage_evidence() {
         .success();
 
     let lines = read_jsonl(&jsonl);
-    assert_eq!(lines.len(), 5);
+    assert_eq!(lines.len(), 6);
     assert!(lines.iter().all(|line| line["passed"] == true));
     assert!(
         lines
@@ -187,5 +206,10 @@ fn recorded_probe_comm_all_adapters_emit_stage_evidence() {
         lines
             .iter()
             .any(|line| line["scenario"] == "merge_reclose_lifecycle_evidence")
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line["scenario"] == "slo_aggregate_evidence")
     );
 }

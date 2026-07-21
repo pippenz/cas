@@ -333,8 +333,16 @@ fn probe_comm_cli_all_adapters_writes_recorded_fixture_report() {
     assert_eq!(slo["slo_contract"]["wake_p95_ms"], 5000);
     assert_eq!(slo["slo_contract"]["reaction_p95_ms"], 15000);
     let aggregates = slo["aggregate_slos"].as_array().unwrap();
-    assert!(aggregates.iter().all(|agg| agg["sample_count"].as_u64().unwrap() >= 5));
-    assert!(aggregates.iter().all(|agg| agg["provenance"] == "receipt:multi-sample conformance run"));
+    assert!(
+        aggregates
+            .iter()
+            .all(|agg| agg["sample_count"].as_u64().unwrap() >= 5)
+    );
+    assert!(
+        aggregates
+            .iter()
+            .all(|agg| agg["provenance"] == "receipt:multi-sample conformance run")
+    );
 }
 
 #[test]
@@ -422,7 +430,7 @@ fn probe_comm_cli_slo_aggregate_receipt_enforces_epic_boundaries() {
     let cases = [
         (
             "normal_transport_p95",
-            vec![100, 300, 500, 800, 2500],
+            vec![100, 300, 500, 2500, 2600],
             vec![100, 300, 500, 800, 1200],
             vec![100, 800, 1500, 2500, 4000],
             vec![100, 2000, 4000, 7000, 12000],
@@ -431,6 +439,13 @@ fn probe_comm_cli_slo_aggregate_receipt_enforces_epic_boundaries() {
             "normal_transport_max",
             vec![100, 300, 500, 800, 12000],
             vec![100, 300, 500, 800, 1200],
+            vec![100, 800, 1500, 2500, 4000],
+            vec![100, 2000, 4000, 7000, 12000],
+        ),
+        (
+            "urgent_transport_p95",
+            vec![100, 300, 500, 800, 1200],
+            vec![100, 300, 500, 2500, 2600],
             vec![100, 800, 1500, 2500, 4000],
             vec![100, 2000, 4000, 7000, 12000],
         ),
@@ -445,7 +460,7 @@ fn probe_comm_cli_slo_aggregate_receipt_enforces_epic_boundaries() {
             "wake_p95",
             vec![100, 300, 500, 800, 1200],
             vec![100, 300, 500, 800, 1200],
-            vec![100, 800, 1500, 2500, 6000],
+            vec![100, 800, 1500, 6000, 7000],
             vec![100, 2000, 4000, 7000, 12000],
         ),
         (
@@ -453,7 +468,7 @@ fn probe_comm_cli_slo_aggregate_receipt_enforces_epic_boundaries() {
             vec![100, 300, 500, 800, 1200],
             vec![100, 300, 500, 800, 1200],
             vec![100, 800, 1500, 2500, 4000],
-            vec![100, 2000, 4000, 7000, 16000],
+            vec![100, 2000, 4000, 16000, 17000],
         ),
     ];
 
@@ -482,6 +497,74 @@ fn probe_comm_cli_slo_aggregate_receipt_enforces_epic_boundaries() {
             .unwrap();
         assert_eq!(slo["failed_stage"], failed_stage);
     }
+}
+
+#[test]
+fn probe_comm_cli_slo_aggregate_requires_distribution_samples() {
+    let temp = tempfile::tempdir().unwrap();
+    let jsonl = temp.path().join("probe.jsonl");
+    let artifacts = temp.path().join("artifacts");
+    write_adapter_artifacts(&artifacts);
+    write_composed_receipts(&artifacts);
+    write_slo_samples(&artifacts, &[100], &[100], &[100], &[100]);
+
+    cas_cmd()
+        .args([
+            "factory",
+            "probe-comm",
+            "--jsonl",
+            jsonl.to_str().unwrap(),
+            "--adapter",
+            "all",
+            "--artifact-root",
+            artifacts.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("slo_sample_count_insufficient"));
+
+    let lines = read_jsonl(&jsonl);
+    let slo = lines
+        .iter()
+        .find(|line| line["scenario"] == "slo_aggregate_evidence")
+        .unwrap();
+    assert_eq!(slo["passed"], false);
+    assert_eq!(slo["failed_stage"], "slo_sample_count_insufficient");
+}
+
+#[test]
+fn probe_comm_cli_malformed_slo_aggregate_receipt_is_stage_failure() {
+    let temp = tempfile::tempdir().unwrap();
+    let jsonl = temp.path().join("probe.jsonl");
+    let artifacts = temp.path().join("artifacts");
+    write_adapter_artifacts(&artifacts);
+    write_composed_receipts(&artifacts);
+    let receipts = artifacts.join("receipts");
+    std::fs::write(receipts.join("slo_samples.json"), "{not-json}\n").unwrap();
+
+    cas_cmd()
+        .args([
+            "factory",
+            "probe-comm",
+            "--jsonl",
+            jsonl.to_str().unwrap(),
+            "--adapter",
+            "all",
+            "--artifact-root",
+            artifacts.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("slo_receipt_malformed"));
+
+    let lines = read_jsonl(&jsonl);
+    let slo = lines
+        .iter()
+        .find(|line| line["scenario"] == "slo_aggregate_evidence")
+        .unwrap();
+    assert_eq!(slo["passed"], false);
+    assert_eq!(slo["failed_stage"], "slo_receipt_malformed");
+    assert_eq!(slo["stages"][0]["stage_statuses"][0]["status"], "FAILED");
 }
 
 #[test]

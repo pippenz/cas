@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 
 pub(crate) mod adapters;
 
+const MIN_P95_SAMPLE_COUNT: usize = 5;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum ProbeAdapterKind {
     Fake,
@@ -20,18 +22,26 @@ pub enum ProbeAdapterKind {
 pub(crate) struct ProbeThresholds {
     pub delivery_ms: u64,
     pub selection_ms: u64,
-    pub wake_ms: u64,
-    pub reaction_ms: u64,
+    pub normal_transport_p95_ms: u64,
+    pub normal_transport_max_ms: u64,
+    pub urgent_transport_p95_ms: u64,
+    pub urgent_transport_max_ms: u64,
+    pub wake_p95_ms: u64,
+    pub reaction_p95_ms: u64,
 }
 
 impl ProbeThresholds {
     #[cfg(test)]
     pub(crate) fn epic_defaults() -> Self {
         Self {
-            delivery_ms: 500,
+            delivery_ms: 2_000,
             selection_ms: 250,
-            wake_ms: 250,
-            reaction_ms: 500,
+            normal_transport_p95_ms: 2_000,
+            normal_transport_max_ms: 10_000,
+            urgent_transport_p95_ms: 2_000,
+            urgent_transport_max_ms: 5_000,
+            wake_p95_ms: 5_000,
+            reaction_p95_ms: 15_000,
         }
     }
 }
@@ -76,6 +86,32 @@ pub(crate) struct ScenarioReport {
     pub duplicates_suppressed: u32,
     pub malformed_targets_rejected: u32,
     pub stages: Vec<MessageStageEvidence>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slo_contract: Option<SloContractReport>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub aggregate_slos: Vec<AggregateSloEvidence>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct SloContractReport {
+    pub units: &'static str,
+    pub normal_transport_p95_ms: u64,
+    pub normal_transport_max_ms: u64,
+    pub urgent_transport_p95_ms: u64,
+    pub urgent_transport_max_ms: u64,
+    pub wake_p95_ms: u64,
+    pub reaction_p95_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct AggregateSloEvidence {
+    pub metric: &'static str,
+    pub gate: &'static str,
+    pub sample_count: usize,
+    pub observed_ms: u64,
+    pub threshold_ms: u64,
+    pub passed: bool,
+    pub provenance: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -171,8 +207,12 @@ pub(crate) fn execute_probe_comm(
     adapter: ProbeAdapterKind,
     delivery_slo_ms: u64,
     selection_slo_ms: u64,
-    wake_slo_ms: u64,
-    reaction_slo_ms: u64,
+    normal_transport_p95_slo_ms: u64,
+    normal_transport_max_slo_ms: u64,
+    urgent_transport_p95_slo_ms: u64,
+    urgent_transport_max_slo_ms: u64,
+    wake_p95_slo_ms: u64,
+    reaction_p95_slo_ms: u64,
     failure: Option<ProbeFailure>,
 ) -> Result<()> {
     let report = run_probe_comm_with_parent(
@@ -185,8 +225,12 @@ pub(crate) fn execute_probe_comm(
             thresholds: ProbeThresholds {
                 delivery_ms: delivery_slo_ms,
                 selection_ms: selection_slo_ms,
-                wake_ms: wake_slo_ms,
-                reaction_ms: reaction_slo_ms,
+                normal_transport_p95_ms: normal_transport_p95_slo_ms,
+                normal_transport_max_ms: normal_transport_max_slo_ms,
+                urgent_transport_p95_ms: urgent_transport_p95_slo_ms,
+                urgent_transport_max_ms: urgent_transport_max_slo_ms,
+                wake_p95_ms: wake_p95_slo_ms,
+                reaction_p95_ms: reaction_p95_slo_ms,
             },
             failure,
         },
@@ -404,6 +448,7 @@ fn run_recorded_adapter_scenarios(
     if matches!(adapter, ProbeAdapterKind::All) {
         scenarios.push(routing_matrix_evidence_scenario(artifact_root));
         scenarios.push(merge_reclose_lifecycle_evidence_scenario(artifact_root));
+        scenarios.push(slo_aggregate_evidence_scenario(artifact_root, thresholds));
     }
     scenarios
 }
@@ -445,7 +490,7 @@ fn adapter_scenario(
     let mut failed_stage = None;
     if stage.terminal == "delivered" {
         if let (Some(delivered), Some(wake)) = (stage.delivered_at_ms, stage.wake_at_ms)
-            && wake.saturating_sub(delivered) > thresholds.wake_ms
+            && wake.saturating_sub(delivered) > thresholds.wake_p95_ms
         {
             stage.terminal = "wake_slo_failed";
             failed_stage = Some("wake_slo");
@@ -454,16 +499,16 @@ fn adapter_scenario(
                 stage: "wake".to_string(),
                 status: "FAILED".to_string(),
                 provenance: format!(
-                    "wake observed {}ms after delivery; wake_slo_ms={}",
+                    "wake observed {}ms after delivery; wake_p95_slo_ms={}",
                     wake.saturating_sub(delivered),
-                    thresholds.wake_ms
+                    thresholds.wake_p95_ms
                 ),
             });
         }
         if failed_stage.is_none()
             && let (Some(delivered), Some(reaction)) =
                 (stage.delivered_at_ms, stage.first_reaction_at_ms)
-            && reaction.saturating_sub(delivered) > thresholds.reaction_ms
+            && reaction.saturating_sub(delivered) > thresholds.reaction_p95_ms
         {
             stage.terminal = "reaction_slo_failed";
             failed_stage = Some("reaction_slo");
@@ -472,9 +517,9 @@ fn adapter_scenario(
                 stage: "reaction".to_string(),
                 status: "FAILED".to_string(),
                 provenance: format!(
-                    "reaction observed {}ms after delivery; reaction_slo_ms={}",
+                    "reaction observed {}ms after delivery; reaction_p95_slo_ms={}",
                     reaction.saturating_sub(delivered),
-                    thresholds.reaction_ms
+                    thresholds.reaction_p95_ms
                 ),
             });
         }
@@ -496,6 +541,8 @@ fn adapter_scenario(
         duplicates_suppressed: 0,
         malformed_targets_rejected: 0,
         stages: vec![stage],
+        slo_contract: None,
+        aggregate_slos: Vec::new(),
     }
 }
 
@@ -563,6 +610,8 @@ fn adapter_failure_scenario(
             }],
             terminal: failed_stage,
         }],
+        slo_contract: None,
+        aggregate_slos: Vec::new(),
     }
 }
 
@@ -582,6 +631,20 @@ struct ReceiptEntry {
     stage: String,
     status: String,
     provenance: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SloSamplesDocument {
+    receipt_type: String,
+    provenance: String,
+    #[serde(default)]
+    normal_transport_ms: Vec<u64>,
+    #[serde(default)]
+    urgent_transport_ms: Vec<u64>,
+    #[serde(default)]
+    wake_ms: Vec<u64>,
+    #[serde(default)]
+    reaction_ms: Vec<u64>,
 }
 
 fn routing_matrix_evidence_scenario(artifact_root: Option<&Path>) -> ScenarioReport {
@@ -754,6 +817,8 @@ fn receipt_backed_scenario(
         duplicates_suppressed: 0,
         malformed_targets_rejected: 0,
         stages,
+        slo_contract: None,
+        aggregate_slos: Vec::new(),
     }
 }
 
@@ -780,6 +845,261 @@ fn receipt_failure_scenario(
             },
             provenance,
         )],
+        slo_contract: None,
+        aggregate_slos: Vec::new(),
+    }
+}
+
+fn slo_aggregate_evidence_scenario(
+    artifact_root: Option<&Path>,
+    thresholds: &ProbeThresholds,
+) -> ScenarioReport {
+    let Some(root) = artifact_root else {
+        return slo_failure_scenario(
+            "slo_receipt_missing",
+            "no artifact root for SLO sample receipt",
+            thresholds,
+            Vec::new(),
+        );
+    };
+    let path = root.join("receipts/slo_samples.json");
+    if !path.exists() {
+        return slo_failure_scenario(
+            "slo_receipt_missing",
+            &format!("missing SLO sample receipt {}", path.display()),
+            thresholds,
+            Vec::new(),
+        );
+    }
+    let data = match fs::read_to_string(&path) {
+        Ok(data) => data,
+        Err(error) => {
+            return slo_failure_scenario(
+                "slo_receipt_missing",
+                &format!("read SLO sample receipt {}: {error}", path.display()),
+                thresholds,
+                Vec::new(),
+            );
+        }
+    };
+    let document: SloSamplesDocument = match serde_json::from_str(&data) {
+        Ok(document) => document,
+        Err(error) => {
+            return slo_failure_scenario(
+                "slo_receipt_malformed",
+                &format!("parse SLO sample receipt {}: {error}", path.display()),
+                thresholds,
+                Vec::new(),
+            );
+        }
+    };
+    if document.receipt_type != "probe_comm_slo_samples" {
+        return slo_failure_scenario(
+            "slo_receipt_malformed",
+            &format!(
+                "SLO sample receipt {} type '{}' did not match expected 'probe_comm_slo_samples'",
+                path.display(),
+                document.receipt_type
+            ),
+            thresholds,
+            Vec::new(),
+        );
+    }
+    if document.provenance.is_empty() {
+        return slo_failure_scenario(
+            "slo_receipt_malformed",
+            &format!("SLO sample receipt {} missing provenance", path.display()),
+            thresholds,
+            Vec::new(),
+        );
+    }
+    if document.reaction_ms.is_empty() {
+        return slo_failure_scenario(
+            "reaction_unknown",
+            &format!(
+                "SLO sample receipt {} has no observable reaction samples",
+                path.display()
+            ),
+            thresholds,
+            Vec::new(),
+        );
+    }
+
+    let mut aggregate_slos = Vec::new();
+    for (metric, gate, samples, threshold) in [
+        (
+            "normal_transport",
+            "p95",
+            document.normal_transport_ms.as_slice(),
+            thresholds.normal_transport_p95_ms,
+        ),
+        (
+            "normal_transport",
+            "max",
+            document.normal_transport_ms.as_slice(),
+            thresholds.normal_transport_max_ms,
+        ),
+        (
+            "urgent_transport",
+            "p95",
+            document.urgent_transport_ms.as_slice(),
+            thresholds.urgent_transport_p95_ms,
+        ),
+        (
+            "urgent_transport",
+            "max",
+            document.urgent_transport_ms.as_slice(),
+            thresholds.urgent_transport_max_ms,
+        ),
+        (
+            "wake",
+            "p95",
+            document.wake_ms.as_slice(),
+            thresholds.wake_p95_ms,
+        ),
+        (
+            "reaction",
+            "p95",
+            document.reaction_ms.as_slice(),
+            thresholds.reaction_p95_ms,
+        ),
+    ] {
+        let Some(evidence) = aggregate_slo_evidence(
+            metric,
+            gate,
+            samples,
+            threshold,
+            document.provenance.clone(),
+        ) else {
+            return slo_failure_scenario(
+                "slo_sample_count_insufficient",
+                &format!(
+                    "SLO sample receipt {} has fewer than {MIN_P95_SAMPLE_COUNT} samples for {metric}_{gate}",
+                    path.display()
+                ),
+                thresholds,
+                aggregate_slos,
+            );
+        };
+        aggregate_slos.push(evidence);
+    }
+
+    let failed_stage = aggregate_slos
+        .iter()
+        .find(|evidence| !evidence.passed)
+        .map(|evidence| slo_failed_stage(evidence.metric, evidence.gate));
+    let passed = failed_stage.is_none();
+    ScenarioReport {
+        name: "slo_aggregate_evidence",
+        passed,
+        failed_stage,
+        message_ids: aggregate_slos
+            .iter()
+            .map(|evidence| format!("{}_{}", evidence.metric, evidence.gate))
+            .collect(),
+        duplicates_suppressed: 0,
+        malformed_targets_rejected: 0,
+        stages: vec![composed_evidence_stage(
+            "slo-aggregate-receipt",
+            "probe-comm",
+            failed_stage.unwrap_or("slo_aggregate"),
+            if passed { "OBSERVED" } else { "FAILED" },
+            &document.provenance,
+        )],
+        slo_contract: Some(slo_contract_report(thresholds)),
+        aggregate_slos,
+    }
+}
+
+fn aggregate_slo_evidence(
+    metric: &'static str,
+    gate: &'static str,
+    samples: &[u64],
+    threshold_ms: u64,
+    provenance: String,
+) -> Option<AggregateSloEvidence> {
+    if samples.len() < MIN_P95_SAMPLE_COUNT {
+        return None;
+    }
+    let observed_ms = if gate == "max" {
+        *samples.iter().max()?
+    } else {
+        percentile_95_ms(samples)?
+    };
+    Some(AggregateSloEvidence {
+        metric,
+        gate,
+        sample_count: samples.len(),
+        observed_ms,
+        threshold_ms,
+        passed: observed_ms <= threshold_ms,
+        provenance,
+    })
+}
+
+fn percentile_95_ms(samples: &[u64]) -> Option<u64> {
+    if samples.is_empty() {
+        return None;
+    }
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    let index = ((sorted.len() - 1) * 95) / 100;
+    sorted.get(index).copied()
+}
+
+fn slo_failed_stage(metric: &'static str, gate: &'static str) -> &'static str {
+    match (metric, gate) {
+        ("normal_transport", "p95") => "normal_transport_p95",
+        ("normal_transport", "max") => "normal_transport_max",
+        ("urgent_transport", "p95") => "urgent_transport_p95",
+        ("urgent_transport", "max") => "urgent_transport_max",
+        ("wake", "p95") => "wake_p95",
+        ("reaction", "p95") => "reaction_p95",
+        _ => "slo_aggregate",
+    }
+}
+
+fn slo_contract_report(thresholds: &ProbeThresholds) -> SloContractReport {
+    SloContractReport {
+        units: "milliseconds",
+        normal_transport_p95_ms: thresholds.normal_transport_p95_ms,
+        normal_transport_max_ms: thresholds.normal_transport_max_ms,
+        urgent_transport_p95_ms: thresholds.urgent_transport_p95_ms,
+        urgent_transport_max_ms: thresholds.urgent_transport_max_ms,
+        wake_p95_ms: thresholds.wake_p95_ms,
+        reaction_p95_ms: thresholds.reaction_p95_ms,
+    }
+}
+
+fn slo_failure_scenario(
+    failed_stage: &'static str,
+    provenance: &str,
+    thresholds: &ProbeThresholds,
+    aggregate_slos: Vec<AggregateSloEvidence>,
+) -> ScenarioReport {
+    ScenarioReport {
+        name: "slo_aggregate_evidence",
+        passed: false,
+        failed_stage: Some(failed_stage),
+        message_ids: Vec::new(),
+        duplicates_suppressed: 0,
+        malformed_targets_rejected: 0,
+        stages: vec![composed_evidence_stage(
+            failed_stage,
+            "probe-comm",
+            failed_stage,
+            if failed_stage.ends_with("_missing")
+                || failed_stage == "slo_sample_count_insufficient"
+                || failed_stage == "reaction_unknown"
+            {
+                "BLOCKED"
+            } else {
+                "FAILED"
+            },
+            provenance,
+        )],
+        slo_contract: Some(slo_contract_report(thresholds)),
+        aggregate_slos,
     }
 }
 
@@ -885,6 +1205,8 @@ fn run_scenario(
         duplicates_suppressed,
         malformed_targets_rejected,
         stages,
+        slo_contract: None,
+        aggregate_slos: Vec::new(),
     }
 }
 
