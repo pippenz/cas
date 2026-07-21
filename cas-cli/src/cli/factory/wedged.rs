@@ -34,8 +34,11 @@
 //! with a `signals.json` turn/token counter file, no known crash-screen
 //! signature) and are resolved/classified differently; see
 //! [`resolve_worker`]'s harness branch and [`effective_transcript_age`] /
-//! [`effective_crash_signature`]. Codex still has no dedicated transcript
-//! reader and resolves to `None` regardless of harness.
+//! [`effective_crash_signature`]. Codex rollouts live under
+//! `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` and are matched by
+//! `session_meta.cwd` (cas-c655); classification also refuses to declare
+//! Starved solely on a missing transcript when the process is busy or the
+//! worktree was recently written.
 
 use anyhow::{Context, Result, anyhow, bail};
 use std::io::{BufRead, BufReader, Read};
@@ -43,8 +46,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use crate::mcp::tools::service::factory_ops::{
-    TranscriptResolution, default_claude_projects_dir, default_grok_sessions_dir,
-    resolve_transcript, worker_cli_from_agent,
+    TranscriptResolution, default_claude_projects_dir, default_codex_sessions_dir,
+    default_grok_sessions_dir, resolve_transcript, worker_cli_from_agent,
 };
 
 /// Window in which a transcript mtime counts as "recent" — used to distinguish
@@ -60,6 +63,13 @@ use crate::mcp::tools::service::factory_ops::{
 /// A transcript that hasn't been touched in a minute is almost certainly not
 /// actively executing; that's the signal the supervisor needs.
 pub(crate) const TRANSCRIPT_FRESH_WINDOW: Duration = Duration::from_secs(60);
+
+/// Codex workers routinely sit mid-inference for several minutes without a
+/// CAS tool call (and sometimes without a rollout append). A 60 s transcript
+/// window false-flags them Starved; prefer a longer harness-specific window
+/// (cas-c655 / 2026-07-21 bug report). Worktree + CPU activity still override
+/// Starved even inside this window when the transcript is missing entirely.
+pub(crate) const CODEX_TRANSCRIPT_FRESH_WINDOW: Duration = Duration::from_secs(5 * 60);
 
 /// Number of trailing JSONL lines inspected for the crash-screen signature.
 ///
@@ -175,14 +185,24 @@ const CRASH_SIGNATURE_NEEDLES: &[&str] = &[
 /// [`classify_worker`] wrapper does the measurement; keeping the decision
 /// logic separate means the 4-way branch is exhaustively unit-testable
 /// without ptrace or tempdir dependencies.
+///
+/// `fresh_window` is harness-specific (see [`activity_fresh_window`]).
+/// `process_busy` is true when the resolved worker PID is consuming CPU
+/// (cas-c655: codex mid-inference must not be Starved solely because the
+/// rollout path was unresolved or cold).
 pub(crate) fn classify_from_evidence(
     pid_alive: bool,
     transcript_mtime_age: Option<Duration>,
     crash_signature: bool,
     worktree_recent_edit_age: Option<Duration>,
+    process_busy: bool,
+    fresh_window: Duration,
 ) -> WorkerLivenessState {
     let fresh = transcript_mtime_age
-        .map(|age| age < TRANSCRIPT_FRESH_WINDOW)
+        .map(|age| age < fresh_window)
+        .unwrap_or(false);
+    let worktree_recent = worktree_recent_edit_age
+        .map(|age| age < fresh_window)
         .unwrap_or(false);
     if !pid_alive {
         // cas-f781 AC c: a pid-only "not alive" reading must never emit
@@ -194,9 +214,6 @@ pub(crate) fn classify_from_evidence(
         // writing to its transcript and worktree. Report Unverified so a
         // caller (e.g. a supervisor auto-reset) doesn't treat one
         // contradicted signal as ground truth for a destructive action.
-        let worktree_recent = worktree_recent_edit_age
-            .map(|age| age < TRANSCRIPT_FRESH_WINDOW)
-            .unwrap_or(false);
         return if fresh || worktree_recent {
             WorkerLivenessState::Unverified
         } else {
@@ -206,7 +223,21 @@ pub(crate) fn classify_from_evidence(
     match (fresh, crash_signature) {
         (true, true) => WorkerLivenessState::Wedged,
         (true, false) => WorkerLivenessState::Alive,
+        // cas-c655: missing/stale transcript alone must not force Starved
+        // when the process is demonstrably busy (CPU) or the worktree was
+        // recently written (including a fresh HEAD commit). Healthy codex
+        // workers mid-inference hit this path constantly.
+        (false, _) if worktree_recent || process_busy => WorkerLivenessState::Alive,
         (false, _) => WorkerLivenessState::Starved,
+    }
+}
+
+/// Harness-specific transcript freshness window. Codex gets a longer
+/// grace period (cas-c655); Claude/Grok keep the original 60 s.
+pub(crate) fn activity_fresh_window(cli: cas_mux::SupervisorCli) -> Duration {
+    match cli {
+        cas_mux::SupervisorCli::Codex => CODEX_TRANSCRIPT_FRESH_WINDOW,
+        cas_mux::SupervisorCli::Claude | cas_mux::SupervisorCli::Grok => TRANSCRIPT_FRESH_WINDOW,
     }
 }
 
@@ -224,11 +255,27 @@ pub(crate) fn transcript_mtime_age(path: &Path) -> Option<Duration> {
 /// alongside pid liveness and transcript mtime). Only files git considers
 /// dirty are checked, not the whole tree — `.git/objects` and `target/`
 /// churn constantly regardless of real edits and would swamp the signal.
-/// `None` when `clone_path` isn't a git worktree, git isn't on `PATH`, or
-/// nothing is dirty — callers must treat `None` as "no signal", never as
-/// "confirmed clean" (a worker between edits with a clean tree still
-/// exists and may be alive).
+///
+/// cas-c655: also considers the current branch tip (`git log -1 --format=%ct`)
+/// so a worker that just committed/pushed (clean tree, fresh HEAD) still
+/// counts as active. Takes the freshest (minimum age) of dirty-file mtime
+/// and HEAD commit age.
+///
+/// `None` when `clone_path` isn't a git worktree, git isn't on `PATH`, and
+/// neither dirty files nor HEAD resolve — callers must treat `None` as
+/// "no signal", never as "confirmed clean".
 pub(crate) fn worktree_recent_edit_age(clone_path: &Path) -> Option<Duration> {
+    let dirty = worktree_dirty_file_age(clone_path);
+    let tip = worktree_branch_tip_age(clone_path);
+    match (dirty, tip) {
+        (Some(d), Some(t)) => Some(d.min(t)),
+        (Some(d), None) => Some(d),
+        (None, Some(t)) => Some(t),
+        (None, None) => None,
+    }
+}
+
+fn worktree_dirty_file_age(clone_path: &Path) -> Option<Duration> {
     let output = std::process::Command::new("git")
         .arg("-C")
         .arg(clone_path)
@@ -251,6 +298,25 @@ pub(crate) fn worktree_recent_edit_age(clone_path: &Path) -> Option<Duration> {
         }
     }
     newest
+}
+
+/// Age of `HEAD` on the worktree's current branch (`git log -1 --format=%ct`).
+/// Used so a just-committed clean tree still counts as active (cas-c655).
+pub(crate) fn worktree_branch_tip_age(clone_path: &Path) -> Option<Duration> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(clone_path)
+        .arg("log")
+        .arg("-1")
+        .arg("--format=%ct")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let ts: u64 = String::from_utf8_lossy(&output.stdout).trim().parse().ok()?;
+    let commit_time = SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(ts))?;
+    SystemTime::now().duration_since(commit_time).ok()
 }
 
 /// Collect the last `n` lines from `reader` via a bounded ring buffer.
@@ -324,9 +390,9 @@ fn grok_activity_age(updates_jsonl_path: &Path) -> Option<Duration> {
 }
 
 /// Harness-aware transcript freshness: Grok prefers `signals.json` (see
-/// [`grok_activity_age`]); Claude and Codex use the transcript's own mtime
-/// (Codex has no dedicated transcript reader today and resolves to `None`
-/// upstream anyway — see `factory_ops::resolve_transcript` docs).
+/// [`grok_activity_age`]); Claude and Codex use the transcript/rollout's
+/// own mtime (Codex rollouts resolved via `factory_ops::resolve_codex_transcript`,
+/// cas-c655).
 fn effective_transcript_age(path: &Path, cli: cas_mux::SupervisorCli) -> Option<Duration> {
     match cli {
         cas_mux::SupervisorCli::Grok => grok_activity_age(path),
@@ -339,16 +405,15 @@ fn effective_transcript_age(path: &Path, cli: cas_mux::SupervisorCli) -> Option<
 /// Harness-aware crash-signature detection. [`CRASH_SIGNATURE_NEEDLES`] are
 /// Claude/Bun/React-Ink-specific — cas-058f audited whether they apply to
 /// Grok's UI stack and found no evidence they would (Grok isn't a Bun/Ink
-/// CLI), and no Grok-specific crash signature is known yet. Rather than
-/// silently no-op-matching Claude's needles against Grok transcripts (which
-/// would never fire but implies a false sense of coverage), skip the check
-/// explicitly for Grok — `Wedged` simply isn't a classification this
-/// harness supports today; a stalled/crashed Grok worker still correctly
-/// falls into `Starved`/`Dead`/`Unverified` via the other signals.
+/// CLI), and no Grok-specific crash signature is known yet. Codex is also
+/// not a Bun/Ink CLI (cas-c655) — skip the check for both. `Wedged` simply
+/// isn't a classification those harnesses support today; a stalled/crashed
+/// worker still correctly falls into `Starved`/`Dead`/`Unverified` via the
+/// other signals.
 fn effective_crash_signature(path: &Path, cli: cas_mux::SupervisorCli) -> bool {
     match cli {
-        cas_mux::SupervisorCli::Grok => false,
-        cas_mux::SupervisorCli::Claude | cas_mux::SupervisorCli::Codex => {
+        cas_mux::SupervisorCli::Grok | cas_mux::SupervisorCli::Codex => false,
+        cas_mux::SupervisorCli::Claude => {
             transcript_has_crash_signature(path, CRASH_SIGNATURE_TAIL_LINES)
         }
     }
@@ -360,9 +425,11 @@ fn effective_crash_signature(path: &Path, cli: cas_mux::SupervisorCli) -> bool {
 ///
 /// `pid_alive_probe` is injectable so tests don't need to exercise the real
 /// `kill(pid, 0)` path (cas-2749's `pid_alive` helper covers production).
-/// `cli` (cas-058f) selects the harness-appropriate freshness/crash-signature
-/// logic — see [`effective_transcript_age`] / [`effective_crash_signature`].
-pub(crate) fn classify_worker<F, G>(
+/// `process_busy_probe` is injectable for the same reason (cas-c655 CPU
+/// activity signal). `cli` (cas-058f) selects the harness-appropriate
+/// freshness/crash-signature logic — see [`effective_transcript_age`] /
+/// [`effective_crash_signature`] / [`activity_fresh_window`].
+pub(crate) fn classify_worker<F, G, H>(
     pid: Option<u32>,
     transcript_path: Option<&Path>,
     clone_path: Option<&Path>,
@@ -370,12 +437,18 @@ pub(crate) fn classify_worker<F, G>(
     cli: cas_mux::SupervisorCli,
     pid_alive_probe: F,
     worktree_age_probe: G,
+    process_busy_probe: H,
 ) -> (WorkerLivenessState, WorkerEvidence)
 where
     F: FnOnce(u32) -> bool,
     G: FnOnce(&Path) -> Option<Duration>,
+    H: FnOnce(u32) -> bool,
 {
     let pid_alive = pid.map(pid_alive_probe).unwrap_or(false);
+    let process_busy = pid
+        .filter(|_| pid_alive)
+        .map(process_busy_probe)
+        .unwrap_or(false);
     let (age_opt, sig) = match transcript_path {
         Some(p) => (
             effective_transcript_age(p, cli),
@@ -384,7 +457,14 @@ where
         None => (None, false),
     };
     let worktree_age = clone_path.and_then(worktree_age_probe);
-    let state = classify_from_evidence(pid_alive, age_opt, sig, worktree_age);
+    let state = classify_from_evidence(
+        pid_alive,
+        age_opt,
+        sig,
+        worktree_age,
+        process_busy,
+        activity_fresh_window(cli),
+    );
     let evidence = WorkerEvidence {
         pid,
         pid_alive,
@@ -433,15 +513,14 @@ pub(crate) fn resolve_worker(
         .cc_session_id
         .clone()
         .unwrap_or_else(|| agent.id.clone());
-    // cas-058f: which harness this worker runs determines both the
-    // transcript layout (Claude's single JSONL vs. Grok's session
-    // directory) and the base dir to glob under.
+    // cas-058f / cas-c655: which harness this worker runs determines both
+    // the transcript layout (Claude JSONL / Grok session dir / Codex
+    // rollout tree) and the base dir to glob under.
     let cli = worker_cli_from_agent(&agent);
     let base_dir = match cli {
         cas_mux::SupervisorCli::Grok => default_grok_sessions_dir(),
-        cas_mux::SupervisorCli::Claude | cas_mux::SupervisorCli::Codex => {
-            default_claude_projects_dir()
-        }
+        cas_mux::SupervisorCli::Codex => default_codex_sessions_dir(),
+        cas_mux::SupervisorCli::Claude => default_claude_projects_dir(),
     };
     let transcript_path = match resolve_transcript(base_dir.as_deref(), clone_path.as_deref(), &session_id, cli) {
         TranscriptResolution::Resolved(p) => Some(p),
@@ -521,14 +600,21 @@ pub(crate) fn execute_is_wedged(
     // function skips Rust destructors entirely. cas-4513 adversarial P2.
     let exit_code = {
         let w = resolve_worker(cas_root, worker)?;
+        // cas-c655 / cas-f781: the agent-store PID is frequently the MCP
+        // `cas serve` child (self-registration), not the real worker. Prefer
+        // a live process-table match (argv --agent-name / CAS_AGENT_NAME,
+        // with codex binary preferred over cas-serve descendants).
+        let resolved_pid = find_worker_pid(&RealProcessTable, &w.name);
+        let pid = pick_kill_pid(w.pid, resolved_pid);
         let (state, evidence) = classify_worker(
-            w.pid,
+            pid,
             w.transcript_path.as_deref(),
             w.clone_path.as_deref().map(Path::new),
             &w.session_id,
             w.cli,
             crate::mcp::daemon::pid_alive,
             worktree_recent_edit_age,
+            process_cpu_busy,
         );
         if json {
             println!("{}", format_state_json(&state, &evidence));
@@ -654,11 +740,11 @@ pub(crate) fn agent_name_from_environ(environ: &[u8]) -> Option<String> {
 
 /// Scan the live process table for the pid whose cmdline or environ
 /// identifies it as `worker_name`. This is the authoritative resolution
-/// [`execute_kill`] trusts over the agent store's `pid` column — that
-/// column can be overwritten by an unrelated process's self-registration
-/// (cas-f781 discovery: an MCP-server child process re-registers over the
-/// real `claude --agent-name <worker>` pid using its own
-/// `std::process::id()`). Matching against a live process's own
+/// [`execute_kill`] / [`execute_is_wedged`] trust over the agent store's
+/// `pid` column — that column can be overwritten by an unrelated process's
+/// self-registration (cas-f781 discovery: an MCP-server child process
+/// re-registers over the real `claude --agent-name <worker>` pid using its
+/// own `std::process::id()`). Matching against a live process's own
 /// argv/environ is a direct identity proof, unlike a stored pid that might
 /// describe the wrong process entirely.
 pub(crate) fn find_worker_pid<T: ProcessTable + ?Sized>(
@@ -685,13 +771,124 @@ pub(crate) fn find_worker_pid<T: ProcessTable + ?Sized>(
     }) {
         return Some(pid);
     }
-    pids.into_iter().find(|&pid| {
-        table
-            .environ(pid)
-            .and_then(|e| agent_name_from_environ(&e))
-            .as_deref()
-            == Some(worker_name)
-    })
+    // cas-c655: among environ matches, prefer the real harness binary
+    // (codex/claude/grok) over inherited descendants like `cas serve`.
+    // Score all candidates and pick the highest; ties break on lowest pid
+    // for determinism under unspecified `pids()` order.
+    let mut best: Option<(u32, i32)> = None;
+    for pid in pids {
+        let Some(environ) = table.environ(pid) else {
+            continue;
+        };
+        if agent_name_from_environ(&environ).as_deref() != Some(worker_name) {
+            continue;
+        }
+        let score = environ_candidate_score(table.cmdline(pid).as_deref());
+        match best {
+            Some((_, best_score)) if score < best_score => {}
+            Some((best_pid, best_score)) if score == best_score && pid >= best_pid => {}
+            _ => best = Some((pid, score)),
+        }
+    }
+    best.map(|(pid, _)| pid)
+}
+
+/// Rank an environ-matched process by how likely it is to be the actual
+/// worker harness rather than a descendant that inherited `CAS_AGENT_NAME`.
+/// Higher is better. Pure function of cmdline bytes so tests drive it
+/// without `/proc`.
+pub(crate) fn environ_candidate_score(cmdline: Option<&[u8]>) -> i32 {
+    let Some(raw) = cmdline else {
+        return 40;
+    };
+    let tokens: Vec<&str> = raw
+        .split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| std::str::from_utf8(s).ok())
+        .collect();
+    if tokens.is_empty() {
+        return 40;
+    }
+    let joined = tokens.join(" ").to_ascii_lowercase();
+    // MCP self-registration child — the cas-f781 / cas-c655 false-pid
+    // source. Hard deprioritize so is-wedged doesn't report cas-serve as
+    // the worker.
+    if tokens.iter().any(|t| {
+        let base = std::path::Path::new(t)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(t)
+            .to_ascii_lowercase();
+        base == "cas" || base.starts_with("cas-")
+    }) && joined.contains("serve")
+    {
+        return 0;
+    }
+    // Prefer harness binaries (argv0 basename or path component).
+    for t in &tokens {
+        let base = std::path::Path::new(t)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(t)
+            .to_ascii_lowercase();
+        if base == "codex" || base.starts_with("codex-") {
+            return 100;
+        }
+        if base == "claude" || base.starts_with("claude") {
+            return 100;
+        }
+        if base == "grok" || base.starts_with("grok") {
+            return 100;
+        }
+    }
+    // Common tool descendants of a worker — keep above cas-serve but well
+    // below the harness so a busy cargo child doesn't win when codex is
+    // also visible.
+    if joined.contains("cargo")
+        || joined.contains("rustc")
+        || joined.contains("git")
+        || joined.contains("node")
+        || joined.contains("python")
+    {
+        return 10;
+    }
+    50
+}
+
+/// Sum of user+system jiffies from `/proc/<pid>/stat` (fields 14 and 15
+/// after the parenthesized `comm`). `None` when unreadable or non-Linux.
+pub(crate) fn process_cpu_ticks(pid: u32) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let raw = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let last_paren = raw.rfind(')')?;
+        let tail = raw.get(last_paren + 1..)?;
+        // fields after comm: state(3) ppid(4) ... utime(14) stime(15)
+        // index 0 of tail split is state → utime is index 11, stime index 12
+        let mut parts = tail.split_whitespace();
+        let utime: u64 = parts.nth(11)?.parse().ok()?;
+        let stime: u64 = parts.next()?.parse().ok()?;
+        Some(utime.saturating_add(stime))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// True when `pid` consumed CPU between two short samples — the mid-
+/// inference signal for codex workers whose rollout path is unresolved
+/// (cas-c655). 50 ms ceiling keeps `is-wedged` snappy.
+pub(crate) fn process_cpu_busy(pid: u32) -> bool {
+    let Some(t1) = process_cpu_ticks(pid) else {
+        return false;
+    };
+    std::thread::sleep(Duration::from_millis(50));
+    let Some(t2) = process_cpu_ticks(pid) else {
+        return false;
+    };
+    t2 > t1
 }
 
 /// Convert `pid` to its process GROUP LEADER's pid via `getpgid()` (cas-a91b).
@@ -1133,7 +1330,7 @@ mod tests {
         // cas-f781 AC c: Dead requires TWO independent signals to agree —
         // pid gone AND (transcript stale AND worktree not recently edited).
         for sig in [true, false] {
-            let got = classify_from_evidence(false, Some(Duration::from_secs(5 * 60)), sig, None);
+            let got = classify_from_evidence(false, Some(Duration::from_secs(5 * 60)), sig, None, false, TRANSCRIPT_FRESH_WINDOW);
             assert_eq!(got, WorkerLivenessState::Dead, "sig={sig}");
         }
     }
@@ -1147,7 +1344,7 @@ mod tests {
         // Report Unverified so an operator investigates before a caller
         // (e.g. a supervisor auto-reset) treats it as ground truth.
         for sig in [true, false] {
-            let got = classify_from_evidence(false, Some(Duration::from_secs(5)), sig, None);
+            let got = classify_from_evidence(false, Some(Duration::from_secs(5)), sig, None, false, TRANSCRIPT_FRESH_WINDOW);
             assert_eq!(got, WorkerLivenessState::Unverified, "sig={sig}");
         }
     }
@@ -1162,6 +1359,8 @@ mod tests {
             Some(Duration::from_secs(5 * 60)),
             false,
             Some(Duration::from_secs(20)),
+            false,
+            TRANSCRIPT_FRESH_WINDOW,
         );
         assert_eq!(got, WorkerLivenessState::Unverified);
     }
@@ -1171,19 +1370,19 @@ mod tests {
         // No transcript resolved, no worktree resolved, pid gone: nothing
         // contradicts "dead", so Dead still fires — matches the
         // no-pid-registered case (classify_worker_no_pid_short_circuits_to_dead).
-        let got = classify_from_evidence(false, None, true, None);
+        let got = classify_from_evidence(false, None, true, None, false, TRANSCRIPT_FRESH_WINDOW);
         assert_eq!(got, WorkerLivenessState::Dead);
     }
 
     #[test]
     fn classify_wedged_when_alive_fresh_and_signature_matches() {
-        let got = classify_from_evidence(true, Some(Duration::from_secs(5)), true, None);
+        let got = classify_from_evidence(true, Some(Duration::from_secs(5)), true, None, false, TRANSCRIPT_FRESH_WINDOW);
         assert_eq!(got, WorkerLivenessState::Wedged);
     }
 
     #[test]
     fn classify_alive_when_fresh_and_no_signature() {
-        let got = classify_from_evidence(true, Some(Duration::from_secs(5)), false, None);
+        let got = classify_from_evidence(true, Some(Duration::from_secs(5)), false, None, false, TRANSCRIPT_FRESH_WINDOW);
         assert_eq!(got, WorkerLivenessState::Alive);
     }
 
@@ -1194,7 +1393,7 @@ mod tests {
         // is the same (SIGKILL + respawn) but the label matters for
         // operator triage.
         for sig in [true, false] {
-            let got = classify_from_evidence(true, Some(Duration::from_secs(120)), sig, None);
+            let got = classify_from_evidence(true, Some(Duration::from_secs(120)), sig, None, false, TRANSCRIPT_FRESH_WINDOW);
             assert_eq!(got, WorkerLivenessState::Starved, "sig={sig}");
         }
     }
@@ -1202,8 +1401,110 @@ mod tests {
     #[test]
     fn classify_starved_when_no_mtime_available() {
         // File missing / mtime unreadable → treated as not-fresh.
-        let got = classify_from_evidence(true, None, true, None);
+        let got = classify_from_evidence(true, None, true, None, false, TRANSCRIPT_FRESH_WINDOW);
         assert_eq!(got, WorkerLivenessState::Starved);
+    }
+
+    /// cas-c655 AC: missing transcript alone must not force Starved when the
+    /// resolved process is busy (codex mid-inference).
+    #[test]
+    fn classify_alive_when_no_transcript_but_process_busy() {
+        let got = classify_from_evidence(
+            true,
+            None,
+            false,
+            None,
+            true,
+            CODEX_TRANSCRIPT_FRESH_WINDOW,
+        );
+        assert_eq!(got, WorkerLivenessState::Alive);
+    }
+
+    /// cas-c655 AC: fixture codex worker with recent worktree writes → not
+    /// starved even with unresolved transcript.
+    #[test]
+    fn classify_alive_when_no_transcript_but_worktree_recent() {
+        let got = classify_from_evidence(
+            true,
+            None,
+            false,
+            Some(Duration::from_secs(15)),
+            false,
+            CODEX_TRANSCRIPT_FRESH_WINDOW,
+        );
+        assert_eq!(got, WorkerLivenessState::Alive);
+    }
+
+    /// cas-c655 edge: truly dead process with no corroborating activity
+    /// still reports Dead.
+    #[test]
+    fn classify_dead_when_pid_gone_and_no_activity_codex_window() {
+        let got = classify_from_evidence(
+            false,
+            None,
+            false,
+            None,
+            false,
+            CODEX_TRANSCRIPT_FRESH_WINDOW,
+        );
+        assert_eq!(got, WorkerLivenessState::Dead);
+    }
+
+    /// cas-c655: a stale-but-within-codex-window transcript is still Alive.
+    #[test]
+    fn classify_codex_window_keeps_3min_transcript_fresh() {
+        let age = Duration::from_secs(3 * 60);
+        assert!(
+            age < CODEX_TRANSCRIPT_FRESH_WINDOW && age >= TRANSCRIPT_FRESH_WINDOW,
+            "fixture must sit between the claude and codex windows"
+        );
+        let got = classify_from_evidence(
+            true,
+            Some(age),
+            false,
+            None,
+            false,
+            CODEX_TRANSCRIPT_FRESH_WINDOW,
+        );
+        assert_eq!(got, WorkerLivenessState::Alive);
+        let claude = classify_from_evidence(
+            true,
+            Some(age),
+            false,
+            None,
+            false,
+            TRANSCRIPT_FRESH_WINDOW,
+        );
+        assert_eq!(claude, WorkerLivenessState::Starved);
+    }
+
+    #[test]
+    fn activity_fresh_window_is_longer_for_codex() {
+        assert_eq!(
+            activity_fresh_window(cas_mux::SupervisorCli::Codex),
+            CODEX_TRANSCRIPT_FRESH_WINDOW
+        );
+        assert_eq!(
+            activity_fresh_window(cas_mux::SupervisorCli::Claude),
+            TRANSCRIPT_FRESH_WINDOW
+        );
+        assert_eq!(
+            activity_fresh_window(cas_mux::SupervisorCli::Grok),
+            TRANSCRIPT_FRESH_WINDOW
+        );
+    }
+
+    #[test]
+    fn environ_candidate_score_prefers_codex_over_cas_serve() {
+        assert!(
+            environ_candidate_score(Some(b"codex\0--yolo\0"))
+                > environ_candidate_score(Some(b"cas\0serve\0--foreground\0"))
+        );
+        assert_eq!(
+            environ_candidate_score(Some(b"cas\0serve\0--foreground\0")),
+            0
+        );
+        assert_eq!(environ_candidate_score(Some(b"codex\0--yolo\0")), 100);
     }
 
     #[test]
@@ -1367,6 +1668,7 @@ mod tests {
             cas_mux::SupervisorCli::Grok,
             pid_probe,
             worktree_probe,
+            |_: u32| false,
         );
         assert_eq!(
             state,
@@ -1452,6 +1754,7 @@ mod tests {
             cas_mux::SupervisorCli::Claude,
             probe,
             worktree_probe,
+            |_: u32| false,
         );
         assert!(called.get(), "probe must be called when pid is Some");
         // no transcript → not fresh, crash=false, alive=true → Starved.
@@ -1474,6 +1777,7 @@ mod tests {
             cas_mux::SupervisorCli::Claude,
             probe,
             worktree_probe,
+            |_: u32| false,
         );
         assert_eq!(state, WorkerLivenessState::Dead);
         assert!(!ev.pid_alive);
@@ -1494,6 +1798,7 @@ mod tests {
             cas_mux::SupervisorCli::Claude,
             pid_probe,
             worktree_probe,
+            |_: u32| false,
         );
         assert_eq!(state, WorkerLivenessState::Dead);
         assert_eq!(ev.worktree_edit_age_secs, None);
@@ -1511,6 +1816,7 @@ mod tests {
             cas_mux::SupervisorCli::Claude,
             pid_probe,
             worktree_probe,
+            |_: u32| false,
         );
         // pid gone, transcript unresolved (not fresh), but worktree edited
         // 20s ago (fresh) — contradiction → Unverified, not Dead.
@@ -1821,6 +2127,81 @@ mod tests {
         );
         let table = FakeProcessTable { entries };
         assert_eq!(find_worker_pid(&table, "hv-live"), Some(5555));
+    }
+
+    /// cas-c655: when both `cas serve` (MCP child) and the real `codex`
+    /// binary inherit `CAS_AGENT_NAME`, prefer the codex PID — is-wedged
+    /// was previously reporting the cas-serve PID as the worker.
+    #[test]
+    fn find_worker_pid_prefers_codex_binary_over_cas_serve_environ_twin() {
+        let mut entries = std::collections::HashMap::new();
+        entries.insert(
+            111084, // cas serve — the false PID from the bug report
+            (
+                Some(b"cas\0serve\0--foreground\0".to_vec()),
+                Some(b"PATH=/usr/bin\0CAS_AGENT_NAME=worker-android\0".to_vec()),
+            ),
+        );
+        entries.insert(
+            222000,
+            (
+                Some(b"/home/x/.local/bin/codex\0--yolo\0--no-alt-screen\0".to_vec()),
+                Some(b"PATH=/usr/bin\0CAS_AGENT_NAME=worker-android\0".to_vec()),
+            ),
+        );
+        let table = OrderedFakeProcessTable {
+            // Enumerate cas-serve FIRST so a naive .find() would pick it.
+            order: vec![111084, 222000],
+            entries,
+        };
+        assert_eq!(
+            find_worker_pid(&table, "worker-android"),
+            Some(222000),
+            "codex harness binary must win over cas-serve descendant"
+        );
+    }
+
+    /// End-to-end cas-c655 happy path through classify_worker: codex cli,
+    /// unresolved transcript, process busy → Alive (not Starved).
+    #[test]
+    fn classify_worker_codex_busy_without_transcript_is_alive() {
+        let pid_probe = |_: u32| true;
+        let worktree_probe = |_: &Path| None::<Duration>;
+        let (state, ev) = classify_worker(
+            Some(222000),
+            None,
+            None,
+            "codex-worker-android-2f828ac6-deadbeef",
+            cas_mux::SupervisorCli::Codex,
+            pid_probe,
+            worktree_probe,
+            |_: u32| true, // process busy
+        );
+        assert_eq!(
+            state,
+            WorkerLivenessState::Alive,
+            "busy codex with unresolved transcript must not be Starved: {ev:?}"
+        );
+        assert_eq!(ev.pid, Some(222000));
+        assert!(ev.transcript_path.is_none());
+    }
+
+    /// End-to-end cas-c655: recent worktree activity rescues missing transcript.
+    #[test]
+    fn classify_worker_codex_recent_worktree_without_transcript_is_alive() {
+        let pid_probe = |_: u32| true;
+        let worktree_probe = |_: &Path| Some(Duration::from_secs(10));
+        let (state, _) = classify_worker(
+            Some(222000),
+            None,
+            Some(Path::new("/tmp/clone")),
+            "codex-worker-android-2f828ac6-deadbeef",
+            cas_mux::SupervisorCli::Codex,
+            pid_probe,
+            worktree_probe,
+            |_: u32| false,
+        );
+        assert_eq!(state, WorkerLivenessState::Alive);
     }
 
     #[test]

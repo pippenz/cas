@@ -1996,7 +1996,8 @@ pub(crate) fn resolve_transcript(
 ) -> TranscriptResolution {
     match cli {
         cas_mux::SupervisorCli::Grok => resolve_grok_transcript(base_dir, clone_path, session_id),
-        cas_mux::SupervisorCli::Claude | cas_mux::SupervisorCli::Codex => {
+        cas_mux::SupervisorCli::Codex => resolve_codex_transcript(base_dir, clone_path, session_id),
+        cas_mux::SupervisorCli::Claude => {
             resolve_claude_transcript(base_dir, clone_path, session_id)
         }
     }
@@ -2138,6 +2139,134 @@ fn resolve_grok_transcript(
     }
 }
 
+// ---------------------------------------------------------------------------
+// cas-c655: Codex rollout resolution.
+//
+// Codex does NOT use Claude's `~/.claude/projects/<escaped-cwd>/<session>.jsonl`
+// layout. Factory workers get a CAS session id of the form
+// `codex-<name>-<uuid>` (see `PtyConfig::codex`), but on-disk rollouts live at:
+//   ~/.codex/sessions/YYYY/MM/DD/rollout-<timestamp>-<rollout-uuid>.jsonl
+// with `session_meta.payload.cwd` equal to the worker's clone_path and a
+// different rollout UUID than the CAS session id. Matching is therefore by
+// cwd (primary) and by rollout UUID substring in the filename (secondary —
+// useful only when the caller already knows the rollout id).
+// ---------------------------------------------------------------------------
+
+/// `~/.codex/sessions` — Codex CLI's per-user rollout root.
+/// `CODEX_HOME` overrides the base directory when set (mirrors Codex's own
+/// env-var convention). Returns `None` if neither resolves.
+pub(crate) fn default_codex_sessions_dir() -> Option<std::path::PathBuf> {
+    if let Ok(codex_home) = std::env::var("CODEX_HOME") {
+        return Some(std::path::PathBuf::from(codex_home).join("sessions"));
+    }
+    dirs::home_dir().map(|h| h.join(".codex").join("sessions"))
+}
+
+fn synthesized_codex_transcript_path(clone_path: &str, session_id: &str) -> String {
+    format!(
+        "~/.codex/sessions/<YYYY/MM/DD>/rollout-*-*.jsonl (cwd={clone_path}; cas_session={session_id})"
+    )
+}
+
+fn synthesized_unknown_codex_clone_path(session_id: &str) -> String {
+    format!(
+        "~/.codex/sessions/<YYYY/MM/DD>/rollout-*-*.jsonl (clone path unknown; cas_session={session_id})"
+    )
+}
+
+/// Read `payload.cwd` from the first JSONL line when it is a `session_meta`
+/// event. Returns `None` on any parse/IO failure — callers treat that as
+/// "this rollout does not match by cwd".
+pub(crate) fn codex_rollout_cwd(path: &std::path::Path) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut line = String::new();
+    std::io::BufRead::read_line(&mut reader, &mut line).ok()?;
+    let value: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    // Be tolerant of missing/mismatched type — still try payload.cwd.
+    value
+        .get("payload")
+        .and_then(|p| p.get("cwd"))
+        .and_then(|c| c.as_str())
+        .map(|s| s.to_string())
+}
+
+/// Scan budget for `**/rollout-*.jsonl` under the sessions root. Codex hosts
+/// accumulate hundreds of historical rollouts; matching by cwd only needs
+/// recent ones, so we mtime-sort and cap the walk (cas-c655 / cas-900b cap
+/// spirit).
+const MAX_CODEX_ROLLOUT_SCAN: usize = 200;
+
+/// Collect recent rollout paths under `sessions_dir`, newest mtime first.
+fn collect_codex_rollouts(sessions_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let pattern = format!("{}/**/rollout-*.jsonl", sessions_dir.to_string_lossy());
+    let iter = match glob::glob(&pattern) {
+        Ok(it) => it,
+        Err(_) => return Vec::new(),
+    };
+    let mut all: Vec<std::path::PathBuf> = iter.flatten().collect();
+    all.sort_by_key(|p| {
+        std::fs::metadata(p)
+            .and_then(|m| m.modified())
+            .ok()
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+    });
+    all.reverse(); // newest first
+    if all.len() > MAX_CODEX_ROLLOUT_SCAN {
+        all.truncate(MAX_CODEX_ROLLOUT_SCAN);
+    }
+    all
+}
+
+/// Whether `path`'s filename contains `session_id` (rollout UUID match).
+fn codex_rollout_filename_matches_session(path: &std::path::Path, session_id: &str) -> bool {
+    if session_id.is_empty() {
+        return false;
+    }
+    path.file_name()
+        .and_then(|s| s.to_str())
+        .is_some_and(|name| name.contains(session_id))
+}
+
+fn resolve_codex_transcript(
+    sessions_dir: Option<&std::path::Path>,
+    clone_path: Option<&str>,
+    session_id: &str,
+) -> TranscriptResolution {
+    let synthesized = clone_path
+        .map(|p| synthesized_codex_transcript_path(p, session_id))
+        .unwrap_or_else(|| synthesized_unknown_codex_clone_path(session_id));
+    let Some(dir) = sessions_dir else {
+        return TranscriptResolution::Synthesized(synthesized);
+    };
+    let candidates = collect_codex_rollouts(dir);
+    let mut matches = Vec::new();
+    let mut truncated = false;
+    for path in candidates {
+        let cwd_hit = clone_path
+            .map(|cwd| codex_rollout_cwd(&path).as_deref() == Some(cwd))
+            .unwrap_or(false);
+        let id_hit = codex_rollout_filename_matches_session(&path, session_id);
+        if !cwd_hit && !id_hit {
+            continue;
+        }
+        if matches.len() >= MAX_TRANSCRIPT_CANDIDATES {
+            truncated = true;
+            break;
+        }
+        matches.push(path);
+    }
+    match matches.len() {
+        0 => TranscriptResolution::Synthesized(synthesized),
+        1 => TranscriptResolution::Resolved(matches.remove(0)),
+        _ => TranscriptResolution::Ambiguous {
+            matches,
+            synthesized,
+            truncated,
+        },
+    }
+}
+
 /// Render the transcript block for `worker_status` output. Always surfaces
 /// the raw `session_id` so a supervisor who doesn't trust our resolution
 /// can grep the projects tree themselves (cas-900b AC).
@@ -2152,9 +2281,8 @@ fn format_transcript_block(
 ) -> String {
     let base_dir = match cli {
         cas_mux::SupervisorCli::Grok => default_grok_sessions_dir(),
-        cas_mux::SupervisorCli::Claude | cas_mux::SupervisorCli::Codex => {
-            default_claude_projects_dir()
-        }
+        cas_mux::SupervisorCli::Codex => default_codex_sessions_dir(),
+        cas_mux::SupervisorCli::Claude => default_claude_projects_dir(),
     };
     let resolution = resolve_transcript(base_dir.as_deref(), clone_path, session_id, cli);
     render_transcript_block(&resolution, session_id, base_dir.is_some())
@@ -3104,6 +3232,146 @@ effort = "high"
             got,
             Some(std::path::PathBuf::from("/custom/grok/home/sessions"))
         );
+    }
+
+    // --- cas-c655: Codex rollout resolution ---------------------------------
+
+    /// Build `sessions/YYYY/MM/DD/rollout-...jsonl` with a `session_meta`
+    /// first line carrying `cwd` — matches Codex CLI's on-disk layout.
+    fn fake_codex_sessions_dir(
+        rollouts: &[(&str /* relative path under sessions */, &str /* cwd */)],
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sessions = tmp.path().join("sessions");
+        for (rel, cwd) in rollouts {
+            let path = sessions.join(rel);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            let meta = serde_json::json!({
+                "timestamp": "2026-07-21T12:00:00.000Z",
+                "type": "session_meta",
+                "payload": {
+                    "session_id": "019f84af-3121-7950-ba14-b01db2dad6c7",
+                    "cwd": cwd,
+                    "originator": "codex-tui"
+                }
+            });
+            std::fs::write(&path, format!("{meta}\n")).unwrap();
+        }
+        (tmp, sessions)
+    }
+
+    #[test]
+    fn default_codex_sessions_dir_honors_codex_home_override() {
+        let _lock = crate::hooks::test_env_lock();
+        let old = std::env::var("CODEX_HOME").ok();
+        unsafe {
+            std::env::set_var("CODEX_HOME", "/custom/codex/home");
+        }
+        let got = default_codex_sessions_dir();
+        unsafe {
+            match &old {
+                Some(v) => std::env::set_var("CODEX_HOME", v),
+                None => std::env::remove_var("CODEX_HOME"),
+            }
+        }
+        assert_eq!(
+            got,
+            Some(std::path::PathBuf::from("/custom/codex/home/sessions"))
+        );
+    }
+
+    #[test]
+    fn resolve_codex_transcript_matches_by_cwd() {
+        let clone = "/home/pippenz/Petrastella/ozer/.cas/worktrees/worker-android";
+        let rel = "2026/07/21/rollout-2026-07-21T08-38-21-019f84af-3121-7950-ba14-b01db2dad6c7.jsonl";
+        let (_tmp, sessions) = fake_codex_sessions_dir(&[(rel, clone)]);
+        // CAS session id is NOT the rollout UUID — resolution must use cwd.
+        let cas_session = "codex-worker-android-2f828ac6-deadbeefcafe";
+        let got = resolve_transcript(
+            Some(&sessions),
+            Some(clone),
+            cas_session,
+            cas_mux::SupervisorCli::Codex,
+        );
+        let expected = sessions.join(rel);
+        assert_eq!(got, TranscriptResolution::Resolved(expected));
+    }
+
+    #[test]
+    fn resolve_codex_transcript_matches_by_rollout_uuid_in_filename() {
+        let clone = "/tmp/other-worktree";
+        let uuid = "019f84af-3121-7950-ba14-b01db2dad6c7";
+        let rel = format!("2026/07/21/rollout-2026-07-21T08-38-21-{uuid}.jsonl");
+        let (_tmp, sessions) = fake_codex_sessions_dir(&[(&rel, clone)]);
+        // Even with a mismatched/missing clone_path match path, filename
+        // UUID lookup works when the caller has the rollout id.
+        let got = resolve_transcript(
+            Some(&sessions),
+            Some("/tmp/unrelated"),
+            uuid,
+            cas_mux::SupervisorCli::Codex,
+        );
+        let expected = sessions.join(rel);
+        assert_eq!(got, TranscriptResolution::Resolved(expected));
+    }
+
+    #[test]
+    fn resolve_codex_transcript_synthesized_on_no_match() {
+        let (_tmp, sessions) = fake_codex_sessions_dir(&[(
+            "2026/07/21/rollout-other.jsonl",
+            "/tmp/other",
+        )]);
+        let clone = "/tmp/missing-worker";
+        let cas_session = "codex-worker-x-aaaa";
+        let got = resolve_transcript(
+            Some(&sessions),
+            Some(clone),
+            cas_session,
+            cas_mux::SupervisorCli::Codex,
+        );
+        assert_eq!(
+            got,
+            TranscriptResolution::Synthesized(synthesized_codex_transcript_path(
+                clone,
+                cas_session
+            ))
+        );
+    }
+
+    #[test]
+    fn resolve_codex_transcript_no_sessions_dir_is_synthesized() {
+        let clone = "/tmp/w";
+        let session = "codex-worker-x-aaaa";
+        let got = resolve_transcript(None, Some(clone), session, cas_mux::SupervisorCli::Codex);
+        assert_eq!(
+            got,
+            TranscriptResolution::Synthesized(synthesized_codex_transcript_path(clone, session))
+        );
+    }
+
+    #[test]
+    fn resolve_codex_transcript_no_clone_path_falls_back_to_placeholder() {
+        let (_tmp, sessions) = fake_codex_sessions_dir(&[]);
+        let session = "codex-worker-x-aaaa";
+        let got = resolve_transcript(Some(&sessions), None, session, cas_mux::SupervisorCli::Codex);
+        assert_eq!(
+            got,
+            TranscriptResolution::Synthesized(synthesized_unknown_codex_clone_path(session))
+        );
+    }
+
+    #[test]
+    fn codex_rollout_cwd_reads_session_meta() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("rollout.jsonl");
+        let meta = serde_json::json!({
+            "type": "session_meta",
+            "payload": { "cwd": "/work/tree", "session_id": "abc" }
+        });
+        std::fs::write(&path, format!("{meta}\n")).unwrap();
+        assert_eq!(codex_rollout_cwd(&path).as_deref(), Some("/work/tree"));
     }
 
     #[test]
