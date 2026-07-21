@@ -648,19 +648,18 @@ pub const GROK_BUILTIN_AGENTS: &[BuiltinFile] = &[
 ];
 
 /// All built-in skills managed by CAS for Grok (EPIC cas-8888, Phase 5 /
-/// cas-6f46; required-capability parity closed by cas-cc8c).
+/// cas-6f46; required-capability parity closed by cas-cc8c, full general-skill
+/// parity closed by cas-20f2).
 ///
-/// Covers every factory-critical required capability in its OWN right —
-/// supervisor, worker, task, search, memory, review, verification, and
-/// brainstorming/ideation (see `REQUIRED_FACTORY_CAPABILITIES`). A Grok
-/// factory session MUST NOT depend on implicitly inheriting `~/.claude` for
-/// any required capability: the factory can run against a project-local
-/// `.grok` mirror or a `~/.grok` home with no Claude tree present, so every
-/// required skill is installed here directly. Non-required, general-purpose
-/// skills (codemap, fallow, project-overview, session-learn, cas-nuxt-playwright)
-/// are intentionally omitted — they are not part of the required factory
-/// manifest and remain available ad hoc; `REQUIRED_FACTORY_CAPABILITIES` does
-/// not demand them.
+/// Covers every factory-critical required capability (see
+/// `REQUIRED_FACTORY_CAPABILITIES`) AND every general CAS skill Claude/Codex
+/// expose (see `GENERAL_PARITY_CAPABILITIES`: session-learn, codemap,
+/// project-overview, fallow, cas-nuxt-playwright, cas-codex-exec) in its OWN
+/// right. A Grok session MUST NOT depend on implicitly inheriting `~/.claude`
+/// for ANY skill: the factory can run against a project-local `.grok` mirror or
+/// a `~/.grok` home with no Claude tree present, so every twin is installed here
+/// directly. The only intentional differences from the Claude set are the tool
+/// prefix and the supervisor-checklist twin spelling — no capability is dropped.
 ///
 /// Tool-prefix content is modeled on the Claude originals (matching
 /// capability tier — hooks/subagents/textbox-submit all supported, unlike
@@ -851,6 +850,54 @@ pub const GROK_BUILTIN_SKILLS: &[BuiltinFile] = &[
             "builtins/grok/skills/cas-ideate/references/post-ideation-workflow.md"
         ),
     },
+    // cas-20f2: full GENERAL-skill parity — Grok now owns twins for every
+    // general CAS skill Claude/Codex expose (session-learn, codemap,
+    // project-overview, fallow, cas-nuxt-playwright, cas-codex-exec), so a Grok
+    // session never has to fall back to `~/.claude`. Twins are the Claude
+    // sources with the `mcp__cas__` → `cas__` swap; fallow/cas-nuxt-playwright/
+    // cas-codex-exec make no CAS MCP calls so their twins are byte-identical.
+    BuiltinFile {
+        path: "skills/session-learn/SKILL.md",
+        content: include_str!("builtins/grok/skills/session-learn/SKILL.md"),
+    },
+    BuiltinFile {
+        path: "skills/codemap/SKILL.md",
+        content: include_str!("builtins/grok/skills/codemap/SKILL.md"),
+    },
+    BuiltinFile {
+        path: "skills/project-overview/SKILL.md",
+        content: include_str!("builtins/grok/skills/project-overview/SKILL.md"),
+    },
+    BuiltinFile {
+        path: "skills/fallow/SKILL.md",
+        content: include_str!("builtins/grok/skills/fallow/SKILL.md"),
+    },
+    BuiltinFile {
+        path: "skills/fallow/references/cli-reference.md",
+        content: include_str!("builtins/grok/skills/fallow/references/cli-reference.md"),
+    },
+    BuiltinFile {
+        path: "skills/fallow/references/gotchas.md",
+        content: include_str!("builtins/grok/skills/fallow/references/gotchas.md"),
+    },
+    BuiltinFile {
+        path: "skills/fallow/references/patterns.md",
+        content: include_str!("builtins/grok/skills/fallow/references/patterns.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-nuxt-playwright/SKILL.md",
+        content: include_str!("builtins/grok/skills/cas-nuxt-playwright/SKILL.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-nuxt-playwright/references/auth-fixture-template.md",
+        content: include_str!(
+            "builtins/grok/skills/cas-nuxt-playwright/references/auth-fixture-template.md"
+        ),
+    },
+    BuiltinFile {
+        path: "skills/cas-codex-exec/SKILL.md",
+        content: include_str!("builtins/grok/skills/cas-codex-exec/SKILL.md"),
+    },
 ];
 
 /// A factory-critical capability that every harness must resolve from its own
@@ -955,6 +1002,68 @@ pub const REQUIRED_FACTORY_CAPABILITIES: &[RequiredCapability] = &[
         grok: Some("skills/cas-supervisor-checklist"),
         note: "Codex uses the cas-codex-supervisor-checklist twin (no-hooks variant); \
                Claude and Grok share the hooks-aware cas-supervisor-checklist.",
+    },
+];
+
+/// General (non-factory-critical) CAS skills that must still reach FULL parity
+/// across all three harnesses (cas-20f2 — operator-requested full parity beyond
+/// the minimal factory roles). Every one of these is a general-purpose skill
+/// already exposed to Claude/Codex; Grok now owns a `cas__`-prefixed twin of
+/// each rather than relying on `~/.claude`. Twin directory names are identical
+/// across harnesses (no tailored spelling), so the same `RequiredCapability`
+/// shape applies with all three fields set — the only allowed `None` is a
+/// documented, tested runtime-prerequisite exemption.
+pub const GENERAL_PARITY_CAPABILITIES: &[RequiredCapability] = &[
+    RequiredCapability {
+        id: "session-learn",
+        claude: Some("skills/session-learn"),
+        codex: Some("skills/session-learn"),
+        grok: Some("skills/session-learn"),
+        note: "",
+    },
+    RequiredCapability {
+        id: "codemap",
+        claude: Some("skills/codemap"),
+        codex: Some("skills/codemap"),
+        grok: Some("skills/codemap"),
+        note: "",
+    },
+    RequiredCapability {
+        id: "project-overview",
+        claude: Some("skills/project-overview"),
+        codex: Some("skills/project-overview"),
+        grok: Some("skills/project-overview"),
+        note: "",
+    },
+    RequiredCapability {
+        id: "fallow",
+        claude: Some("skills/fallow"),
+        codex: Some("skills/fallow"),
+        grok: Some("skills/fallow"),
+        note: "",
+    },
+    RequiredCapability {
+        id: "cas-nuxt-playwright",
+        claude: Some("skills/cas-nuxt-playwright"),
+        codex: Some("skills/cas-nuxt-playwright"),
+        grok: Some("skills/cas-nuxt-playwright"),
+        note: "",
+    },
+    RequiredCapability {
+        // cas-20f2 AC-2: cas-codex-exec is a harness-neutral read-only helper
+        // that shells out to the `codex exec` CLI and makes NO CAS MCP tool
+        // calls. Its only prerequisite is the `codex` binary on PATH — exactly
+        // the same prerequisite Claude's copy carries (the skill itself handles
+        // "codex not installed" as a runtime fallback). Because the prerequisite
+        // is identical across harnesses, it is INCLUDED for Grok (all three
+        // Some), not exempted. The twin is byte-identical to the Claude source
+        // (no `mcp__cas__` occurrences to swap).
+        id: "cas-codex-exec",
+        claude: Some("skills/cas-codex-exec"),
+        codex: Some("skills/cas-codex-exec"),
+        grok: Some("skills/cas-codex-exec"),
+        note: "Runtime-bound on the `codex` CLI (same prerequisite for every \
+               harness); included for Grok rather than exempted.",
     },
 ];
 
@@ -3576,11 +3685,42 @@ This is the body content."#;
         }
     }
 
+    /// cas-20f2: every GENERAL-parity skill also resolves to a present `SKILL.md`
+    /// in each harness's own catalog — the operator-requested full parity. Grok
+    /// owns twins for session-learn, codemap, project-overview, fallow,
+    /// cas-nuxt-playwright, and cas-codex-exec rather than inheriting `~/.claude`.
+    #[test]
+    fn test_general_parity_capabilities_resolved_by_every_harness() {
+        for harness in [
+            SupervisorCli::Claude,
+            SupervisorCli::Codex,
+            SupervisorCli::Grok,
+        ] {
+            let catalog = skill_catalog_for_harness(harness);
+            for cap in GENERAL_PARITY_CAPABILITIES {
+                let Some(dir) = required_dir_for(cap, harness) else {
+                    continue; // documented runtime-prerequisite exemption
+                };
+                let skill_md = format!("{dir}/SKILL.md");
+                assert!(
+                    catalog.iter().any(|b| b.path == skill_md),
+                    "{harness:?} catalog is missing general-parity skill '{}' \
+                     (expected twin at {skill_md}) — full parity requires it to \
+                     resolve from {harness:?}'s own catalog, not from ~/.claude",
+                    cap.id
+                );
+            }
+        }
+    }
+
     /// A capability may be exempt for a harness (`None`) only when it documents
     /// why. Prevents silently dropping a required capability by nulling a field.
     #[test]
     fn test_required_capability_exemptions_are_documented() {
-        for cap in REQUIRED_FACTORY_CAPABILITIES {
+        for cap in REQUIRED_FACTORY_CAPABILITIES
+            .iter()
+            .chain(GENERAL_PARITY_CAPABILITIES.iter())
+        {
             let has_none = cap.claude.is_none() || cap.codex.is_none() || cap.grok.is_none();
             if has_none {
                 assert!(
@@ -3701,15 +3841,20 @@ This is the body content."#;
 
             sync_all_builtins_for_harness(harness, &dir).unwrap();
 
-            for cap in REQUIRED_FACTORY_CAPABILITIES {
+            // Every required-factory AND general-parity capability must land on
+            // disk from this harness's own catalog — no ~/.claude present.
+            for cap in REQUIRED_FACTORY_CAPABILITIES
+                .iter()
+                .chain(GENERAL_PARITY_CAPABILITIES.iter())
+            {
                 let Some(rel) = required_dir_for(cap, harness) else {
                     continue;
                 };
                 let on_disk = dir.join(rel).join("SKILL.md");
                 assert!(
                     on_disk.exists(),
-                    "{harness:?} fresh sync did not install required capability \
-                     '{}' at {} — the factory checklist would FAIL for {harness:?}",
+                    "{harness:?} fresh sync did not install capability \
+                     '{}' at {} — the checklist would FAIL for {harness:?}",
                     cap.id,
                     on_disk.display()
                 );
