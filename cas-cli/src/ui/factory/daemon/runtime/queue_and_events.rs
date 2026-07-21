@@ -278,7 +278,8 @@ impl FactoryDaemon {
                     target = %queued.target,
                     "Dropping message from dead worker"
                 );
-                let _ = queue.mark_processed(queued.id);
+                // cas-2c5f: not transport delivery — structured stage=dropped.
+                let _ = queue.mark_dropped(queued.id, Some("source worker is dead/shut down"));
                 continue;
             }
 
@@ -301,7 +302,11 @@ impl FactoryDaemon {
                         source = %queued.source,
                         "Suppressing duplicate idle message (rate-limited to 5min)"
                     );
-                    let _ = queue.mark_processed(queued.id);
+                    // cas-2c5f: not transport delivery — structured stage=suppressed.
+                    let _ = queue.mark_suppressed(
+                        queued.id,
+                        Some("duplicate idle message rate-limited (5min)"),
+                    );
                     continue;
                 }
                 self.last_idle_message_times
@@ -584,7 +589,13 @@ impl FactoryDaemon {
                                 "Abandoning queued prompt for unknown target — \
                                  message will not be delivered"
                             );
-                            let _ = queue.mark_processed(queued.id);
+                            // cas-2c5f: not transport delivery — structured stage=abandoned.
+                            let _ = queue.mark_abandoned(
+                                queued.id,
+                                Some(&format!(
+                                    "target '{pane_target}' not found in current session"
+                                )),
+                            );
 
                             // Record the drop and notify the supervisor so the
                             // message isn't silently lost.
@@ -644,8 +655,13 @@ impl FactoryDaemon {
             }
 
             if success {
-                if let Err(e) = queue.mark_processed(queued.id) {
-                    tracing::error!("Failed to mark prompt {} as processed: {}", queued.id, e);
+                // cas-2c5f: authoritative transport handoff only.
+                if let Err(e) = queue.mark_transport_delivered(queued.id) {
+                    tracing::error!(
+                        "Failed to mark prompt {} as transport-delivered: {}",
+                        queued.id,
+                        e
+                    );
                 }
             }
         }
