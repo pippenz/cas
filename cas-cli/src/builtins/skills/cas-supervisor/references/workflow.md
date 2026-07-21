@@ -43,27 +43,29 @@ In shared mode, file-overlap analysis is even more critical — two workers edit
 
 1. Spawn workers:
    ```
-   mcp__cas__coordination action=spawn_workers count=N isolate=true cli=grok model=grok-4.5 effort=medium
+   mcp__cas__coordination action=spawn_workers count=N isolate=true cli=codex model=gpt-5.6-sol effort=medium
    ```
    Omit `isolate` for shared mode.
 
-   **Hard rule:** every `spawn_workers` call MUST include explicit `model=` (and
-   `effort=` for standard/heavy/frontier and any Claude/Codex spawn). Include
-   `cli=` explicitly — Grok is the stock floor (`cli=grok model=grok-4.5`).
+   **Hard rule:** every `spawn_workers` call MUST include explicit `cli=`,
+   `model=`, and `effort=`. Codex is the default matrix
+   (`cli=codex model=gpt-5.6-sol`); taste/judgment uses
+   `cli=codex model=gpt-5.6-sol effort=medium`, Opus is exceptional, and Grok
+   is the health-gated capacity route.
    Omitted fields fall back through the factory config cascade and stock floor;
    the spawn acknowledgement nags because supervisors should make worker tier
    selection intentional and visible.
 
-   **Tiered mix example** — standard floor + light Composer + heavy Grok:
+   **Tiered mix example** — Codex-first standard floor + light + heavy:
    ```
-   # Standard floor (Grok 4.5 medium)
-   mcp__cas__coordination action=spawn_workers count=2 cli=grok model=grok-4.5 effort=medium isolate=true
+   # Standard floor (Codex gpt-5.6-sol medium)
+   mcp__cas__coordination action=spawn_workers count=2 cli=codex model=gpt-5.6-sol effort=medium isolate=true
 
-   # Light / flash (Composer is a Grok model id — not cli=cursor)
-   mcp__cas__coordination action=spawn_workers count=1 cli=grok model=grok-composer-2.5-fast worker_names="lt-ada" isolate=true
+   # Light / bulk (Codex gpt-5.6-sol low)
+   mcp__cas__coordination action=spawn_workers count=1 cli=codex model=gpt-5.6-sol effort=low worker_names="lt-ada" isolate=true
 
-   # Heavy (Grok 4.5 high)
-   mcp__cas__coordination action=spawn_workers count=1 cli=grok model=grok-4.5 effort=high worker_names="hv-ada" isolate=true
+   # Heavy (Codex gpt-5.6-sol high); frontier is model=gpt-5.6-sol
+   mcp__cas__coordination action=spawn_workers count=1 cli=codex model=gpt-5.6-sol effort=high worker_names="hv-ada" isolate=true
    ```
    `cli`, `model`, and `effort` are per-spawn controls for the workers spawned
    by that call.
