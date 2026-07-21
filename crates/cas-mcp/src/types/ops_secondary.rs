@@ -565,6 +565,16 @@ pub struct CoordinationRequest {
     #[serde(default)]
     pub allow_trunk: Option<bool>,
 
+    /// worktree_merge only: physically remove the worktree directory and delete
+    /// the factory/* branch after a successful merge (end-of-lane consume).
+    /// Default false (cas-369f): mid-session merges leave the worker cwd intact.
+    /// `force=true` never implies cleanup — force only bypasses dirty protection.
+    #[schemars(
+        description = "worktree_merge only: remove worktree + delete branch after merge (default false). force= does NOT enable cleanup. Live workers with open tasks refuse cleanup and still preserve the path."
+    )]
+    #[serde(default)]
+    pub cleanup: Option<bool>,
+
     /// Clear the pinned epic focus for focus_epic
     #[schemars(description = "Clear the pinned epic focus (focus_epic only)")]
     #[serde(default)]

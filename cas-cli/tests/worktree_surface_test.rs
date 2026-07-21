@@ -110,6 +110,7 @@ fn coord_req(action: &str) -> CoordinationRequest {
         urgent: None,
         force: None,
         allow_trunk: None,
+        cleanup: None,
         clear: None,
         limit: None,
         name: None,
@@ -490,10 +491,52 @@ async fn test_worktree_merge_succeeds_for_factory_worktree_when_system_a_disable
         repo.root.join("alice-work.txt").exists(),
         "merged content must land on the parent branch's working tree"
     );
-    // cleanup_on_close defaults true: the worktree directory is reclaimed.
+    // cas-369f: default mid-session merge preserves the worktree (ENOENT fix).
+    // Pass cleanup=true explicitly for end-of-lane consume.
+    assert!(
+        wt_path.exists(),
+        "worktree directory must remain after default worktree_merge (no cleanup=true)"
+    );
+    assert!(
+        text.contains("Worktree preserved") || text.contains("preserved"),
+        "merge response should note worktree was preserved.\nGot:\n{text}"
+    );
+}
+
+/// cas-369f: explicit cleanup=true removes path when worker is not live.
+#[tokio::test]
+async fn test_worktree_merge_cleanup_true_removes_worktree() {
+    let repo = GitRepo::new();
+    let cas_root = init_cas_dir(&repo.root).expect("init_cas_dir");
+    disable_system_a(&cas_root);
+
+    let wt_path = cas_root.join("worktrees").join("dave");
+    repo.add_worktree(&wt_path, "factory/dave");
+    std::fs::write(wt_path.join("dave-work.txt"), "dave's work").unwrap();
+    run_git(&["add", "."], &wt_path);
+    run_git(&["commit", "-m", "dave work"], &wt_path);
+
+    let _lock = merge_cwd_lock().lock().unwrap_or_else(|p| p.into_inner());
+    let _cwd = CwdGuard::enter(&repo.root);
+
+    let svc = make_service(cas_root);
+    let mut req = coord_req("worktree_merge");
+    req.id = Some("factory/dave".to_string());
+    req.allow_trunk = Some(true);
+    req.cleanup = Some(true);
+    let result = svc
+        .coordination(Parameters(req))
+        .await
+        .expect("coordination call should succeed");
+    let text = get_text(&result);
+
+    assert!(
+        text.contains("Merged worktree"),
+        "cleanup merge should succeed.\nGot:\n{text}"
+    );
     assert!(
         !wt_path.exists(),
-        "worktree directory should be cleaned up after a successful merge"
+        "cleanup=true with no live worker must remove the worktree directory"
     );
 }
 

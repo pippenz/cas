@@ -26,6 +26,66 @@ fn assignee_task_is_merge_relevant(status: cas_types::TaskStatus) -> bool {
     )
 }
 
+/// Heartbeat window for "live worker" preserve-after-merge (cas-369f).
+/// Aligned with claim/close assignee liveness (~5 min).
+const WORKTREE_MERGE_LIVE_HEARTBEAT_SECS: i64 = 300;
+
+/// Why consume-on-merge (`cleanup=true`) must be refused for a live factory worker.
+///
+/// Returns `Some(reason)` when the worktree/branch must stay (worker has non-closed
+/// assigned tasks, or a registered agent is alive with a fresh heartbeat).
+/// Pure decision helper — unit-tested without git.
+pub(crate) fn worktree_merge_preserve_reason(
+    worker_name: &str,
+    has_non_closed_assigned_tasks: bool,
+    agent_alive_with_fresh_heartbeat: bool,
+) -> Option<String> {
+    if has_non_closed_assigned_tasks {
+        return Some(format!(
+            "worker '{worker_name}' still has non-closed assigned tasks"
+        ));
+    }
+    if agent_alive_with_fresh_heartbeat {
+        return Some(format!(
+            "worker '{worker_name}' is still alive (fresh heartbeat)"
+        ));
+    }
+    None
+}
+
+/// Inspect task + agent stores for mid-session preserve signals (cas-369f).
+fn live_worker_merge_preserve_reason(
+    task_store: &dyn cas_store::TaskStore,
+    agent_store: Option<&dyn cas_store::AgentStore>,
+    worker_name: &str,
+) -> Option<String> {
+    let has_open_tasks = task_store
+        .list(None)
+        .ok()
+        .map(|tasks| {
+            tasks.iter().any(|t| {
+                t.assignee
+                    .as_deref()
+                    .is_some_and(|a| a.eq_ignore_ascii_case(worker_name))
+                    && assignee_task_is_merge_relevant(t.status)
+            })
+        })
+        .unwrap_or(false);
+
+    let alive_fresh = agent_store
+        .and_then(|store| store.list(None).ok())
+        .map(|agents| {
+            agents.iter().any(|a| {
+                a.name.eq_ignore_ascii_case(worker_name)
+                    && a.is_alive()
+                    && !a.is_heartbeat_expired(WORKTREE_MERGE_LIVE_HEARTBEAT_SECS)
+            })
+        })
+        .unwrap_or(false);
+
+    worktree_merge_preserve_reason(worker_name, has_open_tasks, alive_fresh)
+}
+
 /// Remediation block shared by merge-target rejections (cas-0b32).
 fn merge_target_remediation(assignee: &str) -> String {
     format!(
@@ -1117,12 +1177,19 @@ impl CasCore {
     /// defaults a factory worker merge to trunk — trunk requires explicit
     /// `allow_trunk=true` (independent of `force`, which only bypasses dirty
     /// worktree protection). The resolved target is always surfaced.
+    ///
+    /// **Cleanup (cas-369f):** default is merge-only — worktree path and
+    /// `factory/*` branch stay so a live worker's cwd is not ENOENT mid-epic.
+    /// Pass `cleanup=true` for end-of-lane consume. `force=true` never implies
+    /// cleanup. Live workers (open tasks / fresh heartbeat) refuse cleanup and
+    /// still preserve the path.
     pub async fn worktree_merge(
         &self,
         id: &str,
         force: bool,
         task_id: Option<&str>,
         allow_trunk: bool,
+        cleanup: bool,
     ) -> Result<CallToolResult, McpError> {
         use crate::config::Config;
         use crate::store::open_worktree_store;
@@ -1149,12 +1216,46 @@ impl CasCore {
         // trusted to match the intended repo (cas-0938).
         let cwd = cas_root.parent().unwrap_or(&cas_root).to_path_buf();
 
+        // cas-369f: do NOT inherit worktrees.cleanup_on_close for this op —
+        // that config default (true) was consuming live factory worktrees on
+        // every mid-session merge. cleanup is opt-in via the request flag.
+        let mut do_cleanup = cleanup;
+        let mut preserve_note: Option<String> = None;
+
+        // Resolve path existence before manager construction needs assignee.
+        // Manager is built after cleanup decision so cleanup_on_close is final.
+        let system_a_probe = match worktree_store.get(id) {
+            Ok(wt) => Some(wt),
+            Err(_) => worktree_store.get_by_branch(id).map_err(|e| McpError {
+                code: ErrorCode::INTERNAL_ERROR,
+                message: Cow::from(format!("Failed to get worktree: {e}")),
+                data: None,
+            })?,
+        };
+
+        let is_system_b_probe = system_a_probe.is_none();
+        if do_cleanup && is_system_b_probe {
+            let assignee = id.strip_prefix("factory/").unwrap_or(id);
+            let task_store = self.open_task_store()?;
+            let agent_store = crate::store::open_agent_store(&cas_root).ok();
+            if let Some(reason) = live_worker_merge_preserve_reason(
+                task_store.as_ref(),
+                agent_store.as_deref(),
+                assignee,
+            ) {
+                do_cleanup = false;
+                preserve_note = Some(format!(
+                    "Cleanup requested but refused ({reason}); worktree preserved"
+                ));
+            }
+        }
+
         let manager_config = WorktreeConfig {
             enabled: wt_config.enabled,
             base_path: wt_config.base_path.clone(),
             branch_prefix: wt_config.branch_prefix.clone(),
             auto_merge: true, // Force merge for this operation
-            cleanup_on_close: wt_config.cleanup_on_close,
+            cleanup_on_close: do_cleanup,
             promote_entries_on_merge: wt_config.promote_entries_on_merge,
         };
 
@@ -1164,16 +1265,7 @@ impl CasCore {
             data: None,
         })?;
 
-        let system_a = match worktree_store.get(id) {
-            Ok(wt) => Some(wt),
-            Err(_) => worktree_store.get_by_branch(id).map_err(|e| McpError {
-                code: ErrorCode::INTERNAL_ERROR,
-                message: Cow::from(format!("Failed to get worktree: {e}")),
-                data: None,
-            })?,
-        };
-
-        let (mut worktree, is_system_b, target_reason) = match system_a {
+        let (mut worktree, is_system_b, target_reason) = match system_a_probe {
             Some(wt) => (wt, false, String::new()),
             None => {
                 let assignee = id.strip_prefix("factory/").unwrap_or(id);
@@ -1237,7 +1329,7 @@ impl CasCore {
 
         // Update store — System B worktrees were never registered there, so
         // there's no row to update (and nothing worth persisting: the
-        // git-level merge + cleanup above already happened).
+        // git-level merge + optional cleanup above already happened).
         if !is_system_b {
             worktree_store.update(&worktree).map_err(|e| McpError {
                 code: ErrorCode::INTERNAL_ERROR,
@@ -1255,28 +1347,38 @@ impl CasCore {
             String::new()
         };
 
+        let cleanup_suffix = if do_cleanup {
+            " Cleanup: removed worktree + branch.".to_string()
+        } else if let Some(note) = &preserve_note {
+            format!(" {note}.")
+        } else {
+            " Worktree preserved (pass cleanup=true to remove after merge).".to_string()
+        };
+
         // Promote entries if configured
         if wt_config.promote_entries_on_merge {
             if let Ok(count) = self.promote_branch_entries(&worktree.branch) {
                 if count > 0 {
                     return Ok(Self::success(format!(
-                        "Merged worktree {} to {}.{} Commit: {}\nPromoted {} entries from branch scope.",
+                        "Merged worktree {} to {}.{} Commit: {}.{}{}",
                         worktree.id,
                         worktree.parent_branch,
                         target_suffix,
                         merge_commit.as_deref().unwrap_or("none"),
-                        count
+                        cleanup_suffix,
+                        format!("\nPromoted {count} entries from branch scope.")
                     )));
                 }
             }
         }
 
         Ok(Self::success(format!(
-            "Merged worktree {} to {}.{} Commit: {}",
+            "Merged worktree {} to {}.{} Commit: {}.{}",
             worktree.id,
             worktree.parent_branch,
             target_suffix,
-            merge_commit.as_deref().unwrap_or("none")
+            merge_commit.as_deref().unwrap_or("none"),
+            cleanup_suffix
         )))
     }
 
@@ -1391,9 +1493,41 @@ impl CasCore {
 mod tests {
     use super::{
         is_cas_pattern_worktree, is_factory_style_worktree, is_git_worktree, path_is_under,
+        worktree_merge_preserve_reason,
     };
     use std::path::Path;
     use tempfile::TempDir;
+
+    // -----------------------------------------------------------------------
+    // cas-369f: mid-session merge must preserve live worker worktrees
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn preserve_when_worker_has_open_tasks() {
+        let reason = worktree_merge_preserve_reason("alice", true, false);
+        assert!(
+            reason.as_deref().is_some_and(|r| r.contains("non-closed")),
+            "open tasks must block cleanup: {reason:?}"
+        );
+    }
+
+    #[test]
+    fn preserve_when_worker_alive_even_without_open_tasks() {
+        let reason = worktree_merge_preserve_reason("bob", false, true);
+        assert!(
+            reason.as_deref().is_some_and(|r| r.contains("alive")),
+            "live heartbeat must block cleanup: {reason:?}"
+        );
+    }
+
+    #[test]
+    fn cleanup_allowed_when_worker_idle_and_no_open_tasks() {
+        assert_eq!(
+            worktree_merge_preserve_reason("carol", false, false),
+            None,
+            "end-of-lane cleanup must be allowed when worker is gone"
+        );
+    }
 
     #[test]
     fn is_git_worktree_true_when_git_entry_present() {

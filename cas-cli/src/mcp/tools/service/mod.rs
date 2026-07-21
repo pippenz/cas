@@ -106,6 +106,9 @@ pub struct WorktreeRequest {
     pub force: Option<bool>,
     /// Explicit trunk merge intent (cas-0b32) — independent of force.
     pub allow_trunk: Option<bool>,
+    /// Explicit consume-on-merge (cas-369f) — independent of force.
+    /// Default false: mid-session merge preserves worktree + factory branch.
+    pub cleanup: Option<bool>,
 }
 
 // ============================================================================
@@ -594,6 +597,7 @@ impl CasService {
                         dry_run: req.dry_run,
                         force: req.force,
                         allow_trunk: req.allow_trunk,
+                        cleanup: req.cleanup,
                     };
                     match wt_action {
                         "create" => this.worktree_create(wt_req).await,

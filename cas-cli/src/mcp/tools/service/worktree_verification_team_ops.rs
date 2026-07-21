@@ -59,6 +59,7 @@ impl CasService {
                 req.force.unwrap_or(false),
                 req.task_id.as_deref(),
                 req.allow_trunk.unwrap_or(false),
+                req.cleanup.unwrap_or(false),
             )
             .await
     }

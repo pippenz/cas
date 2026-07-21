@@ -120,6 +120,118 @@ fn test_create_and_cleanup_worktree_for_epic() {
     assert!(!worktree.path.exists());
 }
 
+/// cas-369f: merge with cleanup_on_close=false leaves path + branch intact.
+#[test]
+fn merge_without_cleanup_preserves_worktree_path_and_branch() {
+    let (_temp, repo_path) = create_test_repo();
+    // Detect default branch name (main or master depending on git version).
+    let default_branch = {
+        let out = Command::new("git")
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    let config = WorktreeConfig {
+        enabled: true,
+        auto_merge: true,
+        cleanup_on_close: false, // mid-session preserve
+        ..Default::default()
+    };
+    let manager = WorktreeManager::new(&repo_path, config).unwrap();
+    let mut worktree = manager
+        .create_for_epic("cas-epic-preserve", Some("agent-1"))
+        .unwrap();
+
+    // Commit on the worktree branch so merge has content.
+    std::fs::write(worktree.path.join("feature.txt"), "hi").unwrap();
+    Command::new("git")
+        .args(["add", "."])
+        .current_dir(&worktree.path)
+        .output()
+        .unwrap();
+    Command::new("git")
+        .args(["commit", "-m", "feature"])
+        .current_dir(&worktree.path)
+        .output()
+        .unwrap();
+
+    // Parent branch for epic worktrees is typically the default branch.
+    worktree.parent_branch = default_branch;
+
+    let commit = manager
+        .merge_and_cleanup(&mut worktree, false)
+        .expect("merge should succeed");
+    assert!(commit.is_some());
+
+    assert!(
+        worktree.path.exists(),
+        "cleanup_on_close=false must leave the worktree directory"
+    );
+    // Branch should still resolve (not deleted).
+    let branch_check = Command::new("git")
+        .args(["rev-parse", "--verify", &worktree.branch])
+        .current_dir(&repo_path)
+        .output()
+        .unwrap();
+    assert!(
+        branch_check.status.success(),
+        "factory/epic branch must still exist after preserve-merge"
+    );
+}
+
+/// cas-369f: merge with cleanup_on_close=true still consumes (end-of-lane).
+#[test]
+fn merge_with_cleanup_removes_worktree_path() {
+    let (_temp, repo_path) = create_test_repo();
+    let default_branch = {
+        let out = Command::new("git")
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    let config = WorktreeConfig {
+        enabled: true,
+        auto_merge: true,
+        cleanup_on_close: true,
+        ..Default::default()
+    };
+    let manager = WorktreeManager::new(&repo_path, config).unwrap();
+    let mut worktree = manager
+        .create_for_epic("cas-epic-consume", Some("agent-1"))
+        .unwrap();
+
+    std::fs::write(worktree.path.join("feature.txt"), "bye").unwrap();
+    Command::new("git")
+        .args(["add", "."])
+        .current_dir(&worktree.path)
+        .output()
+        .unwrap();
+    Command::new("git")
+        .args(["commit", "-m", "feature"])
+        .current_dir(&worktree.path)
+        .output()
+        .unwrap();
+
+    worktree.parent_branch = default_branch;
+    let path = worktree.path.clone();
+
+    manager
+        .merge_and_cleanup(&mut worktree, false)
+        .expect("merge+cleanup should succeed");
+
+    assert!(
+        !path.exists(),
+        "cleanup_on_close=true must remove the worktree directory"
+    );
+    assert_eq!(worktree.status, WorktreeStatus::Removed);
+}
+
 #[test]
 fn test_worktree_path_for_worker() {
     let (_temp, repo_path) = create_test_repo();
