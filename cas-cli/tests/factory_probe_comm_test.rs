@@ -49,7 +49,7 @@ fn write_adapter_artifacts(root: &std::path::Path) {
     write_jsonl(
         &claude.join("transcript.jsonl"),
         &[
-            serde_json::json!({"timestamp":"2026-07-21T17:00:04.000Z","type":"assistant","message":"ack probe-message-id=claude-1"}),
+            serde_json::json!({"timestamp":"2026-07-21T17:00:01.200Z","type":"assistant","message":"ack probe-message-id=claude-1"}),
         ],
     );
     write_jsonl(
@@ -57,16 +57,16 @@ fn write_adapter_artifacts(root: &std::path::Path) {
         &[
             serde_json::json!({"timestamp":"2026-07-21T17:00:00.000Z","type":"session_meta","payload":{"cwd":"/tmp/probe"}}),
             serde_json::json!({"timestamp":"2026-07-21T17:00:02.000Z","type":"event_msg","payload":{"type":"user_message","message":"probe-message-id=codex-1"}}),
-            serde_json::json!({"timestamp":"2026-07-21T17:00:03.000Z","type":"event_msg","payload":{"type":"turn_started"}}),
-            serde_json::json!({"timestamp":"2026-07-21T17:00:06.000Z","type":"response_item","payload":{"type":"message","content":"ack probe-message-id=codex-1"}}),
+            serde_json::json!({"timestamp":"2026-07-21T17:00:02.100Z","type":"event_msg","payload":{"type":"turn_started"}}),
+            serde_json::json!({"timestamp":"2026-07-21T17:00:02.200Z","type":"response_item","payload":{"type":"message","content":"ack probe-message-id=codex-1"}}),
         ],
     );
     write_jsonl(
         &grok.join("updates.jsonl"),
         &[
             serde_json::json!({"timestamp":"2026-07-21T17:00:02.000Z","type":"user_message","text":"probe-message-id=grok-1"}),
-            serde_json::json!({"timestamp":"2026-07-21T17:00:03.000Z","type":"turn_started"}),
-            serde_json::json!({"timestamp":"2026-07-21T17:00:07.000Z","type":"assistant_message","text":"ack probe-message-id=grok-1"}),
+            serde_json::json!({"timestamp":"2026-07-21T17:00:02.100Z","type":"turn_started"}),
+            serde_json::json!({"timestamp":"2026-07-21T17:00:02.200Z","type":"assistant_message","text":"ack probe-message-id=grok-1"}),
         ],
     );
     write_jsonl(
@@ -175,6 +175,23 @@ fn probe_comm_cli_all_adapters_writes_recorded_fixture_report() {
                 && line["stages"][0]["selected_at_ms"].is_null()),
         "recorded adapters must not fabricate enqueue/select timestamps: {lines:?}"
     );
+    let routing = lines
+        .iter()
+        .find(|line| line["scenario"] == "routing_matrix_evidence")
+        .unwrap();
+    assert_eq!(
+        routing["stages"].as_array().unwrap().len(),
+        19,
+        "18 bidirectional harness pairings plus one live-observation disclosure"
+    );
+    assert!(
+        routing["stages"].as_array().unwrap().iter().any(|stage| {
+            stage["message_id"] == "live-disposable-model-observation"
+                && stage["stage_statuses"][0]["status"] == "BLOCKED"
+                && stage["reaction_status"] == "BLOCKED"
+        }),
+        "unsupported live observation must be BLOCKED/UNKNOWN, never pass-like: {routing}"
+    );
 }
 
 #[test]
@@ -246,5 +263,81 @@ fn probe_comm_cli_malformed_recorded_artifact_emits_stage_status_jsonl() {
             .unwrap()
             .iter()
             .any(|stage| stage["stage"] == "artifact" && stage["status"] == "FAILED")
+    );
+}
+
+#[test]
+fn probe_comm_cli_missing_recorded_artifact_emits_stage_status_jsonl() {
+    let temp = tempfile::tempdir().unwrap();
+    let jsonl = temp.path().join("probe.jsonl");
+    let artifacts = temp.path().join("artifacts");
+    std::fs::create_dir_all(&artifacts).unwrap();
+
+    cas_cmd()
+        .args([
+            "factory",
+            "probe-comm",
+            "--jsonl",
+            jsonl.to_str().unwrap(),
+            "--adapter",
+            "codex",
+            "--artifact-root",
+            artifacts.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("artifact_missing"));
+
+    let lines = read_jsonl(&jsonl);
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0]["scenario"], "codex_adapter");
+    assert_eq!(lines[0]["failed_stage"], "artifact_missing");
+    assert_eq!(lines[0]["stages"][0]["terminal"], "artifact_missing");
+    assert_eq!(lines[0]["stages"][0]["delivered_status"], "FAILED");
+}
+
+#[test]
+fn probe_comm_cli_unmatched_recorded_artifact_emits_unknown_stage_status_jsonl() {
+    let temp = tempfile::tempdir().unwrap();
+    let jsonl = temp.path().join("probe.jsonl");
+    let artifacts = temp.path().join("artifacts");
+    let codex = artifacts.join("codex");
+    std::fs::create_dir_all(&codex).unwrap();
+    write_jsonl(
+        &codex.join("rollout.jsonl"),
+        &[serde_json::json!({
+            "timestamp":"2026-07-21T17:00:02.000Z",
+            "type":"event_msg",
+            "payload":{"type":"user_message","message":"probe-message-id=other"}
+        })],
+    );
+
+    cas_cmd()
+        .args([
+            "factory",
+            "probe-comm",
+            "--jsonl",
+            jsonl.to_str().unwrap(),
+            "--adapter",
+            "codex",
+            "--artifact-root",
+            artifacts.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("correlation_unknown"));
+
+    let lines = read_jsonl(&jsonl);
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0]["scenario"], "codex_adapter");
+    assert_eq!(lines[0]["failed_stage"], "correlation_unknown");
+    assert_eq!(lines[0]["stages"][0]["terminal"], "correlation_unknown");
+    assert_eq!(lines[0]["stages"][0]["delivered_status"], "UNKNOWN");
+    assert!(
+        lines[0]["stages"][0]["stage_statuses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|stage| stage["stage"] == "artifact" && stage["status"] == "UNKNOWN")
     );
 }

@@ -1,6 +1,6 @@
-use super::MessageStageEvidence;
+use super::{MessageStageEvidence, StageStatusEvidence};
 use anyhow::{Context, Result};
-use chrono::{DateTime, Timelike, Utc};
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::path::PathBuf;
 
@@ -68,7 +68,7 @@ impl ClaudeAdapter {
             &fixture.message_id,
             &fixture.target,
             delivered_at_ms,
-            Some(delivered_at_ms),
+            None,
             first_reaction_at_ms,
         ))
     }
@@ -162,11 +162,19 @@ fn stage_from_parts(
     MessageStageEvidence {
         message_id: message_id.to_string(),
         target: target.to_string(),
-        enqueued_at_ms: delivered_at_ms.saturating_sub(1),
-        selected_at_ms: delivered_at_ms,
+        enqueued_at_ms: None,
+        selected_at_ms: None,
         delivered_at_ms: Some(delivered_at_ms),
         wake_at_ms,
         first_reaction_at_ms,
+        enqueued_status: "UNKNOWN",
+        selected_status: "UNKNOWN",
+        delivered_status: "OBSERVED",
+        wake_status: if wake_at_ms.is_some() {
+            "OBSERVED"
+        } else {
+            "UNKNOWN"
+        },
         reaction_status: Some(
             if first_reaction_at_ms.is_some() {
                 "OBSERVED"
@@ -175,8 +183,65 @@ fn stage_from_parts(
             }
             .to_string(),
         ),
+        stage_statuses: recorded_stage_statuses(delivered_at_ms, wake_at_ms, first_reaction_at_ms),
         terminal: "delivered",
     }
+}
+
+fn recorded_stage_statuses(
+    delivered_at_ms: u64,
+    wake_at_ms: Option<u64>,
+    first_reaction_at_ms: Option<u64>,
+) -> Vec<StageStatusEvidence> {
+    let mut statuses = vec![
+        StageStatusEvidence {
+            stage: "enqueued",
+            status: "UNKNOWN",
+            provenance: "recorded adapter artifacts do not contain CAS enqueue evidence"
+                .to_string(),
+        },
+        StageStatusEvidence {
+            stage: "selected",
+            status: "UNKNOWN",
+            provenance: "recorded adapter artifacts do not contain queue selection evidence"
+                .to_string(),
+        },
+        StageStatusEvidence {
+            stage: "delivered",
+            status: "OBSERVED",
+            provenance: format!(
+                "recorded adapter artifact contains correlated delivery at {delivered_at_ms}ms"
+            ),
+        },
+    ];
+    statuses.push(match wake_at_ms {
+        Some(ts) => StageStatusEvidence {
+            stage: "wake",
+            status: "OBSERVED",
+            provenance: format!("recorded adapter artifact contains correlated wake at {ts}ms"),
+        },
+        None => StageStatusEvidence {
+            stage: "wake",
+            status: "UNKNOWN",
+            provenance: "recorded adapter artifact does not prove worker wake".to_string(),
+        },
+    });
+    statuses.push(match first_reaction_at_ms {
+        Some(ts) => StageStatusEvidence {
+            stage: "reaction",
+            status: "OBSERVED",
+            provenance: format!(
+                "recorded adapter artifact contains correlated first reaction at {ts}ms"
+            ),
+        },
+        None => StageStatusEvidence {
+            stage: "reaction",
+            status: "UNKNOWN",
+            provenance: "recorded adapter artifact does not contain a correlated reaction"
+                .to_string(),
+        },
+    });
+    statuses
 }
 
 fn read_jsonl(path: &std::path::Path) -> Result<Vec<Value>> {
@@ -238,11 +303,7 @@ fn json_timestamp_ms(value: &Value) -> Option<u64> {
 
 fn timestamp_ms(raw: &str) -> Option<u64> {
     let ts = DateTime::parse_from_rfc3339(raw).ok()?.with_timezone(&Utc);
-    Some(
-        (ts.second() as u64 * 1_000)
-            + (ts.nanosecond() as u64 / 1_000_000)
-            + (ts.minute() as u64 * 60_000),
-    )
+    u64::try_from(ts.timestamp_millis()).ok()
 }
 
 fn value_contains_message_id(value: &Value, message_id: &str) -> bool {
@@ -318,12 +379,12 @@ mod tests {
             got_json["selected_at_ms"].is_null(),
             "recorded adapters must not fabricate selection timestamps: {got_json}"
         );
-        assert_eq!(got.delivered_at_ms, Some(1_184_957_201_000));
+        assert_eq!(got.delivered_at_ms, Some(1_784_653_201_000));
         assert_eq!(
             got.wake_at_ms, None,
             "Claude inbox persistence is delivery evidence, not worker wake evidence"
         );
-        assert_eq!(got.first_reaction_at_ms, Some(1_184_957_204_000));
+        assert_eq!(got.first_reaction_at_ms, Some(1_784_653_204_000));
         assert_eq!(got.reaction_status.as_deref(), Some("OBSERVED"));
         assert_eq!(got.terminal, "delivered");
     }
@@ -332,11 +393,11 @@ mod tests {
     fn timestamp_ms_preserves_full_rfc3339_epoch_across_day_boundary() {
         assert_eq!(
             timestamp_ms("2026-07-21T23:59:59.999Z"),
-            Some(1_184_982_399_999)
+            Some(1_784_678_399_999)
         );
         assert_eq!(
             timestamp_ms("2026-07-22T00:00:00.001Z"),
-            Some(1_184_982_400_001)
+            Some(1_784_678_400_001)
         );
     }
 
@@ -361,9 +422,9 @@ mod tests {
         })
         .expect("codex fixture should parse");
 
-        assert_eq!(got.delivered_at_ms, Some(1_184_957_202_000));
-        assert_eq!(got.wake_at_ms, Some(1_184_957_203_000));
-        assert_eq!(got.first_reaction_at_ms, Some(1_184_957_206_000));
+        assert_eq!(got.delivered_at_ms, Some(1_784_653_202_000));
+        assert_eq!(got.wake_at_ms, Some(1_784_653_203_000));
+        assert_eq!(got.first_reaction_at_ms, Some(1_784_653_206_000));
         assert_eq!(got.reaction_status.as_deref(), Some("OBSERVED"));
     }
 
@@ -392,8 +453,8 @@ mod tests {
         })
         .expect("grok fixture should parse");
 
-        assert_eq!(got.delivered_at_ms, Some(2_000));
-        assert_eq!(got.wake_at_ms, Some(3_000));
+        assert_eq!(got.delivered_at_ms, Some(1_784_653_202_000));
+        assert_eq!(got.wake_at_ms, Some(1_784_653_203_000));
         assert_eq!(got.first_reaction_at_ms, None);
         assert_eq!(got.reaction_status.as_deref(), Some("UNKNOWN"));
         assert_eq!(got.terminal, "delivered");

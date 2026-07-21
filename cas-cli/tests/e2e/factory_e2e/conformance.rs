@@ -54,7 +54,7 @@ fn write_adapter_artifacts(root: &std::path::Path) {
     write_jsonl(
         &claude.join("transcript.jsonl"),
         &[
-            serde_json::json!({"timestamp":"2026-07-21T17:00:04.000Z","type":"assistant","message":"ack probe-message-id=claude-1"}),
+            serde_json::json!({"timestamp":"2026-07-21T17:00:01.200Z","type":"assistant","message":"ack probe-message-id=claude-1"}),
         ],
     );
     write_jsonl(
@@ -62,16 +62,16 @@ fn write_adapter_artifacts(root: &std::path::Path) {
         &[
             serde_json::json!({"timestamp":"2026-07-21T17:00:00.000Z","type":"session_meta","payload":{"cwd":"/tmp/probe"}}),
             serde_json::json!({"timestamp":"2026-07-21T17:00:02.000Z","type":"event_msg","payload":{"type":"user_message","message":"probe-message-id=codex-1"}}),
-            serde_json::json!({"timestamp":"2026-07-21T17:00:03.000Z","type":"event_msg","payload":{"type":"turn_started"}}),
-            serde_json::json!({"timestamp":"2026-07-21T17:00:06.000Z","type":"response_item","payload":{"type":"message","content":"ack probe-message-id=codex-1"}}),
+            serde_json::json!({"timestamp":"2026-07-21T17:00:02.100Z","type":"event_msg","payload":{"type":"turn_started"}}),
+            serde_json::json!({"timestamp":"2026-07-21T17:00:02.200Z","type":"response_item","payload":{"type":"message","content":"ack probe-message-id=codex-1"}}),
         ],
     );
     write_jsonl(
         &grok.join("updates.jsonl"),
         &[
             serde_json::json!({"timestamp":"2026-07-21T17:00:02.000Z","type":"user_message","text":"probe-message-id=grok-1"}),
-            serde_json::json!({"timestamp":"2026-07-21T17:00:03.000Z","type":"turn_started"}),
-            serde_json::json!({"timestamp":"2026-07-21T17:00:07.000Z","type":"assistant_message","text":"ack probe-message-id=grok-1"}),
+            serde_json::json!({"timestamp":"2026-07-21T17:00:02.100Z","type":"turn_started"}),
+            serde_json::json!({"timestamp":"2026-07-21T17:00:02.200Z","type":"assistant_message","text":"ack probe-message-id=grok-1"}),
         ],
     );
     write_jsonl(
@@ -104,11 +104,22 @@ fn recorded_probe_comm_all_adapters_emit_stage_evidence() {
         .success();
 
     let lines = read_jsonl(&jsonl);
-    assert_eq!(lines.len(), 3);
+    assert_eq!(lines.len(), 5);
     assert!(lines.iter().all(|line| line["passed"] == true));
     assert!(
         lines
             .iter()
+            .filter(|line| line["scenario"].as_str().unwrap().ends_with("_adapter"))
             .all(|line| line["stages"][0]["reaction_status"] == "OBSERVED")
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line["scenario"] == "routing_matrix_evidence")
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line["scenario"] == "merge_reclose_lifecycle_evidence")
     );
 }
