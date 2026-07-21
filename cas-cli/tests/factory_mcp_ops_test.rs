@@ -69,6 +69,33 @@ impl FactoryTestEnv {
         id
     }
 
+    /// Create a task parked in `AwaitingMerge` assigned to `assignee`
+    /// (cas-126b fixtures). Returns the generated task id.
+    fn create_awaiting_merge_task(&self, title: &str, assignee: &str) -> String {
+        let store = self.task_store();
+        let id = store.generate_id().expect("generate_id");
+        let mut task = Task::new(id.clone(), title.to_string());
+        task.status = TaskStatus::AwaitingMerge;
+        task.assignee = Some(assignee.to_string());
+        store.add(&task).expect("add awaiting-merge task");
+        id
+    }
+
+    /// Read a registered worker's `halt_task_work` metadata flag by name.
+    fn worker_halted(&self, name: &str) -> bool {
+        let agents = self.agent_store().list(None).expect("list agents");
+        agents
+            .iter()
+            .find(|a| a.name.eq_ignore_ascii_case(name) && a.role == AgentRole::Worker)
+            .map(|a| {
+                a.metadata
+                    .get("halt_task_work")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false)
+    }
+
     fn register_worker(&self, name: &str) -> String {
         let store = self.agent_store();
         let id = Agent::generate_fallback_id();
@@ -287,6 +314,7 @@ fn coord_req(action: &str) -> CoordinationRequest {
         urgent: None,
         force: None,
         allow_trunk: None,
+        cleanup: None,
         clear: None,
         limit: None,
         name: None,
@@ -1929,6 +1957,7 @@ fn coord_msg(
         urgent,
         force: None,
         allow_trunk: None,
+        cleanup: None,
         clear: None,
         limit: None,
         name: None,
@@ -2017,6 +2046,123 @@ async fn test_coordination_message_urgent_flag_enqueues_urgent() {
         prompts[0].priority,
         cas_store::NotificationPriority::Critical,
         "urgent with no explicit priority defaults to Critical so it jumps the queue"
+    );
+}
+
+/// cas-126b: an urgent "MERGE DONE → re-close now" hand-off to the worker that
+/// OWNS the parked task must NOT arm halt_task_work — otherwise the re-close it
+/// asks for deadlocks (WORK HALTED). The urgent is still enqueued (worker wakes).
+#[tokio::test]
+async fn test_126b_target_awaiting_merge_reclose_urgent_does_not_halt() {
+    let _guard = EnvGuard::set_optional(&[
+        ("CAS_AGENT_ROLE", Some("supervisor")),
+        ("CAS_AGENT_NAME", Some("supervisor")),
+        // No factory session → halt fan-out is unfiltered (worker in scope).
+        ("CAS_FACTORY_SESSION", None),
+    ]);
+    let env = FactoryTestEnv::new();
+    env.register_worker("swift-fox");
+    let task_id = env.create_awaiting_merge_task("parked work", "swift-fox");
+
+    let msg = format!(
+        "MERGE DONE: factory/swift-fox merged to epic. \
+         Re-close now: task action=close id={task_id} reason=\"merged\""
+    );
+    let req = coord_msg("message", "swift-fox", &msg, Some(true));
+    let result = env.service.coordination(Parameters(req)).await;
+    assert!(result.is_ok(), "urgent re-close should succeed: {result:?}");
+
+    // Still enqueued as an urgent so the worker wakes.
+    let prompts = env.prompt_queue().peek_all(10).expect("peek");
+    assert_eq!(prompts.len(), 1);
+    assert!(prompts[0].urgent, "merge re-close must still enqueue urgent");
+    // But halt must NOT be armed on the owning worker.
+    assert!(
+        !env.worker_halted("swift-fox"),
+        "merge-complete re-close to the owning worker must not arm halt_task_work"
+    );
+}
+
+/// cas-126b scope/authorization gate: an urgent close-guidance message to worker
+/// B that merely NAMES worker A's parked task must STILL halt B — the exemption
+/// binds to the target's OWN AwaitingMerge task, not any AwaitingMerge task.
+#[tokio::test]
+async fn test_126b_other_workers_task_does_not_exempt_target() {
+    let _guard = EnvGuard::set_optional(&[
+        ("CAS_AGENT_ROLE", Some("supervisor")),
+        ("CAS_AGENT_NAME", Some("supervisor")),
+        ("CAS_FACTORY_SESSION", None),
+    ]);
+    let env = FactoryTestEnv::new();
+    env.register_worker("swift-fox"); // target B
+    env.register_worker("brave-otter"); // owner A
+    // Parked task belongs to A, not to the target B.
+    let a_task = env.create_awaiting_merge_task("A's parked work", "brave-otter");
+
+    let msg = format!("MERGE DONE — task action=close id={a_task} reason=\"merged\"");
+    let req = coord_msg("message", "swift-fox", &msg, Some(true));
+    let result = env.service.coordination(Parameters(req)).await;
+    assert!(result.is_ok(), "urgent should succeed: {result:?}");
+
+    assert!(
+        env.worker_halted("swift-fox"),
+        "close guidance naming another worker's parked task must NOT exempt the \
+         target — halt must still fire"
+    );
+}
+
+/// cas-126b: an ordinary urgent stop/redirect (not close guidance) must STILL
+/// arm halt_task_work even if the target owns a parked AwaitingMerge task.
+#[tokio::test]
+async fn test_126b_ordinary_urgent_still_halts_even_with_parked_task() {
+    let _guard = EnvGuard::set_optional(&[
+        ("CAS_AGENT_ROLE", Some("supervisor")),
+        ("CAS_AGENT_NAME", Some("supervisor")),
+        ("CAS_FACTORY_SESSION", None),
+    ]);
+    let env = FactoryTestEnv::new();
+    env.register_worker("swift-fox");
+    let _parked = env.create_awaiting_merge_task("parked work", "swift-fox");
+
+    let req = coord_msg("message", "swift-fox", "STOP — you are on the wrong file", Some(true));
+    let result = env.service.coordination(Parameters(req)).await;
+    assert!(result.is_ok(), "urgent stop should succeed: {result:?}");
+
+    assert!(
+        env.worker_halted("swift-fox"),
+        "ordinary urgent stop must still arm halt_task_work (stale-work protection)"
+    );
+}
+
+/// cas-126b fail-closed: an urgent close-guidance message with no positive
+/// AwaitingMerge evidence for the target (no matching task in the store — the
+/// same net branch as a task-store read error) must STILL halt. The exemption
+/// only fires on positive, target-bound AwaitingMerge evidence.
+#[tokio::test]
+async fn test_126b_close_guidance_without_target_awaiting_task_fails_closed_to_halt() {
+    let _guard = EnvGuard::set_optional(&[
+        ("CAS_AGENT_ROLE", Some("supervisor")),
+        ("CAS_AGENT_NAME", Some("supervisor")),
+        ("CAS_FACTORY_SESSION", None),
+    ]);
+    let env = FactoryTestEnv::new();
+    env.register_worker("swift-fox");
+    // No AwaitingMerge task exists for swift-fox (store returns none → no
+    // positive evidence; identical safe outcome to a store read error).
+
+    let req = coord_msg(
+        "message",
+        "swift-fox",
+        "MERGE DONE — task action=close id=cas-9999 reason=\"merged\"",
+        Some(true),
+    );
+    let result = env.service.coordination(Parameters(req)).await;
+    assert!(result.is_ok(), "urgent should succeed: {result:?}");
+
+    assert!(
+        env.worker_halted("swift-fox"),
+        "close guidance without a target-owned AwaitingMerge task must fail closed \
+         (halt still armed)"
     );
 }
 
