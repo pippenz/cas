@@ -958,7 +958,9 @@ fn test_lease_release_for_task_atomically_decrements_active_tasks() {
     assert_eq!(agent.active_tasks, 1);
 
     // Release via release_lease_for_task (used when closing tasks)
-    let released = store.release_lease_for_task("task-close").unwrap();
+    let released = store
+        .release_lease_for_task("task-close", "Task closed")
+        .unwrap();
     assert!(released, "Should return true when a lease was released");
 
     let agent = store.get("agent-fortask").unwrap();
@@ -970,10 +972,45 @@ fn test_lease_release_for_task_atomically_decrements_active_tasks() {
     // Verify release was logged with "Task closed" note
     let history = store.get_lease_history("task-close", Some(1)).unwrap();
     assert_eq!(history[0].event_type, "released");
+    assert_eq!(
+        history[0].previous_agent_id.as_deref(),
+        Some("Task closed")
+    );
 
     // Release again — should return false (no active lease)
-    let released = store.release_lease_for_task("task-close").unwrap();
+    let released = store
+        .release_lease_for_task("task-close", "Task closed")
+        .unwrap();
     assert!(!released, "Should return false when no active lease exists");
+}
+
+#[test]
+fn test_lease_release_for_task_records_awaiting_merge_park_reason() {
+    let (_temp, store) = create_test_store();
+
+    let agent = Agent::new("agent-park".to_string(), "Park Test".to_string());
+    store.register(&agent).unwrap();
+
+    store
+        .try_claim("task-park", "agent-park", 600, None)
+        .unwrap();
+
+    let released = store
+        .release_lease_for_task("task-park", "MERGE REQUIRED: parked awaiting_merge")
+        .unwrap();
+    assert!(released, "Should return true when a lease was released");
+
+    let history = store.get_lease_history("task-park", Some(1)).unwrap();
+    assert_eq!(history[0].event_type, "released");
+    assert_eq!(
+        history[0].previous_agent_id.as_deref(),
+        Some("MERGE REQUIRED: parked awaiting_merge")
+    );
+    assert_ne!(
+        history[0].previous_agent_id.as_deref(),
+        Some("Task closed"),
+        "parked MERGE REQUIRED close rejection must not look like a successful close"
+    );
 }
 
 #[test]

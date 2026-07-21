@@ -317,7 +317,10 @@ impl CasCore {
         }
 
         if let Ok(agent_store) = self.open_agent_store() {
-            if let Err(e) = agent_store.release_lease_for_task(&task.id) {
+            if let Err(e) = agent_store.release_lease_for_task(
+                &task.id,
+                "MERGE REQUIRED: parked awaiting_merge",
+            ) {
                 tracing::warn!(
                     task_id = %task.id,
                     error = %e,
@@ -816,7 +819,10 @@ impl CasCore {
 
                         // Release any lease so the supervisor can reclaim the task.
                         if let Ok(agent_store) = self.open_agent_store() {
-                            let _ = agent_store.release_lease_for_task(&req.id);
+                            let _ = agent_store.release_lease_for_task(
+                                &req.id,
+                                "Verification timed out: supervisor escalation",
+                            );
                         }
 
                         // Replace the stale dispatch row with a timeout diagnostic so
@@ -1694,7 +1700,8 @@ impl CasCore {
                     // the worker holds a phantom lease for ~10 min and
                     // `task action=claim` by the supervisor is blocked.
                     if let Ok(agent_store) = self.open_agent_store() {
-                        let _ = agent_store.release_lease_for_task(&req.id);
+                        let _ = agent_store
+                            .release_lease_for_task(&req.id, "Queued for supervisor review");
                     }
 
                     return Ok(Self::success(format!(
@@ -2054,7 +2061,7 @@ impl CasCore {
 
         // Release any lease on this task (regardless of who owns it)
         let lease_msg = if let Ok(agent_store) = self.open_agent_store() {
-            match agent_store.release_lease_for_task(&req.id) {
+            match agent_store.release_lease_for_task(&req.id, "Task closed") {
                 Ok(true) => " (lease released)",
                 Ok(false) => "",
                 Err(_) => "",

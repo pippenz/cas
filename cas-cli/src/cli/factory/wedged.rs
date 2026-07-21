@@ -1255,7 +1255,7 @@ fn reset_worker_tasks(cas_root: &Path, worker_name: &str) -> Result<usize> {
         //      when no lease exists).
         //   2. Set task.status = Open.
         //   3. Clear task.assignee.
-        let _ = agent_store.release_lease_for_task(&t.id);
+        let _ = agent_store.release_lease_for_task(&t.id, "Wedged worker recovery");
         t.status = TaskStatus::Open;
         t.assignee = None;
         t.updated_at = chrono::Utc::now();
