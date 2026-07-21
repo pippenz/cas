@@ -388,6 +388,131 @@ fn test_merge_workers_to_epic() {
     assert!(repo_path.join("worker-file.txt").exists());
 }
 
+/// cas-369f: mid-session merge with cleanup=false leaves worktree + branch.
+#[test]
+fn merge_and_cleanup_preserve_leaves_worktree_and_branch() {
+    let (_temp, repo_path) = create_test_repo();
+    let mut config = WorktreeConfig::default();
+    config.auto_merge = true;
+    config.cleanup_on_close = true; // config would clean — caller opts out
+    let mut manager = WorktreeManager::new(&repo_path, config).unwrap();
+
+    let epic_branch = manager.create_epic_branch("Preserve Merge").unwrap();
+    let mut worktree = manager.create_for_worker("preserve-worker").unwrap();
+    let wt_path = worktree.path.clone();
+    let worker_branch = worktree.branch.clone();
+
+    std::fs::write(wt_path.join("mid-epic.txt"), "still working").unwrap();
+    Command::new("git")
+        .args(["add", "mid-epic.txt"])
+        .current_dir(&wt_path)
+        .output()
+        .unwrap();
+    Command::new("git")
+        .args(["commit", "-m", "mid-epic work"])
+        .current_dir(&wt_path)
+        .output()
+        .unwrap();
+
+    worktree.parent_branch = epic_branch.clone();
+    let commit = manager
+        .merge_and_cleanup(&mut worktree, false, false)
+        .expect("merge preserve");
+    assert!(commit.is_some());
+
+    assert!(
+        wt_path.exists(),
+        "worktree path must remain when cleanup=false (mid-session)"
+    );
+    assert!(
+        manager.git.branch_exists(&worker_branch).unwrap(),
+        "factory branch must remain when cleanup=false"
+    );
+    manager.git.checkout(&epic_branch).unwrap();
+    assert!(
+        repo_path.join("mid-epic.txt").exists(),
+        "merge content must land on parent"
+    );
+}
+
+/// cas-369f: cleanup=true still consumes the worktree after merge.
+#[test]
+fn merge_and_cleanup_true_removes_worktree() {
+    let (_temp, repo_path) = create_test_repo();
+    let mut config = WorktreeConfig::default();
+    config.auto_merge = true;
+    let mut manager = WorktreeManager::new(&repo_path, config).unwrap();
+
+    let epic_branch = manager.create_epic_branch("Cleanup Merge").unwrap();
+    let mut worktree = manager.create_for_worker("cleanup-merge-worker").unwrap();
+    let wt_path = worktree.path.clone();
+    let worker_branch = worktree.branch.clone();
+
+    std::fs::write(wt_path.join("done.txt"), "lane done").unwrap();
+    Command::new("git")
+        .args(["add", "done.txt"])
+        .current_dir(&wt_path)
+        .output()
+        .unwrap();
+    Command::new("git")
+        .args(["commit", "-m", "done"])
+        .current_dir(&wt_path)
+        .output()
+        .unwrap();
+
+    worktree.parent_branch = epic_branch.clone();
+    manager
+        .merge_and_cleanup(&mut worktree, false, true)
+        .expect("merge cleanup");
+
+    assert!(
+        !wt_path.exists(),
+        "worktree must be removed when cleanup=true"
+    );
+    assert!(
+        !manager.git.branch_exists(&worker_branch).unwrap(),
+        "branch must be deleted when cleanup=true"
+    );
+}
+
+/// cas-369f: force=true on dirty tree merges without implying cleanup.
+#[test]
+fn merge_force_dirty_does_not_remove_when_cleanup_false() {
+    let (_temp, repo_path) = create_test_repo();
+    let mut config = WorktreeConfig::default();
+    config.auto_merge = true;
+    let mut manager = WorktreeManager::new(&repo_path, config).unwrap();
+
+    let epic_branch = manager.create_epic_branch("Force Dirty").unwrap();
+    let mut worktree = manager.create_for_worker("force-dirty-worker").unwrap();
+    let wt_path = worktree.path.clone();
+
+    std::fs::write(wt_path.join("committed.txt"), "c").unwrap();
+    Command::new("git")
+        .args(["add", "committed.txt"])
+        .current_dir(&wt_path)
+        .output()
+        .unwrap();
+    Command::new("git")
+        .args(["commit", "-m", "committed"])
+        .current_dir(&wt_path)
+        .output()
+        .unwrap();
+    // Dirty uncommitted change
+    std::fs::write(wt_path.join("dirty.txt"), "uncommitted").unwrap();
+
+    worktree.parent_branch = epic_branch;
+    // Without force, dirty fails
+    assert!(manager
+        .merge_and_cleanup(&mut worktree, false, false)
+        .is_err());
+    // force=true merges dirty; cleanup=false keeps path
+    manager
+        .merge_and_cleanup(&mut worktree, true, false)
+        .expect("force dirty merge preserve");
+    assert!(wt_path.exists(), "force must not imply cleanup");
+}
+
 #[test]
 fn test_cleanup_worker_branches_after_merge() {
     let (_temp, repo_path) = create_test_repo();

@@ -565,6 +565,17 @@ pub struct CoordinationRequest {
     #[serde(default)]
     pub allow_trunk: Option<bool>,
 
+    /// worktree_merge only: remove the worktree directory and delete the
+    /// factory branch after a successful merge (cas-369f). Independent of
+    /// `force` (dirty-tree override). Default for System-B factory workers is
+    /// preserve (mid-session merges leave the worker cwd intact); pass
+    /// `cleanup=true` for end-of-lane consume.
+    #[schemars(
+        description = "worktree_merge only: remove worktree + delete branch after merge (end-of-lane). Separate from force= (dirty only). System-B default is preserve so mid-epic merges do not destroy a live worker cwd."
+    )]
+    #[serde(default)]
+    pub cleanup: Option<bool>,
+
     /// Clear the pinned epic focus for focus_epic
     #[schemars(description = "Clear the pinned epic focus (focus_epic only)")]
     #[serde(default)]

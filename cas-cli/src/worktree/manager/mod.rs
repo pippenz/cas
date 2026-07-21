@@ -246,11 +246,16 @@ impl WorktreeManager {
         path.exists()
     }
 
-    /// Merge and cleanup a worktree
+    /// Merge a worktree into its parent branch, optionally removing it.
     ///
     /// # Arguments
     /// * `worktree` - The worktree to merge
-    /// * `force` - Force removal even if there are uncommitted changes
+    /// * `force` - Bypass dirty-tree protection only (cas-369f / cas-0b32).
+    ///   Does **not** imply worktree removal.
+    /// * `cleanup` - When true, remove the worktree directory and delete the
+    ///   branch after a successful merge. When false, leave both intact so a
+    ///   live factory worker can keep working mid-epic (cas-369f). Independent
+    ///   of `force` and of `config.cleanup_on_close` — callers decide.
     ///
     /// # Returns
     /// The merge commit hash if successful, or None if merge was skipped
@@ -258,6 +263,7 @@ impl WorktreeManager {
         &self,
         worktree: &mut Worktree,
         force: bool,
+        cleanup: bool,
     ) -> WorktreeResult<Option<String>> {
         // Check for uncommitted changes
         if !force && self.git.has_uncommitted_changes(&worktree.path)? {
@@ -285,8 +291,9 @@ impl WorktreeManager {
             None
         };
 
-        // Remove the worktree
-        if self.config.cleanup_on_close {
+        // cas-369f: force ≠ cleanup. Only remove when the caller explicitly
+        // requested cleanup (or System-A path that passed config-driven true).
+        if cleanup {
             self.git.remove_worktree(&worktree.path, force)?;
 
             // Delete the branch
