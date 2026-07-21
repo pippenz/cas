@@ -426,15 +426,40 @@ fn all_workers_broadcast_routes_per_recipient_in_mixed_factory() {
 /// Error path: an unsupported/unknown harness string must not parse into a
 /// `SupervisorCli` that could silently inherit Claude's TeamsInbox path (or any
 /// other channel). Routing only accepts the closed enum; parse rejects unknowns.
+///
+/// Valid harness spelling for Codex is exactly `"codex"` (`crates/cas-mux/src/harness.rs`).
+/// `"codexx"` appears below only as an intentional near-miss typo sentinel — it is
+/// never an accepted alias or production identifier.
 #[test]
 fn unknown_harness_cannot_silently_inherit_channel() {
-    for bad in ["", "gpt", "cursor", "composer", "unknown", "codexx", "claude-code"] {
+    // Positive: the sole valid Codex harness spelling.
+    assert_eq!(
+        SupervisorCli::from_str("codex"),
+        Ok(Codex),
+        "valid harness spelling is exactly \"codex\""
+    );
+    // Positive: the other supported harnesses round-trip by their canonical names.
+    assert_eq!(SupervisorCli::from_str("claude"), Ok(Claude));
+    assert_eq!(SupervisorCli::from_str("grok"), Ok(Grok));
+
+    // Negative: unknown / unsupported strings must not parse.
+    for bad in ["", "gpt", "cursor", "composer", "unknown", "claude-code"] {
         let err = SupervisorCli::from_str(bad).expect_err("unknown harness must not parse");
         assert!(
             err.contains("unsupported harness"),
             "expected unsupported-harness error for {bad:?}, got {err:?}"
         );
     }
+
+    // Near-miss sentinel: "codexx" is a typo of "codex", not an alias.
+    // Must stay rejected so a silent-accept of the misspelling cannot inherit
+    // any channel (including Claude's TeamsInbox under teams_active).
+    let near_miss = SupervisorCli::from_str("codexx")
+        .expect_err("codexx is an intentional near-miss typo sentinel, not a valid harness");
+    assert!(
+        near_miss.contains("unsupported harness"),
+        "expected unsupported-harness error for near-miss \"codexx\", got {near_miss:?}"
+    );
 
     // Under teams_active, only Claude may use TeamsInbox — Codex and Grok must
     // never inherit that channel even when the factory is teams-mode.
