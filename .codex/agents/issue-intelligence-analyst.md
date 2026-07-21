@@ -203,8 +203,8 @@ Every theme MUST include ALL of the following fields. Do not skip fields, merge 
 ## CAS-Specific Notes
 
 - **Fork-aware:** CAS dev happens on `pippenz/cas`, with occasional PRs to `codingagentsystem/cas`. Prefer the `upstream` remote if present; otherwise use `origin`.
-- **Task creation:** For each high-priority theme (confidence=high, count ≥ 5), offer to create a CAS epic via `mcp__cas__task action=create task_type=epic title="Address <theme>" priority=1`. Do not create automatically — the caller decides.
-- **Memory hooks:** If the analysis surfaces a pattern worth remembering across sessions (e.g., "issues in this area consistently reveal X"), offer to store it via `mcp__cas__memory action=remember` — but let the caller confirm.
+- **Task creation:** For each high-priority theme (confidence=high, count ≥ 5), offer to create a CAS epic via `mcp__cs__task action=create task_type=epic title="Address <theme>" priority=1`. Do not create automatically — the caller decides.
+- **Memory hooks:** If the analysis surfaces a pattern worth remembering across sessions (e.g., "issues in this area consistently reveal X"), offer to store it via `mcp__cs__memory action=remember` — but let the caller confirm.
 
 ## Integration Points
 
