@@ -5,9 +5,15 @@ use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
+pub(crate) mod adapters;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum ProbeAdapterKind {
     Fake,
+    Claude,
+    Codex,
+    Grok,
+    All,
 }
 
 #[derive(Clone, Debug)]
@@ -70,10 +76,16 @@ pub(crate) struct ScenarioReport {
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct MessageStageEvidence {
     pub message_id: String,
-    pub target: &'static str,
+    pub target: String,
     pub enqueued_at_ms: u64,
     pub selected_at_ms: u64,
     pub delivered_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wake_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_reaction_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reaction_status: Option<String>,
     pub terminal: &'static str,
 }
 
@@ -395,6 +407,9 @@ fn run_message(
             enqueued_at_ms,
             selected_at_ms,
             delivered_at_ms: None,
+            wake_at_ms: None,
+            first_reaction_at_ms: None,
+            reaction_status: Some("UNKNOWN".to_string()),
             terminal: "target_rejected",
         };
     }
@@ -410,6 +425,9 @@ fn run_message(
             enqueued_at_ms,
             selected_at_ms,
             delivered_at_ms: None,
+            wake_at_ms: None,
+            first_reaction_at_ms: None,
+            reaction_status: Some("UNKNOWN".to_string()),
             terminal: "transport_failed",
         };
     }
@@ -435,6 +453,9 @@ fn run_message(
         enqueued_at_ms,
         selected_at_ms,
         delivered_at_ms: Some(delivered_at_ms),
+        wake_at_ms: None,
+        first_reaction_at_ms: None,
+        reaction_status: None,
         terminal,
     }
 }
