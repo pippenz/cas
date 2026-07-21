@@ -228,24 +228,28 @@ impl SqliteSupervisorQueueStore {
 
 impl SupervisorQueueStore for SqliteSupervisorQueueStore {
     fn init(&self) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute_batch(SUPERVISOR_QUEUE_SCHEMA)?;
-        // cas-062d: transition_key for idempotent lifecycle events
-        if conn
-            .prepare_cached("SELECT transition_key FROM supervisor_queue LIMIT 0")
-            .is_err()
-        {
-            conn.execute_batch(SUPERVISOR_QUEUE_TRANSITION_KEY_MIGRATION)?;
-        }
-        conn.execute_batch(SUPERVISOR_QUEUE_TRANSITION_KEY_INDEX)?;
-        // cas-17e4: outbox prompt-delivery marker
-        if conn
-            .prepare_cached("SELECT prompt_delivered_at FROM supervisor_queue LIMIT 0")
-            .is_err()
-        {
-            conn.execute_batch(SUPERVISOR_QUEUE_PROMPT_DELIVERED_MIGRATION)?;
-        }
-        Ok(())
+        // cas-88d8: concurrent openers (daemon + MCP) can race on check-then-ALTER.
+        // SQLite auto-commits DDL, so we do NOT wrap ADD COLUMN in ImmediateTx
+        // (that leaves the transaction state inconsistent). Instead:
+        // ensure_column + with_write_retry, and CREATE INDEX only after columns exist.
+        crate::shared_db::with_write_retry(|| {
+            let conn = self.conn.lock().unwrap();
+            conn.execute_batch(SUPERVISOR_QUEUE_SCHEMA)?;
+            crate::shared_db::ensure_column(
+                &conn,
+                "supervisor_queue",
+                "transition_key",
+                SUPERVISOR_QUEUE_TRANSITION_KEY_MIGRATION,
+            )?;
+            conn.execute_batch(SUPERVISOR_QUEUE_TRANSITION_KEY_INDEX)?;
+            crate::shared_db::ensure_column(
+                &conn,
+                "supervisor_queue",
+                "prompt_delivered_at",
+                SUPERVISOR_QUEUE_PROMPT_DELIVERED_MIGRATION,
+            )?;
+            Ok(())
+        })
     }
 
     fn notify(
@@ -752,6 +756,65 @@ mod tests {
         let notifications = store.poll("supervisor-2", 10).unwrap();
         assert_eq!(notifications.len(), 1);
         assert_eq!(notifications[0].event_type, "event2");
+    }
+
+    /// cas-88d8: concurrent SqliteSupervisorQueueStore::init on a legacy DB all succeed.
+    #[test]
+    fn test_concurrent_init_on_legacy_supervisor_queue() {
+        use std::sync::{Arc, Barrier};
+        let temp = TempDir::new().unwrap();
+        let cas_dir = temp.path().to_path_buf();
+        let db_path = cas_dir.join("cas.db");
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                r#"
+                PRAGMA journal_mode=WAL;
+                CREATE TABLE supervisor_queue (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    supervisor_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    priority INTEGER NOT NULL DEFAULT 2,
+                    created_at TEXT NOT NULL,
+                    processed_at TEXT
+                );
+                INSERT INTO supervisor_queue (supervisor_id, event_type, payload, priority, created_at)
+                VALUES ('sup', 'worker_died', '{}', 0, '2026-01-01T00:00:00Z');
+                "#,
+            )
+            .unwrap();
+        }
+
+        let barrier = Arc::new(Barrier::new(6));
+        let handles: Vec<_> = (0..6)
+            .map(|_| {
+                let cas_dir = cas_dir.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let store = SqliteSupervisorQueueStore::open(&cas_dir).unwrap();
+                    store.init()
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap().expect("concurrent init must succeed");
+        }
+        let store = SqliteSupervisorQueueStore::open(&cas_dir).unwrap();
+        store.init().unwrap();
+        assert_eq!(store.list_pending("sup").unwrap().len(), 1);
+        // New columns usable.
+        store
+            .notify_idempotent(
+                "sup",
+                "task_lifecycle",
+                "{}",
+                NotificationPriority::Normal,
+                "k-concurrent",
+            )
+            .unwrap();
+        assert_eq!(store.list_pending_lifecycle_outbox(10).unwrap().len(), 1);
     }
 
     /// cas-3a47: open a pre-transition_key / pre-prompt_delivered schema, upgrade, keep data.

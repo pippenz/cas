@@ -953,112 +953,46 @@ impl<'a> AtomicStampOpts<'a> {
 
 impl PromptQueueStore for SqlitePromptQueueStore {
     fn init(&self) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute_batch(PROMPT_QUEUE_SCHEMA)?;
+        // cas-88d8: concurrent openers race on check-then-ALTER. SQLite
+        // auto-commits DDL, so do not wrap ADD COLUMN in ImmediateTx.
+        // ensure_column + with_write_retry; indexes only after columns exist.
+        crate::shared_db::with_write_retry(|| {
+            let conn = self.conn.lock().unwrap();
+            conn.execute_batch(PROMPT_QUEUE_SCHEMA)?;
 
-        // Add factory_session column if missing (safe migration for multi-session isolation)
-        let has_session_col = conn
-            .prepare_cached("SELECT factory_session FROM prompt_queue LIMIT 0")
-            .is_ok();
-        if !has_session_col {
-            conn.execute_batch(PROMPT_QUEUE_SESSION_MIGRATION)?;
-        }
-
-        // Add summary column if missing
-        let has_summary_col = conn
-            .prepare_cached("SELECT summary FROM prompt_queue LIMIT 0")
-            .is_ok();
-        if !has_summary_col {
-            conn.execute_batch(PROMPT_QUEUE_SUMMARY_MIGRATION)?;
-        }
-
-        // Add priority column if missing
-        let has_priority_col = conn
-            .prepare_cached("SELECT priority FROM prompt_queue LIMIT 0")
-            .is_ok();
-        if !has_priority_col {
-            conn.execute_batch(PROMPT_QUEUE_PRIORITY_MIGRATION)?;
-        }
-
-        // Add acked_at column if missing (delivery confirmation)
-        let has_acked_at_col = conn
-            .prepare_cached("SELECT acked_at FROM prompt_queue LIMIT 0")
-            .is_ok();
-        if !has_acked_at_col {
-            conn.execute_batch(PROMPT_QUEUE_ACKED_AT_MIGRATION)?;
-        }
-
-        // Add urgent column if missing (cas-c931 interrupt-and-redirect)
-        let has_urgent_col = conn
-            .prepare_cached("SELECT urgent FROM prompt_queue LIMIT 0")
-            .is_ok();
-        if !has_urgent_col {
-            conn.execute_batch(PROMPT_QUEUE_URGENT_MIGRATION)?;
-        }
-
-        // Stage-observability columns (cas-2c5f)
-        let has_selected_at = conn
-            .prepare_cached("SELECT selected_at FROM prompt_queue LIMIT 0")
-            .is_ok();
-        if !has_selected_at {
-            conn.execute_batch(PROMPT_QUEUE_SELECTED_AT_MIGRATION)?;
-        }
-        let has_pending_reason = conn
-            .prepare_cached("SELECT last_pending_reason FROM prompt_queue LIMIT 0")
-            .is_ok();
-        if !has_pending_reason {
-            conn.execute_batch(PROMPT_QUEUE_PENDING_REASON_MIGRATION)?;
-        }
-        let has_pending_detail = conn
-            .prepare_cached("SELECT last_pending_detail FROM prompt_queue LIMIT 0")
-            .is_ok();
-        if !has_pending_detail {
-            conn.execute_batch(PROMPT_QUEUE_PENDING_DETAIL_MIGRATION)?;
-        }
-        let has_transport_delivered = conn
-            .prepare_cached("SELECT transport_delivered_at FROM prompt_queue LIMIT 0")
-            .is_ok();
-        if !has_transport_delivered {
-            conn.execute_batch(PROMPT_QUEUE_TRANSPORT_DELIVERED_AT_MIGRATION)?;
-        }
-        let has_highest_stage = conn
-            .prepare_cached("SELECT highest_stage FROM prompt_queue LIMIT 0")
-            .is_ok();
-        if !has_highest_stage {
-            conn.execute_batch(PROMPT_QUEUE_HIGHEST_STAGE_MIGRATION)?;
-        }
-        for (check, mig) in [
-            (
-                "SELECT broadcast_attempted FROM prompt_queue LIMIT 0",
-                PROMPT_QUEUE_BROADCAST_ATTEMPTED_MIGRATION,
-            ),
-            (
-                "SELECT broadcast_succeeded FROM prompt_queue LIMIT 0",
-                PROMPT_QUEUE_BROADCAST_SUCCEEDED_MIGRATION,
-            ),
-            (
-                "SELECT broadcast_failed FROM prompt_queue LIMIT 0",
-                PROMPT_QUEUE_BROADCAST_FAILED_MIGRATION,
-            ),
-        ] {
-            if conn.prepare_cached(check).is_err() {
-                conn.execute_batch(mig)?;
+            for (col, mig) in [
+                ("factory_session", PROMPT_QUEUE_SESSION_MIGRATION),
+                ("summary", PROMPT_QUEUE_SUMMARY_MIGRATION),
+                ("priority", PROMPT_QUEUE_PRIORITY_MIGRATION),
+                ("acked_at", PROMPT_QUEUE_ACKED_AT_MIGRATION),
+                ("urgent", PROMPT_QUEUE_URGENT_MIGRATION),
+                ("selected_at", PROMPT_QUEUE_SELECTED_AT_MIGRATION),
+                ("last_pending_reason", PROMPT_QUEUE_PENDING_REASON_MIGRATION),
+                ("last_pending_detail", PROMPT_QUEUE_PENDING_DETAIL_MIGRATION),
+                (
+                    "transport_delivered_at",
+                    PROMPT_QUEUE_TRANSPORT_DELIVERED_AT_MIGRATION,
+                ),
+                ("highest_stage", PROMPT_QUEUE_HIGHEST_STAGE_MIGRATION),
+                (
+                    "broadcast_attempted",
+                    PROMPT_QUEUE_BROADCAST_ATTEMPTED_MIGRATION,
+                ),
+                (
+                    "broadcast_succeeded",
+                    PROMPT_QUEUE_BROADCAST_SUCCEEDED_MIGRATION,
+                ),
+                ("broadcast_failed", PROMPT_QUEUE_BROADCAST_FAILED_MIGRATION),
+                ("dedupe_key", PROMPT_QUEUE_DEDUPE_KEY_MIGRATION),
+            ] {
+                crate::shared_db::ensure_column(&conn, "prompt_queue", col, mig)?;
             }
-        }
 
-        // Two-lane peek indexes (idempotent CREATE INDEX IF NOT EXISTS).
-        conn.execute_batch(PROMPT_QUEUE_TWO_LANE_INDEXES)?;
-
-        // cas-ecff: lifecycle outbox dedupe_key
-        if conn
-            .prepare_cached("SELECT dedupe_key FROM prompt_queue LIMIT 0")
-            .is_err()
-        {
-            conn.execute_batch(PROMPT_QUEUE_DEDUPE_KEY_MIGRATION)?;
-        }
-        conn.execute_batch(PROMPT_QUEUE_DEDUPE_KEY_INDEX)?;
-
-        Ok(())
+            // Indexes are IF NOT EXISTS — safe under concurrency once columns exist.
+            conn.execute_batch(PROMPT_QUEUE_TWO_LANE_INDEXES)?;
+            conn.execute_batch(PROMPT_QUEUE_DEDUPE_KEY_INDEX)?;
+            Ok(())
+        })
     }
 
     fn enqueue(&self, source: &str, target: &str, prompt: &str) -> Result<i64> {
@@ -3282,6 +3216,65 @@ mod tests {
         );
         assert!(r.delivered_at.is_some());
         assert_eq!(r.wake, ObservationStatus::Unobserved);
+    }
+
+    /// cas-88d8: concurrent SqlitePromptQueueStore::init on a legacy DB all succeed.
+    #[test]
+    fn test_concurrent_init_on_legacy_prompt_queue() {
+        use std::sync::{Arc, Barrier};
+        let temp = TempDir::new().unwrap();
+        let cas_dir = temp.path().to_path_buf();
+        let db_path = cas_dir.join("cas.db");
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                r#"
+                PRAGMA journal_mode=WAL;
+                CREATE TABLE prompt_queue (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source TEXT NOT NULL,
+                    target TEXT NOT NULL,
+                    prompt TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    processed_at TEXT
+                );
+                INSERT INTO prompt_queue (source, target, prompt, created_at)
+                VALUES ('s', 'w', 'legacy', '2026-01-01T00:00:00Z');
+                "#,
+            )
+            .unwrap();
+        }
+
+        let barrier = Arc::new(Barrier::new(6));
+        let handles: Vec<_> = (0..6)
+            .map(|_| {
+                let cas_dir = cas_dir.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let store = SqlitePromptQueueStore::open(&cas_dir).unwrap();
+                    store.init()
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap().expect("concurrent init must succeed");
+        }
+        let store = SqlitePromptQueueStore::open(&cas_dir).unwrap();
+        store.init().unwrap();
+        assert_eq!(store.peek_all(10).unwrap().len(), 1);
+        store
+            .enqueue_idempotent(
+                "lifecycle:9",
+                "supervisor",
+                "body",
+                None,
+                None,
+                None,
+                "lifecycle-outbox:9",
+            )
+            .unwrap();
+        assert_eq!(store.pending_count().unwrap(), 2);
     }
 
     /// cas-3a47: upgrade pre-dedupe_key prompt_queue without losing rows; init idempotent.
