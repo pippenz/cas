@@ -705,10 +705,8 @@ impl PromptQueueStore for SqlitePromptQueueStore {
                AND factory_session = ?
              ORDER BY priority ASC, id ASC
              LIMIT ?";
-        let session_params: Vec<Box<dyn rusqlite::ToSql>> = vec![
-            Box::new(session.to_string()),
-            Box::new(limit as i64),
-        ];
+        let session_params: Vec<Box<dyn rusqlite::ToSql>> =
+            vec![Box::new(session.to_string()), Box::new(limit as i64)];
         let session_lane = Self::query_lane(&conn, session_sql, &session_params)?;
 
         let legacy_lane = if targets.is_empty() {
@@ -1379,7 +1377,11 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(peeked.len(), LIMIT, "peek must still respect the caller LIMIT");
+        assert_eq!(
+            peeked.len(),
+            LIMIT,
+            "peek must still respect the caller LIMIT"
+        );
         assert!(
             peeked.iter().any(|p| p.id == live_id),
             "live-session row must appear in one peek despite >LIMIT lower-ID NULL-session backlog; got ids {:?}",
@@ -1409,9 +1411,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        let legacy_id = store
-            .enqueue("old", "supervisor", "lonely legacy")
-            .unwrap();
+        let legacy_id = store.enqueue("old", "supervisor", "lonely legacy").unwrap();
 
         let peeked = store
             .peek_for_targets(&["supervisor"], Some("session-live"), LIMIT)
@@ -1447,12 +1447,7 @@ mod tests {
         for i in 0..PER_LANE {
             session_ids.push(
                 store
-                    .enqueue_with_session(
-                        "w",
-                        "supervisor",
-                        &format!("sess {i}"),
-                        "session-a",
-                    )
+                    .enqueue_with_session("w", "supervisor", &format!("sess {i}"), "session-a")
                     .unwrap(),
             );
             legacy_ids.push(
@@ -1576,7 +1571,11 @@ mod tests {
             .iter()
             .filter(|p| p.factory_session.as_deref() == Some("session-a"))
             .collect();
-        assert_eq!(live.len(), 3, "all three session-a rows must fit under quota");
+        assert_eq!(
+            live.len(),
+            3,
+            "all three session-a rows must fit under quota"
+        );
         assert_eq!(live[0].id, urgent, "urgent eligible precedes normal");
         assert_eq!(live[1].id, first, "equal-priority FIFO: first then second");
         assert_eq!(live[2].id, second);
@@ -1622,7 +1621,13 @@ mod tests {
                 .count(),
             5
         );
-        assert_eq!(merged.iter().filter(|p| p.factory_session.is_none()).count(), 5);
+        assert_eq!(
+            merged
+                .iter()
+                .filter(|p| p.factory_session.is_none())
+                .count(),
+            5
+        );
 
         // One live + many legacy (same priority) → live included; remainder legacy.
         let session = vec![row(50, Some("s"), 2)];
@@ -1630,7 +1635,13 @@ mod tests {
         let merged = SqlitePromptQueueStore::merge_two_lane_peeks(session, legacy, 10);
         assert!(merged.iter().any(|p| p.id == 50));
         assert_eq!(merged.len(), 10);
-        assert_eq!(merged.iter().filter(|p| p.factory_session.is_none()).count(), 9);
+        assert_eq!(
+            merged
+                .iter()
+                .filter(|p| p.factory_session.is_none())
+                .count(),
+            9
+        );
 
         // CRITICAL: session has 10 Critical, legacy 10 Normal, limit=10 →
         // all 10 Critical; zero Normal (global priority before lane quota).
@@ -1654,9 +1665,11 @@ mod tests {
         let legacy: Vec<_> = (100..=109).map(|i| row(i, None, 0)).collect();
         let merged = SqlitePromptQueueStore::merge_two_lane_peeks(session, legacy, 10);
         assert_eq!(merged.len(), 10);
-        assert!(merged
-            .iter()
-            .all(|p| p.priority == NotificationPriority::Critical));
+        assert!(
+            merged
+                .iter()
+                .all(|p| p.priority == NotificationPriority::Critical)
+        );
 
         // limit=1: Critical legacy beats Normal session.
         let session = vec![row(2, Some("s"), 2)];
@@ -1740,9 +1753,9 @@ mod tests {
             .unwrap();
         assert_eq!(peeked.len(), 10);
         assert!(
-            peeked
-                .iter()
-                .all(|p| p.priority == NotificationPriority::Critical && p.factory_session.is_none()),
+            peeked.iter().all(
+                |p| p.priority == NotificationPriority::Critical && p.factory_session.is_none()
+            ),
             "Critical legacy must fill LIMIT before Normal session; got {:?}",
             peeked
                 .iter()
@@ -1811,13 +1824,15 @@ mod tests {
             "peek over 10× backlog must stay fast; took {elapsed:?}"
         );
 
-        fn explain_plan(conn: &rusqlite::Connection, sql: &str, params: &[&dyn rusqlite::ToSql]) -> String {
+        fn explain_plan(
+            conn: &rusqlite::Connection,
+            sql: &str,
+            params: &[&dyn rusqlite::ToSql],
+        ) -> String {
             let mut plan = String::new();
             let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
             let rows = stmt
-                .query_map(params, |row| {
-                    Ok(row.get::<_, String>(3)?)
-                })
+                .query_map(params, |row| Ok(row.get::<_, String>(3)?))
                 .unwrap();
             for r in rows {
                 plan.push_str(&r.unwrap());
@@ -1867,11 +1882,7 @@ mod tests {
             &[&"supervisor", &(LIMIT as i64)],
         );
 
-        assert_index_plan(
-            &session_plan,
-            "idx_prompt_queue_session_pending",
-            "session",
-        );
+        assert_index_plan(&session_plan, "idx_prompt_queue_session_pending", "session");
         assert_index_plan(&legacy_plan, "idx_prompt_queue_legacy_pending", "legacy");
     }
 }
