@@ -1043,7 +1043,9 @@ fn percentile_95_ms(samples: &[u64]) -> Option<u64> {
     }
     let mut sorted = samples.to_vec();
     sorted.sort_unstable();
-    let index = ((sorted.len() - 1) * 95) / 100;
+
+    // Nearest-rank percentile: rank = ceil(p/100 * n), then convert to 0-based index.
+    let index = (sorted.len() * 95).div_ceil(100).saturating_sub(1);
     sorted.get(index).copied()
 }
 
@@ -1396,6 +1398,19 @@ mod tests {
             thresholds: ProbeThresholds::epic_defaults(),
             failure: None,
         }
+    }
+
+    #[test]
+    fn percentile_95_uses_nearest_rank_boundaries() {
+        assert_eq!(percentile_95_ms(&[]), None);
+        assert_eq!(percentile_95_ms(&[42]), Some(42));
+        assert_eq!(percentile_95_ms(&[100, 300, 500, 800, 2500]), Some(2500));
+
+        let twenty: Vec<u64> = (1..=20).collect();
+        assert_eq!(percentile_95_ms(&twenty), Some(19));
+
+        let twenty_one: Vec<u64> = (1..=21).collect();
+        assert_eq!(percentile_95_ms(&twenty_one), Some(20));
     }
 
     #[test]
