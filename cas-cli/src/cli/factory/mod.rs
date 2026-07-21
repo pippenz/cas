@@ -562,6 +562,10 @@ pub enum FactoryCommands {
         #[arg(long)]
         cas_root: Option<std::path::PathBuf>,
 
+        /// Recorded harness artifact root for Claude/Codex/Grok adapters
+        #[arg(long)]
+        artifact_root: Option<std::path::PathBuf>,
+
         /// Explicitly permit using the active parent CAS root
         #[arg(long)]
         allow_active_cas_root: bool,
@@ -759,6 +763,7 @@ pub fn execute(args: &FactoryArgs, cli: &Cli, cas_root: Option<&std::path::Path>
             FactoryCommands::ProbeComm {
                 jsonl,
                 cas_root: sub_cas_root,
+                artifact_root,
                 allow_active_cas_root,
                 adapter,
                 delivery_slo_ms,
@@ -768,6 +773,7 @@ pub fn execute(args: &FactoryArgs, cli: &Cli, cas_root: Option<&std::path::Path>
             } => probe_comm::execute_probe_comm(
                 jsonl.clone(),
                 sub_cas_root.clone(),
+                artifact_root.clone(),
                 cas_root,
                 *allow_active_cas_root,
                 *adapter,

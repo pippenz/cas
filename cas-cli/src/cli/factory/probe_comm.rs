@@ -49,6 +49,7 @@ pub(crate) enum ProbeFailure {
 pub(crate) struct ProbeCommConfig {
     pub jsonl: PathBuf,
     pub cas_root: Option<PathBuf>,
+    pub artifact_root: Option<PathBuf>,
     pub allow_active_cas_root: bool,
     pub adapter: Option<ProbeAdapterKind>,
     pub thresholds: ProbeThresholds,
@@ -148,6 +149,7 @@ const SCENARIOS: &[ScenarioDef] = &[
 pub(crate) fn execute_probe_comm(
     jsonl: PathBuf,
     cas_root: Option<PathBuf>,
+    artifact_root: Option<PathBuf>,
     parent_cas_root: Option<&Path>,
     allow_active_cas_root: bool,
     adapter: ProbeAdapterKind,
@@ -159,6 +161,7 @@ pub(crate) fn execute_probe_comm(
         ProbeCommConfig {
             jsonl,
             cas_root,
+            artifact_root,
             allow_active_cas_root,
             adapter: Some(adapter),
             thresholds: ProbeThresholds {
@@ -237,6 +240,7 @@ pub(crate) fn run_probe_comm_with_parent(
     let ProbeCommConfig {
         jsonl,
         cas_root,
+        artifact_root,
         allow_active_cas_root,
         adapter,
         thresholds,
@@ -244,9 +248,6 @@ pub(crate) fn run_probe_comm_with_parent(
     } = config;
 
     let adapter = adapter.context("probe adapter is required")?;
-    match adapter {
-        ProbeAdapterKind::Fake => {}
-    }
 
     if jsonl.is_dir() {
         bail!("jsonl output path is a directory: {}", jsonl.display());
@@ -277,10 +278,18 @@ pub(crate) fn run_probe_comm_with_parent(
             .with_context(|| format!("failed to create jsonl output path {}", jsonl.display()))?,
     );
 
-    let mut clock = FakeClock::default();
-    let mut scenarios = Vec::with_capacity(SCENARIOS.len());
-    for scenario in SCENARIOS {
-        let report = run_scenario(*scenario, &thresholds, failure.as_ref(), &mut clock);
+    let scenarios_to_write = match adapter {
+        ProbeAdapterKind::Fake => run_fake_scenarios(&thresholds, failure.as_ref()),
+        ProbeAdapterKind::Claude
+        | ProbeAdapterKind::Codex
+        | ProbeAdapterKind::Grok
+        | ProbeAdapterKind::All => {
+            run_recorded_adapter_scenarios(adapter, artifact_root.as_deref())?
+        }
+    };
+
+    let mut scenarios = Vec::with_capacity(scenarios_to_write.len());
+    for report in scenarios_to_write {
         serde_json::to_writer(&mut writer, &report)
             .context("failed to serialize probe scenario evidence")?;
         writer
@@ -306,6 +315,76 @@ pub(crate) fn run_probe_comm_with_parent(
     }
 
     Ok(report)
+}
+
+fn run_fake_scenarios(
+    thresholds: &ProbeThresholds,
+    failure: Option<&ProbeFailure>,
+) -> Vec<ScenarioReport> {
+    let mut clock = FakeClock::default();
+    SCENARIOS
+        .iter()
+        .map(|scenario| run_scenario(*scenario, thresholds, failure, &mut clock))
+        .collect()
+}
+
+fn run_recorded_adapter_scenarios(
+    adapter: ProbeAdapterKind,
+    artifact_root: Option<&Path>,
+) -> Result<Vec<ScenarioReport>> {
+    let root = artifact_root.context("recorded harness adapters require --artifact-root")?;
+    let mut scenarios = Vec::new();
+    if matches!(adapter, ProbeAdapterKind::Claude | ProbeAdapterKind::All) {
+        scenarios.push(adapter_scenario(
+            "claude_adapter",
+            adapters::ClaudeAdapter::extract_fixture(&adapters::ClaudeFixture {
+                inbox_path: root.join("claude").join("inbox.json"),
+                transcript_path: Some(root.join("claude").join("transcript.jsonl")),
+                message_id: "claude-1".to_string(),
+                target: "worker-a".to_string(),
+            })?,
+        ));
+    }
+    if matches!(adapter, ProbeAdapterKind::Codex | ProbeAdapterKind::All) {
+        scenarios.push(adapter_scenario(
+            "codex_adapter",
+            adapters::CodexAdapter::extract_fixture(&adapters::CodexFixture {
+                rollout_path: root.join("codex").join("rollout.jsonl"),
+                message_id: "codex-1".to_string(),
+                target: "worker-a".to_string(),
+            })?,
+        ));
+    }
+    if matches!(adapter, ProbeAdapterKind::Grok | ProbeAdapterKind::All) {
+        scenarios.push(adapter_scenario(
+            "grok_adapter",
+            adapters::GrokAdapter::extract_fixture(&adapters::GrokFixture {
+                updates_path: root.join("grok").join("updates.jsonl"),
+                events_path: Some(root.join("grok").join("events.jsonl")),
+                message_id: "grok-1".to_string(),
+                target: "worker-a".to_string(),
+            })?,
+        ));
+    }
+    Ok(scenarios)
+}
+
+fn adapter_scenario(name: &'static str, stage: MessageStageEvidence) -> ScenarioReport {
+    let passed =
+        stage.terminal == "delivered" && stage.reaction_status.as_deref() != Some("UNKNOWN");
+    ScenarioReport {
+        name,
+        passed,
+        failed_stage: if passed {
+            None
+        } else {
+            Some("reaction_unknown")
+        },
+        message_ids: vec![stage.message_id.clone()],
+        duplicates_suppressed: 0,
+        malformed_targets_rejected: 0,
+        stages: vec![stage],
+    }
 }
 
 fn guard_active_parent_root(
@@ -403,7 +482,7 @@ fn run_message(
     if scenario.malformed_target {
         return MessageStageEvidence {
             message_id: message_id.to_string(),
-            target,
+            target: target.to_string(),
             enqueued_at_ms,
             selected_at_ms,
             delivered_at_ms: None,
@@ -421,7 +500,7 @@ fn run_message(
     ) {
         return MessageStageEvidence {
             message_id: message_id.to_string(),
-            target,
+            target: target.to_string(),
             enqueued_at_ms,
             selected_at_ms,
             delivered_at_ms: None,
@@ -449,7 +528,7 @@ fn run_message(
 
     MessageStageEvidence {
         message_id: message_id.to_string(),
-        target,
+        target: target.to_string(),
         enqueued_at_ms,
         selected_at_ms,
         delivered_at_ms: Some(delivered_at_ms),
@@ -493,6 +572,7 @@ mod tests {
         ProbeCommConfig {
             jsonl,
             cas_root: Some(cas_root),
+            artifact_root: None,
             allow_active_cas_root: true,
             adapter: Some(ProbeAdapterKind::Fake),
             thresholds: ProbeThresholds::epic_defaults(),

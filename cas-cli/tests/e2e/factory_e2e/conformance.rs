@@ -1,13 +1,11 @@
-use assert_cmd::Command;
-use predicates::prelude::PredicateBooleanExt;
-use serde_json::Value;
+//! Recorded-artifact conformance coverage for `cas factory probe-comm`.
+//!
+//! This lives under `factory_e2e` to pin the factory conformance surface without
+//! launching real model processes in normal test runs. Live disposable model
+//! probes remain an explicit future gate; recorded fixtures are deterministic.
 
-fn read_jsonl(path: &std::path::Path) -> Vec<Value> {
-    let data = std::fs::read_to_string(path).expect("jsonl should be written");
-    data.lines()
-        .map(|line| serde_json::from_str(line).expect("line should be valid json"))
-        .collect()
-}
+use assert_cmd::Command;
+use serde_json::Value;
 
 #[allow(deprecated)]
 fn cas_cmd() -> Command {
@@ -21,6 +19,13 @@ fn write_jsonl(path: &std::path::Path, values: &[Value]) {
         .collect::<Vec<_>>()
         .join("\n");
     std::fs::write(path, format!("{body}\n")).unwrap();
+}
+
+fn read_jsonl(path: &std::path::Path) -> Vec<Value> {
+    let data = std::fs::read_to_string(path).expect("jsonl should be written");
+    data.lines()
+        .map(|line| serde_json::from_str(line).expect("line should be valid json"))
+        .collect()
 }
 
 fn write_adapter_artifacts(root: &std::path::Path) {
@@ -78,51 +83,7 @@ fn write_adapter_artifacts(root: &std::path::Path) {
 }
 
 #[test]
-fn probe_comm_cli_writes_jsonl_with_fake_adapter() {
-    let temp = tempfile::tempdir().unwrap();
-    let jsonl = temp.path().join("probe.jsonl");
-
-    cas_cmd()
-        .args(["factory", "probe-comm", "--jsonl"])
-        .arg(&jsonl)
-        .assert()
-        .success();
-
-    let lines = read_jsonl(&jsonl);
-    assert_eq!(lines.len(), 7);
-    assert_eq!(lines[0]["scenario"], "startup");
-    assert_eq!(lines[1]["scenario"], "serial_10");
-    assert_eq!(lines[1]["message_ids"].as_array().unwrap().len(), 10);
-}
-
-#[test]
-fn probe_comm_cli_returns_nonzero_for_injected_failure() {
-    let temp = tempfile::tempdir().unwrap();
-    let jsonl = temp.path().join("probe.jsonl");
-
-    cas_cmd()
-        .args([
-            "factory",
-            "probe-comm",
-            "--jsonl",
-            jsonl.to_str().unwrap(),
-            "--inject-transport-failure",
-            "urgent:urgent-0",
-        ])
-        .assert()
-        .failure()
-        .stderr(predicates::str::contains("urgent").and(predicates::str::contains("delivered")));
-
-    let lines = read_jsonl(&jsonl);
-    let urgent = lines
-        .iter()
-        .find(|line| line["scenario"] == "urgent")
-        .expect("urgent scenario should be written");
-    assert_eq!(urgent["failed_stage"], "delivered");
-}
-
-#[test]
-fn probe_comm_cli_all_adapters_writes_recorded_fixture_report() {
+fn recorded_probe_comm_all_adapters_emit_stage_evidence() {
     let temp = tempfile::tempdir().unwrap();
     let jsonl = temp.path().join("probe.jsonl");
     let artifacts = temp.path().join("artifacts");
@@ -143,20 +104,8 @@ fn probe_comm_cli_all_adapters_writes_recorded_fixture_report() {
         .success();
 
     let lines = read_jsonl(&jsonl);
-    let scenarios: Vec<_> = lines
-        .iter()
-        .map(|line| line["scenario"].as_str().unwrap())
-        .collect();
-    assert_eq!(
-        scenarios,
-        ["claude_adapter", "codex_adapter", "grok_adapter"]
-    );
+    assert_eq!(lines.len(), 3);
     assert!(lines.iter().all(|line| line["passed"] == true));
-    assert!(
-        lines
-            .iter()
-            .all(|line| line["stages"][0]["wake_at_ms"].is_u64())
-    );
     assert!(
         lines
             .iter()

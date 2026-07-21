@@ -1,3 +1,263 @@
+use super::MessageStageEvidence;
+use anyhow::{Context, Result};
+use chrono::{DateTime, Timelike, Utc};
+use serde_json::Value;
+use std::path::PathBuf;
+
+pub(crate) struct ClaudeAdapter;
+pub(crate) struct CodexAdapter;
+pub(crate) struct GrokAdapter;
+
+#[derive(Clone, Debug)]
+pub(crate) struct ClaudeFixture {
+    pub inbox_path: PathBuf,
+    pub transcript_path: Option<PathBuf>,
+    pub message_id: String,
+    pub target: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CodexFixture {
+    pub rollout_path: PathBuf,
+    pub message_id: String,
+    pub target: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct GrokFixture {
+    pub updates_path: PathBuf,
+    pub events_path: Option<PathBuf>,
+    pub message_id: String,
+    pub target: String,
+}
+
+impl ClaudeAdapter {
+    pub(crate) fn extract_fixture(fixture: &ClaudeFixture) -> Result<MessageStageEvidence> {
+        let inbox: Value = serde_json::from_str(
+            &std::fs::read_to_string(&fixture.inbox_path)
+                .with_context(|| format!("read Claude inbox {}", fixture.inbox_path.display()))?,
+        )
+        .context("parse Claude inbox JSON")?;
+        let delivered_at_ms = inbox
+            .as_array()
+            .and_then(|messages| {
+                messages
+                    .iter()
+                    .filter(|message| value_contains_message_id(message, &fixture.message_id))
+                    .filter_map(|message| {
+                        message
+                            .get("timestamp")
+                            .and_then(Value::as_str)
+                            .and_then(timestamp_ms)
+                    })
+                    .min()
+            })
+            .context("Claude inbox did not contain correlated probe message")?;
+
+        let first_reaction_at_ms = fixture
+            .transcript_path
+            .as_ref()
+            .and_then(|path| {
+                first_correlated_jsonl_timestamp(path, &fixture.message_id)
+                    .ok()
+                    .flatten()
+            })
+            .filter(|ts| *ts >= delivered_at_ms);
+
+        Ok(stage_from_parts(
+            &fixture.message_id,
+            &fixture.target,
+            delivered_at_ms,
+            Some(delivered_at_ms),
+            first_reaction_at_ms,
+        ))
+    }
+}
+
+impl CodexAdapter {
+    pub(crate) fn extract_fixture(fixture: &CodexFixture) -> Result<MessageStageEvidence> {
+        let lines = read_jsonl(&fixture.rollout_path)
+            .with_context(|| format!("read Codex rollout {}", fixture.rollout_path.display()))?;
+        let delivered_at_ms = first_line_timestamp_matching(&lines, |value| {
+            value_contains_message_id(value, &fixture.message_id)
+                && value.get("type").and_then(Value::as_str) == Some("event_msg")
+        })
+        .context("Codex rollout did not contain correlated user event")?;
+        let wake_at_ms = first_line_timestamp_matching(&lines, |value| {
+            value.get("type").and_then(Value::as_str) == Some("event_msg")
+                && value
+                    .get("payload")
+                    .and_then(|payload| payload.get("type"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| matches!(kind, "turn_started" | "task_started"))
+        })
+        .filter(|ts| *ts >= delivered_at_ms);
+        let first_reaction_at_ms = first_line_timestamp_matching(&lines, |value| {
+            value_contains_message_id(value, &fixture.message_id)
+                && value.get("type").and_then(Value::as_str) == Some("response_item")
+        })
+        .filter(|ts| *ts >= delivered_at_ms);
+
+        Ok(stage_from_parts(
+            &fixture.message_id,
+            &fixture.target,
+            delivered_at_ms,
+            wake_at_ms,
+            first_reaction_at_ms,
+        ))
+    }
+}
+
+impl GrokAdapter {
+    pub(crate) fn extract_fixture(fixture: &GrokFixture) -> Result<MessageStageEvidence> {
+        let updates = read_jsonl(&fixture.updates_path)
+            .with_context(|| format!("read Grok updates {}", fixture.updates_path.display()))?;
+        let delivered_at_ms = first_line_timestamp_matching(&updates, |value| {
+            value_contains_message_id(value, &fixture.message_id)
+        })
+        .context("Grok updates did not contain correlated probe message")?;
+        let wake_at_ms = first_line_timestamp_matching(&updates, |value| {
+            value
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| matches!(kind, "turn_started" | "task_started"))
+        })
+        .filter(|ts| *ts >= delivered_at_ms);
+        let first_reaction_at_ms = first_line_timestamp_matching(&updates, |value| {
+            value_contains_message_id(value, &fixture.message_id)
+                && value
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| matches!(kind, "assistant_message" | "agent_message"))
+        })
+        .filter(|ts| *ts >= delivered_at_ms);
+
+        let mut stage = stage_from_parts(
+            &fixture.message_id,
+            &fixture.target,
+            delivered_at_ms,
+            wake_at_ms,
+            first_reaction_at_ms,
+        );
+        if stage.first_reaction_at_ms.is_none()
+            && fixture
+                .events_path
+                .as_ref()
+                .and_then(|path| first_grok_turn_ended_timestamp(path).ok().flatten())
+                .is_some()
+        {
+            stage.reaction_status = Some("UNKNOWN".to_string());
+        }
+        Ok(stage)
+    }
+}
+
+fn stage_from_parts(
+    message_id: &str,
+    target: &str,
+    delivered_at_ms: u64,
+    wake_at_ms: Option<u64>,
+    first_reaction_at_ms: Option<u64>,
+) -> MessageStageEvidence {
+    MessageStageEvidence {
+        message_id: message_id.to_string(),
+        target: target.to_string(),
+        enqueued_at_ms: delivered_at_ms.saturating_sub(1),
+        selected_at_ms: delivered_at_ms,
+        delivered_at_ms: Some(delivered_at_ms),
+        wake_at_ms,
+        first_reaction_at_ms,
+        reaction_status: Some(
+            if first_reaction_at_ms.is_some() {
+                "OBSERVED"
+            } else {
+                "UNKNOWN"
+            }
+            .to_string(),
+        ),
+        terminal: "delivered",
+    }
+}
+
+fn read_jsonl(path: &std::path::Path) -> Result<Vec<Value>> {
+    let data = std::fs::read_to_string(path)?;
+    let mut out = Vec::new();
+    for line in data.lines().filter(|line| !line.trim().is_empty()) {
+        out.push(serde_json::from_str(line).with_context(|| format!("parse JSONL line: {line}"))?);
+    }
+    Ok(out)
+}
+
+fn first_correlated_jsonl_timestamp(
+    path: &std::path::Path,
+    message_id: &str,
+) -> Result<Option<u64>> {
+    let lines = read_jsonl(path)?;
+    Ok(first_line_timestamp_matching(&lines, |value| {
+        value_contains_message_id(value, message_id)
+    }))
+}
+
+fn first_grok_turn_ended_timestamp(path: &std::path::Path) -> Result<Option<u64>> {
+    let lines = read_jsonl(path)?;
+    Ok(first_line_timestamp_matching(&lines, |value| {
+        value.get("type").and_then(Value::as_str) == Some("turn_ended")
+    })
+    .or_else(|| {
+        lines.iter().find_map(|value| {
+            if value.get("type").and_then(Value::as_str) == Some("turn_ended") {
+                value
+                    .get("ts")
+                    .and_then(Value::as_str)
+                    .and_then(timestamp_ms)
+            } else {
+                None
+            }
+        })
+    }))
+}
+
+fn first_line_timestamp_matching(
+    lines: &[Value],
+    predicate: impl Fn(&Value) -> bool,
+) -> Option<u64> {
+    lines
+        .iter()
+        .filter(|value| predicate(value))
+        .filter_map(json_timestamp_ms)
+        .min()
+}
+
+fn json_timestamp_ms(value: &Value) -> Option<u64> {
+    value
+        .get("timestamp")
+        .or_else(|| value.get("ts"))
+        .and_then(Value::as_str)
+        .and_then(timestamp_ms)
+}
+
+fn timestamp_ms(raw: &str) -> Option<u64> {
+    let ts = DateTime::parse_from_rfc3339(raw).ok()?.with_timezone(&Utc);
+    Some(
+        (ts.second() as u64 * 1_000)
+            + (ts.nanosecond() as u64 / 1_000_000)
+            + (ts.minute() as u64 * 60_000),
+    )
+}
+
+fn value_contains_message_id(value: &Value, message_id: &str) -> bool {
+    match value {
+        Value::String(s) => s.contains(message_id),
+        Value::Array(items) => items
+            .iter()
+            .any(|item| value_contains_message_id(item, message_id)),
+        Value::Object(map) => map
+            .values()
+            .any(|item| value_contains_message_id(item, message_id)),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

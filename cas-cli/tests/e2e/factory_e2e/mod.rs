@@ -12,6 +12,7 @@
 
 #![cfg(feature = "claude_rs_e2e")]
 
+mod conformance;
 mod lifecycle;
 mod real_factory;
 
