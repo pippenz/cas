@@ -3283,4 +3283,70 @@ mod tests {
         assert!(r.delivered_at.is_some());
         assert_eq!(r.wake, ObservationStatus::Unobserved);
     }
+
+    /// cas-3a47: upgrade pre-dedupe_key prompt_queue without losing rows; init idempotent.
+    #[test]
+    fn test_upgrade_from_legacy_prompt_queue_adds_dedupe_key() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("cas.db");
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE prompt_queue (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source TEXT NOT NULL,
+                    target TEXT NOT NULL,
+                    prompt TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    processed_at TEXT
+                );
+                INSERT INTO prompt_queue (source, target, prompt, created_at)
+                VALUES ('supervisor', 'worker-a', 'hello legacy', '2026-01-01T00:00:00Z');
+                "#,
+            )
+            .unwrap();
+        }
+
+        let store = SqlitePromptQueueStore::open(temp.path()).unwrap();
+        store.init().unwrap();
+        store.init().unwrap(); // idempotent
+
+        let pending = store.peek_all(10).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].prompt, "hello legacy");
+
+        // Idempotent enqueue works on upgraded schema.
+        let r1 = store
+            .enqueue_idempotent(
+                "lifecycle:1",
+                "supervisor",
+                "body",
+                Some("sess"),
+                Some("sum"),
+                None,
+                "lifecycle-outbox:1",
+            )
+            .unwrap();
+        let r2 = store
+            .enqueue_idempotent(
+                "lifecycle:1",
+                "supervisor",
+                "body-again",
+                Some("sess"),
+                Some("sum"),
+                None,
+                "lifecycle-outbox:1",
+            )
+            .unwrap();
+        match (r1, r2) {
+            (
+                EnqueueIdempotentResult::Created(id1),
+                EnqueueIdempotentResult::AlreadyExists(id2),
+            ) => assert_eq!(id1, id2),
+            other => panic!("expected Created then AlreadyExists: {other:?}"),
+        }
+        // legacy + one lifecycle row
+        assert_eq!(store.pending_count().unwrap(), 2);
+    }
 }

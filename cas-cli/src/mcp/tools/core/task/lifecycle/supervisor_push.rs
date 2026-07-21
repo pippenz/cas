@@ -400,7 +400,59 @@ fn deliver_prompt_for_notification(
     Ok(())
 }
 
+/// Required payload fields for truthful outbox recovery (cas-3a47).
+///
+/// Missing/malformed fields **fail closed** — never fabricate Started / Open→InProgress.
+fn require_payload_str<'a>(
+    payload: &'a serde_json::Value,
+    field: &str,
+    notification_id: i64,
+) -> Result<&'a str, String> {
+    payload
+        .get(field)
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "incomplete lifecycle payload id={notification_id}: missing or empty required field `{field}` \
+                 (row left pending; will not fabricate defaults)"
+            )
+        })
+}
+
+fn parse_lifecycle_kind(transition: &str, notification_id: i64) -> Result<LifecycleTransition, String> {
+    match transition {
+        "task_started" => Ok(LifecycleTransition::Started),
+        "task_blocked" => Ok(LifecycleTransition::Blocked),
+        "task_ready" => Ok(LifecycleTransition::ReadyReopened),
+        "task_close_rejected" => Ok(LifecycleTransition::CloseRejected),
+        "task_awaiting_merge" => Ok(LifecycleTransition::AwaitingMerge),
+        "task_closed" => Ok(LifecycleTransition::Closed),
+        other => Err(format!(
+            "incomplete lifecycle payload id={notification_id}: unknown transition `{other}` \
+             (row left pending; will not fabricate Started)"
+        )),
+    }
+}
+
+fn parse_required_status(
+    payload: &serde_json::Value,
+    field: &str,
+    notification_id: i64,
+) -> Result<TaskStatus, String> {
+    let s = require_payload_str(payload, field, notification_id)?;
+    s.parse().map_err(|_| {
+        format!(
+            "incomplete lifecycle payload id={notification_id}: invalid {field}=`{s}` \
+             (row left pending; will not fabricate Open/InProgress)"
+        )
+    })
+}
+
 /// Deliver prompt for a persisted durable outbox row (drain / restart recovery).
+///
+/// Fail-closed on corrupt/incomplete payloads (cas-3a47): leaves
+/// `prompt_delivered_at` unmarked so a later fix can re-drain.
 pub fn deliver_lifecycle_outbox_row(
     supervisor_queue: &dyn SupervisorQueueStore,
     prompt_queue: &dyn PromptQueueStore,
@@ -419,55 +471,51 @@ pub fn deliver_lifecycle_outbox_row(
     }
 
     let payload: serde_json::Value = serde_json::from_str(&notification.payload)
-        .map_err(|e| format!("corrupt lifecycle payload id={}: {e}", notification.id))?;
+        .map_err(|e| {
+            format!(
+                "corrupt lifecycle payload id={}: {e} (row left pending)",
+                notification.id
+            )
+        })?;
 
-    let task_id = payload
-        .get("task_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
+    let task_id = require_payload_str(&payload, "task_id", notification.id)?;
+    // title/actor may be empty string for legacy rows, but keys must be present as strings.
     let task_title = payload
         .get("title")
         .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let actor = payload
-        .get("actor")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
-    let occurrence_id = payload
-        .get("occurrence_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
+        .ok_or_else(|| {
+            format!(
+                "incomplete lifecycle payload id={}: missing field `title` (row left pending)",
+                notification.id
+            )
+        })?;
+    let actor = require_payload_str(&payload, "actor", notification.id)?;
+    let occurrence_id = require_payload_str(&payload, "occurrence_id", notification.id)?;
     let key = payload
         .get("transition_key")
         .and_then(|v| v.as_str())
-        .or(notification.transition_key.as_deref())
-        .unwrap_or("");
-    let factory_session = payload
-        .get("factory_session")
-        .and_then(|v| v.as_str());
+        .filter(|s| !s.is_empty())
+        .or(notification.transition_key.as_deref().filter(|s| !s.is_empty()))
+        .ok_or_else(|| {
+            format!(
+                "incomplete lifecycle payload id={}: missing transition_key \
+                 (row left pending)",
+                notification.id
+            )
+        })?;
+    let factory_session = payload.get("factory_session").and_then(|v| {
+        // null is ok (non-factory); wrong type is not
+        match v {
+            serde_json::Value::Null => None,
+            serde_json::Value::String(s) => Some(s.as_str()),
+            _ => None,
+        }
+    });
     let reason = payload.get("reason").and_then(|v| v.as_str());
-    let transition = payload
-        .get("transition")
-        .and_then(|v| v.as_str())
-        .unwrap_or("task_started");
-    let kind = match transition {
-        "task_blocked" => LifecycleTransition::Blocked,
-        "task_ready" => LifecycleTransition::ReadyReopened,
-        "task_close_rejected" => LifecycleTransition::CloseRejected,
-        "task_awaiting_merge" => LifecycleTransition::AwaitingMerge,
-        "task_closed" => LifecycleTransition::Closed,
-        _ => LifecycleTransition::Started,
-    };
-    let old_status = payload
-        .get("old_status")
-        .and_then(|v| v.as_str())
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(TaskStatus::Open);
-    let new_status = payload
-        .get("new_status")
-        .and_then(|v| v.as_str())
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(TaskStatus::InProgress);
+    let transition = require_payload_str(&payload, "transition", notification.id)?;
+    let kind = parse_lifecycle_kind(transition, notification.id)?;
+    let old_status = parse_required_status(&payload, "old_status", notification.id)?;
+    let new_status = parse_required_status(&payload, "new_status", notification.id)?;
 
     deliver_prompt_for_notification(
         supervisor_queue,
@@ -884,6 +932,214 @@ mod tests {
                 None => std::env::remove_var("CAS_FACTORY_SESSION"),
             }
         }
+    }
+
+    /// cas-3a47 AC4: malformed payload stays pending; never fabricates Started/Open→InProgress.
+    #[test]
+    fn corrupt_payload_stays_pending_with_specific_error() {
+        let temp = TempDir::new().unwrap();
+        let sq = SqliteSupervisorQueueStore::open(temp.path()).unwrap();
+        sq.init().unwrap();
+        let pq = SqlitePromptQueueStore::open(temp.path()).unwrap();
+        pq.init().unwrap();
+
+        let id_bad = match sq
+            .notify_idempotent(
+                "sup",
+                "task_lifecycle",
+                "not-json",
+                NotificationPriority::Normal,
+                "key-corrupt",
+            )
+            .unwrap()
+        {
+            NotifyIdempotentResult::Created(id) => id,
+            other => panic!("{other:?}"),
+        };
+        let row = sq
+            .list_pending_lifecycle_outbox(10)
+            .unwrap()
+            .into_iter()
+            .find(|n| n.id == id_bad)
+            .unwrap();
+        let err = deliver_lifecycle_outbox_row(&sq, &pq, &row).unwrap_err();
+        assert!(err.contains("corrupt lifecycle payload"), "{err}");
+        assert!(err.contains("left pending"), "{err}");
+        assert!(sq
+            .get_by_transition_key("key-corrupt")
+            .unwrap()
+            .unwrap()
+            .prompt_delivered_at
+            .is_none());
+        assert_eq!(pq.pending_count().unwrap(), 0);
+
+        let id_inc = match sq
+            .notify_idempotent(
+                "sup",
+                "task_lifecycle",
+                r#"{"task_id":"cas-x"}"#,
+                NotificationPriority::Normal,
+                "key-incomplete",
+            )
+            .unwrap()
+        {
+            NotifyIdempotentResult::Created(id) => id,
+            other => panic!("{other:?}"),
+        };
+        let row = sq
+            .list_pending_lifecycle_outbox(10)
+            .unwrap()
+            .into_iter()
+            .find(|n| n.id == id_inc)
+            .unwrap();
+        let err = deliver_lifecycle_outbox_row(&sq, &pq, &row).unwrap_err();
+        assert!(
+            err.contains("incomplete lifecycle payload") || err.contains("missing"),
+            "{err}"
+        );
+        assert!(
+            sq.get_by_transition_key("key-incomplete")
+                .unwrap()
+                .unwrap()
+                .prompt_delivered_at
+                .is_none()
+        );
+        assert_eq!(pq.pending_count().unwrap(), 0, "no fabricated prompt delivery");
+
+        let id_unk = match sq
+            .notify_idempotent(
+                "sup",
+                "task_lifecycle",
+                r#"{"task_id":"cas-x","title":"t","actor":"a","occurrence_id":"o","transition":"task_magic","old_status":"open","new_status":"closed","transition_key":"key-unk"}"#,
+                NotificationPriority::Normal,
+                "key-unk",
+            )
+            .unwrap()
+        {
+            NotifyIdempotentResult::Created(id) => id,
+            other => panic!("{other:?}"),
+        };
+        let row = sq
+            .list_pending_lifecycle_outbox(10)
+            .unwrap()
+            .into_iter()
+            .find(|n| n.id == id_unk)
+            .unwrap();
+        let err = deliver_lifecycle_outbox_row(&sq, &pq, &row).unwrap_err();
+        assert!(err.contains("unknown transition"), "{err}");
+        assert!(err.contains("will not fabricate Started"), "{err}");
+        assert!(sq
+            .get_by_transition_key("key-unk")
+            .unwrap()
+            .unwrap()
+            .prompt_delivered_at
+            .is_none());
+    }
+
+    /// cas-3a47: valid drains; malformed stays pending; concurrent drain no dup.
+    #[test]
+    fn drain_mixed_valid_and_corrupt_rows_exactly_once() {
+        let temp = TempDir::new().unwrap();
+        let sq = SqliteSupervisorQueueStore::open(temp.path()).unwrap();
+        sq.init().unwrap();
+        let pq = SqlitePromptQueueStore::open(temp.path()).unwrap();
+        pq.init().unwrap();
+
+        let good_payload = r#"{
+            "task_id":"cas-good",
+            "title":"Good",
+            "old_status":"open",
+            "new_status":"in_progress",
+            "actor":"w",
+            "transition":"task_started",
+            "factory_session":"s",
+            "occurrence_id":"occ-g",
+            "transition_key":"key-good"
+        }"#;
+        sq.notify_idempotent(
+            "sup",
+            "task_lifecycle",
+            good_payload,
+            NotificationPriority::Normal,
+            "key-good",
+        )
+        .unwrap();
+        sq.notify_idempotent(
+            "sup",
+            "task_lifecycle",
+            r#"{"task_id":"cas-bad"}"#,
+            NotificationPriority::Normal,
+            "key-bad",
+        )
+        .unwrap();
+
+        let report = drain_lifecycle_outbox(&sq, &pq, 20).unwrap();
+        assert_eq!(report.recovered, 1, "errors={:?}", report.errors);
+        assert_eq!(report.failed, 1, "corrupt must fail closed");
+        assert_eq!(pq.pending_count().unwrap(), 1);
+        assert!(sq
+            .get_by_transition_key("key-good")
+            .unwrap()
+            .unwrap()
+            .prompt_delivered_at
+            .is_some());
+        assert!(sq
+            .get_by_transition_key("key-bad")
+            .unwrap()
+            .unwrap()
+            .prompt_delivered_at
+            .is_none());
+
+        let report2 = drain_lifecycle_outbox(&sq, &pq, 20).unwrap();
+        assert_eq!(report2.recovered, 0);
+        assert_eq!(report2.failed, 1);
+        assert_eq!(pq.pending_count().unwrap(), 1);
+
+        sq.notify_idempotent(
+            "sup",
+            "task_lifecycle",
+            r#"{
+            "task_id":"cas-c2",
+            "title":"C2",
+            "old_status":"blocked",
+            "new_status":"open",
+            "actor":"w",
+            "transition":"task_ready",
+            "occurrence_id":"occ-c2",
+            "transition_key":"key-c2"
+        }"#,
+            NotificationPriority::High,
+            "key-c2",
+        )
+        .unwrap();
+
+        let path = temp.path().to_path_buf();
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let sq = SqliteSupervisorQueueStore::open(&path).unwrap();
+                    sq.init().unwrap();
+                    let pq = SqlitePromptQueueStore::open(&path).unwrap();
+                    pq.init().unwrap();
+                    drain_lifecycle_outbox(&sq, &pq, 20).unwrap()
+                })
+            })
+            .collect();
+        for h in handles {
+            let _ = h.join().unwrap();
+        }
+        assert_eq!(
+            pq.pending_count().unwrap(),
+            2,
+            "concurrent drain must not duplicate"
+        );
+        assert!(sq
+            .get_by_transition_key("key-c2")
+            .unwrap()
+            .unwrap()
+            .prompt_delivered_at
+            .is_some());
     }
 
     fn agent_in_session(id: &str, name: &str, role: AgentRole, session: &str) -> Agent {
