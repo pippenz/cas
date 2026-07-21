@@ -77,6 +77,71 @@ fn write_adapter_artifacts(root: &std::path::Path) {
     );
 }
 
+fn write_composed_receipts(root: &std::path::Path) {
+    let receipts = root.join("receipts");
+    std::fs::create_dir_all(&receipts).unwrap();
+    let harnesses = ["claude", "codex", "grok"];
+    let mut contracts = Vec::new();
+    for supervisor in harnesses {
+        for worker in harnesses {
+            contracts.push(serde_json::json!({
+                "message_id": format!("{supervisor}-supervisor-to-{worker}-worker"),
+                "target": format!("{worker}-worker"),
+                "stage": "routing_matrix",
+                "status": "OBSERVED",
+                "provenance": "receipt:delivery_matrix_all_combos_both_directions"
+            }));
+            contracts.push(serde_json::json!({
+                "message_id": format!("{worker}-worker-to-{supervisor}-supervisor"),
+                "target": format!("{supervisor}-supervisor"),
+                "stage": "routing_matrix",
+                "status": "OBSERVED",
+                "provenance": "receipt:delivery_matrix_all_combos_both_directions"
+            }));
+        }
+    }
+    std::fs::write(
+        receipts.join("routing_matrix.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "receipt_type": "routing_matrix",
+            "contracts": contracts
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        receipts.join("lifecycle.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "receipt_type": "merge_reclose_lifecycle",
+            "receipts": [
+                {
+                    "message_id": "cas-126b-merge-reclose-halt-exemption",
+                    "target": "awaiting-merge-worker",
+                    "stage": "merge_reclose",
+                    "status": "OBSERVED",
+                    "provenance": "receipt:bounded re-close urgent halt exemption"
+                },
+                {
+                    "message_id": "cas-062d-owner-lifecycle-transitions",
+                    "target": "owning-supervisor",
+                    "stage": "lifecycle_transition",
+                    "status": "OBSERVED",
+                    "provenance": "receipt:owner lifecycle transition push"
+                },
+                {
+                    "message_id": "cas-ecff-lifecycle-outbox-recovery",
+                    "target": "owning-supervisor",
+                    "stage": "lifecycle_outbox_recovery",
+                    "status": "OBSERVED",
+                    "provenance": "receipt:exactly-once lifecycle outbox recovery"
+                }
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
 #[test]
 fn probe_comm_cli_writes_jsonl_with_fake_adapter() {
     let temp = tempfile::tempdir().unwrap();
@@ -127,6 +192,7 @@ fn probe_comm_cli_all_adapters_writes_recorded_fixture_report() {
     let jsonl = temp.path().join("probe.jsonl");
     let artifacts = temp.path().join("artifacts");
     write_adapter_artifacts(&artifacts);
+    write_composed_receipts(&artifacts);
 
     cas_cmd()
         .args([
@@ -181,21 +247,109 @@ fn probe_comm_cli_all_adapters_writes_recorded_fixture_report() {
         .unwrap();
     assert_eq!(
         routing["stages"].as_array().unwrap().len(),
-        19,
-        "18 bidirectional harness pairings plus one live-observation disclosure"
+        18,
+        "18 bidirectional harness pairings must come from receipts"
     );
+    assert!(routing["passed"].as_bool().unwrap());
     assert!(
-        routing["stages"].as_array().unwrap().iter().any(|stage| {
-            stage["message_id"] == "live-disposable-model-observation"
-                && stage["stage_statuses"][0]["status"] == "BLOCKED"
-                && stage["reaction_status"] == "BLOCKED"
+        routing["stages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|stage| stage["stage_statuses"][0]["provenance"]
+                .as_str()
+                .unwrap()
+                .starts_with("receipt:")),
+        "routing observations must be receipt-backed: {routing}"
+    );
+    let lifecycle = lines
+        .iter()
+        .find(|line| line["scenario"] == "merge_reclose_lifecycle_evidence")
+        .unwrap();
+    assert!(lifecycle["passed"].as_bool().unwrap());
+    assert!(
+        lifecycle["stages"].as_array().unwrap().iter().any(|stage| {
+            stage["message_id"] == "cas-ecff-lifecycle-outbox-recovery"
+                && stage["stage_statuses"][0]["status"] == "OBSERVED"
         }),
-        "unsupported live observation must be BLOCKED/UNKNOWN, never pass-like: {routing}"
+        "lifecycle OBSERVED requires the merged cas-ecff receipt: {lifecycle}"
     );
 }
 
 #[test]
-fn probe_comm_cli_recorded_adapter_applies_slo_thresholds() {
+fn probe_comm_cli_all_adapters_without_receipts_is_not_full_pass() {
+    let temp = tempfile::tempdir().unwrap();
+    let jsonl = temp.path().join("probe.jsonl");
+    let artifacts = temp.path().join("artifacts");
+    write_adapter_artifacts(&artifacts);
+
+    cas_cmd()
+        .args([
+            "factory",
+            "probe-comm",
+            "--jsonl",
+            jsonl.to_str().unwrap(),
+            "--adapter",
+            "all",
+            "--artifact-root",
+            artifacts.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("routing_receipt_missing"));
+
+    let lines = read_jsonl(&jsonl);
+    let routing = lines
+        .iter()
+        .find(|line| line["scenario"] == "routing_matrix_evidence")
+        .unwrap();
+    assert_eq!(routing["passed"], false);
+    assert_eq!(routing["failed_stage"], "routing_receipt_missing");
+    assert!(
+        routing["stages"].as_array().unwrap().iter().any(|stage| {
+            stage["stage_statuses"][0]["status"] == "BLOCKED"
+                || stage["stage_statuses"][0]["status"] == "UNKNOWN"
+        }),
+        "missing receipts must not create OBSERVED/PASS evidence: {routing}"
+    );
+}
+
+#[test]
+fn probe_comm_cli_malformed_receipt_is_stage_failure() {
+    let temp = tempfile::tempdir().unwrap();
+    let jsonl = temp.path().join("probe.jsonl");
+    let artifacts = temp.path().join("artifacts");
+    write_adapter_artifacts(&artifacts);
+    let receipts = artifacts.join("receipts");
+    std::fs::create_dir_all(&receipts).unwrap();
+    std::fs::write(receipts.join("routing_matrix.json"), "{not-json}\n").unwrap();
+
+    cas_cmd()
+        .args([
+            "factory",
+            "probe-comm",
+            "--jsonl",
+            jsonl.to_str().unwrap(),
+            "--adapter",
+            "all",
+            "--artifact-root",
+            artifacts.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("routing_receipt_malformed"));
+
+    let lines = read_jsonl(&jsonl);
+    let routing = lines
+        .iter()
+        .find(|line| line["scenario"] == "routing_matrix_evidence")
+        .unwrap();
+    assert_eq!(routing["failed_stage"], "routing_receipt_malformed");
+    assert_eq!(routing["stages"][0]["stage_statuses"][0]["status"], "FAILED");
+}
+
+#[test]
+fn probe_comm_cli_recorded_adapter_applies_reaction_slo_threshold() {
     let temp = tempfile::tempdir().unwrap();
     let jsonl = temp.path().join("probe.jsonl");
     let artifacts = temp.path().join("artifacts");
@@ -211,7 +365,7 @@ fn probe_comm_cli_recorded_adapter_applies_slo_thresholds() {
             "codex",
             "--artifact-root",
             artifacts.to_str().unwrap(),
-            "--delivery-slo-ms",
+            "--reaction-slo-ms",
             "1",
         ])
         .assert()
@@ -224,6 +378,81 @@ fn probe_comm_cli_recorded_adapter_applies_slo_thresholds() {
     assert_eq!(lines[0]["passed"], false);
     assert_eq!(lines[0]["failed_stage"], "reaction_slo");
     assert_eq!(lines[0]["stages"][0]["terminal"], "reaction_slo_failed");
+}
+
+#[test]
+fn probe_comm_cli_recorded_adapter_applies_wake_slo_threshold() {
+    let temp = tempfile::tempdir().unwrap();
+    let jsonl = temp.path().join("probe.jsonl");
+    let artifacts = temp.path().join("artifacts");
+    write_adapter_artifacts(&artifacts);
+
+    cas_cmd()
+        .args([
+            "factory",
+            "probe-comm",
+            "--jsonl",
+            jsonl.to_str().unwrap(),
+            "--adapter",
+            "codex",
+            "--artifact-root",
+            artifacts.to_str().unwrap(),
+            "--wake-slo-ms",
+            "1",
+            "--reaction-slo-ms",
+            "1000",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("wake_slo"));
+
+    let lines = read_jsonl(&jsonl);
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0]["scenario"], "codex_adapter");
+    assert_eq!(lines[0]["passed"], false);
+    assert_eq!(lines[0]["failed_stage"], "wake_slo");
+    assert_eq!(lines[0]["stages"][0]["terminal"], "wake_slo_failed");
+}
+
+#[test]
+fn probe_comm_cli_fake_adapter_applies_delivery_and_selection_thresholds_independently() {
+    let temp = tempfile::tempdir().unwrap();
+    let delivery_jsonl = temp.path().join("delivery.jsonl");
+    cas_cmd()
+        .args([
+            "factory",
+            "probe-comm",
+            "--jsonl",
+            delivery_jsonl.to_str().unwrap(),
+            "--inject-slo-failure",
+            "serial_10:serial-0:50",
+            "--delivery-slo-ms",
+            "1",
+            "--selection-slo-ms",
+            "1000",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("delivery_slo"));
+
+    let selection_jsonl = temp.path().join("selection.jsonl");
+    cas_cmd()
+        .args([
+            "factory",
+            "probe-comm",
+            "--jsonl",
+            selection_jsonl.to_str().unwrap(),
+            "--delivery-slo-ms",
+            "1000",
+            "--selection-slo-ms",
+            "0",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("selected"));
+
+    let lines = read_jsonl(&selection_jsonl);
+    assert_eq!(lines[0]["failed_stage"], "selected");
 }
 
 #[test]
@@ -264,6 +493,76 @@ fn probe_comm_cli_malformed_recorded_artifact_emits_stage_status_jsonl() {
             .iter()
             .any(|stage| stage["stage"] == "artifact" && stage["status"] == "FAILED")
     );
+}
+
+#[test]
+fn probe_comm_cli_malformed_claude_transcript_is_not_swallowed() {
+    let temp = tempfile::tempdir().unwrap();
+    let jsonl = temp.path().join("probe.jsonl");
+    let artifacts = temp.path().join("artifacts");
+    write_adapter_artifacts(&artifacts);
+    std::fs::write(
+        artifacts.join("claude").join("transcript.jsonl"),
+        "{not-json}\n",
+    )
+    .unwrap();
+
+    cas_cmd()
+        .args([
+            "factory",
+            "probe-comm",
+            "--jsonl",
+            jsonl.to_str().unwrap(),
+            "--adapter",
+            "claude",
+            "--artifact-root",
+            artifacts.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("transcript_parse_failed"));
+
+    let lines = read_jsonl(&jsonl);
+    assert_eq!(lines[0]["scenario"], "claude_adapter");
+    assert_eq!(lines[0]["failed_stage"], "transcript_parse_failed");
+    assert_eq!(lines[0]["stages"][0]["terminal"], "transcript_parse_failed");
+}
+
+#[test]
+fn probe_comm_cli_malformed_grok_events_is_not_swallowed() {
+    let temp = tempfile::tempdir().unwrap();
+    let jsonl = temp.path().join("probe.jsonl");
+    let artifacts = temp.path().join("artifacts");
+    write_adapter_artifacts(&artifacts);
+    let grok = artifacts.join("grok");
+    write_jsonl(
+        &grok.join("updates.jsonl"),
+        &[
+            serde_json::json!({"timestamp":"2026-07-21T17:00:02.000Z","type":"user_message","text":"probe-message-id=grok-1"}),
+            serde_json::json!({"timestamp":"2026-07-21T17:00:02.100Z","type":"turn_started"}),
+        ],
+    );
+    std::fs::write(grok.join("events.jsonl"), "{not-json}\n").unwrap();
+
+    cas_cmd()
+        .args([
+            "factory",
+            "probe-comm",
+            "--jsonl",
+            jsonl.to_str().unwrap(),
+            "--adapter",
+            "grok",
+            "--artifact-root",
+            artifacts.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("events_parse_failed"));
+
+    let lines = read_jsonl(&jsonl);
+    assert_eq!(lines[0]["scenario"], "grok_adapter");
+    assert_eq!(lines[0]["failed_stage"], "events_parse_failed");
+    assert_eq!(lines[0]["stages"][0]["terminal"], "events_parse_failed");
 }
 
 #[test]
