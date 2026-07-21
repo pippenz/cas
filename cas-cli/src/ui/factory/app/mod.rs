@@ -1502,7 +1502,11 @@ pub(crate) fn queue_supervisor_intro_prompt(
 - Canonical current workers for this session: {worker_list}\n\
 - First steps: mcp__cs__coordination action=whoami; mcp__cs__task action=list task_type=epic; mcp__cs__task action=ready"
         ),
-        cas_mux::SupervisorCli::Claude => return,
+        // cas-0263: Claude has no --rules/developer_instructions launch flag, so
+        // the canonical supervisor role contract is delivered as this launch-time
+        // intro prompt (the surface a Claude supervisor consumes). Previously
+        // Claude got nothing here, leaving it without any launch role contract.
+        cas_mux::SupervisorCli::Claude => cas_mux::claude_supervisor_contract(&worker_list),
         // EPIC cas-8888 (cas-9a31, Phase 1): Grok's SessionStart hook fires
         // but its stdout is ignored, so the SessionStart-additionalContext
         // bundle injection Claude relies on does NOT reach a Grok
@@ -1543,13 +1547,9 @@ pub(crate) fn queue_codex_worker_intro_prompt(
             // Avoid queue injection here to prevent duplicate or draft-only startup prompts.
         }
         cas_mux::SupervisorCli::Claude => {
-            let prompt = format!(
-                "You are a CAS factory worker ({worker_name}).\n\
-                 \n\
-                 Check your assigned tasks: `mcp__cas__task action=mine`\n\
-                 \n\
-                 See the cas-worker skill for detailed workflow guidance."
-            );
+            // cas-0263: deliver the full canonical worker role contract (not just
+            // a skill pointer) via the launch-time intro prompt Claude consumes.
+            let prompt = cas_mux::claude_worker_contract(worker_name);
             if let Ok(queue) = open_prompt_queue_store(cas_dir) {
                 let _ = queue.enqueue("cas", worker_name, &prompt);
             }
@@ -1855,8 +1855,50 @@ mod tests {
 
     use super::{
         DirectorData, DirectorEvent, merge_director_data_preserving_git, non_closed_task_ids,
-        unfiltered_snapshot_from,
+        queue_codex_worker_intro_prompt, queue_supervisor_intro_prompt, unfiltered_snapshot_from,
     };
+
+    /// cas-0263: the Claude launch surface is the queued intro prompt (Claude has
+    /// no --rules/developer_instructions flag). This drives the ACTUAL enqueue
+    /// path and proves the queued prompt carries the full canonical role
+    /// contract — the Claude supervisor previously got nothing here, the worker
+    /// only a skill pointer.
+    #[test]
+    fn test_claude_intro_prompts_carry_full_role_contract() {
+        use crate::store::detect::open_prompt_queue_store;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cas_dir = tmp.path();
+
+        queue_supervisor_intro_prompt(
+            cas_dir,
+            "sup",
+            cas_mux::SupervisorCli::Claude,
+            &["worker-a".to_string()],
+            None,
+        );
+        queue_codex_worker_intro_prompt(cas_dir, "worker-a", cas_mux::SupervisorCli::Claude);
+
+        let queue = open_prompt_queue_store(cas_dir).unwrap();
+
+        let sup = queue.peek_for_targets(&["sup"], None, 10).unwrap();
+        assert_eq!(sup.len(), 1, "Claude supervisor must receive a launch intro");
+        assert!(
+            cas_mux::missing_contract_elements(&sup[0].prompt, cas_mux::ContractRole::Supervisor)
+                .is_empty(),
+            "Claude supervisor intro missing: {:?}",
+            cas_mux::missing_contract_elements(&sup[0].prompt, cas_mux::ContractRole::Supervisor)
+        );
+
+        let wrk = queue.peek_for_targets(&["worker-a"], None, 10).unwrap();
+        assert_eq!(wrk.len(), 1, "Claude worker must receive a launch intro");
+        assert!(
+            cas_mux::missing_contract_elements(&wrk[0].prompt, cas_mux::ContractRole::Worker)
+                .is_empty(),
+            "Claude worker intro missing: {:?}",
+            cas_mux::missing_contract_elements(&wrk[0].prompt, cas_mux::ContractRole::Worker)
+        );
+    }
 
     fn data_with_changes(git_loaded: bool, changes: Vec<SourceChangesInfo>) -> DirectorData {
         DirectorData {
