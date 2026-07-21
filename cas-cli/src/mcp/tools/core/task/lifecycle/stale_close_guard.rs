@@ -214,6 +214,74 @@ pub fn rewrite_stale_close_guidance(
     ))
 }
 
+/// Whether a byte can be part of a CAS task-id run (`cas-<hex>`): ASCII
+/// alphanumeric or `-`. Used to reject prefix/suffix near-matches so that
+/// `cas-5c02x` (trailing alnum) or `xcas-5c02` (leading alnum) do NOT count as
+/// a mention of `cas-5c02`.
+fn is_task_id_boundary_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'-'
+}
+
+/// Whether `text` mentions `task_id` as a **bounded** token — i.e. the id is not
+/// a prefix or suffix of a longer id-like run. Guards the exemption predicate
+/// against near-misses (`cas-5c02x`, `cas-5c02-b`, `xcas-5c02`).
+pub fn text_mentions_task_id_bounded(text: &str, task_id: &str) -> bool {
+    if task_id.is_empty() {
+        return false;
+    }
+    let bytes = text.as_bytes();
+    let id_len = task_id.len();
+    let mut search_from = 0;
+    while let Some(rel) = text[search_from..].find(task_id) {
+        let start = search_from + rel;
+        let end = start + id_len;
+        let before_ok = start == 0 || !is_task_id_boundary_char(bytes[start - 1]);
+        let after_ok = end >= bytes.len() || !is_task_id_boundary_char(bytes[end]);
+        if before_ok && after_ok {
+            return true;
+        }
+        // Advance one byte past this occurrence and keep scanning for a
+        // bounded match later in the string.
+        search_from = start + 1;
+    }
+    false
+}
+
+/// cas-126b: Whether an urgent message is a merge-complete **re-close**
+/// hand-off that must NOT arm `halt_task_work`.
+///
+/// The urgent "MERGE DONE → re-close now" notification wakes a worker parked in
+/// [`TaskStatus::AwaitingMerge`] and instructs it to `task close` the very task
+/// the message names. Arming halt on *that* send deadlocks the worker: close is
+/// refused (`WORK HALTED`) yet the parked task cannot be `start`ed to clear the
+/// halt (starting an `AwaitingMerge` task is illegal by design), so the only
+/// escape is starting an *unrelated* Open task — the exact multi-step recovery
+/// that made factory throughput die at the merge/re-close handoff.
+///
+/// We exempt exactly this class — close/verify guidance that references, as a
+/// **bounded** token, at least one task the caller has already resolved to be
+/// (a) currently in `AwaitingMerge` **and** (b) assigned to the urgent's target
+/// worker. Binding to the target's own parked task is essential: an urgent to
+/// worker B must not skip halt merely because its text names worker A's parked
+/// task. Halt is preserved for ordinary urgent stop / re-scope messages (which
+/// either don't look like close guidance or don't name the target's
+/// `AwaitingMerge` task). The exemption only skips the halt flag; it does not
+/// touch the factory-branch merge gate, so a re-close sent before the merge is
+/// actually visible still rejects with `MERGE REQUIRED` (never a false
+/// success).
+///
+/// Callers pass the ids of the **target worker's** tasks currently in
+/// `AwaitingMerge`; this keeps the predicate pure and harness-agnostic (Grok /
+/// Codex / Claude all funnel through the same `message_send` fan-out).
+pub fn is_merge_reclose_exempt_urgent(text: &str, target_awaiting_merge_task_ids: &[String]) -> bool {
+    if !looks_like_close_or_verify_guidance(text) {
+        return false;
+    }
+    target_awaiting_merge_task_ids
+        .iter()
+        .any(|id| text_mentions_task_id_bounded(text, id))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -405,6 +473,113 @@ mod tests {
         clear_halt_metadata(&mut meta);
         assert!(!agent_task_work_halted(&meta));
         assert_eq!(halt_generation(&meta), 0);
+    }
+
+    /// cas-126b: the urgent MERGE DONE re-close hand-off (close guidance that
+    /// names a task currently AwaitingMerge) is halt-exempt so the worker can
+    /// re-close without starting a second task.
+    #[test]
+    fn test_126b_merge_reclose_urgent_is_halt_exempt() {
+        let awaiting = vec!["cas-5c02".to_string()];
+        let merge_done = "MERGE DONE: factory/comm-grok merged to epic. \
+             Re-close now: task action=close id=cas-5c02 reason=\"merged\"";
+        assert!(
+            is_merge_reclose_exempt_urgent(merge_done, &awaiting),
+            "close guidance naming an AwaitingMerge task must be halt-exempt"
+        );
+    }
+
+    /// cas-126b: an ordinary urgent stop / re-scope must STILL arm halt — it is
+    /// neither close guidance nor references an AwaitingMerge task.
+    #[test]
+    fn test_126b_ordinary_urgent_stop_still_halts() {
+        let awaiting = vec!["cas-5c02".to_string()];
+        let stop = "STOP — you are off the rails. Abandon the current approach \
+             and stand by for a re-scope.";
+        assert!(
+            !is_merge_reclose_exempt_urgent(stop, &awaiting),
+            "ordinary stop/redirect must not be halt-exempt (halt must still fire)"
+        );
+    }
+
+    /// cas-126b: close guidance that does NOT name an AwaitingMerge task is not
+    /// exempt — e.g. a re-close nudge for a task that is not parked, or when no
+    /// task is AwaitingMerge at all (the no-merge / error case). Halt still fires
+    /// and the merge gate remains the sole authority on close success.
+    #[test]
+    fn test_126b_close_guidance_without_awaiting_merge_task_not_exempt() {
+        let close_text =
+            "task action=close id=cas-9999 reason=\"done\""; // cas-9999 not AwaitingMerge
+        // Referenced task is not among the AwaitingMerge ids.
+        assert!(!is_merge_reclose_exempt_urgent(
+            close_text,
+            &["cas-5c02".to_string()]
+        ));
+        // No task is AwaitingMerge at all → never exempt.
+        assert!(!is_merge_reclose_exempt_urgent(close_text, &[]));
+        // Empty id string must never match via substring.
+        assert!(!is_merge_reclose_exempt_urgent(
+            close_text,
+            &[String::new()]
+        ));
+    }
+
+    /// cas-126b review-2 gate: exact bounded id match — a near-miss id that is a
+    /// prefix/suffix of a longer id-like run must NOT be exempt.
+    #[test]
+    fn test_126b_task_id_match_is_bounded_not_substring() {
+        // Whole-token mentions in realistic phrasings match.
+        assert!(text_mentions_task_id_bounded(
+            "task action=close id=cas-5c02 reason=merged",
+            "cas-5c02"
+        ));
+        assert!(text_mentions_task_id_bounded("re-close cas-5c02.", "cas-5c02"));
+        assert!(text_mentions_task_id_bounded(
+            "close cas-5c02, then continue",
+            "cas-5c02"
+        ));
+        // Trailing / leading alnum or '-' near-misses must NOT match.
+        assert!(!text_mentions_task_id_bounded("close cas-5c02x now", "cas-5c02"));
+        assert!(!text_mentions_task_id_bounded("close cas-5c02-b now", "cas-5c02"));
+        assert!(!text_mentions_task_id_bounded("close xcas-5c02 now", "cas-5c02"));
+        // Empty id never matches.
+        assert!(!text_mentions_task_id_bounded("anything", ""));
+        // A later bounded occurrence is found even if an earlier one is a near-miss.
+        assert!(text_mentions_task_id_bounded(
+            "cas-5c02x is wrong; use cas-5c02 instead",
+            "cas-5c02"
+        ));
+
+        // Predicate level: near-miss id in close guidance is not exempt.
+        assert!(!is_merge_reclose_exempt_urgent(
+            "MERGE DONE — task action=close id=cas-5c02x reason=merged",
+            &["cas-5c02".to_string()]
+        ));
+    }
+
+    /// cas-126b composition: halt persists for an authorized urgent EXCEPT when
+    /// the send is a merge re-close hand-off. Ties `should_persist_urgent_halt`
+    /// (authorization/targeting) together with the new exemption to encode the
+    /// net decision made in `message_send`.
+    #[test]
+    fn test_126b_net_halt_decision_skips_only_merge_reclose() {
+        let workers = vec!["comm-grok".to_string()];
+        let awaiting = vec!["cas-5c02".to_string()];
+
+        let net_halt = |urgent: bool, text: &str| -> bool {
+            should_persist_urgent_halt(urgent, "supervisor", "supervisor", "comm-grok", &workers)
+                && !is_merge_reclose_exempt_urgent(text, &awaiting)
+        };
+
+        // Merge re-close urgent from supervisor → do NOT halt.
+        assert!(!net_halt(
+            true,
+            "MERGE DONE — task action=close id=cas-5c02 reason=merged"
+        ));
+        // Ordinary urgent stop from supervisor → DO halt.
+        assert!(net_halt(true, "STOP and stand by for re-scope"));
+        // Non-urgent never halts regardless of text.
+        assert!(!net_halt(false, "STOP and stand by for re-scope"));
     }
 
     #[test]

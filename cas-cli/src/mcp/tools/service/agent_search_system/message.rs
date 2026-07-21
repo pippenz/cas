@@ -304,12 +304,12 @@ impl CasService {
             Vec::new();
         {
             use crate::mcp::tools::core::task::lifecycle::stale_close_guard::{
-                apply_halt_metadata, halt_targets_for_urgent, may_source_role_set_halt,
-                may_source_set_halt, session_scoped_worker_names, should_persist_urgent_halt,
-                HaltWorkerCandidate,
+                apply_halt_metadata, halt_targets_for_urgent, is_merge_reclose_exempt_urgent,
+                may_source_role_set_halt, may_source_set_halt, session_scoped_worker_names,
+                should_persist_urgent_halt, HaltWorkerCandidate,
             };
-            use crate::store::open_agent_store;
-            use cas_types::AgentRole;
+            use crate::store::{open_agent_store, open_task_store};
+            use cas_types::{AgentRole, TaskStatus};
 
             // Prefer typed role from agent store when available.
             let source_role_for_halt = agent_from_store
@@ -351,7 +351,47 @@ impl CasService {
                 let session_workers =
                     session_scoped_worker_names(&worker_candidates, factory_session.as_deref());
 
-                if should_persist_urgent_halt(
+                // cas-126b: an urgent "MERGE DONE → re-close now" hand-off both
+                // wakes the parked worker AND (before this guard) armed
+                // halt_task_work — deadlocking the very re-close it asks for.
+                // Skip the halt fan-out when this urgent send is close/verify
+                // guidance that references, as a bounded token, a task that is
+                // (a) currently AwaitingMerge AND (b) assigned to THIS urgent's
+                // target worker. The assignee binding is a scope/authorization
+                // gate: an urgent to worker B must not skip halt because its
+                // text happens to name worker A's parked task. The exemption
+                // only skips the halt flag — the message is still
+                // enqueued+injected, and the factory-branch merge gate in
+                // close_ops remains the sole authority on close success, so a
+                // re-close sent before the merge is visible still rejects with
+                // MERGE REQUIRED (never a false success). Fail closed — if the
+                // task store can't be read, keep the original halt behavior.
+                let reclose_exempt = match open_task_store(&self.inner.cas_root)
+                    .ok()
+                    .and_then(|ts| ts.list(Some(TaskStatus::AwaitingMerge)).ok())
+                {
+                    Some(tasks) => {
+                        let target_awaiting_ids: Vec<String> = tasks
+                            .into_iter()
+                            .filter(|t| {
+                                t.assignee
+                                    .as_deref()
+                                    .map(|a| a.eq_ignore_ascii_case(&resolved_target))
+                                    .unwrap_or(false)
+                            })
+                            .map(|t| t.id)
+                            .collect();
+                        is_merge_reclose_exempt_urgent(&message, &target_awaiting_ids)
+                    }
+                    None => false,
+                };
+
+                if reclose_exempt {
+                    tracing::debug!(
+                        target = %resolved_target,
+                        "cas-126b: skipping halt_task_work for merge-complete re-close urgent"
+                    );
+                } else if should_persist_urgent_halt(
                     urgent,
                     &display_name,
                     &source_role_for_halt,
