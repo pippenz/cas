@@ -123,12 +123,17 @@ impl std::fmt::Display for MessageStatus {
 
 /// Monotonic transport stage CAS can authoritatively observe (cas-2c5f).
 ///
-/// Rank order (never regresses once stamped via `highest_stage`):
-/// Enqueued < Selected < Gated < {Dropped|Suppressed|Abandoned|Delivered} < Confirmed
+/// Rank order:
+/// Enqueued < Selected < Gated <
+///   {Dropped|Suppressed|Abandoned|PartiallyDelivered|Delivered} < Confirmed
 ///
-/// **Delivered** is only for successful inbox/PTY handoff (`transport_delivered_at`).
-/// Legacy `processed_at` alone is **not** sufficient (drops/suppression/abandon also
-/// set it). Harness wake/reaction are never stages — see [`ObservationStatus`].
+/// **Delivered** requires successful handoff to *all* intended recipients and
+/// `transport_delivered_at`. Partial `all_workers` success is
+/// [`DeliveryStage::PartiallyDelivered`] (never silent full Delivered).
+///
+/// Terminal siblings share rank 3; only the legal same-rank transition is
+/// `PartiallyDelivered → Delivered`. Illegal sibling rewrites are rejected.
+/// Corrupt/unknown `highest_stage` is a typed error (never silent Enqueued).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DeliveryStage {
@@ -144,21 +149,25 @@ pub enum DeliveryStage {
     Suppressed,
     /// Intentionally not delivered: unknown/stale target abandoned.
     Abandoned,
-    /// Authoritative transport handoff succeeded (inbox/PTY inject Ok).
+    /// Broadcast reached some but not all intended recipients.
+    PartiallyDelivered,
+    /// Authoritative full transport handoff (all intended recipients Ok).
     Delivered,
     /// Target acknowledged (`acked_at` set).
     Confirmed,
 }
 
 impl DeliveryStage {
-    /// Monotonic rank. Equal ranks (Dropped/Suppressed/Abandoned/Delivered)
-    /// are terminal siblings — once any is set, only Confirmed may advance.
     pub fn rank(self) -> u8 {
         match self {
             Self::Enqueued => 0,
             Self::Selected => 1,
             Self::Gated => 2,
-            Self::Dropped | Self::Suppressed | Self::Abandoned | Self::Delivered => 3,
+            Self::Dropped
+            | Self::Suppressed
+            | Self::Abandoned
+            | Self::PartiallyDelivered
+            | Self::Delivered => 3,
             Self::Confirmed => 4,
         }
     }
@@ -171,6 +180,7 @@ impl DeliveryStage {
             Self::Dropped => "dropped",
             Self::Suppressed => "suppressed",
             Self::Abandoned => "abandoned",
+            Self::PartiallyDelivered => "partially_delivered",
             Self::Delivered => "delivered",
             Self::Confirmed => "confirmed",
         }
@@ -184,19 +194,27 @@ impl DeliveryStage {
             "dropped" => Some(Self::Dropped),
             "suppressed" => Some(Self::Suppressed),
             "abandoned" => Some(Self::Abandoned),
+            "partially_delivered" => Some(Self::PartiallyDelivered),
             "delivered" => Some(Self::Delivered),
             "confirmed" => Some(Self::Confirmed),
             _ => None,
         }
     }
 
-    /// Advance only if `proposed` ranks strictly higher (monotonic).
-    pub fn advance(self, proposed: Self) -> Self {
-        if proposed.rank() > self.rank() {
-            proposed
-        } else {
-            self
+    pub fn is_terminal_non_delivery(self) -> bool {
+        matches!(self, Self::Dropped | Self::Suppressed | Self::Abandoned)
+    }
+
+    /// Whether transition `self → to` is legal (idempotent same stage always ok).
+    pub fn can_transition_to(self, to: Self) -> bool {
+        if self == to {
+            return true;
         }
+        if to.rank() > self.rank() {
+            return true;
+        }
+        // Sole legal same-rank rewrite: partial → full delivery (retry completed).
+        self == Self::PartiallyDelivered && to == Self::Delivered
     }
 }
 
@@ -231,6 +249,10 @@ pub enum PendingReason {
     SuppressedIdle,
     /// Terminal non-delivery: unknown/stale target abandoned.
     AbandonedUnknownTarget,
+    /// Broadcast reached a subset of intended recipients.
+    PartialBroadcast,
+    /// Broadcast had zero intended recipients (e.g. no non-native workers).
+    NoIntendedRecipients,
 }
 
 impl PendingReason {
@@ -245,6 +267,8 @@ impl PendingReason {
             Self::DroppedDeadSource => "dropped_dead_source",
             Self::SuppressedIdle => "suppressed_idle",
             Self::AbandonedUnknownTarget => "abandoned_unknown_target",
+            Self::PartialBroadcast => "partial_broadcast",
+            Self::NoIntendedRecipients => "no_intended_recipients",
         }
     }
 
@@ -259,19 +283,21 @@ impl PendingReason {
             "dropped_dead_source" => Some(Self::DroppedDeadSource),
             "suppressed_idle" => Some(Self::SuppressedIdle),
             "abandoned_unknown_target" => Some(Self::AbandonedUnknownTarget),
-            // Legacy alias from first implementation (no longer inferred).
+            "partial_broadcast" => Some(Self::PartialBroadcast),
+            "no_intended_recipients" => Some(Self::NoIntendedRecipients),
             "behind_queue_head" => Some(Self::AwaitingDelivery),
             _ => None,
         }
     }
 
-    /// Stage implied when this reason is first observed (before monotonic merge).
     fn implied_stage(self) -> DeliveryStage {
         match self {
             Self::GatedNotReady | Self::TargetUnavailable => DeliveryStage::Gated,
             Self::DroppedDeadSource => DeliveryStage::Dropped,
             Self::SuppressedIdle => DeliveryStage::Suppressed,
             Self::AbandonedUnknownTarget => DeliveryStage::Abandoned,
+            Self::PartialBroadcast => DeliveryStage::PartiallyDelivered,
+            Self::NoIntendedRecipients => DeliveryStage::Selected,
             Self::AdapterRetryable
             | Self::AwaitingDelivery
             | Self::SessionIneligible
@@ -308,8 +334,8 @@ impl std::fmt::Display for ObservationStatus {
 /// Additive to legacy [`MessageStatus`]. Wake/reaction are always
 /// [`ObservationStatus::Unobserved`] — never inferred from timestamps.
 ///
-/// `delivered_at` is **only** set after successful transport handoff
-/// (`transport_delivered_at`), never from legacy `processed_at` alone.
+/// `delivered_at` is **only** set after full transport handoff
+/// (`transport_delivered_at`). Partial broadcasts never populate it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MessageDeliveryReport {
     pub id: i64,
@@ -324,13 +350,17 @@ pub struct MessageDeliveryReport {
     pub urgent: bool,
     pub enqueued_at: DateTime<Utc>,
     pub selected_at: Option<DateTime<Utc>>,
-    /// Authoritative transport handoff time only (not legacy processed_at).
+    /// Full transport handoff time only (not legacy processed_at / partial).
     pub delivered_at: Option<DateTime<Utc>>,
     pub confirmed_at: Option<DateTime<Utc>>,
-    /// Present when waiting/blocked or for terminal non-delivery explanation.
+    /// Present when waiting/blocked, partial, or terminal non-delivery.
     pub pending_reason: Option<PendingReason>,
     /// Human-readable detail for the pending reason (error text, …).
     pub pending_detail: Option<String>,
+    /// Broadcast recipient counts when applicable (`all_workers`).
+    pub broadcast_attempted: Option<u32>,
+    pub broadcast_succeeded: Option<u32>,
+    pub broadcast_failed: Option<u32>,
     pub wake: ObservationStatus,
     pub reaction: ObservationStatus,
 }
@@ -350,6 +380,15 @@ ALTER TABLE prompt_queue ADD COLUMN transport_delivered_at TEXT;
 "#;
 const PROMPT_QUEUE_HIGHEST_STAGE_MIGRATION: &str = r#"
 ALTER TABLE prompt_queue ADD COLUMN highest_stage TEXT;
+"#;
+const PROMPT_QUEUE_BROADCAST_ATTEMPTED_MIGRATION: &str = r#"
+ALTER TABLE prompt_queue ADD COLUMN broadcast_attempted INTEGER;
+"#;
+const PROMPT_QUEUE_BROADCAST_SUCCEEDED_MIGRATION: &str = r#"
+ALTER TABLE prompt_queue ADD COLUMN broadcast_succeeded INTEGER;
+"#;
+const PROMPT_QUEUE_BROADCAST_FAILED_MIGRATION: &str = r#"
+ALTER TABLE prompt_queue ADD COLUMN broadcast_failed INTEGER;
 "#;
 
 /// Trait for prompt queue operations
@@ -502,9 +541,24 @@ pub trait PromptQueueStore: Send + Sync {
         detail: Option<&str>,
     ) -> Result<()>;
 
-    /// Authoritative successful transport handoff (inbox/PTY Ok).
-    /// Sets `transport_delivered_at` + stage Delivered + legacy `processed_at`.
+    /// Authoritative full transport handoff (all intended recipients Ok).
+    /// Atomically sets `transport_delivered_at` + stage Delivered + `processed_at`.
     fn mark_transport_delivered(&self, prompt_id: i64) -> Result<()>;
+
+    /// Broadcast outcome for `all_workers` (attempted/succeeded/failed counts).
+    ///
+    /// - all succeeded → Delivered + transport_delivered_at
+    /// - mixed → PartiallyDelivered (no transport_delivered_at; processed to avoid re-inject)
+    /// - zero succeeded (attempted > 0) → pending AdapterRetryable (not processed)
+    /// - attempted == 0 → pending NoIntendedRecipients (not processed)
+    fn mark_broadcast_outcome(
+        &self,
+        prompt_id: i64,
+        attempted: u32,
+        succeeded: u32,
+        failed: u32,
+        detail: Option<&str>,
+    ) -> Result<()>;
 
     /// Dead-source drop: marks processed for queue drainage without transport success.
     fn mark_dropped(&self, prompt_id: i64, detail: Option<&str>) -> Result<()>;
@@ -708,12 +762,8 @@ impl SqlitePromptQueueStore {
         }
     }
 
-    /// Read current highest_stage, merge with proposed, persist if advanced.
-    fn advance_highest_stage(
-        conn: &Connection,
-        prompt_id: i64,
-        proposed: DeliveryStage,
-    ) -> Result<DeliveryStage> {
+    /// Read current highest_stage. Missing/null → Enqueued. Corrupt → Parse error.
+    fn read_highest_stage(conn: &Connection, prompt_id: i64) -> Result<DeliveryStage> {
         let current_s: Option<String> = conn
             .query_row(
                 "SELECT highest_stage FROM prompt_queue WHERE id = ?",
@@ -722,42 +772,130 @@ impl SqlitePromptQueueStore {
             )
             .optional()?
             .flatten();
-        let current = current_s
-            .as_deref()
-            .and_then(DeliveryStage::parse)
-            .unwrap_or(DeliveryStage::Enqueued);
-        let next = current.advance(proposed);
-        if next != current {
-            conn.execute(
-                "UPDATE prompt_queue SET highest_stage = ? WHERE id = ?",
-                params![next.as_str(), prompt_id],
-            )?;
+        match current_s {
+            None => Ok(DeliveryStage::Enqueued),
+            Some(ref s) => DeliveryStage::parse(s).ok_or_else(|| {
+                crate::error::StoreError::Parse(format!(
+                    "prompt_queue id={prompt_id}: corrupt/unknown highest_stage: {s:?}"
+                ))
+            }),
         }
-        Ok(next)
     }
 
-    fn stamp_terminal_non_delivery(
-        &self,
+    /// Resolve next stage under legal-transition rules.
+    /// - Higher rank → accept proposed
+    /// - Lower rank → keep current (reason-only update; no regression)
+    /// - Same rank different siblings → reject (except Partial→Delivered)
+    fn resolve_stage_transition(
+        current: DeliveryStage,
+        proposed: DeliveryStage,
         prompt_id: i64,
-        stage: DeliveryStage,
-        reason: PendingReason,
-        detail: Option<&str>,
+    ) -> Result<DeliveryStage> {
+        if current == proposed {
+            return Ok(current);
+        }
+        if proposed.rank() > current.rank() {
+            return Ok(proposed);
+        }
+        if current == DeliveryStage::PartiallyDelivered && proposed == DeliveryStage::Delivered {
+            return Ok(proposed);
+        }
+        if proposed.rank() < current.rank() {
+            // Keep higher stage; allow pending_reason refresh only.
+            return Ok(current);
+        }
+        Err(crate::error::StoreError::Other(format!(
+            "prompt_queue id={prompt_id}: illegal stage transition {current} → {proposed}"
+        )))
+    }
+
+    /// Atomic stage stamp: single UPDATE for stage + timestamps + reason/outcome.
+    /// Safe across connections when used under the store write lock + write_retry.
+    fn atomic_stage_stamp(
+        conn: &Connection,
+        prompt_id: i64,
+        proposed: DeliveryStage,
+        opts: AtomicStampOpts<'_>,
     ) -> Result<()> {
-        crate::shared_db::with_write_retry(|| {
-            let conn = self.conn.lock().unwrap();
-            let now = Utc::now().to_rfc3339();
-            Self::advance_highest_stage(&conn, prompt_id, stage)?;
-            conn.execute(
-                "UPDATE prompt_queue
-                 SET selected_at = COALESCE(selected_at, ?),
-                     processed_at = COALESCE(processed_at, ?),
-                     last_pending_reason = ?,
-                     last_pending_detail = ?
-                 WHERE id = ?",
-                params![now, now, reason.as_str(), detail, prompt_id],
-            )?;
-            Ok(())
-        })
+        let current = Self::read_highest_stage(conn, prompt_id)?;
+        let next = Self::resolve_stage_transition(current, proposed, prompt_id)?;
+        let now = Utc::now().to_rfc3339();
+
+        // Full Delivered always stamps transport_delivered_at; partial never does.
+        let stamp_transport = next == DeliveryStage::Delivered;
+        let stamp_processed = opts.set_processed
+            || stamp_transport
+            || next.is_terminal_non_delivery()
+            || next == DeliveryStage::PartiallyDelivered;
+
+        conn.execute(
+            "UPDATE prompt_queue SET
+                highest_stage = ?,
+                selected_at = COALESCE(selected_at, ?),
+                transport_delivered_at = CASE
+                    WHEN ? THEN COALESCE(transport_delivered_at, ?)
+                    ELSE transport_delivered_at
+                END,
+                processed_at = CASE
+                    WHEN ? THEN COALESCE(processed_at, ?)
+                    ELSE processed_at
+                END,
+                last_pending_reason = ?,
+                last_pending_detail = ?,
+                broadcast_attempted = COALESCE(?, broadcast_attempted),
+                broadcast_succeeded = COALESCE(?, broadcast_succeeded),
+                broadcast_failed = COALESCE(?, broadcast_failed)
+             WHERE id = ?",
+            params![
+                next.as_str(),
+                now,
+                stamp_transport as i64,
+                now,
+                stamp_processed as i64,
+                now,
+                opts.reason.map(|r| r.as_str()),
+                opts.detail,
+                opts.broadcast_attempted.map(|n| n as i64),
+                opts.broadcast_succeeded.map(|n| n as i64),
+                opts.broadcast_failed.map(|n| n as i64),
+                prompt_id,
+            ],
+        )?;
+        Ok(())
+    }
+}
+
+/// Options for [`SqlitePromptQueueStore::atomic_stage_stamp`].
+struct AtomicStampOpts<'a> {
+    reason: Option<PendingReason>,
+    detail: Option<&'a str>,
+    set_processed: bool,
+    broadcast_attempted: Option<u32>,
+    broadcast_succeeded: Option<u32>,
+    broadcast_failed: Option<u32>,
+}
+
+impl<'a> AtomicStampOpts<'a> {
+    fn reason(reason: PendingReason, detail: Option<&'a str>) -> Self {
+        Self {
+            reason: Some(reason),
+            detail,
+            set_processed: false,
+            broadcast_attempted: None,
+            broadcast_succeeded: None,
+            broadcast_failed: None,
+        }
+    }
+
+    fn clear_reason() -> Self {
+        Self {
+            reason: None,
+            detail: None,
+            set_processed: false,
+            broadcast_attempted: None,
+            broadcast_succeeded: None,
+            broadcast_failed: None,
+        }
     }
 }
 
@@ -836,6 +974,24 @@ impl PromptQueueStore for SqlitePromptQueueStore {
             .is_ok();
         if !has_highest_stage {
             conn.execute_batch(PROMPT_QUEUE_HIGHEST_STAGE_MIGRATION)?;
+        }
+        for (check, mig) in [
+            (
+                "SELECT broadcast_attempted FROM prompt_queue LIMIT 0",
+                PROMPT_QUEUE_BROADCAST_ATTEMPTED_MIGRATION,
+            ),
+            (
+                "SELECT broadcast_succeeded FROM prompt_queue LIMIT 0",
+                PROMPT_QUEUE_BROADCAST_SUCCEEDED_MIGRATION,
+            ),
+            (
+                "SELECT broadcast_failed FROM prompt_queue LIMIT 0",
+                PROMPT_QUEUE_BROADCAST_FAILED_MIGRATION,
+            ),
+        ] {
+            if conn.prepare_cached(check).is_err() {
+                conn.execute_batch(mig)?;
+            }
         }
 
         // Two-lane peek indexes (idempotent CREATE INDEX IF NOT EXISTS).
@@ -1114,7 +1270,13 @@ impl PromptQueueStore for SqlitePromptQueueStore {
         crate::shared_db::with_write_retry(|| {
             let conn = self.conn.lock().unwrap();
             let now = Utc::now().to_rfc3339();
-            let _ = Self::advance_highest_stage(&conn, prompt_id, DeliveryStage::Confirmed);
+            // Atomic stage advance to Confirmed (legal from Delivered or Partial).
+            let _ = Self::atomic_stage_stamp(
+                &conn,
+                prompt_id,
+                DeliveryStage::Confirmed,
+                AtomicStampOpts::clear_reason(),
+            );
             conn.execute(
                 "UPDATE prompt_queue SET acked_at = ? WHERE id = ? AND acked_at IS NULL",
                 params![now, prompt_id],
@@ -1173,7 +1335,8 @@ impl PromptQueueStore for SqlitePromptQueueStore {
         let row = conn.query_row(
             "SELECT id, source, target, created_at, processed_at, factory_session,
                     priority, acked_at, urgent, selected_at, last_pending_reason,
-                    last_pending_detail, transport_delivered_at, highest_stage
+                    last_pending_detail, transport_delivered_at, highest_stage,
+                    broadcast_attempted, broadcast_succeeded, broadcast_failed
              FROM prompt_queue WHERE id = ?",
             params![prompt_id],
             |row| {
@@ -1192,6 +1355,9 @@ impl PromptQueueStore for SqlitePromptQueueStore {
                     row.get::<_, Option<String>>(11).unwrap_or(None),
                     row.get::<_, Option<String>>(12).unwrap_or(None),
                     row.get::<_, Option<String>>(13).unwrap_or(None),
+                    row.get::<_, Option<i64>>(14).unwrap_or(None),
+                    row.get::<_, Option<i64>>(15).unwrap_or(None),
+                    row.get::<_, Option<i64>>(16).unwrap_or(None),
                 ))
             },
         );
@@ -1211,13 +1377,15 @@ impl PromptQueueStore for SqlitePromptQueueStore {
             stored_detail,
             transport_delivered_s,
             highest_stage_s,
+            bc_attempted,
+            bc_succeeded,
+            bc_failed,
         ) = match row {
             Ok(v) => v,
             Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
             Err(e) => return Err(e.into()),
         };
 
-        // Never fabricate timestamps — corrupt created_at is a hard error.
         let enqueued_at = Self::require_datetime(&created_at_s, "created_at", id)?;
         let selected_at = Self::optional_datetime(selected_at_s.as_deref(), "selected_at", id)?;
         let delivered_at = Self::optional_datetime(
@@ -1226,7 +1394,6 @@ impl PromptQueueStore for SqlitePromptQueueStore {
             id,
         )?;
         let confirmed_at = Self::optional_datetime(acked_at_s.as_deref(), "acked_at", id)?;
-        // Legacy processed_at only for MessageStatus compatibility.
         let legacy_processed = processed_at_s.is_some();
 
         let legacy_status = if confirmed_at.is_some() {
@@ -1237,28 +1404,41 @@ impl PromptQueueStore for SqlitePromptQueueStore {
             MessageStatus::Pending
         };
 
-        let stored_pending = stored_reason.as_deref().and_then(PendingReason::parse);
-        let mut stage = highest_stage_s
-            .as_deref()
-            .and_then(DeliveryStage::parse)
-            .unwrap_or(DeliveryStage::Enqueued);
+        let mut stage = match highest_stage_s {
+            None => DeliveryStage::Enqueued,
+            Some(ref s) => DeliveryStage::parse(s).ok_or_else(|| {
+                crate::error::StoreError::Parse(format!(
+                    "prompt_queue id={id}: corrupt/unknown highest_stage: {s:?}"
+                ))
+            })?,
+        };
 
-        // Reconcile from authoritative columns (still monotonic via advance).
-        if confirmed_at.is_some() {
-            stage = stage.advance(DeliveryStage::Confirmed);
-        } else if delivered_at.is_some() {
-            stage = stage.advance(DeliveryStage::Delivered);
-        } else if let Some(reason) = stored_pending {
-            stage = stage.advance(reason.implied_stage());
-        } else if selected_at.is_some() {
-            stage = stage.advance(DeliveryStage::Selected);
+        if stage == DeliveryStage::Delivered && delivered_at.is_none() {
+            return Err(crate::error::StoreError::Parse(format!(
+                "prompt_queue id={id}: invariant violated: stage=delivered without transport_delivered_at"
+            )));
+        }
+        if stage.is_terminal_non_delivery() && delivered_at.is_some() {
+            return Err(crate::error::StoreError::Parse(format!(
+                "prompt_queue id={id}: invariant violated: stage={stage} with transport_delivered_at"
+            )));
+        }
+        if stage == DeliveryStage::PartiallyDelivered && delivered_at.is_some() {
+            return Err(crate::error::StoreError::Parse(format!(
+                "prompt_queue id={id}: invariant violated: partially_delivered with transport_delivered_at"
+            )));
         }
 
+        let stored_pending = stored_reason.as_deref().and_then(PendingReason::parse);
         let (pending_reason, pending_detail) = match stage {
             DeliveryStage::Confirmed => (None, None),
             DeliveryStage::Delivered => (
                 Some(PendingReason::AwaitingAck),
                 Some("transport delivered; waiting for message_ack".into()),
+            ),
+            DeliveryStage::PartiallyDelivered => (
+                Some(stored_pending.unwrap_or(PendingReason::PartialBroadcast)),
+                stored_detail,
             ),
             DeliveryStage::Dropped => (
                 Some(stored_pending.unwrap_or(PendingReason::DroppedDeadSource)),
@@ -1276,7 +1456,6 @@ impl PromptQueueStore for SqlitePromptQueueStore {
                 if let Some(reason) = stored_pending {
                     (Some(reason), stored_detail)
                 } else {
-                    // No false queue-head inference — less specific but truthful.
                     (
                         Some(PendingReason::AwaitingDelivery),
                         Some("awaiting authoritative delivery-path observation".into()),
@@ -1284,6 +1463,10 @@ impl PromptQueueStore for SqlitePromptQueueStore {
                 }
             }
         };
+
+        if confirmed_at.is_some() {
+            stage = DeliveryStage::Confirmed;
+        }
 
         Ok(Some(MessageDeliveryReport {
             id,
@@ -1300,6 +1483,9 @@ impl PromptQueueStore for SqlitePromptQueueStore {
             confirmed_at,
             pending_reason,
             pending_detail,
+            broadcast_attempted: bc_attempted.map(|n| n as u32),
+            broadcast_succeeded: bc_succeeded.map(|n| n as u32),
+            broadcast_failed: bc_failed.map(|n| n as u32),
             wake: ObservationStatus::Unobserved,
             reaction: ObservationStatus::Unobserved,
         }))
@@ -1308,15 +1494,12 @@ impl PromptQueueStore for SqlitePromptQueueStore {
     fn record_selected(&self, prompt_id: i64) -> Result<()> {
         crate::shared_db::with_write_retry(|| {
             let conn = self.conn.lock().unwrap();
-            let now = Utc::now().to_rfc3339();
-            Self::advance_highest_stage(&conn, prompt_id, DeliveryStage::Selected)?;
-            conn.execute(
-                "UPDATE prompt_queue
-                 SET selected_at = COALESCE(selected_at, ?)
-                 WHERE id = ?",
-                params![now, prompt_id],
-            )?;
-            Ok(())
+            Self::atomic_stage_stamp(
+                &conn,
+                prompt_id,
+                DeliveryStage::Selected,
+                AtomicStampOpts::clear_reason(),
+            )
         })
     }
 
@@ -1328,65 +1511,177 @@ impl PromptQueueStore for SqlitePromptQueueStore {
     ) -> Result<()> {
         crate::shared_db::with_write_retry(|| {
             let conn = self.conn.lock().unwrap();
-            let now = Utc::now().to_rfc3339();
-            // Monotonic: Gated stays Gated even if later AdapterRetryable is stamped.
-            Self::advance_highest_stage(&conn, prompt_id, reason.implied_stage())?;
-            conn.execute(
-                "UPDATE prompt_queue
-                 SET selected_at = COALESCE(selected_at, ?),
-                     last_pending_reason = ?,
-                     last_pending_detail = ?
-                 WHERE id = ?",
-                params![now, reason.as_str(), detail, prompt_id],
-            )?;
-            Ok(())
+            Self::atomic_stage_stamp(
+                &conn,
+                prompt_id,
+                reason.implied_stage(),
+                AtomicStampOpts::reason(reason, detail),
+            )
         })
     }
 
     fn mark_transport_delivered(&self, prompt_id: i64) -> Result<()> {
         crate::shared_db::with_write_retry(|| {
             let conn = self.conn.lock().unwrap();
-            let now = Utc::now().to_rfc3339();
-            Self::advance_highest_stage(&conn, prompt_id, DeliveryStage::Delivered)?;
+            Self::atomic_stage_stamp(
+                &conn,
+                prompt_id,
+                DeliveryStage::Delivered,
+                AtomicStampOpts {
+                    reason: None,
+                    detail: None,
+                    set_processed: true,
+                    broadcast_attempted: None,
+                    broadcast_succeeded: None,
+                    broadcast_failed: None,
+                },
+            )?;
             conn.execute(
                 "UPDATE prompt_queue
-                 SET transport_delivered_at = COALESCE(transport_delivered_at, ?),
-                     processed_at = COALESCE(processed_at, ?),
-                     selected_at = COALESCE(selected_at, ?),
-                     last_pending_reason = NULL,
-                     last_pending_detail = NULL
+                 SET last_pending_reason = NULL, last_pending_detail = NULL
                  WHERE id = ?",
-                params![now, now, now, prompt_id],
+                params![prompt_id],
             )?;
             Ok(())
         })
     }
 
+    fn mark_broadcast_outcome(
+        &self,
+        prompt_id: i64,
+        attempted: u32,
+        succeeded: u32,
+        failed: u32,
+        detail: Option<&str>,
+    ) -> Result<()> {
+        crate::shared_db::with_write_retry(|| {
+            let conn = self.conn.lock().unwrap();
+            if attempted == 0 {
+                return Self::atomic_stage_stamp(
+                    &conn,
+                    prompt_id,
+                    DeliveryStage::Selected,
+                    AtomicStampOpts {
+                        reason: Some(PendingReason::NoIntendedRecipients),
+                        detail: detail.or(Some("all_workers broadcast: zero intended recipients")),
+                        set_processed: false,
+                        broadcast_attempted: Some(0),
+                        broadcast_succeeded: Some(0),
+                        broadcast_failed: Some(0),
+                    },
+                );
+            }
+            if succeeded == attempted {
+                Self::atomic_stage_stamp(
+                    &conn,
+                    prompt_id,
+                    DeliveryStage::Delivered,
+                    AtomicStampOpts {
+                        reason: None,
+                        detail: None,
+                        set_processed: true,
+                        broadcast_attempted: Some(attempted),
+                        broadcast_succeeded: Some(succeeded),
+                        broadcast_failed: Some(failed),
+                    },
+                )?;
+                conn.execute(
+                    "UPDATE prompt_queue
+                     SET last_pending_reason = NULL, last_pending_detail = NULL
+                     WHERE id = ?",
+                    params![prompt_id],
+                )?;
+                return Ok(());
+            }
+            if succeeded == 0 {
+                return Self::atomic_stage_stamp(
+                    &conn,
+                    prompt_id,
+                    DeliveryStage::Selected,
+                    AtomicStampOpts {
+                        reason: Some(PendingReason::AdapterRetryable),
+                        detail: detail.or(Some("all_workers broadcast: zero successes")),
+                        set_processed: false,
+                        broadcast_attempted: Some(attempted),
+                        broadcast_succeeded: Some(0),
+                        broadcast_failed: Some(failed),
+                    },
+                );
+            }
+            let summary = detail.unwrap_or("all_workers partial delivery");
+            let detail_owned =
+                format!("{summary}: attempted={attempted} succeeded={succeeded} failed={failed}");
+            Self::atomic_stage_stamp(
+                &conn,
+                prompt_id,
+                DeliveryStage::PartiallyDelivered,
+                AtomicStampOpts {
+                    reason: Some(PendingReason::PartialBroadcast),
+                    detail: Some(detail_owned.as_str()),
+                    set_processed: true,
+                    broadcast_attempted: Some(attempted),
+                    broadcast_succeeded: Some(succeeded),
+                    broadcast_failed: Some(failed),
+                },
+            )
+        })
+    }
+
     fn mark_dropped(&self, prompt_id: i64, detail: Option<&str>) -> Result<()> {
-        self.stamp_terminal_non_delivery(
-            prompt_id,
-            DeliveryStage::Dropped,
-            PendingReason::DroppedDeadSource,
-            detail,
-        )
+        crate::shared_db::with_write_retry(|| {
+            let conn = self.conn.lock().unwrap();
+            Self::atomic_stage_stamp(
+                &conn,
+                prompt_id,
+                DeliveryStage::Dropped,
+                AtomicStampOpts {
+                    reason: Some(PendingReason::DroppedDeadSource),
+                    detail,
+                    set_processed: true,
+                    broadcast_attempted: None,
+                    broadcast_succeeded: None,
+                    broadcast_failed: None,
+                },
+            )
+        })
     }
 
     fn mark_suppressed(&self, prompt_id: i64, detail: Option<&str>) -> Result<()> {
-        self.stamp_terminal_non_delivery(
-            prompt_id,
-            DeliveryStage::Suppressed,
-            PendingReason::SuppressedIdle,
-            detail,
-        )
+        crate::shared_db::with_write_retry(|| {
+            let conn = self.conn.lock().unwrap();
+            Self::atomic_stage_stamp(
+                &conn,
+                prompt_id,
+                DeliveryStage::Suppressed,
+                AtomicStampOpts {
+                    reason: Some(PendingReason::SuppressedIdle),
+                    detail,
+                    set_processed: true,
+                    broadcast_attempted: None,
+                    broadcast_succeeded: None,
+                    broadcast_failed: None,
+                },
+            )
+        })
     }
 
     fn mark_abandoned(&self, prompt_id: i64, detail: Option<&str>) -> Result<()> {
-        self.stamp_terminal_non_delivery(
-            prompt_id,
-            DeliveryStage::Abandoned,
-            PendingReason::AbandonedUnknownTarget,
-            detail,
-        )
+        crate::shared_db::with_write_retry(|| {
+            let conn = self.conn.lock().unwrap();
+            Self::atomic_stage_stamp(
+                &conn,
+                prompt_id,
+                DeliveryStage::Abandoned,
+                AtomicStampOpts {
+                    reason: Some(PendingReason::AbandonedUnknownTarget),
+                    detail,
+                    set_processed: true,
+                    broadcast_attempted: None,
+                    broadcast_succeeded: None,
+                    broadcast_failed: None,
+                },
+            )
+        })
     }
 
     fn pending_count(&self) -> Result<usize> {
@@ -2641,5 +2936,161 @@ mod tests {
             msg.contains("corrupt") || msg.contains("unparseable") || msg.contains("parse"),
             "expected parse error, got {msg}"
         );
+    }
+
+    #[test]
+    fn test_broadcast_all_success_is_delivered() {
+        let (_temp, store) = create_test_store();
+        let id = store.enqueue("sup", "all_workers", "hi all").unwrap();
+        store.mark_broadcast_outcome(id, 3, 3, 0, None).unwrap();
+        let r = store.message_delivery_report(id).unwrap().unwrap();
+        assert_eq!(r.stage, DeliveryStage::Delivered);
+        assert!(r.delivered_at.is_some());
+        assert_eq!(r.broadcast_attempted, Some(3));
+        assert_eq!(r.broadcast_succeeded, Some(3));
+        assert_eq!(r.broadcast_failed, Some(0));
+    }
+
+    #[test]
+    fn test_broadcast_mixed_is_partial_never_full_delivered() {
+        let (_temp, store) = create_test_store();
+        let id = store.enqueue("sup", "all_workers", "hi all").unwrap();
+        store
+            .mark_broadcast_outcome(id, 3, 2, 1, Some("w3 failed"))
+            .unwrap();
+        let r = store.message_delivery_report(id).unwrap().unwrap();
+        assert_eq!(r.stage, DeliveryStage::PartiallyDelivered);
+        assert!(
+            r.delivered_at.is_none(),
+            "partial must not set transport_delivered_at"
+        );
+        assert_eq!(r.pending_reason, Some(PendingReason::PartialBroadcast));
+        assert_eq!(r.broadcast_attempted, Some(3));
+        assert_eq!(r.broadcast_succeeded, Some(2));
+        assert_eq!(r.broadcast_failed, Some(1));
+        // Legacy processed so queue drains (no re-inject of successes).
+        assert_eq!(r.legacy_status, MessageStatus::Delivered);
+    }
+
+    #[test]
+    fn test_broadcast_zero_success_stays_pending_retryable() {
+        let (_temp, store) = create_test_store();
+        let id = store.enqueue("sup", "all_workers", "hi all").unwrap();
+        store
+            .mark_broadcast_outcome(id, 2, 0, 2, Some("all failed"))
+            .unwrap();
+        let r = store.message_delivery_report(id).unwrap().unwrap();
+        assert_ne!(r.stage, DeliveryStage::Delivered);
+        assert!(r.delivered_at.is_none());
+        assert_eq!(r.pending_reason, Some(PendingReason::AdapterRetryable));
+        assert_eq!(r.legacy_status, MessageStatus::Pending); // not processed
+    }
+
+    #[test]
+    fn test_broadcast_zero_intended_recipients() {
+        let (_temp, store) = create_test_store();
+        let id = store.enqueue("sup", "all_workers", "hi all").unwrap();
+        store.mark_broadcast_outcome(id, 0, 0, 0, None).unwrap();
+        let r = store.message_delivery_report(id).unwrap().unwrap();
+        assert_eq!(r.pending_reason, Some(PendingReason::NoIntendedRecipients));
+        assert!(r.delivered_at.is_none());
+        assert_eq!(r.legacy_status, MessageStatus::Pending);
+    }
+
+    #[test]
+    fn test_partial_to_delivered_legal_transition() {
+        let (_temp, store) = create_test_store();
+        let id = store.enqueue("sup", "all_workers", "hi").unwrap();
+        store
+            .mark_broadcast_outcome(id, 2, 1, 1, Some("mixed"))
+            .unwrap();
+        assert_eq!(
+            store.message_delivery_report(id).unwrap().unwrap().stage,
+            DeliveryStage::PartiallyDelivered
+        );
+        // Completing remaining recipients may advance Partial → Delivered.
+        store.mark_transport_delivered(id).unwrap();
+        let r = store.message_delivery_report(id).unwrap().unwrap();
+        assert_eq!(r.stage, DeliveryStage::Delivered);
+        assert!(r.delivered_at.is_some());
+    }
+
+    #[test]
+    fn test_illegal_terminal_sibling_rewrite_rejected() {
+        let (_temp, store) = create_test_store();
+        let id = store.enqueue("s", "w", "x").unwrap();
+        store.mark_dropped(id, Some("dead")).unwrap();
+        let err = store
+            .mark_abandoned(id, Some("should fail"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("illegal stage transition"),
+            "expected illegal transition, got {err}"
+        );
+        let r = store.message_delivery_report(id).unwrap().unwrap();
+        assert_eq!(r.stage, DeliveryStage::Dropped);
+        assert!(r.delivered_at.is_none());
+    }
+
+    #[test]
+    fn test_corrupt_highest_stage_errors() {
+        let (_temp, store) = create_test_store();
+        let id = store.enqueue("s", "w", "x").unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE prompt_queue SET highest_stage = 'not-a-stage' WHERE id = ?",
+                params![id],
+            )
+            .unwrap();
+        }
+        let err = store.message_delivery_report(id).unwrap_err().to_string();
+        assert!(
+            err.contains("corrupt") || err.contains("unknown highest_stage"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn test_invariants_delivered_requires_transport_ts() {
+        let (_temp, store) = create_test_store();
+        let id = store.enqueue("s", "w", "x").unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE prompt_queue SET highest_stage = 'delivered', transport_delivered_at = NULL WHERE id = ?",
+                params![id],
+            )
+            .unwrap();
+        }
+        let err = store.message_delivery_report(id).unwrap_err().to_string();
+        assert!(err.contains("invariant violated"), "got {err}");
+    }
+
+    #[test]
+    fn test_monotonic_repeated_calls_idempotent() {
+        let (_temp, store) = create_test_store();
+        let id = store.enqueue("s", "w", "x").unwrap();
+        store.record_selected(id).unwrap();
+        store.record_selected(id).unwrap();
+        store
+            .record_pending_reason(id, PendingReason::GatedNotReady, Some("gate"))
+            .unwrap();
+        store
+            .record_pending_reason(id, PendingReason::GatedNotReady, Some("gate again"))
+            .unwrap();
+        store
+            .record_pending_reason(id, PendingReason::AdapterRetryable, Some("retry"))
+            .unwrap();
+        let r = store.message_delivery_report(id).unwrap().unwrap();
+        assert_eq!(r.stage, DeliveryStage::Gated);
+        assert_eq!(r.pending_reason, Some(PendingReason::AdapterRetryable));
+        store.mark_transport_delivered(id).unwrap();
+        store.mark_transport_delivered(id).unwrap();
+        let r = store.message_delivery_report(id).unwrap().unwrap();
+        assert_eq!(r.stage, DeliveryStage::Delivered);
+        assert!(r.delivered_at.is_some());
+        assert_eq!(r.wake, ObservationStatus::Unobserved);
     }
 }

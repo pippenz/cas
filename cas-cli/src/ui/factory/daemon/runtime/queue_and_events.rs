@@ -416,6 +416,8 @@ impl FactoryDaemon {
 
             let mut success = false;
             if target == "all_workers" {
+                // cas-2c5f: truthful broadcast outcomes — never stamp full
+                // Delivered on any_success. Count intended/succeeded/failed.
                 let workers: Vec<String> = self
                     .app
                     .worker_names()
@@ -427,21 +429,33 @@ impl FactoryDaemon {
                     .cloned()
                     .collect();
                 tracing::info!("all_workers target, workers: {:?}", workers);
-                if workers.is_empty() {
+                let attempted = workers.len() as u32;
+                if attempted == 0 {
+                    let _ = queue.mark_broadcast_outcome(
+                        queued.id,
+                        0,
+                        0,
+                        0,
+                        Some("no non-native workers for all_workers broadcast"),
+                    );
                     continue;
                 }
-                let mut any_success = false;
-                for name in workers {
+                let mut succeeded: u32 = 0;
+                let mut failed: u32 = 0;
+                let mut fail_notes: Vec<String> = Vec::new();
+                for name in &workers {
                     // For urgent broadcasts, skip workers whose pane isn't ready
-                    // yet (don't ack the row — it stays queued for retry).
-                    if queued.urgent && !self.app.mux.pane_ready_for_injection(&name) {
+                    // yet — count as failed for this tick (not full delivery).
+                    if queued.urgent && !self.app.mux.pane_ready_for_injection(name) {
+                        failed += 1;
+                        fail_notes.push(format!("{name}: pane not ready"));
                         continue;
                     }
                     let inject_result: anyhow::Result<()> = if queued.urgent {
-                        let settle = self.urgent_settle_duration(&name);
+                        let settle = self.urgent_settle_duration(name);
                         self.app
                             .mux
-                            .interrupt_and_inject(&name, &prompt_with_instructions, settle)
+                            .interrupt_and_inject(name, &prompt_with_instructions, settle)
                             .await
                             .map_err(Into::into)
                     } else {
@@ -450,7 +464,7 @@ impl FactoryDaemon {
                         // color=None: peer/supervisor senders; team manager resolves
                         // configured color from the sender's team record.
                         self.deliver_to_worker(
-                            &name,
+                            name,
                             &inbox_source,
                             &prompt_with_instructions,
                             queued.summary.as_deref(),
@@ -460,7 +474,7 @@ impl FactoryDaemon {
                     };
                     match inject_result {
                         Ok(_) => {
-                            any_success = true;
+                            succeeded += 1;
                             tracing::info!("Injected to worker '{}'", name);
                             if let Some(ref store) = event_store {
                                 record_injection(
@@ -468,13 +482,15 @@ impl FactoryDaemon {
                                     queued.id,
                                     &queued.source,
                                     &queued.target,
-                                    &name,
+                                    name,
                                     "ok",
                                     None,
                                 );
                             }
                         }
                         Err(e) => {
+                            failed += 1;
+                            fail_notes.push(format!("{name}: {e}"));
                             tracing::error!("Failed to inject to '{}': {}", name, e);
                             if let Some(ref store) = event_store {
                                 record_injection(
@@ -482,7 +498,7 @@ impl FactoryDaemon {
                                     queued.id,
                                     &queued.source,
                                     &queued.target,
-                                    &name,
+                                    name,
                                     "error",
                                     Some(e.to_string()),
                                 );
@@ -490,7 +506,26 @@ impl FactoryDaemon {
                         }
                     }
                 }
-                success = any_success;
+                let detail = if fail_notes.is_empty() {
+                    None
+                } else {
+                    Some(fail_notes.join("; "))
+                };
+                if let Err(e) = queue.mark_broadcast_outcome(
+                    queued.id,
+                    attempted,
+                    succeeded,
+                    failed,
+                    detail.as_deref(),
+                ) {
+                    tracing::error!(
+                        "Failed to stamp broadcast outcome for prompt {}: {}",
+                        queued.id,
+                        e
+                    );
+                }
+                // Do not fall through to mark_transport_delivered — outcome already stamped.
+                continue;
             } else {
                 // Resolve the pane name for diagnostics / event records. Delivery
                 // itself (channel selection + name normalisation) is handled by the
