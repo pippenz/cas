@@ -30,7 +30,7 @@ mod branch_visibility;
 mod imports;
 mod init;
 mod panels_and_modes;
-mod render_and_ops;
+pub(crate) mod render_and_ops;
 mod sidecar_and_selection;
 
 pub(crate) use branch_visibility::BranchAheadBehind;
