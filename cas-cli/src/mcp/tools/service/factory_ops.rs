@@ -1114,7 +1114,6 @@ impl CasService {
     ) -> Result<CallToolResult, McpError> {
         use crate::store::{open_agent_store, open_task_store};
         use cas_types::{AgentRole, AgentStatus, TaskStatus, TaskType};
-        use std::path::Path;
 
         let store = open_agent_store(&self.inner.cas_root).map_err(|e| {
             Self::error(
@@ -1203,23 +1202,20 @@ impl CasService {
         let mut failed = Vec::new();
 
         for worker in workers {
-            let clone_path = match worker.metadata.get("clone_path") {
-                Some(p) => p.clone(),
-                None => {
-                    skipped.push(format!("{} (missing clone_path metadata)", worker.name));
-                    continue;
-                }
-            };
-            let path = Path::new(&clone_path);
-            if !path.exists() {
-                skipped.push(format!(
-                    "{} (clone path not found: {})",
-                    worker.name, clone_path
-                ));
+            // cas-f53c: same path resolution as worker_status — do not require
+            // clone_path metadata when the convention worktree already exists
+            // (common race right after isolate spawn).
+            let resolve = resolve_worker_clone_path(&self.inner.cas_root, &worker);
+            if let Some(reason) = sync_skip_reason_for_clone_resolve(&worker.name, &resolve) {
+                skipped.push(reason);
                 continue;
             }
+            let WorkerClonePathResolve::Ready(path) = resolve else {
+                // Exhaustive: skip helper already covered NotOnDisk.
+                continue;
+            };
 
-            match sync_worker_clone(path, &sync_ref) {
+            match sync_worker_clone(&path, &sync_ref) {
                 Ok(details) => synced.push(format!("{} ({})", worker.name, details)),
                 Err(err) => failed.push(format!("{} ({})", worker.name, err)),
             }
@@ -1639,36 +1635,101 @@ struct WorkerWorktreeStatus {
     git_info: String,
 }
 
+/// cas-f53c: shared resolution for worker clone/worktree path used by both
+/// `worker_status` and `sync_all_workers`.
+///
+/// Priority when a path exists on disk:
+/// 1. `agent.metadata["clone_path"]` if present and exists
+/// 2. Convention path `{cas_root}/worktrees/{worker_name}` if it exists
+///
+/// When nothing is on disk, returns `NotOnDisk` with the best candidate path
+/// for messaging (metadata if set, else convention). Sync treats that as a
+/// **retryable** skip (registration/provisioning lag), not a success.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WorkerClonePathResolve {
+    /// Worktree path exists and is ready for git ops / status.
+    Ready(std::path::PathBuf),
+    /// No worktree on disk at metadata or convention path.
+    NotOnDisk {
+        candidate: std::path::PathBuf,
+        /// True when `clone_path` metadata was set (even if the path is missing).
+        had_metadata: bool,
+    },
+}
+
+fn resolve_worker_clone_path(
+    cas_root: &std::path::Path,
+    agent: &cas_types::Agent,
+) -> WorkerClonePathResolve {
+    let metadata_path = agent
+        .metadata
+        .get("clone_path")
+        .map(|s| std::path::PathBuf::from(s));
+    let convention_path = cas_root.join("worktrees").join(&agent.name);
+
+    if let Some(ref meta) = metadata_path {
+        if meta.exists() {
+            return WorkerClonePathResolve::Ready(meta.clone());
+        }
+    }
+    if convention_path.exists() {
+        return WorkerClonePathResolve::Ready(convention_path);
+    }
+
+    WorkerClonePathResolve::NotOnDisk {
+        candidate: metadata_path.unwrap_or(convention_path),
+        had_metadata: agent.metadata.contains_key("clone_path"),
+    }
+}
+
+/// Human-readable skip reason for `sync_all_workers` when no worktree is ready.
+/// Pure for unit testing (cas-f53c).
+fn sync_skip_reason_for_clone_resolve(
+    worker_name: &str,
+    resolve: &WorkerClonePathResolve,
+) -> Option<String> {
+    match resolve {
+        WorkerClonePathResolve::Ready(_) => None,
+        WorkerClonePathResolve::NotOnDisk {
+            candidate,
+            had_metadata: false,
+        } => Some(format!(
+            "{worker_name} (registration in progress or no worktree — retry sync after \
+             isolate spawn completes; expected path: {})",
+            candidate.display()
+        )),
+        WorkerClonePathResolve::NotOnDisk {
+            candidate,
+            had_metadata: true,
+        } => Some(format!(
+            "{worker_name} (clone path not found: {} — retry if spawn still provisioning)",
+            candidate.display()
+        )),
+    }
+}
+
 fn collect_worker_worktree_status(
     cas_root: &std::path::Path,
     agent: &cas_types::Agent,
 ) -> WorkerWorktreeStatus {
-    let metadata_clone_path = agent.metadata.get("clone_path").cloned();
-    let inferred_path = cas_root.join("worktrees").join(&agent.name);
-
-    let resolved_path = metadata_clone_path
-        .clone()
-        .filter(|path| std::path::Path::new(path).exists())
-        .or_else(|| {
-            inferred_path
-                .exists()
-                .then(|| inferred_path.display().to_string())
-        });
-
-    if let Some(clone_path) = resolved_path {
-        let gs = collect_worker_git_status(std::path::Path::new(&clone_path));
-        return WorkerWorktreeStatus {
-            clone_info: format!("\n    Clone: {clone_path}"),
-            git_info: format_worker_git_status(&gs),
-            clone_path: Some(clone_path),
-        };
-    }
-
-    let missing_path = metadata_clone_path.unwrap_or_else(|| inferred_path.display().to_string());
-    WorkerWorktreeStatus {
-        clone_info: format!("\n    Clone: {missing_path} [missing-worktree]"),
-        git_info: "\n    git: missing-worktree".to_string(),
-        clone_path: Some(missing_path),
+    match resolve_worker_clone_path(cas_root, agent) {
+        WorkerClonePathResolve::Ready(path) => {
+            let clone_path = path.display().to_string();
+            let gs = collect_worker_git_status(&path);
+            WorkerWorktreeStatus {
+                clone_info: format!("\n    Clone: {clone_path}"),
+                git_info: format_worker_git_status(&gs),
+                clone_path: Some(clone_path),
+            }
+        }
+        WorkerClonePathResolve::NotOnDisk { candidate, .. } => {
+            let missing_path = candidate.display().to_string();
+            WorkerWorktreeStatus {
+                clone_info: format!("\n    Clone: {missing_path} [missing-worktree]"),
+                git_info: "\n    git: missing-worktree".to_string(),
+                clone_path: Some(missing_path),
+            }
+        }
     }
 }
 
@@ -4005,6 +4066,96 @@ effort = "high"
             out.contains("not pushed") || out.contains("none"),
             "unpushed state must be visible in output: {out}"
         );
+    }
+
+    // --- cas-f53c: sync_all_workers clone_path resolution -----------------
+
+    #[test]
+    fn resolve_worker_clone_path_uses_convention_when_metadata_absent_and_worktree_exists() {
+        let (_tmp, project) = setup_factory_project_with_worker_worktrees(&["recipes-fixer"]);
+        let cas_root = project.join(".cas");
+        let expected = cas_root.join("worktrees/recipes-fixer");
+        let agent = cas_types::Agent::new_with_role(
+            "session-1".to_string(),
+            "recipes-fixer".to_string(),
+            AgentRole::Worker,
+        );
+        // No clone_path metadata — the post-spawn race in the bug report.
+        assert!(!agent.metadata.contains_key("clone_path"));
+
+        match resolve_worker_clone_path(&cas_root, &agent) {
+            WorkerClonePathResolve::Ready(path) => {
+                assert_eq!(path, expected);
+            }
+            other => panic!("expected Ready(convention path), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_worker_clone_path_prefers_existing_metadata_over_convention() {
+        let (_tmp, project) =
+            setup_factory_project_with_worker_worktrees(&["named-a", "named-b"]);
+        let cas_root = project.join(".cas");
+        let meta_path = cas_root.join("worktrees/named-b");
+        let mut agent = cas_types::Agent::new_with_role(
+            "session-1".to_string(),
+            "named-a".to_string(),
+            AgentRole::Worker,
+        );
+        agent.metadata.insert(
+            "clone_path".to_string(),
+            meta_path.to_string_lossy().to_string(),
+        );
+
+        match resolve_worker_clone_path(&cas_root, &agent) {
+            WorkerClonePathResolve::Ready(path) => assert_eq!(path, meta_path),
+            other => panic!("expected Ready(metadata path), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_worker_clone_path_not_on_disk_when_neither_exists() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let cas_root = tmp.path().join(".cas");
+        std::fs::create_dir_all(&cas_root).unwrap();
+        let agent = cas_types::Agent::new_with_role(
+            "session-1".to_string(),
+            "ghost-worker".to_string(),
+            AgentRole::Worker,
+        );
+
+        match resolve_worker_clone_path(&cas_root, &agent) {
+            WorkerClonePathResolve::NotOnDisk {
+                candidate,
+                had_metadata,
+            } => {
+                assert!(!had_metadata);
+                assert_eq!(candidate, cas_root.join("worktrees/ghost-worker"));
+            }
+            other => panic!("expected NotOnDisk, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sync_skip_reason_is_retryable_when_metadata_missing_and_no_worktree() {
+        let resolve = WorkerClonePathResolve::NotOnDisk {
+            candidate: std::path::PathBuf::from("/proj/.cas/worktrees/w1"),
+            had_metadata: false,
+        };
+        let msg = sync_skip_reason_for_clone_resolve("w1", &resolve).expect("skip reason");
+        assert!(
+            msg.contains("registration in progress") || msg.contains("retry"),
+            "must be retryable, not silent missing-metadata: {msg}"
+        );
+        assert!(
+            !msg.contains("missing clone_path metadata"),
+            "old skip text must not return: {msg}"
+        );
+        assert!(sync_skip_reason_for_clone_resolve(
+            "w1",
+            &WorkerClonePathResolve::Ready(std::path::PathBuf::from("/x"))
+        )
+        .is_none());
     }
 
     #[test]
