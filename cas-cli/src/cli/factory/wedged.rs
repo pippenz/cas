@@ -190,6 +190,12 @@ const CRASH_SIGNATURE_NEEDLES: &[&str] = &[
 /// `process_busy` is true when the resolved worker PID is consuming CPU
 /// (cas-c655: codex mid-inference must not be Starved solely because the
 /// rollout path was unresolved or cold).
+///
+/// **cas-de95:** a **missing/unresolved** transcript (`transcript_mtime_age =
+/// None`) is missing evidence, not proof of inactivity. Without a positive
+/// progress signal (worktree / CPU) it classifies [`WorkerLivenessState::Unverified`]
+/// rather than Starved — so director/auto-nudge paths must not treat telemetry
+/// absence as starvation.
 pub(crate) fn classify_from_evidence(
     pid_alive: bool,
     transcript_mtime_age: Option<Duration>,
@@ -198,6 +204,8 @@ pub(crate) fn classify_from_evidence(
     process_busy: bool,
     fresh_window: Duration,
 ) -> WorkerLivenessState {
+    // Distinguish unresolved (None) from resolved-but-stale (Some(age ≥ window)).
+    let transcript_resolved = transcript_mtime_age.is_some();
     let fresh = transcript_mtime_age
         .map(|age| age < fresh_window)
         .unwrap_or(false);
@@ -223,11 +231,12 @@ pub(crate) fn classify_from_evidence(
     match (fresh, crash_signature) {
         (true, true) => WorkerLivenessState::Wedged,
         (true, false) => WorkerLivenessState::Alive,
-        // cas-c655: missing/stale transcript alone must not force Starved
-        // when the process is demonstrably busy (CPU) or the worktree was
-        // recently written (including a fresh HEAD commit). Healthy codex
-        // workers mid-inference hit this path constantly.
+        // Positive activity overrides a cold/missing transcript (cas-c655).
         (false, _) if worktree_recent || process_busy => WorkerLivenessState::Alive,
+        // cas-de95: unresolved transcript + no other progress signal →
+        // Unverified (investigate), not Starved. A resolved but stale
+        // transcript with no activity remains genuine Starved.
+        (false, _) if !transcript_resolved => WorkerLivenessState::Unverified,
         (false, _) => WorkerLivenessState::Starved,
     }
 }
@@ -1399,9 +1408,47 @@ mod tests {
     }
 
     #[test]
-    fn classify_starved_when_no_mtime_available() {
-        // File missing / mtime unreadable → treated as not-fresh.
+    fn classify_unverified_when_no_mtime_available() {
+        // cas-de95: missing/unresolved transcript is missing evidence, not
+        // Starved — even if a crash needle were claimed without a file.
         let got = classify_from_evidence(true, None, true, None, false, TRANSCRIPT_FRESH_WINDOW);
+        assert_eq!(got, WorkerLivenessState::Unverified);
+        let got_clean =
+            classify_from_evidence(true, None, false, None, false, TRANSCRIPT_FRESH_WINDOW);
+        assert_eq!(got_clean, WorkerLivenessState::Unverified);
+    }
+
+    /// cas-de95: Claude + Codex with unresolved transcript + recent worktree → Alive.
+    #[test]
+    fn classify_claude_and_codex_unresolved_with_worktree_are_alive() {
+        for window in [TRANSCRIPT_FRESH_WINDOW, CODEX_TRANSCRIPT_FRESH_WINDOW] {
+            let got = classify_from_evidence(
+                true,
+                None,
+                false,
+                Some(Duration::from_secs(10)),
+                false,
+                window,
+            );
+            assert_eq!(
+                got,
+                WorkerLivenessState::Alive,
+                "window={window:?}"
+            );
+        }
+    }
+
+    /// cas-de95: genuine starvation requires a resolved cold transcript.
+    #[test]
+    fn classify_genuine_starvation_when_transcript_stale_and_no_activity() {
+        let got = classify_from_evidence(
+            true,
+            Some(Duration::from_secs(10 * 60)),
+            false,
+            None,
+            false,
+            TRANSCRIPT_FRESH_WINDOW,
+        );
         assert_eq!(got, WorkerLivenessState::Starved);
     }
 
@@ -1757,8 +1804,8 @@ mod tests {
             |_: u32| false,
         );
         assert!(called.get(), "probe must be called when pid is Some");
-        // no transcript → not fresh, crash=false, alive=true → Starved.
-        assert_eq!(state, WorkerLivenessState::Starved);
+        // cas-de95: no transcript → Unverified (missing evidence), not Starved.
+        assert_eq!(state, WorkerLivenessState::Unverified);
         assert_eq!(ev.pid, Some(1234));
         assert!(ev.pid_alive);
         assert!(!ev.crash_signature_match);
