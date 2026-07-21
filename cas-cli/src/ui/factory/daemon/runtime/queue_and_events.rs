@@ -1208,6 +1208,14 @@ impl FactoryDaemon {
             };
 
             for reminder in &candidates {
+                // cas-fcd4: only fire reminds registered in this factory session
+                // (shared cas.db otherwise cross-fires concurrent sessions).
+                if !reminder_matches_factory_session(
+                    reminder.session_id.as_deref(),
+                    &self.session_name,
+                ) {
+                    continue;
+                }
                 if matches_event_filter(reminder, event) {
                     fire_reminder(
                         reminder,
@@ -1424,11 +1432,28 @@ fn fire_reminder(
     }
 }
 
+/// Whether this factory daemon session may fire the reminder (cas-fcd4).
+///
+/// Reminders registered with a non-empty `session_id` only fire when the
+/// processing daemon's session name matches. Legacy / non-factory reminds
+/// (`session_id` unset) still fire in any session so single-session behavior
+/// is unchanged.
+pub(crate) fn reminder_matches_factory_session(
+    reminder_session_id: Option<&str>,
+    current_session: &str,
+) -> bool {
+    match reminder_session_id.map(str::trim).filter(|s| !s.is_empty()) {
+        None => true,
+        Some(sid) => sid == current_session,
+    }
+}
+
 /// Check if a reminder's event filter matches a detected DirectorEvent.
 ///
 /// Uses JSON subset matching: every key-value in the filter must appear
 /// in the event's JSON representation. An empty or missing filter matches
-/// any event of the correct type.
+/// any event of the correct type (after session scoping — see
+/// [`reminder_matches_factory_session`]).
 fn matches_event_filter(
     reminder: &cas_store::Reminder,
     event: &crate::ui::factory::director::DirectorEvent,
@@ -1460,10 +1485,79 @@ fn is_exact_agent_name_match(agent: &AgentSummary, worker_name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_exact_agent_name_match;
+    use super::{
+        is_exact_agent_name_match, matches_event_filter, reminder_matches_factory_session,
+    };
     use crate::ui::factory::daemon::FactoryDaemon;
-    use crate::ui::factory::director::AgentSummary;
+    use crate::ui::factory::director::{AgentSummary, DirectorEvent};
     use cas_types::AgentStatus;
+
+    // -----------------------------------------------------------------------
+    // cas-fcd4: event remind session scoping
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn reminder_session_scope_blocks_foreign_factory_session() {
+        assert!(
+            !reminder_matches_factory_session(Some("session-a"), "session-b"),
+            "session A remind must not fire in session B"
+        );
+        assert!(
+            reminder_matches_factory_session(Some("session-a"), "session-a"),
+            "same-session must match"
+        );
+    }
+
+    #[test]
+    fn reminder_session_scope_legacy_none_matches_any_session() {
+        // Single-session / pre-cas-fcd4 rows keep working.
+        assert!(reminder_matches_factory_session(None, "session-a"));
+        assert!(reminder_matches_factory_session(None, "session-b"));
+        assert!(reminder_matches_factory_session(Some(""), "session-a"));
+        assert!(reminder_matches_factory_session(Some("  "), "session-b"));
+    }
+
+    #[test]
+    fn matches_event_filter_task_id_still_works() {
+        let reminder = cas_store::Reminder {
+            id: 1,
+            owner_id: "owner".into(),
+            target_id: "owner".into(),
+            message: "review".into(),
+            trigger_type: cas_store::ReminderTriggerType::Event,
+            trigger_at: None,
+            trigger_event: Some("task_completed".into()),
+            trigger_filter: Some(serde_json::json!({"task_id": "cas-keep"})),
+            status: cas_store::ReminderStatus::Pending,
+            ttl_secs: 3600,
+            created_at: chrono::Utc::now(),
+            fired_at: None,
+            cancelled_at: None,
+            fired_event: None,
+            session_id: Some("session-a".into()),
+        };
+        let match_event = DirectorEvent::TaskCompleted {
+            task_id: "cas-keep".into(),
+            task_title: "Keep".into(),
+            worker: "worker-1".into(),
+        };
+        let other_event = DirectorEvent::TaskCompleted {
+            task_id: "cas-other".into(),
+            task_title: "Other".into(),
+            worker: "worker-2".into(),
+        };
+        assert!(matches_event_filter(&reminder, &match_event));
+        assert!(!matches_event_filter(&reminder, &other_event));
+        // Session gate is separate: filter alone still matches; session blocks foreign.
+        assert!(reminder_matches_factory_session(
+            reminder.session_id.as_deref(),
+            "session-a"
+        ));
+        assert!(!reminder_matches_factory_session(
+            reminder.session_id.as_deref(),
+            "session-b"
+        ));
+    }
 
     #[test]
     fn test_agent_match_is_exact_not_substring() {
