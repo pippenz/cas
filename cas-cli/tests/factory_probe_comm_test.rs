@@ -142,6 +142,48 @@ fn write_composed_receipts(root: &std::path::Path) {
     .unwrap();
 }
 
+fn write_slo_samples(
+    root: &std::path::Path,
+    normal_transport_ms: &[u64],
+    urgent_transport_ms: &[u64],
+    wake_ms: &[u64],
+    reaction_ms: &[u64],
+) {
+    let receipts = root.join("receipts");
+    std::fs::create_dir_all(&receipts).unwrap();
+    std::fs::write(
+        receipts.join("slo_samples.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "receipt_type": "probe_comm_slo_samples",
+            "provenance": "receipt:multi-sample conformance run",
+            "normal_transport_ms": normal_transport_ms,
+            "urgent_transport_ms": urgent_transport_ms,
+            "wake_ms": wake_ms,
+            "reaction_ms": reaction_ms
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn probe_comm_help_exposes_epic_slo_defaults() {
+    cas_cmd()
+        .args(["factory", "probe-comm", "--help"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("--normal-transport-p95-slo-ms"))
+        .stdout(predicates::str::contains("--normal-transport-max-slo-ms"))
+        .stdout(predicates::str::contains("--urgent-transport-p95-slo-ms"))
+        .stdout(predicates::str::contains("--urgent-transport-max-slo-ms"))
+        .stdout(predicates::str::contains("--wake-p95-slo-ms"))
+        .stdout(predicates::str::contains("--reaction-p95-slo-ms"))
+        .stdout(predicates::str::contains("2000"))
+        .stdout(predicates::str::contains("10000"))
+        .stdout(predicates::str::contains("5000"))
+        .stdout(predicates::str::contains("15000"));
+}
+
 #[test]
 fn probe_comm_cli_writes_jsonl_with_fake_adapter() {
     let temp = tempfile::tempdir().unwrap();
@@ -193,6 +235,13 @@ fn probe_comm_cli_all_adapters_writes_recorded_fixture_report() {
     let artifacts = temp.path().join("artifacts");
     write_adapter_artifacts(&artifacts);
     write_composed_receipts(&artifacts);
+    write_slo_samples(
+        &artifacts,
+        &[100, 300, 500, 800, 1200],
+        &[100, 300, 500, 800, 1200],
+        &[100, 800, 1500, 2500, 4000],
+        &[100, 2000, 4000, 7000, 12000],
+    );
 
     cas_cmd()
         .args([
@@ -272,6 +321,20 @@ fn probe_comm_cli_all_adapters_writes_recorded_fixture_report() {
         }),
         "lifecycle OBSERVED requires the merged cas-ecff receipt: {lifecycle}"
     );
+    let slo = lines
+        .iter()
+        .find(|line| line["scenario"] == "slo_aggregate_evidence")
+        .unwrap();
+    assert_eq!(slo["passed"], true);
+    assert_eq!(slo["slo_contract"]["normal_transport_p95_ms"], 2000);
+    assert_eq!(slo["slo_contract"]["normal_transport_max_ms"], 10000);
+    assert_eq!(slo["slo_contract"]["urgent_transport_p95_ms"], 2000);
+    assert_eq!(slo["slo_contract"]["urgent_transport_max_ms"], 5000);
+    assert_eq!(slo["slo_contract"]["wake_p95_ms"], 5000);
+    assert_eq!(slo["slo_contract"]["reaction_p95_ms"], 15000);
+    let aggregates = slo["aggregate_slos"].as_array().unwrap();
+    assert!(aggregates.iter().all(|agg| agg["sample_count"].as_u64().unwrap() >= 5));
+    assert!(aggregates.iter().all(|agg| agg["provenance"] == "receipt:multi-sample conformance run"));
 }
 
 #[test]
@@ -350,6 +413,78 @@ fn probe_comm_cli_malformed_receipt_is_stage_failure() {
 }
 
 #[test]
+fn probe_comm_cli_slo_aggregate_receipt_enforces_epic_boundaries() {
+    let temp = tempfile::tempdir().unwrap();
+    let artifacts = temp.path().join("artifacts");
+    write_adapter_artifacts(&artifacts);
+    write_composed_receipts(&artifacts);
+
+    let cases = [
+        (
+            "normal_transport_p95",
+            vec![100, 300, 500, 800, 2500],
+            vec![100, 300, 500, 800, 1200],
+            vec![100, 800, 1500, 2500, 4000],
+            vec![100, 2000, 4000, 7000, 12000],
+        ),
+        (
+            "normal_transport_max",
+            vec![100, 300, 500, 800, 12000],
+            vec![100, 300, 500, 800, 1200],
+            vec![100, 800, 1500, 2500, 4000],
+            vec![100, 2000, 4000, 7000, 12000],
+        ),
+        (
+            "urgent_transport_max",
+            vec![100, 300, 500, 800, 1200],
+            vec![100, 300, 500, 800, 6000],
+            vec![100, 800, 1500, 2500, 4000],
+            vec![100, 2000, 4000, 7000, 12000],
+        ),
+        (
+            "wake_p95",
+            vec![100, 300, 500, 800, 1200],
+            vec![100, 300, 500, 800, 1200],
+            vec![100, 800, 1500, 2500, 6000],
+            vec![100, 2000, 4000, 7000, 12000],
+        ),
+        (
+            "reaction_p95",
+            vec![100, 300, 500, 800, 1200],
+            vec![100, 300, 500, 800, 1200],
+            vec![100, 800, 1500, 2500, 4000],
+            vec![100, 2000, 4000, 7000, 16000],
+        ),
+    ];
+
+    for (failed_stage, normal, urgent, wake, reaction) in cases {
+        write_slo_samples(&artifacts, &normal, &urgent, &wake, &reaction);
+        let jsonl = temp.path().join(format!("{failed_stage}.jsonl"));
+        cas_cmd()
+            .args([
+                "factory",
+                "probe-comm",
+                "--jsonl",
+                jsonl.to_str().unwrap(),
+                "--adapter",
+                "all",
+                "--artifact-root",
+                artifacts.to_str().unwrap(),
+            ])
+            .assert()
+            .failure()
+            .stderr(predicates::str::contains(failed_stage));
+
+        let lines = read_jsonl(&jsonl);
+        let slo = lines
+            .iter()
+            .find(|line| line["scenario"] == "slo_aggregate_evidence")
+            .unwrap();
+        assert_eq!(slo["failed_stage"], failed_stage);
+    }
+}
+
+#[test]
 fn probe_comm_cli_recorded_adapter_applies_reaction_slo_threshold() {
     let temp = tempfile::tempdir().unwrap();
     let jsonl = temp.path().join("probe.jsonl");
@@ -366,7 +501,7 @@ fn probe_comm_cli_recorded_adapter_applies_reaction_slo_threshold() {
             "codex",
             "--artifact-root",
             artifacts.to_str().unwrap(),
-            "--reaction-slo-ms",
+            "--reaction-p95-slo-ms",
             "1",
         ])
         .assert()
@@ -398,9 +533,9 @@ fn probe_comm_cli_recorded_adapter_applies_wake_slo_threshold() {
             "codex",
             "--artifact-root",
             artifacts.to_str().unwrap(),
-            "--wake-slo-ms",
+            "--wake-p95-slo-ms",
             "1",
-            "--reaction-slo-ms",
+            "--reaction-p95-slo-ms",
             "1000",
         ])
         .assert()
