@@ -171,6 +171,7 @@ impl FactoryDaemon {
                                             bytes = payload.len(),
                                             "alt-screen scroll up: forwarding wheel payload to PTY"
                                         );
+                                        // Scroll is not a prompt submit.
                                         let _ = self.app.mux.send_input(&payload).await;
                                     }
                                     // ScrollAction::Done: scroll was handled by handle_scroll_up.
@@ -192,18 +193,76 @@ impl FactoryDaemon {
                                     // ScrollAction::Done: scroll was handled by handle_scroll_down.
                                 }
                                 ControlEvent::MouseClick { col, row } => {
-                                    self.app.handle_mouse_click(col, row);
+                                    use crate::ui::factory::app::{
+                                        ClickAction, ClientGeometryMode, sgr_left_click_bytes,
+                                    };
+                                    // Use this client's view mode so full/compact
+                                    // geometry maps stay independent (cas-7f6f).
+                                    let geometry = match self
+                                        .clients
+                                        .get(&client_id)
+                                        .map(|c| c.view_mode)
+                                    {
+                                        Some(ClientViewMode::Compact) => {
+                                            ClientGeometryMode::Compact
+                                        }
+                                        _ => ClientGeometryMode::Full,
+                                    };
+                                    match self.app.handle_mouse_click(col, row, geometry) {
+                                        ClickAction::Handled => {}
+                                        ClickAction::ForwardSgr {
+                                            pane,
+                                            col: pty_col,
+                                            row: pty_row,
+                                        } => {
+                                            // cas-7f6f: forward SGR so Grok's on-screen
+                                            // Stop can cancel inside the harness. Do NOT
+                                            // clear turn_in_flight here — generic clicks
+                                            // (non-Stop) must preserve active; Stop
+                                            // completion comes from Grok turn_ended.
+                                            let payload = sgr_left_click_bytes(pty_col, pty_row);
+                                            tracing::debug!(
+                                                %pane,
+                                                pty_col,
+                                                pty_row,
+                                                ?geometry,
+                                                "forwarding SGR click to focused Grok pane"
+                                            );
+                                            let _ =
+                                                self.app.mux.send_input_to(&pane, &payload).await;
+                                        }
+                                    }
                                 }
                                 ControlEvent::SetSelectMode(on) => {
                                     self.app.select_mode = on;
                                 }
                                 ControlEvent::DropImage { col, row, path } => {
-                                    let target = self.resolve_drop_target(col, row);
+                                    // Mode-aware drop target (cas-7f6f): compact
+                                    // clients must not use full-layout hit tests.
+                                    let geometry = match self
+                                        .clients
+                                        .get(&client_id)
+                                        .map(|c| c.view_mode)
+                                    {
+                                        Some(ClientViewMode::Compact) => {
+                                            crate::ui::factory::app::ClientGeometryMode::Compact
+                                        }
+                                        _ => crate::ui::factory::app::ClientGeometryMode::Full,
+                                    };
+                                    let target = self.resolve_drop_target(col, row, geometry);
                                     if let Some(target_pane) = target {
                                         let _ = self.app.mux.focus(&target_pane);
+                                        // StructuredPaste — never marks turn-in-flight.
                                         let payload = bracketed_paste_bytes(&path);
-                                        if let Err(e) =
-                                            self.app.mux.send_input_to(&target_pane, &payload).await
+                                        if let Err(e) = self
+                                            .app
+                                            .mux
+                                            .deliver_user_input_to(
+                                                &target_pane,
+                                                &payload,
+                                                cas_mux::UserInputKind::StructuredPaste,
+                                            )
+                                            .await
                                         {
                                             tracing::warn!(
                                                 "Failed to deliver dropped image payload to {}: {}",
@@ -230,9 +289,18 @@ impl FactoryDaemon {
                                     // walks one byte at a time) keeps embedded
                                     // newlines/control bytes literal, so the inner
                                     // CLI stops submitting mid-paste (cas-5702).
+                                    // StructuredPaste — never marks turn-in-flight.
                                     if self.app.focused_accepts_input() {
                                         let bytes = bracketed_paste_bytes(&payload);
-                                        if let Err(e) = self.app.mux.send_input(&bytes).await {
+                                        if let Err(e) = self
+                                            .app
+                                            .mux
+                                            .deliver_user_input(
+                                                &bytes,
+                                                cas_mux::UserInputKind::StructuredPaste,
+                                            )
+                                            .await
+                                        {
                                             tracing::warn!(
                                                 "Failed to deliver paste payload: {}",
                                                 e
@@ -725,8 +793,32 @@ impl FactoryDaemon {
                     i += 1;
                     continue;
                 } else if is_standalone_esc && self.app.focused_accepts_input() {
-                    // Forward ESC to focused pane
-                    let _ = self.app.mux.send_input(&[byte]).await;
+                    // cas-7f6f: Grok mid-turn Esc is a no-op (0.2.93). Only
+                    // rewrite Esc→cancel when turn_in_flight is set (submit/
+                    // inject; cleared by break_turn or Grok turn_ended).
+                    // Idle keeps raw Esc for clear/rewind.
+                    use crate::ui::factory::app::GrokEscAction;
+                    if self.app.focused_harness() == cas_mux::SupervisorCli::Grok {
+                        match self.app.focused_grok_esc_action() {
+                            GrokEscAction::CancelTurn => {
+                                if let Some(id) = self.app.mux.focused_id().map(|s| s.to_string())
+                                {
+                                    tracing::debug!(
+                                        pane = %id,
+                                        "Grok Esc (turn active) → cancel via break_turn"
+                                    );
+                                    let _ = self.app.mux.break_turn(&id).await;
+                                }
+                            }
+                            GrokEscAction::ForwardRaw => {
+                                tracing::debug!("Grok Esc (idle) → raw Esc");
+                                let _ = self.app.mux.send_input(&[byte]).await;
+                            }
+                        }
+                    } else {
+                        // Claude/Codex: Esc is the native cancel key — forward raw.
+                        let _ = self.app.mux.send_input(&[byte]).await;
+                    }
                     i += 1;
                     continue;
                 } else if !is_standalone_esc {
@@ -865,8 +957,13 @@ impl FactoryDaemon {
                     continue;
                 }
 
-                // Forward all other input (including Tab) to the focused pane
-                let _ = self.app.mux.send_input(&[byte]).await;
+                // Unified submit API (cas-7f6f): KeyStream marks on true Enter;
+                // paste/drop use StructuredPaste elsewhere and never mark here.
+                let _ = self
+                    .app
+                    .mux
+                    .deliver_user_input(&[byte], cas_mux::UserInputKind::KeyStream)
+                    .await;
                 i += 1;
                 continue;
             }
@@ -904,15 +1001,25 @@ impl FactoryDaemon {
         Ok(())
     }
 
-    fn resolve_drop_target(&self, col: u16, row: u16) -> Option<String> {
+    fn resolve_drop_target(
+        &self,
+        col: u16,
+        row: u16,
+        geometry: crate::ui::factory::app::ClientGeometryMode,
+    ) -> Option<String> {
         if col != u16::MAX && row != u16::MAX {
-            if let Some(pane_name) = self.app.pane_at_screen(col, row) {
+            if let Some(pane_name) = self.app.pane_at_screen_for(col, row, geometry) {
                 if pane_name == self.app.supervisor_name()
                     || self.app.worker_names().iter().any(|w| w == &pane_name)
                 {
                     return Some(pane_name);
                 }
             }
+        }
+
+        // Compact clients only show the supervisor content area.
+        if geometry == crate::ui::factory::app::ClientGeometryMode::Compact {
+            return Some(self.app.supervisor_name().to_string());
         }
 
         if self.app.focused_is_supervisor() {

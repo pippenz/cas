@@ -96,6 +96,13 @@ impl CasService {
 
         let ttl_secs = req.remind_ttl_secs.unwrap_or(3600);
 
+        // cas-fcd4: bind event-based (and all) reminds to the registering factory
+        // session so concurrent factories sharing cas.db do not cross-fire.
+        let session_id = std::env::var("CAS_FACTORY_SESSION")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
         if has_delay {
             let delay_secs = req.remind_delay_secs.unwrap();
             if delay_secs <= 0 {
@@ -117,6 +124,7 @@ impl CasService {
                     None,
                     None,
                     ttl_secs,
+                    session_id.as_deref(),
                 )
                 .map_err(|e| {
                     Self::error(
@@ -195,6 +203,7 @@ impl CasService {
                     Some(&event_type),
                     filter.as_ref(),
                     ttl_secs,
+                    session_id.as_deref(),
                 )
                 .map_err(|e| {
                     Self::error(
@@ -214,8 +223,13 @@ impl CasService {
                 None => String::new(),
             };
 
+            let session_desc = match &session_id {
+                Some(s) => format!(", session: {s}"),
+                None => String::new(),
+            };
+
             Ok(Self::success(format!(
-                "Reminder #{id} set (event-based, fires on {event_type}{filter_desc}{target_desc})\nMessage: {message}"
+                "Reminder #{id} set (event-based, fires on {event_type}{filter_desc}{target_desc}{session_desc})\nMessage: {message}"
             )))
         }
     }

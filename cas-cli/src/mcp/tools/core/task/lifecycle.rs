@@ -2,6 +2,41 @@ use crate::harness_policy::is_worker_without_subagents_from_env;
 use crate::mcp::tools::core::imports::*;
 
 pub(crate) mod close_ops;
+pub(crate) mod stale_close_guard;
+pub(crate) mod supervisor_push;
+
+/// Resolve `epic_verification_owner` for a factory-mode epic create (cas-9fff).
+///
+/// Preference: agent id → display name → session id. Returns `Err` when none
+/// resolve so factory epic creation cannot silently leave the owner unset
+/// (which would disable both director routing and the close ownership gate).
+pub(crate) fn resolve_factory_epic_owner(
+    agent_id: Option<String>,
+    agent_name: Option<String>,
+    session_id: Option<String>,
+) -> Result<String, String> {
+    // cas-cc74: normalize/trim at the create write boundary so close gating
+    // and owner-routed compares never see padded owner strings.
+    let trim_nonempty = |s: Option<String>| {
+        s.and_then(|v| {
+            let t = v.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            }
+        })
+    };
+    trim_nonempty(agent_id)
+        .or_else(|| trim_nonempty(agent_name))
+        .or_else(|| trim_nonempty(session_id))
+        .ok_or_else(|| {
+            "Factory epic create requires a resolvable agent identity for \
+             epic_verification_owner (CAS agent id / CAS_AGENT_NAME / CAS_SESSION_ID). \
+             Refusing ownerless factory epic (cas-9fff)."
+                .to_string()
+        })
+}
 
 impl CasCore {
     pub async fn cas_task_create(
@@ -82,6 +117,32 @@ impl CasCore {
             .unwrap_or_default();
 
         let now = chrono::Utc::now();
+        // cas-9fff: in factory mode, stamp the creating agent as
+        // epic_verification_owner on new epics so director completion
+        // notifications route to the owning session (not every concurrent
+        // supervisor). Fail closed when identity cannot be resolved —
+        // silent None would disable both routing and the close guard.
+        // Outside factory mode leave unset (legacy solo flow).
+        let in_factory = std::env::var("CAS_FACTORY_MODE").is_ok()
+            || std::env::var("CAS_FACTORY_SESSION").is_ok();
+        let epic_verification_owner = if task_type == TaskType::Epic && in_factory {
+            match resolve_factory_epic_owner(
+                self.get_agent_id().ok(),
+                std::env::var("CAS_AGENT_NAME").ok(),
+                std::env::var("CAS_SESSION_ID").ok(),
+            ) {
+                Ok(owner) => Some(owner),
+                Err(msg) => {
+                    return Err(McpError {
+                        code: ErrorCode::INVALID_PARAMS,
+                        message: Cow::from(msg),
+                        data: None,
+                    });
+                }
+            }
+        } else {
+            None
+        };
         let task = Task {
             id: id.clone(),
             scope: crate::types::Scope::Project, // MCP tasks are project-scoped
@@ -109,7 +170,7 @@ impl CasCore {
             worktree_id: None,
             pending_verification: false,
             pending_worktree_merge: false,
-            epic_verification_owner: None,
+            epic_verification_owner,
             share: None,
             depth,
         };
@@ -309,6 +370,8 @@ impl CasCore {
             // supervisor-only action (see `cas_task_reopen`), so the
             // guidance must differ by role: a supervisor may still reopen,
             // a worker must not.
+            // cas-b269 review: do NOT clear halt_task_work here — failed
+            // starts must preserve the urgent-stop halt.
             return Err(Self::error(
                 ErrorCode::INVALID_PARAMS,
                 if crate::harness_policy::is_supervisor_from_env() {
@@ -654,6 +717,8 @@ impl CasCore {
             }
         }
 
+        // Capture old status before mutation for lifecycle push (cas-062d).
+        let old_status = task.status;
         task.status = TaskStatus::InProgress;
         task.updated_at = chrono::Utc::now();
 
@@ -663,18 +728,133 @@ impl CasCore {
             data: None,
         })?;
 
+        // cas-b269 review 2: clear urgent-stop halt ONLY after start fully
+        // succeeds, and only if halt gen is not newer than this start's
+        // ceiling (concurrent urgent stop must win).
+        if let Ok(agent_store) = self.open_agent_store() {
+            if let Ok(mut agent) = agent_store.get(&agent_id) {
+                if stale_close_guard::agent_task_work_halted(&agent.metadata) {
+                    let clear_ceiling = chrono::Utc::now().timestamp_millis().max(0) as u64;
+                    let stored_gen = stale_close_guard::halt_generation(&agent.metadata);
+                    if stale_close_guard::should_clear_halt_at_generation(stored_gen, clear_ceiling)
+                    {
+                        stale_close_guard::clear_halt_metadata(&mut agent.metadata);
+                        let _ = agent_store.update(&agent);
+                    }
+                }
+            }
+        }
+
+        // cas-062d / cas-17e4: durable outbox push after successful start.
+        let actor = agent_store
+            .get(&agent_id)
+            .map(|a| a.name)
+            .unwrap_or_else(|_| agent_id.clone());
+        let occurrence = supervisor_push::occurrence_from_updated_at(task.updated_at);
+        let push_note = match self.push_task_lifecycle(
+            &req.id,
+            &task.title,
+            old_status,
+            TaskStatus::InProgress,
+            &actor,
+            None,
+            supervisor_push::LifecycleTransition::Started,
+            &occurrence,
+        ) {
+            Ok(supervisor_push::LifecyclePushResult::Enqueued { notification_id })
+            | Ok(supervisor_push::LifecyclePushResult::Recovered { notification_id }) => {
+                format!("\n\n📡 Supervisor notified (lifecycle event id={notification_id})")
+            }
+            Ok(supervisor_push::LifecyclePushResult::AlreadyComplete { .. }) => {
+                "\n\n📡 Supervisor lifecycle event already complete (outbox)".to_string()
+            }
+            Ok(supervisor_push::LifecyclePushResult::NoSupervisor) => String::new(),
+            Err(e) => {
+                let key = supervisor_push::transition_key(
+                    &req.id,
+                    old_status,
+                    TaskStatus::InProgress,
+                    std::env::var("CAS_FACTORY_SESSION").ok().as_deref(),
+                    supervisor_push::LifecycleTransition::Started,
+                    &occurrence,
+                );
+                return Err(Self::error(
+                    ErrorCode::INTERNAL_ERROR,
+                    supervisor_push::lifecycle_push_failure_message(
+                        &req.id,
+                        TaskStatus::InProgress,
+                        supervisor_push::LifecycleTransition::Started,
+                        &key,
+                        &e,
+                    ),
+                ));
+            }
+        };
+
         // For subtasks, show parent epic's worktree; for epics, show newly created worktree
         let wt_info = parent_worktree_info.or(worktree_info).unwrap_or_default();
 
         Ok(Self::success(format!(
-            "Started task: {} - {}{}{}{}{}{}",
+            "Started task: {} - {}{}{}{}{}{}{}",
             req.id,
             task.title,
             claim_info.unwrap_or_default(),
             epic_ownership_info.unwrap_or_default(),
             wt_info,
             sibling_notes_info.unwrap_or_default(),
-            Self::workflow_guidance()
+            Self::workflow_guidance(),
+            push_note,
         )))
+    }
+}
+
+#[cfg(test)]
+mod factory_epic_owner_tests {
+    use super::resolve_factory_epic_owner;
+
+    #[test]
+    fn test_9fff_factory_epic_owner_prefers_agent_id() {
+        let owner = resolve_factory_epic_owner(
+            Some("agent-uuid".into()),
+            Some("display-name".into()),
+            Some("session".into()),
+        )
+        .unwrap();
+        assert_eq!(owner, "agent-uuid");
+    }
+
+    #[test]
+    fn test_9fff_factory_epic_owner_falls_back_to_name_then_session() {
+        assert_eq!(
+            resolve_factory_epic_owner(None, Some("owner-sup".into()), Some("sess".into()))
+                .unwrap(),
+            "owner-sup"
+        );
+        assert_eq!(
+            resolve_factory_epic_owner(None, None, Some("sess-only".into())).unwrap(),
+            "sess-only"
+        );
+    }
+
+    #[test]
+    fn test_9fff_factory_epic_create_rejects_when_identity_unresolvable() {
+        let err = resolve_factory_epic_owner(None, None, None).unwrap_err();
+        assert!(
+            err.contains("cas-9fff") && err.contains("Refusing ownerless factory epic"),
+            "expected fail-closed ownerless create, got: {err}"
+        );
+        // Empty strings must not count as identity either.
+        let err_empty =
+            resolve_factory_epic_owner(Some("  ".into()), Some("".into()), None).unwrap_err();
+        assert!(err_empty.contains("Refusing ownerless factory epic"));
+    }
+
+    /// cas-cc74: create write boundary trims owner identity before store.
+    #[test]
+    fn test_cc74_factory_epic_owner_trims_whitespace() {
+        let owner =
+            resolve_factory_epic_owner(Some("  agent-uuid  ".into()), Some("display".into()), None)
+                .unwrap();
+        assert_eq!(owner, "agent-uuid");
     }
 }

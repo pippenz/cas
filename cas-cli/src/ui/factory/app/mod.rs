@@ -12,7 +12,7 @@ use ratatui::layout::Rect;
 
 use super::director::{
     DiffLine, DirectorData, DirectorEvent, DirectorEventDetector, DirectorStores, PanelAreas,
-    Prompt, SidecarFocus, ViewMode, generate_prompt, revalidate_event_for_delivery,
+    Prompt, SidecarFocus, ViewMode, generate_prompt, revalidate_event_for_delivery_with_focus,
 };
 use crate::store::open_prompt_queue_store;
 use crate::types::Worktree;
@@ -30,7 +30,7 @@ mod branch_visibility;
 mod imports;
 mod init;
 mod panels_and_modes;
-mod render_and_ops;
+pub(crate) mod render_and_ops;
 mod sidecar_and_selection;
 
 pub(crate) use branch_visibility::BranchAheadBehind;
@@ -42,12 +42,16 @@ use branch_visibility::{
 // Re-export from cas-factory for backward compatibility
 pub use cas_factory::{AutoPromptConfig, EpicState, FactoryConfig};
 
-// Re-export scroll dispatch types so callers can use them without reaching
-// into the private `sidecar_and_selection` submodule. Constants
+// Re-export scroll / click dispatch types so callers can use them without
+// reaching into the private `sidecar_and_selection` submodule. Constants
 // (SCROLL_*_ARROWS / SCROLL_*_SGR / SCROLL_LINES) and
-// `alt_screen_wheel_bytes` remain reachable via this module's children for
-// tests; production daemon code uses `FactoryApp::alt_screen_scroll_payload`.
-pub use sidecar_and_selection::ScrollAction;
+// `alt_screen_wheel_bytes` / `sgr_left_click_bytes` remain reachable via this
+// module's children for tests; production daemon code uses
+// `FactoryApp::alt_screen_scroll_payload` and `ClickAction` +
+// `sgr_left_click_bytes` for cas-7f6f Stop-click forwarding.
+pub use sidecar_and_selection::{
+    ClickAction, ClientGeometryMode, GrokEscAction, ScrollAction, sgr_left_click_bytes,
+};
 
 /// Booting state for a worker that is being spawned (after prepare, before finish)
 #[derive(Debug, Clone)]
@@ -475,6 +479,13 @@ pub struct FactoryApp {
     worker_areas: Vec<Rect>,
     supervisor_area: Option<Rect>,
     sidecar_area: Option<Rect>,
+    /// Full-mode PTY content rects (bordered inners), updated by `render`.
+    /// Kept separate from compact so simultaneous full+compact clients do not
+    /// clobber each other (cas-7f6f).
+    full_pty_content_areas: HashMap<String, Rect>,
+    /// Compact-mode PTY content rects (borderless supervisor content), updated
+    /// by `render_compact` only.
+    compact_pty_content_areas: HashMap<String, Rect>,
     /// Stored terminal dimensions (for daemon mode where crossterm::terminal::size() doesn't work)
     terminal_cols: u16,
     terminal_rows: u16,
@@ -690,10 +701,18 @@ impl FactoryApp {
 
         let unfiltered_data = self.load_unfiltered_director_data_for_delivery();
 
+        // cas-9fff: pass session-focused epic so EpicAllSubtasksClosed can
+        // use session-affinity routing (not just epic_verification_owner).
+        let focused_epic_id = self.current_epic_id.as_deref();
         let delivery_events: Vec<DirectorEvent> = events
             .iter()
             .filter_map(|event| {
-                revalidate_event_for_delivery(event, &unfiltered_data, &self.supervisor_name)
+                revalidate_event_for_delivery_with_focus(
+                    event,
+                    &unfiltered_data,
+                    &self.supervisor_name,
+                    focused_epic_id,
+                )
             })
             .collect();
 
@@ -1483,7 +1502,11 @@ pub(crate) fn queue_supervisor_intro_prompt(
 - Canonical current workers for this session: {worker_list}\n\
 - First steps: mcp__cs__coordination action=whoami; mcp__cs__task action=list task_type=epic; mcp__cs__task action=ready"
         ),
-        cas_mux::SupervisorCli::Claude => return,
+        // cas-0263: Claude has no --rules/developer_instructions launch flag, so
+        // the canonical supervisor role contract is delivered as this launch-time
+        // intro prompt (the surface a Claude supervisor consumes). Previously
+        // Claude got nothing here, leaving it without any launch role contract.
+        cas_mux::SupervisorCli::Claude => cas_mux::claude_supervisor_contract(&worker_list),
         // EPIC cas-8888 (cas-9a31, Phase 1): Grok's SessionStart hook fires
         // but its stdout is ignored, so the SessionStart-additionalContext
         // bundle injection Claude relies on does NOT reach a Grok
@@ -1524,13 +1547,9 @@ pub(crate) fn queue_codex_worker_intro_prompt(
             // Avoid queue injection here to prevent duplicate or draft-only startup prompts.
         }
         cas_mux::SupervisorCli::Claude => {
-            let prompt = format!(
-                "You are a CAS factory worker ({worker_name}).\n\
-                 \n\
-                 Check your assigned tasks: `mcp__cas__task action=mine`\n\
-                 \n\
-                 See the cas-worker skill for detailed workflow guidance."
-            );
+            // cas-0263: deliver the full canonical worker role contract (not just
+            // a skill pointer) via the launch-time intro prompt Claude consumes.
+            let prompt = cas_mux::claude_worker_contract(worker_name);
             if let Ok(queue) = open_prompt_queue_store(cas_dir) {
                 let _ = queue.enqueue("cas", worker_name, &prompt);
             }
@@ -1836,8 +1855,50 @@ mod tests {
 
     use super::{
         DirectorData, DirectorEvent, merge_director_data_preserving_git, non_closed_task_ids,
-        unfiltered_snapshot_from,
+        queue_codex_worker_intro_prompt, queue_supervisor_intro_prompt, unfiltered_snapshot_from,
     };
+
+    /// cas-0263: the Claude launch surface is the queued intro prompt (Claude has
+    /// no --rules/developer_instructions flag). This drives the ACTUAL enqueue
+    /// path and proves the queued prompt carries the full canonical role
+    /// contract — the Claude supervisor previously got nothing here, the worker
+    /// only a skill pointer.
+    #[test]
+    fn test_claude_intro_prompts_carry_full_role_contract() {
+        use crate::store::detect::open_prompt_queue_store;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cas_dir = tmp.path();
+
+        queue_supervisor_intro_prompt(
+            cas_dir,
+            "sup",
+            cas_mux::SupervisorCli::Claude,
+            &["worker-a".to_string()],
+            None,
+        );
+        queue_codex_worker_intro_prompt(cas_dir, "worker-a", cas_mux::SupervisorCli::Claude);
+
+        let queue = open_prompt_queue_store(cas_dir).unwrap();
+
+        let sup = queue.peek_for_targets(&["sup"], None, 10).unwrap();
+        assert_eq!(sup.len(), 1, "Claude supervisor must receive a launch intro");
+        assert!(
+            cas_mux::missing_contract_elements(&sup[0].prompt, cas_mux::ContractRole::Supervisor)
+                .is_empty(),
+            "Claude supervisor intro missing: {:?}",
+            cas_mux::missing_contract_elements(&sup[0].prompt, cas_mux::ContractRole::Supervisor)
+        );
+
+        let wrk = queue.peek_for_targets(&["worker-a"], None, 10).unwrap();
+        assert_eq!(wrk.len(), 1, "Claude worker must receive a launch intro");
+        assert!(
+            cas_mux::missing_contract_elements(&wrk[0].prompt, cas_mux::ContractRole::Worker)
+                .is_empty(),
+            "Claude worker intro missing: {:?}",
+            cas_mux::missing_contract_elements(&wrk[0].prompt, cas_mux::ContractRole::Worker)
+        );
+    }
 
     fn data_with_changes(git_loaded: bool, changes: Vec<SourceChangesInfo>) -> DirectorData {
         DirectorData {
@@ -1883,8 +1944,9 @@ mod tests {
             epic: Some(epic.to_string()),
             branch: None,
             updated_at: None,
+        epic_verification_owner: None,
         }
-    }
+        }
 
     /// Epic-kind `TaskSummary` fixture, branch-focused (see `epic_summary`
     /// above for the title/status-focused variant used elsewhere).
@@ -1899,8 +1961,9 @@ mod tests {
             epic: None,
             branch: branch.map(str::to_string),
             updated_at: None,
+        epic_verification_owner: None,
         }
-    }
+        }
 
     fn epic_summary(id: &str, title: &str, status: TaskStatus) -> TaskSummary {
         TaskSummary {
@@ -1913,8 +1976,9 @@ mod tests {
             epic: None,
             branch: Some(format!("epic/{id}")),
             updated_at: None,
+        epic_verification_owner: None,
         }
-    }
+        }
 
     /// cas-a91b review finding: `director.rs::load_with_stores` pushes EVERY
     /// epic into `epic_tasks` regardless of status, including `Closed` —
@@ -1966,8 +2030,9 @@ mod tests {
             epic: epic.map(str::to_string),
             branch: None,
             updated_at: None,
+        epic_verification_owner: None,
         }
-    }
+        }
 
     static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -2075,8 +2140,9 @@ mod tests {
                 epic: epic.map(str::to_string),
                 branch: None,
                 updated_at: None,
+            epic_verification_owner: None,
             }
-        }
+            }
 
         fn set(items: &[&str]) -> HashSet<String> {
             items.iter().map(|s| s.to_string()).collect()
@@ -2194,7 +2260,8 @@ mod tests {
                 epic: Some(new_epic_id.to_string()),
                 branch: None,
                 updated_at: None,
-            }],
+            epic_verification_owner: None,
+        }],
             in_progress_tasks: vec![TaskSummary {
                 id: "task-2".to_string(),
                 title: "In-progress subtask".to_string(),
@@ -2205,7 +2272,8 @@ mod tests {
                 epic: Some(new_epic_id.to_string()),
                 branch: None,
                 updated_at: None,
-            }],
+            epic_verification_owner: None,
+        }],
             epic_tasks: vec![TaskSummary {
                 id: new_epic_id.to_string(),
                 title: new_epic_title.to_string(),
@@ -2216,7 +2284,8 @@ mod tests {
                 epic: None,
                 branch: Some("epic/new-feature".to_string()),
                 updated_at: None,
-            }],
+            epic_verification_owner: None,
+        }],
             agents: Vec::new(),
             activity: Vec::new(),
             agent_id_to_name: HashMap::new(),
@@ -2477,8 +2546,9 @@ mod tests {
                 epic: Some(epic_id.to_string()),
                 branch: None,
                 updated_at: None,
+            epic_verification_owner: None,
             }
-        }
+            }
 
         let mut app = super::FactoryApp::for_test();
         app.current_epic_id = Some("epic-current".to_string());
@@ -2559,7 +2629,8 @@ mod tests {
                 epic: Some("epic-shared".to_string()),
                 branch: None,
                 updated_at: None,
-            }],
+            epic_verification_owner: None,
+        }],
             in_progress_tasks: Vec::new(),
             epic_tasks: vec![TaskSummary {
                 id: "epic-shared".to_string(),
@@ -2571,7 +2642,8 @@ mod tests {
                 epic: None,
                 branch: Some("epic/shared".to_string()),
                 updated_at: None,
-            }],
+            epic_verification_owner: None,
+        }],
             agents: Vec::new(),
             activity: Vec::new(),
             agent_id_to_name: HashMap::new(),
@@ -2714,7 +2786,7 @@ mod tests {
             cols: 80,
         };
         let pty = cas_mux::Pty::spawn(pty_id, pty_config).ok()?;
-        cas_mux::Pane::with_pty(pane_id, cas_mux::PaneKind::Worker, pty, 24, 80).ok()
+        cas_mux::Pane::with_pty(pane_id, cas_mux::PaneKind::Worker, pty, 24, 80, cas_mux::SupervisorCli::Claude).ok()
     }
 
     /// cas-eb7f (review finding, cas-ebc1 final): `sync_worker_pane_branch_titles`
@@ -2964,7 +3036,8 @@ mod tests {
                 epic: Some(active_epic_id.to_string()),
                 branch: None,
                 updated_at: None,
-            }],
+            epic_verification_owner: None,
+        }],
             in_progress_tasks: vec![TaskSummary {
                 id: "task-ip".to_string(),
                 title: "In-progress subtask".to_string(),
@@ -2975,7 +3048,8 @@ mod tests {
                 epic: Some(active_epic_id.to_string()),
                 branch: None,
                 updated_at: None,
-            }],
+            epic_verification_owner: None,
+        }],
             epic_tasks: vec![
                 TaskSummary {
                     id: stale_epic_id.to_string(),
@@ -2987,7 +3061,8 @@ mod tests {
                     epic: None,
                     branch: Some("epic/stale".to_string()),
                     updated_at: None,
-                },
+            epic_verification_owner: None,
+        },
                 TaskSummary {
                     id: active_epic_id.to_string(),
                     title: "Active Epic".to_string(),
@@ -2998,7 +3073,8 @@ mod tests {
                     epic: None,
                     branch: Some("epic/active".to_string()),
                     updated_at: None,
-                },
+            epic_verification_owner: None,
+        },
             ],
             agents: Vec::new(),
             activity: Vec::new(),
@@ -3040,7 +3116,8 @@ mod tests {
                 epic: Some(active_epic_id.to_string()),
                 branch: None,
                 updated_at: None,
-            }],
+            epic_verification_owner: None,
+        }],
             in_progress_tasks: Vec::new(),
             epic_tasks: vec![
                 TaskSummary {
@@ -3053,7 +3130,8 @@ mod tests {
                     epic: None,
                     branch: Some("epic/stale".to_string()),
                     updated_at: None,
-                },
+            epic_verification_owner: None,
+        },
                 TaskSummary {
                     id: active_epic_id.to_string(),
                     title: "Active Epic".to_string(),
@@ -3064,7 +3142,8 @@ mod tests {
                     epic: None,
                     branch: Some("epic/active".to_string()),
                     updated_at: None,
-                },
+            epic_verification_owner: None,
+        },
             ],
             agents: Vec::new(),
             activity: Vec::new(),
@@ -3109,7 +3188,8 @@ mod tests {
                     epic: None,
                     branch: Some("epic/preferred".to_string()),
                     updated_at: None,
-                },
+            epic_verification_owner: None,
+        },
                 TaskSummary {
                     id: unrelated_id.to_string(),
                     title: "Unrelated InProgress Epic".to_string(),
@@ -3120,7 +3200,8 @@ mod tests {
                     epic: None,
                     branch: Some("epic/unrelated".to_string()),
                     updated_at: None,
-                },
+            epic_verification_owner: None,
+        },
             ],
             agents: Vec::new(),
             activity: Vec::new(),
@@ -3158,6 +3239,7 @@ mod tests {
             )],
             in_progress_tasks: vec![TaskSummary {
                 status: TaskStatus::InProgress,
+                epic_verification_owner: None,
                 ..task_summary(
                     "cas-ip",
                     "Active heuristic subtask",
@@ -3923,7 +4005,8 @@ mod tests {
                 epic: Some(active_id.to_string()),
                 branch: None,
                 updated_at: None,
-            }],
+            epic_verification_owner: None,
+        }],
             in_progress_tasks: vec![TaskSummary {
                 id: "task-ip".to_string(),
                 title: "In-progress subtask of active epic".to_string(),
@@ -3934,7 +4017,8 @@ mod tests {
                 epic: Some(active_id.to_string()),
                 branch: None,
                 updated_at: None,
-            }],
+            epic_verification_owner: None,
+        }],
             epic_tasks: vec![
                 TaskSummary {
                     id: active_id.to_string(),
@@ -3946,7 +4030,8 @@ mod tests {
                     epic: None,
                     branch: Some("epic/active".to_string()),
                     updated_at: None,
-                },
+            epic_verification_owner: None,
+        },
                 TaskSummary {
                     id: hijacker_id.to_string(),
                     title: "Stray zero-subtask epic".to_string(),
@@ -3957,7 +4042,8 @@ mod tests {
                     epic: None,
                     branch: Some("epic/hijacker".to_string()),
                     updated_at: None,
-                },
+            epic_verification_owner: None,
+        },
             ],
             agents: Vec::new(),
             activity: Vec::new(),
@@ -4052,7 +4138,8 @@ mod tests {
                 epic: Some(new_id.to_string()),
                 branch: None,
                 updated_at: None,
-            }],
+            epic_verification_owner: None,
+        }],
             in_progress_tasks: Vec::new(),
             epic_tasks: vec![TaskSummary {
                 id: new_id.to_string(),
@@ -4064,7 +4151,8 @@ mod tests {
                 epic: None,
                 branch: Some("epic/new".to_string()),
                 updated_at: None,
-            }],
+            epic_verification_owner: None,
+        }],
             agents: Vec::new(),
             activity: Vec::new(),
             agent_id_to_name: HashMap::new(),
@@ -4129,7 +4217,8 @@ mod tests {
                 epic: Some(active_id.to_string()),
                 branch: None,
                 updated_at: None,
-            }],
+            epic_verification_owner: None,
+        }],
             in_progress_tasks: Vec::new(),
             epic_tasks: vec![
                 TaskSummary {
@@ -4142,7 +4231,8 @@ mod tests {
                     epic: None,
                     branch: Some("epic/active".to_string()),
                     updated_at: None,
-                },
+            epic_verification_owner: None,
+        },
                 TaskSummary {
                     id: hijacker_id.to_string(),
                     title: "Stray epic".to_string(),
@@ -4153,7 +4243,8 @@ mod tests {
                     epic: None,
                     branch: Some("epic/hijacker".to_string()),
                     updated_at: None,
-                },
+            epic_verification_owner: None,
+        },
             ],
             agents: Vec::new(),
             activity: Vec::new(),

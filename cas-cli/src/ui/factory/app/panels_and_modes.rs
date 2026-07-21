@@ -467,7 +467,14 @@ impl FactoryApp {
         };
 
         match Pty::spawn(pane_name, config) {
-            Ok(pty) => match Pane::with_pty(pane_name, PaneKind::Shell, pty, 24, 80) {
+            Ok(pty) => match Pane::with_pty(
+                pane_name,
+                PaneKind::Shell,
+                pty,
+                24,
+                80,
+                cas_mux::SupervisorCli::Claude,
+            ) {
                 Ok(pane) => {
                     self.mux.add_pane(pane);
                     self.terminal_pane_name = Some(pane_name.to_string());
@@ -1057,8 +1064,9 @@ mod tests {
             epic: epic.map(str::to_string),
             branch: Some(format!("epic/{id}")).filter(|_| task_type == TaskType::Epic),
             updated_at: None,
+        epic_verification_owner: None,
         }
-    }
+        }
 
     #[test]
     fn get_epic_at_display_index_uses_current_epic_scoped_mapping() {

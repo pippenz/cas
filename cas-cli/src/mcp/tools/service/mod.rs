@@ -104,6 +104,10 @@ pub struct WorktreeRequest {
     pub orphans: Option<bool>,
     pub dry_run: Option<bool>,
     pub force: Option<bool>,
+    /// Explicit trunk merge intent (cas-0b32) — independent of force.
+    pub allow_trunk: Option<bool>,
+    /// cas-369f: remove worktree after merge (independent of force=dirty).
+    pub cleanup: Option<bool>,
 }
 
 // ============================================================================
@@ -591,6 +595,8 @@ impl CasService {
                         orphans: req.orphans,
                         dry_run: req.dry_run,
                         force: req.force,
+                        allow_trunk: req.allow_trunk,
+                        cleanup: req.cleanup,
                     };
                     match wt_action {
                         "create" => this.worktree_create(wt_req).await,
@@ -1106,6 +1112,7 @@ pub(crate) mod agent_liveness;
 mod core;
 pub(crate) mod factory_ops;
 mod factory_remind;
+pub(crate) mod orphan_recovery;
 mod panic_catch;
 #[cfg(test)]
 mod panic_regression_test;

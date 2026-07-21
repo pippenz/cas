@@ -1,4 +1,4 @@
-use crate::store::open_task_store;
+use crate::store::{open_agent_store, open_task_store};
 use crate::ui::factory::app::imports::*;
 use crate::worktree::RemoveOutcome;
 
@@ -95,19 +95,26 @@ fn worker_has_open_tasks(cas_dir: &std::path::Path, agent_id: &str) -> bool {
     }
 }
 
-/// cas-6913: pre-assign `task_id` to the just-spawned `worker_name`, so the
-/// worker's very first `task action=mine` shows it without the supervisor
-/// needing to send a follow-up assignment message. Assignees are display
-/// names, not session IDs (cas-dbbb, same convention as `task action=start`'s
-/// auto-assign in cas-6945's task/lifecycle.rs).
+/// cas-6913 / cas-7a94: pre-assign `task_id` to `worker_name` so the worker's
+/// first `task action=mine` shows it without a follow-up assignment message.
+/// Assignees are display names, not session IDs (cas-dbbb).
 ///
-/// Best-effort and silent on failure by design: `finish_worker_spawn` calls
-/// this after the worker's PTY is already running, so raising an error here
-/// has nowhere useful to go — it would only orphan a live process. Every
-/// failure path is logged instead so it's diagnosable without being fatal.
-/// Never overwrites an existing assignee (e.g. a concurrent supervisor
-/// action beat the spawn to it).
-fn assign_task_to_new_worker(cas_dir: &std::path::Path, task_id: &str, worker_name: &str) {
+/// Called once the worker name is known (after `prepare_worker_spawn`, before
+/// the isolate worktree finishes) and again at `finish_worker_spawn` as a
+/// confirm path — so codex+isolate async gaps cannot skip the binding.
+///
+/// Best-effort and silent on failure by design: callers may already have a
+/// live PTY, so raising here has nowhere useful to go. Every failure path is
+/// logged instead. Never overwrites a *different* assignee; re-assigning to
+/// the same worker is a no-op success (finish-path confirm after early assign).
+///
+/// Returns `true` when the task is assigned to `worker_name` after this call
+/// (including already-ours), `false` on any miss/skip/error.
+pub(crate) fn assign_task_to_new_worker(
+    cas_dir: &std::path::Path,
+    task_id: &str,
+    worker_name: &str,
+) -> bool {
     let store = match open_task_store(cas_dir) {
         Ok(store) => store,
         Err(e) => {
@@ -115,7 +122,7 @@ fn assign_task_to_new_worker(cas_dir: &std::path::Path, task_id: &str, worker_na
                 task_id, worker_name, error = %e,
                 "cas-6913: failed to open task store for spawn-time task pre-assignment"
             );
-            return;
+            return false;
         }
     };
 
@@ -126,30 +133,188 @@ fn assign_task_to_new_worker(cas_dir: &std::path::Path, task_id: &str, worker_na
                 task_id, worker_name, error = %e,
                 "cas-6913: task not found for spawn-time pre-assignment"
             );
-            return;
+            return false;
         }
     };
 
     if let Some(ref existing) = task.assignee {
+        if existing == worker_name {
+            // Early-assign already pinned this worker (cas-7a94 isolate path).
+            return true;
+        }
         tracing::warn!(
             task_id, worker_name, existing_assignee = %existing,
             "cas-6913: task already has an assignee — not overwriting at spawn-time pre-assignment"
         );
-        return;
+        return false;
     }
 
     let mut updated = task;
     updated.assignee = Some(worker_name.to_string());
+    updated.updated_at = chrono::Utc::now();
     match store.update(&updated) {
         Ok(()) => {
-            tracing::info!(task_id, worker_name, "cas-6913: pre-assigned task to newly spawned worker");
+            tracing::info!(
+                task_id,
+                worker_name,
+                "cas-6913: pre-assigned task to newly spawned worker"
+            );
+            true
         }
         Err(e) => {
             tracing::error!(
                 task_id, worker_name, error = %e,
                 "cas-6913: failed to persist spawn-time task pre-assignment"
             );
+            false
         }
+    }
+}
+
+/// cas-7a94: release tasks bound to a dead/shutting-down worker so they are
+/// claimable again without a manual `task action=reset`.
+///
+/// Covers pure spawn-time pre-assigns (`Open` + assignee, no lease) and the
+/// ghost `InProgress`/`Blocked` state left when a worker dies before a real
+/// lease is held. For each matching non-Closed task assigned to
+/// `worker_name`: force-release any lease, force status to `Open`, clear
+/// assignee. Closed and AwaitingMerge tasks are left alone (supervisor-owned
+/// merge parking must not be clobbered by worker teardown).
+///
+/// Best-effort: store failures are logged; returns the number of tasks cleared.
+pub(crate) fn release_worker_task_bindings(
+    cas_dir: &std::path::Path,
+    worker_name: &str,
+) -> usize {
+    let task_store = match open_task_store(cas_dir) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(
+                worker_name, error = %e,
+                "cas-7a94: failed to open task store for shutdown task release"
+            );
+            return 0;
+        }
+    };
+    let agent_store = match open_agent_store(cas_dir) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                worker_name, error = %e,
+                "cas-7a94: failed to open agent store for lease release — continuing with assignee clear"
+            );
+            // Continue without lease release — clearing assignee is still useful.
+            // agent_store calls below are skipped when this is None-equivalent by
+            // using a local flag.
+            return release_worker_task_bindings_tasks_only(&*task_store, worker_name, None);
+        }
+    };
+
+    release_worker_task_bindings_tasks_only(&*task_store, worker_name, Some(&*agent_store))
+}
+
+fn release_worker_task_bindings_tasks_only(
+    task_store: &dyn cas_store::TaskStore,
+    worker_name: &str,
+    agent_store: Option<&dyn cas_store::AgentStore>,
+) -> usize {
+    let assigned: Vec<_> = match task_store.list(None) {
+        Ok(tasks) => tasks
+            .into_iter()
+            .filter(|t| {
+                t.assignee.as_deref() == Some(worker_name)
+                    && matches!(
+                        t.status,
+                        cas_types::TaskStatus::Open
+                            | cas_types::TaskStatus::InProgress
+                            | cas_types::TaskStatus::Blocked
+                    )
+            })
+            .collect(),
+        Err(e) => {
+            tracing::error!(
+                worker_name, error = %e,
+                "cas-7a94: failed to list tasks for shutdown release"
+            );
+            return 0;
+        }
+    };
+
+    let mut released = 0usize;
+    for mut t in assigned {
+        if let Some(agents) = agent_store {
+            let _ = agents.release_lease_for_task(&t.id);
+        }
+        t.status = cas_types::TaskStatus::Open;
+        t.assignee = None;
+        t.updated_at = chrono::Utc::now();
+        match task_store.update(&t) {
+            Ok(()) => {
+                released += 1;
+                tracing::info!(
+                    task_id = %t.id,
+                    worker_name,
+                    "cas-7a94: released task binding on worker shutdown/cancel"
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    task_id = %t.id, worker_name, error = %e,
+                    "cas-7a94: failed to clear assignee on worker shutdown"
+                );
+            }
+        }
+    }
+    released
+}
+
+/// cas-7a94: release a single task by id if it is still bound to `worker_name`
+/// (or bound to anyone when `worker_name` is empty — used for failed pre-boots
+/// where we know the task_id but want a surgical clear only when assignee
+/// matches the aborted worker).
+pub(crate) fn release_preassign_if_bound(
+    cas_dir: &std::path::Path,
+    task_id: &str,
+    worker_name: &str,
+) {
+    let store = match open_task_store(cas_dir) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(
+                task_id, worker_name, error = %e,
+                "cas-7a94: failed to open task store for pre-assign release"
+            );
+            return;
+        }
+    };
+    let mut task = match store.get(task_id) {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+    if task.assignee.as_deref() != Some(worker_name) {
+        return;
+    }
+    if matches!(task.status, cas_types::TaskStatus::Closed | cas_types::TaskStatus::AwaitingMerge)
+    {
+        return;
+    }
+    if let Ok(agents) = open_agent_store(cas_dir) {
+        let _ = agents.release_lease_for_task(task_id);
+    }
+    task.status = cas_types::TaskStatus::Open;
+    task.assignee = None;
+    task.updated_at = chrono::Utc::now();
+    if let Err(e) = store.update(&task) {
+        tracing::error!(
+            task_id, worker_name, error = %e,
+            "cas-7a94: failed to release pre-assign after aborted spawn"
+        );
+    } else {
+        tracing::info!(
+            task_id,
+            worker_name,
+            "cas-7a94: released pre-assign after aborted/cancelled spawn"
+        );
     }
 }
 
@@ -477,11 +642,19 @@ impl FactoryApp {
         // Track the worker name
         self.worker_names.push(worker_name.clone());
 
-        // cas-6913: pre-assign the requested task now that the worker name
-        // is final. Best-effort — a failure here must not unwind the spawn,
-        // the worker's PTY is already running.
+        // cas-6913 / cas-7a94: pre-assign (or confirm early-assign) now that
+        // the worker name is final and the PTY is up. Best-effort — a failure
+        // here must not unwind the spawn.
         if let Some(ref task_id) = task_id {
-            assign_task_to_new_worker(self.cas_dir(), task_id, &worker_name);
+            let ok = assign_task_to_new_worker(self.cas_dir(), task_id, &worker_name);
+            if !ok {
+                tracing::warn!(
+                    task_id = %task_id,
+                    worker = %worker_name,
+                    "cas-7a94: finish_worker_spawn pre-assign did not stick — \
+                     worker boots without the requested task"
+                );
+            }
         }
 
         crate::ui::factory::app::queue_codex_worker_intro_prompt(
@@ -524,6 +697,20 @@ impl FactoryApp {
             anyhow::bail!("Worker '{name}' not found");
         }
 
+        // cas-7a94: release pre-assigns / leases bound to this worker *before*
+        // tearing down the agent record. Assignees are display names (cas-dbbb),
+        // so match on `name` not agent_id. Without this, spawn-time pre-assigns
+        // and InProgress ghosts survive shutdown and block transfer/start.
+        let cas_dir = self.cas_dir().to_path_buf();
+        let released = release_worker_task_bindings(&cas_dir, name);
+        if released > 0 {
+            tracing::info!(
+                worker = %name,
+                released,
+                "cas-7a94: released task bindings on shutdown_worker"
+            );
+        }
+
         // Mark agent as shutdown in CAS first; this must succeed so supervisor sees errors
         // instead of silently leaving stale idle agents in director panels.
         let agent_store = open_agent_store(self.cas_dir())?;
@@ -545,11 +732,12 @@ impl FactoryApp {
             )
         })?;
 
-        // Snapshot task state BEFORE graceful_shutdown() — that call zeroes the
-        // agent's active_tasks counter, which would otherwise mask open work.
+        // Snapshot task state AFTER release — should be free of this worker's
+        // Open/InProgress/Blocked bindings. Remaining non-Closed work (e.g.
+        // AwaitingMerge) still blocks worktree reclaim.
         let agent_id = agent.id.clone();
-        let cas_dir = self.cas_dir().to_path_buf();
-        let has_open_tasks = worker_has_open_tasks(&cas_dir, &agent_id);
+        let has_open_tasks = worker_has_open_tasks(&cas_dir, name)
+            || worker_has_open_tasks(&cas_dir, &agent_id);
 
         if let Err(e) = agent_store.graceful_shutdown(&agent.id) {
             // Best effort fallback to stale state for consistency, but still surface original failure.
@@ -1022,7 +1210,7 @@ mod tests {
         assert!(!worker_has_open_tasks(&cas_dir, "agent-d"));
     }
 
-    // --- cas-6913: spawn-time task pre-assignment -----------------------
+    // --- cas-6913 / cas-7a94: spawn-time task pre-assignment ------------
 
     /// AC3: `spawn_workers task_id=<id>` must result in the task's assignee
     /// being the newly spawned worker's display name — the same field
@@ -1036,7 +1224,10 @@ mod tests {
             .add(&task_with("cas-abc1", None, TaskStatus::Open))
             .unwrap();
 
-        assign_task_to_new_worker(&cas_dir, "cas-abc1", "swift-fox");
+        assert!(
+            assign_task_to_new_worker(&cas_dir, "cas-abc1", "swift-fox"),
+            "pre-assign should report success"
+        );
 
         let updated = store.get("cas-abc1").unwrap();
         assert_eq!(
@@ -1057,7 +1248,10 @@ mod tests {
             .add(&task_with("cas-abc1", Some("other-worker"), TaskStatus::Open))
             .unwrap();
 
-        assign_task_to_new_worker(&cas_dir, "cas-abc1", "swift-fox");
+        assert!(
+            !assign_task_to_new_worker(&cas_dir, "cas-abc1", "swift-fox"),
+            "must not steal another worker's assignment"
+        );
 
         let updated = store.get("cas-abc1").unwrap();
         assert_eq!(
@@ -1072,8 +1266,130 @@ mod tests {
     fn assign_task_to_new_worker_missing_task_does_not_panic() {
         let (_temp, cas_dir) = seeded_cas_dir();
         // No task seeded — "cas-missing" does not exist.
-        assign_task_to_new_worker(&cas_dir, "cas-missing", "swift-fox");
-        // Reaching this line without panicking is the assertion.
+        assert!(!assign_task_to_new_worker(
+            &cas_dir,
+            "cas-missing",
+            "swift-fox"
+        ));
+    }
+
+    /// cas-7a94: finish-path confirm after early-assign must treat
+    /// already-ours as success (no warn-and-skip that would look like failure).
+    #[test]
+    fn assign_task_to_new_worker_idempotent_for_same_worker() {
+        let (_temp, cas_dir) = seeded_cas_dir();
+        let store = crate::store::open_task_store(&cas_dir).unwrap();
+        store
+            .add(&task_with("cas-abc1", None, TaskStatus::Open))
+            .unwrap();
+
+        assert!(assign_task_to_new_worker(
+            &cas_dir,
+            "cas-abc1",
+            "recipes-fixer"
+        ));
+        assert!(
+            assign_task_to_new_worker(&cas_dir, "cas-abc1", "recipes-fixer"),
+            "confirm-path after early-assign must succeed for the same worker"
+        );
+        assert_eq!(
+            store.get("cas-abc1").unwrap().assignee.as_deref(),
+            Some("recipes-fixer")
+        );
+    }
+
+    // --- cas-7a94: shutdown / cancel must release pre-assigns -----------
+
+    /// Inverse bug: Open pre-assign to a dead worker must clear on release so
+    /// the next worker can transfer/start without a manual reset.
+    #[test]
+    fn release_worker_task_bindings_clears_open_preassign() {
+        let (_temp, cas_dir) = seeded_cas_dir();
+        let store = crate::store::open_task_store(&cas_dir).unwrap();
+        store
+            .add(&task_with(
+                "cas-7f61",
+                Some("recipes-fixer"),
+                TaskStatus::Open,
+            ))
+            .unwrap();
+
+        let n = release_worker_task_bindings(&cas_dir, "recipes-fixer");
+        assert_eq!(n, 1, "should clear the Open pre-assign");
+
+        let updated = store.get("cas-7f61").unwrap();
+        assert_eq!(updated.assignee, None, "assignee cleared");
+        assert_eq!(
+            updated.status,
+            TaskStatus::Open,
+            "Open stays Open"
+        );
+    }
+
+    /// Inverse bug (observed): InProgress ghost with no live agent / no lease
+    /// blocks transfer. Release must force Open + clear assignee.
+    #[test]
+    fn release_worker_task_bindings_resets_in_progress_ghost() {
+        let (_temp, cas_dir) = seeded_cas_dir();
+        let store = crate::store::open_task_store(&cas_dir).unwrap();
+        store
+            .add(&task_with(
+                "cas-3d23",
+                Some("sow-auditor"),
+                TaskStatus::InProgress,
+            ))
+            .unwrap();
+
+        let n = release_worker_task_bindings(&cas_dir, "sow-auditor");
+        assert_eq!(n, 1);
+
+        let updated = store.get("cas-3d23").unwrap();
+        assert_eq!(updated.assignee, None);
+        assert_eq!(updated.status, TaskStatus::Open);
+    }
+
+    /// Surgical release used when isolate prep fails after early assign.
+    #[test]
+    fn release_preassign_if_bound_only_clears_matching_worker() {
+        let (_temp, cas_dir) = seeded_cas_dir();
+        let store = crate::store::open_task_store(&cas_dir).unwrap();
+        store
+            .add(&task_with(
+                "cas-abc1",
+                Some("recipes-fixer"),
+                TaskStatus::Open,
+            ))
+            .unwrap();
+
+        // Wrong worker name → no-op
+        release_preassign_if_bound(&cas_dir, "cas-abc1", "other-worker");
+        assert_eq!(
+            store.get("cas-abc1").unwrap().assignee.as_deref(),
+            Some("recipes-fixer")
+        );
+
+        // Matching worker → cleared
+        release_preassign_if_bound(&cas_dir, "cas-abc1", "recipes-fixer");
+        assert_eq!(store.get("cas-abc1").unwrap().assignee, None);
+    }
+
+    /// Closed tasks must never be reopened by shutdown release.
+    #[test]
+    fn release_worker_task_bindings_skips_closed() {
+        let (_temp, cas_dir) = seeded_cas_dir();
+        let store = crate::store::open_task_store(&cas_dir).unwrap();
+        store
+            .add(&task_with(
+                "cas-done",
+                Some("dead-worker"),
+                TaskStatus::Closed,
+            ))
+            .unwrap();
+
+        assert_eq!(release_worker_task_bindings(&cas_dir, "dead-worker"), 0);
+        let t = store.get("cas-done").unwrap();
+        assert_eq!(t.assignee.as_deref(), Some("dead-worker"));
+        assert_eq!(t.status, TaskStatus::Closed);
     }
 
     // --- cas-9bc6: resolve_live_worker_harness reads from disk, not cache ----

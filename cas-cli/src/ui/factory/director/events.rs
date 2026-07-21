@@ -509,24 +509,32 @@ pub struct DirectorEventDetector {
     /// present, a checkpoint-age stall candidate is additionally confirmed
     /// against transcript mtime — the same liveness signal
     /// `cas factory is-wedged` reads (cas-4513) — before firing/escalating:
-    /// a transcript written to within `TRANSCRIPT_FRESH_WINDOW` means the
-    /// worker is actively producing output (reading, reasoning, tool
-    /// calls) even though no *checkpoint-class* event has landed yet, so
-    /// the checkpoint-age-only signal alone is unreliable. `None` (e.g. in
-    /// tests, or before the daemon has resolved a cas root) skips the
-    /// confirmation step and falls back to the checkpoint-only predicate —
-    /// preserves old behavior rather than going silent when the stronger
-    /// signal is unavailable.
+    /// a transcript written within the harness-specific
+    /// [`activity_fresh_window`](crate::cli::factory::wedged::activity_fresh_window)
+    /// (Codex 5m; Claude/Grok 60s; cas-ab80) means the worker is actively
+    /// producing output even though no *checkpoint-class* event has landed
+    /// yet, so the checkpoint-age-only signal alone is unreliable. `None`
+    /// (e.g. in tests, or before the daemon has resolved a cas root) skips
+    /// the confirmation step and falls back to the checkpoint-only
+    /// predicate — preserves old behavior rather than going silent when the
+    /// stronger signal is unavailable.
     cas_root: Option<std::path::PathBuf>,
     /// (cas-09d0) Test-only override for transcript-age resolution, keyed by
     /// resolved worker name. When `Some`, `transcript_confirms_stall` uses
     /// this map directly instead of doing real `/proc` + filesystem I/O via
     /// `cas_root` + `resolve_worker` — lets tests exercise the
     /// transcript-confirms-stall suppression path (AC a: "transcript mtime
-    /// < 60s suppresses stall alert") without a full `SqliteAgentStore` +
-    /// real transcript file round-trip. `None` (production default) leaves
-    /// the existing `cas_root`-based path untouched.
+    /// within the harness fresh window suppresses stall alert") without a
+    /// full `SqliteAgentStore` + real transcript file round-trip. `None`
+    /// (production default) leaves the existing `cas_root`-based path
+    /// untouched.
     transcript_age_override: Option<HashMap<String, Option<Duration>>>,
+    /// (cas-ab80) Test-only per-worker transcript freshness window used with
+    /// `transcript_age_override`. Production resolves the window via
+    /// `activity_fresh_window(resolved.cli)` (same helper as is-wedged).
+    /// When a worker is absent from this map under age override, defaults to
+    /// `TRANSCRIPT_FRESH_WINDOW` (Claude/Grok 60s).
+    transcript_window_override: Option<HashMap<String, Duration>>,
     /// (cas-09d0) Workers explicitly put on hold by the supervisor — a
     /// first-class primitive for "deliberately paused, not idle-needing-work"
     /// that doesn't require a task-status transition (unlike `AwaitingMerge`,
@@ -558,6 +566,7 @@ impl DirectorEventDetector {
             task_start_observed: HashMap::new(),
             cas_root: None,
             transcript_age_override: None,
+            transcript_window_override: None,
             held_workers: HashSet::new(),
         }
     }
@@ -592,6 +601,14 @@ impl DirectorEventDetector {
         self.transcript_age_override = Some(ages);
     }
 
+    /// (cas-ab80) Test-only seam: inject harness-specific transcript fresh
+    /// windows alongside `set_transcript_age_override`. Production uses
+    /// `activity_fresh_window(cli)` from the resolved worker.
+    #[cfg(test)]
+    pub(crate) fn set_transcript_window_override(&mut self, windows: HashMap<String, Duration>) {
+        self.transcript_window_override = Some(windows);
+    }
+
     /// Initialize with current state (call after first data load)
     pub fn initialize(&mut self, data: &DirectorData) {
         self.last_state = DirectorState::from_data(data);
@@ -622,6 +639,11 @@ impl DirectorEventDetector {
     /// worker is evidently still producing output, and the checkpoint-age
     /// signal alone was a false positive.
     ///
+    /// Freshness uses the same harness-specific window as
+    /// `cas factory is-wedged` via
+    /// [`activity_fresh_window`](crate::cli::factory::wedged::activity_fresh_window)
+    /// (cas-ab80): Codex 5m, Claude/Grok 60s.
+    ///
     /// Defaults to `true` (proceed with the checkpoint-only verdict, the
     /// pre-cas-728b behavior) whenever the stronger signal is unavailable:
     /// no `cas_root` set, the worker isn't resolvable in the agent store,
@@ -634,7 +656,12 @@ impl DirectorEventDetector {
     fn transcript_confirms_stall(&self, worker_name: &str) -> bool {
         if let Some(overrides) = &self.transcript_age_override {
             let age = overrides.get(worker_name).copied().flatten();
-            return transcript_confirms_stall_for_age(age);
+            let window = self
+                .transcript_window_override
+                .as_ref()
+                .and_then(|m| m.get(worker_name).copied())
+                .unwrap_or(crate::cli::factory::wedged::TRANSCRIPT_FRESH_WINDOW);
+            return transcript_confirms_stall_for_age(age, window);
         }
         let Some(cas_root) = &self.cas_root else {
             return true;
@@ -643,7 +670,7 @@ impl DirectorEventDetector {
         else {
             return true;
         };
-        transcript_confirms_stall_for_path(resolved.transcript_path.as_deref())
+        transcript_confirms_stall_for_path(resolved.transcript_path.as_deref(), resolved.cli)
     }
 
     /// Add a worker to the tracked list (call when spawning workers dynamically)
@@ -983,11 +1010,12 @@ impl DirectorEventDetector {
 
                 if has_fresh_heartbeat {
                     if let Some(elapsed) = stalled_elapsed_secs {
-                        // cas-728b: confirm against transcript mtime — the
-                        // same liveness signal `cas factory is-wedged`
-                        // reads — before firing/escalating. A transcript
-                        // written to within TRANSCRIPT_FRESH_WINDOW means
-                        // the worker is actively producing output (reading,
+                        // cas-728b / cas-ab80: confirm against transcript
+                        // mtime — the same liveness signal `cas factory
+                        // is-wedged` reads, using the same harness-specific
+                        // activity_fresh_window — before firing/escalating.
+                        // A transcript written within that window means the
+                        // worker is actively producing output (reading,
                         // reasoning, tool calls) even though no
                         // checkpoint-class event has landed; the
                         // checkpoint-age signal alone can't tell that apart
@@ -1359,31 +1387,47 @@ impl DirectorEventDetector {
     }
 }
 
-/// (cas-728b) Pure decision given an already-resolved transcript path:
-/// `false` means the transcript was written to within
-/// `TRANSCRIPT_FRESH_WINDOW` (the worker is evidently still producing
-/// output, so a checkpoint-age stall candidate is a false positive);
-/// `true` means proceed with the checkpoint-age verdict (stale, missing,
-/// or unresolvable transcript — the confirming signal isn't available or
-/// doesn't contradict the checkpoint-age evidence). Split out from
-/// `DirectorEventDetector::transcript_confirms_stall` so this decision is
-/// unit-testable with a real temp file without needing a full
-/// `SqliteAgentStore` round-trip via `resolve_worker`.
-fn transcript_confirms_stall_for_path(transcript_path: Option<&std::path::Path>) -> bool {
+/// (cas-728b / cas-de95) Pure decision given an already-resolved transcript path
+/// and the worker's harness: `false` means do **not** fire a stalled nudge
+/// (worker still producing output, **or** transcript telemetry is unavailable
+/// so absence is not evidence); `true` means a **resolved, cold** transcript
+/// corroborates the checkpoint-age stall candidate.
+///
+/// cas-de95: missing/unresolvable path returns `false` — treating telemetry
+/// absence as a stall confirmation was the live false-nudge failure mode for
+/// Codex/Claude workers with unresolved rollouts/transcripts.
+///
+/// cas-ab80: freshness window is harness-specific via
+/// [`activity_fresh_window`](crate::cli::factory::wedged::activity_fresh_window),
+/// matching `is-wedged`.
+fn transcript_confirms_stall_for_path(
+    transcript_path: Option<&std::path::Path>,
+    cli: cas_mux::SupervisorCli,
+) -> bool {
     let Some(path) = transcript_path else {
-        return true;
+        return false;
     };
-    transcript_confirms_stall_for_age(crate::cli::factory::wedged::transcript_mtime_age(path))
+    let window = crate::cli::factory::wedged::activity_fresh_window(cli);
+    transcript_confirms_stall_for_age(
+        crate::cli::factory::wedged::transcript_mtime_age(path),
+        window,
+    )
 }
 
-/// (cas-09d0) Pure core of the confirmation decision, split out one layer
-/// further than `transcript_confirms_stall_for_path` so tests (and the
-/// `transcript_age_override` seam) can drive it from a plain `Option<Duration>`
-/// without touching the filesystem at all.
-fn transcript_confirms_stall_for_age(age: Option<Duration>) -> bool {
+/// (cas-09d0 / cas-de95 / cas-ab80) Pure core of the confirmation decision.
+///
+/// - `Some(age < fresh_window)` → not stalled (fresh transcript)
+/// - `Some(age ≥ fresh_window)` → confirm stall (cold transcript is positive evidence)
+/// - `None` → **do not confirm** (unresolved/missing telemetry is not starvation)
+///
+/// `fresh_window` must come from
+/// [`activity_fresh_window`](crate::cli::factory::wedged::activity_fresh_window)
+/// (or the same constants) so director and is-wedged agree.
+fn transcript_confirms_stall_for_age(age: Option<Duration>, fresh_window: Duration) -> bool {
     match age {
-        Some(age) if age < crate::cli::factory::wedged::TRANSCRIPT_FRESH_WINDOW => false,
-        _ => true,
+        Some(age) if age < fresh_window => false,
+        Some(_) => true,
+        None => false,
     }
 }
 

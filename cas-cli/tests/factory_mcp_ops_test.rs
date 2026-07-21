@@ -69,6 +69,33 @@ impl FactoryTestEnv {
         id
     }
 
+    /// Create a task parked in `AwaitingMerge` assigned to `assignee`
+    /// (cas-126b fixtures). Returns the generated task id.
+    fn create_awaiting_merge_task(&self, title: &str, assignee: &str) -> String {
+        let store = self.task_store();
+        let id = store.generate_id().expect("generate_id");
+        let mut task = Task::new(id.clone(), title.to_string());
+        task.status = TaskStatus::AwaitingMerge;
+        task.assignee = Some(assignee.to_string());
+        store.add(&task).expect("add awaiting-merge task");
+        id
+    }
+
+    /// Read a registered worker's `halt_task_work` metadata flag by name.
+    fn worker_halted(&self, name: &str) -> bool {
+        let agents = self.agent_store().list(None).expect("list agents");
+        agents
+            .iter()
+            .find(|a| a.name.eq_ignore_ascii_case(name) && a.role == AgentRole::Worker)
+            .map(|a| {
+                a.metadata
+                    .get("halt_task_work")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false)
+    }
+
     fn register_worker(&self, name: &str) -> String {
         let store = self.agent_store();
         let id = Agent::generate_fallback_id();
@@ -259,6 +286,7 @@ fn factory_req(action: &str) -> FactoryRequest {
         target: None,
         message: None,
         force: None,
+        // allow_trunk is CoordinationRequest/worktree_merge only — not FactoryRequest
         clear: None,
         branch: None,
         older_than_secs: None,
@@ -285,6 +313,8 @@ fn coord_req(action: &str) -> CoordinationRequest {
         summary: None,
         urgent: None,
         force: None,
+        allow_trunk: None,
+        cleanup: None,
         clear: None,
         limit: None,
         name: None,
@@ -628,7 +658,10 @@ async fn test_spawn_workers_task_id_enqueues_for_single_worker() {
     req.task_id = Some(task_id.clone());
 
     let result = env.service.factory(Parameters(req)).await;
-    assert!(result.is_ok(), "single-worker spawn with task_id should succeed: {result:?}");
+    assert!(
+        result.is_ok(),
+        "single-worker spawn with task_id should succeed: {result:?}"
+    );
     let text = get_text(&result.unwrap());
     assert!(
         text.contains(&task_id),
@@ -657,7 +690,10 @@ async fn test_spawn_workers_task_id_enqueues_for_single_named_worker() {
     req.task_id = Some(task_id.clone());
 
     let result = env.service.factory(Parameters(req)).await;
-    assert!(result.is_ok(), "single named-worker spawn with task_id should succeed: {result:?}");
+    assert!(
+        result.is_ok(),
+        "single named-worker spawn with task_id should succeed: {result:?}"
+    );
 
     let entries = env.spawn_queue().peek(10).expect("peek");
     assert_eq!(entries.len(), 1);
@@ -712,7 +748,10 @@ async fn test_spawn_workers_task_id_rejects_multi_worker_names() {
     req.task_id = Some(task_id);
 
     let result = env.service.factory(Parameters(req)).await;
-    assert!(result.is_err(), "task_id with 2 worker_names must be rejected");
+    assert!(
+        result.is_err(),
+        "task_id with 2 worker_names must be rejected"
+    );
 }
 
 /// cas-6913: task_id referencing a task that doesn't exist must fail fast
@@ -1050,7 +1089,9 @@ async fn test_worker_status_and_agent_list_agree_on_live_workers() {
     alive.last_heartbeat = chrono::Utc::now() - staleness;
     alive.registered_at = chrono::Utc::now() - staleness;
     alive.pid = Some(std::process::id());
-    store.register(&alive).expect("register process-alive stale-hb worker");
+    store
+        .register(&alive)
+        .expect("register process-alive stale-hb worker");
 
     // Truly dead stale (no pid) — must not appear as live.
     env.register_stale_worker_with_clone_path("dead-stale", "/tmp/cas-wt-dead", 40);
@@ -1192,18 +1233,22 @@ async fn test_worker_status_prunes_stale_worker_and_keeps_live_one() {
         .expect("worker_status call should succeed");
     let text = get_text(&result);
 
-    // Live worker must appear; stale must not.
+    // Live worker must appear; stale must not appear as an Active bullet.
+    // cas-2e81: stale workers that held no lease may be absent entirely;
+    // those that held a lease can appear under "Recently died while leased".
     assert!(
         text.contains("live-fox"),
         "live worker must appear in Active listing. Got:\n{text}"
     );
+    let active_section = text
+        .split("Recently died while leased")
+        .next()
+        .unwrap_or(&text);
     assert!(
-        !text.contains("dead-wolf"),
+        !active_section
+            .lines()
+            .any(|l| l.contains("• dead-wolf") || l.contains(&format!("• {stale_id}"))),
         "stale worker must be pruned out of the Active listing. Got:\n{text}"
-    );
-    assert!(
-        !text.contains(&stale_id),
-        "stale worker's id must not appear in render. Got:\n{text}"
     );
 
     // The footer must account for the prune so operators can see the
@@ -1332,6 +1377,216 @@ async fn test_9829_worker_status_marks_stalled_worker_with_in_progress_task() {
     assert!(
         !ibis_block.contains("⚠ STALLED"),
         "a worker with no claimed task must never be marked STALLED. Got:\n{ibis_block}"
+    );
+}
+
+// =============================================================================
+// cas-2e81: orphan InProgress + death/lease-expiry signal
+// =============================================================================
+
+/// Simulated kill of a lease holder after start: worker_status prune must
+/// park the InProgress task Open with an audit note (non-silent recovery).
+#[tokio::test]
+async fn test_2e81_worker_status_parks_orphaned_inprogress_on_stale_prune() {
+    let _guard = EnvGuard::set(&[]);
+    let env = FactoryTestEnv::new();
+    let sup_id = env.register_supervisor("sup-orphan");
+
+    let worker_id =
+        env.register_stale_worker_with_clone_path("gone-worker", "/tmp/cas-worktrees/gone", 40);
+    let task_store = env.task_store();
+    let mut task = Task::new("cas-orphan1".to_string(), "Orphan mid-task".to_string());
+    task.status = TaskStatus::InProgress;
+    task.assignee = Some("gone-worker".to_string());
+    task_store.add(&task).expect("add task");
+    env.agent_store()
+        .try_claim("cas-orphan1", &worker_id, 600, Some("started"))
+        .expect("claim")
+        .is_success();
+
+    let req = factory_req("worker_status");
+    let result = env
+        .service
+        .factory(Parameters(req))
+        .await
+        .expect("worker_status");
+    let text = get_text(&result);
+
+    let recovered = task_store.get("cas-orphan1").expect("task still exists");
+    assert_eq!(
+        recovered.status,
+        TaskStatus::Open,
+        "orphaned InProgress must park to Open. Got notes: {}",
+        recovered.notes
+    );
+    assert!(
+        recovered.assignee.is_none(),
+        "assignee must clear on orphan recovery"
+    );
+    assert!(
+        recovered.notes.contains("orphaned")
+            || recovered.notes.contains("worker vanished")
+            || recovered.notes.contains("lease"),
+        "audit note required. notes={}",
+        recovered.notes
+    );
+
+    // Recovery signal also visible on worker_status (died-while-leased section).
+    assert!(
+        text.contains("Recently died while leased") || text.contains("gone-worker"),
+        "worker_status must surface death/orphan signal. Got:\n{text}"
+    );
+    assert!(
+        text.contains("cas-orphan1"),
+        "held task id must appear in death signal. Got:\n{text}"
+    );
+
+    // worker_died queue notification for the supervising session.
+    let queue = cas::store::open_supervisor_queue_store(&env.cas_root).expect("queue");
+    let pending = queue.peek(&sup_id, 20).expect("peek");
+    assert!(
+        pending.iter().any(|n| n.event_type == "worker_died"),
+        "worker_died must be queued for supervisor. pending={pending:?}"
+    );
+    let _ = sup_id;
+}
+
+/// Empty fleet with no deaths vs died-while-leased must read differently.
+#[tokio::test]
+async fn test_2e81_worker_status_distinguishes_empty_fleet_vs_died_while_leased() {
+    let _guard = EnvGuard::set(&[]);
+    let env = FactoryTestEnv::new();
+    env.register_supervisor("sup-empty");
+
+    // Empty fleet (only supervisor) — no died-while-leased section.
+    let empty_text = get_text(
+        &env.service
+            .factory(Parameters(factory_req("worker_status")))
+            .await
+            .expect("worker_status empty"),
+    );
+    assert!(
+        empty_text.contains("None active") || empty_text.contains("No active"),
+        "empty fleet must say no active workers. Got:\n{empty_text}"
+    );
+    assert!(
+        !empty_text.contains("Recently died while leased"),
+        "empty fleet must NOT claim died-while-leased. Got:\n{empty_text}"
+    );
+
+    // Kill a lease holder mid-task.
+    let worker_id =
+        env.register_stale_worker_with_clone_path("crash-worker", "/tmp/cas-worktrees/crash", 45);
+    let task_store = env.task_store();
+    let mut task = Task::new("cas-crash1".to_string(), "Crash mid-task".to_string());
+    task.status = TaskStatus::InProgress;
+    task.assignee = Some("crash-worker".to_string());
+    task_store.add(&task).expect("add");
+    env.agent_store()
+        .try_claim("cas-crash1", &worker_id, 600, None)
+        .expect("claim")
+        .is_success();
+
+    let died_text = get_text(
+        &env.service
+            .factory(Parameters(factory_req("worker_status")))
+            .await
+            .expect("worker_status after death"),
+    );
+    assert!(
+        died_text.contains("Recently died while leased"),
+        "died-while-leased must be explicit. Got:\n{died_text}"
+    );
+    assert!(
+        died_text.contains("crash-worker") && died_text.contains("cas-crash1"),
+        "must name dead worker + held task. Got:\n{died_text}"
+    );
+}
+
+/// agent_cleanup path: lease reclaim + stale mark also parks orphaned tasks
+/// and emits worker_died (not only worker_status).
+#[tokio::test]
+async fn test_2e81_agent_cleanup_parks_orphan_and_emits_worker_died() {
+    let _guard = EnvGuard::set(&[]);
+    let env = FactoryTestEnv::new();
+    let sup_id = env.register_supervisor("sup-cleanup");
+
+    let worker_id =
+        env.register_stale_worker_with_clone_path("cleanup-dead", "/tmp/cas-worktrees/cd", 200);
+    let task_store = env.task_store();
+    let mut task = Task::new("cas-clean1".to_string(), "Cleanup orphan".to_string());
+    task.status = TaskStatus::InProgress;
+    task.assignee = Some("cleanup-dead".to_string());
+    task_store.add(&task).expect("add");
+    env.agent_store()
+        .try_claim("cas-clean1", &worker_id, 600, None)
+        .expect("claim")
+        .is_success();
+
+    let mut req = coord_req("agent_cleanup");
+    req.stale_threshold_secs = Some(30);
+    let result = env
+        .service
+        .coordination(Parameters(req))
+        .await
+        .expect("agent_cleanup");
+    let text = get_text(&result);
+    assert!(
+        text.contains("Cleanup complete") || text.contains("Stale"),
+        "cleanup should succeed: {text}"
+    );
+
+    let recovered = task_store.get("cas-clean1").expect("task");
+    assert_eq!(
+        recovered.status,
+        TaskStatus::Open,
+        "agent_cleanup must park orphaned InProgress. notes={}",
+        recovered.notes
+    );
+
+    let queue = cas::store::open_supervisor_queue_store(&env.cas_root).expect("queue");
+    let pending = queue.peek(&sup_id, 20).expect("peek");
+    assert!(
+        pending.iter().any(|n| n.event_type == "worker_died"),
+        "agent_cleanup must queue worker_died. pending={pending:?}"
+    );
+}
+
+/// PSR tasks must not be reset to Open by orphan recovery (cas-6e4c invariant).
+#[tokio::test]
+async fn test_2e81_orphan_recovery_skips_psr_tasks() {
+    let _guard = EnvGuard::set(&[]);
+    let env = FactoryTestEnv::new();
+    env.register_supervisor("sup-psr");
+
+    let worker_id =
+        env.register_stale_worker_with_clone_path("psr-worker", "/tmp/cas-worktrees/psr", 40);
+    let task_store = env.task_store();
+    let mut task = Task::new("cas-psr1".to_string(), "PSR task".to_string());
+    task.status = TaskStatus::PendingSupervisorReview;
+    task.assignee = Some("psr-worker".to_string());
+    task_store.add(&task).expect("add");
+    // Still hold a lease so mark_stale revokes something — recovery must skip status flip.
+    env.agent_store()
+        .try_claim("cas-psr1", &worker_id, 600, None)
+        .expect("claim")
+        .is_success();
+    // Force PSR again in case claim path rewrote status.
+    let mut t = task_store.get("cas-psr1").unwrap();
+    t.status = TaskStatus::PendingSupervisorReview;
+    task_store.update(&t).unwrap();
+
+    let _ = env
+        .service
+        .factory(Parameters(factory_req("worker_status")))
+        .await
+        .expect("worker_status");
+
+    let after = task_store.get("cas-psr1").unwrap();
+    assert_eq!(
+        after.status,
+        TaskStatus::PendingSupervisorReview,
+        "PSR must not be auto-reset to Open by orphan recovery"
     );
 }
 
@@ -1712,6 +1967,8 @@ fn coord_msg(
         summary: Some("test".to_string()),
         urgent,
         force: None,
+        allow_trunk: None,
+        cleanup: None,
         clear: None,
         limit: None,
         name: None,
@@ -1803,6 +2060,131 @@ async fn test_coordination_message_urgent_flag_enqueues_urgent() {
     );
 }
 
+/// cas-126b: an urgent "MERGE DONE → re-close now" hand-off to the worker that
+/// OWNS the parked task must NOT arm halt_task_work — otherwise the re-close it
+/// asks for deadlocks (WORK HALTED). The urgent is still enqueued (worker wakes).
+#[tokio::test]
+async fn test_126b_target_awaiting_merge_reclose_urgent_does_not_halt() {
+    let _guard = EnvGuard::set_optional(&[
+        ("CAS_AGENT_ROLE", Some("supervisor")),
+        ("CAS_AGENT_NAME", Some("supervisor")),
+        // No factory session → halt fan-out is unfiltered (worker in scope).
+        ("CAS_FACTORY_SESSION", None),
+    ]);
+    let env = FactoryTestEnv::new();
+    env.register_worker("swift-fox");
+    let task_id = env.create_awaiting_merge_task("parked work", "swift-fox");
+
+    let msg = format!(
+        "MERGE DONE: factory/swift-fox merged to epic. \
+         Re-close now: task action=close id={task_id} reason=\"merged\""
+    );
+    let req = coord_msg("message", "swift-fox", &msg, Some(true));
+    let result = env.service.coordination(Parameters(req)).await;
+    assert!(result.is_ok(), "urgent re-close should succeed: {result:?}");
+
+    // Still enqueued as an urgent so the worker wakes.
+    let prompts = env.prompt_queue().peek_all(10).expect("peek");
+    assert_eq!(prompts.len(), 1);
+    assert!(
+        prompts[0].urgent,
+        "merge re-close must still enqueue urgent"
+    );
+    // But halt must NOT be armed on the owning worker.
+    assert!(
+        !env.worker_halted("swift-fox"),
+        "merge-complete re-close to the owning worker must not arm halt_task_work"
+    );
+}
+
+/// cas-126b scope/authorization gate: an urgent close-guidance message to worker
+/// B that merely NAMES worker A's parked task must STILL halt B — the exemption
+/// binds to the target's OWN AwaitingMerge task, not any AwaitingMerge task.
+#[tokio::test]
+async fn test_126b_other_workers_task_does_not_exempt_target() {
+    let _guard = EnvGuard::set_optional(&[
+        ("CAS_AGENT_ROLE", Some("supervisor")),
+        ("CAS_AGENT_NAME", Some("supervisor")),
+        ("CAS_FACTORY_SESSION", None),
+    ]);
+    let env = FactoryTestEnv::new();
+    env.register_worker("swift-fox"); // target B
+    env.register_worker("brave-otter"); // owner A
+    // Parked task belongs to A, not to the target B.
+    let a_task = env.create_awaiting_merge_task("A's parked work", "brave-otter");
+
+    let msg = format!("MERGE DONE — task action=close id={a_task} reason=\"merged\"");
+    let req = coord_msg("message", "swift-fox", &msg, Some(true));
+    let result = env.service.coordination(Parameters(req)).await;
+    assert!(result.is_ok(), "urgent should succeed: {result:?}");
+
+    assert!(
+        env.worker_halted("swift-fox"),
+        "close guidance naming another worker's parked task must NOT exempt the \
+         target — halt must still fire"
+    );
+}
+
+/// cas-126b: an ordinary urgent stop/redirect (not close guidance) must STILL
+/// arm halt_task_work even if the target owns a parked AwaitingMerge task.
+#[tokio::test]
+async fn test_126b_ordinary_urgent_still_halts_even_with_parked_task() {
+    let _guard = EnvGuard::set_optional(&[
+        ("CAS_AGENT_ROLE", Some("supervisor")),
+        ("CAS_AGENT_NAME", Some("supervisor")),
+        ("CAS_FACTORY_SESSION", None),
+    ]);
+    let env = FactoryTestEnv::new();
+    env.register_worker("swift-fox");
+    let _parked = env.create_awaiting_merge_task("parked work", "swift-fox");
+
+    let req = coord_msg(
+        "message",
+        "swift-fox",
+        "STOP — you are on the wrong file",
+        Some(true),
+    );
+    let result = env.service.coordination(Parameters(req)).await;
+    assert!(result.is_ok(), "urgent stop should succeed: {result:?}");
+
+    assert!(
+        env.worker_halted("swift-fox"),
+        "ordinary urgent stop must still arm halt_task_work (stale-work protection)"
+    );
+}
+
+/// cas-126b fail-closed: an urgent close-guidance message with no positive
+/// AwaitingMerge evidence for the target (no matching task in the store — the
+/// same net branch as a task-store read error) must STILL halt. The exemption
+/// only fires on positive, target-bound AwaitingMerge evidence.
+#[tokio::test]
+async fn test_126b_close_guidance_without_target_awaiting_task_fails_closed_to_halt() {
+    let _guard = EnvGuard::set_optional(&[
+        ("CAS_AGENT_ROLE", Some("supervisor")),
+        ("CAS_AGENT_NAME", Some("supervisor")),
+        ("CAS_FACTORY_SESSION", None),
+    ]);
+    let env = FactoryTestEnv::new();
+    env.register_worker("swift-fox");
+    // No AwaitingMerge task exists for swift-fox (store returns none → no
+    // positive evidence; identical safe outcome to a store read error).
+
+    let req = coord_msg(
+        "message",
+        "swift-fox",
+        "MERGE DONE — task action=close id=cas-9999 reason=\"merged\"",
+        Some(true),
+    );
+    let result = env.service.coordination(Parameters(req)).await;
+    assert!(result.is_ok(), "urgent should succeed: {result:?}");
+
+    assert!(
+        env.worker_halted("swift-fox"),
+        "close guidance without a target-owned AwaitingMerge task must fail closed \
+         (halt still armed)"
+    );
+}
+
 /// cas-6913 AC2: a message to a target that IS registered must say so
 /// honestly — not just "queued", but "queued for next poll (target is
 /// registered)". Regression guard against re-collapsing the two cases.
@@ -1826,6 +2208,35 @@ async fn test_coordination_message_to_registered_target_reports_delivery_status(
     assert!(
         !text.contains("not yet registered"),
         "a registered target must not read as unregistered: {text}"
+    );
+}
+
+/// cas-73c8 AC3: `director` is a permanent team member and the source of
+/// inbound teammate messages, but is not an agent_store registration.
+/// Outbound `target=director` must report registered (symmetric with inbound).
+#[tokio::test]
+async fn test_coordination_message_to_director_reports_registered() {
+    let _guard = EnvGuard::set(&[
+        ("CAS_AGENT_ROLE", "supervisor"),
+        ("CAS_AGENT_NAME", "supervisor"),
+    ]);
+    let env = FactoryTestEnv::new();
+    // Deliberately do NOT register "director" in agent_store.
+
+    let req = coord_msg("message", "director", "ack director nudge", None);
+    let result = env.service.coordination(Parameters(req)).await;
+    assert!(
+        result.is_ok(),
+        "message to director should succeed: {result:?}"
+    );
+    let text = get_text(&result.unwrap());
+    assert!(
+        text.contains("target is registered"),
+        "director must resolve as registered: {text}"
+    );
+    assert!(
+        !text.contains("not yet registered"),
+        "director must not read as unregistered after inbound teammate traffic: {text}"
     );
 }
 
@@ -2234,5 +2645,235 @@ async fn test_efc4_worker_status_shows_clone_path_for_both_harnesses() {
     assert!(
         text.contains("/tmp/cas-worktrees/codex-worker"),
         "cas-efc4 AC4: Codex worker clone_path must be rendered: {text}"
+    );
+}
+
+// =============================================================================
+// cas-062d: task lifecycle → owning supervisor push
+// =============================================================================
+
+/// Happy path + isolation: start + blocked create durable `task_lifecycle`
+/// events only for the owning factory session's supervisor. Replay of the
+/// same transition identity does not create a second row.
+#[tokio::test]
+async fn test_062d_lifecycle_start_and_blocked_push_session_isolated() {
+    let _guard = EnvGuard::set(&[("CAS_FACTORY_SESSION", "sess-062d-a")]);
+    let env = FactoryTestEnv::with_agent_id("worker-062d");
+
+    // Owning supervisor (session A) vs foreign supervisor (session B).
+    let sup_a = env.register_supervisor_in_session("sup-a", "sess-062d-a");
+    let sup_b = env.register_supervisor_in_session("sup-b", "sess-062d-b");
+
+    // Register the starting agent so assignee/actor resolve cleanly.
+    {
+        let store = env.agent_store();
+        let mut worker = Agent::new("worker-062d".to_string(), "worker-062d".to_string());
+        worker.role = AgentRole::Worker;
+        worker.factory_session = Some("sess-062d-a".to_string());
+        store.register(&worker).expect("register worker");
+    }
+
+    let task_store = env.task_store();
+    let mut task = Task::new(
+        "cas-062d-start".to_string(),
+        "Lifecycle start push".to_string(),
+    );
+    task.status = TaskStatus::Open;
+    task_store.add(&task).expect("add task");
+
+    let start = env
+        .service
+        .inner
+        .cas_task_start(Parameters(cas::mcp::tools::IdRequest {
+            id: "cas-062d-start".to_string(),
+        }))
+        .await
+        .expect("start should succeed");
+    let start_text = get_text(&start);
+    assert!(
+        start_text.contains("Started task") || start_text.contains("cas-062d-start"),
+        "start response: {start_text}"
+    );
+
+    let queue = cas::store::open_supervisor_queue_store(&env.cas_root).expect("queue");
+    let pending_a = queue.peek(&sup_a, 20).expect("peek a");
+    assert!(
+        pending_a.iter().any(|n| {
+            n.event_type == "task_lifecycle"
+                && n.payload.contains("task_started")
+                && n.payload.contains("cas-062d-start")
+        }),
+        "session-A supervisor must receive task_started. pending={pending_a:?}"
+    );
+    let pending_b = queue.peek(&sup_b, 20).expect("peek b");
+    assert!(
+        !pending_b
+            .iter()
+            .any(|n| n.payload.contains("cas-062d-start")),
+        "session-B supervisor must NOT receive session-A lifecycle events. pending={pending_b:?}"
+    );
+    assert_eq!(
+        queue.pending_count(&sup_a).unwrap(),
+        1,
+        "exactly one start event before blocked"
+    );
+
+    // Blocked transition via task update.
+    let update = env
+        .service
+        .inner
+        .cas_task_update(Parameters(cas::mcp::tools::TaskUpdateRequest {
+            id: "cas-062d-start".to_string(),
+            title: None,
+            notes: None,
+            priority: None,
+            labels: None,
+            description: None,
+            design: None,
+            acceptance_criteria: None,
+            demo_statement: None,
+            execution_note: None,
+            external_ref: None,
+            assignee: None,
+            status: Some("blocked".to_string()),
+            epic: None,
+            epic_verification_owner: None,
+            depth: None,
+        }))
+        .await
+        .expect("update blocked");
+    let _ = get_text(&update);
+
+    let pending_a2 = queue.peek(&sup_a, 20).expect("peek a after blocked");
+    assert!(
+        pending_a2.iter().any(|n| {
+            n.event_type == "task_lifecycle"
+                && n.payload.contains("task_blocked")
+                && n.payload.contains("cas-062d-start")
+        }),
+        "blocked transition must enqueue task_blocked. pending={pending_a2:?}"
+    );
+    assert_eq!(
+        queue.pending_count(&sup_a).unwrap(),
+        2,
+        "start + blocked = 2 durable events"
+    );
+    assert_eq!(
+        queue.pending_count(&sup_b).unwrap(),
+        0,
+        "foreign session still empty"
+    );
+}
+
+/// Reopen (supervisor) emits ReadyReopened / task_ready for the owning session.
+#[tokio::test]
+async fn test_062d_lifecycle_reopen_pushes_ready() {
+    let _guard = EnvGuard::set(&[
+        ("CAS_FACTORY_SESSION", "sess-062d-reopen"),
+        ("CAS_AGENT_ROLE", "supervisor"),
+    ]);
+    let env = FactoryTestEnv::with_agent_id("sup-reopen-agent");
+
+    let sup_id = env.register_supervisor_in_session("sup-reopen", "sess-062d-reopen");
+    {
+        let store = env.agent_store();
+        let mut sup = Agent::new("sup-reopen-agent".to_string(), "sup-reopen".to_string());
+        sup.role = AgentRole::Supervisor;
+        sup.factory_session = Some("sess-062d-reopen".to_string());
+        store.register(&sup).expect("register calling supervisor");
+    }
+
+    let task_store = env.task_store();
+    let mut task = Task::new(
+        "cas-062d-reopen".to_string(),
+        "Reopen lifecycle".to_string(),
+    );
+    task.status = TaskStatus::Closed;
+    task.closed_at = Some(chrono::Utc::now());
+    task_store.add(&task).expect("add closed task");
+
+    let result = env
+        .service
+        .inner
+        .cas_task_reopen(Parameters(cas::mcp::tools::IdRequest {
+            id: "cas-062d-reopen".to_string(),
+        }))
+        .await
+        .expect("reopen should succeed");
+    let text = get_text(&result);
+    assert!(
+        text.contains("Reopened") || text.contains("cas-062d-reopen"),
+        "reopen response: {text}"
+    );
+
+    let after = task_store.get("cas-062d-reopen").expect("task");
+    assert_eq!(after.status, TaskStatus::Open);
+
+    let queue = cas::store::open_supervisor_queue_store(&env.cas_root).expect("queue");
+    let pending = queue.peek(&sup_id, 20).expect("peek");
+    assert!(
+        pending.iter().any(|n| {
+            n.event_type == "task_lifecycle"
+                && n.payload.contains("task_ready")
+                && n.payload.contains("cas-062d-reopen")
+        }),
+        "reopen must push task_ready. pending={pending:?}"
+    );
+}
+
+/// Supervisor close of an orphaned task pushes task_closed (Closed transition).
+#[tokio::test]
+async fn test_062d_lifecycle_close_pushes_closed() {
+    let _guard = EnvGuard::set(&[
+        ("CAS_FACTORY_SESSION", "sess-062d-close"),
+        ("CAS_AGENT_ROLE", "supervisor"),
+    ]);
+    let env = FactoryTestEnv::with_agent_id("sup-close-agent");
+
+    let sup_id = env.register_supervisor_in_session("sup-close", "sess-062d-close");
+    {
+        let store = env.agent_store();
+        let mut sup = Agent::new("sup-close-agent".to_string(), "sup-close".to_string());
+        sup.role = AgentRole::Supervisor;
+        sup.factory_session = Some("sess-062d-close".to_string());
+        store.register(&sup).expect("register calling supervisor");
+    }
+
+    let task_store = env.task_store();
+    let mut task = Task::new("cas-062d-close".to_string(), "Close lifecycle".to_string());
+    // Orphaned InProgress → supervisor bypass skips verification.
+    task.status = TaskStatus::InProgress;
+    task.assignee = None;
+    task_store.add(&task).expect("add task");
+
+    let result = env
+        .service
+        .inner
+        .cas_task_close(Parameters(cas::mcp::tools::TaskCloseRequest {
+            id: "cas-062d-close".to_string(),
+            reason: Some("lifecycle close proof".to_string()),
+            code_review_findings: None,
+            bypass_code_review: Some(true),
+        }))
+        .await
+        .expect("close should succeed");
+    let text = get_text(&result);
+    assert!(
+        text.contains("Closed") || text.contains("cas-062d-close"),
+        "close response: {text}"
+    );
+
+    let after = task_store.get("cas-062d-close").expect("task");
+    assert_eq!(after.status, TaskStatus::Closed, "notes={}", after.notes);
+
+    let queue = cas::store::open_supervisor_queue_store(&env.cas_root).expect("queue");
+    let pending = queue.peek(&sup_id, 20).expect("peek");
+    assert!(
+        pending.iter().any(|n| {
+            n.event_type == "task_lifecycle"
+                && n.payload.contains("task_closed")
+                && n.payload.contains("cas-062d-close")
+        }),
+        "close must push task_closed. pending={pending:?}"
     );
 }

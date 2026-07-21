@@ -5,6 +5,48 @@ use crate::harness_policy::{
 };
 use crate::mcp::tools::core::imports::*;
 
+/// cas-9fff: gate epic close when `epic_verification_owner` is set.
+///
+/// Fail closed: the caller must present an identity that matches `owner`.
+/// An unknown / absent identity is a rejection (not a silent fall-through),
+/// so a mis-routed completion prompt cannot close an owned epic without
+/// credentials.
+pub(crate) fn epic_close_owner_gate(
+    epic_id: &str,
+    owner: &str,
+    caller_id: Option<&str>,
+    caller_name: Option<&str>,
+    caller_session: Option<&str>,
+) -> Result<(), String> {
+    // cas-cc74: trim owner + identity facets so write-boundary normalize and
+    // close compare stay consistent (exact match after trim).
+    let owner = owner.trim();
+    let matches_owner = [caller_id, caller_name, caller_session]
+        .into_iter()
+        .flatten()
+        .any(|id| id.trim() == owner);
+    if matches_owner {
+        return Ok(());
+    }
+    let has_identity = [caller_id, caller_name, caller_session]
+        .into_iter()
+        .flatten()
+        .any(|s| !s.trim().is_empty());
+    if !has_identity {
+        return Err(format!(
+            "Epic {epic_id} is owned by epic_verification_owner={owner}; \
+             caller identity is unknown — refusing close (fail closed, cas-9fff). \
+             Present CAS agent id / CAS_AGENT_NAME / CAS_SESSION_ID matching the owner, \
+             or transfer epic_verification_owner first."
+        ));
+    }
+    Err(format!(
+        "Epic {epic_id} is owned by epic_verification_owner={owner}; \
+         this session cannot close it. Update epic_verification_owner \
+         if ownership has transferred (cas-9fff)."
+    ))
+}
+
 /// Maximum time a task may sit in `pending_verification` before the close path
 /// treats the task-verifier subagent as dead, auto-escalates, and releases the
 /// jail. Addresses cas-c29a (within-task verification deadlock): if the
@@ -229,6 +271,49 @@ impl CasCore {
                 error = %e,
                 "failed to park task awaiting merge after close rejection"
             );
+        } else {
+            // cas-062d / cas-17e4: durable outbox for AwaitingMerge + close-rejected.
+            let actor = self.get_agent_id().unwrap_or_else(|_| "unknown".into());
+            let actor_name = self
+                .open_agent_store()
+                .ok()
+                .and_then(|s| s.get(&actor).ok())
+                .map(|a| a.name)
+                .unwrap_or_else(|| actor.clone());
+            let occurrence =
+                super::supervisor_push::occurrence_from_updated_at(parked.updated_at);
+            if let Err(e) = self.push_task_lifecycle(
+                &task.id,
+                &task.title,
+                task.status,
+                TaskStatus::AwaitingMerge,
+                &actor_name,
+                Some(reason),
+                super::supervisor_push::LifecycleTransition::AwaitingMerge,
+                &occurrence,
+            ) {
+                tracing::error!(
+                    task_id = %task.id,
+                    error = %e,
+                    "supervisor lifecycle push failed after AwaitingMerge park (task remains AwaitingMerge; replay outbox)"
+                );
+            }
+            if let Err(e) = self.push_task_lifecycle(
+                &task.id,
+                &task.title,
+                task.status,
+                TaskStatus::AwaitingMerge,
+                &actor_name,
+                Some(reason),
+                super::supervisor_push::LifecycleTransition::CloseRejected,
+                &occurrence,
+            ) {
+                tracing::error!(
+                    task_id = %task.id,
+                    error = %e,
+                    "supervisor lifecycle push failed after close rejection (task remains AwaitingMerge; replay outbox)"
+                );
+            }
         }
 
         if let Ok(agent_store) = self.open_agent_store() {
@@ -255,6 +340,86 @@ impl CasCore {
             message: Cow::from(format!("Task not found: {e}")),
             data: None,
         })?;
+
+        // cas-6d0b / cas-b269: short-circuit already-Closed before
+        // merge/review/verification gates. Do not re-success, overwrite
+        // closed_at, or demand CODE_REVIEW_REQUIRED.
+        if super::stale_close_guard::is_terminal_closed(task.status)
+            || task.status == TaskStatus::Closed
+        {
+            let closed_at_msg = task
+                .closed_at
+                .map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string())
+                .unwrap_or_else(|| "unknown time".to_string());
+            return Ok(Self::success(format!(
+                "Already closed: {} - {} (closed at {}). This call did not re-close \
+                 the task; closed_at and notes were left unchanged.",
+                req.id, task.title, closed_at_msg
+            )));
+        }
+
+        // cas-b269: urgent stop sets halt_task_work; block close until new start.
+        //
+        // cas-60393: narrow exemption — a pre-existing halt armed by an
+        // EARLIER, unrelated urgent stop must not deadlock re-close of the
+        // caller's OWN already-parked `AwaitingMerge` task (there is no
+        // in-band way to `start` an `AwaitingMerge` task to clear the halt).
+        // The exemption only skips *this* check; the merge-integrity gate
+        // below remains authoritative, so an AwaitingMerge task whose branch
+        // is not actually merged yet still bounces MERGE REQUIRED. Halt
+        // continues to block close for every other task/status/assignee.
+        if let Ok(agent_id) = self.get_agent_id() {
+            if let Ok(agent_store) = self.open_agent_store() {
+                if let Ok(agent) = agent_store.get(&agent_id) {
+                    let halt_exempt =
+                        super::stale_close_guard::halt_exempt_for_owned_awaiting_merge(
+                            task.status,
+                            task.assignee.as_deref(),
+                            Some(agent.name.as_str()),
+                        );
+                    if super::stale_close_guard::agent_task_work_halted(&agent.metadata)
+                        && !halt_exempt
+                    {
+                        return Err(McpError {
+                            code: ErrorCode::INVALID_PARAMS,
+                            message: Cow::from(
+                                super::stale_close_guard::halt_blocks_task_work_message(
+                                    "task action=close",
+                                ),
+                            ),
+                            data: None,
+                        });
+                    }
+                }
+            }
+        }
+
+        // cas-9fff: refuse silent cross-session epic close when
+        // epic_verification_owner is set. Fail closed: unknown caller
+        // identity is a rejection (not a fall-through). Callers who need
+        // to take over must update epic_verification_owner first (or act
+        // as the owner). Prevents a mis-routed director completion prompt
+        // from racing the owning supervisor on `task close`.
+        if task.task_type == TaskType::Epic {
+            if let Some(ref owner) = task.epic_verification_owner {
+                let caller_id = self.get_agent_id().ok();
+                let caller_name = std::env::var("CAS_AGENT_NAME").ok();
+                let caller_session = std::env::var("CAS_SESSION_ID").ok();
+                if let Err(msg) = epic_close_owner_gate(
+                    &req.id,
+                    owner,
+                    caller_id.as_deref(),
+                    caller_name.as_deref(),
+                    caller_session.as_deref(),
+                ) {
+                    return Err(McpError {
+                        code: ErrorCode::INVALID_PARAMS,
+                        message: Cow::from(msg),
+                        data: None,
+                    });
+                }
+            }
+        }
 
         // cas-6538 (EPIC cas-1255 — per-task depth speed mode): a `depth=light`
         // task is the feel-driven, fast-iteration path. The close gate skips
@@ -1225,7 +1390,12 @@ impl CasCore {
                                 .map(|wt| wt.parent_branch.clone())
                         })
                         .unwrap_or_else(|| "main".to_string());
-                    match check_commit_claim_integrity(worker_wt, &parent_branch, true) {
+                    match check_commit_claim_integrity(
+                        worker_wt,
+                        &parent_branch,
+                        true,
+                        task.deliverables.factory_branch_anchor.as_deref(),
+                    ) {
                         CommitClaimGateOutcome::Reject(msg) => {
                             return Ok(Self::tool_error(msg));
                         }
@@ -1348,20 +1518,24 @@ impl CasCore {
         // non-isolated tasks, fall through to the existing main-repo check —
         // those workers share the main worktree so its state IS the task diff.
         //
-        // Also capture `worker_review_parent_branch` for the case-3 ambiguity
-        // check below (avoids a second open_worktree_store call).
+        // Also capture `worker_review_parent_branch` for lint / merge-reality /
+        // case-3 ambiguity (avoids a second parent lookup).
+        //
+        // cas-dc5d P1: System-B isolated workers (`spawn_workers isolate=true`)
+        // almost never set `task.worktree_id` (that's System A). The previous
+        // worktree_id → parent_branch lookup therefore fell through to a
+        // hard-coded `"main"`, so lightweight lint's merge-base..HEAD range
+        // was wrong whenever the real integration target was `epic/<slug>`.
+        // Reuse the same authoritative resolution as the merge-state gate:
+        // `get_parent_epic(...).branch`, else `resolve_standalone_merge_target`.
         let (effective_has_reviewable, worker_review_parent_branch) =
             if let Some(worker_wt) = worker_worktree_path.as_ref() {
-                let parent_branch = task
-                    .worktree_id
-                    .as_deref()
-                    .and_then(|wt_id| {
-                        self.open_worktree_store()
-                            .ok()
-                            .and_then(|store| store.get(wt_id).ok())
-                            .map(|wt| wt.parent_branch.clone())
-                    })
-                    .unwrap_or_else(|| "main".to_string());
+                let parent_branch = task_store
+                    .get_parent_epic(&req.id)
+                    .ok()
+                    .flatten()
+                    .and_then(|p| p.branch)
+                    .unwrap_or_else(|| resolve_standalone_merge_target(close_project_root));
                 let reviewable = has_worker_committed_reviewable_changes(worker_wt, &parent_branch);
                 (reviewable, Some(parent_branch))
             } else {
@@ -1453,8 +1627,18 @@ impl CasCore {
             && effective_has_reviewable
             && !depth_light
         {
-            // Run the lightweight structural lint.
-            match run_lightweight_structural_lint(close_project_root) {
+            // cas-dc5d: scope lightweight lint to the closing worker's
+            // worktree + committed task range (merge-base..HEAD), never
+            // the shared main checkout's working-tree WIP. Sibling gates
+            // (cas-ee2b / cas-bc1b) already use this authority; lint was
+            // the remaining caller of bare `close_project_root`.
+            let lint_outcome = if let Some(worker_wt) = worker_worktree_path.as_ref() {
+                let parent = worker_review_parent_branch.as_deref().unwrap_or("main");
+                run_lightweight_structural_lint_with_scope(worker_wt, Some(parent))
+            } else {
+                run_lightweight_structural_lint(close_project_root)
+            };
+            match lint_outcome {
                 LightweightLintOutcome::Fail(msg) => {
                     return Ok(Self::tool_error(format!(
                         "⚠️ LIGHTWEIGHT LINT FAILED\n\n\
@@ -1581,6 +1765,9 @@ impl CasCore {
                         &task.task_type,
                         task.execution_note.as_deref(),
                         has_review_findings,
+                        // cas-127f: parked tip from MERGE REQUIRED — proves
+                        // real work even when merge-base..HEAD is now empty.
+                        task.deliverables.factory_branch_anchor.as_deref(),
                     ) {
                         ZeroCommitCloseOutcome::AmbiguousCodeTask(msg) => {
                             return Ok(Self::tool_error(msg));
@@ -1593,7 +1780,7 @@ impl CasCore {
             // no-code (spike, chore, execution_note set, bypass).
             CodeReviewGateOutcome::Proceed
         } else {
-            run_code_review_gate(&task, &req, close_project_root)
+            run_code_review_gate(&task, &req, close_project_root, supervisor_review_mode)
         };
         match gate_outcome {
             CodeReviewGateOutcome::Proceed => {}
@@ -1617,6 +1804,8 @@ impl CasCore {
         // Proceed with close
         let mut task = task;
         let now = chrono::Utc::now();
+        // cas-062d: capture pre-close status for durable lifecycle push identity.
+        let old_status_for_lifecycle = task.status;
         task.status = TaskStatus::Closed;
         task.closed_at = Some(now);
         task.updated_at = now;
@@ -1736,6 +1925,51 @@ impl CasCore {
             data: None,
         })?;
 
+        // cas-062d / cas-17e4: durable Closed outbox push after successful close.
+        {
+            let actor = self
+                .get_agent_id()
+                .ok()
+                .and_then(|id| {
+                    self.open_agent_store()
+                        .ok()
+                        .and_then(|s| s.get(&id).ok())
+                        .map(|a| a.name)
+                })
+                .unwrap_or_else(|| "unknown".into());
+            let occurrence =
+                super::supervisor_push::occurrence_from_updated_at(task.updated_at);
+            if let Err(e) = self.push_task_lifecycle(
+                &req.id,
+                &task.title,
+                old_status_for_lifecycle,
+                TaskStatus::Closed,
+                &actor,
+                req.reason.as_deref(),
+                super::supervisor_push::LifecycleTransition::Closed,
+                &occurrence,
+            ) {
+                let key = super::supervisor_push::transition_key(
+                    &req.id,
+                    old_status_for_lifecycle,
+                    TaskStatus::Closed,
+                    std::env::var("CAS_FACTORY_SESSION").ok().as_deref(),
+                    super::supervisor_push::LifecycleTransition::Closed,
+                    &occurrence,
+                );
+                return Err(Self::error(
+                    ErrorCode::INTERNAL_ERROR,
+                    super::supervisor_push::lifecycle_push_failure_message(
+                        &req.id,
+                        TaskStatus::Closed,
+                        super::supervisor_push::LifecycleTransition::Closed,
+                        &key,
+                        &e,
+                    ),
+                ));
+            }
+        }
+
         // Auto-unblock tasks that were blocked solely by this task.
         // This keeps dependency state and task status synchronized.
         let mut auto_unblocked_tasks: Vec<String> = Vec::new();
@@ -1769,7 +2003,39 @@ impl CasCore {
                             format!("{}\n\n{}", dependent_task.notes, unblock_note);
                     }
                     if task_store.update(&dependent_task).is_ok() {
-                        auto_unblocked_tasks.push(dependent_task.id.clone());
+                        // cas-062d / cas-17e4: ready/reopened outbox for auto-unblocked dependents.
+                        let dep_id = dependent_task.id.clone();
+                        let dep_title = dependent_task.title.clone();
+                        let occurrence = super::supervisor_push::occurrence_from_updated_at(
+                            dependent_task.updated_at,
+                        );
+                        let actor = self
+                            .get_agent_id()
+                            .ok()
+                            .and_then(|id| {
+                                self.open_agent_store()
+                                    .ok()
+                                    .and_then(|s| s.get(&id).ok())
+                                    .map(|a| a.name)
+                            })
+                            .unwrap_or_else(|| "unknown".into());
+                        if let Err(e) = self.push_task_lifecycle(
+                            &dep_id,
+                            &dep_title,
+                            TaskStatus::Blocked,
+                            TaskStatus::Open,
+                            &actor,
+                            Some("auto-unblocked"),
+                            super::supervisor_push::LifecycleTransition::ReadyReopened,
+                            &occurrence,
+                        ) {
+                            tracing::error!(
+                                task_id = %dep_id,
+                                error = %e,
+                                "supervisor lifecycle push failed after auto-unblock (task remains Open; replay outbox)"
+                            );
+                        }
+                        auto_unblocked_tasks.push(dep_id);
                     }
                 }
             }
@@ -2167,6 +2433,7 @@ impl CasCore {
             ));
         }
 
+        let old_status = task.status;
         task.status = TaskStatus::Open;
         task.closed_at = None;
         task.updated_at = chrono::Utc::now();
@@ -2185,6 +2452,48 @@ impl CasCore {
             message: Cow::from(format!("Failed to update: {e}")),
             data: None,
         })?;
+
+        // cas-062d / cas-17e4: ready/reopened outbox after successful reopen.
+        let actor = self
+            .get_agent_id()
+            .ok()
+            .and_then(|id| {
+                self.open_agent_store()
+                    .ok()
+                    .and_then(|s| s.get(&id).ok())
+                    .map(|a| a.name)
+            })
+            .unwrap_or_else(|| "unknown".into());
+        let occurrence = super::supervisor_push::occurrence_from_updated_at(task.updated_at);
+        if let Err(e) = self.push_task_lifecycle(
+            &req.id,
+            &task.title,
+            old_status,
+            TaskStatus::Open,
+            &actor,
+            Some("reopen"),
+            super::supervisor_push::LifecycleTransition::ReadyReopened,
+            &occurrence,
+        ) {
+            let key = super::supervisor_push::transition_key(
+                &req.id,
+                old_status,
+                TaskStatus::Open,
+                std::env::var("CAS_FACTORY_SESSION").ok().as_deref(),
+                super::supervisor_push::LifecycleTransition::ReadyReopened,
+                &occurrence,
+            );
+            return Err(Self::error(
+                ErrorCode::INTERNAL_ERROR,
+                super::supervisor_push::lifecycle_push_failure_message(
+                    &req.id,
+                    TaskStatus::Open,
+                    super::supervisor_push::LifecycleTransition::ReadyReopened,
+                    &key,
+                    &e,
+                ),
+            ));
+        }
 
         Ok(Self::success(format!(
             "Reopened task: {} - {}",
@@ -2459,6 +2768,46 @@ pub(crate) enum MergeStateGateOutcome {
 /// both of which now clear it): if `status` isn't `AwaitingMerge`, an
 /// existing anchor value is ignored and the gate falls back to the live
 /// branch name, matching first-attempt behavior.
+///
+/// ## cas-2938: squash-equivalent convergence (content + live-ref)
+///
+/// The parked anchor is a *historical* commit-ish. GitHub squash-merge
+/// rewrites the factory tip A into a new integration tip B that does not
+/// have A as an ancestor, so raw ancestry against A never clears.
+///
+/// When the gate is evaluating a trusted AwaitingMerge anchor and that
+/// anchor still looks stranded by rev-list ancestry, two secondary
+/// signals may clear the gate without deleting the historical anchor:
+///
+/// 1. **Content / tip-tree reachability** — the anchor tip's tree object
+///    is reachable from the parent (or `origin/<parent>`). Clean squash
+///    of one or many commits produces a tip tree identical to the
+///    pre-squash factory tip; this also preserves cas-4b3f serial-task
+///    protection after squash (task A can close while task B's later
+///    unmerged commits ride on the live factory HEAD).
+/// 2. **Live-ref convergence** — the live `factory/<assignee>` tip is
+///    **known** to have zero commits not on the parent, via
+///    [`known_unmerged_factory_commits`] → [`KnownUnmergedCount::KnownZero`]
+///    (never the fail-open `count_unmerged_factory_commits == 0`). Covers
+///    conflict-resolved squashes whose tip tree differs from A after the
+///    worker force-aligns the factory ref to the integration tip. Missing
+///    refs / merge-base / rev-list failure are `Unknown` and do not clear
+///    the gate. Cannot mask later unmerged serial work (KnownPositive).
+///
+/// ## cas-5485: stale pre-rebase factory SHA
+///
+/// A normal `git rebase` rewrites parked tip A → A' (new SHA). The first
+/// park still stores A. After A' is integrated, ancestry against A never
+/// clears. Secondary acceptance (fail-closed):
+///
+/// 1. **Tip-tree reachability** of A on parent (identical tip tree).
+/// 2. **Live tip KnownZero** — factory HEAD fully integrated (no later
+///    unmerged work). Does not help when serial task B advanced HEAD.
+/// 3. **Cherry-equivalent patches of A on parent** — `git cherry` reports
+///    every commit unique to A as equivalent (`-`) on parent/origin. This
+///    is the task-specific proof for the rebased form A': it does **not**
+///    require live HEAD to be zero-ahead, so serial B cannot mask or
+///    satisfy task A. Unknown/failed cherry → not integrated (fail closed).
 pub(crate) fn run_factory_branch_merge_gate(
     task: &Task,
     _req: &TaskCloseRequest,
@@ -2519,12 +2868,69 @@ pub(crate) fn run_factory_branch_merge_gate(
     // degradation posture of every other gate in this file: an
     // unreachable/unconfigured origin is not treated as evidence of
     // non-integration, just as "nothing extra to check."
+    //
+    // cas-f522: origin-parent *acceptance* must use the success-bearing
+    // [`known_unmerged_factory_commits`] helper — only
+    // [`KnownUnmergedCount::KnownZero`] authorizes close. The legacy
+    // `count_unmerged_factory_commits == 0` fail-open treats missing
+    // merge-base / failed rev-list as "merged" and would let unknowable
+    // origin Git state masquerade as integration. Missing origin ref
+    // simply skips this block (no rescue); KnownPositive and Unknown
+    // fall through to Reject.
     fetch_parent_branch_best_effort(repo_path, parent_branch);
     let origin_parent_branch = format!("origin/{parent_branch}");
-    if git_ref_exists(repo_path, &origin_parent_branch) {
-        let stranded_vs_origin =
-            count_unmerged_factory_commits(repo_path, commit_ish, &origin_parent_branch);
-        if stranded_vs_origin == 0 {
+    if git_ref_exists(repo_path, &origin_parent_branch)
+        && matches!(
+            known_unmerged_factory_commits(repo_path, commit_ish, &origin_parent_branch),
+            KnownUnmergedCount::KnownZero
+        )
+    {
+        return MergeStateGateOutcome::Proceed;
+    }
+
+    // cas-2938 / cas-5485: when a trusted historical anchor still looks
+    // stranded by ancestry (squash A→B, or rebase A→A'), accept close if
+    // tip-tree, live KnownZero, or cherry-equivalent patches of the
+    // *parked anchor* are on parent. Live KnownZero alone cannot cover
+    // serial task B on the same factory branch; cherry-equivalence is
+    // task-specific to A and cannot be satisfied by B's unmerged commits.
+    // Unknown Git state never authorizes close.
+    if task.status == TaskStatus::AwaitingMerge
+        && task.deliverables.factory_branch_anchor.is_some()
+        && commit_ish != factory_branch.as_str()
+    {
+        if commit_tip_tree_reachable_from(repo_path, commit_ish, parent_branch) {
+            return MergeStateGateOutcome::Proceed;
+        }
+        if git_ref_exists(repo_path, &origin_parent_branch)
+            && commit_tip_tree_reachable_from(repo_path, commit_ish, &origin_parent_branch)
+        {
+            return MergeStateGateOutcome::Proceed;
+        }
+
+        // cas-2938 P0 / cas-5485: live factory tip KnownZero after rewrite.
+        if live_factory_tip_known_fully_merged(
+            repo_path,
+            factory_branch.as_str(),
+            parent_branch,
+            &origin_parent_branch,
+        ) {
+            return MergeStateGateOutcome::Proceed;
+        }
+
+        // cas-5485 P2: rebased A' integrated while live HEAD carries later
+        // unmerged B — prove parked anchor A via patch-id equivalence on
+        // parent (not live HEAD zero-ahead). B cannot satisfy this check.
+        if commit_patches_cherry_equivalent_on_parent(repo_path, commit_ish, parent_branch) {
+            return MergeStateGateOutcome::Proceed;
+        }
+        if git_ref_exists(repo_path, &origin_parent_branch)
+            && commit_patches_cherry_equivalent_on_parent(
+                repo_path,
+                commit_ish,
+                &origin_parent_branch,
+            )
+        {
             return MergeStateGateOutcome::Proceed;
         }
     }
@@ -2647,6 +3053,228 @@ pub(crate) fn count_unmerged_factory_commits(
             // direction for an unparseable count.
             .unwrap_or(u32::MAX),
         _ => 0,
+    }
+}
+
+/// Success-bearing unmerged-count for close-integrity **acceptance** paths
+/// (cas-2938 live-ref convergence / cas-5485 pre-rebase SHA refresh).
+///
+/// Unlike [`count_unmerged_factory_commits`], which deliberately fail-opens
+/// to `0` when Git history is unknowable (legacy Proceed-friendly posture
+/// for the primary ancestry path), this tri-state never maps unknown state
+/// to zero. Callers that authorize close must match on [`KnownZero`] only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KnownUnmergedCount {
+    /// Refs resolved, merge-base computed, rev-list succeeded with count 0.
+    KnownZero,
+    /// Refs resolved and rev-list reported a positive stranded count.
+    KnownPositive(u32),
+    /// Missing ref, failed merge-base, failed/unparseable rev-list, or
+    /// unsafe refname — Git state is not evidence of convergence.
+    Unknown,
+}
+
+/// cas-5485 / cas-2938: true when the live factory tip is **known** fully
+/// merged into `parent_branch` or `origin/<parent>` (KnownZero only).
+///
+/// This is the auditable "refresh to current factory tip" acceptance proof
+/// used when a parked pre-rebase (or pre-squash) anchor still looks
+/// stranded by ancestry. Does not treat Unknown as merged.
+fn live_factory_tip_known_fully_merged(
+    repo_path: &std::path::Path,
+    factory_branch: &str,
+    parent_branch: &str,
+    origin_parent_branch: &str,
+) -> bool {
+    if matches!(
+        known_unmerged_factory_commits(repo_path, factory_branch, parent_branch),
+        KnownUnmergedCount::KnownZero
+    ) {
+        return true;
+    }
+    git_ref_exists(repo_path, origin_parent_branch)
+        && matches!(
+            known_unmerged_factory_commits(repo_path, factory_branch, origin_parent_branch),
+            KnownUnmergedCount::KnownZero
+        )
+}
+
+/// cas-5485 P2: true when every commit unique to `commit_ish` (vs
+/// `parent_ref`) has a patch-id-equivalent commit on `parent_ref`
+/// (`git cherry` marks them `-`).
+///
+/// Used when a parked pre-rebase tip A was rewritten to A' and A' is
+/// integrated, but the live factory HEAD carries later unmerged work B
+/// (so live KnownZero cannot clear). Equivalence is evaluated against
+/// the **parked task anchor**, never against live HEAD — so B cannot
+/// satisfy task A.
+///
+/// Fail-closed: missing refs, unsafe names, failed `git cherry`, empty
+/// output (no positive evidence), or any `+` (non-equivalent) line →
+/// false.
+fn commit_patches_cherry_equivalent_on_parent(
+    repo_path: &std::path::Path,
+    commit_ish: &str,
+    parent_ref: &str,
+) -> bool {
+    use std::process::Command;
+
+    if !is_safe_git_refname(commit_ish) || !is_safe_git_refname(parent_ref) {
+        return false;
+    }
+    if !git_ref_exists(repo_path, commit_ish) || !git_ref_exists(repo_path, parent_ref) {
+        return false;
+    }
+
+    // `git cherry <upstream> <head>` lists commits reachable from head but
+    // not upstream; prefix `-` = equivalent patch on upstream, `+` = not.
+    let cherry_out = Command::new("git")
+        .args(["cherry", parent_ref, commit_ish])
+        .current_dir(repo_path)
+        .output();
+    let Ok(o) = cherry_out else {
+        return false;
+    };
+    if !o.status.success() {
+        return false;
+    }
+
+    let stdout = String::from_utf8_lossy(&o.stdout);
+    let mut saw_equivalent = false;
+    for line in stdout.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        // Lines look like "+ <sha>" or "- <sha>".
+        if t.starts_with('+') {
+            return false;
+        }
+        if t.starts_with('-') {
+            saw_equivalent = true;
+            continue;
+        }
+        // Unrecognized cherry output is not evidence of equivalence.
+        return false;
+    }
+    // Empty output is not positive proof (already-ancestor cases are
+    // handled by the primary ancestry path; fail closed here).
+    saw_equivalent
+}
+
+/// Explicit success-bearing counterpart to [`count_unmerged_factory_commits`].
+///
+/// Returns:
+/// - [`KnownUnmergedCount::KnownZero`] only when both refs resolve, merge-base
+///   succeeds, and `rev-list --count` parses as `0`.
+/// - [`KnownUnmergedCount::KnownPositive`] when the count is a known `> 0`
+///   (or the cas-cf64 unsafe-refname fail-closed `u32::MAX` case).
+/// - [`KnownUnmergedCount::Unknown`] on any resolution/computation failure —
+///   never treats "couldn't tell" as "zero ahead".
+fn known_unmerged_factory_commits(
+    repo_path: &std::path::Path,
+    factory_branch: &str,
+    parent_branch: &str,
+) -> KnownUnmergedCount {
+    use std::process::Command;
+
+    if !is_safe_git_refname(factory_branch) || !is_safe_git_refname(parent_branch) {
+        // Corrupted/injection input: not KnownZero. Surface as positive so
+        // any caller that only checks `== KnownZero` still refuses, and
+        // callers that inspect magnitude still see "stranded".
+        return KnownUnmergedCount::KnownPositive(u32::MAX);
+    }
+
+    // Both tips must resolve — missing factory or parent is Unknown, not zero.
+    if !git_ref_exists(repo_path, factory_branch) || !git_ref_exists(repo_path, parent_branch) {
+        return KnownUnmergedCount::Unknown;
+    }
+
+    let merge_base_out = Command::new("git")
+        .args(["merge-base", parent_branch, factory_branch])
+        .current_dir(repo_path)
+        .output();
+    let merge_base = match merge_base_out {
+        Ok(o) if o.status.success() => {
+            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if s.is_empty() {
+                return KnownUnmergedCount::Unknown;
+            }
+            s
+        }
+        _ => return KnownUnmergedCount::Unknown,
+    };
+
+    let count_out = Command::new("git")
+        .args([
+            "rev-list",
+            "--count",
+            &format!("{merge_base}..{factory_branch}"),
+        ])
+        .current_dir(repo_path)
+        .output();
+    match count_out {
+        Ok(o) if o.status.success() => {
+            match String::from_utf8_lossy(&o.stdout).trim().parse::<u32>() {
+                Ok(0) => KnownUnmergedCount::KnownZero,
+                Ok(n) => KnownUnmergedCount::KnownPositive(n),
+                // Unparseable count is not evidence of zero.
+                Err(_) => KnownUnmergedCount::Unknown,
+            }
+        }
+        _ => KnownUnmergedCount::Unknown,
+    }
+}
+
+/// cas-2938: true when the tip tree of `commit_ish` appears on `parent_ref`.
+///
+/// Clean GitHub squash-merges rewrite the commit SHA (so ancestry fails)
+/// but preserve the factory tip tree as the squash commit's tree. Scanning
+/// parent history for that tree object is the content-level equivalence
+/// check that lets an AwaitingMerge task clear after squash without
+/// requiring the pre-squash SHA to be an ancestor.
+///
+/// Returns false on any resolution failure (missing ref, unsafe name,
+/// empty tree sha) — fail closed toward "not integrated" so the live-ref
+/// path / Reject can still decide.
+fn commit_tip_tree_reachable_from(
+    repo_path: &std::path::Path,
+    commit_ish: &str,
+    parent_ref: &str,
+) -> bool {
+    use std::process::Command;
+
+    if !is_safe_git_refname(commit_ish) || !is_safe_git_refname(parent_ref) {
+        return false;
+    }
+    if !git_ref_exists(repo_path, commit_ish) || !git_ref_exists(repo_path, parent_ref) {
+        return false;
+    }
+
+    let tree_out = Command::new("git")
+        .args(["rev-parse", &format!("{commit_ish}^{{tree}}")])
+        .current_dir(repo_path)
+        .output();
+    let tree = match tree_out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        _ => return false,
+    };
+    if tree.is_empty() || !tree.chars().all(|c| c.is_ascii_hexdigit()) {
+        return false;
+    }
+
+    // Walk parent history for any commit whose tree matches the anchor tip.
+    // `--pretty=%T` emits one tree SHA per commit; exact-line match avoids
+    // substring false positives from longer hashes (full SHA is fixed length).
+    let log_out = Command::new("git")
+        .args(["log", "--pretty=%T", parent_ref])
+        .current_dir(repo_path)
+        .output();
+    match log_out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .any(|line| line.trim() == tree),
+        _ => false,
     }
 }
 
@@ -3126,12 +3754,21 @@ pub(crate) fn check_commit_claim_integrity(
     worker_worktree_path: &std::path::Path,
     parent_branch: &str,
     has_review_findings: bool,
+    factory_branch_anchor: Option<&str>,
 ) -> CommitClaimGateOutcome {
     if !has_review_findings {
         return CommitClaimGateOutcome::Proceed;
     }
     let commit_count = count_worker_branch_commits(worker_worktree_path, parent_branch);
     if commit_count == 0 {
+        // cas-127f: after MERGE REQUIRED + supervisor merge, merge-base..HEAD
+        // is empty even though real work (the parked anchor) landed on parent.
+        // That is not fabrication — it is merge-satisfied.
+        if let Some(anchor) = factory_branch_anchor {
+            if commit_is_merged_into_parent(worker_worktree_path, anchor, parent_branch) {
+                return CommitClaimGateOutcome::Proceed;
+            }
+        }
         CommitClaimGateOutcome::Reject(format!(
             "⚠️ FABRICATION DETECTED\n\n\
             task close rejected: code_review_findings was provided (indicating \
@@ -3178,6 +3815,46 @@ pub(crate) enum ZeroCommitCloseOutcome {
     AmbiguousCodeTask(String),
 }
 
+/// cas-127f: true when `commit_ish` is an ancestor of `parent_branch`
+/// (or `origin/<parent_branch>` when that ref exists) inside `repo_path`.
+///
+/// Used to distinguish "never committed" from "committed, MERGE REQUIRED
+/// parked an anchor, supervisor already integrated those commits" — after
+/// a successful merge, `count_worker_branch_commits` is 0 even though real
+/// work landed on the parent. Fail closed on any git error.
+pub(crate) fn commit_is_merged_into_parent(
+    repo_path: &std::path::Path,
+    commit_ish: &str,
+    parent_branch: &str,
+) -> bool {
+    use std::process::Command;
+    if commit_ish.is_empty() || !is_safe_git_refname(parent_branch) {
+        return false;
+    }
+    // Reject option-injection on the commit-ish too (full SHAs are fine;
+    // leading `-` is not a valid commit ref for our purposes).
+    if commit_ish.starts_with('-') {
+        return false;
+    }
+    let check = |parent: &str| -> bool {
+        Command::new("git")
+            .args(["merge-base", "--is-ancestor", commit_ish, parent])
+            .current_dir(repo_path)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    };
+    if check(parent_branch) {
+        return true;
+    }
+    // Mirror cas-38e2: local parent ref can lag origin after a remote merge.
+    let origin_parent = format!("origin/{parent_branch}");
+    if git_ref_exists(repo_path, &origin_parent) {
+        return check(&origin_parent);
+    }
+    false
+}
+
 /// cas-ee2b: check whether a zero-commit close is ambiguous and should be
 /// rejected.
 ///
@@ -3186,7 +3863,7 @@ pub(crate) enum ZeroCommitCloseOutcome {
 /// i.e. after the main `has_worker_committed_reviewable_changes` check
 /// returned false.
 ///
-/// Three-case decision tree:
+/// Decision tree:
 ///
 /// 1. **Docs-only commits** (`count > 0` but no reviewable files): worker
 ///    committed work; the reviewable-files check correctly returned false.
@@ -3197,8 +3874,16 @@ pub(crate) enum ZeroCommitCloseOutcome {
 ///    gate handles that case):
 ///    → `Proceed`. No ambiguity.
 ///
-/// 3. **Ambiguous zero-commit** (`count == 0`, no `execution_note`, task
-///    type is Bug/Feature/Task, no review findings):
+/// 3. **Merge-satisfied** (cas-127f): `count == 0` but
+///    `factory_branch_anchor` is set and that SHA is an ancestor of
+///    `parent_branch` (work was committed, MERGE REQUIRED parked the tip,
+///    supervisor merged into the epic). → `Proceed`. Without this path,
+///    post-merge close false-rejects ZERO-COMMIT because the worker tip
+///    is no longer *ahead of* parent even though the work landed.
+///
+/// 4. **Ambiguous zero-commit** (`count == 0`, no anchor / anchor not
+///    integrated, no `execution_note`, task type is Bug/Feature/Task, no
+///    review findings):
 ///    → `AmbiguousCodeTask(msg)`. Ask worker to commit, set `execution_note`,
 ///    or have the supervisor bypass.
 ///
@@ -3206,8 +3891,14 @@ pub(crate) enum ZeroCommitCloseOutcome {
 /// When true, the cas-490f gate fires upstream; this function returns `Proceed`
 /// so the two gates don't double-reject.
 ///
-/// Returns `Proceed` on any git failure (graceful degradation — not
-/// ambiguous when history is unknowable).
+/// `factory_branch_anchor`: optional tip SHA recorded by
+/// `park_task_awaiting_merge` the first time the merge gate rejected this
+/// task. Only set when the factory branch had unmerged commits — genuine
+/// zero-commit tasks never park, so they never get an anchor.
+///
+/// Returns `Proceed` on any git failure for the count path (graceful
+/// degradation — not ambiguous when history is unknowable). Ancestor
+/// checks fail closed (unknown integration ≠ merge-satisfied).
 pub(crate) fn check_zero_commit_close(
     worker_worktree_path: &std::path::Path,
     parent_branch: &str,
@@ -3215,6 +3906,7 @@ pub(crate) fn check_zero_commit_close(
     task_type: &TaskType,
     execution_note: Option<&str>,
     has_review_findings: bool,
+    factory_branch_anchor: Option<&str>,
 ) -> ZeroCommitCloseOutcome {
     // Not a code-expecting task type → no ambiguity.
     if !matches!(
@@ -3270,6 +3962,12 @@ pub(crate) fn check_zero_commit_close(
             3. Supervisors may bypass this gate with bypass_code_review=true \
                (logged as a decision note)."
         ));
+    }
+    // cas-127f: merge-satisfied — parked tip is now on the parent.
+    if let Some(anchor) = factory_branch_anchor {
+        if commit_is_merged_into_parent(worker_worktree_path, anchor, parent_branch) {
+            return ZeroCommitCloseOutcome::Proceed;
+        }
     }
     // Case 3: ambiguous zero-commit close.
     let task_type_str = format!("{task_type:?}").to_lowercase();
@@ -3673,10 +4371,50 @@ pub(crate) enum CodeReviewGateOutcome {
 ///   `pre_existing` flag; Check B rejects any P0 in `pre_existing[]`.
 ///   Then [`evaluate_gate`] is called as a safety net. Any rejection
 ///   returns a formatted block message; all checks pass → [`Proceed`].
+/// Build the `CODE_REVIEW_REQUIRED` rejection message with mode guidance
+/// that matches the configured `[code_review] owner` (cas-297e).
+///
+/// - `supervisor_owned = true` (default since v2.13.0): recommend
+///   `mode=interactive` / `mode=headless`.
+/// - `supervisor_owned = false` (`owner = "worker"`): recommend the
+///   legacy `mode=autofix` path.
+fn format_code_review_required(supervisor_owned: bool) -> String {
+    let step1 = if supervisor_owned {
+        "1. Invoke the cas-code-review skill via the Skill or Task tool with \
+         mode=interactive (or mode=headless for skill-to-skill) and the \
+         current diff.\n\
+         Note: mode=autofix is the legacy path for projects that pin \
+         [code_review] owner = \"worker\"."
+    } else {
+        "1. Invoke the cas-code-review skill via the Skill or Task tool with \
+         mode=autofix and the current diff."
+    };
+    format!(
+        "⚠️ CODE_REVIEW_REQUIRED\n\n\
+         task close rejected: this task has reviewable code changes \
+         and no code_review_findings envelope was provided.\n\n\
+         To resolve:\n\
+         {step1}\n\
+         2. Collect the returned ReviewOutcome envelope (residual, \
+            pre_existing, mode).\n\
+         3. Re-call task.close with the envelope JSON-stringified \
+            in code_review_findings.\n\n\
+         {}\n\n\
+         Supervisors may bypass this gate with \
+         bypass_code_review=true (logged as a decision note).",
+        cas_types::review_outcome_shape_hint(),
+    )
+}
+
+/// Run the cas-code-review P0 close gate.
+///
+/// `supervisor_owned` selects owner-aware mode guidance in
+/// `CODE_REVIEW_REQUIRED` (interactive/headless vs legacy autofix).
 pub(crate) fn run_code_review_gate(
     task: &Task,
     req: &TaskCloseRequest,
     project_root: &std::path::Path,
+    supervisor_owned: bool,
 ) -> CodeReviewGateOutcome {
     // Skip 1: additive-only tasks bypass the gate entirely.
     if task.execution_note.as_deref() == Some("additive-only") {
@@ -3734,45 +4472,30 @@ pub(crate) fn run_code_review_gate(
         _ => match persisted_envelope {
             Some(s) => s,
             None => {
-                return CodeReviewGateOutcome::Reject(
-                    "⚠️ CODE_REVIEW_REQUIRED\n\n\
-                     task close rejected: this task has reviewable code changes \
-                     and no code_review_findings envelope was provided.\n\n\
-                     To resolve:\n\
-                     1. Invoke the cas-code-review skill via the Skill or Task \
-                        tool with mode=autofix and the current diff.\n\
-                     2. Collect the returned ReviewOutcome envelope (residual, \
-                        pre_existing, mode).\n\
-                     3. Re-call task.close with the envelope JSON-stringified \
-                        in code_review_findings.\n\n\
-                     Supervisors may bypass this gate with \
-                     bypass_code_review=true (logged as a decision note)."
-                        .to_string(),
-                );
+                return CodeReviewGateOutcome::Reject(format_code_review_required(
+                    supervisor_owned,
+                ));
             }
         },
     };
 
-    let envelope: cas_types::ReviewOutcome = match serde_json::from_str(envelope_json) {
+    // cas-297e: multi-field parse via parse_review_outcome so a single
+    // bad envelope lists every missing Finding field (and documents the
+    // full Finding schema in the reject text).
+    let envelope: cas_types::ReviewOutcome = match cas_types::parse_review_outcome(envelope_json) {
         Ok(e) => e,
         Err(e) => {
             return CodeReviewGateOutcome::Reject(format!(
                 "⚠️ MALFORMED REVIEW ENVELOPE\n\n\
-                 task close rejected: code_review_findings failed to parse \
-                 as ReviewOutcome JSON: {e}\n\n\
-                 Expected shape: {{residual: Finding[], pre_existing: Finding[], mode: string}}."
+                     task close rejected: code_review_findings failed to parse \
+                     as ReviewOutcome JSON:\n{}\n\n\
+                     {}\n\n\
+                     Fix every listed field (or re-run cas-code-review) and retry close.",
+                e.message,
+                cas_types::review_outcome_shape_hint(),
             ));
         }
     };
-
-    if let Err(e) = envelope.validate() {
-        return CodeReviewGateOutcome::Reject(format!(
-            "⚠️ MALFORMED REVIEW ENVELOPE\n\n\
-             task close rejected: code_review_findings failed validation: {e}\n\n\
-             The worker-side cas-code-review skill returned a structurally \
-             invalid envelope. Re-run the review and retry close."
-        ));
-    }
 
     use cas_store::code_review::close_gate::{GateDecision, evaluate_gate, format_block_message};
     use cas_types::FindingSeverity;
@@ -4301,10 +5024,21 @@ pub(crate) enum LightweightLintOutcome {
     Fail(String),
 }
 
-/// Run the lightweight structural lint used in supervisor-owned review mode.
+/// Run the lightweight structural lint used in supervisor-owned review mode
+/// against the working tree at `project_root` (`git diff HEAD` / `--cached`).
 ///
-/// Scans the git diff (commits since merge-base with parent, or HEAD diff)
-/// for patterns that must never reach a review queue:
+/// Prefer [`run_lightweight_structural_lint_with_scope`] for isolated factory
+/// workers (cas-dc5d) so lint evaluates the committed task range inside the
+/// worker worktree rather than shared main-checkout WIP.
+pub(crate) fn run_lightweight_structural_lint(
+    project_root: &std::path::Path,
+) -> LightweightLintOutcome {
+    run_lightweight_structural_lint_with_scope(project_root, None)
+}
+
+/// Lightweight structural lint with optional committed-range scoping.
+///
+/// Scans the git diff for patterns that must never reach a review queue:
 ///
 /// - `unimplemented!()` / `todo!()` macros (incomplete stubs)
 /// - `dbg!` macro calls (leftover debug instrumentation)
@@ -4314,21 +5048,98 @@ pub(crate) enum LightweightLintOutcome {
 /// language-aware parsing. False positives in multi-line string literals
 /// are accepted in exchange for zero external dependencies and <1s latency.
 ///
-/// The scan is scoped to the same `project_root` the full code review gate
-/// uses. If git is unavailable or the diff is empty, the lint passes
-/// (graceful degradation — same rule as `has_reviewable_changes`).
-pub(crate) fn run_lightweight_structural_lint(
+/// ## Scope (cas-dc5d)
+///
+/// - `committed_range_parent = Some(parent)` — diff
+///   `merge-base(HEAD, parent)..HEAD` inside `project_root`. Used for
+///   isolated worker worktrees so only task commits are linted; unrelated
+///   dirty files in the main checkout are never visible. **Fail-closed**
+///   (cas-dc5d P2): unsafe/missing parent, failed merge-base, or failed
+///   `git diff` returns [`LightweightLintOutcome::Fail`] with an actionable
+///   message — never silent Pass.
+/// - `committed_range_parent = None` — legacy working-tree `git diff HEAD`
+///   (then `--cached`) in `project_root`, for non-isolated closes. Empty
+///   diff still Passes (graceful degradation).
+pub(crate) fn run_lightweight_structural_lint_with_scope(
     project_root: &std::path::Path,
+    committed_range_parent: Option<&str>,
 ) -> LightweightLintOutcome {
     use std::process::Command;
 
-    // Collect the diff text. Try `HEAD` (committed + staged vs last commit)
-    // first; fall back to `--cached` (staged only) when HEAD fails (e.g.
-    // fresh repo with no commits). We use `--unified=0` to get minimal
-    // context so the consecutive-comment heuristic below is not confused by
-    // context lines from the surrounding diff. Only one diff source is used
-    // to avoid duplicating added-lines counts.
-    let diff_text = {
+    // Collect the diff text.
+    //
+    // Isolated workers (cas-dc5d): committed range only — merge-base..HEAD
+    // inside the worker worktree. Never `git diff HEAD` against a shared
+    // main checkout that may carry unrelated WIP.
+    //
+    // Non-isolated: try `HEAD` (working tree + staged vs last commit) then
+    // `--cached`. `--unified=0` keeps the consecutive-comment heuristic
+    // free of context lines. Only one diff source is used.
+    let diff_text = if let Some(parent) = committed_range_parent {
+        // cas-dc5d P2: committed-range proof must fail closed. Passing on
+        // unsafe/missing parent or failed merge-base/diff would silently
+        // skip lint for isolated workers (worse than scanning wrong root).
+        if !is_safe_git_refname(parent) {
+            return LightweightLintOutcome::Fail(format!(
+                "Cannot scope structural lint: parent branch name {parent:?} is not a safe git \
+                 ref (empty or starts with '-'). Fix the task's parent epic branch and retry."
+            ));
+        }
+        if !git_ref_exists(project_root, parent) {
+            return LightweightLintOutcome::Fail(format!(
+                "Cannot scope structural lint: parent branch `{parent}` does not resolve in the \
+                 worker worktree. Ensure the epic/integration branch is available locally \
+                 (fetch or merge base) and retry close."
+            ));
+        }
+        let merge_base_out = Command::new("git")
+            .args(["merge-base", "HEAD", parent])
+            .current_dir(project_root)
+            .output();
+        let merge_base = match merge_base_out {
+            Ok(o) if o.status.success() => {
+                let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                if s.is_empty() {
+                    return LightweightLintOutcome::Fail(format!(
+                        "Cannot scope structural lint: empty merge-base between HEAD and \
+                         `{parent}`. Check that the worker branch shares history with the \
+                         integration branch."
+                    ));
+                }
+                s
+            }
+            _ => {
+                return LightweightLintOutcome::Fail(format!(
+                    "Cannot scope structural lint: failed to compute merge-base(HEAD, `{parent}`). \
+                     Ensure both refs exist in the worker worktree and share history."
+                ));
+            }
+        };
+        match Command::new("git")
+            .args(["diff", "--unified=0", &format!("{merge_base}..HEAD")])
+            .current_dir(project_root)
+            .output()
+        {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                return LightweightLintOutcome::Fail(format!(
+                    "Cannot scope structural lint: `git diff {merge_base}..HEAD` failed \
+                     against parent `{parent}`.{maybe_stderr}",
+                    maybe_stderr = if stderr.trim().is_empty() {
+                        String::new()
+                    } else {
+                        format!(" stderr: {}", stderr.trim())
+                    }
+                ));
+            }
+            Err(e) => {
+                return LightweightLintOutcome::Fail(format!(
+                    "Cannot scope structural lint: failed to spawn git diff ({e})."
+                ));
+            }
+        }
+    } else {
         let mut text = String::new();
         for args in [
             &["diff", "--unified=0", "HEAD"][..],
@@ -4730,6 +5541,266 @@ mod lightweight_lint_tests {
             "dbg!() in a .rs file must still fail lint"
         );
     }
+
+    // --- cas-dc5d: scope lint to worker committed range, not main WIP ------
+
+    fn git_dc5d(dir: &std::path::Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@test")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@test")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .status()
+            .expect("git");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// Reproduces BUG-factory-close-lightweight-lint-wrong-project-root:
+    /// main checkout has a dirty tracked file with >5 consecutive `//`
+    /// lines; worker worktree has a clean committed task diff. Scoped
+    /// lint (worker + merge-base..HEAD) must Pass; unscoped lint on main
+    /// would Fail (precondition).
+    #[test]
+    fn lint_scoped_to_worker_range_ignores_main_checkout_wip() {
+        let main = TempDir::new().unwrap();
+        let p = main.path();
+        git_dc5d(p, &["init", "-q", "-b", "main"]);
+        std::fs::write(p.join("base.rs"), "fn main() {}\n").unwrap();
+        git_dc5d(p, &["add", "base.rs"]);
+        git_dc5d(p, &["commit", "-q", "-m", "init"]);
+
+        // Isolated worker worktree with clean committed feature (no lint hit).
+        let worker = p.join("worktrees").join("worker");
+        std::fs::create_dir_all(worker.parent().unwrap()).unwrap();
+        git_dc5d(
+            p,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "factory/worker",
+                worker.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(
+            worker.join("feature.rs"),
+            "pub fn feature() -> u32 { 42 }\n",
+        )
+        .unwrap();
+        git_dc5d(&worker, &["add", "feature.rs"]);
+        git_dc5d(&worker, &["commit", "-q", "-m", "feat: clean worker task"]);
+
+        // Unrelated dirty *tracked* main-checkout WIP with 7 consecutive //
+        // lines (must be tracked so `git diff HEAD` sees it).
+        std::fs::write(p.join("wip.rs"), "fn leftover() {}\n").unwrap();
+        git_dc5d(p, &["add", "wip.rs"]);
+        git_dc5d(p, &["commit", "-q", "-m", "track wip placeholder"]);
+        let dirty_comments = "\
+// line 1 of unrelated WIP comment block
+// line 2 of unrelated WIP comment block
+// line 3 of unrelated WIP comment block
+// line 4 of unrelated WIP comment block
+// line 5 of unrelated WIP comment block
+// line 6 of unrelated WIP comment block
+// line 7 of unrelated WIP comment block
+fn leftover() {}\n";
+        std::fs::write(p.join("wip.rs"), dirty_comments).unwrap();
+
+        // Precondition: unscoped lint on main would see the dirty WIP.
+        let main_unscoped = run_lightweight_structural_lint(p);
+        assert!(
+            matches!(main_unscoped, LightweightLintOutcome::Fail(_)),
+            "precondition: unscoped lint on dirty main must Fail, got {main_unscoped:?}"
+        );
+
+        // Worker-scoped committed-range lint must ignore main WIP.
+        let scoped = run_lightweight_structural_lint_with_scope(&worker, Some("main"));
+        assert!(
+            matches!(scoped, LightweightLintOutcome::Pass),
+            "worker committed-range lint must Pass despite dirty main, got {scoped:?}"
+        );
+    }
+
+    /// Real violation in the worker's committed task range still fails
+    /// when lint is scoped to merge-base..HEAD (not only working-tree).
+    #[test]
+    fn lint_scoped_to_worker_range_fails_on_committed_todo() {
+        let main = TempDir::new().unwrap();
+        let p = main.path();
+        git_dc5d(p, &["init", "-q", "-b", "main"]);
+        std::fs::write(p.join("base.rs"), "fn main() {}\n").unwrap();
+        git_dc5d(p, &["add", "base.rs"]);
+        git_dc5d(p, &["commit", "-q", "-m", "init"]);
+
+        let worker = p.join("worktrees").join("worker");
+        std::fs::create_dir_all(worker.parent().unwrap()).unwrap();
+        git_dc5d(
+            p,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "factory/worker",
+                worker.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(
+            worker.join("bad.rs"),
+            "pub fn bad() { todo!(\"not done\"); }\n",
+        )
+        .unwrap();
+        git_dc5d(&worker, &["add", "bad.rs"]);
+        git_dc5d(&worker, &["commit", "-q", "-m", "feat: incomplete"]);
+
+        // Working tree clean — unscoped `git diff HEAD` would Pass wrongly.
+        let unscoped = run_lightweight_structural_lint(&worker);
+        assert!(
+            matches!(unscoped, LightweightLintOutcome::Pass),
+            "precondition: clean working tree makes unscoped HEAD-diff Pass"
+        );
+
+        let scoped = run_lightweight_structural_lint_with_scope(&worker, Some("main"));
+        assert!(
+            matches!(scoped, LightweightLintOutcome::Fail(_)),
+            "committed todo!() in worker range must Fail scoped lint, got {scoped:?}"
+        );
+    }
+
+    /// cas-dc5d P1: when the real integration parent is `epic/x` (diverged
+    /// from `main`), scoping against `main` falsely includes epic-branch
+    /// comment blocks in the lint range; scoping against `epic/x` does not.
+    #[test]
+    fn lint_scoped_parent_must_be_epic_not_main_when_they_diverge() {
+        let main = TempDir::new().unwrap();
+        let p = main.path();
+        git_dc5d(p, &["init", "-q", "-b", "main"]);
+        std::fs::write(p.join("base.rs"), "fn main() {}\n").unwrap();
+        git_dc5d(p, &["add", "base.rs"]);
+        git_dc5d(p, &["commit", "-q", "-m", "init"]);
+
+        // Epic diverges from main with a large // comment block (would Fail
+        // lint if incorrectly included in the worker's range vs main).
+        git_dc5d(p, &["checkout", "-q", "-b", "epic/x"]);
+        let epic_comments = "\
+// epic line 1
+// epic line 2
+// epic line 3
+// epic line 4
+// epic line 5
+// epic line 6
+// epic line 7
+pub fn epic_only() {}\n";
+        std::fs::write(p.join("epic.rs"), epic_comments).unwrap();
+        git_dc5d(p, &["add", "epic.rs"]);
+        git_dc5d(
+            p,
+            &["commit", "-q", "-m", "epic clean-ish but comment-heavy"],
+        );
+
+        // Worker branches from epic with a clean feature.
+        let worker = p.join("worktrees").join("worker");
+        std::fs::create_dir_all(worker.parent().unwrap()).unwrap();
+        git_dc5d(
+            p,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "factory/worker",
+                worker.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(worker.join("feature.rs"), "pub fn feature() -> u32 { 1 }\n").unwrap();
+        git_dc5d(&worker, &["add", "feature.rs"]);
+        git_dc5d(&worker, &["commit", "-q", "-m", "feat: worker task"]);
+
+        // Wrong parent (main): range includes epic comment block → Fail.
+        let vs_main = run_lightweight_structural_lint_with_scope(&worker, Some("main"));
+        assert!(
+            matches!(vs_main, LightweightLintOutcome::Fail(_)),
+            "wrong parent=main must include epic comments and Fail, got {vs_main:?}"
+        );
+
+        // Correct parent (epic/x): only clean feature → Pass.
+        let vs_epic = run_lightweight_structural_lint_with_scope(&worker, Some("epic/x"));
+        assert!(
+            matches!(vs_epic, LightweightLintOutcome::Pass),
+            "parent=epic/x must Pass for clean worker feature, got {vs_epic:?}"
+        );
+    }
+
+    /// cas-dc5d P2: missing parent ref must Fail with actionable text.
+    #[test]
+    fn lint_scoped_fails_closed_on_missing_parent() {
+        let dir = init_repo_with_diff("fn ok() {}\n");
+        let out =
+            run_lightweight_structural_lint_with_scope(dir.path(), Some("epic/does-not-exist"));
+        match out {
+            LightweightLintOutcome::Fail(msg) => {
+                assert!(
+                    msg.contains("does not resolve") || msg.contains("Cannot scope"),
+                    "must be actionable, got: {msg}"
+                );
+            }
+            other => panic!("missing parent must Fail closed, got {other:?}"),
+        }
+    }
+
+    /// cas-dc5d P2: unsafe parent refname must Fail closed (not Pass).
+    #[test]
+    fn lint_scoped_fails_closed_on_unsafe_parent() {
+        let dir = init_repo_with_diff("fn ok() {}\n");
+        let out =
+            run_lightweight_structural_lint_with_scope(dir.path(), Some("-oProxyCommand=evil"));
+        match out {
+            LightweightLintOutcome::Fail(msg) => {
+                assert!(
+                    msg.contains("not a safe git") || msg.contains("Cannot scope"),
+                    "must mention unsafe ref, got: {msg}"
+                );
+            }
+            other => panic!("unsafe parent must Fail closed, got {other:?}"),
+        }
+    }
+
+    /// cas-dc5d P2: unrelated histories (merge-base fails) must Fail closed.
+    #[test]
+    fn lint_scoped_fails_closed_on_merge_base_failure() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path();
+        git_dc5d(p, &["init", "-q", "-b", "main"]);
+        std::fs::write(p.join("seed.txt"), "seed\n").unwrap();
+        git_dc5d(p, &["add", "seed.txt"]);
+        git_dc5d(p, &["commit", "-q", "-m", "seed"]);
+
+        // Orphan factory tip — no merge-base with main.
+        git_dc5d(p, &["checkout", "-q", "--orphan", "factory/worker"]);
+        let _ = Command::new("git")
+            .args(["rm", "-rf", "--cached", "."])
+            .current_dir(p)
+            .output();
+        std::fs::write(p.join("orphan.txt"), "orphan\n").unwrap();
+        git_dc5d(p, &["add", "orphan.txt"]);
+        git_dc5d(p, &["commit", "-q", "-m", "orphan"]);
+
+        let out = run_lightweight_structural_lint_with_scope(p, Some("main"));
+        match out {
+            LightweightLintOutcome::Fail(msg) => {
+                assert!(
+                    msg.contains("merge-base") || msg.contains("Cannot scope"),
+                    "must mention merge-base failure, got: {msg}"
+                );
+            }
+            other => panic!("failed merge-base must Fail closed, got {other:?}"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4968,7 +6039,7 @@ mod code_review_gate_tests {
         t.execution_note = Some("additive-only".to_string());
         let mut req = base_req(&t.id);
         req.code_review_findings = Some(autofix_envelope(vec![p0_finding()]));
-        let out = run_code_review_gate(&t, &req, dir.path());
+        let out = run_code_review_gate(&t, &req, dir.path(), true);
         assert!(matches!(out, CodeReviewGateOutcome::Proceed));
     }
 
@@ -4978,7 +6049,7 @@ mod code_review_gate_tests {
         let dir = repo_with_staged(&[("README.md", "new content\n"), ("docs/x.md", "x\n")]);
         let t = base_task();
         let req = base_req(&t.id); // no findings
-        let out = run_code_review_gate(&t, &req, dir.path());
+        let out = run_code_review_gate(&t, &req, dir.path(), true);
         assert!(
             matches!(out, CodeReviewGateOutcome::Proceed),
             "pure-docs diff must skip the review gate"
@@ -4991,14 +6062,106 @@ mod code_review_gate_tests {
         let dir = repo_with_staged(&[("src/foo.rs", "fn new() {}\n")]);
         let t = base_task();
         let req = base_req(&t.id);
-        let out = run_code_review_gate(&t, &req, dir.path());
+        // supervisor_owned=true is the config default (cas-865b).
+        let out = run_code_review_gate(&t, &req, dir.path(), true);
         match out {
             CodeReviewGateOutcome::Reject(msg) => {
                 assert!(msg.contains("CODE_REVIEW_REQUIRED"));
                 assert!(msg.contains("cas-code-review"));
                 assert!(msg.contains("code_review_findings"));
+                // cas-297e: supervisor-owned mode recommends interactive/headless.
+                assert!(
+                    msg.contains("mode=interactive"),
+                    "supervisor-owned guidance must recommend interactive: {msg}"
+                );
+                assert!(
+                    msg.contains("mode=headless"),
+                    "supervisor-owned guidance must mention headless: {msg}"
+                );
+                assert!(
+                    !msg.contains("mode=autofix and the current diff"),
+                    "supervisor-owned guidance must not primary-recommend autofix: {msg}"
+                );
+                // Finding schema documented at the point of failure.
+                assert!(
+                    msg.contains("why_it_matters"),
+                    "CODE_REVIEW_REQUIRED must document Finding fields: {msg}"
+                );
             }
             other => panic!("expected CODE_REVIEW_REQUIRED reject, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn code_review_required_worker_owned_recommends_autofix() {
+        // cas-297e AC3: owner=worker keeps the legacy autofix guidance.
+        let _g = env_lock();
+        let dir = repo_with_staged(&[("src/foo.rs", "fn new() {}\n")]);
+        let t = base_task();
+        let req = base_req(&t.id);
+        let out = run_code_review_gate(&t, &req, dir.path(), false);
+        match out {
+            CodeReviewGateOutcome::Reject(msg) => {
+                assert!(msg.contains("CODE_REVIEW_REQUIRED"));
+                assert!(
+                    msg.contains("mode=autofix"),
+                    "worker-owned guidance must recommend autofix: {msg}"
+                );
+                assert!(
+                    !msg.contains("mode=interactive"),
+                    "worker-owned guidance must not recommend interactive: {msg}"
+                );
+            }
+            other => panic!("expected CODE_REVIEW_REQUIRED reject, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn partial_finding_envelope_lists_all_missing_fields_once() {
+        // cas-297e AC1+AC2: one response lists every missing Finding field
+        // and documents the Finding schema.
+        let _g = env_lock();
+        let dir = repo_with_staged(&[("src/foo.rs", "fn new() {}\n")]);
+        let t = base_task();
+        let mut req = base_req(&t.id);
+        req.code_review_findings = Some(
+            r#"{
+                "mode": "interactive",
+                "residual": [{
+                    "title": "partial finding",
+                    "severity": "P2",
+                    "file": "src/foo.rs",
+                    "line": 1
+                }],
+                "pre_existing": []
+            }"#
+            .to_string(),
+        );
+        let out = run_code_review_gate(&t, &req, dir.path(), true);
+        match out {
+            CodeReviewGateOutcome::Reject(msg) => {
+                assert!(msg.contains("MALFORMED REVIEW ENVELOPE"), "{msg}");
+                for field in [
+                    "why_it_matters",
+                    "autofix_class",
+                    "owner",
+                    "confidence",
+                    "evidence",
+                    "pre_existing",
+                ] {
+                    assert!(
+                        msg.contains(&format!("missing field `{field}`")),
+                        "expected all-fields list to include `{field}`:\n{msg}"
+                    );
+                }
+                // Schema hint documents required Finding keys.
+                assert!(
+                    msg.contains("Each Finding requires:"),
+                    "error must document Finding required fields:\n{msg}"
+                );
+                assert!(msg.contains("residual[0]"), "{msg}");
+            }
+            other => panic!("expected MALFORMED reject, got {other:?}"),
         }
     }
 
@@ -5009,7 +6172,7 @@ mod code_review_gate_tests {
         let t = base_task();
         let mut req = base_req(&t.id);
         req.code_review_findings = Some(autofix_envelope(vec![p0_finding()]));
-        let out = run_code_review_gate(&t, &req, dir.path());
+        let out = run_code_review_gate(&t, &req, dir.path(), true);
         match out {
             CodeReviewGateOutcome::Reject(msg) => {
                 assert!(msg.contains("P0 BLOCK"));
@@ -5027,7 +6190,7 @@ mod code_review_gate_tests {
         let t = base_task();
         let mut req = base_req(&t.id);
         req.code_review_findings = Some(autofix_envelope(vec![p2_finding()]));
-        let out = run_code_review_gate(&t, &req, dir.path());
+        let out = run_code_review_gate(&t, &req, dir.path(), true);
         assert!(
             matches!(out, CodeReviewGateOutcome::Proceed),
             "P2 residual must route to Unit 8, not block close"
@@ -5041,7 +6204,7 @@ mod code_review_gate_tests {
         let t = base_task();
         let mut req = base_req(&t.id);
         req.code_review_findings = Some(autofix_envelope(Vec::new()));
-        let out = run_code_review_gate(&t, &req, dir.path());
+        let out = run_code_review_gate(&t, &req, dir.path(), true);
         assert!(matches!(out, CodeReviewGateOutcome::Proceed));
     }
 
@@ -5054,7 +6217,7 @@ mod code_review_gate_tests {
         // Whitespace-only mode passes serde but fails validate().
         req.code_review_findings =
             Some(r#"{"residual":[],"pre_existing":[],"mode":"   "}"#.to_string());
-        let out = run_code_review_gate(&t, &req, dir.path());
+        let out = run_code_review_gate(&t, &req, dir.path(), true);
         match out {
             CodeReviewGateOutcome::Reject(msg) => {
                 assert!(msg.contains("MALFORMED REVIEW ENVELOPE"));
@@ -5070,11 +6233,16 @@ mod code_review_gate_tests {
         let t = base_task();
         let mut req = base_req(&t.id);
         req.code_review_findings = Some("not json at all".to_string());
-        let out = run_code_review_gate(&t, &req, dir.path());
+        let out = run_code_review_gate(&t, &req, dir.path(), true);
         match out {
             CodeReviewGateOutcome::Reject(msg) => {
                 assert!(msg.contains("MALFORMED REVIEW ENVELOPE"));
                 assert!(msg.contains("failed to parse"));
+                // cas-297e AC2: even parse failures document the Finding schema.
+                assert!(
+                    msg.contains("Each Finding requires:"),
+                    "parse error must document Finding schema:\n{msg}"
+                );
             }
             other => panic!("expected parse reject, got {other:?}"),
         }
@@ -5094,7 +6262,7 @@ mod code_review_gate_tests {
         req.bypass_code_review = Some(true);
         req.reason = Some("P0 is a false positive, tracked in cas-xyz".to_string());
 
-        let out = run_code_review_gate(&t, &req, dir.path());
+        let out = run_code_review_gate(&t, &req, dir.path(), true);
 
         unsafe {
             match prev {
@@ -5126,7 +6294,7 @@ mod code_review_gate_tests {
         let mut req = base_req(&t.id);
         req.bypass_code_review = Some(true);
 
-        let out = run_code_review_gate(&t, &req, dir.path());
+        let out = run_code_review_gate(&t, &req, dir.path(), true);
 
         unsafe {
             match prev {
@@ -5151,7 +6319,7 @@ mod code_review_gate_tests {
         t.execution_note = Some("additive-only".to_string());
         let req = base_req(&t.id); // no findings, no override
         // additive-only short-circuits before the findings check.
-        let out = run_code_review_gate(&t, &req, dir.path());
+        let out = run_code_review_gate(&t, &req, dir.path(), true);
         assert!(matches!(out, CodeReviewGateOutcome::Proceed));
     }
 
@@ -5162,7 +6330,7 @@ mod code_review_gate_tests {
         let t = base_task();
         let req = base_req(&t.id);
         // Non-git dir → has_reviewable_changes returns false → skip.
-        let out = run_code_review_gate(&t, &req, dir.path());
+        let out = run_code_review_gate(&t, &req, dir.path(), true);
         assert!(matches!(out, CodeReviewGateOutcome::Proceed));
     }
 
@@ -5179,7 +6347,7 @@ mod code_review_gate_tests {
         let mut t = base_task();
         t.deliverables.review_envelope = Some(autofix_envelope(Vec::new()));
         let req = base_req(&t.id); // no findings in request
-        let out = run_code_review_gate(&t, &req, dir.path());
+        let out = run_code_review_gate(&t, &req, dir.path(), true);
         assert!(
             matches!(out, CodeReviewGateOutcome::Proceed),
             "persisted clean envelope must let supervisor-close proceed without bypass"
@@ -5194,7 +6362,7 @@ mod code_review_gate_tests {
         let mut t = base_task();
         t.deliverables.review_envelope = Some(autofix_envelope(vec![p0_finding()]));
         let req = base_req(&t.id);
-        let out = run_code_review_gate(&t, &req, dir.path());
+        let out = run_code_review_gate(&t, &req, dir.path(), true);
         match out {
             CodeReviewGateOutcome::Reject(msg) => {
                 assert!(msg.contains("P0 BLOCK"), "P0 must still block: {msg}");
@@ -5215,7 +6383,7 @@ mod code_review_gate_tests {
         let mut req = base_req(&t.id);
         // Request envelope is clean — should let the close proceed.
         req.code_review_findings = Some(autofix_envelope(Vec::new()));
-        let out = run_code_review_gate(&t, &req, dir.path());
+        let out = run_code_review_gate(&t, &req, dir.path(), true);
         assert!(
             matches!(out, CodeReviewGateOutcome::Proceed),
             "explicit request envelope must win over persisted fallback"
@@ -5229,7 +6397,7 @@ mod code_review_gate_tests {
         let mut t = base_task();
         t.deliverables.review_envelope = Some("not-json".to_string());
         let req = base_req(&t.id);
-        let out = run_code_review_gate(&t, &req, dir.path());
+        let out = run_code_review_gate(&t, &req, dir.path(), true);
         assert!(
             matches!(out, CodeReviewGateOutcome::Reject(_)),
             "malformed persisted envelope must be rejected, not silently bypassed"
@@ -5394,7 +6562,7 @@ mod code_review_gate_tests {
         let forged = envelope_with_pre_existing(vec![p0_finding_pre_existing_true()], Vec::new());
         t.deliverables.review_envelope = Some(forged);
         let req = base_req(&t.id); // no findings in request — reads persisted
-        let out = run_code_review_gate(&t, &req, dir.path());
+        let out = run_code_review_gate(&t, &req, dir.path(), true);
         match out {
             CodeReviewGateOutcome::Reject(msg) => {
                 assert!(
@@ -5421,7 +6589,7 @@ mod code_review_gate_tests {
         let forged = envelope_with_pre_existing(Vec::new(), vec![p0_finding()]);
         t.deliverables.review_envelope = Some(forged);
         let req = base_req(&t.id);
-        let out = run_code_review_gate(&t, &req, dir.path());
+        let out = run_code_review_gate(&t, &req, dir.path(), true);
         match out {
             CodeReviewGateOutcome::Reject(msg) => {
                 assert!(
@@ -5466,7 +6634,7 @@ mod code_review_gate_tests {
         t.deliverables.review_envelope = Some(forged);
         // Step 3: worker retries without providing code_review_findings.
         let req = base_req(&t.id);
-        let out = run_code_review_gate(&t, &req, dir.path());
+        let out = run_code_review_gate(&t, &req, dir.path(), true);
         match out {
             CodeReviewGateOutcome::Reject(msg) => {
                 // Must block with P0 — not CODE_REVIEW_REQUIRED (which would
@@ -6044,6 +7212,657 @@ mod merge_state_gate_tests {
         );
     }
 
+    // --- cas-2938: squash-equivalent live-ref convergence -------------------
+
+    fn rev_parse_local(dir: &std::path::Path, refname: &str) -> String {
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", refname])
+            .current_dir(dir)
+            .output()
+            .expect("git rev-parse");
+        assert!(out.status.success(), "rev-parse {refname} failed");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Reproduces BUG-awaitingmerge-anchor-squash-merge-2026-07-09.md:
+    /// park with tip A, squash-merge into parent as B (A is not an ancestor
+    /// of B), force-align factory tip to B. Historical anchor A still looks
+    /// stranded; live factory has 0 commits ahead → must Proceed.
+    #[test]
+    fn squash_merged_awaiting_merge_with_live_ref_aligned_to_integration_proceeds() {
+        let dir = init_factory_repo("worker");
+        let p = dir.path();
+
+        // Task work as commit A on factory/worker.
+        std::fs::write(p.join("a.rs"), "// a\n").unwrap();
+        git(p, &["add", "a.rs"]);
+        git(p, &["commit", "-q", "-m", "feat: task A"]);
+        let anchor_a = rev_parse_local(p, "HEAD");
+
+        // GitHub-style squash: apply factory tip as a NEW commit B on main
+        // that does not have A as an ancestor.
+        git(p, &["checkout", "-q", "main"]);
+        git(p, &["merge", "-q", "--squash", "factory/worker"]);
+        git(p, &["commit", "-q", "-m", "feat: task A (#683)"]);
+        let integration_b = rev_parse_local(p, "HEAD");
+        assert_ne!(
+            anchor_a, integration_b,
+            "precondition: squash must rewrite SHA (A ≠ B)"
+        );
+        // A is not an ancestor of B after squash.
+        let is_ancestor = std::process::Command::new("git")
+            .args(["merge-base", "--is-ancestor", &anchor_a, &integration_b])
+            .current_dir(p)
+            .status()
+            .expect("merge-base --is-ancestor");
+        assert!(
+            !is_ancestor.success(),
+            "precondition: A must NOT be an ancestor of squash tip B"
+        );
+
+        // Worker force-aligns factory/<name> to the integration tip B.
+        git(p, &["checkout", "-q", "factory/worker"]);
+        git(p, &["reset", "-q", "--hard", &integration_b]);
+        assert_eq!(
+            rev_parse_local(p, "factory/worker"),
+            integration_b,
+            "precondition: live factory ref must equal integration tip B"
+        );
+        assert_eq!(
+            count_unmerged_factory_commits(p, "factory/worker", "main"),
+            0,
+            "precondition: live factory must have 0 commits ahead of main"
+        );
+        assert_eq!(
+            count_unmerged_factory_commits(p, &anchor_a, "main"),
+            1,
+            "precondition: historical anchor A still looks stranded vs main"
+        );
+
+        // Task still AwaitingMerge with park-time anchor A.
+        let mut task = worker_task("worker");
+        task.status = TaskStatus::AwaitingMerge;
+        task.deliverables.factory_branch_anchor = Some(anchor_a);
+        let req = base_req(&task.id);
+        let out = run_factory_branch_merge_gate(&task, &req, "main", p);
+        assert!(
+            matches!(out, MergeStateGateOutcome::Proceed),
+            "squash-integrated + live-ref-aligned AwaitingMerge close must \
+             Proceed (cas-2938), got {out:?}"
+        );
+    }
+
+    /// Clean squash preserves tip tree: even without force-aligning the
+    /// factory ref to B, content reachability of A's tree on main must
+    /// clear the gate (better UX than requiring a manual reset).
+    #[test]
+    fn squash_merged_content_equivalent_without_live_ref_align_proceeds() {
+        let dir = init_factory_repo("worker");
+        let p = dir.path();
+
+        std::fs::write(p.join("a.rs"), "// a\n").unwrap();
+        git(p, &["add", "a.rs"]);
+        git(p, &["commit", "-q", "-m", "feat: task A"]);
+        let anchor_a = rev_parse_local(p, "HEAD");
+
+        // Squash onto main as B, leave factory/worker at A.
+        git(p, &["checkout", "-q", "main"]);
+        git(p, &["merge", "-q", "--squash", "factory/worker"]);
+        git(p, &["commit", "-q", "-m", "feat: task A (#683)"]);
+        git(p, &["checkout", "-q", "factory/worker"]);
+        assert_eq!(
+            rev_parse_local(p, "factory/worker"),
+            anchor_a,
+            "precondition: factory tip still at historical A"
+        );
+        assert_eq!(
+            count_unmerged_factory_commits(p, &anchor_a, "main"),
+            1,
+            "precondition: ancestry still counts A as stranded"
+        );
+        assert!(
+            commit_tip_tree_reachable_from(p, &anchor_a, "main"),
+            "precondition: tip tree of A must be on main after clean squash"
+        );
+
+        let mut task = worker_task("worker");
+        task.status = TaskStatus::AwaitingMerge;
+        task.deliverables.factory_branch_anchor = Some(anchor_a);
+        let req = base_req(&task.id);
+        let out = run_factory_branch_merge_gate(&task, &req, "main", p);
+        assert!(
+            matches!(out, MergeStateGateOutcome::Proceed),
+            "clean squash must clear via tip-tree reachability even without \
+             live-ref alignment, got {out:?}"
+        );
+    }
+
+    /// cas-2938 + cas-4b3f: after squash of A, a later unmerged task B on the
+    /// same factory branch must NOT re-strand task A's close — content of A
+    /// is on main even though live HEAD is ahead with B.
+    #[test]
+    fn squash_then_serial_second_task_does_not_restrand_first_close() {
+        let dir = init_factory_repo("worker");
+        let p = dir.path();
+
+        // Task A tip.
+        std::fs::write(p.join("a.rs"), "// a\n").unwrap();
+        git(p, &["add", "a.rs"]);
+        git(p, &["commit", "-q", "-m", "feat: task A"]);
+        let anchor_a = rev_parse_local(p, "HEAD");
+
+        // Squash A onto main as B (A not ancestor of main).
+        git(p, &["checkout", "-q", "main"]);
+        git(p, &["merge", "-q", "--squash", "factory/worker"]);
+        git(p, &["commit", "-q", "-m", "feat: task A (#683)"]);
+
+        // Align factory to B, then start task B with a new unmerged commit.
+        git(p, &["checkout", "-q", "factory/worker"]);
+        git(p, &["reset", "-q", "--hard", "main"]);
+        std::fs::write(p.join("b.rs"), "// b (task B, unmerged)\n").unwrap();
+        git(p, &["add", "b.rs"]);
+        git(p, &["commit", "-q", "-m", "feat: task B (unmerged)"]);
+
+        assert_eq!(
+            count_unmerged_factory_commits(p, "factory/worker", "main"),
+            1,
+            "precondition: live factory carries task B's unmerged commit"
+        );
+
+        let mut task_a = worker_task("worker");
+        task_a.status = TaskStatus::AwaitingMerge;
+        task_a.deliverables.factory_branch_anchor = Some(anchor_a);
+        let req = base_req(&task_a.id);
+        let out = run_factory_branch_merge_gate(&task_a, &req, "main", p);
+        assert!(
+            matches!(out, MergeStateGateOutcome::Proceed),
+            "task A's squash-integrated content must clear close even while \
+             task B's later unmerged commits ride on the live factory HEAD, \
+             got {out:?}"
+        );
+    }
+
+    /// Genuinely unmerged parked work still rejects: anchor A not on main
+    /// by ancestry or tip tree, live factory still carries A.
+    #[test]
+    fn genuinely_unmerged_awaiting_merge_anchor_still_rejects() {
+        let dir = init_factory_repo("worker");
+        let p = dir.path();
+
+        std::fs::write(p.join("a.rs"), "// a unmerged\n").unwrap();
+        git(p, &["add", "a.rs"]);
+        git(
+            p,
+            &["commit", "-q", "-m", "feat: task A (never integrated)"],
+        );
+        let anchor_a = rev_parse_local(p, "HEAD");
+
+        assert_eq!(
+            count_unmerged_factory_commits(p, &anchor_a, "main"),
+            1,
+            "precondition: A is stranded vs main"
+        );
+        assert!(
+            !commit_tip_tree_reachable_from(p, &anchor_a, "main"),
+            "precondition: A's tree must not be on main"
+        );
+
+        let mut task = worker_task("worker");
+        task.status = TaskStatus::AwaitingMerge;
+        task.deliverables.factory_branch_anchor = Some(anchor_a);
+        let req = base_req(&task.id);
+        let out = run_factory_branch_merge_gate(&task, &req, "main", p);
+        assert!(
+            matches!(out, MergeStateGateOutcome::Reject(_)),
+            "genuinely unmerged parked work must still Reject, got {out:?}"
+        );
+    }
+
+    /// cas-2938 P0 integrity: missing live factory ref must not authorize
+    /// close. Legacy `count_unmerged_factory_commits` returns 0 for a missing
+    /// factory ref; the live-ref path must use KnownZero-only and Reject.
+    #[test]
+    fn live_ref_fallback_rejects_when_live_factory_ref_missing() {
+        let dir = init_factory_repo("worker");
+        let p = dir.path();
+
+        std::fs::write(p.join("a.rs"), "// a unmerged\n").unwrap();
+        git(p, &["add", "a.rs"]);
+        git(
+            p,
+            &["commit", "-q", "-m", "feat: task A (never integrated)"],
+        );
+        let anchor_a = rev_parse_local(p, "HEAD");
+
+        // Drop the live factory branch while keeping the parked anchor sha
+        // resolvable as a dangling commit object.
+        git(p, &["checkout", "-q", "main"]);
+        git(p, &["branch", "-D", "factory/worker"]);
+
+        assert!(
+            git_ref_exists(p, &anchor_a),
+            "precondition: parked anchor commit object still resolves"
+        );
+        assert!(
+            !git_ref_exists(p, "factory/worker"),
+            "precondition: live factory ref is gone"
+        );
+        // Legacy helper fail-opens to 0 — pins the bug class under test.
+        assert_eq!(
+            count_unmerged_factory_commits(p, "factory/worker", "main"),
+            0,
+            "precondition: legacy count treats missing factory ref as 0"
+        );
+        assert!(
+            matches!(
+                known_unmerged_factory_commits(p, "factory/worker", "main"),
+                KnownUnmergedCount::Unknown
+            ),
+            "success-bearing helper must report Unknown for missing factory ref"
+        );
+        assert!(
+            !commit_tip_tree_reachable_from(p, &anchor_a, "main"),
+            "precondition: content path must not clear (A never integrated)"
+        );
+
+        let mut task = worker_task("worker");
+        task.status = TaskStatus::AwaitingMerge;
+        task.deliverables.factory_branch_anchor = Some(anchor_a);
+        let req = base_req(&task.id);
+        let out = run_factory_branch_merge_gate(&task, &req, "main", p);
+        assert!(
+            matches!(out, MergeStateGateOutcome::Reject(_)),
+            "missing live factory ref must not authorize close via live-ref \
+             fallback (unknown Git state ≠ KnownZero), got {out:?}"
+        );
+    }
+
+    /// cas-2938 P0 integrity: when live factory merge-base cannot be computed
+    /// (unrelated histories), live-ref must not treat fail-open count==0 as
+    /// convergence. Primary path still uses the historical anchor (known
+    /// stranded); live-ref must not clear on Unknown.
+    #[test]
+    fn live_ref_fallback_rejects_when_merge_base_unknowable() {
+        let dir = init_factory_repo("worker");
+        let p = dir.path();
+
+        // Parked anchor A: related history, genuinely unmerged (KnownPositive).
+        std::fs::write(p.join("a.rs"), "// a unmerged\n").unwrap();
+        git(p, &["add", "a.rs"]);
+        git(
+            p,
+            &["commit", "-q", "-m", "feat: task A (never integrated)"],
+        );
+        let anchor_a = rev_parse_local(p, "HEAD");
+        assert_eq!(
+            count_unmerged_factory_commits(p, &anchor_a, "main"),
+            1,
+            "precondition: primary anchor ancestry must still see 1 stranded"
+        );
+
+        // Rewrite live factory/worker onto an orphan history so merge-base
+        // with main fails — legacy count fail-opens to 0; Known* is Unknown.
+        git(p, &["checkout", "-q", "--orphan", "factory-orphan"]);
+        let _ = std::process::Command::new("git")
+            .args(["rm", "-rf", "--cached", "."])
+            .current_dir(p)
+            .output();
+        std::fs::write(p.join("orphan.txt"), "orphan\n").unwrap();
+        git(p, &["add", "orphan.txt"]);
+        git(p, &["commit", "-q", "-m", "orphan factory tip"]);
+        git(p, &["branch", "-f", "factory/worker", "HEAD"]);
+        git(p, &["checkout", "-q", "factory/worker"]);
+
+        let mb = std::process::Command::new("git")
+            .args(["merge-base", "main", "factory/worker"])
+            .current_dir(p)
+            .status()
+            .expect("merge-base");
+        assert!(
+            !mb.success(),
+            "precondition: live factory must have no merge-base with main"
+        );
+        assert_eq!(
+            count_unmerged_factory_commits(p, "factory/worker", "main"),
+            0,
+            "precondition: legacy count fail-opens to 0 on merge-base failure"
+        );
+        assert!(
+            matches!(
+                known_unmerged_factory_commits(p, "factory/worker", "main"),
+                KnownUnmergedCount::Unknown
+            ),
+            "success-bearing helper must report Unknown when merge-base fails"
+        );
+        assert!(
+            !commit_tip_tree_reachable_from(p, &anchor_a, "main"),
+            "precondition: content path must not clear"
+        );
+
+        let mut task = worker_task("worker");
+        task.status = TaskStatus::AwaitingMerge;
+        task.deliverables.factory_branch_anchor = Some(anchor_a);
+        let req = base_req(&task.id);
+        let out = run_factory_branch_merge_gate(&task, &req, "main", p);
+        assert!(
+            matches!(out, MergeStateGateOutcome::Reject(_)),
+            "unknowable live merge-base must not authorize close via live-ref \
+             fallback, got {out:?}"
+        );
+    }
+
+    /// Unit coverage: known_unmerged_factory_commits is KnownZero only for a
+    /// real zero-ahead tip, not for missing refs.
+    #[test]
+    fn known_unmerged_count_distinguishes_known_zero_from_unknown() {
+        let dir = init_factory_repo("worker");
+        let p = dir.path();
+        // factory tip == main tip after init (no extra commits) → KnownZero.
+        assert!(
+            matches!(
+                known_unmerged_factory_commits(p, "factory/worker", "main"),
+                KnownUnmergedCount::KnownZero
+            ),
+            "fully-merged live factory must be KnownZero"
+        );
+
+        std::fs::write(p.join("a.rs"), "// a\n").unwrap();
+        git(p, &["add", "a.rs"]);
+        git(p, &["commit", "-q", "-m", "feat: a"]);
+        assert!(
+            matches!(
+                known_unmerged_factory_commits(p, "factory/worker", "main"),
+                KnownUnmergedCount::KnownPositive(1)
+            ),
+            "one stranded commit must be KnownPositive(1)"
+        );
+
+        assert!(
+            matches!(
+                known_unmerged_factory_commits(p, "factory/ghost", "main"),
+                KnownUnmergedCount::Unknown
+            ),
+            "missing factory ref must be Unknown, not KnownZero"
+        );
+    }
+
+    // --- cas-5485: stale pre-rebase factory SHA ----------------------------
+
+    /// Reproduces BUG-factory-close-stale-pre-rebase-sha.md:
+    /// park with tip A, parent advances, rebase A→A', integrate A'.
+    /// Historical anchor A is no longer an ancestor of parent; close must
+    /// still Proceed when the post-rebase tip is integrated.
+    #[test]
+    fn rebased_awaiting_merge_anchor_proceeds_after_post_rebase_tip_integrated() {
+        let dir = init_factory_repo("worker");
+        let p = dir.path();
+
+        // Task work as commit A on factory/worker.
+        std::fs::write(p.join("a.rs"), "// a\n").unwrap();
+        git(p, &["add", "a.rs"]);
+        git(p, &["commit", "-q", "-m", "feat: task A"]);
+        let anchor_a = rev_parse_local(p, "HEAD");
+
+        // Parent advances with an unrelated commit (other workers).
+        git(p, &["checkout", "-q", "main"]);
+        std::fs::write(p.join("other.rs"), "// other\n").unwrap();
+        git(p, &["add", "other.rs"]);
+        git(p, &["commit", "-q", "-m", "feat: other worker"]);
+
+        // Rebase factory/worker onto advanced main → A' (new SHA).
+        git(p, &["checkout", "-q", "factory/worker"]);
+        git(p, &["rebase", "-q", "main"]);
+        let tip_a_prime = rev_parse_local(p, "HEAD");
+        assert_ne!(
+            anchor_a, tip_a_prime,
+            "precondition: rebase must rewrite SHA (A ≠ A')"
+        );
+        let a_still_ancestor = std::process::Command::new("git")
+            .args(["merge-base", "--is-ancestor", &anchor_a, "main"])
+            .current_dir(p)
+            .status()
+            .expect("is-ancestor A main");
+        assert!(
+            !a_still_ancestor.success(),
+            "precondition: pre-rebase A must not be an ancestor of main yet"
+        );
+
+        // Integrate post-rebase tip A' into main.
+        git(p, &["checkout", "-q", "main"]);
+        git(
+            p,
+            &["merge", "-q", "--no-ff", "factory/worker", "-m", "merge A'"],
+        );
+        git(p, &["checkout", "-q", "factory/worker"]);
+
+        assert_eq!(
+            count_unmerged_factory_commits(p, &anchor_a, "main"),
+            1,
+            "precondition: stale pre-rebase A still looks stranded by ancestry"
+        );
+        assert!(
+            matches!(
+                known_unmerged_factory_commits(p, "factory/worker", "main"),
+                KnownUnmergedCount::KnownZero
+            ),
+            "precondition: live post-rebase tip is fully integrated (KnownZero)"
+        );
+
+        let mut task = worker_task("worker");
+        task.status = TaskStatus::AwaitingMerge;
+        task.deliverables.factory_branch_anchor = Some(anchor_a);
+        let req = base_req(&task.id);
+        let out = run_factory_branch_merge_gate(&task, &req, "main", p);
+        assert!(
+            matches!(out, MergeStateGateOutcome::Proceed),
+            "integrated post-rebase tip must clear close despite stale \
+             pre-rebase anchor A (cas-5485), got {out:?}"
+        );
+    }
+
+    /// Characterization of the false reject: evaluating *only* the stale
+    /// pre-rebase anchor (primary ancestry path) reports stranded after a
+    /// successful rebase+integrate of A'. Pins the bug class so the full
+    /// gate's Proceed cannot pass for the wrong reason.
+    #[test]
+    fn stale_pre_rebase_anchor_alone_is_stranded_after_rebase_integrate() {
+        let dir = init_factory_repo("worker");
+        let p = dir.path();
+
+        std::fs::write(p.join("a.rs"), "// a\n").unwrap();
+        git(p, &["add", "a.rs"]);
+        git(p, &["commit", "-q", "-m", "feat: task A"]);
+        let anchor_a = rev_parse_local(p, "HEAD");
+
+        git(p, &["checkout", "-q", "main"]);
+        std::fs::write(p.join("other.rs"), "// other\n").unwrap();
+        git(p, &["add", "other.rs"]);
+        git(p, &["commit", "-q", "-m", "feat: other"]);
+        git(p, &["checkout", "-q", "factory/worker"]);
+        git(p, &["rebase", "-q", "main"]);
+        git(p, &["checkout", "-q", "main"]);
+        git(
+            p,
+            &["merge", "-q", "--no-ff", "factory/worker", "-m", "merge A'"],
+        );
+
+        assert_eq!(
+            count_unmerged_factory_commits(p, &anchor_a, "main"),
+            1,
+            "stale pre-rebase SHA alone must still look stranded (the bug \
+             the refresh path must clear)"
+        );
+        // A is not an ancestor of live factory tip after rewrite either.
+        let live = rev_parse_local(p, "factory/worker");
+        let a_anc_of_live = std::process::Command::new("git")
+            .args(["merge-base", "--is-ancestor", &anchor_a, &live])
+            .current_dir(p)
+            .status()
+            .expect("is-ancestor");
+        assert!(
+            !a_anc_of_live.success(),
+            "precondition: rebase rewrote history — A is not ancestor of live tip"
+        );
+    }
+
+    /// cas-5485 safety: after rebase of A→A', if A' is NOT integrated and
+    /// live tip is still ahead, close must Reject (absent work).
+    #[test]
+    fn rebased_but_unmerged_work_still_rejects() {
+        let dir = init_factory_repo("worker");
+        let p = dir.path();
+
+        std::fs::write(p.join("a.rs"), "// a unmerged\n").unwrap();
+        git(p, &["add", "a.rs"]);
+        git(p, &["commit", "-q", "-m", "feat: task A"]);
+        let anchor_a = rev_parse_local(p, "HEAD");
+
+        git(p, &["checkout", "-q", "main"]);
+        std::fs::write(p.join("other.rs"), "// other\n").unwrap();
+        git(p, &["add", "other.rs"]);
+        git(p, &["commit", "-q", "-m", "feat: other"]);
+        git(p, &["checkout", "-q", "factory/worker"]);
+        git(p, &["rebase", "-q", "main"]);
+        // Do NOT merge into main — work is absent from integration.
+
+        assert!(
+            matches!(
+                known_unmerged_factory_commits(p, "factory/worker", "main"),
+                KnownUnmergedCount::KnownPositive(_)
+            ),
+            "precondition: rebased tip still genuinely unmerged"
+        );
+
+        let mut task = worker_task("worker");
+        task.status = TaskStatus::AwaitingMerge;
+        task.deliverables.factory_branch_anchor = Some(anchor_a);
+        let req = base_req(&task.id);
+        let out = run_factory_branch_merge_gate(&task, &req, "main", p);
+        assert!(
+            matches!(out, MergeStateGateOutcome::Reject(_)),
+            "rebased but unmerged work must still Reject, got {out:?}"
+        );
+    }
+
+    /// cas-5485 P2: park A → rebase A' → integrate A' → unmerged serial B
+    /// on the same factory branch. Live KnownZero fails (B ahead); tip-tree
+    /// of pre-rebase A differs from A' after rebase onto parent files.
+    /// Cherry-equivalence of parked A must still clear task A without
+    /// letting B satisfy the gate.
+    #[test]
+    fn rebased_integrated_a_with_later_unmerged_b_still_closes_a() {
+        let dir = init_factory_repo("worker");
+        let p = dir.path();
+
+        std::fs::write(p.join("a.rs"), "// a\n").unwrap();
+        git(p, &["add", "a.rs"]);
+        git(p, &["commit", "-q", "-m", "feat: task A"]);
+        let anchor_a = rev_parse_local(p, "HEAD");
+
+        // Parent advances; rebase A→A'; integrate A'.
+        git(p, &["checkout", "-q", "main"]);
+        std::fs::write(p.join("other.rs"), "// other\n").unwrap();
+        git(p, &["add", "other.rs"]);
+        git(p, &["commit", "-q", "-m", "feat: other worker"]);
+        git(p, &["checkout", "-q", "factory/worker"]);
+        git(p, &["rebase", "-q", "main"]);
+        let tip_a_prime = rev_parse_local(p, "HEAD");
+        assert_ne!(anchor_a, tip_a_prime, "precondition: rebase rewrites SHA");
+        git(p, &["checkout", "-q", "main"]);
+        git(
+            p,
+            &["merge", "-q", "--no-ff", "factory/worker", "-m", "merge A'"],
+        );
+        git(p, &["checkout", "-q", "factory/worker"]);
+
+        // Serial task B unmerged on the same factory branch.
+        std::fs::write(p.join("b.rs"), "// b task B unmerged\n").unwrap();
+        git(p, &["add", "b.rs"]);
+        git(p, &["commit", "-q", "-m", "feat: task B (unmerged)"]);
+
+        assert!(
+            matches!(
+                known_unmerged_factory_commits(p, "factory/worker", "main"),
+                KnownUnmergedCount::KnownPositive(_)
+            ),
+            "precondition: live tip carries B — KnownZero path must not apply"
+        );
+        assert_eq!(
+            count_unmerged_factory_commits(p, &anchor_a, "main"),
+            1,
+            "precondition: pre-rebase A still ancestry-stranded"
+        );
+        assert!(
+            !commit_tip_tree_reachable_from(p, &anchor_a, "main"),
+            "precondition: tip-tree of pre-rebase A is not on main after \
+             rebase onto parent-with-other (trees differ)"
+        );
+        assert!(
+            commit_patches_cherry_equivalent_on_parent(p, &anchor_a, "main"),
+            "precondition: patch of A must be cherry-equivalent on main via A'"
+        );
+
+        let mut task_a = worker_task("worker");
+        task_a.status = TaskStatus::AwaitingMerge;
+        task_a.deliverables.factory_branch_anchor = Some(anchor_a);
+        let req = base_req(&task_a.id);
+        let out = run_factory_branch_merge_gate(&task_a, &req, "main", p);
+        assert!(
+            matches!(out, MergeStateGateOutcome::Proceed),
+            "task A must close after A' integrated even with later unmerged \
+             B on live factory HEAD (cas-5485 P2), got {out:?}"
+        );
+    }
+
+    /// cas-5485 P2 safety: later unmerged B must not clear close for an
+    /// anchor whose patches are still absent from the parent.
+    #[test]
+    fn later_unmerged_b_does_not_satisfy_unintegrated_anchor_a() {
+        let dir = init_factory_repo("worker");
+        let p = dir.path();
+
+        // Anchor A — never integrated (no rebase, no merge).
+        std::fs::write(p.join("a.rs"), "// a only on factory\n").unwrap();
+        git(p, &["add", "a.rs"]);
+        git(p, &["commit", "-q", "-m", "feat: task A never integrated"]);
+        let anchor_a = rev_parse_local(p, "HEAD");
+
+        // Task B on same branch — also unmerged.
+        std::fs::write(p.join("b.rs"), "// b\n").unwrap();
+        git(p, &["add", "b.rs"]);
+        git(p, &["commit", "-q", "-m", "feat: task B"]);
+
+        assert!(
+            !commit_patches_cherry_equivalent_on_parent(p, &anchor_a, "main"),
+            "precondition: A's patch is not on main"
+        );
+
+        let mut task_a = worker_task("worker");
+        task_a.status = TaskStatus::AwaitingMerge;
+        task_a.deliverables.factory_branch_anchor = Some(anchor_a);
+        let req = base_req(&task_a.id);
+        let out = run_factory_branch_merge_gate(&task_a, &req, "main", p);
+        assert!(
+            matches!(out, MergeStateGateOutcome::Reject(_)),
+            "unintegrated A must still Reject even when live HEAD has later \
+             commits (B must not satisfy A), got {out:?}"
+        );
+    }
+
+    #[test]
+    fn cherry_equivalent_fails_closed_on_missing_ref() {
+        let dir = init_factory_repo("worker");
+        let p = dir.path();
+        assert!(
+            !commit_patches_cherry_equivalent_on_parent(p, "factory/ghost", "main"),
+            "missing commit-ish must fail closed"
+        );
+        assert!(
+            !commit_patches_cherry_equivalent_on_parent(p, "factory/worker", "no-such-parent"),
+            "missing parent must fail closed"
+        );
+    }
+
     // --- cas-38e2: stale local parent-branch ref vs. origin ----------------
 
     fn rev_parse(dir: &std::path::Path, refname: &str) -> String {
@@ -6091,7 +7910,17 @@ mod merge_state_gate_tests {
         // origin. This is what makes `origin/epic/x` genuinely contain the
         // work.
         git(p, &["checkout", "-q", "epic/x"]);
-        git(p, &["merge", "-q", "--no-ff", "factory/worker", "-m", "merge worker"]);
+        git(
+            p,
+            &[
+                "merge",
+                "-q",
+                "--no-ff",
+                "factory/worker",
+                "-m",
+                "merge worker",
+            ],
+        );
         git(p, &["push", "-q", "origin", "epic/x"]);
 
         // Now force the LOCAL epic/x ref back to the pre-merge tip —
@@ -6152,7 +7981,10 @@ mod merge_state_gate_tests {
         let out = run_factory_branch_merge_gate(&task, &req, "epic/x", p);
         match out {
             MergeStateGateOutcome::Reject(msg) => {
-                assert!(msg.contains("1 commit"), "expected stranded count of 1: {msg}");
+                assert!(
+                    msg.contains("1 commit"),
+                    "expected stranded count of 1: {msg}"
+                );
             }
             other => panic!(
                 "commit reachable from neither local nor origin epic/x must still reject, got {other:?}"
@@ -6176,6 +8008,249 @@ mod merge_state_gate_tests {
         assert!(
             matches!(out, MergeStateGateOutcome::Reject(_)),
             "no-origin-remote case must still reject on the real stranded commit, got {out:?}"
+        );
+    }
+
+    // --- cas-f522: origin-parent ancestry fallback fail-closed on Unknown ---
+
+    /// AC1: origin/<parent> KnownZero is the only origin-ancestry signal that
+    /// may authorize close when local parent still looks stranded. Pins the
+    /// success-bearing helper (not fail-open count==0) for the happy path.
+    #[test]
+    fn origin_parent_known_zero_authorizes_close_cas_f522() {
+        let bare = tempfile::tempdir().unwrap();
+        let bare_status = std::process::Command::new("git")
+            .args(["init", "-q", "--bare"])
+            .current_dir(bare.path())
+            .status()
+            .expect("git init --bare");
+        assert!(bare_status.success());
+
+        let dir = init_factory_repo_with_parent("worker", "epic/x");
+        let p = dir.path();
+        git(
+            p,
+            &["remote", "add", "origin", bare.path().to_str().unwrap()],
+        );
+
+        let old_epic_tip = rev_parse(p, "epic/x");
+
+        std::fs::write(p.join("a.rs"), "// a\n").unwrap();
+        git(p, &["add", "a.rs"]);
+        git(p, &["commit", "-q", "-m", "feat: a"]);
+
+        git(p, &["checkout", "-q", "epic/x"]);
+        git(
+            p,
+            &[
+                "merge",
+                "-q",
+                "--no-ff",
+                "factory/worker",
+                "-m",
+                "merge worker",
+            ],
+        );
+        git(p, &["push", "-q", "origin", "epic/x"]);
+
+        git(p, &["checkout", "-q", "factory/worker"]);
+        git(p, &["branch", "-f", "epic/x", &old_epic_tip]);
+
+        assert_eq!(
+            count_unmerged_factory_commits(p, "factory/worker", "epic/x"),
+            1,
+            "precondition: local epic/x still looks stranded"
+        );
+        assert!(
+            matches!(
+                known_unmerged_factory_commits(p, "factory/worker", "origin/epic/x"),
+                KnownUnmergedCount::KnownZero
+            ),
+            "precondition: origin/epic/x must be KnownZero vs factory tip"
+        );
+
+        let task = worker_task("worker");
+        let req = base_req(&task.id);
+        let out = run_factory_branch_merge_gate(&task, &req, "epic/x", p);
+        assert!(
+            matches!(out, MergeStateGateOutcome::Proceed),
+            "origin/<parent> KnownZero must authorize close despite stale local parent, got {out:?}"
+        );
+    }
+
+    /// AC2: when origin/<parent> exists but merge-base is unknowable
+    /// (unrelated histories), legacy count fail-opens to 0 — that must NOT
+    /// authorize close. Unknown never masquerades as integration.
+    #[test]
+    fn origin_parent_unknown_merge_base_rejects_cas_f522() {
+        let bare = tempfile::tempdir().unwrap();
+        let bare_status = std::process::Command::new("git")
+            .args(["init", "-q", "--bare"])
+            .current_dir(bare.path())
+            .status()
+            .expect("git init --bare");
+        assert!(bare_status.success());
+
+        let dir = init_factory_repo_with_parent("worker", "epic/x");
+        let p = dir.path();
+        git(
+            p,
+            &["remote", "add", "origin", bare.path().to_str().unwrap()],
+        );
+
+        // Unmerged factory work so local parent ancestry is KnownPositive.
+        std::fs::write(p.join("a.rs"), "// a unmerged\n").unwrap();
+        git(p, &["add", "a.rs"]);
+        git(p, &["commit", "-q", "-m", "feat: a (never integrated)"]);
+
+        // Push an UNRELATED orphan tip as origin/epic/x so the origin ref
+        // exists but cannot compute merge-base with factory/worker.
+        git(p, &["checkout", "-q", "--orphan", "origin-orphan"]);
+        let _ = std::process::Command::new("git")
+            .args(["rm", "-rf", "--cached", "."])
+            .current_dir(p)
+            .output();
+        // Clear the worktree so the orphan commit is pure.
+        for entry in std::fs::read_dir(p).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name();
+            if name == ".git" {
+                continue;
+            }
+            let path = entry.path();
+            if path.is_dir() {
+                let _ = std::fs::remove_dir_all(&path);
+            } else {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+        std::fs::write(p.join("orphan.txt"), "unrelated origin tip\n").unwrap();
+        git(p, &["add", "orphan.txt"]);
+        git(p, &["commit", "-q", "-m", "orphan origin epic tip"]);
+        // Publish orphan as epic/x on origin (creates origin/epic/x tracking).
+        git(p, &["push", "-q", "origin", "HEAD:epic/x"]);
+        git(p, &["checkout", "-q", "factory/worker"]);
+        // Ensure remote-tracking ref is present without re-fetching local epic.
+        git(
+            p,
+            &["fetch", "-q", "origin", "epic/x:refs/remotes/origin/epic/x"],
+        );
+
+        assert!(
+            git_ref_exists(p, "origin/epic/x"),
+            "precondition: origin/epic/x must resolve"
+        );
+        assert_eq!(
+            count_unmerged_factory_commits(p, "factory/worker", "epic/x"),
+            1,
+            "precondition: local epic/x must still strand the factory tip"
+        );
+        // Pin the fail-open hole under test.
+        assert_eq!(
+            count_unmerged_factory_commits(p, "factory/worker", "origin/epic/x"),
+            0,
+            "precondition: legacy count fail-opens to 0 on unknowable origin merge-base"
+        );
+        assert!(
+            matches!(
+                known_unmerged_factory_commits(p, "factory/worker", "origin/epic/x"),
+                KnownUnmergedCount::Unknown
+            ),
+            "success-bearing helper must report Unknown for origin merge-base failure"
+        );
+
+        let task = worker_task("worker");
+        let req = base_req(&task.id);
+        let out = run_factory_branch_merge_gate(&task, &req, "epic/x", p);
+        assert!(
+            matches!(out, MergeStateGateOutcome::Reject(_)),
+            "origin-parent Unknown (failed merge-base) must not authorize close, got {out:?}"
+        );
+    }
+
+    /// AC2 variant: origin/<parent> ref missing entirely — no origin rescue;
+    /// gate must still Reject on the real local stranded work (not treat
+    /// absence as KnownZero).
+    #[test]
+    fn origin_parent_missing_ref_does_not_authorize_close_cas_f522() {
+        let dir = init_factory_repo_with_parent("worker", "epic/x");
+        let p = dir.path();
+        // Remote present but never pushed — origin/epic/x does not resolve.
+        let bare = tempfile::tempdir().unwrap();
+        let bare_status = std::process::Command::new("git")
+            .args(["init", "-q", "--bare"])
+            .current_dir(bare.path())
+            .status()
+            .expect("git init --bare");
+        assert!(bare_status.success());
+        git(
+            p,
+            &["remote", "add", "origin", bare.path().to_str().unwrap()],
+        );
+
+        std::fs::write(p.join("a.rs"), "// a\n").unwrap();
+        git(p, &["add", "a.rs"]);
+        git(p, &["commit", "-q", "-m", "feat: a"]);
+
+        assert!(
+            !git_ref_exists(p, "origin/epic/x"),
+            "precondition: origin/epic/x must be missing"
+        );
+        assert!(
+            matches!(
+                known_unmerged_factory_commits(p, "factory/worker", "origin/epic/x"),
+                KnownUnmergedCount::Unknown
+            ),
+            "missing origin ref must be Unknown, not zero"
+        );
+
+        let task = worker_task("worker");
+        let req = base_req(&task.id);
+        let out = run_factory_branch_merge_gate(&task, &req, "epic/x", p);
+        assert!(
+            matches!(out, MergeStateGateOutcome::Reject(_)),
+            "missing origin/<parent> must not authorize close, got {out:?}"
+        );
+    }
+
+    /// AC3: origin/<parent> KnownPositive (genuinely unmerged vs origin) rejects.
+    /// Strengthens the existing negative control with the success-bearing helper.
+    #[test]
+    fn origin_parent_known_positive_rejects_cas_f522() {
+        let bare = tempfile::tempdir().unwrap();
+        let bare_status = std::process::Command::new("git")
+            .args(["init", "-q", "--bare"])
+            .current_dir(bare.path())
+            .status()
+            .expect("git init --bare");
+        assert!(bare_status.success());
+
+        let dir = init_factory_repo_with_parent("worker", "epic/x");
+        let p = dir.path();
+        git(
+            p,
+            &["remote", "add", "origin", bare.path().to_str().unwrap()],
+        );
+        git(p, &["push", "-q", "origin", "epic/x"]);
+
+        std::fs::write(p.join("a.rs"), "// a\n").unwrap();
+        git(p, &["add", "a.rs"]);
+        git(p, &["commit", "-q", "-m", "feat: a"]);
+
+        assert!(
+            matches!(
+                known_unmerged_factory_commits(p, "factory/worker", "origin/epic/x"),
+                KnownUnmergedCount::KnownPositive(1)
+            ),
+            "precondition: origin must report KnownPositive(1)"
+        );
+
+        let task = worker_task("worker");
+        let req = base_req(&task.id);
+        let out = run_factory_branch_merge_gate(&task, &req, "epic/x", p);
+        assert!(
+            matches!(out, MergeStateGateOutcome::Reject(_)),
+            "origin KnownPositive must reject, got {out:?}"
         );
     }
 }
@@ -6334,7 +8409,10 @@ mod system_b_worktree_resolution_tests {
         // The configured location: NOT under `.cas/worktrees` at all.
         let configured_wt_path = override_base.join("worker-1");
         std::fs::create_dir_all(&configured_wt_path).unwrap();
-        git(&configured_wt_path, &["init", "-q", "-b", "factory/worker-1"]);
+        git(
+            &configured_wt_path,
+            &["init", "-q", "-b", "factory/worker-1"],
+        );
 
         assert_eq!(
             resolve_system_b_worktree_path(&cas_root, "worker-1"),
@@ -6940,7 +9018,7 @@ mod commit_claim_integrity_tests {
     fn fabrication_detected_when_zero_commits_with_review_findings() {
         let dir = init_worker_repo();
         // No commits beyond base — fabrication scenario.
-        let outcome = check_commit_claim_integrity(dir.path(), "main", true);
+        let outcome = check_commit_claim_integrity(dir.path(), "main", true, None);
         match outcome {
             CommitClaimGateOutcome::Reject(msg) => {
                 assert!(
@@ -6967,7 +9045,7 @@ mod commit_claim_integrity_tests {
         // Worker did documentation-only work and did not supply
         // code_review_findings. Empty branch is fine in that case.
         let dir = init_worker_repo();
-        let outcome = check_commit_claim_integrity(dir.path(), "main", false);
+        let outcome = check_commit_claim_integrity(dir.path(), "main", false, None);
         assert!(
             matches!(outcome, CommitClaimGateOutcome::Proceed),
             "no-findings close on empty branch must proceed (no fabrication claim)"
@@ -6982,10 +9060,58 @@ mod commit_claim_integrity_tests {
         git(dir.path(), &["add", "real.rs"]);
         git(dir.path(), &["commit", "-q", "-m", "real work"]);
 
-        let outcome = check_commit_claim_integrity(dir.path(), "main", true);
+        let outcome = check_commit_claim_integrity(dir.path(), "main", true, None);
         assert!(
             matches!(outcome, CommitClaimGateOutcome::Proceed),
             "commits + findings must proceed (worker did real work)"
+        );
+    }
+
+    /// cas-127f: findings + empty merge-base..HEAD after supervisor merge is
+    /// not fabrication when the parked factory tip is an ancestor of parent.
+    #[test]
+    fn findings_after_merge_satisfied_anchor_proceeds() {
+        let dir = init_worker_repo();
+        std::fs::write(dir.path().join("real.rs"), "fn real() {}\n").unwrap();
+        git(dir.path(), &["add", "real.rs"]);
+        git(dir.path(), &["commit", "-q", "-m", "real work"]);
+        let anchor = String::from_utf8(
+            std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(dir.path())
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        // Supervisor merges factory tip into main (no-ff).
+        git(dir.path(), &["checkout", "-q", "main"]);
+        git(
+            dir.path(),
+            &[
+                "merge",
+                "--no-ff",
+                "-m",
+                "merge worker",
+                "factory/test-worker",
+            ],
+        );
+        // Worker tip is now even with parent (or still at anchor which is
+        // ancestor) — count beyond parent is 0 either way after checkout.
+        git(dir.path(), &["checkout", "-q", "factory/test-worker"]);
+        git(dir.path(), &["reset", "--hard", "main"]);
+
+        assert_eq!(
+            count_worker_branch_commits(dir.path(), "main"),
+            0,
+            "post-merge worker tip must not be ahead of parent"
+        );
+        let outcome = check_commit_claim_integrity(dir.path(), "main", true, Some(&anchor));
+        assert!(
+            matches!(outcome, CommitClaimGateOutcome::Proceed),
+            "merge-satisfied anchor must not look like fabrication"
         );
     }
 }
@@ -7124,6 +9250,7 @@ mod zero_change_close_tests {
             &TaskType::Bug,
             None,  // no execution_note
             false, // no review findings
+            None,  // factory_branch_anchor
         );
         assert!(
             matches!(outcome, ZeroCommitCloseOutcome::Proceed),
@@ -7144,6 +9271,7 @@ mod zero_change_close_tests {
             &TaskType::Bug,
             None,  // no execution_note
             false, // no review findings
+            None,  // factory_branch_anchor
         );
         match outcome {
             ZeroCommitCloseOutcome::AmbiguousCodeTask(msg) => {
@@ -7174,6 +9302,7 @@ mod zero_change_close_tests {
             &TaskType::Bug,
             Some("additive-only"), // explicit no-code signal
             false,
+            None, // factory_branch_anchor
         );
         assert!(
             matches!(outcome, ZeroCommitCloseOutcome::Proceed),
@@ -7186,8 +9315,15 @@ mod zero_change_close_tests {
     fn case4_zero_commits_on_chore_or_spike_proceeds() {
         let dir = init_worker_repo();
         for task_type in [TaskType::Chore, TaskType::Epic] {
-            let outcome =
-                check_zero_commit_close(dir.path(), "main", "cas-test1", &task_type, None, false);
+            let outcome = check_zero_commit_close(
+                dir.path(),
+                "main",
+                "cas-test1",
+                &task_type,
+                None,
+                false,
+                None,
+            );
             assert!(
                 matches!(outcome, ZeroCommitCloseOutcome::Proceed),
                 "{task_type:?} task type must not be flagged as ambiguous"
@@ -7207,6 +9343,7 @@ mod zero_change_close_tests {
             &TaskType::Bug,
             None,
             true, // has_review_findings = true (cas-490f rejects, not this gate)
+            None, // factory_branch_anchor
         );
         assert!(
             matches!(outcome, ZeroCommitCloseOutcome::Proceed),
@@ -7260,6 +9397,7 @@ mod zero_change_close_tests {
             &TaskType::Bug,
             None,  // no execution_note
             false, // no review findings
+            None,  // factory_branch_anchor
         );
         match outcome {
             ZeroCommitCloseOutcome::AmbiguousCodeTask(msg) => {
@@ -7276,6 +9414,153 @@ mod zero_change_close_tests {
                 );
             }
         }
+    }
+
+    // ── cas-127f: post-MERGE-REQUIRED zero-commit false-positive ───────────
+
+    /// Happy path: worker commits C, MERGE REQUIRED records C as anchor,
+    /// supervisor merges C into parent, worker tip is no longer ahead →
+    /// count==0 but anchor is ancestor → Proceed (not ZERO-COMMIT).
+    #[test]
+    fn cas127f_post_merge_ancestor_anchor_proceeds() {
+        let dir = init_worker_repo();
+        std::fs::write(dir.path().join("fix.rs"), "pub fn work() {}\n").unwrap();
+        git(dir.path(), &["add", "fix.rs"]);
+        git(dir.path(), &["commit", "-q", "-m", "feat: task work"]);
+        let anchor = String::from_utf8(
+            std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(dir.path())
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+
+        // Sanity: before merge, zero-commit gate would Proceed via count>0.
+        assert!(count_worker_branch_commits(dir.path(), "main") > 0);
+
+        // Supervisor merges factory tip into main.
+        git(dir.path(), &["checkout", "-q", "main"]);
+        git(
+            dir.path(),
+            &[
+                "merge",
+                "--no-ff",
+                "-m",
+                "merge factory/test-worker",
+                "factory/test-worker",
+            ],
+        );
+        // Worker factory branch reset to epic tip (post-merge sync).
+        git(dir.path(), &["checkout", "-q", "factory/test-worker"]);
+        git(dir.path(), &["reset", "--hard", "main"]);
+
+        assert_eq!(
+            count_worker_branch_commits(dir.path(), "main"),
+            0,
+            "post-merge: merge-base..HEAD must be empty (the false-positive fixture)"
+        );
+        assert!(
+            commit_is_merged_into_parent(dir.path(), &anchor, "main"),
+            "parked anchor must be ancestor of parent after merge"
+        );
+
+        let outcome = check_zero_commit_close(
+            dir.path(),
+            "main",
+            "cas-127f",
+            &TaskType::Bug,
+            None,
+            false,
+            Some(&anchor),
+        );
+        assert!(
+            matches!(outcome, ZeroCommitCloseOutcome::Proceed),
+            "merge-satisfied anchor must Proceed, not ZERO-COMMIT; got {outcome:?}"
+        );
+    }
+
+    /// Edge: genuine never-had-commits code task still rejects (no anchor).
+    #[test]
+    fn cas127f_genuine_zero_commit_without_anchor_still_rejects() {
+        let dir = init_worker_repo();
+        let outcome = check_zero_commit_close(
+            dir.path(),
+            "main",
+            "cas-127f",
+            &TaskType::Bug,
+            None,
+            false,
+            None,
+        );
+        match outcome {
+            ZeroCommitCloseOutcome::AmbiguousCodeTask(msg) => {
+                assert!(
+                    msg.contains("ZERO-COMMIT CLOSE ON CODE TASK"),
+                    "genuine zero-commit must still name the gate: {msg}"
+                );
+            }
+            ZeroCommitCloseOutcome::Proceed => {
+                panic!("genuine zero-commit without anchor must not Proceed");
+            }
+        }
+    }
+
+    /// Edge: anchor set but not integrated (still unmerged) + count 0 —
+    /// e.g. factory tip was force-reset without merging. Fail closed.
+    #[test]
+    fn cas127f_unmerged_anchor_with_empty_ahead_still_rejects() {
+        let dir = init_worker_repo();
+        // Commit work, record anchor, then hard-reset factory away so the
+        // commit is orphaned from parent *and* HEAD is back at base.
+        std::fs::write(dir.path().join("orphan.rs"), "fn orphan() {}\n").unwrap();
+        git(dir.path(), &["add", "orphan.rs"]);
+        git(dir.path(), &["commit", "-q", "-m", "orphaned work"]);
+        let anchor = String::from_utf8(
+            std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(dir.path())
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        git(dir.path(), &["reset", "--hard", "main"]);
+
+        assert_eq!(count_worker_branch_commits(dir.path(), "main"), 0);
+        assert!(
+            !commit_is_merged_into_parent(dir.path(), &anchor, "main"),
+            "orphan anchor must not be considered merged"
+        );
+
+        let outcome = check_zero_commit_close(
+            dir.path(),
+            "main",
+            "cas-127f",
+            &TaskType::Feature,
+            None,
+            false,
+            Some(&anchor),
+        );
+        assert!(
+            matches!(outcome, ZeroCommitCloseOutcome::AmbiguousCodeTask(_)),
+            "unmerged anchor must not unlock zero-commit; got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn commit_is_merged_into_parent_false_for_unknown_sha() {
+        let dir = init_worker_repo();
+        assert!(!commit_is_merged_into_parent(
+            dir.path(),
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+            "main"
+        ));
     }
 }
 
@@ -7462,6 +9747,59 @@ mod merge_reality_tests {
         assert!(
             matches!(outcome, MergeRealityOutcome::Proceed),
             "absent factory branch (push+merge+prune) must PROCEED"
+        );
+    }
+}
+
+#[cfg(test)]
+mod epic_close_owner_gate_tests {
+    use super::epic_close_owner_gate;
+
+    #[test]
+    fn test_9fff_owner_match_by_id_or_name_allows_close() {
+        assert!(
+            epic_close_owner_gate("cas-epic", "owner-id", Some("owner-id"), None, None).is_ok()
+        );
+        assert!(
+            epic_close_owner_gate("cas-epic", "owner-sup", None, Some("owner-sup"), None).is_ok()
+        );
+    }
+
+    #[test]
+    fn test_9fff_wrong_identity_rejects_close() {
+        let err = epic_close_owner_gate(
+            "cas-epic",
+            "owner-id",
+            Some("other-id"),
+            Some("other-sup"),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("cannot close") && err.contains("owner-id"),
+            "wrong identity must reject: {err}"
+        );
+    }
+
+    /// Review P1: unknown caller must fail closed — never fall through when
+    /// epic_verification_owner is set.
+    #[test]
+    fn test_9fff_unknown_caller_identity_fail_closed() {
+        let err = epic_close_owner_gate("cas-epic", "owner-id", None, None, None).unwrap_err();
+        assert!(
+            err.contains("identity is unknown") && err.contains("fail closed"),
+            "unknown identity must fail closed, got: {err}"
+        );
+    }
+
+    /// cas-cc74: close compare trims owner + identity facets.
+    #[test]
+    fn test_cc74_close_owner_gate_trims_whitespace() {
+        assert!(
+            epic_close_owner_gate("cas-epic", "  owner-id  ", Some("owner-id"), None, None).is_ok()
+        );
+        assert!(
+            epic_close_owner_gate("cas-epic", "owner-id", Some("  owner-id  "), None, None).is_ok()
         );
     }
 }

@@ -169,6 +169,12 @@ pub enum HookSpecificOutput {
         permission_decision_reason: Option<String>,
         #[serde(rename = "updatedInput", skip_serializing_if = "Option::is_none")]
         updated_input: Option<serde_json::Value>,
+        /// Optional context injected alongside the tool result (Claude Code
+        /// PreToolUse supports this). Used by factory SendMessage auto-route
+        /// to surface a success receipt without a deny/`<error>` envelope
+        /// (cas-73c8).
+        #[serde(rename = "additionalContext", skip_serializing_if = "Option::is_none")]
+        additional_context: Option<String>,
     },
     UserPromptSubmit {
         /// Required by Claude Code's schema — a UserPromptSubmit
@@ -341,6 +347,29 @@ impl HookOutput {
                 permission_decision: Some(decision.to_string()),
                 permission_decision_reason: Some(reason.to_string()),
                 updated_input: None,
+                additional_context: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// PreToolUse permission decision with `additionalContext` for Claude.
+    ///
+    /// Use when the hook both decides permission and needs to inject a
+    /// success-shaped receipt into the model's context (e.g. factory
+    /// SendMessage auto-route: `allow` + "AUTO-ROUTED" context so the tool
+    /// is not reported as an `<error>`).
+    pub fn with_pre_tool_permission_and_context(
+        decision: &str,
+        reason: &str,
+        additional_context: &str,
+    ) -> Self {
+        Self {
+            hook_specific_output: Some(HookSpecificOutput::PreToolUse {
+                permission_decision: Some(decision.to_string()),
+                permission_decision_reason: Some(reason.to_string()),
+                updated_input: None,
+                additional_context: Some(additional_context.to_string()),
             }),
             ..Default::default()
         }
@@ -354,6 +383,7 @@ impl HookOutput {
                 permission_decision: None,
                 permission_decision_reason: None,
                 updated_input: Some(updated_input),
+                additional_context: None,
             }),
             ..Default::default()
         }

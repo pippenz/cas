@@ -46,4 +46,8 @@ mod error;
 mod pty;
 
 pub use error::{Error, Result};
+pub use pty::{
+    ContractRole, claude_supervisor_contract, claude_worker_contract, missing_contract_elements,
+    rendered_contract_surface,
+};
 pub use pty::{Pty, PtyConfig, PtyEvent, TeamsSpawnConfig};

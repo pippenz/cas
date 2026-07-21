@@ -29,6 +29,7 @@
 
 mod error;
 mod harness;
+mod input_stream;
 mod mux;
 mod pane;
 mod pty;
@@ -37,9 +38,14 @@ mod spec;
 
 pub use error::{Error, Result};
 pub use harness::{HarnessCapabilities, SupervisorCli};
+pub use input_stream::{BracketedPasteTracker, StreamByteClass, key_stream_marks_submit};
 pub use mux::{Mux, MuxConfig, MuxEvent};
 pub use pane::TerminalSnapshot;
-pub use pane::{Pane, PaneBackend, PaneId, PaneKind};
+pub use pane::{Pane, PaneBackend, PaneId, PaneKind, UserInputKind};
+pub use pty::{
+    ContractRole, claude_supervisor_contract, claude_worker_contract, missing_contract_elements,
+    rendered_contract_surface,
+};
 pub use pty::{Pty, PtyConfig, PtyEvent, TeamsSpawnConfig};
 pub use render::{LayoutDirection, Renderer};
 pub use spec::{Effort, WorkerSpec};

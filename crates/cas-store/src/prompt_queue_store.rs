@@ -4,7 +4,7 @@
 //! Factory TUI polls this queue and injects prompts into worker PTYs.
 
 use chrono::{DateTime, TimeZone, Utc};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -86,7 +86,40 @@ const PROMPT_QUEUE_URGENT_MIGRATION: &str = r#"
 ALTER TABLE prompt_queue ADD COLUMN urgent INTEGER NOT NULL DEFAULT 0;
 "#;
 
-/// Delivery status of a prompt queue message
+/// Indexes supporting two-lane `peek_for_targets` selection (cas-2bcb).
+/// Partial indexes keep the path bounded to pending rows only.
+const PROMPT_QUEUE_TWO_LANE_INDEXES: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_prompt_queue_session_pending
+    ON prompt_queue(factory_session, priority, id)
+    WHERE processed_at IS NULL AND factory_session IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_prompt_queue_legacy_pending
+    ON prompt_queue(target, priority, id)
+    WHERE processed_at IS NULL AND factory_session IS NULL;
+"#;
+
+/// Idempotent lifecycle outbox enqueue key (cas-ecff).
+const PROMPT_QUEUE_DEDUPE_KEY_MIGRATION: &str = r#"
+ALTER TABLE prompt_queue ADD COLUMN dedupe_key TEXT;
+"#;
+const PROMPT_QUEUE_DEDUPE_KEY_INDEX: &str = r#"
+CREATE UNIQUE INDEX IF NOT EXISTS idx_prompt_queue_dedupe_key
+    ON prompt_queue(dedupe_key)
+    WHERE dedupe_key IS NOT NULL;
+"#;
+
+/// Result of an idempotent prompt enqueue (cas-ecff).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnqueueIdempotentResult {
+    /// New row inserted.
+    Created(i64),
+    /// Existing row for the same dedupe_key (no second insert).
+    AlreadyExists(i64),
+}
+
+/// Delivery status of a prompt queue message (legacy three-value ladder).
+///
+/// Preserved for existing MCP/clients. Prefer [`MessageDeliveryReport`] for
+/// stage-based observability (cas-2c5f).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum MessageStatus {
     /// Message is queued but not yet delivered
@@ -106,6 +139,276 @@ impl std::fmt::Display for MessageStatus {
         }
     }
 }
+
+/// Monotonic transport stage CAS can authoritatively observe (cas-2c5f).
+///
+/// Rank order:
+/// Enqueued < Selected < Gated <
+///   {Dropped|Suppressed|Abandoned|PartiallyDelivered|Delivered} < Confirmed
+///
+/// **Delivered** requires successful handoff to *all* intended recipients and
+/// `transport_delivered_at`. Partial `all_workers` success is
+/// [`DeliveryStage::PartiallyDelivered`] (never silent full Delivered).
+///
+/// Terminal siblings share rank 3; only the legal same-rank transition is
+/// `PartiallyDelivered → Delivered`. Illegal sibling rewrites are rejected.
+/// Corrupt/unknown `highest_stage` is a typed error (never silent Enqueued).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryStage {
+    /// Row exists with parseable `created_at`.
+    Enqueued,
+    /// Daemon selected/peeked the row for a delivery attempt.
+    Selected,
+    /// Delivery attempt blocked by a gate (pane not ready, target unavailable).
+    Gated,
+    /// Intentionally not delivered: dead-source drop.
+    Dropped,
+    /// Intentionally not delivered: idle-message rate-limit suppression.
+    Suppressed,
+    /// Intentionally not delivered: unknown/stale target abandoned.
+    Abandoned,
+    /// Broadcast reached some but not all intended recipients.
+    PartiallyDelivered,
+    /// Authoritative full transport handoff (all intended recipients Ok).
+    Delivered,
+    /// Target acknowledged (`acked_at` set).
+    Confirmed,
+}
+
+impl DeliveryStage {
+    pub fn rank(self) -> u8 {
+        match self {
+            Self::Enqueued => 0,
+            Self::Selected => 1,
+            Self::Gated => 2,
+            Self::Dropped
+            | Self::Suppressed
+            | Self::Abandoned
+            | Self::PartiallyDelivered
+            | Self::Delivered => 3,
+            Self::Confirmed => 4,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Enqueued => "enqueued",
+            Self::Selected => "selected",
+            Self::Gated => "gated",
+            Self::Dropped => "dropped",
+            Self::Suppressed => "suppressed",
+            Self::Abandoned => "abandoned",
+            Self::PartiallyDelivered => "partially_delivered",
+            Self::Delivered => "delivered",
+            Self::Confirmed => "confirmed",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "enqueued" => Some(Self::Enqueued),
+            "selected" => Some(Self::Selected),
+            "gated" => Some(Self::Gated),
+            "dropped" => Some(Self::Dropped),
+            "suppressed" => Some(Self::Suppressed),
+            "abandoned" => Some(Self::Abandoned),
+            "partially_delivered" => Some(Self::PartiallyDelivered),
+            "delivered" => Some(Self::Delivered),
+            "confirmed" => Some(Self::Confirmed),
+            _ => None,
+        }
+    }
+
+    pub fn is_terminal_non_delivery(self) -> bool {
+        matches!(self, Self::Dropped | Self::Suppressed | Self::Abandoned)
+    }
+
+    /// Whether transition `self → to` is legal (idempotent same stage always ok).
+    pub fn can_transition_to(self, to: Self) -> bool {
+        if self == to {
+            return true;
+        }
+        if to.rank() > self.rank() {
+            return true;
+        }
+        // Sole legal same-rank rewrite: partial → full delivery (retry completed).
+        self == Self::PartiallyDelivered && to == Self::Delivered
+    }
+}
+
+impl std::fmt::Display for DeliveryStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// Why a message has not completed transport confirmation (cas-2c5f).
+///
+/// Only reasons CAS can authoritatively stamp or derive without false precision.
+/// Inaccurate queue-head inference was removed (review reject of ae8f47b).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingReason {
+    /// Row is not eligible for the observing session's selection rules.
+    SessionIneligible,
+    /// Target agent/pane is not available to receive delivery.
+    TargetUnavailable,
+    /// Delivery gated (e.g. pane not ready for injection).
+    GatedNotReady,
+    /// Last adapter attempt failed; row left pending for retry.
+    AdapterRetryable,
+    /// Enqueued/selected and not known blocked; awaiting next delivery tick.
+    AwaitingDelivery,
+    /// Authoritative transport delivered; waiting for target `message_ack`.
+    AwaitingAck,
+    /// Terminal non-delivery: dead worker source dropped.
+    DroppedDeadSource,
+    /// Terminal non-delivery: duplicate idle suppression.
+    SuppressedIdle,
+    /// Terminal non-delivery: unknown/stale target abandoned.
+    AbandonedUnknownTarget,
+    /// Broadcast reached a subset of intended recipients.
+    PartialBroadcast,
+    /// Broadcast had zero intended recipients (e.g. no non-native workers).
+    NoIntendedRecipients,
+}
+
+impl PendingReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SessionIneligible => "session_ineligible",
+            Self::TargetUnavailable => "target_unavailable",
+            Self::GatedNotReady => "gated_not_ready",
+            Self::AdapterRetryable => "adapter_retryable",
+            Self::AwaitingDelivery => "awaiting_delivery",
+            Self::AwaitingAck => "awaiting_ack",
+            Self::DroppedDeadSource => "dropped_dead_source",
+            Self::SuppressedIdle => "suppressed_idle",
+            Self::AbandonedUnknownTarget => "abandoned_unknown_target",
+            Self::PartialBroadcast => "partial_broadcast",
+            Self::NoIntendedRecipients => "no_intended_recipients",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "session_ineligible" => Some(Self::SessionIneligible),
+            "target_unavailable" => Some(Self::TargetUnavailable),
+            "gated_not_ready" => Some(Self::GatedNotReady),
+            "adapter_retryable" => Some(Self::AdapterRetryable),
+            "awaiting_delivery" => Some(Self::AwaitingDelivery),
+            "awaiting_ack" => Some(Self::AwaitingAck),
+            "dropped_dead_source" => Some(Self::DroppedDeadSource),
+            "suppressed_idle" => Some(Self::SuppressedIdle),
+            "abandoned_unknown_target" => Some(Self::AbandonedUnknownTarget),
+            "partial_broadcast" => Some(Self::PartialBroadcast),
+            "no_intended_recipients" => Some(Self::NoIntendedRecipients),
+            "behind_queue_head" => Some(Self::AwaitingDelivery),
+            _ => None,
+        }
+    }
+
+    fn implied_stage(self) -> DeliveryStage {
+        match self {
+            Self::GatedNotReady | Self::TargetUnavailable => DeliveryStage::Gated,
+            Self::DroppedDeadSource => DeliveryStage::Dropped,
+            Self::SuppressedIdle => DeliveryStage::Suppressed,
+            Self::AbandonedUnknownTarget => DeliveryStage::Abandoned,
+            Self::PartialBroadcast => DeliveryStage::PartiallyDelivered,
+            Self::NoIntendedRecipients => DeliveryStage::Selected,
+            Self::AdapterRetryable
+            | Self::AwaitingDelivery
+            | Self::SessionIneligible
+            | Self::AwaitingAck => DeliveryStage::Selected,
+        }
+    }
+}
+
+impl std::fmt::Display for PendingReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// Evidence CAS does **not** fabricate (harness wake / model reaction).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservationStatus {
+    /// No authoritative CAS observation for this stage.
+    #[default]
+    Unobserved,
+}
+
+impl std::fmt::Display for ObservationStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unobserved => write!(f, "unobserved"),
+        }
+    }
+}
+
+/// Stage-based delivery report for one prompt_queue message (cas-2c5f).
+///
+/// Additive to legacy [`MessageStatus`]. Wake/reaction are always
+/// [`ObservationStatus::Unobserved`] — never inferred from timestamps.
+///
+/// `delivered_at` is **only** set after full transport handoff
+/// (`transport_delivered_at`). Partial broadcasts never populate it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MessageDeliveryReport {
+    pub id: i64,
+    /// Legacy three-value status (processed_at/acked_at) for older clients.
+    pub legacy_status: MessageStatus,
+    /// Highest monotonic stage reached (authoritative columns only).
+    pub stage: DeliveryStage,
+    pub source: String,
+    pub target: String,
+    pub factory_session: Option<String>,
+    pub priority: u8,
+    pub urgent: bool,
+    pub enqueued_at: DateTime<Utc>,
+    pub selected_at: Option<DateTime<Utc>>,
+    /// Full transport handoff time only (not legacy processed_at / partial).
+    pub delivered_at: Option<DateTime<Utc>>,
+    pub confirmed_at: Option<DateTime<Utc>>,
+    /// Present when waiting/blocked, partial, or terminal non-delivery.
+    pub pending_reason: Option<PendingReason>,
+    /// Human-readable detail for the pending reason (error text, …).
+    pub pending_detail: Option<String>,
+    /// Broadcast recipient counts when applicable (`all_workers`).
+    pub broadcast_attempted: Option<u32>,
+    pub broadcast_succeeded: Option<u32>,
+    pub broadcast_failed: Option<u32>,
+    pub wake: ObservationStatus,
+    pub reaction: ObservationStatus,
+}
+
+/// Stage-observability columns (cas-2c5f). Idempotent ALTERs.
+const PROMPT_QUEUE_SELECTED_AT_MIGRATION: &str = r#"
+ALTER TABLE prompt_queue ADD COLUMN selected_at TEXT;
+"#;
+const PROMPT_QUEUE_PENDING_REASON_MIGRATION: &str = r#"
+ALTER TABLE prompt_queue ADD COLUMN last_pending_reason TEXT;
+"#;
+const PROMPT_QUEUE_PENDING_DETAIL_MIGRATION: &str = r#"
+ALTER TABLE prompt_queue ADD COLUMN last_pending_detail TEXT;
+"#;
+const PROMPT_QUEUE_TRANSPORT_DELIVERED_AT_MIGRATION: &str = r#"
+ALTER TABLE prompt_queue ADD COLUMN transport_delivered_at TEXT;
+"#;
+const PROMPT_QUEUE_HIGHEST_STAGE_MIGRATION: &str = r#"
+ALTER TABLE prompt_queue ADD COLUMN highest_stage TEXT;
+"#;
+const PROMPT_QUEUE_BROADCAST_ATTEMPTED_MIGRATION: &str = r#"
+ALTER TABLE prompt_queue ADD COLUMN broadcast_attempted INTEGER;
+"#;
+const PROMPT_QUEUE_BROADCAST_SUCCEEDED_MIGRATION: &str = r#"
+ALTER TABLE prompt_queue ADD COLUMN broadcast_succeeded INTEGER;
+"#;
+const PROMPT_QUEUE_BROADCAST_FAILED_MIGRATION: &str = r#"
+ALTER TABLE prompt_queue ADD COLUMN broadcast_failed INTEGER;
+"#;
 
 /// Trait for prompt queue operations
 pub trait PromptQueueStore: Send + Sync {
@@ -176,6 +479,21 @@ pub trait PromptQueueStore: Send + Sync {
         urgent: bool,
     ) -> Result<i64>;
 
+    /// Idempotent enqueue keyed by `dedupe_key` (cas-ecff lifecycle outbox).
+    ///
+    /// Replaying the same key returns [`EnqueueIdempotentResult::AlreadyExists`]
+    /// without inserting a second row — stamp-failure recovery cannot duplicate.
+    fn enqueue_idempotent(
+        &self,
+        source: &str,
+        target: &str,
+        prompt: &str,
+        factory_session: Option<&str>,
+        summary: Option<&str>,
+        priority: Option<NotificationPriority>,
+        dedupe_key: &str,
+    ) -> Result<EnqueueIdempotentResult>;
+
     /// Poll for pending prompts for a specific target (marks as processed)
     fn poll_for_target(&self, target: &str, limit: usize) -> Result<Vec<QueuedPrompt>>;
 
@@ -199,11 +517,30 @@ pub trait PromptQueueStore: Send + Sync {
 
     /// Peek at pending prompts for specific targets only.
     ///
-    /// Only returns legacy NULL-session messages whose target is in `targets`.
-    /// When `factory_session` is provided, also returns all session-tagged
-    /// messages for that exact session.
-    /// This prevents one factory daemon from consuming messages meant for
-    /// another daemon's workers/supervisor in multi-session setups.
+    /// # Eligibility (applied before LIMIT)
+    /// - **Session lane:** rows with `factory_session` equal to the supplied
+    ///   session (never matched by target-name collision alone).
+    /// - **Legacy lane:** NULL-session rows whose `target` is in `targets`
+    ///   (historical compatibility arm).
+    ///
+    /// # Cross-lane selection contract (when `factory_session` is set)
+    /// Two independent peeks (each `ORDER BY priority ASC, id ASC LIMIT n`)
+    /// are merged with **global priority first**, then same-priority lane
+    /// fairness (cas-2bcb / cas-04a6 R1):
+    /// 1. Walk priority bands from highest urgency (lowest numeric priority)
+    ///    to lowest. No lower-priority row is selected while any higher-
+    ///    priority eligible row remains in either lane's candidate set.
+    /// 2. Within a single priority band, apply a bounded two-lane quota so
+    ///    neither session nor legacy can permanently occupy the band's
+    ///    remaining slots: `ceil(remaining/2)` session + `floor(remaining/2)`
+    ///    legacy when both have work at that priority; unused quota fills
+    ///    the other lane. Final order within a band: `id ASC` (FIFO).
+    /// 3. `limit == 1`: the single slot is the highest-priority eligible
+    ///    head; only when both heads share the same priority does equal-
+    ///    priority fairness apply (session preferred at limit=1).
+    ///
+    /// Without a session tag, behavior is the historical single-lane target
+    /// filter. Session isolation: other sessions' tagged rows never leak.
     fn peek_for_targets(
         &self,
         targets: &[&str],
@@ -220,8 +557,51 @@ pub trait PromptQueueStore: Send + Sync {
     /// Get messages that were processed but not acked within the timeout
     fn unacked(&self, timeout_secs: i64, limit: usize) -> Result<Vec<QueuedPrompt>>;
 
-    /// Get delivery status of a specific message
+    /// Get delivery status of a specific message (legacy three-value ladder).
     fn message_status(&self, prompt_id: i64) -> Result<Option<MessageStatus>>;
+
+    /// Stage-based delivery report (cas-2c5f). `None` if the id does not exist.
+    /// Returns `Err` if required timestamps are corrupt (never fabricates `now`).
+    fn message_delivery_report(&self, prompt_id: i64) -> Result<Option<MessageDeliveryReport>>;
+
+    /// Record that the daemon selected/peeked this message for a delivery attempt.
+    fn record_selected(&self, prompt_id: i64) -> Result<()>;
+
+    /// Record a durable pending reason; advances highest_stage monotonically.
+    fn record_pending_reason(
+        &self,
+        prompt_id: i64,
+        reason: PendingReason,
+        detail: Option<&str>,
+    ) -> Result<()>;
+
+    /// Authoritative full transport handoff (all intended recipients Ok).
+    /// Atomically sets `transport_delivered_at` + stage Delivered + `processed_at`.
+    fn mark_transport_delivered(&self, prompt_id: i64) -> Result<()>;
+
+    /// Broadcast outcome for `all_workers` (attempted/succeeded/failed counts).
+    ///
+    /// - all succeeded → Delivered + transport_delivered_at
+    /// - mixed → PartiallyDelivered (no transport_delivered_at; processed to avoid re-inject)
+    /// - zero succeeded (attempted > 0) → pending AdapterRetryable (not processed)
+    /// - attempted == 0 → pending NoIntendedRecipients (not processed)
+    fn mark_broadcast_outcome(
+        &self,
+        prompt_id: i64,
+        attempted: u32,
+        succeeded: u32,
+        failed: u32,
+        detail: Option<&str>,
+    ) -> Result<()>;
+
+    /// Dead-source drop: marks processed for queue drainage without transport success.
+    fn mark_dropped(&self, prompt_id: i64, detail: Option<&str>) -> Result<()>;
+
+    /// Idle-message suppression: processed without transport success.
+    fn mark_suppressed(&self, prompt_id: i64, detail: Option<&str>) -> Result<()>;
+
+    /// Unknown-target abandon: processed without transport success.
+    fn mark_abandoned(&self, prompt_id: i64, detail: Option<&str>) -> Result<()>;
 
     /// Get count of pending prompts
     fn pending_count(&self) -> Result<usize>;
@@ -285,54 +665,334 @@ impl SqlitePromptQueueStore {
             urgent,
         })
     }
+
+    /// Merge session-lane and legacy-lane peeks.
+    ///
+    /// Contract (see `PromptQueueStore::peek_for_targets`):
+    /// 1. Global priority bands first (never emit priority P+1 while any
+    ///    priority ≤P candidate remains).
+    /// 2. Within one priority band only: bounded two-lane quota
+    ///    (ceil(n/2) session + floor(n/2) legacy; unused fills the other).
+    /// 3. Within a band, FIFO by id across the selected set.
+    fn merge_two_lane_peeks(
+        session: Vec<QueuedPrompt>,
+        legacy: Vec<QueuedPrompt>,
+        limit: usize,
+    ) -> Vec<QueuedPrompt> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        if session.is_empty() {
+            return legacy.into_iter().take(limit).collect();
+        }
+        if legacy.is_empty() {
+            return session.into_iter().take(limit).collect();
+        }
+
+        // Inputs are already ORDER BY priority ASC, id ASC per lane.
+        let mut s_idx = 0usize;
+        let mut l_idx = 0usize;
+        let mut selected: Vec<QueuedPrompt> = Vec::with_capacity(limit);
+
+        while selected.len() < limit && (s_idx < session.len() || l_idx < legacy.len()) {
+            let next_priority = match (session.get(s_idx), legacy.get(l_idx)) {
+                (Some(s), Some(l)) => (s.priority as u8).min(l.priority as u8),
+                (Some(s), None) => s.priority as u8,
+                (None, Some(l)) => l.priority as u8,
+                (None, None) => break,
+            };
+
+            // Drain the full same-priority band from each lane head.
+            let s_start = s_idx;
+            while s_idx < session.len() && session[s_idx].priority as u8 == next_priority {
+                s_idx += 1;
+            }
+            let l_start = l_idx;
+            while l_idx < legacy.len() && legacy[l_idx].priority as u8 == next_priority {
+                l_idx += 1;
+            }
+
+            let remaining = limit - selected.len();
+            let band = Self::fair_quota_same_priority(
+                &session[s_start..s_idx],
+                &legacy[l_start..l_idx],
+                remaining,
+            );
+            selected.extend(band);
+        }
+
+        selected
+    }
+
+    /// Bounded two-lane fairness among rows that already share one priority.
+    /// Session reserve = ceil(limit/2), legacy = floor(limit/2); unused fills
+    /// the other lane. Output ordered by id ASC (equal-priority FIFO).
+    fn fair_quota_same_priority(
+        session: &[QueuedPrompt],
+        legacy: &[QueuedPrompt],
+        limit: usize,
+    ) -> Vec<QueuedPrompt> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        if session.is_empty() {
+            return legacy.iter().take(limit).cloned().collect();
+        }
+        if legacy.is_empty() {
+            return session.iter().take(limit).cloned().collect();
+        }
+
+        let session_quota = (limit + 1) / 2;
+        let legacy_quota = limit / 2;
+
+        let mut s_take = session_quota.min(session.len());
+        let mut l_take = legacy_quota.min(legacy.len());
+
+        // Give unused reserve to the other lane.
+        let used = s_take + l_take;
+        if used < limit {
+            let spare = limit - used;
+            let s_extra = (session.len() - s_take).min(spare);
+            s_take += s_extra;
+            let spare = limit - s_take - l_take;
+            let l_extra = (legacy.len() - l_take).min(spare);
+            l_take += l_extra;
+        }
+
+        let mut selected: Vec<QueuedPrompt> = Vec::with_capacity(s_take + l_take);
+        selected.extend(session.iter().take(s_take).cloned());
+        selected.extend(legacy.iter().take(l_take).cloned());
+        selected.sort_by_key(|p| p.id);
+        selected
+    }
+
+    fn query_lane(
+        conn: &Connection,
+        sql: &str,
+        params: &[Box<dyn rusqlite::ToSql>],
+    ) -> Result<Vec<QueuedPrompt>> {
+        let mut stmt = conn.prepare_cached(sql)?;
+        let prompts = stmt
+            .query_map(
+                rusqlite::params_from_iter(params.iter().map(|p| p.as_ref())),
+                Self::prompt_from_row,
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(prompts)
+    }
+
+    fn require_datetime(s: &str, field: &str, id: i64) -> Result<DateTime<Utc>> {
+        Self::parse_datetime(s).ok_or_else(|| {
+            crate::error::StoreError::Parse(format!(
+                "prompt_queue id={id}: corrupt/unparseable {field} timestamp: {s:?}"
+            ))
+        })
+    }
+
+    fn optional_datetime(s: Option<&str>, field: &str, id: i64) -> Result<Option<DateTime<Utc>>> {
+        match s {
+            None => Ok(None),
+            Some(raw) => Ok(Some(Self::require_datetime(raw, field, id)?)),
+        }
+    }
+
+    /// Read current highest_stage. Missing/null → Enqueued. Corrupt → Parse error.
+    fn read_highest_stage(conn: &Connection, prompt_id: i64) -> Result<DeliveryStage> {
+        let current_s: Option<String> = conn
+            .query_row(
+                "SELECT highest_stage FROM prompt_queue WHERE id = ?",
+                params![prompt_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        match current_s {
+            None => Ok(DeliveryStage::Enqueued),
+            Some(ref s) => DeliveryStage::parse(s).ok_or_else(|| {
+                crate::error::StoreError::Parse(format!(
+                    "prompt_queue id={prompt_id}: corrupt/unknown highest_stage: {s:?}"
+                ))
+            }),
+        }
+    }
+
+    /// Resolve next stage under legal-transition rules.
+    /// - Higher rank → accept proposed
+    /// - Lower rank → keep current (reason-only update; no regression)
+    /// - Same rank different siblings → reject (except Partial→Delivered)
+    fn resolve_stage_transition(
+        current: DeliveryStage,
+        proposed: DeliveryStage,
+        prompt_id: i64,
+    ) -> Result<DeliveryStage> {
+        if current == proposed {
+            return Ok(current);
+        }
+        if proposed.rank() > current.rank() {
+            return Ok(proposed);
+        }
+        if current == DeliveryStage::PartiallyDelivered && proposed == DeliveryStage::Delivered {
+            return Ok(proposed);
+        }
+        if proposed.rank() < current.rank() {
+            // Keep higher stage; allow pending_reason refresh only.
+            return Ok(current);
+        }
+        Err(crate::error::StoreError::Other(format!(
+            "prompt_queue id={prompt_id}: illegal stage transition {current} → {proposed}"
+        )))
+    }
+
+    /// Cross-process atomic stage stamp (cas-2c5f review 3).
+    ///
+    /// Uses `BEGIN IMMEDIATE` so read_highest_stage + legal-transition check +
+    /// stage/timestamp/reason write are one SQLite write transaction — safe
+    /// across independent connections/processes (not just process-local Mutex).
+    fn atomic_stage_stamp(
+        conn: &Connection,
+        prompt_id: i64,
+        proposed: DeliveryStage,
+        opts: AtomicStampOpts<'_>,
+    ) -> Result<()> {
+        let tx = crate::shared_db::ImmediateTx::new(conn)?;
+        Self::atomic_stage_stamp_in_tx(&tx, prompt_id, proposed, opts)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Read + resolve + write inside an already-open IMMEDIATE transaction.
+    fn atomic_stage_stamp_in_tx(
+        tx: &Connection,
+        prompt_id: i64,
+        proposed: DeliveryStage,
+        opts: AtomicStampOpts<'_>,
+    ) -> Result<()> {
+        let current = Self::read_highest_stage(tx, prompt_id)?;
+        let next = Self::resolve_stage_transition(current, proposed, prompt_id)?;
+        let now = Utc::now().to_rfc3339();
+
+        // Full Delivered always stamps transport_delivered_at; partial never does.
+        let stamp_transport = next == DeliveryStage::Delivered;
+        let stamp_processed = opts.set_processed
+            || stamp_transport
+            || next.is_terminal_non_delivery()
+            || next == DeliveryStage::PartiallyDelivered;
+
+        // reason=None clears pending reason fields (Delivered success path).
+        // No follow-up UPDATE — keeps the atomic contract intact.
+        tx.execute(
+            "UPDATE prompt_queue SET
+                highest_stage = ?,
+                selected_at = COALESCE(selected_at, ?),
+                transport_delivered_at = CASE
+                    WHEN ? THEN COALESCE(transport_delivered_at, ?)
+                    ELSE transport_delivered_at
+                END,
+                processed_at = CASE
+                    WHEN ? THEN COALESCE(processed_at, ?)
+                    ELSE processed_at
+                END,
+                last_pending_reason = ?,
+                last_pending_detail = ?,
+                broadcast_attempted = COALESCE(?, broadcast_attempted),
+                broadcast_succeeded = COALESCE(?, broadcast_succeeded),
+                broadcast_failed = COALESCE(?, broadcast_failed)
+             WHERE id = ?",
+            params![
+                next.as_str(),
+                now,
+                stamp_transport as i64,
+                now,
+                stamp_processed as i64,
+                now,
+                opts.reason.map(|r| r.as_str()),
+                opts.detail,
+                opts.broadcast_attempted.map(|n| n as i64),
+                opts.broadcast_succeeded.map(|n| n as i64),
+                opts.broadcast_failed.map(|n| n as i64),
+                prompt_id,
+            ],
+        )?;
+        Ok(())
+    }
+}
+
+/// Options for [`SqlitePromptQueueStore::atomic_stage_stamp`].
+struct AtomicStampOpts<'a> {
+    reason: Option<PendingReason>,
+    detail: Option<&'a str>,
+    set_processed: bool,
+    broadcast_attempted: Option<u32>,
+    broadcast_succeeded: Option<u32>,
+    broadcast_failed: Option<u32>,
+}
+
+impl<'a> AtomicStampOpts<'a> {
+    fn reason(reason: PendingReason, detail: Option<&'a str>) -> Self {
+        Self {
+            reason: Some(reason),
+            detail,
+            set_processed: false,
+            broadcast_attempted: None,
+            broadcast_succeeded: None,
+            broadcast_failed: None,
+        }
+    }
+
+    fn clear_reason() -> Self {
+        Self {
+            reason: None,
+            detail: None,
+            set_processed: false,
+            broadcast_attempted: None,
+            broadcast_succeeded: None,
+            broadcast_failed: None,
+        }
+    }
 }
 
 impl PromptQueueStore for SqlitePromptQueueStore {
     fn init(&self) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute_batch(PROMPT_QUEUE_SCHEMA)?;
+        // cas-88d8: concurrent openers race on check-then-ALTER. SQLite
+        // auto-commits DDL, so do not wrap ADD COLUMN in ImmediateTx.
+        // ensure_column + with_write_retry; indexes only after columns exist.
+        crate::shared_db::with_write_retry(|| {
+            let conn = self.conn.lock().unwrap();
+            conn.execute_batch(PROMPT_QUEUE_SCHEMA)?;
 
-        // Add factory_session column if missing (safe migration for multi-session isolation)
-        let has_session_col = conn
-            .prepare_cached("SELECT factory_session FROM prompt_queue LIMIT 0")
-            .is_ok();
-        if !has_session_col {
-            conn.execute_batch(PROMPT_QUEUE_SESSION_MIGRATION)?;
-        }
+            for (col, mig) in [
+                ("factory_session", PROMPT_QUEUE_SESSION_MIGRATION),
+                ("summary", PROMPT_QUEUE_SUMMARY_MIGRATION),
+                ("priority", PROMPT_QUEUE_PRIORITY_MIGRATION),
+                ("acked_at", PROMPT_QUEUE_ACKED_AT_MIGRATION),
+                ("urgent", PROMPT_QUEUE_URGENT_MIGRATION),
+                ("selected_at", PROMPT_QUEUE_SELECTED_AT_MIGRATION),
+                ("last_pending_reason", PROMPT_QUEUE_PENDING_REASON_MIGRATION),
+                ("last_pending_detail", PROMPT_QUEUE_PENDING_DETAIL_MIGRATION),
+                (
+                    "transport_delivered_at",
+                    PROMPT_QUEUE_TRANSPORT_DELIVERED_AT_MIGRATION,
+                ),
+                ("highest_stage", PROMPT_QUEUE_HIGHEST_STAGE_MIGRATION),
+                (
+                    "broadcast_attempted",
+                    PROMPT_QUEUE_BROADCAST_ATTEMPTED_MIGRATION,
+                ),
+                (
+                    "broadcast_succeeded",
+                    PROMPT_QUEUE_BROADCAST_SUCCEEDED_MIGRATION,
+                ),
+                ("broadcast_failed", PROMPT_QUEUE_BROADCAST_FAILED_MIGRATION),
+                ("dedupe_key", PROMPT_QUEUE_DEDUPE_KEY_MIGRATION),
+            ] {
+                crate::shared_db::ensure_column(&conn, "prompt_queue", col, mig)?;
+            }
 
-        // Add summary column if missing
-        let has_summary_col = conn
-            .prepare_cached("SELECT summary FROM prompt_queue LIMIT 0")
-            .is_ok();
-        if !has_summary_col {
-            conn.execute_batch(PROMPT_QUEUE_SUMMARY_MIGRATION)?;
-        }
-
-        // Add priority column if missing
-        let has_priority_col = conn
-            .prepare_cached("SELECT priority FROM prompt_queue LIMIT 0")
-            .is_ok();
-        if !has_priority_col {
-            conn.execute_batch(PROMPT_QUEUE_PRIORITY_MIGRATION)?;
-        }
-
-        // Add acked_at column if missing (delivery confirmation)
-        let has_acked_at_col = conn
-            .prepare_cached("SELECT acked_at FROM prompt_queue LIMIT 0")
-            .is_ok();
-        if !has_acked_at_col {
-            conn.execute_batch(PROMPT_QUEUE_ACKED_AT_MIGRATION)?;
-        }
-
-        // Add urgent column if missing (cas-c931 interrupt-and-redirect)
-        let has_urgent_col = conn
-            .prepare_cached("SELECT urgent FROM prompt_queue LIMIT 0")
-            .is_ok();
-        if !has_urgent_col {
-            conn.execute_batch(PROMPT_QUEUE_URGENT_MIGRATION)?;
-        }
-
-        Ok(())
+            // Indexes are IF NOT EXISTS — safe under concurrency once columns exist.
+            conn.execute_batch(PROMPT_QUEUE_TWO_LANE_INDEXES)?;
+            conn.execute_batch(PROMPT_QUEUE_DEDUPE_KEY_INDEX)?;
+            Ok(())
+        })
     }
 
     fn enqueue(&self, source: &str, target: &str, prompt: &str) -> Result<i64> {
@@ -374,6 +1034,52 @@ impl PromptQueueStore for SqlitePromptQueueStore {
             let _ = capture_message_event(&conn, source, target);
             Ok(id)
         }) // with_write_retry
+    }
+
+    fn enqueue_idempotent(
+        &self,
+        source: &str,
+        target: &str,
+        prompt: &str,
+        factory_session: Option<&str>,
+        summary: Option<&str>,
+        priority: Option<NotificationPriority>,
+        dedupe_key: &str,
+    ) -> Result<EnqueueIdempotentResult> {
+        crate::shared_db::with_write_retry(|| {
+            let conn = self.conn.lock().unwrap();
+            let now = Utc::now().to_rfc3339();
+            let prio: i32 = priority.unwrap_or(NotificationPriority::Normal).into();
+
+            let changed = conn.execute(
+                "INSERT OR IGNORE INTO prompt_queue
+                    (source, target, prompt, created_at, factory_session, summary, priority, urgent, dedupe_key)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)",
+                params![
+                    source,
+                    target,
+                    prompt,
+                    now,
+                    factory_session,
+                    summary,
+                    prio,
+                    dedupe_key
+                ],
+            )?;
+
+            if changed > 0 {
+                let id = conn.last_insert_rowid();
+                let _ = capture_message_event(&conn, source, target);
+                return Ok(EnqueueIdempotentResult::Created(id));
+            }
+
+            let existing_id: i64 = conn.query_row(
+                "SELECT id FROM prompt_queue WHERE dedupe_key = ?",
+                params![dedupe_key],
+                |row| row.get(0),
+            )?;
+            Ok(EnqueueIdempotentResult::AlreadyExists(existing_id))
+        })
     }
 
     fn poll_for_target(&self, target: &str, limit: usize) -> Result<Vec<QueuedPrompt>> {
@@ -435,7 +1141,7 @@ impl PromptQueueStore for SqlitePromptQueueStore {
                 let ids: Vec<i64> = prompts.iter().map(|p| p.id).collect();
                 let placeholders: Vec<String> = ids.iter().map(|_| "?".to_string()).collect();
                 let sql = format!(
-                    "UPDATE prompt_queue SET processed_at = ? WHERE id IN ({})",
+                    "UPDATE prompt_queue SET processed_at = ?, last_pending_reason = NULL, last_pending_detail = NULL WHERE id IN ({})",
                     placeholders.join(", ")
                 );
 
@@ -476,7 +1182,7 @@ impl PromptQueueStore for SqlitePromptQueueStore {
                 let ids: Vec<i64> = prompts.iter().map(|p| p.id).collect();
                 let placeholders: Vec<String> = ids.iter().map(|_| "?".to_string()).collect();
                 let sql = format!(
-                    "UPDATE prompt_queue SET processed_at = ? WHERE id IN ({})",
+                    "UPDATE prompt_queue SET processed_at = ?, last_pending_reason = NULL, last_pending_detail = NULL WHERE id IN ({})",
                     placeholders.join(", ")
                 );
 
@@ -519,71 +1225,84 @@ impl PromptQueueStore for SqlitePromptQueueStore {
         factory_session: Option<&str>,
         limit: usize,
     ) -> Result<Vec<QueuedPrompt>> {
-        if targets.is_empty() && factory_session.is_none() {
+        if limit == 0 || (targets.is_empty() && factory_session.is_none()) {
             return Ok(Vec::new());
         }
 
         let conn = self.conn.lock().unwrap();
 
-        // Target matching catches only legacy messages with no session tag.
-        // Session matching catches tagged messages for exactly this daemon's session.
-        let mut conditions = Vec::new();
-        let mut param_values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-
-        if !targets.is_empty() {
-            let placeholders: Vec<&str> = std::iter::repeat_n("?", targets.len()).collect();
-            let target_clause = if factory_session.is_some() {
-                format!(
-                    "(factory_session IS NULL AND target IN ({}))",
-                    placeholders.join(", ")
-                )
-            } else {
-                format!("target IN ({})", placeholders.join(", "))
-            };
-            conditions.push(target_clause);
-            for t in targets {
-                param_values.push(Box::new(t.to_string()));
+        // Legacy path (no session): single-lane target filter.
+        let Some(session) = factory_session else {
+            if targets.is_empty() {
+                return Ok(Vec::new());
             }
-        }
+            let placeholders: Vec<&str> = std::iter::repeat_n("?", targets.len()).collect();
+            let sql = format!(
+                "SELECT id, source, target, prompt, created_at, processed_at, summary, priority, acked_at, urgent, factory_session
+                 FROM prompt_queue
+                 WHERE processed_at IS NULL
+                   AND target IN ({})
+                 ORDER BY priority ASC, id ASC
+                 LIMIT ?",
+                placeholders.join(", ")
+            );
+            let mut params: Vec<Box<dyn rusqlite::ToSql>> = targets
+                .iter()
+                .map(|t| Box::new(t.to_string()) as Box<dyn rusqlite::ToSql>)
+                .collect();
+            params.push(Box::new(limit as i64));
+            return Self::query_lane(&conn, &sql, &params);
+        };
 
-        if let Some(session) = factory_session {
-            conditions.push("factory_session = ?".to_string());
-            param_values.push(Box::new(session.to_string()));
-        }
-
-        let where_clause = conditions.join(" OR ");
-        let sql = format!(
-            "SELECT id, source, target, prompt, created_at, processed_at, summary, priority, acked_at, urgent, factory_session
+        // Live-session path: two indexable peeks + bounded two-lane merge
+        // (cas-2bcb). Each lane is LIMIT-bounded so neither can permanently
+        // occupy the caller's window.
+        let session_sql = "SELECT id, source, target, prompt, created_at, processed_at, summary, priority, acked_at, urgent, factory_session
              FROM prompt_queue
              WHERE processed_at IS NULL
-               AND ({where_clause})
+               AND factory_session = ?
              ORDER BY priority ASC, id ASC
-             LIMIT ?"
-        );
+             LIMIT ?";
+        let session_params: Vec<Box<dyn rusqlite::ToSql>> =
+            vec![Box::new(session.to_string()), Box::new(limit as i64)];
+        let session_lane = Self::query_lane(&conn, session_sql, &session_params)?;
 
-        param_values.push(Box::new(limit as i64));
+        let legacy_lane = if targets.is_empty() {
+            Vec::new()
+        } else {
+            let placeholders: Vec<&str> = std::iter::repeat_n("?", targets.len()).collect();
+            let legacy_sql = format!(
+                "SELECT id, source, target, prompt, created_at, processed_at, summary, priority, acked_at, urgent, factory_session
+                 FROM prompt_queue
+                 WHERE processed_at IS NULL
+                   AND factory_session IS NULL
+                   AND target IN ({})
+                 ORDER BY priority ASC, id ASC
+                 LIMIT ?",
+                placeholders.join(", ")
+            );
+            let mut legacy_params: Vec<Box<dyn rusqlite::ToSql>> = targets
+                .iter()
+                .map(|t| Box::new(t.to_string()) as Box<dyn rusqlite::ToSql>)
+                .collect();
+            legacy_params.push(Box::new(limit as i64));
+            Self::query_lane(&conn, &legacy_sql, &legacy_params)?
+        };
 
-        let mut stmt = conn.prepare_cached(&sql)?;
-        let prompts = stmt
-            .query_map(
-                rusqlite::params_from_iter(param_values.iter().map(|p| p.as_ref())),
-                Self::prompt_from_row,
-            )?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-
-        Ok(prompts)
+        Ok(Self::merge_two_lane_peeks(session_lane, legacy_lane, limit))
     }
 
     fn mark_processed(&self, prompt_id: i64) -> Result<()> {
+        // Legacy API: sets processed_at only. Does **not** stamp authoritative
+        // transport delivery (cas-2c5f). Prefer mark_transport_delivered /
+        // mark_dropped / mark_suppressed / mark_abandoned on the delivery path.
         crate::shared_db::with_write_retry(|| {
             let conn = self.conn.lock().unwrap();
             let now = Utc::now().to_rfc3339();
-
             conn.execute(
                 "UPDATE prompt_queue SET processed_at = ? WHERE id = ?",
                 params![now, prompt_id],
             )?;
-
             Ok(())
         }) // with_write_retry
     }
@@ -592,12 +1311,17 @@ impl PromptQueueStore for SqlitePromptQueueStore {
         crate::shared_db::with_write_retry(|| {
             let conn = self.conn.lock().unwrap();
             let now = Utc::now().to_rfc3339();
-
+            // Atomic stage advance to Confirmed (legal from Delivered or Partial).
+            let _ = Self::atomic_stage_stamp(
+                &conn,
+                prompt_id,
+                DeliveryStage::Confirmed,
+                AtomicStampOpts::clear_reason(),
+            );
             conn.execute(
                 "UPDATE prompt_queue SET acked_at = ? WHERE id = ? AND acked_at IS NULL",
                 params![now, prompt_id],
             )?;
-
             // rows_affected == 0 means either not found or already acked — both idempotent
             Ok(())
         }) // with_write_retry
@@ -625,8 +1349,9 @@ impl PromptQueueStore for SqlitePromptQueueStore {
     }
 
     fn message_status(&self, prompt_id: i64) -> Result<Option<MessageStatus>> {
+        // Legacy ladder: processed_at / acked_at only (includes non-delivery
+        // drains). Structured stage uses separate columns.
         let conn = self.conn.lock().unwrap();
-
         let result = conn.query_row(
             "SELECT processed_at, acked_at FROM prompt_queue WHERE id = ?",
             params![prompt_id],
@@ -636,7 +1361,6 @@ impl PromptQueueStore for SqlitePromptQueueStore {
                 Ok((processed_at, acked_at))
             },
         );
-
         match result {
             Ok((_, Some(_))) => Ok(Some(MessageStatus::Confirmed)),
             Ok((Some(_), None)) => Ok(Some(MessageStatus::Delivered)),
@@ -644,6 +1368,349 @@ impl PromptQueueStore for SqlitePromptQueueStore {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    fn message_delivery_report(&self, prompt_id: i64) -> Result<Option<MessageDeliveryReport>> {
+        let conn = self.conn.lock().unwrap();
+
+        let row = conn.query_row(
+            "SELECT id, source, target, created_at, processed_at, factory_session,
+                    priority, acked_at, urgent, selected_at, last_pending_reason,
+                    last_pending_detail, transport_delivered_at, highest_stage,
+                    broadcast_attempted, broadcast_succeeded, broadcast_failed
+             FROM prompt_queue WHERE id = ?",
+            params![prompt_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, u8>(6).unwrap_or(2),
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, i64>(8).map(|v| v != 0).unwrap_or(false),
+                    row.get::<_, Option<String>>(9).unwrap_or(None),
+                    row.get::<_, Option<String>>(10).unwrap_or(None),
+                    row.get::<_, Option<String>>(11).unwrap_or(None),
+                    row.get::<_, Option<String>>(12).unwrap_or(None),
+                    row.get::<_, Option<String>>(13).unwrap_or(None),
+                    row.get::<_, Option<i64>>(14).unwrap_or(None),
+                    row.get::<_, Option<i64>>(15).unwrap_or(None),
+                    row.get::<_, Option<i64>>(16).unwrap_or(None),
+                ))
+            },
+        );
+
+        let (
+            id,
+            source,
+            target,
+            created_at_s,
+            processed_at_s,
+            factory_session,
+            priority,
+            acked_at_s,
+            urgent,
+            selected_at_s,
+            stored_reason,
+            stored_detail,
+            transport_delivered_s,
+            highest_stage_s,
+            bc_attempted,
+            bc_succeeded,
+            bc_failed,
+        ) = match row {
+            Ok(v) => v,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+
+        let enqueued_at = Self::require_datetime(&created_at_s, "created_at", id)?;
+        let selected_at = Self::optional_datetime(selected_at_s.as_deref(), "selected_at", id)?;
+        let delivered_at = Self::optional_datetime(
+            transport_delivered_s.as_deref(),
+            "transport_delivered_at",
+            id,
+        )?;
+        let confirmed_at = Self::optional_datetime(acked_at_s.as_deref(), "acked_at", id)?;
+        let legacy_processed = processed_at_s.is_some();
+
+        let legacy_status = if confirmed_at.is_some() {
+            MessageStatus::Confirmed
+        } else if legacy_processed {
+            MessageStatus::Delivered
+        } else {
+            MessageStatus::Pending
+        };
+
+        let mut stage = match highest_stage_s {
+            None => DeliveryStage::Enqueued,
+            Some(ref s) => DeliveryStage::parse(s).ok_or_else(|| {
+                crate::error::StoreError::Parse(format!(
+                    "prompt_queue id={id}: corrupt/unknown highest_stage: {s:?}"
+                ))
+            })?,
+        };
+
+        if stage == DeliveryStage::Delivered && delivered_at.is_none() {
+            return Err(crate::error::StoreError::Parse(format!(
+                "prompt_queue id={id}: invariant violated: stage=delivered without transport_delivered_at"
+            )));
+        }
+        if stage.is_terminal_non_delivery() && delivered_at.is_some() {
+            return Err(crate::error::StoreError::Parse(format!(
+                "prompt_queue id={id}: invariant violated: stage={stage} with transport_delivered_at"
+            )));
+        }
+        if stage == DeliveryStage::PartiallyDelivered && delivered_at.is_some() {
+            return Err(crate::error::StoreError::Parse(format!(
+                "prompt_queue id={id}: invariant violated: partially_delivered with transport_delivered_at"
+            )));
+        }
+
+        let stored_pending = stored_reason.as_deref().and_then(PendingReason::parse);
+        let (pending_reason, pending_detail) = match stage {
+            DeliveryStage::Confirmed => (None, None),
+            DeliveryStage::Delivered => (
+                Some(PendingReason::AwaitingAck),
+                Some("transport delivered; waiting for message_ack".into()),
+            ),
+            DeliveryStage::PartiallyDelivered => (
+                Some(stored_pending.unwrap_or(PendingReason::PartialBroadcast)),
+                stored_detail,
+            ),
+            DeliveryStage::Dropped => (
+                Some(stored_pending.unwrap_or(PendingReason::DroppedDeadSource)),
+                stored_detail,
+            ),
+            DeliveryStage::Suppressed => (
+                Some(stored_pending.unwrap_or(PendingReason::SuppressedIdle)),
+                stored_detail,
+            ),
+            DeliveryStage::Abandoned => (
+                Some(stored_pending.unwrap_or(PendingReason::AbandonedUnknownTarget)),
+                stored_detail,
+            ),
+            DeliveryStage::Gated | DeliveryStage::Selected | DeliveryStage::Enqueued => {
+                if let Some(reason) = stored_pending {
+                    (Some(reason), stored_detail)
+                } else {
+                    (
+                        Some(PendingReason::AwaitingDelivery),
+                        Some("awaiting authoritative delivery-path observation".into()),
+                    )
+                }
+            }
+        };
+
+        if confirmed_at.is_some() {
+            stage = DeliveryStage::Confirmed;
+        }
+
+        Ok(Some(MessageDeliveryReport {
+            id,
+            legacy_status,
+            stage,
+            source,
+            target,
+            factory_session,
+            priority,
+            urgent,
+            enqueued_at,
+            selected_at,
+            delivered_at,
+            confirmed_at,
+            pending_reason,
+            pending_detail,
+            broadcast_attempted: bc_attempted.map(|n| n as u32),
+            broadcast_succeeded: bc_succeeded.map(|n| n as u32),
+            broadcast_failed: bc_failed.map(|n| n as u32),
+            wake: ObservationStatus::Unobserved,
+            reaction: ObservationStatus::Unobserved,
+        }))
+    }
+
+    fn record_selected(&self, prompt_id: i64) -> Result<()> {
+        crate::shared_db::with_write_retry(|| {
+            let conn = self.conn.lock().unwrap();
+            Self::atomic_stage_stamp(
+                &conn,
+                prompt_id,
+                DeliveryStage::Selected,
+                AtomicStampOpts::clear_reason(),
+            )
+        })
+    }
+
+    fn record_pending_reason(
+        &self,
+        prompt_id: i64,
+        reason: PendingReason,
+        detail: Option<&str>,
+    ) -> Result<()> {
+        crate::shared_db::with_write_retry(|| {
+            let conn = self.conn.lock().unwrap();
+            Self::atomic_stage_stamp(
+                &conn,
+                prompt_id,
+                reason.implied_stage(),
+                AtomicStampOpts::reason(reason, detail),
+            )
+        })
+    }
+
+    fn mark_transport_delivered(&self, prompt_id: i64) -> Result<()> {
+        crate::shared_db::with_write_retry(|| {
+            let conn = self.conn.lock().unwrap();
+            // reason=None clears last_pending_* inside the same ImmediateTx UPDATE.
+            Self::atomic_stage_stamp(
+                &conn,
+                prompt_id,
+                DeliveryStage::Delivered,
+                AtomicStampOpts {
+                    reason: None,
+                    detail: None,
+                    set_processed: true,
+                    broadcast_attempted: None,
+                    broadcast_succeeded: None,
+                    broadcast_failed: None,
+                },
+            )
+        })
+    }
+
+    fn mark_broadcast_outcome(
+        &self,
+        prompt_id: i64,
+        attempted: u32,
+        succeeded: u32,
+        failed: u32,
+        detail: Option<&str>,
+    ) -> Result<()> {
+        crate::shared_db::with_write_retry(|| {
+            let conn = self.conn.lock().unwrap();
+            if attempted == 0 {
+                return Self::atomic_stage_stamp(
+                    &conn,
+                    prompt_id,
+                    DeliveryStage::Selected,
+                    AtomicStampOpts {
+                        reason: Some(PendingReason::NoIntendedRecipients),
+                        detail: detail.or(Some("all_workers broadcast: zero intended recipients")),
+                        set_processed: false,
+                        broadcast_attempted: Some(0),
+                        broadcast_succeeded: Some(0),
+                        broadcast_failed: Some(0),
+                    },
+                );
+            }
+            if succeeded == attempted {
+                // Full success: reason=None clears pending fields atomically.
+                return Self::atomic_stage_stamp(
+                    &conn,
+                    prompt_id,
+                    DeliveryStage::Delivered,
+                    AtomicStampOpts {
+                        reason: None,
+                        detail: None,
+                        set_processed: true,
+                        broadcast_attempted: Some(attempted),
+                        broadcast_succeeded: Some(succeeded),
+                        broadcast_failed: Some(failed),
+                    },
+                );
+            }
+            if succeeded == 0 {
+                return Self::atomic_stage_stamp(
+                    &conn,
+                    prompt_id,
+                    DeliveryStage::Selected,
+                    AtomicStampOpts {
+                        reason: Some(PendingReason::AdapterRetryable),
+                        detail: detail.or(Some("all_workers broadcast: zero successes")),
+                        set_processed: false,
+                        broadcast_attempted: Some(attempted),
+                        broadcast_succeeded: Some(0),
+                        broadcast_failed: Some(failed),
+                    },
+                );
+            }
+            let summary = detail.unwrap_or("all_workers partial delivery");
+            let detail_owned =
+                format!("{summary}: attempted={attempted} succeeded={succeeded} failed={failed}");
+            Self::atomic_stage_stamp(
+                &conn,
+                prompt_id,
+                DeliveryStage::PartiallyDelivered,
+                AtomicStampOpts {
+                    reason: Some(PendingReason::PartialBroadcast),
+                    detail: Some(detail_owned.as_str()),
+                    set_processed: true,
+                    broadcast_attempted: Some(attempted),
+                    broadcast_succeeded: Some(succeeded),
+                    broadcast_failed: Some(failed),
+                },
+            )
+        })
+    }
+
+    fn mark_dropped(&self, prompt_id: i64, detail: Option<&str>) -> Result<()> {
+        crate::shared_db::with_write_retry(|| {
+            let conn = self.conn.lock().unwrap();
+            Self::atomic_stage_stamp(
+                &conn,
+                prompt_id,
+                DeliveryStage::Dropped,
+                AtomicStampOpts {
+                    reason: Some(PendingReason::DroppedDeadSource),
+                    detail,
+                    set_processed: true,
+                    broadcast_attempted: None,
+                    broadcast_succeeded: None,
+                    broadcast_failed: None,
+                },
+            )
+        })
+    }
+
+    fn mark_suppressed(&self, prompt_id: i64, detail: Option<&str>) -> Result<()> {
+        crate::shared_db::with_write_retry(|| {
+            let conn = self.conn.lock().unwrap();
+            Self::atomic_stage_stamp(
+                &conn,
+                prompt_id,
+                DeliveryStage::Suppressed,
+                AtomicStampOpts {
+                    reason: Some(PendingReason::SuppressedIdle),
+                    detail,
+                    set_processed: true,
+                    broadcast_attempted: None,
+                    broadcast_succeeded: None,
+                    broadcast_failed: None,
+                },
+            )
+        })
+    }
+
+    fn mark_abandoned(&self, prompt_id: i64, detail: Option<&str>) -> Result<()> {
+        crate::shared_db::with_write_retry(|| {
+            let conn = self.conn.lock().unwrap();
+            Self::atomic_stage_stamp(
+                &conn,
+                prompt_id,
+                DeliveryStage::Abandoned,
+                AtomicStampOpts {
+                    reason: Some(PendingReason::AbandonedUnknownTarget),
+                    detail,
+                    set_processed: true,
+                    broadcast_attempted: None,
+                    broadcast_succeeded: None,
+                    broadcast_failed: None,
+                },
+            )
+        })
     }
 
     fn pending_count(&self) -> Result<usize> {
@@ -688,6 +1755,7 @@ impl PromptQueueStore for SqlitePromptQueueStore {
 #[cfg(test)]
 mod tests {
     use crate::prompt_queue_store::*;
+    use rusqlite::params;
     use tempfile::TempDir;
 
     fn create_test_store() -> (TempDir, SqlitePromptQueueStore) {
@@ -1185,5 +2253,1093 @@ mod tests {
             .unwrap();
         let prompts = store.poll_for_target("w", 10).unwrap();
         assert!(prompts.iter().any(|p| p.prompt == "new urgent" && p.urgent));
+    }
+
+    /// cas-2bcb / cas-04a6 R1: lower-ID NULL-session legacy rows must not
+    /// occupy the fetch LIMIT ahead of eligible live-session rows.
+    #[test]
+    fn test_live_session_not_starved_by_legacy_null_session_hol() {
+        let (_temp, store) = create_test_store();
+        const LIMIT: usize = 10;
+
+        for i in 0..(LIMIT + 5) {
+            store
+                .enqueue("old-worker", "supervisor", &format!("legacy backlog {i}"))
+                .unwrap();
+        }
+
+        let live_id = store
+            .enqueue_with_session(
+                "worker-live",
+                "supervisor",
+                "live session coordination",
+                "session-live",
+            )
+            .unwrap();
+
+        let peeked = store
+            .peek_for_targets(
+                &["supervisor", "director", "all_workers", "worker-live"],
+                Some("session-live"),
+                LIMIT,
+            )
+            .unwrap();
+
+        assert_eq!(
+            peeked.len(),
+            LIMIT,
+            "peek must still respect the caller LIMIT"
+        );
+        assert!(
+            peeked.iter().any(|p| p.id == live_id),
+            "live-session row must appear in one peek despite >LIMIT lower-ID NULL-session backlog; got ids {:?}",
+            peeked.iter().map(|p| p.id).collect::<Vec<_>>()
+        );
+        assert!(
+            peeked.iter().any(|p| p.factory_session.is_none()),
+            "legacy NULL-session rows remain eligible under the two-lane quota"
+        );
+    }
+
+    /// Symmetric fairness: sustained live-session traffic must not starve
+    /// eligible legacy NULL-session rows either (supervisor reject of pure
+    /// session-first ordering).
+    #[test]
+    fn test_legacy_not_starved_by_live_session_traffic() {
+        let (_temp, store) = create_test_store();
+        const LIMIT: usize = 10;
+
+        for i in 0..(LIMIT + 5) {
+            store
+                .enqueue_with_session(
+                    "worker",
+                    "supervisor",
+                    &format!("live backlog {i}"),
+                    "session-live",
+                )
+                .unwrap();
+        }
+        let legacy_id = store.enqueue("old", "supervisor", "lonely legacy").unwrap();
+
+        let peeked = store
+            .peek_for_targets(&["supervisor"], Some("session-live"), LIMIT)
+            .unwrap();
+
+        assert_eq!(peeked.len(), LIMIT);
+        assert!(
+            peeked.iter().any(|p| p.id == legacy_id),
+            "legacy row must appear in one peek despite >LIMIT live-session backlog; got {:?}",
+            peeked
+                .iter()
+                .map(|p| (p.id, p.factory_session.as_deref()))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            peeked
+                .iter()
+                .any(|p| p.factory_session.as_deref() == Some("session-live")),
+            "session lane also represented"
+        );
+    }
+
+    /// Repeated peek+mark batches: both lanes drain with bounded progress
+    /// (neither lane stuck forever while the other has work).
+    #[test]
+    fn test_two_lane_bounded_progress_across_repeated_peeks() {
+        let (_temp, store) = create_test_store();
+        const LIMIT: usize = 10;
+        const PER_LANE: usize = 25;
+
+        let mut session_ids = Vec::new();
+        let mut legacy_ids = Vec::new();
+        for i in 0..PER_LANE {
+            session_ids.push(
+                store
+                    .enqueue_with_session("w", "supervisor", &format!("sess {i}"), "session-a")
+                    .unwrap(),
+            );
+            legacy_ids.push(
+                store
+                    .enqueue("old", "supervisor", &format!("leg {i}"))
+                    .unwrap(),
+            );
+        }
+
+        let mut session_seen = 0usize;
+        let mut legacy_seen = 0usize;
+        let mut rounds = 0usize;
+        loop {
+            let batch = store
+                .peek_for_targets(&["supervisor"], Some("session-a"), LIMIT)
+                .unwrap();
+            if batch.is_empty() {
+                break;
+            }
+            rounds += 1;
+            assert!(rounds <= PER_LANE * 2, "must drain without infinite loop");
+
+            let sess_in_batch = batch
+                .iter()
+                .filter(|p| p.factory_session.as_deref() == Some("session-a"))
+                .count();
+            let leg_in_batch = batch.iter().filter(|p| p.factory_session.is_none()).count();
+            // While both lanes still have residual work beyond this batch,
+            // each peek must take from both (bounded dual progress).
+            let session_remaining_before = PER_LANE - session_seen;
+            let legacy_remaining_before = PER_LANE - legacy_seen;
+            if session_remaining_before > 0 && legacy_remaining_before > 0 && LIMIT >= 2 {
+                assert!(
+                    sess_in_batch >= 1 && leg_in_batch >= 1,
+                    "round {rounds}: both lanes must progress while both pending; \
+                     session={sess_in_batch} legacy={leg_in_batch}"
+                );
+            }
+            session_seen += sess_in_batch;
+            legacy_seen += leg_in_batch;
+
+            // Within each lane contribution, FIFO by id.
+            let sess_ids: Vec<i64> = batch
+                .iter()
+                .filter(|p| p.factory_session.as_deref() == Some("session-a"))
+                .map(|p| p.id)
+                .collect();
+            assert!(
+                sess_ids.windows(2).all(|w| w[0] < w[1]),
+                "session lane FIFO violated: {sess_ids:?}"
+            );
+            let leg_ids: Vec<i64> = batch
+                .iter()
+                .filter(|p| p.factory_session.is_none())
+                .map(|p| p.id)
+                .collect();
+            assert!(
+                leg_ids.windows(2).all(|w| w[0] < w[1]),
+                "legacy lane FIFO violated: {leg_ids:?}"
+            );
+
+            // Priority non-decreasing across the merged delivery set.
+            for window in batch.windows(2) {
+                assert!(window[0].priority as u8 <= window[1].priority as u8);
+            }
+
+            for p in &batch {
+                store.mark_processed(p.id).unwrap();
+            }
+        }
+
+        assert_eq!(session_seen, PER_LANE, "all session rows drained");
+        assert_eq!(legacy_seen, PER_LANE, "all legacy rows drained");
+    }
+
+    /// Priority authoritative across lanes; FIFO within lane; isolation holds.
+    #[test]
+    fn test_peek_for_targets_priority_fifo_and_isolation_with_legacy() {
+        let (_temp, store) = create_test_store();
+
+        store
+            .enqueue_with_session("sup-b", "worker", "other session", "session-b")
+            .unwrap();
+
+        let first = store
+            .enqueue_with_session("worker-a", "supervisor", "live first", "session-a")
+            .unwrap();
+        let second = store
+            .enqueue_with_session("worker-a", "supervisor", "live second", "session-a")
+            .unwrap();
+        let urgent = store
+            .enqueue_urgent(
+                "worker-a",
+                "supervisor",
+                "live urgent",
+                Some("session-a"),
+                Some("urgent"),
+                Some(NotificationPriority::Critical),
+                true,
+            )
+            .unwrap();
+
+        for i in 0..15 {
+            store
+                .enqueue("old", "supervisor", &format!("legacy tail {i}"))
+                .unwrap();
+        }
+
+        let peeked = store
+            .peek_for_targets(&["supervisor", "worker"], Some("session-a"), 10)
+            .unwrap();
+
+        assert!(
+            !peeked
+                .iter()
+                .any(|p| p.factory_session.as_deref() == Some("session-b")),
+            "other session must not leak"
+        );
+
+        let live: Vec<_> = peeked
+            .iter()
+            .filter(|p| p.factory_session.as_deref() == Some("session-a"))
+            .collect();
+        assert_eq!(
+            live.len(),
+            3,
+            "all three session-a rows must fit under quota"
+        );
+        assert_eq!(live[0].id, urgent, "urgent eligible precedes normal");
+        assert_eq!(live[1].id, first, "equal-priority FIFO: first then second");
+        assert_eq!(live[2].id, second);
+
+        for window in peeked.windows(2) {
+            assert!(
+                window[0].priority as u8 <= window[1].priority as u8,
+                "priority order violated: {:?} then {:?}",
+                window[0].priority,
+                window[1].priority
+            );
+        }
+    }
+
+    /// Pure merge helper: global priority before same-priority lane fairness.
+    #[test]
+    fn test_merge_two_lane_peeks_quota_contract() {
+        fn row(id: i64, session: Option<&str>, priority: u8) -> QueuedPrompt {
+            QueuedPrompt {
+                id,
+                source: "s".into(),
+                target: "t".into(),
+                prompt: format!("p{id}"),
+                created_at: Utc::now(),
+                processed_at: None,
+                factory_session: session.map(|s| s.to_string()),
+                summary: None,
+                priority: NotificationPriority::from(priority),
+                acked_at: None,
+                urgent: priority == 0,
+            }
+        }
+
+        // Equal priority both lanes full, limit 10 → 5+5 lane fairness.
+        let session: Vec<_> = (1..=20).map(|i| row(i, Some("s"), 2)).collect();
+        let legacy: Vec<_> = (100..=119).map(|i| row(i, None, 2)).collect();
+        let merged = SqlitePromptQueueStore::merge_two_lane_peeks(session, legacy, 10);
+        assert_eq!(merged.len(), 10);
+        assert_eq!(
+            merged
+                .iter()
+                .filter(|p| p.factory_session.is_some())
+                .count(),
+            5
+        );
+        assert_eq!(
+            merged
+                .iter()
+                .filter(|p| p.factory_session.is_none())
+                .count(),
+            5
+        );
+
+        // One live + many legacy (same priority) → live included; remainder legacy.
+        let session = vec![row(50, Some("s"), 2)];
+        let legacy: Vec<_> = (1..=20).map(|i| row(i, None, 2)).collect();
+        let merged = SqlitePromptQueueStore::merge_two_lane_peeks(session, legacy, 10);
+        assert!(merged.iter().any(|p| p.id == 50));
+        assert_eq!(merged.len(), 10);
+        assert_eq!(
+            merged
+                .iter()
+                .filter(|p| p.factory_session.is_none())
+                .count(),
+            9
+        );
+
+        // CRITICAL: session has 10 Critical, legacy 10 Normal, limit=10 →
+        // all 10 Critical; zero Normal (global priority before lane quota).
+        let session: Vec<_> = (1..=10).map(|i| row(i, Some("s"), 0)).collect();
+        let legacy: Vec<_> = (100..=109).map(|i| row(i, None, 2)).collect();
+        let merged = SqlitePromptQueueStore::merge_two_lane_peeks(session, legacy, 10);
+        assert_eq!(merged.len(), 10);
+        assert!(
+            merged
+                .iter()
+                .all(|p| p.priority == NotificationPriority::Critical),
+            "must not admit Normal while Critical remains; got {:?}",
+            merged
+                .iter()
+                .map(|p| (p.id, p.priority as u8))
+                .collect::<Vec<_>>()
+        );
+
+        // Symmetric: session 10 Normal, legacy 10 Critical → all Critical.
+        let session: Vec<_> = (1..=10).map(|i| row(i, Some("s"), 2)).collect();
+        let legacy: Vec<_> = (100..=109).map(|i| row(i, None, 0)).collect();
+        let merged = SqlitePromptQueueStore::merge_two_lane_peeks(session, legacy, 10);
+        assert_eq!(merged.len(), 10);
+        assert!(
+            merged
+                .iter()
+                .all(|p| p.priority == NotificationPriority::Critical)
+        );
+
+        // limit=1: Critical legacy beats Normal session.
+        let session = vec![row(2, Some("s"), 2)];
+        let legacy = vec![row(1, None, 0)];
+        let merged = SqlitePromptQueueStore::merge_two_lane_peeks(session, legacy, 1);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].id, 1);
+        assert_eq!(merged[0].priority, NotificationPriority::Critical);
+
+        // limit=1 equal priority → session preferred (same-priority fairness).
+        let session = vec![row(2, Some("s"), 2)];
+        let legacy = vec![row(1, None, 2)];
+        let merged = SqlitePromptQueueStore::merge_two_lane_peeks(session, legacy, 1);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].id, 2);
+        assert!(merged[0].factory_session.is_some());
+    }
+
+    /// Store-level asymmetric priority + limit=1 regressions (supervisor gate).
+    #[test]
+    fn test_global_priority_before_lane_fairness_asymmetric_and_limit_one() {
+        let (_temp, store) = create_test_store();
+
+        // 10 Critical session + 10 Normal legacy → peek LIMIT 10 is all Critical.
+        for i in 0..10 {
+            store
+                .enqueue_urgent(
+                    "w",
+                    "supervisor",
+                    &format!("crit-sess {i}"),
+                    Some("session-p"),
+                    None,
+                    Some(NotificationPriority::Critical),
+                    true,
+                )
+                .unwrap();
+        }
+        for i in 0..10 {
+            store
+                .enqueue("old", "supervisor", &format!("norm-leg {i}"))
+                .unwrap();
+        }
+        let peeked = store
+            .peek_for_targets(&["supervisor"], Some("session-p"), 10)
+            .unwrap();
+        assert_eq!(peeked.len(), 10);
+        assert!(
+            peeked
+                .iter()
+                .all(|p| p.priority == NotificationPriority::Critical
+                    && p.factory_session.as_deref() == Some("session-p")),
+            "Critical session must fill LIMIT before any Normal legacy; got {:?}",
+            peeked
+                .iter()
+                .map(|p| (p.priority as u8, p.factory_session.as_deref()))
+                .collect::<Vec<_>>()
+        );
+
+        // Fresh store: Normal session flood + Critical legacy heads.
+        let (_temp2, store2) = create_test_store();
+        for i in 0..10 {
+            store2
+                .enqueue_with_session("w", "supervisor", &format!("norm {i}"), "session-p")
+                .unwrap();
+        }
+        for i in 0..10 {
+            store2
+                .enqueue_urgent(
+                    "old",
+                    "supervisor",
+                    &format!("crit-leg {i}"),
+                    None,
+                    None,
+                    Some(NotificationPriority::Critical),
+                    true,
+                )
+                .unwrap();
+        }
+        let peeked = store2
+            .peek_for_targets(&["supervisor"], Some("session-p"), 10)
+            .unwrap();
+        assert_eq!(peeked.len(), 10);
+        assert!(
+            peeked.iter().all(
+                |p| p.priority == NotificationPriority::Critical && p.factory_session.is_none()
+            ),
+            "Critical legacy must fill LIMIT before Normal session; got {:?}",
+            peeked
+                .iter()
+                .map(|p| (p.priority as u8, p.factory_session.as_deref()))
+                .collect::<Vec<_>>()
+        );
+
+        // limit=1: Critical legacy over Normal session.
+        let (_temp3, store3) = create_test_store();
+        store3
+            .enqueue_with_session("w", "supervisor", "normal live", "session-p")
+            .unwrap();
+        let crit_id = store3
+            .enqueue_urgent(
+                "old",
+                "supervisor",
+                "critical legacy",
+                None,
+                None,
+                Some(NotificationPriority::Critical),
+                true,
+            )
+            .unwrap();
+        let peeked = store3
+            .peek_for_targets(&["supervisor"], Some("session-p"), 1)
+            .unwrap();
+        assert_eq!(peeked.len(), 1);
+        assert_eq!(
+            peeked[0].id, crit_id,
+            "limit=1 must pick Critical legacy over Normal session"
+        );
+    }
+
+    /// Scale + query plan: 10× backlog; EXPLAIN must name the expected indexes
+    /// and must not use SCAN prompt_queue or USE TEMP B-TREE for the lane queries.
+    #[test]
+    fn test_two_lane_peek_scale_and_query_plan() {
+        let (_temp, store) = create_test_store();
+        const LIMIT: usize = 10;
+        const BACKLOG: usize = LIMIT * 10;
+
+        for i in 0..BACKLOG {
+            store
+                .enqueue_with_session("w", "supervisor", &format!("s{i}"), "session-scale")
+                .unwrap();
+            store
+                .enqueue("old", "supervisor", &format!("l{i}"))
+                .unwrap();
+        }
+
+        let started = std::time::Instant::now();
+        let peeked = store
+            .peek_for_targets(&["supervisor"], Some("session-scale"), LIMIT)
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(peeked.len(), LIMIT);
+        assert!(
+            peeked
+                .iter()
+                .any(|p| p.factory_session.as_deref() == Some("session-scale"))
+        );
+        assert!(peeked.iter().any(|p| p.factory_session.is_none()));
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "peek over 10× backlog must stay fast; took {elapsed:?}"
+        );
+
+        fn explain_plan(
+            conn: &rusqlite::Connection,
+            sql: &str,
+            params: &[&dyn rusqlite::ToSql],
+        ) -> String {
+            let mut plan = String::new();
+            let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            let rows = stmt
+                .query_map(params, |row| Ok(row.get::<_, String>(3)?))
+                .unwrap();
+            for r in rows {
+                plan.push_str(&r.unwrap());
+                plan.push('\n');
+            }
+            plan
+        }
+
+        fn assert_index_plan(plan: &str, expected_index: &str, lane: &str) {
+            let lower = plan.to_lowercase();
+            assert!(
+                plan.contains(expected_index),
+                "{lane} plan must name {expected_index}; plan was:\n{plan}"
+            );
+            assert!(
+                lower.contains("search") || lower.contains("using index"),
+                "{lane} plan must SEARCH via index; plan was:\n{plan}"
+            );
+            // Reject full table scan of prompt_queue and temp sort materialization.
+            assert!(
+                !lower.contains("scan prompt_queue"),
+                "{lane} plan must not SCAN prompt_queue; plan was:\n{plan}"
+            );
+            assert!(
+                !lower.contains("use temp b-tree"),
+                "{lane} plan must not USE TEMP B-TREE; plan was:\n{plan}"
+            );
+        }
+
+        let conn = store.conn.lock().unwrap();
+        let session_plan = explain_plan(
+            &conn,
+            "SELECT id FROM prompt_queue
+             WHERE processed_at IS NULL AND factory_session = ?
+             ORDER BY priority ASC, id ASC
+             LIMIT ?",
+            &[&"session-scale", &(LIMIT as i64)],
+        );
+        let legacy_plan = explain_plan(
+            &conn,
+            "SELECT id FROM prompt_queue
+             WHERE processed_at IS NULL
+               AND factory_session IS NULL
+               AND target IN (?)
+             ORDER BY priority ASC, id ASC
+             LIMIT ?",
+            &[&"supervisor", &(LIMIT as i64)],
+        );
+
+        assert_index_plan(&session_plan, "idx_prompt_queue_session_pending", "session");
+        assert_index_plan(&legacy_plan, "idx_prompt_queue_legacy_pending", "legacy");
+    }
+
+    /// cas-2c5f: enqueued → selected → transport delivered → confirmed.
+    /// mark_processed alone must NOT yield structured Delivered.
+    #[test]
+    fn test_message_delivery_report_stage_ladder_authoritative_delivery() {
+        let (_temp, store) = create_test_store();
+        let id = store
+            .enqueue_with_session("sup", "worker", "hello", "sess-1")
+            .unwrap();
+
+        let r = store.message_delivery_report(id).unwrap().unwrap();
+        assert_eq!(r.legacy_status, MessageStatus::Pending);
+        assert_eq!(r.stage, DeliveryStage::Enqueued);
+        assert_eq!(r.pending_reason, Some(PendingReason::AwaitingDelivery));
+        assert_eq!(r.wake, ObservationStatus::Unobserved);
+        assert_eq!(r.reaction, ObservationStatus::Unobserved);
+        assert!(r.delivered_at.is_none());
+
+        store.record_selected(id).unwrap();
+        let r = store.message_delivery_report(id).unwrap().unwrap();
+        assert_eq!(r.stage, DeliveryStage::Selected);
+
+        // Legacy mark_processed (queue drain) is NOT transport success.
+        store.mark_processed(id).unwrap();
+        let r = store.message_delivery_report(id).unwrap().unwrap();
+        assert_eq!(
+            r.legacy_status,
+            MessageStatus::Delivered,
+            "legacy ladder still uses processed_at"
+        );
+        assert_ne!(
+            r.stage,
+            DeliveryStage::Delivered,
+            "structured Delivered requires transport_delivered_at"
+        );
+        assert!(r.delivered_at.is_none());
+
+        // Authoritative handoff.
+        store.mark_transport_delivered(id).unwrap();
+        let r = store.message_delivery_report(id).unwrap().unwrap();
+        assert_eq!(r.stage, DeliveryStage::Delivered);
+        assert_eq!(r.pending_reason, Some(PendingReason::AwaitingAck));
+        assert!(r.delivered_at.is_some());
+
+        store.ack(id).unwrap();
+        let r = store.message_delivery_report(id).unwrap().unwrap();
+        assert_eq!(r.stage, DeliveryStage::Confirmed);
+        assert_eq!(r.legacy_status, MessageStatus::Confirmed);
+        assert!(r.pending_reason.is_none());
+        assert_eq!(r.wake, ObservationStatus::Unobserved);
+    }
+
+    /// Gated must not regress to Selected when adapter failure is later stamped.
+    #[test]
+    fn test_message_delivery_report_stage_monotonic_gated_then_adapter() {
+        let (_temp, store) = create_test_store();
+        let id = store.enqueue("s", "worker", "body").unwrap();
+
+        store
+            .record_pending_reason(
+                id,
+                PendingReason::GatedNotReady,
+                Some("pane not ready for injection"),
+            )
+            .unwrap();
+        let r = store.message_delivery_report(id).unwrap().unwrap();
+        assert_eq!(r.stage, DeliveryStage::Gated);
+
+        store
+            .record_pending_reason(
+                id,
+                PendingReason::AdapterRetryable,
+                Some("inject failed: broken pipe"),
+            )
+            .unwrap();
+        let r = store.message_delivery_report(id).unwrap().unwrap();
+        assert_eq!(
+            r.stage,
+            DeliveryStage::Gated,
+            "stage must not regress Gated→Selected on adapter retry"
+        );
+        assert_eq!(r.pending_reason, Some(PendingReason::AdapterRetryable));
+        assert!(r.delivered_at.is_none());
+    }
+
+    #[test]
+    fn test_delivery_path_drop_suppress_abandon_never_transport_delivered() {
+        let (_temp, store) = create_test_store();
+
+        let drop_id = store.enqueue("dead-w", "supervisor", "from dead").unwrap();
+        store
+            .mark_dropped(drop_id, Some("source worker is dead"))
+            .unwrap();
+        let r = store.message_delivery_report(drop_id).unwrap().unwrap();
+        assert_eq!(r.stage, DeliveryStage::Dropped);
+        assert_eq!(r.pending_reason, Some(PendingReason::DroppedDeadSource));
+        assert!(r.delivered_at.is_none());
+        assert_eq!(r.legacy_status, MessageStatus::Delivered); // processed_at set
+
+        let sup_id = store.enqueue("w", "supervisor", "standing by").unwrap();
+        store
+            .mark_suppressed(sup_id, Some("duplicate idle"))
+            .unwrap();
+        let r = store.message_delivery_report(sup_id).unwrap().unwrap();
+        assert_eq!(r.stage, DeliveryStage::Suppressed);
+        assert!(r.delivered_at.is_none());
+
+        let ab_id = store.enqueue("s", "ghost-worker", "hi").unwrap();
+        store
+            .mark_abandoned(ab_id, Some("target not in session"))
+            .unwrap();
+        let r = store.message_delivery_report(ab_id).unwrap().unwrap();
+        assert_eq!(r.stage, DeliveryStage::Abandoned);
+        assert!(r.delivered_at.is_none());
+    }
+
+    #[test]
+    fn test_success_transport_delivery_stamps_delivered() {
+        let (_temp, store) = create_test_store();
+        let id = store.enqueue("sup", "worker", "do work").unwrap();
+        store.record_selected(id).unwrap();
+        store.mark_transport_delivered(id).unwrap();
+        let r = store.message_delivery_report(id).unwrap().unwrap();
+        assert_eq!(r.stage, DeliveryStage::Delivered);
+        assert!(r.delivered_at.is_some());
+        assert_eq!(r.legacy_status, MessageStatus::Delivered);
+        assert_eq!(r.pending_reason, Some(PendingReason::AwaitingAck));
+    }
+
+    #[test]
+    fn test_message_delivery_report_no_false_queue_head() {
+        // Lower-id peer must not invent behind_queue_head (removed inaccurate heuristic).
+        let (_temp, store) = create_test_store();
+        let _first = store
+            .enqueue_with_session("w", "supervisor", "first", "sess")
+            .unwrap();
+        let second = store
+            .enqueue_with_session("w", "supervisor", "second", "sess")
+            .unwrap();
+        let r = store.message_delivery_report(second).unwrap().unwrap();
+        assert_eq!(r.pending_reason, Some(PendingReason::AwaitingDelivery));
+        assert_ne!(
+            r.pending_reason.map(|p| p.as_str()),
+            Some("behind_queue_head")
+        );
+    }
+
+    #[test]
+    fn test_message_delivery_report_unknown_id() {
+        let (_temp, store) = create_test_store();
+        assert!(store.message_delivery_report(999_999).unwrap().is_none());
+        assert!(store.message_status(999_999).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_message_delivery_report_corrupt_created_at_errors() {
+        let (_temp, store) = create_test_store();
+        let id = store.enqueue("s", "w", "x").unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE prompt_queue SET created_at = 'not-a-timestamp' WHERE id = ?",
+                params![id],
+            )
+            .unwrap();
+        }
+        let err = store.message_delivery_report(id).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("corrupt") || msg.contains("unparseable") || msg.contains("parse"),
+            "expected parse error, got {msg}"
+        );
+    }
+
+    #[test]
+    fn test_broadcast_all_success_is_delivered() {
+        let (_temp, store) = create_test_store();
+        let id = store.enqueue("sup", "all_workers", "hi all").unwrap();
+        store.mark_broadcast_outcome(id, 3, 3, 0, None).unwrap();
+        let r = store.message_delivery_report(id).unwrap().unwrap();
+        assert_eq!(r.stage, DeliveryStage::Delivered);
+        assert!(r.delivered_at.is_some());
+        assert_eq!(r.broadcast_attempted, Some(3));
+        assert_eq!(r.broadcast_succeeded, Some(3));
+        assert_eq!(r.broadcast_failed, Some(0));
+    }
+
+    #[test]
+    fn test_broadcast_mixed_is_partial_never_full_delivered() {
+        let (_temp, store) = create_test_store();
+        let id = store.enqueue("sup", "all_workers", "hi all").unwrap();
+        store
+            .mark_broadcast_outcome(id, 3, 2, 1, Some("w3 failed"))
+            .unwrap();
+        let r = store.message_delivery_report(id).unwrap().unwrap();
+        assert_eq!(r.stage, DeliveryStage::PartiallyDelivered);
+        assert!(
+            r.delivered_at.is_none(),
+            "partial must not set transport_delivered_at"
+        );
+        assert_eq!(r.pending_reason, Some(PendingReason::PartialBroadcast));
+        assert_eq!(r.broadcast_attempted, Some(3));
+        assert_eq!(r.broadcast_succeeded, Some(2));
+        assert_eq!(r.broadcast_failed, Some(1));
+        // Legacy processed so queue drains (no re-inject of successes).
+        assert_eq!(r.legacy_status, MessageStatus::Delivered);
+    }
+
+    #[test]
+    fn test_broadcast_zero_success_stays_pending_retryable() {
+        let (_temp, store) = create_test_store();
+        let id = store.enqueue("sup", "all_workers", "hi all").unwrap();
+        store
+            .mark_broadcast_outcome(id, 2, 0, 2, Some("all failed"))
+            .unwrap();
+        let r = store.message_delivery_report(id).unwrap().unwrap();
+        assert_ne!(r.stage, DeliveryStage::Delivered);
+        assert!(r.delivered_at.is_none());
+        assert_eq!(r.pending_reason, Some(PendingReason::AdapterRetryable));
+        assert_eq!(r.legacy_status, MessageStatus::Pending); // not processed
+    }
+
+    #[test]
+    fn test_broadcast_zero_intended_recipients() {
+        let (_temp, store) = create_test_store();
+        let id = store.enqueue("sup", "all_workers", "hi all").unwrap();
+        store.mark_broadcast_outcome(id, 0, 0, 0, None).unwrap();
+        let r = store.message_delivery_report(id).unwrap().unwrap();
+        assert_eq!(r.pending_reason, Some(PendingReason::NoIntendedRecipients));
+        assert!(r.delivered_at.is_none());
+        assert_eq!(r.legacy_status, MessageStatus::Pending);
+    }
+
+    #[test]
+    fn test_partial_to_delivered_legal_transition() {
+        let (_temp, store) = create_test_store();
+        let id = store.enqueue("sup", "all_workers", "hi").unwrap();
+        store
+            .mark_broadcast_outcome(id, 2, 1, 1, Some("mixed"))
+            .unwrap();
+        assert_eq!(
+            store.message_delivery_report(id).unwrap().unwrap().stage,
+            DeliveryStage::PartiallyDelivered
+        );
+        // Completing remaining recipients may advance Partial → Delivered.
+        store.mark_transport_delivered(id).unwrap();
+        let r = store.message_delivery_report(id).unwrap().unwrap();
+        assert_eq!(r.stage, DeliveryStage::Delivered);
+        assert!(r.delivered_at.is_some());
+    }
+
+    #[test]
+    fn test_illegal_terminal_sibling_rewrite_rejected() {
+        let (_temp, store) = create_test_store();
+        let id = store.enqueue("s", "w", "x").unwrap();
+        store.mark_dropped(id, Some("dead")).unwrap();
+        let err = store
+            .mark_abandoned(id, Some("should fail"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("illegal stage transition"),
+            "expected illegal transition, got {err}"
+        );
+        let r = store.message_delivery_report(id).unwrap().unwrap();
+        assert_eq!(r.stage, DeliveryStage::Dropped);
+        assert!(r.delivered_at.is_none());
+    }
+
+    #[test]
+    fn test_corrupt_highest_stage_errors() {
+        let (_temp, store) = create_test_store();
+        let id = store.enqueue("s", "w", "x").unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE prompt_queue SET highest_stage = 'not-a-stage' WHERE id = ?",
+                params![id],
+            )
+            .unwrap();
+        }
+        let err = store.message_delivery_report(id).unwrap_err().to_string();
+        assert!(
+            err.contains("corrupt") || err.contains("unknown highest_stage"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn test_invariants_delivered_requires_transport_ts() {
+        let (_temp, store) = create_test_store();
+        let id = store.enqueue("s", "w", "x").unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE prompt_queue SET highest_stage = 'delivered', transport_delivered_at = NULL WHERE id = ?",
+                params![id],
+            )
+            .unwrap();
+        }
+        let err = store.message_delivery_report(id).unwrap_err().to_string();
+        assert!(err.contains("invariant violated"), "got {err}");
+    }
+
+    #[test]
+    fn test_monotonic_repeated_calls_idempotent() {
+        let (_temp, store) = create_test_store();
+        let id = store.enqueue("s", "w", "x").unwrap();
+        store.record_selected(id).unwrap();
+        store.record_selected(id).unwrap();
+        store
+            .record_pending_reason(id, PendingReason::GatedNotReady, Some("gate"))
+            .unwrap();
+        store
+            .record_pending_reason(id, PendingReason::GatedNotReady, Some("gate again"))
+            .unwrap();
+        store
+            .record_pending_reason(id, PendingReason::AdapterRetryable, Some("retry"))
+            .unwrap();
+        let r = store.message_delivery_report(id).unwrap().unwrap();
+        assert_eq!(r.stage, DeliveryStage::Gated);
+        assert_eq!(r.pending_reason, Some(PendingReason::AdapterRetryable));
+        store.mark_transport_delivered(id).unwrap();
+        store.mark_transport_delivered(id).unwrap();
+        let r = store.message_delivery_report(id).unwrap().unwrap();
+        assert_eq!(r.stage, DeliveryStage::Delivered);
+        assert!(r.delivered_at.is_some());
+        assert_eq!(r.wake, ObservationStatus::Unobserved);
+    }
+
+    /// cas-2c5f review 3: two independent SQLite connections to the same DB.
+    /// A holds BEGIN IMMEDIATE while stamping Delivered; B waits then attempts
+    /// Dropped. B must not overwrite — final stage is Delivered.
+    #[test]
+    fn test_cross_connection_immediate_tx_prevents_stale_overwrite() {
+        use crate::shared_db::ImmediateTx;
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+        use std::time::Duration;
+
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().to_path_buf();
+        let db_path = path.join("cas.db");
+
+        let id = {
+            let store = SqlitePromptQueueStore::open(&path).unwrap();
+            store.init().unwrap();
+            store.enqueue("s", "w", "race").unwrap()
+        };
+
+        let barrier = Arc::new(Barrier::new(2));
+        let db_a = db_path.clone();
+        let db_b = db_path.clone();
+        let barrier_a = Arc::clone(&barrier);
+        let barrier_b = Arc::clone(&barrier);
+
+        // Connection A: hold IMMEDIATE lock, stamp Delivered, then commit.
+        let t_a = thread::spawn(move || {
+            let conn = rusqlite::Connection::open(&db_a).unwrap();
+            conn.busy_timeout(Duration::from_secs(10)).unwrap();
+            let tx = ImmediateTx::new(&conn).unwrap();
+            // Hold the write lock before B starts.
+            barrier_a.wait();
+            thread::sleep(Duration::from_millis(80));
+            SqlitePromptQueueStore::atomic_stage_stamp_in_tx(
+                &tx,
+                id,
+                DeliveryStage::Delivered,
+                AtomicStampOpts {
+                    reason: None,
+                    detail: None,
+                    set_processed: true,
+                    broadcast_attempted: None,
+                    broadcast_succeeded: None,
+                    broadcast_failed: None,
+                },
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        });
+
+        // Connection B: waits for A's IMMEDIATE, then tries illegal Dropped.
+        let t_b = thread::spawn(move || {
+            let conn = rusqlite::Connection::open(&db_b).unwrap();
+            conn.busy_timeout(Duration::from_secs(10)).unwrap();
+            barrier_b.wait();
+            // Blocks until A commits, then reads Delivered and rejects Dropped.
+            SqlitePromptQueueStore::atomic_stage_stamp(
+                &conn,
+                id,
+                DeliveryStage::Dropped,
+                AtomicStampOpts {
+                    reason: Some(PendingReason::DroppedDeadSource),
+                    detail: Some("stale writer"),
+                    set_processed: true,
+                    broadcast_attempted: None,
+                    broadcast_succeeded: None,
+                    broadcast_failed: None,
+                },
+            )
+        });
+
+        t_a.join().expect("writer A panicked");
+        let b_result = t_b.join().expect("writer B panicked");
+        assert!(
+            b_result.is_err(),
+            "stale Dropped after Delivered must fail; got {b_result:?}"
+        );
+        let err = b_result.unwrap_err().to_string();
+        assert!(
+            err.contains("illegal stage transition"),
+            "expected illegal transition, got {err}"
+        );
+
+        let store = SqlitePromptQueueStore::open(&path).unwrap();
+        let r = store.message_delivery_report(id).unwrap().unwrap();
+        assert_eq!(
+            r.stage,
+            DeliveryStage::Delivered,
+            "Delivered must survive interleaved Dropped attempt"
+        );
+        assert!(r.delivered_at.is_some());
+        assert_eq!(r.wake, ObservationStatus::Unobserved);
+    }
+
+    /// cas-88d8: concurrent SqlitePromptQueueStore::init on a legacy DB all succeed.
+    #[test]
+    fn test_concurrent_init_on_legacy_prompt_queue() {
+        use std::sync::{Arc, Barrier};
+        let temp = TempDir::new().unwrap();
+        let cas_dir = temp.path().to_path_buf();
+        let db_path = cas_dir.join("cas.db");
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                r#"
+                PRAGMA journal_mode=WAL;
+                CREATE TABLE prompt_queue (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source TEXT NOT NULL,
+                    target TEXT NOT NULL,
+                    prompt TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    processed_at TEXT
+                );
+                INSERT INTO prompt_queue (source, target, prompt, created_at)
+                VALUES ('s', 'w', 'legacy', '2026-01-01T00:00:00Z');
+                "#,
+            )
+            .unwrap();
+        }
+
+        let barrier = Arc::new(Barrier::new(6));
+        let handles: Vec<_> = (0..6)
+            .map(|_| {
+                let cas_dir = cas_dir.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let store = SqlitePromptQueueStore::open(&cas_dir).unwrap();
+                    store.init()
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap().expect("concurrent init must succeed");
+        }
+        let store = SqlitePromptQueueStore::open(&cas_dir).unwrap();
+        store.init().unwrap();
+        assert_eq!(store.peek_all(10).unwrap().len(), 1);
+        store
+            .enqueue_idempotent(
+                "lifecycle:9",
+                "supervisor",
+                "body",
+                None,
+                None,
+                None,
+                "lifecycle-outbox:9",
+            )
+            .unwrap();
+        assert_eq!(store.pending_count().unwrap(), 2);
+    }
+
+    /// cas-3a47: upgrade pre-dedupe_key prompt_queue without losing rows; init idempotent.
+    #[test]
+    fn test_upgrade_from_legacy_prompt_queue_adds_dedupe_key() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("cas.db");
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE prompt_queue (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source TEXT NOT NULL,
+                    target TEXT NOT NULL,
+                    prompt TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    processed_at TEXT
+                );
+                INSERT INTO prompt_queue (source, target, prompt, created_at)
+                VALUES ('supervisor', 'worker-a', 'hello legacy', '2026-01-01T00:00:00Z');
+                "#,
+            )
+            .unwrap();
+        }
+
+        let store = SqlitePromptQueueStore::open(temp.path()).unwrap();
+        store.init().unwrap();
+        store.init().unwrap(); // idempotent
+
+        let pending = store.peek_all(10).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].prompt, "hello legacy");
+
+        // Idempotent enqueue works on upgraded schema.
+        let r1 = store
+            .enqueue_idempotent(
+                "lifecycle:1",
+                "supervisor",
+                "body",
+                Some("sess"),
+                Some("sum"),
+                None,
+                "lifecycle-outbox:1",
+            )
+            .unwrap();
+        let r2 = store
+            .enqueue_idempotent(
+                "lifecycle:1",
+                "supervisor",
+                "body-again",
+                Some("sess"),
+                Some("sum"),
+                None,
+                "lifecycle-outbox:1",
+            )
+            .unwrap();
+        match (r1, r2) {
+            (
+                EnqueueIdempotentResult::Created(id1),
+                EnqueueIdempotentResult::AlreadyExists(id2),
+            ) => assert_eq!(id1, id2),
+            other => panic!("expected Created then AlreadyExists: {other:?}"),
+        }
+        // legacy + one lifecycle row
+        assert_eq!(store.pending_count().unwrap(), 2);
     }
 }

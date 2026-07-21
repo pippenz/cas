@@ -468,8 +468,7 @@ async fn test_merge_required_close_parks_awaiting_merge_and_releases_gate_cas_8d
     // must now fall back to resolving A by assignee + AwaitingMerge status
     // directly from the task table — confirmed P1,
     // docs/reviews/2026-07-07-cas-b646-epic.md.
-    let director_data =
-        cas_factory::DirectorData::load_fast(&cas_dir).expect("load director data");
+    let director_data = cas_factory::DirectorData::load_fast(&cas_dir).expect("load director data");
     let agent_summary = director_data
         .agents
         .iter()
@@ -1007,12 +1006,7 @@ async fn test_stale_local_epic_ref_falls_back_to_origin_cas_38e2() {
     std::fs::write(repo.join("seed.txt"), "seed\n").unwrap();
     git(&["add", "seed.txt"]);
     git(&["commit", "-q", "-m", "seed"]);
-    git(&[
-        "remote",
-        "add",
-        "origin",
-        bare.path().to_str().unwrap(),
-    ]);
+    git(&["remote", "add", "origin", bare.path().to_str().unwrap()]);
     git(&["checkout", "-q", "-b", "epic/cas-38e2"]);
     let old_epic_tip = git_output(&["rev-parse", "epic/cas-38e2"]);
     git(&["checkout", "-q", "-b", "factory/test-agent"]);
@@ -6269,5 +6263,537 @@ async fn test_timeout_escalation_uses_codex_supervisor_verification_alias_cas_79
     assert!(
         !text.contains("mcp__cas__verification"),
         "Codex supervisor timeout guidance must not use the Claude alias: {text}"
+    );
+}
+
+/// cas-062d: successful close must durable-push `task_closed` to the owning
+/// supervisor queue (session-isolated). Covers the close path that lives in
+/// verification_flow's domain (supervisor orphan bypass → Closed).
+#[tokio::test]
+async fn test_062d_close_lifecycle_push_to_owning_supervisor() {
+    let (temp, service) = setup_cas();
+    let _env_lock = env_test_lock();
+    let cas_dir = temp.path().join(".cas");
+
+    // Register a factory-session supervisor that owns lifecycle events.
+    let session = "sess-062d-vf";
+    let agent_store = open_agent_store(&cas_dir).expect("agent store");
+    let mut sup = cas::types::Agent::new("sup-062d-vf".to_string(), "sup-062d-vf".to_string());
+    sup.role = AgentRole::Supervisor;
+    sup.factory_session = Some(session.to_string());
+    agent_store.register(&sup).expect("register supervisor");
+
+    // SAFETY: hold env_test_lock for the factory session + supervisor role.
+    let _guard = ScopedFactoryEnv::apply(&[
+        ("CAS_FACTORY_SESSION", Some(session)),
+        ("CAS_AGENT_ROLE", Some("supervisor")),
+    ]);
+
+    let task_store = open_task_store(&cas_dir).unwrap();
+    let create_text = extract_text(
+        service
+            .cas_task_create(Parameters(TaskCreateRequest {
+                depth: None,
+                title: "062d close lifecycle".to_string(),
+                description: None,
+                priority: 2,
+                task_type: "task".to_string(),
+                labels: None,
+                notes: None,
+                blocked_by: None,
+                design: None,
+                acceptance_criteria: None,
+                external_ref: None,
+                assignee: None,
+                demo_statement: None,
+                execution_note: None,
+                epic: None,
+            }))
+            .await
+            .expect("create"),
+    );
+    let id = extract_task_id(&create_text).expect("task id").to_string();
+
+    // Orphan InProgress so supervisor bypass skips verification.
+    let mut task = task_store.get(&id).expect("task");
+    task.status = TaskStatus::InProgress;
+    task.assignee = None;
+    task_store.update(&task).expect("orphan task");
+
+    let close_text = extract_text(
+        service
+            .cas_task_close(Parameters(TaskCloseRequest {
+                id: id.clone(),
+                reason: Some("062d close proof".to_string()),
+                bypass_code_review: Some(true),
+                code_review_findings: None,
+            }))
+            .await
+            .expect("close"),
+    );
+    assert!(
+        close_text.contains("Closed") || close_text.contains(&id),
+        "close response: {close_text}"
+    );
+    assert_eq!(
+        task_store.get(&id).unwrap().status,
+        TaskStatus::Closed,
+        "task must be Closed after successful close"
+    );
+
+    let queue = cas::store::open_supervisor_queue_store(&cas_dir).expect("queue");
+    let pending = queue.peek("sup-062d-vf", 20).expect("peek");
+    assert!(
+        pending.iter().any(|n| {
+            n.event_type == "task_lifecycle"
+                && n.payload.contains("task_closed")
+                && n.payload.contains(&id)
+        }),
+        "close must durable-push task_closed to owning supervisor. pending={pending:?}"
+    );
+}
+
+/// cas-60393 (G-M1/X-M1 deadlock): a task already parked `AwaitingMerge` and
+/// assigned to the caller must be able to re-close once its commit is
+/// actually merged, even though the worker's agent record carries a
+/// `halt_task_work` flag armed by an **earlier, unrelated** urgent stop.
+/// Before the fix this call is rejected with `WORK HALTED` forever, because
+/// starting an `AwaitingMerge` task (the only thing that clears halt) is
+/// illegal — the exact deadlock this task exists to break.
+#[tokio::test]
+async fn test_60393_owned_awaiting_merge_recloses_despite_preexisting_halt() {
+    use std::process::Command;
+
+    let (temp, service) = setup_cas();
+    let _env_lock = env_test_lock();
+    let cas_dir = temp.path().join(".cas");
+    let agent_store = open_agent_store(&cas_dir).expect("open agent store");
+    {
+        let mut agent = agent_store
+            .list(None)
+            .expect("list agents")
+            .into_iter()
+            .find(|agent| agent.name == "test-agent")
+            .expect("test agent exists");
+        agent.role = AgentRole::Worker;
+        agent_store.update(&agent).expect("mark test agent worker");
+    }
+
+    std::fs::write(
+        cas_dir.join("config.toml"),
+        "[verification]\nenabled = true\n",
+    )
+    .expect("write config");
+
+    let repo = temp.path();
+    let git = |args: &[&str]| {
+        let ok = Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .status()
+            .expect("git")
+            .success();
+        assert!(ok, "git {args:?} failed");
+    };
+    git(&["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("seed.txt"), "seed\n").unwrap();
+    git(&["add", "seed.txt"]);
+    git(&["commit", "-q", "-m", "seed"]);
+    git(&["checkout", "-q", "-b", "epic/cas-60393"]);
+    git(&["checkout", "-q", "-b", "factory/test-agent"]);
+    std::fs::write(repo.join("worker.txt"), "worker\n").unwrap();
+    git(&["add", "worker.txt"]);
+    git(&["commit", "-q", "-m", "worker change"]);
+
+    let task_store = open_task_store(&cas_dir).expect("open task store");
+
+    let epic_id = extract_task_id(&extract_text(
+        service
+            .cas_task_create(Parameters(TaskCreateRequest {
+                depth: None,
+                title: "Merge epic".to_string(),
+                description: None,
+                priority: 2,
+                task_type: "epic".to_string(),
+                labels: None,
+                notes: None,
+                blocked_by: None,
+                design: None,
+                acceptance_criteria: None,
+                external_ref: None,
+                assignee: None,
+                demo_statement: None,
+                execution_note: None,
+                epic: None,
+            }))
+            .await
+            .expect("create epic"),
+    ))
+    .expect("epic id")
+    .to_string();
+    {
+        let mut epic = task_store.get(&epic_id).expect("epic exists");
+        epic.branch = Some("epic/cas-60393".to_string());
+        task_store.update(&epic).expect("update epic branch");
+    }
+
+    let id_a = extract_task_id(&extract_text(
+        service
+            .cas_task_create(Parameters(TaskCreateRequest {
+                epic: Some(epic_id.clone()),
+                ..simple_task_req("Task A")
+            }))
+            .await
+            .expect("create A"),
+    ))
+    .expect("id A")
+    .to_string();
+    service
+        .cas_task_start(Parameters(IdRequest { id: id_a.clone() }))
+        .await
+        .expect("start A");
+    {
+        let mut task_a = task_store.get(&id_a).expect("A exists after start");
+        task_a.assignee = Some("test-agent".to_string());
+        task_store.update(&task_a).expect("set A assignee");
+    }
+
+    // First close: no merge yet → parks AwaitingMerge (MERGE REQUIRED).
+    let close_text = extract_text(
+        service
+            .cas_task_close(Parameters(TaskCloseRequest {
+                id: id_a.clone(),
+                reason: Some("ready for merge".to_string()),
+                bypass_code_review: None,
+                code_review_findings: None,
+            }))
+            .await
+            .expect("close A returns"),
+    );
+    assert!(
+        close_text.contains("MERGE REQUIRED"),
+        "close must reject on stranded factory branch: {close_text}"
+    );
+    assert_eq!(
+        task_store.get(&id_a).expect("A exists").status,
+        TaskStatus::AwaitingMerge
+    );
+
+    // Simulate the deadlock precondition: an EARLIER, unrelated urgent stop
+    // armed halt_task_work on this worker (not the merge-done hand-off —
+    // cas-126b already covers that path; this is a halt that predates it).
+    {
+        let mut agent = agent_store
+            .list(None)
+            .expect("list agents")
+            .into_iter()
+            .find(|agent| agent.name == "test-agent")
+            .expect("test agent exists");
+        agent
+            .metadata
+            .insert("halt_task_work".to_string(), "1".to_string());
+        agent_store.update(&agent).expect("arm unrelated halt");
+    }
+
+    // Now the supervisor actually merges the branch.
+    git(&["checkout", "-q", "epic/cas-60393"]);
+    git(&["merge", "--no-ff", "-q", "factory/test-agent"]);
+    git(&["checkout", "-q", "factory/test-agent"]);
+    let verification_store = open_verification_store(&cas_dir).expect("open verification store");
+    verification_store
+        .add(&Verification::approved(
+            "ver-cas-60393".to_string(),
+            id_a.clone(),
+            "Simulated approval after supervisor merge".to_string(),
+        ))
+        .expect("record verification approval");
+
+    // Re-close must succeed DESPITE the pre-existing halt: this is the
+    // caller's own AwaitingMerge task and the merge-integrity gate now says
+    // Proceed.
+    let close_after_merge = extract_text(
+        service
+            .cas_task_close(Parameters(TaskCloseRequest {
+                id: id_a.clone(),
+                reason: Some("merged and ready to close".to_string()),
+                bypass_code_review: None,
+                code_review_findings: None,
+            }))
+            .await
+            .expect("close A after merge returns"),
+    );
+    assert!(
+        !close_after_merge.contains("WORK HALTED"),
+        "a pre-existing unrelated halt must not deadlock re-close of the caller's \
+         own merged AwaitingMerge task: {close_after_merge}"
+    );
+    assert!(
+        close_after_merge.contains("Closed task:"),
+        "awaiting_merge task must become closeable after merge guard passes \
+         even under a pre-existing halt: {close_after_merge}"
+    );
+    assert_eq!(
+        task_store.get(&id_a).expect("A exists").status,
+        TaskStatus::Closed
+    );
+}
+
+/// cas-60393: the halt exemption is narrow — it never bypasses the
+/// merge-integrity gate. An `AwaitingMerge` task whose branch has NOT
+/// actually been merged yet must still bounce `MERGE REQUIRED`, even though
+/// the halt check itself was skipped for this owned task.
+#[tokio::test]
+async fn test_60393_unmerged_awaiting_merge_still_bounces_merge_required_under_halt() {
+    use std::process::Command;
+
+    let (temp, service) = setup_cas();
+    let _env_lock = env_test_lock();
+    let cas_dir = temp.path().join(".cas");
+    let agent_store = open_agent_store(&cas_dir).expect("open agent store");
+    {
+        let mut agent = agent_store
+            .list(None)
+            .expect("list agents")
+            .into_iter()
+            .find(|agent| agent.name == "test-agent")
+            .expect("test agent exists");
+        agent.role = AgentRole::Worker;
+        agent_store.update(&agent).expect("mark test agent worker");
+    }
+
+    std::fs::write(
+        cas_dir.join("config.toml"),
+        "[verification]\nenabled = true\n",
+    )
+    .expect("write config");
+
+    let repo = temp.path();
+    let git = |args: &[&str]| {
+        let ok = Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .status()
+            .expect("git")
+            .success();
+        assert!(ok, "git {args:?} failed");
+    };
+    git(&["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("seed.txt"), "seed\n").unwrap();
+    git(&["add", "seed.txt"]);
+    git(&["commit", "-q", "-m", "seed"]);
+    git(&["checkout", "-q", "-b", "epic/cas-60393b"]);
+    git(&["checkout", "-q", "-b", "factory/test-agent"]);
+    std::fs::write(repo.join("worker.txt"), "worker\n").unwrap();
+    git(&["add", "worker.txt"]);
+    git(&["commit", "-q", "-m", "worker change"]);
+
+    let task_store = open_task_store(&cas_dir).expect("open task store");
+
+    let epic_id = extract_task_id(&extract_text(
+        service
+            .cas_task_create(Parameters(TaskCreateRequest {
+                depth: None,
+                title: "Merge epic".to_string(),
+                description: None,
+                priority: 2,
+                task_type: "epic".to_string(),
+                labels: None,
+                notes: None,
+                blocked_by: None,
+                design: None,
+                acceptance_criteria: None,
+                external_ref: None,
+                assignee: None,
+                demo_statement: None,
+                execution_note: None,
+                epic: None,
+            }))
+            .await
+            .expect("create epic"),
+    ))
+    .expect("epic id")
+    .to_string();
+    {
+        let mut epic = task_store.get(&epic_id).expect("epic exists");
+        epic.branch = Some("epic/cas-60393b".to_string());
+        task_store.update(&epic).expect("update epic branch");
+    }
+
+    let id_a = extract_task_id(&extract_text(
+        service
+            .cas_task_create(Parameters(TaskCreateRequest {
+                epic: Some(epic_id.clone()),
+                ..simple_task_req("Task A")
+            }))
+            .await
+            .expect("create A"),
+    ))
+    .expect("id A")
+    .to_string();
+    service
+        .cas_task_start(Parameters(IdRequest { id: id_a.clone() }))
+        .await
+        .expect("start A");
+    {
+        let mut task_a = task_store.get(&id_a).expect("A exists after start");
+        task_a.assignee = Some("test-agent".to_string());
+        task_store.update(&task_a).expect("set A assignee");
+    }
+
+    // Park AwaitingMerge (no merge yet).
+    let close_text = extract_text(
+        service
+            .cas_task_close(Parameters(TaskCloseRequest {
+                id: id_a.clone(),
+                reason: Some("ready for merge".to_string()),
+                bypass_code_review: None,
+                code_review_findings: None,
+            }))
+            .await
+            .expect("close A returns"),
+    );
+    assert!(close_text.contains("MERGE REQUIRED"));
+
+    // Arm an unrelated pre-existing halt (same as the happy-path test) but do
+    // NOT merge the branch this time.
+    {
+        let mut agent = agent_store
+            .list(None)
+            .expect("list agents")
+            .into_iter()
+            .find(|agent| agent.name == "test-agent")
+            .expect("test agent exists");
+        agent
+            .metadata
+            .insert("halt_task_work".to_string(), "1".to_string());
+        agent_store.update(&agent).expect("arm unrelated halt");
+    }
+
+    let retry_text = extract_text(
+        service
+            .cas_task_close(Parameters(TaskCloseRequest {
+                id: id_a.clone(),
+                reason: Some("retry before merge".to_string()),
+                bypass_code_review: None,
+                code_review_findings: None,
+            }))
+            .await
+            .expect("retry close A returns"),
+    );
+    assert!(
+        retry_text.contains("MERGE REQUIRED"),
+        "unmerged AwaitingMerge must still bounce MERGE REQUIRED, halt-exempt \
+         or not: {retry_text}"
+    );
+    assert!(
+        !retry_text.contains("Closed task:"),
+        "the halt exemption must never manufacture a false close success: {retry_text}"
+    );
+    assert_eq!(
+        task_store.get(&id_a).expect("A exists").status,
+        TaskStatus::AwaitingMerge,
+        "task must remain parked, not falsely closed"
+    );
+}
+
+/// cas-60393: the exemption is scoped to the caller's OWN AwaitingMerge task.
+/// A halted worker attempting to close an unrelated, ordinary InProgress task
+/// must still be refused with `WORK HALTED` — halt continues to protect all
+/// other work.
+#[tokio::test]
+async fn test_60393_halt_still_blocks_close_of_unrelated_inprogress_task() {
+    let (temp, service) = setup_cas();
+    let _env_lock = env_test_lock();
+    let cas_dir = temp.path().join(".cas");
+    let agent_store = open_agent_store(&cas_dir).expect("open agent store");
+    {
+        let mut agent = agent_store
+            .list(None)
+            .expect("list agents")
+            .into_iter()
+            .find(|agent| agent.name == "test-agent")
+            .expect("test agent exists");
+        agent.role = AgentRole::Worker;
+        agent_store.update(&agent).expect("mark test agent worker");
+    }
+
+    let task_store = open_task_store(&cas_dir).expect("open task store");
+    let verification_store = open_verification_store(&cas_dir).expect("open verification store");
+
+    let id_b = extract_task_id(&extract_text(
+        service
+            .cas_task_create(Parameters(simple_task_req("Task B")))
+            .await
+            .expect("create B"),
+    ))
+    .expect("id B")
+    .to_string();
+    service
+        .cas_task_start(Parameters(IdRequest { id: id_b.clone() }))
+        .await
+        .expect("start B");
+    {
+        let mut task_b = task_store.get(&id_b).expect("B exists after start");
+        task_b.assignee = Some("test-agent".to_string());
+        task_store.update(&task_b).expect("set B assignee");
+    }
+    // Give B an approved verification so the ONLY thing standing between it
+    // and a successful close is the halt flag under test.
+    verification_store
+        .add(&Verification::approved(
+            "ver-cas-60393-b".to_string(),
+            id_b.clone(),
+            "pre-approved for isolation".to_string(),
+        ))
+        .expect("record verification approval");
+
+    // Arm halt (unrelated urgent stop) on the worker.
+    {
+        let mut agent = agent_store
+            .list(None)
+            .expect("list agents")
+            .into_iter()
+            .find(|agent| agent.name == "test-agent")
+            .expect("test agent exists");
+        agent
+            .metadata
+            .insert("halt_task_work".to_string(), "1".to_string());
+        agent_store.update(&agent).expect("arm halt");
+    }
+
+    // The halt gate rejects with an `McpError` (not a success payload), so
+    // assert on the `Err` arm directly rather than unwrapping to success.
+    let close_result = service
+        .cas_task_close(Parameters(TaskCloseRequest {
+            id: id_b.clone(),
+            reason: Some("done".to_string()),
+            bypass_code_review: None,
+            code_review_findings: None,
+        }))
+        .await;
+    let err = close_result.expect_err(
+        "an ordinary InProgress task (not AwaitingMerge) must still be refused under halt",
+    );
+    assert!(
+        err.message.contains("WORK HALTED"),
+        "expected the halt-blocks-close message, got: {}",
+        err.message
+    );
+    assert_eq!(
+        task_store.get(&id_b).expect("B exists").status,
+        TaskStatus::InProgress,
+        "halted close attempt must not change task status"
     );
 }

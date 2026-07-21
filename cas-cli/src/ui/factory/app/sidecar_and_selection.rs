@@ -73,6 +73,75 @@ pub fn alt_screen_wheel_bytes(cli: cas_mux::SupervisorCli, up: bool) -> Vec<u8> 
     }
 }
 
+/// SGR 1006 left-button press+release at 1-based terminal coordinates.
+///
+/// Used to forward factory mouse clicks into an already-focused Grok alt-screen
+/// pane so the on-screen **Stop** control receives the click (cas-7f6f). Factory
+/// mouse capture otherwise steals clicks for pane-focus only.
+pub fn sgr_left_click_bytes(col: u16, row: u16) -> Vec<u8> {
+    let col = col.max(1);
+    let row = row.max(1);
+    // Press: CSI < 0 ; col ; row M   Release: CSI < 0 ; col ; row m
+    format!("\x1b[<0;{col};{row}M\x1b[<0;{col};{row}m").into_bytes()
+}
+
+/// Outcome of [`FactoryApp::handle_mouse_click`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum ClickAction {
+    /// Click was handled by factory chrome (tabs, focus change, dialogs).
+    Handled,
+    /// Forward an SGR click into the named pane (already focused, alt-screen Grok).
+    ForwardSgr {
+        pane: String,
+        /// 1-based PTY column
+        col: u16,
+        /// 1-based PTY row
+        row: u16,
+    },
+}
+
+/// How the factory should handle a standalone Esc on a focused Grok pane (cas-7f6f).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrokEscAction {
+    /// Mid-turn: rewrite Esc to harness cancel (Ctrl+C via `break_turn`).
+    CancelTurn,
+    /// Idle: forward raw Esc so clear/rewind semantics stay intact.
+    ForwardRaw,
+}
+
+/// Pure decision for Grok Esc routing (unit-tested active-vs-idle).
+///
+/// `turn_in_flight` is the authoritative pane flag (set on submit/inject,
+/// cleared on cancel) — not inferred from output timing.
+pub fn grok_esc_action(turn_in_flight: bool) -> GrokEscAction {
+    if turn_in_flight {
+        GrokEscAction::CancelTurn
+    } else {
+        GrokEscAction::ForwardRaw
+    }
+}
+
+/// Which client render surface to use for hit-testing / Stop coords (cas-7f6f).
+///
+/// Full and compact clients share one `FactoryApp` but paint different layouts;
+/// geometry must be selected by the input-owning client's view mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientGeometryMode {
+    Full,
+    Compact,
+}
+
+/// Full-mode bordered content inset (1 cell each side). Kept next to click
+/// geometry so tests don't reach into private render modules.
+pub fn full_mode_pty_content(outer: Rect) -> Rect {
+    Rect {
+        x: outer.x.saturating_add(1),
+        y: outer.y.saturating_add(1),
+        width: outer.width.saturating_sub(2),
+        height: outer.height.saturating_sub(2),
+    }
+}
+
 impl FactoryApp {
     // ========================================================================
     // Sidecar navigation
@@ -207,11 +276,26 @@ impl FactoryApp {
         }
     }
 
-    /// Handle mouse click at screen coordinates
+    /// Handle mouse click at screen coordinates.
     ///
     /// Resolves which pane was clicked and focuses it. Also handles clicks
     /// on the worker tab bar to switch worker tabs.
-    pub fn handle_mouse_click(&mut self, col: u16, row: u16) {
+    ///
+    /// When the click is inside an **already-focused** Grok alt-screen pane,
+    /// returns [`ClickAction::ForwardSgr`] so the caller can inject an SGR
+    /// click into the PTY — this is what makes Grok's on-screen **Stop**
+    /// control work under factory mouse capture (cas-7f6f). First click on an
+    /// unfocused pane still only focuses (no forward), so idle clicks stay
+    /// harmless.
+    ///
+    /// `geometry` selects full vs compact content maps so concurrent clients
+    /// do not share one overwritten layout.
+    pub fn handle_mouse_click(
+        &mut self,
+        col: u16,
+        row: u16,
+        geometry: ClientGeometryMode,
+    ) -> ClickAction {
         // Don't handle clicks while modal dialogs are open
         if self.show_task_dialog
             || self.show_changes_dialog
@@ -219,76 +303,179 @@ impl FactoryApp {
             || self.show_help
             || self.show_terminal_dialog
         {
-            return;
+            return ClickAction::Handled;
         }
 
-        // Check worker tab bar clicks (switches tab without focusing)
-        if self.is_tabbed {
-            if let Some(tab_area) = self.worker_tab_bar_area {
-                if tab_area.contains((col, row).into()) {
-                    let all_names = self.layout_worker_names();
-                    if !all_names.is_empty() {
-                        let click_x = col.saturating_sub(tab_area.x) as usize;
-                        // Account for 1-char left padding before first tab
-                        let mut pos: usize = 1;
-                        let mut clicked_tab: Option<usize> = None;
-                        for (i, name) in all_names.iter().enumerate() {
-                            let number = i + 1;
-                            let status_icon = if self.is_pending_worker(name) {
-                                " \u{2801}" // spinner placeholder — 2 chars, same width as any frame
-                            } else {
-                                self.get_worker_status_icon(name)
-                            };
-                            // Must match renderer: format!(" {number} {name}{status_icon} ")
-                            let label_width =
-                                3 + number.to_string().len() + name.len() + status_icon.len();
-                            if click_x >= pos && click_x < pos + label_width {
-                                clicked_tab = Some(i);
-                                break;
+        // Compact has no worker tabs / sidecar — only supervisor content.
+        if geometry == ClientGeometryMode::Full {
+            // Check worker tab bar clicks (switches tab without focusing)
+            if self.is_tabbed {
+                if let Some(tab_area) = self.worker_tab_bar_area {
+                    if tab_area.contains((col, row).into()) {
+                        let all_names = self.layout_worker_names();
+                        if !all_names.is_empty() {
+                            let click_x = col.saturating_sub(tab_area.x) as usize;
+                            // Account for 1-char left padding before first tab
+                            let mut pos: usize = 1;
+                            let mut clicked_tab: Option<usize> = None;
+                            for (i, name) in all_names.iter().enumerate() {
+                                let number = i + 1;
+                                let status_icon = if self.is_pending_worker(name) {
+                                    " \u{2801}" // spinner placeholder — 2 chars
+                                } else {
+                                    self.get_worker_status_icon(name)
+                                };
+                                // Must match renderer: format!(" {number} {name}{status_icon} ")
+                                let label_width =
+                                    3 + number.to_string().len() + name.len() + status_icon.len();
+                                if click_x >= pos && click_x < pos + label_width {
+                                    clicked_tab = Some(i);
+                                    break;
+                                }
+                                pos += label_width;
+                                // 1-char separator between tabs
+                                if i < all_names.len() - 1 {
+                                    pos += 1;
+                                }
                             }
-                            pos += label_width;
-                            // 1-char separator between tabs
-                            if i < all_names.len() - 1 {
-                                pos += 1;
+                            if let Some(clicked_tab) = clicked_tab {
+                                self.select_worker_tab(clicked_tab);
+                                // Also focus the clicked worker pane
+                                if let Some(name) = self.worker_names.get(clicked_tab) {
+                                    let name = name.clone();
+                                    let _ = self.mux.focus(&name);
+                                    self.sidecar_focus = SidecarFocus::None;
+                                }
                             }
                         }
-                        if let Some(clicked_tab) = clicked_tab {
-                            self.select_worker_tab(clicked_tab);
-                            // Also focus the clicked worker pane
-                            if let Some(name) = self.worker_names.get(clicked_tab) {
-                                let name = name.clone();
-                                let _ = self.mux.focus(&name);
-                                self.sidecar_focus = SidecarFocus::None;
-                            }
-                        }
+                        return ClickAction::Handled;
                     }
-                    return;
+                }
+            }
+
+            // Check sidecar area clicks
+            if let Some(sidecar_area) = self.sidecar_area {
+                if sidecar_area.contains((col, row).into()) {
+                    if self.sidecar_focus == SidecarFocus::None {
+                        self.toggle_sidecar_focus();
+                    }
+                    return ClickAction::Handled;
                 }
             }
         }
 
-        // Check sidecar area clicks
-        if let Some(sidecar_area) = self.sidecar_area {
-            if sidecar_area.contains((col, row).into()) {
-                if self.sidecar_focus == SidecarFocus::None {
-                    self.toggle_sidecar_focus();
-                }
-                return;
-            }
-        }
-
-        // Check pane clicks (supervisor + workers)
-        if let Some(pane_name) = self.pane_at_screen(col, row) {
+        // Check pane clicks using geometry-mode hit testing
+        if let Some(pane_name) = self.pane_at_screen_for(col, row, geometry) {
+            let already_focused = self.mux.focused_id() == Some(pane_name.as_str());
             let _ = self.mux.focus(&pane_name);
             self.sidecar_focus = SidecarFocus::None;
 
             // Update selected worker tab when clicking a worker in tabbed mode
-            if self.is_tabbed {
+            if geometry == ClientGeometryMode::Full && self.is_tabbed {
                 if let Some(idx) = self.worker_names.iter().position(|n| n == &pane_name) {
                     self.selected_worker_tab = idx;
                 }
             }
+
+            // cas-7f6f: forward click into already-focused Grok alt-screen so
+            // Stop (and other in-TUI controls) receive the event.
+            if already_focused
+                && self.harness_for(&pane_name) == cas_mux::SupervisorCli::Grok
+                && self.mux.get(&pane_name).is_some_and(|p| p.is_in_alt_screen())
+            {
+                if let Some((pty_col, pty_row)) =
+                    self.screen_to_pty_coords(&pane_name, col, row, geometry)
+                {
+                    return ClickAction::ForwardSgr {
+                        pane: pane_name,
+                        col: pty_col,
+                        row: pty_row,
+                    };
+                }
+            }
         }
+        ClickAction::Handled
+    }
+
+    /// Map factory screen coordinates to 1-based PTY cell coordinates for a pane.
+    ///
+    /// Uses the mode-specific content rect from the last matching render —
+    /// full mode is border-inset, compact is borderless. Concurrent full and
+    /// compact clients each keep their own map (cas-7f6f).
+    pub fn screen_to_pty_coords(
+        &self,
+        pane_name: &str,
+        screen_col: u16,
+        screen_row: u16,
+        geometry: ClientGeometryMode,
+    ) -> Option<(u16, u16)> {
+        let content = self.pty_content_area(pane_name, geometry)?;
+        if content.width == 0 || content.height == 0 {
+            return None;
+        }
+        if screen_col < content.x
+            || screen_row < content.y
+            || screen_col >= content.x + content.width
+            || screen_row >= content.y + content.height
+        {
+            return None;
+        }
+        // 1-based terminal coordinates relative to painted content origin.
+        let pty_col = screen_col - content.x + 1;
+        let pty_row = screen_row - content.y + 1;
+        Some((pty_col, pty_row))
+    }
+
+    /// Mode-specific PTY content rect for a pane.
+    pub fn pty_content_area(
+        &self,
+        pane_name: &str,
+        geometry: ClientGeometryMode,
+    ) -> Option<Rect> {
+        match geometry {
+            ClientGeometryMode::Full => self.full_pty_content_areas.get(pane_name).copied(),
+            ClientGeometryMode::Compact => self.compact_pty_content_areas.get(pane_name).copied(),
+        }
+    }
+
+    /// Pane under screen coords for the given client geometry mode.
+    pub fn pane_at_screen_for(
+        &self,
+        x: u16,
+        y: u16,
+        geometry: ClientGeometryMode,
+    ) -> Option<String> {
+        match geometry {
+            ClientGeometryMode::Compact => {
+                // Compact paints only the supervisor (borderless content rect).
+                let area = self.pty_content_area(&self.supervisor_name, geometry)?;
+                if area.contains((x, y).into()) {
+                    Some(self.supervisor_name.clone())
+                } else {
+                    None
+                }
+            }
+            ClientGeometryMode::Full => self.pane_at_screen(x, y),
+        }
+    }
+
+    /// Whether the focused pane has an authoritative in-flight turn.
+    ///
+    /// Refreshes from harness events (Grok `turn_ended`) before reading so
+    /// Esc routing never uses a stale in-flight flag after normal completion.
+    pub fn focused_turn_in_flight(&self) -> bool {
+        let Some(id) = self.mux.focused_id() else {
+            return false;
+        };
+        self.mux.get(id).is_some_and(|p| {
+            p.refresh_harness_turn_state();
+            p.is_turn_in_flight()
+        })
+    }
+
+    /// Esc routing for the focused pane when the harness is Grok.
+    pub fn focused_grok_esc_action(&self) -> GrokEscAction {
+        grok_esc_action(self.focused_turn_in_flight())
     }
 
     /// Focus the next PTY pane (cycles through supervisor + worker panes only)
@@ -927,6 +1114,7 @@ mod tests {
     use cas_factory::TaskSummary;
     use cas_mux::Pane;
     use cas_types::{Priority, TaskStatus, TaskType};
+    use ratatui::layout::Rect;
     use std::collections::HashMap;
 
     /// Helper: create a FactoryApp with a single director pane that has been
@@ -964,6 +1152,7 @@ mod tests {
             epic: epic.map(str::to_string),
             branch: Some(format!("epic/{id}")).filter(|_| task_type == TaskType::Epic),
             updated_at: None,
+            epic_verification_owner: None,
         }
     }
 
@@ -1331,6 +1520,365 @@ mod tests {
             app.alt_screen_scroll_payload(false),
             SCROLL_DOWN_SGR.repeat(SCROLL_LINES),
             "Grok focused pane must get SGR wheel-down × SCROLL_LINES"
+        );
+    }
+
+    // =========================================================================
+    // cas-7f6f: Grok Stop click + Esc cancel path
+    // =========================================================================
+
+    /// SGR left-click is press (M) + release (m) at the given 1-based cell.
+    #[test]
+    fn sgr_left_click_bytes_shape_cas_7f6f() {
+        assert_eq!(
+            sgr_left_click_bytes(12, 7),
+            b"\x1b[<0;12;7M\x1b[<0;12;7m",
+            "SGR 1006 left click = press then release"
+        );
+        // Coordinates are clamped to ≥1 (terminals are 1-based).
+        assert_eq!(sgr_left_click_bytes(0, 0), b"\x1b[<0;1;1M\x1b[<0;1;1m");
+    }
+
+    /// Click on an unfocused Grok pane only focuses (no SGR forward).
+    /// Click on an already-focused Grok alt-screen pane forwards SGR so the
+    /// on-screen Stop control can receive the event.
+    #[test]
+    fn mouse_click_forwards_sgr_only_when_already_focused_grok_alt_cas_7f6f() {
+        let mut app = FactoryApp::for_test();
+        // Placeholder first so the Grok pane is not auto-focused on add.
+        app.mux
+            .add_pane(Pane::director("other", 20, 40).unwrap());
+        let mut pane = Pane::director("test-supervisor", 20, 40).unwrap();
+        pane.set_harness(cas_mux::SupervisorCli::Grok);
+        pane.feed(b"\x1b[?1049h").unwrap();
+        app.mux.add_pane(pane);
+        app.supervisor_name = "test-supervisor".to_string();
+        app.supervisor_cli = cas_mux::SupervisorCli::Grok;
+        // Outer rect for focus hit-test; full-mode content is border-inset.
+        let outer = Rect::new(0, 0, 40, 20);
+        app.supervisor_area = Some(outer);
+        app.full_pty_content_areas
+            .insert("test-supervisor".to_string(), full_mode_pty_content(outer));
+
+        // Focus is on "other" — first click on Grok pane focuses only.
+        assert_eq!(app.mux.focused_id(), Some("other"));
+        assert_eq!(
+            app.handle_mouse_click(10, 10, ClientGeometryMode::Full),
+            ClickAction::Handled,
+            "first click on unfocused pane must only focus"
+        );
+        assert_eq!(app.mux.focused_id(), Some("test-supervisor"));
+
+        // Already focused + Grok + alt-screen → ForwardSgr.
+        match app.handle_mouse_click(10, 10, ClientGeometryMode::Full) {
+            ClickAction::ForwardSgr { pane, col, row } => {
+                assert_eq!(pane, "test-supervisor");
+                // screen (10,10) → content origin (1,1) → pty (10,10)
+                assert_eq!((col, row), (10, 10));
+            }
+            other => panic!("expected ForwardSgr, got {other:?}"),
+        }
+
+        // Border click (col 0) stays Handled — outside content rect.
+        assert_eq!(
+            app.handle_mouse_click(0, 10, ClientGeometryMode::Full),
+            ClickAction::Handled,
+            "border click must not forward SGR"
+        );
+    }
+
+    /// Full and compact geometry maps coexist — compact render must not
+    /// overwrite full-client Stop coordinates (simultaneous clients).
+    #[test]
+    fn full_and_compact_geometry_independent_cas_7f6f() {
+        let mut app = FactoryApp::for_test();
+        app.supervisor_name = "sup".to_string();
+        let full_outer = Rect::new(0, 2, 80, 30);
+        let compact_outer = Rect::new(0, 1, 40, 20);
+
+        app.full_pty_content_areas
+            .insert("sup".to_string(), full_mode_pty_content(full_outer));
+        app.compact_pty_content_areas
+            .insert("sup".to_string(), compact_outer);
+
+        // Same screen cell maps differently under each mode.
+        let full = app
+            .screen_to_pty_coords("sup", 10, 10, ClientGeometryMode::Full)
+            .expect("full");
+        let compact = app
+            .screen_to_pty_coords("sup", 10, 10, ClientGeometryMode::Compact)
+            .expect("compact");
+        assert_ne!(full, compact, "full vs compact coords must differ");
+
+        // Updating compact must not change full mapping.
+        app.compact_pty_content_areas
+            .insert("sup".to_string(), Rect::new(0, 1, 50, 25));
+        let full_after = app
+            .screen_to_pty_coords("sup", 10, 10, ClientGeometryMode::Full)
+            .unwrap();
+        assert_eq!(full, full_after, "compact map mutation must not clobber full");
+
+        // Full-mode border is not content.
+        assert_eq!(
+            app.screen_to_pty_coords("sup", 0, 10, ClientGeometryMode::Full),
+            None
+        );
+        // Compact borderless accepts top-left of its content rect.
+        assert_eq!(
+            app.screen_to_pty_coords("sup", 0, 1, ClientGeometryMode::Compact),
+            Some((1, 1))
+        );
+    }
+
+    /// submit → quiet >8s stays active; turn_ended completes; idle Esc is raw.
+    #[test]
+    fn grok_esc_submit_quiet_complete_idle_cas_7f6f() {
+        assert_eq!(grok_esc_action(true), GrokEscAction::CancelTurn);
+        assert_eq!(grok_esc_action(false), GrokEscAction::ForwardRaw);
+
+        let mut app = FactoryApp::for_test();
+        let mut pane = Pane::director("g", 10, 20).unwrap();
+        pane.set_harness(cas_mux::SupervisorCli::Grok);
+        app.mux.add_pane(pane);
+        app.mux.focus("g");
+        app.supervisor_name = "g".to_string();
+        app.supervisor_cli = cas_mux::SupervisorCli::Grok;
+
+        // Idle redraw alone never starts a turn.
+        app.mux
+            .get_mut("g")
+            .unwrap()
+            .feed(b"\x1b[2Jidle-redraw")
+            .unwrap();
+        assert!(!app.focused_turn_in_flight());
+        assert_eq!(app.focused_grok_esc_action(), GrokEscAction::ForwardRaw);
+
+        // Submit starts in-flight.
+        assert!(cas_mux::Pane::is_true_prompt_submit(b"\r"));
+        assert!(cas_mux::Pane::key_stream_is_submit(b"hello\r"));
+        assert!(!cas_mux::Pane::is_true_prompt_submit(
+            b"\x1b[200~line1\nline2\r\x1b[201~"
+        ));
+        app.mux.get("g").unwrap().mark_turn_in_flight();
+        assert!(app.focused_turn_in_flight());
+        assert_eq!(app.focused_grok_esc_action(), GrokEscAction::CancelTurn);
+
+        // Quiet active for >8s (long MCP/tool wait) must stay cancelable —
+        // PTY quiet timers are forbidden as completion evidence.
+        app.mux
+            .get_mut("g")
+            .unwrap()
+            .feed(b"tool wait...")
+            .unwrap();
+        // No events.jsonl → refresh must not clear.
+        app.mux.get("g").unwrap().refresh_harness_turn_state();
+        assert!(
+            app.focused_turn_in_flight(),
+            "quiet >8s without turn_ended must stay in-flight"
+        );
+        assert_eq!(
+            app.focused_grok_esc_action(),
+            GrokEscAction::CancelTurn,
+            "quiet active turn remains cancelable"
+        );
+
+        // Authoritative completion via Grok events.jsonl turn_ended.
+        let dir = std::env::temp_dir().join(format!(
+            "cas-7f6f-events-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let events = dir.join("events.jsonl");
+        std::fs::write(&events, b"").unwrap();
+        app.mux
+            .get("g")
+            .unwrap()
+            .set_harness_events_path_for_test(&events);
+        // Re-mark so offset captures empty file, then append turn_ended.
+        app.mux.get("g").unwrap().mark_turn_in_flight();
+        assert!(app.focused_turn_in_flight());
+        std::fs::write(
+            &events,
+            b"{\"ts\":\"2026-07-11T00:00:00Z\",\"type\":\"turn_ended\",\"outcome\":\"completed\"}\n",
+        )
+        .unwrap();
+        app.mux.get("g").unwrap().refresh_harness_turn_state();
+        assert!(
+            !app.focused_turn_in_flight(),
+            "turn_ended must clear in-flight"
+        );
+        assert_eq!(app.focused_grok_esc_action(), GrokEscAction::ForwardRaw);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Bracketed paste / multi-byte payloads with embedded CR must not mark submit.
+    #[test]
+    fn true_prompt_submit_not_paste_payload_cas_7f6f() {
+        assert!(cas_mux::Pane::is_true_prompt_submit(b"\r"));
+        assert!(cas_mux::Pane::is_true_prompt_submit(b"\n"));
+        assert!(cas_mux::Pane::is_true_prompt_submit(b"\r\n"));
+        assert!(!cas_mux::Pane::is_true_prompt_submit(b"hello\r"));
+        // KeyStream multi-byte line+Enter is a submit; paste payload is not.
+        assert!(cas_mux::Pane::key_stream_is_submit(b"hello\r"));
+        assert!(!cas_mux::Pane::is_true_prompt_submit(
+            b"\x1b[200~path/with\nnewline\r\x1b[201~"
+        ));
+        assert!(!cas_mux::Pane::is_true_prompt_submit(b"\x1b[200~\x1b[201~"));
+    }
+
+    /// Generic SGR click must not clear turn_in_flight (non-Stop preserves active).
+    #[test]
+    fn sgr_click_does_not_clear_turn_in_flight_cas_7f6f() {
+        let mut app = FactoryApp::for_test();
+        let mut pane = Pane::director("g", 10, 20).unwrap();
+        pane.set_harness(cas_mux::SupervisorCli::Grok);
+        app.mux.add_pane(pane);
+        app.mux.focus("g");
+        app.supervisor_name = "g".to_string();
+        app.supervisor_cli = cas_mux::SupervisorCli::Grok;
+
+        app.mux.get("g").unwrap().mark_turn_in_flight();
+        assert!(app.focused_turn_in_flight());
+        // Simulate raw SGR forward (no note_turn_completed) — state preserved.
+        let payload = sgr_left_click_bytes(5, 10);
+        // send_input is the non-submit path used for SGR; does not clear.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let _ = app.mux.send_input_to("g", &payload).await;
+        });
+        assert!(
+            app.focused_turn_in_flight(),
+            "generic SGR must not clear in-flight; only turn_ended/break_turn do"
+        );
+    }
+
+    /// KeyStream marks submit; StructuredPaste with embedded CR never does.
+    #[test]
+    fn deliver_user_input_keystream_vs_paste_cas_7f6f() {
+        let mut app = FactoryApp::for_test();
+        let mut pane = Pane::director("g", 10, 20).unwrap();
+        pane.set_harness(cas_mux::SupervisorCli::Grok);
+        // Director has no PTY backend — deliver_user_input will fail write, but
+        // mark happens before write. Use mark helpers for kind classification
+        // and assert the pure predicates + mark path.
+        app.mux.add_pane(pane);
+        app.mux.focus("g");
+
+        assert!(cas_mux::Pane::key_stream_is_submit(b"\r"));
+        assert!(!cas_mux::Pane::key_stream_is_submit(b"x"));
+        // Structured paste classification: never a true lone-CR submit.
+        let paste = b"\x1b[200~hello\rworld\x1b[201~";
+        assert!(!cas_mux::Pane::is_true_prompt_submit(paste));
+
+        // Explicit mark only on KeyStream submit path.
+        app.mux.get("g").unwrap().mark_turn_in_flight();
+        assert!(app.focused_turn_in_flight());
+        app.mux.get("g").unwrap().mark_turn_completed();
+        assert!(!app.focused_turn_in_flight());
+        // Paste does not auto-mark (no call to mark for StructuredPaste).
+        assert!(!app.focused_turn_in_flight());
+    }
+
+    /// Drop hit-testing is mode-aware so compact and full coexist.
+    #[test]
+    fn drop_target_geometry_mode_aware_cas_7f6f() {
+        let mut app = FactoryApp::for_test();
+        app.supervisor_name = "sup".to_string();
+        app.worker_names = vec!["w1".to_string()];
+        // Full: supervisor at left, worker at right (stale full layout).
+        app.supervisor_area = Some(Rect::new(0, 0, 40, 20));
+        app.worker_areas = vec![Rect::new(40, 0, 40, 20)];
+        app.full_pty_content_areas
+            .insert("sup".to_string(), full_mode_pty_content(Rect::new(0, 0, 40, 20)));
+        app.full_pty_content_areas
+            .insert("w1".to_string(), full_mode_pty_content(Rect::new(40, 0, 40, 20)));
+        // Compact paints only supervisor borderless in a different rect.
+        app.compact_pty_content_areas
+            .insert("sup".to_string(), Rect::new(0, 1, 40, 18));
+
+        // Full hit at worker content maps to w1.
+        assert_eq!(
+            app.pane_at_screen_for(50, 10, ClientGeometryMode::Full),
+            Some("w1".to_string())
+        );
+        // Compact ignores full worker areas — only supervisor content.
+        assert_eq!(
+            app.pane_at_screen_for(50, 10, ClientGeometryMode::Compact),
+            None,
+            "compact must not use full-layout worker hit tests"
+        );
+        assert_eq!(
+            app.pane_at_screen_for(5, 5, ClientGeometryMode::Compact),
+            Some("sup".to_string())
+        );
+        // Updating compact map must not change full hit tests.
+        app.compact_pty_content_areas
+            .insert("sup".to_string(), Rect::new(0, 1, 10, 5));
+        assert_eq!(
+            app.pane_at_screen_for(50, 10, ClientGeometryMode::Full),
+            Some("w1".to_string())
+        );
+    }
+
+    /// Claude focused alt-screen must NOT forward SGR clicks (Stop path is
+    /// Grok-only; Claude keeps Esc cancel).
+    #[test]
+    fn mouse_click_does_not_forward_sgr_for_claude_cas_7f6f() {
+        let mut app = FactoryApp::for_test();
+        let pane = Pane::director("test-supervisor", 20, 40).unwrap();
+        app.mux.add_pane(pane);
+        app.mux.focus("test-supervisor");
+        app.mux
+            .get_mut("test-supervisor")
+            .unwrap()
+            .feed(b"\x1b[?1049h")
+            .unwrap();
+        app.supervisor_name = "test-supervisor".to_string();
+        app.supervisor_cli = cas_mux::SupervisorCli::Claude;
+        app.supervisor_area = Some(Rect::new(0, 0, 40, 20));
+        app.full_pty_content_areas.insert(
+            "test-supervisor".to_string(),
+            full_mode_pty_content(Rect::new(0, 0, 40, 20)),
+        );
+
+        assert_eq!(
+            app.handle_mouse_click(10, 10, ClientGeometryMode::Full),
+            ClickAction::Handled,
+            "Claude must not receive factory-forwarded SGR clicks"
+        );
+    }
+
+    /// Idle / no-pane click is harmless.
+    #[test]
+    fn mouse_click_idle_is_harmless_cas_7f6f() {
+        let mut app = FactoryApp::for_test();
+        assert_eq!(
+            app.handle_mouse_click(5, 5, ClientGeometryMode::Full),
+            ClickAction::Handled
+        );
+    }
+
+    /// Harness-aware turn cancel bytes (pin for Esc routing + break_turn).
+    #[test]
+    fn turn_cancel_bytes_follow_harness_cas_7f6f() {
+        assert_eq!(
+            cas_mux::SupervisorCli::Claude.turn_cancel_bytes(),
+            &[0x1b],
+            "Claude cancel = Esc"
+        );
+        assert_eq!(
+            cas_mux::SupervisorCli::Codex.turn_cancel_bytes(),
+            &[0x1b],
+            "Codex cancel = Esc"
+        );
+        assert_eq!(
+            cas_mux::SupervisorCli::Grok.turn_cancel_bytes(),
+            &[0x03],
+            "Grok cancel = Ctrl+C (Esc is mid-turn no-op since 0.2.93)"
         );
     }
 

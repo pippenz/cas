@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use cas::mcp::{CasCore, CasService};
-use cas::store::{init_cas_dir, open_task_store};
-use cas::types::{Task, TaskType};
+use cas::store::{init_cas_dir, open_agent_store, open_task_store};
+use cas::types::{Agent, AgentType, Task, TaskType};
 use cas_mcp::types::CoordinationRequest;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::RawContent;
@@ -109,6 +109,8 @@ fn coord_req(action: &str) -> CoordinationRequest {
         summary: None,
         urgent: None,
         force: None,
+        allow_trunk: None,
+        cleanup: None,
         clear: None,
         limit: None,
         name: None,
@@ -238,6 +240,159 @@ async fn test_worktree_list_no_disabled_message_when_no_factory_worktrees() {
 }
 
 // =============================================================================
+// cas-d1a0: project-scoped git reconcile — sibling-session worktrees must
+// appear in worktree_list even with no WorktreeStore row (System B never
+// registers; epic worktrees often live outside .cas/worktrees).
+// =============================================================================
+
+/// Factory worktree under a *customized* `worktrees.base_path` (not the
+/// hardcoded `<cas_root>/worktrees` layout) must still appear in
+/// `worktree_list` — same path resolution spawn / worktree_merge use.
+#[tokio::test]
+async fn test_worktree_list_honors_configured_base_path() {
+    let repo = GitRepo::new();
+    let cas_root = init_cas_dir(&repo.root).expect("init_cas_dir");
+    // Unique name: relative base_path resolves under the project parent
+    // (often /tmp), so a fixed name collides across tests/processes.
+    let base_name = format!(
+        "cas-d1a0-list-base-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    std::fs::write(
+        cas_root.join("config.toml"),
+        format!("[worktrees]\nenabled = false\nbase_path = \"{base_name}\"\n"),
+    )
+    .unwrap();
+
+    // Mirrors WorktreeManager::worktree_root for relative non-{project} base_path:
+    // repo_root.parent().join(base_path)/<worker>
+    let base_root = repo.root.parent().unwrap().join(&base_name);
+    let wt_path = base_root.join("erin");
+    repo.add_worktree(&wt_path, "factory/erin");
+    assert_ne!(wt_path, cas_root.join("worktrees").join("erin"));
+
+    let svc = make_service(cas_root);
+    let result = svc
+        .coordination(Parameters(coord_req("worktree_list")))
+        .await
+        .expect("coordination call should succeed");
+    let text = get_text(&result);
+
+    // Reclaim external worktree before asserts so a failure still cleans up.
+    let _ = Command::new("git")
+        .args(["worktree", "remove", "--force", wt_path.to_str().unwrap()])
+        .current_dir(&repo.root)
+        .output();
+    let _ = std::fs::remove_dir_all(&base_root);
+
+    assert!(
+        text.contains("factory/erin"),
+        "worktree_list must surface factory worktrees under configured base_path.\nGot:\n{text}"
+    );
+    assert!(
+        text.contains("[factory]"),
+        "custom-base factory worktree must be labeled [factory].\nGot:\n{text}"
+    );
+}
+/// Epic worktree outside `.cas/worktrees` (e.g. director `/tmp/…-epic-…`)
+/// with an `epic/*` branch must appear as untracked so a sibling session
+/// can see it for merge/cleanup (BUG report cas-d1a0).
+#[tokio::test]
+async fn test_worktree_list_surfaces_unregistered_epic_worktree_outside_cas_dir() {
+    let repo = GitRepo::new();
+    let cas_root = init_cas_dir(&repo.root).expect("init_cas_dir");
+    disable_system_a(&cas_root);
+
+    // No SQLite WorktreeStore row — simulates a worktree created by a
+    // sibling/predecessor session that never registered System A.
+    let tmp = TempDir::new().expect("TempDir for epic worktree");
+    let epic_path = tmp.path().join("ozer-epic-ea3e-hv");
+    repo.add_worktree(&epic_path, "epic/integrate-cas-ea3e");
+
+    let svc = make_service(cas_root);
+    let result = svc
+        .coordination(Parameters(coord_req("worktree_list")))
+        .await
+        .expect("coordination call should succeed");
+    let text = get_text(&result);
+
+    assert!(
+        text.contains("epic/integrate-cas-ea3e"),
+        "unregistered epic/* worktree outside .cas/worktrees must appear in list.\nGot:\n{text}"
+    );
+    assert!(
+        text.contains("[untracked]"),
+        "CAS-pattern worktree with no store row must be labeled [untracked].\nGot:\n{text}"
+    );
+    // Keep the temp dir alive until after the list call (git worktree still present).
+    drop(tmp);
+}
+
+/// Non-CAS user worktrees (arbitrary branch outside CAS layouts) must NOT
+/// pollute worktree_list — only CAS-pattern paths/branches are reconciled.
+#[tokio::test]
+async fn test_worktree_list_ignores_unrelated_git_worktrees() {
+    let repo = GitRepo::new();
+    let cas_root = init_cas_dir(&repo.root).expect("init_cas_dir");
+    disable_system_a(&cas_root);
+
+    let tmp = TempDir::new().expect("TempDir for unrelated worktree");
+    let other_path = tmp.path().join("hand-made-wt");
+    repo.add_worktree(&other_path, "feature/hand-made");
+
+    let svc = make_service(cas_root);
+    let result = svc
+        .coordination(Parameters(coord_req("worktree_list")))
+        .await
+        .expect("coordination call should succeed");
+    let text = get_text(&result);
+
+    assert!(
+        !text.contains("feature/hand-made"),
+        "unrelated user worktrees must not appear in worktree_list.\nGot:\n{text}"
+    );
+    assert!(
+        text.contains("No worktrees"),
+        "only non-CAS worktrees present → empty list message.\nGot:\n{text}"
+    );
+    drop(tmp);
+}
+
+/// Sibling-session factory worker under the default `.cas/worktrees/<name>`
+/// path with no store row must still list (git reconcile is the project-
+/// scoped source of truth for System B).
+#[tokio::test]
+async fn test_worktree_list_shows_sibling_session_factory_worktree_without_store_row() {
+    let repo = GitRepo::new();
+    let cas_root = init_cas_dir(&repo.root).expect("init_cas_dir");
+    disable_system_a(&cas_root);
+
+    // Session A created this; session B only has the git worktree + shared .cas.
+    let wt_path = cas_root.join("worktrees").join("hv-food-qa");
+    repo.add_worktree(&wt_path, "factory/hv-food-qa");
+
+    let svc = make_service(cas_root);
+    let result = svc
+        .coordination(Parameters(coord_req("worktree_list")))
+        .await
+        .expect("coordination call should succeed");
+    let text = get_text(&result);
+
+    assert!(
+        text.contains("factory/hv-food-qa"),
+        "director-spawned factory worktree must be visible to another session's worktree_list.\nGot:\n{text}"
+    );
+    assert!(
+        text.contains("[factory]"),
+        "expected [factory] label for System B reconcile entry.\nGot:\n{text}"
+    );
+}
+
+// =============================================================================
 // cas-1d11: worktree_merge must agree with spawn isolate=true on
 // worktrees.enabled — a factory (System B) worktree must be mergeable
 // even when System A is off, since spawn never checked that flag either.
@@ -312,6 +467,9 @@ async fn test_worktree_merge_succeeds_for_factory_worktree_when_system_a_disable
     let svc = make_service(cas_root);
     let mut req = coord_req("worktree_merge");
     req.id = Some("factory/alice".to_string());
+    // No epic context — allow_trunk authorizes trunk; force stays false so dirty protection remains.
+    req.allow_trunk = Some(true);
+    req.cleanup = Some(true);
     let result = svc
         .coordination(Parameters(req))
         .await
@@ -334,7 +492,7 @@ async fn test_worktree_merge_succeeds_for_factory_worktree_when_system_a_disable
         repo.root.join("alice-work.txt").exists(),
         "merged content must land on the parent branch's working tree"
     );
-    // cleanup_on_close defaults true: the worktree directory is reclaimed.
+    // The request opted into cleanup, so the worktree directory is reclaimed.
     assert!(
         !wt_path.exists(),
         "worktree directory should be cleaned up after a successful merge"
@@ -398,7 +556,11 @@ async fn test_worktree_merge_reports_not_found_not_disabled_when_nothing_matches
 // the only copy of it gone.
 // =============================================================================
 
-fn create_epic_and_worker_task(cas_root: &Path, epic_branch: &str) -> (String, String) {
+fn create_epic_and_worker_task(
+    cas_root: &Path,
+    epic_branch: &str,
+    assignee: Option<&str>,
+) -> (String, String) {
     let task_store = open_task_store(cas_root).expect("open_task_store");
 
     let mut epic = Task::new("epic-1".to_string(), "Test epic".to_string());
@@ -406,12 +568,31 @@ fn create_epic_and_worker_task(cas_root: &Path, epic_branch: &str) -> (String, S
     epic.branch = Some(epic_branch.to_string());
     task_store.add(&epic).expect("add epic task");
 
-    let worker_task = Task::new("worker-task-1".to_string(), "Worker task".to_string());
+    let mut worker_task = Task::new("worker-task-1".to_string(), "Worker task".to_string());
+    // cas-bd5f: explicit task_id merges require assignee/lease belonging to the worker.
+    if let Some(name) = assignee {
+        worker_task.assignee = Some(name.to_string());
+    }
     task_store
         .create_atomic(&worker_task, &[], Some(&epic.id), None)
         .expect("create worker task under epic");
 
     (epic.id, worker_task.id)
+}
+
+/// Register a System-B style worker agent and optionally claim a task lease.
+fn register_worker_agent(
+    cas_root: &Path,
+    name: &str,
+    factory_session: Option<&str>,
+) -> String {
+    let agent_store = open_agent_store(cas_root).expect("open_agent_store");
+    let id = Agent::generate_fallback_id();
+    let mut agent = Agent::new(id.clone(), name.to_string());
+    agent.agent_type = AgentType::Worker;
+    agent.factory_session = factory_session.map(|s| s.to_string());
+    agent_store.register(&agent).expect("register worker agent");
+    id
 }
 
 #[tokio::test]
@@ -428,7 +609,9 @@ async fn test_worktree_merge_targets_epic_branch_when_task_id_given() {
         .output()
         .unwrap();
 
-    let (_epic_id, worker_task_id) = create_epic_and_worker_task(&cas_root, "epic/foo");
+    // cas-bd5f: task must belong to alice (matching worker/task/epic).
+    let (_epic_id, worker_task_id) =
+        create_epic_and_worker_task(&cas_root, "epic/foo", Some("alice"));
 
     let wt_path = cas_root.join("worktrees").join("alice");
     repo.add_worktree(&wt_path, "factory/alice");
@@ -477,14 +660,16 @@ async fn test_worktree_merge_targets_epic_branch_when_task_id_given() {
 }
 
 #[tokio::test]
-async fn test_worktree_merge_falls_back_to_trunk_when_task_has_no_parent_epic() {
+async fn test_worktree_merge_standalone_task_requires_force_for_trunk() {
+    // cas-0b32 AC4: standalone (no parent epic) trunk merge needs explicit intent.
     let repo = GitRepo::new();
     let cas_root = init_cas_dir(&repo.root).expect("init_cas_dir");
     disable_system_a(&cas_root);
 
-    // A standalone (non-epic) task — legitimately "no epic in play".
     let task_store = open_task_store(&cas_root).expect("open_task_store");
-    let standalone_task = Task::new("standalone-1".to_string(), "Standalone task".to_string());
+    let mut standalone_task = Task::new("standalone-1".to_string(), "Standalone task".to_string());
+    // cas-bd5f: explicit task_id requires worker ownership.
+    standalone_task.assignee = Some("bob".to_string());
     task_store.add(&standalone_task).expect("add standalone task");
 
     let wt_path = cas_root.join("worktrees").join("bob");
@@ -493,23 +678,42 @@ async fn test_worktree_merge_falls_back_to_trunk_when_task_has_no_parent_epic() 
     let _lock = merge_cwd_lock().lock().unwrap_or_else(|p| p.into_inner());
     let _cwd = CwdGuard::enter(&repo.root);
 
-    let svc = make_service(cas_root);
+    let svc = make_service(cas_root.clone());
+
+    // Without allow_trunk: refuse silent trunk (force alone must NOT authorize).
     let mut req = coord_req("worktree_merge");
     req.id = Some("factory/bob".to_string());
     req.task_id = Some(standalone_task.id.clone());
-    let result = svc
-        .coordination(Parameters(req))
-        .await
-        .expect("coordination call should succeed");
-    let text = get_text(&result);
+    req.force = Some(true); // dirty bypass only — must not open trunk
+    let refused = svc.coordination(Parameters(req)).await;
+    assert!(
+        refused.is_err(),
+        "standalone task with force but without allow_trunk must refuse trunk"
+    );
+    let msg = format!("{:?}", refused.unwrap_err());
+    assert!(
+        msg.contains("no parent epic") || msg.contains("refusing") || msg.contains("allow_trunk"),
+        "refusal must explain missing parent epic / allow_trunk. Got: {msg}"
+    );
 
+    // allow_trunk=true (force=false): trunk authorized without dirty bypass.
+    let mut trunk_ok = coord_req("worktree_merge");
+    trunk_ok.id = Some("factory/bob".to_string());
+    trunk_ok.task_id = Some(standalone_task.id.clone());
+    trunk_ok.allow_trunk = Some(true);
+    trunk_ok.force = Some(false);
+    let result = svc
+        .coordination(Parameters(trunk_ok))
+        .await
+        .expect("allow_trunk=true standalone merge should succeed");
+    let text = get_text(&result);
     assert!(
         text.contains("Merged worktree"),
-        "a task with no parent epic must still merge to trunk, not refuse.\nGot:\n{text}"
+        "allow_trunk=true must allow trunk for standalone task.\nGot:\n{text}"
     );
     assert!(
-        text.contains("no parent epic"),
-        "the trunk fallback reason must explain why (no parent epic), not just say 'trunk'.\nGot:\n{text}"
+        text.contains("allow_trunk=true") || text.contains("no parent epic"),
+        "reason must cite allow_trunk / no parent epic.\nGot:\n{text}"
     );
 }
 
@@ -552,10 +756,9 @@ async fn test_worktree_merge_refuses_when_task_id_does_not_exist() {
 }
 
 #[tokio::test]
-async fn test_worktree_merge_falls_back_to_trunk_when_no_task_id_given() {
-    // Regression guard: the original cas-1d11 caller pattern (no task_id at
-    // all) must keep working exactly as before — trunk fallback, not a
-    // refusal, since "no task_id" is a legitimate "no epic context" case.
+async fn test_worktree_merge_refuses_silent_trunk_when_no_task_id_and_no_epic_context() {
+    // cas-0b32: the old cas-1d11/cas-0938 "no task_id → trunk" path is the
+    // hv-director→main incident. Without epic context, refuse unless force.
     let repo = GitRepo::new();
     let cas_root = init_cas_dir(&repo.root).expect("init_cas_dir");
     disable_system_a(&cas_root);
@@ -569,16 +772,476 @@ async fn test_worktree_merge_falls_back_to_trunk_when_no_task_id_given() {
     let svc = make_service(cas_root);
     let mut req = coord_req("worktree_merge");
     req.id = Some("factory/dave".to_string());
+    let result = svc.coordination(Parameters(req)).await;
+    assert!(
+        result.is_err(),
+        "no task_id / no epic / no focus must refuse silent trunk (cas-0b32)"
+    );
+    let msg = format!("{:?}", result.unwrap_err());
+    assert!(
+        msg.contains("refusing silent trunk")
+            || msg.contains("cas-0b32")
+            || msg.contains("Remediation"),
+        "refusal must explain silent-trunk ban + remediation. Got: {msg}"
+    );
+    assert!(
+        wt_path.exists(),
+        "refused merge must not delete the worktree"
+    );
+}
+
+/// cas-0b32 AC1/AC5: System-B worker assigned to an epic, merge without
+/// task_id (supervisor pattern that previously hit main) → epic branch.
+/// Reproduces the hv-director / cas-9fff / cas-0e22 incident shape.
+#[tokio::test]
+async fn test_worktree_merge_uses_assignee_epic_when_no_task_id_cas_0b32() {
+    let repo = GitRepo::new();
+    let cas_root = init_cas_dir(&repo.root).expect("init_cas_dir");
+    disable_system_a(&cas_root);
+
+    Command::new("git")
+        .args([
+            "branch",
+            "epic/epic-triage-and-fix-jul-9-11-docs-requests-factory-cas-0e22",
+        ])
+        .current_dir(&repo.root)
+        .output()
+        .unwrap();
+
+    let task_store = open_task_store(&cas_root).expect("open_task_store");
+    let mut epic = Task::new("cas-0e22".to_string(), "EPIC triage".to_string());
+    epic.task_type = TaskType::Epic;
+    epic.branch = Some(
+        "epic/epic-triage-and-fix-jul-9-11-docs-requests-factory-cas-0e22".to_string(),
+    );
+    task_store.add(&epic).expect("add epic");
+
+    let mut worker_task = Task::new("cas-9fff".to_string(), "Director routing".to_string());
+    worker_task.assignee = Some("hv-director".to_string());
+    worker_task.status = cas::types::TaskStatus::InProgress;
+    task_store
+        .create_atomic(&worker_task, &[], Some(&epic.id), None)
+        .expect("create child under epic");
+
+    let wt_path = cas_root.join("worktrees").join("hv-director");
+    repo.add_worktree(&wt_path, "factory/hv-director");
+    std::fs::write(wt_path.join("director-fix.txt"), "work").unwrap();
+    run_git(&["add", "."], &wt_path);
+    run_git(&["commit", "-m", "director work"], &wt_path);
+
+    let _lock = merge_cwd_lock().lock().unwrap_or_else(|p| p.into_inner());
+    let _cwd = CwdGuard::enter(&repo.root);
+
+    let svc = make_service(cas_root);
+    // Incident shape: id only, no task_id.
+    let mut req = coord_req("worktree_merge");
+    req.id = Some("hv-director".to_string());
     let result = svc
         .coordination(Parameters(req))
         .await
-        .expect("coordination call should succeed");
+        .expect("assignee epic merge should succeed without task_id");
     let text = get_text(&result);
 
-    assert!(text.contains("Merged worktree"));
     assert!(
-        text.contains("no task_id given"),
-        "the trunk-fallback reason must be explicit about why. Got:\n{text}"
+        text.contains("epic/epic-triage-and-fix-jul-9-11-docs-requests-factory-cas-0e22"),
+        "must merge to epic branch, not main. Got:\n{text}"
+    );
+    assert!(
+        !text.contains("to main") && !text.contains("to master"),
+        "must never silently land on trunk. Got:\n{text}"
+    );
+    assert!(
+        text.contains("assignee") || text.contains("parent epic"),
+        "reason should cite assignee/epic resolution. Got:\n{text}"
+    );
+
+    let epic_tree = Command::new("git")
+        .args([
+            "ls-tree",
+            "-r",
+            "--name-only",
+            "epic/epic-triage-and-fix-jul-9-11-docs-requests-factory-cas-0e22",
+        ])
+        .current_dir(&repo.root)
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&epic_tree.stdout).contains("director-fix.txt"),
+        "epic branch must contain merged content"
+    );
+}
+
+/// cas-0b32 AC2: focused epic is honored when unambiguous (no assignee epic).
+#[tokio::test]
+async fn test_worktree_merge_uses_focused_epic_when_unambiguous_cas_0b32() {
+    let repo = GitRepo::new();
+    let cas_root = init_cas_dir(&repo.root).expect("init_cas_dir");
+    disable_system_a(&cas_root);
+
+    Command::new("git")
+        .args(["branch", "epic/focused"])
+        .current_dir(&repo.root)
+        .output()
+        .unwrap();
+
+    let task_store = open_task_store(&cas_root).expect("open_task_store");
+    let mut epic = Task::new("cas-focus".to_string(), "Focused epic".to_string());
+    epic.task_type = TaskType::Epic;
+    epic.branch = Some("epic/focused".to_string());
+    task_store.add(&epic).expect("add epic");
+
+    // Pin focused epic via session metadata (same store focus_epic writes).
+    let session = "test-focus-session-0b32";
+    let home = TempDir::new().expect("home");
+    let _lock = merge_cwd_lock().lock().unwrap_or_else(|p| p.into_inner());
+    let _cwd = CwdGuard::enter(&repo.root);
+    let prev_session = std::env::var("CAS_FACTORY_SESSION").ok();
+    let prev_home = std::env::var("HOME").ok();
+    // SAFETY: exclusive merge_cwd_lock serializes env mutation in this file.
+    unsafe {
+        std::env::set_var("CAS_FACTORY_SESSION", session);
+        std::env::set_var("HOME", home.path());
+    }
+    let meta_path = cas::ui::factory::metadata_path(session);
+    std::fs::create_dir_all(meta_path.parent().expect("metadata parent")).unwrap();
+    let workers = vec!["erin".to_string()];
+    let mut meta = cas::ui::factory::create_metadata(
+        session,
+        1,
+        "supervisor",
+        &workers,
+        None,
+        Some(repo.root.to_str().unwrap()),
+        None,
+    );
+    meta.pinned_epic_id = Some("cas-focus".to_string());
+    std::fs::write(
+        &meta_path,
+        serde_json::to_string_pretty(&meta).expect("serialize metadata"),
+    )
+    .expect("write session metadata");
+
+    let wt_path = cas_root.join("worktrees").join("erin");
+    repo.add_worktree(&wt_path, "factory/erin");
+    std::fs::write(wt_path.join("erin-work.txt"), "work").unwrap();
+    run_git(&["add", "."], &wt_path);
+    run_git(&["commit", "-m", "erin work"], &wt_path);
+
+    let svc = make_service(cas_root);
+    let mut req = coord_req("worktree_merge");
+    req.id = Some("factory/erin".to_string());
+    let result = svc.coordination(Parameters(req)).await;
+
+    unsafe {
+        match prev_session {
+            Some(v) => std::env::set_var("CAS_FACTORY_SESSION", v),
+            None => std::env::remove_var("CAS_FACTORY_SESSION"),
+        }
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    let result = result.expect("focused epic merge should succeed");
+    let text = get_text(&result);
+    assert!(
+        text.contains("epic/focused") && text.contains("focused epic"),
+        "must merge via focused epic. Got:\n{text}"
+    );
+}
+
+/// cas-0b32 review P1: focused epic with mismatched project_dir is ignored
+/// (cross-project / stale) — refuse silent trunk without allow_trunk.
+#[tokio::test]
+async fn test_worktree_merge_rejects_cross_project_focused_epic_cas_0b32() {
+    let repo = GitRepo::new();
+    let cas_root = init_cas_dir(&repo.root).expect("init_cas_dir");
+    disable_system_a(&cas_root);
+
+    Command::new("git")
+        .args(["branch", "epic/focused"])
+        .current_dir(&repo.root)
+        .output()
+        .unwrap();
+    let task_store = open_task_store(&cas_root).expect("open_task_store");
+    let mut epic = Task::new("cas-focus".to_string(), "Focused epic".to_string());
+    epic.task_type = TaskType::Epic;
+    epic.branch = Some("epic/focused".to_string());
+    task_store.add(&epic).unwrap();
+
+    let session = "test-focus-cross-project-0b32";
+    let home = TempDir::new().expect("home");
+    let _lock = merge_cwd_lock().lock().unwrap_or_else(|p| p.into_inner());
+    let _cwd = CwdGuard::enter(&repo.root);
+    let prev_session = std::env::var("CAS_FACTORY_SESSION").ok();
+    let prev_home = std::env::var("HOME").ok();
+    unsafe {
+        std::env::set_var("CAS_FACTORY_SESSION", session);
+        std::env::set_var("HOME", home.path());
+    }
+    let meta_path = cas::ui::factory::metadata_path(session);
+    std::fs::create_dir_all(meta_path.parent().unwrap()).unwrap();
+    let workers = vec!["erin".to_string()];
+    let mut meta = cas::ui::factory::create_metadata(
+        session,
+        1,
+        "supervisor",
+        &workers,
+        None,
+        Some("/tmp/other-project-not-this-repo"), // mismatched project_dir
+        None,
+    );
+    meta.pinned_epic_id = Some("cas-focus".to_string());
+    std::fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
+
+    let wt_path = cas_root.join("worktrees").join("erin");
+    repo.add_worktree(&wt_path, "factory/erin");
+
+    let svc = make_service(cas_root);
+    let mut req = coord_req("worktree_merge");
+    req.id = Some("factory/erin".to_string());
+    let result = svc.coordination(Parameters(req)).await;
+    unsafe {
+        match prev_session {
+            Some(v) => std::env::set_var("CAS_FACTORY_SESSION", v),
+            None => std::env::remove_var("CAS_FACTORY_SESSION"),
+        }
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+    assert!(
+        result.is_err(),
+        "cross-project focused epic must not authorize merge to that epic/trunk silently"
+    );
+    let msg = format!("{:?}", result.unwrap_err());
+    assert!(
+        msg.contains("refusing silent trunk") || msg.contains("Remediation"),
+        "must refuse with remediation. Got: {msg}"
+    );
+}
+
+/// cas-0b32 review P1: focused epic with matching project but worker not in
+/// session membership → ignore focus, refuse trunk.
+#[tokio::test]
+async fn test_worktree_merge_rejects_focused_epic_for_non_member_worker_cas_0b32() {
+    let repo = GitRepo::new();
+    let cas_root = init_cas_dir(&repo.root).expect("init_cas_dir");
+    disable_system_a(&cas_root);
+
+    Command::new("git")
+        .args(["branch", "epic/focused"])
+        .current_dir(&repo.root)
+        .output()
+        .unwrap();
+    let task_store = open_task_store(&cas_root).expect("open_task_store");
+    let mut epic = Task::new("cas-focus".to_string(), "Focused epic".to_string());
+    epic.task_type = TaskType::Epic;
+    epic.branch = Some("epic/focused".to_string());
+    task_store.add(&epic).unwrap();
+
+    let session = "test-focus-non-member-0b32";
+    let home = TempDir::new().expect("home");
+    let _lock = merge_cwd_lock().lock().unwrap_or_else(|p| p.into_inner());
+    let _cwd = CwdGuard::enter(&repo.root);
+    let prev_session = std::env::var("CAS_FACTORY_SESSION").ok();
+    let prev_home = std::env::var("HOME").ok();
+    unsafe {
+        std::env::set_var("CAS_FACTORY_SESSION", session);
+        std::env::set_var("HOME", home.path());
+    }
+    let meta_path = cas::ui::factory::metadata_path(session);
+    std::fs::create_dir_all(meta_path.parent().unwrap()).unwrap();
+    // Session workers list does NOT include "stranger".
+    let workers = vec!["other-worker".to_string()];
+    let mut meta = cas::ui::factory::create_metadata(
+        session,
+        1,
+        "supervisor",
+        &workers,
+        None,
+        Some(repo.root.to_str().unwrap()),
+        None,
+    );
+    meta.pinned_epic_id = Some("cas-focus".to_string());
+    std::fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
+
+    let wt_path = cas_root.join("worktrees").join("stranger");
+    repo.add_worktree(&wt_path, "factory/stranger");
+
+    let svc = make_service(cas_root);
+    let mut req = coord_req("worktree_merge");
+    req.id = Some("factory/stranger".to_string());
+    let result = svc.coordination(Parameters(req)).await;
+    unsafe {
+        match prev_session {
+            Some(v) => std::env::set_var("CAS_FACTORY_SESSION", v),
+            None => std::env::remove_var("CAS_FACTORY_SESSION"),
+        }
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+    assert!(
+        result.is_err(),
+        "non-member worker must not inherit focused epic merge target"
+    );
+}
+
+/// cas-0b32 second review: one branchful + one branchless active parent must
+/// reject (must not silently pick the branchful epic).
+#[tokio::test]
+async fn test_worktree_merge_rejects_mixed_branchful_and_branchless_parent_epics_cas_0b32() {
+    let repo = GitRepo::new();
+    let cas_root = init_cas_dir(&repo.root).expect("init_cas_dir");
+    disable_system_a(&cas_root);
+
+    Command::new("git")
+        .args(["branch", "epic/with-branch"])
+        .current_dir(&repo.root)
+        .output()
+        .unwrap();
+
+    let task_store = open_task_store(&cas_root).expect("open_task_store");
+    let mut epic_ok = Task::new("epic-ok".to_string(), "Has branch".to_string());
+    epic_ok.task_type = TaskType::Epic;
+    epic_ok.branch = Some("epic/with-branch".to_string());
+    task_store.add(&epic_ok).unwrap();
+    let mut epic_nb = Task::new("epic-nb".to_string(), "No branch".to_string());
+    epic_nb.task_type = TaskType::Epic;
+    epic_nb.branch = None;
+    task_store.add(&epic_nb).unwrap();
+
+    let mut t1 = Task::new("t-ok".to_string(), "Under branchful".to_string());
+    t1.assignee = Some("mixed".to_string());
+    t1.status = cas::types::TaskStatus::InProgress;
+    task_store
+        .create_atomic(&t1, &[], Some("epic-ok"), None)
+        .unwrap();
+    let mut t2 = Task::new("t-nb".to_string(), "Under branchless".to_string());
+    t2.assignee = Some("mixed".to_string());
+    t2.status = cas::types::TaskStatus::InProgress;
+    task_store
+        .create_atomic(&t2, &[], Some("epic-nb"), None)
+        .unwrap();
+
+    let wt_path = cas_root.join("worktrees").join("mixed");
+    repo.add_worktree(&wt_path, "factory/mixed");
+
+    let _lock = merge_cwd_lock().lock().unwrap_or_else(|p| p.into_inner());
+    let _cwd = CwdGuard::enter(&repo.root);
+    let svc = make_service(cas_root);
+    let mut req = coord_req("worktree_merge");
+    req.id = Some("factory/mixed".to_string());
+    let result = svc.coordination(Parameters(req)).await;
+    assert!(
+        result.is_err(),
+        "mixed branchful+branchless parent epics must reject, not pick branchful"
+    );
+    let msg = format!("{:?}", result.unwrap_err());
+    assert!(
+        (msg.contains("no branch") || msg.contains("branch field"))
+            && (msg.contains("epic-nb") || msg.contains("branchless") || msg.contains("epic-ok")),
+        "must cite branchless parent and not silently merge. Got: {msg}"
+    );
+    assert!(
+        !msg.contains("Merged worktree"),
+        "must not have merged. Got: {msg}"
+    );
+}
+
+/// cas-0b32 review P2: branchless parent epic rejects (no fall-through).
+#[tokio::test]
+async fn test_worktree_merge_rejects_branchless_assignee_parent_epic_cas_0b32() {
+    let repo = GitRepo::new();
+    let cas_root = init_cas_dir(&repo.root).expect("init_cas_dir");
+    disable_system_a(&cas_root);
+
+    let task_store = open_task_store(&cas_root).expect("open_task_store");
+    let mut epic = Task::new("epic-nobranch".to_string(), "No branch epic".to_string());
+    epic.task_type = TaskType::Epic;
+    epic.branch = None;
+    task_store.add(&epic).unwrap();
+    let mut t = Task::new("t-nobranch".to_string(), "Child".to_string());
+    t.assignee = Some("nb".to_string());
+    t.status = cas::types::TaskStatus::InProgress;
+    task_store
+        .create_atomic(&t, &[], Some("epic-nobranch"), None)
+        .unwrap();
+
+    let wt_path = cas_root.join("worktrees").join("nb");
+    repo.add_worktree(&wt_path, "factory/nb");
+
+    let _lock = merge_cwd_lock().lock().unwrap_or_else(|p| p.into_inner());
+    let _cwd = CwdGuard::enter(&repo.root);
+    let svc = make_service(cas_root);
+    let mut req = coord_req("worktree_merge");
+    req.id = Some("factory/nb".to_string());
+    let result = svc.coordination(Parameters(req)).await;
+    assert!(result.is_err(), "branchless parent epic must reject");
+    let msg = format!("{:?}", result.unwrap_err());
+    assert!(
+        msg.contains("no branch") || msg.contains("branch field"),
+        "must cite missing branch. Got: {msg}"
+    );
+}
+
+/// cas-0b32 AC3: multiple assignee epics → reject with remediation.
+#[tokio::test]
+async fn test_worktree_merge_rejects_ambiguous_assignee_epics_cas_0b32() {
+    let repo = GitRepo::new();
+    let cas_root = init_cas_dir(&repo.root).expect("init_cas_dir");
+    disable_system_a(&cas_root);
+
+    for b in ["epic/a", "epic/b"] {
+        Command::new("git")
+            .args(["branch", b])
+            .current_dir(&repo.root)
+            .output()
+            .unwrap();
+    }
+
+    let task_store = open_task_store(&cas_root).expect("open_task_store");
+    let mut epic_a = Task::new("epic-a".to_string(), "Epic A".to_string());
+    epic_a.task_type = TaskType::Epic;
+    epic_a.branch = Some("epic/a".to_string());
+    task_store.add(&epic_a).unwrap();
+    let mut epic_b = Task::new("epic-b".to_string(), "Epic B".to_string());
+    epic_b.task_type = TaskType::Epic;
+    epic_b.branch = Some("epic/b".to_string());
+    task_store.add(&epic_b).unwrap();
+
+    let mut t1 = Task::new("t1".to_string(), "T1".to_string());
+    t1.assignee = Some("multi".to_string());
+    t1.status = cas::types::TaskStatus::InProgress;
+    task_store
+        .create_atomic(&t1, &[], Some("epic-a"), None)
+        .unwrap();
+    let mut t2 = Task::new("t2".to_string(), "T2".to_string());
+    t2.assignee = Some("multi".to_string());
+    t2.status = cas::types::TaskStatus::InProgress;
+    task_store
+        .create_atomic(&t2, &[], Some("epic-b"), None)
+        .unwrap();
+
+    let wt_path = cas_root.join("worktrees").join("multi");
+    repo.add_worktree(&wt_path, "factory/multi");
+
+    let _lock = merge_cwd_lock().lock().unwrap_or_else(|p| p.into_inner());
+    let _cwd = CwdGuard::enter(&repo.root);
+
+    let svc = make_service(cas_root);
+    let mut req = coord_req("worktree_merge");
+    req.id = Some("factory/multi".to_string());
+    let result = svc.coordination(Parameters(req)).await;
+    assert!(result.is_err(), "ambiguous assignee epics must reject");
+    let msg = format!("{:?}", result.unwrap_err());
+    assert!(
+        msg.contains("ambiguous") && msg.contains("Remediation"),
+        "must explain ambiguity + remediation. Got: {msg}"
     );
 }
 
@@ -592,20 +1255,24 @@ async fn test_worktree_merge_falls_back_to_trunk_when_no_task_id_given() {
 async fn test_worktree_merge_honors_configured_base_path_not_hardcoded_convention() {
     let repo = GitRepo::new();
     let cas_root = init_cas_dir(&repo.root).expect("init_cas_dir");
+    // Unique base_path under the temp parent so parallel/rerun tests don't
+    // collide on a shared /tmp/custom-worktree-loc path.
+    let unique = format!(
+        "custom-wt-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
     std::fs::write(
         cas_root.join("config.toml"),
-        "[worktrees]\nenabled = false\nbase_path = \"custom-worktree-loc\"\n",
+        format!("[worktrees]\nenabled = false\nbase_path = \"{unique}\"\n"),
     )
     .unwrap();
 
     // Mirrors WorktreeManager::worktree_root()'s resolution for a relative,
     // non-{project} base_path: repo_root.parent().join(base_path).
-    let expected_root = repo
-        .root
-        .parent()
-        .unwrap()
-        .join("custom-worktree-loc")
-        .join("erin");
+    let expected_root = repo.root.parent().unwrap().join(&unique).join("erin");
     repo.add_worktree(&expected_root, "factory/erin");
 
     // Sanity: this is NOT where the old hardcoded convention would look.
@@ -617,6 +1284,8 @@ async fn test_worktree_merge_honors_configured_base_path_not_hardcoded_conventio
     let svc = make_service(cas_root);
     let mut req = coord_req("worktree_merge");
     req.id = Some("factory/erin".to_string());
+    // Path-resolution fixture has no epic context — allow_trunk (not force).
+    req.allow_trunk = Some(true);
     let result = svc
         .coordination(Parameters(req))
         .await
@@ -631,5 +1300,246 @@ async fn test_worktree_merge_honors_configured_base_path_not_hardcoded_conventio
     assert!(
         !text.contains("Worktree not found"),
         "must not false-not-found a worker under a customized base_path.\nGot:\n{text}"
+    );
+}
+
+// =============================================================================
+// cas-bd5f: worktree_merge explicit task_id must belong to the worker being merged.
+// A foreign task_id must not redirect worker A's branch into another task's epic.
+// =============================================================================
+
+/// AC1: Matching worker + assigned task + parent epic resolves normally.
+#[tokio::test]
+async fn test_worktree_merge_task_id_matching_worker_succeeds_cas_bd5f() {
+    let repo = GitRepo::new();
+    let cas_root = init_cas_dir(&repo.root).expect("init_cas_dir");
+    disable_system_a(&cas_root);
+
+    Command::new("git")
+        .args(["branch", "epic/match"])
+        .current_dir(&repo.root)
+        .output()
+        .unwrap();
+
+    let (_epic_id, task_id) =
+        create_epic_and_worker_task(&cas_root, "epic/match", Some("alice"));
+
+    let wt_path = cas_root.join("worktrees").join("alice");
+    repo.add_worktree(&wt_path, "factory/alice");
+    std::fs::write(wt_path.join("match.txt"), "ok").unwrap();
+    run_git(&["add", "."], &wt_path);
+    run_git(&["commit", "-m", "match work"], &wt_path);
+
+    let _lock = merge_cwd_lock().lock().unwrap_or_else(|p| p.into_inner());
+    let _cwd = CwdGuard::enter(&repo.root);
+
+    let svc = make_service(cas_root);
+    let mut req = coord_req("worktree_merge");
+    req.id = Some("factory/alice".to_string());
+    req.task_id = Some(task_id);
+    let result = svc
+        .coordination(Parameters(req))
+        .await
+        .expect("matching worker/task must merge");
+    let text = get_text(&result);
+    assert!(
+        text.contains("Merged worktree") && text.contains("epic/match"),
+        "matching worker/task/epic must resolve. Got:\n{text}"
+    );
+    assert!(
+        text.contains("authorized for worker alice"),
+        "success reason should note authorization. Got:\n{text}"
+    );
+}
+
+/// AC2: Worker A + task assigned to worker B rejects — no foreign epic redirect.
+#[tokio::test]
+async fn test_worktree_merge_rejects_foreign_task_assignee_cas_bd5f() {
+    let repo = GitRepo::new();
+    let cas_root = init_cas_dir(&repo.root).expect("init_cas_dir");
+    disable_system_a(&cas_root);
+
+    Command::new("git")
+        .args(["branch", "epic/foreign"])
+        .current_dir(&repo.root)
+        .output()
+        .unwrap();
+
+    // Task belongs to bob; we attempt to merge alice with that task_id.
+    let (_epic_id, foreign_task_id) =
+        create_epic_and_worker_task(&cas_root, "epic/foreign", Some("bob"));
+
+    let wt_path = cas_root.join("worktrees").join("alice");
+    repo.add_worktree(&wt_path, "factory/alice");
+
+    let _lock = merge_cwd_lock().lock().unwrap_or_else(|p| p.into_inner());
+    let _cwd = CwdGuard::enter(&repo.root);
+
+    let svc = make_service(cas_root);
+    let mut req = coord_req("worktree_merge");
+    req.id = Some("factory/alice".to_string());
+    req.task_id = Some(foreign_task_id.clone());
+    let result = svc.coordination(Parameters(req)).await;
+
+    assert!(
+        result.is_err(),
+        "worker A + task assigned to worker B must reject"
+    );
+    let msg = format!("{:?}", result.unwrap_err());
+    assert!(
+        msg.contains("authorization failed")
+            || msg.contains("cas-bd5f")
+            || msg.contains("assigned to"),
+        "refusal must be audit-ready about ownership mismatch. Got: {msg}"
+    );
+    assert!(
+        msg.contains("alice") && msg.contains("bob"),
+        "diagnostics must name both workers. Got: {msg}"
+    );
+    assert!(
+        wt_path.exists(),
+        "rejected merge must not delete the worktree"
+    );
+}
+
+/// AC3: Missing assignee and no active lease → conservative reject.
+#[tokio::test]
+async fn test_worktree_merge_rejects_task_without_assignee_or_lease_cas_bd5f() {
+    let repo = GitRepo::new();
+    let cas_root = init_cas_dir(&repo.root).expect("init_cas_dir");
+    disable_system_a(&cas_root);
+
+    Command::new("git")
+        .args(["branch", "epic/orphan"])
+        .current_dir(&repo.root)
+        .output()
+        .unwrap();
+
+    // Intentionally no assignee — pre-cas-bd5f this would still merge to epic.
+    let (_epic_id, orphan_task_id) =
+        create_epic_and_worker_task(&cas_root, "epic/orphan", None);
+
+    let wt_path = cas_root.join("worktrees").join("carol");
+    repo.add_worktree(&wt_path, "factory/carol");
+
+    let _lock = merge_cwd_lock().lock().unwrap_or_else(|p| p.into_inner());
+    let _cwd = CwdGuard::enter(&repo.root);
+
+    let svc = make_service(cas_root);
+    let mut req = coord_req("worktree_merge");
+    req.id = Some("factory/carol".to_string());
+    req.task_id = Some(orphan_task_id);
+    let result = svc.coordination(Parameters(req)).await;
+
+    assert!(
+        result.is_err(),
+        "missing assignee/lease must conservatively reject"
+    );
+    let msg = format!("{:?}", result.unwrap_err());
+    assert!(
+        msg.contains("no assignee")
+            || msg.contains("conservative")
+            || msg.contains("authorization failed"),
+        "refusal must cite missing assignee/lease. Got: {msg}"
+    );
+}
+
+/// AC4: Cross-session — active lease held by a different agent rejects even if
+/// the display name could be confused; worker alice must not inherit bob's lease.
+#[tokio::test]
+async fn test_worktree_merge_rejects_cross_session_lease_mismatch_cas_bd5f() {
+    let repo = GitRepo::new();
+    let cas_root = init_cas_dir(&repo.root).expect("init_cas_dir");
+    disable_system_a(&cas_root);
+
+    Command::new("git")
+        .args(["branch", "epic/xsession"])
+        .current_dir(&repo.root)
+        .output()
+        .unwrap();
+
+    // Task has no assignee field but an active lease held by bob in session-B.
+    let (_epic_id, task_id) =
+        create_epic_and_worker_task(&cas_root, "epic/xsession", None);
+
+    let bob_id = register_worker_agent(&cas_root, "bob", Some("session-b"));
+    let agent_store = open_agent_store(&cas_root).expect("open_agent_store");
+    agent_store
+        .try_claim(&task_id, &bob_id, 600, Some("bob owns this"))
+        .expect("bob claims task");
+
+    // alice is a separate session agent — name does not match bob's lease.
+    let _alice_id = register_worker_agent(&cas_root, "alice", Some("session-a"));
+
+    let wt_path = cas_root.join("worktrees").join("alice");
+    repo.add_worktree(&wt_path, "factory/alice");
+
+    let _lock = merge_cwd_lock().lock().unwrap_or_else(|p| p.into_inner());
+    let _cwd = CwdGuard::enter(&repo.root);
+
+    let svc = make_service(cas_root);
+    let mut req = coord_req("worktree_merge");
+    req.id = Some("factory/alice".to_string());
+    req.task_id = Some(task_id);
+    let result = svc.coordination(Parameters(req)).await;
+
+    assert!(
+        result.is_err(),
+        "cross-session lease holder mismatch must reject"
+    );
+    let msg = format!("{:?}", result.unwrap_err());
+    assert!(
+        msg.contains("lease") || msg.contains("authorization failed") || msg.contains("cas-bd5f"),
+        "refusal must cite lease ownership. Got: {msg}"
+    );
+    assert!(
+        msg.contains("alice"),
+        "diagnostics must name the worker being merged. Got: {msg}"
+    );
+}
+
+/// Lease held by the matching worker authorizes even when assignee field is empty.
+#[tokio::test]
+async fn test_worktree_merge_task_id_authorized_via_matching_lease_cas_bd5f() {
+    let repo = GitRepo::new();
+    let cas_root = init_cas_dir(&repo.root).expect("init_cas_dir");
+    disable_system_a(&cas_root);
+
+    Command::new("git")
+        .args(["branch", "epic/lease-ok"])
+        .current_dir(&repo.root)
+        .output()
+        .unwrap();
+
+    let (_epic_id, task_id) =
+        create_epic_and_worker_task(&cas_root, "epic/lease-ok", None);
+
+    let alice_id = register_worker_agent(&cas_root, "alice", Some("session-a"));
+    let agent_store = open_agent_store(&cas_root).expect("open_agent_store");
+    agent_store
+        .try_claim(&task_id, &alice_id, 600, Some("alice lease"))
+        .expect("alice claims task");
+
+    let wt_path = cas_root.join("worktrees").join("alice");
+    repo.add_worktree(&wt_path, "factory/alice");
+    std::fs::write(wt_path.join("lease-work.txt"), "via lease").unwrap();
+    run_git(&["add", "."], &wt_path);
+    run_git(&["commit", "-m", "lease work"], &wt_path);
+
+    let _lock = merge_cwd_lock().lock().unwrap_or_else(|p| p.into_inner());
+    let _cwd = CwdGuard::enter(&repo.root);
+
+    let svc = make_service(cas_root);
+    let mut req = coord_req("worktree_merge");
+    req.id = Some("factory/alice".to_string());
+    req.task_id = Some(task_id);
+    let result = svc
+        .coordination(Parameters(req))
+        .await
+        .expect("matching lease must authorize task_id");
+    let text = get_text(&result);
+    assert!(
+        text.contains("Merged worktree") && text.contains("epic/lease-ok"),
+        "lease-authorized merge must target epic. Got:\n{text}"
     );
 }

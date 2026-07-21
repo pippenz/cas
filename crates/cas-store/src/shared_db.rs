@@ -149,6 +149,64 @@ pub fn is_busy_error(e: &rusqlite::Error) -> bool {
     )
 }
 
+/// Whether an error message is SQLite's concurrent "duplicate column name" race.
+pub fn is_duplicate_column_error(e: &rusqlite::Error) -> bool {
+    let msg = e.to_string().to_lowercase();
+    msg.contains("duplicate column")
+}
+
+/// True when `table` has a column named `column` (via `PRAGMA table_info`).
+///
+/// More reliable than `SELECT col FROM table LIMIT 0` for schema probes.
+/// `table` / `column` must be trusted identifiers (not user input).
+pub fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
+    let Ok(mut stmt) = conn.prepare(&format!("PRAGMA table_info(\"{table}\")")) else {
+        return false;
+    };
+    let Ok(rows) = stmt.query_map([], |row| {
+        let name: String = row.get(1)?;
+        Ok(name)
+    }) else {
+        return false;
+    };
+    rows.flatten().any(|name| name == column)
+}
+
+/// Ensure `column` exists on `table` by running `alter_sql` only when missing.
+///
+/// **Concurrency (cas-88d8):** two processes can both observe a missing column
+/// and race on `ALTER TABLE ... ADD COLUMN`. The loser gets "duplicate column
+/// name". We recheck presence and treat that as success **only** when the
+/// column now exists. All other migration errors still surface.
+///
+/// Note: SQLite auto-commits DDL, so do **not** wrap ADD COLUMN in a larger
+/// multi-statement ImmediateTx that also creates indexes — the transaction
+/// state becomes inconsistent after ALTER.
+///
+/// `table` / `column` must be trusted identifiers (not user input).
+pub fn ensure_column(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    alter_sql: &str,
+) -> crate::Result<()> {
+    if column_exists(conn, table, column) {
+        return Ok(());
+    }
+    match conn.execute_batch(alter_sql.trim()) {
+        Ok(()) => Ok(()),
+        Err(e) if is_duplicate_column_error(&e) => {
+            // Authoritative recheck: another initializer won the race.
+            if column_exists(conn, table, column) {
+                Ok(())
+            } else {
+                Err(crate::error::StoreError::Database(e))
+            }
+        }
+        Err(e) => Err(crate::error::StoreError::Database(e)),
+    }
+}
+
 /// Execute a fallible closure with retry on SQLITE_BUSY errors.
 ///
 /// Uses exponential backoff with jitter: base delays of 50ms, 100ms, 200ms,
@@ -662,6 +720,97 @@ mod tests {
     }
 
     // ── with_write_retry ────────────────────────────────────────────
+
+    #[test]
+    fn ensure_column_is_idempotent_and_tolerates_duplicate() {
+        let temp = TempDir::new().unwrap();
+        let db = temp.path().join("mig.db");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY);")
+            .unwrap();
+
+        ensure_column(&conn, "t", "c1", "ALTER TABLE t ADD COLUMN c1 TEXT;").unwrap();
+        assert!(column_exists(&conn, "t", "c1"));
+        // Second call is a no-op (column already present).
+        ensure_column(&conn, "t", "c1", "ALTER TABLE t ADD COLUMN c1 TEXT;").unwrap();
+
+        // Force ALTER to get a real duplicate-column error, then ensure_column
+        // must still succeed via recheck (race-loser path).
+        match conn.execute_batch("ALTER TABLE t ADD COLUMN c1 TEXT;") {
+            Err(e) => {
+                assert!(is_duplicate_column_error(&e), "expected duplicate column, got {e}");
+                ensure_column(&conn, "t", "c1", "ALTER TABLE t ADD COLUMN c1 TEXT;").unwrap();
+            }
+            Ok(()) => {
+                // Some SQLite builds may no-op re-ADD; ensure_column still Ok.
+                ensure_column(&conn, "t", "c1", "ALTER TABLE t ADD COLUMN c1 TEXT;").unwrap();
+            }
+        }
+        assert!(column_exists(&conn, "t", "c1"));
+    }
+
+    #[test]
+    fn ensure_column_surfaces_genuine_migration_errors() {
+        let temp = TempDir::new().unwrap();
+        let db = temp.path().join("mig.db");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        // Table does not exist for this ALTER — not a duplicate-column race.
+        let err = ensure_column(
+            &conn,
+            "missing_table",
+            "c1",
+            "ALTER TABLE missing_table ADD COLUMN c1 TEXT;",
+        )
+        .unwrap_err();
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("no such table") || msg.contains("missing_table"),
+            "expected real schema error, got {msg}"
+        );
+    }
+
+    /// cas-88d8: concurrent ensure_column on a legacy table must all succeed.
+    #[test]
+    fn ensure_column_concurrent_add_all_succeed() {
+        let temp = TempDir::new().unwrap();
+        let db = temp.path().join("race.db");
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "PRAGMA journal_mode=WAL; CREATE TABLE t (id INTEGER PRIMARY KEY);",
+            )
+            .unwrap();
+        }
+
+        let barrier = Arc::new(Barrier::new(8));
+        let path = db.clone();
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let conn = Connection::open(&path).unwrap();
+                    conn.busy_timeout(Duration::from_secs(5)).unwrap();
+                    barrier.wait();
+                    // No ImmediateTx here — maximize chance of check/ALTER race.
+                    ensure_column(
+                        &conn,
+                        "t",
+                        "race_col",
+                        "ALTER TABLE t ADD COLUMN race_col TEXT;",
+                    )
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap().expect("concurrent ensure_column must succeed");
+        }
+        let conn = Connection::open(&db).unwrap();
+        assert!(conn.prepare("SELECT race_col FROM t LIMIT 0").is_ok());
+    }
 
     #[test]
     fn with_write_retry_succeeds_on_first_try() {

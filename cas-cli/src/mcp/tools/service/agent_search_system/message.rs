@@ -258,8 +258,15 @@ impl CasService {
         // signal this happened. Check registration state up front so the
         // response can say so honestly. `all_workers` is a broadcast, not a
         // single-target claim, so it's always reported as delivered framing.
+        //
+        // cas-73c8: `director` is a permanent team member (TeamsManager
+        // init_team_config) and the source of inbound teammate messages, but
+        // is not an agent_store registration. Treat it as always registered
+        // so outbound replies after an inbound director message are not
+        // reported as "not yet registered".
         let target_is_registered = resolved_target == "all_workers"
             || resolved_target == "supervisor"
+            || resolved_target.eq_ignore_ascii_case("director")
             || {
                 use crate::store::open_agent_store;
                 open_agent_store(&self.inner.cas_root)
@@ -288,6 +295,158 @@ impl CasService {
         } else {
             priority
         };
+
+        // cas-b269 review 2: halt fan-out is session-scoped, authorized by
+        // AgentRole::Supervisor|Director (and display fallback), fail-closed
+        // on store errors, generation-stamped, and all-or-none with enqueue
+        // (compensate halt writes if enqueue fails).
+        let mut halt_compensation: Vec<(String, std::collections::HashMap<String, String>)> =
+            Vec::new();
+        {
+            use crate::mcp::tools::core::task::lifecycle::stale_close_guard::{
+                HaltWorkerCandidate, apply_halt_metadata, halt_targets_for_urgent,
+                is_merge_reclose_exempt_urgent, may_source_role_set_halt, may_source_set_halt,
+                session_scoped_worker_names, should_persist_urgent_halt,
+            };
+            use crate::store::{open_agent_store, open_task_store};
+            use cas_types::{AgentRole, TaskStatus};
+
+            // Prefer typed role from agent store when available.
+            let source_role_for_halt = agent_from_store
+                .as_ref()
+                .map(|a| a.role.to_string())
+                .unwrap_or_else(|| role.clone());
+            let source_authorized = agent_from_store
+                .as_ref()
+                .map(|a| may_source_role_set_halt(a.role))
+                .unwrap_or_else(|| may_source_set_halt(&display_name, &source_role_for_halt));
+
+            if urgent
+                && (source_authorized || may_source_set_halt(&display_name, &source_role_for_halt))
+            {
+                let agent_store = open_agent_store(&self.inner.cas_root).map_err(|e| {
+                    Self::error(
+                        ErrorCode::INTERNAL_ERROR,
+                        format!(
+                            "Failed to open agent store for urgent halt (cas-b269, fail closed): {e}"
+                        ),
+                    )
+                })?;
+                let agents = agent_store.list(None).map_err(|e| {
+                    Self::error(
+                        ErrorCode::INTERNAL_ERROR,
+                        format!(
+                            "Failed to list agents for urgent halt (cas-b269, fail closed): {e}"
+                        ),
+                    )
+                })?;
+
+                let worker_candidates: Vec<HaltWorkerCandidate> = agents
+                    .iter()
+                    .filter(|a| a.role == AgentRole::Worker)
+                    .map(|a| HaltWorkerCandidate {
+                        name: a.name.clone(),
+                        factory_session: a.factory_session.clone(),
+                    })
+                    .collect();
+                let session_workers =
+                    session_scoped_worker_names(&worker_candidates, factory_session.as_deref());
+
+                // cas-126b: an urgent "MERGE DONE → re-close now" hand-off both
+                // wakes the parked worker AND (before this guard) armed
+                // halt_task_work — deadlocking the very re-close it asks for.
+                // Skip the halt fan-out when this urgent send is close/verify
+                // guidance that references, as a bounded token, a task that is
+                // (a) currently AwaitingMerge AND (b) assigned to THIS urgent's
+                // target worker. The assignee binding is a scope/authorization
+                // gate: an urgent to worker B must not skip halt because its
+                // text happens to name worker A's parked task. The exemption
+                // only skips the halt flag — the message is still
+                // enqueued+injected, and the factory-branch merge gate in
+                // close_ops remains the sole authority on close success, so a
+                // re-close sent before the merge is visible still rejects with
+                // MERGE REQUIRED (never a false success). Fail closed — if the
+                // task store can't be read, keep the original halt behavior.
+                let reclose_exempt = match open_task_store(&self.inner.cas_root)
+                    .ok()
+                    .and_then(|ts| ts.list(Some(TaskStatus::AwaitingMerge)).ok())
+                {
+                    Some(tasks) => {
+                        let target_awaiting_ids: Vec<String> = tasks
+                            .into_iter()
+                            .filter(|t| {
+                                t.assignee
+                                    .as_deref()
+                                    .map(|a| a.eq_ignore_ascii_case(&resolved_target))
+                                    .unwrap_or(false)
+                            })
+                            .map(|t| t.id)
+                            .collect();
+                        is_merge_reclose_exempt_urgent(&message, &target_awaiting_ids)
+                    }
+                    None => false,
+                };
+
+                if reclose_exempt {
+                    tracing::debug!(
+                        target = %resolved_target,
+                        "cas-126b: skipping halt_task_work for merge-complete re-close urgent"
+                    );
+                } else if should_persist_urgent_halt(
+                    urgent,
+                    &display_name,
+                    &source_role_for_halt,
+                    &resolved_target,
+                    &session_workers,
+                ) {
+                    let targets = halt_targets_for_urgent(&resolved_target, &session_workers);
+                    let halt_generation = chrono::Utc::now().timestamp_millis().max(0) as u64;
+                    for target_name in &targets {
+                        // Match by name + session so same-name cross-session
+                        // peers are not halted.
+                        let Some(mut agent) = agents
+                            .iter()
+                            .find(|a| {
+                                a.role == AgentRole::Worker
+                                    && a.name.eq_ignore_ascii_case(target_name)
+                                    && a.visible_to_factory_session(factory_session.as_deref())
+                            })
+                            .cloned()
+                        else {
+                            continue;
+                        };
+                        halt_compensation.push((agent.id.clone(), agent.metadata.clone()));
+                        apply_halt_metadata(&mut agent.metadata, halt_generation);
+                        if let Err(e) = agent_store.update(&agent) {
+                            // Compensate any prior successful writes.
+                            for (id, prev) in halt_compensation.drain(..) {
+                                if let Ok(mut a) = agent_store.get(&id) {
+                                    a.metadata = prev;
+                                    let _ = agent_store.update(&a);
+                                }
+                            }
+                            return Err(Self::error(
+                                ErrorCode::INTERNAL_ERROR,
+                                format!(
+                                    "Failed to persist halt_task_work for {target_name} \
+                                     before urgent enqueue (cas-b269): {e}"
+                                ),
+                            ));
+                        }
+                    }
+                }
+            } else if urgent
+                && !source_authorized
+                && !may_source_set_halt(&display_name, &source_role_for_halt)
+            {
+                tracing::debug!(
+                    source = %display_name,
+                    role = %source_role_for_halt,
+                    "cas-b269: ignoring halt for unauthorized source"
+                );
+            }
+        }
+
         // cas-f9e8 telemetry: measure the wall-clock spent inside the DB
         // insert and log it alongside the caller-visible message id, so a
         // future investigator can bisect whether stalls live in send-side
@@ -295,22 +454,37 @@ impl CasService {
         // at debug so normal sessions stay quiet; enable via
         // `RUST_LOG=cas::coordination=debug`.
         let enqueue_started = std::time::Instant::now();
-        let message_id = queue
-            .enqueue_urgent(
-                &display_name,
-                &resolved_target,
-                &message,
-                factory_session.as_deref(),
-                Some(summary.as_str()),
-                priority,
-                urgent,
-            )
-            .map_err(|error| {
-                Self::error(
+        let message_id = match queue.enqueue_urgent(
+            &display_name,
+            &resolved_target,
+            &message,
+            factory_session.as_deref(),
+            Some(summary.as_str()),
+            priority,
+            urgent,
+        ) {
+            Ok(id) => id,
+            Err(error) => {
+                // Compensate halt fan-out so we never leave halt without the
+                // corresponding urgent message (all-or-none).
+                if !halt_compensation.is_empty() {
+                    use crate::store::open_agent_store;
+                    if let Ok(agent_store) = open_agent_store(&self.inner.cas_root) {
+                        for (id, prev) in halt_compensation.drain(..) {
+                            if let Ok(mut a) = agent_store.get(&id) {
+                                a.metadata = prev;
+                                let _ = agent_store.update(&a);
+                            }
+                        }
+                    }
+                }
+                return Err(Self::error(
                     ErrorCode::INTERNAL_ERROR,
                     format!("Failed to queue message: {error}"),
-                )
-            })?;
+                ));
+            }
+        };
+
         let persist_latency_ms = enqueue_started.elapsed().as_secs_f64() * 1000.0;
         tracing::debug!(
             target: "cas::coordination",
@@ -431,17 +605,36 @@ impl CasService {
             )
         })?;
 
-        let status = queue.message_status(notification_id).map_err(|error| {
-            Self::error(
-                ErrorCode::INTERNAL_ERROR,
-                format!("Failed to query message status: {error}"),
-            )
-        })?;
+        // cas-2c5f: stage-based report is additive; legacy status string is
+        // preserved on the first line for older clients/scripts.
+        let report = queue
+            .message_delivery_report(notification_id)
+            .map_err(|error| {
+                Self::error(
+                    ErrorCode::INTERNAL_ERROR,
+                    format!("Failed to query message status: {error}"),
+                )
+            })?;
 
-        match status {
-            Some(s) => Ok(Self::success(format!(
-                "Message {notification_id} status: {s}"
-            ))),
+        match report {
+            Some(r) => {
+                let json = serde_json::to_string_pretty(&r).unwrap_or_else(|_| {
+                    format!(
+                        "{{\"id\":{},\"legacy_status\":\"{}\",\"stage\":\"{}\"}}",
+                        r.id, r.legacy_status, r.stage
+                    )
+                });
+                let reason = r
+                    .pending_reason
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "none".into());
+                Ok(Self::success(format!(
+                    "Message {notification_id} status: {}\n\
+                     stage: {}  pending_reason: {}  wake: {}  reaction: {}\n\
+                     {json}",
+                    r.legacy_status, r.stage, reason, r.wake, r.reaction
+                )))
+            }
             None => Ok(Self::success(format!(
                 "Message {notification_id} not found"
             ))),

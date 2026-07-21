@@ -181,7 +181,11 @@ pub struct TaskCloseRequest {
                        Required whenever the task has reviewable code \
                        changes unless bypass_code_review=true or the \
                        task is additive-only. Shape: \
-                       {residual: Finding[], pre_existing: Finding[], mode: string}."
+                       {residual: Finding[], pre_existing: Finding[], mode: string}. \
+                       Each Finding requires: title, severity, file, line, \
+                       why_it_matters, autofix_class, owner, confidence, \
+                       evidence, pre_existing (optional: suggested_fix, \
+                       requires_verification)."
     )]
     #[serde(default)]
     pub code_review_findings: Option<String>,
@@ -247,8 +251,10 @@ pub struct TaskUpdateRequest {
     #[serde(default)]
     pub external_ref: Option<String>,
 
-    /// Update assignee
-    #[schemars(description = "New assignee")]
+    /// Update assignee. Empty string clears (unassigns). Omit to leave unchanged.
+    #[schemars(
+        description = "New assignee (worker display name). Pass empty string to clear/unassign; omit to leave unchanged."
+    )]
     #[serde(default)]
     pub assignee: Option<String>,
 
@@ -264,7 +270,11 @@ pub struct TaskUpdateRequest {
     #[serde(default)]
     pub epic: Option<String>,
 
-    /// Set epic verification owner (for epics in factory mode)
+    /// Set epic verification owner (for epics in factory mode).
+    ///
+    /// cas-cc74: this is an authorized transfer — only the current owner or a
+    /// supervisor may change it, and the target must be a live
+    /// supervisor/director identity. Unauthorized rewrites are rejected.
     #[schemars(
         description = "Agent ID responsible for epic verification (supervisor in factory mode)"
     )]

@@ -56,6 +56,62 @@ pub(crate) fn choose_channel(harness: SupervisorCli, teams_active: bool) -> Deli
     }
 }
 
+/// The queue-bookkeeping decision for a single queued message after one
+/// delivery attempt (cas-6257). Centralises the "record transport delivery only
+/// after the inbox handoff succeeds" invariant so it is unit-testable and cannot
+/// drift between call sites.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QueuedDeliveryOutcome {
+    /// Handoff to the recipient's channel succeeded (inbox write / PTY inject) —
+    /// the queue row may be marked processed.
+    MarkProcessed,
+    /// Handoff failed but the target is a live/known member of this session —
+    /// leave the row **pending** (do not advance `processed_at`) so the next
+    /// tick retries. This is the load-bearing retryable state.
+    Retry,
+    /// Handoff failed and the target is not a pane in this session and not a
+    /// current worker/supervisor — the message can never be delivered as
+    /// addressed, so the row is consumed (marked processed) and its content is
+    /// re-routed to the supervisor rather than blocking the queue forever.
+    Abandon,
+}
+
+/// Decide the queue bookkeeping for one single-target delivery attempt
+/// (cas-6257).
+///
+/// - A successful handoff always marks the row processed.
+/// - A failed handoff to a **known pane** (`pane_known`) is retryable — the pane
+///   exists, the write just didn't land this tick (e.g. a transient inbox lock
+///   or a not-yet-ready PTY), so the row stays pending.
+/// - A failed handoff to an **unknown pane** is retryable *only* while the target
+///   is still a current worker/supervisor (it may still be spawning); otherwise
+///   it is abandoned so a stale cross-session row cannot wedge the queue.
+///
+/// Crucially, failure never yields `MarkProcessed`: a dropped inbox write leaves
+/// the message deliverable on the next tick, matching the durable director-events
+/// lane. `process_prompt_queue`'s single-target branch calls this directly, so
+/// the contract is exercised by the production path (not a hand-written mirror).
+pub(crate) fn classify_queued_delivery(
+    delivered_ok: bool,
+    pane_known: bool,
+    target_is_current: bool,
+) -> QueuedDeliveryOutcome {
+    if delivered_ok {
+        return QueuedDeliveryOutcome::MarkProcessed;
+    }
+    if pane_known {
+        // Pane exists — the failure is transient; retry next tick.
+        return QueuedDeliveryOutcome::Retry;
+    }
+    // Pane not found: retry while the target is still a live session member
+    // (it may be mid-spawn); otherwise abandon so the queue can't wedge.
+    if target_is_current {
+        QueuedDeliveryOutcome::Retry
+    } else {
+        QueuedDeliveryOutcome::Abandon
+    }
+}
+
 /// Whether a message to `harness` must clear the PTY pane-readiness gate before
 /// injection. True exactly when the message is PTY-delivered — i.e. for every
 /// Codex recipient (even under teams) and for everyone in a non-teams factory.
@@ -100,8 +156,23 @@ pub(crate) fn pty_payload_needs_framing(harness: SupervisorCli) -> bool {
 /// Emits exactly `Message from <sender>: <text>` — no summary interpolation before
 /// the colon — because the Codex prompt (cas-83c8) matches on that literal prefix.
 /// `source` is the human-readable sender name ("supervisor" or a worker name).
-fn attribute_for_pty(source: &str, text: &str) -> String {
+pub(crate) fn attribute_for_pty(source: &str, text: &str) -> String {
     format!("Message from {source}: {text}")
+}
+
+/// Apply the shared Codex sender framing when the recipient needs it.
+///
+/// Used by both normal `deliver_to_worker` PTY injection and the urgent
+/// interrupt-and-inject paths (direct + `all_workers` + ClientMessage::Inject).
+/// Urgent delivery previously skipped this helper, so Codex recipients saw bare
+/// text that their prompt contract does not recognise as an actionable message
+/// (cas-ab80). Claude/Grok payloads stay byte-for-byte unchanged.
+pub(crate) fn frame_pty_payload(harness: SupervisorCli, source: &str, text: &str) -> String {
+    if pty_payload_needs_framing(harness) {
+        attribute_for_pty(source, text)
+    } else {
+        text.to_string()
+    }
 }
 
 impl FactoryDaemon {
@@ -159,20 +230,13 @@ impl FactoryDaemon {
                 // recipient always gets the literal `Message from <sender>: ` prefix
                 // its prompt keys on (even codex-only, teams=None); a Claude
                 // recipient reached via the PTY fallback stays byte-for-byte bare.
-                if pty_payload_needs_framing(harness) {
-                    let framed = attribute_for_pty(source, text);
-                    self.app
-                        .mux
-                        .inject(pane_target, &framed)
-                        .await
-                        .map_err(Into::into)
-                } else {
-                    self.app
-                        .mux
-                        .inject(pane_target, text)
-                        .await
-                        .map_err(Into::into)
-                }
+                // Shared helper also used by urgent interrupt-and-inject (cas-ab80).
+                let payload = frame_pty_payload(harness, source, text);
+                self.app
+                    .mux
+                    .inject(pane_target, &payload)
+                    .await
+                    .map_err(Into::into)
             }
         }
     }
@@ -244,6 +308,53 @@ mod tests {
         assert!(!pty_payload_needs_framing(SupervisorCli::Grok));
     }
 
+    /// cas-6257: the queue-bookkeeping contract. A successful handoff marks the
+    /// row processed; a FAILED handoff never does — it is retryable while the
+    /// target is live, or abandoned only when the target is gone.
+    #[test]
+    fn queued_delivery_marks_processed_only_after_successful_handoff() {
+        // Success → always MarkProcessed regardless of pane/current flags.
+        for pane_known in [true, false] {
+            for is_current in [true, false] {
+                assert_eq!(
+                    classify_queued_delivery(true, pane_known, is_current),
+                    QueuedDeliveryOutcome::MarkProcessed,
+                    "successful handoff must mark processed (pane_known={pane_known}, current={is_current})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn queued_delivery_failure_to_known_pane_is_retryable() {
+        // Inbox write / PTY inject failed but the pane exists → retry, never
+        // mark processed (the core "don't falsely advance processed_at" rule).
+        assert_eq!(
+            classify_queued_delivery(false, true, true),
+            QueuedDeliveryOutcome::Retry
+        );
+        assert_eq!(
+            classify_queued_delivery(false, true, false),
+            QueuedDeliveryOutcome::Retry
+        );
+    }
+
+    #[test]
+    fn queued_delivery_failure_to_unknown_pane_retries_only_while_current() {
+        // Pane gone but target is still a current session member (mid-spawn) →
+        // retry so its first message isn't lost.
+        assert_eq!(
+            classify_queued_delivery(false, false, true),
+            QueuedDeliveryOutcome::Retry
+        );
+        // Pane gone and target is not in this session → abandon so a stale
+        // cross-session row cannot wedge the queue forever.
+        assert_eq!(
+            classify_queued_delivery(false, false, false),
+            QueuedDeliveryOutcome::Abandon
+        );
+    }
+
     #[test]
     fn attribution_uses_literal_sender_prefix() {
         // Exactly `Message from <sender>: <text>` — the string the codex prompt
@@ -255,6 +366,34 @@ mod tests {
         assert_eq!(
             attribute_for_pty("worker-3", "start cas-1234"),
             "Message from worker-3: start cas-1234"
+        );
+    }
+
+    /// cas-ab80: urgent Codex delivery must use the same framing contract as
+    /// normal PTY delivery. The shared helper is what both paths call.
+    #[test]
+    fn frame_pty_payload_frames_codex_with_sender_prefix() {
+        assert_eq!(
+            frame_pty_payload(SupervisorCli::Codex, "supervisor", "stop and re-close"),
+            "Message from supervisor: stop and re-close"
+        );
+        assert_eq!(
+            frame_pty_payload(SupervisorCli::Codex, "worker-2", "blocker: need merge"),
+            "Message from worker-2: blocker: need merge"
+        );
+    }
+
+    /// cas-ab80: Claude and Grok stay bare under urgent and normal paths alike.
+    #[test]
+    fn frame_pty_payload_leaves_claude_and_grok_unframed() {
+        let text = "urgent: drop what you are doing";
+        assert_eq!(
+            frame_pty_payload(SupervisorCli::Claude, "supervisor", text),
+            text
+        );
+        assert_eq!(
+            frame_pty_payload(SupervisorCli::Grok, "supervisor", text),
+            text
         );
     }
 }

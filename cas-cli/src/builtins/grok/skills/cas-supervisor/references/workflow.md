@@ -102,6 +102,13 @@ base branch ────────────────────► (sta
                └─ factory/owl ┘
 ```
 
+**Worker hits MERGE REQUIRED / `awaiting_merge` (cas-c145):**
+1. This is a **push signal**, not optional chat. Drain the merge queue before free-form user replies.
+2. Confirm: `cas__coordination action=epic_status id=<focused-epic>` and/or `cas__task action=list status=awaiting_merge`.
+3. Merge `factory/<worker>` into the epic branch (FF preferred; else `git merge --no-ff factory/<worker>` on the epic checkout). Push if remote tracking applies.
+4. Message the worker to re-close (`cas__task action=close id=<task-id>`). After merge, normal close/review flow resumes.
+5. Then clear context / hand the worker their next task. Do **not** poll for merge state.
+
 **Worker completes a task:**
 1. Worker closes their own task
 2. Review changes in the worker worktree: `git -C .cas/worktrees/<worker> log --oneline main..HEAD`

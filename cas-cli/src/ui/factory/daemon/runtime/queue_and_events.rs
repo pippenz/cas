@@ -197,9 +197,15 @@ impl FactoryDaemon {
         // session running in the same project directory.
         let supervisor_name = self.app.supervisor_name().to_string();
         let worker_names = self.app.worker_names().to_vec();
-        let mut targets: Vec<&str> = Vec::with_capacity(worker_names.len() + 2);
+        // cas-73c8: include `director` so outbound replies to the permanent
+        // team director member are delivered (write_to_inbox / PTY), matching
+        // inbound director → agent delivery. Without this, messages queued
+        // to target=director sat forever while registration reported them
+        // as "not yet registered".
+        let mut targets: Vec<&str> = Vec::with_capacity(worker_names.len() + 3);
         targets.push(&supervisor_name);
         targets.push("all_workers");
+        targets.push(super::teams::DIRECTOR_AGENT_NAME);
         for w in &worker_names {
             targets.push(w.as_str());
         }
@@ -216,8 +222,11 @@ impl FactoryDaemon {
             // and `queued.created_at` is the queue→deliver latency, which
             // is what the P99 SLO targets. Logged at debug; enable via
             // `RUST_LOG=cas::coordination=debug`.
+            // cas-2c5f: stamp selected_at so message_status can report the
+            // Selected stage (authoritative daemon observation).
             let now = chrono::Utc::now();
             for queued in &prompts {
+                let _ = queue.record_selected(queued.id);
                 let wait_ms = (now - queued.created_at).num_milliseconds();
                 tracing::debug!(
                     target: "cas::coordination",
@@ -269,7 +278,8 @@ impl FactoryDaemon {
                     target = %queued.target,
                     "Dropping message from dead worker"
                 );
-                let _ = queue.mark_processed(queued.id);
+                // cas-2c5f: not transport delivery — structured stage=dropped.
+                let _ = queue.mark_dropped(queued.id, Some("source worker is dead/shut down"));
                 continue;
             }
 
@@ -283,17 +293,24 @@ impl FactoryDaemon {
                 let dominated = self
                     .last_idle_message_times
                     .get(&queued.source)
-                    .is_some_and(|last| now.duration_since(*last) < std::time::Duration::from_secs(300));
+                    .is_some_and(|last| {
+                        now.duration_since(*last) < std::time::Duration::from_secs(300)
+                    });
                 if dominated {
                     tracing::debug!(
                         prompt_id = queued.id,
                         source = %queued.source,
                         "Suppressing duplicate idle message (rate-limited to 5min)"
                     );
-                    let _ = queue.mark_processed(queued.id);
+                    // cas-2c5f: not transport delivery — structured stage=suppressed.
+                    let _ = queue.mark_suppressed(
+                        queued.id,
+                        Some("duplicate idle message rate-limited (5min)"),
+                    );
                     continue;
                 }
-                self.last_idle_message_times.insert(queued.source.clone(), now);
+                self.last_idle_message_times
+                    .insert(queued.source.clone(), now);
             }
 
             // Skip PTY injection for native extension agents that use plain PTY mode —
@@ -333,6 +350,12 @@ impl FactoryDaemon {
                             )));
                 if pty_delivered && !self.app.mux.pane_ready_for_injection(pane_target) {
                     // Don't ack — the prompt stays in the queue for the next tick.
+                    // cas-2c5f: durable pending reason for message_status.
+                    let _ = queue.record_pending_reason(
+                        queued.id,
+                        cas_store::PendingReason::GatedNotReady,
+                        Some("pane not ready for injection"),
+                    );
                     continue;
                 }
             }
@@ -393,6 +416,8 @@ impl FactoryDaemon {
 
             let mut success = false;
             if target == "all_workers" {
+                // cas-2c5f: truthful broadcast outcomes — never stamp full
+                // Delivered on any_success. Count intended/succeeded/failed.
                 let workers: Vec<String> = self
                     .app
                     .worker_names()
@@ -404,21 +429,42 @@ impl FactoryDaemon {
                     .cloned()
                     .collect();
                 tracing::info!("all_workers target, workers: {:?}", workers);
-                if workers.is_empty() {
+                let attempted = workers.len() as u32;
+                if attempted == 0 {
+                    let _ = queue.mark_broadcast_outcome(
+                        queued.id,
+                        0,
+                        0,
+                        0,
+                        Some("no non-native workers for all_workers broadcast"),
+                    );
                     continue;
                 }
-                let mut any_success = false;
-                for name in workers {
+                let mut succeeded: u32 = 0;
+                let mut failed: u32 = 0;
+                let mut fail_notes: Vec<String> = Vec::new();
+                for name in &workers {
                     // For urgent broadcasts, skip workers whose pane isn't ready
-                    // yet (don't ack the row — it stays queued for retry).
-                    if queued.urgent && !self.app.mux.pane_ready_for_injection(&name) {
+                    // yet — count as failed for this tick (not full delivery).
+                    if queued.urgent && !self.app.mux.pane_ready_for_injection(name) {
+                        failed += 1;
+                        fail_notes.push(format!("{name}: pane not ready"));
                         continue;
                     }
                     let inject_result: anyhow::Result<()> = if queued.urgent {
-                        let settle = self.urgent_settle_duration(&name);
+                        // cas-ab80: urgent Codex recipients still need the shared
+                        // `Message from <sender>:` framing (same contract as
+                        // normal `deliver_to_worker`); Claude/Grok stay bare.
+                        let harness = self.app.harness_for(name);
+                        let payload = super::delivery::frame_pty_payload(
+                            harness,
+                            &inbox_source,
+                            &prompt_with_instructions,
+                        );
+                        let settle = self.urgent_settle_duration(name);
                         self.app
                             .mux
-                            .interrupt_and_inject(&name, &prompt_with_instructions, settle)
+                            .interrupt_and_inject(name, &payload, settle)
                             .await
                             .map_err(Into::into)
                     } else {
@@ -427,7 +473,7 @@ impl FactoryDaemon {
                         // color=None: peer/supervisor senders; team manager resolves
                         // configured color from the sender's team record.
                         self.deliver_to_worker(
-                            &name,
+                            name,
                             &inbox_source,
                             &prompt_with_instructions,
                             queued.summary.as_deref(),
@@ -437,7 +483,7 @@ impl FactoryDaemon {
                     };
                     match inject_result {
                         Ok(_) => {
-                            any_success = true;
+                            succeeded += 1;
                             tracing::info!("Injected to worker '{}'", name);
                             if let Some(ref store) = event_store {
                                 record_injection(
@@ -445,13 +491,15 @@ impl FactoryDaemon {
                                     queued.id,
                                     &queued.source,
                                     &queued.target,
-                                    &name,
+                                    name,
                                     "ok",
                                     None,
                                 );
                             }
                         }
                         Err(e) => {
+                            failed += 1;
+                            fail_notes.push(format!("{name}: {e}"));
                             tracing::error!("Failed to inject to '{}': {}", name, e);
                             if let Some(ref store) = event_store {
                                 record_injection(
@@ -459,7 +507,7 @@ impl FactoryDaemon {
                                     queued.id,
                                     &queued.source,
                                     &queued.target,
-                                    &name,
+                                    name,
                                     "error",
                                     Some(e.to_string()),
                                 );
@@ -467,7 +515,26 @@ impl FactoryDaemon {
                         }
                     }
                 }
-                success = any_success;
+                let detail = if fail_notes.is_empty() {
+                    None
+                } else {
+                    Some(fail_notes.join("; "))
+                };
+                if let Err(e) = queue.mark_broadcast_outcome(
+                    queued.id,
+                    attempted,
+                    succeeded,
+                    failed,
+                    detail.as_deref(),
+                ) {
+                    tracing::error!(
+                        "Failed to stamp broadcast outcome for prompt {}: {}",
+                        queued.id,
+                        e
+                    );
+                }
+                // Do not fall through to mark_transport_delivered — outcome already stamped.
+                continue;
             } else {
                 // Resolve the pane name for diagnostics / event records. Delivery
                 // itself (channel selection + name normalisation) is handled by the
@@ -482,6 +549,14 @@ impl FactoryDaemon {
                     // bypassing the inbox even in teams mode. Break the turn
                     // (Esc), wait the bounded settle window for the turn to
                     // actually break, then inject.
+                    // cas-ab80: apply shared Codex framing before inject so
+                    // urgent direct delivery matches normal PTY framing.
+                    let harness = self.app.harness_for(pane_target);
+                    let payload = super::delivery::frame_pty_payload(
+                        harness,
+                        &inbox_source,
+                        &prompt_with_instructions,
+                    );
                     let settle = self.urgent_settle_duration(pane_target);
                     tracing::info!(
                         target: "cas::coordination",
@@ -493,7 +568,7 @@ impl FactoryDaemon {
                     );
                     self.app
                         .mux
-                        .interrupt_and_inject(pane_target, &prompt_with_instructions, settle)
+                        .interrupt_and_inject(pane_target, &payload, settle)
                         .await
                         .map_err(Into::into)
                 } else {
@@ -517,8 +592,8 @@ impl FactoryDaemon {
                         // measured from the sender-assigned `created_at` to
                         // the moment the daemon completed the inbox write.
                         // This is the number the P99 SLO tracks.
-                        let deliver_ms = (chrono::Utc::now() - queued.created_at)
-                            .num_milliseconds();
+                        let deliver_ms =
+                            (chrono::Utc::now() - queued.created_at).num_milliseconds();
                         tracing::info!(
                             target: "cas::coordination",
                             stage = "delivered",
@@ -542,82 +617,133 @@ impl FactoryDaemon {
                         }
                     }
                     Err(e) => {
-                        if self.app.mux.get(pane_target).is_none() {
-                            // Pane not found — only retry if target is a known
-                            // worker/supervisor in this session (it may still be spawning).
-                            // Stale messages for workers from previous sessions would
-                            // otherwise block the queue forever (peek_all has a limit).
-                            let is_current =
-                                self.app.worker_names().contains(&pane_target.to_string())
-                                    || pane_target == self.app.supervisor_name();
-                            if is_current {
-                                continue;
+                        // cas-6257 + cas-2c5f: centralised bookkeeping via
+                        // classify_queued_delivery — a FAILED handoff is never
+                        // marked processed/transport-delivered. It is retryable
+                        // while the target is a live/known session member
+                        // (transient inbox/PTY failure, or the pane is still
+                        // spawning), and abandoned only when the target is not a
+                        // pane in this session and not a current worker/supervisor.
+                        // `success` stays false in the retry cases so the row is
+                        // left pending (processed_at not advanced). The structured
+                        // cas-2c5f status (pending reason / abandoned) is stamped
+                        // alongside so message_status stays truthful about *why* a
+                        // row is still pending.
+                        let pane_known = self.app.mux.get(pane_target).is_some();
+                        let target_is_current =
+                            self.app.worker_names().contains(&pane_target.to_string())
+                                || pane_target == self.app.supervisor_name();
+                        match super::delivery::classify_queued_delivery(
+                            false,
+                            pane_known,
+                            target_is_current,
+                        ) {
+                            super::delivery::QueuedDeliveryOutcome::MarkProcessed => {
+                                // Unreachable for delivered_ok=false, but handle
+                                // defensively: leave the row pending rather than
+                                // falsely advancing processed_at on a failed write.
                             }
-                            tracing::warn!(
-                                prompt_id = queued.id,
-                                target = pane_target,
-                                source = %queued.source,
-                                "Abandoning queued prompt for unknown target — \
-                                 message will not be delivered"
-                            );
-                            let _ = queue.mark_processed(queued.id);
-
-                            // Record the drop and notify the supervisor so the
-                            // message isn't silently lost.
-                            if let Some(ref store) = event_store {
-                                record_injection(
-                                    store,
+                            super::delivery::QueuedDeliveryOutcome::Retry => {
+                                if pane_known {
+                                    // Pane exists — transient adapter failure;
+                                    // record it and leave the row pending for the
+                                    // next tick.
+                                    tracing::error!("Failed to inject to '{}': {}", pane_target, e);
+                                    // cas-2c5f: adapter failure leaves row pending for retry.
+                                    let _ = queue.record_pending_reason(
+                                        queued.id,
+                                        cas_store::PendingReason::AdapterRetryable,
+                                        Some(&e.to_string()),
+                                    );
+                                    if let Some(ref store) = event_store {
+                                        record_injection(
+                                            store,
+                                            queued.id,
+                                            &queued.source,
+                                            &queued.target,
+                                            pane_target,
+                                            "error",
+                                            Some(e.to_string()),
+                                        );
+                                    }
+                                } else {
+                                    // Pane missing but the target is still a current
+                                    // session member (mid-spawn) — bare retry.
+                                    // cas-2c5f: known target still spawning — retryable unavail.
+                                    let _ = queue.record_pending_reason(
+                                        queued.id,
+                                        cas_store::PendingReason::TargetUnavailable,
+                                        Some("pane missing; target is current session member"),
+                                    );
+                                }
+                            }
+                            super::delivery::QueuedDeliveryOutcome::Abandon => {
+                                // Pane not found and not a current worker/supervisor.
+                                // Stale messages for workers from previous sessions
+                                // would otherwise block the queue forever (peek_all
+                                // has a limit), so consume the row and re-route its
+                                // content to the supervisor.
+                                tracing::warn!(
+                                    prompt_id = queued.id,
+                                    target = pane_target,
+                                    source = %queued.source,
+                                    "Abandoning queued prompt for unknown target — \
+                                     message will not be delivered"
+                                );
+                                // cas-2c5f: not transport delivery — structured stage=abandoned.
+                                let _ = queue.mark_abandoned(
                                     queued.id,
-                                    &queued.source,
-                                    &queued.target,
-                                    pane_target,
-                                    "abandoned",
-                                    Some(format!(
-                                        "Target '{}' not found in current session",
-                                        pane_target
+                                    Some(&format!(
+                                        "target '{pane_target}' not found in current session"
                                     )),
                                 );
+
+                                // Record the drop and notify the supervisor so the
+                                // message isn't silently lost.
+                                if let Some(ref store) = event_store {
+                                    record_injection(
+                                        store,
+                                        queued.id,
+                                        &queued.source,
+                                        &queued.target,
+                                        pane_target,
+                                        "abandoned",
+                                        Some(format!(
+                                            "Target '{}' not found in current session",
+                                            pane_target
+                                        )),
+                                    );
+                                }
+
+                                // Re-queue to supervisor so the message content isn't
+                                // lost. The supervisor can then re-assign or re-send.
+                                let notice = format!(
+                                    "<system-notice>\n\
+                                     Undelivered message from '{}' to '{}' (target not in session):\n\n\
+                                     {}\n\
+                                     </system-notice>",
+                                    queued.source, pane_target, &queued.prompt
+                                );
+                                let _ = queue.enqueue_with_session(
+                                    super::teams::DIRECTOR_AGENT_NAME,
+                                    self.app.supervisor_name(),
+                                    &notice,
+                                    &self.session_name,
+                                );
                             }
-
-                            // Re-queue to supervisor so the message content isn't lost.
-                            // The supervisor can then re-assign the task or re-send.
-                            let notice = format!(
-                                "<system-notice>\n\
-                                 Undelivered message from '{}' to '{}' (target not in session):\n\n\
-                                 {}\n\
-                                 </system-notice>",
-                                queued.source,
-                                pane_target,
-                                &queued.prompt
-                            );
-                            let _ = queue.enqueue_with_session(
-                                super::teams::DIRECTOR_AGENT_NAME,
-                                self.app.supervisor_name(),
-                                &notice,
-                                &self.session_name,
-                            );
-
-                            continue;
-                        }
-                        tracing::error!("Failed to inject to '{}': {}", pane_target, e);
-                        if let Some(ref store) = event_store {
-                            record_injection(
-                                store,
-                                queued.id,
-                                &queued.source,
-                                &queued.target,
-                                pane_target,
-                                "error",
-                                Some(e.to_string()),
-                            );
                         }
                     }
                 }
             }
 
             if success {
-                if let Err(e) = queue.mark_processed(queued.id) {
-                    tracing::error!("Failed to mark prompt {} as processed: {}", queued.id, e);
+                // cas-2c5f: authoritative transport handoff only.
+                if let Err(e) = queue.mark_transport_delivered(queued.id) {
+                    tracing::error!(
+                        "Failed to mark prompt {} as transport-delivered: {}",
+                        queued.id,
+                        e
+                    );
                 }
             }
         }
@@ -720,7 +846,31 @@ impl FactoryDaemon {
                 self.spawn_task.take().unwrap();
             // Remove from pending workers (boot pane transitions to real pane or disappears)
             self.app.remove_pending_worker(&pending_name);
+            // cas-7a94: if this worker was cancelled via shutdown while the
+            // isolate worktree was still building, drop the result and release
+            // any early pre-assign so the task is not stuck on a never-started
+            // worker.
+            let cancelled = self.dead_workers.contains(&pending_name);
             match handle.await {
+                Ok(Ok(_result)) if cancelled => {
+                    tracing::info!(
+                        worker = %pending_name,
+                        "cas-7a94: spawn finished after shutdown cancel — discarding pane, releasing pre-assign"
+                    );
+                    if let Some(ref task_id) = pending_task_id {
+                        crate::ui::factory::app::render_and_ops::epic_workers::release_preassign_if_bound(
+                            self.app.cas_dir(),
+                            task_id,
+                            &pending_name,
+                        );
+                    }
+                    crate::ui::factory::app::render_and_ops::epic_workers::release_worker_task_bindings(
+                        self.app.cas_dir(),
+                        &pending_name,
+                    );
+                    // Do not call finish_worker_spawn — the worktree (if any) is
+                    // left for the reaper; no PTY pane is registered.
+                }
                 Ok(Ok(result)) => {
                     // Build per-worker Teams config before finish_worker_spawn adds to worker list
                     let worker_name_for_teams = result.worker_name.clone();
@@ -738,10 +888,13 @@ impl FactoryDaemon {
                     if let Some(ref tc) = teams_config {
                         crate::ui::theme::register_agent_color(&tc.agent_name, &tc.agent_color);
                     }
-                    match self
-                        .app
-                        .finish_worker_spawn(result, teams_config, pending_spec, pending_task_id)
-                    {
+                    let task_id_for_finish = pending_task_id.clone();
+                    match self.app.finish_worker_spawn(
+                        result,
+                        teams_config,
+                        pending_spec,
+                        task_id_for_finish,
+                    ) {
                         Ok(name) => {
                             tracing::info!("Spawned worker (async): {}", name);
                             // A worker may reuse a retired name (e.g. a Codex worker
@@ -790,6 +943,15 @@ impl FactoryDaemon {
                                     ("reason", "finish_worker_spawn_failed"),
                                 ],
                             );
+                            // cas-7a94: early pre-assign may have bound the task —
+                            // release so a failed finish cannot leave a ghost assignee.
+                            if let Some(ref task_id) = pending_task_id {
+                                crate::ui::factory::app::render_and_ops::epic_workers::release_preassign_if_bound(
+                                    self.app.cas_dir(),
+                                    task_id,
+                                    &pending_name,
+                                );
+                            }
                             self.app.set_error(format!("Failed to finish spawn: {e}"));
                         }
                     }
@@ -799,6 +961,14 @@ impl FactoryDaemon {
                         "factory_worker_spawn_result",
                         vec![("success", "false"), ("reason", "background_spawn_failed")],
                     );
+                    // cas-7a94: isolate worktree failed after early pre-assign.
+                    if let Some(ref task_id) = pending_task_id {
+                        crate::ui::factory::app::render_and_ops::epic_workers::release_preassign_if_bound(
+                            self.app.cas_dir(),
+                            task_id,
+                            &pending_name,
+                        );
+                    }
                     self.app.set_error(format!("Failed to spawn worker: {e}"));
                 }
                 Err(e) => {
@@ -806,6 +976,13 @@ impl FactoryDaemon {
                         "factory_worker_spawn_result",
                         vec![("success", "false"), ("reason", "spawn_task_panicked")],
                     );
+                    if let Some(ref task_id) = pending_task_id {
+                        crate::ui::factory::app::render_and_ops::epic_workers::release_preassign_if_bound(
+                            self.app.cas_dir(),
+                            task_id,
+                            &pending_name,
+                        );
+                    }
                     self.app.set_error(format!("Spawn task panicked: {e}"));
                 }
             }
@@ -828,6 +1005,18 @@ impl FactoryDaemon {
                 match self.app.prepare_worker_spawn(None, isolate) {
                     Ok(prep) => {
                         let worker_name = prep.worker_name.clone();
+                        // cas-7a94: bind task_id as soon as the worker name is
+                        // known — before the isolate worktree finishes — so
+                        // codex+isolate async gaps cannot skip pre-assign.
+                        // finish_worker_spawn confirms; failure/cancel paths
+                        // release via release_preassign_if_bound.
+                        if let Some(ref tid) = task_id {
+                            let _ = crate::ui::factory::app::render_and_ops::epic_workers::assign_task_to_new_worker(
+                                self.app.cas_dir(),
+                                tid,
+                                &worker_name,
+                            );
+                        }
                         self.app.add_pending_worker(worker_name.clone(), isolate);
                         self.spawn_task = Some((
                             worker_name,
@@ -858,6 +1047,14 @@ impl FactoryDaemon {
                 match self.app.prepare_worker_spawn(Some(&name), isolate) {
                     Ok(prep) => {
                         let worker_name = prep.worker_name.clone();
+                        // cas-7a94: early pre-assign once name is final (see Anonymous).
+                        if let Some(ref tid) = task_id {
+                            let _ = crate::ui::factory::app::render_and_ops::epic_workers::assign_task_to_new_worker(
+                                self.app.cas_dir(),
+                                tid,
+                                &worker_name,
+                            );
+                        }
                         self.app.add_pending_worker(worker_name.clone(), isolate);
                         self.spawn_task = Some((
                             worker_name,
@@ -897,14 +1094,73 @@ impl FactoryDaemon {
                         self.app.worker_names().iter().take(c).cloned().collect()
                     }
                 };
+
+                // cas-7a94: drop still-queued spawns for these names and release
+                // any early pre-assigns so "shutdown before boot finishes" cannot
+                // leave Open/InProgress ghosts on never-started workers.
+                {
+                    let stop_set: std::collections::HashSet<&str> =
+                        workers_to_stop.iter().map(String::as_str).collect();
+                    let cancel_all = names.is_empty() && count.unwrap_or(0) == 0;
+                    let mut kept = std::collections::VecDeque::new();
+                    while let Some(pending) = self.pending_spawns.pop_front() {
+                        match pending {
+                            PendingSpawn::Named {
+                                name,
+                                isolate,
+                                spec,
+                                task_id,
+                            } if cancel_all || stop_set.contains(name.as_str()) => {
+                                if let Some(ref tid) = task_id {
+                                    crate::ui::factory::app::render_and_ops::epic_workers::release_preassign_if_bound(
+                                        self.app.cas_dir(),
+                                        tid,
+                                        &name,
+                                    );
+                                }
+                                crate::ui::factory::app::render_and_ops::epic_workers::release_worker_task_bindings(
+                                    self.app.cas_dir(),
+                                    &name,
+                                );
+                                self.app.spawning_count = self.app.spawning_count.saturating_sub(1);
+                                tracing::info!(
+                                    worker = %name,
+                                    "cas-7a94: cancelled pending spawn on shutdown — released pre-assign"
+                                );
+                                let _ = (isolate, spec); // consumed
+                            }
+                            PendingSpawn::Anonymous {
+                                isolate,
+                                spec,
+                                task_id,
+                            } if cancel_all => {
+                                // Anonymous names are only known once prepare runs;
+                                // if still in the queue, no early assign has fired yet.
+                                let _ = (isolate, spec, task_id);
+                                self.app.spawning_count = self.app.spawning_count.saturating_sub(1);
+                            }
+                            other => kept.push_back(other),
+                        }
+                    }
+                    self.pending_spawns = kept;
+                }
+
                 if self.app.record_enabled() {
                     for name in &workers_to_stop {
                         let _ = self.app.stop_recording_for_pane(name).await;
                     }
                 }
                 // Track shut-down workers so their queued messages are dropped
+                // and any in-flight isolate spawn is discarded on completion.
                 for name in &workers_to_stop {
                     self.dead_workers.insert(name.clone());
+                    // Also release bindings for workers that never made it into
+                    // worker_names (early pre-assign only) — shutdown_worker
+                    // only runs for live workers.
+                    crate::ui::factory::app::render_and_ops::epic_workers::release_worker_task_bindings(
+                        self.app.cas_dir(),
+                        name,
+                    );
                 }
                 if let Err(e) = self.app.shutdown_workers(count, &names, force) {
                     let target = if !names.is_empty() {
@@ -1070,6 +1326,14 @@ impl FactoryDaemon {
             };
 
             for reminder in &candidates {
+                // cas-fcd4: only fire reminds registered in this factory session
+                // (shared cas.db otherwise cross-fires concurrent sessions).
+                if !reminder_matches_factory_session(
+                    reminder.session_id.as_deref(),
+                    &self.session_name,
+                ) {
+                    continue;
+                }
                 if matches_event_filter(reminder, event) {
                     fire_reminder(
                         reminder,
@@ -1286,11 +1550,28 @@ fn fire_reminder(
     }
 }
 
+/// Whether this factory daemon session may fire the reminder (cas-fcd4).
+///
+/// Reminders registered with a non-empty `session_id` only fire when the
+/// processing daemon's session name matches. Legacy / non-factory reminds
+/// (`session_id` unset) still fire in any session so single-session behavior
+/// is unchanged.
+pub(crate) fn reminder_matches_factory_session(
+    reminder_session_id: Option<&str>,
+    current_session: &str,
+) -> bool {
+    match reminder_session_id.map(str::trim).filter(|s| !s.is_empty()) {
+        None => true,
+        Some(sid) => sid == current_session,
+    }
+}
+
 /// Check if a reminder's event filter matches a detected DirectorEvent.
 ///
 /// Uses JSON subset matching: every key-value in the filter must appear
 /// in the event's JSON representation. An empty or missing filter matches
-/// any event of the correct type.
+/// any event of the correct type (after session scoping — see
+/// [`reminder_matches_factory_session`]).
 fn matches_event_filter(
     reminder: &cas_store::Reminder,
     event: &crate::ui::factory::director::DirectorEvent,
@@ -1322,10 +1603,79 @@ fn is_exact_agent_name_match(agent: &AgentSummary, worker_name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_exact_agent_name_match;
+    use super::{
+        is_exact_agent_name_match, matches_event_filter, reminder_matches_factory_session,
+    };
     use crate::ui::factory::daemon::FactoryDaemon;
-    use crate::ui::factory::director::AgentSummary;
+    use crate::ui::factory::director::{AgentSummary, DirectorEvent};
     use cas_types::AgentStatus;
+
+    // -----------------------------------------------------------------------
+    // cas-fcd4: event remind session scoping
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn reminder_session_scope_blocks_foreign_factory_session() {
+        assert!(
+            !reminder_matches_factory_session(Some("session-a"), "session-b"),
+            "session A remind must not fire in session B"
+        );
+        assert!(
+            reminder_matches_factory_session(Some("session-a"), "session-a"),
+            "same-session must match"
+        );
+    }
+
+    #[test]
+    fn reminder_session_scope_legacy_none_matches_any_session() {
+        // Single-session / pre-cas-fcd4 rows keep working.
+        assert!(reminder_matches_factory_session(None, "session-a"));
+        assert!(reminder_matches_factory_session(None, "session-b"));
+        assert!(reminder_matches_factory_session(Some(""), "session-a"));
+        assert!(reminder_matches_factory_session(Some("  "), "session-b"));
+    }
+
+    #[test]
+    fn matches_event_filter_task_id_still_works() {
+        let reminder = cas_store::Reminder {
+            id: 1,
+            owner_id: "owner".into(),
+            target_id: "owner".into(),
+            message: "review".into(),
+            trigger_type: cas_store::ReminderTriggerType::Event,
+            trigger_at: None,
+            trigger_event: Some("task_completed".into()),
+            trigger_filter: Some(serde_json::json!({"task_id": "cas-keep"})),
+            status: cas_store::ReminderStatus::Pending,
+            ttl_secs: 3600,
+            created_at: chrono::Utc::now(),
+            fired_at: None,
+            cancelled_at: None,
+            fired_event: None,
+            session_id: Some("session-a".into()),
+        };
+        let match_event = DirectorEvent::TaskCompleted {
+            task_id: "cas-keep".into(),
+            task_title: "Keep".into(),
+            worker: "worker-1".into(),
+        };
+        let other_event = DirectorEvent::TaskCompleted {
+            task_id: "cas-other".into(),
+            task_title: "Other".into(),
+            worker: "worker-2".into(),
+        };
+        assert!(matches_event_filter(&reminder, &match_event));
+        assert!(!matches_event_filter(&reminder, &other_event));
+        // Session gate is separate: filter alone still matches; session blocks foreign.
+        assert!(reminder_matches_factory_session(
+            reminder.session_id.as_deref(),
+            "session-a"
+        ));
+        assert!(!reminder_matches_factory_session(
+            reminder.session_id.as_deref(),
+            "session-b"
+        ));
+    }
 
     #[test]
     fn test_agent_match_is_exact_not_substring() {
@@ -1367,7 +1717,11 @@ mod tests {
 
         // A live worker was respawned into the same name → NOT dead, must deliver.
         let live = vec!["backend-admin".to_string(), "frontend-dry".to_string()];
-        assert!(!FactoryDaemon::source_is_dead(&dead, &live, "backend-admin"));
+        assert!(!FactoryDaemon::source_is_dead(
+            &dead,
+            &live,
+            "backend-admin"
+        ));
         assert!(!FactoryDaemon::source_is_dead(&dead, &live, "frontend-dry"));
 
         // A source never in the dead set (external sender / fresh worker) passes.
@@ -1387,7 +1741,9 @@ mod tests {
         assert!(FactoryDaemon::is_idle_message("No task assigned."));
         // Case-insensitive and leading whitespace tolerant.
         assert!(FactoryDaemon::is_idle_message("  STANDING BY."));
-        assert!(FactoryDaemon::is_idle_message("standing by for further direction"));
+        assert!(FactoryDaemon::is_idle_message(
+            "standing by for further direction"
+        ));
     }
 
     /// Regression for cas-f9e8: the old unanchored substring filter silently

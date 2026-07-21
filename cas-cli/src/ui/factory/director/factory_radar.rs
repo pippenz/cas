@@ -699,8 +699,9 @@ mod tests {
             epic: None,
             branch: None,
             updated_at: None,
+        epic_verification_owner: None,
         }
-    }
+        }
 
     fn data_with_unrelated_epic() -> DirectorData {
         DirectorData {
@@ -714,7 +715,8 @@ mod tests {
                 epic: Some("cas-foreign".to_string()),
                 branch: None,
                 updated_at: None,
-            }],
+            epic_verification_owner: None,
+        }],
             in_progress_tasks: Vec::new(),
             epic_tasks: vec![task(
                 "cas-foreign",
@@ -904,7 +906,8 @@ mod tests {
                 epic: Some("cas-foreign".to_string()),
                 branch: None,
                 updated_at: None,
-            },
+            epic_verification_owner: None,
+        },
             TaskSummary {
                 id: "cas-name2".to_string(),
                 title: "Assigned by display name".to_string(),
@@ -915,7 +918,8 @@ mod tests {
                 epic: Some("cas-foreign".to_string()),
                 branch: None,
                 updated_at: None,
-            },
+            epic_verification_owner: None,
+        },
         ];
         let backend = TestBackend::new(120, 14);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -961,8 +965,9 @@ mod tests {
             epic: Some(epic.to_string()),
             branch: None,
             updated_at: None,
+        epic_verification_owner: None,
         }
-    }
+        }
 
     fn data_with_two_live_epics() -> DirectorData {
         DirectorData {

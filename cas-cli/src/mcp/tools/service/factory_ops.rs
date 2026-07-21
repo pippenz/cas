@@ -575,9 +575,44 @@ impl CasService {
                     let _ = store.revive(&agent.id);
                     continue;
                 }
+                // cas-2e81: capture held leases BEFORE mark_stale revokes them,
+                // then park orphaned InProgress tasks + emit worker_died.
+                let held: Vec<String> = store
+                    .list_agent_leases(&agent.id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|l| l.task_id)
+                    .collect();
                 if store.mark_stale(&agent.id).is_ok() {
                     stale_pruned += 1;
+                    let _ = super::orphan_recovery::recover_worker_vanished(
+                        &self.inner.cas_root,
+                        store.as_ref(),
+                        &agent,
+                        &held,
+                        "worker_status stale prune (heartbeat gone, process not alive)",
+                    );
                 }
+            }
+        }
+
+        // cas-2e81: reclaim expired leases and park tasks when the holder is
+        // already dead/stale (lease expiry alone must not silence orphans).
+        if let Ok(active_leases) = store.list_active_leases() {
+            let now = chrono::Utc::now();
+            let expired: Vec<(String, String)> = active_leases
+                .into_iter()
+                .filter(|l| l.expires_at < now)
+                .map(|l| (l.task_id, l.agent_id))
+                .collect();
+            if !expired.is_empty() {
+                let _ = store.reclaim_expired_leases();
+                let _ = super::orphan_recovery::recover_expired_leases_for_dead_holders(
+                    &self.inner.cas_root,
+                    store.as_ref(),
+                    &expired,
+                    worker_stale_threshold_secs,
+                );
             }
         }
 
@@ -593,10 +628,26 @@ impl CasService {
             .filter(|a| a.visible_to_factory_session(factory_session.as_deref()))
             .collect();
 
+        // cas-2e81: always surface recently-died-while-leased even when the
+        // Active roster is empty — "None active" must not hide a mid-P0 crash.
+        let died_section = super::orphan_recovery::format_recently_died_while_leased(
+            &self.inner.cas_root,
+            store.as_ref(),
+            factory_session.as_deref(),
+            3600, // 1h window
+        );
+
         if agents.is_empty() {
-            return Ok(Self::success(
+            let mut msg = String::from(
                 "No active agents registered.\n\nNote: Factory TUI must be running for agents to be registered.",
-            ));
+            );
+            msg.push_str(&died_section);
+            if stale_pruned > 0 {
+                msg.push_str(&format!(
+                    "\nFiltered stale agent record(s): {stale_pruned} (>{worker_stale_threshold_secs}s heartbeat age)\n"
+                ));
+            }
+            return Ok(Self::success(msg));
         }
 
         let owned = supervisor_owned_workers();
@@ -777,6 +828,9 @@ impl CasService {
                 ));
             }
         }
+
+        // cas-2e81: died-while-leased section (empty-fleet vs crash distinction).
+        output.push_str(&died_section);
 
         if stale_pruned > 0 {
             output.push_str(&format!(
@@ -1060,7 +1114,6 @@ impl CasService {
     ) -> Result<CallToolResult, McpError> {
         use crate::store::{open_agent_store, open_task_store};
         use cas_types::{AgentRole, AgentStatus, TaskStatus, TaskType};
-        use std::path::Path;
 
         let store = open_agent_store(&self.inner.cas_root).map_err(|e| {
             Self::error(
@@ -1149,23 +1202,20 @@ impl CasService {
         let mut failed = Vec::new();
 
         for worker in workers {
-            let clone_path = match worker.metadata.get("clone_path") {
-                Some(p) => p.clone(),
-                None => {
-                    skipped.push(format!("{} (missing clone_path metadata)", worker.name));
-                    continue;
-                }
-            };
-            let path = Path::new(&clone_path);
-            if !path.exists() {
-                skipped.push(format!(
-                    "{} (clone path not found: {})",
-                    worker.name, clone_path
-                ));
+            // cas-f53c: same path resolution as worker_status — do not require
+            // clone_path metadata when the convention worktree already exists
+            // (common race right after isolate spawn).
+            let resolve = resolve_worker_clone_path(&self.inner.cas_root, &worker);
+            if let Some(reason) = sync_skip_reason_for_clone_resolve(&worker.name, &resolve) {
+                skipped.push(reason);
                 continue;
             }
+            let WorkerClonePathResolve::Ready(path) = resolve else {
+                // Exhaustive: skip helper already covered NotOnDisk.
+                continue;
+            };
 
-            match sync_worker_clone(path, &sync_ref) {
+            match sync_worker_clone(&path, &sync_ref) {
                 Ok(details) => synced.push(format!("{} ({})", worker.name, details)),
                 Err(err) => failed.push(format!("{} ({})", worker.name, err)),
             }
@@ -1585,36 +1635,101 @@ struct WorkerWorktreeStatus {
     git_info: String,
 }
 
+/// cas-f53c: shared resolution for worker clone/worktree path used by both
+/// `worker_status` and `sync_all_workers`.
+///
+/// Priority when a path exists on disk:
+/// 1. `agent.metadata["clone_path"]` if present and exists
+/// 2. Convention path `{cas_root}/worktrees/{worker_name}` if it exists
+///
+/// When nothing is on disk, returns `NotOnDisk` with the best candidate path
+/// for messaging (metadata if set, else convention). Sync treats that as a
+/// **retryable** skip (registration/provisioning lag), not a success.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WorkerClonePathResolve {
+    /// Worktree path exists and is ready for git ops / status.
+    Ready(std::path::PathBuf),
+    /// No worktree on disk at metadata or convention path.
+    NotOnDisk {
+        candidate: std::path::PathBuf,
+        /// True when `clone_path` metadata was set (even if the path is missing).
+        had_metadata: bool,
+    },
+}
+
+fn resolve_worker_clone_path(
+    cas_root: &std::path::Path,
+    agent: &cas_types::Agent,
+) -> WorkerClonePathResolve {
+    let metadata_path = agent
+        .metadata
+        .get("clone_path")
+        .map(|s| std::path::PathBuf::from(s));
+    let convention_path = cas_root.join("worktrees").join(&agent.name);
+
+    if let Some(ref meta) = metadata_path {
+        if meta.exists() {
+            return WorkerClonePathResolve::Ready(meta.clone());
+        }
+    }
+    if convention_path.exists() {
+        return WorkerClonePathResolve::Ready(convention_path);
+    }
+
+    WorkerClonePathResolve::NotOnDisk {
+        candidate: metadata_path.unwrap_or(convention_path),
+        had_metadata: agent.metadata.contains_key("clone_path"),
+    }
+}
+
+/// Human-readable skip reason for `sync_all_workers` when no worktree is ready.
+/// Pure for unit testing (cas-f53c).
+fn sync_skip_reason_for_clone_resolve(
+    worker_name: &str,
+    resolve: &WorkerClonePathResolve,
+) -> Option<String> {
+    match resolve {
+        WorkerClonePathResolve::Ready(_) => None,
+        WorkerClonePathResolve::NotOnDisk {
+            candidate,
+            had_metadata: false,
+        } => Some(format!(
+            "{worker_name} (registration in progress or no worktree — retry sync after \
+             isolate spawn completes; expected path: {})",
+            candidate.display()
+        )),
+        WorkerClonePathResolve::NotOnDisk {
+            candidate,
+            had_metadata: true,
+        } => Some(format!(
+            "{worker_name} (clone path not found: {} — retry if spawn still provisioning)",
+            candidate.display()
+        )),
+    }
+}
+
 fn collect_worker_worktree_status(
     cas_root: &std::path::Path,
     agent: &cas_types::Agent,
 ) -> WorkerWorktreeStatus {
-    let metadata_clone_path = agent.metadata.get("clone_path").cloned();
-    let inferred_path = cas_root.join("worktrees").join(&agent.name);
-
-    let resolved_path = metadata_clone_path
-        .clone()
-        .filter(|path| std::path::Path::new(path).exists())
-        .or_else(|| {
-            inferred_path
-                .exists()
-                .then(|| inferred_path.display().to_string())
-        });
-
-    if let Some(clone_path) = resolved_path {
-        let gs = collect_worker_git_status(std::path::Path::new(&clone_path));
-        return WorkerWorktreeStatus {
-            clone_info: format!("\n    Clone: {clone_path}"),
-            git_info: format_worker_git_status(&gs),
-            clone_path: Some(clone_path),
-        };
-    }
-
-    let missing_path = metadata_clone_path.unwrap_or_else(|| inferred_path.display().to_string());
-    WorkerWorktreeStatus {
-        clone_info: format!("\n    Clone: {missing_path} [missing-worktree]"),
-        git_info: "\n    git: missing-worktree".to_string(),
-        clone_path: Some(missing_path),
+    match resolve_worker_clone_path(cas_root, agent) {
+        WorkerClonePathResolve::Ready(path) => {
+            let clone_path = path.display().to_string();
+            let gs = collect_worker_git_status(&path);
+            WorkerWorktreeStatus {
+                clone_info: format!("\n    Clone: {clone_path}"),
+                git_info: format_worker_git_status(&gs),
+                clone_path: Some(clone_path),
+            }
+        }
+        WorkerClonePathResolve::NotOnDisk { candidate, .. } => {
+            let missing_path = candidate.display().to_string();
+            WorkerWorktreeStatus {
+                clone_info: format!("\n    Clone: {missing_path} [missing-worktree]"),
+                git_info: "\n    git: missing-worktree".to_string(),
+                clone_path: Some(missing_path),
+            }
+        }
     }
 }
 
@@ -1942,7 +2057,8 @@ pub(crate) fn resolve_transcript(
 ) -> TranscriptResolution {
     match cli {
         cas_mux::SupervisorCli::Grok => resolve_grok_transcript(base_dir, clone_path, session_id),
-        cas_mux::SupervisorCli::Claude | cas_mux::SupervisorCli::Codex => {
+        cas_mux::SupervisorCli::Codex => resolve_codex_transcript(base_dir, clone_path, session_id),
+        cas_mux::SupervisorCli::Claude => {
             resolve_claude_transcript(base_dir, clone_path, session_id)
         }
     }
@@ -2084,6 +2200,134 @@ fn resolve_grok_transcript(
     }
 }
 
+// ---------------------------------------------------------------------------
+// cas-c655: Codex rollout resolution.
+//
+// Codex does NOT use Claude's `~/.claude/projects/<escaped-cwd>/<session>.jsonl`
+// layout. Factory workers get a CAS session id of the form
+// `codex-<name>-<uuid>` (see `PtyConfig::codex`), but on-disk rollouts live at:
+//   ~/.codex/sessions/YYYY/MM/DD/rollout-<timestamp>-<rollout-uuid>.jsonl
+// with `session_meta.payload.cwd` equal to the worker's clone_path and a
+// different rollout UUID than the CAS session id. Matching is therefore by
+// cwd (primary) and by rollout UUID substring in the filename (secondary —
+// useful only when the caller already knows the rollout id).
+// ---------------------------------------------------------------------------
+
+/// `~/.codex/sessions` — Codex CLI's per-user rollout root.
+/// `CODEX_HOME` overrides the base directory when set (mirrors Codex's own
+/// env-var convention). Returns `None` if neither resolves.
+pub(crate) fn default_codex_sessions_dir() -> Option<std::path::PathBuf> {
+    if let Ok(codex_home) = std::env::var("CODEX_HOME") {
+        return Some(std::path::PathBuf::from(codex_home).join("sessions"));
+    }
+    dirs::home_dir().map(|h| h.join(".codex").join("sessions"))
+}
+
+fn synthesized_codex_transcript_path(clone_path: &str, session_id: &str) -> String {
+    format!(
+        "~/.codex/sessions/<YYYY/MM/DD>/rollout-*-*.jsonl (cwd={clone_path}; cas_session={session_id})"
+    )
+}
+
+fn synthesized_unknown_codex_clone_path(session_id: &str) -> String {
+    format!(
+        "~/.codex/sessions/<YYYY/MM/DD>/rollout-*-*.jsonl (clone path unknown; cas_session={session_id})"
+    )
+}
+
+/// Read `payload.cwd` from the first JSONL line when it is a `session_meta`
+/// event. Returns `None` on any parse/IO failure — callers treat that as
+/// "this rollout does not match by cwd".
+pub(crate) fn codex_rollout_cwd(path: &std::path::Path) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut line = String::new();
+    std::io::BufRead::read_line(&mut reader, &mut line).ok()?;
+    let value: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    // Be tolerant of missing/mismatched type — still try payload.cwd.
+    value
+        .get("payload")
+        .and_then(|p| p.get("cwd"))
+        .and_then(|c| c.as_str())
+        .map(|s| s.to_string())
+}
+
+/// Scan budget for `**/rollout-*.jsonl` under the sessions root. Codex hosts
+/// accumulate hundreds of historical rollouts; matching by cwd only needs
+/// recent ones, so we mtime-sort and cap the walk (cas-c655 / cas-900b cap
+/// spirit).
+const MAX_CODEX_ROLLOUT_SCAN: usize = 200;
+
+/// Collect recent rollout paths under `sessions_dir`, newest mtime first.
+fn collect_codex_rollouts(sessions_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let pattern = format!("{}/**/rollout-*.jsonl", sessions_dir.to_string_lossy());
+    let iter = match glob::glob(&pattern) {
+        Ok(it) => it,
+        Err(_) => return Vec::new(),
+    };
+    let mut all: Vec<std::path::PathBuf> = iter.flatten().collect();
+    all.sort_by_key(|p| {
+        std::fs::metadata(p)
+            .and_then(|m| m.modified())
+            .ok()
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+    });
+    all.reverse(); // newest first
+    if all.len() > MAX_CODEX_ROLLOUT_SCAN {
+        all.truncate(MAX_CODEX_ROLLOUT_SCAN);
+    }
+    all
+}
+
+/// Whether `path`'s filename contains `session_id` (rollout UUID match).
+fn codex_rollout_filename_matches_session(path: &std::path::Path, session_id: &str) -> bool {
+    if session_id.is_empty() {
+        return false;
+    }
+    path.file_name()
+        .and_then(|s| s.to_str())
+        .is_some_and(|name| name.contains(session_id))
+}
+
+fn resolve_codex_transcript(
+    sessions_dir: Option<&std::path::Path>,
+    clone_path: Option<&str>,
+    session_id: &str,
+) -> TranscriptResolution {
+    let synthesized = clone_path
+        .map(|p| synthesized_codex_transcript_path(p, session_id))
+        .unwrap_or_else(|| synthesized_unknown_codex_clone_path(session_id));
+    let Some(dir) = sessions_dir else {
+        return TranscriptResolution::Synthesized(synthesized);
+    };
+    let candidates = collect_codex_rollouts(dir);
+    let mut matches = Vec::new();
+    let mut truncated = false;
+    for path in candidates {
+        let cwd_hit = clone_path
+            .map(|cwd| codex_rollout_cwd(&path).as_deref() == Some(cwd))
+            .unwrap_or(false);
+        let id_hit = codex_rollout_filename_matches_session(&path, session_id);
+        if !cwd_hit && !id_hit {
+            continue;
+        }
+        if matches.len() >= MAX_TRANSCRIPT_CANDIDATES {
+            truncated = true;
+            break;
+        }
+        matches.push(path);
+    }
+    match matches.len() {
+        0 => TranscriptResolution::Synthesized(synthesized),
+        1 => TranscriptResolution::Resolved(matches.remove(0)),
+        _ => TranscriptResolution::Ambiguous {
+            matches,
+            synthesized,
+            truncated,
+        },
+    }
+}
+
 /// Render the transcript block for `worker_status` output. Always surfaces
 /// the raw `session_id` so a supervisor who doesn't trust our resolution
 /// can grep the projects tree themselves (cas-900b AC).
@@ -2098,9 +2342,8 @@ fn format_transcript_block(
 ) -> String {
     let base_dir = match cli {
         cas_mux::SupervisorCli::Grok => default_grok_sessions_dir(),
-        cas_mux::SupervisorCli::Claude | cas_mux::SupervisorCli::Codex => {
-            default_claude_projects_dir()
-        }
+        cas_mux::SupervisorCli::Codex => default_codex_sessions_dir(),
+        cas_mux::SupervisorCli::Claude => default_claude_projects_dir(),
     };
     let resolution = resolve_transcript(base_dir.as_deref(), clone_path, session_id, cli);
     render_transcript_block(&resolution, session_id, base_dir.is_some())
@@ -3052,6 +3295,146 @@ effort = "high"
         );
     }
 
+    // --- cas-c655: Codex rollout resolution ---------------------------------
+
+    /// Build `sessions/YYYY/MM/DD/rollout-...jsonl` with a `session_meta`
+    /// first line carrying `cwd` — matches Codex CLI's on-disk layout.
+    fn fake_codex_sessions_dir(
+        rollouts: &[(&str /* relative path under sessions */, &str /* cwd */)],
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sessions = tmp.path().join("sessions");
+        for (rel, cwd) in rollouts {
+            let path = sessions.join(rel);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            let meta = serde_json::json!({
+                "timestamp": "2026-07-21T12:00:00.000Z",
+                "type": "session_meta",
+                "payload": {
+                    "session_id": "019f84af-3121-7950-ba14-b01db2dad6c7",
+                    "cwd": cwd,
+                    "originator": "codex-tui"
+                }
+            });
+            std::fs::write(&path, format!("{meta}\n")).unwrap();
+        }
+        (tmp, sessions)
+    }
+
+    #[test]
+    fn default_codex_sessions_dir_honors_codex_home_override() {
+        let _lock = crate::hooks::test_env_lock();
+        let old = std::env::var("CODEX_HOME").ok();
+        unsafe {
+            std::env::set_var("CODEX_HOME", "/custom/codex/home");
+        }
+        let got = default_codex_sessions_dir();
+        unsafe {
+            match &old {
+                Some(v) => std::env::set_var("CODEX_HOME", v),
+                None => std::env::remove_var("CODEX_HOME"),
+            }
+        }
+        assert_eq!(
+            got,
+            Some(std::path::PathBuf::from("/custom/codex/home/sessions"))
+        );
+    }
+
+    #[test]
+    fn resolve_codex_transcript_matches_by_cwd() {
+        let clone = "/home/pippenz/Petrastella/ozer/.cas/worktrees/worker-android";
+        let rel = "2026/07/21/rollout-2026-07-21T08-38-21-019f84af-3121-7950-ba14-b01db2dad6c7.jsonl";
+        let (_tmp, sessions) = fake_codex_sessions_dir(&[(rel, clone)]);
+        // CAS session id is NOT the rollout UUID — resolution must use cwd.
+        let cas_session = "codex-worker-android-2f828ac6-deadbeefcafe";
+        let got = resolve_transcript(
+            Some(&sessions),
+            Some(clone),
+            cas_session,
+            cas_mux::SupervisorCli::Codex,
+        );
+        let expected = sessions.join(rel);
+        assert_eq!(got, TranscriptResolution::Resolved(expected));
+    }
+
+    #[test]
+    fn resolve_codex_transcript_matches_by_rollout_uuid_in_filename() {
+        let clone = "/tmp/other-worktree";
+        let uuid = "019f84af-3121-7950-ba14-b01db2dad6c7";
+        let rel = format!("2026/07/21/rollout-2026-07-21T08-38-21-{uuid}.jsonl");
+        let (_tmp, sessions) = fake_codex_sessions_dir(&[(&rel, clone)]);
+        // Even with a mismatched/missing clone_path match path, filename
+        // UUID lookup works when the caller has the rollout id.
+        let got = resolve_transcript(
+            Some(&sessions),
+            Some("/tmp/unrelated"),
+            uuid,
+            cas_mux::SupervisorCli::Codex,
+        );
+        let expected = sessions.join(rel);
+        assert_eq!(got, TranscriptResolution::Resolved(expected));
+    }
+
+    #[test]
+    fn resolve_codex_transcript_synthesized_on_no_match() {
+        let (_tmp, sessions) = fake_codex_sessions_dir(&[(
+            "2026/07/21/rollout-other.jsonl",
+            "/tmp/other",
+        )]);
+        let clone = "/tmp/missing-worker";
+        let cas_session = "codex-worker-x-aaaa";
+        let got = resolve_transcript(
+            Some(&sessions),
+            Some(clone),
+            cas_session,
+            cas_mux::SupervisorCli::Codex,
+        );
+        assert_eq!(
+            got,
+            TranscriptResolution::Synthesized(synthesized_codex_transcript_path(
+                clone,
+                cas_session
+            ))
+        );
+    }
+
+    #[test]
+    fn resolve_codex_transcript_no_sessions_dir_is_synthesized() {
+        let clone = "/tmp/w";
+        let session = "codex-worker-x-aaaa";
+        let got = resolve_transcript(None, Some(clone), session, cas_mux::SupervisorCli::Codex);
+        assert_eq!(
+            got,
+            TranscriptResolution::Synthesized(synthesized_codex_transcript_path(clone, session))
+        );
+    }
+
+    #[test]
+    fn resolve_codex_transcript_no_clone_path_falls_back_to_placeholder() {
+        let (_tmp, sessions) = fake_codex_sessions_dir(&[]);
+        let session = "codex-worker-x-aaaa";
+        let got = resolve_transcript(Some(&sessions), None, session, cas_mux::SupervisorCli::Codex);
+        assert_eq!(
+            got,
+            TranscriptResolution::Synthesized(synthesized_unknown_codex_clone_path(session))
+        );
+    }
+
+    #[test]
+    fn codex_rollout_cwd_reads_session_meta() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("rollout.jsonl");
+        let meta = serde_json::json!({
+            "type": "session_meta",
+            "payload": { "cwd": "/work/tree", "session_id": "abc" }
+        });
+        std::fs::write(&path, format!("{meta}\n")).unwrap();
+        assert_eq!(codex_rollout_cwd(&path).as_deref(), Some("/work/tree"));
+    }
+
     #[test]
     fn worker_cli_from_agent_parses_grok_metadata() {
         let mut agent = cas_types::Agent::new("sess-1".to_string(), "grok-worker".to_string());
@@ -3683,6 +4066,96 @@ effort = "high"
             out.contains("not pushed") || out.contains("none"),
             "unpushed state must be visible in output: {out}"
         );
+    }
+
+    // --- cas-f53c: sync_all_workers clone_path resolution -----------------
+
+    #[test]
+    fn resolve_worker_clone_path_uses_convention_when_metadata_absent_and_worktree_exists() {
+        let (_tmp, project) = setup_factory_project_with_worker_worktrees(&["recipes-fixer"]);
+        let cas_root = project.join(".cas");
+        let expected = cas_root.join("worktrees/recipes-fixer");
+        let agent = cas_types::Agent::new_with_role(
+            "session-1".to_string(),
+            "recipes-fixer".to_string(),
+            AgentRole::Worker,
+        );
+        // No clone_path metadata — the post-spawn race in the bug report.
+        assert!(!agent.metadata.contains_key("clone_path"));
+
+        match resolve_worker_clone_path(&cas_root, &agent) {
+            WorkerClonePathResolve::Ready(path) => {
+                assert_eq!(path, expected);
+            }
+            other => panic!("expected Ready(convention path), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_worker_clone_path_prefers_existing_metadata_over_convention() {
+        let (_tmp, project) =
+            setup_factory_project_with_worker_worktrees(&["named-a", "named-b"]);
+        let cas_root = project.join(".cas");
+        let meta_path = cas_root.join("worktrees/named-b");
+        let mut agent = cas_types::Agent::new_with_role(
+            "session-1".to_string(),
+            "named-a".to_string(),
+            AgentRole::Worker,
+        );
+        agent.metadata.insert(
+            "clone_path".to_string(),
+            meta_path.to_string_lossy().to_string(),
+        );
+
+        match resolve_worker_clone_path(&cas_root, &agent) {
+            WorkerClonePathResolve::Ready(path) => assert_eq!(path, meta_path),
+            other => panic!("expected Ready(metadata path), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_worker_clone_path_not_on_disk_when_neither_exists() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let cas_root = tmp.path().join(".cas");
+        std::fs::create_dir_all(&cas_root).unwrap();
+        let agent = cas_types::Agent::new_with_role(
+            "session-1".to_string(),
+            "ghost-worker".to_string(),
+            AgentRole::Worker,
+        );
+
+        match resolve_worker_clone_path(&cas_root, &agent) {
+            WorkerClonePathResolve::NotOnDisk {
+                candidate,
+                had_metadata,
+            } => {
+                assert!(!had_metadata);
+                assert_eq!(candidate, cas_root.join("worktrees/ghost-worker"));
+            }
+            other => panic!("expected NotOnDisk, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sync_skip_reason_is_retryable_when_metadata_missing_and_no_worktree() {
+        let resolve = WorkerClonePathResolve::NotOnDisk {
+            candidate: std::path::PathBuf::from("/proj/.cas/worktrees/w1"),
+            had_metadata: false,
+        };
+        let msg = sync_skip_reason_for_clone_resolve("w1", &resolve).expect("skip reason");
+        assert!(
+            msg.contains("registration in progress") || msg.contains("retry"),
+            "must be retryable, not silent missing-metadata: {msg}"
+        );
+        assert!(
+            !msg.contains("missing clone_path metadata"),
+            "old skip text must not return: {msg}"
+        );
+        assert!(sync_skip_reason_for_clone_resolve(
+            "w1",
+            &WorkerClonePathResolve::Ready(std::path::PathBuf::from("/x"))
+        )
+        .is_none());
     }
 
     #[test]

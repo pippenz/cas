@@ -8,6 +8,8 @@
 mod cloud_attach;
 mod daemon;
 mod lifecycle;
+pub(crate) mod parity;
+pub(crate) mod probe_comm;
 mod queries;
 mod remote_attach;
 // cas-728b: pub(crate) (not private) so the director's stall-detection
@@ -551,6 +553,79 @@ pub enum FactoryCommands {
         cas_root: Option<std::path::PathBuf>,
     },
 
+    /// Run the isolated supervisor/worker communication conformance probe
+    /// Launched-agent skill + instruction parity conformance gate (cas-bd9d):
+    /// emit a machine-readable 3×2 (Claude/Codex/Grok × supervisor/worker) report
+    /// proving required skills/agents, effective role clauses, and tool prefix
+    /// from the real launch configuration. Non-zero exit if any cell fails.
+    Parity {
+        /// Optional path to also write the per-cell report as JSONL.
+        #[arg(long)]
+        jsonl: Option<std::path::PathBuf>,
+    },
+
+    ProbeComm {
+        /// JSONL output path for per-scenario stage evidence
+        #[arg(long)]
+        jsonl: std::path::PathBuf,
+
+        /// Disposable CAS root to use for the probe; defaults to a temp root
+        #[arg(long)]
+        cas_root: Option<std::path::PathBuf>,
+
+        /// Recorded harness artifact root for Claude/Codex/Grok adapters
+        #[arg(long)]
+        artifact_root: Option<std::path::PathBuf>,
+
+        /// Explicitly permit using the active parent CAS root
+        #[arg(long)]
+        allow_active_cas_root: bool,
+
+        /// Probe adapter. Unit 6 ships only the deterministic fake adapter.
+        #[arg(long, value_enum, default_value = "fake")]
+        adapter: probe_comm::ProbeAdapterKind,
+
+        /// Legacy per-sample delivery threshold in milliseconds (hidden; use aggregate transport gates)
+        #[arg(long, default_value = "2000", hide = true)]
+        delivery_slo_ms: u64,
+
+        /// Legacy fake-runner selection threshold in milliseconds
+        #[arg(long, default_value = "250", hide = true)]
+        selection_slo_ms: u64,
+
+        /// Normal transport p95 SLO threshold in milliseconds (epic contract: <=2000ms)
+        #[arg(long, default_value = "2000")]
+        normal_transport_p95_slo_ms: u64,
+
+        /// Normal transport max SLO threshold in milliseconds (epic contract: <=10000ms)
+        #[arg(long, default_value = "10000")]
+        normal_transport_max_slo_ms: u64,
+
+        /// Urgent transport p95 SLO threshold in milliseconds (epic contract: <=2000ms)
+        #[arg(long, default_value = "2000")]
+        urgent_transport_p95_slo_ms: u64,
+
+        /// Urgent transport max SLO threshold in milliseconds (epic contract: <=5000ms)
+        #[arg(long, default_value = "5000")]
+        urgent_transport_max_slo_ms: u64,
+
+        /// Worker wake p95 SLO threshold in milliseconds (epic contract: <=5000ms)
+        #[arg(long, default_value = "5000")]
+        wake_p95_slo_ms: u64,
+
+        /// Visible reaction p95 SLO threshold in milliseconds when observable (epic contract: <=15000ms)
+        #[arg(long, default_value = "15000")]
+        reaction_p95_slo_ms: u64,
+
+        /// Inject a transport failure as SCENARIO:MESSAGE_ID
+        #[arg(long, value_name = "SCENARIO:MESSAGE_ID")]
+        inject_transport_failure: Option<String>,
+
+        /// Inject an SLO failure as SCENARIO:MESSAGE_ID:DELIVERED_AFTER_MS
+        #[arg(long, value_name = "SCENARIO:MESSAGE_ID:MS")]
+        inject_slo_failure: Option<String>,
+    },
+
     /// Classify a worker as alive / wedged / starved / dead (cas-4513).
     ///
     /// Exit codes (differentiated so supervisor scripts can branch without
@@ -719,6 +794,43 @@ pub fn execute(args: &FactoryArgs, cli: &Cli, cas_root: Option<&std::path::Path>
                 *wait_ack,
                 *timeout_ms,
                 cas_root.as_deref(),
+            ),
+            FactoryCommands::Parity { jsonl } => parity::execute_parity(jsonl.clone()),
+            FactoryCommands::ProbeComm {
+                jsonl,
+                cas_root: sub_cas_root,
+                artifact_root,
+                allow_active_cas_root,
+                adapter,
+                delivery_slo_ms,
+                selection_slo_ms,
+                normal_transport_p95_slo_ms,
+                normal_transport_max_slo_ms,
+                urgent_transport_p95_slo_ms,
+                urgent_transport_max_slo_ms,
+                wake_p95_slo_ms,
+                reaction_p95_slo_ms,
+                inject_transport_failure,
+                inject_slo_failure,
+            } => probe_comm::execute_probe_comm(
+                jsonl.clone(),
+                sub_cas_root.clone(),
+                artifact_root.clone(),
+                cas_root,
+                *allow_active_cas_root,
+                *adapter,
+                *delivery_slo_ms,
+                *selection_slo_ms,
+                *normal_transport_p95_slo_ms,
+                *normal_transport_max_slo_ms,
+                *urgent_transport_p95_slo_ms,
+                *urgent_transport_max_slo_ms,
+                *wake_p95_slo_ms,
+                *reaction_p95_slo_ms,
+                probe_comm::parse_probe_failure(
+                    inject_transport_failure.as_deref(),
+                    inject_slo_failure.as_deref(),
+                )?,
             ),
             FactoryCommands::IsWedged {
                 worker,

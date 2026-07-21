@@ -1,5 +1,5 @@
-//! Tests for cas-f32b: PreToolUse `SendMessage` auto-route onto the CAS
-//! prompt queue in factory mode.
+//! Tests for cas-f32b / cas-73c8: PreToolUse `SendMessage` auto-route onto
+//! the CAS prompt queue in factory mode.
 //!
 //! Before cas-f32b, the hook denied `SendMessage` with guidance telling the
 //! agent to call `mcp__cas__coordination action=message` instead. Claude
@@ -7,10 +7,12 @@
 //! so they often retried the denied call instead of switching tools —
 //! wedging workers on a deny loop (observed 2026-04-23, gabber-studio).
 //!
-//! New behaviour: parse the call, enqueue onto the CAS prompt queue, notify
-//! the daemon, and return `deny` with an "AUTO-ROUTED — do not retry"
-//! receipt. On any failure we fall back to the original deny-with-guidance
-//! path so the agent's message is never silently dropped.
+//! cas-f32b: parse the call, enqueue onto the CAS prompt queue, notify the
+//! daemon. cas-73c8: return `allow` + `additionalContext` with an
+//! "AUTO-ROUTED — do not retry" receipt so success is not wrapped in
+//! Claude Code's `<error>` envelope (deny always surfaces as tool error).
+//! On any failure we fall back to deny-with-guidance so the agent's
+//! message is never silently dropped.
 
 use crate::hooks::handlers::handle_pre_tool_use;
 use cas_core::hooks::types::HookInput;
@@ -58,6 +60,15 @@ fn send_message_input(tool_input: Option<serde_json::Value>) -> HookInput {
     }
 }
 
+fn permission_decision(out: &cas_core::hooks::types::HookOutput) -> Option<String> {
+    let specific = out.hook_specific_output.as_ref()?;
+    let value = serde_json::to_value(specific).ok()?;
+    value
+        .get("permissionDecision")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
 fn deny_reason(out: &cas_core::hooks::types::HookOutput) -> Option<String> {
     let specific = out.hook_specific_output.as_ref()?;
     let value = serde_json::to_value(specific).ok()?;
@@ -71,8 +82,18 @@ fn deny_reason(out: &cas_core::hooks::types::HookOutput) -> Option<String> {
         .map(str::to_string)
 }
 
+fn additional_context(out: &cas_core::hooks::types::HookOutput) -> Option<String> {
+    let specific = out.hook_specific_output.as_ref()?;
+    let value = serde_json::to_value(specific).ok()?;
+    value
+        .get("additionalContext")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
 // ============================================================================
-// Happy path — SendMessage with full args enqueues and returns AUTO-ROUTED.
+// Happy path — SendMessage with full args enqueues and returns AUTO-ROUTED
+// as tool success (allow + additionalContext), not deny/`<error>`.
 // ============================================================================
 
 #[test]
@@ -92,18 +113,28 @@ fn send_message_auto_routes_onto_prompt_queue() {
     })));
 
     let out = handle_pre_tool_use(&input, Some(tmp.path())).expect("handler ok");
-    let reason = deny_reason(&out).expect("expected deny receipt");
-    assert!(
-        reason.contains("AUTO-ROUTED"),
-        "deny reason should signal auto-route success, got: {reason}"
+    // cas-73c8: success must not use deny (deny → `<error>` envelope in CC).
+    assert_eq!(
+        permission_decision(&out).as_deref(),
+        Some("allow"),
+        "successful auto-route must be allow, not deny/error"
     );
     assert!(
-        reason.contains("supervisor"),
-        "receipt should name the target: {reason}"
+        deny_reason(&out).is_none(),
+        "successful auto-route must not emit a deny reason"
+    );
+    let ctx = additional_context(&out).expect("expected additionalContext receipt");
+    assert!(
+        ctx.contains("AUTO-ROUTED"),
+        "context should signal auto-route success, got: {ctx}"
     );
     assert!(
-        reason.contains("DO NOT"),
-        "receipt must tell the agent not to retry: {reason}"
+        ctx.contains("supervisor"),
+        "receipt should name the target: {ctx}"
+    );
+    assert!(
+        ctx.contains("DO NOT"),
+        "receipt must tell the agent not to retry: {ctx}"
     );
 
     // Verify a row actually landed on the prompt queue.
@@ -145,8 +176,15 @@ fn send_message_serializes_structured_payload() {
     })));
 
     let out = handle_pre_tool_use(&input, Some(tmp.path())).expect("handler ok");
+    assert_eq!(
+        permission_decision(&out).as_deref(),
+        Some("allow"),
+        "structured messages must auto-route as success"
+    );
     assert!(
-        deny_reason(&out).expect("deny").contains("AUTO-ROUTED"),
+        additional_context(&out)
+            .expect("context")
+            .contains("AUTO-ROUTED"),
         "structured messages must auto-route too"
     );
 

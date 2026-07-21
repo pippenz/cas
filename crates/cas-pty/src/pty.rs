@@ -14,10 +14,10 @@ use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 
 /// Instructions injected into Codex supervisor agents via `--config developer_instructions`.
-const CODEX_SUPERVISOR_INSTRUCTIONS: &str = "You are the CAS Factory Supervisor. Coordinate only: plan epics, assign tasks, monitor progress, review/merge. Never implement tasks. Use skills cas-supervisor and cas-codex-supervisor-checklist. Use MCP tools explicitly; no /cas-start, /cas-context, or /cas-end. Worker messages (status/blocker/ready) arrive asynchronously as new injected turns framed 'Message from <sender>: …'. Each is a triage trigger, not a fresh startup: read it, then assign/answer/redirect/merge as appropriate and reply via `mcp__cs__coordination action=message target=<worker>`. Finishing one round does not mean you are done — remain available to coordinate the next message.";
+const CODEX_SUPERVISOR_INSTRUCTIONS: &str = "You are the CAS Factory Supervisor. Coordinate only: plan epics, assign tasks, monitor progress, review/merge. Never implement tasks. Use skills cas-supervisor and cas-codex-supervisor-checklist. Use MCP tools explicitly; no /cas-start, /cas-context, or /cas-end. Worker messages (status/blocker/ready) arrive asynchronously as new injected turns framed 'Message from <sender>: …'. Each is a triage trigger, not a fresh startup: read it, then assign/answer/redirect/merge as appropriate and reply via `mcp__cs__coordination action=message target=<worker>`. MERGE REQUIRED / awaiting_merge / idle-with-close-rejected is always top priority: run `mcp__cs__coordination action=epic_status` (and/or `mcp__cs__task action=list status=awaiting_merge`), merge `factory/<worker>` into the epic branch, then tell the worker to re-close — before free-form user chat. Recovery: to unblock a worker wedged by an urgent-stop/halt or a rejected close, assign it a fresh task or tell it to re-close after the merge — its legitimate `mcp__cs__task action=start` clears the urgent-stop halt. Finishing one round does not mean you are done — remain available to coordinate the next message.";
 
 /// Instructions injected into Codex worker agents via `--config developer_instructions`.
-const CODEX_WORKER_INSTRUCTIONS: &str = "You are a CAS Factory Worker. Always use CAS MCP tools for task lifecycle and coordination. On startup your CAS session is already registered automatically — do NOT call session_start. Just run `mcp__cs__coordination action=whoami` then `mcp__cs__task action=mine`. Work exactly ONE task at a time: choose a single assigned task, run `mcp__cs__task action=show id=<task-id>` then `mcp__cs__task action=start id=<task-id>` before coding, implement it, commit and push your changes, then close it with `mcp__cs__task action=close id=<task-id> reason=\"...\"` (or hand it to the supervisor if close returns verification-required guidance) BEFORE starting any other task. Never start a second task while one is still in progress — the verification jail allows only one unverified in-progress task at a time, so batch-starting tasks will block you. Add progress notes frequently using `mcp__cs__task action=notes id=<task-id> note_type=progress notes=\"...\"`. For blockers, add a blocker note, set `status=blocked`, and message supervisor via `mcp__cs__coordination action=message target=supervisor message=\"...\"`. If close returns verification-required guidance, immediately ask the supervisor to verify/close on your behalf. After closing or handing off a task, stay available — you are not permanently done. The supervisor will send you more work or redirection as new messages. Treat any injected turn framed 'Message from <sender>: …' as an instruction to act on, not noise: read it and follow it. Keep honoring one-task-at-a-time — finish or hand off your current task before starting the next one a message assigns. Do not use /cas-start, /cas-context, or /cas-end. Stay within assigned task scope.";
+const CODEX_WORKER_INSTRUCTIONS: &str = "You are a CAS Factory Worker. Always use CAS MCP tools for task lifecycle and coordination. On startup your CAS session is already registered automatically — do NOT call session_start. Just run `mcp__cs__coordination action=whoami` then `mcp__cs__task action=mine`. Work exactly ONE task at a time: choose a single assigned task, run `mcp__cs__task action=show id=<task-id>` then `mcp__cs__task action=start id=<task-id>` before coding, implement it, commit and push your changes, then close it with `mcp__cs__task action=close id=<task-id> reason=\"...\"` (or hand it to the supervisor if close returns verification-required guidance) BEFORE starting any other task. Never start a second task while one is still in progress — the verification jail allows only one unverified in-progress task at a time, so batch-starting tasks will block you. Add progress notes frequently using `mcp__cs__task action=notes id=<task-id> note_type=progress notes=\"...\"`. For blockers, add a blocker note, set `status=blocked`, and message supervisor via `mcp__cs__coordination action=message target=supervisor message=\"...\"`. If close returns verification-required guidance, immediately ask the supervisor to verify/close on your behalf. If close returns MERGE REQUIRED, push your branch and ask the supervisor to merge `factory/<your-name>` into the epic branch, then re-close after the merge lands. Urgent-stop recovery: if an urgent redirect halts your work (WORK HALTED), do not fight it — a legitimate `mcp__cs__task action=start` on your newly-assigned task clears the urgent-stop halt and resumes you; start the assigned task. After closing or handing off a task, stay available — you are not permanently done. The supervisor will send you more work or redirection as new messages. Treat any injected turn framed 'Message from <sender>: …' as an instruction to act on, not noise: read it and follow it. Keep honoring one-task-at-a-time — finish or hand off your current task before starting the next one a message assigns. Do not use /cas-start, /cas-context, or /cas-end. Stay within assigned task scope.";
 
 /// Prefix for the Codex worker startup prompt. The worker name is appended at runtime.
 const CODEX_WORKER_STARTUP_PREFIX: &str = "I'm initiating CAS worker startup now: confirm identity, check assigned tasks, then start any assigned task with a progress note. My CAS session is already registered automatically (do NOT call session_start).\n1) Run mcp__cs__coordination action=whoami";
@@ -33,12 +33,211 @@ const CODEX_WORKER_STARTUP_PREFIX: &str = "I'm initiating CAS worker startup now
 /// namespaces MCP tools as `cas__<tool>` (its own `search_tool`/`use_tool`
 /// dispatch, NOT `mcp__cas__`/`mcp__cs__`), so every tool reference here
 /// uses that prefix.
-const GROK_SUPERVISOR_INSTRUCTIONS: &str = "You are the CAS Factory Supervisor, running on Grok Build. Coordinate only: plan epics, assign tasks, monitor progress, review/merge. Never implement tasks. Use skills cas-supervisor and cas-supervisor-checklist. MCP tools are namespaced cas__<tool> (e.g. cas__task, cas__coordination) — not mcp__cas__ or mcp__cs__. Worker messages (status/blocker/ready) arrive asynchronously as new injected turns; each is a triage trigger, not a fresh startup — read it, then assign/answer/redirect/merge as appropriate and reply via `cas__coordination action=message target=<worker>`. Finishing one round does not mean you are done — remain available to coordinate the next message.";
+const GROK_SUPERVISOR_INSTRUCTIONS: &str = "You are the CAS Factory Supervisor, running on Grok Build. Coordinate only: plan epics, assign tasks, monitor progress, review/merge. Never implement tasks. Use skills cas-supervisor and cas-supervisor-checklist. MCP tools are namespaced cas__<tool> (e.g. cas__task, cas__coordination) — not mcp__cas__ or mcp__cs__. Worker messages (status/blocker/ready) arrive asynchronously as new injected turns; each is a triage trigger, not a fresh startup — read it, then assign/answer/redirect/merge as appropriate and reply via `cas__coordination action=message target=<worker>`. MERGE REQUIRED / awaiting_merge / idle-with-close-rejected is always top priority: run `cas__coordination action=epic_status` (and/or `cas__task action=list status=awaiting_merge`), merge `factory/<worker>` into the epic branch, tell the worker to re-close — before free-form user chat. Act on the injected signal; do not poll. Recovery: to unblock a worker wedged by an urgent-stop/halt or a rejected close, assign it a fresh task or tell it to re-close after the merge — its legitimate `cas__task action=start` clears the urgent-stop halt. Finishing one round does not mean you are done — remain available to coordinate the next message.";
 
 /// Instructions injected into Grok Build worker agents via `--rules`
 /// (EPIC cas-8888, cas-6569 Phase 2). See `GROK_SUPERVISOR_INSTRUCTIONS`
 /// for the context-injection rationale.
-const GROK_WORKER_INSTRUCTIONS: &str = "You are a CAS Factory Worker, running on Grok Build. Always use CAS MCP tools for task lifecycle and coordination — they are namespaced cas__<tool> (e.g. cas__task, cas__coordination), not mcp__cas__ or mcp__cs__. On startup your CAS session is already registered automatically. Run `cas__coordination action=whoami` then `cas__task action=mine`. Work exactly ONE task at a time: choose a single assigned task, run `cas__task action=show id=<task-id>` then `cas__task action=start id=<task-id>` before coding, implement it, commit and push your changes, then close it with `cas__task action=close id=<task-id> reason=\"...\"` (or hand it to the supervisor if close returns verification-required guidance) BEFORE starting any other task. Never start a second task while one is still in progress. Add progress notes frequently using `cas__task action=notes id=<task-id> note_type=progress notes=\"...\"`. For blockers, add a blocker note, set status=blocked, and message supervisor via `cas__coordination action=message target=supervisor message=\"...\"`. After closing or handing off a task, stay available — the supervisor will send you more work as new messages; treat any injected turn as an instruction to act on, not noise. Stay within assigned task scope.";
+const GROK_WORKER_INSTRUCTIONS: &str = "You are a CAS Factory Worker, running on Grok Build. Always use CAS MCP tools for task lifecycle and coordination — they are namespaced cas__<tool> (e.g. cas__task, cas__coordination), not mcp__cas__ or mcp__cs__. On startup your CAS session is already registered automatically. Run `cas__coordination action=whoami` then `cas__task action=mine`. Work exactly ONE task at a time: choose a single assigned task, run `cas__task action=show id=<task-id>` then `cas__task action=start id=<task-id>` before coding, implement it, commit and push your changes, then close it with `cas__task action=close id=<task-id> reason=\"...\"` (or hand it to the supervisor if close returns verification-required guidance) BEFORE starting any other task. Never start a second task while one is still in progress. Add progress notes frequently using `cas__task action=notes id=<task-id> note_type=progress notes=\"...\"`. For blockers, add a blocker note, set status=blocked, and message supervisor via `cas__coordination action=message target=supervisor message=\"...\"`. If close returns MERGE REQUIRED, push your branch and ask the supervisor to merge `factory/<your-name>` into the epic branch, then re-close after the merge lands. Urgent-stop recovery: if an urgent redirect halts your work (WORK HALTED), do not fight it — a legitimate `cas__task action=start` on your newly-assigned task clears the urgent-stop halt and resumes you; start the assigned task. After closing or handing off a task, stay available — the supervisor will send you more work as new messages; treat any injected turn as an instruction to act on, not noise. Stay within assigned task scope.";
+
+// ===========================================================================
+// Canonical CAS role-instruction contract (cas-0263).
+//
+// Every launched factory agent — Claude / Codex / Grok × supervisor / worker —
+// must receive the SAME semantic role contract, differing only in the
+// harness-correct MCP tool prefix (`mcp__cas__` for Claude, `mcp__cs__` for
+// Codex, bare `cas__` for Grok) and launch syntax. The contract is carried on
+// the surface each runtime actually consumes: Codex `--config
+// developer_instructions`, Grok `--rules`, and Claude a launch-time queued intro
+// prompt (Claude has no equivalent launch flag). The renderers are the four
+// CODEX_*/GROK_* constants above plus the two `claude_*_contract` builders
+// below; `*_CONTRACT_ELEMENTS` + `missing_contract_elements` are the single
+// source of truth that a parity test enforces across all six rendered surfaces.
+// ===========================================================================
+
+/// Whether a launch shape carries the supervisor or worker half of the contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContractRole {
+    Supervisor,
+    Worker,
+}
+
+/// One required element of the canonical role contract. A rendered surface
+/// satisfies the element iff (mode = `Any`) it contains at least one marker, or
+/// (mode = `All`) it contains every marker — checked after normalizing the
+/// harness tool prefix so only intentional prefix differences are ignored.
+pub struct ContractElement {
+    pub id: &'static str,
+    pub markers: &'static [&'static str],
+    pub all: bool,
+}
+
+/// The canonical supervisor contract: coordinate-only, async triage, delegate
+/// lifecycle, merge/re-close priority, urgent-stop recovery.
+pub const SUPERVISOR_CONTRACT_ELEMENTS: &[ContractElement] = &[
+    ContractElement {
+        id: "coordinate-only",
+        markers: &["coordinate only"],
+        all: false,
+    },
+    ContractElement {
+        id: "async-message-handling",
+        markers: &["asynchron", "injected turn", "triage trigger"],
+        all: false,
+    },
+    ContractElement {
+        id: "assigns-work",
+        markers: &["assign"],
+        all: false,
+    },
+    ContractElement {
+        id: "merge-reclose",
+        markers: &["merge required", "re-close"],
+        all: false,
+    },
+    ContractElement {
+        id: "urgent-stop-recovery",
+        markers: &["urgent-stop halt"],
+        all: false,
+    },
+];
+
+/// The canonical worker contract: one-task ownership, async availability, full
+/// task lifecycle, merge/re-close, urgent-stop recovery.
+pub const WORKER_CONTRACT_ELEMENTS: &[ContractElement] = &[
+    ContractElement {
+        id: "one-task-ownership",
+        markers: &["one task at a time", "exactly one task"],
+        all: false,
+    },
+    ContractElement {
+        id: "async-message-handling",
+        markers: &["injected turn", "new messages", "stay available"],
+        all: false,
+    },
+    ContractElement {
+        id: "task-lifecycle",
+        markers: &["action=start", "action=close", "action=notes"],
+        all: true,
+    },
+    ContractElement {
+        id: "merge-reclose",
+        markers: &["merge required", "re-close"],
+        all: false,
+    },
+    ContractElement {
+        id: "urgent-stop-recovery",
+        markers: &["urgent-stop halt"],
+        all: false,
+    },
+];
+
+/// Canonical elements for a role.
+pub fn contract_elements(role: ContractRole) -> &'static [ContractElement] {
+    match role {
+        ContractRole::Supervisor => SUPERVISOR_CONTRACT_ELEMENTS,
+        ContractRole::Worker => WORKER_CONTRACT_ELEMENTS,
+    }
+}
+
+/// Normalize the three harness tool prefixes to one token so parity checks only
+/// ignore the intentional prefix difference, never a missing capability.
+fn normalize_tool_prefix(text: &str) -> String {
+    text.replace("mcp__cas__", "TOOL__")
+        .replace("mcp__cs__", "TOOL__")
+        .replace("cas__", "TOOL__")
+        .to_lowercase()
+}
+
+/// Return the ids of any canonical contract elements MISSING from `text` for
+/// `role`. Empty ⇒ the surface carries the full contract.
+pub fn missing_contract_elements(text: &str, role: ContractRole) -> Vec<&'static str> {
+    let norm = normalize_tool_prefix(text);
+    contract_elements(role)
+        .iter()
+        .filter(|el| {
+            let present: Vec<bool> = el
+                .markers
+                .iter()
+                .map(|m| norm.contains(&normalize_tool_prefix(m)))
+                .collect();
+            if el.all {
+                !present.iter().all(|p| *p)
+            } else {
+                !present.iter().any(|p| *p)
+            }
+        })
+        .map(|el| el.id)
+        .collect()
+}
+
+/// Render the Claude **supervisor** role contract (cas-0263). Claude has no
+/// `--rules`/`developer_instructions` launch flag, so this is delivered as the
+/// launch-time intro prompt CAS queues for the supervisor (see
+/// `queue_supervisor_intro_prompt`). Uses Claude's `mcp__cas__` tool prefix.
+pub fn claude_supervisor_contract(worker_list: &str) -> String {
+    format!(
+        "You are the CAS Factory Supervisor. Coordinate only: plan epics, assign tasks, \
+monitor progress, review/merge. Never implement tasks. Use skills cas-supervisor and \
+cas-supervisor-checklist; MCP tools are namespaced mcp__cas__<tool> (e.g. mcp__cas__task, \
+mcp__cas__coordination). Worker messages (status/blocker/ready) arrive asynchronously as new \
+injected turns; each is a triage trigger, not a fresh startup — read it, then \
+assign/answer/redirect/merge and reply via `mcp__cas__coordination action=message \
+target=<worker>`. MERGE REQUIRED / awaiting_merge / idle-with-close-rejected is always top \
+priority: run `mcp__cas__coordination action=epic_status` (and/or `mcp__cas__task action=list \
+status=awaiting_merge`), merge `factory/<worker>` into the epic branch, then tell the worker to \
+re-close — before free-form user chat. Recovery: to unblock a worker wedged by an \
+urgent-stop/halt or a rejected close, assign it a fresh task or tell it to re-close after the \
+merge — its legitimate `mcp__cas__task action=start` clears the urgent-stop halt. Act on the \
+injected signal; do not poll. Finishing one round does not mean you are done — remain available \
+to coordinate the next message. Canonical current workers for this session: {worker_list}. First \
+steps: mcp__cas__coordination action=whoami; mcp__cas__task action=list task_type=epic; \
+mcp__cas__task action=ready."
+    )
+}
+
+/// Render the Claude **worker** role contract (cas-0263), delivered as the
+/// launch-time intro prompt CAS queues for the worker (see
+/// `queue_codex_worker_intro_prompt`). Uses Claude's `mcp__cas__` tool prefix.
+pub fn claude_worker_contract(worker_name: &str) -> String {
+    format!(
+        "You are a CAS Factory Worker ({worker_name}). Always use CAS MCP tools for task \
+lifecycle and coordination — namespaced mcp__cas__<tool> (e.g. mcp__cas__task, \
+mcp__cas__coordination). On startup your CAS session is already registered automatically — do \
+NOT call session_start. Run `mcp__cas__coordination action=whoami` then `mcp__cas__task \
+action=mine`. Work exactly ONE task at a time: run `mcp__cas__task action=show id=<task-id>` \
+then `mcp__cas__task action=start id=<task-id>` before coding, implement it, commit and push, \
+then close it with `mcp__cas__task action=close id=<task-id> reason=\"...\"` (or hand to the \
+supervisor if close returns verification-required guidance) BEFORE starting any other task — the \
+verification jail allows only one unverified in-progress task at a time. Add progress notes \
+frequently via `mcp__cas__task action=notes id=<task-id> note_type=progress notes=\"...\"`. For \
+blockers, add a blocker note, set status=blocked, and message supervisor via \
+`mcp__cas__coordination action=message target=supervisor message=\"...\"`. If close returns MERGE \
+REQUIRED, push your branch and ask the supervisor to merge `factory/<your-name>` into the epic \
+branch, then re-close after the merge lands. Urgent-stop recovery: if an urgent redirect halts \
+your work, a legitimate `mcp__cas__task action=start` on your newly-assigned task clears the \
+urgent-stop halt and resumes you; start the assigned task, do not fight the halt. After closing \
+or handing off a task, stay available — the supervisor will send you more work as new messages; \
+treat any injected turn as an instruction to act on, not noise. See the cas-worker skill for \
+detailed workflow guidance. Stay within assigned task scope."
+    )
+}
+
+/// The rendered contract text for a launch shape — the single accessor a parity
+/// test uses to check all six surfaces uniformly (cas-0263). Keyed on the
+/// harness's `--help`-stable name to avoid a dependency cycle (cas-pty is a leaf
+/// crate that cannot import cas-mux's `SupervisorCli`).
+pub fn rendered_contract_surface(harness: &str, role: ContractRole) -> String {
+    match (harness, role) {
+        ("codex", ContractRole::Supervisor) => CODEX_SUPERVISOR_INSTRUCTIONS.to_string(),
+        ("codex", ContractRole::Worker) => CODEX_WORKER_INSTRUCTIONS.to_string(),
+        ("grok", ContractRole::Supervisor) => GROK_SUPERVISOR_INSTRUCTIONS.to_string(),
+        ("grok", ContractRole::Worker) => GROK_WORKER_INSTRUCTIONS.to_string(),
+        ("claude", ContractRole::Supervisor) => claude_supervisor_contract("worker-a, worker-b"),
+        ("claude", ContractRole::Worker) => claude_worker_contract("worker-a"),
+        other => panic!("unknown launch shape: {other:?}"),
+    }
+}
 
 /// Configuration for spawning a PTY
 #[derive(Debug, Clone)]
@@ -2925,11 +3124,7 @@ mod tests {
             None, // teams
         );
         assert_eq!(config.command, "grok");
-        assert!(
-            config
-                .args
-                .contains(&"--permission-mode".to_string())
-        );
+        assert!(config.args.contains(&"--permission-mode".to_string()));
         assert!(config.args.contains(&"bypassPermissions".to_string()));
         assert!(
             config
@@ -3159,6 +3354,21 @@ mod tests {
             rules.contains("cas__coordination") && rules.contains("Supervisor"),
             "grok supervisor rules must reference the cas__ prefix and supervisor role: {rules}"
         );
+        // cas-c145: Grok supervisors must get merge-queue-first lifecycle
+        // guidance equivalent to other harnesses (no SessionStart bundle).
+        assert!(
+            rules.contains("MERGE REQUIRED")
+                && rules.contains("awaiting_merge")
+                && rules.contains("factory/<worker>")
+                && rules.contains("do not poll"),
+            "grok supervisor rules must surface AwaitingMerge merge-queue priority \
+             (task/branch/next action, no polling): {rules}"
+        );
+        assert!(
+            rules.contains("cas__task action=list status=awaiting_merge")
+                || rules.contains("status=awaiting_merge"),
+            "grok supervisor rules must name the awaiting_merge list command: {rules}"
+        );
     }
 
     /// EPIC cas-8888 (cas-9a31, Phase 1 wiring): CAS_FACTORY_WORKER_CLI must
@@ -3232,6 +3442,115 @@ mod tests {
             Some("codex"),
             "the last CAS_FACTORY_WORKER_CLI entry (which Command::env applies last, \
              winning) must be the supervisor's actual workers' cli, not grok's self-id: {values:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // cas-0263: canonical role-contract parity across all six launch shapes.
+    // -----------------------------------------------------------------------
+
+    /// AC-1/AC-2: every one of the six launch shapes (Claude/Codex/Grok ×
+    /// supervisor/worker) carries the full canonical role contract — coordinate-
+    /// only / one-task, async message handling, task lifecycle, merge/re-close,
+    /// and safe urgent-stop recovery — on the surface each runtime consumes.
+    #[test]
+    fn test_all_six_launch_shapes_carry_full_role_contract() {
+        let shapes = [
+            ("claude", ContractRole::Supervisor),
+            ("claude", ContractRole::Worker),
+            ("codex", ContractRole::Supervisor),
+            ("codex", ContractRole::Worker),
+            ("grok", ContractRole::Supervisor),
+            ("grok", ContractRole::Worker),
+        ];
+        for (harness, role) in shapes {
+            let surface = rendered_contract_surface(harness, role);
+            let missing = missing_contract_elements(&surface, role);
+            assert!(
+                missing.is_empty(),
+                "launch shape {harness}/{role:?} is missing canonical contract \
+                 element(s) {missing:?} — all six shapes must carry one \
+                 semantically equivalent CAS role contract"
+            );
+        }
+    }
+
+    /// AC-5: normalized parity allows only the intentional tool-prefix
+    /// difference — each harness's surface issues tool CALLS with ITS prefix and
+    /// never a foreign one. Checked on the tool-CALL form (`<prefix>task` /
+    /// `<prefix>coordination`), not the bare prefix, because a surface may
+    /// legitimately NAME the other prefixes in "not mcp__cas__ or mcp__cs__"
+    /// negative guidance (Grok/Codex do this).
+    #[test]
+    fn test_launch_shapes_use_harness_correct_tool_prefix() {
+        let claude_calls = ["mcp__cas__task", "mcp__cas__coordination"];
+        let codex_calls = ["mcp__cs__task", "mcp__cs__coordination"];
+        let grok_calls = ["cas__task", "cas__coordination"];
+        for role in [ContractRole::Supervisor, ContractRole::Worker] {
+            let c = rendered_contract_surface("claude", role);
+            assert!(
+                claude_calls.iter().any(|m| c.contains(m)),
+                "claude/{role:?} must issue mcp__cas__ tool calls"
+            );
+            for bad in codex_calls {
+                assert!(!c.contains(bad), "claude/{role:?} leaks Codex call {bad}");
+            }
+            let x = rendered_contract_surface("codex", role);
+            assert!(
+                codex_calls.iter().any(|m| x.contains(m)),
+                "codex/{role:?} must issue mcp__cs__ tool calls"
+            );
+            for bad in claude_calls {
+                assert!(!x.contains(bad), "codex/{role:?} leaks Claude call {bad}");
+            }
+            let g = rendered_contract_surface("grok", role);
+            assert!(
+                grok_calls.iter().any(|m| g.contains(m)),
+                "grok/{role:?} must issue cas__ tool calls"
+            );
+            for bad in claude_calls.iter().chain(codex_calls.iter()) {
+                assert!(!g.contains(bad), "grok/{role:?} leaks wrapped call {bad}");
+            }
+        }
+    }
+
+    /// AC-3 (AGENTS.md decision): the Codex role contract is supplied entirely by
+    /// the launch instruction string injected via `--config
+    /// developer_instructions` — NO AGENTS.md file is written or required. The
+    /// launched Codex process is not observed to auto-discover a cwd AGENTS.md
+    /// for the CAS contract, so CAS delivers the contract inline at launch. This
+    /// regression proves that inline delivery is complete, documenting why no
+    /// file is managed.
+    #[test]
+    fn test_codex_contract_supplied_by_launch_injection_no_agents_md() {
+        for role in [ContractRole::Supervisor, ContractRole::Worker] {
+            let surface = rendered_contract_surface("codex", role);
+            assert!(
+                missing_contract_elements(&surface, role).is_empty(),
+                "Codex {role:?} contract must be fully supplied by the launch \
+                 developer_instructions string (no AGENTS.md fallback needed)"
+            );
+        }
+        let cfg = PtyConfig::codex(
+            "w1",
+            "worker",
+            PathBuf::from("/tmp"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(
+            cfg.args
+                .iter()
+                .any(|a| a.contains("developer_instructions")),
+            "Codex launch argv must carry developer_instructions (the contract surface)"
+        );
+        assert!(
+            !cfg.args.iter().any(|a| a.contains("AGENTS.md")),
+            "Codex launch must not reference an AGENTS.md file — contract is inline"
         );
     }
 }

@@ -309,6 +309,33 @@ impl FactoryDaemon {
                     }
                 }
                 let _ = self.process_prompt_queue().await;
+                // cas-ecff: auto-drain pending lifecycle outbox (durable
+                // task_lifecycle rows with prompt_delivered_at unset) so
+                // partial failures recover without re-running task mutations.
+                if let Ok(sq) =
+                    crate::store::open_supervisor_queue_store(self.app.cas_dir())
+                {
+                    if let Ok(pq) = crate::store::open_prompt_queue_store(self.app.cas_dir()) {
+                        match crate::mcp::tools::core::task::lifecycle::supervisor_push::drain_lifecycle_outbox(
+                            sq.as_ref(),
+                            pq.as_ref(),
+                            50,
+                        ) {
+                            Ok(report) if report.recovered > 0 || report.failed > 0 => {
+                                tracing::info!(
+                                    recovered = report.recovered,
+                                    failed = report.failed,
+                                    attempted = report.attempted,
+                                    "lifecycle outbox drain"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "lifecycle outbox drain failed");
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 last_prompt_poll = std::time::Instant::now();
                 prompt_notified = false;
             }
