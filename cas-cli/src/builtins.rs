@@ -648,16 +648,19 @@ pub const GROK_BUILTIN_AGENTS: &[BuiltinFile] = &[
 ];
 
 /// All built-in skills managed by CAS for Grok (EPIC cas-8888, Phase 5 /
-/// cas-6f46).
+/// cas-6f46; required-capability parity closed by cas-cc8c).
 ///
-/// Deliberately a SUBSET of the full Claude/Codex catalogs — the priority
-/// twins named in the task: cas-worker, cas-supervisor (+ its references
-/// and the cas-c093/cas-edf4 model-tiering rule), cas-supervisor-checklist,
-/// cas-code-review, cas-task-tracking, cas-memory-management, plus
-/// verify-before-claim (a hard dependency of cas-worker's close step).
-/// Grok reads `~/.claude` skills natively too, so the non-priority skills
-/// remain available there; this set only needs to cover what a Grok
-/// worker/supervisor session actually depends on to operate correctly.
+/// Covers every factory-critical required capability in its OWN right —
+/// supervisor, worker, task, search, memory, review, verification, and
+/// brainstorming/ideation (see `REQUIRED_FACTORY_CAPABILITIES`). A Grok
+/// factory session MUST NOT depend on implicitly inheriting `~/.claude` for
+/// any required capability: the factory can run against a project-local
+/// `.grok` mirror or a `~/.grok` home with no Claude tree present, so every
+/// required skill is installed here directly. Non-required, general-purpose
+/// skills (codemap, fallow, project-overview, session-learn, cas-nuxt-playwright)
+/// are intentionally omitted — they are not part of the required factory
+/// manifest and remain available ad hoc; `REQUIRED_FACTORY_CAPABILITIES` does
+/// not demand them.
 ///
 /// Tool-prefix content is modeled on the Claude originals (matching
 /// capability tier — hooks/subagents/textbox-submit all supported, unlike
@@ -814,7 +817,189 @@ pub const GROK_BUILTIN_SKILLS: &[BuiltinFile] = &[
             "builtins/grok/skills/cas-code-review/references/personas/testing.md"
         ),
     },
+    // cas-cc8c: required-capability parity — a Grok factory session must resolve
+    // the search and brainstorm/ideation capabilities from its OWN catalog, not
+    // by implicitly inheriting `~/.claude` (which the factory can no longer rely
+    // on). Twins are the Claude sources with the `mcp__cas__` → `cas__` prefix
+    // swap (Grok's capability tier matches Claude's), same as the other Grok
+    // skills above.
+    BuiltinFile {
+        path: "skills/cas-search/SKILL.md",
+        content: include_str!("builtins/grok/skills/cas-search.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-brainstorm/SKILL.md",
+        content: include_str!("builtins/grok/skills/cas-brainstorm/SKILL.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-brainstorm/references/handoff.md",
+        content: include_str!("builtins/grok/skills/cas-brainstorm/references/handoff.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-brainstorm/references/requirements-capture.md",
+        content: include_str!(
+            "builtins/grok/skills/cas-brainstorm/references/requirements-capture.md"
+        ),
+    },
+    BuiltinFile {
+        path: "skills/cas-ideate/SKILL.md",
+        content: include_str!("builtins/grok/skills/cas-ideate/SKILL.md"),
+    },
+    BuiltinFile {
+        path: "skills/cas-ideate/references/post-ideation-workflow.md",
+        content: include_str!(
+            "builtins/grok/skills/cas-ideate/references/post-ideation-workflow.md"
+        ),
+    },
 ];
+
+/// A factory-critical capability that every harness must resolve from its own
+/// catalog (cas-cc8c). The *capability* is harness-neutral; the concrete skill
+/// that provides it may be a tailored twin whose directory name differs by
+/// harness (e.g. Codex's `cas-codex-supervisor-checklist` vs the shared
+/// `cas-supervisor-checklist`) — that intentional spelling difference is
+/// encoded here, not treated as a gap.
+pub struct RequiredCapability {
+    /// Harness-neutral capability id (matches the AC-1 required list).
+    pub id: &'static str,
+    /// Skill directory (relative, e.g. `skills/cas-search`) that provides this
+    /// capability for Claude / Codex / Grok respectively. `None` means the
+    /// capability is intentionally not applicable to that harness — which is
+    /// only legal when `note` documents why.
+    pub claude: Option<&'static str>,
+    pub codex: Option<&'static str>,
+    pub grok: Option<&'static str>,
+    /// Documented reason for any `None` above (harness-specific exemption).
+    /// Must be non-empty whenever any of the three is `None`.
+    pub note: &'static str,
+}
+
+/// The canonical required-capability manifest (cas-cc8c AC-1). Init/update must
+/// make each harness resolve every one of these from its own catalog — never by
+/// implicitly inheriting another harness's home directory. Semantic-parity tests
+/// (see the test module) assert each harness catalog contains the twin's
+/// `SKILL.md` for every capability, normalizing only the intentional
+/// twin-spelling differences captured in the per-harness fields.
+pub const REQUIRED_FACTORY_CAPABILITIES: &[RequiredCapability] = &[
+    RequiredCapability {
+        id: "supervisor",
+        claude: Some("skills/cas-supervisor"),
+        codex: Some("skills/cas-supervisor"),
+        grok: Some("skills/cas-supervisor"),
+        note: "",
+    },
+    RequiredCapability {
+        id: "worker",
+        claude: Some("skills/cas-worker"),
+        codex: Some("skills/cas-worker"),
+        grok: Some("skills/cas-worker"),
+        note: "",
+    },
+    RequiredCapability {
+        id: "task",
+        claude: Some("skills/cas-task-tracking"),
+        codex: Some("skills/cas-task-tracking"),
+        grok: Some("skills/cas-task-tracking"),
+        note: "",
+    },
+    RequiredCapability {
+        id: "search",
+        claude: Some("skills/cas-search"),
+        codex: Some("skills/cas-search"),
+        grok: Some("skills/cas-search"),
+        note: "",
+    },
+    RequiredCapability {
+        id: "memory",
+        claude: Some("skills/cas-memory-management"),
+        codex: Some("skills/cas-memory-management"),
+        grok: Some("skills/cas-memory-management"),
+        note: "",
+    },
+    RequiredCapability {
+        id: "review",
+        claude: Some("skills/cas-code-review"),
+        codex: Some("skills/cas-code-review"),
+        grok: Some("skills/cas-code-review"),
+        note: "",
+    },
+    RequiredCapability {
+        id: "verification",
+        claude: Some("skills/verify-before-claim"),
+        codex: Some("skills/verify-before-claim"),
+        grok: Some("skills/verify-before-claim"),
+        note: "",
+    },
+    RequiredCapability {
+        id: "brainstorm",
+        claude: Some("skills/cas-brainstorm"),
+        codex: Some("skills/cas-brainstorm"),
+        grok: Some("skills/cas-brainstorm"),
+        note: "",
+    },
+    RequiredCapability {
+        id: "ideation",
+        claude: Some("skills/cas-ideate"),
+        codex: Some("skills/cas-ideate"),
+        grok: Some("skills/cas-ideate"),
+        note: "",
+    },
+    RequiredCapability {
+        // AC-1 "Codex supervisor-checklist ... where applicable": Claude and Grok
+        // share the hooks-aware `cas-supervisor-checklist`; Codex uses its
+        // tailored `cas-codex-supervisor-checklist` twin (a "no hooks"
+        // compensation variant). Same capability, intentional twin spelling.
+        id: "supervisor-checklist",
+        claude: Some("skills/cas-supervisor-checklist"),
+        codex: Some("skills/cas-codex-supervisor-checklist"),
+        grok: Some("skills/cas-supervisor-checklist"),
+        note: "Codex uses the cas-codex-supervisor-checklist twin (no-hooks variant); \
+               Claude and Grok share the hooks-aware cas-supervisor-checklist.",
+    },
+];
+
+/// Factory-critical agent roles that every harness must define in its own agent
+/// catalog (cas-cc8c AC-3). Harness-specific extras (e.g. Codex's
+/// `factory-supervisor` agent, which Claude/Grok don't need because their
+/// supervisor is the primary pane rather than a spawned sub-agent) are allowed
+/// and are simply absent from this required set.
+pub const REQUIRED_FACTORY_AGENTS: &[&str] = &[
+    "agents/task-verifier.md",
+    "agents/learning-reviewer.md",
+    "agents/rule-reviewer.md",
+    "agents/duplicate-detector.md",
+    "agents/session-summarizer.md",
+    "agents/git-history-analyzer.md",
+    "agents/issue-intelligence-analyst.md",
+];
+
+/// The skill catalog for a harness (cas-cc8c parity helpers).
+pub fn skill_catalog_for_harness(harness: SupervisorCli) -> &'static [BuiltinFile] {
+    match harness {
+        SupervisorCli::Claude => BUILTIN_SKILLS,
+        SupervisorCli::Codex => CODEX_BUILTIN_SKILLS,
+        SupervisorCli::Grok => GROK_BUILTIN_SKILLS,
+    }
+}
+
+/// The agent catalog for a harness (cas-cc8c parity helpers).
+pub fn agent_catalog_for_harness(harness: SupervisorCli) -> &'static [BuiltinFile] {
+    match harness {
+        SupervisorCli::Claude => BUILTIN_AGENTS,
+        SupervisorCli::Codex => CODEX_BUILTIN_AGENTS,
+        SupervisorCli::Grok => GROK_BUILTIN_AGENTS,
+    }
+}
+
+/// The skill directory a capability requires for `harness`, or `None` when it is
+/// intentionally not applicable to that harness.
+pub fn required_dir_for(cap: &RequiredCapability, harness: SupervisorCli) -> Option<&'static str> {
+    match harness {
+        SupervisorCli::Claude => cap.claude,
+        SupervisorCli::Codex => cap.codex,
+        SupervisorCli::Grok => cap.grok,
+    }
+}
 
 /// Check if a file is managed by CAS (has `managed_by: cas` in frontmatter)
 pub fn is_managed_by_cas(content: &str) -> bool {
@@ -3143,7 +3328,10 @@ This is the body content."#;
     /// Anti-drift guard mirroring the Grok corpus check (cas-6f46).
     #[test]
     fn test_codex_builtins_never_reference_claude_tool_prefix() {
-        for builtin in CODEX_BUILTIN_SKILLS.iter().chain(CODEX_BUILTIN_AGENTS.iter()) {
+        for builtin in CODEX_BUILTIN_SKILLS
+            .iter()
+            .chain(CODEX_BUILTIN_AGENTS.iter())
+        {
             assert!(
                 !builtin.content.contains("mcp__cas__"),
                 "{} must not reference mcp__cas__ (Claude's prefix) — Codex uses mcp__cs__",
@@ -3221,7 +3409,10 @@ This is the body content."#;
         // Target is empty, so every builtin is a "new" change.
         let changes = preview_all_builtins_for_harness(SupervisorCli::Grok, &target).unwrap();
 
-        assert!(!changes.is_empty(), "expected preview changes on an empty target");
+        assert!(
+            !changes.is_empty(),
+            "expected preview changes on an empty target"
+        );
         assert!(changes.iter().all(|c| c.is_new));
         assert!(
             changes
@@ -3248,8 +3439,7 @@ This is the body content."#;
         std::fs::create_dir_all(&orphan_dir).unwrap();
         std::fs::write(orphan_dir.join("SKILL.md"), "not managed by cas").unwrap();
 
-        let removed =
-            prune_stale_user_skills_for_harness(SupervisorCli::Grok, &grok_dir).unwrap();
+        let removed = prune_stale_user_skills_for_harness(SupervisorCli::Grok, &grok_dir).unwrap();
 
         assert!(
             removed.contains(&"cas-orphan-skill".to_string()),
@@ -3346,4 +3536,212 @@ This is the body content."#;
         );
     }
 
+    // ----------------------------------------------------------------------
+    // cas-cc8c: cross-harness required-capability parity (semantic).
+    //
+    // These normalize ONLY intentional differences — the twin-spelling per
+    // harness in REQUIRED_FACTORY_CAPABILITIES, and the tool-prefix that each
+    // harness legitimately uses — and FAIL on a genuine gap: a required
+    // capability/agent missing from a harness's own catalog, a referenced
+    // twin whose SKILL.md is absent, or a catalog leaking the wrong harness's
+    // MCP tool prefix.
+    // ----------------------------------------------------------------------
+
+    /// Every required capability resolves to a present `SKILL.md` in each
+    /// harness's OWN catalog (not by inheriting another harness's home). This is
+    /// the load-bearing cas-cc8c assertion: adding cas-search/brainstorm/ideate
+    /// to Grok is what makes this pass for `SupervisorCli::Grok`.
+    #[test]
+    fn test_required_capabilities_resolved_by_every_harness() {
+        for harness in [
+            SupervisorCli::Claude,
+            SupervisorCli::Codex,
+            SupervisorCli::Grok,
+        ] {
+            let catalog = skill_catalog_for_harness(harness);
+            for cap in REQUIRED_FACTORY_CAPABILITIES {
+                let Some(dir) = required_dir_for(cap, harness) else {
+                    continue; // intentional exemption (guarded by the note test)
+                };
+                let skill_md = format!("{dir}/SKILL.md");
+                assert!(
+                    catalog.iter().any(|b| b.path == skill_md),
+                    "{harness:?} catalog is missing required capability '{}' \
+                     (expected twin at {skill_md}) — a factory {harness:?} session \
+                     must resolve it from its own catalog, not by inheriting \
+                     another harness's home directory",
+                    cap.id
+                );
+            }
+        }
+    }
+
+    /// A capability may be exempt for a harness (`None`) only when it documents
+    /// why. Prevents silently dropping a required capability by nulling a field.
+    #[test]
+    fn test_required_capability_exemptions_are_documented() {
+        for cap in REQUIRED_FACTORY_CAPABILITIES {
+            let has_none = cap.claude.is_none() || cap.codex.is_none() || cap.grok.is_none();
+            if has_none {
+                assert!(
+                    !cap.note.trim().is_empty(),
+                    "required capability '{}' exempts a harness (None) without a \
+                     documented reason in `note`",
+                    cap.id
+                );
+            }
+        }
+    }
+
+    /// Every required twin actually referenced by the manifest points at a real,
+    /// non-empty, `managed_by: cas` skill file — so "install missing" installs a
+    /// working skill and the overwrite gate will keep it fresh.
+    #[test]
+    fn test_required_capability_twins_are_managed_and_nonempty() {
+        for harness in [
+            SupervisorCli::Claude,
+            SupervisorCli::Codex,
+            SupervisorCli::Grok,
+        ] {
+            let catalog = skill_catalog_for_harness(harness);
+            for cap in REQUIRED_FACTORY_CAPABILITIES {
+                let Some(dir) = required_dir_for(cap, harness) else {
+                    continue;
+                };
+                let skill_md = format!("{dir}/SKILL.md");
+                let file = catalog
+                    .iter()
+                    .find(|b| b.path == skill_md)
+                    .unwrap_or_else(|| panic!("{harness:?} missing {skill_md}"));
+                assert!(
+                    file.content.len() > 40,
+                    "{harness:?} {skill_md} looks empty/stub"
+                );
+                assert!(
+                    is_managed_by_cas(file.content),
+                    "{harness:?} {skill_md} must carry `managed_by: cas` so sync can \
+                     install/overwrite it"
+                );
+            }
+        }
+    }
+
+    /// Required agent roles have equivalent coverage across all three harnesses.
+    /// Harness-specific extras (Codex `factory-supervisor`) are allowed and are
+    /// simply not in the required set.
+    #[test]
+    fn test_required_agents_present_in_every_harness() {
+        for harness in [
+            SupervisorCli::Claude,
+            SupervisorCli::Codex,
+            SupervisorCli::Grok,
+        ] {
+            let catalog = agent_catalog_for_harness(harness);
+            for agent in REQUIRED_FACTORY_AGENTS {
+                assert!(
+                    catalog.iter().any(|b| &b.path == agent),
+                    "{harness:?} agent catalog is missing required role {agent}"
+                );
+            }
+        }
+    }
+
+    /// No tailored-harness catalog leaks a foreign MCP tool prefix in its OWN
+    /// tool-call guidance (cas-cc8c AC-5). Grok must never carry `mcp__cas__`
+    /// (Claude) or `mcp__cs__` (Codex); Codex must never carry `mcp__cas__`.
+    /// (Claude is the reference harness and legitimately documents the other
+    /// aliases in cross-harness recovery guidance, so it is not swept here — its
+    /// own tool calls use `mcp__cas__` by construction.) This spans every entry
+    /// in both tailored catalogs, so the new cas-cc8c Grok required twins are
+    /// covered automatically.
+    #[test]
+    fn test_tailored_catalogs_never_leak_foreign_tool_prefix() {
+        for b in GROK_BUILTIN_SKILLS.iter().chain(GROK_BUILTIN_AGENTS.iter()) {
+            assert!(
+                !b.content.contains("mcp__cas__"),
+                "Grok {} leaks Claude prefix mcp__cas__",
+                b.path
+            );
+            assert!(
+                !b.content.contains("mcp__cs__"),
+                "Grok {} leaks Codex prefix mcp__cs__",
+                b.path
+            );
+        }
+        for b in CODEX_BUILTIN_SKILLS
+            .iter()
+            .chain(CODEX_BUILTIN_AGENTS.iter())
+        {
+            assert!(
+                !b.content.contains("mcp__cas__"),
+                "Codex {} leaks Claude prefix mcp__cas__",
+                b.path
+            );
+        }
+    }
+
+    /// Demo / AC-2 end-to-end: a fresh sync of EACH harness into an empty temp
+    /// tree installs every required-capability twin on disk — proving each
+    /// harness resolves the required factory checklist from its OWN directory,
+    /// with no other harness's home present. This is the executable form of the
+    /// task's demo ("initialize each harness and print the same required factory
+    /// capability checklist as PASS for Claude, Codex, and Grok").
+    #[test]
+    fn test_fresh_sync_installs_required_capabilities_for_every_harness() {
+        use tempfile::tempdir;
+
+        for harness in [
+            SupervisorCli::Claude,
+            SupervisorCli::Codex,
+            SupervisorCli::Grok,
+        ] {
+            let temp = tempdir().unwrap();
+            let dir = temp.path().join("harness-home");
+            std::fs::create_dir_all(&dir).unwrap();
+
+            sync_all_builtins_for_harness(harness, &dir).unwrap();
+
+            for cap in REQUIRED_FACTORY_CAPABILITIES {
+                let Some(rel) = required_dir_for(cap, harness) else {
+                    continue;
+                };
+                let on_disk = dir.join(rel).join("SKILL.md");
+                assert!(
+                    on_disk.exists(),
+                    "{harness:?} fresh sync did not install required capability \
+                     '{}' at {} — the factory checklist would FAIL for {harness:?}",
+                    cap.id,
+                    on_disk.display()
+                );
+            }
+            for agent in REQUIRED_FACTORY_AGENTS {
+                assert!(
+                    dir.join(agent).exists(),
+                    "{harness:?} fresh sync did not install required agent {agent}"
+                );
+            }
+        }
+    }
+
+    /// The three new Grok required twins (cas-cc8c) exist and use the `cas__`
+    /// prefix for the tools their workflow calls — a Grok session copying tool
+    /// syntax from them must get a working call.
+    #[test]
+    fn test_grok_search_brainstorm_ideate_use_cas_prefix() {
+        let expect = [
+            ("skills/cas-search/SKILL.md", "cas__search"),
+            ("skills/cas-brainstorm/SKILL.md", "cas__"),
+            ("skills/cas-ideate/SKILL.md", "cas__"),
+        ];
+        for (path, needle) in expect {
+            let file = GROK_BUILTIN_SKILLS
+                .iter()
+                .find(|b| b.path == path)
+                .unwrap_or_else(|| panic!("GROK_BUILTIN_SKILLS missing {path}"));
+            assert!(
+                file.content.contains(needle),
+                "grok {path} must reference {needle} (cas__ prefix)"
+            );
+        }
+    }
 }
