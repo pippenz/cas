@@ -289,7 +289,9 @@ impl FactoryDaemon {
                 let dominated = self
                     .last_idle_message_times
                     .get(&queued.source)
-                    .is_some_and(|last| now.duration_since(*last) < std::time::Duration::from_secs(300));
+                    .is_some_and(|last| {
+                        now.duration_since(*last) < std::time::Duration::from_secs(300)
+                    });
                 if dominated {
                     tracing::debug!(
                         prompt_id = queued.id,
@@ -299,7 +301,8 @@ impl FactoryDaemon {
                     let _ = queue.mark_processed(queued.id);
                     continue;
                 }
-                self.last_idle_message_times.insert(queued.source.clone(), now);
+                self.last_idle_message_times
+                    .insert(queued.source.clone(), now);
             }
 
             // Skip PTY injection for native extension agents that use plain PTY mode —
@@ -523,8 +526,8 @@ impl FactoryDaemon {
                         // measured from the sender-assigned `created_at` to
                         // the moment the daemon completed the inbox write.
                         // This is the number the P99 SLO tracks.
-                        let deliver_ms = (chrono::Utc::now() - queued.created_at)
-                            .num_milliseconds();
+                        let deliver_ms =
+                            (chrono::Utc::now() - queued.created_at).num_milliseconds();
                         tracing::info!(
                             target: "cas::coordination",
                             stage = "delivered",
@@ -548,74 +551,96 @@ impl FactoryDaemon {
                         }
                     }
                     Err(e) => {
-                        if self.app.mux.get(pane_target).is_none() {
-                            // Pane not found — only retry if target is a known
-                            // worker/supervisor in this session (it may still be spawning).
-                            // Stale messages for workers from previous sessions would
-                            // otherwise block the queue forever (peek_all has a limit).
-                            let is_current =
-                                self.app.worker_names().contains(&pane_target.to_string())
-                                    || pane_target == self.app.supervisor_name();
-                            if is_current {
-                                continue;
+                        // cas-6257: centralised bookkeeping — a FAILED handoff is
+                        // never marked processed. It is retryable while the target
+                        // is a live/known session member (transient inbox/PTY
+                        // failure, or the pane is still spawning), and abandoned
+                        // only when the target is not a pane in this session and
+                        // not a current worker/supervisor. `success` stays false in
+                        // the retry cases, so the row is left pending for the next
+                        // tick (processed_at is not advanced).
+                        let pane_known = self.app.mux.get(pane_target).is_some();
+                        let target_is_current =
+                            self.app.worker_names().contains(&pane_target.to_string())
+                                || pane_target == self.app.supervisor_name();
+                        match super::delivery::classify_queued_delivery(
+                            false,
+                            pane_known,
+                            target_is_current,
+                        ) {
+                            super::delivery::QueuedDeliveryOutcome::MarkProcessed => {
+                                // Unreachable for delivered_ok=false, but handle
+                                // defensively: leave the row pending rather than
+                                // falsely advancing processed_at on a failed write.
                             }
-                            tracing::warn!(
-                                prompt_id = queued.id,
-                                target = pane_target,
-                                source = %queued.source,
-                                "Abandoning queued prompt for unknown target — \
-                                 message will not be delivered"
-                            );
-                            let _ = queue.mark_processed(queued.id);
+                            super::delivery::QueuedDeliveryOutcome::Retry => {
+                                if pane_known {
+                                    // Pane exists — transient failure; record it and
+                                    // leave the row pending for the next tick.
+                                    tracing::error!("Failed to inject to '{}': {}", pane_target, e);
+                                    if let Some(ref store) = event_store {
+                                        record_injection(
+                                            store,
+                                            queued.id,
+                                            &queued.source,
+                                            &queued.target,
+                                            pane_target,
+                                            "error",
+                                            Some(e.to_string()),
+                                        );
+                                    }
+                                }
+                                // else: target still spawning — bare retry, no event
+                                // (avoids log spam while a pane comes up).
+                            }
+                            super::delivery::QueuedDeliveryOutcome::Abandon => {
+                                // Pane not found and not a current worker/supervisor.
+                                // Stale messages for workers from previous sessions
+                                // would otherwise block the queue forever (peek_all
+                                // has a limit), so consume the row and re-route its
+                                // content to the supervisor.
+                                tracing::warn!(
+                                    prompt_id = queued.id,
+                                    target = pane_target,
+                                    source = %queued.source,
+                                    "Abandoning queued prompt for unknown target — \
+                                     message will not be delivered"
+                                );
+                                let _ = queue.mark_processed(queued.id);
 
-                            // Record the drop and notify the supervisor so the
-                            // message isn't silently lost.
-                            if let Some(ref store) = event_store {
-                                record_injection(
-                                    store,
-                                    queued.id,
-                                    &queued.source,
-                                    &queued.target,
-                                    pane_target,
-                                    "abandoned",
-                                    Some(format!(
-                                        "Target '{}' not found in current session",
-                                        pane_target
-                                    )),
+                                // Record the drop and notify the supervisor so the
+                                // message isn't silently lost.
+                                if let Some(ref store) = event_store {
+                                    record_injection(
+                                        store,
+                                        queued.id,
+                                        &queued.source,
+                                        &queued.target,
+                                        pane_target,
+                                        "abandoned",
+                                        Some(format!(
+                                            "Target '{}' not found in current session",
+                                            pane_target
+                                        )),
+                                    );
+                                }
+
+                                // Re-queue to supervisor so the message content isn't
+                                // lost. The supervisor can then re-assign or re-send.
+                                let notice = format!(
+                                    "<system-notice>\n\
+                                     Undelivered message from '{}' to '{}' (target not in session):\n\n\
+                                     {}\n\
+                                     </system-notice>",
+                                    queued.source, pane_target, &queued.prompt
+                                );
+                                let _ = queue.enqueue_with_session(
+                                    super::teams::DIRECTOR_AGENT_NAME,
+                                    self.app.supervisor_name(),
+                                    &notice,
+                                    &self.session_name,
                                 );
                             }
-
-                            // Re-queue to supervisor so the message content isn't lost.
-                            // The supervisor can then re-assign the task or re-send.
-                            let notice = format!(
-                                "<system-notice>\n\
-                                 Undelivered message from '{}' to '{}' (target not in session):\n\n\
-                                 {}\n\
-                                 </system-notice>",
-                                queued.source,
-                                pane_target,
-                                &queued.prompt
-                            );
-                            let _ = queue.enqueue_with_session(
-                                super::teams::DIRECTOR_AGENT_NAME,
-                                self.app.supervisor_name(),
-                                &notice,
-                                &self.session_name,
-                            );
-
-                            continue;
-                        }
-                        tracing::error!("Failed to inject to '{}': {}", pane_target, e);
-                        if let Some(ref store) = event_store {
-                            record_injection(
-                                store,
-                                queued.id,
-                                &queued.source,
-                                &queued.target,
-                                pane_target,
-                                "error",
-                                Some(e.to_string()),
-                            );
                         }
                     }
                 }
@@ -1002,8 +1027,7 @@ impl FactoryDaemon {
                                     self.app.cas_dir(),
                                     &name,
                                 );
-                                self.app.spawning_count =
-                                    self.app.spawning_count.saturating_sub(1);
+                                self.app.spawning_count = self.app.spawning_count.saturating_sub(1);
                                 tracing::info!(
                                     worker = %name,
                                     "cas-7a94: cancelled pending spawn on shutdown — released pre-assign"
@@ -1018,8 +1042,7 @@ impl FactoryDaemon {
                                 // Anonymous names are only known once prepare runs;
                                 // if still in the queue, no early assign has fired yet.
                                 let _ = (isolate, spec, task_id);
-                                self.app.spawning_count =
-                                    self.app.spawning_count.saturating_sub(1);
+                                self.app.spawning_count = self.app.spawning_count.saturating_sub(1);
                             }
                             other => kept.push_back(other),
                         }
@@ -1599,7 +1622,11 @@ mod tests {
 
         // A live worker was respawned into the same name → NOT dead, must deliver.
         let live = vec!["backend-admin".to_string(), "frontend-dry".to_string()];
-        assert!(!FactoryDaemon::source_is_dead(&dead, &live, "backend-admin"));
+        assert!(!FactoryDaemon::source_is_dead(
+            &dead,
+            &live,
+            "backend-admin"
+        ));
         assert!(!FactoryDaemon::source_is_dead(&dead, &live, "frontend-dry"));
 
         // A source never in the dead set (external sender / fresh worker) passes.
@@ -1619,7 +1646,9 @@ mod tests {
         assert!(FactoryDaemon::is_idle_message("No task assigned."));
         // Case-insensitive and leading whitespace tolerant.
         assert!(FactoryDaemon::is_idle_message("  STANDING BY."));
-        assert!(FactoryDaemon::is_idle_message("standing by for further direction"));
+        assert!(FactoryDaemon::is_idle_message(
+            "standing by for further direction"
+        ));
     }
 
     /// Regression for cas-f9e8: the old unanchored substring filter silently

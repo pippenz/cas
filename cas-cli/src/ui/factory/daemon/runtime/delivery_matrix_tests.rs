@@ -9,11 +9,18 @@
 //! recipient-aware routing must choose the right channel, honor the PTY
 //! readiness gate, and frame codex recipients.
 //!
-//! This is a pure regression test over `choose_channel` /
+//! The top-level matrix here is a pure regression test over `choose_channel` /
 //! `requires_pty_readiness_gate` / `pty_payload_needs_framing` — it never
 //! touches a live MCP server, a PTY, or a Teams inbox (per the live-MCP testing
 //! convention: fixture-driven in `cargo test`, live behavior smoke-tested
 //! manually and documented separately).
+//!
+//! The appended `supervisor_claude_delivery` submodule (cas-6257, EPIC cas-873a
+//! Unit 3) goes one layer deeper: it drives the **real** `TeamsManager` inbox
+//! adapter (under an isolated temp `HOME`) and the **real** `SqlitePromptQueueStore`
+//! to prove that a normal supervisor→Claude message lands on the durable inbox
+//! turn surface with the same bookkeeping as the director-events lane — still no
+//! live PTY / MCP server, only on-disk adapters.
 //!
 //! The matrix deliberately re-derives the *expected* answer from first
 //! principles inside each row so a future change to the routing logic that
@@ -335,7 +342,10 @@ fn claude_recipient_teams_active_versus_pty_fallback() {
 #[test]
 fn claude_sup_to_codex_worker_is_pty_gated_framed() {
     let shape = SHAPES[0];
-    assert!(shape.teams_active(), "claude supervisor implies teams active");
+    assert!(
+        shape.teams_active(),
+        "claude supervisor implies teams active"
+    );
     let recipient = shape.recipient(Direction::Downward);
     assert_eq!(recipient, Codex);
     assert_eq!(
@@ -474,5 +484,271 @@ fn unknown_harness_cannot_silently_inherit_channel() {
             DeliveryChannel::Pty,
             "{non_claude:?} must not inherit TeamsInbox when teams_active"
         );
+    }
+}
+
+/// cas-6257 (EPIC cas-873a Unit 3): end-to-end coverage that a **normal**
+/// supervisor coordination message reaches a Claude worker's durable turn
+/// surface (the Agent-Teams inbox) with delivery bookkeeping identical to the
+/// director-events lane.
+///
+/// Unlike the routing-primitive matrix above, these drive the **real adapters**:
+/// a real [`TeamsManager::write_to_inbox`] (isolated temp `HOME`) and a real
+/// [`SqlitePromptQueueStore`] (temp cas dir), applying the real
+/// [`classify_queued_delivery`] bookkeeping contract. They mirror the
+/// non-urgent, single-Claude-target path of `process_prompt_queue`: peek →
+/// deliver over the recipient's channel → mark the row processed **only** after
+/// a successful inbox handoff. No live PTY / MCP server is touched.
+#[cfg(test)]
+mod supervisor_claude_delivery {
+    use std::path::Path;
+
+    use cas_mux::SupervisorCli::Claude;
+    use cas_store::{PromptQueueStore, SqlitePromptQueueStore};
+    use tempfile::TempDir;
+
+    use super::super::delivery::{
+        DeliveryChannel, QueuedDeliveryOutcome, choose_channel, classify_queued_delivery,
+    };
+    use super::super::teams::{DIRECTOR_AGENT_NAME, InboxMessage, TeamsManager};
+
+    /// Run `f` with a real `TeamsManager` under an **isolated, serialized** temp
+    /// `HOME`. Delegates HOME isolation to the crate-wide
+    /// [`crate::test_support::with_temp_home`] (guarded by the shared
+    /// `HOME_MUTEX`), so these tests never race the many other HOME-mutating lib
+    /// tests — the failure mode that a private lock would miss. When
+    /// `create_inboxes` is true the inbox dir is created (write_to_inbox needs it
+    /// to exist); leaving it false drives the inbox-write-failure path
+    /// deterministically (missing parent dir). `f` receives the manager, the
+    /// resolved inboxes dir, and the session name. The temp HOME is auto-removed.
+    fn with_team_session(
+        label: &str,
+        create_inboxes: bool,
+        f: impl FnOnce(&TeamsManager, &Path, &str),
+    ) {
+        crate::test_support::with_temp_home(|home| {
+            let session = format!("cas6257-{label}");
+            let teams = TeamsManager::new(&session);
+            let inboxes = home
+                .join(".claude")
+                .join("teams")
+                .join(&session)
+                .join("inboxes");
+            if create_inboxes {
+                std::fs::create_dir_all(&inboxes).expect("mk inboxes dir");
+            }
+            f(&teams, &inboxes, &session);
+        });
+    }
+
+    fn open_queue(dir: &Path) -> SqlitePromptQueueStore {
+        let store = SqlitePromptQueueStore::open(dir).expect("open prompt queue");
+        store.init().expect("init prompt queue");
+        store
+    }
+
+    fn read_inbox(inboxes: &Path, target: &str) -> Vec<InboxMessage> {
+        let path = inboxes.join(format!("{target}.json"));
+        if !path.exists() {
+            return Vec::new();
+        }
+        let content = std::fs::read_to_string(&path).expect("read inbox");
+        serde_json::from_str(&content).expect("parse inbox")
+    }
+
+    /// Faithfully mirror the non-urgent, single-Claude-target delivery loop of
+    /// `process_prompt_queue`: peek the session's rows, deliver each over the
+    /// REAL Claude channel (a teams-active Claude recipient routes to the inbox,
+    /// which is exactly what `deliver_to_worker` does), then apply the REAL
+    /// bookkeeping contract — `mark_processed` iff the handoff succeeded.
+    /// Returns the number of rows marked processed.
+    fn drain_claude(
+        queue: &SqlitePromptQueueStore,
+        teams: &TeamsManager,
+        targets: &[&str],
+        session: &str,
+    ) -> usize {
+        // Pin the production routing decision so this harness can't drift from
+        // choose_channel: a teams-active Claude recipient uses the inbox.
+        assert_eq!(choose_channel(Claude, true), DeliveryChannel::TeamsInbox);
+
+        let prompts = queue
+            .peek_for_targets(targets, Some(session), 10)
+            .expect("peek");
+        let mut marked = 0usize;
+        for q in prompts {
+            let delivered =
+                teams.write_to_inbox(&q.target, &q.source, &q.prompt, q.summary.as_deref(), None);
+            // A live Claude teams worker/supervisor has a pane and is a current
+            // session member, so the only failure mode here is a failed inbox
+            // handoff → Retry (never MarkProcessed).
+            match classify_queued_delivery(delivered.is_ok(), true, true) {
+                QueuedDeliveryOutcome::MarkProcessed => {
+                    queue.mark_processed(q.id).expect("mark processed");
+                    marked += 1;
+                }
+                QueuedDeliveryOutcome::Retry | QueuedDeliveryOutcome::Abandon => {}
+            }
+        }
+        marked
+    }
+
+    /// Happy path: a normal supervisor→Claude message lands in the worker's inbox
+    /// and its queue row is marked processed.
+    #[test]
+    fn supervisor_message_reaches_claude_worker_inbox_and_is_marked_processed() {
+        let qdir = TempDir::new().unwrap();
+        let queue = open_queue(qdir.path());
+
+        with_team_session("happy", true, |teams, inboxes, session| {
+            queue
+                .enqueue_with_session("supervisor", "swift-fox", "start cas-1234", session)
+                .unwrap();
+
+            let marked = drain_claude(&queue, teams, &["swift-fox"], session);
+            assert_eq!(marked, 1, "the delivered row must be marked processed");
+
+            let inbox = read_inbox(inboxes, "swift-fox");
+            assert_eq!(inbox.len(), 1, "message must land in the worker inbox");
+            assert_eq!(inbox[0].from, "supervisor");
+            assert_eq!(inbox[0].text, "start cas-1234");
+
+            // Row consumed — no longer pending.
+            assert!(
+                queue
+                    .peek_for_targets(&["swift-fox"], Some(session), 10)
+                    .unwrap()
+                    .is_empty(),
+                "processed row must not be re-peeked"
+            );
+        });
+    }
+
+    /// FIFO: a serial burst of 10 supervisor messages surfaces in enqueue order.
+    #[test]
+    fn supervisor_message_burst_preserves_fifo_order_into_claude_inbox() {
+        let qdir = TempDir::new().unwrap();
+        let queue = open_queue(qdir.path());
+
+        with_team_session("fifo", true, |teams, inboxes, session| {
+            let expected: Vec<String> = (0..10).map(|i| format!("msg-{i:02}")).collect();
+            for text in &expected {
+                queue
+                    .enqueue_with_session("supervisor", "swift-fox", text, session)
+                    .unwrap();
+            }
+
+            let marked = drain_claude(&queue, teams, &["swift-fox"], session);
+            assert_eq!(marked, 10, "all 10 rows delivered + processed");
+
+            let got: Vec<String> = read_inbox(inboxes, "swift-fox")
+                .into_iter()
+                .map(|m| m.text)
+                .collect();
+            assert_eq!(got, expected, "inbox must preserve enqueue (FIFO) order");
+        });
+    }
+
+    /// Reverse path: 10 worker→supervisor messages reach the supervisor's inbox
+    /// (the supervisor is a Claude teammate) in order.
+    #[test]
+    fn worker_messages_reach_supervisor_inbox_in_order() {
+        let qdir = TempDir::new().unwrap();
+        let queue = open_queue(qdir.path());
+
+        with_team_session("reverse", true, |teams, inboxes, session| {
+            let expected: Vec<String> = (0..10).map(|i| format!("status-{i:02}")).collect();
+            for text in &expected {
+                queue
+                    .enqueue_with_session("swift-fox", "supervisor", text, session)
+                    .unwrap();
+            }
+
+            let marked = drain_claude(&queue, teams, &["supervisor"], session);
+            assert_eq!(marked, 10);
+
+            let got: Vec<String> = read_inbox(inboxes, "supervisor")
+                .into_iter()
+                .map(|m| m.text)
+                .collect();
+            assert_eq!(got, expected, "supervisor inbox must be FIFO");
+            assert!(
+                read_inbox(inboxes, "supervisor")
+                    .iter()
+                    .all(|m| m.from == "swift-fox"),
+                "reverse-path sender must be the worker"
+            );
+        });
+    }
+
+    /// Error path: an inbox write failure (inbox dir unavailable) leaves the row
+    /// **retryable** and does NOT advance `processed_at` — matching the durable
+    /// director-events lane's at-least-once semantics.
+    #[test]
+    fn failed_inbox_write_leaves_row_retryable_and_unprocessed() {
+        let qdir = TempDir::new().unwrap();
+        let queue = open_queue(qdir.path());
+
+        // create_inboxes=false → the inbox directory does not exist, so
+        // write_to_inbox's initial `[]` write fails (missing parent).
+        with_team_session("error", false, |teams, inboxes, session| {
+            queue
+                .enqueue_with_session("supervisor", "swift-fox", "please retry me", session)
+                .unwrap();
+
+            let marked = drain_claude(&queue, teams, &["swift-fox"], session);
+            assert_eq!(marked, 0, "a failed handoff must NOT be marked processed");
+
+            // Nothing landed on disk.
+            assert!(
+                read_inbox(inboxes, "swift-fox").is_empty(),
+                "no message should be persisted on write failure"
+            );
+
+            // The row is still pending → retryable on the next tick.
+            let still_pending = queue
+                .peek_for_targets(&["swift-fox"], Some(session), 10)
+                .unwrap();
+            assert_eq!(
+                still_pending.len(),
+                1,
+                "unprocessed row must remain peekable (retryable)"
+            );
+            assert!(
+                still_pending[0].processed_at.is_none(),
+                "processed_at must not advance on a failed inbox handoff"
+            );
+        });
+    }
+
+    /// Director-events lane stays green: a director-sourced message travels the
+    /// identical durable inbox mechanism and lands with `from = "director"`,
+    /// proving supervisor and director messages share one seam.
+    #[test]
+    fn director_message_uses_the_same_durable_inbox_lane() {
+        let qdir = TempDir::new().unwrap();
+        let queue = open_queue(qdir.path());
+
+        with_team_session("director", true, |teams, inboxes, session| {
+            queue
+                .enqueue_with_session(
+                    DIRECTOR_AGENT_NAME,
+                    "swift-fox",
+                    "Reminder #7: merge is ready",
+                    session,
+                )
+                .unwrap();
+
+            let marked = drain_claude(&queue, teams, &["swift-fox"], session);
+            assert_eq!(marked, 1);
+
+            let inbox = read_inbox(inboxes, "swift-fox");
+            assert_eq!(inbox.len(), 1);
+            assert_eq!(
+                inbox[0].from, DIRECTOR_AGENT_NAME,
+                "director messages ride the same inbox lane as supervisor messages"
+            );
+            assert_eq!(inbox[0].text, "Reminder #7: merge is ready");
+        });
     }
 }
