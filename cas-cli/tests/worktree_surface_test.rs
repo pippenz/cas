@@ -110,6 +110,7 @@ fn coord_req(action: &str) -> CoordinationRequest {
         urgent: None,
         force: None,
         allow_trunk: None,
+        cleanup: None,
         clear: None,
         limit: None,
         name: None,
@@ -468,6 +469,7 @@ async fn test_worktree_merge_succeeds_for_factory_worktree_when_system_a_disable
     req.id = Some("factory/alice".to_string());
     // No epic context — allow_trunk authorizes trunk; force stays false so dirty protection remains.
     req.allow_trunk = Some(true);
+    req.cleanup = Some(true);
     let result = svc
         .coordination(Parameters(req))
         .await
@@ -490,7 +492,7 @@ async fn test_worktree_merge_succeeds_for_factory_worktree_when_system_a_disable
         repo.root.join("alice-work.txt").exists(),
         "merged content must land on the parent branch's working tree"
     );
-    // cleanup_on_close defaults true: the worktree directory is reclaimed.
+    // The request opted into cleanup, so the worktree directory is reclaimed.
     assert!(
         !wt_path.exists(),
         "worktree directory should be cleaned up after a successful merge"
