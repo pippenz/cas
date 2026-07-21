@@ -359,10 +359,27 @@ impl CasCore {
         }
 
         // cas-b269: urgent stop sets halt_task_work; block close until new start.
+        //
+        // cas-60393: narrow exemption — a pre-existing halt armed by an
+        // EARLIER, unrelated urgent stop must not deadlock re-close of the
+        // caller's OWN already-parked `AwaitingMerge` task (there is no
+        // in-band way to `start` an `AwaitingMerge` task to clear the halt).
+        // The exemption only skips *this* check; the merge-integrity gate
+        // below remains authoritative, so an AwaitingMerge task whose branch
+        // is not actually merged yet still bounces MERGE REQUIRED. Halt
+        // continues to block close for every other task/status/assignee.
         if let Ok(agent_id) = self.get_agent_id() {
             if let Ok(agent_store) = self.open_agent_store() {
                 if let Ok(agent) = agent_store.get(&agent_id) {
-                    if super::stale_close_guard::agent_task_work_halted(&agent.metadata) {
+                    let halt_exempt =
+                        super::stale_close_guard::halt_exempt_for_owned_awaiting_merge(
+                            task.status,
+                            task.assignee.as_deref(),
+                            Some(agent.name.as_str()),
+                        );
+                    if super::stale_close_guard::agent_task_work_halted(&agent.metadata)
+                        && !halt_exempt
+                    {
                         return Err(McpError {
                             code: ErrorCode::INVALID_PARAMS,
                             message: Cow::from(
