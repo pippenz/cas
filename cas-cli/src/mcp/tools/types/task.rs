@@ -251,8 +251,10 @@ pub struct TaskUpdateRequest {
     #[serde(default)]
     pub external_ref: Option<String>,
 
-    /// Update assignee
-    #[schemars(description = "New assignee")]
+    /// Update assignee. Empty string clears (unassigns). Omit to leave unchanged.
+    #[schemars(
+        description = "New assignee (worker display name). Pass empty string to clear/unassign; omit to leave unchanged."
+    )]
     #[serde(default)]
     pub assignee: Option<String>,
 

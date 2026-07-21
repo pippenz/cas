@@ -15,6 +15,23 @@ pub(crate) fn normalize_epic_verification_owner(raw: &str) -> Option<String> {
     }
 }
 
+/// Normalize `assignee` on task update (cas-bf98).
+///
+/// - Empty / whitespace-only → `None` (explicit **clear / unassign**).
+/// - Non-empty → trimmed string for storage and factory session-id normalization.
+///
+/// Must run **before** session-id → display-name remapping: `Some("")` is still
+/// `Some`, so without this guard factory mode can treat empty as a session id
+/// and rewrite it to a live worker name (observed: remapped to `hv-scope`).
+pub(crate) fn normalize_assignee_update_value(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 /// True when any caller identity facet matches the stored owner (after trim).
 pub(crate) fn caller_matches_epic_owner(
     owner: &str,
@@ -326,148 +343,181 @@ impl CasCore {
         // Track warnings to include in response
         let mut warnings: Vec<String> = Vec::new();
 
-        if let Some(ref assignee) = req.assignee {
-            // In factory mode: normalize and validate the assignee value.
-            //
-            // cas-dbbb: `task mine` matches assignees against agent_name (the
-            // display name) and CAS_AGENT_NAME env var. Assigning by session UUID /
-            // agent ID is silently accepted but the task never appears in the target
-            // worker's `task mine` list — observed in the 2026-06-30 smoke test
-            // where director-provided session IDs left tasks in Ready/Open with no
-            // visible assignee, while worker names dispatched correctly.
-            //
-            // Resolution order:
-            //   1. Assignee matches agent.name → canonical, store as-is.
-            //   2. Assignee matches agent.id  → normalize to agent.name, warn.
-            //   3. No match                   → warn; store as-is (agent may not yet
-            //                                   be registered, e.g. pre-spawn).
-            let mut canonical_assignee = assignee.clone();
-            if std::env::var("CAS_FACTORY_MODE").is_ok() {
-                let config = self.load_config();
-                let factory_config = config.factory();
-                // cas-44e9: scope freshness to this task's parent epic (or focus pin),
-                // never an unrelated concurrent epic branch.
-                let preferred_sync =
-                    resolve_assignment_freshness_branch(task_store.as_ref(), &task);
+        if let Some(ref assignee_raw) = req.assignee {
+            // cas-bf98: empty/whitespace = explicit clear (unassign). Must run
+            // before factory session-id normalization — `Some("")` is still Some
+            // and was previously stored as empty or remapped to a live worker.
+            match normalize_assignee_update_value(assignee_raw) {
+                None => {
+                    task.assignee = None;
+                    changes.push("assignee");
+                }
+                Some(assignee) => {
+                    // In factory mode: normalize and validate the assignee value.
+                    //
+                    // cas-dbbb: `task mine` matches assignees against agent_name (the
+                    // display name) and CAS_AGENT_NAME env var. Assigning by session UUID /
+                    // agent ID is silently accepted but the task never appears in the target
+                    // worker's `task mine` list — observed in the 2026-06-30 smoke test
+                    // where director-provided session IDs left tasks in Ready/Open with no
+                    // visible assignee, while worker names dispatched correctly.
+                    //
+                    // Resolution order:
+                    //   1. Assignee matches agent.name → canonical, store as-is.
+                    //   2. Assignee matches agent.id  → normalize to agent.name, warn.
+                    //   3. No match                   → warn; store as-is (agent may not yet
+                    //                                   be registered, e.g. pre-spawn).
+                    let mut canonical_assignee = assignee.clone();
+                    if std::env::var("CAS_FACTORY_MODE").is_ok() {
+                        let config = self.load_config();
+                        let factory_config = config.factory();
+                        // cas-44e9: scope freshness to this task's parent epic (or focus pin),
+                        // never an unrelated concurrent epic branch.
+                        let preferred_sync =
+                            resolve_assignment_freshness_branch(task_store.as_ref(), &task);
 
-                if let Ok(agent_store) = self.open_agent_store() {
-                    if let Ok(agents) = agent_store.list(None) {
-                        // Find by name first (canonical path).
-                        // cas-dbbb P2: use case-insensitive compare to match
-                        // `task mine`'s own identity matching logic.
-                        let by_name =
-                            agents.iter().find(|a| a.name.eq_ignore_ascii_case(assignee));
-                        // Fall back to ID lookup (supervisor may have copy-pasted session UUID).
-                        let by_id = if by_name.is_none() {
-                            agents.iter().find(|a| a.id.eq_ignore_ascii_case(assignee))
-                        } else {
-                            None
-                        };
+                        if let Ok(agent_store) = self.open_agent_store() {
+                            if let Ok(agents) = agent_store.list(None) {
+                                // Find by name first (canonical path).
+                                // cas-dbbb P2: use case-insensitive compare to match
+                                // `task mine`'s own identity matching logic.
+                                let by_name = agents
+                                    .iter()
+                                    .find(|a| a.name.eq_ignore_ascii_case(&assignee));
+                                // Fall back to ID lookup (supervisor may have copy-pasted
+                                // session UUID).
+                                let by_id = if by_name.is_none() {
+                                    agents
+                                        .iter()
+                                        .find(|a| a.id.eq_ignore_ascii_case(&assignee))
+                                } else {
+                                    None
+                                };
 
-                        if let Some(worker) = by_name {
-                            // Canonical — no normalization needed.
-                            // Worktree staleness check.
-                            if factory_config.warn_stale_assignment
-                                || factory_config.block_stale_assignment
-                            {
-                                if let Some(clone_path) = worker.metadata.get("clone_path") {
-                                    if let Some((behind_count, branch)) = check_worktree_staleness(
-                                        clone_path,
-                                        preferred_sync.as_deref(),
-                                    ) {
-                                        if behind_count > 0 {
-                                            let warning_msg = format!(
-                                                "⚠️ Worker '{assignee}' is {behind_count} commit(s) \
-                                                 behind {branch}. Consider syncing first."
-                                            );
-                                            if factory_config.block_stale_assignment
-                                                && behind_count
-                                                    >= factory_config.stale_threshold_commits
+                                if let Some(worker) = by_name {
+                                    // Canonical — no normalization needed.
+                                    // Worktree staleness check.
+                                    if factory_config.warn_stale_assignment
+                                        || factory_config.block_stale_assignment
+                                    {
+                                        if let Some(clone_path) =
+                                            worker.metadata.get("clone_path")
+                                        {
+                                            if let Some((behind_count, branch)) =
+                                                check_worktree_staleness(
+                                                    clone_path,
+                                                    preferred_sync.as_deref(),
+                                                )
                                             {
-                                                return Err(McpError {
-                                                    code: ErrorCode::INVALID_PARAMS,
-                                                    message: Cow::from(format!(
-                                                        "Cannot assign to worker '{}': {} commits \
-                                                         behind {} (threshold: {}). Ask the worker \
-                                                         to rebase: `git rebase {}`",
-                                                        assignee,
-                                                        behind_count,
-                                                        branch,
-                                                        factory_config.stale_threshold_commits,
-                                                        branch
-                                                    )),
-                                                    data: None,
-                                                });
+                                                if behind_count > 0 {
+                                                    let warning_msg = format!(
+                                                        "⚠️ Worker '{assignee}' is {behind_count} \
+                                                         commit(s) behind {branch}. Consider \
+                                                         syncing first."
+                                                    );
+                                                    if factory_config.block_stale_assignment
+                                                        && behind_count
+                                                            >= factory_config
+                                                                .stale_threshold_commits
+                                                    {
+                                                        return Err(McpError {
+                                                            code: ErrorCode::INVALID_PARAMS,
+                                                            message: Cow::from(format!(
+                                                                "Cannot assign to worker '{}': {} \
+                                                                 commits behind {} (threshold: \
+                                                                 {}). Ask the worker to rebase: \
+                                                                 `git rebase {}`",
+                                                                assignee,
+                                                                behind_count,
+                                                                branch,
+                                                                factory_config
+                                                                    .stale_threshold_commits,
+                                                                branch
+                                                            )),
+                                                            data: None,
+                                                        });
+                                                    }
+                                                    warnings.push(warning_msg);
+                                                }
                                             }
-                                            warnings.push(warning_msg);
                                         }
                                     }
-                                }
-                            }
-                        } else if let Some(worker) = by_id {
-                            // Assignee is a session UUID — normalize to display name
-                            // so `task mine` can find it.
-                            let worker_name = worker.name.clone();
-                            warnings.push(format!(
-                                "⚠️ Assignee '{assignee}' is a session ID. \
-                                 Normalized to display name '{worker_name}' so \
-                                 `task mine` can find this task. \
-                                 Use '{worker_name}' directly to avoid this warning."
-                            ));
-                            canonical_assignee = worker_name.clone();
-                            // cas-dbbb P1: run the same staleness check as the by_name
-                            // branch. The original code skipped this after normalization,
-                            // leaving stale-worktree blocking disabled for UUID assignees.
-                            if factory_config.warn_stale_assignment
-                                || factory_config.block_stale_assignment
-                            {
-                                if let Some(clone_path) = worker.metadata.get("clone_path") {
-                                    if let Some((behind_count, branch)) = check_worktree_staleness(
-                                        clone_path,
-                                        preferred_sync.as_deref(),
-                                    ) {
-                                        if behind_count > 0 {
-                                            let staleness_msg = format!(
-                                                "⚠️ Worker '{worker_name}' is {behind_count} \
-                                                 commit(s) behind {branch}. Consider syncing first."
-                                            );
-                                            if factory_config.block_stale_assignment
-                                                && behind_count
-                                                    >= factory_config.stale_threshold_commits
+                                } else if let Some(worker) = by_id {
+                                    // Assignee is a session UUID — normalize to display name
+                                    // so `task mine` can find it.
+                                    let worker_name = worker.name.clone();
+                                    warnings.push(format!(
+                                        "⚠️ Assignee '{assignee}' is a session ID. \
+                                         Normalized to display name '{worker_name}' so \
+                                         `task mine` can find this task. \
+                                         Use '{worker_name}' directly to avoid this warning."
+                                    ));
+                                    canonical_assignee = worker_name.clone();
+                                    // cas-dbbb P1: run the same staleness check as the by_name
+                                    // branch. The original code skipped this after
+                                    // normalization, leaving stale-worktree blocking disabled
+                                    // for UUID assignees.
+                                    if factory_config.warn_stale_assignment
+                                        || factory_config.block_stale_assignment
+                                    {
+                                        if let Some(clone_path) =
+                                            worker.metadata.get("clone_path")
+                                        {
+                                            if let Some((behind_count, branch)) =
+                                                check_worktree_staleness(
+                                                    clone_path,
+                                                    preferred_sync.as_deref(),
+                                                )
                                             {
-                                                return Err(McpError {
-                                                    code: ErrorCode::INVALID_PARAMS,
-                                                    message: Cow::from(format!(
-                                                        "Cannot assign to worker '{worker_name}': \
-                                                         {behind_count} commits behind {branch} \
-                                                         (threshold: {}). Ask the worker to rebase: \
-                                                         `git rebase {branch}`",
-                                                        factory_config.stale_threshold_commits,
-                                                    )),
-                                                    data: None,
-                                                });
+                                                if behind_count > 0 {
+                                                    let staleness_msg = format!(
+                                                        "⚠️ Worker '{worker_name}' is \
+                                                         {behind_count} commit(s) behind \
+                                                         {branch}. Consider syncing first."
+                                                    );
+                                                    if factory_config.block_stale_assignment
+                                                        && behind_count
+                                                            >= factory_config
+                                                                .stale_threshold_commits
+                                                    {
+                                                        return Err(McpError {
+                                                            code: ErrorCode::INVALID_PARAMS,
+                                                            message: Cow::from(format!(
+                                                                "Cannot assign to worker \
+                                                                 '{worker_name}': {behind_count} \
+                                                                 commits behind {branch} \
+                                                                 (threshold: {}). Ask the worker \
+                                                                 to rebase: `git rebase {branch}`",
+                                                                factory_config
+                                                                    .stale_threshold_commits,
+                                                            )),
+                                                            data: None,
+                                                        });
+                                                    }
+                                                    warnings.push(staleness_msg);
+                                                }
                                             }
-                                            warnings.push(staleness_msg);
                                         }
                                     }
+                                } else {
+                                    // No agent found by name or ID — warn but allow (agent
+                                    // may not yet be registered, e.g. spawning in progress).
+                                    warnings.push(format!(
+                                        "⚠️ No registered factory agent found for assignee \
+                                         '{assignee}'. Verify the worker name with \
+                                         `mcp__cas__system action=worker_status`. Use the \
+                                         worker's display name (e.g. 'codex-jester'), not \
+                                         their session UUID, for reliable `task mine` dispatch."
+                                    ));
                                 }
                             }
-                        } else {
-                            // No agent found by name or ID — warn but allow (agent
-                            // may not yet be registered, e.g. spawning in progress).
-                            warnings.push(format!(
-                                "⚠️ No registered factory agent found for assignee '{assignee}'. \
-                                 Verify the worker name with `mcp__cas__system action=worker_status`. \
-                                 Use the worker's display name (e.g. 'codex-jester'), not their \
-                                 session UUID, for reliable `task mine` dispatch."
-                            ));
                         }
                     }
+
+                    task.assignee = Some(canonical_assignee);
+                    changes.push("assignee");
                 }
             }
-
-            task.assignee = Some(canonical_assignee);
-            changes.push("assignee");
         }
 
         // cas-cc74: epic_verification_owner is an authorized transfer, not a
@@ -697,6 +747,18 @@ mod epic_owner_transfer_auth_tests {
         a.status = status;
         a.last_heartbeat = chrono::Utc::now();
         a
+    }
+
+    #[test]
+    fn test_bf98_normalize_assignee_empty_clears() {
+        assert_eq!(normalize_assignee_update_value(""), None);
+        assert_eq!(normalize_assignee_update_value("   \t  "), None);
+        assert_eq!(
+            normalize_assignee_update_value("  hv-scope  ").as_deref(),
+            Some("hv-scope")
+        );
+        // Must never treat empty as a value that could session-id match.
+        assert!(normalize_assignee_update_value("").is_none());
     }
 
     #[test]
