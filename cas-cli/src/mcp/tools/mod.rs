@@ -140,10 +140,50 @@ fn check_unmerged_epic_branches(epic_id: &str, target_branch: &str) -> Vec<Strin
         .collect()
 }
 
-/// Check how many commits behind its sync target a worktree is
+/// Resolve which git ref a worktree should be compared against for assignment
+/// freshness (cas-44e9).
 ///
-/// Returns (commits_behind, sync_ref) or None if check fails
-fn check_worktree_staleness(clone_path: &str) -> Option<(u32, String)> {
+/// Order:
+/// 1. `preferred` — task's parent epic branch, or session focus_epic pin (caller-resolved)
+/// 2. upstream tracking ref of HEAD (when set)
+/// 3. current branch when it is already `epic/*`
+/// 4. repository default / base branch
+///
+/// **Never** picks an arbitrary `epic/*` from `git branch --list` — that is the
+/// multi-epic bug where concurrent epic B contaminated assignments for epic A.
+pub(crate) fn resolve_staleness_sync_ref(
+    preferred: Option<&str>,
+    current_branch: &str,
+    upstream: Option<&str>,
+    default_branch: &str,
+) -> String {
+    if let Some(p) = preferred.map(str::trim).filter(|s| !s.is_empty()) {
+        return p.to_string();
+    }
+    if let Some(u) = upstream.map(str::trim).filter(|s| !s.is_empty()) {
+        return u.to_string();
+    }
+    if current_branch.starts_with("epic/") {
+        return current_branch.to_string();
+    }
+    // factory/* and all other local branches: base/main — not "last epic/*".
+    if default_branch.trim().is_empty() {
+        "main".to_string()
+    } else {
+        default_branch.to_string()
+    }
+}
+
+/// Check how many commits behind its sync target a worktree is.
+///
+/// `preferred_sync_ref` is the task-scoped target (parent epic branch / focus pin).
+/// When set, it always wins so multi-epic factories compare against the correct epic.
+///
+/// Returns (commits_behind, sync_ref) or None if check fails (missing path / git error).
+fn check_worktree_staleness(
+    clone_path: &str,
+    preferred_sync_ref: Option<&str>,
+) -> Option<(u32, String)> {
     use crate::worktree::GitOperations;
     use std::path::Path;
     use std::process::Command;
@@ -168,29 +208,18 @@ fn check_worktree_staleness(clone_path: &str) -> Option<(u32, String)> {
         return None;
     };
 
-    // Prefer upstream tracking ref, fall back to local parent/default branch.
-    let sync_ref = if let Some(upstream) = current_upstream(path) {
-        upstream
-    } else if current_branch.starts_with("epic/") {
-        current_branch.clone()
-    } else if current_branch.starts_with("factory/") {
-        list_git_branches(Some(path), &["branch", "--list", "epic/*"])
-            .last()
-            .cloned()
-            .or_else(|| {
-                GitOperations::detect_repo_root(path)
-                    .ok()
-                    .map(GitOperations::new)
-                    .map(|git| git.detect_default_branch())
-            })
-            .unwrap_or_else(|| "main".to_string())
-    } else {
-        GitOperations::detect_repo_root(path)
-            .ok()
-            .map(GitOperations::new)
-            .map(|git| git.detect_default_branch())
-            .unwrap_or_else(|| "main".to_string())
-    };
+    let default_branch = GitOperations::detect_repo_root(path)
+        .ok()
+        .map(GitOperations::new)
+        .map(|git| git.detect_default_branch())
+        .unwrap_or_else(|| "main".to_string());
+
+    let sync_ref = resolve_staleness_sync_ref(
+        preferred_sync_ref,
+        &current_branch,
+        current_upstream(path).as_deref(),
+        &default_branch,
+    );
 
     // Fetch latest refs when sync target is a remote-tracking ref.
     if let Some(remote) = remote_for_ref(path, &sync_ref) {
