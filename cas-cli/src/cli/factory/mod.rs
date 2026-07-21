@@ -8,6 +8,7 @@
 mod cloud_attach;
 mod daemon;
 mod lifecycle;
+pub(crate) mod probe_comm;
 mod queries;
 mod remote_attach;
 // cas-728b: pub(crate) (not private) so the director's stall-detection
