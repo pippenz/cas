@@ -8,6 +8,7 @@
 mod cloud_attach;
 mod daemon;
 mod lifecycle;
+pub(crate) mod parity;
 pub(crate) mod probe_comm;
 mod queries;
 mod remote_attach;
@@ -553,6 +554,16 @@ pub enum FactoryCommands {
     },
 
     /// Run the isolated supervisor/worker communication conformance probe
+    /// Launched-agent skill + instruction parity conformance gate (cas-bd9d):
+    /// emit a machine-readable 3×2 (Claude/Codex/Grok × supervisor/worker) report
+    /// proving required skills/agents, effective role clauses, and tool prefix
+    /// from the real launch configuration. Non-zero exit if any cell fails.
+    Parity {
+        /// Optional path to also write the per-cell report as JSONL.
+        #[arg(long)]
+        jsonl: Option<std::path::PathBuf>,
+    },
+
     ProbeComm {
         /// JSONL output path for per-scenario stage evidence
         #[arg(long)]
@@ -784,6 +795,7 @@ pub fn execute(args: &FactoryArgs, cli: &Cli, cas_root: Option<&std::path::Path>
                 *timeout_ms,
                 cas_root.as_deref(),
             ),
+            FactoryCommands::Parity { jsonl } => parity::execute_parity(jsonl.clone()),
             FactoryCommands::ProbeComm {
                 jsonl,
                 cas_root: sub_cas_root,

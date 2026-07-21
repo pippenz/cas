@@ -69,6 +69,8 @@ pub mod renderer;
 mod session;
 mod status_bar;
 pub(crate) use app::persist_session_metadata_pinned_epic_id_at;
+// cas-bd9d: the parity conformance gate drives these launch intro-prompt paths.
+pub(crate) use app::{queue_codex_worker_intro_prompt, queue_supervisor_intro_prompt};
 pub use app::{FactoryApp, FactoryConfig};
 pub use boot::{BootConfig, run_boot_screen_client};
 pub use client::{
