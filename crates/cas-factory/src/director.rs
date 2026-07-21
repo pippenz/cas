@@ -334,6 +334,7 @@ impl DirectorData {
             EventType::WorkerVerificationBlocked,
             EventType::VerificationStarted,
             EventType::VerificationAdded,
+            EventType::TaskNoteAdded,
             EventType::AuditTrailGap,
         ];
         let mut agent_latest_activity: HashMap<String, (String, chrono::DateTime<chrono::Utc>)> =
@@ -879,5 +880,83 @@ fn parse_diff_numstat(output: &str, line_counts: &mut HashMap<String, (usize, us
         let entry = line_counts.entry(file_s.to_string()).or_insert((0, 0));
         entry.0 += added;
         entry.1 += removed;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cas_store::TaskStore;
+    use cas_types::{Agent, EventEntityType};
+    use chrono::{Duration, Utc};
+
+    #[test]
+    fn task_note_activity_counts_as_recent_worker_activity() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let stores = DirectorStores::open(temp_dir.path()).unwrap();
+        stores.task_store.init().unwrap();
+        stores.agent_store.init().unwrap();
+        stores.event_store.init().unwrap();
+
+        let now = Utc::now();
+        let worker_id = "worker-session-1";
+        let worker_name = "lively-worker-1";
+
+        let mut worker = Agent::new_with_role(
+            worker_id.to_string(),
+            worker_name.to_string(),
+            AgentRole::Worker,
+        );
+        worker.last_heartbeat = now;
+        stores.agent_store.register(&worker).unwrap();
+
+        let mut task = Task::new("cas-note-activity".to_string(), "Note activity".to_string());
+        task.status = TaskStatus::InProgress;
+        task.assignee = Some(worker_name.to_string());
+        task.updated_at = now;
+        stores.task_store.add(&task).unwrap();
+
+        let mut stale_file_event = Event::new(
+            EventType::WorkerFileEdited,
+            EventEntityType::Task,
+            &task.id,
+            "old file edit",
+        )
+        .with_session(worker_id);
+        stale_file_event.created_at =
+            now - Duration::seconds(crate::config::DEFAULT_STALL_THRESHOLD_SECS as i64 + 30);
+        stores.event_store.record(&stale_file_event).unwrap();
+
+        let mut recent_note_event = Event::new(
+            EventType::TaskNoteAdded,
+            EventEntityType::Task,
+            &task.id,
+            "recent progress note",
+        )
+        .with_session(worker_id);
+        recent_note_event.created_at =
+            now - Duration::seconds(crate::config::DEFAULT_STALL_THRESHOLD_SECS as i64 / 2);
+        stores.event_store.record(&recent_note_event).unwrap();
+
+        let data =
+            DirectorData::load_with_stores(temp_dir.path(), None, false, Some(&stores)).unwrap();
+        let worker_summary = data
+            .agents
+            .iter()
+            .find(|agent| agent.id == worker_id)
+            .expect("worker is present in director data");
+
+        let (summary, latest_activity_at) = worker_summary
+            .latest_activity
+            .as_ref()
+            .expect("task notes are loaded as worker activity");
+        assert_eq!(summary, "recent progress note");
+        assert_eq!(*latest_activity_at, recent_note_event.created_at);
+
+        let activity_age = now.signed_duration_since(*latest_activity_at).num_seconds();
+        assert!(
+            activity_age < crate::config::DEFAULT_STALL_THRESHOLD_SECS as i64,
+            "recent task-note activity must keep the stall predicate below threshold"
+        );
     }
 }
