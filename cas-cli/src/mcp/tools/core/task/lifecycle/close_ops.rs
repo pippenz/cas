@@ -1330,7 +1330,12 @@ impl CasCore {
                                 .map(|wt| wt.parent_branch.clone())
                         })
                         .unwrap_or_else(|| "main".to_string());
-                    match check_commit_claim_integrity(worker_wt, &parent_branch, true) {
+                    match check_commit_claim_integrity(
+                        worker_wt,
+                        &parent_branch,
+                        true,
+                        task.deliverables.factory_branch_anchor.as_deref(),
+                    ) {
                         CommitClaimGateOutcome::Reject(msg) => {
                             return Ok(Self::tool_error(msg));
                         }
@@ -1700,6 +1705,9 @@ impl CasCore {
                         &task.task_type,
                         task.execution_note.as_deref(),
                         has_review_findings,
+                        // cas-127f: parked tip from MERGE REQUIRED — proves
+                        // real work even when merge-base..HEAD is now empty.
+                        task.deliverables.factory_branch_anchor.as_deref(),
                     ) {
                         ZeroCommitCloseOutcome::AmbiguousCodeTask(msg) => {
                             return Ok(Self::tool_error(msg));
@@ -3568,12 +3576,21 @@ pub(crate) fn check_commit_claim_integrity(
     worker_worktree_path: &std::path::Path,
     parent_branch: &str,
     has_review_findings: bool,
+    factory_branch_anchor: Option<&str>,
 ) -> CommitClaimGateOutcome {
     if !has_review_findings {
         return CommitClaimGateOutcome::Proceed;
     }
     let commit_count = count_worker_branch_commits(worker_worktree_path, parent_branch);
     if commit_count == 0 {
+        // cas-127f: after MERGE REQUIRED + supervisor merge, merge-base..HEAD
+        // is empty even though real work (the parked anchor) landed on parent.
+        // That is not fabrication — it is merge-satisfied.
+        if let Some(anchor) = factory_branch_anchor {
+            if commit_is_merged_into_parent(worker_worktree_path, anchor, parent_branch) {
+                return CommitClaimGateOutcome::Proceed;
+            }
+        }
         CommitClaimGateOutcome::Reject(format!(
             "⚠️ FABRICATION DETECTED\n\n\
             task close rejected: code_review_findings was provided (indicating \
@@ -3620,6 +3637,46 @@ pub(crate) enum ZeroCommitCloseOutcome {
     AmbiguousCodeTask(String),
 }
 
+/// cas-127f: true when `commit_ish` is an ancestor of `parent_branch`
+/// (or `origin/<parent_branch>` when that ref exists) inside `repo_path`.
+///
+/// Used to distinguish "never committed" from "committed, MERGE REQUIRED
+/// parked an anchor, supervisor already integrated those commits" — after
+/// a successful merge, `count_worker_branch_commits` is 0 even though real
+/// work landed on the parent. Fail closed on any git error.
+pub(crate) fn commit_is_merged_into_parent(
+    repo_path: &std::path::Path,
+    commit_ish: &str,
+    parent_branch: &str,
+) -> bool {
+    use std::process::Command;
+    if commit_ish.is_empty() || !is_safe_git_refname(parent_branch) {
+        return false;
+    }
+    // Reject option-injection on the commit-ish too (full SHAs are fine;
+    // leading `-` is not a valid commit ref for our purposes).
+    if commit_ish.starts_with('-') {
+        return false;
+    }
+    let check = |parent: &str| -> bool {
+        Command::new("git")
+            .args(["merge-base", "--is-ancestor", commit_ish, parent])
+            .current_dir(repo_path)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    };
+    if check(parent_branch) {
+        return true;
+    }
+    // Mirror cas-38e2: local parent ref can lag origin after a remote merge.
+    let origin_parent = format!("origin/{parent_branch}");
+    if git_ref_exists(repo_path, &origin_parent) {
+        return check(&origin_parent);
+    }
+    false
+}
+
 /// cas-ee2b: check whether a zero-commit close is ambiguous and should be
 /// rejected.
 ///
@@ -3628,7 +3685,7 @@ pub(crate) enum ZeroCommitCloseOutcome {
 /// i.e. after the main `has_worker_committed_reviewable_changes` check
 /// returned false.
 ///
-/// Three-case decision tree:
+/// Decision tree:
 ///
 /// 1. **Docs-only commits** (`count > 0` but no reviewable files): worker
 ///    committed work; the reviewable-files check correctly returned false.
@@ -3639,8 +3696,16 @@ pub(crate) enum ZeroCommitCloseOutcome {
 ///    gate handles that case):
 ///    → `Proceed`. No ambiguity.
 ///
-/// 3. **Ambiguous zero-commit** (`count == 0`, no `execution_note`, task
-///    type is Bug/Feature/Task, no review findings):
+/// 3. **Merge-satisfied** (cas-127f): `count == 0` but
+///    `factory_branch_anchor` is set and that SHA is an ancestor of
+///    `parent_branch` (work was committed, MERGE REQUIRED parked the tip,
+///    supervisor merged into the epic). → `Proceed`. Without this path,
+///    post-merge close false-rejects ZERO-COMMIT because the worker tip
+///    is no longer *ahead of* parent even though the work landed.
+///
+/// 4. **Ambiguous zero-commit** (`count == 0`, no anchor / anchor not
+///    integrated, no `execution_note`, task type is Bug/Feature/Task, no
+///    review findings):
 ///    → `AmbiguousCodeTask(msg)`. Ask worker to commit, set `execution_note`,
 ///    or have the supervisor bypass.
 ///
@@ -3648,8 +3713,14 @@ pub(crate) enum ZeroCommitCloseOutcome {
 /// When true, the cas-490f gate fires upstream; this function returns `Proceed`
 /// so the two gates don't double-reject.
 ///
-/// Returns `Proceed` on any git failure (graceful degradation — not
-/// ambiguous when history is unknowable).
+/// `factory_branch_anchor`: optional tip SHA recorded by
+/// `park_task_awaiting_merge` the first time the merge gate rejected this
+/// task. Only set when the factory branch had unmerged commits — genuine
+/// zero-commit tasks never park, so they never get an anchor.
+///
+/// Returns `Proceed` on any git failure for the count path (graceful
+/// degradation — not ambiguous when history is unknowable). Ancestor
+/// checks fail closed (unknown integration ≠ merge-satisfied).
 pub(crate) fn check_zero_commit_close(
     worker_worktree_path: &std::path::Path,
     parent_branch: &str,
@@ -3657,6 +3728,7 @@ pub(crate) fn check_zero_commit_close(
     task_type: &TaskType,
     execution_note: Option<&str>,
     has_review_findings: bool,
+    factory_branch_anchor: Option<&str>,
 ) -> ZeroCommitCloseOutcome {
     // Not a code-expecting task type → no ambiguity.
     if !matches!(
@@ -3712,6 +3784,12 @@ pub(crate) fn check_zero_commit_close(
             3. Supervisors may bypass this gate with bypass_code_review=true \
                (logged as a decision note)."
         ));
+    }
+    // cas-127f: merge-satisfied — parked tip is now on the parent.
+    if let Some(anchor) = factory_branch_anchor {
+        if commit_is_merged_into_parent(worker_worktree_path, anchor, parent_branch) {
+            return ZeroCommitCloseOutcome::Proceed;
+        }
     }
     // Case 3: ambiguous zero-commit close.
     let task_type_str = format!("{task_type:?}").to_lowercase();
@@ -8710,7 +8788,7 @@ mod commit_claim_integrity_tests {
     fn fabrication_detected_when_zero_commits_with_review_findings() {
         let dir = init_worker_repo();
         // No commits beyond base — fabrication scenario.
-        let outcome = check_commit_claim_integrity(dir.path(), "main", true);
+        let outcome = check_commit_claim_integrity(dir.path(), "main", true, None);
         match outcome {
             CommitClaimGateOutcome::Reject(msg) => {
                 assert!(
@@ -8737,7 +8815,7 @@ mod commit_claim_integrity_tests {
         // Worker did documentation-only work and did not supply
         // code_review_findings. Empty branch is fine in that case.
         let dir = init_worker_repo();
-        let outcome = check_commit_claim_integrity(dir.path(), "main", false);
+        let outcome = check_commit_claim_integrity(dir.path(), "main", false, None);
         assert!(
             matches!(outcome, CommitClaimGateOutcome::Proceed),
             "no-findings close on empty branch must proceed (no fabrication claim)"
@@ -8752,10 +8830,52 @@ mod commit_claim_integrity_tests {
         git(dir.path(), &["add", "real.rs"]);
         git(dir.path(), &["commit", "-q", "-m", "real work"]);
 
-        let outcome = check_commit_claim_integrity(dir.path(), "main", true);
+        let outcome = check_commit_claim_integrity(dir.path(), "main", true, None);
         assert!(
             matches!(outcome, CommitClaimGateOutcome::Proceed),
             "commits + findings must proceed (worker did real work)"
+        );
+    }
+
+    /// cas-127f: findings + empty merge-base..HEAD after supervisor merge is
+    /// not fabrication when the parked factory tip is an ancestor of parent.
+    #[test]
+    fn findings_after_merge_satisfied_anchor_proceeds() {
+        let dir = init_worker_repo();
+        std::fs::write(dir.path().join("real.rs"), "fn real() {}\n").unwrap();
+        git(dir.path(), &["add", "real.rs"]);
+        git(dir.path(), &["commit", "-q", "-m", "real work"]);
+        let anchor = String::from_utf8(
+            std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(dir.path())
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        // Supervisor merges factory tip into main (no-ff).
+        git(dir.path(), &["checkout", "-q", "main"]);
+        git(
+            dir.path(),
+            &["merge", "--no-ff", "-m", "merge worker", "factory/test-worker"],
+        );
+        // Worker tip is now even with parent (or still at anchor which is
+        // ancestor) — count beyond parent is 0 either way after checkout.
+        git(dir.path(), &["checkout", "-q", "factory/test-worker"]);
+        git(dir.path(), &["reset", "--hard", "main"]);
+
+        assert_eq!(
+            count_worker_branch_commits(dir.path(), "main"),
+            0,
+            "post-merge worker tip must not be ahead of parent"
+        );
+        let outcome = check_commit_claim_integrity(dir.path(), "main", true, Some(&anchor));
+        assert!(
+            matches!(outcome, CommitClaimGateOutcome::Proceed),
+            "merge-satisfied anchor must not look like fabrication"
         );
     }
 }
@@ -8894,6 +9014,7 @@ mod zero_change_close_tests {
             &TaskType::Bug,
             None,  // no execution_note
             false, // no review findings
+            None,  // factory_branch_anchor
         );
         assert!(
             matches!(outcome, ZeroCommitCloseOutcome::Proceed),
@@ -8914,6 +9035,7 @@ mod zero_change_close_tests {
             &TaskType::Bug,
             None,  // no execution_note
             false, // no review findings
+            None,  // factory_branch_anchor
         );
         match outcome {
             ZeroCommitCloseOutcome::AmbiguousCodeTask(msg) => {
@@ -8944,6 +9066,7 @@ mod zero_change_close_tests {
             &TaskType::Bug,
             Some("additive-only"), // explicit no-code signal
             false,
+            None, // factory_branch_anchor
         );
         assert!(
             matches!(outcome, ZeroCommitCloseOutcome::Proceed),
@@ -8957,7 +9080,7 @@ mod zero_change_close_tests {
         let dir = init_worker_repo();
         for task_type in [TaskType::Chore, TaskType::Epic] {
             let outcome =
-                check_zero_commit_close(dir.path(), "main", "cas-test1", &task_type, None, false);
+                check_zero_commit_close(dir.path(), "main", "cas-test1", &task_type, None, false, None);
             assert!(
                 matches!(outcome, ZeroCommitCloseOutcome::Proceed),
                 "{task_type:?} task type must not be flagged as ambiguous"
@@ -8977,6 +9100,7 @@ mod zero_change_close_tests {
             &TaskType::Bug,
             None,
             true, // has_review_findings = true (cas-490f rejects, not this gate)
+            None, // factory_branch_anchor
         );
         assert!(
             matches!(outcome, ZeroCommitCloseOutcome::Proceed),
@@ -9030,6 +9154,7 @@ mod zero_change_close_tests {
             &TaskType::Bug,
             None,  // no execution_note
             false, // no review findings
+            None,  // factory_branch_anchor
         );
         match outcome {
             ZeroCommitCloseOutcome::AmbiguousCodeTask(msg) => {
@@ -9046,6 +9171,147 @@ mod zero_change_close_tests {
                 );
             }
         }
+    }
+
+    // ── cas-127f: post-MERGE-REQUIRED zero-commit false-positive ───────────
+
+    /// Happy path: worker commits C, MERGE REQUIRED records C as anchor,
+    /// supervisor merges C into parent, worker tip is no longer ahead →
+    /// count==0 but anchor is ancestor → Proceed (not ZERO-COMMIT).
+    #[test]
+    fn cas127f_post_merge_ancestor_anchor_proceeds() {
+        let dir = init_worker_repo();
+        std::fs::write(dir.path().join("fix.rs"), "pub fn work() {}\n").unwrap();
+        git(dir.path(), &["add", "fix.rs"]);
+        git(dir.path(), &["commit", "-q", "-m", "feat: task work"]);
+        let anchor = String::from_utf8(
+            std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(dir.path())
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+
+        // Sanity: before merge, zero-commit gate would Proceed via count>0.
+        assert!(count_worker_branch_commits(dir.path(), "main") > 0);
+
+        // Supervisor merges factory tip into main.
+        git(dir.path(), &["checkout", "-q", "main"]);
+        git(
+            dir.path(),
+            &["merge", "--no-ff", "-m", "merge factory/test-worker", "factory/test-worker"],
+        );
+        // Worker factory branch reset to epic tip (post-merge sync).
+        git(dir.path(), &["checkout", "-q", "factory/test-worker"]);
+        git(dir.path(), &["reset", "--hard", "main"]);
+
+        assert_eq!(
+            count_worker_branch_commits(dir.path(), "main"),
+            0,
+            "post-merge: merge-base..HEAD must be empty (the false-positive fixture)"
+        );
+        assert!(
+            commit_is_merged_into_parent(dir.path(), &anchor, "main"),
+            "parked anchor must be ancestor of parent after merge"
+        );
+
+        let outcome = check_zero_commit_close(
+            dir.path(),
+            "main",
+            "cas-127f",
+            &TaskType::Bug,
+            None,
+            false,
+            Some(&anchor),
+        );
+        assert!(
+            matches!(outcome, ZeroCommitCloseOutcome::Proceed),
+            "merge-satisfied anchor must Proceed, not ZERO-COMMIT; got {outcome:?}"
+        );
+    }
+
+    /// Edge: genuine never-had-commits code task still rejects (no anchor).
+    #[test]
+    fn cas127f_genuine_zero_commit_without_anchor_still_rejects() {
+        let dir = init_worker_repo();
+        let outcome = check_zero_commit_close(
+            dir.path(),
+            "main",
+            "cas-127f",
+            &TaskType::Bug,
+            None,
+            false,
+            None,
+        );
+        match outcome {
+            ZeroCommitCloseOutcome::AmbiguousCodeTask(msg) => {
+                assert!(
+                    msg.contains("ZERO-COMMIT CLOSE ON CODE TASK"),
+                    "genuine zero-commit must still name the gate: {msg}"
+                );
+            }
+            ZeroCommitCloseOutcome::Proceed => {
+                panic!("genuine zero-commit without anchor must not Proceed");
+            }
+        }
+    }
+
+    /// Edge: anchor set but not integrated (still unmerged) + count 0 —
+    /// e.g. factory tip was force-reset without merging. Fail closed.
+    #[test]
+    fn cas127f_unmerged_anchor_with_empty_ahead_still_rejects() {
+        let dir = init_worker_repo();
+        // Commit work, record anchor, then hard-reset factory away so the
+        // commit is orphaned from parent *and* HEAD is back at base.
+        std::fs::write(dir.path().join("orphan.rs"), "fn orphan() {}\n").unwrap();
+        git(dir.path(), &["add", "orphan.rs"]);
+        git(dir.path(), &["commit", "-q", "-m", "orphaned work"]);
+        let anchor = String::from_utf8(
+            std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(dir.path())
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        git(dir.path(), &["reset", "--hard", "main"]);
+
+        assert_eq!(count_worker_branch_commits(dir.path(), "main"), 0);
+        assert!(
+            !commit_is_merged_into_parent(dir.path(), &anchor, "main"),
+            "orphan anchor must not be considered merged"
+        );
+
+        let outcome = check_zero_commit_close(
+            dir.path(),
+            "main",
+            "cas-127f",
+            &TaskType::Feature,
+            None,
+            false,
+            Some(&anchor),
+        );
+        assert!(
+            matches!(outcome, ZeroCommitCloseOutcome::AmbiguousCodeTask(_)),
+            "unmerged anchor must not unlock zero-commit; got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn commit_is_merged_into_parent_false_for_unknown_sha() {
+        let dir = init_worker_repo();
+        assert!(!commit_is_merged_into_parent(
+            dir.path(),
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+            "main"
+        ));
     }
 }
 
