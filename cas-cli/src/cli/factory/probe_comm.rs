@@ -1,19 +1,27 @@
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
+pub(crate) mod adapters;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum ProbeAdapterKind {
     Fake,
+    Claude,
+    Codex,
+    Grok,
+    All,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct ProbeThresholds {
     pub delivery_ms: u64,
     pub selection_ms: u64,
+    pub wake_ms: u64,
+    pub reaction_ms: u64,
 }
 
 impl ProbeThresholds {
@@ -22,6 +30,8 @@ impl ProbeThresholds {
         Self {
             delivery_ms: 500,
             selection_ms: 250,
+            wake_ms: 250,
+            reaction_ms: 500,
         }
     }
 }
@@ -43,6 +53,7 @@ pub(crate) enum ProbeFailure {
 pub(crate) struct ProbeCommConfig {
     pub jsonl: PathBuf,
     pub cas_root: Option<PathBuf>,
+    pub artifact_root: Option<PathBuf>,
     pub allow_active_cas_root: bool,
     pub adapter: Option<ProbeAdapterKind>,
     pub thresholds: ProbeThresholds,
@@ -70,11 +81,29 @@ pub(crate) struct ScenarioReport {
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct MessageStageEvidence {
     pub message_id: String,
-    pub target: &'static str,
-    pub enqueued_at_ms: u64,
-    pub selected_at_ms: u64,
+    pub target: String,
+    pub enqueued_at_ms: Option<u64>,
+    pub selected_at_ms: Option<u64>,
     pub delivered_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wake_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_reaction_at_ms: Option<u64>,
+    pub enqueued_status: &'static str,
+    pub selected_status: &'static str,
+    pub delivered_status: &'static str,
+    pub wake_status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reaction_status: Option<String>,
+    pub stage_statuses: Vec<StageStatusEvidence>,
     pub terminal: &'static str,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct StageStatusEvidence {
+    pub stage: String,
+    pub status: String,
+    pub provenance: String,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -136,22 +165,28 @@ const SCENARIOS: &[ScenarioDef] = &[
 pub(crate) fn execute_probe_comm(
     jsonl: PathBuf,
     cas_root: Option<PathBuf>,
+    artifact_root: Option<PathBuf>,
     parent_cas_root: Option<&Path>,
     allow_active_cas_root: bool,
     adapter: ProbeAdapterKind,
     delivery_slo_ms: u64,
     selection_slo_ms: u64,
+    wake_slo_ms: u64,
+    reaction_slo_ms: u64,
     failure: Option<ProbeFailure>,
 ) -> Result<()> {
     let report = run_probe_comm_with_parent(
         ProbeCommConfig {
             jsonl,
             cas_root,
+            artifact_root,
             allow_active_cas_root,
             adapter: Some(adapter),
             thresholds: ProbeThresholds {
                 delivery_ms: delivery_slo_ms,
                 selection_ms: selection_slo_ms,
+                wake_ms: wake_slo_ms,
+                reaction_ms: reaction_slo_ms,
             },
             failure,
         },
@@ -225,6 +260,7 @@ pub(crate) fn run_probe_comm_with_parent(
     let ProbeCommConfig {
         jsonl,
         cas_root,
+        artifact_root,
         allow_active_cas_root,
         adapter,
         thresholds,
@@ -232,9 +268,6 @@ pub(crate) fn run_probe_comm_with_parent(
     } = config;
 
     let adapter = adapter.context("probe adapter is required")?;
-    match adapter {
-        ProbeAdapterKind::Fake => {}
-    }
 
     if jsonl.is_dir() {
         bail!("jsonl output path is a directory: {}", jsonl.display());
@@ -265,10 +298,18 @@ pub(crate) fn run_probe_comm_with_parent(
             .with_context(|| format!("failed to create jsonl output path {}", jsonl.display()))?,
     );
 
-    let mut clock = FakeClock::default();
-    let mut scenarios = Vec::with_capacity(SCENARIOS.len());
-    for scenario in SCENARIOS {
-        let report = run_scenario(*scenario, &thresholds, failure.as_ref(), &mut clock);
+    let scenarios_to_write = match adapter {
+        ProbeAdapterKind::Fake => run_fake_scenarios(&thresholds, failure.as_ref()),
+        ProbeAdapterKind::Claude
+        | ProbeAdapterKind::Codex
+        | ProbeAdapterKind::Grok
+        | ProbeAdapterKind::All => {
+            run_recorded_adapter_scenarios(adapter, artifact_root.as_deref(), &thresholds)
+        }
+    };
+
+    let mut scenarios = Vec::with_capacity(scenarios_to_write.len());
+    for report in scenarios_to_write {
         serde_json::to_writer(&mut writer, &report)
             .context("failed to serialize probe scenario evidence")?;
         writer
@@ -294,6 +335,481 @@ pub(crate) fn run_probe_comm_with_parent(
     }
 
     Ok(report)
+}
+
+fn run_fake_scenarios(
+    thresholds: &ProbeThresholds,
+    failure: Option<&ProbeFailure>,
+) -> Vec<ScenarioReport> {
+    let mut clock = FakeClock::default();
+    SCENARIOS
+        .iter()
+        .map(|scenario| run_scenario(*scenario, thresholds, failure, &mut clock))
+        .collect()
+}
+
+fn run_recorded_adapter_scenarios(
+    adapter: ProbeAdapterKind,
+    artifact_root: Option<&Path>,
+    thresholds: &ProbeThresholds,
+) -> Vec<ScenarioReport> {
+    let mut scenarios = Vec::new();
+    if matches!(adapter, ProbeAdapterKind::Claude | ProbeAdapterKind::All) {
+        scenarios.push(adapter_scenario_from_result(
+            "claude_adapter",
+            "claude-1",
+            "worker-a",
+            artifact_root.map(|root| {
+                adapters::ClaudeAdapter::extract_fixture(&adapters::ClaudeFixture {
+                    inbox_path: root.join("claude").join("inbox.json"),
+                    transcript_path: Some(root.join("claude").join("transcript.jsonl")),
+                    message_id: "claude-1".to_string(),
+                    target: "worker-a".to_string(),
+                })
+            }),
+            thresholds,
+        ));
+    }
+    if matches!(adapter, ProbeAdapterKind::Codex | ProbeAdapterKind::All) {
+        scenarios.push(adapter_scenario_from_result(
+            "codex_adapter",
+            "codex-1",
+            "worker-a",
+            artifact_root.map(|root| {
+                adapters::CodexAdapter::extract_fixture(&adapters::CodexFixture {
+                    rollout_path: root.join("codex").join("rollout.jsonl"),
+                    message_id: "codex-1".to_string(),
+                    target: "worker-a".to_string(),
+                })
+            }),
+            thresholds,
+        ));
+    }
+    if matches!(adapter, ProbeAdapterKind::Grok | ProbeAdapterKind::All) {
+        scenarios.push(adapter_scenario_from_result(
+            "grok_adapter",
+            "grok-1",
+            "worker-a",
+            artifact_root.map(|root| {
+                adapters::GrokAdapter::extract_fixture(&adapters::GrokFixture {
+                    updates_path: root.join("grok").join("updates.jsonl"),
+                    events_path: Some(root.join("grok").join("events.jsonl")),
+                    message_id: "grok-1".to_string(),
+                    target: "worker-a".to_string(),
+                })
+            }),
+            thresholds,
+        ));
+    }
+    if matches!(adapter, ProbeAdapterKind::All) {
+        scenarios.push(routing_matrix_evidence_scenario(artifact_root));
+        scenarios.push(merge_reclose_lifecycle_evidence_scenario(artifact_root));
+    }
+    scenarios
+}
+
+fn adapter_scenario_from_result(
+    name: &'static str,
+    message_id: &str,
+    target: &str,
+    result: Option<Result<MessageStageEvidence>>,
+    thresholds: &ProbeThresholds,
+) -> ScenarioReport {
+    match result {
+        Some(Ok(stage)) => adapter_scenario(name, stage, thresholds),
+        Some(Err(error)) => {
+            let detail = format!("{error:?}");
+            adapter_failure_scenario(
+                name,
+                message_id,
+                target,
+                classify_artifact_error(&detail),
+                detail,
+            )
+        }
+        None => adapter_failure_scenario(
+            name,
+            message_id,
+            target,
+            "artifact_missing",
+            "recorded harness adapter requires --artifact-root".to_string(),
+        ),
+    }
+}
+
+fn adapter_scenario(
+    name: &'static str,
+    mut stage: MessageStageEvidence,
+    thresholds: &ProbeThresholds,
+) -> ScenarioReport {
+    let mut failed_stage = None;
+    if stage.terminal == "delivered" {
+        if let (Some(delivered), Some(wake)) = (stage.delivered_at_ms, stage.wake_at_ms)
+            && wake.saturating_sub(delivered) > thresholds.wake_ms
+        {
+            stage.terminal = "wake_slo_failed";
+            failed_stage = Some("wake_slo");
+            stage.wake_status = "FAILED";
+            stage.stage_statuses.push(StageStatusEvidence {
+                stage: "wake".to_string(),
+                status: "FAILED".to_string(),
+                provenance: format!(
+                    "wake observed {}ms after delivery; wake_slo_ms={}",
+                    wake.saturating_sub(delivered),
+                    thresholds.wake_ms
+                ),
+            });
+        }
+        if failed_stage.is_none()
+            && let (Some(delivered), Some(reaction)) =
+                (stage.delivered_at_ms, stage.first_reaction_at_ms)
+            && reaction.saturating_sub(delivered) > thresholds.reaction_ms
+        {
+            stage.terminal = "reaction_slo_failed";
+            failed_stage = Some("reaction_slo");
+            stage.reaction_status = Some("FAILED".to_string());
+            stage.stage_statuses.push(StageStatusEvidence {
+                stage: "reaction".to_string(),
+                status: "FAILED".to_string(),
+                provenance: format!(
+                    "reaction observed {}ms after delivery; reaction_slo_ms={}",
+                    reaction.saturating_sub(delivered),
+                    thresholds.reaction_ms
+                ),
+            });
+        }
+    } else {
+        failed_stage = Some(stage.terminal);
+    }
+
+    let passed =
+        stage.terminal == "delivered" && stage.reaction_status.as_deref() != Some("UNKNOWN");
+    ScenarioReport {
+        name,
+        passed,
+        failed_stage: if passed {
+            None
+        } else {
+            failed_stage.or(Some("reaction_unknown"))
+        },
+        message_ids: vec![stage.message_id.clone()],
+        duplicates_suppressed: 0,
+        malformed_targets_rejected: 0,
+        stages: vec![stage],
+    }
+}
+
+fn classify_artifact_error(error: &str) -> &'static str {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("transcript_parse_failed") {
+        "transcript_parse_failed"
+    } else if lower.contains("events_parse_failed") {
+        "events_parse_failed"
+    } else if lower.contains("no such file")
+        || lower.contains("not found")
+        || lower.contains("os error 2")
+        || lower.contains("requires --artifact-root")
+    {
+        "artifact_missing"
+    } else if lower.contains("did not contain correlated") {
+        "correlation_unknown"
+    } else if lower.contains("parse") || lower.contains("expected") {
+        "artifact_parse_failed"
+    } else {
+        "correlation_unknown"
+    }
+}
+
+fn adapter_failure_scenario(
+    name: &'static str,
+    message_id: &str,
+    target: &str,
+    failed_stage: &'static str,
+    detail: String,
+) -> ScenarioReport {
+    ScenarioReport {
+        name,
+        passed: false,
+        failed_stage: Some(failed_stage),
+        message_ids: Vec::new(),
+        duplicates_suppressed: 0,
+        malformed_targets_rejected: 0,
+        stages: vec![MessageStageEvidence {
+            message_id: message_id.to_string(),
+            target: target.to_string(),
+            enqueued_at_ms: None,
+            selected_at_ms: None,
+            delivered_at_ms: None,
+            wake_at_ms: None,
+            first_reaction_at_ms: None,
+            enqueued_status: "UNKNOWN",
+            selected_status: "UNKNOWN",
+            delivered_status: if failed_stage == "correlation_unknown" {
+                "UNKNOWN"
+            } else {
+                "FAILED"
+            },
+            wake_status: "UNKNOWN",
+            reaction_status: Some("UNKNOWN".to_string()),
+            stage_statuses: vec![StageStatusEvidence {
+                stage: "artifact".to_string(),
+                status: if failed_stage == "correlation_unknown" {
+                    "UNKNOWN"
+                } else {
+                    "FAILED"
+                }
+                .to_string(),
+                provenance: detail,
+            }],
+            terminal: failed_stage,
+        }],
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ReceiptDocument {
+    receipt_type: String,
+    #[serde(default)]
+    contracts: Vec<ReceiptEntry>,
+    #[serde(default)]
+    receipts: Vec<ReceiptEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReceiptEntry {
+    message_id: String,
+    target: String,
+    stage: String,
+    status: String,
+    provenance: String,
+}
+
+fn routing_matrix_evidence_scenario(artifact_root: Option<&Path>) -> ScenarioReport {
+    let expected = expected_routing_contracts();
+    receipt_backed_scenario(
+        "routing_matrix_evidence",
+        artifact_root,
+        "receipts/routing_matrix.json",
+        "routing_matrix",
+        "contracts",
+        &expected,
+        "routing_receipt_missing",
+        "routing_receipt_malformed",
+        "routing_receipt_incomplete",
+    )
+}
+
+fn merge_reclose_lifecycle_evidence_scenario(artifact_root: Option<&Path>) -> ScenarioReport {
+    let expected = vec![
+        (
+            "cas-126b-merge-reclose-halt-exemption".to_string(),
+            "awaiting-merge-worker".to_string(),
+            "merge_reclose".to_string(),
+        ),
+        (
+            "cas-062d-owner-lifecycle-transitions".to_string(),
+            "owning-supervisor".to_string(),
+            "lifecycle_transition".to_string(),
+        ),
+        (
+            "cas-ecff-lifecycle-outbox-recovery".to_string(),
+            "owning-supervisor".to_string(),
+            "lifecycle_outbox_recovery".to_string(),
+        ),
+    ];
+    receipt_backed_scenario(
+        "merge_reclose_lifecycle_evidence",
+        artifact_root,
+        "receipts/lifecycle.json",
+        "merge_reclose_lifecycle",
+        "receipts",
+        &expected,
+        "lifecycle_receipt_missing",
+        "lifecycle_receipt_malformed",
+        "lifecycle_receipt_incomplete",
+    )
+}
+
+fn expected_routing_contracts() -> Vec<(String, String, String)> {
+    let harnesses = ["claude", "codex", "grok"];
+    let mut expected = Vec::new();
+    for supervisor in harnesses {
+        for worker in harnesses {
+            expected.push((
+                format!("{supervisor}-supervisor-to-{worker}-worker"),
+                format!("{worker}-worker"),
+                "routing_matrix".to_string(),
+            ));
+            expected.push((
+                format!("{worker}-worker-to-{supervisor}-supervisor"),
+                format!("{supervisor}-supervisor"),
+                "routing_matrix".to_string(),
+            ));
+        }
+    }
+    expected
+}
+
+fn receipt_backed_scenario(
+    name: &'static str,
+    artifact_root: Option<&Path>,
+    receipt_relpath: &str,
+    receipt_type: &str,
+    entry_field: &str,
+    expected: &[(String, String, String)],
+    missing_stage: &'static str,
+    malformed_stage: &'static str,
+    incomplete_stage: &'static str,
+) -> ScenarioReport {
+    let Some(root) = artifact_root else {
+        return receipt_failure_scenario(name, missing_stage, "no artifact root for receipts");
+    };
+    let path = root.join(receipt_relpath);
+    if !path.exists() {
+        return receipt_failure_scenario(
+            name,
+            missing_stage,
+            &format!("missing receipt {}", path.display()),
+        );
+    }
+    let data = match fs::read_to_string(&path) {
+        Ok(data) => data,
+        Err(error) => {
+            return receipt_failure_scenario(
+                name,
+                missing_stage,
+                &format!("read receipt {}: {error}", path.display()),
+            );
+        }
+    };
+    let document: ReceiptDocument = match serde_json::from_str(&data) {
+        Ok(document) => document,
+        Err(error) => {
+            return receipt_failure_scenario(
+                name,
+                malformed_stage,
+                &format!("parse receipt {}: {error}", path.display()),
+            );
+        }
+    };
+    if document.receipt_type != receipt_type {
+        return receipt_failure_scenario(
+            name,
+            malformed_stage,
+            &format!(
+                "receipt {} type '{}' did not match expected '{}'",
+                path.display(),
+                document.receipt_type,
+                receipt_type
+            ),
+        );
+    }
+    let entries = if entry_field == "contracts" {
+        document.contracts
+    } else {
+        document.receipts
+    };
+    let mut stages = Vec::new();
+    for (message_id, target, stage) in expected {
+        let Some(entry) = entries
+            .iter()
+            .find(|entry| entry.message_id == *message_id && entry.target == *target)
+        else {
+            return receipt_failure_scenario(
+                name,
+                incomplete_stage,
+                &format!(
+                    "receipt {} missing expected message_id={message_id}",
+                    path.display()
+                ),
+            );
+        };
+        if entry.stage != *stage || entry.status != "OBSERVED" || entry.provenance.is_empty() {
+            return receipt_failure_scenario(
+                name,
+                malformed_stage,
+                &format!(
+                    "receipt {} has invalid entry for {message_id}",
+                    path.display()
+                ),
+            );
+        }
+        stages.push(composed_evidence_stage(
+            &entry.message_id,
+            &entry.target,
+            stage,
+            "OBSERVED",
+            &entry.provenance,
+        ));
+    }
+
+    ScenarioReport {
+        name,
+        passed: true,
+        failed_stage: None,
+        message_ids: stages
+            .iter()
+            .map(|stage| stage.message_id.clone())
+            .collect(),
+        duplicates_suppressed: 0,
+        malformed_targets_rejected: 0,
+        stages,
+    }
+}
+
+fn receipt_failure_scenario(
+    name: &'static str,
+    failed_stage: &'static str,
+    provenance: &str,
+) -> ScenarioReport {
+    ScenarioReport {
+        name,
+        passed: false,
+        failed_stage: Some(failed_stage),
+        message_ids: Vec::new(),
+        duplicates_suppressed: 0,
+        malformed_targets_rejected: 0,
+        stages: vec![composed_evidence_stage(
+            failed_stage,
+            "receipt",
+            failed_stage,
+            if failed_stage.ends_with("_malformed") {
+                "FAILED"
+            } else {
+                "BLOCKED"
+            },
+            provenance,
+        )],
+    }
+}
+
+fn composed_evidence_stage(
+    message_id: &str,
+    target: &str,
+    stage: &str,
+    status: &'static str,
+    provenance: &str,
+) -> MessageStageEvidence {
+    MessageStageEvidence {
+        message_id: message_id.to_string(),
+        target: target.to_string(),
+        enqueued_at_ms: None,
+        selected_at_ms: None,
+        delivered_at_ms: None,
+        wake_at_ms: None,
+        first_reaction_at_ms: None,
+        enqueued_status: "UNKNOWN",
+        selected_status: "UNKNOWN",
+        delivered_status: status,
+        wake_status: "UNKNOWN",
+        reaction_status: Some(status.to_string()),
+        stage_statuses: vec![StageStatusEvidence {
+            stage: stage.to_string(),
+            status: status.to_string(),
+            provenance: provenance.to_string(),
+        }],
+        terminal: "evidence_composed",
+    }
 }
 
 fn guard_active_parent_root(
@@ -344,10 +860,9 @@ fn run_scenario(
             failed_stage = Some("delivered");
         } else if evidence.terminal == "delivery_slo_failed" {
             failed_stage = Some("delivery_slo");
-        } else if evidence
-            .selected_at_ms
-            .saturating_sub(evidence.enqueued_at_ms)
-            > thresholds.selection_ms
+        } else if let (Some(selected), Some(enqueued)) =
+            (evidence.selected_at_ms, evidence.enqueued_at_ms)
+            && selected.saturating_sub(enqueued) > thresholds.selection_ms
         {
             failed_stage = Some("selected");
         }
@@ -381,7 +896,7 @@ fn run_message(
     clock: &mut FakeClock,
 ) -> MessageStageEvidence {
     let enqueued_at_ms = clock.tick(1);
-    let selected_at_ms = clock.tick(0);
+    let selected_at_ms = clock.tick(1);
     let target = if scenario.malformed_target {
         "missing-worker"
     } else {
@@ -391,10 +906,23 @@ fn run_message(
     if scenario.malformed_target {
         return MessageStageEvidence {
             message_id: message_id.to_string(),
-            target,
-            enqueued_at_ms,
-            selected_at_ms,
+            target: target.to_string(),
+            enqueued_at_ms: Some(enqueued_at_ms),
+            selected_at_ms: Some(selected_at_ms),
             delivered_at_ms: None,
+            wake_at_ms: None,
+            first_reaction_at_ms: None,
+            enqueued_status: "OBSERVED",
+            selected_status: "OBSERVED",
+            delivered_status: "FAILED",
+            wake_status: "UNKNOWN",
+            reaction_status: Some("UNKNOWN".to_string()),
+            stage_statuses: fake_stage_statuses(
+                "target_rejected",
+                enqueued_at_ms,
+                selected_at_ms,
+                None,
+            ),
             terminal: "target_rejected",
         };
     }
@@ -406,10 +934,23 @@ fn run_message(
     ) {
         return MessageStageEvidence {
             message_id: message_id.to_string(),
-            target,
-            enqueued_at_ms,
-            selected_at_ms,
+            target: target.to_string(),
+            enqueued_at_ms: Some(enqueued_at_ms),
+            selected_at_ms: Some(selected_at_ms),
             delivered_at_ms: None,
+            wake_at_ms: None,
+            first_reaction_at_ms: None,
+            enqueued_status: "OBSERVED",
+            selected_status: "OBSERVED",
+            delivered_status: "FAILED",
+            wake_status: "UNKNOWN",
+            reaction_status: Some("UNKNOWN".to_string()),
+            stage_statuses: fake_stage_statuses(
+                "transport_failed",
+                enqueued_at_ms,
+                selected_at_ms,
+                None,
+            ),
             terminal: "transport_failed",
         };
     }
@@ -431,12 +972,67 @@ fn run_message(
 
     MessageStageEvidence {
         message_id: message_id.to_string(),
-        target,
-        enqueued_at_ms,
-        selected_at_ms,
+        target: target.to_string(),
+        enqueued_at_ms: Some(enqueued_at_ms),
+        selected_at_ms: Some(selected_at_ms),
         delivered_at_ms: Some(delivered_at_ms),
+        wake_at_ms: None,
+        first_reaction_at_ms: None,
+        enqueued_status: "OBSERVED",
+        selected_status: "OBSERVED",
+        delivered_status: if terminal == "delivered" {
+            "OBSERVED"
+        } else {
+            "FAILED"
+        },
+        wake_status: "UNKNOWN",
+        reaction_status: None,
+        stage_statuses: fake_stage_statuses(
+            terminal,
+            enqueued_at_ms,
+            selected_at_ms,
+            Some(delivered_at_ms),
+        ),
         terminal,
     }
+}
+
+fn fake_stage_statuses(
+    terminal: &'static str,
+    enqueued_at_ms: u64,
+    selected_at_ms: u64,
+    delivered_at_ms: Option<u64>,
+) -> Vec<StageStatusEvidence> {
+    let mut statuses = vec![
+        StageStatusEvidence {
+            stage: "enqueued".to_string(),
+            status: "OBSERVED".to_string(),
+            provenance: format!("fake adapter clock observed enqueue at {enqueued_at_ms}ms"),
+        },
+        StageStatusEvidence {
+            stage: "selected".to_string(),
+            status: "OBSERVED".to_string(),
+            provenance: format!("fake adapter clock observed selection at {selected_at_ms}ms"),
+        },
+    ];
+    statuses.push(match delivered_at_ms {
+        Some(ts) => StageStatusEvidence {
+            stage: "delivered".to_string(),
+            status: if terminal == "delivered" {
+                "OBSERVED"
+            } else {
+                "FAILED"
+            }
+            .to_string(),
+            provenance: format!("fake adapter clock observed delivery at {ts}ms"),
+        },
+        None => StageStatusEvidence {
+            stage: "delivered".to_string(),
+            status: "FAILED".to_string(),
+            provenance: format!("fake adapter terminal outcome {terminal}"),
+        },
+    });
+    statuses
 }
 
 #[derive(Default)]
@@ -472,6 +1068,7 @@ mod tests {
         ProbeCommConfig {
             jsonl,
             cas_root: Some(cas_root),
+            artifact_root: None,
             allow_active_cas_root: true,
             adapter: Some(ProbeAdapterKind::Fake),
             thresholds: ProbeThresholds::epic_defaults(),
