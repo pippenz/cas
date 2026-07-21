@@ -275,7 +275,11 @@ impl FactoryDaemon {
                 }
                 self.apply_effective_pane_size(&actual);
             }
-            ClientMessage::SpawnWorkers { count, names, specs } => {
+            ClientMessage::SpawnWorkers {
+                count,
+                names,
+                specs,
+            } => {
                 if names.is_empty() {
                     self.app.spawning_count += count;
                     for i in 0..count {
@@ -317,11 +321,19 @@ impl FactoryDaemon {
                 if urgent {
                     // Urgent: interrupt-and-redirect by name via the PTY,
                     // bypassing the inbox even in teams mode (cas-c931).
+                    // cas-ab80: frame Codex payloads with the same sender
+                    // contract as normal delivery (director is the inject source).
+                    let harness = self.app.harness_for(&actual);
+                    let payload = super::delivery::frame_pty_payload(
+                        harness,
+                        super::teams::DIRECTOR_AGENT_NAME,
+                        &prompt,
+                    );
                     let settle = self.urgent_settle_duration(&actual);
                     let _ = self
                         .app
                         .mux
-                        .interrupt_and_inject(&actual, &prompt, settle)
+                        .interrupt_and_inject(&actual, &payload, settle)
                         .await;
                 } else {
                     // Recipient-aware routing (cas-b68a): inject reaches a Codex pane
@@ -329,7 +341,13 @@ impl FactoryDaemon {
                     // color=Some(DIRECTOR_AGENT_COLOR): D-4 (cas-405f) — match the
                     // director's config.json color so the inbox bubble isn't misattributed.
                     let _ = self
-                        .deliver_to_worker(&actual, super::teams::DIRECTOR_AGENT_NAME, &prompt, None, Some(super::teams::DIRECTOR_AGENT_COLOR))
+                        .deliver_to_worker(
+                            &actual,
+                            super::teams::DIRECTOR_AGENT_NAME,
+                            &prompt,
+                            None,
+                            Some(super::teams::DIRECTOR_AGENT_COLOR),
+                        )
                         .await;
                 }
             }
