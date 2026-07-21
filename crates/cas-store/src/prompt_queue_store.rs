@@ -199,9 +199,16 @@ pub trait PromptQueueStore: Send + Sync {
 
     /// Peek at pending prompts for specific targets only.
     ///
-    /// Only returns legacy NULL-session messages whose target is in `targets`.
-    /// When `factory_session` is provided, also returns all session-tagged
-    /// messages for that exact session.
+    /// Eligibility (applied before LIMIT):
+    /// - Session-tagged rows match only when `factory_session` equals the
+    ///   row's session (never by target-name collision).
+    /// - Legacy NULL-session rows match only when `target` is in `targets`
+    ///   (historical compatibility arm).
+    ///
+    /// Ordering among eligible rows: `priority ASC`, then (when a session is
+    /// supplied) prefer non-NULL session-tagged rows over legacy NULL-session
+    /// rows so a legacy backlog cannot occupy the entire LIMIT window ahead
+    /// of live-session traffic (cas-2bcb / cas-04a6 R1), then `id ASC` FIFO.
     /// This prevents one factory daemon from consuming messages meant for
     /// another daemon's workers/supervisor in multi-session setups.
     fn peek_for_targets(
@@ -552,12 +559,21 @@ impl PromptQueueStore for SqlitePromptQueueStore {
         }
 
         let where_clause = conditions.join(" OR ");
+        // When a factory session is active, prefer its tagged rows over the
+        // legacy NULL-session arm so equal-priority lower-ID legacy backlog
+        // cannot HOL-block live traffic under a small LIMIT (cas-2bcb).
+        // Priority still wins first; FIFO by id is preserved within each arm.
+        let order_clause = if factory_session.is_some() {
+            "priority ASC, CASE WHEN factory_session IS NOT NULL THEN 0 ELSE 1 END, id ASC"
+        } else {
+            "priority ASC, id ASC"
+        };
         let sql = format!(
             "SELECT id, source, target, prompt, created_at, processed_at, summary, priority, acked_at, urgent, factory_session
              FROM prompt_queue
              WHERE processed_at IS NULL
                AND ({where_clause})
-             ORDER BY priority ASC, id ASC
+             ORDER BY {order_clause}
              LIMIT ?"
         );
 
@@ -1185,5 +1201,141 @@ mod tests {
             .unwrap();
         let prompts = store.poll_for_target("w", 10).unwrap();
         assert!(prompts.iter().any(|p| p.prompt == "new urgent" && p.urgent));
+    }
+
+    /// cas-2bcb / cas-04a6 R1: lower-ID NULL-session legacy rows must not
+    /// occupy the fetch LIMIT ahead of eligible live-session rows.
+    ///
+    /// Reproduces the production failure mode where ~45 equal-priority
+    /// legacy supervisor/director rows permanently filled `LIMIT 10` so
+    /// session-tagged normal traffic never entered the daemon peek window.
+    #[test]
+    fn test_live_session_not_starved_by_legacy_null_session_hol() {
+        let (_temp, store) = create_test_store();
+        const LIMIT: usize = 10;
+
+        // More than LIMIT lower-ID legacy NULL-session rows targeting names
+        // every factory daemon always peeks (supervisor/director).
+        for i in 0..(LIMIT + 5) {
+            store
+                .enqueue(
+                    "old-worker",
+                    "supervisor",
+                    &format!("legacy backlog {i}"),
+                )
+                .unwrap();
+        }
+
+        // Live-session normal-priority row enqueued after the backlog
+        // (higher id, equal priority) — must still appear in one peek.
+        let live_id = store
+            .enqueue_with_session(
+                "worker-live",
+                "supervisor",
+                "live session coordination",
+                "session-live",
+            )
+            .unwrap();
+
+        let peeked = store
+            .peek_for_targets(
+                &["supervisor", "director", "all_workers", "worker-live"],
+                Some("session-live"),
+                LIMIT,
+            )
+            .unwrap();
+
+        assert_eq!(
+            peeked.len(),
+            LIMIT,
+            "peek must still respect the caller LIMIT"
+        );
+        assert!(
+            peeked.iter().any(|p| p.id == live_id),
+            "live-session row must appear in one peek despite >LIMIT lower-ID NULL-session backlog; got ids {:?}",
+            peeked.iter().map(|p| p.id).collect::<Vec<_>>()
+        );
+        assert!(
+            peeked
+                .iter()
+                .any(|p| p.factory_session.as_deref() == Some("session-live")),
+            "session-tagged live row must be selected"
+        );
+        // Legacy arm remains eligible (fills remaining slots) rather than being dropped.
+        assert!(
+            peeked.iter().any(|p| p.factory_session.is_none()),
+            "legacy NULL-session rows remain eligible when room remains under LIMIT"
+        );
+    }
+
+    /// Within equal priority, eligible session-tagged rows keep id FIFO;
+    /// urgent eligible rows still precede normal ones; other sessions never leak.
+    #[test]
+    fn test_peek_for_targets_priority_fifo_and_isolation_with_legacy() {
+        let (_temp, store) = create_test_store();
+
+        // Other-session row must never leak into session-a's peek.
+        store
+            .enqueue_with_session("sup-b", "worker", "other session", "session-b")
+            .unwrap();
+
+        // Two equal-priority live rows for session-a — FIFO by id among them.
+        let first = store
+            .enqueue_with_session("worker-a", "supervisor", "live first", "session-a")
+            .unwrap();
+        let second = store
+            .enqueue_with_session("worker-a", "supervisor", "live second", "session-a")
+            .unwrap();
+
+        // Urgent live row enqueued later must still sort ahead of normals.
+        let urgent = store
+            .enqueue_urgent(
+                "worker-a",
+                "supervisor",
+                "live urgent",
+                Some("session-a"),
+                Some("urgent"),
+                Some(NotificationPriority::Critical),
+                true,
+            )
+            .unwrap();
+
+        // Legacy backlog after the live rows would starve under pure id ASC;
+        // with the HOL fix, live rows still surface first at equal priority.
+        for i in 0..15 {
+            store
+                .enqueue("old", "supervisor", &format!("legacy tail {i}"))
+                .unwrap();
+        }
+
+        let peeked = store
+            .peek_for_targets(&["supervisor", "worker"], Some("session-a"), 10)
+            .unwrap();
+
+        assert!(
+            !peeked
+                .iter()
+                .any(|p| p.factory_session.as_deref() == Some("session-b")),
+            "other session must not leak"
+        );
+
+        let live: Vec<_> = peeked
+            .iter()
+            .filter(|p| p.factory_session.as_deref() == Some("session-a"))
+            .collect();
+        assert_eq!(live.len(), 3, "all three session-a rows must fit in LIMIT");
+        assert_eq!(live[0].id, urgent, "urgent eligible precedes normal");
+        assert_eq!(live[1].id, first, "equal-priority FIFO: first then second");
+        assert_eq!(live[2].id, second);
+
+        // Among all returned rows, priority order is non-decreasing.
+        for window in peeked.windows(2) {
+            assert!(
+                window[0].priority as u8 <= window[1].priority as u8,
+                "priority order violated: {:?} then {:?}",
+                window[0].priority,
+                window[1].priority
+            );
+        }
     }
 }
