@@ -2987,3 +2987,176 @@ async fn test_factory_mode_normalizes_session_uuid_assignee_to_display_name() {
         "cas-dbbb: stored assignee must NOT retain session UUID '{WORKER_SESSION}' after normalization"
     );
 }
+
+// =============================================================================
+// cas-bf98: empty assignee clear must unassign — never remap to a live worker
+// =============================================================================
+
+/// Supervisor used `assignee=""` to clear so a worker would not hold two concurrent
+/// tasks. Factory-mode session-id normalization treated `""` as a session id and
+/// rewrote it to a live worker display name (e.g. hv-scope). Empty/whitespace must
+/// clear the assignee (None), not assign anyone.
+#[tokio::test]
+async fn test_factory_mode_empty_assignee_clears_without_remapping_to_live_worker() {
+    let (temp, service) = setup_cas();
+    let _env_lock = env_test_lock();
+    let cas_dir = temp.path().join(".cas");
+    let agent_store = open_agent_store(&cas_dir).expect("open agent store");
+    let task_store = cas::store::open_task_store(&cas_dir).expect("open task store");
+
+    // Live worker that must NOT receive a silent reassignment on clear.
+    const WORKER_SESSION: &str = "sess-uuid-bf98-hv-scope";
+    const WORKER_NAME: &str = "hv-scope";
+    const PRIOR_ASSIGNEE: &str = "std-life";
+
+    let worker =
+        cas::types::Agent::new(WORKER_SESSION.to_string(), WORKER_NAME.to_string());
+    agent_store.register(&worker).expect("register worker");
+
+    unsafe { std::env::set_var("CAS_FACTORY_MODE", "1") }
+
+    let created = service
+        .cas_task_create(Parameters(make_task_create_req(
+            "empty-assignee clear (cas-bf98)",
+        )))
+        .await
+        .expect("create task");
+    let task_id = extract_task_id(&extract_text(created))
+        .expect("task id")
+        .to_string();
+
+    // Seed a real assignee, then clear with empty string (supervisor intent).
+    service
+        .cas_task_update(Parameters(TaskUpdateRequest {
+            depth: None,
+            id: task_id.clone(),
+            title: None,
+            notes: None,
+            priority: None,
+            labels: None,
+            description: None,
+            design: None,
+            acceptance_criteria: None,
+            demo_statement: None,
+            execution_note: None,
+            external_ref: None,
+            assignee: Some(PRIOR_ASSIGNEE.to_string()),
+            status: None,
+            epic: None,
+            epic_verification_owner: None,
+        }))
+        .await
+        .expect("seed assignee");
+
+    let seeded = task_store.get(&task_id).expect("get after seed");
+    assert_eq!(
+        seeded.assignee.as_deref(),
+        Some(PRIOR_ASSIGNEE),
+        "precondition: assignee seeded to {PRIOR_ASSIGNEE}"
+    );
+
+    let clear_result = service
+        .cas_task_update(Parameters(TaskUpdateRequest {
+            depth: None,
+            id: task_id.clone(),
+            title: None,
+            notes: None,
+            priority: None,
+            labels: None,
+            description: None,
+            design: None,
+            acceptance_criteria: None,
+            demo_statement: None,
+            execution_note: None,
+            external_ref: None,
+            assignee: Some(String::new()),
+            status: None,
+            epic: None,
+            epic_verification_owner: None,
+        }))
+        .await
+        .expect("empty assignee update must succeed as clear");
+
+    unsafe { std::env::remove_var("CAS_FACTORY_MODE") }
+
+    let text = extract_text(clear_result);
+    assert!(
+        !text.contains("Normalized to display name"),
+        "cas-bf98: empty assignee must not session-id-normalize; got: {text}"
+    );
+    assert!(
+        !text.contains(WORKER_NAME),
+        "cas-bf98: clear must not mention live worker '{WORKER_NAME}'; got: {text}"
+    );
+
+    let task = task_store.get(&task_id).expect("get task after clear");
+    assert!(
+        task.assignee.is_none(),
+        "cas-bf98: empty assignee must unassign (None); got {:?}",
+        task.assignee
+    );
+    assert_ne!(
+        task.assignee.as_deref(),
+        Some(WORKER_NAME),
+        "cas-bf98: must never remap empty clear to live worker '{WORKER_NAME}'"
+    );
+    assert_ne!(
+        task.assignee.as_deref(),
+        Some(PRIOR_ASSIGNEE),
+        "cas-bf98: prior assignee must be cleared"
+    );
+
+    // Whitespace-only is also an explicit clear.
+    service
+        .cas_task_update(Parameters(TaskUpdateRequest {
+            depth: None,
+            id: task_id.clone(),
+            title: None,
+            notes: None,
+            priority: None,
+            labels: None,
+            description: None,
+            design: None,
+            acceptance_criteria: None,
+            demo_statement: None,
+            execution_note: None,
+            external_ref: None,
+            assignee: Some(PRIOR_ASSIGNEE.to_string()),
+            status: None,
+            epic: None,
+            epic_verification_owner: None,
+        }))
+        .await
+        .expect("re-seed");
+
+    unsafe { std::env::set_var("CAS_FACTORY_MODE", "1") }
+    service
+        .cas_task_update(Parameters(TaskUpdateRequest {
+            depth: None,
+            id: task_id.clone(),
+            title: None,
+            notes: None,
+            priority: None,
+            labels: None,
+            description: None,
+            design: None,
+            acceptance_criteria: None,
+            demo_statement: None,
+            execution_note: None,
+            external_ref: None,
+            assignee: Some("   \t  ".to_string()),
+            status: None,
+            epic: None,
+            epic_verification_owner: None,
+        }))
+        .await
+        .expect("whitespace assignee must clear");
+    unsafe { std::env::remove_var("CAS_FACTORY_MODE") }
+
+    let after_ws = task_store.get(&task_id).expect("get after whitespace clear");
+    assert!(
+        after_ws.assignee.is_none(),
+        "cas-bf98: whitespace-only assignee must unassign; got {:?}",
+        after_ws.assignee
+    );
+}
