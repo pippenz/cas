@@ -11,7 +11,8 @@ Pay for reasoning only where reasoning is the bottleneck. Every worker slot has 
 Routing is two stages. **Stage 1 — tier the task** by complexity; the tier is a stable property of the work. **Stage 2 — pick the lane** that fills that tier:
 
 - **Codex is the default matrix** — every tier resolves to a Codex `gpt-5.5`/`gpt-5.6-sol` spawn.
-- **Claude Max is a fit overlay** — route to it immediately when the work benefits (taste, Claude-native tooling, architecture, safety, rescue, independent review), not only after Codex fails.
+- **GPT-5.6 Sol medium is the taste/judgment overlay** — route routine taste, public-surface, and general-judgment work to `cli=codex model=gpt-5.6-sol effort=medium`.
+- **Claude Opus is exceptional-only** — use it for architecture, safety, rescue, or independent challenge. Sonnet is not a normal worker lane.
 - **Grok is a capacity overlay** — route to it while its credits/auth/throughput are healthy; fall back to the same Codex tier when they are not.
 
 Evidence rule: change routing guidance only on independent, cross-vendor evidence (e.g. Artificial Analysis II/CAI leaderboards **plus** a live harness check) — never on a single failed spawn. A spawn failure from a mistyped slug tests the slug, not the model. Optional write-up: `docs/reports/2026-07-09-factory-model-matrix-recommendations.html` (rev 2).
@@ -27,12 +28,17 @@ Evidence rule: change routing guidance only on independent, cross-vendor evidenc
 
 Token-heavy read-only investigation belongs in a `cas-codex-exec` shell-out, not a worker and not your own context window.
 
-### Claude Max lane (fit routing — not a last resort)
+### Taste/judgment lane (Codex GPT-5.6 Sol medium)
 
-The operator has a Claude Code Max subscription; use that prepaid capacity where Claude materially fits the task. Route **immediately**, not only after Codex bounces:
+Routine taste-sensitive output, public surfaces, API/SDK shape, naming, prompts, docs, release notes, error wording, and general judgment route to Codex GPT-5.6 Sol at medium effort:
 
-- **`cli=claude model=sonnet effort=high`** — taste-sensitive output (UI/UX, API/SDK shape, naming, prompts, docs, release notes, error wording) and Claude-native work (Claude Code harness / skills / hooks compatibility, public-facing surfaces).
-- **`cli=claude model=opus effort=high`** — architecture judgment, safety-critical changes, rescue of a stuck task, and independent / second-opinion review.
+- **`cli=codex model=gpt-5.6-sol effort=medium`** — routine taste / public-surface / general-judgment work. This is the normal lane that replaced routine Sonnet routing.
+
+### Claude Opus lane (exceptional only)
+
+Claude Sonnet is **not** a normal spawn lane and must not appear in copyable supervisor recipes. Keep Claude for exceptional cases only:
+
+- **`cli=claude model=opus effort=high`** — architecture judgment, safety-critical changes, rescue of a stuck task, and independent / second-opinion challenge.
 
 Max is still quota-limited capacity: keep `effort=high` as the ceiling on long worker loops (no `xhigh`/`max`), preserve explicit `cli`/`model`/`effort`, and fall back to the equivalent Codex tier when the Claude usage window is constrained.
 
@@ -50,7 +56,7 @@ Health check before routing to Grok: credits/quota available, auth valid, throug
 | `cli=` | Accepted `model=` slugs | Notes |
 |---|---|---|
 | `codex` | `gpt-5.5`, `gpt-5.6-sol` | Plain slugs only — `-codex`-suffixed slugs are rejected by the API. Frontier is the exact slug `gpt-5.6-sol`; bare `gpt-5.6` is invalid. |
-| `claude` | `sonnet`, `opus`, `haiku` (full Anthropic ids also ok) | Aliases preferred in factory docs. |
+| `claude` | `opus` (full Anthropic ids also ok) | Supervisor docs only expose Opus for exceptional architecture/safety/rescue/challenge; Sonnet is not a normal worker lane. |
 | `grok` | `grok-4.5`, `grok-composer-2.5-fast` | From live `grok models`. Composer is a **model id on the Grok harness** — never invent `cli=cursor`. |
 
 ### Effort vocabulary (CAS-wide)
@@ -87,13 +93,17 @@ cas__coordination action=spawn_workers count=1 isolate=true cli=codex model=gpt-
 cas__coordination action=spawn_workers count=1 isolate=true cli=codex model=gpt-5.6-sol effort=high worker_names="fr-ada"
 ```
 
-### Claude Max workers (fit: taste / architecture / review)
+### Taste / judgment workers (Codex GPT-5.6 Sol medium)
 
 ```
-# taste / Claude-native work
-cas__coordination action=spawn_workers count=1 isolate=true cli=claude model=sonnet effort=high worker_names="sn-ada"
+# taste / public-surface / general-judgment work
+cas__coordination action=spawn_workers count=1 isolate=true cli=codex model=gpt-5.6-sol effort=medium worker_names="tj-ada"
+```
 
-# architecture / safety / rescue / independent review
+### Claude Opus workers (exceptional: architecture / safety / rescue / challenge)
+
+```
+# exceptional architecture / safety / rescue / independent challenge
 cas__coordination action=spawn_workers count=1 isolate=true cli=claude model=opus effort=high worker_names="op-ada"
 ```
 
@@ -118,17 +128,17 @@ Use tier labels as defaults, then check four axes before spawning:
 |---|---|---|---|---|
 | **light** | Lowest agent $/task (Codex gpt-5.5 low; Grok Composer when capacity-routed) | Sufficient for well-bounded mechanical work | Highest — low wall time / flash lane | Low: fine for renames and internal scaffolding; review public surfaces |
 | **standard** | Low — Codex gpt-5.5 medium is the cost-efficient floor | High for bounded engineering; default for most factory work | High throughput on sustained agent loops | Low-to-mid: fine for internal code; review user-facing prose |
-| **heavy** | Codex gpt-5.5 high; Claude/Grok only when fit/capacity says so | High for messy codebases, lifecycle bugs, multi-module judgment | Strong multi-step agent loops; slower than light on tiny tasks | Mid: good default for critical-path code; route Claude for taste |
-| **frontier** | Highest — reserve for quality/risk that justifies it | Highest ceiling (Codex gpt-5.6-sol; Claude Opus for architecture / review) | Slowest / most expensive agent loops | High: taste-sensitive output that must land cleanly |
+| **heavy** | Codex gpt-5.5 high; Opus/Grok only when exception/capacity says so | High for messy codebases, lifecycle bugs, multi-module judgment | Strong multi-step agent loops; slower than light on tiny tasks | Mid: good default for critical-path code; use GPT-5.6 Sol medium for taste |
+| **frontier** | Highest — reserve for quality/risk that justifies it | Highest ceiling (Codex gpt-5.6-sol; Claude Opus only for exceptional architecture / challenge) | Slowest / most expensive agent loops | High: taste-sensitive output that must land cleanly |
 
 Glossary:
 
-- **Cost** is budget spent per task (prefer $/task and tokens/task over list $/M tokens alone). Codex is the efficient default lane; Claude Max is prepaid but quota-limited; Grok is credit-gated capacity.
+- **Cost** is budget spent per task (prefer $/task and tokens/task over list $/M tokens alone). Codex is the default lane; Claude Opus is exceptional and quota-limited; Grok is credit-gated capacity.
 - **Intelligence** is how hard a problem the model can handle unsupervised: ambiguity, hidden coupling, long reasoning chains, and unfamiliar code.
 - **Speed** is wall-clock and throughput: decode TPS, agent task wall time, and tokens burned per task.
 - **Taste** is the quality of what ships: UI/UX judgment, API and SDK shape, naming, code style, prompts, docs, release notes, and error-message wording.
 
-Taste-sensitive work routes to a high-taste tier even when the task is mechanically simple. Skill wording, supervisor guidance, release notes, public docs, API/SDK surfaces, and user-facing error text are not "light" just because the diff is small — start those on Claude Max (Sonnet → Opus), not the cheapest lane.
+Taste-sensitive work routes to Codex GPT-5.6 Sol at medium effort even when the task is mechanically simple. Skill wording, supervisor guidance, release notes, public docs, API/SDK surfaces, and user-facing error text are not "light" just because the diff is small — start those on `cli=codex model=gpt-5.6-sol effort=medium`, not Sonnet and not the cheapest lane.
 
 ## Reading the task signals
 
@@ -139,10 +149,11 @@ Score each task while breaking down the EPIC:
 - Priority 0–1 AND on the critical path → at least **heavy**
 - Touches 3+ modules, shared traits/schemas, or unwind/panic/locking behavior → **heavy**
 - You would read the diff twice yourself before merging → **frontier**
-- Taste, Claude-native, architecture, safety, rescue, or independent review in play → the **Claude Max lane** at the matching tier
+- Taste, public-surface, or general-judgment work → `cli=codex model=gpt-5.6-sol effort=medium`
+- Architecture, safety, rescue, or independent challenge in play → the **Claude Opus exceptional lane**
 - Everything else → **standard** (the default is the default for a reason)
 
-Effort is the main cost lever on reasoning-capable models. Prefer raising **effort on Codex gpt-5.5** (`low` → `medium` → `high`) before changing lane or model. Move to `gpt-5.6-sol` for frontier reasoning; move to Claude Max for fit (taste / architecture / review); move to Grok for capacity relief.
+Effort is the main cost lever on reasoning-capable models. Prefer raising **effort on Codex gpt-5.5** (`low` → `medium` → `high`) before changing lane or model. Move to `gpt-5.6-sol effort=medium` for taste/general judgment, `gpt-5.6-sol effort=high` for frontier reasoning, Claude Opus for exceptional architecture/safety/rescue/challenge, and Grok for capacity relief.
 
 For every worker, `effort=high` is the ceiling. `xhigh`/`max` increase per-step reasoning, not step count or run length; on hard multi-step work they tend to overthink each move, produce heavier diffs, and multiply cost. Escalate the model tier or split the task before raising effort above `high`.
 
@@ -164,8 +175,8 @@ For every worker, `effort=high` is the ceiling. `xhigh`/`max` increase per-step 
    Relying on omitted fields is a fallback path that emits an acknowledgement
    warning, not an approved supervisor workflow.
    Tiers change the fleet's composition, not its size — worker-count strategy (3–4 max, sized by independent file groups) still applies.
-3. **Route by tier and lane** — assign `tier:*`-labelled tasks to a matching worker; standard tasks go to anyone at that tier. Send taste / architecture / review to the Claude Max lane; send capacity overflow to Grok while healthy. Name heavier workers so routing stays legible (`hv-*`, `fr-*`, `op-*`).
-4. **Escalate on failure** — a task rejected or verification-failed twice moves up one tier: raise Codex effort, then Codex model (`gpt-5.5` → `gpt-5.6-sol`), or move to the Claude Max lane. Don't re-run the same task on the same tier hoping for different output.
+3. **Route by tier and lane** — assign `tier:*`-labelled tasks to a matching worker; standard tasks go to anyone at that tier. Send taste/general judgment to `gpt-5.6-sol effort=medium`, exceptional architecture/safety/rescue/challenge to Opus, and capacity overflow to Grok while healthy. Name heavier workers so routing stays legible (`hv-*`, `fr-*`, `tj-*`, `op-*`).
+4. **Escalate on failure** — a task rejected or verification-failed twice moves up one tier: raise Codex effort, then Codex model (`gpt-5.5` → `gpt-5.6-sol`), or use Opus for an exceptional architecture/safety/rescue/challenge case. Don't re-run the same task on the same tier hoping for different output.
 5. **Escalate on judgment** — the two-rejection rule is a floor, not a permission gate. If a cheaper worker's draft gathers facts but misses the quality bar, escalate before verification fails. Judge the output, not the price tag; use cheap tiers for information and drafts, then pay for what ships. Cost is a tiebreaker only.
 
 ### Escalation ladder (Codex-first, with fit/capacity overlays)
@@ -175,12 +186,14 @@ light     codex  model=gpt-5.5 effort=low
 → standard  codex  model=gpt-5.5 effort=medium
   → heavy     codex  model=gpt-5.5 effort=high
     → frontier  codex  model=gpt-5.6-sol effort=high   # exact slug; +reasoning ceiling
-  fit overlay:  claude model=sonnet|opus effort=high   # taste / architecture / rescue / review
+  taste lane:   codex  model=gpt-5.6-sol effort=medium # taste / public surface / judgment
+  exception:    claude model=opus effort=high           # architecture / safety / rescue / challenge
   capacity:     grok   model=grok-composer-2.5-fast effort=low | grok-4.5 effort=medium|high (health-gated)
 ```
 
 - Raise Codex effort before switching model; raise Codex model before assuming you need another vendor.
-- Taste, Claude-native, architecture, safety, rescue, or independent review can jump straight to Claude Max even if the diff is small.
+- Taste, public-surface, and general-judgment work can jump straight to `cli=codex model=gpt-5.6-sol effort=medium` even if the diff is small.
+- Claude Sonnet is not a normal spawn lane; Opus is reserved for architecture, safety, rescue, and independent challenge.
 - Route to Grok only while its credits/auth/throughput are healthy; otherwise take the same-tier Codex rung.
 6. **De-escalate the tail** — when only light tasks remain, don't leave a heavy/frontier worker idle-burning; shut it down and let light workers sweep the tail.
 
