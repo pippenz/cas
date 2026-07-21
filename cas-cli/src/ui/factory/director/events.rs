@@ -1359,31 +1359,32 @@ impl DirectorEventDetector {
     }
 }
 
-/// (cas-728b) Pure decision given an already-resolved transcript path:
-/// `false` means the transcript was written to within
-/// `TRANSCRIPT_FRESH_WINDOW` (the worker is evidently still producing
-/// output, so a checkpoint-age stall candidate is a false positive);
-/// `true` means proceed with the checkpoint-age verdict (stale, missing,
-/// or unresolvable transcript — the confirming signal isn't available or
-/// doesn't contradict the checkpoint-age evidence). Split out from
-/// `DirectorEventDetector::transcript_confirms_stall` so this decision is
-/// unit-testable with a real temp file without needing a full
-/// `SqliteAgentStore` round-trip via `resolve_worker`.
+/// (cas-728b / cas-de95) Pure decision given an already-resolved transcript path:
+/// `false` means do **not** fire a stalled nudge (worker still producing output,
+/// **or** transcript telemetry is unavailable so absence is not evidence);
+/// `true` means a **resolved, cold** transcript corroborates the checkpoint-age
+/// stall candidate.
+///
+/// cas-de95: missing/unresolvable path returns `false` — treating telemetry
+/// absence as a stall confirmation was the live false-nudge failure mode for
+/// Codex/Claude workers with unresolved rollouts/transcripts.
 fn transcript_confirms_stall_for_path(transcript_path: Option<&std::path::Path>) -> bool {
     let Some(path) = transcript_path else {
-        return true;
+        return false;
     };
     transcript_confirms_stall_for_age(crate::cli::factory::wedged::transcript_mtime_age(path))
 }
 
-/// (cas-09d0) Pure core of the confirmation decision, split out one layer
-/// further than `transcript_confirms_stall_for_path` so tests (and the
-/// `transcript_age_override` seam) can drive it from a plain `Option<Duration>`
-/// without touching the filesystem at all.
+/// (cas-09d0 / cas-de95) Pure core of the confirmation decision.
+///
+/// - `Some(age < window)` → not stalled (fresh transcript)
+/// - `Some(age ≥ window)` → confirm stall (cold transcript is positive evidence)
+/// - `None` → **do not confirm** (unresolved/missing telemetry is not starvation)
 fn transcript_confirms_stall_for_age(age: Option<Duration>) -> bool {
     match age {
         Some(age) if age < crate::cli::factory::wedged::TRANSCRIPT_FRESH_WINDOW => false,
-        _ => true,
+        Some(_) => true,
+        None => false,
     }
 }
 

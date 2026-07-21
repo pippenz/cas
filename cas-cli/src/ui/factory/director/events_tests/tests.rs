@@ -2067,31 +2067,27 @@ fn test_728b_worker_stalled_suppressed_within_grace_window_then_fires_once_elaps
     );
 }
 
-/// cas-728b: `transcript_confirms_stall_for_path` — the pure decision
-/// behind the transcript-mtime confirmation gate, split out for testing
-/// without a full `SqliteAgentStore` round-trip. Uses real temp files so
-/// this exercises the actual `std::fs::metadata` mtime read, not a mock.
+/// cas-728b / cas-de95: `transcript_confirms_stall_for_path` — the pure
+/// decision behind the transcript-mtime confirmation gate. Missing telemetry
+/// must **not** confirm a stall (false auto-nudge root cause).
 #[test]
 fn test_728b_transcript_confirms_stall_for_path_freshness_decision() {
     let tmp = tempfile::tempdir().unwrap();
 
-    // No path resolved at all (e.g. worker unresolvable, or is-wedged
-    // couldn't locate a transcript) — proceed with the checkpoint verdict.
+    // cas-de95: unresolved path is missing evidence — do not confirm stall.
     assert!(
-        transcript_confirms_stall_for_path(None),
-        "missing transcript path must not block the checkpoint-age verdict"
+        !transcript_confirms_stall_for_path(None),
+        "missing transcript path must NOT confirm stall (telemetry absence ≠ starvation)"
     );
 
-    // Path resolved but the file doesn't exist (mtime unreadable) — same
-    // fallback: proceed with the checkpoint verdict.
+    // Path claimed but file missing → mtime unreadable → same: no confirm.
     let missing = tmp.path().join("does-not-exist.jsonl");
     assert!(
-        transcript_confirms_stall_for_path(Some(&missing)),
-        "unreadable transcript mtime must not block the checkpoint-age verdict"
+        !transcript_confirms_stall_for_path(Some(&missing)),
+        "unreadable transcript mtime must NOT confirm stall"
     );
 
-    // Just-written file: fresh mtime — the worker is evidently still
-    // producing output. Must suppress (return false).
+    // Just-written file: fresh mtime — suppress stall.
     let fresh = tmp.path().join("fresh.jsonl");
     std::fs::write(&fresh, b"{}").unwrap();
     assert!(
@@ -2099,8 +2095,7 @@ fn test_728b_transcript_confirms_stall_for_path_freshness_decision() {
         "a transcript written moments ago must suppress the stall verdict"
     );
 
-    // File exists but its mtime is well past TRANSCRIPT_FRESH_WINDOW (60s)
-    // — the confirming signal agrees with the checkpoint-age verdict.
+    // Resolved cold transcript — positive evidence of inactivity; confirm.
     let stale = tmp.path().join("stale.jsonl");
     std::fs::write(&stale, b"{}").unwrap();
     let old_mtime = filetime::FileTime::from_system_time(
@@ -2109,7 +2104,7 @@ fn test_728b_transcript_confirms_stall_for_path_freshness_decision() {
     filetime::set_file_mtime(&stale, old_mtime).unwrap();
     assert!(
         transcript_confirms_stall_for_path(Some(&stale)),
-        "a transcript stale past TRANSCRIPT_FRESH_WINDOW must not block the stall verdict"
+        "a transcript stale past TRANSCRIPT_FRESH_WINDOW must confirm the stall verdict"
     );
 }
 
@@ -2273,10 +2268,59 @@ fn test_09d0_transcript_confirms_stall_for_age_pure_cases() {
         transcript_confirms_stall_for_age(Some(std::time::Duration::from_secs(120))),
         "stale age must confirm (proceed with) the stall verdict"
     );
+    // cas-de95: unknown age is missing evidence, not a stall confirmation.
     assert!(
-        transcript_confirms_stall_for_age(None),
-        "unknown age (no signal) must confirm — preserves pre-existing behavior \
-         when the stronger signal is unavailable"
+        !transcript_confirms_stall_for_age(None),
+        "unknown age (no telemetry) must NOT confirm stall — absence ≠ starvation"
+    );
+}
+
+/// cas-de95: unresolved transcript must not auto-nudge a worker that only
+/// looks stalled on checkpoint-age (live Codex/Claude false-positive class).
+#[test]
+fn test_de95_missing_transcript_does_not_auto_nudge() {
+    let base_utc = chrono::Utc::now();
+    let t0 = std::time::Instant::now();
+
+    let mut detector =
+        DirectorEventDetector::new(vec!["codex-worker".to_string()], "supervisor".to_string());
+    detector.set_stall_threshold_secs(300);
+    // Explicit None age = unresolved telemetry (same as no path).
+    detector.set_transcript_age_override(HashMap::from([(
+        "codex-worker".to_string(),
+        None,
+    )]));
+
+    let data = stalled_data_for(make_agent_working_stalled(
+        "agent-1",
+        "codex-worker",
+        "cas-de95",
+        5,
+        Some(310),
+        base_utc,
+    ));
+    detector.initialize(&data);
+
+    let events = detector.detect_changes_at(&data, None, t0, base_utc);
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, DirectorEvent::WorkerStalled { .. })),
+        "missing transcript must not fire WorkerStalled auto-nudge: {events:?}"
+    );
+
+    // Unchanged evidence on the next tick must still not nudge (dedup/suppression).
+    let events2 = detector.detect_changes_at(
+        &data,
+        None,
+        t0 + std::time::Duration::from_secs(30),
+        base_utc,
+    );
+    assert!(
+        !events2
+            .iter()
+            .any(|e| matches!(e, DirectorEvent::WorkerStalled { .. })),
+        "repeat tick with same missing-transcript evidence must not nudge: {events2:?}"
     );
 }
 
