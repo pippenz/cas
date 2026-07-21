@@ -58,6 +58,18 @@ pub struct SupervisorNotification {
     pub created_at: DateTime<Utc>,
     /// When the notification was processed (None if pending)
     pub processed_at: Option<DateTime<Utc>>,
+    /// Optional idempotency key (cas-062d lifecycle transitions).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transition_key: Option<String>,
+}
+
+/// Result of an idempotent notify (cas-062d).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotifyIdempotentResult {
+    /// New row inserted.
+    Created(i64),
+    /// Existing row for the same transition_key (no duplicate insert).
+    AlreadyExists(i64),
 }
 
 /// Schema for supervisor queue table
@@ -76,6 +88,16 @@ CREATE INDEX IF NOT EXISTS idx_supervisor_queue_supervisor ON supervisor_queue(s
 CREATE INDEX IF NOT EXISTS idx_supervisor_queue_pending ON supervisor_queue(supervisor_id, priority) WHERE processed_at IS NULL;
 "#;
 
+/// Idempotency key for lifecycle transition events (cas-062d).
+const SUPERVISOR_QUEUE_TRANSITION_KEY_MIGRATION: &str = r#"
+ALTER TABLE supervisor_queue ADD COLUMN transition_key TEXT;
+"#;
+const SUPERVISOR_QUEUE_TRANSITION_KEY_INDEX: &str = r#"
+CREATE UNIQUE INDEX IF NOT EXISTS idx_supervisor_queue_transition_key
+    ON supervisor_queue(transition_key)
+    WHERE transition_key IS NOT NULL;
+"#;
+
 /// Trait for supervisor queue operations
 pub trait SupervisorQueueStore: Send + Sync {
     /// Initialize the store (create tables)
@@ -89,6 +111,19 @@ pub trait SupervisorQueueStore: Send + Sync {
         payload: &str,
         priority: NotificationPriority,
     ) -> Result<i64>;
+
+    /// Idempotent notify keyed by `transition_key` (cas-062d).
+    ///
+    /// Replaying the same transition identity returns [`NotifyIdempotentResult::AlreadyExists`]
+    /// without inserting a second row — no duplicate supervisor reactions.
+    fn notify_idempotent(
+        &self,
+        supervisor_id: &str,
+        event_type: &str,
+        payload: &str,
+        priority: NotificationPriority,
+        transition_key: &str,
+    ) -> Result<NotifyIdempotentResult>;
 
     /// Poll for pending notifications (ordered by priority, then created_at)
     /// Returns up to `limit` notifications and marks them as processed
@@ -143,6 +178,8 @@ impl SqliteSupervisorQueueStore {
     fn notification_from_row(row: &rusqlite::Row) -> rusqlite::Result<SupervisorNotification> {
         let processed_at_str: Option<String> = row.get(6)?;
         let processed_at = processed_at_str.and_then(|s| Self::parse_datetime(&s));
+        // Column 7 = transition_key (cas-062d); tolerate pre-migration tables.
+        let transition_key: Option<String> = row.get(7).unwrap_or(None);
 
         Ok(SupervisorNotification {
             id: row.get(0)?,
@@ -152,6 +189,7 @@ impl SqliteSupervisorQueueStore {
             priority: NotificationPriority::from(row.get::<_, u8>(4)?),
             created_at: Self::parse_datetime(&row.get::<_, String>(5)?).unwrap_or_else(Utc::now),
             processed_at,
+            transition_key,
         })
     }
 }
@@ -160,6 +198,14 @@ impl SupervisorQueueStore for SqliteSupervisorQueueStore {
     fn init(&self) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch(SUPERVISOR_QUEUE_SCHEMA)?;
+        // cas-062d: transition_key for idempotent lifecycle events
+        if conn
+            .prepare_cached("SELECT transition_key FROM supervisor_queue LIMIT 0")
+            .is_err()
+        {
+            conn.execute_batch(SUPERVISOR_QUEUE_TRANSITION_KEY_MIGRATION)?;
+        }
+        conn.execute_batch(SUPERVISOR_QUEUE_TRANSITION_KEY_INDEX)?;
         Ok(())
     }
 
@@ -171,62 +217,102 @@ impl SupervisorQueueStore for SqliteSupervisorQueueStore {
         priority: NotificationPriority,
     ) -> Result<i64> {
         crate::shared_db::with_write_retry(|| {
-        let conn = self.conn.lock().unwrap();
-        let now = Utc::now().to_rfc3339();
+            let conn = self.conn.lock().unwrap();
+            let now = Utc::now().to_rfc3339();
 
-        conn.execute(
-            "INSERT INTO supervisor_queue (supervisor_id, event_type, payload, priority, created_at)
+            conn.execute(
+                "INSERT INTO supervisor_queue (supervisor_id, event_type, payload, priority, created_at)
              VALUES (?, ?, ?, ?, ?)",
-            params![supervisor_id, event_type, payload, i32::from(priority), now],
-        )?;
+                params![supervisor_id, event_type, payload, i32::from(priority), now],
+            )?;
 
-        let id = conn.last_insert_rowid();
-        Ok(id)
+            let id = conn.last_insert_rowid();
+            Ok(id)
         }) // with_write_retry
+    }
+
+    fn notify_idempotent(
+        &self,
+        supervisor_id: &str,
+        event_type: &str,
+        payload: &str,
+        priority: NotificationPriority,
+        transition_key: &str,
+    ) -> Result<NotifyIdempotentResult> {
+        crate::shared_db::with_write_retry(|| {
+            let conn = self.conn.lock().unwrap();
+            let now = Utc::now().to_rfc3339();
+
+            // Atomic insert-or-ignore under unique transition_key.
+            let changed = conn.execute(
+                "INSERT OR IGNORE INTO supervisor_queue
+                    (supervisor_id, event_type, payload, priority, created_at, transition_key)
+                 VALUES (?, ?, ?, ?, ?, ?)",
+                params![
+                    supervisor_id,
+                    event_type,
+                    payload,
+                    i32::from(priority),
+                    now,
+                    transition_key
+                ],
+            )?;
+
+            if changed > 0 {
+                return Ok(NotifyIdempotentResult::Created(conn.last_insert_rowid()));
+            }
+
+            let existing_id: i64 = conn.query_row(
+                "SELECT id FROM supervisor_queue WHERE transition_key = ?",
+                params![transition_key],
+                |row| row.get(0),
+            )?;
+            Ok(NotifyIdempotentResult::AlreadyExists(existing_id))
+        })
     }
 
     fn poll(&self, supervisor_id: &str, limit: usize) -> Result<Vec<SupervisorNotification>> {
         crate::shared_db::with_write_retry(|| {
-        let conn = self.conn.lock().unwrap();
-        let now = Utc::now().to_rfc3339();
+            let conn = self.conn.lock().unwrap();
+            let now = Utc::now().to_rfc3339();
 
-        // Get pending notifications ordered by priority (ascending = critical first), then created_at
-        let mut stmt = conn.prepare_cached(
-            "SELECT id, supervisor_id, event_type, payload, priority, created_at, processed_at
+            // Get pending notifications ordered by priority (ascending = critical first), then created_at
+            let mut stmt = conn.prepare_cached(
+            "SELECT id, supervisor_id, event_type, payload, priority, created_at, processed_at, transition_key
              FROM supervisor_queue
              WHERE supervisor_id = ? AND processed_at IS NULL
              ORDER BY priority ASC, created_at ASC
              LIMIT ?",
         )?;
 
-        let notifications: Vec<SupervisorNotification> = stmt
-            .query_map(
-                params![supervisor_id, limit as i64],
-                Self::notification_from_row,
-            )?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+            let notifications: Vec<SupervisorNotification> = stmt
+                .query_map(
+                    params![supervisor_id, limit as i64],
+                    Self::notification_from_row,
+                )?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
 
-        // Mark them as processed
-        if !notifications.is_empty() {
-            let ids: Vec<i64> = notifications.iter().map(|n| n.id).collect();
-            let placeholders: Vec<String> = ids.iter().map(|_| "?".to_string()).collect();
-            let sql = format!(
-                "UPDATE supervisor_queue SET processed_at = ? WHERE id IN ({})",
-                placeholders.join(", ")
-            );
+            // Mark them as processed
+            if !notifications.is_empty() {
+                let ids: Vec<i64> = notifications.iter().map(|n| n.id).collect();
+                let placeholders: Vec<String> = ids.iter().map(|_| "?".to_string()).collect();
+                let sql = format!(
+                    "UPDATE supervisor_queue SET processed_at = ? WHERE id IN ({})",
+                    placeholders.join(", ")
+                );
 
-            let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(now)];
-            for id in ids {
-                params.push(Box::new(id));
+                let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(now)];
+                for id in ids {
+                    params.push(Box::new(id));
+                }
+
+                conn.execute(
+                    &sql,
+                    rusqlite::params_from_iter(params.iter().map(|p| p.as_ref())),
+                )?;
             }
 
-            conn.execute(
-                &sql,
-                rusqlite::params_from_iter(params.iter().map(|p| p.as_ref())),
-            )?;
-        }
-
-        Ok(notifications)
+            Ok(notifications)
         }) // with_write_retry
     }
 
@@ -234,7 +320,7 @@ impl SupervisorQueueStore for SqliteSupervisorQueueStore {
         let conn = self.conn.lock().unwrap();
 
         let mut stmt = conn.prepare_cached(
-            "SELECT id, supervisor_id, event_type, payload, priority, created_at, processed_at
+            "SELECT id, supervisor_id, event_type, payload, priority, created_at, processed_at, transition_key
              FROM supervisor_queue
              WHERE supervisor_id = ? AND processed_at IS NULL
              ORDER BY priority ASC, created_at ASC
@@ -253,21 +339,21 @@ impl SupervisorQueueStore for SqliteSupervisorQueueStore {
 
     fn ack(&self, notification_id: i64) -> Result<()> {
         crate::shared_db::with_write_retry(|| {
-        let conn = self.conn.lock().unwrap();
-        let now = Utc::now().to_rfc3339();
+            let conn = self.conn.lock().unwrap();
+            let now = Utc::now().to_rfc3339();
 
-        let rows = conn.execute(
+            let rows = conn.execute(
             "UPDATE supervisor_queue SET processed_at = ? WHERE id = ? AND processed_at IS NULL",
             params![now, notification_id],
         )?;
 
-        if rows == 0 {
-            return Err(StoreError::NotFound(format!(
-                "Notification not found or already processed: {notification_id}"
-            )));
-        }
+            if rows == 0 {
+                return Err(StoreError::NotFound(format!(
+                    "Notification not found or already processed: {notification_id}"
+                )));
+            }
 
-        Ok(())
+            Ok(())
         }) // with_write_retry
     }
 
@@ -287,7 +373,7 @@ impl SupervisorQueueStore for SqliteSupervisorQueueStore {
         let conn = self.conn.lock().unwrap();
 
         let mut stmt = conn.prepare_cached(
-            "SELECT id, supervisor_id, event_type, payload, priority, created_at, processed_at
+            "SELECT id, supervisor_id, event_type, payload, priority, created_at, processed_at, transition_key
              FROM supervisor_queue
              WHERE supervisor_id = ? AND processed_at IS NULL
              ORDER BY priority ASC, created_at ASC",
@@ -302,28 +388,28 @@ impl SupervisorQueueStore for SqliteSupervisorQueueStore {
 
     fn clear(&self, supervisor_id: &str) -> Result<usize> {
         crate::shared_db::with_write_retry(|| {
-        let conn = self.conn.lock().unwrap();
+            let conn = self.conn.lock().unwrap();
 
-        let rows = conn.execute(
-            "DELETE FROM supervisor_queue WHERE supervisor_id = ?",
-            params![supervisor_id],
-        )?;
+            let rows = conn.execute(
+                "DELETE FROM supervisor_queue WHERE supervisor_id = ?",
+                params![supervisor_id],
+            )?;
 
-        Ok(rows)
+            Ok(rows)
         }) // with_write_retry
     }
 
     fn cleanup_old(&self, older_than_secs: i64) -> Result<usize> {
         crate::shared_db::with_write_retry(|| {
-        let conn = self.conn.lock().unwrap();
-        let cutoff = (Utc::now() - chrono::Duration::seconds(older_than_secs)).to_rfc3339();
+            let conn = self.conn.lock().unwrap();
+            let cutoff = (Utc::now() - chrono::Duration::seconds(older_than_secs)).to_rfc3339();
 
-        let rows = conn.execute(
-            "DELETE FROM supervisor_queue WHERE processed_at IS NOT NULL AND processed_at < ?",
-            params![cutoff],
-        )?;
+            let rows = conn.execute(
+                "DELETE FROM supervisor_queue WHERE processed_at IS NOT NULL AND processed_at < ?",
+                params![cutoff],
+            )?;
 
-        Ok(rows)
+            Ok(rows)
         }) // with_write_retry
     }
 
@@ -342,6 +428,49 @@ mod tests {
         let store = SqliteSupervisorQueueStore::open(temp.path()).unwrap();
         store.init().unwrap();
         (temp, store)
+    }
+
+    #[test]
+    fn test_notify_idempotent_no_duplicate() {
+        let (_temp, store) = create_test_store();
+        let key = "cas-x:in_progress:closed:sess-a:task_closed";
+        let r1 = store
+            .notify_idempotent(
+                "sup-a",
+                "task_lifecycle",
+                r#"{"task_id":"cas-x"}"#,
+                NotificationPriority::High,
+                key,
+            )
+            .unwrap();
+        let r2 = store
+            .notify_idempotent(
+                "sup-a",
+                "task_lifecycle",
+                r#"{"task_id":"cas-x"}"#,
+                NotificationPriority::High,
+                key,
+            )
+            .unwrap();
+        match (r1, r2) {
+            (NotifyIdempotentResult::Created(id1), NotifyIdempotentResult::AlreadyExists(id2)) => {
+                assert_eq!(id1, id2)
+            }
+            other => panic!("expected Created then AlreadyExists, got {other:?}"),
+        }
+        assert_eq!(store.pending_count("sup-a").unwrap(), 1);
+        // Different session key is a separate event (isolation).
+        store
+            .notify_idempotent(
+                "sup-b",
+                "task_lifecycle",
+                r#"{"task_id":"cas-x"}"#,
+                NotificationPriority::High,
+                "cas-x:in_progress:closed:sess-b:task_closed",
+            )
+            .unwrap();
+        assert_eq!(store.pending_count("sup-b").unwrap(), 1);
+        assert_eq!(store.pending_count("sup-a").unwrap(), 1);
     }
 
     #[test]

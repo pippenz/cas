@@ -112,7 +112,8 @@ pub use recording_store::{
 
 // Supervisor queue store for factory sessions
 pub use supervisor_queue_store::{
-    NotificationPriority, SqliteSupervisorQueueStore, SupervisorNotification, SupervisorQueueStore,
+    NotificationPriority, NotifyIdempotentResult, SqliteSupervisorQueueStore,
+    SupervisorNotification, SupervisorQueueStore,
 };
 
 // Prompt queue store for supervisor → worker communication

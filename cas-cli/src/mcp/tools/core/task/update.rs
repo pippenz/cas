@@ -75,9 +75,7 @@ pub(crate) fn authorize_epic_owner_transfer_caller(
         );
     }
 
-    let current = current_owner
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
+    let current = current_owner.map(str::trim).filter(|s| !s.is_empty());
 
     if let Some(owner) = current {
         if caller_matches_epic_owner(owner, caller_id, caller_name, caller_session) {
@@ -313,11 +311,13 @@ impl CasCore {
         }
 
         if let Some(raw) = req.execution_note.as_deref() {
-            let validated = crate::mcp::tools::types::validate_execution_note(Some(raw))
-                .map_err(|msg| McpError {
-                    code: ErrorCode::INVALID_PARAMS,
-                    message: Cow::from(msg),
-                    data: None,
+            let validated =
+                crate::mcp::tools::types::validate_execution_note(Some(raw)).map_err(|msg| {
+                    McpError {
+                        code: ErrorCode::INVALID_PARAMS,
+                        message: Cow::from(msg),
+                        data: None,
+                    }
                 })?;
             task.execution_note = validated;
             changes.push("execution_note");
@@ -387,9 +387,7 @@ impl CasCore {
                                 // Fall back to ID lookup (supervisor may have copy-pasted
                                 // session UUID).
                                 let by_id = if by_name.is_none() {
-                                    agents
-                                        .iter()
-                                        .find(|a| a.id.eq_ignore_ascii_case(&assignee))
+                                    agents.iter().find(|a| a.id.eq_ignore_ascii_case(&assignee))
                                 } else {
                                     None
                                 };
@@ -400,8 +398,7 @@ impl CasCore {
                                     if factory_config.warn_stale_assignment
                                         || factory_config.block_stale_assignment
                                     {
-                                        if let Some(clone_path) =
-                                            worker.metadata.get("clone_path")
+                                        if let Some(clone_path) = worker.metadata.get("clone_path")
                                         {
                                             if let Some((behind_count, branch)) =
                                                 check_worktree_staleness(
@@ -460,8 +457,7 @@ impl CasCore {
                                     if factory_config.warn_stale_assignment
                                         || factory_config.block_stale_assignment
                                     {
-                                        if let Some(clone_path) =
-                                            worker.metadata.get("clone_path")
+                                        if let Some(clone_path) = worker.metadata.get("clone_path")
                                         {
                                             if let Some((behind_count, branch)) =
                                                 check_worktree_staleness(
@@ -549,8 +545,7 @@ impl CasCore {
                 let caller_id = self.get_agent_id().ok();
                 let caller_name = std::env::var("CAS_AGENT_NAME").ok();
                 let caller_session = std::env::var("CAS_SESSION_ID").ok();
-                let caller_is_supervisor =
-                    crate::harness_policy::is_supervisor_from_env();
+                let caller_is_supervisor = crate::harness_policy::is_supervisor_from_env();
 
                 if let Err(msg) = authorize_epic_owner_transfer_caller(
                     current_norm.as_deref(),
@@ -630,6 +625,8 @@ impl CasCore {
             }
         }
 
+        // cas-062d: track status transition for supervisor lifecycle push.
+        let mut lifecycle_status_change: Option<(TaskStatus, TaskStatus)> = None;
         if let Some(status_str) = req.status {
             use std::str::FromStr;
             let new_status =
@@ -640,6 +637,9 @@ impl CasCore {
                     )),
                     data: None,
                 })?;
+            if new_status != task.status {
+                lifecycle_status_change = Some((task.status, new_status));
+            }
             task.status = new_status;
             changes.push("status");
         }
@@ -726,6 +726,49 @@ impl CasCore {
             data: None,
         })?;
 
+        // cas-062d: push blocked / ready-reopened transitions.
+        if let Some((old_st, new_st)) = lifecycle_status_change {
+            use crate::mcp::tools::core::task::lifecycle::supervisor_push::LifecycleTransition;
+            let kind = match new_st {
+                TaskStatus::Blocked => Some(LifecycleTransition::Blocked),
+                TaskStatus::Open if matches!(old_st, TaskStatus::Blocked | TaskStatus::Closed) => {
+                    Some(LifecycleTransition::ReadyReopened)
+                }
+                TaskStatus::Closed => Some(LifecycleTransition::Closed),
+                _ => None,
+            };
+            if let Some(kind) = kind {
+                let actor = self
+                    .get_agent_id()
+                    .ok()
+                    .and_then(|id| {
+                        self.open_agent_store()
+                            .ok()
+                            .and_then(|s| s.get(&id).ok())
+                            .map(|a| a.name)
+                    })
+                    .unwrap_or_else(|| "unknown".into());
+                if let Err(e) = self.push_task_lifecycle(
+                    &req.id,
+                    &task.title,
+                    old_st,
+                    new_st,
+                    &actor,
+                    None,
+                    kind,
+                ) {
+                    return Err(Self::error(
+                        ErrorCode::INTERNAL_ERROR,
+                        format!(
+                            "Task {} updated, but supervisor lifecycle push failed: {e}. \
+                             Task state is {new_st}; retry is safe (idempotent).",
+                            req.id
+                        ),
+                    ));
+                }
+            }
+        }
+
         // Build response message with warnings if any
         let mut response = format!("Updated task {}: {}", req.id, changes.join(", "));
         if !warnings.is_empty() {
@@ -789,9 +832,8 @@ mod epic_owner_transfer_auth_tests {
 
     #[test]
     fn test_cc74_unknown_caller_identity_fail_closed() {
-        let err =
-            authorize_epic_owner_transfer_caller(Some("owner-id"), None, None, None, false)
-                .unwrap_err();
+        let err = authorize_epic_owner_transfer_caller(Some("owner-id"), None, None, None, false)
+            .unwrap_err();
         assert!(
             err.contains("identity is unknown") && err.contains("fail closed"),
             "unknown caller must fail closed: {err}"
@@ -813,52 +855,55 @@ mod epic_owner_transfer_auth_tests {
 
     #[test]
     fn test_cc74_current_owner_may_transfer() {
-        assert!(authorize_epic_owner_transfer_caller(
-            Some("owner-id"),
-            Some("owner-id"),
-            None,
-            None,
-            false,
-        )
-        .is_ok());
+        assert!(
+            authorize_epic_owner_transfer_caller(
+                Some("owner-id"),
+                Some("owner-id"),
+                None,
+                None,
+                false,
+            )
+            .is_ok()
+        );
         // Match by display name
-        assert!(authorize_epic_owner_transfer_caller(
-            Some("owner-sup"),
-            None,
-            Some("owner-sup"),
-            None,
-            false,
-        )
-        .is_ok());
+        assert!(
+            authorize_epic_owner_transfer_caller(
+                Some("owner-sup"),
+                None,
+                Some("owner-sup"),
+                None,
+                false,
+            )
+            .is_ok()
+        );
         // Match ignores surrounding whitespace on facets
-        assert!(authorize_epic_owner_transfer_caller(
-            Some("owner-id"),
-            Some("  owner-id  "),
-            None,
-            None,
-            false,
-        )
-        .is_ok());
+        assert!(
+            authorize_epic_owner_transfer_caller(
+                Some("owner-id"),
+                Some("  owner-id  "),
+                None,
+                None,
+                false,
+            )
+            .is_ok()
+        );
     }
 
     #[test]
     fn test_cc74_supervisor_may_transfer_or_claim_unset() {
-        assert!(authorize_epic_owner_transfer_caller(
-            Some("owner-id"),
-            Some("other-sup"),
-            None,
-            None,
-            true,
-        )
-        .is_ok());
-        assert!(authorize_epic_owner_transfer_caller(
-            None,
-            Some("sup-id"),
-            None,
-            None,
-            true,
-        )
-        .is_ok());
+        assert!(
+            authorize_epic_owner_transfer_caller(
+                Some("owner-id"),
+                Some("other-sup"),
+                None,
+                None,
+                true,
+            )
+            .is_ok()
+        );
+        assert!(
+            authorize_epic_owner_transfer_caller(None, Some("sup-id"), None, None, true,).is_ok()
+        );
     }
 
     #[test]
@@ -893,18 +938,11 @@ mod epic_owner_transfer_auth_tests {
             AgentRole::Director,
             AgentStatus::Active,
         );
-        assert!(
-            validate_epic_owner_target_agent(&director, EPIC_OWNER_TARGET_STALE_SECS).is_ok()
-        );
+        assert!(validate_epic_owner_target_agent(&director, EPIC_OWNER_TARGET_STALE_SECS).is_ok());
 
-        let worker = agent(
-            "w-1",
-            "worker-1",
-            AgentRole::Worker,
-            AgentStatus::Active,
-        );
-        let err = validate_epic_owner_target_agent(&worker, EPIC_OWNER_TARGET_STALE_SECS)
-            .unwrap_err();
+        let worker = agent("w-1", "worker-1", AgentRole::Worker, AgentStatus::Active);
+        let err =
+            validate_epic_owner_target_agent(&worker, EPIC_OWNER_TARGET_STALE_SECS).unwrap_err();
         assert!(
             err.contains("not a supervisor") && err.contains("cas-cc74"),
             "worker target must fail: {err}"
@@ -916,14 +954,14 @@ mod epic_owner_transfer_auth_tests {
             AgentRole::Supervisor,
             AgentStatus::Shutdown,
         );
-        let err = validate_epic_owner_target_agent(&dead, EPIC_OWNER_TARGET_STALE_SECS)
-            .unwrap_err();
+        let err =
+            validate_epic_owner_target_agent(&dead, EPIC_OWNER_TARGET_STALE_SECS).unwrap_err();
         assert!(err.contains("not live"), "dead supervisor must fail: {err}");
 
         dead.status = AgentStatus::Active;
         dead.last_heartbeat = chrono::Utc::now() - chrono::Duration::seconds(10_000);
-        let err = validate_epic_owner_target_agent(&dead, EPIC_OWNER_TARGET_STALE_SECS)
-            .unwrap_err();
+        let err =
+            validate_epic_owner_target_agent(&dead, EPIC_OWNER_TARGET_STALE_SECS).unwrap_err();
         assert!(err.contains("stale"), "stale heartbeat must fail: {err}");
     }
 
@@ -936,12 +974,7 @@ mod epic_owner_transfer_auth_tests {
                 AgentRole::Supervisor,
                 AgentStatus::Active,
             ),
-            agent(
-                "w-uuid",
-                "worker-1",
-                AgentRole::Worker,
-                AgentStatus::Active,
-            ),
+            agent("w-uuid", "worker-1", AgentRole::Worker, AgentStatus::Active),
         ];
         assert_eq!(
             find_agent_for_epic_owner(&agents, "sup-uuid").map(|a| a.id.as_str()),

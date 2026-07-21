@@ -271,6 +271,45 @@ impl CasCore {
                 error = %e,
                 "failed to park task awaiting merge after close rejection"
             );
+        } else {
+            // cas-062d: durable lifecycle push for AwaitingMerge + close-rejected.
+            let actor = self.get_agent_id().unwrap_or_else(|_| "unknown".into());
+            let actor_name = self
+                .open_agent_store()
+                .ok()
+                .and_then(|s| s.get(&actor).ok())
+                .map(|a| a.name)
+                .unwrap_or_else(|| actor.clone());
+            if let Err(e) = self.push_task_lifecycle(
+                &task.id,
+                &task.title,
+                task.status,
+                TaskStatus::AwaitingMerge,
+                &actor_name,
+                Some(reason),
+                super::supervisor_push::LifecycleTransition::AwaitingMerge,
+            ) {
+                tracing::error!(
+                    task_id = %task.id,
+                    error = %e,
+                    "supervisor lifecycle push failed after AwaitingMerge park"
+                );
+            }
+            if let Err(e) = self.push_task_lifecycle(
+                &task.id,
+                &task.title,
+                task.status,
+                TaskStatus::AwaitingMerge,
+                &actor_name,
+                Some(reason),
+                super::supervisor_push::LifecycleTransition::CloseRejected,
+            ) {
+                tracing::error!(
+                    task_id = %task.id,
+                    error = %e,
+                    "supervisor lifecycle push failed after close rejection"
+                );
+            }
         }
 
         if let Ok(agent_store) = self.open_agent_store() {
@@ -1720,12 +1759,7 @@ impl CasCore {
             // no-code (spike, chore, execution_note set, bypass).
             CodeReviewGateOutcome::Proceed
         } else {
-            run_code_review_gate(
-                &task,
-                &req,
-                close_project_root,
-                supervisor_review_mode,
-            )
+            run_code_review_gate(&task, &req, close_project_root, supervisor_review_mode)
         };
         match gate_outcome {
             CodeReviewGateOutcome::Proceed => {}
@@ -1749,6 +1783,8 @@ impl CasCore {
         // Proceed with close
         let mut task = task;
         let now = chrono::Utc::now();
+        // cas-062d: capture pre-close status for durable lifecycle push identity.
+        let old_status_for_lifecycle = task.status;
         task.status = TaskStatus::Closed;
         task.closed_at = Some(now);
         task.updated_at = now;
@@ -1868,6 +1904,40 @@ impl CasCore {
             data: None,
         })?;
 
+        // cas-062d: durable Closed lifecycle push after successful close.
+        {
+            let actor = self
+                .get_agent_id()
+                .ok()
+                .and_then(|id| {
+                    self.open_agent_store()
+                        .ok()
+                        .and_then(|s| s.get(&id).ok())
+                        .map(|a| a.name)
+                })
+                .unwrap_or_else(|| "unknown".into());
+            if let Err(e) = self.push_task_lifecycle(
+                &req.id,
+                &task.title,
+                old_status_for_lifecycle,
+                TaskStatus::Closed,
+                &actor,
+                req.reason.as_deref(),
+                super::supervisor_push::LifecycleTransition::Closed,
+            ) {
+                // Task is already Closed — surface push failure without
+                // rolling back task state. Retry is idempotent by transition_key.
+                return Err(Self::error(
+                    ErrorCode::INTERNAL_ERROR,
+                    format!(
+                        "Task {} closed, but supervisor lifecycle push failed: {e}. \
+                         Task state is Closed; retry is safe (idempotent).",
+                        req.id
+                    ),
+                ));
+            }
+        }
+
         // Auto-unblock tasks that were blocked solely by this task.
         // This keeps dependency state and task status synchronized.
         let mut auto_unblocked_tasks: Vec<String> = Vec::new();
@@ -1901,7 +1971,35 @@ impl CasCore {
                             format!("{}\n\n{}", dependent_task.notes, unblock_note);
                     }
                     if task_store.update(&dependent_task).is_ok() {
-                        auto_unblocked_tasks.push(dependent_task.id.clone());
+                        // cas-062d: ready/reopened push for auto-unblocked dependents.
+                        let dep_id = dependent_task.id.clone();
+                        let dep_title = dependent_task.title.clone();
+                        let actor = self
+                            .get_agent_id()
+                            .ok()
+                            .and_then(|id| {
+                                self.open_agent_store()
+                                    .ok()
+                                    .and_then(|s| s.get(&id).ok())
+                                    .map(|a| a.name)
+                            })
+                            .unwrap_or_else(|| "unknown".into());
+                        if let Err(e) = self.push_task_lifecycle(
+                            &dep_id,
+                            &dep_title,
+                            TaskStatus::Blocked,
+                            TaskStatus::Open,
+                            &actor,
+                            Some("auto-unblocked"),
+                            super::supervisor_push::LifecycleTransition::ReadyReopened,
+                        ) {
+                            tracing::error!(
+                                task_id = %dep_id,
+                                error = %e,
+                                "supervisor lifecycle push failed after auto-unblock"
+                            );
+                        }
+                        auto_unblocked_tasks.push(dep_id);
                     }
                 }
             }
@@ -2299,6 +2397,7 @@ impl CasCore {
             ));
         }
 
+        let old_status = task.status;
         task.status = TaskStatus::Open;
         task.closed_at = None;
         task.updated_at = chrono::Utc::now();
@@ -2317,6 +2416,36 @@ impl CasCore {
             message: Cow::from(format!("Failed to update: {e}")),
             data: None,
         })?;
+
+        // cas-062d: ready/reopened lifecycle push after successful reopen.
+        let actor = self
+            .get_agent_id()
+            .ok()
+            .and_then(|id| {
+                self.open_agent_store()
+                    .ok()
+                    .and_then(|s| s.get(&id).ok())
+                    .map(|a| a.name)
+            })
+            .unwrap_or_else(|| "unknown".into());
+        if let Err(e) = self.push_task_lifecycle(
+            &req.id,
+            &task.title,
+            old_status,
+            TaskStatus::Open,
+            &actor,
+            Some("reopen"),
+            super::supervisor_push::LifecycleTransition::ReadyReopened,
+        ) {
+            return Err(Self::error(
+                ErrorCode::INTERNAL_ERROR,
+                format!(
+                    "Task {} reopened, but supervisor lifecycle push failed: {e}. \
+                     Task state is Open; retry is safe (idempotent).",
+                    req.id
+                ),
+            ));
+        }
 
         Ok(Self::success(format!(
             "Reopened task: {} - {}",
@@ -3037,13 +3166,14 @@ fn known_unmerged_factory_commits(
         .current_dir(repo_path)
         .output();
     match count_out {
-        Ok(o) if o.status.success() => match String::from_utf8_lossy(&o.stdout).trim().parse::<u32>()
-        {
-            Ok(0) => KnownUnmergedCount::KnownZero,
-            Ok(n) => KnownUnmergedCount::KnownPositive(n),
-            // Unparseable count is not evidence of zero.
-            Err(_) => KnownUnmergedCount::Unknown,
-        },
+        Ok(o) if o.status.success() => {
+            match String::from_utf8_lossy(&o.stdout).trim().parse::<u32>() {
+                Ok(0) => KnownUnmergedCount::KnownZero,
+                Ok(n) => KnownUnmergedCount::KnownPositive(n),
+                // Unparseable count is not evidence of zero.
+                Err(_) => KnownUnmergedCount::Unknown,
+            }
+        }
         _ => KnownUnmergedCount::Unknown,
     }
 }
@@ -4304,21 +4434,20 @@ pub(crate) fn run_code_review_gate(
     // cas-297e: multi-field parse via parse_review_outcome so a single
     // bad envelope lists every missing Finding field (and documents the
     // full Finding schema in the reject text).
-    let envelope: cas_types::ReviewOutcome =
-        match cas_types::parse_review_outcome(envelope_json) {
-            Ok(e) => e,
-            Err(e) => {
-                return CodeReviewGateOutcome::Reject(format!(
-                    "⚠️ MALFORMED REVIEW ENVELOPE\n\n\
+    let envelope: cas_types::ReviewOutcome = match cas_types::parse_review_outcome(envelope_json) {
+        Ok(e) => e,
+        Err(e) => {
+            return CodeReviewGateOutcome::Reject(format!(
+                "⚠️ MALFORMED REVIEW ENVELOPE\n\n\
                      task close rejected: code_review_findings failed to parse \
                      as ReviewOutcome JSON:\n{}\n\n\
                      {}\n\n\
                      Fix every listed field (or re-run cas-code-review) and retry close.",
-                    e.message,
-                    cas_types::review_outcome_shape_hint(),
-                ));
-            }
-        };
+                e.message,
+                cas_types::review_outcome_shape_hint(),
+            ));
+        }
+    };
 
     use cas_store::code_review::close_gate::{GateDecision, evaluate_gate, format_block_message};
     use cas_types::FindingSeverity;
@@ -5410,7 +5539,11 @@ mod lightweight_lint_tests {
                 worker.to_str().unwrap(),
             ],
         );
-        std::fs::write(worker.join("feature.rs"), "pub fn feature() -> u32 { 42 }\n").unwrap();
+        std::fs::write(
+            worker.join("feature.rs"),
+            "pub fn feature() -> u32 { 42 }\n",
+        )
+        .unwrap();
         git_dc5d(&worker, &["add", "feature.rs"]);
         git_dc5d(&worker, &["commit", "-q", "-m", "feat: clean worker task"]);
 
@@ -5517,7 +5650,10 @@ fn leftover() {}\n";
 pub fn epic_only() {}\n";
         std::fs::write(p.join("epic.rs"), epic_comments).unwrap();
         git_dc5d(p, &["add", "epic.rs"]);
-        git_dc5d(p, &["commit", "-q", "-m", "epic clean-ish but comment-heavy"]);
+        git_dc5d(
+            p,
+            &["commit", "-q", "-m", "epic clean-ish but comment-heavy"],
+        );
 
         // Worker branches from epic with a clean feature.
         let worker = p.join("worktrees").join("worker");
@@ -5556,7 +5692,8 @@ pub fn epic_only() {}\n";
     #[test]
     fn lint_scoped_fails_closed_on_missing_parent() {
         let dir = init_repo_with_diff("fn ok() {}\n");
-        let out = run_lightweight_structural_lint_with_scope(dir.path(), Some("epic/does-not-exist"));
+        let out =
+            run_lightweight_structural_lint_with_scope(dir.path(), Some("epic/does-not-exist"));
         match out {
             LightweightLintOutcome::Fail(msg) => {
                 assert!(
@@ -5572,7 +5709,8 @@ pub fn epic_only() {}\n";
     #[test]
     fn lint_scoped_fails_closed_on_unsafe_parent() {
         let dir = init_repo_with_diff("fn ok() {}\n");
-        let out = run_lightweight_structural_lint_with_scope(dir.path(), Some("-oProxyCommand=evil"));
+        let out =
+            run_lightweight_structural_lint_with_scope(dir.path(), Some("-oProxyCommand=evil"));
         match out {
             LightweightLintOutcome::Fail(msg) => {
                 assert!(
@@ -7205,7 +7343,10 @@ mod merge_state_gate_tests {
 
         std::fs::write(p.join("a.rs"), "// a unmerged\n").unwrap();
         git(p, &["add", "a.rs"]);
-        git(p, &["commit", "-q", "-m", "feat: task A (never integrated)"]);
+        git(
+            p,
+            &["commit", "-q", "-m", "feat: task A (never integrated)"],
+        );
         let anchor_a = rev_parse_local(p, "HEAD");
 
         assert_eq!(
@@ -7239,7 +7380,10 @@ mod merge_state_gate_tests {
 
         std::fs::write(p.join("a.rs"), "// a unmerged\n").unwrap();
         git(p, &["add", "a.rs"]);
-        git(p, &["commit", "-q", "-m", "feat: task A (never integrated)"]);
+        git(
+            p,
+            &["commit", "-q", "-m", "feat: task A (never integrated)"],
+        );
         let anchor_a = rev_parse_local(p, "HEAD");
 
         // Drop the live factory branch while keeping the parked anchor sha
@@ -7297,7 +7441,10 @@ mod merge_state_gate_tests {
         // Parked anchor A: related history, genuinely unmerged (KnownPositive).
         std::fs::write(p.join("a.rs"), "// a unmerged\n").unwrap();
         git(p, &["add", "a.rs"]);
-        git(p, &["commit", "-q", "-m", "feat: task A (never integrated)"]);
+        git(
+            p,
+            &["commit", "-q", "-m", "feat: task A (never integrated)"],
+        );
         let anchor_a = rev_parse_local(p, "HEAD");
         assert_eq!(
             count_unmerged_factory_commits(p, &anchor_a, "main"),
@@ -7434,7 +7581,10 @@ mod merge_state_gate_tests {
 
         // Integrate post-rebase tip A' into main.
         git(p, &["checkout", "-q", "main"]);
-        git(p, &["merge", "-q", "--no-ff", "factory/worker", "-m", "merge A'"]);
+        git(
+            p,
+            &["merge", "-q", "--no-ff", "factory/worker", "-m", "merge A'"],
+        );
         git(p, &["checkout", "-q", "factory/worker"]);
 
         assert_eq!(
@@ -7483,7 +7633,10 @@ mod merge_state_gate_tests {
         git(p, &["checkout", "-q", "factory/worker"]);
         git(p, &["rebase", "-q", "main"]);
         git(p, &["checkout", "-q", "main"]);
-        git(p, &["merge", "-q", "--no-ff", "factory/worker", "-m", "merge A'"]);
+        git(
+            p,
+            &["merge", "-q", "--no-ff", "factory/worker", "-m", "merge A'"],
+        );
 
         assert_eq!(
             count_unmerged_factory_commits(p, &anchor_a, "main"),
@@ -7568,7 +7721,10 @@ mod merge_state_gate_tests {
         let tip_a_prime = rev_parse_local(p, "HEAD");
         assert_ne!(anchor_a, tip_a_prime, "precondition: rebase rewrites SHA");
         git(p, &["checkout", "-q", "main"]);
-        git(p, &["merge", "-q", "--no-ff", "factory/worker", "-m", "merge A'"]);
+        git(
+            p,
+            &["merge", "-q", "--no-ff", "factory/worker", "-m", "merge A'"],
+        );
         git(p, &["checkout", "-q", "factory/worker"]);
 
         // Serial task B unmerged on the same factory branch.
@@ -7706,7 +7862,17 @@ mod merge_state_gate_tests {
         // origin. This is what makes `origin/epic/x` genuinely contain the
         // work.
         git(p, &["checkout", "-q", "epic/x"]);
-        git(p, &["merge", "-q", "--no-ff", "factory/worker", "-m", "merge worker"]);
+        git(
+            p,
+            &[
+                "merge",
+                "-q",
+                "--no-ff",
+                "factory/worker",
+                "-m",
+                "merge worker",
+            ],
+        );
         git(p, &["push", "-q", "origin", "epic/x"]);
 
         // Now force the LOCAL epic/x ref back to the pre-merge tip —
@@ -7767,7 +7933,10 @@ mod merge_state_gate_tests {
         let out = run_factory_branch_merge_gate(&task, &req, "epic/x", p);
         match out {
             MergeStateGateOutcome::Reject(msg) => {
-                assert!(msg.contains("1 commit"), "expected stranded count of 1: {msg}");
+                assert!(
+                    msg.contains("1 commit"),
+                    "expected stranded count of 1: {msg}"
+                );
             }
             other => panic!(
                 "commit reachable from neither local nor origin epic/x must still reject, got {other:?}"
@@ -7825,7 +7994,14 @@ mod merge_state_gate_tests {
         git(p, &["checkout", "-q", "epic/x"]);
         git(
             p,
-            &["merge", "-q", "--no-ff", "factory/worker", "-m", "merge worker"],
+            &[
+                "merge",
+                "-q",
+                "--no-ff",
+                "factory/worker",
+                "-m",
+                "merge worker",
+            ],
         );
         git(p, &["push", "-q", "origin", "epic/x"]);
 
@@ -7907,7 +8083,10 @@ mod merge_state_gate_tests {
         git(p, &["push", "-q", "origin", "HEAD:epic/x"]);
         git(p, &["checkout", "-q", "factory/worker"]);
         // Ensure remote-tracking ref is present without re-fetching local epic.
-        git(p, &["fetch", "-q", "origin", "epic/x:refs/remotes/origin/epic/x"]);
+        git(
+            p,
+            &["fetch", "-q", "origin", "epic/x:refs/remotes/origin/epic/x"],
+        );
 
         assert!(
             git_ref_exists(p, "origin/epic/x"),
@@ -8182,7 +8361,10 @@ mod system_b_worktree_resolution_tests {
         // The configured location: NOT under `.cas/worktrees` at all.
         let configured_wt_path = override_base.join("worker-1");
         std::fs::create_dir_all(&configured_wt_path).unwrap();
-        git(&configured_wt_path, &["init", "-q", "-b", "factory/worker-1"]);
+        git(
+            &configured_wt_path,
+            &["init", "-q", "-b", "factory/worker-1"],
+        );
 
         assert_eq!(
             resolve_system_b_worktree_path(&cas_root, "worker-1"),
@@ -8860,7 +9042,13 @@ mod commit_claim_integrity_tests {
         git(dir.path(), &["checkout", "-q", "main"]);
         git(
             dir.path(),
-            &["merge", "--no-ff", "-m", "merge worker", "factory/test-worker"],
+            &[
+                "merge",
+                "--no-ff",
+                "-m",
+                "merge worker",
+                "factory/test-worker",
+            ],
         );
         // Worker tip is now even with parent (or still at anchor which is
         // ancestor) — count beyond parent is 0 either way after checkout.
@@ -9079,8 +9267,15 @@ mod zero_change_close_tests {
     fn case4_zero_commits_on_chore_or_spike_proceeds() {
         let dir = init_worker_repo();
         for task_type in [TaskType::Chore, TaskType::Epic] {
-            let outcome =
-                check_zero_commit_close(dir.path(), "main", "cas-test1", &task_type, None, false, None);
+            let outcome = check_zero_commit_close(
+                dir.path(),
+                "main",
+                "cas-test1",
+                &task_type,
+                None,
+                false,
+                None,
+            );
             assert!(
                 matches!(outcome, ZeroCommitCloseOutcome::Proceed),
                 "{task_type:?} task type must not be flagged as ambiguous"
@@ -9203,7 +9398,13 @@ mod zero_change_close_tests {
         git(dir.path(), &["checkout", "-q", "main"]);
         git(
             dir.path(),
-            &["merge", "--no-ff", "-m", "merge factory/test-worker", "factory/test-worker"],
+            &[
+                "merge",
+                "--no-ff",
+                "-m",
+                "merge factory/test-worker",
+                "factory/test-worker",
+            ],
         );
         // Worker factory branch reset to epic tip (post-merge sync).
         git(dir.path(), &["checkout", "-q", "factory/test-worker"]);
@@ -9508,22 +9709,12 @@ mod epic_close_owner_gate_tests {
 
     #[test]
     fn test_9fff_owner_match_by_id_or_name_allows_close() {
-        assert!(epic_close_owner_gate(
-            "cas-epic",
-            "owner-id",
-            Some("owner-id"),
-            None,
-            None
-        )
-        .is_ok());
-        assert!(epic_close_owner_gate(
-            "cas-epic",
-            "owner-sup",
-            None,
-            Some("owner-sup"),
-            None
-        )
-        .is_ok());
+        assert!(
+            epic_close_owner_gate("cas-epic", "owner-id", Some("owner-id"), None, None).is_ok()
+        );
+        assert!(
+            epic_close_owner_gate("cas-epic", "owner-sup", None, Some("owner-sup"), None).is_ok()
+        );
     }
 
     #[test]
@@ -9556,21 +9747,11 @@ mod epic_close_owner_gate_tests {
     /// cas-cc74: close compare trims owner + identity facets.
     #[test]
     fn test_cc74_close_owner_gate_trims_whitespace() {
-        assert!(epic_close_owner_gate(
-            "cas-epic",
-            "  owner-id  ",
-            Some("owner-id"),
-            None,
-            None
-        )
-        .is_ok());
-        assert!(epic_close_owner_gate(
-            "cas-epic",
-            "owner-id",
-            Some("  owner-id  "),
-            None,
-            None
-        )
-        .is_ok());
+        assert!(
+            epic_close_owner_gate("cas-epic", "  owner-id  ", Some("owner-id"), None, None).is_ok()
+        );
+        assert!(
+            epic_close_owner_gate("cas-epic", "owner-id", Some("  owner-id  "), None, None).is_ok()
+        );
     }
 }

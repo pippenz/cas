@@ -468,8 +468,7 @@ async fn test_merge_required_close_parks_awaiting_merge_and_releases_gate_cas_8d
     // must now fall back to resolving A by assignee + AwaitingMerge status
     // directly from the task table — confirmed P1,
     // docs/reviews/2026-07-07-cas-b646-epic.md.
-    let director_data =
-        cas_factory::DirectorData::load_fast(&cas_dir).expect("load director data");
+    let director_data = cas_factory::DirectorData::load_fast(&cas_dir).expect("load director data");
     let agent_summary = director_data
         .agents
         .iter()
@@ -1007,12 +1006,7 @@ async fn test_stale_local_epic_ref_falls_back_to_origin_cas_38e2() {
     std::fs::write(repo.join("seed.txt"), "seed\n").unwrap();
     git(&["add", "seed.txt"]);
     git(&["commit", "-q", "-m", "seed"]);
-    git(&[
-        "remote",
-        "add",
-        "origin",
-        bare.path().to_str().unwrap(),
-    ]);
+    git(&["remote", "add", "origin", bare.path().to_str().unwrap()]);
     git(&["checkout", "-q", "-b", "epic/cas-38e2"]);
     let old_epic_tip = git_output(&["rev-parse", "epic/cas-38e2"]);
     git(&["checkout", "-q", "-b", "factory/test-agent"]);
@@ -6269,5 +6263,92 @@ async fn test_timeout_escalation_uses_codex_supervisor_verification_alias_cas_79
     assert!(
         !text.contains("mcp__cas__verification"),
         "Codex supervisor timeout guidance must not use the Claude alias: {text}"
+    );
+}
+
+/// cas-062d: successful close must durable-push `task_closed` to the owning
+/// supervisor queue (session-isolated). Covers the close path that lives in
+/// verification_flow's domain (supervisor orphan bypass → Closed).
+#[tokio::test]
+async fn test_062d_close_lifecycle_push_to_owning_supervisor() {
+    let (temp, service) = setup_cas();
+    let _env_lock = env_test_lock();
+    let cas_dir = temp.path().join(".cas");
+
+    // Register a factory-session supervisor that owns lifecycle events.
+    let session = "sess-062d-vf";
+    let agent_store = open_agent_store(&cas_dir).expect("agent store");
+    let mut sup = cas::types::Agent::new("sup-062d-vf".to_string(), "sup-062d-vf".to_string());
+    sup.role = AgentRole::Supervisor;
+    sup.factory_session = Some(session.to_string());
+    agent_store.register(&sup).expect("register supervisor");
+
+    // SAFETY: hold env_test_lock for the factory session + supervisor role.
+    let _guard = ScopedFactoryEnv::apply(&[
+        ("CAS_FACTORY_SESSION", Some(session)),
+        ("CAS_AGENT_ROLE", Some("supervisor")),
+    ]);
+
+    let task_store = open_task_store(&cas_dir).unwrap();
+    let create_text = extract_text(
+        service
+            .cas_task_create(Parameters(TaskCreateRequest {
+                depth: None,
+                title: "062d close lifecycle".to_string(),
+                description: None,
+                priority: 2,
+                task_type: "task".to_string(),
+                labels: None,
+                notes: None,
+                blocked_by: None,
+                design: None,
+                acceptance_criteria: None,
+                external_ref: None,
+                assignee: None,
+                demo_statement: None,
+                execution_note: None,
+                epic: None,
+            }))
+            .await
+            .expect("create"),
+    );
+    let id = extract_task_id(&create_text).expect("task id").to_string();
+
+    // Orphan InProgress so supervisor bypass skips verification.
+    let mut task = task_store.get(&id).expect("task");
+    task.status = TaskStatus::InProgress;
+    task.assignee = None;
+    task_store.update(&task).expect("orphan task");
+
+    let close_text = extract_text(
+        service
+            .cas_task_close(Parameters(TaskCloseRequest {
+                id: id.clone(),
+                reason: Some("062d close proof".to_string()),
+                bypass_code_review: Some(true),
+                code_review_findings: None,
+            }))
+            .await
+            .expect("close"),
+    );
+    assert!(
+        close_text.contains("Closed") || close_text.contains(&id),
+        "close response: {close_text}"
+    );
+    assert_eq!(
+        task_store.get(&id).unwrap().status,
+        TaskStatus::Closed,
+        "task must be Closed after successful close"
+    );
+
+    let queue = cas::store::open_supervisor_queue_store(&cas_dir).expect("queue");
+    let pending = queue.peek("sup-062d-vf", 20).expect("peek");
+    assert!(
+        pending.iter().any(|n| {
+            n.event_type == "task_lifecycle"
+                && n.payload.contains("task_closed")
+                && n.payload.contains(&id)
+        }),
+        "close must durable-push task_closed to owning supervisor. pending={pending:?}"
     );
 }
