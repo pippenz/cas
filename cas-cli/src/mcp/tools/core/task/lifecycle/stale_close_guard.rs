@@ -282,6 +282,45 @@ pub fn is_merge_reclose_exempt_urgent(text: &str, target_awaiting_merge_task_ids
         .any(|id| text_mentions_task_id_bounded(text, id))
 }
 
+/// cas-60393 (G-M1/X-M1 deadlock): whether the `task close` halt-work gate
+/// should be **exempted** for this specific call.
+///
+/// cas-126b already stops the merge-done *notification itself* from arming
+/// halt. But a halt armed **earlier**, by an unrelated urgent stop, survives
+/// that fix untouched: the worker is parked in [`TaskStatus::AwaitingMerge`],
+/// the supervisor merges the branch, and the re-close is refused anyway
+/// because `halt_task_work` is still `1` from the older, unrelated event.
+/// There is no in-band recovery — starting the parked task is illegal (you
+/// cannot `start` an `AwaitingMerge` task), so only an operator can clear the
+/// halt out of band. That is the deadlock this predicate closes.
+///
+/// The exemption is narrow by construction:
+/// - It fires **only** when the task being closed is `AwaitingMerge` and its
+///   `assignee` is exactly the calling agent's own display name — someone
+///   else's parked task, or this same task in any other status, still halts.
+/// - It does **not** clear `halt_task_work` — every other close/verify call
+///   remains blocked until a real new `task start` clears the flag.
+/// - It does **not** touch the merge-integrity gate. Skipping the halt check
+///   only lets execution reach `run_factory_branch_merge_gate`; an
+///   `AwaitingMerge` task whose commit is not actually merged yet still
+///   bounces `MERGE REQUIRED` from that gate exactly as before, so this can
+///   never manufacture a false close success.
+pub fn halt_exempt_for_owned_awaiting_merge(
+    task_status: TaskStatus,
+    task_assignee: Option<&str>,
+    caller_agent_name: Option<&str>,
+) -> bool {
+    if task_status != TaskStatus::AwaitingMerge {
+        return false;
+    }
+    match (task_assignee, caller_agent_name) {
+        (Some(assignee), Some(caller)) if !assignee.is_empty() && !caller.is_empty() => {
+            assignee == caller
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -598,5 +637,72 @@ mod tests {
                 "status {status:?} is a failed-start path that must preserve halt"
             );
         }
+    }
+
+    /// cas-60393 happy path: the caller's own AwaitingMerge task is exempt
+    /// from an unrelated, pre-existing halt.
+    #[test]
+    fn test_60393_owned_awaiting_merge_is_halt_exempt() {
+        assert!(halt_exempt_for_owned_awaiting_merge(
+            TaskStatus::AwaitingMerge,
+            Some("swift-fox-12"),
+            Some("swift-fox-12"),
+        ));
+    }
+
+    /// cas-60393: only the assigned AwaitingMerge task is exempt — a
+    /// different worker's parked task must not skip the halt gate for this
+    /// caller.
+    #[test]
+    fn test_60393_other_workers_awaiting_merge_task_not_exempt() {
+        assert!(!halt_exempt_for_owned_awaiting_merge(
+            TaskStatus::AwaitingMerge,
+            Some("other-worker"),
+            Some("swift-fox-12"),
+        ));
+    }
+
+    /// cas-60393: the same caller/task pairing is not exempt for any status
+    /// other than AwaitingMerge — e.g. re-close of a plain InProgress task
+    /// must still halt.
+    #[test]
+    fn test_60393_non_awaiting_merge_status_not_exempt() {
+        for status in [
+            TaskStatus::Open,
+            TaskStatus::InProgress,
+            TaskStatus::Blocked,
+            TaskStatus::Closed,
+            TaskStatus::PendingSupervisorReview,
+        ] {
+            assert!(
+                !halt_exempt_for_owned_awaiting_merge(
+                    status,
+                    Some("swift-fox-12"),
+                    Some("swift-fox-12"),
+                ),
+                "status {status:?} must not be halt-exempt"
+            );
+        }
+    }
+
+    /// cas-60393: missing assignee or unknown caller identity must fail
+    /// closed (never exempt) rather than assume ownership.
+    #[test]
+    fn test_60393_missing_identity_fails_closed_to_halt() {
+        assert!(!halt_exempt_for_owned_awaiting_merge(
+            TaskStatus::AwaitingMerge,
+            None,
+            Some("swift-fox-12"),
+        ));
+        assert!(!halt_exempt_for_owned_awaiting_merge(
+            TaskStatus::AwaitingMerge,
+            Some("swift-fox-12"),
+            None,
+        ));
+        assert!(!halt_exempt_for_owned_awaiting_merge(
+            TaskStatus::AwaitingMerge,
+            Some(""),
+            Some(""),
+        ));
     }
 }
