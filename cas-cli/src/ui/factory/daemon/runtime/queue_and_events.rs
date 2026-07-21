@@ -600,90 +600,120 @@ impl FactoryDaemon {
                         }
                     }
                     Err(e) => {
-                        if self.app.mux.get(pane_target).is_none() {
-                            // Pane not found — only retry if target is a known
-                            // worker/supervisor in this session (it may still be spawning).
-                            // Stale messages for workers from previous sessions would
-                            // otherwise block the queue forever (peek_all has a limit).
-                            let is_current =
-                                self.app.worker_names().contains(&pane_target.to_string())
-                                    || pane_target == self.app.supervisor_name();
-                            if is_current {
-                                // cas-2c5f: known target still spawning — retryable unavail.
-                                let _ = queue.record_pending_reason(
-                                    queued.id,
-                                    cas_store::PendingReason::TargetUnavailable,
-                                    Some("pane missing; target is current session member"),
-                                );
-                                continue;
+                        // cas-6257 + cas-2c5f: centralised bookkeeping via
+                        // classify_queued_delivery — a FAILED handoff is never
+                        // marked processed/transport-delivered. It is retryable
+                        // while the target is a live/known session member
+                        // (transient inbox/PTY failure, or the pane is still
+                        // spawning), and abandoned only when the target is not a
+                        // pane in this session and not a current worker/supervisor.
+                        // `success` stays false in the retry cases so the row is
+                        // left pending (processed_at not advanced). The structured
+                        // cas-2c5f status (pending reason / abandoned) is stamped
+                        // alongside so message_status stays truthful about *why* a
+                        // row is still pending.
+                        let pane_known = self.app.mux.get(pane_target).is_some();
+                        let target_is_current =
+                            self.app.worker_names().contains(&pane_target.to_string())
+                                || pane_target == self.app.supervisor_name();
+                        match super::delivery::classify_queued_delivery(
+                            false,
+                            pane_known,
+                            target_is_current,
+                        ) {
+                            super::delivery::QueuedDeliveryOutcome::MarkProcessed => {
+                                // Unreachable for delivered_ok=false, but handle
+                                // defensively: leave the row pending rather than
+                                // falsely advancing processed_at on a failed write.
                             }
-                            tracing::warn!(
-                                prompt_id = queued.id,
-                                target = pane_target,
-                                source = %queued.source,
-                                "Abandoning queued prompt for unknown target — \
-                                 message will not be delivered"
-                            );
-                            // cas-2c5f: not transport delivery — structured stage=abandoned.
-                            let _ = queue.mark_abandoned(
-                                queued.id,
-                                Some(&format!(
-                                    "target '{pane_target}' not found in current session"
-                                )),
-                            );
-
-                            // Record the drop and notify the supervisor so the
-                            // message isn't silently lost.
-                            if let Some(ref store) = event_store {
-                                record_injection(
-                                    store,
+                            super::delivery::QueuedDeliveryOutcome::Retry => {
+                                if pane_known {
+                                    // Pane exists — transient adapter failure;
+                                    // record it and leave the row pending for the
+                                    // next tick.
+                                    tracing::error!("Failed to inject to '{}': {}", pane_target, e);
+                                    // cas-2c5f: adapter failure leaves row pending for retry.
+                                    let _ = queue.record_pending_reason(
+                                        queued.id,
+                                        cas_store::PendingReason::AdapterRetryable,
+                                        Some(&e.to_string()),
+                                    );
+                                    if let Some(ref store) = event_store {
+                                        record_injection(
+                                            store,
+                                            queued.id,
+                                            &queued.source,
+                                            &queued.target,
+                                            pane_target,
+                                            "error",
+                                            Some(e.to_string()),
+                                        );
+                                    }
+                                } else {
+                                    // Pane missing but the target is still a current
+                                    // session member (mid-spawn) — bare retry.
+                                    // cas-2c5f: known target still spawning — retryable unavail.
+                                    let _ = queue.record_pending_reason(
+                                        queued.id,
+                                        cas_store::PendingReason::TargetUnavailable,
+                                        Some("pane missing; target is current session member"),
+                                    );
+                                }
+                            }
+                            super::delivery::QueuedDeliveryOutcome::Abandon => {
+                                // Pane not found and not a current worker/supervisor.
+                                // Stale messages for workers from previous sessions
+                                // would otherwise block the queue forever (peek_all
+                                // has a limit), so consume the row and re-route its
+                                // content to the supervisor.
+                                tracing::warn!(
+                                    prompt_id = queued.id,
+                                    target = pane_target,
+                                    source = %queued.source,
+                                    "Abandoning queued prompt for unknown target — \
+                                     message will not be delivered"
+                                );
+                                // cas-2c5f: not transport delivery — structured stage=abandoned.
+                                let _ = queue.mark_abandoned(
                                     queued.id,
-                                    &queued.source,
-                                    &queued.target,
-                                    pane_target,
-                                    "abandoned",
-                                    Some(format!(
-                                        "Target '{}' not found in current session",
-                                        pane_target
+                                    Some(&format!(
+                                        "target '{pane_target}' not found in current session"
                                     )),
                                 );
+
+                                // Record the drop and notify the supervisor so the
+                                // message isn't silently lost.
+                                if let Some(ref store) = event_store {
+                                    record_injection(
+                                        store,
+                                        queued.id,
+                                        &queued.source,
+                                        &queued.target,
+                                        pane_target,
+                                        "abandoned",
+                                        Some(format!(
+                                            "Target '{}' not found in current session",
+                                            pane_target
+                                        )),
+                                    );
+                                }
+
+                                // Re-queue to supervisor so the message content isn't
+                                // lost. The supervisor can then re-assign or re-send.
+                                let notice = format!(
+                                    "<system-notice>\n\
+                                     Undelivered message from '{}' to '{}' (target not in session):\n\n\
+                                     {}\n\
+                                     </system-notice>",
+                                    queued.source, pane_target, &queued.prompt
+                                );
+                                let _ = queue.enqueue_with_session(
+                                    super::teams::DIRECTOR_AGENT_NAME,
+                                    self.app.supervisor_name(),
+                                    &notice,
+                                    &self.session_name,
+                                );
                             }
-
-                            // Re-queue to supervisor so the message content isn't lost.
-                            // The supervisor can then re-assign the task or re-send.
-                            let notice = format!(
-                                "<system-notice>\n\
-                                 Undelivered message from '{}' to '{}' (target not in session):\n\n\
-                                 {}\n\
-                                 </system-notice>",
-                                queued.source, pane_target, &queued.prompt
-                            );
-                            let _ = queue.enqueue_with_session(
-                                super::teams::DIRECTOR_AGENT_NAME,
-                                self.app.supervisor_name(),
-                                &notice,
-                                &self.session_name,
-                            );
-
-                            continue;
-                        }
-                        tracing::error!("Failed to inject to '{}': {}", pane_target, e);
-                        // cas-2c5f: adapter failure leaves row pending for retry.
-                        let _ = queue.record_pending_reason(
-                            queued.id,
-                            cas_store::PendingReason::AdapterRetryable,
-                            Some(&e.to_string()),
-                        );
-                        if let Some(ref store) = event_store {
-                            record_injection(
-                                store,
-                                queued.id,
-                                &queued.source,
-                                &queued.target,
-                                pane_target,
-                                "error",
-                                Some(e.to_string()),
-                            );
                         }
                     }
                 }
