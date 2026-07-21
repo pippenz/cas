@@ -3,7 +3,7 @@
 Task: `cas-563d`  
 Epic: `cas-04a6`  
 Date: 2026-07-21  
-Status: first-pass synthesis from merged Grok/Codex/audit/alternate-supervisor reports plus CAS task history. Claude `cas-e76b` and deadlock `cas-69e1` are incorporated from task records/worktree evidence but their report files were not present on this branch at draft time.
+Status: final synthesis from the merged provider probes, state-machine audit, alternate-supervisor matrix, and urgent re-close deadlock characterization.
 
 ## Source Register
 
@@ -11,10 +11,10 @@ Status: first-pass synthesis from merged Grok/Codex/audit/alternate-supervisor r
 |---|---|---|---|
 | `docs/reviews/2026-07-21-comm-conformance-grok.md` (`cas-5c02`) | LIVE + source audit | merged | Codex-sup/Grok-worker live rows, HOL diagnosis, cas-126b support |
 | `docs/reviews/2026-07-21-comm-conformance-codex.md` (`cas-13fa`) | LIVE | merged | Codex-sup/Codex-worker live rows, urgent X-U1, normal pending rows |
+| `docs/reviews/2026-07-21-comm-conformance-claude.md` (`cas-e76b`) | LIVE | merged | Codex-sup/Claude-worker live rows, director_events split, Claude FIFO/duplicate/negative-path rows |
 | `docs/reviews/2026-07-21-factory-message-state-machine-audit.md` (`cas-291c`) | SOURCE + design | merged | state machine, blind spots, automation seam |
 | `docs/reviews/2026-07-21-alternate-supervisor-communication-matrix.md` (`cas-474b`) | AUTOMATED + STATIC + historical LIVE | merged | alternate-supervisor routing matrix and safe runbooks |
-| `cas-e76b` task notes | LIVE, pending report merge | AwaitingMerge | Claude live rows until `2026-07-21-comm-conformance-claude.md` is merged |
-| `/home/pippenz/Petrastella/cas-src/.cas/worktrees/comm-grok/docs/reviews/2026-07-21-urgent-merge-reclose-deadlock.md` (`cas-69e1`) | LIVE + SOURCE | closed, not on this branch at draft time | urgent-stop x AwaitingMerge deadlock |
+| `docs/reviews/2026-07-21-urgent-merge-reclose-deadlock.md` (`cas-69e1`) | LIVE + SOURCE | merged | urgent-stop x AwaitingMerge deadlock, safe recovery, SRP remediation spec |
 | `cas-126b` | OPEN bug | CAS task | umbrella for Grok MERGE DONE / re-close failure |
 
 Evidence classes:
@@ -39,7 +39,7 @@ Each cell is `down / up`: supervisor-to-worker, then worker-to-supervisor.
 |---|---|---|---|---|
 | Codex | Grok | FAIL normal; BLOCKED live urgent-to-Grok | FAIL normal | LIVE `cas-5c02`: S2W 3602 pending >5m; W2S 3605, 3607-3611, 3616-3620 all pending. Urgent same-factory controls 3631/3632 delivered but not targeted to Grok. |
 | Codex | Codex | FAIL normal; PASS urgent | FAIL normal; PASS urgent transport | LIVE `cas-13fa`: S2W normal 3603/3646 unprocessed; W2S 3612-3626 pending; urgent 3631/3632 processed in 1.219s/1.206s; X-U1 reaction observed. |
-| Codex | Claude | FAIL normal/FIFO; BLOCKED urgent | ENQUEUE PASS, delivery FAIL/UNKNOWN | LIVE task notes `cas-e76b`: S2W 3662-3674 0/13 delivered by cutoff; W2S 3633-3642 enqueued; Claude report awaiting merge. |
+| Codex | Claude | FAIL normal/FIFO; BLOCKED urgent | SEND PASS, CONFIRM FAIL | LIVE `cas-e76b`: S2W contract 3601 never surfaced; scripted S2W 3662-3674 0/13 delivered even across idle wake; W2S 3633-3642 enqueued FIFO but 0/10 processed/acked. |
 | Claude | Grok | BLOCKED E2E; routing PASS | BLOCKED E2E; routing PASS | AUTOMATED `cas-474b` SHAPES[4]: Grok recipient uses PTY/gate/no frame; upward Claude supervisor uses TeamsInbox. No safe live alt-sup factory launched. |
 | Claude | Codex | BLOCKED E2E; routing PASS | BLOCKED E2E; routing PASS | AUTOMATED `cas-474b` SHAPES[0] and historical `cas-ca04` code-proven/live-pending for Codex legs. |
 | Claude | Claude | historical partial PASS | historical partial PASS | AUTOMATED + historical LIVE `cas-ca04`: Claude worker/supervisor path observed as new turns on 2026-06-25; fresh normal/FIFO/urgent suite not re-run. |
@@ -52,12 +52,12 @@ Each cell is `down / up`: supervisor-to-worker, then worker-to-supervisor.
 | Scenario | Result | Evidence |
 |---|---|---|
 | Startup first-contact | MIXED | Director side channel wakes Grok/Codex/Claude; prompt_queue first-contact rows 3598/3601/3603 stayed unprocessed. |
-| 10 normal S->W | FAIL/BLOCKED | Codex: missing S2W series and normal rows unprocessed. Grok: only 3602 sent, pending. Claude: 3662-3674 0/13 delivered by notes. |
-| 10 normal W->S | FAIL transport | Grok and Codex 10/10 enqueued but stayed pending; Claude 10/10 enqueued but delivery bookkeeping stayed NULL. |
-| FIFO burst | UNKNOWN at inject | Parallel MCP enqueue reorders logical order for Grok; Claude FIFO rows 3672/3673/3674 did not deliver; no injected FIFO order measured. |
+| 10 normal S->W | FAIL/BLOCKED | Codex: missing full S2W series and normal rows unprocessed. Grok: only 3602 sent, pending. Claude: 3662-3671 plus FIFO 3672-3674 0/13 delivered. |
+| 10 normal W->S | FAIL transport | Grok and Codex 10/10 enqueued but stayed pending; Claude 10/10 enqueued FIFO but 0/10 processed/acked. |
+| FIFO burst | UNKNOWN at inject | Parallel MCP enqueue reorders logical order for Grok; Claude FIFO enqueue order by ID was FB/FC/FA but 0/3 delivered; no injected FIFO order measured. |
 | Idle wake | MIXED | Director quiet-nudges wake workers; normal prompt_queue idle rows do not. |
 | Busy urgent redirect | PASS transport for Codex legs; UNKNOWN for Grok/Claude live | Codex urgent X-U1 and worker->supervisor urgent 3631 delivered ~1.2s. Grok urgent to worker not sent; Claude urgent intentionally blocked to avoid cas-b269 deadlock. |
-| Duplicate/replay | PARTIAL | prompt_queue has no content idempotency; Claude duplicate bodies 3644/3645 got distinct IDs. No duplicate model reaction observed. |
+| Duplicate/replay | PARTIAL | prompt_queue has no content idempotency; Claude duplicate bodies 3644/3645 got distinct IDs. No duplicate model reaction observed because delivery failed. |
 | Unknown/malformed target | PASS fail-closed | Worker non-supervisor/unknown targets return `-32600`; missing summary returns `-32602`. |
 | Task close/status transitions | FAIL for push delivery; PASS via CAS task APIs | Starts/notes/closes work through MCP. No supervisor_queue lifecycle push for task start/close; workers rely on explicit messages or polling. |
 | MERGE DONE / re-close | FAIL without recovery | `cas-69e1`: urgent wakes Grok/Codex but sets `halt_task_work`; close is refused until a different Open task is started. Linked to open `cas-126b`. |
@@ -72,6 +72,8 @@ Small sample; treat as SLO proposal input, not production telemetry.
 | Harness startup/assignment -> Codex | 2 | rollout user_message direct | reactions 5.860s and 4.973s |
 | Normal prompt_queue under Codex sup | dozens | unbounded in window; >3m to >5m pending | no recipient turn |
 | Urgent prompt_queue Codex legs | 2 | 1.206s, 1.219s | X-U1 rollout receipt 1.600s after processed; first reaction 13.047s after receipt |
+| Claude director_events lane | 4 | inject ~0.06ms; refresh_to_deliver ~19-34ms | reached only director-channel turns; supervisor prompt_queue rows did not flush |
+| Claude supervisor prompt_queue lane | 30+ | pending through cutoffs; 0/13 scripted S2W delivered; 0/15 W2S processed | no model reaction to supervisor messages |
 | Urgent MERGE DONE Grok G-M1 | 1 | delivered/woke; prompt_history at 14:55:55.262Z | turn_started +4ms; first token ~4.0s |
 | Urgent MERGE DONE Codex X-M1 | 1 | log message_id 3651 delivered in 1.204s | first visible reaction ~6-8s after delivery by task note |
 
@@ -98,7 +100,7 @@ Separate each stage. A single "message queued" response is not a delivery SLO.
 | R1: normal queue HOL | `peek_for_targets` mixes legacy NULL-session rows with live session rows and `LIMIT 10`; normal priority rows starve | Grok report: ~45 lower-id/equal-priority rows ahead of patient-tiger; urgent priority 0 bypasses. State audit B1. |
 | R2: observability conflates queued with pending forever | `message_status=pending` hides whether a row was never peeked, gated, skipped, or undelivered | Codex/Grok/Claude normal rows all pending; state audit B2/B3/B11. |
 | R3: CAS core is blind to turn wake/reaction | `processed_at` is only transport; model wake lives in harness files | state audit TURN_WAKE/REACTED external; reports manually parse rollout/prompt_history/task notes. |
-| R4: director_events bypasses prompt_queue | Startup/idle nudges can work while prompt_queue is broken, masking transport failure | Grok/Codex/Claude all woke through director/harness messages while normal queue rows remained pending. |
+| R4: director_events bypasses prompt_queue | Startup/idle nudges can work while prompt_queue is broken, masking transport failure | Grok/Codex/Claude all woke through director/harness messages while normal queue rows remained pending; Claude report proves director_events woke but supervisor rows 3601/3662-3674/3681/3682 did not. |
 | R5: urgent halt composes badly with AwaitingMerge | urgent MERGE DONE wakes the worker and then blocks the required close | `cas-69e1` G-M1/X-M1; linked open `cas-126b`. |
 | R6: routing tests are incomplete for Grok-sup mixed workers | Grok-sup/Codex and Grok-sup/Claude are STATIC, not AUTOMATED | `cas-474b` SHAPES gap. |
 | R7: no durable replay/ack contract | prompt_queue inserts duplicate bodies with distinct IDs; `message_ack` is rarely used | Claude 3644/3645; state audit B5/B8. |
@@ -112,6 +114,7 @@ Non-duplicative recommendations; link existing tasks where possible.
 | P0 | Fix normal queue HOL for live sessions | Change `peek_for_targets(session)` so legacy NULL-session rows cannot permanently occupy `LIMIT 10` ahead of session-tagged rows; add store tests with lower-id NULL rows and live session rows. | New task; references R1, `prompt_queue_store.rs`, `cas-5c02`, `cas-291c`. |
 | P0 | Add a merge re-close halt exemption or close-time exception | Urgent MERGE DONE / re-close should interrupt without blocking the AwaitingMerge close it requests. Prefer `cas-69e1` Option A halt-exempt re-close urgents. | Do not duplicate; attach to open `cas-126b` or make a child linked to `cas-126b`. |
 | P1 | Promote delivery status from string to state ladder | Expose Enqueued/Peeked/Gated/Delivered/Woke/Reacted/Confirmed or at least pending reason + queue-head diagnosis. | New task; builds on `cas-f9e8` debug telemetry and state audit B2/B3/B11. |
+| P1 | Repair Claude supervisor-message bridge | Ensure supervisor `prompt_queue` messages to Claude workers reach the same worker turn surface as director_events or are explicitly marked unsupported; update `processed_at` semantics to distinguish inbox write from model wake. | New task; references `cas-e76b` CF-1/CF-2/CF-3. |
 | P1 | Build `cas factory probe-comm` core + adapters | Core emits messages, polls DB/status/logs; adapters parse Claude/Codex/Grok wake artifacts; outputs JSONL evidence bundle. | New task; implementation design from state audit §8. |
 | P1 | Extend delivery matrix SHAPES | Add Grok-sup/Codex-worker and Grok-sup/Claude-worker to automated routing matrix. | Small test-only task from `cas-474b`; no live factory required. |
 | P1 | Wire task lifecycle events to supervisor push path | Task start/close/blocker/ready should produce delivery-verifiable supervisor events, not depend on free-form worker messages or polling. | New task; avoid duplicating completed stale-message docs by requiring delivery-time state validation. |
@@ -158,13 +161,11 @@ Until fixes land:
 
 | Unknown | Needed evidence |
 |---|---|
-| Fresh full Claude report after merge | Incorporate `docs/reviews/2026-07-21-comm-conformance-claude.md` once merged; task notes are already reflected here. |
-| Deadlock report on this branch | Incorporate `docs/reviews/2026-07-21-urgent-merge-reclose-deadlock.md` once merged; worktree report is reflected here. |
 | Grok urgent-to-worker live behavior | Send urgent to Grok worker in disposable factory; current run has urgent controls only on Codex legs and G-M1 merge path. |
 | Alternate-supervisor LIVE E2E | Run disposable Grok-sup and Claude-sup factories with isolated CAS roots. |
 | FIFO after transport fix | Re-run serial and burst trials after HOL is fixed; current failures happen before inject. |
+| Claude urgent mid-turn | Run only after urgent halt/re-close safety is fixed or in a disposable factory; cas-e76b intentionally did not send C-URG. |
 
 ## Decision
 
 The communication contract should be stage-based and evidence-driven: enqueue, transport delivery, turn wake, model reaction, and confirmation are separate claims. Today, normal `prompt_queue` traffic under the Codex-supervised live factory fails before transport delivery, while urgent traffic proves the PTY interrupt route can work but exposes a separate urgent-halt lifecycle deadlock. The next engineering work should fix queue HOL first, then the merge re-close halt composition, then add the conformance runner so future harness changes cannot regress silently.
-
