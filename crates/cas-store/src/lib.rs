@@ -117,7 +117,8 @@ pub use supervisor_queue_store::{
 
 // Prompt queue store for supervisor → worker communication
 pub use prompt_queue_store::{
-    MessageStatus, PromptQueueStore, QueuedPrompt, SqlitePromptQueueStore,
+    DeliveryStage, MessageDeliveryReport, MessageStatus, ObservationStatus, PendingReason,
+    PromptQueueStore, QueuedPrompt, SqlitePromptQueueStore,
 };
 
 // Reminder store for supervisor "Remind Me" feature

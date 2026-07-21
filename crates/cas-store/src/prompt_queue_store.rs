@@ -97,7 +97,10 @@ CREATE INDEX IF NOT EXISTS idx_prompt_queue_legacy_pending
     WHERE processed_at IS NULL AND factory_session IS NULL;
 "#;
 
-/// Delivery status of a prompt queue message
+/// Delivery status of a prompt queue message (legacy three-value ladder).
+///
+/// Preserved for existing MCP/clients. Prefer [`MessageDeliveryReport`] for
+/// stage-based observability (cas-2c5f).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum MessageStatus {
     /// Message is queued but not yet delivered
@@ -117,6 +120,147 @@ impl std::fmt::Display for MessageStatus {
         }
     }
 }
+
+/// Monotonic transport stage CAS can authoritatively observe (cas-2c5f).
+///
+/// Harness wake/reaction are **not** stages here — see
+/// [`ObservationStatus::Unobserved`].
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryStage {
+    /// Row exists with `created_at` (enqueue accepted).
+    Enqueued,
+    /// Daemon selected/peeked the row for a delivery attempt.
+    Selected,
+    /// Delivery attempt blocked by a gate (pane not ready, etc.).
+    Gated,
+    /// Transport complete (`processed_at` set) — inbox/PTY inject done.
+    Delivered,
+    /// Target acknowledged (`acked_at` set).
+    Confirmed,
+}
+
+impl std::fmt::Display for DeliveryStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Enqueued => write!(f, "enqueued"),
+            Self::Selected => write!(f, "selected"),
+            Self::Gated => write!(f, "gated"),
+            Self::Delivered => write!(f, "delivered"),
+            Self::Confirmed => write!(f, "confirmed"),
+        }
+    }
+}
+
+/// Why a message has not advanced past its current stage (cas-2c5f).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingReason {
+    /// Eligible lower-priority-or-id rows sit ahead under selection order.
+    BehindQueueHead,
+    /// Row is not eligible for the observing session's selection rules.
+    SessionIneligible,
+    /// Target agent/pane is not available to receive delivery.
+    TargetUnavailable,
+    /// Delivery gated (e.g. pane not ready for injection).
+    GatedNotReady,
+    /// Last adapter attempt failed; row left pending for retry.
+    AdapterRetryable,
+    /// Enqueued and not known to be blocked; awaiting next delivery tick.
+    AwaitingDelivery,
+    /// Transport delivered; waiting for target `message_ack`.
+    AwaitingAck,
+}
+
+impl PendingReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BehindQueueHead => "behind_queue_head",
+            Self::SessionIneligible => "session_ineligible",
+            Self::TargetUnavailable => "target_unavailable",
+            Self::GatedNotReady => "gated_not_ready",
+            Self::AdapterRetryable => "adapter_retryable",
+            Self::AwaitingDelivery => "awaiting_delivery",
+            Self::AwaitingAck => "awaiting_ack",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "behind_queue_head" => Some(Self::BehindQueueHead),
+            "session_ineligible" => Some(Self::SessionIneligible),
+            "target_unavailable" => Some(Self::TargetUnavailable),
+            "gated_not_ready" => Some(Self::GatedNotReady),
+            "adapter_retryable" => Some(Self::AdapterRetryable),
+            "awaiting_delivery" => Some(Self::AwaitingDelivery),
+            "awaiting_ack" => Some(Self::AwaitingAck),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for PendingReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// Evidence CAS does **not** fabricate (harness wake / model reaction).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservationStatus {
+    /// No authoritative CAS observation for this stage.
+    #[default]
+    Unobserved,
+}
+
+impl std::fmt::Display for ObservationStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unobserved => write!(f, "unobserved"),
+        }
+    }
+}
+
+/// Stage-based delivery report for one prompt_queue message (cas-2c5f).
+///
+/// Additive to legacy [`MessageStatus`]. Wake/reaction are always
+/// [`ObservationStatus::Unobserved`] unless a future harness-correlation
+/// task records real evidence — never inferred from timestamps alone.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MessageDeliveryReport {
+    pub id: i64,
+    /// Legacy three-value status for older clients.
+    pub legacy_status: MessageStatus,
+    /// Highest transport stage reached.
+    pub stage: DeliveryStage,
+    pub source: String,
+    pub target: String,
+    pub factory_session: Option<String>,
+    pub priority: u8,
+    pub urgent: bool,
+    pub enqueued_at: DateTime<Utc>,
+    pub selected_at: Option<DateTime<Utc>>,
+    pub delivered_at: Option<DateTime<Utc>>,
+    pub confirmed_at: Option<DateTime<Utc>>,
+    /// Present when progress is blocked or waiting on a later stage.
+    pub pending_reason: Option<PendingReason>,
+    /// Human-readable detail for the pending reason (error text, counts, …).
+    pub pending_detail: Option<String>,
+    pub wake: ObservationStatus,
+    pub reaction: ObservationStatus,
+}
+
+/// Stage-observability columns (cas-2c5f). Idempotent ALTERs.
+const PROMPT_QUEUE_SELECTED_AT_MIGRATION: &str = r#"
+ALTER TABLE prompt_queue ADD COLUMN selected_at TEXT;
+"#;
+const PROMPT_QUEUE_PENDING_REASON_MIGRATION: &str = r#"
+ALTER TABLE prompt_queue ADD COLUMN last_pending_reason TEXT;
+"#;
+const PROMPT_QUEUE_PENDING_DETAIL_MIGRATION: &str = r#"
+ALTER TABLE prompt_queue ADD COLUMN last_pending_detail TEXT;
+"#;
 
 /// Trait for prompt queue operations
 pub trait PromptQueueStore: Send + Sync {
@@ -250,8 +394,22 @@ pub trait PromptQueueStore: Send + Sync {
     /// Get messages that were processed but not acked within the timeout
     fn unacked(&self, timeout_secs: i64, limit: usize) -> Result<Vec<QueuedPrompt>>;
 
-    /// Get delivery status of a specific message
+    /// Get delivery status of a specific message (legacy three-value ladder).
     fn message_status(&self, prompt_id: i64) -> Result<Option<MessageStatus>>;
+
+    /// Stage-based delivery report (cas-2c5f). `None` if the id does not exist.
+    fn message_delivery_report(&self, prompt_id: i64) -> Result<Option<MessageDeliveryReport>>;
+
+    /// Record that the daemon selected/peeked this message for a delivery attempt.
+    fn record_selected(&self, prompt_id: i64) -> Result<()>;
+
+    /// Record a durable pending reason observed by the delivery path.
+    fn record_pending_reason(
+        &self,
+        prompt_id: i64,
+        reason: PendingReason,
+        detail: Option<&str>,
+    ) -> Result<()>;
 
     /// Get count of pending prompts
     fn pending_count(&self) -> Result<usize>;
@@ -430,6 +588,47 @@ impl SqlitePromptQueueStore {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(prompts)
     }
+
+    /// Count pending rows that sort strictly ahead under priority ASC, id ASC
+    /// within the same selection universe as `peek_for_targets` (cas-2c5f).
+    fn count_ahead_in_selection(
+        conn: &Connection,
+        id: i64,
+        priority: u8,
+        factory_session: Option<&str>,
+        target: &str,
+    ) -> Result<i64> {
+        let count: i64 = if let Some(session) = factory_session {
+            // Session-tagged row: peers are same-session rows OR legacy NULL
+            // rows targeting the same name / all_workers.
+            conn.query_row(
+                "SELECT COUNT(*) FROM prompt_queue
+                 WHERE processed_at IS NULL
+                   AND id != ?
+                   AND (priority < ? OR (priority = ? AND id < ?))
+                   AND (
+                        factory_session = ?
+                        OR (factory_session IS NULL AND (target = ? OR target = 'all_workers'))
+                   )",
+                params![id, priority as i64, priority as i64, id, session, target],
+                |row| row.get(0),
+            )?
+        } else {
+            // Legacy NULL-session: peers are other NULL-session rows for the
+            // same target or all_workers (and all_workers rows compete broadly).
+            conn.query_row(
+                "SELECT COUNT(*) FROM prompt_queue
+                 WHERE processed_at IS NULL
+                   AND id != ?
+                   AND factory_session IS NULL
+                   AND (priority < ? OR (priority = ? AND id < ?))
+                   AND (target = ? OR target = 'all_workers' OR ? = 'all_workers')",
+                params![id, priority as i64, priority as i64, id, target, target],
+                |row| row.get(0),
+            )?
+        };
+        Ok(count)
+    }
 }
 
 impl PromptQueueStore for SqlitePromptQueueStore {
@@ -475,6 +674,26 @@ impl PromptQueueStore for SqlitePromptQueueStore {
             .is_ok();
         if !has_urgent_col {
             conn.execute_batch(PROMPT_QUEUE_URGENT_MIGRATION)?;
+        }
+
+        // Stage-observability columns (cas-2c5f)
+        let has_selected_at = conn
+            .prepare_cached("SELECT selected_at FROM prompt_queue LIMIT 0")
+            .is_ok();
+        if !has_selected_at {
+            conn.execute_batch(PROMPT_QUEUE_SELECTED_AT_MIGRATION)?;
+        }
+        let has_pending_reason = conn
+            .prepare_cached("SELECT last_pending_reason FROM prompt_queue LIMIT 0")
+            .is_ok();
+        if !has_pending_reason {
+            conn.execute_batch(PROMPT_QUEUE_PENDING_REASON_MIGRATION)?;
+        }
+        let has_pending_detail = conn
+            .prepare_cached("SELECT last_pending_detail FROM prompt_queue LIMIT 0")
+            .is_ok();
+        if !has_pending_detail {
+            conn.execute_batch(PROMPT_QUEUE_PENDING_DETAIL_MIGRATION)?;
         }
 
         // Two-lane peek indexes (idempotent CREATE INDEX IF NOT EXISTS).
@@ -583,7 +802,7 @@ impl PromptQueueStore for SqlitePromptQueueStore {
                 let ids: Vec<i64> = prompts.iter().map(|p| p.id).collect();
                 let placeholders: Vec<String> = ids.iter().map(|_| "?".to_string()).collect();
                 let sql = format!(
-                    "UPDATE prompt_queue SET processed_at = ? WHERE id IN ({})",
+                    "UPDATE prompt_queue SET processed_at = ?, last_pending_reason = NULL, last_pending_detail = NULL WHERE id IN ({})",
                     placeholders.join(", ")
                 );
 
@@ -624,7 +843,7 @@ impl PromptQueueStore for SqlitePromptQueueStore {
                 let ids: Vec<i64> = prompts.iter().map(|p| p.id).collect();
                 let placeholders: Vec<String> = ids.iter().map(|_| "?".to_string()).collect();
                 let sql = format!(
-                    "UPDATE prompt_queue SET processed_at = ? WHERE id IN ({})",
+                    "UPDATE prompt_queue SET processed_at = ?, last_pending_reason = NULL, last_pending_detail = NULL WHERE id IN ({})",
                     placeholders.join(", ")
                 );
 
@@ -739,8 +958,14 @@ impl PromptQueueStore for SqlitePromptQueueStore {
             let conn = self.conn.lock().unwrap();
             let now = Utc::now().to_rfc3339();
 
+            // Clear pending diagnosis on successful transport; keep selected_at
+            // for stage history (cas-2c5f).
             conn.execute(
-                "UPDATE prompt_queue SET processed_at = ? WHERE id = ?",
+                "UPDATE prompt_queue
+                 SET processed_at = ?,
+                     last_pending_reason = NULL,
+                     last_pending_detail = NULL
+                 WHERE id = ?",
                 params![now, prompt_id],
             )?;
 
@@ -785,25 +1010,175 @@ impl PromptQueueStore for SqlitePromptQueueStore {
     }
 
     fn message_status(&self, prompt_id: i64) -> Result<Option<MessageStatus>> {
+        Ok(self
+            .message_delivery_report(prompt_id)?
+            .map(|r| r.legacy_status))
+    }
+
+    fn message_delivery_report(&self, prompt_id: i64) -> Result<Option<MessageDeliveryReport>> {
         let conn = self.conn.lock().unwrap();
 
-        let result = conn.query_row(
-            "SELECT processed_at, acked_at FROM prompt_queue WHERE id = ?",
+        let row = conn.query_row(
+            "SELECT id, source, target, created_at, processed_at, factory_session,
+                    priority, acked_at, urgent, selected_at, last_pending_reason, last_pending_detail
+             FROM prompt_queue WHERE id = ?",
             params![prompt_id],
             |row| {
-                let processed_at: Option<String> = row.get(0)?;
-                let acked_at: Option<String> = row.get(1)?;
-                Ok((processed_at, acked_at))
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, u8>(6).unwrap_or(2),
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, i64>(8).map(|v| v != 0).unwrap_or(false),
+                    row.get::<_, Option<String>>(9).unwrap_or(None),
+                    row.get::<_, Option<String>>(10).unwrap_or(None),
+                    row.get::<_, Option<String>>(11).unwrap_or(None),
+                ))
             },
         );
 
-        match result {
-            Ok((_, Some(_))) => Ok(Some(MessageStatus::Confirmed)),
-            Ok((Some(_), None)) => Ok(Some(MessageStatus::Delivered)),
-            Ok((None, _)) => Ok(Some(MessageStatus::Pending)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+        let (
+            id,
+            source,
+            target,
+            created_at_s,
+            processed_at_s,
+            factory_session,
+            priority,
+            acked_at_s,
+            urgent,
+            selected_at_s,
+            stored_reason,
+            stored_detail,
+        ) = match row {
+            Ok(v) => v,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+
+        let enqueued_at = Self::parse_datetime(&created_at_s).unwrap_or_else(Utc::now);
+        let selected_at = selected_at_s.as_deref().and_then(Self::parse_datetime);
+        let delivered_at = processed_at_s.as_deref().and_then(Self::parse_datetime);
+        let confirmed_at = acked_at_s.as_deref().and_then(Self::parse_datetime);
+
+        let legacy_status = if confirmed_at.is_some() {
+            MessageStatus::Confirmed
+        } else if delivered_at.is_some() {
+            MessageStatus::Delivered
+        } else {
+            MessageStatus::Pending
+        };
+
+        let stored_pending = stored_reason.as_deref().and_then(PendingReason::parse);
+
+        // Stage is monotonic: confirmed > delivered > gated/selected > enqueued.
+        let stage = if confirmed_at.is_some() {
+            DeliveryStage::Confirmed
+        } else if delivered_at.is_some() {
+            DeliveryStage::Delivered
+        } else if matches!(
+            stored_pending,
+            Some(PendingReason::GatedNotReady | PendingReason::TargetUnavailable)
+        ) {
+            DeliveryStage::Gated
+        } else if selected_at.is_some() {
+            DeliveryStage::Selected
+        } else {
+            DeliveryStage::Enqueued
+        };
+
+        let (pending_reason, pending_detail) = if confirmed_at.is_some() {
+            (None, None)
+        } else if delivered_at.is_some() {
+            (
+                Some(PendingReason::AwaitingAck),
+                Some("transport delivered; waiting for message_ack".into()),
+            )
+        } else if let Some(reason) = stored_pending {
+            (Some(reason), stored_detail)
+        } else {
+            // Query-time diagnosis when the delivery path has not stamped a reason.
+            let ahead = Self::count_ahead_in_selection(
+                &conn,
+                id,
+                priority,
+                factory_session.as_deref(),
+                &target,
+            )?;
+            if ahead > 0 {
+                (
+                    Some(PendingReason::BehindQueueHead),
+                    Some(format!(
+                        "{ahead} eligible pending row(s) sort ahead under priority/id selection"
+                    )),
+                )
+            } else {
+                (
+                    Some(PendingReason::AwaitingDelivery),
+                    Some("enqueued; awaiting daemon delivery tick".into()),
+                )
+            }
+        };
+
+        Ok(Some(MessageDeliveryReport {
+            id,
+            legacy_status,
+            stage,
+            source,
+            target,
+            factory_session,
+            priority,
+            urgent,
+            enqueued_at,
+            selected_at,
+            delivered_at,
+            confirmed_at,
+            pending_reason,
+            pending_detail,
+            wake: ObservationStatus::Unobserved,
+            reaction: ObservationStatus::Unobserved,
+        }))
+    }
+
+    fn record_selected(&self, prompt_id: i64) -> Result<()> {
+        crate::shared_db::with_write_retry(|| {
+            let conn = self.conn.lock().unwrap();
+            let now = Utc::now().to_rfc3339();
+            // First selection wins (monotonic); keep existing selected_at.
+            conn.execute(
+                "UPDATE prompt_queue
+                 SET selected_at = COALESCE(selected_at, ?)
+                 WHERE id = ? AND processed_at IS NULL",
+                params![now, prompt_id],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn record_pending_reason(
+        &self,
+        prompt_id: i64,
+        reason: PendingReason,
+        detail: Option<&str>,
+    ) -> Result<()> {
+        crate::shared_db::with_write_retry(|| {
+            let conn = self.conn.lock().unwrap();
+            let now = Utc::now().to_rfc3339();
+            // Selection is implied by a gate/adapter observation.
+            conn.execute(
+                "UPDATE prompt_queue
+                 SET selected_at = COALESCE(selected_at, ?),
+                     last_pending_reason = ?,
+                     last_pending_detail = ?
+                 WHERE id = ? AND processed_at IS NULL",
+                params![now, reason.as_str(), detail, prompt_id],
+            )?;
+            Ok(())
+        })
     }
 
     fn pending_count(&self) -> Result<usize> {
@@ -1884,5 +2259,138 @@ mod tests {
 
         assert_index_plan(&session_plan, "idx_prompt_queue_session_pending", "session");
         assert_index_plan(&legacy_plan, "idx_prompt_queue_legacy_pending", "legacy");
+    }
+
+    /// cas-2c5f: stage ladder enqueued → selected → delivered → confirmed with
+    /// timestamps; wake/reaction stay unobserved.
+    #[test]
+    fn test_message_delivery_report_stage_ladder() {
+        let (_temp, store) = create_test_store();
+        let id = store
+            .enqueue_with_session("sup", "worker", "hello", "sess-1")
+            .unwrap();
+
+        let r = store.message_delivery_report(id).unwrap().unwrap();
+        assert_eq!(r.legacy_status, MessageStatus::Pending);
+        assert_eq!(r.stage, DeliveryStage::Enqueued);
+        assert_eq!(r.pending_reason, Some(PendingReason::AwaitingDelivery));
+        assert_eq!(r.wake, ObservationStatus::Unobserved);
+        assert_eq!(r.reaction, ObservationStatus::Unobserved);
+        assert!(r.selected_at.is_none());
+        assert!(r.delivered_at.is_none());
+        assert!(r.confirmed_at.is_none());
+
+        store.record_selected(id).unwrap();
+        let r = store.message_delivery_report(id).unwrap().unwrap();
+        assert_eq!(r.stage, DeliveryStage::Selected);
+        assert!(r.selected_at.is_some());
+
+        store.mark_processed(id).unwrap();
+        let r = store.message_delivery_report(id).unwrap().unwrap();
+        assert_eq!(r.legacy_status, MessageStatus::Delivered);
+        assert_eq!(r.stage, DeliveryStage::Delivered);
+        assert_eq!(r.pending_reason, Some(PendingReason::AwaitingAck));
+        assert!(r.delivered_at.is_some());
+
+        store.ack(id).unwrap();
+        let r = store.message_delivery_report(id).unwrap().unwrap();
+        assert_eq!(r.legacy_status, MessageStatus::Confirmed);
+        assert_eq!(r.stage, DeliveryStage::Confirmed);
+        assert!(r.pending_reason.is_none());
+        assert!(r.confirmed_at.is_some());
+        // Legacy API still matches.
+        assert_eq!(
+            store.message_status(id).unwrap(),
+            Some(MessageStatus::Confirmed)
+        );
+    }
+
+    #[test]
+    fn test_message_delivery_report_behind_queue_head() {
+        let (_temp, store) = create_test_store();
+        let _first = store
+            .enqueue_with_session("w", "supervisor", "first", "sess")
+            .unwrap();
+        let second = store
+            .enqueue_with_session("w", "supervisor", "second", "sess")
+            .unwrap();
+
+        let r = store.message_delivery_report(second).unwrap().unwrap();
+        assert_eq!(r.stage, DeliveryStage::Enqueued);
+        assert_eq!(r.pending_reason, Some(PendingReason::BehindQueueHead));
+        assert!(
+            r.pending_detail
+                .as_deref()
+                .unwrap_or("")
+                .contains("eligible pending"),
+            "detail={:?}",
+            r.pending_detail
+        );
+    }
+
+    #[test]
+    fn test_message_delivery_report_gated_and_adapter_reasons() {
+        let (_temp, store) = create_test_store();
+        let id = store.enqueue("s", "worker", "body").unwrap();
+
+        store
+            .record_pending_reason(
+                id,
+                PendingReason::GatedNotReady,
+                Some("pane not ready for injection"),
+            )
+            .unwrap();
+        let r = store.message_delivery_report(id).unwrap().unwrap();
+        assert_eq!(r.stage, DeliveryStage::Gated);
+        assert_eq!(r.pending_reason, Some(PendingReason::GatedNotReady));
+        assert!(r.selected_at.is_some(), "gate implies selection");
+        assert_eq!(
+            r.pending_detail.as_deref(),
+            Some("pane not ready for injection")
+        );
+
+        store
+            .record_pending_reason(
+                id,
+                PendingReason::AdapterRetryable,
+                Some("inject failed: broken pipe"),
+            )
+            .unwrap();
+        let r = store.message_delivery_report(id).unwrap().unwrap();
+        // Adapter failure is still pre-delivery; stage stays Selected (not Gated).
+        assert_eq!(r.stage, DeliveryStage::Selected);
+        assert_eq!(r.pending_reason, Some(PendingReason::AdapterRetryable));
+
+        store
+            .record_pending_reason(id, PendingReason::TargetUnavailable, Some("pane missing"))
+            .unwrap();
+        let r = store.message_delivery_report(id).unwrap().unwrap();
+        assert_eq!(r.stage, DeliveryStage::Gated);
+        assert_eq!(r.pending_reason, Some(PendingReason::TargetUnavailable));
+    }
+
+    #[test]
+    fn test_message_delivery_report_session_ineligible_reason() {
+        let (_temp, store) = create_test_store();
+        let id = store
+            .enqueue_with_session("s", "worker", "other-session msg", "session-b")
+            .unwrap();
+        store
+            .record_pending_reason(
+                id,
+                PendingReason::SessionIneligible,
+                Some("factory_session does not match observing daemon"),
+            )
+            .unwrap();
+        let r = store.message_delivery_report(id).unwrap().unwrap();
+        assert_eq!(r.pending_reason, Some(PendingReason::SessionIneligible));
+        assert_eq!(r.legacy_status, MessageStatus::Pending);
+    }
+
+    #[test]
+    fn test_message_delivery_report_unknown_id() {
+        let (_temp, store) = create_test_store();
+        assert!(store.message_delivery_report(999_999).unwrap().is_none());
+        assert!(store.message_status(999_999).unwrap().is_none());
     }
 }
