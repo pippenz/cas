@@ -49,8 +49,9 @@ In shared mode, file-overlap analysis is even more critical — two workers edit
 
    **Hard rule:** every `spawn_workers` call MUST include explicit `cli=`,
    `model=`, and `effort=`. Codex is the default matrix
-   (`cli=codex model=gpt-5.5`); Claude Max is the fit route and Grok is the
-   health-gated capacity route.
+   (`cli=codex model=gpt-5.5`); taste/judgment uses
+   `cli=codex model=gpt-5.6-sol effort=medium`, Opus is exceptional, and Grok
+   is the health-gated capacity route.
    Omitted fields fall back through the factory config cascade and stock floor;
    the spawn acknowledgement nags because supervisors should make worker tier
    selection intentional and visible.

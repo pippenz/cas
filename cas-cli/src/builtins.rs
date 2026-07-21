@@ -1730,11 +1730,12 @@ This is the body content."#;
             "heavy",
             "frontier",
             "model-selection.md",
-            // cas-b342: Codex-first tier table + fit/capacity lanes in the body.
+            // cas-b342/cas-96ea: Codex-first tier table + exception/capacity lanes in the body.
             "Codex-first tiers",
             "codex/gpt-5.5/low",
             "codex/gpt-5.6-sol/high",
-            "Claude Max",
+            "codex/gpt-5.6-sol/medium",
+            "Opus",
             "capacity route",
         ] {
             assert!(
@@ -3050,8 +3051,9 @@ This is the body content."#;
         );
         // cas-b342: the Codex-first tier table is the contract of the rubric.
         // The four rungs must be exactly codex/gpt-5.5 low|medium|high and
-        // codex/gpt-5.6-sol high, with Claude Max as a fit overlay and Grok as
-        // a health-gated capacity overlay.
+        // codex/gpt-5.6-sol high. Taste/general judgment routes to
+        // gpt-5.6-sol medium; Opus is exceptional-only; Grok remains a
+        // health-gated capacity overlay.
         for required in [
             // Codex-first tier table (AC2)
             "Codex-first",
@@ -3059,13 +3061,17 @@ This is the body content."#;
             "cli=codex model=gpt-5.5 effort=medium",
             "cli=codex model=gpt-5.5 effort=high",
             "cli=codex model=gpt-5.6-sol effort=high",
-            // Claude Max fit lane (AC3)
-            "Claude Max",
-            "cli=claude model=sonnet effort=high",
+            // cas-96ea: routine taste/general judgment uses Sol medium.
+            "cli=codex model=gpt-5.6-sol effort=medium",
+            "Sonnet is not a normal worker lane",
+            "not Sonnet",
+            // Claude Opus exceptional lane (AC3 revised)
+            "Claude Opus",
             "cli=claude model=opus effort=high",
             "architecture",
+            "safety",
             "rescue",
-            "independent",
+            "independent challenge",
             // Grok capacity lane (AC4). The light Grok recipe is pinned with
             // explicit effort=low — every spawn recipe must carry cli/model/effort.
             "capacity",
@@ -3084,7 +3090,7 @@ This is the body content."#;
             "Cost",
             "Intelligence",
             "Taste",
-            "Taste-sensitive work routes to a high-taste tier",
+            "Taste-sensitive work routes to Codex GPT-5.6 Sol at medium effort",
             "effort=high` is the ceiling",
             "Escalate on judgment",
             "Cost is a tiebreaker only",
@@ -3103,14 +3109,19 @@ This is the body content."#;
             !stripped.contains("model=gpt-5.6") && !stripped.contains("codex/gpt-5.6"),
             "model-selection.md must not use a bare gpt-5.6 spawn recipe — exact slug is gpt-5.6-sol"
         );
-        // cas-b342: the hard rule requires explicit cli/model/effort on EVERY
+        // cas-b342/cas-96ea: the hard rule requires explicit cli/model/effort on EVERY
         // spawn, so every `spawn_workers` recipe line in the rubric — including
-        // the light Grok Composer lane — must carry an explicit `effort=`.
+        // the light Grok Composer lane — must carry an explicit `effort=`, and
+        // Sonnet must not remain as a copyable spawn recipe.
         for line in claude.content.lines() {
             if line.contains("action=spawn_workers") {
                 assert!(
                     line.contains("effort="),
                     "spawn_workers recipe omits explicit effort=: {line:?}"
+                );
+                assert!(
+                    !line.contains("model=sonnet"),
+                    "supervisor model-selection.md must not contain a Sonnet spawn recipe: {line:?}"
                 );
             }
         }
@@ -3745,11 +3756,12 @@ This is the body content."#;
             "standard",
             "heavy",
             "frontier",
-            // cas-b342: Codex-first tier table + fit/capacity lanes in the body.
+            // cas-b342/cas-96ea: Codex-first tier table + exception/capacity lanes in the body.
             "Codex-first tiers",
             "codex/gpt-5.5/low",
             "codex/gpt-5.6-sol/high",
-            "Claude Max",
+            "codex/gpt-5.6-sol/medium",
+            "Opus",
             "capacity route",
         ] {
             assert!(
