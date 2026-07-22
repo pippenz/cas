@@ -5172,20 +5172,33 @@ pub(crate) fn run_lightweight_structural_lint_with_scope(
 
     let mut violations: Vec<String> = Vec::new();
 
+    #[derive(Debug)]
+    struct AddedLine<'a> {
+        content: &'a str,
+        path: String,
+        is_rust_file: bool,
+    }
+
     // Scan added lines only, tracking which file each line belongs to so that
-    // Rust-specific macro checks can be scoped to `*.rs` files.
-    // Each entry is (line_content_after_stripping_'+', is_rust_file).
-    let added_lines: Vec<(&str, bool)> = {
+    // Rust-specific macro checks can be scoped to `*.rs` files and findings can
+    // point workers at the file they need to fix.
+    let added_lines: Vec<AddedLine<'_>> = {
         let mut result = Vec::new();
+        let mut current_path = String::new();
         let mut current_is_rust = false;
         for line in diff_text.lines() {
             if line.starts_with("+++ ") {
                 // "+++ b/path/to/file.ext" in a unified git diff.
                 // Strip the diff prefix ("b/") to obtain the bare path.
                 let path = line[4..].trim_start_matches("b/");
+                current_path = path.to_string();
                 current_is_rust = path.ends_with(".rs");
             } else if line.starts_with('+') && !line.starts_with("+++") {
-                result.push((&line[1..], current_is_rust));
+                result.push(AddedLine {
+                    content: &line[1..],
+                    path: current_path.clone(),
+                    is_rust_file: current_is_rust,
+                });
             }
         }
         result
@@ -5195,21 +5208,23 @@ pub(crate) fn run_lightweight_structural_lint_with_scope(
     // Use `contains("macro!(")` to catch both `macro!()` (no args) and
     // `macro!("msg")` forms, regardless of where they appear on the line.
     // Scoped to `*.rs` files; TypeScript/JS/Python etc. are not checked.
-    for (i, (line, is_rust_file)) in added_lines.iter().enumerate() {
-        if !is_rust_file {
+    for (i, added) in added_lines.iter().enumerate() {
+        if !added.is_rust_file {
             continue;
         }
-        let trimmed = line.trim();
+        let trimmed = added.content.trim();
         if trimmed.contains("unimplemented!(") {
             violations.push(format!(
-                "Line +{}: `unimplemented!()` — replace with a real implementation",
-                i + 1
+                "{} line +{}: `unimplemented!()` — replace with a real implementation",
+                added.path,
+                i + 1,
             ));
         }
         if trimmed.contains("todo!(") {
             violations.push(format!(
-                "Line +{}: `todo!()` — replace with a real implementation",
-                i + 1
+                "{} line +{}: `todo!()` — replace with a real implementation",
+                added.path,
+                i + 1,
             ));
         }
     }
@@ -5218,15 +5233,16 @@ pub(crate) fn run_lightweight_structural_lint_with_scope(
     // Use `contains("dbg!(")` to catch all forms regardless of preceding
     // whitespace: bare `dbg!(...)`, `=dbg!(...)`, `let x=dbg!(...)`, etc.
     // Scoped to `*.rs` files; other languages do not use the dbg! macro.
-    for (i, (line, is_rust_file)) in added_lines.iter().enumerate() {
-        if !is_rust_file {
+    for (i, added) in added_lines.iter().enumerate() {
+        if !added.is_rust_file {
             continue;
         }
-        let trimmed = line.trim();
+        let trimmed = added.content.trim();
         if trimmed.contains("dbg!(") {
             violations.push(format!(
-                "Line +{}: `dbg!()` call — remove debug instrumentation before review",
-                i + 1
+                "{} line +{}: `dbg!()` call — remove debug instrumentation before review",
+                added.path,
+                i + 1,
             ));
         }
     }
@@ -5238,33 +5254,44 @@ pub(crate) fn run_lightweight_structural_lint_with_scope(
     {
         let mut run = 0usize;
         let mut run_start = 0usize;
-        for (i, (line, _is_rust_file)) in added_lines.iter().enumerate() {
-            let trimmed = line.trim();
+        let mut run_path = String::new();
+        for (i, added) in added_lines.iter().enumerate() {
+            let trimmed = added.content.trim();
             let is_code_comment = trimmed.starts_with("//")
                 && !trimmed.starts_with("///")
                 && !trimmed.starts_with("//!");
             if is_code_comment {
-                if run == 0 {
+                if run == 0 || run_path != added.path {
+                    if run > 5 {
+                        violations.push(format!(
+                            "{} lines +{}–+{}: {} consecutive commented-out lines — \
+                             remove or restore the code before review (>5-line threshold)",
+                            run_path, run_start, i, run
+                        ));
+                    }
                     run_start = i + 1;
+                    run_path = added.path.clone();
+                    run = 0;
                 }
                 run += 1;
             } else {
                 if run > 5 {
                     violations.push(format!(
-                        "Lines +{}–+{}: {} consecutive commented-out lines — \
+                        "{} lines +{}–+{}: {} consecutive commented-out lines — \
                          remove or restore the code before review (>5-line threshold)",
-                        run_start, i, run
+                        run_path, run_start, i, run
                     ));
                 }
                 run = 0;
+                run_path.clear();
             }
         }
         // Trailing run
         if run > 5 {
             violations.push(format!(
-                "Lines +{}–end: {} consecutive commented-out lines — \
+                "{} lines +{}–end: {} consecutive commented-out lines — \
                  remove or restore the code before review (>5-line threshold)",
-                run_start, run
+                run_path, run_start, run
             ));
         }
     }
@@ -5334,7 +5361,11 @@ mod lightweight_lint_tests {
             .output()
             .unwrap();
         // write changed file using the requested filename/extension
-        std::fs::write(dir.path().join(filename), added_lines).unwrap();
+        let changed_path = dir.path().join(filename);
+        if let Some(parent) = changed_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&changed_path, added_lines).unwrap();
         Command::new("git")
             .args(["add", "."])
             .current_dir(dir.path())
@@ -5425,6 +5456,44 @@ mod lightweight_lint_tests {
         assert!(
             matches!(outcome, LightweightLintOutcome::Fail(_)),
             "6-line comment block should fail lint"
+        );
+    }
+
+    #[test]
+    fn lint_comment_block_finding_names_file() {
+        let code = "// line 1\n// line 2\n// line 3\n// line 4\n// line 5\n// line 6\n";
+        let dir = init_repo_with_diff_for_file("src/legacy.rs", code);
+        let outcome = run_lightweight_structural_lint(dir.path());
+        match outcome {
+            LightweightLintOutcome::Fail(msg) => {
+                assert!(
+                    msg.contains("src/legacy.rs"),
+                    "comment-block finding must identify the file: {msg}"
+                );
+            }
+            other => panic!("6-line comment block should fail lint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lint_allows_xml_block_doc_header() {
+        let xml = "\
+<!--
+  Android colors for the feature.
+  Kept verbose on purpose so this reproduces the ozer-style
+  resource header that used to be confused with commented-out code.
+  XML has block comments only.
+  This is documentation, not disabled code.
+-->
+<resources>
+  <color name=\"brand\">#123456</color>
+</resources>
+";
+        let dir = init_repo_with_diff_for_file("res/values/colors.xml", xml);
+        let outcome = run_lightweight_structural_lint(dir.path());
+        assert!(
+            matches!(outcome, LightweightLintOutcome::Pass),
+            "XML block doc headers must not trip // commented-out-code lint: {outcome:?}"
         );
     }
 
@@ -5676,6 +5745,57 @@ fn leftover() {}\n";
         assert!(
             matches!(scoped, LightweightLintOutcome::Fail(_)),
             "committed todo!() in worker range must Fail scoped lint, got {scoped:?}"
+        );
+    }
+
+    /// cas-6de2 / close-gate false positive addendum: lint must evaluate the
+    /// cumulative worker range at the branch tip, not a single earlier task-
+    /// tagged commit. A bad comment block added in commit 1 and removed in
+    /// commit 2 must clear.
+    #[test]
+    fn lint_scoped_to_worker_range_followup_commit_clears_comment_finding() {
+        let main = TempDir::new().unwrap();
+        let p = main.path();
+        git_dc5d(p, &["init", "-q", "-b", "main"]);
+        std::fs::write(p.join("base.rs"), "fn main() {}\n").unwrap();
+        git_dc5d(p, &["add", "base.rs"]);
+        git_dc5d(p, &["commit", "-q", "-m", "init"]);
+
+        let worker = p.join("worktrees").join("worker");
+        std::fs::create_dir_all(worker.parent().unwrap()).unwrap();
+        git_dc5d(
+            p,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "factory/worker",
+                worker.to_str().unwrap(),
+            ],
+        );
+        let bad = "\
+// disabled line 1
+// disabled line 2
+// disabled line 3
+// disabled line 4
+// disabled line 5
+// disabled line 6
+pub fn feature() -> u32 { 1 }
+";
+        std::fs::write(worker.join("feature.rs"), bad).unwrap();
+        git_dc5d(&worker, &["add", "feature.rs"]);
+        git_dc5d(&worker, &["commit", "-q", "-m", "feat: add bad comments"]);
+
+        let fixed = "pub fn feature() -> u32 { 1 }\n";
+        std::fs::write(worker.join("feature.rs"), fixed).unwrap();
+        git_dc5d(&worker, &["add", "feature.rs"]);
+        git_dc5d(&worker, &["commit", "-q", "-m", "fix: remove bad comments"]);
+
+        let scoped = run_lightweight_structural_lint_with_scope(&worker, Some("main"));
+        assert!(
+            matches!(scoped, LightweightLintOutcome::Pass),
+            "follow-up fix at branch tip must clear earlier comment finding; got {scoped:?}"
         );
     }
 
