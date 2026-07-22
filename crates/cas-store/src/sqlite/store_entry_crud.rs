@@ -4,7 +4,7 @@ use crate::event_store::record_event_with_conn;
 use crate::recording_store::capture_memory_event;
 use crate::sqlite::{ENTRIES_RULES_SCHEMA, SqliteStore};
 use crate::tracing::{DevTracer, TraceTimer};
-use cas_types::{Entry, Event, EventEntityType, EventType};
+use cas_types::{Entry, Event, EventEntityType, EventType, Scope};
 use chrono::Utc;
 use rusqlite::{OptionalExtension, params};
 
@@ -281,6 +281,34 @@ impl SqliteStore {
 
         Ok(entries)
     }
+
+    pub(crate) fn store_list_by_scope_and_tag(
+        &self,
+        scope: Scope,
+        tag: &str,
+    ) -> Result<Vec<Entry>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, type, tags, created, content, title, helpful_count,
+             harmful_count, last_accessed, archived, session_id, source_tool,
+             pending_extraction, observation_type, stability, access_count,
+             raw_content, compressed, memory_tier, importance, valid_from, valid_until, review_after, last_reviewed, pending_embedding,
+             belief_type, confidence, domain, branch, scope, team_id, share
+             FROM entries
+             WHERE archived = 0
+               AND scope = ?
+               AND tags IS NOT NULL
+               AND instr(lower(tags), lower(?)) > 0
+             ORDER BY created DESC LIMIT 10000",
+        )?;
+
+        let entries = stmt
+            .query_map(params![scope.to_string(), tag], Self::row_to_entry)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        Ok(entries)
+    }
+
     pub(crate) fn store_list_decayable(&self) -> Result<Vec<Entry>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare_cached(

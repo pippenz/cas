@@ -8,7 +8,7 @@ use std::sync::Arc;
 use crate::config::NotificationConfig;
 use crate::notifications::{NotificationEvent, get_global_notifier};
 use crate::store::{Result, Store};
-use crate::types::Entry;
+use crate::types::{Entry, Scope};
 
 /// An entry store wrapper that emits notification events
 pub struct NotifyingEntryStore {
@@ -87,6 +87,10 @@ impl Store for NotifyingEntryStore {
 
     fn list(&self) -> Result<Vec<Entry>> {
         self.inner.list()
+    }
+
+    fn list_by_scope_and_tag(&self, scope: Scope, tag: &str) -> Result<Vec<Entry>> {
+        self.inner.list_by_scope_and_tag(scope, tag)
     }
 
     fn recent(&self, n: usize) -> Result<Vec<Entry>> {

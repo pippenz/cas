@@ -1,6 +1,6 @@
 use crate::Store;
 use crate::sqlite::SqliteStore;
-use cas_types::{Entry, ShareScope};
+use cas_types::{Entry, Scope, ShareScope};
 use tempfile::TempDir;
 
 // Imports used only by the per-entity round-trip tests below.
@@ -55,6 +55,55 @@ fn test_sqlite_store_crud() {
     // Delete entry
     store.delete(&id).unwrap();
     assert!(store.get(&id).is_err());
+}
+
+#[test]
+fn test_list_by_scope_and_tag_filters_in_sqlite_store() {
+    let temp = TempDir::new().unwrap();
+    let store = SqliteStore::open(temp.path()).unwrap();
+    store.init().unwrap();
+
+    let mut global_match = Entry::with_scope(
+        "g-host-match".to_string(),
+        "same host global".to_string(),
+        Scope::Global,
+    );
+    global_match.tags = vec!["host:soundwave".to_string(), "tmpfs".to_string()];
+    store.add(&global_match).unwrap();
+
+    let mut project_match = Entry::with_scope(
+        "p-host-match".to_string(),
+        "same host project".to_string(),
+        Scope::Project,
+    );
+    project_match.tags = vec!["host:soundwave".to_string()];
+    store.add(&project_match).unwrap();
+
+    let mut global_other_host = Entry::with_scope(
+        "g-other-host".to_string(),
+        "different host global".to_string(),
+        Scope::Global,
+    );
+    global_other_host.tags = vec!["host:other".to_string()];
+    store.add(&global_other_host).unwrap();
+
+    let global = store
+        .list_by_scope_and_tag(Scope::Global, "host:soundwave")
+        .unwrap();
+    let ids = global
+        .iter()
+        .map(|entry| entry.id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec!["g-host-match"]);
+
+    let project = store
+        .list_by_scope_and_tag(Scope::Project, "host:soundwave")
+        .unwrap();
+    let ids = project
+        .iter()
+        .map(|entry| entry.id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec!["p-host-match"]);
 }
 
 /// T5 cas-07d7: Entry.share must round-trip through SQLite.
@@ -170,7 +219,10 @@ fn test_task_share_roundtrip() {
     let mut t = Task::new("cas-share".to_string(), "test task".to_string());
     t.share = Some(ShareScope::Team);
     store.add(&t).unwrap();
-    assert_eq!(store.get("cas-share").unwrap().share, Some(ShareScope::Team));
+    assert_eq!(
+        store.get("cas-share").unwrap().share,
+        Some(ShareScope::Team)
+    );
 
     let mut loaded = store.get("cas-share").unwrap();
     loaded.share = Some(ShareScope::Private);

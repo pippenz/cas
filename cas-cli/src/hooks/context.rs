@@ -17,9 +17,9 @@ use std::sync::Arc;
 
 use cas_code::{CodeSymbol, SymbolKind};
 use cas_core::hooks::{
+    ContextScorer, ContextStores, HookInput, HooksConfig, RuleMatchCache, SurfacedItemCallback,
     build_context_with_stores, build_plan_context_with_stores, estimate_tokens, rule_matches_path,
-    token_display, truncate, ContextScorer, ContextStores, HookInput, HooksConfig, RuleMatchCache,
-    SurfacedItemCallback,
+    token_display, truncate,
 };
 use cas_store::{AgentStore, RuleStore, SkillStore, Store, TaskStore};
 use cas_types::{Entry, Rule, RuleStatus, Skill, Task, TaskStatus};
@@ -182,7 +182,10 @@ pub fn build_context(input: &HookInput, limit: usize, cas_root: &Path) -> Result
 
 fn current_hostname_tag() -> Option<String> {
     let hostname = hostname::get().ok()?;
-    let hostname = hostname.to_string_lossy();
+    normalize_hostname_tag(hostname.to_string_lossy().as_ref())
+}
+
+fn normalize_hostname_tag(hostname: &str) -> Option<String> {
     let normalized = hostname.trim().to_ascii_lowercase();
     if normalized.is_empty() {
         None
@@ -245,13 +248,12 @@ fn build_host_constraints_section_for_tag(
     let Ok(store) = open_store_local(&host_cas_dir) else {
         return String::new();
     };
-    let Ok(entries) = store.list() else {
+    let Ok(entries) = store.list_by_scope_and_tag(cas_types::Scope::Global, host_tag) else {
         return String::new();
     };
 
     let mut host_entries: Vec<Entry> = entries
         .into_iter()
-        .filter(|entry| entry.scope.is_global())
         .filter(|entry| entry_has_host_tag(entry, host_tag))
         .collect();
     host_entries.sort_by(|a, b| {
@@ -1008,13 +1010,23 @@ mod tests {
         }
     }
 
-    fn add_host_memory(cas_dir: &Path, id: &str, host_tag: &str, content: &str) {
+    fn add_scoped_host_memory(
+        cas_dir: &Path,
+        id: &str,
+        scope: Scope,
+        host_tag: &str,
+        content: &str,
+    ) {
         let store = open_store_local(cas_dir).unwrap();
-        let mut entry = Entry::with_scope(id.to_string(), content.to_string(), Scope::Global);
+        let mut entry = Entry::with_scope(id.to_string(), content.to_string(), scope);
         entry.tags = vec![host_tag.to_string()];
         entry.title = Some("Host constraint".to_string());
         entry.importance = 1.0;
         store.add(&entry).unwrap();
+    }
+
+    fn add_host_memory(cas_dir: &Path, id: &str, host_tag: &str, content: &str) {
+        add_scoped_host_memory(cas_dir, id, Scope::Global, host_tag, content);
     }
 
     #[test]
@@ -1219,6 +1231,56 @@ mod tests {
         assert!(
             section.is_empty(),
             "nonmatching host-tagged memories must be excluded: {section}"
+        );
+    }
+
+    #[test]
+    fn hostname_tag_normalization_rejects_empty_and_whitespace() {
+        assert_eq!(normalize_hostname_tag(""), None);
+        assert_eq!(normalize_hostname_tag("   \t\n"), None);
+        assert_eq!(
+            normalize_hostname_tag(" SoundWave.EXAMPLE "),
+            Some("host:soundwave.example".to_string())
+        );
+    }
+
+    #[test]
+    fn host_constraint_tag_matching_is_case_insensitive() {
+        let mut entry = Entry::with_scope(
+            "g-host-case".to_string(),
+            "case-insensitive host constraint".to_string(),
+            Scope::Global,
+        );
+        entry.tags = vec!["HOST:SoundWave".to_string()];
+
+        assert!(entry_has_host_tag(&entry, "host:soundwave"));
+        assert!(entry_has_host_tag(&entry, "HOST:SOUNDWAVE"));
+        assert!(!entry_has_host_tag(&entry, "host:other"));
+    }
+
+    #[test]
+    fn host_constraint_memory_excludes_project_scoped_host_tag() {
+        let _lock = crate::hooks::test_env_lock();
+        let home = tempfile::tempdir().unwrap();
+        let host_cas = home.path().join(".cas");
+        let project = tempfile::tempdir().unwrap();
+        let project_cas = project.path().join(".cas");
+        std::fs::create_dir_all(&host_cas).unwrap();
+        std::fs::create_dir_all(&project_cas).unwrap();
+        add_scoped_host_memory(
+            &host_cas,
+            "p-host-project-scope",
+            Scope::Project,
+            "host:this-machine",
+            "Project-scoped host-tagged memory must not become a host constraint.",
+        );
+        let _env = EnvGuard::set(&[("HOME", Some(home.path().to_str().unwrap()))]);
+
+        let section =
+            build_host_constraints_section_for_tag(&project_cas, "host:this-machine", 1200);
+        assert!(
+            section.is_empty(),
+            "project-scoped host-tagged memories must be excluded: {section}"
         );
     }
 

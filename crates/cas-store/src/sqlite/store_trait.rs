@@ -1,6 +1,6 @@
 use crate::sqlite::SqliteStore;
 use crate::{Result, Store};
-use cas_types::Entry;
+use cas_types::{Entry, Scope};
 use std::path::Path;
 
 impl Store for SqliteStore {
@@ -34,6 +34,10 @@ impl Store for SqliteStore {
 
     fn list(&self) -> Result<Vec<Entry>> {
         self.store_list()
+    }
+
+    fn list_by_scope_and_tag(&self, scope: Scope, tag: &str) -> Result<Vec<Entry>> {
+        self.store_list_by_scope_and_tag(scope, tag)
     }
 
     fn list_decayable(&self) -> Result<Vec<Entry>> {

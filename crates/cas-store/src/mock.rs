@@ -11,7 +11,7 @@ use chrono::Utc;
 
 use crate::error::{Result, StoreError};
 use crate::{RuleStore, SkillStore, Store};
-use cas_types::{Entry, MemoryTier, Rule, RuleStatus, Skill, SkillStatus};
+use cas_types::{Entry, MemoryTier, Rule, RuleStatus, Scope, Skill, SkillStatus};
 
 /// Thread-safe counter for generating unique IDs
 #[derive(Debug, Default)]
@@ -134,6 +134,23 @@ impl Store for MockStore {
     fn list(&self) -> Result<Vec<Entry>> {
         let entries = self.entries.read().unwrap();
         let mut list: Vec<Entry> = entries.values().cloned().collect();
+        list.sort_by(|a, b| b.created.cmp(&a.created));
+        Ok(list)
+    }
+
+    fn list_by_scope_and_tag(&self, scope: Scope, tag: &str) -> Result<Vec<Entry>> {
+        let entries = self.entries.read().unwrap();
+        let mut list: Vec<Entry> = entries
+            .values()
+            .filter(|entry| entry.scope == scope)
+            .filter(|entry| {
+                entry
+                    .tags
+                    .iter()
+                    .any(|entry_tag| entry_tag.trim().eq_ignore_ascii_case(tag))
+            })
+            .cloned()
+            .collect();
         list.sort_by(|a, b| b.created.cmp(&a.created));
         Ok(list)
     }
