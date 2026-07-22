@@ -1,7 +1,8 @@
 use crate::support::*;
 use cas::mcp::tools::*;
 use cas::mcp::CasCore;
-use cas::store::open_agent_store;
+use cas::store::{open_agent_store, open_event_store};
+use cas::types::EventType;
 use rmcp::handler::server::wrapper::Parameters;
 use rusqlite::Connection;
 
@@ -406,7 +407,7 @@ async fn test_task_update_design_and_acceptance_criteria() {
 
 #[tokio::test]
 async fn test_task_notes() {
-    let (_temp, service) = setup_cas();
+    let (temp, service) = setup_cas();
 
     // Create task
     let req = TaskCreateRequest {
@@ -449,6 +450,89 @@ async fn test_task_notes() {
 
     let text = extract_text(result);
     assert!(text.contains("Added note") || text.contains("note"));
+
+    let session_id = format!("test-session-{}", std::process::id());
+    let event_store = open_event_store(&temp.path().join(".cas")).expect("open event store");
+    let events = event_store
+        .list_by_session(&session_id, 20)
+        .expect("list events for caller session");
+    let note_event = events
+        .iter()
+        .find(|event| {
+            event.event_type == EventType::TaskNoteAdded
+                && event.entity_id == id
+                && event.session_id.as_deref() == Some(session_id.as_str())
+        })
+        .expect("real task notes handler should record caller-attributed TaskNoteAdded event");
+    assert!(note_event.summary.contains("Task note added (progress)"));
+    assert!(note_event.summary.contains("Making progress on implementation"));
+}
+
+#[tokio::test]
+async fn test_task_notes_succeeds_when_activity_event_recording_fails() {
+    let (temp, service) = setup_cas();
+    let cas_dir = temp.path().join(".cas");
+
+    let req = TaskCreateRequest {
+        depth: None,
+        title: "Notes event failure task".to_string(),
+        description: None,
+        priority: 2,
+        task_type: "task".to_string(),
+        labels: None,
+        notes: None,
+        blocked_by: None,
+        design: None,
+        acceptance_criteria: None,
+        external_ref: None,
+        assignee: None,
+        demo_statement: None,
+        execution_note: None,
+        epic: None,
+    };
+
+    let result = service
+        .cas_task_create(Parameters(req))
+        .await
+        .expect("task_create should succeed");
+    let text = extract_text(result);
+    let id = extract_task_id(&text).expect("should have task ID").to_string();
+
+    open_event_store(&cas_dir).expect("event store should initialize");
+    let conn = Connection::open(cas_dir.join("cas.db")).expect("open cas db");
+    conn.execute_batch(
+        r#"
+        CREATE TRIGGER fail_task_note_added_events
+        BEFORE INSERT ON events
+        WHEN NEW.event_type = 'task_note_added'
+        BEGIN
+            SELECT RAISE(ABORT, 'forced task note event failure');
+        END;
+        "#,
+    )
+    .expect("install failing event trigger");
+
+    let result = service
+        .cas_task_notes(Parameters(TaskNotesRequest {
+            id: id.clone(),
+            note: "This note should survive event failure".to_string(),
+            note_type: "progress".to_string(),
+        }))
+        .await
+        .expect("task_notes should succeed even if activity event recording fails");
+
+    let text = extract_text(result);
+    assert!(text.contains("Added note") || text.contains("note"));
+
+    let shown = service
+        .cas_task_show(Parameters(TaskShowRequest {
+            id,
+            with_deps: false,
+        }))
+        .await
+        .expect("task_show should succeed");
+    let shown_text = extract_text(shown);
+    assert!(shown_text.contains("This note should survive event failure"));
 }
 
 #[tokio::test]
