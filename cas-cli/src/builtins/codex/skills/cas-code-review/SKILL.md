@@ -15,7 +15,7 @@ Before any other work, check whether the diff warrants a full review:
 1. `git diff --name-only <base_sha>..HEAD` — if every file matches a docs path (`*.md`, `docs/`) or test path (`tests/`, `*_test.rs`, `*.test.ts`, `*.spec.*`) → return a clean Allow envelope without calling the Workflow.
 2. `git diff --shortstat <base_sha>..HEAD` — if fewer than 5 total lines changed AND no new files → return a clean Allow envelope.
 
-Return shape: `{"residual": [], "pre_existing": [], "mode": "<mode>", "skipped_reason": "..."}`.
+Return shape: `{"residual": [], "pre_existing": [], "dropped": [], "mode": "<mode>", "skipped_reason": "...", "stats": {"dropped_findings": 0}}`.
 
 ## Steps 1-4: Resolve base SHA, pre-fetch, call Workflow
 
@@ -55,7 +55,7 @@ Return shape: `{"residual": [], "pre_existing": [], "mode": "<mode>", "skipped_r
    - **Step 3** (dispatch): parallel persona dispatch, schema-validated, all on Sonnet per R13. Diffs at or below the large-diff threshold keep the old single full-diff dispatch shape. Diffs over the threshold are grouped into subsystem shards by module/concern plus one `interface-integrator` shard for cross-shard contracts. The Workflow validates that subsystem shard file lists cover the full changed-file union and logs missing, duplicate, or extra paths instead of silently dropping files. Docs-only and mechanical test shards use a reduced persona set; code shards keep the risk-weighted activated personas. `gpt-5.5:independent` is a Sonnet-low wrapper that runs `codex exec -s read-only -m gpt-5.5` with a Bash timeout
    - **Step 4** (merge): deterministic 7-step JS merge pipeline (Phase A validated, 30 unit tests)
 
-   The Workflow returns `{ residual, pre_existing, intent_summary, activation, stats }`.
+   The Workflow returns `{ residual, pre_existing, dropped, intent_summary, activation, stats }`.
    When large-diff mode is enabled, `activation.sharding` records the threshold, estimated token count, shard IDs, shard file lists, routed personas, compact per-shard token counts, and coverage diagnostics. It does not include full shard diff bodies.
 
    `gpt-5.5:independent` is opt-in for broad diffs only: 5+ changed files, 300+ changed lines, or an explicit Workflow arg (`gpt55_independent: true`). It never runs on tiny diffs because Step 0 returns before the Workflow. If codex is absent or auth fails, the wrapper returns `findings: []` with `skipped_reason`; activation records that as a skipped persona, distinct from a successful zero-finding review.
@@ -69,9 +69,23 @@ With the Workflow result in hand, branch on `mode`:
 - **`report-only`** — write merged envelope to `docs/reviews/<YYYY-MM-DD>-<short-ref>.md`. No edits, no task creation, no `task.close` side effects. Safe to run in parallel.
 - **`headless`** — return merged envelope as structured text to the caller. No side effects.
 
-In every mode, the output envelope includes `activation` (which personas ran and why) and `intent_summary` from the Workflow return value.
+In every mode, the output envelope contract is:
 
-When the caller must pass the result into `task.close` via `code_review_findings`, the wire envelope is:
+```
+{
+  "residual": Finding[],
+  "pre_existing": Finding[],
+  "dropped": DroppedFinding[],
+  "mode": string,
+  "intent_summary": string,
+  "activation": object,
+  "stats": { "dropped_findings": number, ... }
+}
+```
+
+`dropped` retains every finding the deterministic merge cannot surface. Schema-invalid entries contain `{ reviewer, reason: "schema_validation_failed", validation_errors, finding }`; confidence-gated entries contain `{ reviewer, reason: "confidence_below_threshold", threshold, finding }`. `stats.dropped_findings` is exactly `dropped.length`. Consumers must render or persist these diagnostics rather than silently discarding them. `activation` records which personas ran and why, and `intent_summary` comes from the Workflow return value.
+
+When the caller must pass the result into `task.close` via `code_review_findings`, its narrower wire envelope remains:
 
 ```
 { "residual": Finding[], "pre_existing": Finding[], "mode": string }

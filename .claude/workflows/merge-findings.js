@@ -4,7 +4,7 @@
  * Extracted from .claude/workflows/cas-code-review-prototype.js (cas-e4d4).
  * Implements the 7-step merge defined in cas-code-review SKILL.md §Step 4:
  *
- *   1. Schema validation (pre-assumed: inputs are valid ReviewerOutput objects)
+ *   1. Schema validation — malformed findings are retained in dropped[] with diagnostics
  *   2. Confidence gate — suppress confidence < 0.60 except P0 ≥ 0.50
  *   3. Fingerprint deduplication (file + line-bucket ±3 + normalised title)
  *   4. Cross-reviewer confidence boost — +0.10 per additional agreeing reviewer (cap 1.0)
@@ -47,7 +47,7 @@ const VALID_SEVERITIES = new Set(['P0', 'P1', 'P2', 'P3'])
 const VALID_AUTOFIX_CLASSES = new Set(['safe_auto', 'gated_auto', 'manual', 'advisory'])
 const VALID_OWNERS = new Set(['review-fixer', 'downstream-resolver', 'human'])
 
-function findingValidationErrors(finding) {
+export function findingValidationErrors(finding) {
   if (!finding || typeof finding !== 'object' || Array.isArray(finding)) {
     return ['finding must be an object']
   }

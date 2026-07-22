@@ -48,16 +48,25 @@ import {
   personasRunCount,
 } from './cas-code-review-constants.js'
 
-import { mergeFindings } from './merge-findings.js'
+import { mergeFindings, findingValidationErrors } from './merge-findings.js'
 
 const CANONICAL_ALWAYS_ON = ['correctness', 'testing', 'maintainability', 'project-standards']
 const CANONICAL_CONDITIONAL = ['security', 'performance', 'adversarial']
 const CANONICAL_ALL = [...CANONICAL_ALWAYS_ON, ...CANONICAL_CONDITIONAL, 'fallow']
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor
+const WORKFLOW_SOURCE = readFileSync(new URL('./cas-code-review.js', import.meta.url), 'utf8')
+
+function loadEmbeddedMergeApi() {
+  const start = WORKFLOW_SOURCE.indexOf('const OWNER_RANK =')
+  const end = WORKFLOW_SOURCE.indexOf('// HELPERS', start)
+  assert.notEqual(start, -1, 'embedded merge pipeline start marker must exist')
+  assert.notEqual(end, -1, 'embedded merge pipeline end marker must exist')
+  const source = WORKFLOW_SOURCE.slice(start, end)
+  return new Function(`${source}\nreturn { findingValidationErrors, mergeFindings }`)()
+}
 
 async function runWorkflowDryRun(args, setupOverride = {}, agentOverrides = {}) {
-  const source = readFileSync(new URL('./cas-code-review.js', import.meta.url), 'utf8')
-    .replace('export const meta =', 'const meta =')
+  const source = WORKFLOW_SOURCE.replace('export const meta =', 'const meta =')
   const labels = []
   const logs = []
   async function agent(_prompt, options = {}) {
@@ -96,6 +105,97 @@ async function runWorkflowDryRun(args, setupOverride = {}, agentOverrides = {}) 
   const result = await workflow(args, agent, pipeline, phase, log)
   return { result, labels, logs }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MERGE IMPLEMENTATION PARITY
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('merge implementation parity', () => {
+  test('source Workflow is byte-identical to the shipped builtin copy', () => {
+    const builtin = readFileSync(
+      new URL('../../cas-cli/src/builtins/workflows/cas-code-review.js', import.meta.url),
+      'utf8',
+    )
+    assert.equal(
+      WORKFLOW_SOURCE,
+      builtin,
+      'edit .claude and builtin cas-code-review Workflows together',
+    )
+  })
+
+  test('standalone exported validator matches the embedded Workflow validator', () => {
+    const embedded = loadEmbeddedMergeApi()
+    const candidates = [
+      null,
+      {},
+      {
+        title: 'Valid finding',
+        severity: 'P2',
+        file: 'src/lib.rs',
+        line: 12,
+        why_it_matters: 'It matters.',
+        autofix_class: 'manual',
+        owner: 'downstream-resolver',
+        confidence: 0.8,
+        evidence: ['src/lib.rs:12'],
+        pre_existing: false,
+      },
+      {
+        title: 'x'.repeat(101),
+        severity: 'critical',
+        file: 42,
+        line: 0,
+        why_it_matters: false,
+        autofix_class: 'automatic',
+        owner: 'worker',
+        confidence: 2,
+        evidence: [],
+        pre_existing: 'no',
+        unexpected: true,
+      },
+    ]
+
+    for (const candidate of candidates) {
+      assert.deepEqual(
+        findingValidationErrors(candidate),
+        embedded.findingValidationErrors(candidate),
+      )
+    }
+  })
+
+  test('standalone merge output matches the embedded Workflow merge', () => {
+    const embedded = loadEmbeddedMergeApi()
+    const validFinding = {
+      title: 'Shared issue',
+      severity: 'P1',
+      file: 'src/lib.rs',
+      line: 12,
+      why_it_matters: 'It matters.',
+      autofix_class: 'manual',
+      owner: 'downstream-resolver',
+      confidence: 0.8,
+      evidence: ['src/lib.rs:12'],
+      pre_existing: false,
+    }
+    const reviewerOutputs = [
+      { reviewer: 'correctness', findings: [validFinding] },
+      {
+        reviewer: 'testing',
+        findings: [{ ...validFinding, line: 13, owner: 'human', confidence: 0.7 }],
+      },
+      {
+        reviewer: 'gpt-5.5:independent',
+        findings: [{ ...validFinding, title: 'Low confidence', confidence: 0.55 }],
+      },
+      { reviewer: 'maintainability', findings: [{ title: 'Under-filled' }] },
+    ]
+
+    assert.deepEqual(
+      mergeFindings(reviewerOutputs),
+      embedded.mergeFindings(reviewerOutputs),
+    )
+  })
+})
 
 // ─────────────────────────────────────────────────────────────────────────────
 // META BLOCK

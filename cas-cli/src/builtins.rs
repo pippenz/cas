@@ -2566,6 +2566,33 @@ This is the body content."#;
     }
 
     #[test]
+    fn test_cas_code_review_documents_dropped_findings_contract() {
+        for (label, skills) in [
+            ("claude", BUILTIN_SKILLS),
+            ("codex", CODEX_BUILTIN_SKILLS),
+            ("grok", GROK_BUILTIN_SKILLS),
+        ] {
+            let entry = skills
+                .iter()
+                .find(|b| b.path == "skills/cas-code-review/SKILL.md")
+                .unwrap_or_else(|| panic!("{label}: skills/cas-code-review/SKILL.md missing"));
+            for required in [
+                "\"dropped\": DroppedFinding[]",
+                "schema_validation_failed",
+                "validation_errors",
+                "confidence_below_threshold",
+                "stats.dropped_findings",
+                "exactly `dropped.length`",
+            ] {
+                assert!(
+                    entry.content.contains(required),
+                    "{label}: cas-code-review SKILL.md missing dropped-finding contract marker: {required:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_code_reviewer_agent_is_deprecation_stub() {
         // EPIC cas-0750: the legacy code-reviewer agent is replaced by the
         // cas-code-review skill. The file is kept in BUILTIN_AGENTS only to
