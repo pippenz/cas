@@ -968,14 +968,13 @@ async fn test_shutdown_workers_all() {
 
 #[tokio::test]
 async fn test_shutdown_workers_supervisor_scoping() {
-    let env = FactoryTestEnv::new();
-    env.register_worker("owned-1");
-    env.register_worker("other-1");
-
     let _guard = EnvGuard::set(&[
         ("CAS_AGENT_ROLE", "supervisor"),
         ("CAS_FACTORY_WORKER_NAMES", "owned-1"),
     ]);
+    let env = FactoryTestEnv::new();
+    env.register_worker("owned-1");
+    env.register_worker("other-1");
 
     // Empty worker_names should auto-scope to owned workers
     let req = factory_req("shutdown_workers");
