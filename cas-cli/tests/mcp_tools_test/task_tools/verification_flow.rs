@@ -3017,6 +3017,93 @@ impl ScopedSupervisorEnv {
     }
 }
 
+/// A supervisor-owned epic has no ordinary task assignee by design. Once the
+/// configured verification owner passes the close gate, the response and
+/// audit row must describe the epic verification semantics rather than the
+/// unrelated orphan-recovery path.
+#[tokio::test]
+async fn test_close_supervisor_owned_epic_uses_owner_closed_wording() {
+    let (temp, service) = setup_cas();
+    let _env_lock = env_test_lock();
+    let cas_dir = temp.path().join(".cas");
+    let task_store = open_task_store(&cas_dir).unwrap();
+    let verification_store = open_verification_store(&cas_dir).unwrap();
+    let agent_store = open_agent_store(&cas_dir).expect("open agent store");
+    let owner_id = agent_store
+        .list(None)
+        .expect("list agents")
+        .first()
+        .map(|agent| agent.id.clone())
+        .expect("setup_cas should register the closing agent");
+
+    let req = TaskCreateRequest {
+        depth: None,
+        title: "Supervisor-owned epic".to_string(),
+        description: None,
+        priority: 2,
+        task_type: "epic".to_string(),
+        labels: None,
+        notes: None,
+        blocked_by: None,
+        design: None,
+        acceptance_criteria: None,
+        external_ref: None,
+        assignee: None,
+        demo_statement: None,
+        execution_note: None,
+        epic: None,
+    };
+    let id = extract_task_id(&extract_text(
+        service
+            .cas_task_create(Parameters(req))
+            .await
+            .expect("task_create should succeed"),
+    ))
+    .expect("should have task ID")
+    .to_string();
+
+    let mut epic = task_store.get(&id).expect("epic should exist");
+    epic.status = cas::types::TaskStatus::InProgress;
+    epic.assignee = None;
+    epic.epic_verification_owner = Some(owner_id);
+    task_store.update(&epic).expect("should update epic");
+
+    let _guard = ScopedSupervisorEnv::new();
+    let response_text = extract_text(
+        service
+            .cas_task_close(Parameters(TaskCloseRequest {
+                id: id.clone(),
+                reason: Some("all child tasks complete".to_string()),
+                bypass_code_review: None,
+                code_review_findings: None,
+            }))
+            .await
+            .expect("owner should close epic"),
+    );
+
+    assert!(
+        response_text
+            .contains("epic verification: owner-closed; child tasks individually verified"),
+        "owner-close must explain epic verification semantics: {response_text}"
+    );
+    assert!(
+        !response_text.contains("orphaned task"),
+        "healthy supervisor-owned epic must not be labeled orphaned: {response_text}"
+    );
+
+    let row = verification_store
+        .get_latest_for_task(&id)
+        .expect("verification lookup")
+        .expect("owner-close should write an auditable Skipped row");
+    assert_eq!(row.status, cas::types::VerificationStatus::Skipped);
+    assert!(
+        row.summary.contains("closed by its verification owner")
+            && !row.summary.contains("orphaned"),
+        "audit row must describe owner-close semantics: {}",
+        row.summary
+    );
+}
+
 /// Positive: supervisor closes an orphaned task (no assignee) → bypass fires.
 /// Task goes to Closed without running the verifier and without writing a
 /// verification row. The close_reason passed by the supervisor is preserved
