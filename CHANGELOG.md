@@ -7,6 +7,18 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [2.28.5] - 2026-07-22
+
+### Fixed
+- **Code review no longer silently discards reviewer findings.** The deterministic merge dropped any persona finding under its confidence threshold with no trace — a P1 that mattered was lost this way and only recovered by reading raw workflow journals. The merge now returns every rejected finding in a `dropped[]` list with reviewer provenance and the exact reason (schema errors or confidence vs threshold), logs each drop, and counts them in `stats.dropped_findings`. The codex adapter is contractually required to emit schema-complete findings, and parity tests lock the standalone, embedded, and shipped copies of the merge logic together.
+- **Supervisors closing their own epics are no longer told the epic was "orphaned".** A healthy owner-closed epic now reports "epic verification: owner-closed; child tasks individually verified" in both the close response and the audit row; the orphan-recovery wording is reserved for actual orphans.
+- **Workers no longer fire stale merge requests that cross with supervisor replies.** The close-rejection guidance and worker skills now tell workers to re-read just-delivered supervisor messages before escalating (the previously suggested `queue_poll` cannot see supervisor replies), and every escalation carries the current branch tip SHA plus a freshness qualifier so a stale request is self-identifying on sight.
+- **The factory MCP integration tests no longer cascade-fail under parallel `cargo test`.** The env-var test lock is poison-tolerant (one failing test no longer poisons every later test), one test acquired its guard after env-sensitive setup and is fixed, and the worker skill documents the single canonical 8-variable env sanitization recipe for full-suite gates.
+- **Codemap freshness no longer counts files committed together with CODEMAP.md as drift.** Staleness detection uses a strict commit-range comparison instead of timestamps, so the status line stops reporting phantom staleness after every codemap update — with positive-path coverage proving real drift is still detected.
+- **Releasing a started task returns it to the ready pool.** `task action=release` used to drop only the lease, stranding the task as in-progress with no worker; it now resets status to open, clears the assignee, and records an audit note.
+- **The tmpfs guardrail no longer warns on routine test runs.** Transient write-then-delete churn (parallel test temp dirs) tripped the staged-artifact warning three times per full test suite; growth must now persist across two samples before warning, while genuinely staged large artifacts still trigger.
+- **Director nudges stopped racing the supervisor.** WorkerIdle "assign work" nudges are suppressed when the supervisor has contacted that worker since it went idle, delivery-time revalidation closes the assignment race, and a queued shutdown request can no longer sit unconsumed behind a slow worker spawn (no more zombie workers after shutdown-all).
+
 ## [2.28.4] - 2026-07-22
 
 ### Added
