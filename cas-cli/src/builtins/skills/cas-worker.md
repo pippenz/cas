@@ -93,6 +93,14 @@ Before setting `status=blocked`, re-read with `action=show`. If the task already
 
 For Vercel-deployed projects, `vercel env pull .env.<env> --environment=<env>` (run from the linked project dir) pulls real credentials for prod services (Neon, QStash, etc.) into a local file. Add that file to `.gitignore` — never commit credentials.
 
+## Running the Full Test Suite in a Worker
+
+Factory identity variables inherited by worker processes can change test behavior. Use this canonical sanitized command for full-suite gates; do not shorten the list:
+
+```bash
+env -u CAS_AGENT_ROLE -u CAS_FACTORY_MODE -u CAS_FACTORY_SUPERVISOR_CLI -u CAS_FACTORY_WORKER_CLI -u CAS_SESSION_ID -u CAS_FACTORY_SESSION -u CAS_AGENT_ID -u CAS_TASK_ID cargo test --no-fail-fast
+```
+
 ## References
 
 Open these on demand — they are not pre-loaded.
