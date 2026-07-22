@@ -12,7 +12,8 @@ use ratatui::layout::Rect;
 
 use super::director::{
     DiffLine, DirectorData, DirectorEvent, DirectorEventDetector, DirectorStores, PanelAreas,
-    Prompt, SidecarFocus, ViewMode, generate_prompt, revalidate_event_for_delivery_with_focus,
+    Prompt, SidecarFocus, ViewMode, generate_prompt, revalidate_event_for_delivery_with_context,
+    revalidate_event_for_delivery_with_focus,
 };
 use crate::store::open_prompt_queue_store;
 use crate::types::Worktree;
@@ -707,12 +708,22 @@ impl FactoryApp {
         let delivery_events: Vec<DirectorEvent> = events
             .iter()
             .filter_map(|event| {
-                revalidate_event_for_delivery_with_focus(
-                    event,
-                    &unfiltered_data,
-                    &self.supervisor_name,
-                    focused_epic_id,
-                )
+                if let DirectorEvent::WorkerIdle { worker, .. } = event {
+                    revalidate_event_for_delivery_with_context(
+                        event,
+                        &unfiltered_data,
+                        &self.supervisor_name,
+                        focused_epic_id,
+                        self.event_detector.worker_idle_since(worker),
+                    )
+                } else {
+                    revalidate_event_for_delivery_with_focus(
+                        event,
+                        &unfiltered_data,
+                        &self.supervisor_name,
+                        focused_epic_id,
+                    )
+                }
             })
             .collect();
 
@@ -2926,10 +2937,13 @@ mod tests {
             id: "agent-1".to_string(),
             name: "swift-fox".to_string(),
             status: AgentStatus::Active,
+            registered_at: chrono::Utc::now(),
             current_task: None,
             latest_activity: None,
             last_heartbeat: None,
             pending_messages: 0,
+            pending_supervisor_messages: 0,
+            latest_supervisor_message_at: None,
             active_lease: None,
             effort: None,
         }];

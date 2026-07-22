@@ -454,6 +454,14 @@ pub struct DirectorEventDetector {
     /// idle streak can trigger another emission (subject to `IDLE_RATE_LIMIT`
     /// in `debounce_events`). Keyed by agent id.
     idle_already_emitted: HashSet<String>,
+    /// UTC baseline for the worker's current task-less streak, keyed by
+    /// resolved worker name. Kept across prompt delivery so send-time
+    /// revalidation can recognize supervisor contact newer than the streak.
+    idle_transition_at: HashMap<String, DateTime<chrono::Utc>>,
+    /// Workers whose current idle transition has already been handled by a
+    /// supervisor message. This survives queue drainage and clears only when
+    /// the worker resumes task/activity or leaves the session.
+    idle_handled_by_supervisor: HashSet<String>,
     /// Tasks for which `TaskCompleted` has already been announced this session.
     ///
     /// **Never cleared on active-set reappearance.** When a task oscillates
@@ -558,6 +566,8 @@ impl DirectorEventDetector {
             removed_workers: HashSet::new(),
             consecutive_idle_ticks: HashMap::new(),
             idle_already_emitted: HashSet::new(),
+            idle_transition_at: HashMap::new(),
+            idle_handled_by_supervisor: HashSet::new(),
             task_completed_announced: HashSet::new(),
             task_assigned_announced: HashSet::new(),
             stall_nudged: HashSet::new(),
@@ -685,6 +695,12 @@ impl DirectorEventDetector {
         if !self.worker_names.contains(&name) {
             self.worker_names.push(name);
         }
+    }
+
+    /// Start of a worker's currently-observed idle streak, for the delivery
+    /// race recheck performed after event detection.
+    pub fn worker_idle_since(&self, worker_name: &str) -> Option<DateTime<chrono::Utc>> {
+        self.idle_transition_at.get(worker_name).copied()
     }
 
     /// Remove a worker from the tracked list (call when shutting down workers)
@@ -891,6 +907,7 @@ impl DirectorEventDetector {
         // existing `IDLE_RATE_LIMIT` debounce at `debounce_events` handles the
         // cross-streak cooldown.
         let mut seen_factory_agents: HashSet<String> = HashSet::new();
+        let mut seen_factory_agent_names: HashSet<String> = HashSet::new();
         for agent in &data.agents {
             if !self.is_factory_agent(&agent.id, data) {
                 continue;
@@ -908,6 +925,7 @@ impl DirectorEventDetector {
             }
 
             seen_factory_agents.insert(agent.id.clone());
+            seen_factory_agent_names.insert(resolved_name.clone());
 
             if self.held_workers.contains(&resolved_name) {
                 // cas-09d0: a deliberately held worker is never
@@ -916,6 +934,8 @@ impl DirectorEventDetector {
                 // once released — mirrors the `pending_messages` gate below.
                 self.consecutive_idle_ticks.remove(&agent.id);
                 self.idle_already_emitted.remove(&agent.id);
+                self.idle_transition_at.remove(&resolved_name);
+                self.idle_handled_by_supervisor.remove(&resolved_name);
                 self.stall_nudged.remove(&agent.id);
                 self.stall_escalated.remove(&agent.id);
                 continue;
@@ -928,6 +948,8 @@ impl DirectorEventDetector {
                 // from THIS point on, not a stale count from an earlier streak.
                 self.consecutive_idle_ticks.remove(&agent.id);
                 self.idle_already_emitted.remove(&agent.id);
+                self.idle_transition_at.remove(&resolved_name);
+                self.idle_handled_by_supervisor.remove(&resolved_name);
 
                 // Stall detection (cas-9829): heartbeat alone cannot tell a
                 // healthy in-progress worker from one that printed a plan and
@@ -1062,6 +1084,37 @@ impl DirectorEventDetector {
                 continue;
             }
 
+            let was_already_active = self.last_state.active_agents.contains(&agent.id);
+            let idle_since = *self
+                .idle_transition_at
+                .entry(resolved_name.clone())
+                .or_insert_with(|| {
+                    if was_already_active {
+                        now_utc
+                    } else {
+                        agent.registered_at
+                    }
+                });
+            let supervisor_message_handles_idle = agent
+                .latest_supervisor_message_at
+                .map(|sent_at| sent_at >= idle_since)
+                .unwrap_or(false)
+                // If the director observes the row while it is still pending,
+                // preserve the existing suppression after it drains. This
+                // covers a message queued between refreshes, before the first
+                // task-less snapshot establishes its local baseline.
+                || (agent.pending_supervisor_messages > 0
+                    && agent.latest_supervisor_message_at.is_some());
+            if supervisor_message_handles_idle {
+                self.idle_handled_by_supervisor
+                    .insert(resolved_name.clone());
+            }
+
+            if self.idle_handled_by_supervisor.contains(&resolved_name) {
+                self.consecutive_idle_ticks.remove(&agent.id);
+                continue;
+            }
+
             if agent.pending_messages > 0 {
                 // Worker has unread messages in the prompt queue — don't count
                 // this tick as idle. A freshly spawned worker appears task-less
@@ -1070,7 +1123,6 @@ impl DirectorEventDetector {
                 // queued message (spawn race, cas-afb7). Reset the streak so the
                 // counter only starts accumulating after the queue is drained.
                 self.consecutive_idle_ticks.remove(&agent.id);
-                self.idle_already_emitted.remove(&agent.id);
                 continue;
             }
 
@@ -1111,6 +1163,8 @@ impl DirectorEventDetector {
                 // this tick and reset any partial idle streak so a genuine idle
                 // that follows has to accumulate from zero.
                 self.consecutive_idle_ticks.remove(&agent.id);
+                self.idle_transition_at.remove(&resolved_name);
+                self.idle_handled_by_supervisor.remove(&resolved_name);
                 continue;
             }
 
@@ -1138,6 +1192,10 @@ impl DirectorEventDetector {
             .retain(|id, _| seen_factory_agents.contains(id));
         self.idle_already_emitted
             .retain(|id| seen_factory_agents.contains(id));
+        self.idle_transition_at
+            .retain(|name, _| seen_factory_agent_names.contains(name));
+        self.idle_handled_by_supervisor
+            .retain(|name| seen_factory_agent_names.contains(name));
         self.stall_nudged
             .retain(|id| seen_factory_agents.contains(id));
         self.stall_escalated
@@ -1147,7 +1205,17 @@ impl DirectorEventDetector {
         for agent_id in &new_state.active_agents {
             if !self.last_state.active_agents.contains(agent_id) {
                 let agent_name = self.resolve_agent_name(agent_id, data);
-                if self.is_factory_agent_name(&agent_name) {
+                let already_contacted = data
+                    .agents
+                    .iter()
+                    .find(|agent| agent.id == *agent_id)
+                    .and_then(|agent| {
+                        agent
+                            .latest_supervisor_message_at
+                            .map(|sent_at| sent_at >= agent.registered_at)
+                    })
+                    .unwrap_or(false);
+                if self.is_factory_agent_name(&agent_name) && !already_contacted {
                     events.push(DirectorEvent::AgentRegistered {
                         agent_id: agent_id.clone(),
                         agent_name,
