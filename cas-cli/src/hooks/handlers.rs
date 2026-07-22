@@ -126,7 +126,8 @@ impl<'a> ToolHookStores<'a> {
     /// Get or load Config (cached)
     pub fn config(&mut self) -> &Config {
         if self.config.is_none() {
-            self.config = Some(Config::load(self.cas_root).unwrap_or_default());
+            self.config =
+                Some(Config::load_with_host_staging_defaults(self.cas_root).unwrap_or_default());
         }
         self.config.as_ref().unwrap()
     }
@@ -289,9 +290,9 @@ pub(crate) use handlers_state::{
 pub use handlers_state::{get_session_files, handle_subagent_start, handle_subagent_stop};
 
 mod handlers_middle;
-pub use handlers_middle::{handle_post_tool_use, handle_stop, handle_user_prompt_submit};
 #[cfg(test)]
 pub(crate) use handlers_middle::is_file_within_project;
+pub use handlers_middle::{handle_post_tool_use, handle_stop, handle_user_prompt_submit};
 
 pub(crate) mod handlers_events;
 pub use handlers_events::{

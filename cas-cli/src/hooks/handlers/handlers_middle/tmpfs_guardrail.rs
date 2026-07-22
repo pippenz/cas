@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
@@ -7,6 +8,8 @@ use crate::config::{DEFAULT_TMPFS_WARNING_THRESHOLD_BYTES, StagingConfig};
 use crate::hooks::types::{HookInput, HookOutput};
 
 const STATE_DIR: &str = "tmpfs_guardrail";
+const STATE_LOCK_FILE: &str = "tmpfs_guardrail.lock";
+const STATE_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const MEMORY_FS_TYPES: &[&str] = &["tmpfs", "ramfs"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,9 +44,15 @@ struct GuardrailState {
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct MountState {
     mount_point: String,
-    cumulative_bytes: u64,
+    #[serde(default, alias = "cumulative_bytes")]
+    written_bytes: u64,
+    #[serde(default)]
+    usage_growth_bytes: u64,
     baseline_used_bytes: Option<u64>,
-    last_warned_multiple: u64,
+    #[serde(default, alias = "last_warned_multiple")]
+    last_warned_written_multiple: u64,
+    #[serde(default)]
+    last_warned_usage_multiple: u64,
 }
 
 pub(crate) fn maybe_tmpfs_guardrail_warning(
@@ -76,58 +85,47 @@ pub(crate) fn maybe_tmpfs_guardrail_warning_with(
 ) -> Option<String> {
     let threshold_bytes = threshold_bytes.max(1);
     let tool_name = input.tool_name.as_deref()?;
-    let mut state = load_state(cas_root, &input.session_id);
-    let mut warning: Option<String> = None;
-
-    match tool_name {
-        "Write" | "Edit" => {
-            let path = input
-                .tool_input
-                .as_ref()
-                .and_then(|tool_input| tool_input.get("file_path"))
-                .and_then(|file_path| file_path.as_str())?;
-            let path = resolve_probe_path(path, &input.cwd);
-            let mount = find_mount_for_path(&path, mounts)?;
-            if !is_memory_fs(&mount.fs_type) {
-                return None;
-            }
-
-            let bytes = tool_write_size(input, &path)?;
-            warning = apply_delta(
-                &mut state,
-                &mount.mount_point,
-                bytes,
-                threshold_bytes,
-                staging_dir,
-            );
-        }
-        "Bash" => {
-            for probe in bash_probe_paths(input) {
-                let mount = match find_mount_for_path(&probe, mounts) {
-                    Some(mount) if is_memory_fs(&mount.fs_type) => mount,
-                    _ => continue,
-                };
-                let usage = match usage_reader.usage(&mount.mount_point) {
-                    Some(usage) => usage,
-                    None => continue,
-                };
-                if let Some(candidate) = apply_usage_sample(
-                    &mut state,
-                    &mount.mount_point,
-                    usage.used_bytes,
-                    threshold_bytes,
-                    staging_dir,
-                ) {
-                    warning = Some(candidate);
-                    break;
-                }
-            }
-        }
-        _ => return None,
+    if !matches!(tool_name, "Write" | "Edit" | "Bash") {
+        return None;
     }
 
-    save_state(cas_root, &input.session_id, &state);
-    warning
+    with_state_lock(cas_root, || {
+        let mut state = load_state(cas_root, &input.session_id);
+        let warning = match tool_name {
+            "Write" | "Edit" => {
+                let path = input
+                    .tool_input
+                    .as_ref()
+                    .and_then(|tool_input| tool_input.get("file_path"))
+                    .and_then(|file_path| file_path.as_str())?;
+                let path = resolve_probe_path(path, &input.cwd);
+                let mount = find_mount_for_path(&path, mounts)?;
+                if !is_memory_fs(&mount.fs_type) {
+                    return None;
+                }
+
+                let bytes = tool_write_size(input, &path)?;
+                apply_delta(
+                    &mut state,
+                    &mount.mount_point,
+                    bytes,
+                    threshold_bytes,
+                    staging_dir,
+                )
+            }
+            "Bash" => apply_bash_usage_samples(
+                &mut state,
+                mounts,
+                usage_reader,
+                threshold_bytes,
+                staging_dir,
+            ),
+            _ => None,
+        };
+
+        save_state(cas_root, &input.session_id, &state);
+        warning
+    })
 }
 
 fn effective_threshold(staging: &StagingConfig) -> u64 {
@@ -150,8 +148,41 @@ fn apply_delta(
     }
 
     let entry = state.entry_mut(mount_point);
-    entry.cumulative_bytes = entry.cumulative_bytes.saturating_add(delta_bytes);
-    warning_for_total(entry, mount_point, threshold_bytes, staging_dir)
+    entry.written_bytes = entry.written_bytes.saturating_add(delta_bytes);
+    let written_bytes = entry.written_bytes;
+    warning_for_counter(
+        &mut entry.last_warned_written_multiple,
+        mount_point,
+        written_bytes,
+        threshold_bytes,
+        staging_dir,
+    )
+}
+
+fn apply_bash_usage_samples(
+    state: &mut GuardrailState,
+    mounts: &[MountInfo],
+    usage_reader: &dyn UsageReader,
+    threshold_bytes: u64,
+    staging_dir: Option<&str>,
+) -> Option<String> {
+    let mut warning = None;
+    for mount in mounts.iter().filter(|mount| is_memory_fs(&mount.fs_type)) {
+        let usage = match usage_reader.usage(&mount.mount_point) {
+            Some(usage) => usage,
+            None => continue,
+        };
+        if let Some(candidate) = apply_usage_sample(
+            state,
+            &mount.mount_point,
+            usage.used_bytes,
+            threshold_bytes,
+            staging_dir,
+        ) {
+            warning.get_or_insert(candidate);
+        }
+    }
+    warning
 }
 
 fn apply_usage_sample(
@@ -166,29 +197,37 @@ fn apply_usage_sample(
         Some(baseline) => baseline,
         None => {
             entry.baseline_used_bytes = Some(used_bytes);
-            return None;
+            0
         }
     };
 
-    entry.cumulative_bytes = used_bytes.saturating_sub(baseline);
-    warning_for_total(entry, mount_point, threshold_bytes, staging_dir)
+    entry.usage_growth_bytes = used_bytes.saturating_sub(baseline);
+    let usage_growth_bytes = entry.usage_growth_bytes;
+    warning_for_counter(
+        &mut entry.last_warned_usage_multiple,
+        mount_point,
+        usage_growth_bytes,
+        threshold_bytes,
+        staging_dir,
+    )
 }
 
-fn warning_for_total(
-    entry: &mut MountState,
+fn warning_for_counter(
+    last_warned_multiple: &mut u64,
     mount_point: &Path,
+    total: u64,
     threshold_bytes: u64,
     staging_dir: Option<&str>,
 ) -> Option<String> {
-    let multiple = entry.cumulative_bytes / threshold_bytes;
-    if multiple == 0 || multiple <= entry.last_warned_multiple {
+    let multiple = total / threshold_bytes;
+    if multiple == 0 || multiple <= *last_warned_multiple {
         return None;
     }
-    entry.last_warned_multiple = multiple;
+    *last_warned_multiple = multiple;
 
     Some(format_warning(
         mount_point,
-        entry.cumulative_bytes,
+        total,
         threshold_bytes,
         staging_dir,
     ))
@@ -234,9 +273,11 @@ impl GuardrailState {
         }
         self.mounts.push(MountState {
             mount_point: key,
-            cumulative_bytes: 0,
+            written_bytes: 0,
+            usage_growth_bytes: 0,
             baseline_used_bytes: None,
-            last_warned_multiple: 0,
+            last_warned_written_multiple: 0,
+            last_warned_usage_multiple: 0,
         });
         self.mounts.last_mut().expect("just pushed mount state")
     }
@@ -251,23 +292,14 @@ fn tool_write_size(input: &HookInput, path: &Path) -> Option<u64> {
         };
         if !field.is_empty() {
             if let Some(text) = tool_input.get(field).and_then(|value| value.as_str()) {
+                // Hook payloads carry strings; count bytes, not chars, because
+                // the guardrail threshold is configured in filesystem bytes.
                 return Some(text.len() as u64);
             }
         }
     }
 
     fs::metadata(path).ok().map(|metadata| metadata.len())
-}
-
-fn bash_probe_paths(input: &HookInput) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    if !input.cwd.trim().is_empty() {
-        paths.push(resolve_probe_path(&input.cwd, &input.cwd));
-    }
-    paths.push(PathBuf::from("/tmp"));
-    paths.sort();
-    paths.dedup();
-    paths
 }
 
 fn resolve_probe_path(path: &str, cwd: &str) -> PathBuf {
@@ -348,6 +380,32 @@ fn state_path(cas_root: &Path, session_id: &str) -> PathBuf {
         .join(format!("{safe_session}.json"))
 }
 
+fn with_state_lock<T>(cas_root: &Path, f: impl FnOnce() -> T) -> T {
+    use fs2::FileExt;
+
+    struct LockGuard(std::fs::File, bool);
+    impl Drop for LockGuard {
+        fn drop(&mut self) {
+            if self.1 {
+                let _ = FileExt::unlock(&self.0);
+            }
+        }
+    }
+
+    let lock_path = cas_root.join(STATE_LOCK_FILE);
+    let _guard = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .ok()
+        .map(|file| {
+            let locked = file.lock_exclusive().is_ok();
+            LockGuard(file, locked)
+        });
+    f()
+}
+
 fn load_state(cas_root: &Path, session_id: &str) -> GuardrailState {
     let path = state_path(cas_root, session_id);
     fs::read_to_string(path)
@@ -364,12 +422,38 @@ fn save_state(cas_root: &Path, session_id: &str, state: &GuardrailState) {
     if fs::create_dir_all(parent).is_err() {
         return;
     }
+    prune_old_state_files(parent, STATE_RETENTION);
     let Ok(content) = serde_json::to_string(state) else {
         return;
     };
     let tmp_path = path.with_extension("json.tmp");
     if fs::write(&tmp_path, content).is_ok() {
         let _ = fs::rename(tmp_path, path);
+    }
+}
+
+fn prune_old_state_files(dir: &Path, retention: Duration) {
+    let now = SystemTime::now();
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        let Ok(age) = now.duration_since(modified) else {
+            continue;
+        };
+        if age > retention {
+            let _ = fs::remove_file(path);
+        }
     }
 }
 
@@ -395,4 +479,35 @@ fn fs_usage(path: &Path) -> Option<MountUsage> {
 #[cfg(not(unix))]
 fn fs_usage(_path: &Path) -> Option<MountUsage> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn state_lock_runs_closure_and_creates_sentinel() {
+        let tmp = tempfile::tempdir().unwrap();
+        let called = std::cell::Cell::new(false);
+
+        with_state_lock(tmp.path(), || called.set(true));
+
+        assert!(called.get());
+        assert!(tmp.path().join(STATE_LOCK_FILE).exists());
+    }
+
+    #[test]
+    fn prune_old_state_files_removes_expired_json_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stale = tmp.path().join("old.json");
+        let lock = tmp.path().join(STATE_LOCK_FILE);
+        std::fs::write(&stale, "{}").unwrap();
+        std::fs::write(&lock, "").unwrap();
+
+        std::thread::sleep(Duration::from_millis(2));
+        prune_old_state_files(tmp.path(), Duration::ZERO);
+
+        assert!(!stale.exists(), "expired state json should be pruned");
+        assert!(lock.exists(), "non-json lock sentinel must be retained");
+    }
 }
