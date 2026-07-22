@@ -897,6 +897,60 @@ mod tests {
     }
 
     #[test]
+    fn test_codemap_freshness_detects_file_added_after_codemap_commit() {
+        use std::fs;
+        use std::process::Command;
+
+        let dir = tempfile::tempdir().unwrap();
+        let project_root = dir.path();
+        let cas_root = project_root.join(".cas");
+        fs::create_dir_all(&cas_root).unwrap();
+        fs::create_dir_all(project_root.join(".claude")).unwrap();
+        fs::create_dir_all(project_root.join("src")).unwrap();
+        fs::write(project_root.join(".claude/CODEMAP.md"), "# Codemap\n").unwrap();
+
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(project_root)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.name", "CAS Test"]);
+        git(&["config", "user.email", "cas-test@example.invalid"]);
+        git(&["add", ".claude/CODEMAP.md"]);
+        git(&["commit", "-q", "-m", "add codemap"]);
+
+        fs::write(project_root.join("src/later.rs"), "pub fn later() {}\n").unwrap();
+        git(&["add", "src/later.rs"]);
+        git(&["commit", "-q", "-m", "add later source"]);
+
+        let staleness = check_codemap_freshness(&cas_root)
+            .expect("a structural file committed after CODEMAP.md must be drift");
+        match staleness {
+            CodemapStaleness::Stale {
+                total_changes,
+                file_list,
+                ..
+            } => {
+                assert_eq!(total_changes, 1);
+                assert_eq!(file_list, vec!["+src/later.rs"]);
+            }
+            other => panic!("expected ordinary stale result, got {other:?}"),
+        }
+
+        let reminder = codemap_stop_reminder(&cas_root)
+            .expect("the stop reminder must share the positive freshness path");
+        assert!(reminder.contains("1 pending structural change(s)"));
+    }
+
+    #[test]
     fn test_codemap_stop_reminder_no_file() {
         let temp = std::env::temp_dir().join("test_codemap_stop_reminder");
         let _ = std::fs::create_dir_all(&temp);
