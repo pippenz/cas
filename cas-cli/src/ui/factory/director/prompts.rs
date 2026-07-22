@@ -284,6 +284,25 @@ pub fn revalidate_event_for_delivery_with_focus(
     supervisor_name: &str,
     focused_epic_id: Option<&str>,
 ) -> Option<DirectorEvent> {
+    revalidate_event_for_delivery_with_context(
+        event,
+        unfiltered_data,
+        supervisor_name,
+        focused_epic_id,
+        None,
+    )
+}
+
+/// Delivery-time revalidation with the detector's idle-transition timestamp.
+/// A supervisor message that arrived after event detection must win the race,
+/// even if transport already marked the queue row processed.
+pub fn revalidate_event_for_delivery_with_context(
+    event: &DirectorEvent,
+    unfiltered_data: &DirectorData,
+    supervisor_name: &str,
+    focused_epic_id: Option<&str>,
+    idle_since: Option<chrono::DateTime<chrono::Utc>>,
+) -> Option<DirectorEvent> {
     match event {
         DirectorEvent::EpicAllSubtasksClosed { epic_id, .. } => {
             let factory_session = std::env::var("CAS_FACTORY_SESSION").ok();
@@ -323,6 +342,24 @@ pub fn revalidate_event_for_delivery_with_focus(
             agent_id,
             agent_name,
         } => {
+            let supervisor_already_contacted = unfiltered_data
+                .agents
+                .iter()
+                .find(|agent| agent.name == *agent_name)
+                .and_then(|agent| {
+                    agent
+                        .latest_supervisor_message_at
+                        .map(|sent_at| sent_at >= agent.registered_at)
+                })
+                .unwrap_or(false);
+            if supervisor_already_contacted {
+                tracing::info!(
+                    target: "cas::coordination",
+                    worker = %agent_name,
+                    "suppressing stale worker-ready nudge after supervisor contact"
+                );
+                return None;
+            }
             if agent_name == supervisor_name
                 || live_worker_session_id(unfiltered_data, agent_name).is_none()
                 || worker_has_open_or_in_progress_assignment(unfiltered_data, agent_name)
@@ -348,9 +385,28 @@ pub fn revalidate_event_for_delivery_with_focus(
                 .find(|agent| agent.name == *worker)
                 .and_then(|agent| agent.active_lease.clone());
 
+            let supervisor_already_contacted = idle_since
+                .and_then(|idle_since| {
+                    unfiltered_data
+                        .agents
+                        .iter()
+                        .find(|agent| agent.name == *worker)
+                        .and_then(|agent| agent.latest_supervisor_message_at)
+                        .map(|sent_at| sent_at >= idle_since)
+                })
+                .unwrap_or(false);
+
             if active_task.is_none()
                 && worker_has_open_or_in_progress_assignment(unfiltered_data, worker)
             {
+                return None;
+            }
+            if supervisor_already_contacted {
+                tracing::info!(
+                    target: "cas::coordination",
+                    worker = %worker,
+                    "suppressing stale WorkerIdle nudge after supervisor contact"
+                );
                 return None;
             }
 
@@ -1164,10 +1220,13 @@ mod tests {
                 id: "sess-id-abc123".to_string(),
                 name: "swift-fox".to_string(),
                 status: AgentStatus::Active,
+                registered_at: chrono::Utc::now(),
                 current_task: None,
                 latest_activity: None,
                 last_heartbeat: Some(chrono::Utc::now()),
                 pending_messages: 0,
+                pending_supervisor_messages: 0,
+                latest_supervisor_message_at: None,
                 active_lease: None,
                 effort: None,
             }],
@@ -1231,6 +1290,48 @@ mod tests {
         assert!(
             rechecked.is_none(),
             "WorkerIdle generated before assignment must be dropped when delivery sees assigned work"
+        );
+    }
+
+    #[test]
+    fn test_delivery_recheck_drops_worker_idle_after_newer_supervisor_message() {
+        let idle_since = chrono::Utc::now();
+        let event = DirectorEvent::WorkerIdle {
+            worker: "swift-fox".to_string(),
+            active_task: None,
+        };
+        let mut data = make_data(0);
+        data.agents[0].registered_at = idle_since - chrono::Duration::minutes(5);
+        data.agents[0].latest_supervisor_message_at =
+            Some(idle_since + chrono::Duration::seconds(1));
+
+        assert!(
+            revalidate_event_for_delivery_with_context(
+                &event,
+                &data,
+                "supervisor",
+                None,
+                Some(idle_since),
+            )
+            .is_none(),
+            "supervisor contact that wins the detection/delivery race must suppress the idle nudge"
+        );
+    }
+
+    #[test]
+    fn test_delivery_recheck_drops_ready_nudge_after_supervisor_contact() {
+        let event = DirectorEvent::AgentRegistered {
+            agent_id: "sess-id-abc123".to_string(),
+            agent_name: "swift-fox".to_string(),
+        };
+        let mut data = make_data(0);
+        let registered_at = data.agents[0].registered_at;
+        data.agents[0].latest_supervisor_message_at =
+            Some(registered_at + chrono::Duration::seconds(1));
+
+        assert!(
+            revalidate_event_for_delivery(&event, &data, "supervisor").is_none(),
+            "a supervisor message after registration makes the ready nudge stale"
         );
     }
 
@@ -2768,10 +2869,13 @@ mod tests {
                 id: "sess-id-abc123".to_string(),
                 name: "swift-fox".to_string(),
                 status: AgentStatus::Active,
+                registered_at: chrono::Utc::now(),
                 current_task: None,
                 latest_activity: None,
                 last_heartbeat: Some(chrono::Utc::now()),
                 pending_messages: 0,
+                pending_supervisor_messages: 0,
+                latest_supervisor_message_at: None,
                 active_lease: None,
                 effort: None,
             }],
@@ -3257,10 +3361,13 @@ mod tests {
             id: "sess-id-codex-worker".to_string(),
             name: "codex-worker".to_string(),
             status: AgentStatus::Active,
+            registered_at: chrono::Utc::now(),
             current_task: None,
             latest_activity: None,
             last_heartbeat: Some(chrono::Utc::now()),
             pending_messages: 0,
+            pending_supervisor_messages: 0,
+            latest_supervisor_message_at: None,
             active_lease: None,
             effort: None,
         }];
@@ -3803,10 +3910,13 @@ mod tests {
             id: "owner-session-id".to_string(),
             name: "owner-sup".to_string(),
             status: AgentStatus::Active,
+            registered_at: chrono::Utc::now(),
             current_task: None,
             latest_activity: None,
             last_heartbeat: Some(chrono::Utc::now()),
             pending_messages: 0,
+            pending_supervisor_messages: 0,
+            latest_supervisor_message_at: None,
             active_lease: None,
             effort: None,
         });

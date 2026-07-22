@@ -52,10 +52,13 @@ fn make_agent(id: &str, name: &str, current_task: Option<&str>) -> AgentSummary 
         id: id.to_string(),
         name: name.to_string(),
         status: AgentStatus::Active,
+        registered_at: chrono::Utc::now(),
         current_task: current_task.map(String::from),
         latest_activity: None,
         last_heartbeat: Some(chrono::Utc::now()),
         pending_messages: 0,
+        pending_supervisor_messages: 0,
+        latest_supervisor_message_at: None,
         active_lease: None,
         effort: None,
     }
@@ -1236,10 +1239,13 @@ fn test_no_worker_idle_while_pending_messages_in_queue() {
             id: "agent-1".to_string(),
             name: "swift-fox".to_string(),
             status: AgentStatus::Active,
+            registered_at: chrono::Utc::now(),
             current_task: None,
             latest_activity: None,
             last_heartbeat: Some(chrono::Utc::now()),
             pending_messages: 1,
+            pending_supervisor_messages: 0,
+            latest_supervisor_message_at: None,
             active_lease: None,
             effort: None,
         }],
@@ -1284,6 +1290,78 @@ fn test_no_worker_idle_while_pending_messages_in_queue() {
         )),
         "WorkerIdle must fire once pending messages are gone and idle threshold is met"
     );
+}
+
+#[test]
+fn delivered_supervisor_message_keeps_current_idle_streak_suppressed() {
+    let mut detector =
+        DirectorEventDetector::new(vec!["swift-fox".to_string()], "supervisor".to_string());
+    detector.initialize(&working_data_for(
+        "agent-1",
+        "swift-fox",
+        "task-1",
+        "Work Item",
+    ));
+
+    let clock = Instant::now();
+    let utc = chrono::Utc::now();
+    let idle = idle_data_for("agent-1", "swift-fox");
+    detector.detect_changes_at(&idle, None, clock, utc);
+
+    let mut contacted = idle.clone();
+    contacted.agents[0].pending_messages = 1;
+    contacted.agents[0].pending_supervisor_messages = 1;
+    contacted.agents[0].latest_supervisor_message_at =
+        Some(utc + chrono::Duration::seconds(1));
+    detector.detect_changes_at(
+        &contacted,
+        None,
+        clock + Duration::from_secs(1),
+        utc + chrono::Duration::seconds(1),
+    );
+
+    contacted.agents[0].pending_messages = 0;
+    contacted.agents[0].pending_supervisor_messages = 0;
+    for seconds in 2..8 {
+        let events = detector.detect_changes_at(
+            &contacted,
+            None,
+            clock + Duration::from_secs(seconds),
+            utc + chrono::Duration::seconds(seconds as i64),
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, DirectorEvent::WorkerIdle { .. })),
+            "delivered supervisor contact must handle the current idle streak: {events:?}"
+        );
+    }
+
+    detector.detect_changes_at(
+        &working_data_for("agent-1", "swift-fox", "task-2", "Next Work"),
+        None,
+        clock + Duration::from_secs(10),
+        utc + chrono::Duration::seconds(10),
+    );
+    let later_idle_tick_1 = detector.detect_changes_at(
+        &contacted,
+        None,
+        clock + Duration::from_secs(20),
+        utc + chrono::Duration::seconds(20),
+    );
+    let later_idle_tick_2 = detector.detect_changes_at(
+        &contacted,
+        None,
+        clock + Duration::from_secs(21),
+        utc + chrono::Duration::seconds(21),
+    );
+    assert!(!later_idle_tick_1
+        .iter()
+        .any(|event| matches!(event, DirectorEvent::WorkerIdle { .. })));
+    assert!(later_idle_tick_2.iter().any(|event| matches!(
+        event,
+        DirectorEvent::WorkerIdle { worker, .. } if worker == "swift-fox"
+    )));
 }
 
 /// Covariance with cas-3bd4: a Closed task can still carry a stale
@@ -1533,6 +1611,7 @@ fn make_agent_active(
         id: id.to_string(),
         name: name.to_string(),
         status: AgentStatus::Active,
+        registered_at: base_utc,
         current_task: None, // task-less between turns
         latest_activity: Some((
             "tool_call".to_string(),
@@ -1540,6 +1619,8 @@ fn make_agent_active(
         )),
         last_heartbeat: Some(base_utc - CDuration::seconds(heartbeat_ago_secs)),
         pending_messages: 0,
+        pending_supervisor_messages: 0,
+        latest_supervisor_message_at: None,
         active_lease: None,
         effort: None,
     }
@@ -1775,11 +1856,14 @@ fn make_agent_working_stalled(
         id: id.to_string(),
         name: name.to_string(),
         status: AgentStatus::Active,
+        registered_at: base_utc,
         current_task: Some(task_id.to_string()),
         latest_activity: activity_ago_secs
             .map(|secs| ("tool_call".to_string(), base_utc - CDuration::seconds(secs))),
         last_heartbeat: Some(base_utc - CDuration::seconds(heartbeat_ago_secs)),
         pending_messages: 0,
+        pending_supervisor_messages: 0,
+        latest_supervisor_message_at: None,
         active_lease: None,
         effort: None,
     }

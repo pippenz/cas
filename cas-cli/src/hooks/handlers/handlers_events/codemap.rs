@@ -322,23 +322,19 @@ pub fn check_codemap_freshness(cas_root: &Path) -> Option<CodemapStaleness> {
 
     // Sole mechanism: git-based staleness detection.
     // Works for terminal commits, worker commits, cherry-picks — any commit source.
-    // After `/codemap` regen + commit, CODEMAP.md's git timestamp advances past
-    // all prior structural changes → this returns None (up to date) automatically,
+    // After `/codemap` regen + commit, the CODEMAP commit contains all prior
+    // structural changes → this returns None (up to date) automatically,
     // with no manual `cas codemap clear` step required.
     check_staleness_from_git(project_root)
 }
 
-/// Check staleness by comparing CODEMAP.md's last commit timestamp against
-/// subsequent structural changes (A/D/R) in git history.
+/// Check staleness by comparing CODEMAP.md's last commit against subsequent
+/// structural changes (A/D/R) in git history.
 ///
 /// This is the primary detection mechanism — it works regardless of how commits
 /// were made (terminal, worker, cherry-pick, etc.).
 fn check_staleness_from_git(project_root: &Path) -> Option<CodemapStaleness> {
-    // Get the timestamp of the last commit that touched CODEMAP.md
-    let codemap_timestamp = get_codemap_last_commit_timestamp(project_root)?;
-
-    // Find structural changes (A/D/R) since that timestamp
-    let changes = get_structural_changes_since(project_root, &codemap_timestamp)?;
+    let changes = get_structural_changes_after_codemap(project_root)?;
 
     if changes.is_empty() {
         return None;
@@ -362,12 +358,12 @@ fn check_staleness_from_git(project_root: &Path) -> Option<CodemapStaleness> {
     Some(make_staleness(total_changes, file_list, String::new()))
 }
 
-/// Get the ISO timestamp of the last commit that modified .claude/CODEMAP.md.
+/// Get the object ID of the last commit that modified .claude/CODEMAP.md.
 ///
 /// Returns None if CODEMAP.md has never been committed or git fails.
-fn get_codemap_last_commit_timestamp(project_root: &Path) -> Option<String> {
+fn get_codemap_last_commit(project_root: &Path) -> Option<String> {
     let output = std::process::Command::new("git")
-        .args(["log", "-1", "--format=%cI", "--", ".claude/CODEMAP.md"])
+        .args(["log", "-1", "--format=%H", "--", ".claude/CODEMAP.md"])
         .current_dir(project_root)
         .output()
         .ok()?;
@@ -376,17 +372,24 @@ fn get_codemap_last_commit_timestamp(project_root: &Path) -> Option<String> {
         return None;
     }
 
-    let timestamp = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if timestamp.is_empty() {
-        // CODEMAP.md exists on disk but was never committed — treat as stale
-        // Fall back to file mtime
-        return get_codemap_mtime_timestamp(project_root);
-    }
-
-    Some(timestamp)
+    let commit = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!commit.is_empty()).then_some(commit)
 }
 
-/// Fallback: get CODEMAP.md's file modification time as an ISO timestamp.
+/// Find structural changes after the CODEMAP baseline.
+///
+/// Committed maps use a strict commit range so their same-commit siblings are
+/// excluded. An uncommitted map retains the legacy mtime fallback.
+fn get_structural_changes_after_codemap(project_root: &Path) -> Option<Vec<CodemapChange>> {
+    if let Some(commit) = get_codemap_last_commit(project_root) {
+        return get_structural_changes_after(project_root, &commit);
+    }
+
+    let timestamp = get_codemap_mtime_timestamp(project_root)?;
+    get_structural_changes_since(project_root, &timestamp)
+}
+
+/// Fallback baseline for a CODEMAP.md file that has never been committed.
 fn get_codemap_mtime_timestamp(project_root: &Path) -> Option<String> {
     let codemap_path = project_root.join(".claude/CODEMAP.md");
     let metadata = std::fs::metadata(&codemap_path).ok()?;
@@ -395,20 +398,39 @@ fn get_codemap_mtime_timestamp(project_root: &Path) -> Option<String> {
     Some(datetime.to_rfc3339())
 }
 
-/// Find structural file changes (A/D/R) in git history since the given timestamp.
+/// Find structural file changes (A/D/R) committed after the given commit.
 ///
-/// Uses `git log --diff-filter=ADR --name-status --since=<timestamp>` bounded
-/// by the timestamp for performance (<500ms).
+/// The `<commit>..HEAD` revision range is deliberately strict: paths changed in
+/// the same commit as CODEMAP.md were available to that update and are not drift.
+fn get_structural_changes_after(
+    project_root: &Path,
+    codemap_commit: &str,
+) -> Option<Vec<CodemapChange>> {
+    let revision_range = format!("{codemap_commit}..HEAD");
+    query_structural_history(project_root, &revision_range)
+}
+
+/// Find structural file changes (A/D/R) since the given timestamp.
+///
+/// This is only used for the uncommitted-CODEMAP mtime fallback.
 fn get_structural_changes_since(
     project_root: &Path,
-    since: &str,
+    timestamp: &str,
+) -> Option<Vec<CodemapChange>> {
+    query_structural_history(project_root, &format!("--since={timestamp}"))
+}
+
+/// Run the shared structural-history query with a commit range or date option.
+fn query_structural_history(
+    project_root: &Path,
+    revision_selector: &str,
 ) -> Option<Vec<CodemapChange>> {
     let output = std::process::Command::new("git")
         .args([
             "log",
+            revision_selector,
             "--diff-filter=ADR",
             "--name-status",
-            &format!("--since={since}"),
             "--format=",
             "--no-renames",       // show as A+D instead of R for simplicity
             "-z",                 // NUL-delimited for safety with special chars
@@ -540,8 +562,7 @@ pub fn codemap_stop_reminder(cas_root: &Path) -> Option<String> {
         return None;
     }
 
-    let timestamp = get_codemap_last_commit_timestamp(project_root)?;
-    let changes = get_structural_changes_since(project_root, &timestamp)?;
+    let changes = get_structural_changes_after_codemap(project_root)?;
     if changes.is_empty() {
         return None;
     }
@@ -828,13 +849,105 @@ mod tests {
         fs::write(cas_root.join(CODEMAP_PENDING_FILE), pending_json).unwrap();
 
         // With Strategy A: pending file is NOT consulted; git is the authority.
-        // There is no git repo here, so git returns no timestamp → check_staleness_from_git
+        // There is no git repo here, so git returns no commit → check_staleness_from_git
         // returns None → check_codemap_freshness returns None (up to date).
         let result = check_codemap_freshness(&cas_root);
         assert!(
             result.is_none(),
             "pending-ledger entries must not mark codemap stale when git shows up to date"
         );
+    }
+
+    #[test]
+    fn test_codemap_freshness_ignores_files_added_in_codemap_commit() {
+        use std::fs;
+        use std::process::Command;
+
+        let dir = tempfile::tempdir().unwrap();
+        let project_root = dir.path();
+        let cas_root = project_root.join(".cas");
+        fs::create_dir_all(&cas_root).unwrap();
+        fs::create_dir_all(project_root.join(".claude")).unwrap();
+        fs::create_dir_all(project_root.join("src")).unwrap();
+        fs::write(project_root.join(".claude/CODEMAP.md"), "# Codemap\n").unwrap();
+        fs::write(project_root.join("src/new.rs"), "pub fn new() {}\n").unwrap();
+
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(project_root)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.name", "CAS Test"]);
+        git(&["config", "user.email", "cas-test@example.invalid"]);
+        git(&["add", ".claude/CODEMAP.md", "src/new.rs"]);
+        git(&["commit", "-q", "-m", "update codemap with new source"]);
+
+        assert!(
+            check_codemap_freshness(&cas_root).is_none(),
+            "a file added in the CODEMAP commit is not subsequent drift"
+        );
+    }
+
+    #[test]
+    fn test_codemap_freshness_detects_file_added_after_codemap_commit() {
+        use std::fs;
+        use std::process::Command;
+
+        let dir = tempfile::tempdir().unwrap();
+        let project_root = dir.path();
+        let cas_root = project_root.join(".cas");
+        fs::create_dir_all(&cas_root).unwrap();
+        fs::create_dir_all(project_root.join(".claude")).unwrap();
+        fs::create_dir_all(project_root.join("src")).unwrap();
+        fs::write(project_root.join(".claude/CODEMAP.md"), "# Codemap\n").unwrap();
+
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(project_root)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.name", "CAS Test"]);
+        git(&["config", "user.email", "cas-test@example.invalid"]);
+        git(&["add", ".claude/CODEMAP.md"]);
+        git(&["commit", "-q", "-m", "add codemap"]);
+
+        fs::write(project_root.join("src/later.rs"), "pub fn later() {}\n").unwrap();
+        git(&["add", "src/later.rs"]);
+        git(&["commit", "-q", "-m", "add later source"]);
+
+        let staleness = check_codemap_freshness(&cas_root)
+            .expect("a structural file committed after CODEMAP.md must be drift");
+        match staleness {
+            CodemapStaleness::Stale {
+                total_changes,
+                file_list,
+                ..
+            } => {
+                assert_eq!(total_changes, 1);
+                assert_eq!(file_list, vec!["+src/later.rs"]);
+            }
+            other => panic!("expected ordinary stale result, got {other:?}"),
+        }
+
+        let reminder = codemap_stop_reminder(&cas_root)
+            .expect("the stop reminder must share the positive freshness path");
+        assert!(reminder.contains("1 pending structural change(s)"));
     }
 
     #[test]

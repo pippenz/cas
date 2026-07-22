@@ -2566,6 +2566,33 @@ This is the body content."#;
     }
 
     #[test]
+    fn test_cas_code_review_documents_dropped_findings_contract() {
+        for (label, skills) in [
+            ("claude", BUILTIN_SKILLS),
+            ("codex", CODEX_BUILTIN_SKILLS),
+            ("grok", GROK_BUILTIN_SKILLS),
+        ] {
+            let entry = skills
+                .iter()
+                .find(|b| b.path == "skills/cas-code-review/SKILL.md")
+                .unwrap_or_else(|| panic!("{label}: skills/cas-code-review/SKILL.md missing"));
+            for required in [
+                "\"dropped\": DroppedFinding[]",
+                "schema_validation_failed",
+                "validation_errors",
+                "confidence_below_threshold",
+                "stats.dropped_findings",
+                "exactly `dropped.length`",
+            ] {
+                assert!(
+                    entry.content.contains(required),
+                    "{label}: cas-code-review SKILL.md missing dropped-finding contract marker: {required:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_code_reviewer_agent_is_deprecation_stub() {
         // EPIC cas-0750: the legacy code-reviewer agent is replaced by the
         // cas-code-review skill. The file is kept in BUILTIN_AGENTS only to
@@ -3414,6 +3441,7 @@ This is the body content."#;
         for (label, set) in [
             ("BUILTIN_SKILLS", BUILTIN_SKILLS),
             ("CODEX_BUILTIN_SKILLS", CODEX_BUILTIN_SKILLS),
+            ("GROK_BUILTIN_SKILLS", GROK_BUILTIN_SKILLS),
         ] {
             for path in [
                 "skills/cas-worker/references/close-gate.md",
@@ -3423,7 +3451,14 @@ This is the body content."#;
                     .iter()
                     .find(|b| b.path == path)
                     .unwrap_or_else(|| panic!("{label} missing {path}"));
-                for required in ["MERGE REQUIRED", "gh pr create", "status=closed"] {
+                for required in [
+                    "MERGE REQUIRED",
+                    "gh pr create",
+                    "status=closed",
+                    "injected messages",
+                    "`queue_poll` does not expose them",
+                    "git rev-parse factory/<name>",
+                ] {
                     assert!(
                         entry.content.contains(required),
                         "{label} {path} missing merge-state guidance marker: {required:?}"
@@ -3451,8 +3486,18 @@ This is the body content."#;
                 "codex cas-worker.md",
                 include_str!("builtins/codex/skills/cas-worker.md"),
             ),
+            (
+                "grok cas-worker.md",
+                include_str!("builtins/grok/skills/cas-worker.md"),
+            ),
         ] {
-            for required in ["MERGE REQUIRED", "literal string `supervisor`"] {
+            for required in [
+                "MERGE REQUIRED",
+                "literal string `supervisor`",
+                "injected messages",
+                "`queue_poll` does not expose them",
+                "current factory-branch tip SHA",
+            ] {
                 assert!(
                     guide.contains(required),
                     "{label} missing worker-protocol marker: {required:?}"

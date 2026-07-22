@@ -4,7 +4,7 @@
  * Extracted from .claude/workflows/cas-code-review-prototype.js (cas-e4d4).
  * Implements the 7-step merge defined in cas-code-review SKILL.md §Step 4:
  *
- *   1. Schema validation (pre-assumed: inputs are valid ReviewerOutput objects)
+ *   1. Schema validation — malformed findings are retained in dropped[] with diagnostics
  *   2. Confidence gate — suppress confidence < 0.60 except P0 ≥ 0.50
  *   3. Fingerprint deduplication (file + line-bucket ±3 + normalised title)
  *   4. Cross-reviewer confidence boost — +0.10 per additional agreeing reviewer (cap 1.0)
@@ -33,6 +33,80 @@ export const OWNER_RANK = Object.freeze({
   'downstream-resolver': 1,
   'review-fixer': 0,
 })
+
+const FINDING_REQUIRED_FIELDS = Object.freeze([
+  'title', 'severity', 'file', 'line', 'why_it_matters', 'autofix_class',
+  'owner', 'confidence', 'evidence', 'pre_existing',
+])
+
+const FINDING_ALLOWED_FIELDS = new Set([
+  ...FINDING_REQUIRED_FIELDS, 'suggested_fix', 'requires_verification',
+])
+
+const VALID_SEVERITIES = new Set(['P0', 'P1', 'P2', 'P3'])
+const VALID_AUTOFIX_CLASSES = new Set(['safe_auto', 'gated_auto', 'manual', 'advisory'])
+const VALID_OWNERS = new Set(['review-fixer', 'downstream-resolver', 'human'])
+
+export function findingValidationErrors(finding) {
+  if (!finding || typeof finding !== 'object' || Array.isArray(finding)) {
+    return ['finding must be an object']
+  }
+
+  const errors = []
+  for (const field of FINDING_REQUIRED_FIELDS) {
+    if (!Object.hasOwn(finding, field)) errors.push(`missing required field: ${field}`)
+  }
+
+  if (Object.hasOwn(finding, 'title') &&
+      (typeof finding.title !== 'string' || finding.title.length > 100)) {
+    errors.push('title must be a string of at most 100 characters')
+  }
+  if (Object.hasOwn(finding, 'severity') && !VALID_SEVERITIES.has(finding.severity)) {
+    errors.push('severity must be one of P0, P1, P2, P3')
+  }
+  if (Object.hasOwn(finding, 'file') && typeof finding.file !== 'string') {
+    errors.push('file must be a string')
+  }
+  if (Object.hasOwn(finding, 'line') &&
+      (!Number.isInteger(finding.line) || finding.line < 1)) {
+    errors.push('line must be an integer greater than or equal to 1')
+  }
+  if (Object.hasOwn(finding, 'why_it_matters') && typeof finding.why_it_matters !== 'string') {
+    errors.push('why_it_matters must be a string')
+  }
+  if (Object.hasOwn(finding, 'autofix_class') &&
+      !VALID_AUTOFIX_CLASSES.has(finding.autofix_class)) {
+    errors.push('autofix_class must be safe_auto, gated_auto, manual, or advisory')
+  }
+  if (Object.hasOwn(finding, 'owner') && !VALID_OWNERS.has(finding.owner)) {
+    errors.push('owner must be review-fixer, downstream-resolver, or human')
+  }
+  if (Object.hasOwn(finding, 'confidence') &&
+      (typeof finding.confidence !== 'number' || !Number.isFinite(finding.confidence) ||
+       finding.confidence < 0 || finding.confidence > 1)) {
+    errors.push('confidence must be a number between 0.0 and 1.0')
+  }
+  if (Object.hasOwn(finding, 'evidence') &&
+      (!Array.isArray(finding.evidence) || finding.evidence.length < 1 ||
+       finding.evidence.some(item => typeof item !== 'string'))) {
+    errors.push('evidence must be a non-empty array of strings')
+  }
+  if (Object.hasOwn(finding, 'pre_existing') && typeof finding.pre_existing !== 'boolean') {
+    errors.push('pre_existing must be a boolean')
+  }
+  if (Object.hasOwn(finding, 'suggested_fix') && typeof finding.suggested_fix !== 'string') {
+    errors.push('suggested_fix must be a string when present')
+  }
+  if (Object.hasOwn(finding, 'requires_verification') &&
+      typeof finding.requires_verification !== 'boolean') {
+    errors.push('requires_verification must be a boolean when present')
+  }
+
+  for (const field of Object.keys(finding)) {
+    if (!FINDING_ALLOWED_FIELDS.has(field)) errors.push(`unexpected field: ${field}`)
+  }
+  return errors
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // FINGERPRINT
@@ -78,21 +152,54 @@ export function fingerprint(f) {
  *     - findings: Finding[]
  *     - residual_risks?: string[]
  *     - testing_gaps?: string[]
- * @returns {{ residual: Finding[], pre_existing: Finding[] }}
+ * @returns {{ residual: Finding[], pre_existing: Finding[], dropped: object[] }}
  */
 export function mergeFindings(reviewerOutputs) {
-  // Step 1: Collect all findings from valid (non-null) envelopes.
-  // Schema validation is pre-assumed (done by Workflow schema option).
-  const allFindings = reviewerOutputs
-    .filter(Boolean)
-    .flatMap(r => r.findings || [])
+  // Step 1: Collect and validate findings. Workflow schemas should normally
+  // enforce this contract, but adapter output must still be lossless if an
+  // under-filled finding reaches the deterministic merge.
+  const collected = []
+  reviewerOutputs.filter(Boolean).forEach((output, index) => {
+    const reviewer = typeof output.reviewer === 'string'
+      ? output.reviewer
+      : `unknown-reviewer-${index}`
+    const findings = Array.isArray(output.findings) ? output.findings : []
+    for (const finding of findings) collected.push({ reviewer, finding })
+  })
+
+  const dropped = []
+  const valid = []
+  for (const item of collected) {
+    const validationErrors = findingValidationErrors(item.finding)
+    if (validationErrors.length > 0) {
+      dropped.push({
+        reviewer: item.reviewer,
+        reason: 'schema_validation_failed',
+        validation_errors: validationErrors,
+        finding: item.finding,
+      })
+    } else {
+      valid.push(item)
+    }
+  }
 
   // Step 2: Confidence gate.
   //   P0:  confidence ≥ 0.50 (stakes too high to suppress at 0.60)
   //   P1–P3: confidence ≥ 0.60
-  const gated = allFindings.filter(f =>
-    f.severity === 'P0' ? f.confidence >= 0.50 : f.confidence >= 0.60
-  )
+  const gated = []
+  for (const item of valid) {
+    const threshold = item.finding.severity === 'P0' ? 0.50 : 0.60
+    if (item.finding.confidence >= threshold) {
+      gated.push(item.finding)
+    } else {
+      dropped.push({
+        reviewer: item.reviewer,
+        reason: 'confidence_below_threshold',
+        threshold,
+        finding: item.finding,
+      })
+    }
+  }
 
   // Steps 3 + 4 + 6: Fingerprint dedup, cross-reviewer boost, owner resolution.
   // All three are processed in a single pass for efficiency.
@@ -139,5 +246,5 @@ export function mergeFindings(reviewerOutputs) {
     (b.confidence - a.confidence)
   )
 
-  return { residual, pre_existing }
+  return { residual, pre_existing, dropped }
 }

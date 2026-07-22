@@ -108,6 +108,9 @@ pub struct AgentSummary {
     pub id: String,
     pub name: String,
     pub status: AgentStatus,
+    /// When this agent registered. Used as the ready/idle-transition baseline
+    /// for suppressing a redundant director nudge after supervisor contact.
+    pub registered_at: chrono::DateTime<chrono::Utc>,
     pub current_task: Option<String>,
     /// Latest activity (description, timestamp)
     pub latest_activity: Option<(String, chrono::DateTime<chrono::Utc>)>,
@@ -117,6 +120,11 @@ pub struct AgentSummary {
     /// this agent. Used by the idle detector to suppress `WorkerIdle` when
     /// the worker has unread messages (spawn race mitigation, cas-afb7).
     pub pending_messages: u32,
+    /// Pending subset authored by a live supervisor in this factory session.
+    pub pending_supervisor_messages: u32,
+    /// Most recent prompt-queue message from this factory session's
+    /// supervisor(s), including already-processed rows.
+    pub latest_supervisor_message_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Active task lease state, resolved directly from task_leases. This stays
     /// separate from `current_task` because an agent can appear idle while a
     /// task row remains InProgress after a rejected close.
@@ -397,6 +405,11 @@ impl DirectorData {
         // freshly spawned worker has unread messages waiting in the queue before
         // it has had a chance to poll them (spawn race fix, cas-afb7).
         let agent_names_for_pq: Vec<&str> = agents_list.iter().map(|a| a.name.as_str()).collect();
+        let supervisor_sources: Vec<&str> = agents_list
+            .iter()
+            .filter(|a| a.role == AgentRole::Supervisor)
+            .flat_map(|a| [a.name.as_str(), a.id.as_str()])
+            .collect();
         let pending_msgs: Vec<QueuedPrompt> =
             if let Some(pq) = stores.and_then(|s| s.prompt_queue_store.as_ref()) {
                 pq.peek_for_targets(&agent_names_for_pq, factory_session.as_deref(), 500)
@@ -411,9 +424,35 @@ impl DirectorData {
                     .unwrap_or_default()
             };
         let mut pending_counts: HashMap<String, u32> = HashMap::new();
+        let mut pending_supervisor_counts: HashMap<String, u32> = HashMap::new();
         for msg in pending_msgs {
-            *pending_counts.entry(msg.target).or_insert(0) += 1;
+            let target = msg.target;
+            if supervisor_sources.contains(&msg.source.as_str()) {
+                *pending_supervisor_counts.entry(target.clone()).or_insert(0) += 1;
+            }
+            *pending_counts.entry(target).or_insert(0) += 1;
         }
+        let latest_supervisor_messages =
+            if let Some(pq) = stores.and_then(|s| s.prompt_queue_store.as_ref()) {
+                pq.latest_created_at_for_targets_from_sources(
+                    &supervisor_sources,
+                    &agent_names_for_pq,
+                    factory_session.as_deref(),
+                )
+                .unwrap_or_default()
+            } else {
+                SqlitePromptQueueStore::open(cas_dir)
+                    .ok()
+                    .and_then(|pq| {
+                        pq.latest_created_at_for_targets_from_sources(
+                            &supervisor_sources,
+                            &agent_names_for_pq,
+                            factory_session.as_deref(),
+                        )
+                        .ok()
+                    })
+                    .unwrap_or_default()
+            };
 
         let mut agent_id_to_name = HashMap::new();
         let agents: Vec<AgentSummary> = agents_list
@@ -441,6 +480,10 @@ impl DirectorData {
                 let current_task = assignee_tasks.get(&a.name).cloned();
                 let latest_activity = agent_latest_activity.get(&a.id).cloned();
                 let pending_messages = pending_counts.get(&a.name).copied().unwrap_or(0);
+                let pending_supervisor_messages =
+                    pending_supervisor_counts.get(&a.name).copied().unwrap_or(0);
+                let latest_supervisor_message_at =
+                    latest_supervisor_messages.get(&a.name).copied();
                 let effort = a
                     .metadata
                     .get("worker_effort")
@@ -495,10 +538,13 @@ impl DirectorData {
                     id: a.id,
                     name: a.name,
                     status: display_status,
+                    registered_at: a.registered_at,
                     current_task,
                     latest_activity,
                     last_heartbeat: Some(a.last_heartbeat),
                     pending_messages,
+                    pending_supervisor_messages,
+                    latest_supervisor_message_at,
                     active_lease,
                     effort,
                 }

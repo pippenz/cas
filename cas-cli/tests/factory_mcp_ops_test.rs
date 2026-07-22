@@ -6,9 +6,10 @@
 //!
 //! # Running
 //! Some tests modify process-global environment variables (`CAS_AGENT_ROLE`,
-//! `CAS_FACTORY_WORKER_NAMES`). Run single-threaded to avoid races:
+//! `CAS_FACTORY_WORKER_NAMES`). Those tests use a process-wide, poison-tolerant
+//! lock, so the target is safe to run with Cargo's default parallelism:
 //! ```bash
-//! cargo test --test factory_mcp_ops_test -- --nocapture --test-threads=1
+//! cargo test --test factory_mcp_ops_test -- --nocapture
 //! ```
 
 use std::collections::HashMap;
@@ -225,11 +226,19 @@ impl FactoryTestEnv {
     }
 }
 
-/// Mutex to serialize tests that modify environment variables.
-/// Env vars are process-global, so concurrent tests would interfere.
-static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// Serialize environment mutations across this entire integration-test process.
+///
+/// Poison-tolerant for the same reason as `hooks::test_env_lock`: a failed test
+/// must not turn one env-related failure into a cascade of mutex-poison panics.
+fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    use std::sync::{Mutex, OnceLock};
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+}
 
-/// RAII guard for environment variables. Acquires ENV_MUTEX.
+/// RAII guard for environment variables. Acquires the process-wide test lock.
 struct EnvGuard {
     saved: Vec<(String, Option<String>)>,
     _lock: std::sync::MutexGuard<'static, ()>,
@@ -237,7 +246,7 @@ struct EnvGuard {
 
 impl EnvGuard {
     fn set(vars: &[(&str, &str)]) -> Self {
-        let lock = ENV_MUTEX.lock().unwrap();
+        let lock = test_env_lock();
         let mut saved = Vec::with_capacity(vars.len());
         for (key, value) in vars {
             let key = (*key).to_string();
@@ -249,7 +258,7 @@ impl EnvGuard {
     }
 
     fn set_optional(vars: &[(&str, Option<&str>)]) -> Self {
-        let lock = ENV_MUTEX.lock().unwrap();
+        let lock = test_env_lock();
         let mut saved = Vec::with_capacity(vars.len());
         for (key, value) in vars {
             let key = (*key).to_string();
@@ -959,14 +968,13 @@ async fn test_shutdown_workers_all() {
 
 #[tokio::test]
 async fn test_shutdown_workers_supervisor_scoping() {
-    let env = FactoryTestEnv::new();
-    env.register_worker("owned-1");
-    env.register_worker("other-1");
-
     let _guard = EnvGuard::set(&[
         ("CAS_AGENT_ROLE", "supervisor"),
         ("CAS_FACTORY_WORKER_NAMES", "owned-1"),
     ]);
+    let env = FactoryTestEnv::new();
+    env.register_worker("owned-1");
+    env.register_worker("other-1");
 
     // Empty worker_names should auto-scope to owned workers
     let req = factory_req("shutdown_workers");

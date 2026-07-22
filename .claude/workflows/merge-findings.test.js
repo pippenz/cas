@@ -8,7 +8,12 @@
 
 import { test, describe } from 'node:test'
 import assert from 'node:assert/strict'
-import { mergeFindings, fingerprint, OWNER_RANK } from './merge-findings.js'
+import {
+  mergeFindings,
+  findingValidationErrors,
+  fingerprint,
+  OWNER_RANK,
+} from './merge-findings.js'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // FIXTURES
@@ -35,16 +40,77 @@ function reviewerOutput(reviewer, findings) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// UNIT TESTS — FINDING VALIDATION
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('findingValidationErrors()', () => {
+  test('accepts a schema-complete finding', () => {
+    assert.deepEqual(findingValidationErrors(finding()), [])
+  })
+
+  test('rejects non-object values', () => {
+    assert.deepEqual(findingValidationErrors(null), ['finding must be an object'])
+    assert.deepEqual(findingValidationErrors([]), ['finding must be an object'])
+  })
+
+  test('reports every missing required field', () => {
+    assert.deepEqual(
+      findingValidationErrors({}),
+      [
+        'missing required field: title',
+        'missing required field: severity',
+        'missing required field: file',
+        'missing required field: line',
+        'missing required field: why_it_matters',
+        'missing required field: autofix_class',
+        'missing required field: owner',
+        'missing required field: confidence',
+        'missing required field: evidence',
+        'missing required field: pre_existing',
+      ],
+    )
+  })
+
+  const invalidCases = [
+    ['non-string title', { title: 42 }, 'title must be a string of at most 100 characters'],
+    ['title over 100 characters', { title: 'x'.repeat(101) }, 'title must be a string of at most 100 characters'],
+    ['bad severity enum', { severity: 'critical' }, 'severity must be one of P0, P1, P2, P3'],
+    ['non-string file', { file: 42 }, 'file must be a string'],
+    ['non-integer line', { line: 1.5 }, 'line must be an integer greater than or equal to 1'],
+    ['line below one', { line: 0 }, 'line must be an integer greater than or equal to 1'],
+    ['non-string rationale', { why_it_matters: false }, 'why_it_matters must be a string'],
+    ['bad autofix enum', { autofix_class: 'automatic' }, 'autofix_class must be safe_auto, gated_auto, manual, or advisory'],
+    ['bad owner enum', { owner: 'worker' }, 'owner must be review-fixer, downstream-resolver, or human'],
+    ['confidence below zero', { confidence: -0.01 }, 'confidence must be a number between 0.0 and 1.0'],
+    ['confidence above one', { confidence: 1.01 }, 'confidence must be a number between 0.0 and 1.0'],
+    ['non-finite confidence', { confidence: Number.NaN }, 'confidence must be a number between 0.0 and 1.0'],
+    ['empty evidence', { evidence: [] }, 'evidence must be a non-empty array of strings'],
+    ['non-string evidence item', { evidence: [42] }, 'evidence must be a non-empty array of strings'],
+    ['non-boolean pre-existing flag', { pre_existing: 'false' }, 'pre_existing must be a boolean'],
+    ['non-string suggested fix', { suggested_fix: 42 }, 'suggested_fix must be a string when present'],
+    ['non-boolean verification flag', { requires_verification: 'yes' }, 'requires_verification must be a boolean when present'],
+    ['unexpected field', { mystery: true }, 'unexpected field: mystery'],
+  ]
+
+  for (const [name, override, expected] of invalidCases) {
+    test(`rejects ${name}`, () => {
+      assert.deepEqual(findingValidationErrors(finding(override)), [expected])
+    })
+  }
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
 // UNIT TESTS — 7 steps
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe('mergeFindings()', () => {
 
   // ── Step 1: empty input ──────────────────────────────────────────────────
-  test('empty input returns empty residual and pre_existing', () => {
-    const { residual, pre_existing } = mergeFindings([])
+  test('empty input returns empty residual, pre_existing, and dropped', () => {
+    const { residual, pre_existing, dropped } = mergeFindings([])
     assert.deepEqual(residual, [])
     assert.deepEqual(pre_existing, [])
+    assert.deepEqual(dropped, [])
   })
 
   test('null entries in input are skipped', () => {
@@ -58,6 +124,29 @@ describe('mergeFindings()', () => {
       reviewerOutput('testing', []),
     ])
     assert.deepEqual(residual, [])
+  })
+
+  test('under-filled finding is surfaced in dropped instead of disappearing', () => {
+    const underFilled = {
+      title: 'Important independent finding',
+      severity: 'P1',
+      file: 'src/foo.rs',
+      line: 42,
+      why_it_matters: 'The wrapper omitted required merge metadata.',
+    }
+
+    const { residual, pre_existing, dropped } = mergeFindings([
+      reviewerOutput('gpt-5.5:independent', [underFilled]),
+    ])
+
+    assert.deepEqual(residual, [])
+    assert.deepEqual(pre_existing, [])
+    assert.equal(dropped.length, 1)
+    assert.equal(dropped[0].reviewer, 'gpt-5.5:independent')
+    assert.equal(dropped[0].reason, 'schema_validation_failed')
+    assert.deepEqual(dropped[0].finding, underFilled)
+    assert.ok(dropped[0].validation_errors.includes('missing required field: confidence'))
+    assert.ok(dropped[0].validation_errors.includes('missing required field: evidence'))
   })
 
   // ── Step 2: confidence gate ──────────────────────────────────────────────
@@ -99,6 +188,24 @@ describe('mergeFindings()', () => {
       reviewerOutput('correctness', [finding({ severity: 'P1', confidence: 0.59 })])
     ])
     assert.equal(fail.length, 0)
+  })
+
+  test('confidence-gated finding is surfaced in dropped with its threshold', () => {
+    const lowConfidence = finding({
+      title: 'Factory hook matcher omits AskUserQuestion',
+      severity: 'P1',
+      confidence: 0.55,
+    })
+    const { residual, dropped } = mergeFindings([
+      reviewerOutput('gpt-5.5:independent', [lowConfidence]),
+    ])
+
+    assert.deepEqual(residual, [])
+    assert.equal(dropped.length, 1)
+    assert.equal(dropped[0].reviewer, 'gpt-5.5:independent')
+    assert.equal(dropped[0].reason, 'confidence_below_threshold')
+    assert.equal(dropped[0].threshold, 0.60)
+    assert.deepEqual(dropped[0].finding, lowConfidence)
   })
 
   // ── Step 3: fingerprint deduplication ────────────────────────────────────

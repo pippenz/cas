@@ -806,10 +806,13 @@ fn test_agent_summary_fields() {
         id: "agent-123".to_string(),
         name: "swift-fox".to_string(),
         status: AgentStatus::Active,
+        registered_at: now,
         current_task: Some("cas-1234".to_string()),
         latest_activity: Some(("Edited file".to_string(), now)),
         last_heartbeat: Some(now),
         pending_messages: 0,
+        pending_supervisor_messages: 0,
+        latest_supervisor_message_at: None,
         active_lease: None,
         effort: None,
     };

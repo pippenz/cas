@@ -24,7 +24,7 @@ You execute tasks assigned by the Supervisor. You may be working in an isolated 
    - **Success** → message the supervisor, then go back to step 1. Do not pull the next ready task yourself — wait for the next explicit assignment.
    - **queued for supervisor review** → task is in `pending_supervisor_review`. No action needed; wait for supervisor feedback.
    - **verification-required** → message supervisor immediately. Do NOT spawn verifier agents or retry close.
-   - **MERGE REQUIRED** → your commits aren't on the parent branch yet. See the merge-state section of [references/recovery.md](cas-worker/references/recovery.md) — and never route around it by setting `status=closed` yourself.
+   - **MERGE REQUIRED** → before escalating, re-read any just-delivered supervisor messages in your conversation; supervisor replies arrive as injected messages, and `queue_poll` does not expose them. If escalation is still needed, include the current factory-branch tip SHA and say it is fresh after re-reading those delivered messages. See [references/recovery.md](cas-worker/references/recovery.md), and never route around the guard by setting `status=closed` yourself.
    - **VERIFICATION_JAIL_BLOCKED** → see [references/recovery.md](cas-worker/references/recovery.md). Forward once, then trust the DB.
 
 ## Task Types
@@ -92,6 +92,14 @@ Before setting `status=blocked`, re-read with `action=show`. If the task already
 ## Running Scripts Against Prod
 
 For Vercel-deployed projects, `vercel env pull .env.<env> --environment=<env>` (run from the linked project dir) pulls real credentials for prod services (Neon, QStash, etc.) into a local file. Add that file to `.gitignore` — never commit credentials.
+
+## Running the Full Test Suite in a Worker
+
+Factory identity variables inherited by worker processes can change test behavior. Use this canonical sanitized command for full-suite gates; do not shorten the list:
+
+```bash
+env -u CAS_AGENT_ROLE -u CAS_FACTORY_MODE -u CAS_FACTORY_SUPERVISOR_CLI -u CAS_FACTORY_WORKER_CLI -u CAS_SESSION_ID -u CAS_FACTORY_SESSION -u CAS_AGENT_ID -u CAS_TASK_ID cargo test --no-fail-fast
+```
 
 ## References
 

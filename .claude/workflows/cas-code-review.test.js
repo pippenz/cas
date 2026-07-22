@@ -48,16 +48,25 @@ import {
   personasRunCount,
 } from './cas-code-review-constants.js'
 
-import { mergeFindings } from './merge-findings.js'
+import { mergeFindings, findingValidationErrors } from './merge-findings.js'
 
 const CANONICAL_ALWAYS_ON = ['correctness', 'testing', 'maintainability', 'project-standards']
 const CANONICAL_CONDITIONAL = ['security', 'performance', 'adversarial']
 const CANONICAL_ALL = [...CANONICAL_ALWAYS_ON, ...CANONICAL_CONDITIONAL, 'fallow']
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor
+const WORKFLOW_SOURCE = readFileSync(new URL('./cas-code-review.js', import.meta.url), 'utf8')
 
-async function runWorkflowDryRun(args, setupOverride = {}) {
-  const source = readFileSync(new URL('./cas-code-review.js', import.meta.url), 'utf8')
-    .replace('export const meta =', 'const meta =')
+function loadEmbeddedMergeApi() {
+  const start = WORKFLOW_SOURCE.indexOf('const OWNER_RANK =')
+  const end = WORKFLOW_SOURCE.indexOf('// HELPERS', start)
+  assert.notEqual(start, -1, 'embedded merge pipeline start marker must exist')
+  assert.notEqual(end, -1, 'embedded merge pipeline end marker must exist')
+  const source = WORKFLOW_SOURCE.slice(start, end)
+  return new Function(`${source}\nreturn { findingValidationErrors, mergeFindings }`)()
+}
+
+async function runWorkflowDryRun(args, setupOverride = {}, agentOverrides = {}) {
+  const source = WORKFLOW_SOURCE.replace('export const meta =', 'const meta =')
   const labels = []
   const logs = []
   async function agent(_prompt, options = {}) {
@@ -71,6 +80,9 @@ async function runWorkflowDryRun(args, setupOverride = {}) {
         fallow_skip_reason: 'non-JS/TS repo',
         ...setupOverride,
       }
+    }
+    if (Object.hasOwn(agentOverrides, options.label)) {
+      return agentOverrides[options.label]
     }
     return {
       reviewer: options.label,
@@ -93,6 +105,97 @@ async function runWorkflowDryRun(args, setupOverride = {}) {
   const result = await workflow(args, agent, pipeline, phase, log)
   return { result, labels, logs }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MERGE IMPLEMENTATION PARITY
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('merge implementation parity', () => {
+  test('source Workflow is byte-identical to the shipped builtin copy', () => {
+    const builtin = readFileSync(
+      new URL('../../cas-cli/src/builtins/workflows/cas-code-review.js', import.meta.url),
+      'utf8',
+    )
+    assert.equal(
+      WORKFLOW_SOURCE,
+      builtin,
+      'edit .claude and builtin cas-code-review Workflows together',
+    )
+  })
+
+  test('standalone exported validator matches the embedded Workflow validator', () => {
+    const embedded = loadEmbeddedMergeApi()
+    const candidates = [
+      null,
+      {},
+      {
+        title: 'Valid finding',
+        severity: 'P2',
+        file: 'src/lib.rs',
+        line: 12,
+        why_it_matters: 'It matters.',
+        autofix_class: 'manual',
+        owner: 'downstream-resolver',
+        confidence: 0.8,
+        evidence: ['src/lib.rs:12'],
+        pre_existing: false,
+      },
+      {
+        title: 'x'.repeat(101),
+        severity: 'critical',
+        file: 42,
+        line: 0,
+        why_it_matters: false,
+        autofix_class: 'automatic',
+        owner: 'worker',
+        confidence: 2,
+        evidence: [],
+        pre_existing: 'no',
+        unexpected: true,
+      },
+    ]
+
+    for (const candidate of candidates) {
+      assert.deepEqual(
+        findingValidationErrors(candidate),
+        embedded.findingValidationErrors(candidate),
+      )
+    }
+  })
+
+  test('standalone merge output matches the embedded Workflow merge', () => {
+    const embedded = loadEmbeddedMergeApi()
+    const validFinding = {
+      title: 'Shared issue',
+      severity: 'P1',
+      file: 'src/lib.rs',
+      line: 12,
+      why_it_matters: 'It matters.',
+      autofix_class: 'manual',
+      owner: 'downstream-resolver',
+      confidence: 0.8,
+      evidence: ['src/lib.rs:12'],
+      pre_existing: false,
+    }
+    const reviewerOutputs = [
+      { reviewer: 'correctness', findings: [validFinding] },
+      {
+        reviewer: 'testing',
+        findings: [{ ...validFinding, line: 13, owner: 'human', confidence: 0.7 }],
+      },
+      {
+        reviewer: 'gpt-5.5:independent',
+        findings: [{ ...validFinding, title: 'Low confidence', confidence: 0.55 }],
+      },
+      { reviewer: 'maintainability', findings: [{ title: 'Under-filled' }] },
+    ]
+
+    assert.deepEqual(
+      mergeFindings(reviewerOutputs),
+      embedded.mergeFindings(reviewerOutputs),
+    )
+  })
+})
 
 // ─────────────────────────────────────────────────────────────────────────────
 // META BLOCK
@@ -241,6 +344,18 @@ describe('REVIEWER_OUTPUT_SCHEMA', () => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe('gpt-5.5 independent activation helpers', () => {
+  test('wrapper prompt requires every schema field and tells the adapter to fill omissions', () => {
+    const source = readFileSync(new URL('./cas-code-review.js', import.meta.url), 'utf8')
+    const promptStart = source.indexOf('function buildGpt55IndependentPrompt')
+    const promptEnd = source.indexOf('\nfunction gpt55ShouldRun', promptStart)
+    const prompt = source.slice(promptStart, promptEnd)
+
+    for (const field of REVIEWER_OUTPUT_SCHEMA.properties.findings.items.required) {
+      assert.ok(prompt.includes(field), `gpt-5.5 wrapper prompt must name required field: ${field}`)
+    }
+    assert.match(prompt, /infer conservative values for any metadata Codex omits/i)
+  })
+
   test('activates at broad file-count boundary', () => {
     assert.equal(gpt55ShouldRun({}, 4, 299), false)
     assert.equal(gpt55ShouldRun({}, 5, 299), true)
@@ -278,6 +393,44 @@ describe('gpt-5.5 independent activation helpers', () => {
   test('non-skipped gpt55 result has no skipped persona entry', () => {
     assert.deepEqual(gpt55SkippedPersonas({ findings: [] }), [])
     assert.deepEqual(gpt55SkippedPersonas(null), [])
+  })
+
+  test('workflow surfaces and logs confidence-gated independent findings', async () => {
+    const independentFinding = {
+      title: 'Factory hook matcher omits AskUserQuestion',
+      severity: 'P1',
+      file: 'cas-cli/src/ui/factory/daemon/runtime/teams.rs',
+      line: 361,
+      why_it_matters: 'The deny branch would be unreachable in real sessions.',
+      autofix_class: 'manual',
+      owner: 'downstream-resolver',
+      confidence: 0.55,
+      evidence: ['teams.rs matcher excludes AskUserQuestion'],
+      pre_existing: false,
+      requires_verification: true,
+    }
+    const { result, logs } = await runWorkflowDryRun({
+      diff_text: 'diff --git a/teams.rs b/teams.rs\n-old\n+new',
+      file_list: 'teams.rs',
+      base_sha: 'abc123',
+      gpt55_independent: true,
+    }, {}, {
+      'review:gpt-5.5:independent': {
+        reviewer: 'gpt-5.5:independent',
+        findings: [independentFinding],
+        residual_risks: [],
+        testing_gaps: [],
+      },
+    })
+
+    assert.deepEqual(result.residual, [])
+    assert.equal(result.dropped.length, 1)
+    assert.equal(result.dropped[0].reason, 'confidence_below_threshold')
+    assert.equal(result.dropped[0].reviewer, 'gpt-5.5:independent')
+    assert.equal(result.stats.dropped_findings, 1)
+    assert.ok(logs.some(line => line.includes(
+      'Dropped/unmergeable finding from gpt-5.5:independent'
+    )))
   })
 })
 

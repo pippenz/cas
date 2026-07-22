@@ -6,6 +6,7 @@
 use chrono::{DateTime, TimeZone, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -547,6 +548,18 @@ pub trait PromptQueueStore: Send + Sync {
         factory_session: Option<&str>,
         limit: usize,
     ) -> Result<Vec<QueuedPrompt>>;
+
+    /// Most recent message timestamp for each target from any of `sources`.
+    ///
+    /// Unlike the pending-message APIs, this includes processed rows. The
+    /// director uses it to remember that a supervisor has already handled a
+    /// worker's current idle transition after the transport drains the row.
+    fn latest_created_at_for_targets_from_sources(
+        &self,
+        sources: &[&str],
+        targets: &[&str],
+        factory_session: Option<&str>,
+    ) -> Result<HashMap<String, DateTime<Utc>>>;
 
     /// Mark a prompt as processed
     fn mark_processed(&self, prompt_id: i64) -> Result<()>;
@@ -1307,6 +1320,72 @@ impl PromptQueueStore for SqlitePromptQueueStore {
         Ok(Self::merge_two_lane_peeks(session_lane, legacy_lane, limit))
     }
 
+    fn latest_created_at_for_targets_from_sources(
+        &self,
+        sources: &[&str],
+        targets: &[&str],
+        factory_session: Option<&str>,
+    ) -> Result<HashMap<String, DateTime<Utc>>> {
+        if sources.is_empty() || targets.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let source_placeholders = std::iter::repeat_n("?", sources.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let target_placeholders = std::iter::repeat_n("?", targets.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let session_clause = if factory_session.is_some() {
+            "AND (factory_session = ? OR factory_session IS NULL)"
+        } else {
+            "AND factory_session IS NULL"
+        };
+        let sql = format!(
+            "SELECT target, created_at
+             FROM prompt_queue
+             WHERE id IN (
+                 SELECT MAX(id)
+                 FROM prompt_queue
+                 WHERE source IN ({source_placeholders})
+                   AND target IN ({target_placeholders})
+                   {session_clause}
+                 GROUP BY target
+             )"
+        );
+
+        let mut query_params: Vec<Box<dyn rusqlite::ToSql>> = sources
+            .iter()
+            .map(|value| Box::new((*value).to_string()) as Box<dyn rusqlite::ToSql>)
+            .chain(
+                targets
+                    .iter()
+                    .map(|value| Box::new((*value).to_string()) as Box<dyn rusqlite::ToSql>),
+            )
+            .collect();
+        if let Some(session) = factory_session {
+            query_params.push(Box::new(session.to_string()));
+        }
+
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(
+            rusqlite::params_from_iter(query_params.iter().map(|p| p.as_ref())),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )?;
+        let mut latest = HashMap::new();
+        for row in rows {
+            let (target, created_at) = row?;
+            if latest.contains_key(&target) {
+                continue;
+            }
+            if let Some(created_at) = Self::parse_datetime(&created_at) {
+                latest.insert(target, created_at);
+            }
+        }
+        Ok(latest)
+    }
+
     fn mark_processed(&self, prompt_id: i64) -> Result<()> {
         // Legacy API: sets processed_at only. Does **not** stamp authoritative
         // transport delivery (cas-2c5f). Prefer mark_transport_delivered /
@@ -1832,6 +1911,55 @@ mod tests {
 
         // Pending count should be 1
         assert_eq!(store.pending_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn latest_supervisor_message_includes_processed_rows_and_is_session_scoped() {
+        let (_temp, store) = create_test_store();
+        let expected = store
+            .enqueue_with_session("supervisor", "worker-1", "stand by", "session-a")
+            .unwrap();
+        store.mark_processed(expected).unwrap();
+        let foreign_session = store
+            .enqueue_with_session("supervisor", "worker-1", "wrong session", "session-b")
+            .unwrap();
+        let wrong_source = store
+            .enqueue_with_session("another-worker", "worker-1", "wrong source", "session-a")
+            .unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE prompt_queue SET created_at = ? WHERE id = ?",
+                params!["2026-07-22T12:00:01Z", expected],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE prompt_queue SET created_at = ? WHERE id = ?",
+                params!["2026-07-22T12:00:02Z", foreign_session],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE prompt_queue SET created_at = ? WHERE id = ?",
+                params!["2026-07-22T12:00:03Z", wrong_source],
+            )
+            .unwrap();
+        }
+
+        let latest = store
+            .latest_created_at_for_targets_from_sources(
+                &["supervisor"],
+                &["worker-1"],
+                Some("session-a"),
+            )
+            .unwrap();
+
+        assert_eq!(latest.len(), 1);
+        assert_eq!(
+            latest["worker-1"],
+            chrono::DateTime::parse_from_rfc3339("2026-07-22T12:00:01Z")
+                .unwrap()
+                .with_timezone(&Utc)
+        );
     }
 
     #[test]

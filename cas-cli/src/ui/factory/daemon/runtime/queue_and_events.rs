@@ -1,6 +1,49 @@
 use crate::ui::factory::daemon::imports::*;
 use crate::ui::factory::director::AgentSummary;
 
+/// Select the next control action without allowing a slow worker spawn to
+/// wedge shutdown. Ordinary actions remain FIFO and wait for the in-flight
+/// spawn; shutdown is allowed to jump that queue so it can cancel the spawn.
+fn take_next_pending_spawn(
+    pending: &mut VecDeque<PendingSpawn>,
+    spawn_in_flight: bool,
+) -> Option<PendingSpawn> {
+    if !spawn_in_flight {
+        return pending.pop_front();
+    }
+    let shutdown_index = pending
+        .iter()
+        .position(|action| matches!(action, PendingSpawn::Shutdown { .. }))?;
+    pending.remove(shutdown_index)
+}
+
+fn shutdown_targets(
+    live_workers: &[String],
+    in_flight_worker: Option<&str>,
+    count: Option<usize>,
+    names: &[String],
+) -> Vec<String> {
+    if !names.is_empty() {
+        return names.to_vec();
+    }
+
+    let count = count.unwrap_or(0);
+    let mut targets: Vec<String> = if count == 0 {
+        live_workers.to_vec()
+    } else {
+        live_workers.iter().take(count).cloned().collect()
+    };
+    let should_include_in_flight = count == 0 || targets.len() < count;
+    if should_include_in_flight {
+        if let Some(worker) = in_flight_worker {
+            if !targets.iter().any(|target| target == worker) {
+                targets.push(worker.to_string());
+            }
+        }
+    }
+    targets
+}
+
 impl FactoryDaemon {
     pub(super) fn handle_mux_event(&mut self, event: cas_mux::MuxEvent) {
         match event {
@@ -838,10 +881,12 @@ impl FactoryDaemon {
     /// either: (a) check if the in-flight spawn finished, or (b) start a new one.
     pub(super) async fn process_pending_spawns(&mut self) {
         // Step 1: Check if in-flight background spawn completed
-        if let Some((_, _, _, ref handle)) = self.spawn_task {
-            if !handle.is_finished() {
-                return; // Still running, don't start another
-            }
+        let spawn_finished = self
+            .spawn_task
+            .as_ref()
+            .map(|(_, _, _, handle)| handle.is_finished())
+            .unwrap_or(false);
+        if spawn_finished {
             let (pending_name, pending_spec, pending_task_id, handle) =
                 self.spawn_task.take().unwrap();
             // Remove from pending workers (boot pane transitions to real pane or disappears)
@@ -990,8 +1035,12 @@ impl FactoryDaemon {
             return; // One completion per tick
         }
 
-        // Step 2: No in-flight spawn - pop next action from queue
-        let action = match self.pending_spawns.pop_front() {
+        // Step 2: Pop FIFO when no spawn is active. While one is active, only
+        // a shutdown may pass so it can mark/cancel that in-flight worker.
+        let action = match take_next_pending_spawn(
+            &mut self.pending_spawns,
+            self.spawn_task.is_some(),
+        ) {
             Some(a) => a,
             None => return,
         };
@@ -1084,16 +1133,12 @@ impl FactoryDaemon {
             } => {
                 // Shutdowns are fast - process synchronously
                 // Collect worker names before shutdown for GUI notification
-                let workers_to_stop = if !names.is_empty() {
-                    names.clone()
-                } else {
-                    let c = count.unwrap_or(0);
-                    if c == 0 {
-                        self.app.worker_names().to_vec()
-                    } else {
-                        self.app.worker_names().iter().take(c).cloned().collect()
-                    }
-                };
+                let workers_to_stop = shutdown_targets(
+                    self.app.worker_names(),
+                    self.spawn_task.as_ref().map(|(name, _, _, _)| name.as_str()),
+                    count,
+                    &names,
+                );
 
                 // cas-7a94: drop still-queued spawns for these names and release
                 // any early pre-assigns so "shutdown before boot finishes" cannot
@@ -1605,10 +1650,48 @@ fn is_exact_agent_name_match(agent: &AgentSummary, worker_name: &str) -> bool {
 mod tests {
     use super::{
         is_exact_agent_name_match, matches_event_filter, reminder_matches_factory_session,
+        shutdown_targets, take_next_pending_spawn,
     };
-    use crate::ui::factory::daemon::FactoryDaemon;
+    use crate::ui::factory::daemon::{FactoryDaemon, PendingSpawn};
     use crate::ui::factory::director::{AgentSummary, DirectorEvent};
     use cas_types::AgentStatus;
+    use std::collections::VecDeque;
+
+    #[test]
+    fn shutdown_bypasses_an_in_flight_spawn_without_reordering_other_actions() {
+        let mut pending = VecDeque::from([
+            PendingSpawn::Shell {
+                name: "later-shell".into(),
+                shell: None,
+            },
+            PendingSpawn::Shutdown {
+                count: None,
+                names: vec!["booting-worker".into()],
+                force: false,
+            },
+        ]);
+
+        assert!(matches!(
+            take_next_pending_spawn(&mut pending, true),
+            Some(PendingSpawn::Shutdown { .. })
+        ));
+        assert!(matches!(
+            pending.front(),
+            Some(PendingSpawn::Shell { name, .. }) if name == "later-shell"
+        ));
+        assert!(take_next_pending_spawn(&mut pending, true).is_none());
+        assert!(matches!(
+            take_next_pending_spawn(&mut pending, false),
+            Some(PendingSpawn::Shell { .. })
+        ));
+
+        let live = vec!["live-worker".to_string()];
+        assert_eq!(
+            shutdown_targets(&live, Some("booting-worker"), Some(0), &[]),
+            vec!["live-worker".to_string(), "booting-worker".to_string()],
+            "shutdown-all must mark the in-flight worker dead so its late spawn result is discarded"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // cas-fcd4: event remind session scoping
@@ -1683,10 +1766,13 @@ mod tests {
             id: "agent-10".to_string(),
             name: "worker-10".to_string(),
             status: AgentStatus::Active,
+            registered_at: chrono::Utc::now(),
             current_task: None,
             latest_activity: None,
             last_heartbeat: None,
             pending_messages: 0,
+            pending_supervisor_messages: 0,
+            latest_supervisor_message_at: None,
             active_lease: None,
             effort: None,
         };

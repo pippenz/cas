@@ -96,6 +96,11 @@ pub(crate) enum VerificationSkipReason {
     /// The assignee is alive and no bypass flag was set. Verification
     /// runs normally; this is *not* a skip.
     None,
+    /// The caller passed the epic ownership gate. Epics do not run the
+    /// per-task verifier because their child tasks are verified individually;
+    /// closing one as its verification owner is therefore not an orphan
+    /// recovery action even though epics normally have no task assignee.
+    EpicOwnerClosed,
     /// The task has no assignee at all. Treated as orphaned; legacy
     /// callers reached this via the same skip path.
     NoAssignee,
@@ -133,6 +138,9 @@ impl VerificationSkipReason {
                     String::new()
                 }
             }
+            VerificationSkipReason::EpicOwnerClosed => {
+                " (epic verification: owner-closed; child tasks individually verified)".to_string()
+            }
             VerificationSkipReason::NoAssignee => {
                 " (verification skipped — orphaned task, no assignee)".to_string()
             }
@@ -160,6 +168,10 @@ impl VerificationSkipReason {
     pub(crate) fn audit_reason(&self) -> String {
         match self {
             VerificationSkipReason::None => String::new(),
+            VerificationSkipReason::EpicOwnerClosed => {
+                "Epic closed by its verification owner; child tasks were individually verified."
+                    .to_string()
+            }
             VerificationSkipReason::NoAssignee => {
                 "Closed via supervisor bypass — task had no assignee (orphaned).".to_string()
             }
@@ -641,7 +653,15 @@ impl CasCore {
         // enum so the response message cites the actual state instead of
         // defaulting to "assignee inactive" for every lookup failure.
         let skip_reason = if verification_enabled && is_supervisor_from_env() {
-            self.compute_verification_skip_reason(&task, &req)
+            if task.task_type == TaskType::Epic && task.epic_verification_owner.is_some() {
+                // The ownership gate above already proved that this caller is
+                // the configured epic verification owner. Epics normally have
+                // no task assignee, so feeding them through the generic helper
+                // would mislabel a healthy owner-close as orphan recovery.
+                VerificationSkipReason::EpicOwnerClosed
+            } else {
+                self.compute_verification_skip_reason(&task, &req)
+            }
         } else {
             VerificationSkipReason::None
         };
@@ -2955,30 +2975,45 @@ pub(crate) fn run_factory_branch_merge_gate(
     // `mcp/tools/mod.rs` and `worktree/manager/epic_ops.rs`) and hand the
     // worker a supervisor-merge-request handoff instead of PR instructions.
     let parent_is_local_epic_branch = parent_branch.starts_with("epic/");
+    let branch_tip = resolve_branch_sha(repo_path, &factory_branch)
+        .unwrap_or_else(|| "unresolved at close rejection".to_string());
 
     let remediation = if parent_is_local_epic_branch {
         format!(
             "Remediation:\n\
-             1. {parent_branch} is a local-only epic branch (not pushed to origin) \
+             1. Before escalating, re-read any just-delivered supervisor messages \
+             in your conversation. Supervisor replies arrive as injected messages; \
+             `queue_poll` does not expose them. If one says this branch was merged \
+             or requests more changes, follow it and do not send a stale merge \
+             request.\n\
+             2. {parent_branch} is a local-only epic branch (not pushed to origin) \
              — do NOT run `gh pr create --base {parent_branch}`, it has no \
              matching ref on origin and the PR will fail.\n\
-             2. Push {factory_branch} to origin so your commit is durable: \
+             3. Push {factory_branch} to origin so your commit is durable: \
              `git push origin {factory_branch}`\n\
-             3. Message your supervisor to merge {factory_branch} into \
-             {parent_branch} (e.g. `mcp__cas__coordination action=message \
-             target=supervisor summary=\"ready to merge\" message=\"{factory_branch} \
-             ready for {parent_branch}\"`) — they merge with \
+             4. If a merge is still needed, message your supervisor to merge \
+             {factory_branch} into {parent_branch}, including the current tip \
+             and freshness qualifier (e.g. \
+             `mcp__cas__coordination action=message \
+             target=supervisor summary=\"ready to merge\" message=\"Fresh after \
+             re-reading delivered messages: {factory_branch} tip {branch_tip}; please re-check \
+             reachability, then merge into {parent_branch} if still needed\"`). \
+             They merge with \
              `git merge --no-ff {factory_branch}` on the epic branch.\n\
-             4. Once merged, retry mcp__cas__task action=close",
+             5. Once merged, retry mcp__cas__task action=close",
         )
     } else {
         format!(
             "Remediation:\n\
-             1. Push {factory_branch} to its remote\n\
-             2. Open a PR targeting {parent_branch}\n\
-             3. Merge the PR (or `git fetch --prune` if it was already merged \
+             1. Re-read any just-delivered supervisor messages in your conversation \
+             before continuing. Supervisor replies arrive as injected messages; \
+             `queue_poll` does not expose them. Follow any delivered merge or review \
+             instruction before continuing.\n\
+             2. Push {factory_branch} to its remote\n\
+             3. Open a PR targeting {parent_branch}\n\
+             4. Merge the PR (or `git fetch --prune` if it was already merged \
              and your local ref is stale)\n\
-             4. Retry mcp__cas__task action=close",
+             5. Retry mcp__cas__task action=close",
         )
     };
 
@@ -7062,6 +7097,12 @@ mod merge_state_gate_tests {
                     "plain (non-epic) parent branch must keep the PR-based \
                      remediation unchanged: {msg}"
                 );
+                assert!(
+                    msg.contains("just-delivered supervisor messages")
+                        && msg.contains("Supervisor replies arrive as injected messages")
+                        && msg.contains("`queue_poll` does not expose them"),
+                    "plain (non-epic) remediation must describe the real supervisor-reply mechanism: {msg}"
+                );
             }
             other => panic!("expected Reject for stranded factory branch, got {other:?}"),
         }
@@ -7081,6 +7122,8 @@ mod merge_state_gate_tests {
         std::fs::write(dir.path().join("a.rs"), "// a\n").unwrap();
         git(dir.path(), &["add", "a.rs"]);
         git(dir.path(), &["commit", "-q", "-m", "feat: a"]);
+        let expected_tip = resolve_branch_sha(dir.path(), "factory/worker")
+            .expect("factory branch tip should resolve");
 
         let task = worker_task("worker");
         let req = base_req(&task.id);
@@ -7111,6 +7154,21 @@ mod merge_state_gate_tests {
                 assert!(
                     msg.contains("supervisor to merge"),
                     "must hand the worker a supervisor-merge-request handoff: {msg}"
+                );
+                assert!(
+                    msg.contains("just-delivered supervisor messages")
+                        && msg.contains("Supervisor replies arrive as injected messages")
+                        && msg.contains("`queue_poll` does not expose them"),
+                    "must describe the real supervisor-reply mechanism before escalation: {msg}"
+                );
+                assert!(
+                    msg.contains(&expected_tip),
+                    "escalation template must include the current branch tip {expected_tip}: {msg}"
+                );
+                assert!(
+                    msg.contains("Fresh after re-reading delivered messages")
+                        && msg.contains("re-check reachability"),
+                    "escalation must identify its freshness window and ask the supervisor to re-check: {msg}"
                 );
             }
             other => panic!("expected Reject for stranded factory branch, got {other:?}"),
