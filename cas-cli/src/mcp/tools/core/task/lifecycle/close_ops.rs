@@ -96,6 +96,11 @@ pub(crate) enum VerificationSkipReason {
     /// The assignee is alive and no bypass flag was set. Verification
     /// runs normally; this is *not* a skip.
     None,
+    /// The caller passed the epic ownership gate. Epics do not run the
+    /// per-task verifier because their child tasks are verified individually;
+    /// closing one as its verification owner is therefore not an orphan
+    /// recovery action even though epics normally have no task assignee.
+    EpicOwnerClosed,
     /// The task has no assignee at all. Treated as orphaned; legacy
     /// callers reached this via the same skip path.
     NoAssignee,
@@ -133,6 +138,9 @@ impl VerificationSkipReason {
                     String::new()
                 }
             }
+            VerificationSkipReason::EpicOwnerClosed => {
+                " (epic verification: owner-closed; child tasks individually verified)".to_string()
+            }
             VerificationSkipReason::NoAssignee => {
                 " (verification skipped — orphaned task, no assignee)".to_string()
             }
@@ -160,6 +168,10 @@ impl VerificationSkipReason {
     pub(crate) fn audit_reason(&self) -> String {
         match self {
             VerificationSkipReason::None => String::new(),
+            VerificationSkipReason::EpicOwnerClosed => {
+                "Epic closed by its verification owner; child tasks were individually verified."
+                    .to_string()
+            }
             VerificationSkipReason::NoAssignee => {
                 "Closed via supervisor bypass — task had no assignee (orphaned).".to_string()
             }
@@ -641,7 +653,15 @@ impl CasCore {
         // enum so the response message cites the actual state instead of
         // defaulting to "assignee inactive" for every lookup failure.
         let skip_reason = if verification_enabled && is_supervisor_from_env() {
-            self.compute_verification_skip_reason(&task, &req)
+            if task.task_type == TaskType::Epic && task.epic_verification_owner.is_some() {
+                // The ownership gate above already proved that this caller is
+                // the configured epic verification owner. Epics normally have
+                // no task assignee, so feeding them through the generic helper
+                // would mislabel a healthy owner-close as orphan recovery.
+                VerificationSkipReason::EpicOwnerClosed
+            } else {
+                self.compute_verification_skip_reason(&task, &req)
+            }
         } else {
             VerificationSkipReason::None
         };
