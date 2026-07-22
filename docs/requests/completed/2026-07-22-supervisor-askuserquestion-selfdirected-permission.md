@@ -59,3 +59,13 @@ prevented the whole chain.
 2. As supervisor, invoke `AskUserQuestion` with any human-directed question set.
 3. Observe it surfaces as a permission prompt on the supervisor's own session rather
    than reaching the human; system pauses until manually rejected.
+
+---
+
+## Resolution (2026-07-22)
+
+Fixed on main (merge 4beb8be, commits e3f855a + de0b04f, released v2.28.3). Chose option 2 (block):
+- PreToolUse now DENIES `AskUserQuestion` for factory supervisors AND workers with role-tailored, harness-prefix-correct guidance (plain text + end turn for supervisors; `coordination action=message` for workers). Fires even when no CAS root resolves.
+- Root cause was deeper than reported: `AskUserQuestion` was absent from every PreToolUse hook matcher (default settings + factory per-role settings), so even the old advisory reminder never fired. Both matchers now include it (intercept-only, not auto-allowed), with drift-guard tests.
+- Skill text fixed across claude/codex/grok variants: cas-supervisor hard rules, intake reference, and the cas-brainstorm/cas-ideate skills that mandated AskUserQuestion.
+- Option 3 (director renders the structured question to the human) filed as follow-on feature.

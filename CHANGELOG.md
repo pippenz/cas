@@ -7,6 +7,13 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [2.28.3] - 2026-07-22
+
+### Fixed
+- **Factory agents can no longer wedge themselves with `AskUserQuestion`.** In factory topology the tool has no human UI surface — a supervisor calling it (as the built-in skills actively suggested for human-directed questions) got a permission prompt apparently sent to itself and paused the whole session until a human rejected it. The PreToolUse hook now denies `AskUserQuestion` for factory supervisors and workers with role-tailored guidance: ask the human in plain text and end the turn (the director relays replies); reach teammates via `coordination action=message`. The deny works even when no CAS root resolves.
+- **The intercept actually fires now: `AskUserQuestion` was missing from every PreToolUse hook matcher.** Both the default settings matcher and the factory per-role settings matcher omitted the tool, so the previous advisory reminder had been dead code in real sessions. Both matchers now include it via an intercept-only list that deliberately stays out of `permissions.allow`, with regression tests preventing matcher/handler drift. Regenerate harness settings (`cas update`) to activate.
+- **Skill guidance no longer steers agents into the trap.** The supervisor hard rules, intake reference, and the brainstorm/ideate skills (which mandated `AskUserQuestion` for blocking questions) now carry the factory-mode plain-text rule across all three harness variants (Claude, Codex, Grok).
+
 ## [2.28.2] - 2026-07-22
 
 ### Fixed
