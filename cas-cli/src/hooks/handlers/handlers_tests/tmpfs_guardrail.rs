@@ -235,23 +235,84 @@ fn bash_usage_growth_warns_after_baseline() {
     );
 
     usage.usage_by_path.insert(PathBuf::from("/mem"), 16);
-    let warning =
+    assert!(
         maybe_tmpfs_guardrail_warning_with(tmp.path(), &input, &mounts(), &usage, 10, None)
-            .expect("usage growth past threshold should warn");
+            .is_none(),
+        "one high sample may be transient"
+    );
+    let warning = maybe_tmpfs_guardrail_warning_with(
+        tmp.path(),
+        &input,
+        &mounts(),
+        &usage,
+        10,
+        None,
+    )
+    .expect("persistent usage growth past threshold should warn");
     assert!(warning.contains("11 bytes"));
 }
 
 #[test]
-fn bash_first_sample_over_threshold_warns_immediately() {
+fn bash_first_sample_establishes_baseline_even_when_mount_is_busy() {
     let tmp = tempfile::TempDir::new().unwrap();
     let input = input_for("Bash", serde_json::json!({"command": "make artifact"}));
     let mut usage = FakeUsageReader::default();
     usage.usage_by_path.insert(PathBuf::from("/mem"), 17);
 
+    assert!(
+        maybe_tmpfs_guardrail_warning_with(tmp.path(), &input, &mounts(), &usage, 10, None)
+            .is_none(),
+        "pre-existing mount occupancy is the baseline, not session growth"
+    );
+}
+
+#[test]
+fn bash_write_then_delete_peak_does_not_warn() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let input = input_for("Bash", serde_json::json!({"command": "cargo test"}));
+    let mut usage = FakeUsageReader::default();
+
+    usage.usage_by_path.insert(PathBuf::from("/mem"), 100);
+    assert!(
+        maybe_tmpfs_guardrail_warning_with(tmp.path(), &input, &mounts(), &usage, 10, None)
+            .is_none()
+    );
+
+    usage.usage_by_path.insert(PathBuf::from("/mem"), 125);
+    assert!(
+        maybe_tmpfs_guardrail_warning_with(tmp.path(), &input, &mounts(), &usage, 10, None)
+            .is_none(),
+        "a transient tempdir peak must wait for confirmation"
+    );
+
+    usage.usage_by_path.insert(PathBuf::from("/mem"), 100);
+    assert!(
+        maybe_tmpfs_guardrail_warning_with(tmp.path(), &input, &mounts(), &usage, 10, None)
+            .is_none(),
+        "deletion credits the peak before any warning is emitted"
+    );
+}
+
+#[test]
+fn bash_persistent_large_file_still_warns() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let input = input_for("Bash", serde_json::json!({"command": "stage artifact"}));
+    let mut usage = FakeUsageReader::default();
+
+    for used_bytes in [100, 125] {
+        usage
+            .usage_by_path
+            .insert(PathBuf::from("/mem"), used_bytes);
+        assert!(
+            maybe_tmpfs_guardrail_warning_with(tmp.path(), &input, &mounts(), &usage, 10, None)
+                .is_none()
+        );
+    }
+
     let warning =
         maybe_tmpfs_guardrail_warning_with(tmp.path(), &input, &mounts(), &usage, 10, None)
-            .expect("single-shot tmpfs fill should warn on first Bash sample");
-    assert!(warning.contains("17 bytes"));
+            .expect("persistent growth is staged residency and must warn");
+    assert!(warning.contains("25 bytes"));
 }
 
 #[test]
@@ -307,9 +368,24 @@ fn write_warning_does_not_suppress_bash_usage_warning() {
     );
 
     usage.usage_by_path.insert(PathBuf::from("/mem"), 12);
-    let warning =
+    assert!(
         maybe_tmpfs_guardrail_warning_with(tmp.path(), &bash, &mounts(), &usage, 10, None)
-            .expect("usage-growth threshold should warn even after a write warning");
+            .is_none()
+    );
+    usage.usage_by_path.insert(PathBuf::from("/mem"), 24);
+    assert!(
+        maybe_tmpfs_guardrail_warning_with(tmp.path(), &bash, &mounts(), &usage, 10, None)
+            .is_none()
+    );
+    let warning = maybe_tmpfs_guardrail_warning_with(
+        tmp.path(),
+        &bash,
+        &mounts(),
+        &usage,
+        10,
+        None,
+    )
+    .expect("confirmed usage-growth threshold should warn even after a write warning");
     assert!(warning.contains("12 bytes"));
 }
 
@@ -319,11 +395,26 @@ fn bash_samples_all_tmpfs_mounts_not_just_cwd_and_tmp() {
     let input = input_for("Bash", serde_json::json!({"command": "make artifact"}));
     let mut usage = FakeUsageReader::default();
     usage.usage_by_path.insert(PathBuf::from("/mem"), 0);
+    usage.usage_by_path.insert(PathBuf::from("/dev/shm"), 0);
+    assert!(
+        maybe_tmpfs_guardrail_warning_with(tmp.path(), &input, &mounts(), &usage, 10, None)
+            .is_none()
+    );
     usage.usage_by_path.insert(PathBuf::from("/dev/shm"), 12);
 
-    let warning =
+    assert!(
         maybe_tmpfs_guardrail_warning_with(tmp.path(), &input, &mounts(), &usage, 10, None)
-            .expect("/dev/shm fill should be sampled and warned");
+            .is_none()
+    );
+    let warning = maybe_tmpfs_guardrail_warning_with(
+        tmp.path(),
+        &input,
+        &mounts(),
+        &usage,
+        10,
+        None,
+    )
+    .expect("persistent /dev/shm fill should be sampled and warned");
     assert!(warning.contains("/dev/shm"));
     assert!(warning.contains("12 bytes"));
 }
