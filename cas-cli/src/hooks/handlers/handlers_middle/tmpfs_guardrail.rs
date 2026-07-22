@@ -53,6 +53,8 @@ struct MountState {
     last_warned_written_multiple: u64,
     #[serde(default)]
     last_warned_usage_multiple: u64,
+    #[serde(default)]
+    usage_growth_pending_confirmation: bool,
 }
 
 pub(crate) fn maybe_tmpfs_guardrail_warning(
@@ -197,19 +199,36 @@ fn apply_usage_sample(
         Some(baseline) => baseline,
         None => {
             entry.baseline_used_bytes = Some(used_bytes);
-            0
+            entry.usage_growth_bytes = 0;
+            return None;
         }
     };
 
     entry.usage_growth_bytes = used_bytes.saturating_sub(baseline);
     let usage_growth_bytes = entry.usage_growth_bytes;
-    warning_for_counter(
-        &mut entry.last_warned_usage_multiple,
+    let multiple = usage_growth_bytes / threshold_bytes;
+    if multiple == 0 || multiple <= entry.last_warned_usage_multiple {
+        entry.usage_growth_pending_confirmation = false;
+        return None;
+    }
+
+    // Bash can create large, short-lived temp trees. A single mount-wide peak
+    // does not prove that an artifact was staged, so require the growth to
+    // survive one subsequent sample. Direct Write/Edit calls remain immediate
+    // because their target and byte count are known.
+    if !entry.usage_growth_pending_confirmation {
+        entry.usage_growth_pending_confirmation = true;
+        return None;
+    }
+
+    entry.usage_growth_pending_confirmation = false;
+    entry.last_warned_usage_multiple = multiple;
+    Some(format_warning(
         mount_point,
         usage_growth_bytes,
         threshold_bytes,
         staging_dir,
-    )
+    ))
 }
 
 fn warning_for_counter(
@@ -278,6 +297,7 @@ impl GuardrailState {
             baseline_used_bytes: None,
             last_warned_written_multiple: 0,
             last_warned_usage_multiple: 0,
+            usage_growth_pending_confirmation: false,
         });
         self.mounts.last_mut().expect("just pushed mount state")
     }
