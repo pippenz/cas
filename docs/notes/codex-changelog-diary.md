@@ -26,16 +26,17 @@ verify on upgrade) · 🔧 fix shipped · 🏗 EPIC · ⏭ n/a
 
 - **CAS validated against:** Codex CLI **0.128.0** (the `crates/cas-pty/src/pty.rs` effort-approach
   comment pins to 0.128).
-- **Locally installed:** **0.144.4** (`codex-cli 0.144.4`, checked 2026-07-14).
-- **Latest stable:** **0.144.4** (2026-07-14). **0.145.0** in alpha only (alpha.10 as of 2026-07-14) —
-  index note only; not tracked until stable.
-- **Gap:** ~16 minor versions between the validated pin (0.128) and what's installed/latest (0.144).
+- **Locally installed:** **0.145.0** (`codex-cli 0.145.0`, checked 2026-07-22).
+- **Latest stable:** **0.145.0** (2026-07-21). **0.146.0** is prerelease-only (alpha.2 as of
+  2026-07-22) — untracked under this diary's stable-only policy.
+- **Gap:** ~17 minor versions between the validated pin (0.128) and what's installed/latest (0.145).
   The entries below are a *triage pass* against the touchpoints, not a per-item code audit —
   upgrade-time re-verification is the trigger for promoting any 👀 to a task. (Contrast the Claude
   Code diary's .166/.162 entries, which were deep-verified for specific user questions.) The
   **0.130–0.135 block is a backfill** (lighter fidelity, consolidated) added 2026-06-30 to extend
   coverage below the original 0.136 seed floor. The **0.143–0.144.4 block is a backfill**
-  (2026-07-14) catching the diary up from the previous 0.142.5 ceiling to the host install.
+  (2026-07-14) catching the diary up from the previous 0.142.5 ceiling; 0.145.0 is the first
+  subsequent stable tracked at release time.
 
 ## CAS ↔ Codex touchpoints (what a release can break)
 
@@ -66,7 +67,8 @@ The load-bearing surface, all in `crates/cas-pty/src/pty.rs::PtyConfig::codex` u
 
 | Codex version | Headline | CAS verdict | Pointer |
 |---------------|----------|-------------|---------|
-| 0.145.0-alpha | (pre-release; alpha.10 as of 2026-07-14 — not tracked until stable) | — | — |
+| 0.146.0-alpha | (pre-release; alpha.2 as of 2026-07-22 — untracked until stable) | — | — |
+| 0.145.0 | **Multi-agent V2 stable** · broader `/import` · MCP startup hardening · concurrent skill discovery · approval tightening | 👀 watch | this doc |
 | 0.144.1–.4 | Installer/code-mode reliability · Guardian auto-review prompt revert · two empty patch releases | ✅ no action | this doc |
 | 0.144.0 | **`writes` app-approval mode** · MCP auth elicitation default · plugin skill-loading perf · Ultra+multi-agent usage warn | 👀 watch | this doc |
 | 0.143.0 | **`max` first-class reasoning effort** · MCP tool search by default · rmcp 1.8.0 · AGENTS.md env-reactive + skills/delegation · sandbox profile flag rename | 👀 watch | this doc |
@@ -83,6 +85,46 @@ The load-bearing surface, all in `crates/cas-pty/src/pty.rs::PtyConfig::codex` u
 ---
 
 ## Entries
+
+### 0.145.0 — multi-agent V2 stable · broader `/import` · MCP startup and skills hardening
+
+Reviewed 2026-07-22 (diary-codex / cas-c7f9). Triage pass vs touchpoints. Source: official
+`rust-v0.145.0` release (`gh release view rust-v0.145.0 --repo openai/codex`; published 2026-07-21).
+
+- **"Stabilized the opt-in multi-agent V2 experience" with configurable sub-agent models,
+  reasoning levels, concurrency, restored roles, and improved navigation (#33550, #33631, #33657,
+  #33841, #34383).** → 👀 **touchpoints: `--model`, `model_reasoning_effort`, CAS role/factory env,
+  and multi-agent behavior.** CAS factory orchestration does not rely on Codex-native sub-agents, so
+  no launch change is required. On upgrade, keep native delegation opt-in and verify configured
+  model/effort overrides plus `developer_instructions` still govern the root worker; otherwise a
+  Codex-native role or spawn default could diverge from CAS's supervisor/worker contract or rollout
+  budget expectations.
+- **`/import` now migrates Cursor and Claude Code settings, MCP servers, plugins, sessions, commands,
+  and project-scoped memories (#31672, #33411, #33426, #33444).** → 👀 **touchpoints:
+  `.codex/config.toml`, MCP (`cs`), `.codex/skills/`, and `AGENTS.md`.** This is an onboarding path,
+  not a replacement for `cas integrate`: after any import, verify the local stdio `cs` registration,
+  CAS-synced skills/agents, and workspace instructions were preserved rather than shadowed by imported
+  configuration.
+- **MCP startup/auth fixes add startup timeouts, avoid blocking OAuth discovery, serialize credential
+  refresh, and safely reuse tool catalogs (#32229, #32781, #32825, #33184, #33297).** → 👀
+  **touchpoint: MCP (`cs`).** The local stdio server has no OAuth, and catalog reuse should improve
+  startup, but a new startup timeout is directly load-bearing: smoke `mcp__cs__task` and
+  `mcp__cs__coordination` on a fresh factory worker so a slow CAS launch is not classified as failed
+  and a cached catalog is not stale.
+- **Skill/plugin discovery now scans concurrently and reuses inventory (#31566, #33369, #33423),
+  while shared skill models moved into `codex-skills` (#34429).** → 👀 **touchpoint:
+  `.codex/skills/` + `.codex/agents/`.** Internal plumbing changed again; verify the `cas integrate` /
+  `cas update` mirror still enumerates both CAS skills and agent definitions from a worktree.
+- **Approval/sandbox handling tightened full-access confirmation, forced-`rm` detection, rejection
+  propagation, and Windows network-proxy enforcement (#32989, #33464, #34400, #32857, #34423).** → 👀
+  **touchpoint: `--yolo` + `CAS_AGENT_ROLE` / `CAS_FACTORY_MODE`.** Safety improvements are welcome,
+  but confirm a factory launch still receives non-interactive full access and does not regain approval
+  prompts; Windows workers should also verify proxy enforcement does not narrow expected network access.
+- **Bundled GPT-5.4 selections migrated to GPT-5.6 Terra/Luna variants (#33173), with GPT-5.6 Sol the
+  Bedrock default (#32288).** → ✅ **touchpoint: `--model`.** CAS passes the selected model through and
+  does not pin these bundled defaults, so no mapping change follows from this release. The new Bedrock
+  default and audio/realtime, paginated-history, visualization, TUI-rendering, installer, and packaged
+  ripgrep changes are otherwise ⏭ n/a to the CAS PTY launch contract (`--no-alt-screen` is unchanged).
 
 ### 0.144.1–.4 — installer/code-mode · Guardian review revert · empty patches
 
