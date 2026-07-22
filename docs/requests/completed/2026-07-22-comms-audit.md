@@ -320,3 +320,8 @@ The Ozer team can provide further excerpts or message/task records if useful. Pr
 - `/home/pippenz/.claude/projects/-home-pippenz-Petrastella-ozer/0665ad66-c0f3-41a5-b1b5-fdce26636396.jsonl`
 - `/home/pippenz/Petrastella/ozer/.cas/logs/cas-2026-07-21.log`
 
+
+## Completion
+
+- **completed:** 2026-07-22 (items 5, 6; partial 7)
+- **resolution:** Items 1–4 track existing Ozer tickets; their fixes shipped the same day in epics cas-887b (zero-commit catch-22, assign-gate epic scoping, spawn preassign + shutdown release) and cas-873a (real-time delivery, head-of-line, urgent framing) — the audited factory ran a pre-fix binary. Re-verify cas-9599 delivery latency on v2.28.1 before further work. Item 5 (message_status self-contradiction) fixed in v2.28.1: one-time gated backfill of `highest_stage`/`transport_delivered_at` from `processed_at`; live legacy paths are never promoted. Item 6 (lease_history mislabel) fixed in v2.28.1: release reasons threaded through every `release_lease_for_task` call site. Item 7 (ACK/reaction instrumentation): stage/wake/reaction fields now exist in `message_status`; automatic harness `message_ack` remains open — follow-on cas-7aef covers the remaining lease-history field wart.

@@ -71,3 +71,8 @@ healthy worker's in-flight turn.
    interrupt/kill decisions must not be made from this output.
 3. Stall monitor: incorporate task-note recency (already in the task store) as
    an activity signal before emitting WorkerIdle.
+
+## Completion
+
+- **completed:** 2026-07-22
+- **resolution:** Items 1–2 (wrong-session resolution, starved-with-no-evidence) were already fixed the morning this report landed — cas-c655/cas-de95/cas-900b (epic cas-887b, on main since v2.28.0): session resolution keys off the worker's own agent record and an unresolved transcript now classifies as `unverified`, never `starved`. Item 3 (task-note recency as an activity signal) shipped in v2.28.1: `task action=notes` now emits a `TaskNoteAdded` event and the director stall monitor counts it as worker activity, end-to-end tested through the real handler.
