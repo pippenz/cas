@@ -3428,7 +3428,8 @@ This is the body content."#;
                     "MERGE REQUIRED",
                     "gh pr create",
                     "status=closed",
-                    "queue_poll",
+                    "injected messages",
+                    "`queue_poll` does not expose them",
                     "git rev-parse factory/<name>",
                 ] {
                     assert!(
@@ -3466,7 +3467,8 @@ This is the body content."#;
             for required in [
                 "MERGE REQUIRED",
                 "literal string `supervisor`",
-                "queue_poll",
+                "injected messages",
+                "`queue_poll` does not expose them",
                 "current factory-branch tip SHA",
             ] {
                 assert!(
