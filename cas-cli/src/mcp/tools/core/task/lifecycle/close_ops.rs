@@ -5176,16 +5176,24 @@ pub(crate) fn run_lightweight_structural_lint_with_scope(
     struct AddedLine<'a> {
         content: &'a str,
         path: String,
+        file_line: usize,
         is_rust_file: bool,
+    }
+
+    #[derive(Debug)]
+    enum DiffEntry<'a> {
+        Added(AddedLine<'a>),
+        HunkBoundary,
     }
 
     // Scan added lines only, tracking which file each line belongs to so that
     // Rust-specific macro checks can be scoped to `*.rs` files and findings can
     // point workers at the file they need to fix.
-    let added_lines: Vec<AddedLine<'_>> = {
+    let diff_entries: Vec<DiffEntry<'_>> = {
         let mut result = Vec::new();
         let mut current_path = String::new();
         let mut current_is_rust = false;
+        let mut current_file_line = 0usize;
         for line in diff_text.lines() {
             if line.starts_with("+++ ") {
                 // "+++ b/path/to/file.ext" in a unified git diff.
@@ -5193,12 +5201,17 @@ pub(crate) fn run_lightweight_structural_lint_with_scope(
                 let path = line[4..].trim_start_matches("b/");
                 current_path = path.to_string();
                 current_is_rust = path.ends_with(".rs");
+                current_file_line = 0;
+            } else if line.starts_with("@@ ") {
+                result.push(DiffEntry::HunkBoundary);
             } else if line.starts_with('+') && !line.starts_with("+++") {
-                result.push(AddedLine {
+                current_file_line += 1;
+                result.push(DiffEntry::Added(AddedLine {
                     content: &line[1..],
                     path: current_path.clone(),
+                    file_line: current_file_line,
                     is_rust_file: current_is_rust,
-                });
+                }));
             }
         }
         result
@@ -5208,7 +5221,10 @@ pub(crate) fn run_lightweight_structural_lint_with_scope(
     // Use `contains("macro!(")` to catch both `macro!()` (no args) and
     // `macro!("msg")` forms, regardless of where they appear on the line.
     // Scoped to `*.rs` files; TypeScript/JS/Python etc. are not checked.
-    for (i, added) in added_lines.iter().enumerate() {
+    for entry in &diff_entries {
+        let DiffEntry::Added(added) = entry else {
+            continue;
+        };
         if !added.is_rust_file {
             continue;
         }
@@ -5216,15 +5232,13 @@ pub(crate) fn run_lightweight_structural_lint_with_scope(
         if trimmed.contains("unimplemented!(") {
             violations.push(format!(
                 "{} line +{}: `unimplemented!()` — replace with a real implementation",
-                added.path,
-                i + 1,
+                added.path, added.file_line,
             ));
         }
         if trimmed.contains("todo!(") {
             violations.push(format!(
                 "{} line +{}: `todo!()` — replace with a real implementation",
-                added.path,
-                i + 1,
+                added.path, added.file_line,
             ));
         }
     }
@@ -5233,7 +5247,10 @@ pub(crate) fn run_lightweight_structural_lint_with_scope(
     // Use `contains("dbg!(")` to catch all forms regardless of preceding
     // whitespace: bare `dbg!(...)`, `=dbg!(...)`, `let x=dbg!(...)`, etc.
     // Scoped to `*.rs` files; other languages do not use the dbg! macro.
-    for (i, added) in added_lines.iter().enumerate() {
+    for entry in &diff_entries {
+        let DiffEntry::Added(added) = entry else {
+            continue;
+        };
         if !added.is_rust_file {
             continue;
         }
@@ -5241,8 +5258,7 @@ pub(crate) fn run_lightweight_structural_lint_with_scope(
         if trimmed.contains("dbg!(") {
             violations.push(format!(
                 "{} line +{}: `dbg!()` call — remove debug instrumentation before review",
-                added.path,
-                i + 1,
+                added.path, added.file_line,
             ));
         }
     }
@@ -5252,48 +5268,53 @@ pub(crate) fn run_lightweight_structural_lint_with_scope(
     // and (b) are not doc comments ('///') or copyright headers.
     // Applied across all languages (// comments exist in Rust, TS, JS, etc.).
     {
+        fn flush_comment_run(
+            violations: &mut Vec<String>,
+            run_path: &str,
+            run_start: usize,
+            run_end: usize,
+            run: usize,
+        ) {
+            if run > 5 {
+                violations.push(format!(
+                    "{} lines +{}–+{}: {} consecutive commented-out lines — \
+                     remove or restore the code before review (>5-line threshold)",
+                    run_path, run_start, run_end, run
+                ));
+            }
+        }
+
         let mut run = 0usize;
         let mut run_start = 0usize;
+        let mut run_end = 0usize;
         let mut run_path = String::new();
-        for (i, added) in added_lines.iter().enumerate() {
+        for entry in &diff_entries {
+            let DiffEntry::Added(added) = entry else {
+                flush_comment_run(&mut violations, &run_path, run_start, run_end, run);
+                run = 0;
+                run_path.clear();
+                continue;
+            };
             let trimmed = added.content.trim();
             let is_code_comment = trimmed.starts_with("//")
                 && !trimmed.starts_with("///")
                 && !trimmed.starts_with("//!");
             if is_code_comment {
                 if run == 0 || run_path != added.path {
-                    if run > 5 {
-                        violations.push(format!(
-                            "{} lines +{}–+{}: {} consecutive commented-out lines — \
-                             remove or restore the code before review (>5-line threshold)",
-                            run_path, run_start, i, run
-                        ));
-                    }
-                    run_start = i + 1;
+                    flush_comment_run(&mut violations, &run_path, run_start, run_end, run);
+                    run_start = added.file_line;
                     run_path = added.path.clone();
                     run = 0;
                 }
                 run += 1;
+                run_end = added.file_line;
             } else {
-                if run > 5 {
-                    violations.push(format!(
-                        "{} lines +{}–+{}: {} consecutive commented-out lines — \
-                         remove or restore the code before review (>5-line threshold)",
-                        run_path, run_start, i, run
-                    ));
-                }
+                flush_comment_run(&mut violations, &run_path, run_start, run_end, run);
                 run = 0;
                 run_path.clear();
             }
         }
-        // Trailing run
-        if run > 5 {
-            violations.push(format!(
-                "{} lines +{}–end: {} consecutive commented-out lines — \
-                 remove or restore the code before review (>5-line threshold)",
-                run_path, run_start, run
-            ));
-        }
+        flush_comment_run(&mut violations, &run_path, run_start, run_end, run);
     }
 
     if violations.is_empty() {
@@ -5331,6 +5352,10 @@ mod lightweight_lint_tests {
     /// to exercise the language-aware lint checks (e.g. Rust macros must not
     /// fire for `.ts` / `.js` / `.py` changes).
     fn init_repo_with_diff_for_file(filename: &str, added_lines: &str) -> TempDir {
+        init_repo_with_diffs(&[(filename, added_lines)])
+    }
+
+    fn init_repo_with_diffs(files: &[(&str, &str)]) -> TempDir {
         let dir = TempDir::new().unwrap();
         // init git
         Command::new("git")
@@ -5360,12 +5385,65 @@ mod lightweight_lint_tests {
             .current_dir(dir.path())
             .output()
             .unwrap();
-        // write changed file using the requested filename/extension
-        let changed_path = dir.path().join(filename);
-        if let Some(parent) = changed_path.parent() {
-            std::fs::create_dir_all(parent).unwrap();
+        // write changed files using the requested filename/extension
+        for (filename, added_lines) in files {
+            let changed_path = dir.path().join(filename);
+            if let Some(parent) = changed_path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&changed_path, added_lines).unwrap();
         }
-        std::fs::write(&changed_path, added_lines).unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        dir
+    }
+
+    fn init_repo_with_multihunk_comment_diff() -> TempDir {
+        let dir = TempDir::new().unwrap();
+        Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        let original = (1..=40)
+            .map(|i| format!("pub fn line_{i}() -> u32 {{ {i} }}\n"))
+            .collect::<String>();
+        std::fs::write(dir.path().join("changed.rs"), original).unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        let mut modified = String::new();
+        for i in 1..=40 {
+            modified.push_str(&format!("pub fn line_{i}() -> u32 {{ {i} }}\n"));
+            if i == 2 || i == 30 {
+                modified.push_str("// disabled line 1\n");
+                modified.push_str("// disabled line 2\n");
+                modified.push_str("// disabled line 3\n");
+            }
+        }
+        std::fs::write(dir.path().join("changed.rs"), modified).unwrap();
         Command::new("git")
             .args(["add", "."])
             .current_dir(dir.path())
@@ -5388,20 +5466,30 @@ mod lightweight_lint_tests {
     fn lint_catches_unimplemented() {
         let dir = init_repo_with_diff("fn foo() { unimplemented!() }\n");
         let outcome = run_lightweight_structural_lint(dir.path());
-        assert!(
-            matches!(outcome, LightweightLintOutcome::Fail(_)),
-            "unimplemented!() should fail lint"
-        );
+        match outcome {
+            LightweightLintOutcome::Fail(msg) => {
+                assert!(
+                    msg.contains("changed.rs line +1"),
+                    "unimplemented!() finding must identify the file-local line: {msg}"
+                );
+            }
+            other => panic!("unimplemented!() should fail lint, got {other:?}"),
+        }
     }
 
     #[test]
     fn lint_catches_todo() {
         let dir = init_repo_with_diff("fn bar() { todo!(\"later\") }\n");
         let outcome = run_lightweight_structural_lint(dir.path());
-        assert!(
-            matches!(outcome, LightweightLintOutcome::Fail(_)),
-            "todo!() should fail lint"
-        );
+        match outcome {
+            LightweightLintOutcome::Fail(msg) => {
+                assert!(
+                    msg.contains("changed.rs line +1"),
+                    "todo!() finding must identify the file-local line: {msg}"
+                );
+            }
+            other => panic!("todo!() should fail lint, got {other:?}"),
+        }
     }
 
     #[test]
@@ -5409,10 +5497,15 @@ mod lightweight_lint_tests {
         // "let x = dbg!(foo)" — space before dbg
         let dir = init_repo_with_diff("let x = dbg!(foo);\n");
         let outcome = run_lightweight_structural_lint(dir.path());
-        assert!(
-            matches!(outcome, LightweightLintOutcome::Fail(_)),
-            "dbg!() with space before it should fail lint"
-        );
+        match outcome {
+            LightweightLintOutcome::Fail(msg) => {
+                assert!(
+                    msg.contains("changed.rs line +1"),
+                    "dbg!() finding must identify the file-local line: {msg}"
+                );
+            }
+            other => panic!("dbg!() with space before it should fail lint, got {other:?}"),
+        }
     }
 
     #[test]
@@ -5420,10 +5513,15 @@ mod lightweight_lint_tests {
         // "dbg!(foo)" — bare at start of expression
         let dir = init_repo_with_diff("dbg!(foo);\n");
         let outcome = run_lightweight_structural_lint(dir.path());
-        assert!(
-            matches!(outcome, LightweightLintOutcome::Fail(_)),
-            "bare dbg!() should fail lint"
-        );
+        match outcome {
+            LightweightLintOutcome::Fail(msg) => {
+                assert!(
+                    msg.contains("changed.rs line +1"),
+                    "bare dbg!() finding must identify the file-local line: {msg}"
+                );
+            }
+            other => panic!("bare dbg!() should fail lint, got {other:?}"),
+        }
     }
 
     #[test]
@@ -5431,10 +5529,15 @@ mod lightweight_lint_tests {
         // "let x=dbg!(foo)" — no space between = and dbg
         let dir = init_repo_with_diff("let x=dbg!(foo);\n");
         let outcome = run_lightweight_structural_lint(dir.path());
-        assert!(
-            matches!(outcome, LightweightLintOutcome::Fail(_)),
-            "dbg!() with no space after '=' should fail lint"
-        );
+        match outcome {
+            LightweightLintOutcome::Fail(msg) => {
+                assert!(
+                    msg.contains("changed.rs line +1"),
+                    "dbg!() finding must identify the file-local line: {msg}"
+                );
+            }
+            other => panic!("dbg!() with no space after '=' should fail lint, got {other:?}"),
+        }
     }
 
     #[test]
@@ -5442,10 +5545,15 @@ mod lightweight_lint_tests {
         // "return self.compute(=dbg!(val))" — dbg! embedded in a call-site expression
         let dir = init_repo_with_diff("return self.compute(=dbg!(val));\n");
         let outcome = run_lightweight_structural_lint(dir.path());
-        assert!(
-            matches!(outcome, LightweightLintOutcome::Fail(_)),
-            "dbg!() embedded in expression should fail lint"
-        );
+        match outcome {
+            LightweightLintOutcome::Fail(msg) => {
+                assert!(
+                    msg.contains("changed.rs line +1"),
+                    "dbg!() finding must identify the file-local line: {msg}"
+                );
+            }
+            other => panic!("dbg!() embedded in expression should fail lint, got {other:?}"),
+        }
     }
 
     #[test]
@@ -5467,12 +5575,55 @@ mod lightweight_lint_tests {
         match outcome {
             LightweightLintOutcome::Fail(msg) => {
                 assert!(
-                    msg.contains("src/legacy.rs"),
-                    "comment-block finding must identify the file: {msg}"
+                    msg.contains("src/legacy.rs lines +1–+6"),
+                    "comment-block finding must identify the file-local line range: {msg}"
                 );
             }
             other => panic!("6-line comment block should fail lint, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn lint_does_not_merge_comment_runs_across_files() {
+        let a = "// a1\n// a2\n// a3\n";
+        let b = "// b1\n// b2\n// b3\n";
+        let dir = init_repo_with_diffs(&[("src/a.rs", a), ("src/b.rs", b)]);
+        let outcome = run_lightweight_structural_lint(dir.path());
+        assert!(
+            matches!(outcome, LightweightLintOutcome::Pass),
+            "separate 3-line runs in separate files must not merge: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn lint_reports_real_multifile_comment_run_with_file_local_lines() {
+        let a = "// a1\n// a2\n// a3\n";
+        let b = "pub fn before() {}\n// b1\n// b2\n// b3\n// b4\n// b5\n// b6\n";
+        let dir = init_repo_with_diffs(&[("src/a.rs", a), ("src/b.rs", b)]);
+        let outcome = run_lightweight_structural_lint(dir.path());
+        match outcome {
+            LightweightLintOutcome::Fail(msg) => {
+                assert!(
+                    msg.contains("src/b.rs lines +2–+7"),
+                    "finding must name the violating file and B-local lines: {msg}"
+                );
+                assert!(
+                    !msg.contains("src/a.rs"),
+                    "non-violating file must not appear in the finding: {msg}"
+                );
+            }
+            other => panic!("real 6-line block in file B should fail lint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lint_does_not_merge_comment_runs_across_hunks() {
+        let dir = init_repo_with_multihunk_comment_diff();
+        let outcome = run_lightweight_structural_lint(dir.path());
+        assert!(
+            matches!(outcome, LightweightLintOutcome::Pass),
+            "separate same-file 3-line runs in separate hunks must not merge: {outcome:?}"
+        );
     }
 
     #[test]
