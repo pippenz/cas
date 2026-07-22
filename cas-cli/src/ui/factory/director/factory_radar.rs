@@ -742,10 +742,13 @@ mod tests {
             id: id.to_string(),
             name: name.to_string(),
             status: AgentStatus::Active,
+            registered_at: chrono::Utc::now(),
             current_task: None,
             latest_activity: None,
             last_heartbeat: Some(chrono::Utc::now()),
             pending_messages: 0,
+            pending_supervisor_messages: 0,
+            latest_supervisor_message_at: None,
             active_lease: None,
             effort: None,
         }

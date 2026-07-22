@@ -176,10 +176,13 @@ mod tests {
             id: id.to_string(),
             name: name.to_string(),
             status: AgentStatus::Active,
+            registered_at: Utc::now(),
             current_task: current_task.map(str::to_string),
             latest_activity: None,
             last_heartbeat: Some(Utc::now()),
             pending_messages: 0,
+            pending_supervisor_messages: 0,
+            latest_supervisor_message_at: None,
             active_lease: None,
             effort: None,
         }
