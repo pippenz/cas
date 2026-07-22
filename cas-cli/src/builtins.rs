@@ -3274,7 +3274,7 @@ This is the body content."#;
                     );
                 }
 
-                if line.contains("coordination action=message") {
+                if line.contains("coordination action=message") && line.contains("target=") {
                     let mut command = (*line).to_string();
                     let mut command_index = index;
                     while command.trim_end().ends_with('\\') && command_index + 1 < lines.len() {
