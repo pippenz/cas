@@ -7,6 +7,12 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [2.28.2] - 2026-07-22
+
+### Fixed
+- **The full parallel test gate is green again.** Six `supervisor_push` lifecycle tests raced with env-mutating tests in other modules (a module-local mutex can't guard a process-wide env var), poisoning a shared lock and failing every default-parallelism `cargo test` run. All `CAS_FACTORY_SESSION`-mutating tests now serialize on the process-wide poison-tolerant env lock with panic-safe restore — verified with 5 consecutive green parallel runs. Red gates mean real failures again.
+- **Supervisor rubric consistency pass.** Every copyable spawn recipe across the Claude/Codex/Grok supervisor rubrics now specifies explicit `cli`/`model`/`effort` per the GPT-5.6 Sol tier matrix, the harness `reference.md` twins are normalized (including live-worker transfer lifecycle guidance), workflow message examples include every required argument, and a guard test keeps these invariants from drifting.
+
 ## [2.28.1] - 2026-07-22
 
 ### Fixed
