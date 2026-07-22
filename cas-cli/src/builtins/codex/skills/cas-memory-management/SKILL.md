@@ -24,6 +24,14 @@ Store memories proactively — don't wait to be asked. Before creating a new mem
 
 **Valid `mcp__cs__memory` actions** (exact list — do not invent others): `remember`, `get`, `list`, `update`, `delete`, `archive`, `unarchive`, `helpful`, `harmful`, `mark_reviewed`, `recent`, `set_tier`, `opinion_reinforce`, `opinion_weaken`, `opinion_contradict`. There is **no `recall` action** — use `get` (by id) or `mcp__cs__search action=search` (by query).
 
+## Host-Scoped Memories
+
+Use a global memory tagged `host:<hostname>` for machine-specific constraints that should follow every project session on the same host: tmpfs mount rules, local disk budgets, staging directories, hardware quirks, or installed-tool constraints. SessionStart injects matching host-tagged global memories into each project on that machine, within the startup context budget.
+
+- Example: `mcp__cs__memory action=remember scope=global tags=host:<hostname>,tmpfs title="Host tmpfs constraint" content="..." entry_type=context`
+- Do not tag project-specific facts as host-scoped; keep those in project scope.
+- If a constraint applies to multiple machines, create one global memory per hostname tag or use a different cross-project mechanism.
+
 ## Two Modes: Legacy and Structured
 
 CAS memories support two frontmatter modes. Both are valid; structured mode is preferred for new memories but never required.

@@ -17,9 +17,9 @@ use std::sync::Arc;
 
 use cas_code::{CodeSymbol, SymbolKind};
 use cas_core::hooks::{
-    ContextScorer, ContextStores, HookInput, HooksConfig, RuleMatchCache, SurfacedItemCallback,
     build_context_with_stores, build_plan_context_with_stores, estimate_tokens, rule_matches_path,
-    token_display, truncate,
+    token_display, truncate, ContextScorer, ContextStores, HookInput, HooksConfig, RuleMatchCache,
+    SurfacedItemCallback,
 };
 use cas_store::{AgentStore, RuleStore, SkillStore, Store, TaskStore};
 use cas_types::{Entry, Rule, RuleStatus, Skill, Task, TaskStatus};
@@ -33,8 +33,11 @@ use crate::config::Config;
 use crate::error::MemError;
 use crate::store::{
     open_agent_store, open_code_store, open_rule_store, open_skill_store, open_store,
-    open_task_store,
+    open_store_local, open_task_store,
 };
+
+const HOST_CONSTRAINT_SECTION_BUDGET_BYTES: usize = 1200;
+const HOST_CONSTRAINT_LINE_BUDGET_BYTES: usize = 220;
 
 /// Build context string for session start injection
 ///
@@ -117,6 +120,18 @@ pub fn build_context(input: &HookInput, limit: usize, cas_root: &Path) -> Result
     )
     .map_err(|e| MemError::Other(e.to_string()))?;
 
+    let context = {
+        let mut ctx = context;
+        let host_section = build_host_constraints_section(cas_root);
+        if !host_section.is_empty() {
+            if !ctx.is_empty() {
+                ctx.push_str("\n\n");
+            }
+            ctx.push_str(&host_section);
+        }
+        ctx
+    };
+
     // Inject connected MCP proxy tools (from cached catalog)
     let context = {
         let mut ctx = context;
@@ -163,6 +178,135 @@ pub fn build_context(input: &HookInput, limit: usize, cas_root: &Path) -> Result
     }
 
     Ok(context)
+}
+
+fn current_hostname_tag() -> Option<String> {
+    let hostname = hostname::get().ok()?;
+    let hostname = hostname.to_string_lossy();
+    let normalized = hostname.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(format!("host:{normalized}"))
+    }
+}
+
+fn user_cas_dir() -> Option<std::path::PathBuf> {
+    dirs::home_dir().map(|home| home.join(".cas"))
+}
+
+fn entry_has_host_tag(entry: &Entry, expected_tag: &str) -> bool {
+    entry
+        .tags
+        .iter()
+        .any(|tag| tag.trim().eq_ignore_ascii_case(expected_tag))
+}
+
+fn render_host_constraint_line(entry: &Entry) -> String {
+    let title = entry
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|title| !title.is_empty());
+    let summary = match title {
+        Some(title) => format!("{} — {}", title, entry.content.trim()),
+        None => entry.content.trim().to_string(),
+    };
+    format!(
+        "- {} [{}] {}",
+        entry.id,
+        entry.entry_type,
+        truncate(&summary, HOST_CONSTRAINT_LINE_BUDGET_BYTES)
+    )
+}
+
+fn build_host_constraints_section(cas_root: &Path) -> String {
+    let Some(host_tag) = current_hostname_tag() else {
+        return String::new();
+    };
+    build_host_constraints_section_for_tag(
+        cas_root,
+        &host_tag,
+        HOST_CONSTRAINT_SECTION_BUDGET_BYTES,
+    )
+}
+
+fn build_host_constraints_section_for_tag(
+    cas_root: &Path,
+    host_tag: &str,
+    budget_bytes: usize,
+) -> String {
+    let Some(host_cas_dir) = user_cas_dir() else {
+        return String::new();
+    };
+    if host_cas_dir == cas_root {
+        return String::new();
+    }
+    let Ok(store) = open_store_local(&host_cas_dir) else {
+        return String::new();
+    };
+    let Ok(entries) = store.list() else {
+        return String::new();
+    };
+
+    let mut host_entries: Vec<Entry> = entries
+        .into_iter()
+        .filter(|entry| entry.scope.is_global())
+        .filter(|entry| entry_has_host_tag(entry, host_tag))
+        .collect();
+    host_entries.sort_by(|a, b| {
+        b.importance
+            .partial_cmp(&a.importance)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.created.cmp(&a.created))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+
+    if host_entries.is_empty() {
+        return String::new();
+    }
+
+    let mut lines = vec![
+        format!("## Host Constraints ({host_tag})"),
+        "Global memories tagged for this machine; applies across projects on this host."
+            .to_string(),
+    ];
+    let mut used = lines.iter().map(|line| line.len() + 1).sum::<usize>();
+    let mut omitted = 0usize;
+
+    for entry in &host_entries {
+        let line = render_host_constraint_line(entry);
+        let line_bytes = line.len() + 1;
+        if used + line_bytes > budget_bytes {
+            omitted += 1;
+            continue;
+        }
+        used += line_bytes;
+        lines.push(line);
+    }
+
+    if omitted > 0 {
+        loop {
+            let omitted_line =
+                format!("- {omitted} additional host constraint(s) omitted by budget");
+            if used + omitted_line.len() < budget_bytes {
+                lines.push(omitted_line);
+                break;
+            }
+            if lines.len() <= 2 {
+                break;
+            }
+            let removed = lines.pop().unwrap_or_default();
+            used = used.saturating_sub(removed.len() + 1);
+            omitted += 1;
+        }
+    }
+
+    if lines.len() <= 2 {
+        return String::new();
+    }
+
+    lines.join("\n")
 }
 
 /// Build context with AI-powered prioritization
@@ -825,6 +969,53 @@ fn build_mcp_tools_section(cas_root: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use crate::hooks::context::*;
+    use cas_core::hooks::HookInput;
+    use cas_types::{Entry, Scope};
+
+    struct EnvGuard {
+        saved: Vec<(String, Option<String>)>,
+    }
+
+    impl EnvGuard {
+        fn set(vars: &[(&str, Option<&str>)]) -> Self {
+            let saved = vars
+                .iter()
+                .map(|(key, value)| {
+                    let previous = std::env::var(key).ok();
+                    unsafe {
+                        match value {
+                            Some(value) => std::env::set_var(key, value),
+                            None => std::env::remove_var(key),
+                        }
+                    }
+                    ((*key).to_string(), previous)
+                })
+                .collect();
+            Self { saved }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in &self.saved {
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+    }
+
+    fn add_host_memory(cas_dir: &Path, id: &str, host_tag: &str, content: &str) {
+        let store = open_store_local(cas_dir).unwrap();
+        let mut entry = Entry::with_scope(id.to_string(), content.to_string(), Scope::Global);
+        entry.tags = vec![host_tag.to_string()];
+        entry.title = Some("Host constraint".to_string());
+        entry.importance = 1.0;
+        store.add(&entry).unwrap();
+    }
 
     #[test]
     fn test_parse_ai_selection_json() {
@@ -954,6 +1145,117 @@ mod tests {
         assert!(
             !section.contains("mcp__cas__mcp_search") && !section.contains("mcp__cs__mcp_search"),
             "grok worker must NOT see another harness's prefix: {section}"
+        );
+    }
+
+    #[test]
+    fn host_constraint_memory_surfaces_cross_project_for_same_host() {
+        let _lock = crate::hooks::test_env_lock();
+        let home = tempfile::tempdir().unwrap();
+        let host_cas = home.path().join(".cas");
+        let project_a = tempfile::tempdir().unwrap();
+        let project_b = tempfile::tempdir().unwrap();
+        let project_a_cas = project_a.path().join(".cas");
+        let project_b_cas = project_b.path().join(".cas");
+        std::fs::create_dir_all(&host_cas).unwrap();
+        std::fs::create_dir_all(&project_a_cas).unwrap();
+        std::fs::create_dir_all(&project_b_cas).unwrap();
+
+        let host_tag = current_hostname_tag().expect("hostname available");
+        add_host_memory(
+            &host_cas,
+            "g-host-constraint",
+            &host_tag,
+            "Do not stage large artifacts in tmpfs-backed /tmp on this host.",
+        );
+        let _env = EnvGuard::set(&[
+            ("HOME", Some(home.path().to_str().unwrap())),
+            ("CAS_ROOT", None),
+            ("CAS_AGENT_ROLE", None),
+            ("CAS_FACTORY_WORKER_CLI", None),
+        ]);
+
+        let input = HookInput {
+            session_id: "host-memory-session".to_string(),
+            cwd: project_b.path().to_string_lossy().to_string(),
+            hook_event_name: "SessionStart".to_string(),
+            ..HookInput::default()
+        };
+        let context = build_context(&input, 5, &project_b_cas).unwrap();
+
+        assert!(
+            context.contains("## Host Constraints"),
+            "host constraint section should be injected: {context}"
+        );
+        assert!(
+            context.contains("Do not stage large artifacts in tmpfs-backed /tmp on this host."),
+            "host memory from global store should surface in another project: {context}"
+        );
+        assert!(
+            !context.contains(project_a_cas.to_string_lossy().as_ref()),
+            "test sanity: project A exists only to prove the memory is not project-B local"
+        );
+    }
+
+    #[test]
+    fn host_constraint_memory_excludes_nonmatching_hostname() {
+        let _lock = crate::hooks::test_env_lock();
+        let home = tempfile::tempdir().unwrap();
+        let host_cas = home.path().join(".cas");
+        let project = tempfile::tempdir().unwrap();
+        let project_cas = project.path().join(".cas");
+        std::fs::create_dir_all(&host_cas).unwrap();
+        std::fs::create_dir_all(&project_cas).unwrap();
+        add_host_memory(
+            &host_cas,
+            "g-other-host",
+            "host:not-this-machine",
+            "This constraint belongs to a different host.",
+        );
+        let _env = EnvGuard::set(&[("HOME", Some(home.path().to_str().unwrap()))]);
+
+        let section =
+            build_host_constraints_section_for_tag(&project_cas, "host:this-machine", 1200);
+        assert!(
+            section.is_empty(),
+            "nonmatching host-tagged memories must be excluded: {section}"
+        );
+    }
+
+    #[test]
+    fn host_constraint_memory_section_is_size_capped() {
+        let _lock = crate::hooks::test_env_lock();
+        let home = tempfile::tempdir().unwrap();
+        let host_cas = home.path().join(".cas");
+        let project = tempfile::tempdir().unwrap();
+        let project_cas = project.path().join(".cas");
+        std::fs::create_dir_all(&host_cas).unwrap();
+        std::fs::create_dir_all(&project_cas).unwrap();
+        let host_tag = "host:budget-test";
+        for i in 0..20 {
+            add_host_memory(
+                &host_cas,
+                &format!("g-host-budget-{i:02}"),
+                host_tag,
+                &format!(
+                    "Constraint {i}: {}",
+                    "large host-specific memory text ".repeat(40)
+                ),
+            );
+        }
+        let _env = EnvGuard::set(&[("HOME", Some(home.path().to_str().unwrap()))]);
+
+        let budget = 420;
+        let section = build_host_constraints_section_for_tag(&project_cas, host_tag, budget);
+        assert!(!section.is_empty(), "expected at least one host memory");
+        assert!(
+            section.len() <= budget,
+            "host section must stay within its byte budget; len={} budget={budget}\n{section}",
+            section.len()
+        );
+        assert!(
+            section.contains("omitted by budget"),
+            "budgeted section should disclose omitted host constraints: {section}"
         );
     }
 }
