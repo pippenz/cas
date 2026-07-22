@@ -342,7 +342,55 @@ impl CasCore {
         let agent_id = self.get_agent_id()?;
 
         match agent_store.release_lease(&req.task_id, &agent_id) {
-            Ok(()) => Ok(Self::success(format!("Released task: {}", req.task_id))),
+            Ok(()) => {
+                let mut task = task_store.get(&req.task_id).map_err(|e| McpError {
+                    code: ErrorCode::INTERNAL_ERROR,
+                    message: Cow::from(format!(
+                        "Released task lease, but failed to read task state: {e}"
+                    )),
+                    data: None,
+                })?;
+
+                // cas-8cff: a successful release used to delete only the
+                // lease, leaving a normally-started task InProgress with no
+                // active worker. That phantom state is excluded from the
+                // ready pool and makes a later start report the nonsensical
+                // InProgress → InProgress transition. Returning a started
+                // task to the pool is part of release semantics, so persist
+                // the matching lifecycle state and clear its assignee.
+                if task.status == TaskStatus::InProgress {
+                    let prior_assignee = task.assignee.clone();
+                    task.status = TaskStatus::Open;
+                    task.assignee = None;
+                    task.updated_at = chrono::Utc::now();
+                    let ts = task.updated_at.format("%Y-%m-%d %H:%M");
+                    let audit = format!(
+                        "[{ts}] release: active lease released; status reset from InProgress to Open (prior assignee: {})",
+                        prior_assignee.as_deref().unwrap_or("<none>")
+                    );
+                    task.notes = if task.notes.is_empty() {
+                        audit
+                    } else {
+                        format!("{}\n\n{}", task.notes, audit)
+                    };
+                    task_store.update(&task).map_err(|e| McpError {
+                        code: ErrorCode::INTERNAL_ERROR,
+                        message: Cow::from(format!(
+                            "Released task lease, but failed to reset task status to Open: {e}"
+                        )),
+                        data: None,
+                    })?;
+                    Ok(Self::success(format!(
+                        "Released task: {} (status reset from InProgress to Open)",
+                        req.task_id
+                    )))
+                } else {
+                    Ok(Self::success(format!(
+                        "Released task lease: {} (task status remains {})",
+                        req.task_id, task.status
+                    )))
+                }
+            }
             Err(e) => {
                 // Auto-recovery path: no active lease but the task row may
                 // still be in a non-open state from a dead session. Flip it
