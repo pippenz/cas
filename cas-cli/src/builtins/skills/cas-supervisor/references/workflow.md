@@ -77,7 +77,9 @@ In shared mode, file-overlap analysis is even more critical — two workers edit
 4. Pin epic focus so the TUI shows it immediately: `mcp__cas__coordination action=focus_epic id=<epic-id>`. Without this, the TASKS/FACTORY panels stay empty until a worker's first `task action=start` on a subtask lets the panel infer the epic — and inference only fires once that subtask's `assignee` matches a live session agent (workers now get this for free: `task action=start` sets `assignee` automatically when unset, cas-6945). Clear with `action=focus_epic clear=true` when the epic wraps.
 5. Search for relevant context and send assignment message:
    ```
-   mcp__cas__coordination action=message target=<worker> message="Task <id>: <description>. Context: <findings>. Run mcp__cas__task action=mine to see your tasks."
+   mcp__cas__coordination action=message target=<worker> \
+     summary="Task <id> assignment" \
+     message="Task <id>: <description>. Context: <findings>. Run mcp__cas__task action=mine to see your tasks."
    ```
 6. **End your turn immediately.** Stop here. Do not monitor, poll, or run any commands. Workers will push a message to you when done or blocked. Your next action is triggered by their message, not by checking.
 
@@ -130,7 +132,9 @@ base branch ────────────────────► (sta
      by explicit judgment; this is an exception, not the default cadence.
 6. Message other active workers to sync onto the **local** branch (not `origin/`):
    ```
-   mcp__cas__coordination action=message target=<other-worker> message="Branch updated after cherry-pick. Sync: git stash && git rebase <base-branch> && git stash pop"
+   mcp__cas__coordination action=message target=<other-worker> \
+     summary="Epic branch updated" \
+     message="Branch updated after cherry-pick. Sync: git stash && git rebase <base-branch> && git stash pop"
    ```
 7. Clear completed worker's context: `mcp__cas__coordination action=clear_context target=<worker>`
 8. Assign next task
