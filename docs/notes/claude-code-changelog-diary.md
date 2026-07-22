@@ -24,6 +24,10 @@ When a new Claude Code version ships:
 5. If an item triggers actual work, file a CAS task/EPIC and link it here. If it's a
    "reviewed, no change needed" conclusion worth not re-litigating, also drop a
    `reference`-type CAS memory.
+6. After the diary update merges, publish the mandatory shared **#cas-internal**
+   harness thread: one parent plus exactly three replies ordered **Grok, Claude,
+   Codex**. Follow [the release Slack rubric](../RELEASE_SLACK_RUBRIC.md), including
+   its version-range, verdict/action, source-gap, and no-internal-narration rules.
 
 **Verdict legend**
 
@@ -40,6 +44,14 @@ When a new Claude Code version ships:
 
 | CC version | Headline | CAS verdict | Pointer |
 |------------|----------|-------------|---------|
+| 2.1.217 | **subagent concurrency/depth caps** · transcript-loss warnings · MCP-output leak + symlink-isolation fixes | 🟢 wins / ✅ | this doc |
+| 2.1.216 | **worktree escape routes closed** · resumed-agent restrictions restored · long-session stalls fixed | 🟢 direct wins | this doc |
+| 2.1.215 | `/verify` and `/code-review` no longer auto-invoked | ✅ no action | this doc |
+| 2.1.214 | **hook exit-2 blocking restored** · long-tool heartbeat · permission + SessionStart fork semantics | 🟢 wins / ✅ | this doc |
+| 2.1.213 | No section in Anthropic's official changelog | ⏭ source gap | this doc |
+| 2.1.212 | **subagent/session caps** · long MCP calls auto-background · hook-halt + worktree-symlink fixes | 👀 watch / 🟢 wins | this doc |
+| 2.1.211 | **subagent model override survives resume** · truthful background results · worktree-wide approvals | 🟢 wins / ✅ | this doc |
+| 2.1.210 | **worktree-isolated git mutation fixed** · hook-timeout semantics · dead-worker lock cleanup | 🟢 direct wins | this doc |
 | 2.1.209 | `/model` + dialogs unblocked in `claude agents` background sessions | ⏭ n/a | — |
 | 2.1.208 | **catastrophic `rm` still prompts under `--dangerously-skip-permissions` when command has `$(…)`** · long-session hook/MCP memory leaks fixed · MCP tool-pool cache | 👀 watch / ✅ | this doc |
 | 2.1.207 | **agent-teams mailbox crash-loop fixed** · skill/worktree bracket-glob parse fixes · plugin shell-form `${user_config.*}` rejected | 🟢 win / ✅ | this doc |
@@ -80,6 +92,148 @@ When a new Claude Code version ships:
 ---
 
 ## Entries
+
+### 2.1.217 — bounded subagent fan-out · transcript/MCP memory safety · background isolation
+
+Reviewed 2026-07-22 (diary-claude / cas-9642). Host on **2.1.217**.
+
+- **Concurrent subagents are capped at 20 by default, nested spawning is off by default, and
+  `--max-budget-usd` now halts background subagents.** → 🟢 **direct safety win.** CAS verification and
+  `cas-code-review` use bounded subagent dispatch (`.claude/agents/task-verifier.md` and the
+  `cas-code-review` skill); ordinary fan-out remains well below 20. The host now also bounds accidental
+  recursive or runaway delegation. No CAS change; `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS` and
+  `CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH` are escape hatches if an intentional workflow grows.
+- **Transcript-write failures and inherited session-saving disablement now warn instead of silently
+  losing history.** → 🟢 **debuggability win.** CAS incident work relies on session JSONL/transcripts as
+  proof, so silent loss made hook and worker failures materially harder to diagnose. No CAS change.
+- **Truncated MCP outputs no longer retain the full result, and background-session isolation now
+  canonicalizes symlinked working directories.** → ✅ / 🟢 **no action — direct wins.** Factory turns
+  use a large MCP surface for long sessions, while CAS separately stamps isolated worker paths with
+  `CAS_CLONE_PATH` (`crates/cas-pty/src/pty.rs`). These fixes reduce memory growth and close a host-side
+  workspace escape; CAS's own path/branch guards remain defense in depth.
+- **Auto-compact now works for Opus 4.8 on Bedrock and `/compact` recovers after the limit.** → ✅ no
+  action; long-running supervisors benefit without changing CAS compaction guidance.
+
+### 2.1.216 — worktree escape closure · resumed-agent identity · long-session responsiveness
+
+Reviewed 2026-07-22.
+
+- **Worktree-isolated subagents can no longer redirect git into the shared checkout via `git -C`,
+  `--git-dir`, or Git environment variables; sessions also stop landing in another project's stale
+  worktree.** → 🟢 **direct isolation win.** CAS already creates and records factory worktrees through
+  its own worktree manager and enforces `CAS_CLONE_PATH` at SessionStart
+  (`cas-cli/src/hooks/handlers/handlers_session.rs`). The host now closes bypasses beneath those
+  guards. No CAS change.
+- **Resumed background agents now restore their agent prompt and tool restrictions, and a
+  high-priority message no longer cancels a background subagent during startup.** → 🟢 **lifecycle
+  win.** The task-verifier's restricted prompt/tool contract is load-bearing
+  (`.claude/agents/task-verifier.md`); resume/wake behavior now preserves it instead of silently
+  reverting to the default agent.
+- **Long-session message normalization no longer grows quadratically with turn count.** → ✅ no
+  action — factory supervisors and workers are deliberately long-lived, so the stall/resume fix rides
+  free.
+- **Skills changed during a session now appear without restart; plugin skill prefixes are preserved.**
+  → ✅ no action; aligns with CAS skill sync/hot-reload behavior and removes host-side stale discovery.
+
+### 2.1.215 — no autonomous `/verify` or `/code-review`
+
+Reviewed 2026-07-22. **Single-item release.**
+
+- **Claude no longer invokes `/verify` or `/code-review` on its own.** → ✅ **no action — authority
+  boundary clarified.** CAS's close gate explicitly dispatches the `task-verifier` agent and the
+  supervisor owns `cas-code-review`; neither depends on Claude opportunistically choosing a similarly
+  named built-in skill (`docs/verifier-dispatch-trace.md`). Explicit CAS lifecycle calls remain intact.
+
+### 2.1.214 — hook blocking restored · tool heartbeat · permission hardening
+
+Reviewed 2026-07-22.
+
+- **Hooks exiting 2 now block even when their stdout JSON fails schema validation.** → 🟢 **direct
+  hook-safety win.** CAS uses exit-2 semantics on load-bearing SessionStart/SubagentStart and tool
+  hooks (`cas-cli/src/hooks`); malformed diagnostic JSON can no longer accidentally turn a deny into
+  continued execution. No CAS change.
+- **Long-running tool calls now emit periodic progress heartbeats.** → 🟢 **unattended-worker win.**
+  A factory pane now visibly distinguishes a legitimately long tool operation from an apparently
+  wedged worker. This complements CAS process/session heartbeats rather than replacing them.
+- **Permission checks were hardened for path globs, Bash redirects/long commands, PowerShell, remote
+  prompts, and Docker daemon redirects.** → ✅ no action; host-side defense in depth. Factory workers
+  normally use bypass permissions, while CAS retains its own branch/path commit guards.
+- **SessionStart reports source `"fork"` for forked sessions instead of `"resume"`.** → ✅ **already
+  compatible.** CAS's SessionStart dispatcher handles the shared event and does not require the old
+  mislabeled source (`cas-cli/src/hooks/mod.rs`, `handlers_session.rs`).
+- **Slow stream-json consumers now drain complete output at exit, and OTel logs gained correlation and
+  tool-provenance fields.** → ✅ no action; improves headless evidence and observability without a CAS
+  protocol change.
+
+### 2.1.213 — official changelog section absent
+
+Reviewed 2026-07-22.
+
+- Anthropic's official raw `CHANGELOG.md` jumps from **2.1.214** to **2.1.212**; there is no 2.1.213
+  section or item to evaluate. → ⏭ **source gap.** Recorded explicitly to keep version coverage
+  complete without inventing a release note or CAS verdict.
+
+### 2.1.212 — delegation budgets · long MCP backgrounding · hook/worktree correctness
+
+Reviewed 2026-07-22.
+
+- **Sessions now cap subagent spawns at 200 (reset by `/clear`), and WebSearch calls at 200.** → 🟢
+  **runaway-loop safety win.** CAS review/verification dispatch is intentionally bounded; normal runs
+  stay far below these ceilings. `CLAUDE_CODE_MAX_SUBAGENTS_PER_SESSION` is available if a future large
+  review fan-out proves constrained.
+- **MCP calls longer than two minutes automatically move to the background.** → 👀 **watch — CAS tool
+  semantics.** Search, coordination, and close calls can be long-running on large stores. The session
+  staying usable is beneficial, but if a caller assumes a foreground result, first inspect
+  `CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS` when diagnosing an apparently detached CAS call. No concrete
+  defect observed, so no task filed.
+- **A `continue:false` hook halt is no longer lost when a tool fails/completes mid-stream, and hook
+  infrastructure errors are no longer reported as user rejection.** → 🟢 **direct hook-authority
+  win.** CAS PreToolUse guards rely on harness halts being final; this removes a race and preserves the
+  distinction between policy and human decisions.
+- **Worktree creation no longer follows a committed `.claude/worktrees` symlink outside the repo.** →
+  ✅ no action / host hardening. CAS factory uses `.cas/worktrees` via its own manager, while raw
+  `Agent(isolation: "worktree")` is separately denied for factory supervisors.
+- **Inter-agent `SendMessage` bodies are no longer duplicated in replayed history, agent JSON exposes
+  `Needs input`, and SIGTERM kills print/SDK Bash process trees.** → ✅ no action — smaller context,
+  clearer stall state, and cleaner unattended shutdown all ride free.
+
+### 2.1.211 — subagent identity/model continuity · truthful completion · shared approvals
+
+Reviewed 2026-07-22.
+
+- **Explicit subagent model overrides now survive resume and follow-up messages.** → 🟢 **direct
+  orchestration win.** CAS's factory-worker model/effort pinning happens separately at PTY launch
+  (`crates/cas-pty/src/pty.rs`); for native verifier/review subagents that do receive an explicit
+  override, resume or follow-up no longer silently falls back to the parent model.
+- **Background-agent result reporting now waits for real completion instead of fabricating results,
+  and user-killed agents no longer auto-respawn with stale prompts.** → 🟢 **authority/lifecycle win.**
+  This matches CAS's rule that completion must be proven and launcher messages are task direction,
+  not human approval. Factory workers remain tmux-managed, but native subagent verification benefits.
+- **"Always allow" rules now save at repository root so approvals persist across worktrees.** → ✅ no
+  action. CAS factory normally bypasses host permission prompts and independently protects worker
+  branch/path scope; interactive non-DSP sessions get more consistent worktree behavior.
+- **`--forward-subagent-text` can include subagent text/thinking in stream-json.** → 👀 opportunity,
+  not required. It could improve headless verifier diagnostics, but CAS does not need to expose hidden
+  reasoning and no concrete evidence gap warrants changing spawn flags.
+
+### 2.1.210 — isolated git mutation · hook-timeout semantics · dead-worker cleanup
+
+Reviewed 2026-07-22.
+
+- **`isolation: "worktree"` subagents can no longer run git-mutating commands against the main
+  checkout.** → 🟢 **direct isolation win.** CAS blocks factory supervisors from raw worktree-isolated
+  Agent spawns and routes workers through its own manager; the host now also closes the residual raw
+  native-subagent cross-checkout mutation path. No CAS change.
+- **Hook callback timeouts are no longer described to the model as user rejection.** → 🟢 **unattended
+  worker win.** CAS relies on hooks for SessionStart context and tool guards; a timeout is infrastructure
+  failure, not human denial. Correct classification prevents a worker from stopping to await approval
+  that never occurred.
+- **Dead background sessions no longer leave permanent git worktree locks; the periodic sweep releases
+  locks after the owner exits.** → 🟢 **cleanup win.** CAS's worktree manager remains authoritative for
+  factory trees, while host cleanup reduces stale-lock interference around native subagents.
+- **Plugin MCP servers survive mid-session re-sync, SDK-initialized MCP servers connect in the same
+  turn, and Agent received indirect-prompt-injection hardening.** → ✅ no action — reliability and
+  security improvements on surfaces CAS uses without requiring a protocol or prompt change.
 
 ### 2.1.209 — dialogs unblocked in `claude agents` background sessions
 

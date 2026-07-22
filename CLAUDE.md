@@ -66,7 +66,7 @@ When diagnosing a bug or reasoning about behavior, **verify the claim against th
 
 This repo **is** the CAS source. When a bug is reported in the verifier, hooks, factory orchestration, MCP dispatch, the task-verifier agent, worker prompts, or built-in skills — regardless of which downstream project (gabber-studio, OpenClaw, etc.) surfaced it — the fix lands here as a Rust or markdown change via a task assigned to a worker. Do not file the bug with team-lead, do not "report upstream", do not treat cas-src IS CAS as an external dependency. Other projects consume CAS; they do not modify it. If you catch yourself wanting to escalate a CAS bug, stop and create the fix task in this repo instead.
 
-## Releases → Slack (mandatory on every merge to main)
+## Releases and harness diaries → Slack (mandatory)
 
-Every PR/merge to `main` REQUIRES **two distinct #cas-internal posts** — one user-perspective, one dev-perspective. Each opens with a punchy plain-language **how-it-was → how-it-is-now** hook, then perspective-specific details. Both posts: **no ticket numbers, no internal agent/factory narration**; the user post is always plain language, the dev post may be technical.
+Runtime releases and harness-diary updates have **separate** #cas-internal publication duties. A runtime release requires two distinct top-level posts (user and dev). A diary update requires one top-level cross-harness summary with exactly three replies ordered **Grok, Claude, Codex**. If one merge contains both, publish both workflows; a diary-only merge must not pose as a runtime release. All messages use impact-first prose with no ticket IDs or internal agent/factory narration.
 -> See [docs/RELEASE_SLACK_RUBRIC.md](docs/RELEASE_SLACK_RUBRIC.md)

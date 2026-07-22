@@ -24,6 +24,10 @@ When a new Grok Build version ships (or after `grok` upgrades on the host):
 5. **Version gap matters:** keep **validated pin** (pty.rs comment) vs **locally
    installed** vs **latest in changelog** honest. Do not invent older releases —
    if the local changelog only has N versions, seed those N and mark the **seed floor**.
+6. After the diary update merges, publish the mandatory shared **#cas-internal**
+   harness thread: one parent plus exactly three replies ordered **Grok, Claude,
+   Codex**. Follow [the release Slack rubric](../RELEASE_SLACK_RUBRIC.md), including
+   its version-range, verdict/action, source-gap, and no-internal-narration rules.
 
 **Verdict legend:** ✅ no action · 🟢 already covered · 👀 watch (touches a CAS
 dependency, verify on upgrade) · 🔧 fix shipped · 🏗 EPIC · ⏭ n/a
@@ -33,15 +37,18 @@ dependency, verify on upgrade) · 🔧 fix shipped · 🏗 EPIC · ⏭ n/a
 - **CAS validated against:** Grok Build **0.2.93** (comment on
   `crates/cas-pty/src/pty.rs` `PtyConfig::grok`, verified live 2026-07-09 via
   `grok --help` / `grok inspect` / `grok mcp doctor`).
-- **Locally installed:** **0.2.101** (`grok 0.2.101`, checked 2026-07-14).
-- **Latest in local changelog:** **0.2.101** (2026-07-13). The installable
-  `~/.grok/CHANGELOG.md` currently documents only **0.2.100** and **0.2.101** —
-  that is the **seed floor** for this diary (do not invent pre-0.2.100 history).
-- **Gap:** ~8 patch versions between the validated pin (0.2.93) and installed/latest
-  (0.2.101). Entries below are a *triage pass* against touchpoints for the two
-  changelog-visible releases, not a re-run of the 0.2.93 live verification.
-  Upgrade-time re-verification of the full touchpoint checklist is the trigger for
-  promoting any 👀 to a task.
+- **Locally installed:** **0.2.106** (`grok 0.2.106 (bde89716f6) [stable]`, checked
+  2026-07-22).
+- **Latest in local changelog:** **0.2.106** (2026-07-18). The current
+  `~/.grok/CHANGELOG.md` documents **0.2.104–0.2.106**; it no longer includes the
+  **0.2.100–0.2.101** sections captured here on 2026-07-14, and it omits
+  **0.2.102–0.2.103** entirely. Those two missing releases are recorded explicitly
+  below without invented history. **0.2.100** remains the diary's evidence-backed
+  **seed floor**.
+- **Gap:** ~13 patch versions between the validated pin (0.2.93) and
+  installed/latest (0.2.106). Entries below are a *changelog triage pass*, not a
+  re-run of the 0.2.93 live verification. Upgrade-time re-verification of the full
+  touchpoint checklist remains the trigger for promoting any 👀 to a task.
 
 ## CAS ↔ Grok touchpoints (what a release can break)
 
@@ -113,13 +120,108 @@ At minimum, `PtyConfig::grok` sets:
 
 | Grok version | Headline | CAS verdict | Pointer |
 |--------------|----------|-------------|---------|
+| 0.2.106 | Clipboard fallback/env opt-out · scheduled tasks become background commands · minimal-mode highlighting | ✅ / ⏭ | this doc |
+| 0.2.105 | Grok 4.5 defaults/effort + compaction · login-shell env · global rules discovery · MCP OAuth · background lifecycle/fleet roster | 👀 / ✅ / ⏭ | this doc |
+| 0.2.104 | Persistent background-work status · idle auth recovery · error/rate-limit copy · prompt editing | 👀 / ⏭ | this doc |
+| 0.2.103 | Missing from installed local changelog | — (no evidence) | this doc |
+| 0.2.102 | Missing from installed local changelog | — (no evidence) | this doc |
 | 0.2.101 | **grok inspect** multi-harness compatibility settings · TUI refresh cadence · queue/status/subagent polish · rate-limit copy | 👀 / ✅ / ⏭ | this doc |
 | 0.2.100 | **Session picker + welcome resume** across Claude/Codex/Cursor · web-fetch artifacts · queue/multiline Enter · pane-closed resume crash · hooks honor disabled-at-start · long-turn status markers | 👀 / ✅ / ⏭ | this doc |
-| *(seed floor)* | No older versions in host `~/.grok/CHANGELOG.md` as of 2026-07-14 | — | — |
+| *(seed floor)* | No evidence-backed versions before 0.2.100; current host changelog starts at 0.2.104 | — | — |
 
 ---
 
 ## Entries
+
+### 0.2.106 — scheduled-task lifecycle · clipboard fallback
+
+Reviewed 2026-07-22 (diary-grok / cas-4aef). Host install is **0.2.106**.
+Source: `~/.grok/CHANGELOG.md` (2026-07-18).
+
+- **“Added `GROK_CLIPBOARD_NO_OSC52` env var”** and **copies always write a backup
+  file when the terminal clipboard fails.** → ⏭ n/a. These improve interactive
+  clipboard recovery and terminal compatibility; CAS does not configure Grok's
+  clipboard transport in `PtyConfig::grok`.
+- **“Scheduled tasks can now be updated in place; one-time tasks are retired in
+  favor of background commands.”** → ✅ no action. This changes Grok-native task
+  scheduling/background commands, not CAS task leases or the CAS-managed factory
+  worker process lifecycle. Keep the distinction explicit when diagnosing a Grok
+  “background task”: it is not necessarily a CAS task or worker.
+- **Minimal-mode syntax highlighting is visible on light terminals.** → ⏭ n/a
+  (rendering only; factory workers are not launched through minimal-mode UI flows).
+
+### 0.2.105 — model defaults · login-shell env · rules/MCP · compaction · fleet UX
+
+Reviewed 2026-07-22 (diary-grok / cas-4aef). Source:
+`~/.grok/CHANGELOG.md` (2026-07-18).
+
+- **“Default model is now Grok 4.5 with high/medium/low reasoning effort and
+  improved compaction settings.”** → 👀 **watch — model/effort defaults.** CAS only
+  passes `--model` and `--reasoning-effort` when the factory requests them, so an
+  unpinned worker now inherits Grok 4.5 and its new defaults. The listed effort
+  levels remain within CAS's verified vocabulary, but this changelog review does
+  not replace a live flag/behavior smoke.
+- **“Local shell tools now see the same environment variables, aliases, and
+  functions as your login shell.”** → 👀 **watch — environment boundary.** CAS
+  supplies identity and factory metadata on the top-level Grok child. This fix is
+  favorable for commands Grok launches, but login-shell initialization can also
+  add or override environment state; smoke that `CAS_AGENT_NAME`, `CAS_SESSION_ID`,
+  and `CAS_FACTORY_WORKER_CLI=grok` remain visible after the upgrade.
+- **“Global rules from `~/.grok/rules` and compatible vendor homes are now
+  discovered correctly.”** → 👀 **watch — system-prompt layering.** CAS's
+  load-bearing role contract is appended explicitly with `--rules`; newly restored
+  global/vendor rules are another prompt source and must not displace or contradict
+  that injected contract. No spawn change is indicated.
+- **MCP OAuth logins now accept RFC 9207 issuer callbacks.** → ✅ no action for the
+  current CAS stdio server. It improves discovery/login compatibility for remote
+  OAuth MCP servers but does not alter CAS's persistent project/user MCP discovery
+  or Grok's `cas__*` tool namespace.
+- **Background tasks finishing after Ctrl+C no longer resume the model; Ctrl+\\ from
+  the dashboard returns to the originating agent; fleet roster entries render even
+  with an empty local agent list.** → 👀 **watch — lifecycle/roster UX.** These are
+  Grok-owned background-agent and dashboard behaviors, not CAS lease/roster state.
+  The fixes reduce confusing post-cancel resumes and missing rows, but CAS remains
+  authoritative for factory membership and worker lifecycle.
+- **Long-session compaction no longer fails when servers reject `tool_choice: none`
+  with tools attached.** → 👀 **watch — long factory sessions.** This is a direct
+  reliability improvement for tool-using workers; verify that CAS rules and identity
+  survive a real compaction before treating the 0.2.106 install as validated.
+- **`/btw` in minimal mode, snap-prompt appearance, `/summarize`, syntax colors, and
+  scrolling smoothness.** → ⏭ n/a (interactive commands/rendering; no CAS launch,
+  MCP, rules, transcript, or process contract change).
+
+### 0.2.104 — background status · idle authentication recovery
+
+Reviewed 2026-07-22 (diary-grok / cas-4aef). Source:
+`~/.grok/CHANGELOG.md` (2026-07-17).
+
+- **“Background work counts now appear in a persistent status line instead of
+  repeated transcript messages.”** → 👀 **watch — transcript/liveness evidence.** A
+  presentation change should not alter session transcript activity, but CAS liveness
+  resolves Grok sessions under `~/.grok/sessions/*`. Confirm long background work
+  still produces enough transcript/file activity for diagnostics rather than
+  assuming status-line updates are persisted messages.
+- **Authentication recovery for idle sessions after token timeouts.** → 👀 **watch —
+  worker longevity.** This should reduce dead idle workers after auth expiry; it does
+  not change CAS leases, restarts, or its source of worker truth.
+- **Retry errors hide raw HTML, rate-limit messages show server detail, and in-place
+  prompt editing is temporarily disabled.** → ⏭ n/a (error copy and interactive
+  editor behavior only).
+
+### 0.2.103 — missing from the installed local changelog
+
+Reviewed 2026-07-22 (diary-grok / cas-4aef). The installed
+`~/.grok/CHANGELOG.md` jumps from **0.2.104** to the end of the file; neither it nor
+the current flat `~/.grok/CHANGELOG.json` provides a 0.2.103 section. No release
+items, date, or CAS verdict are fabricated from the version number alone.
+
+### 0.2.102 — missing from the installed local changelog
+
+Reviewed 2026-07-22 (diary-grok / cas-4aef). The installed
+`~/.grok/CHANGELOG.md` has no 0.2.102 section, and the current flat
+`~/.grok/CHANGELOG.json` does not attribute any item to it. No release items, date,
+or CAS verdict are fabricated. The already-recorded 0.2.101 entry below comes from
+the earlier 2026-07-14 host snapshot; it does not fill this evidence gap.
 
 ### 0.2.101 — inspect multi-harness settings · queue/status polish · refresh rate
 
@@ -192,17 +294,18 @@ changelog; no pre-0.2.100 entries inventable from this host.
 
 ## Backlog of opportunities (not required, tracked)
 
-- **0.2.93 → 0.2.101 upgrade validation:** re-run the live checklist that pinned 0.2.93
+- **0.2.93 → 0.2.106 upgrade validation:** re-run the live checklist that pinned 0.2.93
   (`grok --help` flags, `grok inspect`, `grok mcp doctor`, factory spawn smoke):
   `--permission-mode bypassPermissions`, `--session-id`, `-m` / `--reasoning-effort`,
   `--cwd`, `--rules`, MCP discovery of `cas` without per-spawn `-c`, env inheritance
   into `cas serve`, tools as `cas__*`, transcripts under `~/.grok/sessions/*`.
-- **Validated-pin comment bump:** after a successful factory smoke on 0.2.101, update
+- **Validated-pin comment bump:** after a successful factory smoke on 0.2.106, update
   the `PtyConfig::grok` "Verified against … 0.2.93" comment (and this diary's Version
   status) so the pin tracks reality.
-- **Changelog history depth:** when Grok exposes older releases beyond the two-section
-  local CHANGELOG, backfill entries without inventing notes; until then keep the seed
-  floor explicit.
+- **Changelog history depth:** find an authoritative release surface for the missing
+  0.2.102–0.2.103 notes and any pre-0.2.100 history before backfilling them. The
+  current local CHANGELOG covers only 0.2.104–0.2.106; keep both the gap and the
+  0.2.100 evidence-backed seed floor explicit until then.
 - **SessionStart stdout:** if a future Grok release starts delivering SessionStart
   stdout like Claude, re-evaluate whether `--rules` remains the sole context path or
   becomes defense-in-depth (would be a deliberate EPIC, not a silent drop of `--rules`).
