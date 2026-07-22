@@ -34,7 +34,7 @@ The durable output is a **requirements document** stored at `docs/brainstorms/YY
 These exist because CAS agents have a documented tendency to dump multiple questions at once and lead with solutions. Do not skip them.
 
 1. **Ask ONE question at a time.** Never batch unrelated questions into one message. If you find yourself writing "Also,..." or "And another thing:" — stop. Send the first question, wait for the answer, then ask the next.
-2. **Use the `AskUserQuestion` tool for blocking questions.** It is the platform's blocking question tool. Use it instead of presenting numbered options in chat whenever possible. Numbered chat options are a fallback only.
+2. **Use the `AskUserQuestion` tool for blocking questions.** It is the platform's blocking question tool. Use it instead of presenting numbered options in chat whenever possible. Numbered chat options are a fallback only. In factory mode AskUserQuestion is blocked — ask the questions in plain text and end your turn; the director relays answers.
 3. **Prefer single-select multiple choice.** Single-select is faster for the user than open-ended prose questions. Use it when picking one direction, one priority, or one next step.
 4. **Use multi-select rarely and intentionally.** Only for compatible sets like goals, constraints, or non-goals that can all coexist. If prioritization matters, follow up by asking which selected item is primary.
 5. **Ask what the user is thinking BEFORE offering ideas.** This surfaces hidden context and prevents the user from anchoring on AI-generated framings. "What have you already considered?" is more valuable than "Here are 5 options."
@@ -76,7 +76,7 @@ cas__search action=search query="<topic keywords>" doc_type=entry limit=5
 
 If a recent matching `*-requirements.md` file exists, or the user references prior work:
 - Read the document
-- Confirm with the user (one question, `AskUserQuestion`): "Found an existing requirements doc for [topic]. Continue from this, or start fresh?"
+- Confirm with the user (one question, `AskUserQuestion`): "Found an existing requirements doc for [topic]. Continue from this, or start fresh?" In factory mode AskUserQuestion is blocked — ask the question in plain text and end your turn; the director relays answers.
 - If resuming, summarize the current state, continue from existing decisions and outstanding questions, and update the existing document instead of duplicating it.
 
 #### 0.2 Assess Whether Brainstorming Is Even Needed
@@ -162,7 +162,7 @@ Before generating approaches, challenge the request to catch misframing. **This 
 
 #### 1.3 Collaborative Dialogue
 
-This is the heart of the skill. Follow the Interaction Rules above. **Use `AskUserQuestion` for questions whenever possible.**
+This is the heart of the skill. Follow the Interaction Rules above. **Use `AskUserQuestion` for questions whenever possible.** In factory mode AskUserQuestion is blocked — ask the questions in plain text and end your turn; the director relays answers.
 
 **Guidelines:**
 - Ask what the user is already thinking before offering your own ideas

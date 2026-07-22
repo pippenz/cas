@@ -331,8 +331,9 @@ impl TeamsManager {
 
     /// Filesystem tool families whose approval would otherwise route to the
     /// phantom `team-lead` mailbox under Claude Code 2.1.x (see UG9 bug in
-    /// `pre_tool.rs`). Used by both the `permissions.allow` list and the
-    /// `PreToolUse` hook matcher in the per-role settings file.
+    /// `pre_tool.rs`). Used only by the `permissions.allow` list; the
+    /// `PreToolUse` hook matcher also includes intercept-only tools that must
+    /// not be auto-allowed.
     ///
     /// MUST stay in sync with `FACTORY_AUTO_APPROVE_TOOLS` in
     /// `cas-cli/src/hooks/handlers/handlers_events/pre_tool.rs` — the hook
@@ -342,6 +343,12 @@ impl TeamsManager {
     /// for nothing.
     fn factory_allow_list() -> &'static [&'static str] {
         &["Read", "Write", "Edit", "Glob", "Grep", "Bash", "NotebookEdit"]
+    }
+
+    /// Tools that must reach the `PreToolUse` hook for factory-specific
+    /// routing or denial, but must not be listed in `permissions.allow`.
+    fn factory_pre_tool_intercept_list() -> &'static [&'static str] {
+        &["SendMessage", "AskUserQuestion"]
     }
 
     /// `hooks` block for per-role settings files. Wires `PreToolUse` (belt
@@ -355,11 +362,16 @@ impl TeamsManager {
     /// /doctor on every CC version, regardless of #58441 state.
     ///
     /// Defaults mirror `cli/hook/config_gen.rs`: 2000ms timeout for both.
-    /// `PreToolUse` matcher is the filesystem tool list so we don't fire
-    /// the hook on unrelated tools (MCP, Agent, etc. still flow through
-    /// Claude Code's normal paths).
+    /// `PreToolUse` matcher covers the filesystem allow list plus
+    /// intercept-only tools like `SendMessage` and `AskUserQuestion`; those
+    /// intercept-only tools are deliberately omitted from `permissions.allow`.
     fn factory_hooks_block() -> serde_json::Value {
-        let matcher = Self::factory_allow_list().join("|");
+        let matcher = Self::factory_allow_list()
+            .iter()
+            .chain(Self::factory_pre_tool_intercept_list().iter())
+            .copied()
+            .collect::<Vec<_>>()
+            .join("|");
         serde_json::json!({
             "PreToolUse": [
                 {
@@ -995,6 +1007,12 @@ mod tests {
                 "worker allowlist must include {tool}, got {names:?}"
             );
         }
+        for tool in ["SendMessage", "AskUserQuestion"] {
+            assert!(
+                !names.contains(&tool),
+                "worker allowlist must not auto-allow intercept-only tool {tool}: {names:?}"
+            );
+        }
     }
 
     /// Both per-role settings bodies must wire the factory auto-approve
@@ -1039,7 +1057,17 @@ mod tests {
                 .get("matcher")
                 .and_then(|v| v.as_str())
                 .unwrap_or_else(|| panic!("{role} PreToolUse missing matcher: {pre}"));
-            for tool in ["Read", "Write", "Edit", "Glob", "Grep", "Bash", "NotebookEdit"] {
+            for tool in [
+                "Read",
+                "Write",
+                "Edit",
+                "Glob",
+                "Grep",
+                "Bash",
+                "NotebookEdit",
+                "SendMessage",
+                "AskUserQuestion",
+            ] {
                 assert!(
                     matcher.contains(tool),
                     "{role} PreToolUse matcher must cover {tool}, got {matcher:?}"
