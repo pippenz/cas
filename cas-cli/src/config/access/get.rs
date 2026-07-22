@@ -6,6 +6,7 @@ impl Config {
         let hooks = self.hooks.clone().unwrap_or_default();
         let tasks = self.tasks.clone().unwrap_or_default();
         let dev = self.dev.clone().unwrap_or_default();
+        let staging = self.staging.clone().unwrap_or_default();
         let notifications = self.notifications.clone().unwrap_or_default();
         match key {
             // Sync section
@@ -72,6 +73,13 @@ impl Config {
                     .debounce_ms
                     .to_string(),
             ),
+            // Staging section
+            "staging.staging_dir" | "staging.large_artifact_dir" => {
+                Some(staging.staging_dir.unwrap_or_default())
+            }
+            "staging.tmpfs_warning_threshold_bytes" => {
+                Some(staging.tmpfs_warning_threshold_bytes.to_string())
+            }
             // Notifications section
             "notifications.enabled" => Some(notifications.enabled.to_string()),
             "notifications.sound_enabled" => Some(notifications.sound_enabled.to_string()),

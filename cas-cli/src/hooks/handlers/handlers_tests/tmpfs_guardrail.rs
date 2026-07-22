@@ -40,10 +40,38 @@ fn mounts() -> Vec<MountInfo> {
             fs_type: "tmpfs".to_string(),
         },
         MountInfo {
+            mount_point: PathBuf::from("/dev/shm"),
+            fs_type: "tmpfs".to_string(),
+        },
+        MountInfo {
             mount_point: PathBuf::from("/durable"),
             fs_type: "xfs".to_string(),
         },
     ]
+}
+
+#[test]
+fn edit_new_string_crossing_threshold_warns() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let input = input_for(
+        "Edit",
+        serde_json::json!({
+            "file_path": "/mem/out.bin",
+            "old_string": "",
+            "new_string": "hello world"
+        }),
+    );
+    let warning = maybe_tmpfs_guardrail_warning_with(
+        tmp.path(),
+        &input,
+        &mounts(),
+        &FakeUsageReader::default(),
+        10,
+        None,
+    )
+    .expect("tmpfs edit over threshold should warn");
+
+    assert!(warning.contains("11 bytes"));
 }
 
 #[test]
@@ -198,7 +226,7 @@ fn bash_usage_growth_warns_after_baseline() {
     let tmp = tempfile::TempDir::new().unwrap();
     let input = input_for("Bash", serde_json::json!({"command": "make artifact"}));
     let mut usage = FakeUsageReader::default();
-    usage.usage_by_path.insert(PathBuf::from("/mem"), 100);
+    usage.usage_by_path.insert(PathBuf::from("/mem"), 5);
 
     assert!(
         maybe_tmpfs_guardrail_warning_with(tmp.path(), &input, &mounts(), &usage, 10, None)
@@ -206,11 +234,98 @@ fn bash_usage_growth_warns_after_baseline() {
         "first Bash sample establishes the session baseline"
     );
 
-    usage.usage_by_path.insert(PathBuf::from("/mem"), 111);
+    usage.usage_by_path.insert(PathBuf::from("/mem"), 16);
     let warning =
         maybe_tmpfs_guardrail_warning_with(tmp.path(), &input, &mounts(), &usage, 10, None)
             .expect("usage growth past threshold should warn");
     assert!(warning.contains("11 bytes"));
+}
+
+#[test]
+fn bash_first_sample_over_threshold_warns_immediately() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let input = input_for("Bash", serde_json::json!({"command": "make artifact"}));
+    let mut usage = FakeUsageReader::default();
+    usage.usage_by_path.insert(PathBuf::from("/mem"), 17);
+
+    let warning =
+        maybe_tmpfs_guardrail_warning_with(tmp.path(), &input, &mounts(), &usage, 10, None)
+            .expect("single-shot tmpfs fill should warn on first Bash sample");
+    assert!(warning.contains("17 bytes"));
+}
+
+#[test]
+fn write_and_bash_accounting_do_not_clobber_each_other() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let write_16 = input_for(
+        "Write",
+        serde_json::json!({"file_path": "/mem/a.bin", "content": "1234567890123456"}),
+    );
+    let write_4 = input_for(
+        "Write",
+        serde_json::json!({"file_path": "/mem/b.bin", "content": "1234"}),
+    );
+    let bash = input_for("Bash", serde_json::json!({"command": "make artifact"}));
+    let mut usage = FakeUsageReader::default();
+
+    assert!(
+        maybe_tmpfs_guardrail_warning_with(tmp.path(), &write_16, &mounts(), &usage, 10, None)
+            .is_some()
+    );
+
+    usage.usage_by_path.insert(PathBuf::from("/mem"), 1);
+    assert!(
+        maybe_tmpfs_guardrail_warning_with(tmp.path(), &bash, &mounts(), &usage, 10, None)
+            .is_none()
+    );
+
+    usage.usage_by_path.insert(PathBuf::from("/mem"), 5);
+    assert!(
+        maybe_tmpfs_guardrail_warning_with(tmp.path(), &bash, &mounts(), &usage, 10, None)
+            .is_none()
+    );
+
+    let warning =
+        maybe_tmpfs_guardrail_warning_with(tmp.path(), &write_4, &mounts(), &usage, 10, None)
+            .expect("written bytes should still reach the second threshold");
+    assert!(warning.contains("20 bytes"));
+}
+
+#[test]
+fn write_warning_does_not_suppress_bash_usage_warning() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let write = input_for(
+        "Write",
+        serde_json::json!({"file_path": "/mem/a.bin", "content": "123456789012"}),
+    );
+    let bash = input_for("Bash", serde_json::json!({"command": "make artifact"}));
+    let mut usage = FakeUsageReader::default();
+
+    assert!(
+        maybe_tmpfs_guardrail_warning_with(tmp.path(), &write, &mounts(), &usage, 10, None)
+            .is_some()
+    );
+
+    usage.usage_by_path.insert(PathBuf::from("/mem"), 12);
+    let warning =
+        maybe_tmpfs_guardrail_warning_with(tmp.path(), &bash, &mounts(), &usage, 10, None)
+            .expect("usage-growth threshold should warn even after a write warning");
+    assert!(warning.contains("12 bytes"));
+}
+
+#[test]
+fn bash_samples_all_tmpfs_mounts_not_just_cwd_and_tmp() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let input = input_for("Bash", serde_json::json!({"command": "make artifact"}));
+    let mut usage = FakeUsageReader::default();
+    usage.usage_by_path.insert(PathBuf::from("/mem"), 0);
+    usage.usage_by_path.insert(PathBuf::from("/dev/shm"), 12);
+
+    let warning =
+        maybe_tmpfs_guardrail_warning_with(tmp.path(), &input, &mounts(), &usage, 10, None)
+            .expect("/dev/shm fill should be sampled and warned");
+    assert!(warning.contains("/dev/shm"));
+    assert!(warning.contains("12 bytes"));
 }
 
 #[test]

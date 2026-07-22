@@ -264,6 +264,21 @@ impl Config {
                     .parse()
                     .map_err(|_| MemError::Parse(format!("Invalid integer value: {value}")))?;
             }
+            // Staging section
+            "staging.staging_dir" | "staging.large_artifact_dir" => {
+                let staging = self.staging.get_or_insert_with(StagingConfig::default);
+                staging.staging_dir = if value.is_empty() {
+                    None
+                } else {
+                    Some(value.to_string())
+                };
+            }
+            "staging.tmpfs_warning_threshold_bytes" => {
+                let staging = self.staging.get_or_insert_with(StagingConfig::default);
+                staging.tmpfs_warning_threshold_bytes = value
+                    .parse()
+                    .map_err(|_| MemError::Parse(format!("Invalid integer value: {value}")))?;
+            }
             // Notifications section
             "notifications.enabled" => {
                 let notifications = self

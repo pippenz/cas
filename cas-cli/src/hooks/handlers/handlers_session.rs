@@ -161,7 +161,7 @@ pub fn handle_session_start(
 
     // Load config to check AI context setting
     let config = cas_root
-        .map(|r| Config::load_with_host_defaults(r).unwrap_or_default())
+        .map(|r| Config::load_with_host_staging_defaults(r).unwrap_or_default())
         .unwrap_or_default();
 
     // Need cas_root for context building
@@ -365,12 +365,7 @@ pub(crate) fn estimate_tokens(s: &str) -> usize {
 }
 
 pub(crate) fn build_large_artifact_staging_banner(config: &Config) -> Option<String> {
-    let dir = config
-        .staging
-        .as_ref()?
-        .staging_dir
-        .as_deref()?
-        .trim();
+    let dir = config.staging.as_ref()?.staging_dir.as_deref()?.trim();
 
     if dir.is_empty() {
         return None;
@@ -382,16 +377,14 @@ pub(crate) fn build_large_artifact_staging_banner(config: &Config) -> Option<Str
 }
 
 #[cfg(test)]
-mod large_artifact_staging_tests {
-    use super::*;
-
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+mod session_test_env {
+    pub(super) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         crate::hooks::test_env_lock()
     }
 
-    struct EnvGuard(Vec<(String, Option<String>)>);
+    pub(super) struct EnvGuard(Vec<(String, Option<String>)>);
     impl EnvGuard {
-        fn set(vars: &[(&str, Option<&str>)]) -> Self {
+        pub(super) fn set(vars: &[(&str, Option<&str>)]) -> Self {
             let saved = vars
                 .iter()
                 .map(|(k, v)| {
@@ -420,6 +413,12 @@ mod large_artifact_staging_tests {
             }
         }
     }
+}
+
+#[cfg(test)]
+mod large_artifact_staging_tests {
+    use super::session_test_env::{EnvGuard, env_lock};
+    use super::*;
 
     fn session_input(cwd: &str) -> HookInput {
         HookInput {
@@ -1447,45 +1446,8 @@ mod session_learn_tests {
 // ── Worker worktree assertion tests (cas-bea2, LAYER 3) ───────────────────
 #[cfg(test)]
 mod worker_worktree_assertion_tests {
+    use super::session_test_env::{EnvGuard, env_lock};
     use super::*;
-
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        // Use the shared crate-level env lock so we don't race with sibling
-        // test modules that also mutate CAS_AGENT_ROLE / CAS_CLONE_PATH.
-        crate::hooks::test_env_lock()
-    }
-
-    struct EnvGuard(Vec<(String, Option<String>)>);
-    impl EnvGuard {
-        fn set(vars: &[(&str, Option<&str>)]) -> Self {
-            let saved = vars
-                .iter()
-                .map(|(k, v)| {
-                    let prev = std::env::var(k).ok();
-                    unsafe {
-                        match v {
-                            Some(val) => std::env::set_var(k, val),
-                            None => std::env::remove_var(k),
-                        }
-                    }
-                    (k.to_string(), prev)
-                })
-                .collect();
-            EnvGuard(saved)
-        }
-    }
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (k, v) in &self.0 {
-                unsafe {
-                    match v {
-                        Some(val) => std::env::set_var(k, val),
-                        None => std::env::remove_var(k),
-                    }
-                }
-            }
-        }
-    }
 
     fn make_git_repo() -> tempfile::TempDir {
         let tmp = tempfile::tempdir().expect("tempdir");

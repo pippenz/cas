@@ -324,32 +324,6 @@ pub(super) fn register_hooks_and_code(registry: &mut ConfigRegistry) {
     });
 
     registry.register(ConfigMeta {
-        key: "staging.large_artifact_dir",
-        section: "staging",
-        name: "Large Artifact Directory",
-        description: "Host-scoped alias for staging.staging_dir. Set this in ~/.cas/config.toml to surface a SessionStart reminder telling factory agents where to stage large artifacts.",
-        value_type: ConfigType::String,
-        default: "",
-        constraint: Constraint::None,
-        advanced: false,
-        requires_feature: None,
-        keywords: &[
-            "staging",
-            "host",
-            "durable",
-            "tmpfs",
-            "ramfs",
-            "large",
-            "artifacts",
-            "directory",
-        ],
-        use_cases: &[
-            "Configure a per-machine durable path for generated artifacts over 1GB",
-            "Remind factory supervisors and workers not to use tmpfs-backed /tmp for large outputs",
-        ],
-    });
-
-    registry.register(ConfigMeta {
         key: "staging.tmpfs_warning_threshold_bytes",
         section: "staging",
         name: "tmpfs Warning Threshold",
