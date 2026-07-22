@@ -29,7 +29,7 @@ This skill produces a ranked ideation artifact at `docs/ideation/YYYY-MM-DD-<top
 
 ## Interaction Method
 
-Use `AskUserQuestion` when asking the user a question. Ask one question at a time. Prefer concise single-select choices when natural options exist.
+Use `AskUserQuestion` when asking the user a question. Ask one question at a time. Prefer concise single-select choices when natural options exist. In factory mode AskUserQuestion is blocked — ask the questions in plain text and end your turn; the director relays answers.
 
 ## Focus Hint
 
@@ -64,7 +64,7 @@ A prior ideation doc is relevant when:
 - The path or subsystem overlaps the requested focus
 - The request is open-ended and there's an obvious recent open ideation doc
 
-If a relevant doc exists, ask (via `AskUserQuestion`): "Found an existing ideation doc for [topic]. Continue from it, or start fresh?"
+If a relevant doc exists, ask (via `AskUserQuestion`): "Found an existing ideation doc for [topic]. Continue from it, or start fresh?" In factory mode AskUserQuestion is blocked — ask the question in plain text and end your turn; the director relays answers.
 
 If continuing:
 - Read the document

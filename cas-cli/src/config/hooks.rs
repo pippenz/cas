@@ -243,8 +243,9 @@ fn default_pre_tool_use_matcher() -> Vec<String> {
         "Bash".into(),
         "WebFetch".into(),
         "WebSearch".into(),
-        "Task".into(),        // For verification jail unjailing
-        "SendMessage".into(), // Blocked in factory mode → use coordination message
+        "Task".into(),            // For verification jail unjailing
+        "SendMessage".into(),     // Blocked in factory mode → use coordination message
+        "AskUserQuestion".into(), // Blocked in factory mode → ask in plain text / coordination
     ]
 }
 
@@ -654,4 +655,20 @@ impl Default for HookConfig {
 
 fn default_true() -> bool {
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_pre_tool_use_matcher_covers_factory_intercepts() {
+        let matcher = default_pre_tool_use_matcher();
+        for tool in ["SendMessage", "AskUserQuestion"] {
+            assert!(
+                matcher.iter().any(|entry| entry == tool),
+                "PreToolUse matcher must include factory intercept tool {tool}: {matcher:?}"
+            );
+        }
+    }
 }

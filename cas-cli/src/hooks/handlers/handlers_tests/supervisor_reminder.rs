@@ -143,6 +143,8 @@ fn supervisor_reminder_contains_all_6_hard_rule_keywords() {
     // All 6 Hard Rule keywords must appear in the reminder.
     let keywords = [
         "AskUserQuestion",
+        "BLOCKED",
+        "end your turn",
         "mcp__cas__coordination",
         "SendMessage",
         "close",

@@ -104,6 +104,24 @@ fn factory_supervisor_ask_user_question_is_denied_with_plain_text_guidance() {
 }
 
 #[test]
+fn factory_supervisor_ask_user_question_is_denied_from_hook_input_role() {
+    let _g = super::env_lock();
+    let _role = set_env("CAS_AGENT_ROLE", None);
+    let _cli = set_env("CAS_FACTORY_SUPERVISOR_CLI", Some("claude"));
+
+    let mut input = hook_input("AskUserQuestion");
+    input.agent_role = Some("supervisor".into());
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let out = handle_pre_tool_use(&input, Some(tmp.path())).expect("handler ok");
+
+    let reason = deny_reason(&out).expect("HookInput supervisor role must deny AskUserQuestion");
+    assert!(
+        reason.contains("plain text") && reason.contains("END YOUR TURN"),
+        "field-path supervisor guidance must say to ask in plain text and end turn: {reason}"
+    );
+}
+
+#[test]
 fn grok_factory_supervisor_ask_user_question_uses_grok_prefix() {
     let _g = super::env_lock();
     let _role = set_env("CAS_AGENT_ROLE", Some("supervisor"));

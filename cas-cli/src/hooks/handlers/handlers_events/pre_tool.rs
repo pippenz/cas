@@ -135,8 +135,8 @@ pub fn handle_pre_tool_use(
     // protection gates, for the cas_root=Some case. But that path is
     // unreachable when `cas_root` is `None` because of the early return
     // immediately following this block. Since `is_factory_agent` derives
-    // purely from the `CAS_AGENT_ROLE` env var (no store access required),
-    // we fire the allow here to rescue the cas_root=None case — the
+    // from the hook's role snapshot with an env fallback (no store access
+    // required), we fire the allow here to rescue the cas_root=None case — the
     // scenario the user hit in the BUG-factory-write-permission-deadlock
     // report where a supervisor session runs the hook without a CAS root
     // resolved at dispatch time.
