@@ -21,6 +21,8 @@ pub fn handle_pre_tool_use(
         None => return Ok(HookOutput::empty()),
     };
 
+    let is_factory_agent = crate::harness_policy::is_factory_agent(input);
+
     // ========================================================================
     // SUPERVISOR DISCIPLINE: Block Agent(isolation="worktree") for supervisors
     //
@@ -61,6 +63,34 @@ pub fn handle_pre_tool_use(
                 ),
             ));
         }
+    }
+
+    // ========================================================================
+    // FACTORY MODE: Block AskUserQuestion self-directed permission trap
+    //
+    // In factory mode, AskUserQuestion has no human UI surface. It appears as
+    // a permission prompt in the caller's own session and pauses the system, so
+    // both supervisors and workers must use factory-safe routes instead.
+    //
+    // This gate runs before the cas_root check because it only needs the
+    // factory role env/snapshot and must still fire when hook dispatch cannot
+    // resolve a CAS root.
+    // ========================================================================
+    if is_factory_agent && tool_name == "AskUserQuestion" {
+        let prefix = crate::harness_policy::own_tool_prefix();
+        let guidance = if crate::harness_policy::is_supervisor(input) {
+            format!(
+                "AskUserQuestion cannot reach the human in factory mode - it surfaces as a permission prompt on your own session and pauses the system. \
+                Ask the human in plain text in your reply and END YOUR TURN; the director relays their answer. \
+                For workers/teammates use {prefix}coordination action=message."
+            )
+        } else {
+            format!(
+                "AskUserQuestion is blocked in factory mode - it surfaces as a permission prompt on your own session and pauses the system. \
+                Message your supervisor with {prefix}coordination action=message target=<supervisor> summary=\"...\" message=\"...\"."
+            )
+        };
+        return Ok(HookOutput::with_pre_tool_permission("deny", &guidance));
     }
 
     // ========================================================================
@@ -119,7 +149,6 @@ pub fn handle_pre_tool_use(
     // `cas_root` is `Some`, this block is a no-op — we fall through to
     // the normal flow where the post-protection auto-approve still fires.
     // ========================================================================
-    let is_factory_agent = std::env::var("CAS_AGENT_ROLE").is_ok();
     if cas_root.is_none()
         && is_factory_agent
         && FACTORY_AUTO_APPROVE_TOOLS.contains(&tool_name)
@@ -199,32 +228,6 @@ pub fn handle_pre_tool_use(
     // Supervisors are exempt from verification jail — their job is coordination
     let is_supervisor = crate::harness_policy::is_supervisor_from_env();
     let worker_supports_subagents = worker_harness_from_env().capabilities().supports_subagents;
-
-    // ========================================================================
-    // FACTORY SUPERVISOR: Remind about AskUserQuestion routing (cas-e603)
-    //
-    // AskUserQuestion routes to the human user ONLY. Factory supervisors
-    // sometimes invoke it intending to reach a worker/teammate — the correct
-    // path is mcp__cas__coordination action=message. This intercept fires a
-    // permissionDecisionReason reminder at the exact moment of misuse without
-    // blocking the call (decision=allow), since the supervisor may genuinely
-    // need the human's input in some cases (e.g. this very session).
-    //
-    // Never deny: the hint is advisory only. Never parse question content to
-    // guess intent — always remind regardless.
-    // ========================================================================
-    if is_factory_agent && is_supervisor && tool_name == "AskUserQuestion" {
-        // EPIC cas-8888 (cas-fd9f): own_tool_prefix() — this tells the
-        // supervisor what IT should call instead.
-        let prefix = crate::harness_policy::own_tool_prefix();
-        let reminder = format!(
-            "[role-routing reminder] AskUserQuestion routes to the human user ONLY.\n\
-            If you meant to ask a worker/teammate, cancel this call and use:\n  \
-            {prefix}coordination action=message target=<worker-name> message=\"...\"\n\
-            If you genuinely need the human's input, proceed."
-        );
-        return Ok(HookOutput::with_pre_tool_permission("allow", &reminder));
-    }
 
     // ========================================================================
     // CODEMAP FRESHNESS GATE: Block supervisor from creating tasks / spawning

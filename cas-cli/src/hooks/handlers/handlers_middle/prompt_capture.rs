@@ -22,7 +22,7 @@ pub(crate) fn build_supervisor_reminder() -> String {
     format!(
         "[supervisor reminder]\n\
          You are {name}, supervisor of team {team}. Hard rules:\n\
-         \u{2022} AskUserQuestion \u{2192} human user ONLY. Workers/teammates \u{2192} {prefix}coordination action=message.\n\
+         \u{2022} AskUserQuestion is BLOCKED in factory mode: ask humans in plain text and end your turn; teammates \u{2192} {prefix}coordination action=message.\n\
          \u{2022} Never SendMessage. Never close worker tasks. Never implement non-trivial work yourself.\n\
          \u{2022} Never poll/monitor/sleep. End your turn after assigning. Wait for messages."
     )
