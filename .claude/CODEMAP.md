@@ -154,7 +154,7 @@ Planning artifacts only — product/domain content lives in `docs/PRODUCT_OVERVI
 - `guides/` — user-facing guides (`task-depth.md` — deep vs light speed-mode, cas-9d74)
 - `release-notes/` — `YYYY-MM-DD-<topic>-slack.md` postable drafts for #cas-internal (mandatory on every main merge; rubric at `docs/RELEASE_SLACK_RUBRIC.md`)
 - `reports/` — generated smoke-test outputs (`smoke-test-<date>-<harness>-<name>.{html,pdf}`, e.g. claude-jester / codex-jester)
-- `notes/` — working notes + design records: `2026-06-02-cc160-hook-surface.md` (CC hook EPIC), `2026-06-22-mid-turn-interrupt-redirect-design.md` (cas-321da), `claude-code-changelog-diary.md` + `codex-changelog-diary.md` (rolling harness-release → CAS-response ledgers)
+- `notes/` — working notes + design records: `2026-06-02-cc160-hook-surface.md` (CC hook EPIC), `2026-06-22-mid-turn-interrupt-redirect-design.md` (cas-321da), `claude-code-changelog-diary.md` + `codex-changelog-diary.md` + `grok-changelog-diary.md` (rolling harness-release → CAS-response ledgers)
 - `reviews/` — archived cas-code-review outputs (e.g. `2026-06-07-cas-073f.md`, the isolated-worker commit-leak EPIC review)
 - `requests/completed/` — archive of resolved BUG/FEATURE docs, each carrying a resolution note (fixing commit/task). Grows steadily; includes the 2026-07-02 cas-fff9 backlog-triage batch (director/liveness cluster, phantom-close, worker-stall, team-push chunking, rule-id collision, branch-base, cloud-sync, etc.)
 - `spikes/` — investigation outputs (e.g., `2026-05-01-factory-agent-teams-enrollment-spike.md`)
