@@ -21,7 +21,7 @@
 //     task_id,             // optional CAS task ID
 //   }})
 //
-// Returns: { residual, pre_existing, activation, stats }
+// Returns: { residual, pre_existing, dropped, activation, stats }
 
 export const meta = {
   name: 'cas-code-review',
@@ -197,6 +197,76 @@ reviewer MUST be "fallow". No prose outside JSON.`,
 
 const OWNER_RANK = { 'human': 2, 'downstream-resolver': 1, 'review-fixer': 0 }
 
+const FINDING_REQUIRED_FIELDS = [
+  'title', 'severity', 'file', 'line', 'why_it_matters', 'autofix_class',
+  'owner', 'confidence', 'evidence', 'pre_existing',
+]
+const FINDING_ALLOWED_FIELDS = new Set([
+  ...FINDING_REQUIRED_FIELDS, 'suggested_fix', 'requires_verification',
+])
+const VALID_SEVERITIES = new Set(['P0', 'P1', 'P2', 'P3'])
+const VALID_AUTOFIX_CLASSES = new Set(['safe_auto', 'gated_auto', 'manual', 'advisory'])
+const VALID_OWNERS = new Set(['review-fixer', 'downstream-resolver', 'human'])
+
+function findingValidationErrors(finding) {
+  if (!finding || typeof finding !== 'object' || Array.isArray(finding)) {
+    return ['finding must be an object']
+  }
+
+  const errors = []
+  for (const field of FINDING_REQUIRED_FIELDS) {
+    if (!Object.hasOwn(finding, field)) errors.push(`missing required field: ${field}`)
+  }
+  if (Object.hasOwn(finding, 'title') &&
+      (typeof finding.title !== 'string' || finding.title.length > 100)) {
+    errors.push('title must be a string of at most 100 characters')
+  }
+  if (Object.hasOwn(finding, 'severity') && !VALID_SEVERITIES.has(finding.severity)) {
+    errors.push('severity must be one of P0, P1, P2, P3')
+  }
+  if (Object.hasOwn(finding, 'file') && typeof finding.file !== 'string') {
+    errors.push('file must be a string')
+  }
+  if (Object.hasOwn(finding, 'line') &&
+      (!Number.isInteger(finding.line) || finding.line < 1)) {
+    errors.push('line must be an integer greater than or equal to 1')
+  }
+  if (Object.hasOwn(finding, 'why_it_matters') && typeof finding.why_it_matters !== 'string') {
+    errors.push('why_it_matters must be a string')
+  }
+  if (Object.hasOwn(finding, 'autofix_class') &&
+      !VALID_AUTOFIX_CLASSES.has(finding.autofix_class)) {
+    errors.push('autofix_class must be safe_auto, gated_auto, manual, or advisory')
+  }
+  if (Object.hasOwn(finding, 'owner') && !VALID_OWNERS.has(finding.owner)) {
+    errors.push('owner must be review-fixer, downstream-resolver, or human')
+  }
+  if (Object.hasOwn(finding, 'confidence') &&
+      (typeof finding.confidence !== 'number' || !Number.isFinite(finding.confidence) ||
+       finding.confidence < 0 || finding.confidence > 1)) {
+    errors.push('confidence must be a number between 0.0 and 1.0')
+  }
+  if (Object.hasOwn(finding, 'evidence') &&
+      (!Array.isArray(finding.evidence) || finding.evidence.length < 1 ||
+       finding.evidence.some(item => typeof item !== 'string'))) {
+    errors.push('evidence must be a non-empty array of strings')
+  }
+  if (Object.hasOwn(finding, 'pre_existing') && typeof finding.pre_existing !== 'boolean') {
+    errors.push('pre_existing must be a boolean')
+  }
+  if (Object.hasOwn(finding, 'suggested_fix') && typeof finding.suggested_fix !== 'string') {
+    errors.push('suggested_fix must be a string when present')
+  }
+  if (Object.hasOwn(finding, 'requires_verification') &&
+      typeof finding.requires_verification !== 'boolean') {
+    errors.push('requires_verification must be a boolean when present')
+  }
+  for (const field of Object.keys(finding)) {
+    if (!FINDING_ALLOWED_FIELDS.has(field)) errors.push(`unexpected field: ${field}`)
+  }
+  return errors
+}
+
 function fingerprint(f) {
   const title = f.title.toLowerCase().replace(/[^a-z0-9]/g, ' ').replace(/\s+/g, ' ').trim()
   const bucket = Math.floor(f.line / 3)
@@ -204,10 +274,45 @@ function fingerprint(f) {
 }
 
 function mergeFindings(reviewerOutputs) {
-  const allFindings = reviewerOutputs.filter(Boolean).flatMap(r => r.findings || [])
-  const gated = allFindings.filter(f =>
-    f.severity === 'P0' ? f.confidence >= 0.50 : f.confidence >= 0.60
-  )
+  const collected = []
+  reviewerOutputs.filter(Boolean).forEach((output, index) => {
+    const reviewer = typeof output.reviewer === 'string'
+      ? output.reviewer
+      : `unknown-reviewer-${index}`
+    const findings = Array.isArray(output.findings) ? output.findings : []
+    for (const finding of findings) collected.push({ reviewer, finding })
+  })
+
+  const dropped = []
+  const valid = []
+  for (const item of collected) {
+    const validationErrors = findingValidationErrors(item.finding)
+    if (validationErrors.length > 0) {
+      dropped.push({
+        reviewer: item.reviewer,
+        reason: 'schema_validation_failed',
+        validation_errors: validationErrors,
+        finding: item.finding,
+      })
+    } else {
+      valid.push(item)
+    }
+  }
+
+  const gated = []
+  for (const item of valid) {
+    const threshold = item.finding.severity === 'P0' ? 0.50 : 0.60
+    if (item.finding.confidence >= threshold) {
+      gated.push(item.finding)
+    } else {
+      dropped.push({
+        reviewer: item.reviewer,
+        reason: 'confidence_below_threshold',
+        threshold,
+        finding: item.finding,
+      })
+    }
+  }
   const byFp = new Map()
   for (const f of gated) {
     const fp = fingerprint(f)
@@ -233,7 +338,7 @@ function mergeFindings(reviewerOutputs) {
   residual.sort((a, b) =>
     (SEV_ORDER[a.severity] - SEV_ORDER[b.severity]) || (b.confidence - a.confidence)
   )
-  return { residual, pre_existing }
+  return { residual, pre_existing, dropped }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -283,6 +388,13 @@ Steps:
    {"reviewer":"gpt-5.5:independent","findings":[],"skipped_reason":"<specific reason>","residual_risks":[],"testing_gaps":[]}
 5. If codex runs and reports no issues, return findings: [] with no skipped_reason.
 6. If codex reports issues, map only concrete, diff-grounded issues into Finding objects.
+
+Finding mapping contract: every mapped finding MUST contain all of these fields:
+title, severity, file, line, why_it_matters, autofix_class, owner, confidence,
+evidence, pre_existing. Optional fields are suggested_fix and requires_verification.
+Use the same enum values and constraints as the JSON schema supplied to this agent.
+As the adapter, infer conservative values for any metadata Codex omits; never emit
+an under-filled Finding object.
 
 Review focus: independent broad read. Look for important correctness, testing, maintainability, security, performance, or integration issues missed by lane-specific reviewers. Avoid nitpicks.
 
@@ -586,12 +698,12 @@ const {
 
 if (!diffText || !diffText.trim() || diffText.trim() === 'EMPTY_DIFF') {
   log('Diff is empty — returning clean envelope')
-  return { residual: [], pre_existing: [], mode, skipped_reason: 'empty diff', stats: { personas_run: 0 } }
+  return { residual: [], pre_existing: [], dropped: [], mode, skipped_reason: 'empty diff', stats: { personas_run: 0, dropped_findings: 0 } }
 }
 
 if (!baseSha) {
   log('ERROR: base_sha required — pass from skill')
-  return { residual: [], pre_existing: [], mode, error: 'missing base_sha', stats: { personas_run: 0 } }
+  return { residual: [], pre_existing: [], dropped: [], mode, error: 'missing base_sha', stats: { personas_run: 0, dropped_findings: 0 } }
 }
 
 const changeLines = diffText.split('\n').filter(l => l.startsWith('+') || l.startsWith('-')).length
@@ -758,18 +870,27 @@ const personasRun = personasRunCount(dispatchedReviewCount, fallowRuns, gpt55Run
 
 phase('Merge')
 
-const { residual, pre_existing } = mergeFindings(allOutputs)
+const { residual, pre_existing, dropped } = mergeFindings(allOutputs)
 
 const p0 = residual.filter(f => f.severity === 'P0').length
 const p1 = residual.filter(f => f.severity === 'P1').length
 const p2 = residual.filter(f => f.severity === 'P2').length
 const p3 = residual.filter(f => f.severity === 'P3').length
 
-log(`Merged: ${residual.length} new (P0:${p0}, P1:${p1}, P2:${p2}, P3:${p3}), ${pre_existing.length} pre-existing`)
+for (const item of dropped) {
+  const title = typeof item.finding?.title === 'string' ? item.finding.title : '<untitled>'
+  const detail = item.reason === 'schema_validation_failed'
+    ? item.validation_errors.join(', ')
+    : `confidence ${item.finding.confidence} below ${item.threshold}`
+  log(`Dropped/unmergeable finding from ${item.reviewer}: ${title} (${item.reason}: ${detail})`)
+}
+
+log(`Merged: ${residual.length} new (P0:${p0}, P1:${p1}, P2:${p2}, P3:${p3}), ${pre_existing.length} pre-existing, ${dropped.length} dropped/unmergeable`)
 
 return {
   residual,
   pre_existing,
+  dropped,
   mode,
   intent_summary: intentSummary,
   activation: {
@@ -787,6 +908,7 @@ return {
     total_findings: residual.length + pre_existing.length,
     p0, p1, p2, p3,
     personas_run: personasRun,
+    dropped_findings: dropped.length,
     task_id: taskId ?? null,
   },
 }

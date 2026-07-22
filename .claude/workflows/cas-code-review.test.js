@@ -55,7 +55,7 @@ const CANONICAL_CONDITIONAL = ['security', 'performance', 'adversarial']
 const CANONICAL_ALL = [...CANONICAL_ALWAYS_ON, ...CANONICAL_CONDITIONAL, 'fallow']
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor
 
-async function runWorkflowDryRun(args, setupOverride = {}) {
+async function runWorkflowDryRun(args, setupOverride = {}, agentOverrides = {}) {
   const source = readFileSync(new URL('./cas-code-review.js', import.meta.url), 'utf8')
     .replace('export const meta =', 'const meta =')
   const labels = []
@@ -71,6 +71,9 @@ async function runWorkflowDryRun(args, setupOverride = {}) {
         fallow_skip_reason: 'non-JS/TS repo',
         ...setupOverride,
       }
+    }
+    if (Object.hasOwn(agentOverrides, options.label)) {
+      return agentOverrides[options.label]
     }
     return {
       reviewer: options.label,
@@ -241,6 +244,18 @@ describe('REVIEWER_OUTPUT_SCHEMA', () => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe('gpt-5.5 independent activation helpers', () => {
+  test('wrapper prompt requires every schema field and tells the adapter to fill omissions', () => {
+    const source = readFileSync(new URL('./cas-code-review.js', import.meta.url), 'utf8')
+    const promptStart = source.indexOf('function buildGpt55IndependentPrompt')
+    const promptEnd = source.indexOf('\nfunction gpt55ShouldRun', promptStart)
+    const prompt = source.slice(promptStart, promptEnd)
+
+    for (const field of REVIEWER_OUTPUT_SCHEMA.properties.findings.items.required) {
+      assert.ok(prompt.includes(field), `gpt-5.5 wrapper prompt must name required field: ${field}`)
+    }
+    assert.match(prompt, /infer conservative values for any metadata Codex omits/i)
+  })
+
   test('activates at broad file-count boundary', () => {
     assert.equal(gpt55ShouldRun({}, 4, 299), false)
     assert.equal(gpt55ShouldRun({}, 5, 299), true)
@@ -278,6 +293,44 @@ describe('gpt-5.5 independent activation helpers', () => {
   test('non-skipped gpt55 result has no skipped persona entry', () => {
     assert.deepEqual(gpt55SkippedPersonas({ findings: [] }), [])
     assert.deepEqual(gpt55SkippedPersonas(null), [])
+  })
+
+  test('workflow surfaces and logs confidence-gated independent findings', async () => {
+    const independentFinding = {
+      title: 'Factory hook matcher omits AskUserQuestion',
+      severity: 'P1',
+      file: 'cas-cli/src/ui/factory/daemon/runtime/teams.rs',
+      line: 361,
+      why_it_matters: 'The deny branch would be unreachable in real sessions.',
+      autofix_class: 'manual',
+      owner: 'downstream-resolver',
+      confidence: 0.55,
+      evidence: ['teams.rs matcher excludes AskUserQuestion'],
+      pre_existing: false,
+      requires_verification: true,
+    }
+    const { result, logs } = await runWorkflowDryRun({
+      diff_text: 'diff --git a/teams.rs b/teams.rs\n-old\n+new',
+      file_list: 'teams.rs',
+      base_sha: 'abc123',
+      gpt55_independent: true,
+    }, {}, {
+      'review:gpt-5.5:independent': {
+        reviewer: 'gpt-5.5:independent',
+        findings: [independentFinding],
+        residual_risks: [],
+        testing_gaps: [],
+      },
+    })
+
+    assert.deepEqual(result.residual, [])
+    assert.equal(result.dropped.length, 1)
+    assert.equal(result.dropped[0].reason, 'confidence_below_threshold')
+    assert.equal(result.dropped[0].reviewer, 'gpt-5.5:independent')
+    assert.equal(result.stats.dropped_findings, 1)
+    assert.ok(logs.some(line => line.includes(
+      'Dropped/unmergeable finding from gpt-5.5:independent'
+    )))
   })
 })
 
