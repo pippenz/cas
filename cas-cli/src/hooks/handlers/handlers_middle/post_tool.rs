@@ -1,3 +1,4 @@
+use crate::hooks::handlers::handlers_middle::tmpfs_guardrail::maybe_tmpfs_guardrail_warning;
 use crate::hooks::handlers::*;
 
 pub fn handle_post_tool_use(
@@ -17,6 +18,7 @@ pub fn handle_post_tool_use(
 
     // Create shared store cache — Config and stores opened once, reused across checks
     let mut stores = ToolHookStores::new(cas_root);
+    let config = stores.config().clone();
 
     // === WORKER ACTIVITY TRACKING (for supervisor visibility) ===
     // Send activity events for significant tools to the daemon
@@ -40,8 +42,16 @@ pub fn handle_post_tool_use(
         }
     }
 
+    // === TMPFS/RAMFS LARGE-WRITE GUARDRAIL ===
+    // Warning-only: never deny a tool. Compute before normal observation
+    // filtering, but return after existing attribution/commit side effects.
+    let tmpfs_guardrail_warning = maybe_tmpfs_guardrail_warning(cas_root, input, &config);
+
     // Check if this tool is worth capturing for observations
     if !CAPTURE_TOOLS.contains(&tool_name) {
+        if let Some(output) = tmpfs_guardrail_warning.clone() {
+            return Ok(output);
+        }
         return Ok(HookOutput::empty());
     }
 
@@ -49,9 +59,11 @@ pub fn handle_post_tool_use(
     let _ = DevTracer::init_global(cas_root);
 
     // Check config for capture settings (uses cached Config)
-    let config = stores.config().clone();
     if let Some(ref hooks_config) = config.hooks {
         if !hooks_config.capture_enabled {
+            if let Some(output) = tmpfs_guardrail_warning.clone() {
+                return Ok(output);
+            }
             return Ok(HookOutput::empty());
         }
 
@@ -59,6 +71,9 @@ pub fn handle_post_tool_use(
         if !hooks_config.capture_tools.is_empty()
             && !hooks_config.capture_tools.iter().any(|t| t == tool_name)
         {
+            if let Some(output) = tmpfs_guardrail_warning.clone() {
+                return Ok(output);
+            }
             return Ok(HookOutput::empty());
         }
     }
@@ -103,6 +118,10 @@ pub fn handle_post_tool_use(
                 });
             }
         }
+    }
+
+    if let Some(output) = tmpfs_guardrail_warning {
+        return Ok(output);
     }
 
     // === SMART FILTERING ===

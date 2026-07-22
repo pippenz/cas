@@ -304,6 +304,43 @@ pub(super) fn register_hooks_and_code(registry: &mut ConfigRegistry) {
         });
 
     // ============================================================
+    // STAGING SECTION
+    // ============================================================
+    registry.register(ConfigMeta {
+        key: "staging.staging_dir",
+        section: "staging",
+        name: "Durable Staging Directory",
+        description: "Approved durable directory for large generated artifacts. When configured, tmpfs/ramfs write guardrail warnings tell agents to restate this location before continuing large writes.",
+        value_type: ConfigType::String,
+        default: "",
+        constraint: Constraint::None,
+        advanced: false,
+        requires_feature: None,
+        keywords: &["staging", "durable", "tmpfs", "ramfs", "large", "artifacts", "directory"],
+        use_cases: &[
+            "Point agents at a disk-backed mount for generated media, archives, and build outputs",
+            "Avoid filling /tmp or other memory-backed filesystems during long sessions",
+        ],
+    });
+
+    registry.register(ConfigMeta {
+        key: "staging.tmpfs_warning_threshold_bytes",
+        section: "staging",
+        name: "tmpfs Warning Threshold",
+        description: "Warn from the PostToolUse hook when cumulative session writes or usage growth on a tmpfs/ramfs-backed mount crosses this byte threshold. The hook only warns; it never denies tool execution.",
+        value_type: ConfigType::Int,
+        default: "1073741824",
+        constraint: Constraint::Min(1),
+        advanced: false,
+        requires_feature: None,
+        keywords: &["tmpfs", "ramfs", "threshold", "warning", "bytes", "memory", "posttooluse"],
+        use_cases: &[
+            "Lower on memory-constrained hosts to surface risk earlier",
+            "Raise for hosts with intentionally large memory-backed scratch mounts",
+        ],
+    });
+
+    // ============================================================
     // HOOKS.STOP SECTION
     // ============================================================
     registry.register(ConfigMeta {

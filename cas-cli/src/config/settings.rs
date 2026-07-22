@@ -153,6 +153,36 @@ pub struct FactoryConfig {
     pub epic_base_branch: Option<String>,
 }
 
+/// Durable staging configuration for large generated artifacts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StagingConfig {
+    /// Preferred durable directory for large temporary artifacts. When set,
+    /// tmpfs guardrail warnings tell agents to restate this approved location
+    /// before continuing large writes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staging_dir: Option<String>,
+
+    /// Warn when cumulative session writes or tmpfs usage growth crosses this
+    /// many bytes on a tmpfs/ramfs-backed mount. Default: 1 GiB.
+    #[serde(default = "default_tmpfs_warning_threshold_bytes")]
+    pub tmpfs_warning_threshold_bytes: u64,
+}
+
+pub const DEFAULT_TMPFS_WARNING_THRESHOLD_BYTES: u64 = 1024 * 1024 * 1024;
+
+fn default_tmpfs_warning_threshold_bytes() -> u64 {
+    DEFAULT_TMPFS_WARNING_THRESHOLD_BYTES
+}
+
+impl Default for StagingConfig {
+    fn default() -> Self {
+        Self {
+            staging_dir: None,
+            tmpfs_warning_threshold_bytes: default_tmpfs_warning_threshold_bytes(),
+        }
+    }
+}
+
 fn default_stale_threshold() -> u32 {
     1
 }
@@ -911,6 +941,26 @@ mod tests {
         let fc = parsed.get("factory").expect("section present");
         assert_eq!(fc.epic_base_branch.as_deref(), Some("staging"));
         assert_eq!(FactoryConfig::default().epic_base_branch, None);
+    }
+
+    #[test]
+    fn staging_config_defaults_to_one_gib_threshold() {
+        let sc = StagingConfig::default();
+        assert_eq!(
+            sc.tmpfs_warning_threshold_bytes,
+            DEFAULT_TMPFS_WARNING_THRESHOLD_BYTES
+        );
+        assert_eq!(sc.staging_dir, None);
+    }
+
+    #[test]
+    fn staging_config_roundtrips_staging_dir_and_threshold() {
+        let toml_str = "[staging]\nstaging_dir = \"/mnt/durable/cas-staging\"\ntmpfs_warning_threshold_bytes = 2048\n";
+        let parsed: std::collections::HashMap<String, StagingConfig> =
+            toml::from_str(toml_str).expect("valid toml");
+        let sc = parsed.get("staging").expect("section present");
+        assert_eq!(sc.staging_dir.as_deref(), Some("/mnt/durable/cas-staging"));
+        assert_eq!(sc.tmpfs_warning_threshold_bytes, 2048);
     }
 
     /// `Config::configured_epic_base_branch` is the shared read path used by
