@@ -1025,6 +1025,36 @@ mod assignment_freshness_branch_tests {
     use cas_types::{Dependency, DependencyType, Task, TaskType};
     use tempfile::TempDir;
 
+    struct FactorySessionEnv {
+        prior: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl FactorySessionEnv {
+        fn set(value: Option<&str>) -> Self {
+            let lock = crate::hooks::test_env_lock();
+            let prior = std::env::var_os("CAS_FACTORY_SESSION");
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var("CAS_FACTORY_SESSION", value),
+                    None => std::env::remove_var("CAS_FACTORY_SESSION"),
+                }
+            }
+            Self { prior, _lock: lock }
+        }
+    }
+
+    impl Drop for FactorySessionEnv {
+        fn drop(&mut self) {
+            unsafe {
+                match self.prior.take() {
+                    Some(value) => std::env::set_var("CAS_FACTORY_SESSION", value),
+                    None => std::env::remove_var("CAS_FACTORY_SESSION"),
+                }
+            }
+        }
+    }
+
     fn open_store() -> (TempDir, std::sync::Arc<dyn cas_store::TaskStore>) {
         let temp = TempDir::new().unwrap();
         let cas_dir = temp.path().join(".cas");
@@ -1081,12 +1111,8 @@ mod assignment_freshness_branch_tests {
 
     #[test]
     fn standalone_task_without_focus_returns_none() {
+        let _env = FactorySessionEnv::set(None);
         let (_tmp, store) = open_store();
-        // Ensure no session focus leaks from the factory environment.
-        // SAFETY: unit test; no concurrent env readers for this process section.
-        unsafe {
-            std::env::remove_var("CAS_FACTORY_SESSION");
-        }
         let task = Task::new("cas-solo".into(), "Standalone".into());
         store.add(&task).unwrap();
 
@@ -1099,6 +1125,8 @@ mod assignment_freshness_branch_tests {
 
     #[test]
     fn falls_back_to_session_focus_pin_branch() {
+        let session = format!("test-focus-{}", std::process::id());
+        let _env = FactorySessionEnv::set(Some(&session));
         let (_tmp, store) = open_store();
 
         let mut epic_a = Task::new("cas-epinf".into(), "Focused Epic".into());
@@ -1115,7 +1143,6 @@ mod assignment_freshness_branch_tests {
         store.add(&solo).unwrap();
 
         // Write session metadata with pinned focus on epic A.
-        let session = format!("test-focus-{}", std::process::id());
         let meta_path = crate::ui::factory::metadata_path(&session);
         if let Some(parent) = meta_path.parent() {
             std::fs::create_dir_all(parent).unwrap();
@@ -1132,16 +1159,7 @@ mod assignment_freshness_branch_tests {
             "project_dir": null
         });
         std::fs::write(&meta_path, meta.to_string()).unwrap();
-        // SAFETY: unit test scoped env for focus pin path.
-        unsafe {
-            std::env::set_var("CAS_FACTORY_SESSION", &session);
-        }
-
         let branch = resolve_assignment_freshness_branch(store.as_ref(), &solo);
-        // Cleanup env + file before assert so panics still clean in drop path
-        unsafe {
-            std::env::remove_var("CAS_FACTORY_SESSION");
-        }
         let _ = std::fs::remove_file(&meta_path);
 
         assert_eq!(

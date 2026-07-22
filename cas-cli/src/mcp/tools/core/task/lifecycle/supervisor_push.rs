@@ -660,11 +660,13 @@ mod tests {
         SupervisorQueueStore,
     };
     use cas_types::{Agent, AgentRole, AgentStatus};
-    use std::sync::Mutex;
     use tempfile::TempDir;
 
-    /// Serialize env mutations in this module's tests.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    /// Serialize `CAS_FACTORY_SESSION` mutations against every CAS env-mutating
+    /// test module. A module-local mutex does not prevent cross-module races.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::hooks::test_env_lock()
+    }
 
     #[test]
     fn transition_key_includes_session_and_occurrence() {
@@ -780,7 +782,7 @@ mod tests {
 
     #[test]
     fn missing_prompt_queue_leaves_durable_unmarked() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = env_lock();
         let prior = std::env::var("CAS_FACTORY_SESSION").ok();
         unsafe {
             std::env::set_var("CAS_FACTORY_SESSION", "sess-no-pq");
@@ -849,7 +851,7 @@ mod tests {
     /// Stamp fails after enqueue: replay must not create a second prompt row.
     #[test]
     fn stamp_failure_replay_does_not_duplicate_prompt() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = env_lock();
         let prior = std::env::var("CAS_FACTORY_SESSION").ok();
         unsafe {
             std::env::set_var("CAS_FACTORY_SESSION", "sess-stamp");
@@ -1192,9 +1194,9 @@ mod tests {
 
     #[test]
     fn emit_enqueues_once_and_suppresses_same_occurrence() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = env_lock();
         let prior = std::env::var("CAS_FACTORY_SESSION").ok();
-        // SAFETY: ENV_LOCK held for this test body.
+        // SAFETY: process-wide CAS env lock held for this test body.
         unsafe {
             std::env::set_var("CAS_FACTORY_SESSION", "sess-emit");
         }
@@ -1267,7 +1269,7 @@ mod tests {
         assert!(pending[0].prompt_delivered_at.is_some());
         assert_eq!(pq.pending_count().unwrap(), 1);
 
-        // SAFETY: restore env under ENV_LOCK.
+        // SAFETY: restore env under the process-wide CAS env lock.
         unsafe {
             match prior {
                 Some(v) => std::env::set_var("CAS_FACTORY_SESSION", v),
@@ -1278,7 +1280,7 @@ mod tests {
 
     #[test]
     fn emit_two_start_cycles_create_two_events() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = env_lock();
         let prior = std::env::var("CAS_FACTORY_SESSION").ok();
         unsafe {
             std::env::set_var("CAS_FACTORY_SESSION", "sess-cycle");
@@ -1380,7 +1382,7 @@ mod tests {
 
     #[test]
     fn emit_does_not_cross_factory_sessions() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = env_lock();
         let prior = std::env::var("CAS_FACTORY_SESSION").ok();
         unsafe {
             std::env::set_var("CAS_FACTORY_SESSION", "sess-a");
@@ -1439,7 +1441,7 @@ mod tests {
     /// Simulate partial failure: durable insert without prompt stamp, then recover.
     #[test]
     fn durable_without_prompt_recovers_exactly_once_on_replay() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = env_lock();
         let prior = std::env::var("CAS_FACTORY_SESSION").ok();
         unsafe {
             std::env::set_var("CAS_FACTORY_SESSION", "sess-outbox");
