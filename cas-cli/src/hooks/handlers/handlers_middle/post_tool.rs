@@ -18,7 +18,8 @@ pub fn handle_post_tool_use(
 
     // Create shared store cache — Config and stores opened once, reused across checks
     let mut stores = ToolHookStores::new(cas_root);
-    let config = stores.config().clone();
+    let config =
+        Config::load_with_host_defaults(cas_root).unwrap_or_else(|_| stores.config().clone());
 
     // === WORKER ACTIVITY TRACKING (for supervisor visibility) ===
     // Send activity events for significant tools to the daemon

@@ -159,7 +159,11 @@ pub struct StagingConfig {
     /// Preferred durable directory for large temporary artifacts. When set,
     /// tmpfs guardrail warnings tell agents to restate this approved location
     /// before continuing large writes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "large_artifact_dir",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub staging_dir: Option<String>,
 
     /// Warn when cumulative session writes or tmpfs usage growth crosses this
@@ -961,6 +965,19 @@ mod tests {
         let sc = parsed.get("staging").expect("section present");
         assert_eq!(sc.staging_dir.as_deref(), Some("/mnt/durable/cas-staging"));
         assert_eq!(sc.tmpfs_warning_threshold_bytes, 2048);
+    }
+
+    #[test]
+    fn staging_config_accepts_large_artifact_dir_alias() {
+        let toml_str = "[staging]\nlarge_artifact_dir = \"/mnt/datacube/staging\"\n";
+        let parsed: std::collections::HashMap<String, StagingConfig> =
+            toml::from_str(toml_str).expect("valid toml");
+        let sc = parsed.get("staging").expect("section present");
+        assert_eq!(sc.staging_dir.as_deref(), Some("/mnt/datacube/staging"));
+        assert_eq!(
+            sc.tmpfs_warning_threshold_bytes,
+            DEFAULT_TMPFS_WARNING_THRESHOLD_BYTES
+        );
     }
 
     /// `Config::configured_epic_base_branch` is the shared read path used by

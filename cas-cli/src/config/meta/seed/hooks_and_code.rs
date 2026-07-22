@@ -310,7 +310,7 @@ pub(super) fn register_hooks_and_code(registry: &mut ConfigRegistry) {
         key: "staging.staging_dir",
         section: "staging",
         name: "Durable Staging Directory",
-        description: "Approved durable directory for large generated artifacts. When configured, tmpfs/ramfs write guardrail warnings tell agents to restate this location before continuing large writes.",
+        description: "Approved durable directory for large generated artifacts. Alias: staging.large_artifact_dir. When configured, tmpfs/ramfs write guardrail warnings tell agents to restate this location before continuing large writes.",
         value_type: ConfigType::String,
         default: "",
         constraint: Constraint::None,
@@ -320,6 +320,32 @@ pub(super) fn register_hooks_and_code(registry: &mut ConfigRegistry) {
         use_cases: &[
             "Point agents at a disk-backed mount for generated media, archives, and build outputs",
             "Avoid filling /tmp or other memory-backed filesystems during long sessions",
+        ],
+    });
+
+    registry.register(ConfigMeta {
+        key: "staging.large_artifact_dir",
+        section: "staging",
+        name: "Large Artifact Directory",
+        description: "Host-scoped alias for staging.staging_dir. Set this in ~/.cas/config.toml to surface a SessionStart reminder telling factory agents where to stage large artifacts.",
+        value_type: ConfigType::String,
+        default: "",
+        constraint: Constraint::None,
+        advanced: false,
+        requires_feature: None,
+        keywords: &[
+            "staging",
+            "host",
+            "durable",
+            "tmpfs",
+            "ramfs",
+            "large",
+            "artifacts",
+            "directory",
+        ],
+        use_cases: &[
+            "Configure a per-machine durable path for generated artifacts over 1GB",
+            "Remind factory supervisors and workers not to use tmpfs-backed /tmp for large outputs",
         ],
     });
 

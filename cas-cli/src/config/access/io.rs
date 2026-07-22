@@ -62,6 +62,25 @@ impl Config {
         Ok(Self::default())
     }
 
+    /// Load project config with host-level `~/.cas/config.toml` defaults.
+    ///
+    /// Project config wins when it sets a section; host config fills missing
+    /// top-level sections. This is used for machine-scoped settings that need
+    /// to be visible from hooks running inside arbitrary project worktrees.
+    pub fn load_with_host_defaults(cas_dir: &std::path::Path) -> Result<Self, MemError> {
+        let mut config = Self::load(cas_dir)?;
+        let host_dir = dirs::home_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join(".cas");
+
+        if host_dir != cas_dir {
+            let host_config = Self::load(&host_dir).unwrap_or_default();
+            config.merge_missing(&host_config);
+        }
+
+        Ok(config)
+    }
+
     /// Save configuration to .cas directory as TOML (preferred format)
     pub fn save(&self, cas_dir: &std::path::Path) -> Result<(), MemError> {
         self.save_toml(cas_dir)
