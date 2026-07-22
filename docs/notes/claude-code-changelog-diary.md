@@ -24,6 +24,10 @@ When a new Claude Code version ships:
 5. If an item triggers actual work, file a CAS task/EPIC and link it here. If it's a
    "reviewed, no change needed" conclusion worth not re-litigating, also drop a
    `reference`-type CAS memory.
+6. After the diary update merges, publish the mandatory shared **#cas-internal**
+   harness thread: one parent plus exactly three replies ordered **Grok, Claude,
+   Codex**. Follow [the release Slack rubric](../RELEASE_SLACK_RUBRIC.md), including
+   its version-range, verdict/action, source-gap, and no-internal-narration rules.
 
 **Verdict legend**
 

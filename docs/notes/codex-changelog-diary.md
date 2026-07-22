@@ -18,6 +18,10 @@ When a new Codex stable ships:
    SDK, Bedrock) are orthogonal → `⏭ n/a`.
 4. Add a newest-first entry + index row. File a CAS task only when work is actually required.
 5. **Version gap matters:** track the version CAS is validated against vs latest (below).
+6. After the diary update merges, publish the mandatory shared **#cas-internal**
+   harness thread: one parent plus exactly three replies ordered **Grok, Claude,
+   Codex**. Follow [the release Slack rubric](../RELEASE_SLACK_RUBRIC.md), including
+   its version-range, verdict/action, source-gap, and no-internal-narration rules.
 
 **Verdict legend:** ✅ no action · 🟢 already covered · 👀 watch (touches a CAS dependency,
 verify on upgrade) · 🔧 fix shipped · 🏗 EPIC · ⏭ n/a

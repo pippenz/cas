@@ -24,6 +24,10 @@ When a new Grok Build version ships (or after `grok` upgrades on the host):
 5. **Version gap matters:** keep **validated pin** (pty.rs comment) vs **locally
    installed** vs **latest in changelog** honest. Do not invent older releases —
    if the local changelog only has N versions, seed those N and mark the **seed floor**.
+6. After the diary update merges, publish the mandatory shared **#cas-internal**
+   harness thread: one parent plus exactly three replies ordered **Grok, Claude,
+   Codex**. Follow [the release Slack rubric](../RELEASE_SLACK_RUBRIC.md), including
+   its version-range, verdict/action, source-gap, and no-internal-narration rules.
 
 **Verdict legend:** ✅ no action · 🟢 already covered · 👀 watch (touches a CAS
 dependency, verify on upgrade) · 🔧 fix shipped · 🏗 EPIC · ⏭ n/a
