@@ -243,7 +243,7 @@ fn release_worker_task_bindings_tasks_only(
     let mut released = 0usize;
     for mut t in assigned {
         if let Some(agents) = agent_store {
-            let _ = agents.release_lease_for_task(&t.id);
+            let _ = agents.release_lease_for_task(&t.id, "Worker shutdown/cancel cleanup");
         }
         t.status = cas_types::TaskStatus::Open;
         t.assignee = None;
@@ -299,7 +299,7 @@ pub(crate) fn release_preassign_if_bound(
         return;
     }
     if let Ok(agents) = open_agent_store(cas_dir) {
-        let _ = agents.release_lease_for_task(task_id);
+        let _ = agents.release_lease_for_task(task_id, "Preassigned worker startup aborted");
     }
     task.status = cas_types::TaskStatus::Open;
     task.assignee = None;

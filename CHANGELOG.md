@@ -7,6 +7,13 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [2.28.1] - 2026-07-22
+
+### Fixed
+- **`message_status` no longer contradicts itself on pre-telemetry messages.** Rows delivered before the lifecycle columns existed reported `legacy_status: Delivered` alongside `stage: enqueued` / `pending_reason: awaiting_delivery`, forcing audits back to raw logs. A one-time migration backfill hydrates `highest_stage`/`transport_delivered_at` from `processed_at` — gated to the column-creation moment only, so live legacy paths (`queue poll`/`ack`) can never be silently promoted to a fabricated "delivered" later.
+- **Lease history records the real release reason.** `release_lease_for_task` hardcoded "Task closed" for every release, so a MERGE-REQUIRED rejected close was indistinguishable from a genuine close. The reason is now threaded through the `AgentStore` trait and all call sites (awaiting-merge park, verification timeout, supervisor-review queue, reset, force-transfer, worker shutdown, preassign abort, wedged recovery, actual close).
+- **Workers posting task notes are no longer flagged stalled.** `task action=notes` now emits a `TaskNoteAdded` activity event with the caller's session (non-fatal if the event store fails), and the director's stall detector counts it as worker activity — steady note-writers no longer trip false "stalled, consider interrupting" alerts.
+
 ## [2.25.0] - 2026-06-30
 
 ### Changed

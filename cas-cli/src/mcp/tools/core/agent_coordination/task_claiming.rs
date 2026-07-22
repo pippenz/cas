@@ -503,7 +503,7 @@ impl CasCore {
         // `release_lease_for_task` returns Ok(true) if a lease was released,
         // Ok(false) if none existed — either is fine here.
         let lease_released = agent_store
-            .release_lease_for_task(&req.task_id)
+            .release_lease_for_task(&req.task_id, "Task reset")
             .unwrap_or(false);
 
         let prior_status = task.status;
@@ -656,7 +656,7 @@ impl CasCore {
                     // Supervisor force-transfer: release the live worker's lease.
                     let holder = l.agent_id.clone();
                     agent_store
-                        .release_lease_for_task(&req.task_id)
+                        .release_lease_for_task(&req.task_id, "Supervisor force-transfer")
                         .map_err(|e| McpError {
                             code: ErrorCode::INTERNAL_ERROR,
                             message: Cow::from(format!(
