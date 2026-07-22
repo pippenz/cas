@@ -3091,6 +3091,13 @@ async fn test_close_supervisor_owned_epic_uses_owner_closed_wording() {
         "healthy supervisor-owned epic must not be labeled orphaned: {response_text}"
     );
 
+    let persisted = task_store.get(&id).expect("closed epic should persist");
+    assert_eq!(persisted.status, cas::types::TaskStatus::Closed);
+    assert_eq!(
+        persisted.close_reason.as_deref(),
+        Some("all child tasks complete")
+    );
+
     let row = verification_store
         .get_latest_for_task(&id)
         .expect("verification lookup")
