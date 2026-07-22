@@ -3197,6 +3197,101 @@ This is the body content."#;
         }
     }
 
+    /// cas-7199c: copyable supervisor commands and reference twins must stay
+    /// complete across every harness surface, not only model-selection.md.
+    #[test]
+    fn test_supervisor_rubric_recipes_and_reference_twins_stay_normalized() {
+        let claude_body = SUPERVISOR_GUIDE;
+        let claude_model =
+            include_str!("builtins/skills/cas-supervisor/references/model-selection.md");
+        let claude_workflow = include_str!("builtins/skills/cas-supervisor/references/workflow.md");
+        let claude_reference =
+            include_str!("builtins/skills/cas-supervisor/references/reference.md");
+        let codex_body = include_str!("builtins/codex/skills/cas-supervisor.md");
+        let codex_model =
+            include_str!("builtins/codex/skills/cas-supervisor/references/model-selection.md");
+        let codex_workflow =
+            include_str!("builtins/codex/skills/cas-supervisor/references/workflow.md");
+        let codex_reference =
+            include_str!("builtins/codex/skills/cas-supervisor/references/reference.md");
+        let grok_body = include_str!("builtins/grok/skills/cas-supervisor.md");
+        let grok_model =
+            include_str!("builtins/grok/skills/cas-supervisor/references/model-selection.md");
+        let grok_workflow =
+            include_str!("builtins/grok/skills/cas-supervisor/references/workflow.md");
+        let grok_reference =
+            include_str!("builtins/grok/skills/cas-supervisor/references/reference.md");
+
+        assert_eq!(
+            claude_reference.replace("mcp__cas__", "mcp__cs__"),
+            codex_reference,
+            "Codex reference.md must normalize to the Claude twin"
+        );
+        assert_eq!(
+            claude_reference.replace("mcp__cas__", "cas__"),
+            grok_reference,
+            "Grok reference.md must normalize to the Claude twin"
+        );
+
+        for (label, content) in [
+            ("claude body", claude_body),
+            ("claude model-selection", claude_model),
+            ("claude workflow", claude_workflow),
+            ("claude reference", claude_reference),
+            ("codex body", codex_body),
+            ("codex model-selection", codex_model),
+            ("codex workflow", codex_workflow),
+            ("codex reference", codex_reference),
+            ("grok body", grok_body),
+            ("grok model-selection", grok_model),
+            ("grok workflow", grok_workflow),
+            ("grok reference", grok_reference),
+        ] {
+            let lines: Vec<_> = content.lines().collect();
+            for (index, line) in lines.iter().enumerate() {
+                if line.contains("coordination action=spawn_workers") {
+                    for argument in ["cli=", "model=", "effort="] {
+                        assert!(
+                            line.contains(argument),
+                            "{label}:{} spawn_workers recipe omits {argument}: {line:?}",
+                            index + 1
+                        );
+                    }
+                    if line.contains("cli=codex") {
+                        assert!(
+                            line.contains("model=gpt-5.6-sol")
+                                && ["effort=low", "effort=medium", "effort=high"]
+                                    .iter()
+                                    .any(|effort| line.contains(effort)),
+                            "{label}:{} Codex spawn must use the GPT-5.6 Sol tier matrix: {line:?}",
+                            index + 1
+                        );
+                    }
+                    assert!(
+                        !line.contains("model=gpt-5.5") && !line.contains("model=sonnet"),
+                        "{label}:{} contains a disallowed worker route: {line:?}",
+                        index + 1
+                    );
+                }
+
+                if line.contains("coordination action=message") && line.contains("target=") {
+                    let mut command = (*line).to_string();
+                    let mut command_index = index;
+                    while command.trim_end().ends_with('\\') && command_index + 1 < lines.len() {
+                        command_index += 1;
+                        command.push(' ');
+                        command.push_str(lines[command_index].trim());
+                    }
+                    assert!(
+                        command.contains("message=") && command.contains("summary="),
+                        "{label}:{} coordination message example must include message= and summary=: {command:?}",
+                        index + 1
+                    );
+                }
+            }
+        }
+    }
+
     /// cas-1dbf: lessons from the codex-worker fix-round loop must stay in the
     /// supervisor reference layer, mirrored across Claude and Codex surfaces.
     #[test]

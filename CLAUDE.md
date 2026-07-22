@@ -4,7 +4,7 @@
 **DO NOT USE BUILT-IN TOOLS (TodoWrite, EnterPlanMode) FOR TASK TRACKING.**
 
 Use CAS MCP tools instead:
-First use each session — load MCP schemas: ToolSearch(query="select:mcp__cas__task,mcp__cas__memory,mcp__cas__search")
+First use each session — load MCP schemas: ToolSearch(query="select:mcp__cas__task,mcp__cas__memory,mcp__cas__search"). ToolSearch only loads the schema — it does not call the tool. Once it succeeds, call `mcp__cas__task` etc. directly; never re-run ToolSearch for a tool already resolved.
 - `mcp__cas__task` with action: create - Create tasks (NOT TodoWrite)
 - `mcp__cas__task` with action: start/close - Manage task status
 - `mcp__cas__task` with action: ready - See ready tasks

@@ -959,6 +959,8 @@ impl PromptQueueStore for SqlitePromptQueueStore {
         crate::shared_db::with_write_retry(|| {
             let conn = self.conn.lock().unwrap();
             conn.execute_batch(PROMPT_QUEUE_SCHEMA)?;
+            let first_lifecycle_migration =
+                !crate::shared_db::column_exists(&conn, "prompt_queue", "highest_stage");
 
             for (col, mig) in [
                 ("factory_session", PROMPT_QUEUE_SESSION_MIGRATION),
@@ -986,6 +988,19 @@ impl PromptQueueStore for SqlitePromptQueueStore {
                 ("dedupe_key", PROMPT_QUEUE_DEDUPE_KEY_MIGRATION),
             ] {
                 crate::shared_db::ensure_column(&conn, "prompt_queue", col, mig)?;
+            }
+
+            // Pre-telemetry rows only have the legacy processed_at marker. Hydrate
+            // both lifecycle fields so delivery reports stay internally consistent.
+            if first_lifecycle_migration {
+                conn.execute(
+                    "UPDATE prompt_queue
+                     SET highest_stage = 'delivered',
+                         transport_delivered_at = processed_at
+                     WHERE processed_at IS NOT NULL
+                       AND highest_stage IS NULL",
+                    [],
+                )?;
             }
 
             // Indexes are IF NOT EXISTS — safe under concurrency once columns exist.
@@ -2843,6 +2858,72 @@ mod tests {
         assert_eq!(r.legacy_status, MessageStatus::Confirmed);
         assert!(r.pending_reason.is_none());
         assert_eq!(r.wake, ObservationStatus::Unobserved);
+    }
+
+    #[test]
+    fn test_init_backfills_legacy_processed_rows_for_delivery_report() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("cas.db");
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(super::PROMPT_QUEUE_SCHEMA).unwrap();
+            conn.execute(
+                "INSERT INTO prompt_queue (source, target, prompt, created_at, processed_at)
+                 VALUES (?, ?, ?, ?, ?)",
+                params![
+                    "sup",
+                    "worker",
+                    "legacy hello",
+                    "2026-07-21T12:00:00Z",
+                    "2026-07-21T12:00:01Z"
+                ],
+            )
+            .unwrap();
+        }
+
+        let store = SqlitePromptQueueStore::open(temp.path()).unwrap();
+        store.init().unwrap();
+
+        let r = store.message_delivery_report(1).unwrap().unwrap();
+        assert_eq!(r.legacy_status, MessageStatus::Delivered);
+        assert_eq!(r.stage, DeliveryStage::Delivered);
+        assert_eq!(r.pending_reason, Some(PendingReason::AwaitingAck));
+        assert_eq!(
+            r.delivered_at.unwrap(),
+            Utc.with_ymd_and_hms(2026, 7, 21, 12, 0, 1).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_init_does_not_backfill_post_migration_mark_processed_rows() {
+        let temp = TempDir::new().unwrap();
+        let id = {
+            let store = SqlitePromptQueueStore::open(temp.path()).unwrap();
+            store.init().unwrap();
+            let id = store.enqueue("sup", "worker", "live legacy ack").unwrap();
+            store.mark_processed(id).unwrap();
+            id
+        };
+
+        let store = SqlitePromptQueueStore::open(temp.path()).unwrap();
+        store.init().unwrap();
+
+        let r = store.message_delivery_report(id).unwrap().unwrap();
+        assert_eq!(r.legacy_status, MessageStatus::Delivered);
+        assert_eq!(r.stage, DeliveryStage::Enqueued);
+        assert_eq!(r.pending_reason, Some(PendingReason::AwaitingDelivery));
+        assert!(r.delivered_at.is_none());
+
+        let highest_stage: Option<String> = {
+            let conn = store.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT highest_stage FROM prompt_queue WHERE id = ?",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert!(highest_stage.is_none());
     }
 
     /// Gated must not regress to Selected when adapter failure is later stamped.

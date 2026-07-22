@@ -40,9 +40,48 @@ impl CasCore {
             data: None,
         })?;
 
+        if let Err(e) = self.record_task_note_activity(&req.id, &req.note_type, &req.note) {
+            tracing::warn!(
+                task_id = %req.id,
+                error = %e,
+                "failed to record task note activity"
+            );
+        }
+
         Ok(Self::success(format!(
             "Added {} note to task {}",
             req.note_type, req.id
         )))
+    }
+
+    fn record_task_note_activity(
+        &self,
+        task_id: &str,
+        note_type: &str,
+        note: &str,
+    ) -> anyhow::Result<()> {
+        use cas_types::{Event, EventEntityType, EventType};
+
+        let agent_id = self
+            .get_agent_id()
+            .map_err(|e| anyhow::anyhow!(e.message.to_string()))?;
+        let event_store = crate::store::open_event_store(&self.cas_root)?;
+        let summary = format!(
+            "Task note added ({note_type}): {}",
+            truncate_str(note, 120)
+        );
+        let event = Event::new(
+            EventType::TaskNoteAdded,
+            EventEntityType::Task,
+            task_id,
+            summary,
+        )
+        .with_session(agent_id)
+        .with_metadata(serde_json::json!({
+            "note_type": note_type,
+        }));
+
+        event_store.record(&event)?;
+        Ok(())
     }
 }

@@ -205,7 +205,7 @@ impl SqliteAgentStore {
         }
         }) // with_write_retry
     }
-    pub(crate) fn lease_release_lease_for_task(&self, task_id: &str) -> Result<bool> {
+    pub(crate) fn lease_release_lease_for_task(&self, task_id: &str, reason: &str) -> Result<bool> {
         crate::shared_db::with_write_retry(|| {
         let conn = self.lock_conn()?;
         let tx = ImmediateTx::new(&conn)?;
@@ -240,7 +240,7 @@ impl SqliteAgentStore {
                 "released",
                 epoch as u64,
                 None,
-                Some("Task closed"),
+                Some(reason),
             )?;
 
             tx.commit()?;
