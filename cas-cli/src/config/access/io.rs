@@ -62,6 +62,26 @@ impl Config {
         Ok(Self::default())
     }
 
+    /// Load project config with host-level `~/.cas/config.toml` staging defaults.
+    ///
+    /// Only the `[staging]` section is host-scoped. Project config wins when it
+    /// sets `[staging]`; all other sections remain project-local to avoid
+    /// leaking operator-level hooks, telemetry, LLM, or factory settings into
+    /// arbitrary repositories.
+    pub fn load_with_host_staging_defaults(cas_dir: &std::path::Path) -> Result<Self, MemError> {
+        let mut config = Self::load(cas_dir)?;
+        let host_dir = dirs::home_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join(".cas");
+
+        if config.staging.is_none() && host_dir != cas_dir {
+            let host_config = Self::load(&host_dir).unwrap_or_default();
+            config.staging = host_config.staging;
+        }
+
+        Ok(config)
+    }
+
     /// Save configuration to .cas directory as TOML (preferred format)
     pub fn save(&self, cas_dir: &std::path::Path) -> Result<(), MemError> {
         self.save_toml(cas_dir)

@@ -82,6 +82,11 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub factory: Option<FactoryConfig>,
 
+    /// `[staging]` — durable staging path and tmpfs/ramfs warning thresholds
+    /// for hook-side large-write guardrails.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staging: Option<StagingConfig>,
+
     /// Telemetry configuration for anonymous usage tracking and crash reporting
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub telemetry: Option<TelemetryConfig>,
@@ -148,6 +153,7 @@ impl Config {
         merge_option!(theme);
         merge_option!(orchestration);
         merge_option!(factory);
+        merge_option!(staging);
         merge_option!(telemetry);
         merge_option!(logging);
         merge_option!(llm);

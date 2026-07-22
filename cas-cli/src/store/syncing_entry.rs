@@ -12,7 +12,7 @@ use std::sync::Arc;
 use crate::cloud::{CloudConfig, EntityType, SyncOperation, SyncQueue};
 use crate::store::share_policy::{eligible_for_team_entry, resolve_team_id};
 use crate::store::{Result, Store};
-use crate::types::Entry;
+use crate::types::{Entry, Scope};
 
 /// An entry store wrapper that queues changes for cloud sync
 pub struct SyncingEntryStore {
@@ -140,6 +140,10 @@ impl Store for SyncingEntryStore {
 
     fn list(&self) -> Result<Vec<Entry>> {
         self.inner.list()
+    }
+
+    fn list_by_scope_and_tag(&self, scope: Scope, tag: &str) -> Result<Vec<Entry>> {
+        self.inner.list_by_scope_and_tag(scope, tag)
     }
 
     fn recent(&self, n: usize) -> Result<Vec<Entry>> {
@@ -457,7 +461,10 @@ mod tests {
 
         let (personal, team) = queue_counts(&queue);
         assert_eq!(personal, 1);
-        assert_eq!(team, 1, "share=Team forces promotion even for Global+Preference");
+        assert_eq!(
+            team, 1,
+            "share=Team forces promotion even for Global+Preference"
+        );
     }
 
     #[test]

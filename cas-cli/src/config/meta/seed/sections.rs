@@ -53,4 +53,8 @@ pub(super) fn add_section_descriptions(registry: &mut ConfigRegistry) {
         "llm",
         "LLM harness and model configuration for factory agents",
     );
+    registry.section_descriptions.insert(
+        "staging",
+        "Durable staging paths and tmpfs write guardrails",
+    );
 }

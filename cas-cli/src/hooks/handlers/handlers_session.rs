@@ -161,7 +161,7 @@ pub fn handle_session_start(
 
     // Load config to check AI context setting
     let config = cas_root
-        .map(|r| Config::load(r).unwrap_or_default())
+        .map(|r| Config::load_with_host_staging_defaults(r).unwrap_or_default())
         .unwrap_or_default();
 
     // Need cas_root for context building
@@ -280,6 +280,16 @@ pub fn handle_session_start(
         None => context,
     };
 
+    // Host-scoped staging convention for large generated artifacts. Appended
+    // near the end with other runtime banners so immutable role guidance stays
+    // budget-stable, while worker worktree assertions can still prepend above
+    // it when they detect a more urgent safety issue.
+    let context = match build_large_artifact_staging_banner(&config) {
+        Some(banner) if context.is_empty() => banner,
+        Some(banner) => format!("{context}\n{banner}"),
+        None => context,
+    };
+
     // ========================================================================
     // WORKER WORKTREE ASSERTION (cas-bea2 LAYER 3)
     //
@@ -352,6 +362,150 @@ pub fn handle_session_start(
 /// Estimate token count (rough approximation: ~4 chars per token)
 pub(crate) fn estimate_tokens(s: &str) -> usize {
     s.len() / 4
+}
+
+pub(crate) fn build_large_artifact_staging_banner(config: &Config) -> Option<String> {
+    let dir = config.staging.as_ref()?.staging_dir.as_deref()?.trim();
+
+    if dir.is_empty() {
+        return None;
+    }
+
+    Some(format!(
+        "Stage large artifacts (>1GB) in {dir} — /tmp is tmpfs on this host."
+    ))
+}
+
+#[cfg(test)]
+mod session_test_env {
+    pub(super) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::hooks::test_env_lock()
+    }
+
+    pub(super) struct EnvGuard(Vec<(String, Option<String>)>);
+    impl EnvGuard {
+        pub(super) fn set(vars: &[(&str, Option<&str>)]) -> Self {
+            let saved = vars
+                .iter()
+                .map(|(k, v)| {
+                    let prev = std::env::var(k).ok();
+                    unsafe {
+                        match v {
+                            Some(val) => std::env::set_var(k, val),
+                            None => std::env::remove_var(k),
+                        }
+                    }
+                    (k.to_string(), prev)
+                })
+                .collect();
+            EnvGuard(saved)
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in &self.0 {
+                unsafe {
+                    match v {
+                        Some(val) => std::env::set_var(k, val),
+                        None => std::env::remove_var(k),
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod large_artifact_staging_tests {
+    use super::session_test_env::{EnvGuard, env_lock};
+    use super::*;
+
+    fn session_input(cwd: &str) -> HookInput {
+        HookInput {
+            session_id: "staging-session".to_string(),
+            cwd: cwd.to_string(),
+            hook_event_name: "SessionStart".to_string(),
+            ..HookInput::default()
+        }
+    }
+
+    fn additional_context(output: HookOutput) -> String {
+        serde_json::to_value(output)
+            .unwrap()
+            .pointer("/hookSpecificOutput/additionalContext")
+            .and_then(|value| value.as_str())
+            .expect("SessionStart additionalContext")
+            .to_string()
+    }
+
+    #[test]
+    fn staging_banner_is_absent_when_unset() {
+        let config = Config::default();
+        assert!(build_large_artifact_staging_banner(&config).is_none());
+    }
+
+    #[test]
+    fn staging_banner_trims_and_mentions_configured_dir() {
+        let config = Config {
+            staging: Some(crate::config::StagingConfig {
+                staging_dir: Some(" /mnt/datacube/staging ".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let banner = build_large_artifact_staging_banner(&config).expect("banner");
+        assert_eq!(
+            banner,
+            "Stage large artifacts (>1GB) in /mnt/datacube/staging — /tmp is tmpfs on this host."
+        );
+    }
+
+    #[test]
+    fn session_start_includes_staging_banner_for_supervisor() {
+        let _lock = env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("config.toml"),
+            "[staging]\nlarge_artifact_dir = \"/mnt/datacube/staging\"\n",
+        )
+        .unwrap();
+        let _env = EnvGuard::set(&[
+            ("CAS_AGENT_ROLE", Some("supervisor")),
+            ("CAS_CLONE_PATH", None),
+            ("CAS_AGENT_NAME", None),
+        ]);
+
+        let input = session_input(tmp.path().to_str().unwrap());
+        let context = additional_context(handle_session_start(&input, Some(tmp.path())).unwrap());
+
+        assert!(context.contains(
+            "Stage large artifacts (>1GB) in /mnt/datacube/staging — /tmp is tmpfs on this host."
+        ));
+    }
+
+    #[test]
+    fn session_start_includes_staging_banner_for_worker() {
+        let _lock = env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("config.toml"),
+            "[staging]\nlarge_artifact_dir = \"/mnt/datacube/staging\"\n",
+        )
+        .unwrap();
+        let _env = EnvGuard::set(&[
+            ("CAS_AGENT_ROLE", Some("worker")),
+            ("CAS_CLONE_PATH", None),
+            ("CAS_AGENT_NAME", None),
+        ]);
+
+        let input = session_input(tmp.path().to_str().unwrap());
+        let context = additional_context(handle_session_start(&input, Some(tmp.path())).unwrap());
+
+        assert!(context.contains(
+            "Stage large artifacts (>1GB) in /mnt/datacube/staging — /tmp is tmpfs on this host."
+        ));
+    }
 }
 
 // ─── Session title computation (cas-ae09) ─────────────────────────────────
@@ -1292,45 +1446,8 @@ mod session_learn_tests {
 // ── Worker worktree assertion tests (cas-bea2, LAYER 3) ───────────────────
 #[cfg(test)]
 mod worker_worktree_assertion_tests {
+    use super::session_test_env::{EnvGuard, env_lock};
     use super::*;
-
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        // Use the shared crate-level env lock so we don't race with sibling
-        // test modules that also mutate CAS_AGENT_ROLE / CAS_CLONE_PATH.
-        crate::hooks::test_env_lock()
-    }
-
-    struct EnvGuard(Vec<(String, Option<String>)>);
-    impl EnvGuard {
-        fn set(vars: &[(&str, Option<&str>)]) -> Self {
-            let saved = vars
-                .iter()
-                .map(|(k, v)| {
-                    let prev = std::env::var(k).ok();
-                    unsafe {
-                        match v {
-                            Some(val) => std::env::set_var(k, val),
-                            None => std::env::remove_var(k),
-                        }
-                    }
-                    (k.to_string(), prev)
-                })
-                .collect();
-            EnvGuard(saved)
-        }
-    }
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (k, v) in &self.0 {
-                unsafe {
-                    match v {
-                        Some(val) => std::env::set_var(k, val),
-                        None => std::env::remove_var(k),
-                    }
-                }
-            }
-        }
-    }
 
     fn make_git_repo() -> tempfile::TempDir {
         let tmp = tempfile::tempdir().expect("tempdir");

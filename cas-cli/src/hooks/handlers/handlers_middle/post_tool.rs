@@ -1,8 +1,20 @@
+use crate::hooks::handlers::handlers_middle::tmpfs_guardrail::maybe_tmpfs_guardrail_warning;
 use crate::hooks::handlers::*;
+use crate::hooks::types::HookSpecificOutput;
 
 pub fn handle_post_tool_use(
     input: &HookInput,
     cas_root: Option<&Path>,
+) -> Result<HookOutput, MemError> {
+    handle_post_tool_use_with_guardrail(input, cas_root, |cas_root, input, stores| {
+        maybe_tmpfs_guardrail_warning(cas_root, input, stores.config())
+    })
+}
+
+fn handle_post_tool_use_with_guardrail(
+    input: &HookInput,
+    cas_root: Option<&Path>,
+    guardrail: impl FnOnce(&Path, &HookInput, &mut ToolHookStores<'_>) -> Option<HookOutput>,
 ) -> Result<HookOutput, MemError> {
     let tool_name = match &input.tool_name {
         Some(name) => name.as_str(),
@@ -32,16 +44,39 @@ pub fn handle_post_tool_use(
         let _ = crate::mcp::socket::send_event(cas_root, &event);
     }
 
+    let guardrail_tool = should_run_tmpfs_guardrail(tool_name);
+
+    // Read-like tools do not produce PostToolUse observations today. Return
+    // before config/mount/state work so non-Write/Edit/Bash hot paths stay
+    // free of guardrail I/O.
+    if !guardrail_tool && !should_buffer_observation(input, tool_name) {
+        return Ok(HookOutput::empty());
+    }
+
+    // === TMPFS/RAMFS LARGE-WRITE GUARDRAIL ===
+    // Warning-only: never deny a tool. Gate before config and mount/state I/O
+    // so unrelated PostToolUse calls do not pay the tmpfs guardrail cost.
+    let tmpfs_guardrail_warning = if guardrail_tool {
+        guardrail(cas_root, input, &mut stores)
+    } else {
+        None
+    };
+
     // === RIPPLE CHECK (file-to-task/spec consistency reminder) ===
     // When a file linked to a task or spec is modified, remind agent to check consistency
     if tool_name == "Write" || tool_name == "Edit" {
         if let Some(reminder) = check_ripple_consistency(&mut stores, input) {
-            return Ok(HookOutput::with_post_tool_context(reminder));
+            return Ok(HookOutput::with_post_tool_context(
+                merge_post_tool_contexts(tmpfs_guardrail_warning.as_ref(), reminder),
+            ));
         }
     }
 
     // Check if this tool is worth capturing for observations
     if !CAPTURE_TOOLS.contains(&tool_name) {
+        if let Some(output) = tmpfs_guardrail_warning {
+            return Ok(output);
+        }
         return Ok(HookOutput::empty());
     }
 
@@ -49,9 +84,12 @@ pub fn handle_post_tool_use(
     let _ = DevTracer::init_global(cas_root);
 
     // Check config for capture settings (uses cached Config)
-    let config = stores.config().clone();
+    let config = stores.config();
     if let Some(ref hooks_config) = config.hooks {
         if !hooks_config.capture_enabled {
+            if let Some(output) = tmpfs_guardrail_warning {
+                return Ok(output);
+            }
             return Ok(HookOutput::empty());
         }
 
@@ -59,6 +97,9 @@ pub fn handle_post_tool_use(
         if !hooks_config.capture_tools.is_empty()
             && !hooks_config.capture_tools.iter().any(|t| t == tool_name)
         {
+            if let Some(output) = tmpfs_guardrail_warning {
+                return Ok(output);
+            }
             return Ok(HookOutput::empty());
         }
     }
@@ -103,6 +144,10 @@ pub fn handle_post_tool_use(
                 });
             }
         }
+    }
+
+    if let Some(output) = tmpfs_guardrail_warning {
+        return Ok(output);
     }
 
     // === SMART FILTERING ===
@@ -155,6 +200,24 @@ pub fn handle_post_tool_use(
 
     // Silent success - don't clutter Claude's output
     Ok(HookOutput::empty())
+}
+
+fn should_run_tmpfs_guardrail(tool_name: &str) -> bool {
+    matches!(tool_name, "Write" | "Edit" | "Bash")
+}
+
+fn post_tool_context(output: &HookOutput) -> Option<&str> {
+    match output.hook_specific_output.as_ref()? {
+        HookSpecificOutput::PostToolUse { additional_context } => additional_context.as_deref(),
+        _ => None,
+    }
+}
+
+fn merge_post_tool_contexts(warning: Option<&HookOutput>, reminder: String) -> String {
+    match warning.and_then(post_tool_context) {
+        Some(warning) if !warning.trim().is_empty() => format!("{warning}\n{reminder}"),
+        _ => reminder,
+    }
 }
 
 /// Determine if an observation is significant enough to buffer
@@ -696,10 +759,9 @@ pub(crate) fn is_file_within_project(
     file_path: &std::path::Path,
     project_root: &std::path::Path,
 ) -> bool {
-    let canon_root = std::fs::canonicalize(project_root)
-        .unwrap_or_else(|_| project_root.to_path_buf());
-    let canon_file = std::fs::canonicalize(file_path)
-        .unwrap_or_else(|_| file_path.to_path_buf());
+    let canon_root =
+        std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+    let canon_file = std::fs::canonicalize(file_path).unwrap_or_else(|_| file_path.to_path_buf());
     canon_file.starts_with(&canon_root)
 }
 
@@ -822,14 +884,138 @@ fn spec_references_file(
 mod post_tool_wiring_tests {
     use super::*;
     use serde_json::json;
+    use std::cell::Cell;
 
     fn bash_input(command: &str, exit_code: i64) -> HookInput {
         HookInput {
+            session_id: "post-tool-test".to_string(),
+            cwd: "/tmp".to_string(),
             tool_name: Some("Bash".to_string()),
             tool_input: Some(json!({ "command": command })),
             tool_response: Some(json!({ "exitCode": exit_code })),
             ..Default::default()
         }
+    }
+
+    fn write_input() -> HookInput {
+        HookInput {
+            session_id: "post-tool-test".to_string(),
+            cwd: "/tmp".to_string(),
+            hook_event_name: "PostToolUse".to_string(),
+            tool_name: Some("Write".to_string()),
+            tool_input: Some(json!({
+                "file_path": "/tmp/out.bin",
+                "content": "large content"
+            })),
+            ..Default::default()
+        }
+    }
+
+    fn context(output: &HookOutput) -> String {
+        post_tool_context(output).unwrap_or_default().to_string()
+    }
+
+    fn warning_output() -> HookOutput {
+        HookOutput::with_post_tool_context("TMPFS WARNING".to_string())
+    }
+
+    #[test]
+    fn post_tool_does_not_run_guardrail_for_read_hot_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let called = Cell::new(false);
+        let input = HookInput {
+            session_id: "post-tool-test".to_string(),
+            cwd: tmp.path().to_string_lossy().to_string(),
+            hook_event_name: "PostToolUse".to_string(),
+            tool_name: Some("Read".to_string()),
+            tool_input: Some(json!({ "file_path": "src/lib.rs" })),
+            ..Default::default()
+        };
+
+        let output = handle_post_tool_use_with_guardrail(
+            &input,
+            Some(tmp.path()),
+            |_cas_root, _input, _stores| {
+                called.set(true);
+                Some(warning_output())
+            },
+        )
+        .unwrap();
+
+        assert!(!called.get(), "Read must not enter tmpfs guardrail");
+        assert!(post_tool_context(&output).is_none());
+        assert!(
+            !tmp.path().join("tmpfs_guardrail").exists(),
+            "Read hot path must not touch guardrail state"
+        );
+    }
+
+    #[test]
+    fn post_tool_guardrail_warning_survives_capture_disabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("config.toml"),
+            "[hooks]\ncapture_enabled = false\n",
+        )
+        .unwrap();
+
+        let output = handle_post_tool_use_with_guardrail(
+            &write_input(),
+            Some(tmp.path()),
+            |_cas_root, _input, _stores| Some(warning_output()),
+        )
+        .unwrap();
+
+        assert_eq!(context(&output), "TMPFS WARNING");
+    }
+
+    #[test]
+    fn post_tool_guardrail_warning_survives_capture_allowlist_skip() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("config.toml"),
+            "[hooks]\ncapture_tools = [\"Bash\"]\n",
+        )
+        .unwrap();
+
+        let output = handle_post_tool_use_with_guardrail(
+            &write_input(),
+            Some(tmp.path()),
+            |_cas_root, _input, _stores| Some(warning_output()),
+        )
+        .unwrap();
+
+        assert_eq!(context(&output), "TMPFS WARNING");
+    }
+
+    #[test]
+    fn post_tool_guardrail_warning_returns_after_normal_bash_side_effects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = HookInput {
+            session_id: "post-tool-test".to_string(),
+            cwd: tmp.path().to_string_lossy().to_string(),
+            hook_event_name: "PostToolUse".to_string(),
+            tool_name: Some("Bash".to_string()),
+            tool_input: Some(json!({ "command": "dd if=/dev/zero of=/tmp/blob" })),
+            tool_response: Some(json!({ "exitCode": 0 })),
+            ..Default::default()
+        };
+
+        let output = handle_post_tool_use_with_guardrail(
+            &input,
+            Some(tmp.path()),
+            |_cas_root, _input, _stores| Some(warning_output()),
+        )
+        .unwrap();
+
+        assert_eq!(context(&output), "TMPFS WARNING");
+    }
+
+    #[test]
+    fn ripple_context_merges_guardrail_warning() {
+        let warning = warning_output();
+        let merged = merge_post_tool_contexts(Some(&warning), "Ripple reminder".to_string());
+        assert_eq!(merged, "TMPFS WARNING\nRipple reminder");
     }
 
     #[test]

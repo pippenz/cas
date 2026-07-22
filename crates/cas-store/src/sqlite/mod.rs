@@ -8,7 +8,9 @@ use std::sync::{Arc, Mutex};
 use std::str::FromStr;
 
 use crate::Result;
-use cas_types::{BeliefType, Entry, EntryType, MemoryTier, ObservationType, Rule, RuleStatus, Scope};
+use cas_types::{
+    BeliefType, Entry, EntryType, MemoryTier, ObservationType, Rule, RuleStatus, Scope,
+};
 
 /// SQLite DDL for the `entries`, `rules`, and `metadata` tables and their
 /// indexes — the core memory + rules schema.
@@ -80,6 +82,7 @@ CREATE INDEX IF NOT EXISTS idx_entries_pending_embedding ON entries(pending_embe
 CREATE INDEX IF NOT EXISTS idx_entries_confidence ON entries(confidence);
 CREATE INDEX IF NOT EXISTS idx_entries_domain ON entries(domain);
 CREATE INDEX IF NOT EXISTS idx_entries_branch ON entries(branch);
+CREATE INDEX IF NOT EXISTS idx_entries_scope ON entries(scope);
 CREATE INDEX IF NOT EXISTS idx_entries_pending_index ON entries(updated_at) WHERE indexed_at IS NULL OR updated_at > indexed_at;
 CREATE INDEX IF NOT EXISTS idx_entries_unreviewed_learnings ON entries(created DESC) WHERE type = 'learning' AND archived = 0 AND last_reviewed IS NULL;
 

@@ -2,6 +2,32 @@ use crate::config::*;
 use crate::ui::theme::{ThemeConfig, ThemeMode, ThemeVariant};
 use tempfile::TempDir;
 
+struct EnvGuard {
+    key: &'static str,
+    old: Option<String>,
+}
+
+impl EnvGuard {
+    fn set(key: &'static str, value: &std::path::Path) -> Self {
+        let old = std::env::var(key).ok();
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        Self { key, old }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.old {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+}
+
 #[test]
 fn test_config_defaults() {
     let config = Config::default();
@@ -36,6 +62,113 @@ fn test_merge_missing_fills_none_fields() {
     let changed = base.merge_missing(&other);
     assert!(changed);
     assert_eq!(base.theme.as_ref().unwrap().variant, ThemeVariant::Minions);
+}
+
+#[test]
+fn load_with_host_staging_defaults_uses_host_staging_when_project_unset() {
+    let _lock = crate::hooks::test_env_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let host_cas = home.path().join(".cas");
+    std::fs::create_dir_all(&host_cas).unwrap();
+    std::fs::write(
+        host_cas.join("config.toml"),
+        "[staging]\nlarge_artifact_dir = \"/mnt/host-staging\"\n",
+    )
+    .unwrap();
+
+    let _home = EnvGuard::set("HOME", home.path());
+    let loaded = Config::load_with_host_staging_defaults(project.path()).unwrap();
+
+    assert_eq!(
+        loaded
+            .staging
+            .as_ref()
+            .and_then(|s| s.staging_dir.as_deref()),
+        Some("/mnt/host-staging")
+    );
+}
+
+#[test]
+fn load_with_host_staging_defaults_project_staging_overrides_host_staging() {
+    let _lock = crate::hooks::test_env_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let host_cas = home.path().join(".cas");
+    std::fs::create_dir_all(&host_cas).unwrap();
+    std::fs::write(
+        host_cas.join("config.toml"),
+        "[staging]\nlarge_artifact_dir = \"/mnt/host-staging\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("config.toml"),
+        "[staging]\nstaging_dir = \"/mnt/project-staging\"\n",
+    )
+    .unwrap();
+
+    let _home = EnvGuard::set("HOME", home.path());
+    let loaded = Config::load_with_host_staging_defaults(project.path()).unwrap();
+
+    assert_eq!(
+        loaded
+            .staging
+            .as_ref()
+            .and_then(|s| s.staging_dir.as_deref()),
+        Some("/mnt/project-staging")
+    );
+}
+
+#[test]
+fn load_with_host_staging_defaults_does_not_leak_other_host_sections() {
+    let _lock = crate::hooks::test_env_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let host_cas = home.path().join(".cas");
+    std::fs::create_dir_all(&host_cas).unwrap();
+    std::fs::write(
+        host_cas.join("config.toml"),
+        "[staging]\nlarge_artifact_dir = \"/mnt/host-staging\"\n\n[hooks]\ncapture_enabled = false\n\n[llm]\nmodel = \"host-only-model\"\n",
+    )
+    .unwrap();
+
+    let _home = EnvGuard::set("HOME", home.path());
+    let loaded = Config::load_with_host_staging_defaults(project.path()).unwrap();
+
+    assert_eq!(
+        loaded
+            .staging
+            .as_ref()
+            .and_then(|s| s.staging_dir.as_deref()),
+        Some("/mnt/host-staging")
+    );
+    assert!(loaded.hooks.is_none(), "host hooks config must not leak");
+    assert!(loaded.llm.is_none(), "host llm config must not leak");
+}
+
+#[test]
+fn config_set_supports_staging_keys_and_alias() {
+    let mut config = Config::default();
+
+    config
+        .set("staging.large_artifact_dir", "/mnt/large-artifacts")
+        .unwrap();
+    config
+        .set("staging.tmpfs_warning_threshold_bytes", "2048")
+        .unwrap();
+
+    let staging = config.staging.as_ref().expect("staging section");
+    assert_eq!(staging.staging_dir.as_deref(), Some("/mnt/large-artifacts"));
+    assert_eq!(staging.tmpfs_warning_threshold_bytes, 2048);
+
+    config.set("staging.staging_dir", "").unwrap();
+    assert_eq!(
+        config
+            .staging
+            .as_ref()
+            .and_then(|staging| staging.staging_dir.as_deref()),
+        None
+    );
 }
 
 #[test]

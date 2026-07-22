@@ -231,6 +231,7 @@ impl WizardConfig {
             theme: None,
             orchestration: None,
             factory: None,
+            staging: None,
             telemetry: None,
             logging: None,
             llm: None,

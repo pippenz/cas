@@ -165,7 +165,7 @@ pub use task_store::{SqliteTaskStore, TASK_SCHEMA, clear_pending_verification_wi
 
 use cas_types::{
     Dependency, DependencyType, Entity, EntityMention, EntityType, Entry, RelationType,
-    Relationship, Rule, Skill, SkillStatus, Task, TaskStatus, TaskType,
+    Relationship, Rule, Scope, Skill, SkillStatus, Task, TaskStatus, TaskType,
 };
 
 /// Trait for entry storage operations
@@ -193,6 +193,19 @@ pub trait Store: Send + Sync {
 
     /// List all active (non-archived) entries
     fn list(&self) -> Result<Vec<Entry>>;
+
+    /// List active entries matching a scope and tag.
+    ///
+    /// Default falls back to list() + filter for non-SQLite stores; SQLite
+    /// overrides with a query-layer filter for SessionStart hot paths.
+    fn list_by_scope_and_tag(&self, scope: Scope, tag: &str) -> Result<Vec<Entry>> {
+        Ok(self
+            .list()?
+            .into_iter()
+            .filter(|e| e.scope == scope)
+            .filter(|e| e.tags.iter().any(|t| t.trim().eq_ignore_ascii_case(tag)))
+            .collect())
+    }
 
     /// List entries eligible for memory decay (not InContext or Archive tier).
     /// Default falls back to list() + filter; SQLite overrides with a filtered query.
