@@ -8,7 +8,12 @@
 
 import { test, describe } from 'node:test'
 import assert from 'node:assert/strict'
-import { mergeFindings, fingerprint, OWNER_RANK } from './merge-findings.js'
+import {
+  mergeFindings,
+  findingValidationErrors,
+  fingerprint,
+  OWNER_RANK,
+} from './merge-findings.js'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // FIXTURES
@@ -33,6 +38,66 @@ function finding(overrides = {}) {
 function reviewerOutput(reviewer, findings) {
   return { reviewer, findings }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// UNIT TESTS — FINDING VALIDATION
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('findingValidationErrors()', () => {
+  test('accepts a schema-complete finding', () => {
+    assert.deepEqual(findingValidationErrors(finding()), [])
+  })
+
+  test('rejects non-object values', () => {
+    assert.deepEqual(findingValidationErrors(null), ['finding must be an object'])
+    assert.deepEqual(findingValidationErrors([]), ['finding must be an object'])
+  })
+
+  test('reports every missing required field', () => {
+    assert.deepEqual(
+      findingValidationErrors({}),
+      [
+        'missing required field: title',
+        'missing required field: severity',
+        'missing required field: file',
+        'missing required field: line',
+        'missing required field: why_it_matters',
+        'missing required field: autofix_class',
+        'missing required field: owner',
+        'missing required field: confidence',
+        'missing required field: evidence',
+        'missing required field: pre_existing',
+      ],
+    )
+  })
+
+  const invalidCases = [
+    ['non-string title', { title: 42 }, 'title must be a string of at most 100 characters'],
+    ['title over 100 characters', { title: 'x'.repeat(101) }, 'title must be a string of at most 100 characters'],
+    ['bad severity enum', { severity: 'critical' }, 'severity must be one of P0, P1, P2, P3'],
+    ['non-string file', { file: 42 }, 'file must be a string'],
+    ['non-integer line', { line: 1.5 }, 'line must be an integer greater than or equal to 1'],
+    ['line below one', { line: 0 }, 'line must be an integer greater than or equal to 1'],
+    ['non-string rationale', { why_it_matters: false }, 'why_it_matters must be a string'],
+    ['bad autofix enum', { autofix_class: 'automatic' }, 'autofix_class must be safe_auto, gated_auto, manual, or advisory'],
+    ['bad owner enum', { owner: 'worker' }, 'owner must be review-fixer, downstream-resolver, or human'],
+    ['confidence below zero', { confidence: -0.01 }, 'confidence must be a number between 0.0 and 1.0'],
+    ['confidence above one', { confidence: 1.01 }, 'confidence must be a number between 0.0 and 1.0'],
+    ['non-finite confidence', { confidence: Number.NaN }, 'confidence must be a number between 0.0 and 1.0'],
+    ['empty evidence', { evidence: [] }, 'evidence must be a non-empty array of strings'],
+    ['non-string evidence item', { evidence: [42] }, 'evidence must be a non-empty array of strings'],
+    ['non-boolean pre-existing flag', { pre_existing: 'false' }, 'pre_existing must be a boolean'],
+    ['non-string suggested fix', { suggested_fix: 42 }, 'suggested_fix must be a string when present'],
+    ['non-boolean verification flag', { requires_verification: 'yes' }, 'requires_verification must be a boolean when present'],
+    ['unexpected field', { mystery: true }, 'unexpected field: mystery'],
+  ]
+
+  for (const [name, override, expected] of invalidCases) {
+    test(`rejects ${name}`, () => {
+      assert.deepEqual(findingValidationErrors(finding(override)), [expected])
+    })
+  }
+})
 
 // ─────────────────────────────────────────────────────────────────────────────
 // UNIT TESTS — 7 steps
