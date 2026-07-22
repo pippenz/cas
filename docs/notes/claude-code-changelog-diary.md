@@ -7,7 +7,8 @@ require a CAS change, and if so, where's the proof?"*
 This is the index layer. Deep per-EPIC working notes live in their own dated files
 (e.g. `2026-06-02-cc160-hook-surface.md`); this diary links out to them.
 
-Sibling ledger for the other supported harness: `codex-changelog-diary.md`.
+Sibling ledgers for the other supported harnesses: `codex-changelog-diary.md` and
+`grok-changelog-diary.md`.
 
 ## How to update
 
@@ -39,6 +40,13 @@ When a new Claude Code version ships:
 
 | CC version | Headline | CAS verdict | Pointer |
 |------------|----------|-------------|---------|
+| 2.1.209 | `/model` + dialogs unblocked in `claude agents` background sessions | ⏭ n/a | — |
+| 2.1.208 | **catastrophic `rm` still prompts under `--dangerously-skip-permissions` when command has `$(…)`** · long-session hook/MCP memory leaks fixed · MCP tool-pool cache | 👀 watch / ✅ | this doc |
+| 2.1.207 | **agent-teams mailbox crash-loop fixed** · skill/worktree bracket-glob parse fixes · plugin shell-form `${user_config.*}` rejected | 🟢 win / ✅ | this doc |
+| 2.1.206 | **MCP per-server `request_timeout_ms` honored** · OAuth MCP refresh recovery · `EnterWorktree` confirm outside `.claude/worktrees/` | ✅ / 👀 | this doc |
+| 2.1.205 | **background notifications deny fabricated human-approval** · `--json-schema` invalid-schema no longer silent · verify-skills rewrite thrash fixed | 🟢 / ✅ | this doc |
+| 2.1.204 | **SessionStart hook streaming in headless — no more mid-hook idle-reap** | 🟢 direct win | this doc |
+| 2.1.203 | **Bash "arg list too long" with many git worktrees fixed** · worktree-isolated subagent cwd fix · subagents less re-delegate | 🟢 wins | this doc |
 | 2.1.202 | Workflow script parse fixes · **re-invoked skill no longer duplicates instructions** · resume-picker slow with many worktrees fixed · `/review` back to single-pass | ✅ no action (wins ride free) | this doc |
 | 2.1.201 | Sonnet 5 sessions drop mid-conversation system role for harness reminders | ✅ no action | this doc |
 | 2.1.200 | **`AskUserQuestion` no longer auto-continues by default** · "default" mode renamed "Manual" · tmux 3.4+ flicker fix | 👀 watch | this doc |
@@ -72,6 +80,145 @@ When a new Claude Code version ships:
 ---
 
 ## Entries
+
+### 2.1.209 — dialogs unblocked in `claude agents` background sessions
+
+Reviewed 2026-07-14 (w-claude-diary / cas-aeec9). Host on **2.1.209**.
+
+- **"Fixed /model and other dialogs being blocked in `claude agents` background sessions (reverts an
+  overly broad guard)."** → ⏭ **n/a for CAS factory.** Factory workers are CC instances in **tmux
+  panes**, not the `claude agents` background-daemon surface. No CAS change.
+
+### 2.1.208 — DSP catastrophic-rm prompt · hook/MCP long-session leaks · MCP tool-pool cache
+
+Reviewed 2026-07-14.
+
+- **"Catastrophic removals (e.g. `rm -rf ~`) in commands containing `$(…)`/backticks/`<(…)` now prompt
+  in `--dangerously-skip-permissions` and auto mode, matching the plain form."** → 👀 **watch —
+  factory permission surface.** Factory workers spawn with `--permission-mode bypassPermissions` /
+  `--dangerously-skip-permissions` (`cas-pty` worker args). Plain catastrophic `rm` already prompted;
+  substitution-wrapped forms now do too. Expected effect: a worker that builds `rm -rf $(…)` toward a
+  home-path-ish target can stall on a permission dialog even under DSP — stall detection is the
+  backstop. Not a break of the DSP path for normal work; recorded as the failure shape if a pane
+  freezes on shell cleanup.
+- **"Fixed several memory leaks in long sessions: MCP stdio server stderr accumulating up to 64 MB per
+  server, … async hook output retained after backgrounding, …"** → ✅ **no action — direct win.** CAS
+  rides SessionStart/SubagentStart/Stop hooks + multi-server MCP for the whole factory lifetime;
+  unbounded hook-output + MCP-stderr retention was exactly the long-session memory shape. Rides free.
+- **"Reduced per-tool-call CPU overhead in print/SDK sessions with many MCP tools by caching tool-pool
+  assembly (up to 7x faster tool rounds at high tool counts)."** → ✅ no action; CAS sessions expose a
+  large MCP tool surface (`cas__*`, plus host MCPs). Pure perf.
+- **"Fixed the Agent tool launching with no tools when a subagent's `tools` list resolves to nothing —
+  it now returns a clear error naming the unrecognized entries."** → ✅ no action; clearer failure for
+  `cas-code-review` Workflow persona dispatch / named Agent spawns with bad tool allowlists.
+- **"Fixed multi-second per-turn slowdowns in sessions with many permission deny/ask rules — rule
+  matchers are now compiled once and cached."** → ✅ no action; host-side if anyone runs dense deny
+  rules outside DSP.
+- Screen reader / vim remaps / mouse / Remote Control / Bedrock SSO / large-table render → ⏭ n/a.
+
+### 2.1.207 — agent-teams mailbox crash-loop · skill/worktree glob parse · plugin hook shell form
+
+Reviewed 2026-07-14.
+
+- **"Fixed a crash loop in agent teams where a malformed teammate mailbox message caused repeated
+  errors every second until the mailbox file was manually deleted."** → 🟢 **direct factory win.** CAS
+  factory rides CC agent teams (memory `reference_cas_factory_uses_cc_agent_teams_cli_flags`); a
+  corrupted mailbox previously required manual file surgery to unstick a pane. No CAS change;
+  shrinks a known zombie-team failure class (pairs with 2.1.198 teammate-"failed" reporting).
+- **"Fixed malformed bracket patterns in rules globs, skill paths, `.ignore`, and `.worktreeinclude`
+  breaking file reads, file suggestions, and worktree creation."** → ✅ **no action — de-flake.** CAS
+  ships skill paths and worktree isolation; bad bracket globs previously could break reads / worktree
+  create rather than failing clearly. Rides free.
+- **Plugin hooks/monitors/MCP headersHelper: `${user_config.*}` in shell-form commands is now rejected
+  (shell-injection fix).** → ✅ **no action.** CAS hooks are installed as shell-form `cas hook
+  <Event>` without `${user_config.*}` interpolation (`cas init` SessionStart path). Plugin-authored
+  hooks that did use that expansion must migrate to exec form / `$CLAUDE_PLUGIN_OPTION_*` — not a CAS
+  surface.
+- Auto-mode default-on for Bedrock/Vertex/Foundry; `autoMode` no longer read from
+  `.claude/settings.local.json` → ⏭ for factory (workers are DSP/bypassPermissions, not auto mode).
+- Terminal freezes on long lists/tables, Remote Control, Bedrock SSO, Opus 4.8 cloud defaults → ⏭ /
+  ✅ host-only.
+
+### 2.1.206 — MCP request_timeout_ms · OAuth MCP refresh · EnterWorktree outside `.claude/worktrees/`
+
+Reviewed 2026-07-14.
+
+- **"Fixed MCP servers configured via `--mcp-config` or `.mcp.json` ignoring a per-server
+  `request_timeout_ms`, which caused long-running MCP tool calls to time out at the 60s default in
+  fresh sessions."** → ✅ **no action — reliability win.** CAS MCP tools (search, task list, heavy
+  coordination) can exceed 60s on large stores; hosts that set a higher per-server timeout now get
+  the configured value instead of a silent 60s clip. No CAS code change.
+- **"Fixed OAuth MCP servers requiring manual re-authentication after a single failed token refresh."**
+  → ✅ no action; de-flakes host MCP OAuth (GitHub, etc.) mid-factory.
+- **"`EnterWorktree` now asks for confirmation before entering a git worktree outside the project's
+  `.claude/worktrees/` directory."** → 👀 **watch — path-shape note.** CAS factory worktrees live under
+  `.cas/worktrees/…`, not `.claude/worktrees/`. CAS creates/isolates via its own worktree coordination
+  path, not CC's `EnterWorktree` tool, so the confirm should not gate normal factory spawn. Residual
+  risk: an agent that *calls* `EnterWorktree` into a CAS worktree path may now get a human confirm
+  prompt — same unattended-pane hang class as the 2.1.200 `AskUserQuestion` note. No CAS change unless
+  that shape shows up in the wild.
+- Background-agent auto-upgrade after CC update, `/code-review` opus quality, agents-view Ctrl+X →
+  ⏭ / adjacent (built-in `/code-review`, not `cas-code-review`).
+
+### 2.1.205 — fabricated-approval denial · json-schema validity · verify-skills rewrite thrash
+
+Reviewed 2026-07-14.
+
+- **"Background task notifications now explicitly state that no human input has occurred, preventing
+  fabricated in-transcript approvals from being acted on."** → 🟢 **authority-model win.** Same family
+  as 2.1.166 SendMessage hardening and 2.1.198 "launcher messages ≠ user approval." CAS factory already
+  treats agent-to-agent direction as non-approval; this closes a background-notification path that could
+  look like a human yes. No CAS change.
+- **"Fixed `--json-schema` silently producing unstructured output when the schema was invalid, and
+  schemas using the `format` keyword being rejected."** → ✅ no action / residual of 2.1.187
+  structured-output hardening. Helps Workflow `agent({schema})` paths used by `cas-code-review`
+  (Phase C) fail loudly on bad schemas instead of returning free-form prose.
+- **"Fixed project verify skills being rewritten on every session instead of only when a documented
+  command changed."** → ✅ no action; skill hot-reload thrash reduction (pairs with 2.1.174
+  re-announce-only-changed). CAS skill sync already prefers stable skill bodies.
+- **"Fixed background agents staying shown as 'failed' or 'completed' in the agent list after being
+  resumed with `SendMessage`."** → ✅ no action for tmux factory; residual native agent-list correctness
+  when anyone uses CC background agents + SendMessage.
+- Auto-mode transcript-tamper block / `rm -rf` on unresolved vars → ⏭ (auto mode, not DSP factory).
+- Reserved "Claude Browser" MCP name → ⏭ unless a host MCP collides on that exact name.
+
+### 2.1.204 — SessionStart hook streaming in headless (idle-reap mid-hook)
+
+Reviewed 2026-07-14. **Small release, high CAS signal.**
+
+- **"Fixed hook events not streaming during SessionStart hooks in headless sessions, which could cause
+  remote workers to be idle-reaped mid-hook."** → 🟢 **direct win on the load-bearing CAS surface.**
+  SessionStart is how CAS injects factory supervisor/worker guidance, task context, and session
+  mapping (`cas hook SessionStart`). A headless/remote worker that looked idle while SessionStart was
+  still running could be reaped before the hook finished — exactly the "worker died before it ever
+  talked" shape. Interactive tmux factory panes were less exposed, but any headless/`claude -p`/remote
+  CAS path was. No CAS change; rides free on the host bump. Pairs with 2.1.199 SessionStart stderr-on-
+  exit-2 visibility for hook debuggability.
+
+### 2.1.203 — many-worktree Bash · subagent worktree cwd · re-delegation reduction
+
+Reviewed 2026-07-14.
+
+- **"Fixed Bash failing with 'argument list too long' in repos with many git worktrees."** → 🟢
+  **direct factory win.** Factory hosts accumulate `.cas/worktrees/*` (and related) by design; the
+  same class of "many worktrees" pain as the 2.1.202 resume-picker fix. Shell ops that expanded
+  worktree lists no longer blow `ARG_MAX`. No CAS change.
+- **"Fixed worktree-isolated subagents sometimes running shell commands in the parent checkout instead
+  of their own worktree."** → 🟢 **isolation correctness win.** CAS worktree-isolated workers and
+  subagents depend on cwd staying inside the assigned tree; parent-checkout leakage is a silent
+  cross-worker corruption risk. Rides free.
+- **"Improved subagent behavior: agents are now less likely to re-delegate their entire task to another
+  subagent."** → ✅ no action; quality win for task-verifier / `cas-code-review` persona fan-out (less
+  nested Agent thrash).
+- **"Fixed `TaskStop` and `TaskOutput` failing to find background agents spawned by another agent —
+  errors now list running agents by id and description."** → ✅ no action; clearer nested-agent
+  control surface.
+- **"Added the session's additional working directories to MCP `roots/list`, with
+  `notifications/roots/list_changed` when the set changes."** → ✅ no action / minor MCP correctness
+  for multi-root sessions; CAS MCP servers that honor roots see the fuller set.
+- Manual-mode footer ⏸ badge, background-session daemon recovery, `claude agents` UI polish → ✅ /
+  ⏭ (badge is cosmetic for Manual mode; factory is DSP).
+- Login-expiry warning before background sessions drop → ✅ host hygiene, not CAS-owned.
 
 ### 2.1.202 — Workflow parse fixes · re-invoked skill dedup · worktree-heavy resume perf
 

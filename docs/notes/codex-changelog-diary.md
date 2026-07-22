@@ -1,8 +1,8 @@
 # Codex CLI Changelog Diary — CAS Response Ledger
 
 A living, **newest-first** ledger of OpenAI Codex CLI releases and how CAS responded to
-each. Sibling to `claude-code-changelog-diary.md` — CAS supports both harnesses
-(`--worker-cli codex` / `--supervisor-cli codex`), so we track Codex drift too.
+each. Sibling to `claude-code-changelog-diary.md` and `grok-changelog-diary.md` —
+CAS supports three harnesses (`cli=claude` / `cli=codex` / `cli=grok`), so we track Codex drift too.
 
 Codex has no `CHANGELOG.md`; release notes live on the GitHub **releases page**.
 
@@ -26,14 +26,16 @@ verify on upgrade) · 🔧 fix shipped · 🏗 EPIC · ⏭ n/a
 
 - **CAS validated against:** Codex CLI **0.128.0** (the `crates/cas-pty/src/pty.rs` effort-approach
   comment pins to 0.128).
-- **Locally installed:** **0.142.5** (`codex-cli 0.142.5`, checked 2026-07-07).
-- **Latest stable:** **0.142.5** (2026-07-01). **0.143.0** still in alpha (alpha.38 as of 2026-07-07).
-- **Gap:** ~14 minor versions between the validated pin (0.128) and what's installed/latest (0.142).
+- **Locally installed:** **0.144.4** (`codex-cli 0.144.4`, checked 2026-07-14).
+- **Latest stable:** **0.144.4** (2026-07-14). **0.145.0** in alpha only (alpha.10 as of 2026-07-14) —
+  index note only; not tracked until stable.
+- **Gap:** ~16 minor versions between the validated pin (0.128) and what's installed/latest (0.144).
   The entries below are a *triage pass* against the touchpoints, not a per-item code audit —
   upgrade-time re-verification is the trigger for promoting any 👀 to a task. (Contrast the Claude
   Code diary's .166/.162 entries, which were deep-verified for specific user questions.) The
   **0.130–0.135 block is a backfill** (lighter fidelity, consolidated) added 2026-06-30 to extend
-  coverage below the original 0.136 seed floor.
+  coverage below the original 0.136 seed floor. The **0.143–0.144.4 block is a backfill**
+  (2026-07-14) catching the diary up from the previous 0.142.5 ceiling to the host install.
 
 ## CAS ↔ Codex touchpoints (what a release can break)
 
@@ -64,7 +66,10 @@ The load-bearing surface, all in `crates/cas-pty/src/pty.rs::PtyConfig::codex` u
 
 | Codex version | Headline | CAS verdict | Pointer |
 |---------------|----------|-------------|---------|
-| 0.143.0-alpha | (pre-release; not tracked until stable) | — | — |
+| 0.145.0-alpha | (pre-release; alpha.10 as of 2026-07-14 — not tracked until stable) | — | — |
+| 0.144.1–.4 | Installer/code-mode reliability · Guardian auto-review prompt revert · two empty patch releases | ✅ no action | this doc |
+| 0.144.0 | **`writes` app-approval mode** · MCP auth elicitation default · plugin skill-loading perf · Ultra+multi-agent usage warn | 👀 watch | this doc |
+| 0.143.0 | **`max` first-class reasoning effort** · MCP tool search by default · rmcp 1.8.0 · AGENTS.md env-reactive + skills/delegation · sandbox profile flag rename | 👀 watch | this doc |
 | 0.142.5 | Single backport: WebSocket request payloads no longer written to trace logs | ✅ no action | this doc |
 | 0.142.0–.4 | **Rollout token budgets (turns abort when exhausted)** · env-scoped command/network approvals · AGENTS.md from foreign envs · `SkillsManager→SkillsService` + skill-frontmatter repair | 👀 watch | this doc |
 | 0.141.0 | **Hook trust bypass persists through `codex exec`; blocking PostToolUse rejects code-mode** · per-thread plugin stdio MCP activation · MCP tool timeout→300s | 👀 watch | this doc |
@@ -78,6 +83,98 @@ The load-bearing surface, all in `crates/cas-pty/src/pty.rs::PtyConfig::codex` u
 ---
 
 ## Entries
+
+### 0.144.1–.4 — installer/code-mode · Guardian review revert · empty patches
+
+Reviewed 2026-07-14 (w-codex-diary / cas-64d6). Host is `codex-cli 0.144.4`. Consolidated: no CAS-touchpoint
+signal in the patch band after 0.144.0.
+
+- **0.144.4 (2026-07-14):** "No user-facing changes in this patch release." → ✅ **no action.**
+- **0.144.3 (2026-07-13):** Version-only release; no merged PR changes since 0.144.2. → ✅ **no action.**
+- **0.144.2 (2026-07-13):** "Restored the previous Guardian auto-review policy, request format, and tool
+  behavior after rolling back a prompting regression" (#32672). → ✅ **no action** for factory. Guardian
+  auto-review is Codex's review product surface, not CAS's `--yolo` worker launch path.
+- **0.144.1 (2026-07-09):** Standalone-install GitHub metadata robustness + macOS code-mode host packaging
+  + embedded runtime fallback when companion host binary missing (#31913). → ⏭ n/a (installer/code-mode
+  packaging; CAS factory launches `codex` via PTY, not the standalone installer path).
+
+### 0.144.0 — `writes` app-approval · MCP auth elicitation default · skills plugin ns · Ultra concurrency warn
+
+Reviewed 2026-07-14 (w-codex-diary / cas-64d6). Triage pass vs touchpoints. Sources: `gh release view
+rust-v0.144.0 --repo openai/codex`.
+
+- **"Added a `writes` app-approval mode that allows declared read-only actions while prompting for
+  writes" (#30482).** → 👀 **touchpoint: `--yolo`/approval.** New approval-mode vocabulary on the
+  app-approval axis. CAS workers bypass via `--yolo` and do not set app-approval modes; still **verify
+  on upgrade** that the new mode is not a default that reintroduces prompts under `--yolo`, and that
+  any host-level defaults in `.codex/config.toml` don't pin `writes` for factory sessions.
+- **"MCP tools can now request authentication interactively without an experimental opt-in"
+  (#28772).** → 👀 **touchpoint: MCP (`cs`).** Auth elicitation is on by default for MCP tools that need
+  it. Our `cs` server is local stdio with no OAuth, so expected impact is none — but **smoke
+  `mcp__cs__*` load** after the bump in case the elicitation path changes MCP client startup ordering
+  or hangs when a *second* MCP server in the same config needs auth.
+- **"Reduced plugin skill-loading time on remote executors by resolving namespaces once per root"
+  (#31348) + skill catalog/compaction parity tests.** → 👀 **touchpoint: `.codex/skills/`.** Perf/correctness
+  on plugin skill discovery. Local `.codex/skills/` mirror (from `cas integrate`) should be unaffected;
+  verify synced skills still list after upgrade.
+- **"Selecting Ultra reasoning now warns when high multi-agent concurrency could increase usage
+  quickly" (#31621).** → ✅ minor / TUI-adjacent. CAS sets effort via `-c model_reasoning_effort=<e>`
+  (vocabulary still `…|xhigh`, not "Ultra"); this is a TUI warning, not a config-key change. No CAS
+  action unless we start mapping a named "Ultra" product tier into the effort override.
+- **"Windows sandbox sessions can delete files in writable roots and access the managed primary
+  runtime" (#31138, #31574).** → 👀 minor **sandbox** (Windows host only). Factory `--yolo` path should
+  still bypass; note for Windows workers if any.
+- **MCP tool snapshot reuse within a sampling request (#31292); increase tool schema compaction
+  threshold (#31497); round MCP timeout durations in error messages (#31612).** → 👀 **MCP (`cs`)**
+  fidelity/perf. Schema compaction threshold up is usually helpful for large `cs` tool surfaces;
+  smoke a few multi-arg tools on upgrade.
+- **Usage-limit reset-credit picker, app-server hosted auth redirects, global pnpm install detection,
+  Bedrock display names, TUI paste sanitization, code-mode host defaults.** → ⏭ n/a (orthogonal to the
+  CAS launch surface).
+
+### 0.143.0 — `max` reasoning effort · MCP tool search default · rmcp 1.8 · AGENTS.md / skills
+
+Reviewed 2026-07-14 (w-codex-diary / cas-64d6). Triage pass vs touchpoints. Sources: `gh release view
+rust-v0.143.0 --repo openai/codex`. This is the first stable after the diary's previous 0.142.5 ceiling.
+
+- **"…first-class support for `max` reasoning effort" (#30467, #29899; Bedrock GPT-5.6 family
+  #30285).** → 👀 **touchpoint: `-c model_reasoning_effort`.** Codex now treats `max` as a first-class
+  effort level. CAS still maps `Effort::XHigh` → `xhigh` (`Effort::as_codex_config` in
+  `crates/cas-mux/src/spec.rs`) and documents vocabulary `none/minimal/low/medium/high/xhigh`. **Verify
+  on upgrade** that `xhigh` still accepts/works; if Codex deprecates `xhigh` in favor of `max` (or
+  models only advertise `max`), CAS needs a mapping update. No evidence of rename in this release —
+  additive `max` support is the safer reading.
+- **"MCP tools now use tool search by default" (#29486) + ChatGPT-hosted MCP session auth
+  (#29733).** → 👀 **touchpoint: MCP (`cs`).** Tool *search* as the default presentation path can change
+  how tools are discovered vs always-listed. **Highest-risk 0.143 item for CAS:** confirm factory
+  workers still see and invoke `mcp__cs__task` / `mcp__cs__coordination` (and the rest of the `cs`
+  surface) without an extra search step that hides tools. Session-auth is for ChatGPT-hosted MCP, not
+  local stdio `cs`.
+- **"Update rmcp to 1.8.0" (#29634).** → 👀 **touchpoint: MCP (`cs`).** MCP client dep bump (diary
+  already flags rmcp bumps). Smoke stdio MCP connect after upgrade; watch for protocol/schema
+  regressions on large tool lists.
+- **"core: make AGENTS.md react to environment changes" (#29810) + bounded AGENTS.md/Git root probes
+  (#29870) + "allow AGENTS.md and skills to authorize delegation" (#30274).** → 👀 **touchpoint:
+  AGENTS.md (+ skills).** Continuing AGENTS.md accuracy work (from 0.138/0.142). Env-reactive reload
+  likely *helps* worktree workers; delegation-authorization via AGENTS.md/skills is informational for
+  multi-agent v2 (CAS doesn't drive Codex-native delegation for factory workers today). Verify worker
+  role priming still lands from worktree `AGENTS.md`.
+- **Skills plumbing churn:** parallelize environment skill loading (#29990), project executor skills
+  through World State (#30088), load executor skills without host path conversion (#29626), user-level
+  `code-review-*` skills (#30143), model-metadata skill usage instructions (#29740). → 👀 **touchpoint:
+  `.codex/skills/`.** Same subsystem churn pattern as 0.137–0.142. **Verify the `cas integrate`
+  mirror still loads** post-bump.
+- **"cli: rename sandbox permission profile flag" (#30095) + expose permission profile to shell tools
+  (#29941); rm `AskForApproval::OnFailure` (#28418).** → 👀 **touchpoint: `--yolo`/approval.** Profile
+  flag rename is only a 👀 if anything in CAS or host docs still references the old flag — workers use
+  `--yolo`, not named profiles. Approval enum cleanup is internal; confirm `--yolo` still full-bypasses.
+- **Rollout budget continuity:** surface budget exhaustion (#29715), rename to session budget error
+  (#29744), raise token budget message limits (#29970). → 👀 carry-forward from **0.142 rollout token
+  budgets** — still verify factory turns don't inherit a low default budget.
+- **Remote plugins default-on, system proxy for auth/Responses, Bedrock models, `codex remote-control
+  pair`, app-server env/thread APIs, Windows ConPTY.** → ⏭ n/a (plugins/proxy/Bedrock/remote; not on
+  the CAS PTY launch surface). Cancelled-review MCP-busy fix (#31189) is a minor reliability win if a
+  human runs `/review` in a shared Codex, not a factory concern.
 
 ### 0.142.5 — trace-log payload redaction backport
 
