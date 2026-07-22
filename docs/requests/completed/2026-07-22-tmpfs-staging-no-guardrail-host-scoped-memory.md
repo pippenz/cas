@@ -57,3 +57,14 @@ soundwave's `/tmp` is a **32GB tmpfs**. Consequences:
 - Transcript hit: `~/.claude/projects/-home-pippenz-Petrastella-ozer/f9b6f755-*.jsonl`
   contains the `/tmp/sleep-masters` staging decision
 - No repo references: `grep -rln "/tmp/sleep" ~/Petrastella` (excl. node_modules) → empty
+
+---
+
+## Resolution (2026-07-22)
+
+Shipped in v2.28.4 (epic merge c329363). All three suggested fixes implemented:
+1. **tmpfs write guardrail** — warning-only PostToolUse check tracking per-session written bytes AND usage growth per memory-backed mount (separate accounting, flocked state, single-shot Bash fills caught on first sample, all tmpfs/ramfs mounts enumerated incl. /dev/shm). Hot-path safe: zero I/O for non-Write/Edit/Bash calls.
+2. **Host-scoped memory** — global memories tagged `host:<hostname>` inject into SessionStart for every project on the machine (SQLite query-layer filtered, size-capped). The soundwave tmpfs constraint memory migrated as first user.
+3. **Per-host staging convention** — `[staging] large_artifact_dir` (host-level fallback, staging-section-only merge), surfaced in supervisor/worker SessionStart guidance and named in guardrail warnings.
+
+Immediate mitigation same day: 17.3GB rsynced to /mnt/datacube/staging with symlinks left in /tmp; swap pressure released (free RAM 1.8Gi → 14Gi).

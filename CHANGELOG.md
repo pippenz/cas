@@ -7,6 +7,16 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [2.28.4] - 2026-07-22
+
+### Added
+- **Large writes to memory-backed mounts now trigger a loud warning.** An agent staged 17GB of audio into a 32GB tmpfs `/tmp` over two weeks — swap saturated to 100%, the operator's apps were OOM-killed for days, and the only copies sat one reboot from loss. A new warning-only PostToolUse guardrail tracks per-session writes and usage growth on every tmpfs/ramfs mount (flocked state, single-shot fills detected on first sample, all memory-backed mounts enumerated) and tells the agent where to stage instead. Gated off the hot path: non-Write/Edit/Bash tool calls pay zero config or mount I/O.
+- **Per-host staging convention.** `[staging] large_artifact_dir` in `~/.cas/config.toml` (project config wins; only the staging section is host-scoped — operator-level hooks/telemetry/llm settings can never leak into project config). When set, supervisors and workers get a one-line SessionStart notice and the guardrail names the directory in its warning. Settable via `cas config set staging.large_artifact_dir`.
+- **Host-scoped memories.** Global memories tagged `host:<hostname>` now inject into SessionStart context for every project on that machine (query-layer filtered, size-capped under the SessionStart budgets). Machine facts like "this host's /tmp is tmpfs" no longer get trapped in the project where they were learned.
+
+### Fixed
+- **Task-close lint findings now name the right file and the right line.** The close-gate structural lint reported global diff indices (so multi-file diffs pointed at the wrong line), merged separate comment blocks across files and hunks into false "commented-out code" violations, and pinned findings to a single commit so follow-up fixes could never clear them. Findings are now file-qualified with per-file line numbers, comment runs reset at file and hunk boundaries, XML block doc-headers pass, and the lint evaluates the branch tip — a fix commit clears the finding.
+
 ## [2.28.3] - 2026-07-22
 
 ### Fixed
