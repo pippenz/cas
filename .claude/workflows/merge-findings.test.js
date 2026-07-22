@@ -41,10 +41,11 @@ function reviewerOutput(reviewer, findings) {
 describe('mergeFindings()', () => {
 
   // ── Step 1: empty input ──────────────────────────────────────────────────
-  test('empty input returns empty residual and pre_existing', () => {
-    const { residual, pre_existing } = mergeFindings([])
+  test('empty input returns empty residual, pre_existing, and dropped', () => {
+    const { residual, pre_existing, dropped } = mergeFindings([])
     assert.deepEqual(residual, [])
     assert.deepEqual(pre_existing, [])
+    assert.deepEqual(dropped, [])
   })
 
   test('null entries in input are skipped', () => {
@@ -58,6 +59,29 @@ describe('mergeFindings()', () => {
       reviewerOutput('testing', []),
     ])
     assert.deepEqual(residual, [])
+  })
+
+  test('under-filled finding is surfaced in dropped instead of disappearing', () => {
+    const underFilled = {
+      title: 'Important independent finding',
+      severity: 'P1',
+      file: 'src/foo.rs',
+      line: 42,
+      why_it_matters: 'The wrapper omitted required merge metadata.',
+    }
+
+    const { residual, pre_existing, dropped } = mergeFindings([
+      reviewerOutput('gpt-5.5:independent', [underFilled]),
+    ])
+
+    assert.deepEqual(residual, [])
+    assert.deepEqual(pre_existing, [])
+    assert.equal(dropped.length, 1)
+    assert.equal(dropped[0].reviewer, 'gpt-5.5:independent')
+    assert.equal(dropped[0].reason, 'schema_validation_failed')
+    assert.deepEqual(dropped[0].finding, underFilled)
+    assert.ok(dropped[0].validation_errors.includes('missing required field: confidence'))
+    assert.ok(dropped[0].validation_errors.includes('missing required field: evidence'))
   })
 
   // ── Step 2: confidence gate ──────────────────────────────────────────────
@@ -99,6 +123,24 @@ describe('mergeFindings()', () => {
       reviewerOutput('correctness', [finding({ severity: 'P1', confidence: 0.59 })])
     ])
     assert.equal(fail.length, 0)
+  })
+
+  test('confidence-gated finding is surfaced in dropped with its threshold', () => {
+    const lowConfidence = finding({
+      title: 'Factory hook matcher omits AskUserQuestion',
+      severity: 'P1',
+      confidence: 0.55,
+    })
+    const { residual, dropped } = mergeFindings([
+      reviewerOutput('gpt-5.5:independent', [lowConfidence]),
+    ])
+
+    assert.deepEqual(residual, [])
+    assert.equal(dropped.length, 1)
+    assert.equal(dropped[0].reviewer, 'gpt-5.5:independent')
+    assert.equal(dropped[0].reason, 'confidence_below_threshold')
+    assert.equal(dropped[0].threshold, 0.60)
+    assert.deepEqual(dropped[0].finding, lowConfidence)
   })
 
   // ── Step 3: fingerprint deduplication ────────────────────────────────────
