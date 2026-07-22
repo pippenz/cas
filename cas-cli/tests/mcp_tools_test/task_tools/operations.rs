@@ -1740,6 +1740,82 @@ async fn test_task_mine_matches_env_worker_name_during_spawn_race() {
 // ============================================================================
 
 #[tokio::test]
+async fn test_release_active_started_task_resets_status_to_open_and_ready() {
+    let (_temp, service) = setup_cas();
+
+    let created = service
+        .cas_task_create(Parameters(TaskCreateRequest {
+            depth: None,
+            title: "Started task released back to ready".to_string(),
+            description: None,
+            priority: 2,
+            task_type: "task".to_string(),
+            labels: None,
+            notes: None,
+            blocked_by: None,
+            design: None,
+            acceptance_criteria: None,
+            external_ref: None,
+            assignee: None,
+            demo_statement: None,
+            execution_note: None,
+            epic: None,
+        }))
+        .await
+        .expect("create");
+    let id = extract_task_id(&extract_text(created))
+        .expect("id")
+        .to_string();
+
+    service
+        .cas_task_start(Parameters(IdRequest { id: id.clone() }))
+        .await
+        .expect("start should create an active lease");
+
+    let released = service
+        .cas_task_release(Parameters(cas::mcp::tools::TaskReleaseRequest {
+            task_id: id.clone(),
+            force: None,
+        }))
+        .await
+        .expect("active lease release should succeed");
+    let release_text = extract_text(released);
+    assert!(
+        release_text.contains("status reset") && release_text.contains("Open"),
+        "release must report the lifecycle transition: {release_text}"
+    );
+
+    let shown = service
+        .cas_task_show(Parameters(TaskShowRequest {
+            id: id.clone(),
+            with_deps: false,
+        }))
+        .await
+        .expect("show after release");
+    let show_text = extract_text(shown);
+    assert!(
+        show_text.contains("Status: Open"),
+        "started task must return to Open after release: {show_text}"
+    );
+
+    let ready = service
+        .cas_task_ready(Parameters(TaskReadyBlockedRequest {
+            scope: "all".to_string(),
+            limit: Some(20),
+            sort: None,
+            sort_order: None,
+            epic: None,
+        }))
+        .await
+        .expect("ready after release");
+    let ready_text = extract_text(ready);
+    assert!(
+        ready_text.contains(&id),
+        "released task must re-enter the ready pool: {ready_text}"
+    );
+}
+
+#[tokio::test]
 async fn test_release_autorecovers_lease_less_in_progress_task() {
     let (_temp, service) = setup_cas();
 
