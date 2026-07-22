@@ -24,7 +24,7 @@ You execute tasks assigned by the Supervisor. You may be working in an isolated 
    - **Success** → message the supervisor, then go back to step 1. Do not pull the next ready task yourself — wait for the next explicit assignment.
    - **queued for supervisor review** → task is in `pending_supervisor_review`. No action needed; wait for supervisor feedback.
    - **verification-required** → message supervisor immediately. Do NOT spawn verifier agents or retry close.
-   - **MERGE REQUIRED** → your commits aren't on the parent branch yet. See the merge-state section of [references/recovery.md](cas-worker/references/recovery.md) — and never route around it by setting `status=closed` yourself.
+   - **MERGE REQUIRED** → before escalating, drain pending supervisor messages with `mcp__cas__coordination action=queue_poll`; a merge or review instruction may already be waiting. If escalation is still needed, include the current factory-branch tip SHA and say it is fresh only after that inbox drain. See [references/recovery.md](cas-worker/references/recovery.md), and never route around the guard by setting `status=closed` yourself.
    - **VERIFICATION_JAIL_BLOCKED** → see [references/recovery.md](cas-worker/references/recovery.md). Forward once, then trust the DB.
 
 ## Task Types

@@ -2975,30 +2975,43 @@ pub(crate) fn run_factory_branch_merge_gate(
     // `mcp/tools/mod.rs` and `worktree/manager/epic_ops.rs`) and hand the
     // worker a supervisor-merge-request handoff instead of PR instructions.
     let parent_is_local_epic_branch = parent_branch.starts_with("epic/");
+    let branch_tip = resolve_branch_sha(repo_path, &factory_branch)
+        .unwrap_or_else(|| "unresolved at close rejection".to_string());
 
     let remediation = if parent_is_local_epic_branch {
         format!(
             "Remediation:\n\
-             1. {parent_branch} is a local-only epic branch (not pushed to origin) \
+             1. Before escalating, drain pending supervisor messages: \
+             `mcp__cas__coordination action=queue_poll`. If one says this branch \
+             was merged or requests more changes, follow it and do not send a \
+             stale merge request.\n\
+             2. {parent_branch} is a local-only epic branch (not pushed to origin) \
              — do NOT run `gh pr create --base {parent_branch}`, it has no \
              matching ref on origin and the PR will fail.\n\
-             2. Push {factory_branch} to origin so your commit is durable: \
+             3. Push {factory_branch} to origin so your commit is durable: \
              `git push origin {factory_branch}`\n\
-             3. Message your supervisor to merge {factory_branch} into \
-             {parent_branch} (e.g. `mcp__cas__coordination action=message \
-             target=supervisor summary=\"ready to merge\" message=\"{factory_branch} \
-             ready for {parent_branch}\"`) — they merge with \
+             4. If a merge is still needed, message your supervisor to merge \
+             {factory_branch} into {parent_branch}, including the current tip \
+             and freshness qualifier (e.g. \
+             `mcp__cas__coordination action=message \
+             target=supervisor summary=\"ready to merge\" message=\"Fresh after \
+             inbox drain: {factory_branch} tip {branch_tip}; please re-check \
+             reachability, then merge into {parent_branch} if still needed\"`). \
+             They merge with \
              `git merge --no-ff {factory_branch}` on the epic branch.\n\
-             4. Once merged, retry mcp__cas__task action=close",
+             5. Once merged, retry mcp__cas__task action=close",
         )
     } else {
         format!(
             "Remediation:\n\
-             1. Push {factory_branch} to its remote\n\
-             2. Open a PR targeting {parent_branch}\n\
-             3. Merge the PR (or `git fetch --prune` if it was already merged \
+             1. Drain pending supervisor messages with \
+             `mcp__cas__coordination action=queue_poll`; follow any already-queued \
+             merge or review instruction before continuing.\n\
+             2. Push {factory_branch} to its remote\n\
+             3. Open a PR targeting {parent_branch}\n\
+             4. Merge the PR (or `git fetch --prune` if it was already merged \
              and your local ref is stale)\n\
-             4. Retry mcp__cas__task action=close",
+             5. Retry mcp__cas__task action=close",
         )
     };
 
@@ -7101,6 +7114,8 @@ mod merge_state_gate_tests {
         std::fs::write(dir.path().join("a.rs"), "// a\n").unwrap();
         git(dir.path(), &["add", "a.rs"]);
         git(dir.path(), &["commit", "-q", "-m", "feat: a"]);
+        let expected_tip = resolve_branch_sha(dir.path(), "factory/worker")
+            .expect("factory branch tip should resolve");
 
         let task = worker_task("worker");
         let req = base_req(&task.id);
@@ -7131,6 +7146,19 @@ mod merge_state_gate_tests {
                 assert!(
                     msg.contains("supervisor to merge"),
                     "must hand the worker a supervisor-merge-request handoff: {msg}"
+                );
+                assert!(
+                    msg.contains("action=queue_poll"),
+                    "must drain pending supervisor messages before escalation: {msg}"
+                );
+                assert!(
+                    msg.contains(&expected_tip),
+                    "escalation template must include the current branch tip {expected_tip}: {msg}"
+                );
+                assert!(
+                    msg.contains("Fresh after inbox drain")
+                        && msg.contains("re-check reachability"),
+                    "escalation must identify its freshness window and ask the supervisor to re-check: {msg}"
                 );
             }
             other => panic!("expected Reject for stranded factory branch, got {other:?}"),

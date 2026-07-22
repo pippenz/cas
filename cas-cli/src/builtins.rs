@@ -3414,6 +3414,7 @@ This is the body content."#;
         for (label, set) in [
             ("BUILTIN_SKILLS", BUILTIN_SKILLS),
             ("CODEX_BUILTIN_SKILLS", CODEX_BUILTIN_SKILLS),
+            ("GROK_BUILTIN_SKILLS", GROK_BUILTIN_SKILLS),
         ] {
             for path in [
                 "skills/cas-worker/references/close-gate.md",
@@ -3423,7 +3424,13 @@ This is the body content."#;
                     .iter()
                     .find(|b| b.path == path)
                     .unwrap_or_else(|| panic!("{label} missing {path}"));
-                for required in ["MERGE REQUIRED", "gh pr create", "status=closed"] {
+                for required in [
+                    "MERGE REQUIRED",
+                    "gh pr create",
+                    "status=closed",
+                    "queue_poll",
+                    "git rev-parse factory/<name>",
+                ] {
                     assert!(
                         entry.content.contains(required),
                         "{label} {path} missing merge-state guidance marker: {required:?}"
@@ -3451,8 +3458,17 @@ This is the body content."#;
                 "codex cas-worker.md",
                 include_str!("builtins/codex/skills/cas-worker.md"),
             ),
+            (
+                "grok cas-worker.md",
+                include_str!("builtins/grok/skills/cas-worker.md"),
+            ),
         ] {
-            for required in ["MERGE REQUIRED", "literal string `supervisor`"] {
+            for required in [
+                "MERGE REQUIRED",
+                "literal string `supervisor`",
+                "queue_poll",
+                "current factory-branch tip SHA",
+            ] {
                 assert!(
                     guide.contains(required),
                     "{label} missing worker-protocol marker: {required:?}"
