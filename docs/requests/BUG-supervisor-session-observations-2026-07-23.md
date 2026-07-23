@@ -114,6 +114,8 @@ Skill-seen dedup sentinel is a file-per-session with no GC hook.
 
 ## 6. AskUserQuestion reachable-but-fatal in factory mode
 
+**SHIPPED:** `d5a8975` — Claude native factory supervisors and workers now start with `AskUserQuestion` excluded via `--disallowedTools`; the existing PreToolUse denial remains as defense in depth.
+
 ### Symptoms
 Supervisor called `AskUserQuestion` (to clarify a vague bug report) and got a runtime error: "cannot reach the human in factory mode — it surfaces as a permission prompt on your own session and pauses the system."
 

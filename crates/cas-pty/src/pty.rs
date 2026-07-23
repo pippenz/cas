@@ -470,6 +470,14 @@ impl PtyConfig {
                 args.push("--settings".to_string());
                 args.push(settings_path.clone());
             }
+
+            // Factory agents cannot route AskUserQuestion to the human: under
+            // native Agent Teams it becomes a self-directed permission prompt.
+            // Remove it from Claude's model-visible tool surface up front.
+            // The PreToolUse denial remains wired as defense in depth for
+            // stale/replayed sessions or harnesses that bypass this argv path.
+            args.push("--disallowedTools".to_string());
+            args.push("AskUserQuestion".to_string());
         }
 
         // cas-0bf4: optionally lower the worker's scheduling priority so
@@ -2560,6 +2568,13 @@ mod tests {
             config.args.contains(&settings_path.to_string()),
             "supervisor spawn must pass the settings file path"
         );
+        assert!(
+            config
+                .args
+                .windows(2)
+                .any(|pair| pair == ["--disallowedTools", "AskUserQuestion"]),
+            "factory supervisor spawn must remove AskUserQuestion from Claude's tool surface"
+        );
     }
 
     /// Workers now ship their own settings file (cas-e15d). When
@@ -2597,6 +2612,35 @@ mod tests {
         assert!(
             config.args.contains(&settings_path.to_string()),
             "worker spawn must pass the worker settings file path"
+        );
+        assert!(
+            config
+                .args
+                .windows(2)
+                .any(|pair| pair == ["--disallowedTools", "AskUserQuestion"]),
+            "factory worker spawn must remove AskUserQuestion from Claude's tool surface"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pty_config_non_factory_claude_keeps_default_tool_surface() {
+        let config = PtyConfig::claude(
+            "solo",
+            "supervisor",
+            PathBuf::from("/tmp"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(
+            !config
+                .args
+                .iter()
+                .any(|arg| arg == "--disallowedTools" || arg == "AskUserQuestion"),
+            "non-factory Claude spawn must not apply the factory-only tool exclusion"
         );
     }
 
