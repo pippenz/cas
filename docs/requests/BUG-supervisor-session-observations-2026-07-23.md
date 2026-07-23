@@ -47,7 +47,12 @@ Session-end hook logs worktree state, and nothing else feeds the file.
 - b) Point reviewers at an existing queryable source (if the coordination DB already has this, a `cas factory log <date>` renderer suffices).
 - c) Drop the git-status dump or cap it (it's ~97% of current log volume and repeats per session).
 
-## 3. Codemap freshness gate evaluates the current checkout, not the canonical branch
+## 3. Codemap freshness gate evaluates the current checkout, not the canonical branch — SHIPPED (`90e2f60`)
+
+Freshness now evaluates fetched `origin/<default>` alongside `HEAD`, accepts a
+fresh result from either ref, and names the winning evaluation ref in
+`cas codemap status`. Regression coverage reproduces the stale shared-checkout /
+fresh canonical-branch factory shape.
 
 ### Symptoms
 Immediately after regenerating CODEMAP.md and committing it to `staging` (the skill's own reset procedure), `cas codemap status` still reported "significantly out of date (217 structural changes)" with "Last updated: 2026-07-21".
