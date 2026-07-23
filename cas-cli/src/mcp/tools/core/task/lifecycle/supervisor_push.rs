@@ -300,6 +300,28 @@ pub fn emit_task_lifecycle_transition(
         return Ok(LifecyclePushResult::AlreadyComplete { notification_id });
     }
 
+    // The owning supervisor already knows about lifecycle mutations they performed.
+    // Keep the durable row for audit/history, but complete its outbox state without
+    // injecting a prompt that would wake the same supervisor for its own action.
+    // `supervisor` is resolved within the current factory session above, so a
+    // sibling factory's supervisor does not qualify for suppression.
+    let actor_is_owning_supervisor = actor == supervisor.agent_id || actor == supervisor.name;
+    if actor_is_owning_supervisor {
+        supervisor_queue
+            .mark_prompt_delivered(notification_id)
+            .map_err(|e| {
+                format!(
+                    "failed to stamp self-actor lifecycle notification as delivered \
+                     (notification_id={notification_id}, transition_key={key}): {e}"
+                )
+            })?;
+        return if already_existed {
+            Ok(LifecyclePushResult::Recovered { notification_id })
+        } else {
+            Ok(LifecyclePushResult::Enqueued { notification_id })
+        };
+    }
+
     // cas-ecff: with an owning supervisor, prompt delivery store is required.
     // Missing/failed open must leave durable pending (no stamp) and surface repair.
     let Some(pq) = prompt_queue else {
@@ -1270,6 +1292,122 @@ mod tests {
         assert_eq!(pq.pending_count().unwrap(), 1);
 
         // SAFETY: restore env under the process-wide CAS env lock.
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("CAS_FACTORY_SESSION", v),
+                None => std::env::remove_var("CAS_FACTORY_SESSION"),
+            }
+        }
+    }
+
+    #[test]
+    fn emit_supervisor_actor_keeps_durable_event_without_prompt_self_echo() {
+        let _lock = env_lock();
+        let prior = std::env::var("CAS_FACTORY_SESSION").ok();
+        unsafe {
+            std::env::set_var("CAS_FACTORY_SESSION", "sess-self");
+        }
+
+        let temp = TempDir::new().unwrap();
+        let agents = SqliteAgentStore::open(temp.path()).unwrap();
+        agents.init().unwrap();
+        agents
+            .register(&agent_in_session(
+                "sup-self-id",
+                "sup-self-name",
+                AgentRole::Supervisor,
+                "sess-self",
+            ))
+            .unwrap();
+        let sq = SqliteSupervisorQueueStore::open(temp.path()).unwrap();
+        sq.init().unwrap();
+        let pq = SqlitePromptQueueStore::open(temp.path()).unwrap();
+        pq.init().unwrap();
+
+        let result = emit_task_lifecycle_transition(
+            &sq,
+            Some(&pq as &dyn PromptQueueStore),
+            &agents,
+            "cas-self",
+            "Self close",
+            TaskStatus::InProgress,
+            TaskStatus::Closed,
+            "sup-self-name",
+            Some("done"),
+            LifecycleTransition::Closed,
+            "occ-self",
+        )
+        .unwrap();
+
+        assert!(matches!(result, LifecyclePushResult::Enqueued { .. }));
+        assert_eq!(sq.pending_count("sup-self-id").unwrap(), 1);
+        let row = sq
+            .get_by_transition_key("cas-self:in_progress:closed:sess-self:task_closed:occ-self")
+            .unwrap()
+            .expect("durable lifecycle event");
+        assert!(
+            row.prompt_delivered_at.is_some(),
+            "self-actor row must be complete so outbox drain cannot wake the supervisor later"
+        );
+        assert_eq!(
+            pq.pending_count().unwrap(),
+            0,
+            "supervisor must not receive a prompt for its own transition"
+        );
+
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("CAS_FACTORY_SESSION", v),
+                None => std::env::remove_var("CAS_FACTORY_SESSION"),
+            }
+        }
+    }
+
+    #[test]
+    fn emit_worker_actor_still_prompts_owning_supervisor() {
+        let _lock = env_lock();
+        let prior = std::env::var("CAS_FACTORY_SESSION").ok();
+        unsafe {
+            std::env::set_var("CAS_FACTORY_SESSION", "sess-worker");
+        }
+
+        let temp = TempDir::new().unwrap();
+        let agents = SqliteAgentStore::open(temp.path()).unwrap();
+        agents.init().unwrap();
+        agents
+            .register(&agent_in_session(
+                "sup-worker-id",
+                "sup-worker-name",
+                AgentRole::Supervisor,
+                "sess-worker",
+            ))
+            .unwrap();
+        let sq = SqliteSupervisorQueueStore::open(temp.path()).unwrap();
+        sq.init().unwrap();
+        let pq = SqlitePromptQueueStore::open(temp.path()).unwrap();
+        pq.init().unwrap();
+
+        emit_task_lifecycle_transition(
+            &sq,
+            Some(&pq as &dyn PromptQueueStore),
+            &agents,
+            "cas-worker",
+            "Worker close",
+            TaskStatus::InProgress,
+            TaskStatus::Closed,
+            "worker-name",
+            Some("done"),
+            LifecycleTransition::Closed,
+            "occ-worker",
+        )
+        .unwrap();
+
+        assert_eq!(
+            pq.pending_count().unwrap(),
+            1,
+            "worker transition must still wake the owning supervisor"
+        );
+
         unsafe {
             match prior {
                 Some(v) => std::env::set_var("CAS_FACTORY_SESSION", v),

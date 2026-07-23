@@ -9,7 +9,7 @@ cas_task: (none)
 
 Long solo-supervisor session (no spawned workers; heavy task/memory/coordination use, five staging merges, multiple sibling factory sessions active concurrently). Six issues, ordered by cost.
 
-## 1. Task-lifecycle notifications echo back to the acting session
+## 1. Task-lifecycle notifications echo back to the acting session — SHIPPED (`dc3d6e4`)
 
 ### Symptoms
 Every `task close` I performed came back to me minutes later as a director-relayed `<task-lifecycle transition="task_closed">` teammate message — for my own action, verbatim, including my own close reason.
@@ -69,6 +69,7 @@ Freshness is computed from the git history of the working tree's HEAD; shared ch
 ## 4. Overlap-gate update-in-place buries fresh handoffs
 
 **SHIPPED:** `9848a07` — `memory recent` now ranks and displays the later of creation and in-place update time, with regression coverage for resurfacing an updated old entry.
+
 
 ### Symptoms
 The prior supervisor wrote a detailed session handoff. Because the overlap gate steers writers to "update the existing memory in place," it was appended to an entry created 2026-07-03. `memory recent` (created-sorted) didn't surface it; BM25 search for handoff-ish terms ranked it below stale entries; the incoming supervisor found it only because the human operator remembered "07-03-05 something".
