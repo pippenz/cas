@@ -1995,6 +1995,17 @@ impl CasCore {
                     ),
                 ));
             }
+
+            let _ = crate::hooks::handlers::session_hygiene::append_factory_session_event(
+                &self.cas_root,
+                "task_closed",
+                &[
+                    ("task_id", &req.id),
+                    ("title", &task.title),
+                    ("actor", &actor),
+                    ("reason", req.reason.as_deref().unwrap_or("")),
+                ],
+            );
         }
 
         // Auto-unblock tasks that were blocked solely by this task.

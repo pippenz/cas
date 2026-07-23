@@ -28,7 +28,7 @@ Queue fan-out for lifecycle events doesn't exclude (or mark) the transition's ac
 - b) Deliver but flag `self: true` so harness/client can drop it without a model turn.
 - c) Digest mode: batch own-action confirmations into the next unrelated wakeup.
 
-## 2. Factory session logs cannot support post-session review
+## 2. Factory session logs cannot support post-session review — SHIPPED (`ebbef98`)
 
 ### Symptoms
 Operator asked "review the supervisor and worker logs" — but `.cas/logs/factory-session-*.log` contains only a `session_end` header plus a full `git status` dump (114 entries of long-lived untracked files, identical across sessions). No assignments, messages, merges, closes, or errors.

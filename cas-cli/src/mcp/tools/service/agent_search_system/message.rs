@@ -541,6 +541,19 @@ impl CasService {
             "Delivery: queued for next poll (target is registered)\n"
         };
 
+        let message_id_text = message_id.to_string();
+        let _ = crate::hooks::handlers::session_hygiene::append_factory_session_event(
+            &self.inner.cas_root,
+            "coordination_message",
+            &[
+                ("message_id", &message_id_text),
+                ("source", &display_name),
+                ("target", &resolved_target),
+                ("summary", &summary),
+                ("urgent", if urgent { "true" } else { "false" }),
+            ],
+        );
+
         Ok(Self::success(format!(
             "{} queued\n\nID: {}\nFrom: {} ({})\nTo: {}\n{}Message: {}",
             if urgent { "URGENT message" } else { "Message" },
