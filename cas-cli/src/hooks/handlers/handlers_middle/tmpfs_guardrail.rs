@@ -489,8 +489,8 @@ fn fs_usage(path: &Path) -> Option<MountUsage> {
         return None;
     }
     let stat = unsafe { stat.assume_init() };
-    let block_size = stat.f_frsize;
-    let used_blocks = stat.f_blocks.saturating_sub(stat.f_bfree);
+    let block_size = stat.f_frsize as u64;
+    let used_blocks = (stat.f_blocks as u64).saturating_sub(stat.f_bfree as u64);
     Some(MountUsage {
         used_bytes: used_blocks.saturating_mul(block_size),
     })
