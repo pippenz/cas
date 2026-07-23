@@ -1477,7 +1477,11 @@ impl CasCore {
                             .map(|wt| wt.parent_branch.clone())
                     })
                     .unwrap_or_else(|| "main".to_string());
-                let violations = check_additive_only_branch_violations(worker_wt, &parent_branch);
+                let violations = check_additive_only_branch_violations(
+                    worker_wt,
+                    &parent_branch,
+                    task.deliverables.factory_branch_anchor.as_deref(),
+                );
                 if !violations.is_empty() {
                     let file_list = violations
                         .iter()
@@ -2677,10 +2681,13 @@ pub(crate) fn check_uncommitted_work(project_root: &std::path::Path) -> Vec<Unco
 /// worker committed on their isolated branch, immune to the
 /// main-worktree dirty-state confusion that tripped cas-4333.
 ///
-/// Runs `git diff --name-status <merge-base>..HEAD` inside
-/// `worker_worktree_path` and filters to M/D/R statuses via
-/// [`parse_name_status`]. Untracked files don't exist in committed
-/// history, so `??` handling isn't needed here.
+/// Before the factory branch is merged, runs
+/// `git diff --name-status <merge-base>..HEAD`. After MERGE REQUIRED parked a
+/// `factory_branch_anchor` and that anchor is merged into the parent, scopes
+/// the diff to the supervisor merge's first-parent delta instead. This avoids
+/// attributing the epic's pre-existing baseline to the additive-only task.
+/// Untracked files don't exist in committed history, so `??` handling isn't
+/// needed here.
 ///
 /// Graceful degradation: if the worktree isn't a git repo, git can't
 /// find `parent_branch`, or the merge-base computation fails, returns
@@ -2688,8 +2695,62 @@ pub(crate) fn check_uncommitted_work(project_root: &std::path::Path) -> Vec<Unco
 pub(crate) fn check_additive_only_branch_violations(
     worker_worktree_path: &std::path::Path,
     parent_branch: &str,
+    factory_branch_anchor: Option<&str>,
 ) -> Vec<AdditiveOnlyViolation> {
     use std::process::Command;
+
+    // cas-3f7f: once the parked worker tip is integrated, HEAD and the
+    // parent branch may both point at (or beyond) an epic merge. Re-scanning
+    // merge-base..HEAD then includes unrelated epic history. Find the
+    // first-parent merge whose non-first parent is the parked worker tip and
+    // inspect only that merge delta. This preserves every commit introduced
+    // by the worker side, including real M/D/R changes.
+    if let Some(anchor) = factory_branch_anchor {
+        if commit_is_merged_into_parent(worker_worktree_path, anchor, parent_branch) {
+            let parent_ref = if git_ref_exists(worker_worktree_path, parent_branch) {
+                parent_branch.to_string()
+            } else {
+                format!("origin/{parent_branch}")
+            };
+            let history = Command::new("git")
+                .args(["rev-list", "--first-parent", "--parents", &parent_ref])
+                .current_dir(worker_worktree_path)
+                .output();
+            if let Ok(history) = history {
+                if history.status.success() {
+                    for line in String::from_utf8_lossy(&history.stdout).lines() {
+                        let commits = line.split_whitespace().collect::<Vec<_>>();
+                        if commits.len() >= 3 && commits[2..].contains(&anchor) {
+                            let diff_out = Command::new("git")
+                                .args(["diff", "--name-status", commits[1], commits[0]])
+                                .current_dir(worker_worktree_path)
+                                .output();
+                            return match diff_out {
+                                Ok(o) if o.status.success() => {
+                                    parse_name_status(&String::from_utf8_lossy(&o.stdout))
+                                }
+                                _ => Vec::new(),
+                            };
+                        }
+                    }
+                }
+            }
+
+            // Fast-forward or squash-less integration without a merge commit:
+            // the parked tip itself is still the narrowest reliable task
+            // window available (and is the documented fallback for cas-3f7f).
+            let diff_out = Command::new("git")
+                .args(["diff", "--name-status", &format!("{anchor}^"), anchor])
+                .current_dir(worker_worktree_path)
+                .output();
+            return match diff_out {
+                Ok(o) if o.status.success() => {
+                    parse_name_status(&String::from_utf8_lossy(&o.stdout))
+                }
+                _ => Vec::new(),
+            };
+        }
+    }
 
     // Resolve the merge base first. Using `git merge-base` explicitly
     // (rather than the `a..b` revspec shorthand) means we get a clear
@@ -4795,6 +4856,16 @@ mod additive_only_tests {
         assert!(status.success(), "git {args:?} failed");
     }
 
+    fn git_output(dir: &std::path::Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git");
+        assert!(output.status.success(), "git {args:?} failed");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
     fn init_repo() -> tempfile::TempDir {
         let dir = tempdir().unwrap();
         let p = dir.path();
@@ -4934,7 +5005,7 @@ mod additive_only_tests {
     #[test]
     fn branch_check_non_git_returns_empty() {
         let dir = tempdir().unwrap();
-        assert!(check_additive_only_branch_violations(dir.path(), "main").is_empty());
+        assert!(check_additive_only_branch_violations(dir.path(), "main", None).is_empty());
     }
 
     #[test]
@@ -4943,7 +5014,7 @@ mod additive_only_tests {
         // fails → empty. The gate must not fire when it can't reason
         // about history.
         let dir = init_branched_repo();
-        let v = check_additive_only_branch_violations(dir.path(), "nope");
+        let v = check_additive_only_branch_violations(dir.path(), "nope", None);
         assert!(v.is_empty(), "unknown parent must no-op, got: {v:?}");
     }
 
@@ -4952,7 +5023,7 @@ mod additive_only_tests {
         // factory/worker has the same HEAD as main → no commits → no
         // violations.
         let dir = init_branched_repo();
-        let v = check_additive_only_branch_violations(dir.path(), "main");
+        let v = check_additive_only_branch_violations(dir.path(), "main", None);
         assert!(v.is_empty(), "branch with no commits must be clean: {v:?}");
     }
 
@@ -4964,7 +5035,7 @@ mod additive_only_tests {
         std::fs::write(dir.path().join("new.rs"), "fn main() {}\n").unwrap();
         git(dir.path(), &["add", "new.rs"]);
         git(dir.path(), &["commit", "-q", "-m", "feat: new.rs"]);
-        let v = check_additive_only_branch_violations(dir.path(), "main");
+        let v = check_additive_only_branch_violations(dir.path(), "main", None);
         assert!(
             v.is_empty(),
             "purely additive branch commit must pass: {v:?}"
@@ -4982,8 +5053,60 @@ mod additive_only_tests {
             dir.path(),
             &["commit", "-q", "-m", "fix: edit existing.txt"],
         );
-        let v = check_additive_only_branch_violations(dir.path(), "main");
+        let v = check_additive_only_branch_violations(dir.path(), "main", None);
         assert_eq!(v.len(), 1);
+        assert_eq!(v[0].path, "existing.txt");
+        assert!(v[0].status.starts_with('M'));
+    }
+
+    #[test]
+    fn branch_check_merge_satisfied_scopes_to_worker_merge_delta() {
+        // cas-0a2d shape: the epic already modifies a baseline file, while
+        // the additive-only worker contributes one new file. After the
+        // supervisor merge, the epic-vs-main diff contains M+A, but the
+        // task's merge delta contains only A and must pass.
+        let dir = init_branched_repo();
+        git(dir.path(), &["checkout", "-q", "main"]);
+        git(dir.path(), &["checkout", "-q", "-b", "epic"]);
+        std::fs::write(dir.path().join("existing.txt"), "pre-existing epic edit\n").unwrap();
+        git(dir.path(), &["add", "existing.txt"]);
+        git(dir.path(), &["commit", "-q", "-m", "epic: baseline drift"]);
+        git(dir.path(), &["checkout", "-q", "-b", "factory/task"]);
+        std::fs::write(dir.path().join("task-doc.md"), "task docs\n").unwrap();
+        git(dir.path(), &["add", "task-doc.md"]);
+        git(dir.path(), &["commit", "-q", "-m", "docs: additive task"]);
+        let anchor = git_output(dir.path(), &["rev-parse", "HEAD"]);
+        git(dir.path(), &["checkout", "-q", "epic"]);
+        git(
+            dir.path(),
+            &["merge", "-q", "--no-ff", "factory/task", "-m", "merge task"],
+        );
+
+        let v = check_additive_only_branch_violations(dir.path(), "epic", Some(anchor.as_str()));
+        assert!(
+            v.is_empty(),
+            "pre-existing epic modifications must not count against the task: {v:?}"
+        );
+    }
+
+    #[test]
+    fn branch_check_merge_satisfied_still_rejects_task_modification() {
+        let dir = init_branched_repo();
+        git(dir.path(), &["checkout", "-q", "main"]);
+        git(dir.path(), &["checkout", "-q", "-b", "epic"]);
+        git(dir.path(), &["checkout", "-q", "-b", "factory/task"]);
+        std::fs::write(dir.path().join("existing.txt"), "task edit\n").unwrap();
+        git(dir.path(), &["add", "existing.txt"]);
+        git(dir.path(), &["commit", "-q", "-m", "fix: modify existing"]);
+        let anchor = git_output(dir.path(), &["rev-parse", "HEAD"]);
+        git(dir.path(), &["checkout", "-q", "epic"]);
+        git(
+            dir.path(),
+            &["merge", "-q", "--no-ff", "factory/task", "-m", "merge task"],
+        );
+
+        let v = check_additive_only_branch_violations(dir.path(), "epic", Some(anchor.as_str()));
+        assert_eq!(v.len(), 1, "task modification must still be rejected");
         assert_eq!(v[0].path, "existing.txt");
         assert!(v[0].status.starts_with('M'));
     }
@@ -4996,7 +5119,7 @@ mod additive_only_tests {
             dir.path(),
             &["commit", "-q", "-m", "chore: drop existing.txt"],
         );
-        let v = check_additive_only_branch_violations(dir.path(), "main");
+        let v = check_additive_only_branch_violations(dir.path(), "main", None);
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].path, "existing.txt");
         assert!(v[0].status.starts_with('D'));
@@ -5026,7 +5149,7 @@ mod additive_only_tests {
         // leave it unstaged. The legacy `git diff HEAD` path would see
         // this and reject. The branch-diff path must not.
         std::fs::write(dir.path().join("existing.txt"), "drift\n").unwrap();
-        let v = check_additive_only_branch_violations(dir.path(), "main");
+        let v = check_additive_only_branch_violations(dir.path(), "main", None);
         assert!(
             v.is_empty(),
             "uncommitted drift must not count against the branch: {v:?}"

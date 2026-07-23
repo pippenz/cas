@@ -4,6 +4,15 @@
 **Reporter:** supervisor session (ozer project, epics cas-dcae / cas-8936 / cas-1cc5)
 **Severity:** medium — every instance needs a supervisor override or source-side workaround; erodes trust in the gates
 
+## Resolution
+
+All three false-positive classes are resolved. Class 1's remaining
+post-MERGE-REQUIRED case (cas-0a2d) was fixed by cas-3f7f: when a parked
+`factory_branch_anchor` is already integrated, additive-only validation now
+diffs the supervisor merge against its first parent. Pre-existing epic changes
+are excluded while genuine modified, deleted, or renamed files introduced by
+the task still fail. Regression coverage reproduces both outcomes.
+
 ## Class 1 — additive-only + lint gates scan branch baseline, not session deltas
 
 - **Where:** cas-a88c (host-only emulator setup, ZERO commits, clean worktree).
