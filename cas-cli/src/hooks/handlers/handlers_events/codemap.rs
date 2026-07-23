@@ -220,6 +220,13 @@ pub enum CodemapStaleness {
     },
 }
 
+/// Result of evaluating codemap freshness against an explicit git ref.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CodemapFreshnessEvaluation {
+    pub staleness: Option<CodemapStaleness>,
+    pub evaluated_ref: String,
+}
+
 /// Threshold for "significantly stale" — 10+ structural changes warrants urgent messaging.
 const SIGNIFICANT_STALENESS_THRESHOLD: usize = 10;
 
@@ -312,34 +319,86 @@ impl CodemapStaleness {
 ///
 /// Returns None if no action needed (codemap is up to date or fresh enough).
 pub fn check_codemap_freshness(cas_root: &Path) -> Option<CodemapStaleness> {
-    let project_root = cas_root.parent()?;
-
-    let codemap_path = project_root.join(".claude/CODEMAP.md");
-
-    if !codemap_path.exists() {
-        return Some(CodemapStaleness::Missing);
-    }
-
-    // Sole mechanism: git-based staleness detection.
-    // Works for terminal commits, worker commits, cherry-picks — any commit source.
-    // After `/codemap` regen + commit, the CODEMAP commit contains all prior
-    // structural changes → this returns None (up to date) automatically,
-    // with no manual `cas codemap clear` step required.
-    check_staleness_from_git(project_root)
+    evaluate_codemap_freshness(cas_root)?.staleness
 }
 
-/// Check staleness by comparing CODEMAP.md's last commit against subsequent
-/// structural changes (A/D/R) in git history.
+/// Evaluate CODEMAP freshness against the canonical remote default branch and
+/// the current checkout. A fresh result on either ref wins; otherwise the
+/// least-stale result is returned.
 ///
-/// This is the primary detection mechanism — it works regardless of how commits
-/// were made (terminal, worker, cherry-pick, etc.).
-fn check_staleness_from_git(project_root: &Path) -> Option<CodemapStaleness> {
-    let changes = get_structural_changes_after_codemap(project_root)?;
+/// The hook-facing [`check_codemap_freshness`] wrapper preserves the historical
+/// `Option<CodemapStaleness>` API, while CLI status uses this richer result to
+/// name the ref that was evaluated.
+pub fn evaluate_codemap_freshness(cas_root: &Path) -> Option<CodemapFreshnessEvaluation> {
+    let project_root = cas_root.parent()?;
+    let codemap_path = project_root.join(".claude/CODEMAP.md");
 
-    if changes.is_empty() {
-        return None;
+    let default_branch = crate::worktree::git::GitOperations::new(project_root.to_path_buf())
+        .detect_default_branch();
+    let remote_default = format!("origin/{default_branch}");
+    let mut refs = Vec::new();
+    if git_ref_exists(project_root, &remote_default) {
+        refs.push(remote_default);
+    } else if git_ref_exists(project_root, &default_branch) {
+        refs.push(default_branch);
+    }
+    refs.push("HEAD".to_string());
+    refs.dedup();
+
+    let mut best_stale: Option<(usize, CodemapFreshnessEvaluation)> = None;
+    let mut any_codemap = codemap_path.exists();
+    for evaluation_ref in refs {
+        let Some(codemap_commit) = get_codemap_last_commit(project_root, &evaluation_ref) else {
+            continue;
+        };
+        any_codemap = true;
+        let Some(changes) =
+            get_structural_changes_after(project_root, &codemap_commit, &evaluation_ref)
+        else {
+            continue;
+        };
+        if changes.is_empty() {
+            return Some(CodemapFreshnessEvaluation {
+                staleness: None,
+                evaluated_ref: evaluation_ref,
+            });
+        }
+
+        let staleness = staleness_from_changes(changes);
+        let count = staleness_change_count(&staleness);
+        let evaluation = CodemapFreshnessEvaluation {
+            staleness: Some(staleness),
+            evaluated_ref: evaluation_ref,
+        };
+        if best_stale
+            .as_ref()
+            .map(|(best_count, _)| count < *best_count)
+            .unwrap_or(true)
+        {
+            best_stale = Some((count, evaluation));
+        }
     }
 
+    if let Some((_, evaluation)) = best_stale {
+        return Some(evaluation);
+    }
+    if !any_codemap {
+        return Some(CodemapFreshnessEvaluation {
+            staleness: Some(CodemapStaleness::Missing),
+            evaluated_ref: "working tree".to_string(),
+        });
+    }
+
+    // Preserve the uncommitted-map mtime fallback when no ref contains a
+    // committed CODEMAP.
+    let changes = get_structural_changes_after_codemap(project_root)?;
+    Some(CodemapFreshnessEvaluation {
+        staleness: (!changes.is_empty()).then(|| staleness_from_changes(changes)),
+        evaluated_ref: "HEAD (uncommitted CODEMAP)".to_string(),
+    })
+}
+
+fn staleness_from_changes(changes: Vec<CodemapChange>) -> CodemapStaleness {
     let total_changes = changes.len();
     let file_list: Vec<String> = changes
         .iter()
@@ -355,15 +414,39 @@ fn check_staleness_from_git(project_root: &Path) -> Option<CodemapStaleness> {
         })
         .collect();
 
-    Some(make_staleness(total_changes, file_list, String::new()))
+    make_staleness(total_changes, file_list, String::new())
+}
+
+fn staleness_change_count(staleness: &CodemapStaleness) -> usize {
+    match staleness {
+        CodemapStaleness::Missing => usize::MAX,
+        CodemapStaleness::Stale { total_changes, .. }
+        | CodemapStaleness::SignificantlyStale { total_changes, .. } => *total_changes,
+    }
+}
+
+fn git_ref_exists(project_root: &Path, git_ref: &str) -> bool {
+    std::process::Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", git_ref])
+        .current_dir(project_root)
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
 }
 
 /// Get the object ID of the last commit that modified .claude/CODEMAP.md.
 ///
 /// Returns None if CODEMAP.md has never been committed or git fails.
-fn get_codemap_last_commit(project_root: &Path) -> Option<String> {
+fn get_codemap_last_commit(project_root: &Path, evaluation_ref: &str) -> Option<String> {
     let output = std::process::Command::new("git")
-        .args(["log", "-1", "--format=%H", "--", ".claude/CODEMAP.md"])
+        .args([
+            "log",
+            "-1",
+            "--format=%H",
+            evaluation_ref,
+            "--",
+            ".claude/CODEMAP.md",
+        ])
         .current_dir(project_root)
         .output()
         .ok()?;
@@ -381,8 +464,8 @@ fn get_codemap_last_commit(project_root: &Path) -> Option<String> {
 /// Committed maps use a strict commit range so their same-commit siblings are
 /// excluded. An uncommitted map retains the legacy mtime fallback.
 fn get_structural_changes_after_codemap(project_root: &Path) -> Option<Vec<CodemapChange>> {
-    if let Some(commit) = get_codemap_last_commit(project_root) {
-        return get_structural_changes_after(project_root, &commit);
+    if let Some(commit) = get_codemap_last_commit(project_root, "HEAD") {
+        return get_structural_changes_after(project_root, &commit, "HEAD");
     }
 
     let timestamp = get_codemap_mtime_timestamp(project_root)?;
@@ -405,8 +488,9 @@ fn get_codemap_mtime_timestamp(project_root: &Path) -> Option<String> {
 fn get_structural_changes_after(
     project_root: &Path,
     codemap_commit: &str,
+    evaluation_ref: &str,
 ) -> Option<Vec<CodemapChange>> {
-    let revision_range = format!("{codemap_commit}..HEAD");
+    let revision_range = format!("{codemap_commit}..{evaluation_ref}");
     query_structural_history(project_root, &revision_range)
 }
 
@@ -948,6 +1032,78 @@ mod tests {
         let reminder = codemap_stop_reminder(&cas_root)
             .expect("the stop reminder must share the positive freshness path");
         assert!(reminder.contains("1 pending structural change(s)"));
+    }
+
+    #[test]
+    fn test_codemap_freshness_prefers_fresh_origin_default_over_stale_checkout() {
+        use std::fs;
+        use std::process::Command;
+
+        let dir = tempfile::tempdir().unwrap();
+        let project_root = dir.path();
+        let cas_root = project_root.join(".cas");
+        fs::create_dir_all(&cas_root).unwrap();
+        fs::create_dir_all(project_root.join(".claude")).unwrap();
+        fs::create_dir_all(project_root.join("src")).unwrap();
+        fs::write(project_root.join(".claude/CODEMAP.md"), "# Initial map\n").unwrap();
+
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(project_root)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.name", "CAS Test"]);
+        git(&["config", "user.email", "cas-test@example.invalid"]);
+        git(&["add", ".claude/CODEMAP.md"]);
+        git(&["commit", "-q", "-m", "initial codemap"]);
+        git(&["branch", "old-epic"]);
+
+        // Canonical main receives a structural change and a regenerated map in
+        // the same commit, then the fetched origin/main ref records that tip.
+        fs::write(
+            project_root.join("src/canonical.rs"),
+            "pub fn canonical() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            project_root.join(".claude/CODEMAP.md"),
+            "# Regenerated map\n",
+        )
+        .unwrap();
+        git(&["add", ".claude/CODEMAP.md", "src/canonical.rs"]);
+        git(&["commit", "-q", "-m", "regenerate codemap on main"]);
+        git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
+
+        // A sibling session leaves the shared checkout on an old epic with
+        // enough post-map structural drift to trigger the false high-severity
+        // result if freshness is evaluated solely against HEAD.
+        git(&["checkout", "-q", "old-epic"]);
+        fs::create_dir_all(project_root.join("src")).unwrap();
+        for i in 0..12 {
+            fs::write(
+                project_root.join(format!("src/old_epic_{i}.rs")),
+                format!("pub fn old_epic_{i}() {{}}\n"),
+            )
+            .unwrap();
+        }
+        git(&["add", "src"]);
+        git(&["commit", "-q", "-m", "old epic structural drift"]);
+
+        let evaluation = evaluate_codemap_freshness(&cas_root)
+            .expect("git-backed codemap evaluation must be available");
+        assert_eq!(evaluation.evaluated_ref, "origin/main");
+        assert!(
+            evaluation.staleness.is_none(),
+            "fresh origin/main must win over the stale shared checkout: {evaluation:?}"
+        );
     }
 
     #[test]

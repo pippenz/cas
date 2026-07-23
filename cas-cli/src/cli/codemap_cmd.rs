@@ -3,7 +3,7 @@ use std::path::Path;
 use clap::Subcommand;
 
 use crate::hooks::handlers::handlers_events::codemap::{
-    check_codemap_freshness, CodemapPending,
+    CodemapPending, evaluate_codemap_freshness,
 };
 
 use super::Cli;
@@ -50,18 +50,24 @@ fn execute_status(cas_root: &Path) -> anyhow::Result<()> {
 
     // Authoritative freshness signal — same function used by the SessionStart hook.
     // This ensures `cas codemap status` and the hook can never disagree.
-    match check_codemap_freshness(cas_root) {
-        None => println!("  Status: up to date"),
-        Some(staleness) => {
-            // Strip XML wrapper tags (with any attributes) for CLI display
-            let injection = staleness.format_injection(false);
-            let clean = injection
-                .lines()
-                .filter(|l| !l.starts_with("<codemap-freshness") && !l.starts_with("</codemap-freshness"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            println!("  Status: stale");
-            println!("  {clean}");
+    if let Some(evaluation) = evaluate_codemap_freshness(cas_root) {
+        println!("  Evaluated ref: {}", evaluation.evaluated_ref);
+        match evaluation.staleness {
+            None => println!("  Status: up to date"),
+            Some(staleness) => {
+                // Strip XML wrapper tags (with any attributes) for CLI display
+                let injection = staleness.format_injection(false);
+                let clean = injection
+                    .lines()
+                    .filter(|l| {
+                        !l.starts_with("<codemap-freshness")
+                            && !l.starts_with("</codemap-freshness")
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                println!("  Status: stale");
+                println!("  {clean}");
+            }
         }
     }
 
