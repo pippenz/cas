@@ -53,6 +53,19 @@ fn skill_drift_no_sentinel_returns_false() {
     assert!(!result, "no drift when sentinel absent");
 }
 
+#[test]
+fn skill_drift_empty_session_id_does_not_create_bare_marker() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let cas_root = tmp.path();
+    std::fs::write(cas_root.join("skill_sync_sentinel"), b"ts:empty").unwrap();
+
+    assert!(!detect_and_mark_skill_drift(cas_root, ""));
+    assert!(
+        !cas_root.join("session_skills_seen_").exists(),
+        "empty session ids must never create a bare marker"
+    );
+}
+
 /// After drift is detected and marker written, a second call returns false
 /// (idempotent within a session lifecycle).
 #[test]

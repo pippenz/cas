@@ -3,7 +3,7 @@ use std::path::Path;
 use clap::Subcommand;
 
 use crate::hooks::handlers::handlers_events::codemap::{
-    check_codemap_freshness, CodemapPending,
+    CodemapPending, evaluate_codemap_freshness,
 };
 
 use super::Cli;
@@ -50,18 +50,24 @@ fn execute_status(cas_root: &Path) -> anyhow::Result<()> {
 
     // Authoritative freshness signal — same function used by the SessionStart hook.
     // This ensures `cas codemap status` and the hook can never disagree.
-    match check_codemap_freshness(cas_root) {
-        None => println!("  Status: up to date"),
-        Some(staleness) => {
-            // Strip XML wrapper tags (with any attributes) for CLI display
-            let injection = staleness.format_injection(false);
-            let clean = injection
-                .lines()
-                .filter(|l| !l.starts_with("<codemap-freshness") && !l.starts_with("</codemap-freshness"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            println!("  Status: stale");
-            println!("  {clean}");
+    if let Some(evaluation) = evaluate_codemap_freshness(cas_root) {
+        println!("  Evaluated ref: {}", evaluation.evaluated_ref);
+        match evaluation.staleness {
+            None => println!("  Status: up to date"),
+            Some(staleness) => {
+                // Strip XML wrapper tags (with any attributes) for CLI display
+                let injection = staleness.format_injection(false);
+                let clean = injection
+                    .lines()
+                    .filter(|l| {
+                        !l.starts_with("<codemap-freshness")
+                            && !l.starts_with("</codemap-freshness")
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                println!("  Status: stale");
+                println!("  {clean}");
+            }
         }
     }
 
@@ -196,12 +202,12 @@ fn get_codemap_last_updated(codemap_path: &Path) -> String {
 }
 
 // Note: get_git_structural_changes_since (the usize wrapper) was removed by cas-2de1 —
-// execute_status() now calls check_codemap_freshness() directly so both surfaces agree.
+// execute_status() now calls evaluate_codemap_freshness() directly so both surfaces agree.
 // get_git_structural_change_list is kept because execute_pending() uses it for display.
 
 /// Get structural change lines from git since CODEMAP.md was last updated.
 /// Used by execute_pending() to display what has changed — NOT used for
-/// freshness decisions (check_codemap_freshness() in codemap.rs owns that).
+/// freshness decisions (evaluate_codemap_freshness() in codemap.rs owns that).
 fn get_git_structural_change_list(project_root: &Path, codemap_path: &Path) -> Vec<String> {
     // Get CODEMAP.md's last commit timestamp
     let since = match get_codemap_git_timestamp(codemap_path) {

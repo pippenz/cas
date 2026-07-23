@@ -1,6 +1,7 @@
 use crate::sqlite::SqliteStore;
 use crate::{Result, Store};
 use cas_types::{Entry, Scope};
+use chrono::{DateTime, Utc};
 use std::path::Path;
 
 impl Store for SqliteStore {
@@ -50,6 +51,10 @@ impl Store for SqliteStore {
 
     fn recent(&self, n: usize) -> Result<Vec<Entry>> {
         self.store_recent(n)
+    }
+
+    fn recent_timestamp(&self, entry: &Entry) -> Result<DateTime<Utc>> {
+        self.store_recent_timestamp(entry)
     }
 
     fn archive(&self, id: &str) -> Result<()> {

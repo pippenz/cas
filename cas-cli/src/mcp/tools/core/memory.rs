@@ -731,6 +731,11 @@ impl CasCore {
 
         let mut output = format!("Recent entries ({}):\n\n", entries.len());
         for entry in entries {
+            let recent_at = store.recent_timestamp(&entry).map_err(|e| McpError {
+                code: ErrorCode::INTERNAL_ERROR,
+                message: Cow::from(format!("Failed to get recent timestamp: {e}")),
+                data: None,
+            })?;
             let branch_indicator = entry
                 .branch
                 .as_ref()
@@ -739,7 +744,7 @@ impl CasCore {
             output.push_str(&format!(
                 "- [{}] {}{} {}\n",
                 entry.id,
-                entry.created.format("%Y-%m-%d %H:%M"),
+                recent_at.format("%Y-%m-%d %H:%M"),
                 branch_indicator,
                 entry.preview(50)
             ));

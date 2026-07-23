@@ -794,6 +794,17 @@ impl CasCore {
         // For subtasks, show parent epic's worktree; for epics, show newly created worktree
         let wt_info = parent_worktree_info.or(worktree_info).unwrap_or_default();
 
+        let _ = crate::hooks::handlers::session_hygiene::append_factory_session_event(
+            &self.cas_root,
+            "task_started",
+            &[
+                ("task_id", &req.id),
+                ("title", &task.title),
+                ("actor", &actor),
+                ("assignee", task.assignee.as_deref().unwrap_or("")),
+            ],
+        );
+
         Ok(Self::success(format!(
             "Started task: {} - {}{}{}{}{}{}{}",
             req.id,

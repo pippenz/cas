@@ -582,6 +582,24 @@ impl CasCore {
             data: None,
         })?;
 
+        let _ = crate::hooks::handlers::session_hygiene::append_factory_session_event(
+            &self.cas_root,
+            "task_reset",
+            &[
+                ("task_id", &req.task_id),
+                ("prior_status", &format!("{prior_status:?}")),
+                ("prior_assignee", prior_assignee.as_deref().unwrap_or("")),
+                (
+                    "forced",
+                    if req.force.unwrap_or(false) {
+                        "true"
+                    } else {
+                        "false"
+                    },
+                ),
+            ],
+        );
+
         Ok(Self::success(format!(
             "Reset task: {} (was {:?}, assignee cleared, lease released: {})",
             req.task_id, prior_status, lease_released

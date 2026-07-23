@@ -4,11 +4,11 @@
 //!
 //! Two features live here:
 //!
-//! 1. A **session-end manifest** appended to
-//!    `.cas/logs/factory-session-{YYYY-MM-DD}.log`, capturing
-//!    `git status --porcelain` of the main worktree when a session ends.
-//!    This gives the next supervisor a durable record of what was left
-//!    behind (see task cas-a9ab, report §3).
+//! 1. A **structured factory event log** appended to
+//!    `.cas/logs/factory-session-{YYYY-MM-DD}.log`. Mid-session task,
+//!    coordination, and worktree events share the same JSON-lines append
+//!    path as the session-end worktree summary. This gives supervisors a
+//!    greppable history without repeating an unbounded porcelain dump.
 //!
 //! 2. A **WIP candidates** helper used by `coordination action=gc_report`
 //!    (and consumable by `SessionStart` triage for task cas-aeec) that
@@ -20,6 +20,79 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// Append one structured JSON-lines event to today's factory session log.
+///
+/// Mid-session callers use the active `CAS_FACTORY_SESSION`; outside factory
+/// mode this is a no-op. Logging is deliberately best-effort and must never
+/// make the operation being observed fail.
+pub fn append_factory_session_event(
+    cas_root: &Path,
+    event: &str,
+    fields: &[(&str, &str)],
+) -> Option<PathBuf> {
+    let factory_session = std::env::var("CAS_FACTORY_SESSION")
+        .ok()
+        .filter(|value| !value.trim().is_empty())?;
+    let agent_name = std::env::var("CAS_AGENT_NAME").ok();
+    let agent_role = std::env::var("CAS_AGENT_ROLE").ok();
+    append_factory_session_event_with_context(
+        cas_root,
+        event,
+        &factory_session,
+        agent_name.as_deref(),
+        agent_role.as_deref(),
+        fields,
+    )
+}
+
+fn append_factory_session_event_with_context(
+    cas_root: &Path,
+    event: &str,
+    factory_session: &str,
+    agent_name: Option<&str>,
+    agent_role: Option<&str>,
+    fields: &[(&str, &str)],
+) -> Option<PathBuf> {
+    let now = chrono::Utc::now();
+    let log_dir = cas_root.join("logs");
+    std::fs::create_dir_all(&log_dir).ok()?;
+    let log_path = log_dir.join(format!("factory-session-{}.log", now.format("%Y-%m-%d")));
+
+    let mut record = serde_json::Map::new();
+    record.insert("timestamp".into(), serde_json::Value::String(now.to_rfc3339()));
+    record.insert("event".into(), serde_json::Value::String(event.to_string()));
+    record.insert(
+        "factory_session".into(),
+        serde_json::Value::String(factory_session.to_string()),
+    );
+    record.insert(
+        "agent".into(),
+        serde_json::Value::String(agent_name.unwrap_or("unknown").to_string()),
+    );
+    record.insert(
+        "role".into(),
+        serde_json::Value::String(agent_role.unwrap_or("unknown").to_string()),
+    );
+    for (key, value) in fields {
+        record.insert(
+            (*key).to_string(),
+            serde_json::Value::String((*value).to_string()),
+        );
+    }
+
+    let mut line = serde_json::to_string(&serde_json::Value::Object(record)).ok()?;
+    line.push('\n');
+
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .ok()?;
+    file.write_all(line.as_bytes()).ok()?;
+    Some(log_path)
+}
 
 /// Single `git status --porcelain` entry.
 ///
@@ -121,13 +194,11 @@ pub fn porcelain_status(repo: &Path) -> Option<Vec<PorcelainEntry>> {
     Some(entries)
 }
 
-/// Append a session-end manifest entry to
+/// Append a summarized session-end event to
 /// `<cas_root>/logs/factory-session-{YYYY-MM-DD}.log`.
 ///
-/// The manifest is human-readable YAML-ish text, one block per session end,
-/// separated by `---`. The block always includes the session id, the agent
-/// (if known), the worktree path, and a porcelain status dump. A clean
-/// worktree is recorded as `git_status: (clean)` for later auditing.
+/// The event records dirty counts rather than an unbounded list of paths. It
+/// uses the same JSON-lines append path as mid-session factory events.
 ///
 /// Returns the log path on success, or `None` if the worktree could not be
 /// resolved or the git probe failed. I/O errors are swallowed by design.
@@ -139,39 +210,34 @@ pub fn write_session_end_manifest(
 ) -> Option<PathBuf> {
     let repo = main_worktree_path(cas_root)?;
     let entries = porcelain_status(&repo)?;
+    let total = entries.len().to_string();
+    let untracked = entries
+        .iter()
+        .filter(|entry| entry.is_untracked())
+        .count()
+        .to_string();
+    let modified = entries
+        .iter()
+        .filter(|entry| !entry.is_untracked())
+        .count()
+        .to_string();
+    let git_status = if entries.is_empty() { "clean" } else { "dirty" };
+    let worktree = repo.display().to_string();
 
-    let now = chrono::Utc::now();
-    let log_dir = cas_root.join("logs");
-    std::fs::create_dir_all(&log_dir).ok()?;
-    let log_path = log_dir.join(format!("factory-session-{}.log", now.format("%Y-%m-%d")));
-
-    let mut body = String::new();
-    body.push_str("---\n");
-    body.push_str(&format!("session_end: {}\n", now.to_rfc3339()));
-    body.push_str(&format!("session_id: {session_id}\n"));
-    body.push_str(&format!(
-        "agent: {} ({})\n",
-        agent_name.unwrap_or("unknown"),
-        agent_role.unwrap_or("unknown"),
-    ));
-    body.push_str(&format!("worktree: {}\n", repo.display()));
-    if entries.is_empty() {
-        body.push_str("git_status: (clean)\n");
-    } else {
-        body.push_str(&format!("git_status: {} entries\n", entries.len()));
-        for e in &entries {
-            body.push_str(&format!("  {} {}\n", e.status, e.path));
-        }
-    }
-
-    use std::io::Write;
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .ok()?;
-    f.write_all(body.as_bytes()).ok()?;
-    Some(log_path)
+    append_factory_session_event_with_context(
+        cas_root,
+        "session_end",
+        session_id,
+        agent_name,
+        agent_role,
+        &[
+            ("worktree", &worktree),
+            ("git_status", git_status),
+            ("git_status_total", &total),
+            ("git_status_modified", &modified),
+            ("git_status_untracked", &untracked),
+        ],
+    )
 }
 
 /// Summary of WIP candidates in the main worktree.
@@ -450,9 +516,64 @@ mod tests {
 
         assert!(path.exists());
         let contents = fs::read_to_string(&path).unwrap();
-        assert!(contents.contains("session_id: session-abc"));
-        assert!(contents.contains("lively-pelican-94"));
-        assert!(contents.contains("leftover.txt"));
+        let event: serde_json::Value = serde_json::from_str(contents.trim()).unwrap();
+        assert_eq!(event["event"], "session_end");
+        assert_eq!(event["factory_session"], "session-abc");
+        assert_eq!(event["agent"], "lively-pelican-94");
+        assert_eq!(event["role"], "worker");
+        assert_eq!(event["git_status"], "dirty");
+        assert_eq!(event["git_status_total"], "1");
+        assert_eq!(event["git_status_untracked"], "1");
+        assert!(
+            !contents.contains("leftover.txt"),
+            "session-end summary must not dump individual paths"
+        );
+    }
+
+    #[test]
+    fn structured_event_writer_appends_greppable_json_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cas_root = tmp.path().join(".cas");
+        let path = append_factory_session_event_with_context(
+            &cas_root,
+            "task_started",
+            "factory-session-abc",
+            Some("worker-a"),
+            Some("worker"),
+            &[("task_id", "cas-beb0"), ("assignee", "worker-a")],
+        )
+        .expect("event written");
+
+        let contents = fs::read_to_string(path).unwrap();
+        assert_eq!(contents.lines().count(), 1);
+        assert!(contents.contains(r#""event":"task_started""#));
+        assert!(contents.contains(r#""task_id":"cas-beb0""#));
+        assert!(contents.contains(r#""assignee":"worker-a""#));
+        serde_json::from_str::<serde_json::Value>(contents.trim()).expect("valid JSON line");
+    }
+
+    #[test]
+    fn session_end_summarizes_large_git_status_without_path_dump() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        init_repo(repo);
+        for index in 0..125 {
+            fs::write(repo.join(format!("untracked-{index:03}.txt")), "wip").unwrap();
+        }
+        let cas_root = repo.join(".cas");
+
+        let log = write_session_end_manifest(&cas_root, "sess-large", None, None)
+            .expect("summary written");
+        let body = fs::read_to_string(log).unwrap();
+        let event: serde_json::Value = serde_json::from_str(body.trim()).unwrap();
+        assert_eq!(event["git_status_total"], "125");
+        assert_eq!(event["git_status_untracked"], "125");
+        assert_eq!(body.lines().count(), 1, "one bounded JSON event expected");
+        assert!(
+            !body.contains("untracked-124.txt"),
+            "individual git status paths must not be dumped"
+        );
+        assert!(body.len() < 1_000, "summary should remain compact");
     }
 
     #[test]
@@ -518,18 +639,20 @@ mod tests {
         assert_eq!(p1, p2, "same daily log path expected");
 
         let body = fs::read_to_string(&p1).unwrap();
-        assert!(body.contains("session_id: sess-one"));
-        assert!(body.contains("session_id: sess-two"));
-        assert!(body.contains("agent: unknown (unknown)")); // first call, None/None
-        assert!(body.contains("agent: worker-b (worker)")); // second call
-        assert_eq!(
-            body.matches("---").count(),
-            2,
-            "each session-end must produce its own '---' block"
-        );
+        let events: Vec<serde_json::Value> = body
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(events.len(), 2, "each session end is one JSON line");
+        assert_eq!(events[0]["factory_session"], "sess-one");
+        assert_eq!(events[1]["factory_session"], "sess-two");
+        assert_eq!(events[0]["agent"], "unknown");
+        assert_eq!(events[0]["role"], "unknown");
+        assert_eq!(events[1]["agent"], "worker-b");
+        assert_eq!(events[1]["role"], "worker");
     }
 
-    /// A clean worktree records `git_status: (clean)` so audits can tell the
+    /// A clean worktree records `git_status=clean` so audits can tell the
     /// difference between "nothing was wrong" and "manifest never wrote".
     #[test]
     fn manifest_records_clean_tree_marker() {
@@ -557,8 +680,9 @@ mod tests {
         let log = write_session_end_manifest(&cas_root, "sess-clean", None, None)
             .expect("manifest written");
         let body = fs::read_to_string(&log).unwrap();
+        let event: serde_json::Value = serde_json::from_str(body.trim()).unwrap();
         assert!(
-            body.contains("git_status: (clean)"),
+            event["git_status"] == "clean" && event["git_status_total"] == "0",
             "clean worktree should be recorded, got: {body}"
         );
     }

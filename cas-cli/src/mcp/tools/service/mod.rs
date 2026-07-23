@@ -260,6 +260,7 @@ impl CasService {
         let this = self.clone();
         panic_catch::dispatch_with_catch("task", async move {
             let action = req.action.clone();
+            let event_task_id = req.id.clone().unwrap_or_default();
             let is_mutating = matches!(
                 req.action.as_str(),
                 "create"
@@ -286,8 +287,22 @@ impl CasService {
             } else {
                 None
             };
-            this.inner
-                .authorize_agent_action("task", &action, is_mutating, close_task_id)?;
+            if let Err(error) =
+                this.inner
+                    .authorize_agent_action("task", &action, is_mutating, close_task_id)
+            {
+                let _ = crate::hooks::handlers::session_hygiene::append_factory_session_event(
+                    &this.inner.cas_root,
+                    "error",
+                    &[
+                        ("tool", "task"),
+                        ("action", &action),
+                        ("task_id", &event_task_id),
+                        ("message", error.message.as_ref()),
+                    ],
+                );
+                return Err(error);
+            }
 
             let result = match req.action.as_str() {
                 "create" => this.task_create(req).await,
@@ -318,6 +333,19 @@ impl CasService {
                     ),
                 )),
             };
+
+            if let Err(error) = &result {
+                let _ = crate::hooks::handlers::session_hygiene::append_factory_session_event(
+                    &this.inner.cas_root,
+                    "error",
+                    &[
+                        ("tool", "task"),
+                        ("action", &action),
+                        ("task_id", &event_task_id),
+                        ("message", error.message.as_ref()),
+                    ],
+                );
+            }
 
             // Notify client of resource changes (Claude Code 2.1.0+)
             if is_mutating && result.is_ok() {
@@ -458,6 +486,8 @@ impl CasService {
         let this = self.clone();
         panic_catch::dispatch_with_catch("coordination", async move {
             let action = req.action.clone();
+            let event_target = req.target.clone().unwrap_or_default();
+            let event_task_id = req.task_id.clone().unwrap_or_default();
 
             let result = match action.as_str() {
                 // ---- Agent domain ----
@@ -619,6 +649,20 @@ impl CasService {
                     ),
                 )),
             };
+
+            if let Err(error) = &result {
+                let _ = crate::hooks::handlers::session_hygiene::append_factory_session_event(
+                    &this.inner.cas_root,
+                    "error",
+                    &[
+                        ("tool", "coordination"),
+                        ("action", &action),
+                        ("target", &event_target),
+                        ("task_id", &event_task_id),
+                        ("message", error.message.as_ref()),
+                    ],
+                );
+            }
 
             // Track with domain-specific tool name for backwards-compatible telemetry
             let domain = if action.starts_with("worktree_") {
