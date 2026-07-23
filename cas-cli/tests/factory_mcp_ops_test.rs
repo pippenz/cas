@@ -1834,6 +1834,34 @@ async fn test_gc_cleanup_without_force() {
 }
 
 #[tokio::test]
+async fn test_gc_cleanup_removes_only_stale_skill_markers_and_invalid_bare_marker() {
+    let env = FactoryTestEnv::new();
+    let stale = env.cas_root.join("session_skills_seen_old-session");
+    let current = env.cas_root.join("session_skills_seen_current-session");
+    let bare = env.cas_root.join("session_skills_seen_");
+    std::fs::write(&stale, "old").unwrap();
+    std::fs::write(&current, "current").unwrap();
+    std::fs::write(&bare, "invalid").unwrap();
+    filetime::set_file_mtime(
+        &stale,
+        filetime::FileTime::from_unix_time(1, 0),
+    )
+    .unwrap();
+
+    let result = env
+        .service
+        .factory(Parameters(factory_req("gc_cleanup")))
+        .await
+        .unwrap();
+    let text = get_text(&result);
+
+    assert!(text.contains("Stale skill markers removed: 2"), "{text}");
+    assert!(!stale.exists(), "old marker should be removed");
+    assert!(!bare.exists(), "invalid empty-session marker should be removed");
+    assert!(current.exists(), "live session marker must be preserved");
+}
+
+#[tokio::test]
 async fn test_gc_cleanup_with_force() {
     let env = FactoryTestEnv::new();
 

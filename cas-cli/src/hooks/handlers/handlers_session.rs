@@ -575,6 +575,10 @@ pub(crate) fn compute_session_title(agent_role: &str, active_tasks: &[Task]) -> 
 /// Failures (unreadable sentinel, unwritable marker, etc.) are silently
 /// treated as "no drift" so `SessionStart` never blocks on I/O errors.
 pub(crate) fn detect_and_mark_skill_drift(cas_root: &Path, session_id: &str) -> bool {
+    if session_id.trim().is_empty() {
+        return false;
+    }
+
     let sentinel_path = cas_root.join("skill_sync_sentinel");
     let marker_path = cas_root.join(format!("session_skills_seen_{session_id}"));
 

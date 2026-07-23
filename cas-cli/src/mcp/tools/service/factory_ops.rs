@@ -1601,10 +1601,41 @@ impl CasService {
             cleared_prompts = prompt_queue.clear().unwrap_or(0);
         }
 
+        const SKILL_MARKER_MAX_AGE: std::time::Duration =
+            std::time::Duration::from_secs(30 * 24 * 60 * 60);
+        let stale_skill_markers_removed =
+            cleanup_stale_skill_markers(&self.inner.cas_root, SKILL_MARKER_MAX_AGE);
+
         Ok(Self::success(format!(
-            "Factory GC cleanup complete.\n\nStale agents marked: {stale_marked}\nDead agent records purged: {dead_agent_records_purged}\nOrphan worktrees marked removed: {orphan_marked_removed}\nPrompt queue entries cleared: {cleared_prompts}"
+            "Factory GC cleanup complete.\n\nStale agents marked: {stale_marked}\nDead agent records purged: {dead_agent_records_purged}\nOrphan worktrees marked removed: {orphan_marked_removed}\nPrompt queue entries cleared: {cleared_prompts}\nStale skill markers removed: {stale_skill_markers_removed}"
         )))
     }
+}
+
+fn cleanup_stale_skill_markers(cas_root: &std::path::Path, max_age: std::time::Duration) -> usize {
+    let Ok(entries) = std::fs::read_dir(cas_root) else {
+        return 0;
+    };
+    let now = std::time::SystemTime::now();
+    entries
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with("session_skills_seen_"))
+        })
+        .filter(|entry| {
+            let invalid_empty_suffix = entry.file_name() == "session_skills_seen_";
+            let stale = entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| now.duration_since(modified).ok())
+                .is_some_and(|age| age > max_age);
+            (invalid_empty_suffix || stale) && std::fs::remove_file(entry.path()).is_ok()
+        })
+        .count()
 }
 
 /// Returns the set of worker names this supervisor owns, derived from the `CAS_FACTORY_WORKER_NAMES`
