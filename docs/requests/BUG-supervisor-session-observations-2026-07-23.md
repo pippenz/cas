@@ -88,7 +88,7 @@ Recency surfacing keys on created_at; the overlap gate systematically converts n
 - b) Overlap-gate acceptance bumps a `surfaced_at` timestamp used by recent/search boosting.
 - c) A `handoff` entry-type pinned into next-session-start context for the same project, exempt from overlap-merging.
 
-## 5. `.cas/` accumulates unbounded per-session sentinel files
+## 5. `.cas/` accumulates unbounded per-session sentinel files — SHIPPED (`341bd3f`)
 
 ### Symptoms
 `.cas/` contains 166 `session_skills_seen_<uuid>` files (plus an empty-suffixed one), one per historical session, never cleaned.
