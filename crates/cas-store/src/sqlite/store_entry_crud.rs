@@ -355,7 +355,10 @@ impl SqliteStore {
              pending_extraction, observation_type, stability, access_count,
              raw_content, compressed, memory_tier, importance, valid_from, valid_until, review_after, last_reviewed, pending_embedding,
              belief_type, confidence, domain, branch, scope, team_id, share
-             FROM entries WHERE archived = 0 ORDER BY created DESC LIMIT ?",
+             FROM entries
+             WHERE archived = 0
+             ORDER BY MAX(created, COALESCE(updated_at, created)) DESC
+             LIMIT ?",
         )?;
 
         let entries = stmt
@@ -364,6 +367,17 @@ impl SqliteStore {
 
         Ok(entries)
     }
+
+    pub(crate) fn store_recent_timestamp(&self, entry: &Entry) -> Result<chrono::DateTime<Utc>> {
+        let conn = self.conn.lock().unwrap();
+        let timestamp = conn.query_row(
+            "SELECT MAX(created, COALESCE(updated_at, created)) FROM entries WHERE id = ?",
+            params![entry.id],
+            |row| row.get::<_, String>(0),
+        )?;
+        Ok(Self::parse_datetime(&timestamp).unwrap_or(entry.created))
+    }
+
     pub(crate) fn store_archive(&self, id: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let rows = conn.execute(
