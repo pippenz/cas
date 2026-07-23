@@ -1300,6 +1300,18 @@ impl CasCore {
             " Worktree preserved (mid-session merge; pass cleanup=true to remove)."
         };
 
+        let _ = crate::hooks::handlers::session_hygiene::append_factory_session_event(
+            &self.cas_root,
+            "worktree_merged",
+            &[
+                ("worktree_id", &worktree.id),
+                ("branch", &worktree.branch),
+                ("target_branch", &worktree.parent_branch),
+                ("commit", merge_commit.as_deref().unwrap_or("none")),
+                ("cleanup", if do_cleanup { "true" } else { "false" }),
+            ],
+        );
+
         // Promote entries if configured
         if wt_config.promote_entries_on_merge {
             if let Ok(count) = self.promote_branch_entries(&worktree.branch) {

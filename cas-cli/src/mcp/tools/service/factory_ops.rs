@@ -330,6 +330,20 @@ impl CasService {
             .as_ref()
             .map(|id| format!("\nTask: {id} will be pre-assigned once the worker boots"))
             .unwrap_or_default();
+        let request_id_text = request_id.to_string();
+        let count_text = count.to_string();
+        let worker_names_text = worker_names.join(",");
+        let _ = crate::hooks::handlers::session_hygiene::append_factory_session_event(
+            &self.inner.cas_root,
+            "workers_spawn_queued",
+            &[
+                ("request_id", &request_id_text),
+                ("count", &count_text),
+                ("workers", &worker_names_text),
+                ("task_id", req.task_id.as_deref().unwrap_or("")),
+                ("isolate", if isolate { "true" } else { "false" }),
+            ],
+        );
 
         let msg = if worker_names.is_empty() {
             format!(
@@ -449,6 +463,19 @@ impl CasService {
                     format!("Failed to queue shutdown request: {e}"),
                 )
             })?;
+        let request_id_text = request_id.to_string();
+        let count_text = count.map(|value| value.to_string()).unwrap_or_default();
+        let worker_names_text = worker_names.join(",");
+        let _ = crate::hooks::handlers::session_hygiene::append_factory_session_event(
+            &self.inner.cas_root,
+            "workers_shutdown_queued",
+            &[
+                ("request_id", &request_id_text),
+                ("count", &count_text),
+                ("workers", &worker_names_text),
+                ("force", if force { "true" } else { "false" }),
+            ],
+        );
 
         let msg = if !worker_names.is_empty() {
             format!(

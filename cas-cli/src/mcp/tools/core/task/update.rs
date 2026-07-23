@@ -253,6 +253,7 @@ impl CasCore {
             message: Cow::from(format!("Task not found: {e}")),
             data: None,
         })?;
+        let prior_assignee = task.assignee.clone();
 
         let mut changes = Vec::new();
 
@@ -779,6 +780,19 @@ impl CasCore {
                     ));
                 }
             }
+        }
+
+        if changes.contains(&"assignee") {
+            let _ = crate::hooks::handlers::session_hygiene::append_factory_session_event(
+                &self.cas_root,
+                "task_assigned",
+                &[
+                    ("task_id", &req.id),
+                    ("title", &task.title),
+                    ("prior_assignee", prior_assignee.as_deref().unwrap_or("")),
+                    ("assignee", task.assignee.as_deref().unwrap_or("")),
+                ],
+            );
         }
 
         // Build response message with warnings if any
