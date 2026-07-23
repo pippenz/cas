@@ -22,6 +22,7 @@
 //! retry with exponential backoff handles concurrent access from multiple
 //! agents in factory mode.
 
+use chrono::{DateTime, Utc};
 use std::time::Duration;
 
 /// Busy timeout for SQLite connections to handle concurrent access.
@@ -232,6 +233,13 @@ pub trait Store: Send + Sync {
 
     /// Get the N most recent entries
     fn recent(&self, n: usize) -> Result<Vec<Entry>>;
+
+    /// Timestamp used to rank an entry returned by [`Store::recent`].
+    ///
+    /// Stores that do not track updates fall back to the creation time.
+    fn recent_timestamp(&self, entry: &Entry) -> Result<DateTime<Utc>> {
+        Ok(entry.created)
+    }
 
     /// Archive an entry
     fn archive(&self, id: &str) -> Result<()>;

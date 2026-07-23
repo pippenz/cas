@@ -1,6 +1,7 @@
 use crate::Store;
 use crate::sqlite::SqliteStore;
 use cas_types::{Entry, Scope, ShareScope};
+use chrono::{Duration, Utc};
 use tempfile::TempDir;
 
 // Imports used only by the per-entity round-trip tests below.
@@ -55,6 +56,44 @@ fn test_sqlite_store_crud() {
     // Delete entry
     store.delete(&id).unwrap();
     assert!(store.get(&id).is_err());
+}
+
+#[test]
+fn test_recent_resurfaces_an_old_entry_updated_later() {
+    let temp = TempDir::new().unwrap();
+    let store = SqliteStore::open(temp.path()).unwrap();
+    store.init().unwrap();
+
+    let old = Entry {
+        id: "p-old-handoff".to_string(),
+        created: Utc::now() - Duration::days(30),
+        content: "old handoff".to_string(),
+        ..Default::default()
+    };
+    store.add(&old).unwrap();
+
+    let newer = Entry {
+        id: "p-newer-memory".to_string(),
+        created: Utc::now() - Duration::days(1),
+        content: "newer memory".to_string(),
+        ..Default::default()
+    };
+    store.add(&newer).unwrap();
+
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    let mut updated_old = store.get(&old.id).unwrap();
+    updated_old.content.push_str(" with latest session notes");
+    store.update(&updated_old).unwrap();
+
+    let recent = store.recent(2).unwrap();
+    assert_eq!(
+        recent
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["p-old-handoff", "p-newer-memory"]
+    );
+    assert!(store.recent_timestamp(&recent[0]).unwrap() > recent[0].created);
 }
 
 #[test]
